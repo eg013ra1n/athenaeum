@@ -56,8 +56,9 @@ pub use background::{
 pub use grid::{LnFrameGrids, LnGrid};
 pub use reference::{build_reference, read_reference, write_reference, LnReference};
 pub use scale::{
-    relative_scale, relative_scale_against, relative_scale_from_fits, PreparedReferenceChannel,
-    ScaleResult, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
+    relative_scale, relative_scale_against, relative_scale_against_with_diag,
+    relative_scale_from_fits, relative_scale_from_fits_with_diag, PreparedReferenceChannel,
+    ScaleMatchDiag, ScaleResult, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
     LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
 };
 

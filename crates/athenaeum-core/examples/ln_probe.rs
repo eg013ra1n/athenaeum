@@ -45,17 +45,19 @@ use athenaeum_core::stacking::integrate::{
 };
 use athenaeum_core::stacking::ln::{
     background_grid, build_reference, normalize_frame, relative_scale, relative_scale_against,
-    BackgroundParams, LnFrameGrids, LnGrid, LnReferenceForDetection, PreparedReferenceChannel,
+    relative_scale_against_with_diag, relative_scale_from_fits_with_diag, BackgroundParams,
+    LnFrameGrids, LnGrid, LnReferenceForDetection, PreparedReferenceChannel, ScaleMatchDiag,
     DEFAULT_PARAMS, TARGET_DEVIATION_SIGMA,
 };
 use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
 use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
+use athenaeum_core::stacking::robust::rcr;
 use athenaeum_core::stacking::weights::FrameWeight;
 
 fn usage() -> ! {
     eprintln!(
         "usage: ln_probe --db <catalog.db> --set <id> --group <key> \
-[--frames N] [--scale 1024] [--frame <calibrated-file-stem>] [--no-fits]"
+[--frames N] [--scale 1024] [--frame <calibrated-file-stem>] [--no-fits] [--diag]"
     );
     std::process::exit(2);
 }
@@ -74,6 +76,11 @@ struct Args {
     /// with/without this flag on the SAME target frame is the task's own
     /// acceptance measurement.
     no_fits: bool,
+    /// Diagnostics round (ruling C-11): run the same-star-set / per-star /
+    /// aperture-conservation diagnostics on top of the ordinary output.
+    /// Never used by any production path; adds a `"diagC11"` block to the
+    /// printed JSON and nothing else.
+    diag: bool,
 }
 
 fn parse_args() -> Args {
@@ -84,11 +91,16 @@ fn parse_args() -> Args {
     let mut scale: u32 = LocalNormalizationConfig::default().scale;
     let mut frame: Option<String> = None;
     let mut no_fits = false;
+    let mut diag = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         if flag == "--no-fits" {
             no_fits = true;
+            continue;
+        }
+        if flag == "--diag" {
+            diag = true;
             continue;
         }
         let value = it.next().unwrap_or_else(|| usage());
@@ -111,6 +123,7 @@ fn parse_args() -> Args {
         scale,
         frame,
         no_fits,
+        diag,
     }
 }
 
@@ -210,6 +223,89 @@ fn median_abs(values: &[f32]) -> f64 {
     }
     v.sort_by(|a, b| a.total_cmp(b));
     v[v.len() / 2]
+}
+
+// ---- Diagnostics round (ruling C-11) --------------------------------------
+//
+// Everything below is diagnostic-only: it never runs unless `--diag` is
+// passed, and none of it is read by any production path. H1 (selection):
+// `passes_register_cuts` keeps a subset whose flux ratio differs from the
+// whole population's. H2 (profile): a Moffat fit on the NATIVE frame
+// integrates a different `signal` than a fit of the same star on the WARPED
+// (interpolated) frame.
+
+fn median_f64(values: &[f64]) -> f64 {
+    let mut v = values.to_vec();
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[v.len() / 2]
+}
+
+/// Position-matches two [`ScaleMatchDiag`] sets by reference-star centroid
+/// (≤ 1 px — the join key an external caller uses, per the diagnostics
+/// round's own instruction: two independent detect+fit passes on the same
+/// plane/beta are expected to agree far tighter than this, so 1 px is a
+/// generous tolerance, not a loose one). Returns, for each entry in `a`,
+/// the matching index in `b` if any (naive O(n·m) — a few thousand times a
+/// few thousand, fine for a one-off diagnostic run).
+fn match_by_position(
+    a: &[ScaleMatchDiag],
+    b: &[ScaleMatchDiag],
+    radius_px: f64,
+) -> Vec<Option<usize>> {
+    let r2 = radius_px * radius_px;
+    a.iter()
+        .map(|pa| {
+            b.iter().position(|pb| {
+                let dx = pa.ref_x - pb.ref_x;
+                let dy = pa.ref_y - pb.ref_y;
+                dx * dx + dy * dy <= r2
+            })
+        })
+        .collect()
+}
+
+/// Deciles (10 bins, edges at the 10/20/…/90th percentile of `signals`) —
+/// returns, for each entry, which decile (0 = faintest) it falls in.
+fn deciles_of(signals: &[f64]) -> Vec<usize> {
+    let mut sorted = signals.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let n = sorted.len().max(1);
+    signals
+        .iter()
+        .map(|&s| {
+            let rank = sorted.partition_point(|&v| v < s);
+            ((rank * 10) / n).min(9)
+        })
+        .collect()
+}
+
+/// Sum of finite pixel values inside a circular aperture of `radius` px
+/// centred at `(cx, cy)` — the raw SUM, not a background-subtracted or
+/// fitted flux, per the diagnostics round's own instruction (d): a pure
+/// pixel-conservation check independent of any fit model.
+fn aperture_sum(data: &[f32], w: usize, h: usize, cx: f64, cy: f64, radius: f64) -> f64 {
+    let r2 = radius * radius;
+    let x0 = (cx - radius).floor().max(0.0) as i64;
+    let x1 = ((cx + radius).ceil() as i64).min(w as i64 - 1);
+    let y0 = (cy - radius).floor().max(0.0) as i64;
+    let y1 = ((cy + radius).ceil() as i64).min(h as i64 - 1);
+    let mut sum = 0.0f64;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x as f64 - cx;
+            let dy = y as f64 - cy;
+            if dx * dx + dy * dy <= r2 {
+                let v = data[y as usize * w + x as usize];
+                if v.is_finite() {
+                    sum += v as f64;
+                }
+            }
+        }
+    }
+    sum
 }
 
 fn main() {
@@ -709,6 +805,200 @@ registration row for each — run stacking through Register first); found {}",
             )
         });
 
+        // Diagnostics round (ruling C-11), gated behind --diag: never runs
+        // in an ordinary probe invocation, and touches no production code
+        // path — it calls the SAME `_with_diag` variants `normalize_frame`
+        // itself never calls.
+        let mut diag_c11: Option<serde_json::Value> = None;
+        if args.diag {
+            if let Some(beta) = target_own_beta {
+                let plane_fits: Vec<athenaeum_core::stacking::psf_signal::StarFit> =
+                    target_fits.get(p).cloned().unwrap_or_default();
+                let fits_diag_result = relative_scale_from_fits_with_diag(
+                    &ref_for_detection.prepared[p],
+                    &plane_fits,
+                    &target.map,
+                    reference.width,
+                    reference.height,
+                    4.0,
+                    0.3,
+                    local_cfg.local_scale,
+                );
+                let prepared_same_beta = PreparedReferenceChannel::build(
+                    &ref_for_detection.sanitized_planes[p],
+                    reference.width,
+                    reference.height,
+                    PsfModel::Fixed(beta),
+                    &[],
+                    measure_opts.max_stars,
+                    Some(&pool),
+                );
+                let oracle_diag_result = relative_scale_against_with_diag(
+                    &prepared_same_beta,
+                    &sanitized_target,
+                    reference.width,
+                    reference.height,
+                    measure_opts.max_stars,
+                    4.0,
+                    0.3,
+                    local_cfg.local_scale,
+                    Some(&pool),
+                );
+                match (fits_diag_result, oracle_diag_result) {
+                    (Ok((_, fits_diag)), Ok((_, oracle_diag))) => {
+                        // (a) SAME-STAR-SET: for each oracle pair, is its
+                        // reference star also present in the fits path's
+                        // matched set (position, <= 1 px)?
+                        let matches_in_fits = match_by_position(&oracle_diag, &fits_diag, 1.0);
+                        let restricted: Vec<f64> = oracle_diag
+                            .iter()
+                            .zip(matches_in_fits.iter())
+                            .filter(|(_, m)| m.is_some())
+                            .map(|(d, _)| d.ratio)
+                            .collect();
+                        let full_oracle_ratios: Vec<f64> =
+                            oracle_diag.iter().map(|d| d.ratio).collect();
+                        let fits_ratios: Vec<f64> = fits_diag.iter().map(|d| d.ratio).collect();
+                        let restricted_rcr = rcr(&restricted, 0.3);
+                        let full_rcr = rcr(&full_oracle_ratios, 0.3);
+                        let fits_rcr = rcr(&fits_ratios, 0.3);
+
+                        // Flux-decile histogram: bin the ORACLE's own
+                        // (fuller) population by reference-star brightness
+                        // decile, count how many of each decile the fits
+                        // path also kept.
+                        let oracle_signals: Vec<f64> =
+                            oracle_diag.iter().map(|d| d.ref_signal).collect();
+                        let oracle_deciles = deciles_of(&oracle_signals);
+                        let mut decile_total = [0usize; 10];
+                        let mut decile_in_fits = [0usize; 10];
+                        for (i, &d) in oracle_deciles.iter().enumerate() {
+                            decile_total[d] += 1;
+                            if matches_in_fits[i].is_some() {
+                                decile_in_fits[d] += 1;
+                            }
+                        }
+
+                        // (b) PER-STAR ratio, matched-by-both stars only:
+                        // signal_native/signal_warped = oracle.ratio /
+                        // fits.ratio (the shared signal_ref cancels exactly
+                        // — both sides fit the SAME reference plane at the
+                        // SAME beta).
+                        let mut per_star: Vec<(f64, f64, f64)> = Vec::new();
+                        for (oi, m) in matches_in_fits.iter().enumerate() {
+                            if let Some(fi) = m {
+                                let o = &oracle_diag[oi];
+                                let f = &fits_diag[*fi];
+                                if f.ratio > 0.0 {
+                                    per_star.push((o.ratio / f.ratio, o.ref_signal, f.target_fwhm));
+                                }
+                            }
+                        }
+                        let per_star_ratios: Vec<f64> = per_star.iter().map(|x| x.0).collect();
+                        let per_star_median = median_f64(&per_star_ratios);
+                        let matched_signals: Vec<f64> = per_star.iter().map(|x| x.1).collect();
+                        let matched_deciles = deciles_of(&matched_signals);
+                        let mut by_decile: [Vec<f64>; 10] = Default::default();
+                        for (i, &d) in matched_deciles.iter().enumerate() {
+                            by_decile[d].push(per_star[i].0);
+                        }
+                        let decile_medians: Vec<f64> =
+                            by_decile.iter().map(|v| median_f64(v)).collect();
+                        let mut fwhm_sorted: Vec<f64> = per_star.iter().map(|x| x.2).collect();
+                        fwhm_sorted.sort_by(|a, b| a.total_cmp(b));
+                        let fwhm_q = |q: f64| -> f64 {
+                            if fwhm_sorted.is_empty() {
+                                return f64::NAN;
+                            }
+                            fwhm_sorted[(((fwhm_sorted.len() - 1) as f64) * q).round() as usize]
+                        };
+                        let (q1, q2, q3) = (fwhm_q(0.25), fwhm_q(0.5), fwhm_q(0.75));
+                        let mut fwhm_bins: [Vec<f64>; 4] = Default::default();
+                        for &(ratio_v, _, fwhm_v) in &per_star {
+                            let bin = if fwhm_v <= q1 {
+                                0
+                            } else if fwhm_v <= q2 {
+                                1
+                            } else if fwhm_v <= q3 {
+                                2
+                            } else {
+                                3
+                            };
+                            fwhm_bins[bin].push(ratio_v);
+                        }
+                        let fwhm_bin_medians: Vec<f64> =
+                            fwhm_bins.iter().map(|v| median_f64(v)).collect();
+
+                        // (d) ONE star stamp: the brightest Measure fit on
+                        // this plane, native aperture sum vs warped
+                        // aperture sum over a 15 px radius — pure pixel
+                        // conservation, no fit model involved.
+                        let aperture_diag = plane_fits
+                            .iter()
+                            .max_by(|a, b| a.signal.total_cmp(&b.signal))
+                            .and_then(|brightest| {
+                                let reader = PlaneReader::open(&target.path).ok()?;
+                                let native_plane = reader.read_plane(p).ok()?;
+                                let (wx, wy) = target.map.forward_exact(brightest.x, brightest.y);
+                                let native_sum = aperture_sum(
+                                    &native_plane,
+                                    reader.width(),
+                                    reader.height(),
+                                    brightest.x,
+                                    brightest.y,
+                                    15.0,
+                                );
+                                let warped_sum = aperture_sum(
+                                    &target_plane,
+                                    reference.width,
+                                    reference.height,
+                                    wx,
+                                    wy,
+                                    15.0,
+                                );
+                                Some(serde_json::json!({
+                                    "nativeX": brightest.x,
+                                    "nativeY": brightest.y,
+                                    "warpedX": wx,
+                                    "warpedY": wy,
+                                    "nativeApertureSum": native_sum,
+                                    "warpedApertureSum": warped_sum,
+                                    "warpedOverNative": warped_sum / native_sum,
+                                    "interpolation": interpolation,
+                                    "clamping": clamping,
+                                }))
+                            });
+
+                        diag_c11 = Some(serde_json::json!({
+                            "targetBeta": beta,
+                            "a": {
+                                "fullOracleScale": full_rcr.location,
+                                "restrictedOracleScale": restricted_rcr.location,
+                                "fitsScale": fits_rcr.location,
+                                "fullOracleMatches": full_oracle_ratios.len(),
+                                "restrictedOracleMatches": restricted.len(),
+                                "fitsMatches": fits_ratios.len(),
+                                "fluxDecileTotal": decile_total,
+                                "fluxDecileKeptByFits": decile_in_fits,
+                            },
+                            "b": {
+                                "matchedStarCount": per_star.len(),
+                                "medianNativeOverWarped": per_star_median,
+                                "byFluxDecileMedianNativeOverWarped": decile_medians,
+                                "byFwhmQuartileMedianNativeOverWarped": fwhm_bin_medians,
+                                "fwhmQuartileEdges": [q1, q2, q3],
+                            },
+                            "d": aperture_diag,
+                        }));
+                    }
+                    (Err(e), _) => eprintln!("channel {p}: diag fits path: {e}"),
+                    (_, Err(e)) => eprintln!("channel {p}: diag oracle path: {e}"),
+                }
+            } else {
+                eprintln!("channel {p}: diag skipped — no measured target beta");
+            }
+        }
+
         let target_params = BackgroundParams {
             scale: args.scale,
             deviation_sigma: TARGET_DEVIATION_SIGMA,
@@ -792,6 +1082,8 @@ registration row for each — run stacking through Register first); found {}",
                 "scale": same_beta_oracle_ok.map(|r| r.scale),
                 "matches": same_beta_oracle_ok.map(|r| r.matches),
             },
+            // Diagnostics round (ruling C-11), only present with --diag.
+            "diagC11": diag_c11,
         }));
     }
 

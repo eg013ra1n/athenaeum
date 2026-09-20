@@ -343,10 +343,18 @@ fn choose_pairing(
 /// evaluated) and that fit's index (what the spline dedupes on). All three
 /// are index-aligned and in the pairing's own order, so the sample handed
 /// to RCR is exactly what M2's inline loop built.
+///
+/// `ref_signal`/`tgt_fwhm` (Tier C Task 2 diagnostics round, ruling C-11)
+/// are ADDITIVE — populated alongside `ratios`/`positions`/`ref_idx` from
+/// data `ratio_sample` already reads, never changing what those three
+/// contain. They exist only so [`ScaleMatchDiag`] can report a per-pair
+/// brightness/FWHM without a second pass over `pairs`.
 struct RatioSample {
     ratios: Vec<f64>,
     positions: Vec<(f64, f64)>,
     ref_idx: Vec<usize>,
+    ref_signal: Vec<f64>,
+    tgt_fwhm: Vec<f64>,
 }
 
 /// `ref_fits` is the REFERENCE outcome's own fit list — Tier C ruling C-10:
@@ -362,6 +370,8 @@ fn ratio_sample(
         ratios: Vec::with_capacity(pairs.len()),
         positions: Vec::with_capacity(pairs.len()),
         ref_idx: Vec::with_capacity(pairs.len()),
+        ref_signal: Vec::with_capacity(pairs.len()),
+        tgt_fwhm: Vec::with_capacity(pairs.len()),
     };
     for &(r, t) in pairs {
         let rf = &ref_fits[r];
@@ -370,9 +380,51 @@ fn ratio_sample(
             out.ratios.push(flux_ref / flux_tgt);
             out.positions.push((rf.x, rf.y));
             out.ref_idx.push(r);
+            out.ref_signal.push(rf.signal);
+            out.tgt_fwhm.push(tgt_outcome.fits[t].fwhm());
         }
     }
     out
+}
+
+/// Diagnostic-only match record (Tier C Task 2 diagnostics round, ruling
+/// C-11) — never read by `normalize_frame` or any other production caller.
+/// One entry per pair `ratio_sample` accepted (`flux_ref > 0 && flux_tgt >
+/// 0`), in the pairing's own order — exactly [`RatioSample`]'s own rows,
+/// plus the matching [`crate::stacking::robust::RcrResult::kept`] flag.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleMatchDiag {
+    /// The reference star's own fitted centroid, in reference-plane pixel
+    /// coordinates — the join key an external caller uses to line up two
+    /// different calls' matched sets (position, not index: two calls may
+    /// resolve their reference fits via independent detect+fit passes, so
+    /// index equality is not guaranteed even when the physical star is the
+    /// same one).
+    pub ref_x: f64,
+    pub ref_y: f64,
+    /// The reference fit's own `signal` (background-subtracted flux) — a
+    /// stand-in for the star's brightness, for flux-decile binning.
+    pub ref_signal: f64,
+    /// `z_k = signal_ref / signal_target` — the exact ratio RCR sees.
+    pub ratio: f64,
+    /// Whether RCR kept this pair (index-aligned with `ratios` inside the
+    /// ordinary call — the same `RcrResult.kept[k]`).
+    pub kept: bool,
+    /// The TARGET fit's own FWHM (`sqrt(fwhm_x * fwhm_y)`).
+    pub target_fwhm: f64,
+}
+
+fn diag_from_sample(sample: &RatioSample, kept: &[bool]) -> Vec<ScaleMatchDiag> {
+    (0..sample.ratios.len())
+        .map(|k| ScaleMatchDiag {
+            ref_x: sample.positions[k].0,
+            ref_y: sample.positions[k].1,
+            ref_signal: sample.ref_signal[k],
+            ratio: sample.ratios[k],
+            kept: kept.get(k).copied().unwrap_or(false),
+            target_fwhm: sample.tgt_fwhm[k],
+        })
+        .collect()
 }
 
 /// The local scale model of ruling R-M4c-8: an approximating thin-plate
@@ -661,6 +713,64 @@ pub fn relative_scale_against(
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) -> Result<ScaleResult, LnError> {
+    relative_scale_against_core(
+        prepared,
+        target,
+        width,
+        height,
+        max_stars,
+        match_radius_px,
+        rcr_limit,
+        local_scale,
+        pool,
+    )
+    .map(|(r, _diag)| r)
+}
+
+/// Diagnostic-only (Tier C Task 2 diagnostics round, ruling C-11): exactly
+/// [`relative_scale_against`]'s own computation — this and it share ONE
+/// body ([`relative_scale_against_core`]) — but also returning the
+/// per-match [`ScaleMatchDiag`] records, so an external caller (the C-11
+/// probe extension) can compare which pairs two different calls kept
+/// without re-implementing the detect/fit/pairing/RCR chain. Never called
+/// by `normalize_frame` or any other production path.
+#[allow(clippy::too_many_arguments)]
+pub fn relative_scale_against_with_diag(
+    prepared: &PreparedReferenceChannel,
+    target: &[f32],
+    width: usize,
+    height: usize,
+    max_stars: usize,
+    match_radius_px: f64,
+    rcr_limit: f64,
+    local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
+    relative_scale_against_core(
+        prepared,
+        target,
+        width,
+        height,
+        max_stars,
+        match_radius_px,
+        rcr_limit,
+        local_scale,
+        pool,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relative_scale_against_core(
+    prepared: &PreparedReferenceChannel,
+    target: &[f32],
+    width: usize,
+    height: usize,
+    max_stars: usize,
+    match_radius_px: f64,
+    rcr_limit: f64,
+    local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
     let fit_params = FitParams::default();
     let default = prepared.default_prepared();
 
@@ -725,21 +835,25 @@ pub fn relative_scale_against(
         scale_source = "detected",
         "ln relative scale"
     );
-    Ok(ScaleResult {
-        scale: r.location,
-        sigma: r.scale,
-        matches: sample.ratios.len(),
-        rejected: r.rejected,
-        beta: default.outcome.beta,
-        pass,
-        local,
-        timings: ScaleTimings {
-            detect_ms,
-            refine_ms: 0,
-            fit_ms,
-            match_ms,
+    let diag = diag_from_sample(&sample, &r.kept);
+    Ok((
+        ScaleResult {
+            scale: r.location,
+            sigma: r.scale,
+            matches: sample.ratios.len(),
+            rejected: r.rejected,
+            beta: default.outcome.beta,
+            pass,
+            local,
+            timings: ScaleTimings {
+                detect_ms,
+                refine_ms: 0,
+                fit_ms,
+                match_ms,
+            },
         },
-    })
+        diag,
+    ))
 }
 
 /// Local `|det J|` of `map`'s FORWARD transform (native/subject → reference)
@@ -884,6 +998,58 @@ pub fn relative_scale_from_fits(
     rcr_limit: f64,
     local_scale: bool,
 ) -> Result<ScaleResult, LnError> {
+    relative_scale_from_fits_core(
+        prepared,
+        fits,
+        map,
+        ref_width,
+        ref_height,
+        match_radius_px,
+        rcr_limit,
+        local_scale,
+    )
+    .map(|(r, _diag)| r)
+}
+
+/// Diagnostic-only (Tier C Task 2 diagnostics round, ruling C-11): exactly
+/// [`relative_scale_from_fits`]'s own computation — this and it share ONE
+/// body ([`relative_scale_from_fits_core`]) — but also returning the
+/// per-match [`ScaleMatchDiag`] records. Never called by `normalize_frame`
+/// or any other production path.
+#[allow(clippy::too_many_arguments)]
+pub fn relative_scale_from_fits_with_diag(
+    prepared: &PreparedReferenceChannel,
+    fits: &[StarFit],
+    map: &PixelMap,
+    ref_width: usize,
+    ref_height: usize,
+    match_radius_px: f64,
+    rcr_limit: f64,
+    local_scale: bool,
+) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
+    relative_scale_from_fits_core(
+        prepared,
+        fits,
+        map,
+        ref_width,
+        ref_height,
+        match_radius_px,
+        rcr_limit,
+        local_scale,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relative_scale_from_fits_core(
+    prepared: &PreparedReferenceChannel,
+    fits: &[StarFit],
+    map: &PixelMap,
+    ref_width: usize,
+    ref_height: usize,
+    match_radius_px: f64,
+    rcr_limit: f64,
+    local_scale: bool,
+) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
     // Every fit in a plane's list shares one β (Measure's own per-plane
     // `fit_stars_with_beta` convention) — ruling C-10 compares against the
     // reference fitted at exactly that β, never the default.
@@ -951,21 +1117,25 @@ pub fn relative_scale_from_fits(
         scale_source = "fits",
         "ln relative scale"
     );
-    Ok(ScaleResult {
-        scale: r.location,
-        sigma: r.scale,
-        matches: sample.ratios.len(),
-        rejected: r.rejected,
-        beta: target_beta,
-        pass,
-        local,
-        timings: ScaleTimings {
-            detect_ms: 0,
-            refine_ms: 0,
-            fit_ms: 0,
-            match_ms,
+    let diag = diag_from_sample(&sample, &r.kept);
+    Ok((
+        ScaleResult {
+            scale: r.location,
+            sigma: r.scale,
+            matches: sample.ratios.len(),
+            rejected: r.rejected,
+            beta: target_beta,
+            pass,
+            local,
+            timings: ScaleTimings {
+                detect_ms: 0,
+                refine_ms: 0,
+                fit_ms: 0,
+                match_ms,
+            },
         },
-    })
+        diag,
+    ))
 }
 
 /// Thin wrapper: [`PreparedReferenceChannel::build`] +
@@ -1646,6 +1816,10 @@ mod tests {
                 })
                 .collect(),
             ref_idx: (0..60).map(|k| k % 5).collect(),
+            // Unused by `fit_local_scale` — diagnostic-only fields (ruling
+            // C-11), placeholders here.
+            ref_signal: vec![0.0; 60],
+            tgt_fwhm: vec![0.0; 60],
         };
         let kept = vec![true; 60];
 
@@ -1662,6 +1836,8 @@ mod tests {
                 .map(|k| (30.0 + (k % 10) as f64 * 45.0, 30.0 + (k / 10) as f64 * 55.0))
                 .collect(),
             ref_idx: (0..60).collect(),
+            ref_signal: vec![0.0; 60],
+            tgt_fwhm: vec![0.0; 60],
         };
         assert!(
             fit_local_scale(&spread, &kept, 0.8, 0.01, WIDTH, HEIGHT).is_some(),
@@ -2266,5 +2442,59 @@ mod tests {
             relative_scale_from_fits(&prepared, &[], &identity, WIDTH, HEIGHT, 4.0, 0.3, false)
                 .expect_err("no fits at all cannot produce 20 matched pairs");
         assert!(matches!(err, LnError::TooFewMatches { matches: 0 }));
+    }
+
+    /// Diagnostics round (ruling C-11): the `_with_diag` variants must be
+    /// bit-for-bit the SAME computation as the plain ones (they share one
+    /// `_core` body) — this pins that refactor, not any new behavior. Also
+    /// checks the diag vec's own internal consistency: its length is the
+    /// pre-RCR match count, and the number of `kept` entries is
+    /// `matches - rejected`.
+    #[test]
+    fn with_diag_variants_match_the_plain_ones_and_the_diag_vec_is_self_consistent() {
+        let stars = star_grid(35);
+        let reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, 93);
+        let target_stars = scale_stars(&stars, 0.8);
+        let target = synthetic_star_field(WIDTH, HEIGHT, &target_stars, FWHM, NOISE, 94);
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            &[],
+            200,
+            None,
+        );
+
+        let plain = relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+        )
+        .expect("a clean uniformly-scaled field must match");
+        let (diag_result, diag) = relative_scale_against_with_diag(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+        )
+        .expect("the diag variant must succeed identically");
+        assert_eq!(plain, diag_result, "with_diag must not change the result");
+        assert_eq!(diag.len(), plain.matches);
+        assert_eq!(
+            diag.iter().filter(|d| d.kept).count(),
+            plain.matches - plain.rejected
+        );
+
+        let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.default_beta());
+        let identity = identity_map();
+        let plain_fits =
+            relative_scale_from_fits(&prepared, &fits, &identity, WIDTH, HEIGHT, 4.0, 0.3, false)
+                .expect("mapped fits must match");
+        let (diag_fits_result, diag_fits) = relative_scale_from_fits_with_diag(
+            &prepared, &fits, &identity, WIDTH, HEIGHT, 4.0, 0.3, false,
+        )
+        .expect("the diag variant must succeed identically");
+        assert_eq!(plain_fits, diag_fits_result);
+        assert_eq!(diag_fits.len(), plain_fits.matches);
+        assert_eq!(
+            diag_fits.iter().filter(|d| d.kept).count(),
+            plain_fits.matches - plain_fits.rejected
+        );
     }
 }
