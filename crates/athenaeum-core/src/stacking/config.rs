@@ -547,8 +547,13 @@ fn clamp_tps_smoothing(value: f64) -> f64 {
 /// * `2` — Tier C: the same clip, tabulated over a `PHASES x PHASES` grid
 ///   of sub-pixel phases (per frame for a linear map, per 256-px source
 ///   tile under distortion). Level-preserving by construction; the drop's
-///   mass is split among its neighbours as if the drop sat up to 1/64 of
-///   an output pixel from where it really is.
+///   mass is split among its neighbours as if the drop sat up to
+///   `1 / (2 · PHASES)` = 1/128 of an output pixel from where it really
+///   is. `2` names the phase table AS SHIPPED, i.e. at
+///   `drizzle::phase_table::PHASES = 64` (ruling C-21). The 32-phase
+///   variant of the same kernel never left this branch, so it gets no
+///   generation of its own — a generation marks a change in what a
+///   RELEASED run produces.
 ///
 /// **Why it rides [`config_hash`] and no [`stage_hash`].** The drizzle
 /// stage has no cache: it re-runs from the calibrated frames on every run,

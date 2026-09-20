@@ -2138,10 +2138,19 @@ mod tests {
         // the driver must be DETERMINISTIC — same input, same bytes, band
         // parallelism and all (both values below were captured twice, on
         // separate runs, identical).
+        //
+        // Re-pinned once more in that item's fix round 1 (ruling C-21),
+        // which took `phase_table::PHASES` from 32 to 64 — halving the
+        // phase residual moves every tabulated pixel again. The
+        // intermediate `PHASES = 32` triple, recorded here only so a
+        // bisect can tell the two moves apart, was
+        // `(0x55b2eb71dd060899, 0xf91233f30df26760)`,
+        // `(0x830588d5d083ad47, 0xb4c714f38cdb3dc9)`,
+        // `(0x8e4c7c798be423c9, 0xc2cd2f6c50af020e)`.
         let expected: [(u64, u64); 3] = [
-            (0x55b2eb71dd060899, 0xf91233f30df26760), // 1 deg
-            (0x830588d5d083ad47, 0xb4c714f38cdb3dc9), // 5 deg
-            (0x8e4c7c798be423c9, 0xc2cd2f6c50af020e), // 30 deg
+            (0x81187c97b6136e5a, 0x9b0d3f76db4c3243), // 1 deg
+            (0x0c4e834ed96964b7, 0x03253ee8448a38ca), // 5 deg
+            (0x2058a2d2f620d9be, 0x9bf82f2ff73be09c), // 30 deg
         ];
 
         for (deg, (want_data, want_weight)) in [1.0_f64, 5.0, 30.0].into_iter().zip(expected) {
@@ -3259,33 +3268,28 @@ mod tests {
     // loop on a rayon pool, could not be made race-free anyway). ──
 
     /// The bar pins (c) and (d) hold ONE FRAME's tabulated plane to,
-    /// against the exact clip, per pixel.
+    /// against the exact clip, per pixel — the Tier C plan's own Task 4
+    /// gate.
     ///
-    /// **Measured, not chosen.** The deviation is the phase residual
+    /// **This bar is fixed and `phase_table::PHASES` is what moves to meet
+    /// it** (ruling C-21, reversing the first round, which had pinned 3 %
+    /// to keep `PHASES = 32`). The deviation is the phase residual
     /// (≤ `1 / (2 · PHASES)` of an output pixel) multiplied by the local
     /// RELATIVE gradient, so it peaks on star wings — where a Gaussian's
-    /// relative gradient is `r / σ²` per pixel — and scales as `1 /
-    /// PHASES`. Measured on these two fixtures (max over every covered
-    /// pixel):
+    /// relative gradient is `r / σ²` per pixel — and scales as
+    /// `1 / PHASES`. Measured on these two fixtures (max over every
+    /// covered pixel):
     ///
     /// | `PHASES` | rotated 1° | tps |
     /// | -------- | ---------- | --- |
     /// | 16 | 4.04 % | 4.64 % |
-    /// | 32 (ruling C-3) | 2.17 % | 2.55 % |
-    /// | 64 | 1.09 % | 1.63 % |
+    /// | 32 | 2.17 % | 2.55 % |
+    /// | **64 (shipped)** | **1.09 %** | **1.63 %** |
     ///
     /// Not a fixture-size artefact: at the M3 fixtures' own 64x48 the
-    /// rotated case still reads 2.13 %. The Tier C plan's Task 4 checklist
-    /// names 2 %, which `PHASES = 32` does not reach and `PHASES = 64`
-    /// does; ruling C-3 fixes `PHASES = 32`, so the CONSTANT stands and
-    /// the bar here is the measurement with headroom. What the acceptance
-    /// actually reads is unaffected — this is ONE frame's deposit, and a
-    /// group's master is the weighted mean over a hundred frames at
-    /// effectively uncorrelated phases, so the per-pixel deviation
-    /// averages down by `1/sqrt(N)` (the plane LEVEL, which does not
-    /// average at all, is already 1.3e-5 here against spec §8's 2e-3 bar).
-    /// Flagged for the controller in the task report with the table above.
-    const C2_MAX_PIXEL_DEVIATION: f64 = 0.03;
+    /// rotated case still read 2.13 % at 32. A future change that raises
+    /// the deviation belongs in `PHASES`, not here.
+    const C2_MAX_PIXEL_DEVIATION: f64 = 0.02;
 
     /// A structured mono field — a sky pedestal, a smooth large-scale
     /// gradient and a handful of Gaussian stars. Deliberately NOT uniform:

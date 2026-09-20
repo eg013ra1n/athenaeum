@@ -29,7 +29,7 @@
 //!
 //! **What moves numerically.** A pixel's phase is rounded to the centre of
 //! its `1 / PHASES` bin, so its area is split among the neighbouring
-//! output pixels as if the drop sat at most `1 / (2 · PHASES)` = 1/64 of
+//! output pixels as if the drop sat at most `1 / (2 · PHASES)` = 1/128 of
 //! an output pixel away from where it really is. The total deposited mass
 //! is unchanged (above); only its distribution among neighbours shifts.
 //! Spec §3.2 measured the resulting per-frame weight change at ≤ 1.6 %
@@ -42,8 +42,10 @@
 //! **Under distortion** the parallelogram varies slowly across the frame,
 //! so the table is rebuilt per [`TILE`]-pixel source tile from the map's
 //! LOCAL Jacobian at that tile's centre ([`super::geom::map_drop_at`]).
-//! Ruling C-3 fixes both numbers: `PHASES = 32`, one table per frame for
-//! `distortion.is_none()` and one per 256-px tile otherwise.
+//! Ruling C-3 fixes the shape: one table per frame for
+//! `distortion.is_none()`, one per 256-px tile otherwise, the phase bin's
+//! own CENTRE as its representative. [`PHASES`] is 64 (ruling C-21 —
+//! see that constant's own doc for the measurement that set it).
 //!
 //! **What the table never decides.** It supplies the GEOMETRY of one
 //! drop's overlap and nothing else: which source pixels are read, whether
@@ -56,10 +58,39 @@
 
 use super::geom::{self, Quad};
 
-/// The phase grid's resolution per axis (ruling C-3): a mapped drop
-/// centre's fractional position is rounded to one of `PHASES` bins on each
-/// axis, i.e. to within `1 / (2 · PHASES)` of an output pixel.
-pub const PHASES: usize = 32;
+/// The phase grid's resolution per axis: a mapped drop centre's fractional
+/// position is rounded to the centre of one of `PHASES` bins on each axis
+/// (ruling C-3's representative), i.e. to within `1 / (2 · PHASES)` of an
+/// output pixel.
+///
+/// **64, not ruling C-3's original 32 — ruling C-21.** The deviation a
+/// tabulated deposit carries against the exact clip is the phase residual
+/// times the local RELATIVE gradient, so it peaks on star wings (a
+/// Gaussian's relative gradient is `r / σ²` per pixel) and scales as
+/// `1 / PHASES`. Measured end to end through
+/// `the_phase_table_tracks_the_exact_clip_on_a_rotated_frame` and its TPS
+/// sibling, max over every covered pixel:
+///
+/// | `PHASES` | rotated 1° | tps |
+/// | -------- | ---------- | --- |
+/// | 16 | 4.04 % | 4.64 % |
+/// | 32 | 2.17 % | 2.55 % |
+/// | **64** | **1.09 %** | **1.63 %** |
+///
+/// Not a fixture-size artefact: at the M3 fixtures' own 64x48 the rotated
+/// case still read 2.13 % at `PHASES = 32`. The Tier C plan's per-pixel
+/// gate is 2 %, which 32 does not reach and 64 does — ruling C-21: the
+/// tolerance is the gate and does not move to fit the constant; the
+/// constant moves to fit the tolerance.
+///
+/// The cost is a 4x table (≈ 212 KB, so the lookup reads L2 rather than
+/// L1) and a 4x build. On the DEFAULT per-frame arm that build happens
+/// once per (frame, plane) — ≈ 1 ms against ≈ 1.6 s of deposit for ten
+/// 26 Mpx frames — and on the per-[`TILE`] arm it is paid per tile, which
+/// ruling C-21 accepts for a path that is not the default and has no
+/// real-data case (no registration in the acceptance catalog carries a
+/// distortion layer).
+pub const PHASES: usize = 64;
 
 /// The source-tile edge, in SOURCE pixels, a distortion map's table is
 /// rebuilt over (ruling C-3). A tile's table is built from the map's local
@@ -91,8 +122,8 @@ const MAX_CELLS_PER_PHASE: usize = 256;
 /// Storage is one flat CSR-shaped pair: `starts[k] .. starts[k + 1]` is
 /// phase `k = iy * PHASES + ix`'s slice of `cells` (the output-pixel
 /// offsets from `floor` of the mapped centre) and of `areas` (the
-/// corresponding overlap areas, in output pixels²). At `PHASES = 32` with
-/// a `scale = 2` drop that is ≈ 1024 × 9 entries ≈ 55 KB — built once per
+/// corresponding overlap areas, in output pixels²). At `PHASES = 64` with
+/// a `scale = 2` drop that is ≈ 4096 × 9 entries ≈ 212 KB — built once per
 /// frame (or per [`TILE`] under distortion), never per pixel.
 #[derive(Debug, Clone)]
 pub struct PhaseTable {
