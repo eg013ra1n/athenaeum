@@ -26,6 +26,14 @@
 # would distort a wall-clock measurement. Picks the first free port from
 # 8950 up, so a leftover server from an earlier checkpoint attempt never
 # collides with this one.
+# This script uses zsh's 1-based arrays. Invoked through `bash checkpoint.sh …`
+# the positional parse shifts by one (NAME := the base name), and the script
+# then `rm -rf`s and overwrites the BASE checkpoint — which is exactly what
+# destroyed the Tier A ruler on 2026-09-20. Re-exec under zsh whatever shell
+# started us.
+if [ -z "${ZSH_VERSION:-}" ]; then
+  exec zsh "$0" "$@"
+fi
 set -euo pipefail
 NUMERIC=0
 POS=()
@@ -44,6 +52,10 @@ for n in "$NAME" "$BASE"; do
     ''|*[!A-Za-z0-9_-]*) echo "refusing checkpoint name '$n': letters, digits, _ and - only" >&2; exit 1 ;;
   esac
 done
+if [ "$NAME" = "$BASE" ]; then
+  echo "refusing: checkpoint name '$NAME' equals the base name — the base is read, never rewritten" >&2
+  exit 1
+fi
 ACC_ROOT="$HOME/.athenaeum-acc"
 TEMPLATE="$ACC_ROOT/tierA-template"
 COPY="$ACC_ROOT/tierA-$NAME"
