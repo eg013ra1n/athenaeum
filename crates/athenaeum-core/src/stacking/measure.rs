@@ -1041,7 +1041,13 @@ mod tests {
         );
         assert_eq!(c.beta, 10.0, "Auto resolves to the widest β on Gaussians");
         assert_eq!(c.psf_signal_weight, 1.387_068_045_273_481_56e-3);
-        assert_eq!(c.fwhm_px, 4.122_658_320_014_304);
+        // `fwhm_px` is a shape aggregate over 150 Moffat fits whose arithmetic
+        // (Tier C C3: `powi`/`powf`, the reused residual) rounds differently
+        // per platform's libm — the first push after C3 read 4.122_658_320_014_302_5
+        // on the Windows runner against this Mac's ..._304, one ulp. A last-bit
+        // FWHM is not a contract, so this aggregate is pinned to a few ulp,
+        // never exactly; the fields above stay exact on every platform.
+        assert_ulp_close(c.fwhm_px, 4.122_658_320_014_304, "fwhm_px");
         // The delegate equality, kept as a cheap structural check — it is
         // not the pin above. Timings are wall-clock, not measurement output,
         // so they're zeroed before the comparison (perf tier 1 Task 0).
@@ -1205,9 +1211,20 @@ mod tests {
     fn measure_plane_with_seeds_pinned_before_task_3b_rewrite() {
         let (data, w, h) = field(2026_09_19, 1.0, 0.002);
         let opts = MeasureOptions::default();
-        let m = without_timings(
+        let mut m = without_timings(
             measure_plane_with_seeds(&data, w, h, &opts, None, SeedSource::Fast).channel,
         );
+        // The two shape aggregates over the 150 Moffat fits round differently
+        // per platform's libm since Tier C C3 (the first CI run after it read
+        // fwhm_px 4.121_806_182_224_867_5 on Windows and eccentricity
+        // ..._035_98 / ..._036_19 on Windows / Linux against this Mac's
+        // ..._036_08 — 1e-16 absolute, 4e-15 relative). They are pinned to a
+        // few ulp and then snapped to the pinned value, so the remaining 20
+        // fields are compared EXACTLY through one Debug string as before.
+        assert_ulp_close(m.fwhm_px, 4.121_806_182_224_867, "fwhm_px");
+        assert_ulp_close(m.eccentricity, 0.095_246_020_871_036_08, "eccentricity");
+        m.fwhm_px = 4.121_806_182_224_867;
+        m.eccentricity = 0.095_246_020_871_036_08;
         assert_eq!(
             format!("{m:?}"),
             "ChannelMeasurement { stars_detected: 150, stars_fitted: 150, \
@@ -1222,6 +1239,19 @@ noise_scale_high: 0.0024544917978346348, location: 0.08010764420032501, \
 scale: 0.0020880382508039474, psf_signal_weight: 0.0014687684228686841, \
 psf_snr: 0.0021537136857493117, timings: MeasureTimings { read_ms: 0, \
 background_ms: 0, noise_ms: 0, detect_ms: 0, fit_ms: 0 } }"
+        );
+    }
+
+    /// A few ulp of tolerance for the one class of pinned number whose last
+    /// bits legitimately differ between platforms: an aggregate over Moffat
+    /// fits (`powf`/`exp` in the platform libm). 1e-12 relative is ≈ 4 500
+    /// ulp at these magnitudes — far above any libm difference (the measured
+    /// ones are 1–2 ulp) and far below anything the pipeline could notice.
+    fn assert_ulp_close(got: f64, want: f64, what: &str) {
+        let rel = ((got - want) / want).abs();
+        assert!(
+            rel <= 1e-12,
+            "{what}: got {got:?}, pinned {want:?} (relative {rel:.3e} > 1e-12)"
         );
     }
 }
