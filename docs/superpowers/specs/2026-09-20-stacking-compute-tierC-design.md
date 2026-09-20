@@ -24,7 +24,8 @@ but the M-run acceptance: masters against the external reference and against `ti
 within stated tolerances.
 
 Expected on the reduced set (g2/g3 numbers as the base): Normalize 5.8 → ≈ 2.5 min, Drizzle
-4.3 → ≈ 1.2 min, Measure 4.4 → ≈ 3.5 min, Integrate 4.0 → ≈ 3.3 min — **≈ 22.3 → ≈ 15 min**;
+4.3 → ≈ 1.2 min, Measure 4.4 → ≈ 3.5 min, Integrate 4.0 → **4.0 min (unchanged — C4 measured out, §5)** —
+**≈ 22.3 → ≈ 15.7 min**;
 on the full LDN 1272 set (368 frames) ≈ 49 → ≈ 28–30 min.
 
 ## 1. Scope
@@ -34,7 +35,7 @@ on the full LDN 1272 set (368 frames) ≈ 49 → ≈ 28–30 min.
 | C1 | **LN takes Measure's fits** (D1) with β resolved once per group (D9) | numeric | Normalize | −3 min |
 | C2 | **Drizzle phase table** (Z3): tabulated overlap areas, 0 divisions per pixel | numeric | Drizzle | −3 min |
 | C3 | **Moffat fitter arithmetic** (D6): one `powf` per sample-iteration, no `ln` at fixed β, SoA samples, scratch reuse, residual reuse | numeric (last-bit) | Measure, LN, Register refine | −0.8 min |
-| C4 | **`medfit_line` early exit + warm bracket** (I7, I8) | numeric (last-bit) | Integrate | −0.7 min |
+| C4 | **`medfit_line` early exit + warm bracket** (I7, I8) | numeric (last-bit) | Integrate | ~~−0.7 min~~ **0 — measured out, see §5** |
 | C5 | **LN background on a 4×4-binned plane** (L3) + `median_of_finite` from the stratified sample (L4) | numeric | Normalize | −0.3 min |
 | C6 | **Register reuses Measure's fits for mono frames** (D2) | numeric | Register | −0.2 min |
 
@@ -309,7 +310,13 @@ evaluated with different rounding: the fit's fixed point moves by ≈ 1e-6 relat
 flux (the audit's estimate; measured in §7 as the metrics' drift). Ruling C-4: no change to the LM
 control flow (damping, acceptance, iteration cap) — those are what M4a calibrated.
 
-## 5. C4 — `medfit_line` early exit and warm bracket (I7, I8)
+## 5. C4 — `medfit_line` early exit and warm bracket (I7, I8) — **measured out**
+
+**Outcome (ruling C-26): I7 was already implemented, I8 was implemented, measured and reverted.
+C4 contributes 0 to Tier C.** The section below keeps the original proposal for the record,
+followed by what the measurement found.
+
+### The proposal, as designed
 
 `integration/combine.rs::medfit_line`: the bracket is re-derived as `b ± 3σ_b` on every call and
 bisected 12 times; the outer rejection loop runs a confirming iteration that rejects < 0.1 % of
@@ -318,10 +325,55 @@ until the width is below the same tolerance (≈ 4 halvings instead of 12 on a w
 the cold bracket as the fallback when the warm one does not contain a sign change; (I7) stop the
 outer loop when an iteration rejected nothing new (today it runs one more to confirm). The
 tolerance `1e-3 σ_b` is NOT loosened (I9 dropped: its −1.2 min is not worth widening the
-dispersion the R-M4a-17 calibration rests on). What moves: the slope's last bits (the bisection
-converges to the same root within tolerance from a different start) and, for a stack whose
-confirming iteration would have rejected one more sample at the boundary, that sample. The
-rejected fraction is an acceptance metric (§7).
+dispersion the R-M4a-17 calibration rests on).
+
+### What the measurement found (Task 6)
+
+**I7 — the exit already exists**, and has since the original linear-fit clipper (`e8512317`):
+`if w == kept { break; }` ends the loop on the first pass that rejects nothing. That pass IS the
+confirmation — it runs a full `medfit_line` and filter sweep to learn the survivor set has
+stopped moving — and skipping it cannot keep the same survivors. Measured: the final iteration
+rejected 0 samples on 1 000 of 1 000 seeded stacks; `rejection_iters_mean` on the real probe is
+1.588, and no change to the loop can lower it. Commit `fdab9ba1` pins the exit (with teeth:
+deleting it makes the loop run all 20 passes) and changes no production code. The premise "today
+it runs one more to confirm" was simply not true.
+
+**I8 — built, measured, reverted.** Implemented as `3·σ_b/8` with three extra widenings (which
+walk the bracket back up to the cold one exactly, so no fallback branch and a warm call can never
+bracket less than a cold one), pinned against a verbatim pre-change reference, and measured with
+`integrate_probe --limit 60 --rejection linearFit` on 60 real mono frames, interleaved B/A x5:
+
+| metric | before | after | ratio |
+| ------ | ------ | ----- | ----- |
+| `medfit_evals_mean` | 22.690 | 21.466 | **0.946x** |
+| `combine_cpu_ms` (median of arms) | 286 312 | 276 650 | **0.966x** (≈ 9 s per run) |
+| `rejected_fraction` | 0.012 475 337 | 0.012 474 010 | −0.000 13 pp |
+| `rejection_iters_mean` | 1.588 034 | 1.587 973 | −0.004 % |
+
+Reverted under **ruling C-26**: a ≈ 3 % combine gain does not buy a numeric change to the
+rejection kernel, and the item's own bar (`medfit_evals_mean` ≤ 0.5x) was missed rather than met
+— re-sizing the bar to the 0.95x achieved would be tolerance-tuning. Four findings stand, and are
+recorded in `medfit_line`'s doc comment so the shape is not re-proposed:
+
+- **≤ 0.5x is unreachable by ANY change confined to the warm bracket.** The outer loop runs ~1.6
+  iterations per pixel stack on a real plane, so the COLD first call — which has no prior slope
+  and must not move — is about half of all evaluations; free warm calls would still land near
+  0.63x.
+- **The "≈ 4 halvings instead of 12" premise is false.** The slope moves between iterations as the
+  extreme samples leave the survivor set: `|Δb|` p50 = **216 tolerances**, p90 = 929 (4 000 seeded
+  stacks). A bracket narrow enough for 4 halvings misses the root almost always and pays two
+  evaluations per widening to find it again.
+- **A carried half-width is worth nothing** — simulated at 1.00x. `σ_b` collapses between
+  iterations, so a width in absolute slope units is stale when used; only a multiple of the
+  current call's `σ_b` is scale-free.
+- **Any narrower bracket is a real numeric change, not a last-bit one.** 40 of 1 000 warm calls
+  converge to a genuinely different root — inherent to the estimator (`f` is an integer-valued
+  step function whose zero set is a plateau, so the minimum-absolute-deviation line is not unique
+  and both roots are equally valid; the warm line's objective was on average 2.5e-6 BELOW the
+  cold line's and never 0.151 % above it) — which moved ~2 000 of 26 M rejection decisions per
+  plane. Every master built at n ≥ 20 would have differed.
+
+Full measurement: `.superpowers/sdd/2026-09-20-stacking-compute-tierC-plan/task-6-report.md`.
 
 ## 6. C5 — LN background on a binned plane (L3, L4)
 
@@ -375,6 +427,12 @@ flow untouched; C-5 `LN_BIN = 4`; C-6 mono-only fit reuse in Register, OSC keeps
 detection; C-7 (process) one implementer at a time, interleaved before/after measurement for
 every timing, the product-build checkpoint as the arbiter, an honest revert with numbers when an
 item measures ≤ 0 (Tier A's rulings R-TA-8/9 carried over).
+
+**C-26** (Task 6, coordinator): C4 is reverted. `medfit_line`'s warm bracket measured 0.946x
+evaluations and 0.966x `combine_cpu_ms` on real data — a ≈ 3 % combine gain does not buy a
+numeric change to the rejection kernel, and the item's ≤ 0.5x bar was missed, not met (re-sizing
+it to the achieved 0.95x would be tolerance-tuning). The pin of the already-existing
+exit-on-zero-rejection (I7) stands; C4's expected −0.7 min becomes 0. See §5.
 
 **C-1a** (Task 1, plan ledger): the group β is the LOWER median of the members' `Auto` β's
 (`psf_signal::group_beta`, sorted, index `(n-1)/2`), not their mean — a plain average of two
