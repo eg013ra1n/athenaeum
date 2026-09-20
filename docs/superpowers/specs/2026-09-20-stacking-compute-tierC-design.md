@@ -23,10 +23,11 @@ sample-iteration. Tier C changes those routes. **Outputs move**, so its gate is 
 but the M-run acceptance: masters against the external reference and against `tierA-baseline`
 within stated tolerances.
 
-Expected on the reduced set (g2/g3 numbers as the base): Normalize 5.8 → ≈ 2.5 min, Drizzle
+Expected on the reduced set (g2/g3 numbers as the base): Normalize 5.8 → ≈ 2.8 min
+(**C5 measured out, §6** — its −0.3 min is gone with it), Drizzle
 4.3 → ≈ 1.2 min, Measure 4.4 → ≈ 3.5 min, Integrate 4.0 → **4.0 min (unchanged — C4 measured out, §5)** —
-**≈ 22.3 → ≈ 15.7 min**;
-on the full LDN 1272 set (368 frames) ≈ 49 → ≈ 28–30 min.
+**≈ 22.3 → ≈ 16.0 min**;
+on the full LDN 1272 set (368 frames) ≈ 49 → ≈ 29–31 min.
 
 ## 1. Scope
 
@@ -36,7 +37,7 @@ on the full LDN 1272 set (368 frames) ≈ 49 → ≈ 28–30 min.
 | C2 | **Drizzle phase table** (Z3): tabulated overlap areas, 0 divisions per pixel | numeric | Drizzle | −3 min |
 | C3 | **Moffat fitter arithmetic** (D6): one `powf` per sample-iteration, no `ln` at fixed β, SoA samples, scratch reuse, residual reuse | numeric (last-bit) | Measure, LN, Register refine | −0.8 min |
 | C4 | **`medfit_line` early exit + warm bracket** (I7, I8) | numeric (last-bit) | Integrate | ~~−0.7 min~~ **0 — measured out, see §5** |
-| C5 | **LN background on a 4×4-binned plane** (L3) + `median_of_finite` from the stratified sample (L4) | numeric | Normalize | −0.3 min |
+| C5 | **LN background on a 4×4-binned plane** (L3) + `median_of_finite` from the stratified sample (L4) | numeric | Normalize | ~~−0.3 min~~ **0 — measured out, see §6** |
 | C6 | **Register reuses Measure's fits for mono frames** (D2) | numeric | Register | −0.2 min |
 
 Not in Tier C: I10 (IRLS line — recalibrates `LINEAR_FIT_SIGMA_SCALE`, R-M4a-17), Z4 (an
@@ -375,7 +376,14 @@ recorded in `medfit_line`'s doc comment so the shape is not re-proposed:
 
 Full measurement: `.superpowers/sdd/2026-09-20-stacking-compute-tierC-plan/task-6-report.md`.
 
-## 6. C5 — LN background on a binned plane (L3, L4)
+## 6. C5 — LN background on a binned plane (L3, L4) — **measured out**
+
+**Outcome (ruling C-29): built, measured on the full 197-frame acceptance set, and reverted.
+C5 contributes 0 to Tier C.** The section below keeps the original proposal for the record,
+followed by what the measurement found. Same class as C4 (§5): a real speed-up whose numeric
+cost the tier's own §8 bars refuse.
+
+### The proposal, as designed
 
 `background_grid` models the background on a `scale/8 = 128` px node mesh; it reads the full
 26 Mpx plane. C5: `clip_and_bin` — the per-source-pixel hot-pixel and `[low_clip, high_clip]` passes of the
@@ -384,14 +392,42 @@ pixels, NaN if fewer than 8 of 16 are finite) before the cell loop — the model
 so a 32-px-stride input carries it; `median_of_finite` (the placeholder value) from the existing
 1/16 stratified sample. Both change the node values at the 1e-3 relative level on the M2 fixtures (the binned mean
 is a smoother estimator than the per-pixel median inside a 128-px cell); the `.athln` sidecars
-move accordingly. Measured (Task 7): `A` identical on every real frame; `B` moves by 9e-4 of sky
-at the median but single nodes flip validity in `robust_cell_level`'s hard gate (a 16× smaller
-population of 4× quieter means near `rejection_limit`) and, neighbour-filled, move by up to
-0.44·sky — one frame's local offset, rejected by the linear fit at n ≥ 20 (ruling C-28 makes C-3
-measure it at master level: `ln_cells_rejected` per group and the worst node's neighbourhood).
-The cell deviation sigmas (3.0 / 3.2) are NOT re-derived for the binned plane — widening them by
-`LN_BIN` re-admits star wings and measures worse on every fixture — and are pinned. Ruling C-5: `LN_BIN = 4`, applied to the reference model and every target
+move accordingly, behind `LN_BACKGROUND_VERSION`. The cell deviation sigmas (3.0 / 3.2) are NOT
+re-derived for the binned plane — widening them by `LN_BIN` re-admits star wings and measures
+worse on every fixture. Ruling C-5: `LN_BIN = 4`, applied to the reference model and every target
 identically.
+
+### What the measurement found (Task 7, then C-3)
+
+**The speed-up is real and large.** `background_ms` per mono frame 83 → 15 on the probe's 4-wide
+pool and 73 → 10 on a 10-wide one (OSC, three channels, 250 → 45), with ≈ 104 MB less transient
+allocation per channel — the pre-C5 `clean_plane` allocated and walked a whole second plane.
+
+**The output cost is what refuses it.** C-3 (`tierA-tierC` vs `tierA-baseline`, and vs
+`tierA-c2` to isolate Group 3) attributes every master change on the full 197-frame set to C5's
+`B` grids: `A` is untouched (LN scale ratio 1.000000), the weights are identical and Task 5 is
+ulp-level. On the full group the `B` move is far larger than the three-frame probe had shown —
+**2.4e-3 of sky at the MEDIAN node** on mono (probe: 9e-4), OSC green/blue 1.2–1.6e-3, p99
+1.4e-2, single nodes to 4× sky through `robust_cell_level`'s hard validity gate, 31 nodes per
+frame past 1 % (max 110 of 1700), `ln_cells_rejected` +1 median and +10 max. §8 then fails on
+rows C-2 had passed: **mono master MAD +1.88 %** and **OSC blue FWHM +2.67 %** against 1 % bars,
+with medians drifting to ±0.07 %.
+
+**No cliff fix reaches it.** The obvious repair — soften the validity gate so fewer cells flip
+and get neighbour-filled — cannot work, because the move is in the MEDIAN node and not only in
+the tail: on a crowded sky the difference between a mean of 16 binned pixels and the per-pixel
+median of a 128-px cell is a systematic one (binning smears star flux *below* the per-cell
+rejection bound instead of letting the clip remove it), and it is present at every node, not
+just at the ones that change validity.
+
+Against ≈ 0.4 min of a 14-minute run, that is not a trade this tier makes. Reverted in
+`46d0d75d` + `ab1b2061`; the verdict is recorded on `background_grid`'s own doc comment
+(`2b70e9c5`) so it is not re-proposed from the code side. The process lesson is recorded with
+it: **a three-frame probe understated the full-group node move by ≈ 2.5×** — for a numeric item
+whose bar is a master-level statistic, the per-frame probe sizes the speed-up but cannot size
+the cost.
+
+Full measurement: `.superpowers/sdd/2026-09-20-stacking-compute-tierC-plan/task-7-report.md`.
 
 ## 7. C6 — Register reuses Measure's fits for mono frames (D2)
 
@@ -462,10 +498,27 @@ re-measure and re-normalize every set for a last-bit move. The `metrics` artifac
 carry 2e-3 — ≈ 2.7× the measured star-free estimator difference (7.342e-4, two sample
 estimators over different pixel subsets), a derived bar for a quantity 1e-3 cannot describe,
 not a loosening. The discarded uniform-peak fixture stays live as the crowding characterisation.
+Superseded by **C-29**: C5 is reverted, so the fixtures, their bars and the crowding
+characterisation went with it — the ruling stands only as the record of how the fixture bars
+were derived while the item was live.
 
 **C-28** (Task 7 review): C-3 runs on the final numeric head; the review's doc/test minors land in
 the acceptance docs commit; C-3's read adds `ln_cells_rejected` per group, the worst-B-node
 neighbourhood on the master, the coverage zero-set comparison and the FWHM last-bit note.
+Superseded by **C-29**: that C-3 read is what measured C5 out — `ln_cells_rejected` and the
+worst-B-node neighbourhood are exactly the two numbers that showed the move was in the median
+node and not only at the validity cliff. The coverage and FWHM items stand on their own.
+
+**C-29** (Task 7, C-3 acceptance, coordinator): **C5 is reverted.** On the full 197-frame set
+(`tierA-tierC` vs `tierA-baseline`, and vs `tierA-c2` to isolate Group 3) every master change is
+attributable to C5's `B` grids — `A` untouched (LN scale ratio 1.000000), weights identical,
+Task 5 ulp-level — and §8 fails on rows C-2 had passed: mono master MAD +1.88 % and OSC blue
+FWHM +2.67 % against 1 % bars, medians to ±0.07 %. The `B` move on the full group is ≈ 2.5× what
+the three-frame probe reported: 2.4e-3 of sky at the MEDIAN node (probe 9e-4), p99 1.4e-2, single
+nodes to 4× sky, 31 nodes per frame past 1 % (max 110 of 1700), `ln_cells_rejected` +1 median /
++10 max. Because the move is in the MEDIAN and not only at the hard validity gate, no cliff fix
+reaches it. The item was worth ≈ 0.4 min of 14. Same class as C-26. See §6; the verdict is also
+recorded on `background_grid`'s own doc comment so it is not re-proposed from the code side.
 
 **C-26** (Task 6, coordinator): C4 is reverted. `medfit_line`'s warm bracket measured 0.946x
 evaluations and 0.966x `combine_cpu_ms` on real data — a ≈ 3 % combine gain does not buy a
