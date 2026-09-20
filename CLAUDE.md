@@ -1387,9 +1387,82 @@ set 109's config, forces FITS/keepAll, REMOVES `paths`), `server.sh`
 (`ATH_ACC_EXTRA_PATHS`), `tier1/tier1-run.sh … SET_ID` (exits non-zero on a
 refused `start_stacking`), `tier1/checkpoint.sh <name> [base]` (refuses on
 Time Machine/cargo, bare-word names, a `paths` override; needs ≈ 135 GB
-free), `tier1-extract.py`/`tier1-compare.py`. Next: Tier C (numeric — LN from
-Measure's fits, the drizzle phase table; spec
-`docs/superpowers/specs/2026-09-20-stacking-compute-tierC-design.md`).
+free), `tier1-extract.py`/`tier1-compare.py`; `checkpoint.sh` re-execs under
+zsh from any shell and refuses `name == base` (a `bash` invocation once shifted
+its positional parse and overwrote the ruler tree).
+
+**Perf tier C — numeric, gated by spec §8 (2026-09-20)** (spec
+`docs/superpowers/specs/2026-09-20-stacking-compute-tierC-design.md`, plan
+`docs/superpowers/plans/2026-09-20-stacking-compute-tierC-plan.md`, acceptance
+`docs/superpowers/research/2026-09-20-stacking-compute-tierC-acceptance.md`,
+rulings C-1…C-29 in the spec's §9): Tier C changes outputs on purpose, so its
+gate is the §8 tolerance table against the Tier A ruler
+(`.athenaeum-acc/tierA-baseline`, byte-identical to Tier A's own tree on every
+compared artifact — ruling C-19), read by `checkpoint.sh <name> baseline
+--numeric`. Reduced set: **21.73 → 14.47 min against a Tier A build re-run back to
+back (−33 %; 23.44 → 14.47 = −38 % against Tier A's acceptance run on a
+hotter evening; 27.0 → 14.5 = −46 % against the pre-audit baseline)**, every gated row PASS (masters within 0.1 %
+median / 1 % MAD / 2 % noise / 1 % FWHM, rejected fraction +0.002 pp,
+per-frame weights ρ = 1.0, LN scale −0.035 %), the external-masters gate PASS.
+**What shipped.** (1) **Measure persists its PSF fits** as the per-plane `fits`
+artifact (`stacking/fits_artifact.rs`, `FITS_ARTIFACT_VERSION = 1`, kind
+`fits.<plane>`), and the group's β is the LOWER median of the members' Auto β
+(`psf_signal::group_beta`, `PsfModel::Fixed(β)`, `PSF_FIT_VERSION = 3`;
+`stacking_run_groups.beta`). (2) **LN's relative scale comes from those fits
+as SEEDS, not fluxes** (ruling C-12 — H2 finding: a Moffat fit's integrated
+`signal` is NOT warp-invariant, the B-spline-warped frame differs from the
+native one by an FWHM-dependent factor up to 20 %): the seed positions are
+mapped through `forward_exact`, re-fitted on the warped plane at the group β,
+and a per-channel calibration `k = median(s_detected / s_seeds)` over a
+weight-STRATIFIED 7-frame sample (the reference + one member per weight
+sextile, `ln/calibration.rs`, rulings C-14/C-15 — the best-weighted sample was
+one contiguous half-hour and left a +0.44 % systematic; stratified −0.05 %)
+is refused outside `[0.97, 1.03]`, applied only to seeds-path channels, folded
+into the `.athln` hash and recorded in the run summary (`seedsCalibration`).
+The forced-detection calibration arm is silent and not a fallback
+(`ln_scale_source = seeds | detected`, dictionaried). LN scale 6.5 → 0.64 s per
+frame; Normalize 5.70 → 2.01 min; zero fallbacks on the acceptance set. (3)
+**Register on a mono frame reuses the fits** (ruling C-6; OSC keeps luminance
+detection): `Star.flux = fit.signal / ADU_SCALE`, `passes_register_cuts`, a
+`MIN_INLIERS` floor falls back to detection with one `warn!`
+(`star_source = fits | detected`); detect 730 → 0 ms and the frame is opened
+header-only. **Both the LN hashes and the registration hash now fold the
+per-frame MEASUREMENT hash** (rulings C-17/C-18) — the seed population moves
+with `measurement.detectionSigma`/`seedDetector`/`seedPrefilter`/`maxStars`,
+so a Measure config change re-normalizes and re-registers instead of reusing
+stale sidecars/rows. (4) **The drizzle deposit goes through a per-phase
+overlap table** (`stacking/drizzle/phase_table.rs`, `PHASES = 64` — ruling
+C-21, the plan's 2 % per-pixel bound against the exact clip is unreachable at
+32; residual ≤ 1.0–1.6 %, level 1 ± 8e-6, `Σ area` per phase = the drop's
+area to 1e-6): one 212 KB table per (frame, plane) for a linear map, per
+256-px tile from the local Jacobian under distortion, `SquareOverlapPlan::
+resolve` the ONE dispatch (`scale == 1 && dropShrink == 1.0` keeps the exact
+clip, C-3), `DRIZZLE_KERNEL_VERSION = 2` in the whole-config fingerprint only;
+deposit −85 % per plane, Drizzle 4.26 → 1.18 min. (5) **rustafits' Moffat LM
+arithmetic** (`perf/stacking-kernels` `18377bd`/`d98629e`): one
+transcendental per sample-iteration (`power = base^-β` once, `dpower = -β·
+power/base`, `powi` when β is integral), residual reuse from the last ACCEPTED
+Jacobian pass, thread-local Cholesky scratch — control flow untouched (ruling
+C-4: iteration counts identical 180/180, ≤ 7e-15 px), `PSF_FIT_VERSION` NOT
+bumped (C-24: `fwhm_px` moved 1 ulp); fit −30…−49 %, Measure 4.48 → 3.67.
+**Measured out and reverted, numbers in the doc comments (do not re-propose):**
+`medfit_line`'s warm bracket (0.966× combine, 4 % of stacks to a different,
+equally valid MAD root — the exit-on-zero-rejection it was paired with has
+existed since the first clipper and is now pinned; ruling C-26) and the LN
+background on a 4×4-binned plane (−80 % on a 3-frame probe, but on the full
+group the `B` grid moved 2.4e-3 of sky at the MEDIAN node and the masters
+failed §8 — mono MAD +1.9 %, OSC blue FWHM +2.7 %; ruling C-29). **Two absolute
+§8 rows read FAIL on this set for data reasons the baseline shares** (C-20/
+C-23): the OSC-red drizzle level sits at the 0.998 bound in the baseline
+itself (0.998007 vs 0.997995), and coverage is 0.9935 on mono (the rotated
+mono footprint does not reach the OSC reference geometry's corners) and short
+by 2 edge pixels on OSC blue — reported, never re-sized. **Method rules added**
+(memory + ledger): a per-frame numeric change is judged on the WHOLE group at
+master level (a full checkpoint) before its review closes, never on a
+few-frame probe; a small gain (≈ 3 % of the run) that misses any §8 row is
+reverted with its numbers. Harness: `tier1-compare.py --numeric`, the
+`tierC-external.sh` gate (C-8/C-9), `drizzle_probe`, `ln_probe --diag /
+--seeds-calibration / --measure-calibration`, `register_probe --fits`.
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,

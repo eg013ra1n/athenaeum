@@ -334,6 +334,32 @@ this tier's list but the largest gain: W5 (write the warp once; owner decision 2
 LN warp −96 %, Integrate read −75 %, Register +1.1 min, 41 GB. The combine estimate
 (10.7 → ≈ 7) did not materialize: kernel micro-rewrites lose on this toolchain.
 
+**Tier C — MEASURED (2026-09-20, `docs/superpowers/research/2026-09-20-stacking-compute-tierC-acceptance.md`).**
+Executed straight after Tier A on the owner's word (Tier B skipped — its items were either
+absorbed here or measured out). On the reduced set: 21.73 → 14.47 min against a Tier A build re-run back to back (−33 %; 23.44 →
+14.47, −38 %, against Tier A's own acceptance run on a hotter evening; 27.0 → 14.5 against the
+pre-audit baseline, −46 %); every gated §8 row PASS against the Tier A
+ruler (masters within 0.1 % median / 1 % MAD / 2 % noise / 1 % FWHM, rejected fraction
++0.002 pp, per-frame weights ρ = 1.0, LN scale −0.035 %), the external gate PASS. Per item: D1
+(LN takes Measure's fits) — not as FLUXES: a Moffat fit's integrated signal is not
+warp-invariant (up to 20 %, FWHM-dependent), so the fits are SEEDS re-fitted on the warped plane
+at the group β, with a per-channel calibration `k` from a weight-stratified 7-frame sample
+(rulings C-12…C-17); LN scale 6.5 → 0.64 s per frame, Normalize 5.70 → 2.01 min. D2 (mono
+Register from the fits) — detect 730 → 0 ms, the frame is not even read (header only),
+Register 2.36 → 1.52. Z3 (drizzle phase table) — 64 phases, not 32 (the plan's 2 % per-pixel
+bound is unreachable at 32); deposit −85 % per plane, Drizzle 4.26 → 1.18. D6 (Moffat LM
+arithmetic, rustafits) — one transcendental per sample-iteration, residual reuse, Cholesky
+scratch: fit −30…−49 %, iteration counts identical, ≤ 7e-15 px, Measure 4.48 → 3.67. I7/I8
+(`medfit_line` early exit / warm bracket) — the early exit ALREADY EXISTED; the warm bracket
+measured 0.966× and was reverted (C-26): Integrate unchanged at 4.0. L3 (LN background on a
+4×4-binned plane) — background −80 % on the probe, but on the full group the `B` grid moved
+2.4e-3 of sky at the median node and the masters failed §8 (mono MAD +1.9 %, OSC blue FWHM
++2.7 %); reverted (C-29). The two absolute drizzle rows (level 0.998–1.002, coverage 1.0) read
+FAIL on this set for data reasons the baseline shares (rulings C-20/C-23). Lessons: a
+per-frame numeric change is judged on the whole group at master level, never on a few-frame
+probe (Task 7's 3-frame probe understated the move 2.5×); "small gain + any §8 miss" is a
+revert with the numbers in the doc comment (C-26/C-29).
+
 **Tier B — same math, bits move (≈ 1 week + one acceptance run).** D6, D10, W2, I7–I9 (+ D9), Z2
 (§3.4 — its hoisted corner arithmetic rounds differently from the per-pixel version, so it needs
 the hash-bump + acceptance re-run every other Tier B item does).
