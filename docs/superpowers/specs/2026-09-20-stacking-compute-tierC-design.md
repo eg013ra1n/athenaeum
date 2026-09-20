@@ -124,17 +124,33 @@ aggregates only. Per frame (g3 medians): `ln_detect_ms` 3 930, `ln_fit_ms` 1 021
    LEVER 2 ships instead — `stacking::ln::calibration`, driven once per group by
    `stacking::run::measure_ln_seeds_calibration` before stage 6's fan-out.
 
-   **The sample** is the group's registration/geometry reference frame
-   (`RunContext::geometry_of(&group.key).reference_frame_id`) plus its six best-weighted OTHER
-   members (`FrameWeight::normalized_mean`, ties broken on the frame id so two runs over the same
-   catalog pick the same frames): `SEEDS_CALIBRATION_FRAMES = 7`. Fix round 3 used three, which
-   ruling C-14 raised after the review observed that a 3-sample median of a bias spanning
-   +0.1…+1.4 % across a group carries roughly ±0.3 % of common-mode sampling error — and that
-   error lands directly on the master's median, the ±0.1 % row this whole item exists to protect.
+   **The sample** (ruling C-15) is the group's registration/geometry reference frame
+   (`RunContext::geometry_of(&group.key).reference_frame_id`) plus ONE member per weight SEXTILE
+   of the OTHER included members — sort the others by `FrameWeight::normalized_mean` descending
+   (ties on the frame id, so two runs over the same catalog pick the same frames), split into six
+   contiguous bins as evenly as the count allows (the remainder goes to the leading bins), and
+   take each bin's median-weight member: `SEEDS_CALIBRATION_FRAMES = 7` either way. A group with
+   no more others than slots measures all of them.
+
+   Ruling C-14 originally said "the six best-weighted", and fix round 4's hold-out measured why
+   that is wrong: `k` is a median, so it centres on the SAMPLE's own median bias, and on the
+   acceptance catalog's mono group the six best-weighted frames were one contiguous 30-minute
+   window at FWHM 1.99–2.29 px against a group reaching 5.08 px — their median bias (+0.554 %)
+   sat below the group's own (+0.992 %), leaving a **+0.435 % systematic** on every frame outside
+   the window, which is exactly the quantity §8's ±0.1 % master-median row cannot absorb.
+   Stratifying puts the median on the group's middle for the same seven `normalize_frame` pairs.
+   (Fix round 3 used three frames, which C-14 raised to seven after the review observed that a
+   3-sample median of a bias spanning +0.1…+1.4 % carries roughly ±0.3 % of common-mode sampling
+   error; seven made `k` STABLE, C-15's stratification makes it REPRESENTATIVE.)
+
    **The honest cost**: each calibration frame runs BOTH arms of `normalize_frame`, and the
    detection arm is the ≈ 6 s per-frame path the seeds design replaces, so the measurement is
-   ≈ 7 × 6 s ≈ 45 s per group (a little more with the seeds arm's own ≈ 0.4 s). Against it: the
-   seeds path saves ≈ 2.5 s on every one of a group's 90–160 frames, i.e. ≈ 4–7 min. The run emits
+   ≈ 7 × 6 s ≈ 45 s per group (measured: 40.7 s mono / 49.8 s OSC on the reduced set). Against
+   it: the seeds path saves ≈ 2.5 s on every one of a group's 90–160 frames, i.e. ≈ 4–7 min.
+   **Break-even is ≈ 10 members** — below that a group pays more to calibrate than the seeds path
+   saves it, and nothing scales the sample down between the floor (a group with no more others
+   than slots measures all of them) and there; a 10-frame group is the worst case and is accepted
+   as such. The run emits
    a `stacking-progress` message (`"calibrating the seeds path · frame i/7"`) while it happens, so
    the Normalize row says what it is doing instead of appearing stalled. A group whose members are
    ALL cache hits pays nothing: the measurement runs only when a fresh stored calibration is
@@ -161,7 +177,12 @@ aggregates only. Per frame (g3 medians): `ln_detect_ms` 3 930, `ln_fit_ms` 1 021
    mixing frames normalized at two different factors; a re-registered calibration frame
    re-measures `k` and, through the same fold, re-normalizes the group. The plan gate reads the
    stored `ln_calibration` payload and hashes with it, so it and the run agree about what "fresh"
-   means without the gate ever measuring anything. The value is also recorded per frame
+   means without the gate ever measuring anything. **Documented residual**, beside the stored LN
+   reference member list's own: the gate does NOT re-derive whether that stored calibration is
+   itself stale — doing so would need the stage-3 weight ranking that picks the sample, which a
+   DB-only gate does not have — so a run whose calibration IS stale re-measures and re-normalizes
+   while the gate had reported the group fresh. One run's optimism, not a wrong master. The value
+   is also recorded per frame
    (`LnArtifactPayload::seeds_calibration`, beside `ln_scale_source`) and per group in the run
    summary (`SummaryGroup::seedsCalibration`).
 

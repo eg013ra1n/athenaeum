@@ -47,13 +47,17 @@ use super::background::BackgroundGrid;
 use super::reference::LnReference;
 use super::{normalize_frame, LnReferenceForDetection, LnScaleSeeds};
 
-/// How many of the group's own frames the calibration measures (ruling
-/// C-14 item 1): the group's registration/geometry reference frame plus
-/// the six best-weighted OTHER included members. Seven costs ≈ 7 × one
-/// detection-arm `normalize_frame` (≈ 6 s on a real 26 Mpx frame) ≈ 45 s
-/// per group, against the ≈ 2.5 s per frame the seeds path saves over a
-/// group of 90–160 frames — see the spec's §2.2 item 8 for the honest
-/// arithmetic.
+/// How many of the group's own frames the calibration measures: the
+/// group's registration/geometry reference frame plus one member per
+/// weight SEXTILE of the others (ruling C-15; ruling C-14 originally said
+/// "the six best-weighted", which fix round 4's hold-out measured as
+/// unrepresentative — see [`select_calibration_frames`]).
+///
+/// Seven costs ≈ 7 × one detection-arm `normalize_frame` (≈ 6 s on a real
+/// 26 Mpx frame) ≈ 45 s per group, against the ≈ 2.5 s per frame the seeds
+/// path saves. **Break-even is ≈ 10 members**: below that a group pays more
+/// to calibrate than the seeds path saves it, and nothing scales the sample
+/// down between the floor and there — see the spec's §2.2 item 8.
 pub const SEEDS_CALIBRATION_FRAMES: usize = 7;
 
 /// A channel needs at least this many usable `s_detected / s_seeds`
@@ -135,18 +139,39 @@ pub struct ChannelCalibration {
     pub outcome: ChannelOutcome,
 }
 
-/// The calibration sample (ruling C-14 item 1): the group's
-/// registration/geometry reference frame FIRST, then the best-weighted
-/// OTHER members by descending weight, up to `want` frames in total.
+/// The calibration sample (ruling C-15, superseding C-14's "the six
+/// best-weighted"): the group's registration/geometry reference frame
+/// FIRST, then ONE member per weight BIN of the OTHER included members —
+/// six bins when the reference is itself a member, so `want = 7` frames in
+/// total either way.
+///
+/// **Why stratified and not the top six** (ruling C-15, from fix round 4's
+/// own hold-out measurement): `k` is a median, so what it centres on is the
+/// sample's own median bias, and the six best-weighted frames of a real
+/// group are not a sample of the group — on the acceptance catalog's mono
+/// group they were one contiguous 30-minute window at FWHM 1.99–2.29 px
+/// against a group reaching 5.08 px, and their median bias (+0.554 %) sat
+/// below the group's own (+0.992 %). Every other frame was then left
+/// under-corrected by the difference: a **+0.435 % systematic** on the
+/// hold-out, which is what moves a master's LEVEL against the acceptance
+/// spec's ± 0.1 % median row. Taking one frame per weight bin puts the
+/// median on the group's middle at exactly the same cost — the same seven
+/// `normalize_frame` pairs.
 ///
 /// `members` is `(frame_id, weight)` in the group's own member order; the
-/// returned indices point back into it. A reference frame that is not a
-/// member at all (never happens — the reference IS a member — but this
-/// must not panic or silently produce a short sample) simply leaves the
-/// whole sample to the weight ranking. Ties in weight break on the
-/// frame id, ascending: the sample is part of the group's LN hash, so two
-/// runs over the same catalog must choose the same frames in the same
-/// order.
+/// returned indices point back into it, reference first and then bins from
+/// best-weighted to worst. A reference frame that is not a member at all
+/// (the co-registered case, where the run-wide reference can belong to a
+/// different group) simply leaves every slot to the bins. Ties in weight
+/// break on the frame id, ascending, and a bin's chosen member is its
+/// MEDIAN position (`start + size / 2`) — for an even bin the lower-weight
+/// of the two middles, the same "lower median" convention
+/// [`calibration_k`] itself uses. All of it is deterministic because the
+/// sample is part of the group's LN hash: two runs over the same catalog
+/// must choose the same frames in the same order.
+///
+/// A group with no more OTHER members than there are slots measures all of
+/// them, in weight order — the floor case, unchanged from C-14.
 pub fn select_calibration_frames(
     reference_frame_id: i64,
     members: &[(i64, f64)],
@@ -156,6 +181,11 @@ pub fn select_calibration_frames(
     if let Some(idx) = members.iter().position(|(id, _)| *id == reference_frame_id) {
         chosen.push(idx);
     }
+    let slots = want.saturating_sub(chosen.len());
+    if slots == 0 {
+        return chosen;
+    }
+
     let mut by_weight: Vec<usize> = (0..members.len()).filter(|i| !chosen.contains(i)).collect();
     by_weight.sort_by(|&a, &b| {
         members[b]
@@ -164,11 +194,27 @@ pub fn select_calibration_frames(
             .unwrap_or(Ordering::Equal)
             .then_with(|| members[a].0.cmp(&members[b].0))
     });
-    chosen.extend(
-        by_weight
-            .into_iter()
-            .take(want.saturating_sub(chosen.len())),
-    );
+    if by_weight.len() <= slots {
+        chosen.extend(by_weight);
+        return chosen;
+    }
+
+    // Contiguous bins over the weight-sorted list, as even as the count
+    // allows: `n / slots` each, with the first `n % slots` bins taking one
+    // extra. The remainder goes to the LEADING (best-weighted) bins because
+    // that end of a real group's distribution is the denser one — the
+    // frames there differ least from each other, so an extra member costs
+    // the sample the least coverage.
+    let n = by_weight.len();
+    let base = n / slots;
+    let extra = n % slots;
+    let mut start = 0usize;
+    for bin in 0..slots {
+        let size = base + usize::from(bin < extra);
+        chosen.push(by_weight[start + size / 2]);
+        start += size;
+    }
+    debug_assert_eq!(start, n, "the bins must partition the weight-sorted list");
     chosen
 }
 
@@ -450,24 +496,63 @@ fn run_arm(
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_reference_frame_leads_the_sample_and_is_never_picked_twice() {
-        // The reference (id 3) is also the best-weighted member — it must
-        // appear exactly once, first, and the remaining slots must go to
-        // the next-best OTHER members.
-        let members = [(1i64, 0.5f64), (2, 0.9), (3, 1.0), (4, 0.7), (5, 0.6)];
-        let chosen = select_calibration_frames(3, &members, 3);
-        assert_eq!(chosen, vec![2, 1, 3], "{chosen:?}");
-        let ids: Vec<i64> = chosen.iter().map(|&i| members[i].0).collect();
-        assert_eq!(ids, vec![3, 2, 4]);
+    /// `(frame_id, weight)` pairs for a group of `n` members whose weights
+    /// descend from 1.0 in even steps — id `i` carries weight
+    /// `(n - i) / n`, so the id order IS the weight order and a test can
+    /// read the chosen ids as positions in the ranking.
+    fn ranked_members(n: usize) -> Vec<(i64, f64)> {
+        (0..n)
+            .map(|i| (i as i64, (n - i) as f64 / n as f64))
+            .collect()
     }
 
     #[test]
-    fn a_reference_that_is_not_a_member_leaves_the_whole_sample_to_the_weights() {
+    fn the_reference_frame_leads_the_sample_and_is_never_picked_twice() {
+        // The reference (id 3) is also the best-weighted member — it must
+        // appear exactly once, first, and never again among the bins.
+        // Others sorted by weight: 2 (0.9), 4 (0.7), 5 (0.6), 1 (0.5).
+        // Two slots, two bins of two; each bin takes its LOWER-weight
+        // middle: [2, 4] -> 4, [5, 1] -> 1.
+        let members = [(1i64, 0.5f64), (2, 0.9), (3, 1.0), (4, 0.7), (5, 0.6)];
+        let chosen = select_calibration_frames(3, &members, 3);
+        let ids: Vec<i64> = chosen.iter().map(|&i| members[i].0).collect();
+        assert_eq!(ids, vec![3, 4, 1], "{chosen:?}");
+        assert_eq!(
+            chosen.iter().filter(|&&i| members[i].0 == 3).count(),
+            1,
+            "the reference must not also be picked as a bin member"
+        );
+    }
+
+    #[test]
+    fn a_reference_that_is_not_a_member_leaves_every_slot_to_the_bins() {
+        // The co-registered case: the run-wide reference belongs to another
+        // group, so all `want` slots are bins. Three others, two slots ->
+        // bins of 2 and 1: [2 (0.9), 4 (0.7)] -> 4, [1 (0.5)] -> 1.
         let members = [(1i64, 0.5f64), (2, 0.9), (4, 0.7)];
         let chosen = select_calibration_frames(99, &members, 2);
         let ids: Vec<i64> = chosen.iter().map(|&i| members[i].0).collect();
-        assert_eq!(ids, vec![2, 4]);
+        assert_eq!(ids, vec![4, 1]);
+    }
+
+    #[test]
+    fn a_group_with_no_more_others_than_slots_measures_all_of_them() {
+        // The floor, unchanged from C-14: six others and six slots (the
+        // reference takes the seventh) -> every one of them, in weight
+        // order, with no binning at all.
+        let mut members = ranked_members(7);
+        let reference = members[0].0;
+        let chosen = select_calibration_frames(reference, &members, SEEDS_CALIBRATION_FRAMES);
+        let ids: Vec<i64> = chosen.iter().map(|&i| members[i].0).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5, 6]);
+
+        // One more member than slots and the bins engage.
+        members = ranked_members(8);
+        let chosen = select_calibration_frames(members[0].0, &members, SEEDS_CALIBRATION_FRAMES);
+        assert_eq!(chosen.len(), SEEDS_CALIBRATION_FRAMES);
+        let ids: Vec<i64> = chosen.iter().map(|&i| members[i].0).collect();
+        // Seven others, six bins: sizes 2,1,1,1,1,1 -> [1,2]->2, then 3..7.
+        assert_eq!(ids, vec![0, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
@@ -483,13 +568,65 @@ mod tests {
     }
 
     #[test]
-    fn seven_frames_are_asked_for_and_the_reference_costs_one_of_the_seven() {
-        let members: Vec<(i64, f64)> = (0..20).map(|i| (i as i64, i as f64 / 20.0)).collect();
+    fn seven_frames_span_the_weight_range_one_per_sextile() {
+        // 20 members, the reference (id 0) the BEST-weighted. Six bins over
+        // the 19 others: sizes 4,3,3,3,3,3, each yielding its median
+        // position -> ranks 3, 6, 9, 12, 15, 18 of the others.
+        let members = ranked_members(20);
         let chosen = select_calibration_frames(0, &members, SEEDS_CALIBRATION_FRAMES);
         assert_eq!(chosen.len(), SEEDS_CALIBRATION_FRAMES);
         let ids: Vec<i64> = chosen.iter().map(|&i| members[i].0).collect();
-        // The reference (id 0, the WORST-weighted) first, then the six best.
-        assert_eq!(ids, vec![0, 19, 18, 17, 16, 15, 14]);
+        assert_eq!(ids, vec![0, 3, 6, 9, 12, 15, 18]);
+    }
+
+    /// Ruling C-15's own reason, as a pin: the sample must COVER the
+    /// group's weight range, which "the six best-weighted" does not. On a
+    /// realistic 92-member group (the acceptance catalog's mono group) the
+    /// stratified sample's own weight span is nearly the whole group's,
+    /// while the top six span a sliver of it.
+    #[test]
+    fn the_stratified_sample_covers_the_range_the_top_six_did_not() {
+        let members = ranked_members(92);
+        let group_span = members.first().unwrap().1 - members.last().unwrap().1;
+
+        let chosen = select_calibration_frames(members[0].0, &members, SEEDS_CALIBRATION_FRAMES);
+        let weights: Vec<f64> = chosen.iter().map(|&i| members[i].1).collect();
+        let span = weights.iter().cloned().fold(f64::MIN, f64::max)
+            - weights.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            span > 0.9 * group_span,
+            "stratified span {span} must cover the group's {group_span}"
+        );
+
+        // What C-14 did: the reference plus the six best-weighted others.
+        let top_six: Vec<f64> = members[..SEEDS_CALIBRATION_FRAMES]
+            .iter()
+            .map(|(_, w)| *w)
+            .collect();
+        let top_span = top_six.iter().cloned().fold(f64::MIN, f64::max)
+            - top_six.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            top_span < 0.1 * group_span,
+            "the top-six span {top_span} should be a sliver of {group_span}"
+        );
+    }
+
+    #[test]
+    fn uneven_bins_put_the_remainder_in_the_leading_bins() {
+        // 14 others over 6 bins: 14 = 2*6 + 2, so bins 0 and 1 take three
+        // members and the rest two. Medians land at ranks 1, 4, 7, 9, 11,
+        // 13 of the others (ids 2, 5, 8, 10, 12, 14 with the reference at
+        // id 0).
+        let members = ranked_members(15);
+        let chosen = select_calibration_frames(0, &members, SEEDS_CALIBRATION_FRAMES);
+        let ids: Vec<i64> = chosen.iter().map(|&i| members[i].0).collect();
+        assert_eq!(ids, vec![0, 2, 5, 8, 10, 12, 14]);
+
+        // Every bin contributes exactly one member and no member twice.
+        let mut sorted = chosen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), chosen.len(), "no member may be picked twice");
     }
 
     #[test]
