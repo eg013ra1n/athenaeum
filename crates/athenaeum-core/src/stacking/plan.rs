@@ -541,6 +541,43 @@ pub(crate) struct LnReferencePayload {
 /// `plan.rs`'s own freshness read now mirrors it, so a frame with a
 /// genuinely-NULL config hash is not reported permanently stale by the plan
 /// gate while cache-hitting correctly inside a real run.
+///
+/// `beta` (final fix wave, ruling C-30, the whole-branch review's M1) is the
+/// group's own β — [`crate::stacking::psf_signal::group_beta`] over every
+/// member Measure actually measured, the value `stacking_run_groups.beta`
+/// records. It is a real LN INPUT: with `normalization.local.psfModel =
+/// Auto`, stage 6 fits the LN reference at `PsfModel::Fixed(group_beta)` and
+/// `relative_scale_from_seeds` re-fits every member's seeds at that same β,
+/// so two runs whose β differ produce different `A`/`B` grids from byte-
+/// identical inputs otherwise. It was the ONE such input no hash folded:
+/// `normalization_subtree` carries `psfModel` (the CHOICE) but never the
+/// value `Auto` resolves to, which moves with the group's measured
+/// population, not with `cfg`. Folded at `{:.6}` for the reason
+/// [`SeedsCalibration`]'s `k` is: β is picked from a small fixed ladder
+/// (`psf_signal::AUTO_BETAS`), so the last bits of an `f64` carry nothing,
+/// and the rounding keeps the two sides' formatting agreement exact.
+///
+/// `None` hashes as "not recorded" (nothing folded), never as some default
+/// value — which is what keeps the run and the gate in step for a group
+/// that measured nothing at all. Both sides must resolve it the same way:
+/// the run passes what stage 3 put in `RunContext::measured_groups`, the
+/// gate passes `stacking_run_groups.beta` of the LAST run for that group.
+/// That read carries the same "one run's optimism" residual the stored
+/// `ln_calibration` already has — the gate is asking "what were the
+/// sidecars on disk written under", and the last run is who wrote them; a
+/// newer run that never reached stage 3 for this group reports `NULL`, the
+/// hash then differs, and the group reads STALE. Conservative in the safe
+/// direction (a needless re-normalize, never a false cache hit).
+///
+/// Folded UNCONDITIONALLY, not only when `psfModel` is `Auto`: splitting
+/// this into two cases every caller has to get right for the SAME field is
+/// what [`registration_hash_for`]'s own doc argues against just above, and
+/// the cost of the conservative rule is one extra re-normalize for a group
+/// pinned to an explicit β whose measured population moved anyway.
+///
+/// This fold invalidates every `.athln` sidecar once, on the first run after
+/// it ships — no template on disk carries any, and the cost is one LN
+/// fan-out per group.
 pub(crate) fn normalization_hash_for(
     cfg: &StackingConfig,
     registration_hash: &str,
@@ -548,6 +585,7 @@ pub(crate) fn normalization_hash_for(
     reference_member_ids: &[i64],
     reference_hash: &str,
     calibration: Option<&SeedsCalibration>,
+    beta: Option<f64>,
 ) -> String {
     let mut upstream: Vec<String> = vec!["register".to_string(), registration_hash.to_string()];
     // C-17: the frame's own MEASUREMENT hash (`measurement_hash_for`, the
@@ -584,6 +622,12 @@ pub(crate) fn normalization_hash_for(
                 .map(|(channel, k)| format!("ln_calib_k:{channel}:{:.6}", k)),
         );
     }
+    // M1 (final fix wave, ruling C-30): the group β stage 6 fits at — see
+    // this function's own doc for why it is an LN input and why `None`
+    // folds nothing.
+    if let Some(b) = beta {
+        upstream.push(format!("ln_beta:{:.6}", b));
+    }
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
@@ -603,10 +647,19 @@ pub(crate) fn normalization_hash_for(
 /// same reason [`normalization_hash_for`] folds it (C-17): `k` is derived
 /// from the calibration frames' `.athf` seeds, so a Measure seed-config
 /// change has to re-measure it.
+///
+/// `beta` (final fix wave, ruling C-30, review M1) is folded here for the
+/// same reason and in the same shape as in [`normalization_hash_for`] —
+/// read that function's doc for the full argument. It matters twice over
+/// here: `k` is measured by running BOTH the seeds path and the detected
+/// path over the sample and taking their ratio, and the seeds path fits at
+/// exactly this β, so a different β is a different measurement of `k`, not
+/// merely a different way of applying it.
 pub(crate) fn seeds_calibration_hash_for(
     cfg: &StackingConfig,
     reference_hash: &str,
     calibration_frames: &[(i64, &str, &str)],
+    beta: Option<f64>,
 ) -> String {
     let mut upstream: Vec<String> = vec![format!("ln_reference_hash:{reference_hash}")];
     upstream.extend(
@@ -615,6 +668,9 @@ pub(crate) fn seeds_calibration_hash_for(
             .enumerate()
             .map(|(rank, (id, reg, meas))| format!("ln_calib:{rank}:{id}:{reg}:{meas}")),
     );
+    if let Some(b) = beta {
+        upstream.push(format!("ln_beta:{:.6}", b));
+    }
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
 }
@@ -1904,6 +1960,32 @@ pub fn build_plan(
     } else {
         HashSet::new()
     };
+    // M1 (final fix wave, ruling C-30): the group β every `ln` row on disk
+    // was written under — `stacking_run_groups.beta` of the LAST run,
+    // keyed by group. It is a real LN input (stage 6 fits the reference and
+    // re-fits every member's seeds at it), so `normalization_hash_for` and
+    // `seeds_calibration_hash_for` both fold it in, and this gate has to
+    // resolve the same value the run will. It cannot: β comes out of stage
+    // 3's own measurements, which this DB-plus-cheap-FS-probe gate never
+    // runs — so it reads what the last run RECORDED, the same "one run's
+    // optimism" residual the stored `ln_calibration` above already carries,
+    // and for the same reason: the question is what the sidecars on disk
+    // were written under, and the last run is who wrote them. A newer run
+    // that never reached stage 3 for a group leaves `NULL`, which hashes as
+    // "not recorded", the hash differs and the group reads STALE — a
+    // needless re-normalize, never a false cache hit. Fetched once for the
+    // whole build, like `ln_registration_by_frame` above.
+    let ln_beta_by_group: HashMap<String, f64> = if local_normalization_active {
+        match list_runs(conn, frames_set_id, 1)?.into_iter().next() {
+            Some(last_run) => crate::db::stacking::list_groups(conn, last_run.id)?
+                .into_iter()
+                .filter_map(|row| row.beta.map(|b| (row.group_key, b)))
+                .collect(),
+            None => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
 
     for g in &groups {
         // Fix round 1, item 5: the group's LN reference artifact carries the
@@ -2100,6 +2182,10 @@ pub fn build_plan(
                                     &ref_info.reference_member_ids,
                                     &ref_info.reference_hash,
                                     ln_calibration.as_ref(),
+                                    // M1: the SAME value the run folds in
+                                    // — the last run's recorded β for THIS
+                                    // group, `None` when it has none.
+                                    ln_beta_by_group.get(&g.key).copied(),
                                 );
                                 is_fresh(row, &expected)
                             }
@@ -4413,6 +4499,11 @@ mod tests {
             k: vec![0.994],
         };
 
+        // M1 (final fix wave): the group β is an input of both hashes now
+        // — held fixed here, so this pin still isolates the MEASURE seed
+        // config. `the_ln_hashes_follow_the_group_beta` below pins β's own
+        // effect.
+        let beta = Some(4.0);
         let ln = |cfg: &StackingConfig, measurement: &str| {
             normalization_hash_for(
                 cfg,
@@ -4421,6 +4512,7 @@ mod tests {
                 &reference_ids,
                 reference_hash,
                 Some(&calibration),
+                beta,
             )
         };
         let seeds = |cfg: &StackingConfig, measurement: &str| {
@@ -4428,6 +4520,7 @@ mod tests {
                 cfg,
                 reference_hash,
                 &[(11, "registration-hash", measurement)],
+                beta,
             )
         };
 
@@ -4470,6 +4563,83 @@ mod tests {
         // shared by the gate's `None` and the run's `String::new()`.
         assert_eq!(ln(&cfg, ""), ln(&cfg, ""));
         assert_ne!(ln(&cfg, ""), ln(&cfg, &measurement));
+    }
+
+    /// M1 (final fix wave, ruling C-30): the group β — the value
+    /// `psf_signal::group_beta` resolves for a group and
+    /// `stacking_run_groups.beta` records — is an LN INPUT, so both LN
+    /// hashes must follow it. With `normalization.local.psfModel = Auto`,
+    /// stage 6 fits the LN reference at `PsfModel::Fixed(group_beta)` and
+    /// `relative_scale_from_seeds` re-fits every member's seeds at the
+    /// same β; before this fold, two runs whose β differed reused each
+    /// other's `.athln` sidecars and the stored `k`, because
+    /// `normalization_subtree` carries `psfModel` (the CHOICE) but never
+    /// the value `Auto` resolves to.
+    #[test]
+    fn the_ln_hashes_follow_the_group_beta() {
+        let cfg = StackingConfig::default();
+        let reference_ids = [11i64, 22, 33];
+        let reference_hash = "ln-reference-hash";
+        let measurement = measurement_hash_for(&cfg, "calibrated-hash");
+        let calibration = SeedsCalibration {
+            frame_ids: vec![11, 22],
+            k: vec![0.994],
+        };
+
+        let ln = |beta: Option<f64>| {
+            normalization_hash_for(
+                &cfg,
+                "registration-hash",
+                &measurement,
+                &reference_ids,
+                reference_hash,
+                Some(&calibration),
+                beta,
+            )
+        };
+        let seeds = |beta: Option<f64>| {
+            seeds_calibration_hash_for(
+                &cfg,
+                reference_hash,
+                &[(11, "registration-hash", measurement.as_str())],
+                beta,
+            )
+        };
+
+        // Same β, same hash, twice.
+        assert_eq!(ln(Some(4.0)), ln(Some(4.0)));
+        assert_eq!(seeds(Some(4.0)), seeds(Some(4.0)));
+
+        // Two different β the `Auto` ladder can actually produce must not
+        // share a sidecar or a stored `k`.
+        for other in [3.0f64, 6.0, 10.0] {
+            assert_ne!(
+                ln(Some(other)),
+                ln(Some(4.0)),
+                "beta {other} must invalidate the per-frame LN hash"
+            );
+            assert_ne!(
+                seeds(Some(other)),
+                seeds(Some(4.0)),
+                "beta {other} must invalidate the seeds-calibration hash"
+            );
+        }
+
+        // `None` is "not recorded" — its own state, shared by the run's
+        // unmeasured group and the gate's NULL `stacking_run_groups.beta`,
+        // and never equal to any recorded β (least of all the 4.0 the run
+        // FALLS BACK to when it fits, which must still read as a different
+        // cache key from a group that genuinely measured 4.0).
+        assert_eq!(ln(None), ln(None));
+        assert_eq!(seeds(None), seeds(None));
+        assert_ne!(ln(None), ln(Some(4.0)));
+        assert_ne!(seeds(None), seeds(Some(4.0)));
+
+        // Rounded to 1e-6, like `k`: a difference far below what the
+        // `Auto` ladder can express does not churn every sidecar, while
+        // anything at or above it does.
+        assert_eq!(ln(Some(4.0)), ln(Some(4.0 + 1e-9)));
+        assert_ne!(ln(Some(4.0)), ln(Some(4.000_01)));
     }
 
     /// Ruling C-18 (Tier C Task 3 fix round 1): `registration_hash_for`
@@ -4670,8 +4840,10 @@ mod tests {
             hashes.sort_unstable();
             hashes.join(",")
         };
+        // M1: `None` for β on both sides — these fixtures record no run
+        // group with a β, so the gate resolves `None` too.
         let reference_hash =
-            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None);
+            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None, None);
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
@@ -4703,6 +4875,7 @@ mod tests {
                 &metrics_hashes[&gf.frame_id],
                 &reference_member_ids,
                 &reference_hash,
+                None,
                 None,
             );
             let sidecar_path = f.dir.path().join(format!("f{}.athln", gf.frame_id));
@@ -4976,8 +5149,10 @@ mod tests {
             hashes.sort_unstable();
             hashes.join(",")
         };
+        // M1: `None` for β on both sides — these fixtures record no run
+        // group with a β, so the gate resolves `None` too.
         let reference_hash =
-            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None);
+            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None, None);
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
@@ -5010,6 +5185,7 @@ mod tests {
                 &metrics_hashes[&frame_id],
                 &reference_member_ids,
                 &reference_hash,
+                None,
                 None,
             );
             let sidecar_path = f.dir.path().join(format!("f{frame_id}.athln"));

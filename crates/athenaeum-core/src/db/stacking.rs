@@ -93,8 +93,16 @@ pub struct StackingRunGroupRow {
     /// Perf tier C Task 1 (ruling C-1/C-1a): the group β Measure resolved
     /// once from its members' own `Auto` picks — `psf_signal::group_beta`,
     /// always one of `psf_signal::AUTO_BETAS`. `None` for a run predating
-    /// this task, or a group that measured no frame at all. Nothing reads
-    /// this yet (Task 2 will).
+    /// this task, or a group that measured no frame at all.
+    ///
+    /// Read by the PLAN GATE since M1 (final fix wave, ruling C-30): the β
+    /// is an LN input (stage 6 fits the reference and re-fits every
+    /// member's seeds at it), so `stacking::plan::normalization_hash_for`
+    /// folds it in, and the gate — which never runs a measurement of its
+    /// own — recovers it from this column on the LAST run for the group.
+    /// The run itself uses `RunContext::measured_groups`, the in-memory
+    /// value stage 3 just resolved; the two must agree, which is what
+    /// `local_normalization_sidecars_are_cached_on_the_second_run` pins.
     pub beta: Option<f64>,
 }
 

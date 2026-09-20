@@ -8458,6 +8458,17 @@ fn run_group_normalization(
     reference_measure_hashes.sort_unstable();
     let combined_measurement_hash = reference_measure_hashes.join(",");
 
+    // M1 (final fix wave, ruling C-30): the group β stage 3 resolved from
+    // its members' own `Auto` picks — the value `stacking_run_groups.beta`
+    // records and every LN hash below folds in, because stage 6 FITS at it
+    // (see `normalization_hash_for`'s own doc). Resolved here, above the
+    // first hash that needs it, and read again by `group_beta` below for
+    // the fit itself; `None` (a group stage 3 never measured a frame for)
+    // folds nothing, which is exactly what the plan gate does with a NULL
+    // `stacking_run_groups.beta`.
+    let group_beta_recorded: Option<f64> =
+        rc.measured_groups.get(&group.key).and_then(|mg| mg.beta);
+
     // Fix round 1, item 2: the reference's OWN hash has no further
     // reference to fold in — `""` (see `normalization_hash_for`'s own doc).
     let reference_hash = normalization_hash_for(
@@ -8467,6 +8478,7 @@ fn run_group_normalization(
         &reference_member_ids,
         "",
         None,
+        group_beta_recorded,
     );
 
     let force_fresh = stage_forces_fresh(rc.rerun_from, Stage::Normalize);
@@ -8597,12 +8609,10 @@ fn run_group_normalization(
     // Perf tier C Task 2 (ruling C-1): whatever stage 3 resolved for this
     // group's members' own `Auto` picks — `None` for a group stage 3 never
     // measured a frame for (falls back to `Auto`'s own default, same as
-    // `psf_signal::group_beta` on an empty slice).
-    let group_beta = rc
-        .measured_groups
-        .get(&group.key)
-        .and_then(|mg| mg.beta)
-        .unwrap_or(4.0);
+    // `psf_signal::group_beta` on an empty slice). M1 (final fix wave)
+    // resolved the `Option` further up, where the first LN hash needs it;
+    // this is the same value, with that fallback applied.
+    let group_beta = group_beta_recorded.unwrap_or(4.0);
 
     // Fix round 1, item 6: computed ONCE per group, not once per frame.
     // I2 (final fix wave): also hoists the reference-side star detection +
@@ -8645,6 +8655,20 @@ fn run_group_normalization(
     // Normalize read back as `None` here — the same file-gone-missing
     // signal every other cached stage artifact uses — so a caller handed
     // `None` for a plane falls back to detection, never a hard error.
+    //
+    // M2 (final fix wave, ruling C-30): the `find_artifact` + `is_fresh`
+    // pair below is DELIBERATELY per PLANE rather than a call to
+    // `plan::fits_artifact_fresh_for_planes`. That helper answers one
+    // all-or-nothing question about a whole frame, which is what the plan
+    // gate and stage 5 need (`resolve_register_fits` reads plane 0 only,
+    // and Measure's reuse decision is per frame). Normalize's fallback is
+    // per PLANE — one unreadable channel falls back to detection on that
+    // channel alone while its siblings keep their seeds — so collapsing
+    // this to the frame-level helper would throw away the other planes'
+    // usable artifacts. The PREDICATE is still the shared one: `is_fresh`
+    // is exactly what `fits_artifact_fresh_for_planes` applies to each
+    // plane in its own loop, so the two can never drift about what "fresh"
+    // means, only about how many planes have to be.
     let mut fits_paths: Vec<Vec<Option<PathBuf>>> = Vec::with_capacity(members.len());
     for (i, m) in members.iter().enumerate() {
         let channels = m.measurement.channels.len();
@@ -8734,8 +8758,12 @@ fn run_group_normalization(
             )
         })
         .collect();
-    let calibration_input_hash =
-        seeds_calibration_hash_for(&cfg, &reference_hash, &calibration_frames);
+    let calibration_input_hash = seeds_calibration_hash_for(
+        &cfg,
+        &reference_hash,
+        &calibration_frames,
+        group_beta_recorded,
+    );
     let ln_channels = ln_reference.planes.len();
     let stored_calibration: Option<ln::SeedsCalibration> = if force_fresh {
         None
@@ -8760,6 +8788,7 @@ fn run_group_normalization(
                     &reference_member_ids,
                     &reference_hash,
                     calibration,
+                    group_beta_recorded,
                 )
             })
             .collect()
@@ -15004,6 +15033,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ln_ref_artifacts.len(), 1, "{ln_ref_artifacts:?}");
+
+        // M1: the round trip below is only meaningful while there IS a
+        // beta to disagree about — a group whose column stayed NULL would
+        // make both sides fold nothing and pass vacuously.
+        let run2_groups = crate::db::stacking::list_groups(&fixture.conn, run_id2).unwrap();
+        assert!(
+            run2_groups.iter().all(|g| g.beta.is_some()),
+            "stage 3 must have recorded a group beta: {run2_groups:?}"
+        );
+
+        // M1 (final fix wave, ruling C-30): the PLAN GATE must agree with
+        // the run about these same sidecars. It recomputes
+        // `normalization_hash_for` from stored data alone, and since M1
+        // that hash folds in the group beta — which the gate can only read
+        // back from `stacking_run_groups.beta` of the last run, while the
+        // run passes what stage 3 resolved in memory. If the two ever
+        // disagreed (a NULL column, a different rounding, a fold on one
+        // side only), Normalize would read permanently stale here even
+        // though the run just cache-hit every frame. That round trip, not
+        // a second copy of the assertion above, is what this pins.
+        let plan_after = build_plan(
+            &fixture.conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            fixture.set_id,
+            Some(cfg.clone()),
+        )
+        .expect("the plan should build");
+        assert!(
+            !plan_after.stale_stages.contains(&Stage::Normalize),
+            "the gate must resolve the same group beta the run did: {:?}",
+            plan_after.stale_stages
+        );
+        assert_eq!(
+            plan_after.groups[0].ln_cached, 4,
+            "{:?}",
+            plan_after.groups[0]
+        );
     }
 
     /// Fix round 1, item 2: the per-frame `ln` hash must fold in the
