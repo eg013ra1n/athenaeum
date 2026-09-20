@@ -57,7 +57,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: ln_probe --db <catalog.db> --set <id> --group <key> \
 [--frames N] [--scale 1024] [--frame <calibrated-file-stem>] [--no-fits] [--diag] \
-[--seeds-calibration <k0[,k1,k2]>] [--measure-calibration] [--sidecar-out <path>] [--threads N]"
+[--seeds-calibration <k0[,k1,k2]>] [--measure-calibration]"
     );
     std::process::exit(2);
 }
@@ -100,16 +100,6 @@ struct Args {
     /// is a HOLD-OUT residual, so the target frame must be able to sit
     /// outside the calibration sample).
     measure_calibration: bool,
-    /// Perf tier C item C5 (task 7): write the `.athln` this run produces
-    /// to a caller-named path instead of a tempdir that is removed at
-    /// exit, so a before/after pair of runs can be compared grid for grid
-    /// (`A`/`B` per node) and not only through the per-channel scalars.
-    sidecar_out: Option<PathBuf>,
-    /// Perf tier C item C5 (task 7): the probe's own pool size. It was a
-    /// hard-coded 4 — kept as the default so every earlier task's numbers
-    /// stay comparable — but C5's whole subject is a parallel reduction
-    /// over the plane, so it has to be reportable at more than one width.
-    threads: usize,
 }
 
 fn parse_args() -> Args {
@@ -123,8 +113,6 @@ fn parse_args() -> Args {
     let mut diag = false;
     let mut measure_calibration = false;
     let mut seeds_calibration: Option<Vec<f64>> = None;
-    let mut sidecar_out: Option<PathBuf> = None;
-    let mut threads: usize = 4;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -148,8 +136,6 @@ fn parse_args() -> Args {
             "--frames" => frames = value.parse().unwrap_or_else(|_| usage()),
             "--scale" => scale = value.parse().unwrap_or_else(|_| usage()),
             "--frame" => frame = Some(value),
-            "--sidecar-out" => sidecar_out = Some(value.into()),
-            "--threads" => threads = value.parse().unwrap_or_else(|_| usage()),
             "--seeds-calibration" => {
                 let parsed: Vec<f64> = value
                     .split(',')
@@ -175,8 +161,6 @@ fn parse_args() -> Args {
         diag,
         measure_calibration,
         seeds_calibration,
-        sidecar_out,
-        threads,
     }
 }
 
@@ -525,7 +509,7 @@ registration row for each — run stacking through Register first); found {}",
     let n = (args.frames as usize).min(stack_frames.len());
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(args.threads)
+            .num_threads(4)
             .build()
             .expect("build a thread pool"),
     );
@@ -719,15 +703,7 @@ catalog has no artifact for)",
     );
 
     let sidecar_dir = tempfile::tempdir().expect("create a tempdir for the sidecar");
-    let sidecar_path = match &args.sidecar_out {
-        Some(p) => {
-            if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent).expect("create the --sidecar-out directory");
-            }
-            p.clone()
-        }
-        None => sidecar_dir.path().join("probe.athln"),
-    };
+    let sidecar_path = sidecar_dir.path().join("probe.athln");
 
     // Perf tier C Task 2's own acceptance input: this acceptance catalog
     // predates Task 1, so no `fits` artifact exists on disk for the target

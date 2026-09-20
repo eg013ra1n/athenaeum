@@ -14,12 +14,11 @@ use tracing::warn;
 use crate::integration::stats::ScaleEstimator;
 use crate::resample::Interpolation;
 use crate::stacking::integrate::RejectionChoice;
-use crate::stacking::ln::LN_BACKGROUND_VERSION;
 use crate::stacking::measure::MeasureOptions;
 use crate::stacking::prefilter::SeedPrefilter;
+use crate::stacking::structure::SeedDetector;
 use crate::stacking::psf_signal::{PsfModel, PSF_FIT_VERSION};
 use crate::stacking::register::DistortionChoice;
-use crate::stacking::structure::SeedDetector;
 use crate::stacking::weights::{FormulaWeights, WeightMode};
 
 /// Bumped only when the `StackingConfig` shape changes in a way an old
@@ -659,8 +658,8 @@ pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     // the field can never change a cached calibrated artifact and must not
     // move this hash — otherwise every set would recalibrate once for a
     // field it ignores. Pinned by `format_moves_the_run_fingerprint_but_no_stage_hash`.
-    let mut calibration =
-        serde_json::to_value(&cfg.calibration).expect("CalibratedLightOptions serializes");
+    let mut calibration = serde_json::to_value(&cfg.calibration)
+        .expect("CalibratedLightOptions serializes");
     if let Some(obj) = calibration.as_object_mut() {
         obj.remove("format");
     }
@@ -738,28 +737,16 @@ fn registration_subtree_with_fit_version(
 /// its matched stars through the same `fit_stars` /
 /// `FitParams::default()` the measurement uses, so a change to what the
 /// fitter accepts silently changes every `.athln` — and no config field
-/// moves when it does (ruling R-M4a-15) — and, for the same reason,
-/// [`crate::stacking::ln::LN_BACKGROUND_VERSION`] (perf tier C item C5,
-/// ruling C-5): the background model behind every `.athln`'s `B` grid now
-/// reads a `LN_BIN`×`LN_BIN` reduction of the plane, which moves the node
-/// values with no config field moving at all. It is folded in HERE and
-/// nowhere else — neither [`measurement_subtree`] nor
-/// [`registration_subtree`] carries it, and it is not part of
-/// [`config_hash`]'s whole-config run fingerprint — because the numbers it
-/// changes are stored in the `ln`/`ln_reference` artifacts and nowhere
-/// upstream of them. The first run after it changes re-normalizes every
-/// set once, on purpose.
+/// moves when it does (ruling R-M4a-15).
 pub fn normalization_subtree(cfg: &StackingConfig) -> serde_json::Value {
-    normalization_subtree_with_versions(cfg, PSF_FIT_VERSION, LN_BACKGROUND_VERSION)
+    normalization_subtree_with_fit_version(cfg, PSF_FIT_VERSION)
 }
 
-/// [`normalization_subtree`] with BOTH versions supplied — the shape the
-/// two version pins hash at an off-by-one to prove each one is really in
-/// there.
-fn normalization_subtree_with_versions(
+/// [`normalization_subtree`] with the fitter version supplied — see
+/// [`measurement_subtree_with_fit_version`].
+fn normalization_subtree_with_fit_version(
     cfg: &StackingConfig,
     psf_fit_version: u32,
-    ln_background_version: u32,
 ) -> serde_json::Value {
     serde_json::json!({
         "normalization": cfg.normalization,
@@ -768,7 +755,6 @@ fn normalization_subtree_with_versions(
             "maxStars": cfg.measurement.max_stars,
         },
         "psfFitVersion": psf_fit_version,
-        "lnBackgroundVersion": ln_background_version,
     })
 }
 
@@ -887,7 +873,8 @@ mod tests {
         for other in [
             {
                 let mut c = cfg.clone();
-                c.registration.distortion = crate::stacking::register::DistortionChoice::Tps;
+                c.registration.distortion =
+                    crate::stacking::register::DistortionChoice::Tps;
                 c
             },
             {
@@ -996,9 +983,7 @@ mod tests {
             "calibration.format must not invalidate a calibrated frame"
         );
         assert!(
-            calibration_subtree(&cfg)["calibration"]
-                .get("format")
-                .is_none(),
+            calibration_subtree(&cfg)["calibration"].get("format").is_none(),
             "the subtree must not carry the field at all"
         );
     }
@@ -1243,10 +1228,7 @@ mod tests {
             "the measurement stage hash must follow seedDetector"
         );
         assert_eq!(
-            structure
-                .measurement
-                .measure_options(ScaleEstimator::Bwmv)
-                .seed_detector,
+            structure.measurement.measure_options(ScaleEstimator::Bwmv).seed_detector,
             SeedDetector::Structure,
             "and the resolved measure options carry it"
         );
@@ -1266,11 +1248,7 @@ mod tests {
         let h = |v: u32| {
             (
                 stage_hash(&measurement_subtree_with_fit_version(&cfg, v), &[], &[]),
-                stage_hash(
-                    &normalization_subtree_with_versions(&cfg, v, LN_BACKGROUND_VERSION),
-                    &[],
-                    &[],
-                ),
+                stage_hash(&normalization_subtree_with_fit_version(&cfg, v), &[], &[]),
                 stage_hash(&registration_subtree_with_fit_version(&cfg, v), &[], &[]),
             )
         };
@@ -1298,63 +1276,13 @@ mod tests {
         );
     }
 
-    /// Perf tier C item C5 (ruling C-5): the LN background model's own
-    /// version, [`LN_BACKGROUND_VERSION`], moves the `ln` and
-    /// `ln_reference` artifact hashes — and NOTHING else. The `.athln`
-    /// sidecars are the only place the node values it changes are stored,
-    /// so folding it into the measurement or registration subtree, or into
-    /// [`config_hash`]'s whole-config run fingerprint, would recalibrate,
-    /// re-measure or re-register every set for a change that cannot reach
-    /// any of them.
-    #[test]
-    fn only_the_ln_subtree_hash_follows_the_background_model_version() {
-        let cfg = StackingConfig::default();
-        let at = |v: u32| {
-            stage_hash(
-                &normalization_subtree_with_versions(&cfg, PSF_FIT_VERSION, v),
-                &[],
-                &[],
-            )
-        };
-        assert_ne!(
-            at(LN_BACKGROUND_VERSION),
-            at(LN_BACKGROUND_VERSION - 1),
-            "the LN hash must follow the background model's version"
-        );
-        assert_eq!(
-            stage_hash(&normalization_subtree(&cfg), &[], &[]),
-            at(LN_BACKGROUND_VERSION),
-            "normalization_subtree must hash as the current background model version — not \
-             as a second, drifting copy of the JSON shape"
-        );
-        // The other two stages' subtrees do not carry it at all: no value
-        // of `LN_BACKGROUND_VERSION` can move either hash, because the key
-        // is absent from their JSON.
-        for subtree in [measurement_subtree(&cfg), registration_subtree(&cfg)] {
-            assert!(
-                subtree.get("lnBackgroundVersion").is_none(),
-                "{subtree:?} must not carry lnBackgroundVersion — only the LN artifacts store \
-                 background-model output"
-            );
-        }
-        assert_eq!(
-            LN_BACKGROUND_VERSION, 2,
-            "2 is the LN_BIN-binned model; 1 was the full-resolution one M2..perf-tier-A shipped"
-        );
-    }
-
     /// M4c Task 3: the large-scale filter's two integers are clamped to the
     /// ranges the Integrate panel offers — an unclamped `protectedLayers`
     /// would ask for a window of `2^(n+1)` pixels (and shift a `usize` past
     /// its own width on the way).
     #[test]
     fn the_large_scale_integers_are_clamped_to_their_ranges() {
-        let large = |doc: &str| {
-            resolve_config(Some(doc), None)
-                .unwrap()
-                .integration
-                .large_scale
-        };
+        let large = |doc: &str| resolve_config(Some(doc), None).unwrap().integration.large_scale;
         assert_eq!(
             large("{\"integration\":{\"largeScale\":{\"protectedLayers\":0}}}").protected_layers,
             MIN_PROTECTED_LAYERS
@@ -1421,10 +1349,7 @@ mod tests {
         // The shipped default (ruling R-T7-1) is inside the range and must
         // not move without a deliberate re-measurement.
         assert_eq!(
-            resolve_config(None, None)
-                .unwrap()
-                .registration
-                .tps_smoothing,
+            resolve_config(None, None).unwrap().registration.tps_smoothing,
             0.5
         );
     }
