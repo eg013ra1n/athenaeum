@@ -49,5 +49,10 @@ dist-ssr
 .superpowers/
 scripts/__pycache__/
 
+# Python bytecode, at any depth — `scripts/__pycache__/` above is anchored to
+# the repo root and so never matched the harness tools under
+# docs/superpowers/research/scripts/ (final fix wave, ruling C-30, review M6).
+__pycache__/
+
 # Per-machine Claude Code permissions (paths bound to one machine)
 .claude/settings.local.json

@@ -78,8 +78,8 @@ binned background's cost saving plus the machine's state, and is not part of the
 | ----- | ----- | ---- | ---- | ---- | ---- | ---- |
 | frame plane measured | fit | 367 | 340 | 396 | **202** | C3 (Task 5; −30 % on the probe, −49 % here with the fixed group β) |
 | frame plane measured | duration | 1906 | 1906 | 2230 | 1592 | (band + C3) |
-| frame stars detected | detect | 730 | 268 | — | 236 | (Tier A T4; Register no longer calls it on mono) |
-| frame registered | read / detect | 136 / 730 | 0 / 0 | 0 / 0 | **0 / 0** | C6 (Task 3: fits reused, header-only open) |
+| frame stars detected | detect | 730 | 268 | — | **236** | **C6** + Tier A T4 — and Register no longer fires this event on a mono frame at all |
+| frame registered | read / detect | 136 / 730 | 0 / 0 | 0 / 0 | 0 / 0 | NOT C6 evidence — see the note below |
 | ln frame normalized | ln_detect | 3969 | 2 | 3 | **2** | C1 (Task 2: seeds, no detection) |
 | ln frame normalized | ln_fit / scale | — / 5277 | 1000 / 1026 | 1269 / 1310 | **606 / 636** | C1 + C3 |
 | ln frame normalized | background | 391 | 637 | 633 | 463 | (band; C5 reverted) |
@@ -88,6 +88,17 @@ binned background's cost saving plus the machine's state, and is not part of the
 
 `rejection_iters_mean = 2.31` and `medfit_evals_mean = 33.96` on every run — the rejection
 algorithm's shape never moved (C4 was reverted).
+
+**Correction (final fix wave, ruling C-30, review M4).** An earlier reading of this table
+attributed the `frame registered` row's `0 / 0` to C6. It is not C6's: `register_detected` has
+logged `read_ms = 0, detect_ms = 0` UNCONDITIONALLY since perf tier 1 Task 9 split detection
+(`detect_frame_stars`) out of alignment — its own doc comment says so, and the C-1 column above
+already reads `0 / 0`, before Task 3 existed. (The tierA column's `136 / 730` therefore predates
+that split; it is carried from an older log and is not a Tier A measurement of this event.) C6's
+evidence is the row above it — `frame stars detected` median detect 730 → 236 ms, with Register
+no longer calling the event at all on a mono frame — plus `star_source = "fits"` on 92/92 mono
+frames of the run. The header-only open is real and unchanged: the reuse path calls
+`PlaneReader::open` and never reads a pixel plane. Only the timing attribution was wrong.
 
 ## 4. The §8 table (tierC vs tierA-baseline; `tierC-compare.txt` beside the ledger)
 

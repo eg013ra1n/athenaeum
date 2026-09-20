@@ -345,8 +345,12 @@ ruler (masters within 0.1 % median / 1 % MAD / 2 % noise / 1 % FWHM, rejected fr
 warp-invariant (up to 20 %, FWHM-dependent), so the fits are SEEDS re-fitted on the warped plane
 at the group β, with a per-channel calibration `k` from a weight-stratified 7-frame sample
 (rulings C-12…C-17); LN scale 6.5 → 0.64 s per frame, Normalize 5.70 → 2.01 min. D2 (mono
-Register from the fits) — detect 730 → 0 ms, the frame is not even read (header only),
-Register 2.36 → 1.52. Z3 (drizzle phase table) — 64 phases, not 32 (the plan's 2 % per-pixel
+Register from the fits) — `frame stars detected` 730 → 236 ms and Register stops firing it on a
+mono frame at all, `star_source = "fits"` on 92/92 of them, the frame not even read (header only:
+`PlaneReader::open`, no plane); Register 2.36 → 1.52. (Corrected in the final fix wave, ruling
+C-30: the "→ 0 ms" this line first claimed was the `frame registered` event's `detect_ms`, which
+`register_detected` has hard-coded to `0` since perf tier 1 — a pre-existing zero, not this
+item's doing.) Z3 (drizzle phase table) — 64 phases, not 32 (the plan's 2 % per-pixel
 bound is unreachable at 32); deposit −85 % per plane, Drizzle 4.26 → 1.18. D6 (Moffat LM
 arithmetic, rustafits) — one transcendental per sample-iteration, residual reuse, Cholesky
 scratch: fit −30…−49 %, iteration counts identical, ≤ 7e-15 px, Measure 4.48 → 3.67. I7/I8

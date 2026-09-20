@@ -202,6 +202,46 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Stacking perf Tier C (2026-09-20)
+
+Spec `docs/superpowers/specs/2026-09-20-stacking-compute-tierC-design.md`, plan
+`docs/superpowers/plans/2026-09-20-stacking-compute-tierC-plan.md`, acceptance
+`docs/superpowers/research/2026-09-20-stacking-compute-tierC-acceptance.md`. The numeric tier
+after Tier A's bit-identical one: 21.73 → 14.47 min on the reduced set `LDN1272-test`, like for
+like against a same-evening Tier A build re-run (−33 %), every gated §8 row PASS.
+
+- **Owner smokes**: the Normalize row's per-frame message during a real run
+  (`calibrating the seeds path · frame i/7` while the group's seeds calibration is being
+  measured, then the ordinary fan-out count) and the Register rows' own progress — both ride
+  `FanOutTicker` and neither has been watched on the desktop.
+- **Cosmetic, not fixed**: `PlanGroup.fitsCached` reaches the frontend
+  (`src/types/stacking.ts`) but `GroupsTable.tsx`'s cache column shows only
+  "N calibrated · N metrics" — a frame whose `.athf` is missing therefore reads as fully cached
+  in the table while the plan gate correctly reports Measure stale. One more token in that cell.
+- **Owner decision owed (carried from Tier A)**: the rustafits submodule (its own public repo)
+  carries pre-existing third-party product names in comments/docs — does the 2026-09-19 no-names
+  rule extend to it?
+- **Nothing pushed**: `main`, `perf/stacking-tierC` and rustafits `perf/stacking-kernels` — push
+  on the owner's word.
+
+Decisions, do NOT re-flag:
+
+- **C5 (the LN background on a 4×4-binned plane) and C4 (`medfit_line`'s warm bracket) were
+  MEASURED OUT and reverted** — rulings C-29 and C-26. C5's `B` grid moved 2.4e-3 of sky at the
+  median node on the full group and broke §8 (mono MAD +1.9 %, OSC blue FWHM +2.7 %) although a
+  3-frame probe read 9e-4; C4's warm bracket measured 0.966×. Both verdicts live in the code
+  they measured (`ln::background_grid`'s and `medfit_line`'s doc comments) beside Tier A Task 9's
+  own reverted items. Do not re-propose either without a full-group, master-level measurement.
+- **The two absolute drizzle rows read FAIL for data reasons the baseline shares** — rulings
+  C-20 (OSC-red level 0.997995 against an absolute 0.998–1.002 bar) and C-23 (coverage 0.993484
+  is the 92-frame dithered FOOTPRINT, not a phase-table effect: the tabulated arm reproduces the
+  run's own weight map pixel for pixel over 104.4 M pixels, `XOR = 0`).
+- **No SECOND `PSF_FIT_VERSION` bump for the fitter's arithmetic** — ruling C-24. Task 1 already
+  took it 2 → 3 (`6ffdcdee`, for the `fits` artifact and the group β), and Task 5's rustafits
+  change (`perf/stacking-kernels`) leaves the accepted fits identical — 180/180 solves at the
+  same iteration count, position 6.9e-15 px, FWHM 1 ulp — so a further bump would re-measure and
+  re-normalize every set for nothing.
+
 ### Stacking compute Tier A (2026-09-19/20)
 
 - **Owed test**: the Register stage's cache-hit REWRITE batch (registered artifacts missing/stale)

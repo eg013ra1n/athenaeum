@@ -1425,8 +1425,14 @@ frame; Normalize 5.70 → 2.01 min; zero fallbacks on the acceptance set. (3)
 **Register on a mono frame reuses the fits** (ruling C-6; OSC keeps luminance
 detection): `Star.flux = fit.signal / ADU_SCALE`, `passes_register_cuts`, a
 `MIN_INLIERS` floor falls back to detection with one `warn!`
-(`star_source = fits | detected`); detect 730 → 0 ms and the frame is opened
-header-only. **Both the LN hashes and the registration hash now fold the
+(`star_source = fits | detected`); the frame is opened header-only
+(`PlaneReader::open`, no plane read) and `star_source = "fits"` on 92/92
+mono frames of the acceptance run, whose `frame stars detected` median
+detect went 730 → 236 ms — and Register no longer fires that event on a
+mono frame at all. NOT the `frame registered` row's `read/detect`: those
+have been hard-coded `0` since perf tier 1 Task 9 split detection out of
+alignment (`register_detected`'s own doc says so), so they were already
+`0/0` before this task and are no evidence for it. **Both the LN hashes and the registration hash now fold the
 per-frame MEASUREMENT hash** (rulings C-17/C-18) — the seed population moves
 with `measurement.detectionSigma`/`seedDetector`/`seedPrefilter`/`maxStars`,
 so a Measure config change re-normalizes and re-registers instead of reusing
