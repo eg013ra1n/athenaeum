@@ -6347,6 +6347,13 @@ struct IntegrateTickState {
     /// would silently drop every tick of a new plane, since a fresh plane
     /// always starts back at `bytes_done: 0`.
     last_bytes_done: u64,
+    /// The plane's combine progress in ROWS — the one measure that moves
+    /// through the whole plane (reading a band is ≈ 10 % of its time,
+    /// combining it the rest), so it is what `frac` is built from on both
+    /// the read and the combine tick. Before this tracker the combine tick
+    /// passed `frac = 1.0` and a one-plane group sat at 100 % for the whole
+    /// combine while only the bytes text moved (owner report 2026-09-20).
+    rows: CombineRowsTracker,
 }
 
 impl IntegrateTickState {
@@ -6356,6 +6363,78 @@ impl IntegrateTickState {
             last_percent: f64::NEG_INFINITY,
             last_plane: 0,
             last_bytes_done: 0,
+            rows: CombineRowsTracker::default(),
+        }
+    }
+}
+
+/// Rows combined so far in the CURRENT plane, folded from the engine's two
+/// callbacks: `on_band(k, …)` fires when band `k` (1-based) has finished
+/// READING and is about to combine; `on_combine(done, h)` reports rows
+/// combined WITHIN that band (`h` = the band's height, `done` reaches `h`
+/// on its last tick and may repeat). A band's rows are committed exactly
+/// once — on the first tick that reports `done == h` for a band not yet
+/// committed — so a repeated final tick, or a band whose ticks never reach
+/// `h`, cannot double-count; `frac` for the plane is `rows() / plane_rows`.
+/// Monotone by construction, which is what the max-latch in
+/// [`emit_integrate_tick`] needs from both callbacks: the read tick of band
+/// `k+1` reports the same `rows()` as band `k`'s last combine tick, never
+/// less, so it is never dropped and its bytes text still updates.
+#[derive(Default)]
+struct CombineRowsTracker {
+    /// Rows of every band already committed.
+    committed: u64,
+    /// The band the last committed rows belong to (0 = none yet).
+    committed_band: usize,
+    /// The band currently combining, from the last `on_band` tick.
+    cur_band: usize,
+    /// `done` of the current band's last tick, 0 after a commit.
+    cur_done: u64,
+}
+
+impl CombineRowsTracker {
+    /// A new plane starts: nothing combined yet.
+    fn on_plane(&mut self) {
+        *self = CombineRowsTracker::default();
+    }
+
+    /// Band `band` (1-based) finished reading; a `0` is the engine's forecast
+    /// tick before pass 2's first band and names no band.
+    fn on_band(&mut self, band: usize) {
+        if band > 0 && band != self.cur_band {
+            self.cur_band = band;
+            self.cur_done = 0;
+        }
+    }
+
+    /// `done` of `h` rows of the current band are combined.
+    fn on_combine(&mut self, done: u64, h: u64) {
+        if self.cur_band == 0 || self.committed_band == self.cur_band {
+            // No band announced yet, or this band is already committed (a
+            // repeated final tick): nothing to add.
+            return;
+        }
+        if done >= h && h > 0 {
+            self.committed += h;
+            self.committed_band = self.cur_band;
+            self.cur_done = 0;
+        } else {
+            self.cur_done = done.min(h);
+        }
+    }
+
+    /// Rows combined so far in this plane.
+    fn rows(&self) -> u64 {
+        self.committed + self.cur_done
+    }
+
+    /// `rows() / plane_rows`, clamped to `[0, 1]`; `0` for a plane with no
+    /// rows (never true of a real plane).
+    fn frac(&self, plane_rows: u64) -> f64 {
+        if plane_rows == 0 {
+            0.0
+        } else {
+            (self.rows() as f64 / plane_rows as f64).min(1.0)
         }
     }
 }
@@ -7275,6 +7354,9 @@ fn process_group_output(
         channels * large_scale_passes(&group_integration, rej_set.is_some());
     let current_plane = std::sync::atomic::AtomicUsize::new(0);
     let tick_state: Mutex<IntegrateTickState> = Mutex::new(IntegrateTickState::new());
+    // The plane's row count for the combine-progress fraction: the group's
+    // own (reference) geometry, the same rows the engine combines.
+    let plane_rows = rc.geometry_of(&group.key).height as u64;
     let emitter = rc.emitter.clone();
     let run_id = rc.run_id;
     let set_id = rc.set_id;
@@ -7282,6 +7364,11 @@ fn process_group_output(
 
     let on_plane = |p: usize, _total: usize| {
         current_plane.store(p, Ordering::Relaxed);
+        tick_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rows
+            .on_plane();
         emit_integrate_tick(
             &tick_state,
             emitter.as_ref(),
@@ -7304,10 +7391,15 @@ fn process_group_output(
     };
     let on_band = |band: usize, bands: usize, bytes_done: u64, bytes_total: u64| {
         let plane = current_plane.load(Ordering::Relaxed);
-        let frac = if bytes_total > 0 {
-            (bytes_done as f64 / bytes_total as f64).min(1.0)
-        } else {
-            0.0
+        // Percent follows ROWS COMBINED, not bytes read: a band's read is
+        // ≈ 10 % of its time and the bytes pair is what the text shows
+        // anyway. Reporting the bytes fraction here used to put the bar
+        // AHEAD of the combine tick, whose rows fraction the max-latch then
+        // dropped for the rest of the band.
+        let frac = {
+            let mut st = tick_state.lock().unwrap_or_else(|e| e.into_inner());
+            st.rows.on_band(band);
+            st.rows.frac(plane_rows)
         };
         emit_integrate_tick(
             &tick_state,
@@ -7329,8 +7421,13 @@ fn process_group_output(
             )),
         );
     };
-    let on_combine = |_rows: usize, _rows_total: usize, bytes_done: u64, bytes_total: u64| {
+    let on_combine = |rows: usize, rows_total: usize, bytes_done: u64, bytes_total: u64| {
         let plane = current_plane.load(Ordering::Relaxed);
+        let frac = {
+            let mut st = tick_state.lock().unwrap_or_else(|e| e.into_inner());
+            st.rows.on_combine(rows as u64, rows_total as u64);
+            st.rows.frac(plane_rows)
+        };
         emit_integrate_tick(
             &tick_state,
             emitter.as_ref(),
@@ -7339,7 +7436,7 @@ fn process_group_output(
             &group_key_for_progress,
             integrate_planes_total,
             plane,
-            1.0,
+            frac,
             bytes_done,
             bytes_total,
             false,
@@ -13753,6 +13850,44 @@ mod tests {
             last_percent.insert(key, percent);
         }
         order
+    }
+
+    #[test]
+    fn combine_rows_tracker_follows_bands_and_never_double_counts() {
+        // Three bands of 512/512/256 rows in a 1280-row plane.
+        let mut t = CombineRowsTracker::default();
+        assert_eq!(t.rows(), 0);
+        t.on_combine(100, 512); // no band announced yet: ignored
+        assert_eq!(t.rows(), 0);
+        t.on_band(1);
+        t.on_combine(100, 512);
+        assert_eq!(t.rows(), 100);
+        t.on_combine(512, 512); // band 1 done → committed
+        assert_eq!(t.rows(), 512);
+        t.on_combine(512, 512); // the engine repeats the final tick
+        assert_eq!(t.rows(), 512, "a repeated final tick must not double-count");
+        t.on_band(2); // band 2 read: percent holds at band 1's rows
+        assert_eq!(t.rows(), 512);
+        t.on_combine(10, 512);
+        assert_eq!(t.rows(), 522);
+        t.on_combine(512, 512);
+        t.on_band(3);
+        t.on_combine(256, 256);
+        assert_eq!(t.rows(), 1280);
+        assert!((t.frac(1280) - 1.0).abs() < 1e-12);
+        t.on_band(0); // pass-2 forecast tick names no band
+        assert_eq!(t.rows(), 1280);
+        t.on_plane();
+        assert_eq!(t.rows(), 0, "a new plane starts from zero");
+        assert_eq!(t.frac(0), 0.0, "a zero-row plane reads 0, never NaN");
+        // A band whose ticks never reach `h` contributes its last `done`
+        // until the next band is announced, then that partial is dropped
+        // rather than committed as a whole band.
+        t.on_band(1);
+        t.on_combine(300, 512);
+        assert_eq!(t.rows(), 300);
+        t.on_band(2);
+        assert_eq!(t.rows(), 0, "an unfinished band is never committed");
     }
 
     #[test]
