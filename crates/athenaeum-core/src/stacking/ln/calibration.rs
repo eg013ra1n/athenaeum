@@ -66,13 +66,15 @@ pub const SEEDS_CALIBRATION_FRAMES: usize = 7;
 /// "median" that is really a mean of whatever two frames happened to work.
 pub const SEEDS_CALIBRATION_MIN_RATIOS: usize = 3;
 
-/// `k` outside `1 ± this` is refused (ruling C-14 item 1) — four times the
-/// largest per-frame bias ever measured for this path (+1.401 % on frame
-/// 29035 of the acceptance catalog, fix round 2's own table). A `k` beyond
-/// it is not a seeds-path bias: it is a calibration frame whose two arms
-/// disagreed for some other reason, and applying it would move every
-/// frame's `A` — and the master's level — by more than the defect it
-/// claims to correct.
+/// `k` outside `1 ± this` is refused (ruling C-14 item 1) — **about twice**
+/// the largest per-frame bias measured for this path (≈ 2.1 × the +1.449 %
+/// of frame 29047, fix round 5's own hold-out; C-14's doc said "four
+/// times", which was wrong against +1.401 % and is wronger still against
+/// +1.449 % — the VALUE stays, only the claim about it is corrected,
+/// C-17). A `k` beyond the band is not a seeds-path bias: it is a
+/// calibration frame whose two arms disagreed for some other reason, and
+/// applying it would move every frame's `A` — and the master's level — by
+/// more than the defect it claims to correct.
 pub const SEEDS_CALIBRATION_BAND: f64 = 0.03;
 
 /// One group's measured seeds calibration — what
@@ -99,18 +101,19 @@ impl SeedsCalibration {
     /// Channel `channel`'s factor, `1.0` for a channel this calibration
     /// says nothing about (a group whose channel count changed under a
     /// stored calibration — never in one run, but a stored payload is
-    /// read back by the plan gate too).
+    /// read back by the plan gate too) or one whose stored value is not a
+    /// usable positive finite number.
+    ///
+    /// This is the ONE place a `k` is turned into a multiplier:
+    /// [`super::normalize_frame`] calls it per channel (C-17), so the
+    /// short-slice and the non-finite guard live together with the type
+    /// that owns them rather than being restated at the apply site.
     pub fn k_for(&self, channel: usize) -> f64 {
-        self.k.get(channel).copied().unwrap_or(1.0)
-    }
-
-    /// Every factor exactly `1.0` — a calibration that measured cleanly
-    /// and found nothing to correct is indistinguishable, numerically,
-    /// from no calibration at all; the caller still records it, because
-    /// "measured, and it was 1" is a different cache state from "never
-    /// measured".
-    pub fn is_neutral(&self) -> bool {
-        self.k.iter().all(|k| *k == 1.0)
+        self.k
+            .get(channel)
+            .copied()
+            .filter(|k| k.is_finite() && *k > 0.0)
+            .unwrap_or(1.0)
     }
 }
 
@@ -713,12 +716,17 @@ mod tests {
         assert_eq!(calibration.k, vec![0.993, 1.0, 1.0]);
         assert_eq!(calibration.k_for(0), 0.993);
         assert_eq!(calibration.k_for(7), 1.0, "an unknown channel is 1.0");
-        assert!(!calibration.is_neutral());
-        assert!(SeedsCalibration {
+        // C-17: `k_for` is the apply path's own guard, so a stored payload
+        // carrying a value no multiplier may use reads as 1.0 rather than
+        // poisoning a channel's `A`.
+        let broken = SeedsCalibration {
             frame_ids: vec![1],
-            k: vec![1.0, 1.0],
-        }
-        .is_neutral());
+            k: vec![f64::NAN, -0.5, 0.0, 0.99],
+        };
+        assert_eq!(broken.k_for(0), 1.0, "NaN");
+        assert_eq!(broken.k_for(1), 1.0, "negative");
+        assert_eq!(broken.k_for(2), 1.0, "zero");
+        assert_eq!(broken.k_for(3), 0.99);
     }
 
     #[test]

@@ -519,11 +519,29 @@ pub(crate) struct LnReferencePayload {
 pub(crate) fn normalization_hash_for(
     cfg: &StackingConfig,
     registration_hash: &str,
+    measurement_hash: &str,
     reference_member_ids: &[i64],
     reference_hash: &str,
     calibration: Option<&SeedsCalibration>,
 ) -> String {
     let mut upstream: Vec<String> = vec!["register".to_string(), registration_hash.to_string()];
+    // C-17: the frame's own MEASUREMENT hash (`measurement_hash_for`, the
+    // same value its `fits` artifact is keyed on), because stage 6 reads
+    // that artifact. `normalization_subtree` carries only
+    // `measurement.psfModel`/`maxStars` — NOT `detectionSigma`,
+    // `seedDetector`, `seedPrefilter` or `structure`, every one of which
+    // reshapes the `.athf` seed population that
+    // `scale::relative_scale_from_seeds` fits and that the group's `k` is
+    // derived from. Without this, flipping `seedDetector` to `structure`
+    // rewrote every `.athf` while the plan gate still reported Normalize
+    // cached and the run reused both the sidecars and the stored `k`. The
+    // caller-supplied string is the ONE seam: the run and the gate must
+    // pass the same value for the same frame (empty when a frame's
+    // measurement hash cannot be resolved at all, which hashes as "not
+    // recorded" rather than silently as some other frame's).
+    if !measurement_hash.is_empty() {
+        upstream.push(format!("measure:{measurement_hash}"));
+    }
     upstream.extend(reference_member_ids.iter().map(|id| format!("ln_ref:{id}")));
     if !reference_hash.is_empty() {
         upstream.push(format!("ln_reference_hash:{reference_hash}"));
@@ -554,17 +572,23 @@ pub(crate) fn normalization_hash_for(
 /// (the review's I3). `reference_hash` is the group's LN reference: `k` is
 /// a ratio measured AGAINST that reference, so a rebuilt reference is a
 /// different measurement.
+///
+/// `calibration_frames` is `(frame_id, registration hash, measurement
+/// hash)` in the sample's own order. The measurement hash is there for the
+/// same reason [`normalization_hash_for`] folds it (C-17): `k` is derived
+/// from the calibration frames' `.athf` seeds, so a Measure seed-config
+/// change has to re-measure it.
 pub(crate) fn seeds_calibration_hash_for(
     cfg: &StackingConfig,
     reference_hash: &str,
-    calibration_frames: &[(i64, &str)],
+    calibration_frames: &[(i64, &str, &str)],
 ) -> String {
     let mut upstream: Vec<String> = vec![format!("ln_reference_hash:{reference_hash}")];
     upstream.extend(
         calibration_frames
             .iter()
             .enumerate()
-            .map(|(rank, (id, reg))| format!("ln_calib:{rank}:{id}:{reg}")),
+            .map(|(rank, (id, reg, meas))| format!("ln_calib:{rank}:{id}:{reg}:{meas}")),
     );
     let upstream_refs: Vec<&str> = upstream.iter().map(String::as_str).collect();
     stage_hash(&normalization_subtree(cfg), &upstream_refs, &[])
@@ -663,6 +687,26 @@ pub(crate) fn wants_cfa_mosaic(cfg: &StackingConfig, group: &IntegrationGroup) -
         && cfg.drizzle.bayer
         && cfg.calibration.debayer_osc
         && group.color_mode == ColorMode::Osc
+}
+
+/// How many channels this group's calibrated frames — and therefore its LN
+/// reference and every `.athln` grid — will carry: three for a DEBAYERED
+/// OSC group, one otherwise (mono, or OSC with `calibration.debayerOsc`
+/// off, which keeps the CFA mosaic single-plane).
+///
+/// C-17: the plan gate needs this to apply the SAME `k.len()` filter the
+/// run applies to a stored `ln_calibration` payload (`run.rs` compares
+/// against `ln_reference.planes.len()`, which it has because it has the
+/// reference). Without it a payload of the wrong shape read as usable here
+/// and unusable there, so gate and run disagreed about "cached" for a group
+/// whose colour mode or debayer setting had changed under a stored
+/// calibration.
+pub(crate) fn expected_ln_channels(cfg: &StackingConfig, group: &IntegrationGroup) -> usize {
+    if group.color_mode == ColorMode::Osc && cfg.calibration.debayer_osc {
+        3
+    } else {
+        1
+    }
 }
 
 // ── build_plan ──────────────────────────────────────────────────────────────
@@ -1837,9 +1881,15 @@ pub fn build_plan(
         // whatever the last run stored is what its sidecars were written
         // under, which is the question this gate is asking.
         let ln_calibration: Option<SeedsCalibration> = if local_normalization_active {
+            let ln_channels = expected_ln_channels(&cfg, g);
             find_artifact(conn, frames_set_id, &g.key, "ln_calibration", None)?
                 .and_then(|row| row.payload_json)
                 .and_then(|s| serde_json::from_str::<SeedsCalibration>(&s).ok())
+                // C-17: the same shape filter the run applies
+                // (`run.rs`'s `stored_calibration`) — a payload whose `k`
+                // does not match the group's channel count is unusable
+                // THERE, so it must read as absent HERE too.
+                .filter(|c| c.k.len() == ln_channels)
         } else {
             None
         };
@@ -1979,9 +2029,19 @@ pub fn build_plan(
                             // in the map) stays "can't verify".
                             Some(hash_opt) => {
                                 let frame_registration_hash = hash_opt.clone().unwrap_or_default();
+                                // C-17: the same measurement hash the
+                                // Measure check above resolved for this
+                                // frame, and the same value `run.rs` folds
+                                // in. `None` (no group frame, no
+                                // calibration hash) hashes as "" on BOTH
+                                // sides, so the gate and the run still
+                                // agree.
+                                let frame_measurement_hash =
+                                    expected_measurement_hash.clone().unwrap_or_default();
                                 let expected = normalization_hash_for(
                                     &cfg,
                                     &frame_registration_hash,
+                                    &frame_measurement_hash,
                                     &ref_info.reference_member_ids,
                                     &ref_info.reference_hash,
                                     ln_calibration.as_ref(),
@@ -4130,6 +4190,8 @@ mod tests {
 
         let mut divisors = DivisorCache::new();
         let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        // C-17: the LN hash folds the frame's measurement hash in too.
+        let mut metrics_hashes: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
             let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
             calib_hashes.insert(gf.frame_id, hash);
@@ -4161,6 +4223,7 @@ mod tests {
             .unwrap();
 
             let metrics_hash = measurement_hash_for(&cfg, &hash);
+            metrics_hashes.insert(gf.frame_id, metrics_hash.clone());
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
@@ -4265,6 +4328,88 @@ mod tests {
         );
     }
 
+    /// C-17: both LN hashes must follow the MEASURE seed config, because
+    /// stage 6 reads the `.athf` artifact that config shapes.
+    /// `normalization_subtree` carries only `measurement.psfModel` and
+    /// `maxStars`, so before this fix flipping `seedDetector` to
+    /// `structure` rewrote every `.athf` while the plan gate still reported
+    /// Normalize cached and the run reused both the sidecars and the stored
+    /// `k`. The fix folds `measurement_hash_for`'s value into
+    /// `normalization_hash_for` and `seeds_calibration_hash_for` alike, so
+    /// this pin drives BOTH from the same config change.
+    #[test]
+    fn the_ln_hashes_follow_the_measure_seed_config() {
+        use crate::stacking::structure::SeedDetector;
+
+        let cfg = StackingConfig::default();
+        let calibrated = "calibrated-hash";
+        let reference_ids = [11i64, 22, 33];
+        let reference_hash = "ln-reference-hash";
+        let measurement = measurement_hash_for(&cfg, calibrated);
+        let calibration = SeedsCalibration {
+            frame_ids: vec![11, 22],
+            k: vec![0.994],
+        };
+
+        let ln = |cfg: &StackingConfig, measurement: &str| {
+            normalization_hash_for(
+                cfg,
+                "registration-hash",
+                measurement,
+                &reference_ids,
+                reference_hash,
+                Some(&calibration),
+            )
+        };
+        let seeds = |cfg: &StackingConfig, measurement: &str| {
+            seeds_calibration_hash_for(
+                cfg,
+                reference_hash,
+                &[(11, "registration-hash", measurement)],
+            )
+        };
+
+        // Same config, same inputs -> the same hash, twice.
+        assert_eq!(ln(&cfg, &measurement), ln(&cfg, &measurement));
+        assert_eq!(seeds(&cfg, &measurement), seeds(&cfg, &measurement));
+
+        // A changed Measure SEED config moves the measurement hash ...
+        let mut seed_cfg = cfg.clone();
+        seed_cfg.measurement.seed_detector = match cfg.measurement.seed_detector {
+            SeedDetector::Peak => SeedDetector::Structure,
+            SeedDetector::Structure => SeedDetector::Peak,
+        };
+        let seed_measurement = measurement_hash_for(&seed_cfg, calibrated);
+        assert_ne!(
+            measurement, seed_measurement,
+            "sanity: the measurement hash itself must follow seedDetector"
+        );
+
+        // ... and both LN hashes must move with it.
+        assert_ne!(
+            ln(&seed_cfg, &seed_measurement),
+            ln(&cfg, &measurement),
+            "a changed seedDetector must invalidate the per-frame LN hash"
+        );
+        assert_ne!(
+            seeds(&seed_cfg, &seed_measurement),
+            seeds(&cfg, &measurement),
+            "a changed seedDetector must invalidate the seeds-calibration hash"
+        );
+
+        // The seam is the folded VALUE, not the subtree: handing the same
+        // config a different measurement hash has to move them too, which
+        // is what makes the gate and the run agree only when they pass the
+        // same per-frame value.
+        assert_ne!(ln(&cfg, "other-measurement"), ln(&cfg, &measurement));
+        assert_ne!(seeds(&cfg, "other-measurement"), seeds(&cfg, &measurement));
+
+        // And an EMPTY measurement hash ("not recorded") is its own state,
+        // shared by the gate's `None` and the run's `String::new()`.
+        assert_eq!(ln(&cfg, ""), ln(&cfg, ""));
+        assert_ne!(ln(&cfg, ""), ln(&cfg, &measurement));
+    }
+
     /// Fix round 1, item 5: `ln_cached`/`stale_stages`'s `Normalize` entry
     /// must react to a REAL config change, not just artifact presence on
     /// disk — verified via the `ln_reference` artifact's stored
@@ -4314,6 +4459,8 @@ mod tests {
 
         let mut divisors = DivisorCache::new();
         let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        // C-17: the LN hash folds the frame's measurement hash in too.
+        let mut metrics_hashes: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
             let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
             calib_hashes.insert(gf.frame_id, hash);
@@ -4345,6 +4492,7 @@ mod tests {
             .unwrap();
 
             let metrics_hash = measurement_hash_for(&cfg, &hash);
+            metrics_hashes.insert(gf.frame_id, metrics_hash.clone());
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
@@ -4400,7 +4548,7 @@ mod tests {
             hashes.join(",")
         };
         let reference_hash =
-            normalization_hash_for(&cfg, &combined, &reference_member_ids, "", None);
+            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None);
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
@@ -4429,6 +4577,7 @@ mod tests {
             let frame_hash = normalization_hash_for(
                 &cfg,
                 &registration_hashes[&gf.frame_id],
+                &metrics_hashes[&gf.frame_id],
                 &reference_member_ids,
                 &reference_hash,
                 None,
@@ -4543,6 +4692,8 @@ mod tests {
 
         let mut divisors = DivisorCache::new();
         let mut calib_hashes: HashMap<i64, String> = HashMap::new();
+        // C-17: the LN hash folds the frame's measurement hash in too.
+        let mut metrics_hashes: HashMap<i64, String> = HashMap::new();
         for gf in &groups[0].frames {
             let hash = calibration_hash_for(&f.conn, &cfg, gf, &mut divisors).unwrap();
             calib_hashes.insert(gf.frame_id, hash);
@@ -4578,6 +4729,7 @@ mod tests {
             .unwrap();
 
             let metrics_hash = measurement_hash_for(&cfg, &hash);
+            metrics_hashes.insert(gf.frame_id, metrics_hash.clone());
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
@@ -4695,7 +4847,7 @@ mod tests {
             hashes.join(",")
         };
         let reference_hash =
-            normalization_hash_for(&cfg, &combined, &reference_member_ids, "", None);
+            normalization_hash_for(&cfg, &combined, "", &reference_member_ids, "", None);
         let reference_payload = serde_json::to_string(&LnReferencePayload {
             reference_member_ids: reference_member_ids.clone(),
             reference_hash: reference_hash.clone(),
@@ -4725,6 +4877,7 @@ mod tests {
             let frame_hash = normalization_hash_for(
                 &cfg,
                 &registration_hashes[&frame_id],
+                &metrics_hashes[&frame_id],
                 &reference_member_ids,
                 &reference_hash,
                 None,

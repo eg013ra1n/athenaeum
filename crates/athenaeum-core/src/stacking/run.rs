@@ -8095,11 +8095,45 @@ fn run_group_normalization(
         .collect();
     member_reg_hashes.sort_unstable();
     let combined_registration_hash = member_reg_hashes.join(",");
+
+    // C-17: every LN hash below folds in the frame's own MEASUREMENT hash
+    // (`measurement_hash_for`, the value its `fits` artifact is keyed on),
+    // because stage 6 reads that artifact — see `normalization_hash_for`'s
+    // own doc for what went wrong without it. Resolved ONCE per member
+    // here, above the reference hash that needs the combined form, and
+    // read again by the `fits` path resolution below instead of being
+    // recomputed there. `String::new()` for a member with no `GroupFrame`
+    // (never happens in practice) hashes as "not recorded", the same way
+    // the plan gate's own `None` does.
+    let group_frames_by_id: HashMap<i64, &GroupFrame> =
+        group.frames.iter().map(|f| (f.frame_id, f)).collect();
+    let mut member_measurement_hashes: Vec<String> = Vec::with_capacity(members.len());
+    for m in members.iter() {
+        let hash = match group_frames_by_id.get(&m.frame_id).copied() {
+            Some(gf) => {
+                let calib_hash = {
+                    let conn = db(&rc.ctx)?.conn();
+                    rc.memo.calibration_hash_checked(&conn, &cfg, gf)?
+                };
+                measurement_hash_for(&cfg, &calib_hash)
+            }
+            None => String::new(),
+        };
+        member_measurement_hashes.push(hash);
+    }
+    let mut reference_measure_hashes: Vec<&str> = reference_members
+        .iter()
+        .map(|&i| member_measurement_hashes[i].as_str())
+        .collect();
+    reference_measure_hashes.sort_unstable();
+    let combined_measurement_hash = reference_measure_hashes.join(",");
+
     // Fix round 1, item 2: the reference's OWN hash has no further
     // reference to fold in — `""` (see `normalization_hash_for`'s own doc).
     let reference_hash = normalization_hash_for(
         &cfg,
         &combined_registration_hash,
+        &combined_measurement_hash,
         &reference_member_ids,
         "",
         None,
@@ -8270,9 +8304,6 @@ fn run_group_normalization(
         Some(&rc.ctx.image_pool),
     );
 
-    let group_frames_by_id: HashMap<i64, &GroupFrame> =
-        group.frames.iter().map(|f| (f.frame_id, f)).collect();
-
     // Perf tier C Task 2 (spec §2.2.3): resolve each member's per-plane
     // `fits` artifact PATHS up front — a metadata-only DB lookup, the same
     // shape as the `ln` artifact check below — keyed on the SAME
@@ -8285,18 +8316,11 @@ fn run_group_normalization(
     // signal every other cached stage artifact uses — so a caller handed
     // `None` for a plane falls back to detection, never a hard error.
     let mut fits_paths: Vec<Vec<Option<PathBuf>>> = Vec::with_capacity(members.len());
-    for m in members.iter() {
+    for (i, m) in members.iter().enumerate() {
         let channels = m.measurement.channels.len();
-        let expected_hash: Option<String> = match group_frames_by_id.get(&m.frame_id).copied() {
-            Some(gf) => {
-                let calib_hash = {
-                    let conn = db(&rc.ctx)?.conn();
-                    rc.memo.calibration_hash_checked(&conn, &cfg, gf)?
-                };
-                Some(measurement_hash_for(&cfg, &calib_hash))
-            }
-            None => None,
-        };
+        // C-17: the SAME value the LN hashes above folded in, resolved once.
+        let expected_hash: Option<&str> =
+            Some(member_measurement_hashes[i].as_str()).filter(|h| !h.is_empty());
         let mut paths: Vec<Option<PathBuf>> = Vec::with_capacity(channels);
         for plane in 0..channels {
             let resolved = match &expected_hash {
@@ -8370,9 +8394,15 @@ fn run_group_normalization(
         &calibration_member_weights,
         ln::SEEDS_CALIBRATION_FRAMES,
     );
-    let calibration_frames: Vec<(i64, &str)> = calibration_indices
+    let calibration_frames: Vec<(i64, &str, &str)> = calibration_indices
         .iter()
-        .map(|&i| (members[i].frame_id, members[i].registration_hash.as_str()))
+        .map(|&i| {
+            (
+                members[i].frame_id,
+                members[i].registration_hash.as_str(),
+                member_measurement_hashes[i].as_str(),
+            )
+        })
         .collect();
     let calibration_input_hash =
         seeds_calibration_hash_for(&cfg, &reference_hash, &calibration_frames);
@@ -8391,10 +8421,12 @@ fn run_group_normalization(
     let member_hashes = |calibration: Option<&ln::SeedsCalibration>| -> Vec<String> {
         members
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(i, m)| {
                 normalization_hash_for(
                     &cfg,
                     &m.registration_hash,
+                    &member_measurement_hashes[i],
                     &reference_member_ids,
                     &reference_hash,
                     calibration,
@@ -8414,7 +8446,6 @@ fn run_group_normalization(
         seeds_calibration = measure_ln_seeds_calibration(
             rc,
             group,
-            members,
             &calibration_indices,
             &fits_paths,
             input.frames,
@@ -8457,7 +8488,6 @@ fn run_group_normalization(
         rc.group_seeds_calibration
             .insert(group.key.clone(), c.clone());
     }
-    let seeds_calibration_k: Option<Vec<f64>> = seeds_calibration.as_ref().map(|c| c.k.clone());
 
     let mut needs_normalize: Vec<usize> = Vec::new();
     // M2 Task 7 (fix round 1, item 3): every member this function itself
@@ -8587,8 +8617,9 @@ fn run_group_normalization(
 
     // Ruling C-14 item 1: the group's per-CHANNEL factors, resolved (from
     // the cache or by measurement) above the freshness loop, since they are
-    // part of every member's own LN hash.
-    let seeds_calibration_ref: Option<&[f64]> = seeds_calibration_k.as_deref();
+    // part of every member's own LN hash. C-17: handed over whole, so the
+    // apply site reads them through `SeedsCalibration::k_for`.
+    let seeds_calibration_ref: Option<&ln::SeedsCalibration> = seeds_calibration.as_ref();
 
     // v0.6.3: per-frame ticks from inside the fan-out; the cached members
     // (`total - needs_normalize.len()`) count as done from the start.
@@ -8847,9 +8878,10 @@ fn run_group_normalization(
 /// work that used to show as a stalled Normalize row), and turning the
 /// per-channel verdicts into the group's log lines.
 ///
-/// `indices` points into `members`/`frames` (the two are index-aligned)
-/// and comes from `ln::select_calibration_frames`, so the caller can hash
-/// the sample BEFORE deciding whether the measurement is needed at all.
+/// `indices` points into `frames` (index-aligned with the group's own
+/// member list) and comes from `ln::select_calibration_frames`, so the
+/// caller can hash the sample BEFORE deciding whether the measurement is
+/// needed at all.
 /// `None` means no calibration was measured — a cancel (silent, the
 /// review's M3) or a scratch directory that could not be created; the
 /// caller then records nothing and the group runs uncalibrated.
@@ -8857,7 +8889,6 @@ fn run_group_normalization(
 fn measure_ln_seeds_calibration(
     rc: &RunContext,
     group: &IntegrationGroup,
-    members: &[GroupMember],
     indices: &[usize],
     fits_paths: &[Vec<Option<PathBuf>>],
     stack_frames: &[StackFrame],
@@ -8892,8 +8923,18 @@ fn measure_ln_seeds_calibration(
     // immutably here and `RunContext::progress` needs `&mut self`.
     let emitter = rc.emitter.clone();
     let (run_id, set_id, group_key) = (rc.run_id, rc.set_id, group.key.clone());
-    let total_members = members.len();
+    // C-17: the row counts the CALIBRATION's own frames while it runs —
+    // `current`/`total`/`percent` over the sample, not the group. Reporting
+    // `0 / 0 %` against the member count (what the first cut did) made a
+    // minute of real work read as a stalled Normalize row, which is the one
+    // thing the message was added to prevent.
     let on_progress = |done: usize, total: usize, frame_id: i64| {
+        let current = done + 1;
+        let percent = if total == 0 {
+            100.0
+        } else {
+            100.0 * current as f64 / total as f64
+        };
         emit_event(
             emitter.as_ref(),
             STACKING_PROGRESS_EVENT,
@@ -8902,15 +8943,14 @@ fn measure_ln_seeds_calibration(
                 set_id,
                 stage: Stage::Normalize,
                 group_key: Some(group_key.clone()),
-                current: 0,
-                total: total_members,
-                percent: 0.0,
+                current,
+                total,
+                percent,
                 bytes_done: 0,
                 bytes_total: 0,
                 frame_id: Some(frame_id),
                 message: Some(format!(
-                    "calibrating the seeds path · frame {}/{total}",
-                    done + 1
+                    "calibrating the seeds path · frame {current}/{total}"
                 )),
             },
         );

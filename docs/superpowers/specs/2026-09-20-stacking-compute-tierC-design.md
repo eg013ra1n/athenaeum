@@ -162,8 +162,10 @@ aggregates only. Per frame (g3 medians): `ln_detect_ms` 3 930, `ln_fit_ms` 1 021
    detection — and takes the MEDIAN per channel (odd `n` the natural middle, even `n` the LOWER of
    the two middles: an interpolated mid-point is not one of the measured ratios). A channel with
    fewer than `SEEDS_CALIBRATION_MIN_RATIOS = 3` usable ratios runs uncalibrated (`k = 1`), with
-   ONE `warn!` for the whole group. A median outside `1 ± SEEDS_CALIBRATION_BAND` (`0.03`, four
-   times the largest per-frame bias ever measured for this path) is REFUSED outright — `warn!`,
+   ONE `warn!` for the whole group. A median outside `1 ± SEEDS_CALIBRATION_BAND` (`0.03`, about
+   TWICE the largest per-frame bias measured for this path — ≈ 2.1 × the +1.449 % of frame 29047
+   in fix round 5's hold-out; C-14 said "four times", which never matched the measurement, and
+   C-17 corrects the claim while leaving the value) is REFUSED outright — `warn!`,
    `k = 1` for that channel — rather than applied or clamped: a factor beyond that band is not a
    seeds-path bias, and applying it would move the master's level by more than the defect it
    claims to correct. Channels are independent: an OSC group's blue plane being refused says
@@ -171,8 +173,17 @@ aggregates only. Per frame (g3 medians): `ln_detect_ms` 3 930, `ln_fit_ms` 1 021
 
    **Determinism.** The measurement's inputs are hashed as the group's own `ln_calibration`
    artifact (`seeds_calibration_hash_for`: the normalization subtree, the group's LN reference
-   hash, and the calibration frames' ids + registration hashes), and its RESULT — the frame ids and
+   hash, and the calibration frames' ids + registration AND measurement hashes), and its RESULT —
+   the frame ids and
    the per-channel `k` rounded to 1e-6 — is folded into every member's `normalization_hash_for`.
+   **Both LN hashes fold the frame's MEASUREMENT hash** (`measurement_hash_for`, the value its
+   `fits` artifact is keyed on) since C-17: `normalization_subtree` carries only
+   `measurement.psfModel`/`maxStars`, so without it a changed `detectionSigma`, `seedDetector`,
+   `seedPrefilter` or `structure` rewrote every `.athf` while the plan gate reported Normalize
+   cached and the run reused both the sidecars and the stored `k`. The gate and the run pass the
+   SAME per-frame value (empty on both sides when it cannot be resolved), and the group's LN
+   reference hash folds the sorted join of its reference members' measurement hashes the same way
+   it already folds their registration hashes.
    A changed `k` therefore invalidates the whole group's sidecars rather than leaving a group
    mixing frames normalized at two different factors; a re-registered calibration frame
    re-measures `k` and, through the same fold, re-normalizes the group. The plan gate reads the

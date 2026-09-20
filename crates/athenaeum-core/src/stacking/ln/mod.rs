@@ -579,7 +579,7 @@ pub fn normalize_frame(
     interpolation: Interpolation,
     clamping: f32,
     sidecar: &Path,
-    seeds_calibration: Option<&[f64]>,
+    seeds_calibration: Option<&SeedsCalibration>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     cancel: &AtomicBool,
 ) -> Result<LnFrameOutcome, LnError> {
@@ -837,10 +837,9 @@ pub fn normalize_frame(
         // folded into `ScaleResult::scale` itself — which stays exactly
         // what the measurement produced.
         let k = if plane_from_seeds {
-            seeds_calibration
-                .and_then(|ks| ks.get(p).copied())
-                .filter(|k| k.is_finite() && *k > 0.0)
-                .unwrap_or(1.0)
+            // C-17: `SeedsCalibration::k_for` owns the short-slice and
+            // non-finite guards, so the apply site never restates them.
+            seeds_calibration.map_or(1.0, |c| c.k_for(p))
         } else {
             1.0
         };
@@ -1466,7 +1465,8 @@ mod tests {
         };
         let cancel = AtomicBool::new(false);
 
-        let run = |k: Option<&[f64]>, name: &str| -> (LnFrameOutcome, LnFrameGrids) {
+        type Normalized = (LnFrameOutcome, LnFrameGrids);
+        let run = |k: Option<&SeedsCalibration>, name: &str| -> Normalized {
             let sidecar = dir.path().join(format!("{name}.athln"));
             let fits: Vec<Vec<StarFit>> = vec![Vec::new()];
             let outcome = normalize_frame(
@@ -1494,6 +1494,10 @@ mod tests {
             (outcome, grids)
         };
 
+        let calibration = SeedsCalibration {
+            frame_ids: vec![frame.frame_id],
+            k: vec![K],
+        };
         let (plain, plain_grids) = run(None, "plain");
         // A channel that fell back to detection is NOT calibrated (the
         // fallback path has no measured bias to correct) — so this pin
@@ -1501,7 +1505,7 @@ mod tests {
         // seeds-path side by handing the scale through directly.
         assert_eq!(plain.ln_scale_source, "detected");
         assert_eq!(plain.channel_from_seeds, vec![false]);
-        let (_calibrated, calibrated_grids) = run(Some(&[K]), "calibrated");
+        let (_calibrated, calibrated_grids) = run(Some(&calibration), "calibrated");
         assert_eq!(
             calibrated_grids.channels[0].a, plain_grids.channels[0].a,
             "a detection-path channel must be left uncalibrated"
@@ -1516,7 +1520,7 @@ mod tests {
             &cancel,
         )
         .expect("measuring the target's own fits");
-        let seeds_run = |k: Option<&[f64]>, name: &str| -> (LnFrameOutcome, LnFrameGrids) {
+        let seeds_run = |k: Option<&SeedsCalibration>, name: &str| -> Normalized {
             let sidecar = dir.path().join(format!("{name}.athln"));
             let outcome = normalize_frame(
                 &reference,
@@ -1540,7 +1544,7 @@ mod tests {
         let (seeds_plain, seeds_plain_grids) = seeds_run(None, "seeds-plain");
         assert_eq!(seeds_plain.ln_scale_source, "seeds");
         assert_eq!(seeds_plain.channel_from_seeds, vec![true]);
-        let (seeds_k, seeds_k_grids) = seeds_run(Some(&[K]), "seeds-calibrated");
+        let (seeds_k, seeds_k_grids) = seeds_run(Some(&calibration), "seeds-calibrated");
 
         let s = seeds_plain.channel_scales[0];
         assert_eq!(

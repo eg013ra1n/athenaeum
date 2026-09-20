@@ -727,13 +727,17 @@ catalog has no artifact for)",
     // Fix round 4 (ruling C-14): `k` is per channel; a single value on the
     // command line is broadcast, a shorter list leaves the rest at 1.0
     // (`normalize_frame`'s own contract for a short slice).
-    let seeds_calibration: Option<Vec<f64>> = args.seeds_calibration.as_ref().map(|ks| {
-        if ks.len() == 1 {
-            vec![ks[0]; channels]
-        } else {
-            ks.clone()
-        }
-    });
+    let seeds_calibration: Option<ln_calibration::SeedsCalibration> = args
+        .seeds_calibration
+        .as_ref()
+        .map(|ks| ln_calibration::SeedsCalibration {
+            frame_ids: Vec::new(),
+            k: if ks.len() == 1 {
+                vec![ks[0]; channels]
+            } else {
+                ks.clone()
+            },
+        });
 
     let outcome = normalize_frame(
         &reference,
@@ -746,7 +750,7 @@ catalog has no artifact for)",
         interpolation,
         clamping,
         &sidecar_path,
-        seeds_calibration.as_deref(),
+        seeds_calibration.as_ref(),
         // Perf tier A Task 12: the probe's own pool, not `None` — see the
         // `ref_backgrounds` comment above for why.
         Some(&pool),
@@ -925,7 +929,7 @@ catalog has no artifact for)",
             "lnScaleSource": outcome.ln_scale_source,
         },
         "noFits": args.no_fits,
-        "seedsCalibration": seeds_calibration,
+        "seedsCalibration": seeds_calibration.as_ref().map(|c| c.k.clone()),
         "measuredCalibration": measured_calibration,
         "groupBeta": group_beta_value,
         "referenceBuildMs": reference_build_ms,
