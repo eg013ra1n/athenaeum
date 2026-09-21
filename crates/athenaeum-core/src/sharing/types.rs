@@ -367,6 +367,38 @@ pub fn is_local_fault(err: &anyhow::Error) -> bool {
     err.downcast_ref::<LocalFault>().is_some()
 }
 
+/// Marks an `anyhow::Error` from
+/// [`SharingTransport::fetch_collection_multi`](crate::sharing::SharingTransport::fetch_collection_multi)
+/// as belonging to phase 2 (the per-child fan-out) or later, rather than
+/// phase 1 (the hash-seq + collection meta fetch).
+///
+/// Collab's swarm-unfit session cache needs this distinction and cannot
+/// derive it from the bare error (Wave 1 final review item 1): phase 1
+/// succeeding proves the announced `root_hash` really is a collection the
+/// mesh understands, so a phase-2 failure — including the assignment loop's
+/// stall ceiling and backoff ladder, which fail with no error the transport
+/// itself raised — says nothing about the hash and must never be cached as
+/// "this hash will never resolve" the way a phase-1 failure can be. Same
+/// discipline as [`LocalFault`]: `Display` forwards to the inner error, so
+/// the marker never appears in user-facing text.
+#[derive(Debug)]
+pub struct FetchChildrenFault(pub anyhow::Error);
+
+impl std::fmt::Display for FetchChildrenFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for FetchChildrenFault {}
+
+/// True when `err` carries a [`FetchChildrenFault`] anywhere in its context
+/// chain — i.e. the failure happened at phase 2 of `fetch_collection_multi`
+/// or later, never phase 1.
+pub fn is_fetch_children_fault(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<FetchChildrenFault>().is_some()
+}
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;

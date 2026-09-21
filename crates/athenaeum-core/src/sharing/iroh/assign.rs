@@ -26,11 +26,24 @@
 //! byte, never restarts the frame), and the full provider set available to
 //! every child.
 //!
-//! ## What this is NOT (yet)
+//! ## Hedging
 //!
-//! No hedging. [`AssignmentOptions::hedging`] exists and is read nowhere —
-//! Task 8 extends this module with the second, racing assignment and the token
-//! bucket, and [`TransferFault`] already carries the bytes that decision needs.
+//! Task 8 added the second, racing assignment: while a child's primary
+//! transfer runs unhedged, it is re-evaluated every
+//! [`HEDGE_REEVALUATE_INTERVAL`] against the trigger `max(p95 of recent
+//! completions, [`HEDGE_EXPECTED_MULTIPLIER`] × expected)` — late by either
+//! measure arms a hedge on a different provider for the BACK HALF of the
+//! child's still-missing range, split at the midpoint
+//! ([`split_missing_at_midpoint`]), under a gRPC-shaped [`HedgeBudget`] that
+//! caps total spend at [`HEDGE_BUDGET_RATIO`] of the collection. Whichever
+//! side finishes first wins the round; the loser is cancelled by dropping its
+//! `GetProgress` stream (see Cancellation above), which is enough — no pooled
+//! connection needs closing. A primary that fails while its hedge is still
+//! live does not cancel the hedge: the hedge is a real transfer, not a
+//! speculative copy, so it is promoted and carries the round alone
+//! (`primary_gone`). See [`try_arm_hedge`] for the trigger and the budget
+//! check, and [`HedgeBudget`] for the accounting.
+//!
 //! No persistence, no ranking: [`pick_provider`] is a deliberately dumb
 //! least-loaded pick, kept as ONE function so A4's `RankedProviders` is one
 //! edit.
@@ -248,6 +261,12 @@ impl AssignmentReport {
     }
 
     /// Total children some provider carried to completion.
+    ///
+    /// Report-only: a child already complete at its first round (a resumed
+    /// fetch finding it already local) or a duplicate-hash entry never runs
+    /// `record_success`, so it is credited to nobody and this sum undercounts
+    /// the collection's own child count by exactly that many. Nothing here
+    /// re-derives that figure from the collection to true it up.
     pub(crate) fn total_children(&self) -> u32 {
         self.per_provider.values().map(|s| s.children).sum()
     }
@@ -735,6 +754,11 @@ async fn run_child(
                         error = %fault.cause(),
                         "primary failed while a hedge was live — promoting the hedge"
                     );
+                    // The `let Some(_) = hedge.as_ref() else { break }` above
+                    // is exactly this invariant; restated here so a future
+                    // reorder of this arm trips in debug builds instead of
+                    // silently promoting nothing.
+                    debug_assert!(hedge.is_some(), "primary_gone set with no hedge live");
                     primary_gone = true;
                     primary = Box::pin(std::future::pending());
                 }
@@ -773,6 +797,15 @@ async fn run_child(
                                 hedge_elapsed,
                                 completed_child,
                             );
+                            if completed_child {
+                                // The hedge finished the child outright (ruling
+                                // R3's "the last of the child" case above) — it
+                                // is a completed assignment exactly like the
+                                // unhedged success path below, so it feeds the
+                                // same p95 window and earns the same budget
+                                // refill.
+                                note_completion(&ledger, hedge_elapsed, stats.payload_bytes_read);
+                            }
                             let moved = primary_progress.load(Ordering::Relaxed);
                             // `moved` counts payload bytes inside the PRIMARY's
                             // request, which began at ROUND START; the hedged
@@ -822,8 +855,19 @@ async fn run_child(
                 }
                 Step::Reevaluate => {
                     hedge = try_arm_hedge(
-                        &pool, &remote, &blobs, &states, &ledger, &providers, &opts, root, index,
-                        hash, provider, started, &primary_progress,
+                        &pool,
+                        &remote,
+                        &blobs,
+                        &states,
+                        &ledger,
+                        &providers,
+                        &opts,
+                        root,
+                        index,
+                        hash,
+                        provider,
+                        started,
+                        &primary_progress,
                     )
                     .await;
                 }
@@ -895,10 +939,12 @@ struct MissingSplit {
     /// set as `[0,x) ∪ [y,size)`, and measuring the charge against the blob's
     /// end would bill the budget for bytes that are already present.
     charge: u64,
-    /// Bytes of the missing set that come BEFORE the cut — a REQUEST-relative
-    /// offset, because that is the only frame the primary's own progress is
-    /// in: `GetProgressItem::Progress` counts payload bytes within the request,
-    /// which begins at the missing range, not at the blob's offset 0.
+    /// Bytes of the missing set that come BEFORE the cut — relative to the
+    /// missing set AS OBSERVED AT ARM TIME, not to the primary's own request
+    /// (which began at ROUND START, before this hedge existed). That is
+    /// exactly why [`HedgeRun::armed_at`] exists: turning the primary's
+    /// request-relative progress into an arm-time-relative one needs both
+    /// numbers together, `split_rel` alone is not enough.
     split_rel: u64,
 }
 
@@ -1408,8 +1454,31 @@ fn ewma_goodput(states: &States, provider: EndpointId) -> Option<f64> {
 /// them double the rung would jump a two-provider swarm from "500 ms" to
 /// "16 s" on its first round and turn the bounded ladder into a stall. The
 /// report's cumulative `stats.failures` still counts every attempt.
+///
+/// Thin wrapper over [`record_failure_at`] with the real wall clock — see its
+/// doc for why the split exists.
 fn record_failure(states: &States, provider: EndpointId, fault: &TransferFault, elapsed: Duration) {
-    let now = Instant::now();
+    record_failure_at(states, provider, fault, elapsed, Instant::now());
+}
+
+/// [`record_failure`]'s body, with `now` a parameter instead of a fresh
+/// `Instant::now()` read.
+///
+/// The seam a test needs (Wave 1 final review item 3): a test asserting the
+/// backoff ladder's exact rung durations by reading `next_try` back against
+/// its OWN `Instant::now()` call is comparing two different clock reads
+/// separated by however long the test body took to run between them —
+/// ordinarily negligible, but not zero, and not bounded on a saturated CI
+/// runner. Passing the same `now` in both directions makes the rung duration
+/// an exact arithmetic fact (`next_try - now == BACKOFF_BASE * 2^rung`)
+/// rather than a measurement.
+fn record_failure_at(
+    states: &States,
+    provider: EndpointId,
+    fault: &TransferFault,
+    elapsed: Duration,
+    now: Instant,
+) {
     let mut guard = states.lock().expect("assignment states mutex poisoned");
     let Some(st) = guard.get_mut(&provider) else {
         return;
@@ -1460,8 +1529,10 @@ mod tests {
 
     /// A distinct, WELL-FORMED endpoint id. `[n; 32]` will not do: an
     /// `EndpointId` is an ed25519 public key and `from_bytes` verifies the
-    /// point, so a constant-byte array is rejected.
-    fn id(_tag: u8) -> EndpointId {
+    /// point, so a constant-byte array is rejected. Takes no tag — each call
+    /// already generates a fresh key, so a caller-supplied number never
+    /// distinguished anything.
+    fn distinct_id() -> EndpointId {
         iroh::SecretKey::generate().public()
     }
 
@@ -1471,7 +1542,7 @@ mod tests {
 
     #[test]
     fn pick_provider_prefers_the_least_loaded_then_fewest_failures_then_order() {
-        let (a, b, c) = (id(1), id(2), id(3));
+        let (a, b, c) = (distinct_id(), distinct_id(), distinct_id());
         let now = Instant::now();
 
         // Least loaded wins outright.
@@ -1525,7 +1596,7 @@ mod tests {
 
     #[test]
     fn pick_provider_skips_backoff_and_returns_none_when_every_provider_is_parked() {
-        let (a, b) = (id(1), id(2));
+        let (a, b) = (distinct_id(), distinct_id());
         let now = Instant::now();
         let st = states_of(vec![
             (
@@ -1581,7 +1652,7 @@ mod tests {
 
     #[test]
     fn backoff_escalates_once_per_window_and_a_success_clears_it() {
-        let a = id(1);
+        let a = distinct_id();
         let states: States = Arc::new(Mutex::new(states_of(vec![(a, ProviderState::default())])));
         let fault = || TransferFault::Stalled { bytes: 7 };
 
@@ -1696,7 +1767,7 @@ mod tests {
     /// offset it reports is request-relative — the two things findings 2 and 3
     /// were about.
     #[test]
-    fn split_missing_cuts_the_ranges_not_the_blob_and_reports_a_request_offset() {
+    fn split_missing_cuts_the_ranges_not_the_blob_and_reports_an_arm_time_offset() {
         const SIZE: u64 = 64 * CHUNK_BYTES;
 
         // Contiguous whole blob: an even cut, and the front offset is half.
@@ -1783,7 +1854,7 @@ mod tests {
     /// anywhere, there is no hedge (D4 §4.5).
     #[test]
     fn goodput_ewma_warms_up_and_falls_back_to_the_median() {
-        let (a, b, c) = (id(1), id(2), id(3));
+        let (a, b, c) = (distinct_id(), distinct_id(), distinct_id());
         let states: States = Arc::new(Mutex::new(states_of(vec![
             (a, ProviderState::default()),
             (b, ProviderState::default()),
@@ -1822,24 +1893,37 @@ mod tests {
 
     #[test]
     fn backoff_rungs_double_and_stop_at_the_cap() {
-        let a = id(1);
+        let a = distinct_id();
         let states: States = Arc::new(Mutex::new(states_of(vec![(a, ProviderState::default())])));
         let fault = || TransferFault::Failed {
             bytes: 0,
             error: anyhow::anyhow!("dead"),
         };
+        // ONE wall-clock read for the whole test (Wave 1 final review item 3):
+        // every `now` handed to `record_failure_at` is `base` plus pure
+        // arithmetic, and the rung is read back against that SAME `now` —
+        // `next_try - now` is then exactly `BACKOFF_BASE * 2^rung`, not a
+        // measurement across two separate `Instant::now()` calls that a
+        // loaded CI runner could stretch apart.
+        let base = Instant::now();
         let mut seen = Vec::new();
-        for _ in 0..(EVICT_AFTER_FAILURES + BACKOFF_MAX_RUNGS + 3) {
+        for i in 0..(EVICT_AFTER_FAILURES + BACKOFF_MAX_RUNGS + 3) {
             // Force each failure into its own window by clearing the deadline,
             // which is what elapsing it does in the real loop.
             states.lock().unwrap().get_mut(&a).unwrap().next_try = None;
-            record_failure(&states, a, &fault(), Duration::ZERO);
+            // Strictly increasing per call so `next_try.is_some_and(|t| t >
+            // now)` above never spuriously re-fires the "already escalated
+            // this window" guard against a `now` that has not advanced.
+            let now = base + Duration::from_secs(i as u64 * 60);
+            record_failure_at(&states, a, &fault(), Duration::ZERO, now);
             if let Some(t) = states.lock().unwrap()[&a].next_try {
-                seen.push(t.saturating_duration_since(Instant::now()).as_millis() as u64);
+                seen.push(t.saturating_duration_since(now).as_millis() as u64);
             }
         }
-        // 500, 1000, 2000, 4000, 8000, 16000, then flat at the cap.
-        let rungs: Vec<u64> = seen.iter().map(|ms| (ms + 50) / 100 * 100).collect();
+        // 500, 1000, 2000, 4000, 8000, 16000, then flat at the cap — exact,
+        // no rounding needed now that both ends of the subtraction share one
+        // `now`.
+        let rungs = seen;
         assert_eq!(
             &rungs[..6],
             &[500, 1000, 2000, 4000, 8000, 16000],

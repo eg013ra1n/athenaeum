@@ -1456,13 +1456,26 @@ fn mark_swarm_unfit(package_id: &str) {
 }
 
 /// Which stage of a swarm attempt failed — the discrimination the verdict needs
-/// (F6). Deliberately coarse: these two are what the call site can know for a
+/// (F6). Deliberately coarse: these are what the call site can know for a
 /// fact, without reading error strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SwarmStage {
-    /// Nothing was fetched — no provider served the announced collection, or the
-    /// transport refused the fan-out outright.
-    Fetch,
+    /// Phase 1 of `fetch_collection_multi`: the hash-seq + collection meta.
+    /// Nothing was fetched at all — no provider served even that, or the
+    /// transport refused the fan-out outright. Succeeding here proves the
+    /// announced `root_hash` really is a collection the mesh understands.
+    FetchMeta,
+    /// Phase 2 of `fetch_collection_multi` (the per-child fan-out) or later —
+    /// i.e. a failure AFTER phase 1 already proved the hash is real. The
+    /// assignment loop's own progress deadline and backoff ladder can fail
+    /// this phase with no error at all (a peer that dribbles bytes forever, or
+    /// one that goes silent) — conditions that change by themselves as the
+    /// swarm's holders come and go, unlike a hash the mesh will never
+    /// resolve. Wave 1 final review item 1: this used to be folded into
+    /// `Fetch` and cached whenever the fallback delivered, which switched the
+    /// swarm off for the rest of the session on nothing more than a few
+    /// stalls.
+    FetchChildren,
     /// The bytes arrived and the ingest rejected frames.
     Ingest,
 }
@@ -1474,11 +1487,23 @@ struct SwarmAttemptError {
 }
 
 impl SwarmAttemptError {
+    /// Builds the fetch-side variant, reading WHICH phase failed off the
+    /// error itself: `fetch_collection_multi` marks the per-child fan-out's
+    /// own failure with [`crate::sharing::types::FetchChildrenFault`]
+    /// (mirroring how `LocalFault` marks a local-disk failure for the
+    /// receiver). An unmarked error reads as `FetchMeta` — true for a real
+    /// phase-1 failure, and, deliberately unaddressed here, also for the rare
+    /// local-bookkeeping failure AFTER a successful fan-out (tagging,
+    /// exporting): that keeps the exact pre-Wave-1-review treatment for a
+    /// case this review item never named, rather than guessing at a second
+    /// marker for it.
     fn fetch(error: anyhow::Error) -> Self {
-        SwarmAttemptError {
-            stage: SwarmStage::Fetch,
-            error,
-        }
+        let stage = if crate::sharing::types::is_fetch_children_fault(&error) {
+            SwarmStage::FetchChildren
+        } else {
+            SwarmStage::FetchMeta
+        };
+        SwarmAttemptError { stage, error }
     }
 
     fn ingest(error: anyhow::Error) -> Self {
@@ -1498,13 +1523,19 @@ impl SwarmAttemptError {
 /// * `transport_swarm_capable = false` — no bound node, so `fetch_collection_multi`
 ///   is the trait's bail. Nothing on the network is involved; every later attempt
 ///   in this process gets the same answer. Cacheable.
-/// * [`SwarmStage::Fetch`] with a capable transport — no provider served the
-///   collection. A dead swarm (holders offline) and a legacy hash (holders alive,
-///   nobody holds THAT hash) are indistinguishable here… until the sequential
-///   fallback answers it: a fallback that DELIVERED proves a holder was alive and
-///   served the whole package, so what the swarm could not resolve is the hash,
-///   not reachability. Cacheable only in that case; a whole-swarm failure stays
-///   retryable, because 20 minutes later those holders may be back.
+/// * [`SwarmStage::FetchMeta`] with a capable transport — no provider served even
+///   the collection meta. A dead swarm (holders offline) and a legacy hash
+///   (holders alive, nobody holds THAT hash) are indistinguishable here… until the
+///   sequential fallback answers it: a fallback that DELIVERED proves a holder was
+///   alive and served the whole package, so what the swarm could not resolve is
+///   the hash, not reachability. Cacheable only in that case; a whole-swarm
+///   failure stays retryable, because 20 minutes later those holders may be back.
+/// * [`SwarmStage::FetchChildren`] — phase 1 already proved the hash is real, so
+///   NOTHING here is a statement about the hash, whatever the fallback does next.
+///   The assignment loop's stall ceiling and backoff ladder fail this phase with
+///   no error at all on conditions that change by themselves (a trickling peer,
+///   a momentary drop) — caching THOSE off `fallback_delivered` is exactly the
+///   over-caching Wave 1's final review caught (item 1). Never cacheable.
 /// * [`SwarmStage::Ingest`] — the fetch worked. A per-frame rejection can be a
 ///   transient landing fault and says nothing about the swarm. Never cacheable.
 fn cache_swarm_unfit(
@@ -1516,7 +1547,8 @@ fn cache_swarm_unfit(
         return true;
     }
     match stage {
-        SwarmStage::Fetch => fallback_delivered,
+        SwarmStage::FetchMeta => fallback_delivered,
+        SwarmStage::FetchChildren => false,
         SwarmStage::Ingest => false,
     }
 }
@@ -4877,22 +4909,50 @@ mod tests {
     fn swarm_unfit_is_cached_only_for_verdicts_that_cannot_change() {
         // No swarm-capable transport: nothing on the network is involved and no
         // retry in this process can do better.
-        assert!(cache_swarm_unfit(SwarmStage::Fetch, false, false));
+        assert!(cache_swarm_unfit(SwarmStage::FetchMeta, false, false));
         assert!(cache_swarm_unfit(SwarmStage::Ingest, false, false));
 
-        // Dead swarm — nobody served the collection AND the fallback delivered
-        // nothing either. Holders come back; the next pass retries cheaply.
-        assert!(!cache_swarm_unfit(SwarmStage::Fetch, true, false));
+        // Dead swarm — nobody served even the collection meta AND the fallback
+        // delivered nothing either. Holders come back; the next pass retries
+        // cheaply.
+        assert!(!cache_swarm_unfit(SwarmStage::FetchMeta, true, false));
 
-        // Same fetch failure, but a holder then served the WHOLE package through
-        // the fallback: the holders were live, so what the swarm could not resolve
-        // is the announced hash (a pre-D3 identifier, or nobody seeding it).
-        assert!(cache_swarm_unfit(SwarmStage::Fetch, true, true));
+        // Same phase-1 failure, but a holder then served the WHOLE package
+        // through the fallback: the holders were live, so what the swarm could
+        // not resolve is the announced hash (a pre-D3 identifier, or nobody
+        // seeding it).
+        assert!(cache_swarm_unfit(SwarmStage::FetchMeta, true, true));
 
         // An ingest rejection is not a statement about the swarm — the fetch
         // worked — whichever way the fallback goes.
         assert!(!cache_swarm_unfit(SwarmStage::Ingest, true, true));
         assert!(!cache_swarm_unfit(SwarmStage::Ingest, true, false));
+    }
+
+    /// Wave 1 final review item 1: a phase-2 (child fan-out) failure must never
+    /// enter the unfit set, whatever the fallback does — the assignment loop's
+    /// stall ceiling and backoff ladder can fail this phase on a condition that
+    /// changes by itself, and phase 1 already proved the hash resolves. A
+    /// phase-1 (meta) failure keeps the old, unchanged rule: cacheable only when
+    /// the fallback proves the holders were reachable.
+    #[test]
+    fn cache_swarm_unfit_never_caches_a_phase2_failure_but_still_caches_phase1() {
+        assert!(
+            !cache_swarm_unfit(SwarmStage::FetchChildren, true, true),
+            "a phase-2 failure is never cacheable, even when the fallback delivered"
+        );
+        assert!(
+            !cache_swarm_unfit(SwarmStage::FetchChildren, true, false),
+            "a phase-2 failure is never cacheable"
+        );
+        assert!(
+            cache_swarm_unfit(SwarmStage::FetchMeta, true, true),
+            "a phase-1 failure is still cacheable once the fallback proves the holders were live"
+        );
+        assert!(
+            !cache_swarm_unfit(SwarmStage::FetchMeta, true, false),
+            "a phase-1 failure with no fallback delivery stays retryable"
+        );
     }
 
     /// D3 §3.2 legacy discrimination, end to end: an announcement whose

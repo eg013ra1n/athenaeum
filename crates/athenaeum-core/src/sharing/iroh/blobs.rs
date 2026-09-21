@@ -28,7 +28,7 @@ use n0_future::StreamExt as _;
 
 use super::assign::{self, AssignmentOptions, AssignmentReport, SwarmFetchMode};
 use crate::package::{read_manifest, validate_rel_path, ManifestRecord, MANIFEST_FILENAME};
-use crate::sharing::types::{FetchEvent, LocalFault};
+use crate::sharing::types::{FetchChildrenFault, FetchEvent, LocalFault};
 use crate::sharing::{FetchSink, ImportProgressSink, ProviderEvent, ProviderTelemetrySink};
 
 /// Minimum wall-clock gap between two throttled [`FetchEvent`]s from the same
@@ -1209,117 +1209,140 @@ pub(crate) async fn fetch_collection_multi(
     // Phase 2: the fan-out. One arm per `SwarmFetchMode` — the `Stock` body is
     // verbatim what this function always did, kept reachable as the fallback
     // (D4 §9), and `Assigned` is A2a's own loop.
-    let report = match mode {
-        // `SplitStrategy::Split` splits the hash-sequence into one
-        // `GetRequest` per child and runs them buffered-unordered, each against
-        // the full provider set; `Shuffled` re-shuffles per child request, which
-        // load-spreads across holders for free. `Progress` is cumulative request
-        // bytes (incl. locally-present) and can exceed the payload `byte_size`, so
-        // clamp it; the terminal batch event below pins the total.
-        SwarmFetchMode::Stock => {
-            let progress = downloader.download_with_opts(DownloadRequest::new(
-                HashAndFormat::hash_seq(root_hash),
-                Shuffled::new(providers),
-                SplitStrategy::Split,
-            ));
-            let mut stream = progress
-                .stream()
-                .await
-                .with_context(|| format!("open collection download stream {root_hash}"))?;
-            let mut last = Instant::now();
-            while let Some(item) = stream.next().await {
-                match item {
-                    DownloadProgressItem::Progress(done) => {
-                        if last.elapsed() >= FETCH_PROGRESS_MIN_INTERVAL {
-                            last = Instant::now();
-                            sink(FetchEvent::Batch {
-                                bytes_done: done.min(byte_size),
-                                bytes_total: byte_size,
-                            });
+    //
+    // The whole match is wrapped in its own `async` block — not a spawned
+    // task, it runs inline via the `.await` right below — so that every exit
+    // from phase 2, the `?`/`bail!` early returns included, is a `return`
+    // FROM THE BLOCK rather than from this function. That lets the
+    // batch-ticker join after it run on EVERY exit, not only the happy one
+    // (see the join's own comment).
+    let report: Result<Option<AssignmentReport>> = async {
+        match mode {
+            // `SplitStrategy::Split` splits the hash-sequence into one
+            // `GetRequest` per child and runs them buffered-unordered, each against
+            // the full provider set; `Shuffled` re-shuffles per child request, which
+            // load-spreads across holders for free. `Progress` is cumulative request
+            // bytes (incl. locally-present) and can exceed the payload `byte_size`, so
+            // clamp it; the terminal batch event below pins the total.
+            SwarmFetchMode::Stock => {
+                let progress = downloader.download_with_opts(DownloadRequest::new(
+                    HashAndFormat::hash_seq(root_hash),
+                    Shuffled::new(providers),
+                    SplitStrategy::Split,
+                ));
+                let mut stream = progress
+                    .stream()
+                    .await
+                    .with_context(|| format!("open collection download stream {root_hash}"))?;
+                let mut last = Instant::now();
+                while let Some(item) = stream.next().await {
+                    match item {
+                        DownloadProgressItem::Progress(done) => {
+                            if last.elapsed() >= FETCH_PROGRESS_MIN_INTERVAL {
+                                last = Instant::now();
+                                sink(FetchEvent::Batch {
+                                    bytes_done: done.min(byte_size),
+                                    bytes_total: byte_size,
+                                });
+                            }
                         }
+                        // The whole point of the sibling: these two are `_ => {}` in the
+                        // scalar fetch. `TryProvider` fires once per (child, provider)
+                        // attempt — including the attempt that then finds the child already
+                        // local — and `ProviderFailed` once per dial/transfer failure, after
+                        // which the downloader moves to the next provider for that child with
+                        // byte-level resume. Neither is a fetch outcome; both are the raw
+                        // material for the "downloading from N sources" figure and the
+                        // per-provider journal.
+                        DownloadProgressItem::TryProvider { id, .. } => {
+                            telemetry(ProviderEvent::Trying(*id.as_bytes()));
+                        }
+                        DownloadProgressItem::ProviderFailed { id, .. } => {
+                            telemetry(ProviderEvent::Failed(*id.as_bytes()));
+                        }
+                        // The `AbortObserversOnDrop` guards abort every observer and
+                        // the ticker as they drop on this early return/bail — no manual
+                        // abort loop.
+                        DownloadProgressItem::Error(e) => return Err(e.into()),
+                        // In Split mode this arrives when a CHILD exhausted every provider.
+                        // Bail on the first one: the collection is incomplete and no later
+                        // child can repair it.
+                        DownloadProgressItem::DownloadError => {
+                            anyhow::bail!("multi-source download of collection {root_hash} failed")
+                        }
+                        // `PartComplete` — one child finished; the per-file observers already
+                        // report completion with names the caller understands.
+                        _ => {}
                     }
-                    // The whole point of the sibling: these two are `_ => {}` in the
-                    // scalar fetch. `TryProvider` fires once per (child, provider)
-                    // attempt — including the attempt that then finds the child already
-                    // local — and `ProviderFailed` once per dial/transfer failure, after
-                    // which the downloader moves to the next provider for that child with
-                    // byte-level resume. Neither is a fetch outcome; both are the raw
-                    // material for the "downloading from N sources" figure and the
-                    // per-provider journal.
-                    DownloadProgressItem::TryProvider { id, .. } => {
-                        telemetry(ProviderEvent::Trying(*id.as_bytes()));
-                    }
-                    DownloadProgressItem::ProviderFailed { id, .. } => {
-                        telemetry(ProviderEvent::Failed(*id.as_bytes()));
-                    }
-                    // The `AbortObserversOnDrop` guards abort every observer and
-                    // the ticker as they drop on this early return/bail — no manual
-                    // abort loop.
-                    DownloadProgressItem::Error(e) => return Err(e.into()),
-                    // In Split mode this arrives when a CHILD exhausted every provider.
-                    // Bail on the first one: the collection is incomplete and no later
-                    // child can repair it.
-                    DownloadProgressItem::DownloadError => {
-                        anyhow::bail!("multi-source download of collection {root_hash} failed")
-                    }
-                    // `PartComplete` — one child finished; the per-file observers already
-                    // report completion with names the caller understands.
-                    _ => {}
                 }
+                Ok(None)
             }
-            None
+            SwarmFetchMode::Assigned => {
+                // Hash-sequence layout is `[meta, file0, file1, …]`: `Collection::load`
+                // takes the FIRST element as the metadata blob and builds the entry
+                // list from `hs.into_iter().skip(1)`. Phase 1 above already fetched
+                // that meta as child 0, so entry `i` of `collection.iter()` is child
+                // `i + 1`. (`GetRequest::builder().child(c, …)` is itself
+                // `offset(c + 1)`, offset 0 being the root hash-seq blob — the `+ 1`
+                // here and the one inside the builder are different steps, not a
+                // double count.)
+                let children: Vec<(u64, Hash)> = collection
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, h))| (i as u64 + 1, *h))
+                    .collect();
+                let report = assign::fetch_children_assigned(
+                    store,
+                    endpoint,
+                    providers,
+                    root_hash,
+                    children,
+                    AssignmentOptions {
+                        stall_hard_limit,
+                        // A2b: hedging is on for the swarm fetch; production always
+                        // passes `true` and only a test turns it off.
+                        hedging,
+                        total_bytes: byte_size,
+                        telemetry,
+                    },
+                )
+                .await?;
+                tracing::info!(
+                    root_hash = %root_hash,
+                    providers = report.per_provider.len(),
+                    stalls = report.stalls,
+                    count = report.total_children(),
+                    bytes = report.total_bytes(),
+                    "assigned fetch complete"
+                );
+                Ok(Some(report))
+            }
         }
-        SwarmFetchMode::Assigned => {
-            // Hash-sequence layout is `[meta, file0, file1, …]`: `Collection::load`
-            // takes the FIRST element as the metadata blob and builds the entry
-            // list from `hs.into_iter().skip(1)`. Phase 1 above already fetched
-            // that meta as child 0, so entry `i` of `collection.iter()` is child
-            // `i + 1`. (`GetRequest::builder().child(c, …)` is itself
-            // `offset(c + 1)`, offset 0 being the root hash-seq blob — the `+ 1`
-            // here and the one inside the builder are different steps, not a
-            // double count.)
-            let children: Vec<(u64, Hash)> = collection
-                .iter()
-                .enumerate()
-                .map(|(i, (_, h))| (i as u64 + 1, *h))
-                .collect();
-            let report = assign::fetch_children_assigned(
-                store,
-                endpoint,
-                providers,
-                root_hash,
-                children,
-                AssignmentOptions {
-                    stall_hard_limit,
-                    // A2b: hedging is on for the swarm fetch; production always
-                    // passes `true` and only a test turns it off.
-                    hedging,
-                    total_bytes: byte_size,
-                    telemetry,
-                },
-            )
-            .await?;
-            tracing::info!(
-                root_hash = %root_hash,
-                providers = report.per_provider.len(),
-                stalls = report.stalls,
-                count = report.total_children(),
-                bytes = report.total_bytes(),
-                "assigned fetch complete"
-            );
-            Some(report)
-        }
-    };
+    }
+    .await;
 
-    // The ticker never ends by itself: abort it before draining the observers —
-    // and AWAIT the abort. `abort()` only requests cancellation, so without the
-    // join a tick already past its `sleep` could still call the sink after the
-    // terminal 100 % event below, and the caller would see the batch series go
-    // backwards at the very end.
+    // The ticker never ends by itself: abort it before draining the
+    // observers — and AWAIT the abort, on EVERY exit from phase 2 above,
+    // `report` being an `Err` included (the `async` block wrapping the match
+    // is what makes that possible). `abort()` only requests cancellation, so
+    // without the join a tick already past its `sleep` could still call the
+    // sink — after this function has already told its caller the fetch is
+    // over on the error paths, or after the terminal 100 % event below on the
+    // happy one, either way a stale `Batch` landing where none should. The
+    // observers' own join stays happy-path-only below: a stale PER-FILE event
+    // is not the hazard this join closes.
     for h in batch_ticker.0.drain(..) {
         h.abort();
         let _ = h.await;
     }
+    // Marked so a caller (collab's swarm-unfit cache, Wave 1 final review item
+    // 1) can tell "phase 1 never even resolved the hash" from "phase 1 proved
+    // the hash real, and phase 2 — or the local bookkeeping after it — failed
+    // for a reason that says nothing about the hash". Phase 1's own errors
+    // (above the async block this `report` came out of) reach their `?` sites
+    // unmarked, which is what makes "unmarked" the phase-1 default below.
+    let report = report.map_err(FetchChildrenFault)?;
+
     // Happy path: drain (await) each observer so its terminal completion event
     // is emitted — then the now-empty guards drop harmlessly.
     for h in observers.0.drain(..) {

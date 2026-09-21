@@ -35,7 +35,11 @@ controlled.
 re-runs on both sides of the bump landed in the 70-113 MB/s band — this Mac's
 short-run noise floor for a 384 MB in-process localhost transfer, see
 `before.json`/`after.json` here for the exact numbers this table is built
-from).
+from). Read the +41.7 % headline inside that band, not against it: `single_mb_s`
+moved −12.7 % in the SAME pair of runs, on a gate that watches `multi` only —
+one column improving by 42 % and its sibling column, from the identical
+before/after pair, worsening by 13 % is what a 70-113 MB/s noise floor looks
+like on this machine, not evidence that `single` regressed.
 
 ## Dependency record (Cargo.lock, `9503a13f..f8e5f96a`)
 

@@ -2401,6 +2401,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_project_contributions_uuid ON project_contributions(frame_uuid)",
         [],
     )?;
+    // Wave 1 final review item 4: `find_contribution_by_project_and_hash`
+    // (`db/collab_exchange.rs`) runs once per manifest record per held
+    // package per `report_held_set` pass, filtering on exactly these two
+    // columns — with no supporting index it was a full scan of the table on
+    // every call.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_contributions_project_hash ON project_contributions(project_id, xxh3)",
+        [],
+    )?;
 
     // Perf tier C Task 1 (ruling C-1/C-1a, spec §2.2.2): the group β Measure
     // resolves once per group from its members' own `Auto` picks (the

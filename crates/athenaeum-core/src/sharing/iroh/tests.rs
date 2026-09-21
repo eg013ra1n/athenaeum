@@ -2557,7 +2557,11 @@ async fn assigned_fetch_reassigns_a_trickling_provider() {
     let dest = tempdir().unwrap();
     let started = Instant::now();
     let report = tokio::time::timeout(
-        Duration::from_secs(30),
+        // Was 30 s; raised to 120 s (Wave 1 final review item 3) for the same
+        // CI-margin reason as the other assignment-loop tests below — a
+        // 4-CPU runner saturated by the rest of the workspace has left this
+        // test past its old deadline before.
+        Duration::from_secs(120),
         c.fetch_collection_multi_tuned_for_test(
             Role::Recv,
             vec![a_info.node_id, b_info.node_id],
@@ -2679,7 +2683,11 @@ async fn assigned_fetch_fails_fast_when_every_provider_is_dead() {
     let dest = tempdir().unwrap();
     let started = Instant::now();
     let res = tokio::time::timeout(
-        Duration::from_secs(60),
+        // Was 60 s; raised to 120 s (Wave 1 final review item 3) for CI
+        // margin — the ladder's own ~40 s measured bound plus dials already
+        // ate most of 60 s on a quiet machine, leaving nothing for a
+        // saturated 4-CPU runner.
+        Duration::from_secs(120),
         c.fetch_collection_multi_tuned_for_test(
             Role::Recv,
             vec![a_info.node_id],
@@ -2787,8 +2795,11 @@ async fn assigned_fetch_report_matches_provider_send_counters() {
     // Arm 1: the stock Split fan-out, into puller C.
     let stock_dest = tempdir().unwrap();
     let (stock_telemetry, _) = recording_telemetry();
-    let stock_report = c
-        .fetch_collection_multi_tuned_for_test(
+    // 120 s harness timeout (Wave 1 final review item 3): this test had none,
+    // so a wedge here hung the whole CI job instead of failing it.
+    let stock_report = tokio::time::timeout(
+        Duration::from_secs(120),
+        c.fetch_collection_multi_tuned_for_test(
             Role::Recv,
             vec![a_info.node_id, b_info.node_id],
             &root.to_string(),
@@ -2799,9 +2810,11 @@ async fn assigned_fetch_report_matches_provider_send_counters() {
             SwarmFetchMode::Stock,
             super::assign::STALL_HARD_LIMIT,
             false,
-        )
-        .await
-        .expect("the stock fan-out must still complete");
+        ),
+    )
+    .await
+    .expect("arm 1 must not hang")
+    .expect("the stock fan-out must still complete");
     assert!(
         stock_report.is_none(),
         "the stock path runs upstream's loop and has no per-provider report to give"
@@ -2814,8 +2827,10 @@ async fn assigned_fetch_report_matches_provider_send_counters() {
     let (telemetry, _) = recording_telemetry();
     let a_before = sent_bytes(&a);
     let b_before = sent_bytes(&b);
-    let report = d
-        .fetch_collection_multi_tuned_for_test(
+    // Same 120 s harness timeout as arm 1 above, same reason.
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        d.fetch_collection_multi_tuned_for_test(
             Role::Recv,
             vec![a_info.node_id, b_info.node_id],
             &root.to_string(),
@@ -2828,10 +2843,12 @@ async fn assigned_fetch_report_matches_provider_send_counters() {
             // See the doc: with hedging on, `bytes` and egress are different
             // quantities and this reconciliation would be asserting nonsense.
             false,
-        )
-        .await
-        .expect("the assigned loop must complete")
-        .expect("the assigned loop always reports");
+        ),
+    )
+    .await
+    .expect("arm 2 must not hang")
+    .expect("the assigned loop must complete")
+    .expect("the assigned loop always reports");
     let a_sent = sent_bytes(&a).saturating_sub(a_before);
     let b_sent = sent_bytes(&b).saturating_sub(b_before);
 
@@ -2919,19 +2936,24 @@ async fn assigned_fetch_batch_progress_is_monotonic_and_ends_at_the_total() {
     let (sink, events) = recording_sink();
     let (telemetry, _) = recording_telemetry();
     let dest = tempdir().unwrap();
-    c.fetch_collection_multi_tuned_for_test(
-        Role::Recv,
-        vec![a_info.node_id, b_info.node_id],
-        &root.to_string(),
-        announce.byte_size,
-        dest.path(),
-        sink,
-        telemetry,
-        SwarmFetchMode::Assigned,
-        super::assign::STALL_HARD_LIMIT,
-        true,
+    // 120 s harness timeout (Wave 1 final review item 3): this test had none.
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        c.fetch_collection_multi_tuned_for_test(
+            Role::Recv,
+            vec![a_info.node_id, b_info.node_id],
+            &root.to_string(),
+            announce.byte_size,
+            dest.path(),
+            sink,
+            telemetry,
+            SwarmFetchMode::Assigned,
+            super::assign::STALL_HARD_LIMIT,
+            true,
+        ),
     )
     .await
+    .expect("the fetch must not hang")
     .expect("the fetch must complete")
     .expect("the assigned loop always reports");
     assert_package_landed(&pkg_dir, dest.path(), FILES);
