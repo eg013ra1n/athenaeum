@@ -145,6 +145,16 @@ const GOODPUT_ALPHA: f64 = 0.25;
 /// is only known once bytes have flowed. A refused budget must not disqualify a
 /// child permanently either, or one momentary shortfall strands it on a useless
 /// peer for the rest of the run. So the arm decision is a poll, not a one-shot.
+///
+/// One consequence worth knowing before reading a provider's numbers: while
+/// this tick runs [`try_arm_hedge`], THE PRIMARY IS NOT POLLED. The `select!`
+/// has already committed to this branch, and `blobs.observe(hash).await` inside
+/// it is an await on the local store, so a store that is slow to answer parks
+/// the primary for exactly as long as it takes. That time still accrues to the
+/// primary's wall-clock `elapsed`, and so to its goodput, as though the peer
+/// had gone idle — the provider is billed for the store's latency. In practice
+/// `observe` answers from memory and this is a footnote; it would become a real
+/// bound if it ever went to disk on a cold cache.
 const HEDGE_REEVALUATE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Environment override for [`swarm_fetch_mode`].
@@ -380,6 +390,19 @@ impl TransferFault {
 
     fn is_stall(&self) -> bool {
         matches!(self, Self::Stalled { .. })
+    }
+
+    /// One line for a log's `error` field.
+    ///
+    /// A stall carries no error to render — it is this loop's OWN judgement,
+    /// not something the transport reported — so it says so rather than
+    /// logging an empty cause, and a real failure renders the anyhow chain the
+    /// same way [`record_failure`] stores it.
+    fn cause(&self) -> String {
+        match self {
+            Self::Stalled { .. } => "stalled: no progress within the ceiling".to_string(),
+            Self::Failed { error, .. } => format!("{error:#}"),
+        }
     }
 }
 
@@ -709,6 +732,7 @@ async fn run_child(
                         child = index,
                         provider = %provider.fmt_short(),
                         bytes = fault.bytes(),
+                        error = %fault.cause(),
                         "primary failed while a hedge was live — promoting the hedge"
                     );
                     primary_gone = true;
@@ -718,20 +742,47 @@ async fn run_child(
                     let h = hedge.take().expect("the hedge branch only runs when armed");
                     match r {
                         Ok(stats) => {
-                            // A hedge finishes its HALF, never the child, so it
-                            // is not counted as a child completion here — the
-                            // round below that fetches the remainder is.
-                            record_success(&states, h.provider, &stats, h.started.elapsed(), false);
+                            // Sampled before the completeness query below, so
+                            // the local store's latency is not billed to the
+                            // peer as transfer time.
+                            let hedge_elapsed = h.started.elapsed();
+                            // Ruling R3: a child is credited to whichever
+                            // transfer made it complete. A hedge usually
+                            // finishes only its own half and the round below
+                            // that fetches the remainder does the crediting —
+                            // but when the primary had already delivered
+                            // everything in FRONT of the cut, the hedge's back
+                            // half is the last of the child, and the
+                            // `continue 'child` below then returns through the
+                            // top-of-loop `is_complete` early return, which
+                            // records nothing at all. Without asking here, such
+                            // a child would be counted for NOBODY and
+                            // `total_children` would quietly under-report. An
+                            // error is read as "not complete": the next round's
+                            // own `local_for_request` hits the same fault and
+                            // propagates it, so nothing is swallowed.
+                            let completed_child = remote
+                                .local_for_request(request.clone())
+                                .await
+                                .map(|l| l.is_complete())
+                                .unwrap_or(false);
+                            record_success(
+                                &states,
+                                h.provider,
+                                &stats,
+                                hedge_elapsed,
+                                completed_child,
+                            );
                             let moved = primary_progress.load(Ordering::Relaxed);
-                            // Both figures are request-relative: `moved` counts
-                            // payload bytes inside the PRIMARY's request, which
-                            // starts at the missing range, and `split_rel` is
-                            // how far into that same range the hedged half
-                            // begins. Comparing progress with a blob offset
-                            // under-counted duplication by everything already
-                            // present — zero on a fresh first round, wrong on
-                            // every resumed one.
-                            let duplicated = moved.saturating_sub(h.split_rel).min(h.charge);
+                            // `moved` counts payload bytes inside the PRIMARY's
+                            // request, which began at ROUND START; the hedged
+                            // half begins `armed_at + split_rel` into that same
+                            // request (see `HedgeRun::armed_at`). What the
+                            // primary moved PAST that point, and only that, was
+                            // fetched twice.
+                            let duplicated = moved
+                                .saturating_sub(h.armed_at.saturating_add(h.split_rel))
+                                .min(h.charge);
                             settle_hedge_loser(&ledger, &h, duplicated);
                             if !primary_gone {
                                 // Cancelling the primary IS dropping it; the
@@ -772,7 +823,7 @@ async fn run_child(
                 Step::Reevaluate => {
                     hedge = try_arm_hedge(
                         &pool, &remote, &blobs, &states, &ledger, &providers, &opts, root, index,
-                        hash, provider, started,
+                        hash, provider, started, &primary_progress,
                     )
                     .await;
                 }
@@ -928,7 +979,22 @@ struct HedgeRun {
     /// range, so its progress counter can be turned into "how much of the
     /// charged range did it duplicate". Request-relative, never a blob offset
     /// — see [`MissingSplit::split_rel`].
+    ///
+    /// Relative to the missing set AS IT STOOD WHEN THIS HEDGE WAS ARMED, which
+    /// is not where the primary's request began — hence `armed_at` below.
     split_rel: u64,
+    /// The primary's progress at the instant the split was cut.
+    ///
+    /// `split_rel` indexes the missing set observed at arm time, while the
+    /// primary's counter indexes the request it was handed at ROUND START; by
+    /// arm time the primary has already consumed `armed_at` bytes of that
+    /// request. The hedged range therefore begins at `armed_at + split_rel` in
+    /// the primary's frame, and comparing its progress against `split_rel`
+    /// alone over-counts duplication by everything the primary moved before the
+    /// hedge existed — on a 1 MiB child with the primary at 600 KiB when the
+    /// hedge took the last 212 KiB, that read as 488 KiB duplicated (clamped to
+    /// the whole charge, refunding nothing) where the truth was zero.
+    armed_at: u64,
     started: Instant,
     /// Keeps the hedge provider's assignment slot claimed for as long as the
     /// hedge runs; released structurally when this struct drops.
@@ -1002,6 +1068,7 @@ async fn try_arm_hedge(
     hash: Hash,
     primary: EndpointId,
     started: Instant,
+    primary_progress: &Arc<AtomicU64>,
 ) -> Option<HedgeRun> {
     // What is still missing, from the progress truth (`store.observe`) rather
     // than from the primary's stream.
@@ -1013,6 +1080,11 @@ async fn try_arm_hedge(
     // them — the ceiling handles "not moving", the hedge handles "moving, but
     // far too slowly for this swarm".
     let bitfield = blobs.observe(hash).await.ok()?;
+    // Read against the SAME snapshot the split below is cut from: `split_rel`
+    // is an offset into this bitfield's missing set, so the primary's progress
+    // has to be sampled here, beside it, and not at any later point where the
+    // two would describe different instants.
+    let armed_at = primary_progress.load(Ordering::Relaxed);
     let size = bitfield.size();
     if size == 0 || bitfield.is_complete() {
         return None;
@@ -1108,6 +1180,7 @@ async fn try_arm_hedge(
         progress,
         charge,
         split_rel: split.split_rel,
+        armed_at,
         started: Instant::now(),
         _claim: claim,
     })
@@ -1264,12 +1337,17 @@ fn earliest_wait(states: &States) -> Duration {
 
 /// Record a completed transfer against its provider.
 ///
-/// `completed_child` distinguishes the two kinds of success this loop produces:
-/// a primary (or a promoted hedge's follow-up round) that finishes the CHILD,
-/// and a hedge that finishes its own half of one. Both are real transfers and
-/// both feed `bytes`, the goodput EWMA and the backoff reset — but only the
-/// first may touch `children`, or a hedged child would be counted twice and
-/// `AssignmentReport::total_children` would stop meaning "children fetched".
+/// `completed_child` carries ruling R3: the child belongs to whichever transfer
+/// made it COMPLETE, whoever that was. A primary that finishes the whole
+/// missing range qualifies; so does a hedge whose back half happened to be the
+/// last of the child, and so does the follow-up round that picks up a
+/// remainder. Every success feeds `bytes`, the goodput EWMA and the backoff
+/// reset — but `children` moves exactly once per child, or
+/// `AssignmentReport::total_children` stops meaning "children fetched", in
+/// either direction: double-counting a hedged child inflates it, and the
+/// earlier rule of never crediting a hedge lost the ones a hedge finished
+/// outright, because the round that would have credited them returned through
+/// the `is_complete` early return without recording anything.
 fn record_success(
     states: &States,
     provider: EndpointId,

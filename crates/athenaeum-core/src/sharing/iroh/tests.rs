@@ -3232,9 +3232,17 @@ async fn hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
     let slow_before = sent_bytes(&rig.slow);
     let started = Instant::now();
     let report = tokio::time::timeout(
-        // Same 120 s of harness patience as the sibling: this test asserts a
-        // byte budget, not a clock, so a loaded runner must not fail it.
-        Duration::from_secs(120),
+        // This test asserts a byte budget, not a clock, so a loaded runner must
+        // not fail it — and at 120 s one did, twice, timing out at 127 s and
+        // 128 s while the machine carried an unrelated load (the same tree
+        // finished in 75 s once it was quiet). 240 s is patience for that,
+        // chosen so it still cannot mask the defect this test exists for: a
+        // primary that is never cancelled has to deliver all thirteen children
+        // it is handed at 5 KB/s, which is about eleven minutes and blows any
+        // timeout in this range. The slow peer also contributes a real term of
+        // its own — a child that misses its hedge grinds at 5 KB/s for ~52 s —
+        // so the margin is deliberately several multiples of the observed run.
+        Duration::from_secs(240),
         rig.puller.fetch_collection_multi_tuned_for_test(
             Role::Recv,
             rig.providers.clone(),
@@ -3259,6 +3267,19 @@ async fn hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
     assert!(
         report.hedges >= 1,
         "the test needs a hedge to have fired: {report:?}"
+    );
+    // Ruling R3, and the reason this assertion lives in the HEDGING test rather
+    // than only in `assigned_fetch_report_matches_provider_send_counters`: this
+    // is the run where a hedge's back half can be the last of its child. When
+    // it is, the round that would otherwise do the crediting returns through
+    // the top-of-loop `is_complete` early return and records nothing, so before
+    // R3 such a child was counted for NOBODY and this sum came up short. The
+    // collection is FILES payload entries plus `manifest.ndjson`.
+    assert_eq!(
+        report.total_children() as usize,
+        FILES + 1,
+        "every child must be credited exactly once, hedge-won ones included: \
+         {report:?}"
     );
 
     // THE cancel oracle: the loser's own socket counter, never our telemetry.
@@ -3351,7 +3372,14 @@ async fn hedge_budget_stops_a_storm() {
         })
     };
     let report = tokio::time::timeout(
-        Duration::from_secs(60),
+        // 120 s, matching the identically shaped
+        // `hedge_fires_before_the_stall_ceiling_on_a_slow_provider`. At 60 s
+        // this test's patience EQUALLED the stall ceiling it configures, so a
+        // run in which the loop legitimately spent the ceiling on a provider
+        // had nothing left for the rest of the fetch: observed hanging once in
+        // six runs on a loaded machine. The claim here is a byte budget, not a
+        // duration.
+        Duration::from_secs(120),
         rig.puller.fetch_collection_multi_tuned_for_test(
             Role::Recv,
             rig.providers.clone(),
@@ -3384,15 +3412,35 @@ async fn hedge_budget_stops_a_storm() {
     // the bucket as they go; anything beyond that means charges are not being
     // refunded, i.e. hedges are duplicating whole ranges.
     //
-    // MEASURED on this package (reviewer item 11): 11 hedges duplicating
-    // 425 984 B against a cap of 524 288 B — 0.81 x the cap, and about 4 % of
-    // the ~10.5 MB payload, which is what a 5 % budget is supposed to look
-    // like. The bound below is 2 x the cap; the observed figure sits under the
-    // cap itself. It is not asserted exactly because it moves with how much of
-    // each stranded child the collapsed peer had already fetched when its hedge
+    // MEASURED on this package (reviewer item 11, RE-measured after the
+    // `armed_at` fix): three runs gave 22/20/22 hedges duplicating
+    // 65 536 / 65 536 / 114 688 B against a cap of 524 288 B — 0.12-0.22 x the
+    // cap, and 0.6-1.1 % of the ~10.5 MB payload, comfortably inside what a 5 %
+    // budget promises.
+    //
+    // The earlier figure recorded here, 425 984 B over 11 hedges, was not a
+    // measurement of this mechanism at all: duplication was computed against
+    // `split_rel` alone, an offset into the missing set as it stood at ARM
+    // time, while the primary's progress counts from the request it was given
+    // at ROUND START. Everything the primary moved in between was charged as
+    // duplicate. That inflated the reported cost ~4 x AND starved the bucket of
+    // refunds, which is why the hedge count doubled once it was fixed: the
+    // budget had been refusing hedges it could always have afforded.
+    //
+    // It is still not asserted exactly, because it moves with how much of each
+    // stranded child the collapsed peer had already fetched when its hedge
     // fired — a timing fact, not a contract — and it rides the
     // `"assignment loop finished"` debug as `hedge_bytes` on every run.
     let cap = (report_cap_basis as f64 * 0.05) as u64;
+    // Ruling R3 again, in the run that arms the most hedges (20-22 of them
+    // across 41 children), so a hedge finishing the last of its own child is
+    // near-certain here rather than incidental.
+    assert_eq!(
+        report.total_children() as usize,
+        FILES + 1,
+        "every child must be credited exactly once, hedge-won ones included: \
+         {report:?}"
+    );
     assert!(
         report.hedge_bytes <= 2 * cap,
         "hedging must stay inside its byte budget — it duplicated {} B against \
@@ -3453,8 +3501,6 @@ async fn stall_ceiling_is_independent_of_the_hedge_budget() {
     // That is correct behaviour and it is beside the point here — this test's
     // claim is that the progress deadline fires on its own schedule, whatever
     // the budget is doing.
-    let slow_before_check = report.hedges;
-    let _ = slow_before_check;
     let slow = report
         .per_provider
         .get(&endpoint_id(rig.slow_id))
@@ -3462,8 +3508,8 @@ async fn stall_ceiling_is_independent_of_the_hedge_budget() {
         .expect("the slow provider appears in the report");
     assert!(
         slow.failures >= 1,
-        "the 1500 ms progress deadline must still fail the trickling provider \
-         out with the hedge budget exhausted: {slow:?}"
+        "the 1500 ms progress deadline must fail the trickling provider out \
+         while hedging is enabled: {slow:?}"
     );
     assert!(
         report.stalls >= 1,
