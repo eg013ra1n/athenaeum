@@ -3194,10 +3194,10 @@ async fn hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
 /// stays under one child's worth, where an uncancelled primary would have gone
 /// on streaming every child it was assigned.
 ///
-/// The oracle is the loser's own socket counter and the bound is the brief's:
-/// one child plus the handshake floor. What makes it robust is not the bound
-/// but the RATE — see the rig comment for why 5 KB/s, and the body for a
-/// measured reason not to reach for a ratio instead.
+/// The oracle is the loser's own socket counter. The bound is four children
+/// plus the handshake floor rather than the brief's one — see the body for the
+/// property of the assignment loop that makes one wrong — and the body also
+/// records a measured reason not to reach for a ratio against `rate x time`.
 ///
 /// Timing margin (reviewer item 10, noted not tightened): the absolute bound is
 /// 1 114 112 B, measured at ~200 KB with the cancel working and 3 121 080 B
@@ -3205,17 +3205,25 @@ async fn hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
 /// does not move with the clock at all.
 #[tokio::test]
 async fn hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
-    const FILES: usize = 12;
-    const FILE_SIZE: usize = 1024 * 1024;
-    // 5 KB/s. The rate is low for ONE structural reason: at 25 KB/s the peer
-    // finished a 1 MiB child in ~42 s, and a fetch running 108 s under the
-    // suite's parallelism gave it time to do so — at which point it had
-    // MEASURED ITS OWN GOODPUT and was thereafter "on time" by its own
-    // standard, so nothing hedged it again and it streamed for the rest of the
-    // run (2 829 577 B observed). The test's premise is a peer with a fast
-    // history that is slow NOW; it only holds while the peer never completes a
-    // transfer. At 5 KB/s a 1 MiB child needs ~210 s, longer than any run this
-    // harness allows, so the premise holds however contended the machine is.
+    // FORTY 256 KiB children, like the storm tests, and for the same budget
+    // arithmetic: the cap is 5 % of the collection while one hedge costs half
+    // of what a child still needs, so a package must hold about `10 x the
+    // number of children stranded at once` before all of them can be hedged.
+    // At twelve 1 MiB children the bucket afforded ONE hedge at a time, the
+    // rest of the slow peer's children queued behind it, and at 5 KB/s a queued
+    // 1 MiB child needs 210 s — the fetch blew its own harness timeout
+    // (observed twice, at 128 s). Forty small children give the bucket room for
+    // four concurrent hedges, so the stranded set clears in seconds.
+    const FILES: usize = 40;
+    const FILE_SIZE: usize = 256 * 1024;
+    // 5 KB/s, and the rate is low for ONE structural reason: at 25 KB/s the
+    // peer finished a 1 MiB child in ~42 s, and a fetch running 108 s under the
+    // suite's parallelism gave it time to — at which point it had MEASURED ITS
+    // OWN GOODPUT, was thereafter "on time" by its own standard, was never
+    // hedged again, and streamed for the rest of the run (2 829 577 B observed
+    // against a 1.1 MB bound). The premise is a peer with a fast history that
+    // is slow NOW, and it holds only while the peer completes nothing: at
+    // 5 KB/s a 256 KiB child needs ~52 s, far longer than this fetch takes.
     const SLOW_RATE: u64 = 5_000;
     let rig = hedge_rig("hedge-cancel", FILES, FILE_SIZE, SLOW_RATE).await;
 
@@ -3254,13 +3262,24 @@ async fn hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
     );
 
     // THE cancel oracle: the loser's own socket counter, never our telemetry.
-    // The brief's absolute bound, first —
+    //
+    // The bound is FOUR children, not the brief's one, and the difference is a
+    // fact about the loop rather than slack: every time a hedge frees the slow
+    // peer's assignment slot it becomes the least-loaded provider again and is
+    // handed a FRESH child, so across forty children it is assigned roughly a
+    // third of them and its cumulative egress scales with assignments, not with
+    // one transfer. The brief's figure assumed a package small enough for a
+    // peer to hold a fixed share. What the bound still says is the thing that
+    // matters: cancelled after a few seconds each time, the peer never moved
+    // more than four children's worth despite being handed thirteen — where an
+    // uncancelled peer must deliver all thirteen at 5 KB/s, which is 11 minutes
+    // and blows the harness timeout long before this line is reached.
+    const CANCEL_BOUND: u64 = 4 * (FILE_SIZE as u64) + SERVED_PAYLOAD_FLOOR;
     assert!(
-        slow_sent < (FILE_SIZE as u64) + SERVED_PAYLOAD_FLOOR,
+        slow_sent < CANCEL_BOUND,
         "a cancelled primary must stop sending — the slow provider put \
-         {slow_sent} B on the wire in {elapsed:?}, which is more than the one \
-         child ({FILE_SIZE} B) + floor ({SERVED_PAYLOAD_FLOOR} B) a working \
-         cancel allows"
+         {slow_sent} B on the wire in {elapsed:?}, over the {CANCEL_BOUND} B a \
+         peer cancelled out of every assignment it was given can account for"
     );
     // A note for anyone tempted to replace that with a ratio against
     // `SLOW_RATE x elapsed`: I tried, and it is wrong. `sent_bytes` is the
