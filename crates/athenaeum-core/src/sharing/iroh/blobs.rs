@@ -1073,6 +1073,7 @@ pub(crate) async fn fetch_collection_multi(
     telemetry: ProviderTelemetrySink,
     mode: SwarmFetchMode,
     stall_hard_limit: Duration,
+    hedging: bool,
 ) -> Result<Option<AssignmentReport>> {
     if providers.is_empty() {
         anyhow::bail!("fetch_collection_multi {root_hash} called with an empty provider set");
@@ -1290,8 +1291,9 @@ pub(crate) async fn fetch_collection_multi(
                 children,
                 AssignmentOptions {
                     stall_hard_limit,
-                    // A2b: hedging is on by default for the swarm fetch.
-                    hedging: true,
+                    // A2b: hedging is on for the swarm fetch; production always
+                    // passes `true` and only a test turns it off.
+                    hedging,
                     total_bytes: byte_size,
                     telemetry,
                 },

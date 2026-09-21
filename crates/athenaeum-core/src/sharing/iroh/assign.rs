@@ -300,13 +300,19 @@ impl HedgeBudget {
         self.tokens = (self.tokens + HEDGE_BUDGET_RATIO * bytes as f64).min(self.cap);
     }
 
-    /// D4 §4.5: hedge only while the bucket is over half full AND can pay for
-    /// this hedge's whole range. The half rule is the storm brake — it stops
-    /// hedging long before the budget is actually exhausted, so a degraded run
-    /// cannot ride the bucket to zero one hedge at a time.
+    /// D4 §4.5: hedge only while the bucket is at least half full AND can pay
+    /// for this hedge's whole range. The half rule is the storm brake — it
+    /// stops hedging long before the budget is actually exhausted, so a
+    /// degraded run cannot ride the bucket to zero one hedge at a time.
+    ///
+    /// The comparison is `>=`, not `>`, and that is load-bearing rather than
+    /// cosmetic: tokens land on EXACTLY `cap / 2` in an ordinary case — two
+    /// providers splitting the children evenly, where completed bytes are half
+    /// the collection and the cap is 5 % of it — and a strict `>` refused every
+    /// hedge there for pure arithmetic reasons. Controller ruling R1.
     fn try_charge(&mut self, bytes: u64) -> bool {
         let want = bytes as f64;
-        if self.tokens > self.cap / 2.0 && self.tokens >= want {
+        if self.tokens >= self.cap / 2.0 && self.tokens >= want {
             self.tokens -= want;
             true
         } else {
@@ -647,7 +653,7 @@ async fn run_child(
         // missing from a different provider; whichever side finishes, the other
         // is dropped, which resets its QUIC stream (see the module doc).
         let primary_progress = Arc::new(AtomicU64::new(0));
-        let mut primary = Box::pin(transfer_once(
+        let mut primary: BoxedTransfer = Box::pin(transfer_once(
             pool.clone(),
             remote.clone(),
             provider,
@@ -656,45 +662,88 @@ async fn run_child(
             Arc::clone(&primary_progress),
         ));
         let mut hedge: Option<HedgeRun> = None;
+        // Set when the primary failed while a hedge was live: the hedge is
+        // promoted and carries the round alone (ruling R2). `primary` is then a
+        // future that never completes, so the race is the hedge and nothing
+        // else, and no second hedge is armed on a provider that is already out.
+        let mut primary_gone = false;
         let outcome = loop {
             let armed = hedge.is_some();
             let step = tokio::select! {
                 r = &mut primary => Step::Primary(r),
                 r = poll_slot(hedge.as_mut().map(|h| &mut h.fut)) => Step::Hedge(r),
                 _ = tokio::time::sleep(HEDGE_REEVALUATE_INTERVAL),
-                    if !armed && opts.hedging => Step::Reevaluate,
+                    if !armed && opts.hedging && !primary_gone => Step::Reevaluate,
             };
             match step {
-                Step::Primary(r) => {
+                Step::Primary(Ok(stats)) => {
                     if let Some(h) = hedge.take() {
-                        settle_hedge_loser(&ledger, &h, h.progress.load(Ordering::Relaxed));
+                        // The primary finished the WHOLE missing range, so every
+                        // byte the hedge moved was fetched twice. Its own
+                        // progress is already request-relative to the hedged
+                        // range, so it needs no offsetting.
+                        let duplicated = h.progress.load(Ordering::Relaxed).min(h.charge);
+                        settle_hedge_loser(&ledger, &h, duplicated);
                         tracing::debug!(
                             child = index,
                             loser = %h.provider.fmt_short(),
-                            refunded_bytes = h.charge.saturating_sub(h.progress.load(Ordering::Relaxed).min(h.charge)),
+                            refunded_bytes = h.charge - duplicated,
                             "swarm hedge loser cancelled"
                         );
                     }
-                    break r;
+                    break Ok(stats);
+                }
+                Step::Primary(Err(fault)) => {
+                    let Some(_) = hedge.as_ref() else {
+                        break Err(fault);
+                    };
+                    // Ruling R2: a hedge is a real transfer, not a speculative
+                    // copy to be thrown away because its primary died. Record
+                    // the primary's failure, then let the hedge finish and
+                    // become this round's result; the remainder is picked up by
+                    // the next round, on the hedge's provider.
+                    record_failure(&states, provider, &fault, started.elapsed());
+                    (opts.telemetry)(ProviderEvent::Failed(*provider.as_bytes()));
+                    tracing::debug!(
+                        root_hash = %root,
+                        child = index,
+                        provider = %provider.fmt_short(),
+                        bytes = fault.bytes(),
+                        "primary failed while a hedge was live — promoting the hedge"
+                    );
+                    primary_gone = true;
+                    primary = Box::pin(std::future::pending());
                 }
                 Step::Hedge(r) => {
                     let h = hedge.take().expect("the hedge branch only runs when armed");
                     match r {
                         Ok(stats) => {
-                            record_success(&states, h.provider, &stats, h.started.elapsed());
-                            // The hedge won its half. Cancel the primary — it is
-                            // the loser — and refund whatever of the charged
-                            // back range the primary had NOT duplicated.
-                            drop(primary);
+                            // A hedge finishes its HALF, never the child, so it
+                            // is not counted as a child completion here — the
+                            // round below that fetches the remainder is.
+                            record_success(&states, h.provider, &stats, h.started.elapsed(), false);
                             let moved = primary_progress.load(Ordering::Relaxed);
-                            let duplicated = moved.saturating_sub(h.split_at).min(h.charge);
+                            // Both figures are request-relative: `moved` counts
+                            // payload bytes inside the PRIMARY's request, which
+                            // starts at the missing range, and `split_rel` is
+                            // how far into that same range the hedged half
+                            // begins. Comparing progress with a blob offset
+                            // under-counted duplication by everything already
+                            // present — zero on a fresh first round, wrong on
+                            // every resumed one.
+                            let duplicated = moved.saturating_sub(h.split_rel).min(h.charge);
                             settle_hedge_loser(&ledger, &h, duplicated);
-                            tracing::debug!(
-                                child = index,
-                                loser = %provider.fmt_short(),
-                                refunded_bytes = h.charge.saturating_sub(duplicated),
-                                "swarm hedge loser cancelled"
-                            );
+                            if !primary_gone {
+                                // Cancelling the primary IS dropping it; the
+                                // `continue` below ends its scope.
+                                drop(primary);
+                                tracing::debug!(
+                                    child = index,
+                                    loser = %provider.fmt_short(),
+                                    refunded_bytes = h.charge - duplicated,
+                                    "swarm hedge loser cancelled"
+                                );
+                            }
                             // D4 §4.5: the rest of the child goes to the hedge's
                             // provider, not back to the one we just gave up on.
                             forced = Some(h.provider);
@@ -702,10 +751,21 @@ async fn run_child(
                         }
                         Err(fault) => {
                             // A failed hedge is the hedge's provider's problem,
-                            // never the child's: the primary is still running.
+                            // never the child's — unless it was carrying the
+                            // round alone, in which case it IS the round's
+                            // outcome and the loop below reassigns.
                             record_failure(&states, h.provider, &fault, h.started.elapsed());
                             (opts.telemetry)(ProviderEvent::Failed(*h.provider.as_bytes()));
                             settle_hedge_loser(&ledger, &h, fault.bytes().min(h.charge));
+                            if primary_gone {
+                                // Nothing is left running. Both failures are
+                                // already recorded against their OWN providers,
+                                // so this round is over — and it must not
+                                // `break` with the hedge's fault, which the
+                                // round's epilogue would bill to the primary's
+                                // provider a second time.
+                                continue 'child;
+                            }
                         }
                     }
                 }
@@ -729,7 +789,7 @@ async fn run_child(
             // it: the caller exports every child right after this returns, so an
             // incomplete one fails loudly there rather than passing silently.
             Ok(stats) => {
-                record_success(&states, provider, &stats, elapsed);
+                record_success(&states, provider, &stats, elapsed, true);
                 note_completion(&ledger, elapsed, stats.payload_bytes_read);
                 tracing::debug!(
                     root_hash = %root,
@@ -772,6 +832,90 @@ async fn run_child(
     }
 }
 
+/// A BLAKE3 chunk, the unit `ChunkRanges` counts in.
+const CHUNK_BYTES: u64 = 1024;
+
+/// Where a missing range was cut in two, and what each side is worth.
+struct MissingSplit {
+    /// The back half, as ranges — what the hedge asks for.
+    back: ChunkRanges,
+    /// Bytes inside `back`. This is the charge, and it is the byte extent of
+    /// the RANGES, never `size - split`: a cancelled hedge leaves the missing
+    /// set as `[0,x) ∪ [y,size)`, and measuring the charge against the blob's
+    /// end would bill the budget for bytes that are already present.
+    charge: u64,
+    /// Bytes of the missing set that come BEFORE the cut — a REQUEST-relative
+    /// offset, because that is the only frame the primary's own progress is
+    /// in: `GetProgressItem::Progress` counts payload bytes within the request,
+    /// which begins at the missing range, not at the blob's offset 0.
+    split_rel: u64,
+}
+
+/// Bytes of the chunk span `[start, end)` that fall inside a blob of `size`.
+fn span_bytes(start: u64, end: u64, size: u64) -> u64 {
+    let s = start.saturating_mul(CHUNK_BYTES).min(size);
+    let e = end.saturating_mul(CHUNK_BYTES).min(size);
+    e.saturating_sub(s)
+}
+
+/// Cut a missing set in half BY CHUNK COUNT, wherever its spans happen to lie.
+///
+/// `ChunkRanges` is a boundary list — `[b0,b1) ∪ [b2,b3) ∪ …`, with an open
+/// tail when the count is odd — so the spans are walked directly rather than
+/// assumed to be one contiguous prefix-complement. Returns `None` when there
+/// is nothing worth splitting: an empty set, or a remainder so small that one
+/// side of the cut would be empty (a single chunk left is not worth racing).
+fn split_missing_at_midpoint(missing: &ChunkRanges, size: u64) -> Option<MissingSplit> {
+    let last_chunk = size.div_ceil(CHUNK_BYTES);
+    let boundaries = missing.boundaries();
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    let mut i = 0;
+    while i < boundaries.len() {
+        let start = boundaries[i].0;
+        let end = boundaries
+            .get(i + 1)
+            .map(|c| c.0)
+            .unwrap_or(last_chunk)
+            .min(last_chunk);
+        if end > start {
+            spans.push((start, end));
+        }
+        i += 2;
+    }
+    let total: u64 = spans.iter().map(|(a, b)| span_bytes(*a, *b, size)).sum();
+    if total == 0 {
+        return None;
+    }
+
+    // Walk to the halfway byte and cut at the chunk boundary at or past it.
+    let target = total / 2;
+    let mut front_bytes = 0u64;
+    let mut split_chunk = spans[0].0;
+    for (a, b) in &spans {
+        let bytes = span_bytes(*a, *b, size);
+        if front_bytes + bytes >= target {
+            let need = target - front_bytes;
+            let chunks_in = need.div_ceil(CHUNK_BYTES).min(b - a);
+            split_chunk = a + chunks_in;
+            front_bytes += span_bytes(*a, split_chunk, size);
+            break;
+        }
+        front_bytes += bytes;
+        split_chunk = *b;
+    }
+
+    let back = missing.clone() & ChunkRanges::chunks(split_chunk..);
+    let charge = total - front_bytes;
+    if charge == 0 || front_bytes == 0 || back.is_empty() {
+        return None;
+    }
+    Some(MissingSplit {
+        back,
+        charge,
+        split_rel: front_bytes,
+    })
+}
+
 /// A hedge assignment in flight beside its primary.
 struct HedgeRun {
     provider: EndpointId,
@@ -780,9 +924,11 @@ struct HedgeRun {
     /// Bytes charged to the budget when this hedge was armed — the size of the
     /// back range it asked for.
     charge: u64,
-    /// The byte offset the back range starts at, so the primary's own progress
-    /// can be turned into "how much of the charged range did it duplicate".
-    split_at: u64,
+    /// How many bytes of the primary's OWN request come before the hedged
+    /// range, so its progress counter can be turned into "how much of the
+    /// charged range did it duplicate". Request-relative, never a blob offset
+    /// — see [`MissingSplit::split_rel`].
+    split_rel: u64,
     started: Instant,
     /// Keeps the hedge provider's assignment slot claimed for as long as the
     /// hedge runs; released structurally when this struct drops.
@@ -871,8 +1017,7 @@ async fn try_arm_hedge(
     if size == 0 || bitfield.is_complete() {
         return None;
     }
-    let present = bitfield.total_bytes();
-    let missing_bytes = size.saturating_sub(present);
+    let missing_bytes = size.saturating_sub(bitfield.total_bytes());
     if missing_bytes == 0 {
         return None;
     }
@@ -914,17 +1059,12 @@ async fn try_arm_hedge(
     }
     let claim = claim_provider(states, &others, None)?;
 
-    // The back half of what is still missing. The primary reads forward from
-    // the start, so the present bytes are a prefix and the split is a byte
-    // offset; intersecting with the real missing set keeps that an assumption
-    // we do not have to rely on.
-    let split_at = present + missing_bytes / 2;
+    // The back half of what is still missing, cut at the missing set's OWN
+    // chunk-count midpoint — no assumption that the present bytes form a
+    // prefix, because after a cancelled hedge they do not.
     let missing_ranges = ChunkRanges::bytes(0..size) - bitfield.ranges.clone();
-    let back = missing_ranges & ChunkRanges::bytes(split_at..size);
-    if back.is_empty() {
-        return None;
-    }
-    let charge = size.saturating_sub(split_at);
+    let split = split_missing_at_midpoint(&missing_ranges, size)?;
+    let charge = split.charge;
 
     if !ledger
         .lock()
@@ -936,7 +1076,7 @@ async fn try_arm_hedge(
     }
 
     let hedge_provider = claim.provider();
-    let request = GetRequest::builder().child(index, back).build(root);
+    let request = GetRequest::builder().child(index, split.back).build(root);
     let progress = Arc::new(AtomicU64::new(0));
     let fut: BoxedTransfer = Box::pin(transfer_once(
         pool.clone(),
@@ -967,7 +1107,7 @@ async fn try_arm_hedge(
         fut,
         progress,
         charge,
-        split_at,
+        split_rel: split.split_rel,
         started: Instant::now(),
         _claim: claim,
     })
@@ -1122,7 +1262,21 @@ fn earliest_wait(states: &States) -> Duration {
         .max(MIN_BACKOFF_SLEEP)
 }
 
-fn record_success(states: &States, provider: EndpointId, stats: &Stats, elapsed: Duration) {
+/// Record a completed transfer against its provider.
+///
+/// `completed_child` distinguishes the two kinds of success this loop produces:
+/// a primary (or a promoted hedge's follow-up round) that finishes the CHILD,
+/// and a hedge that finishes its own half of one. Both are real transfers and
+/// both feed `bytes`, the goodput EWMA and the backoff reset — but only the
+/// first may touch `children`, or a hedged child would be counted twice and
+/// `AssignmentReport::total_children` would stop meaning "children fetched".
+fn record_success(
+    states: &States,
+    provider: EndpointId,
+    stats: &Stats,
+    elapsed: Duration,
+    completed_child: bool,
+) {
     let mut guard = states.lock().expect("assignment states mutex poisoned");
     if let Some(st) = guard.get_mut(&provider) {
         // D4 §6: a success resets the consecutive-failure count AND clears the
@@ -1130,7 +1284,9 @@ fn record_success(states: &States, provider: EndpointId, stats: &Stats, elapsed:
         st.failures = 0;
         st.next_try = None;
         st.stats.bytes += stats.payload_bytes_read;
-        st.stats.children += 1;
+        if completed_child {
+            st.stats.children += 1;
+        }
         st.stats.elapsed += elapsed;
         // Goodput EWMA, warm-started so the first samples are not diluted by a
         // cold value: α = min(1/n, GOODPUT_ALPHA), n counting this sample.
@@ -1387,7 +1543,13 @@ mod tests {
         }
 
         // One success readmits it immediately.
-        record_success(&states, a, &Stats::default(), Duration::from_millis(1));
+        record_success(
+            &states,
+            a,
+            &Stats::default(),
+            Duration::from_millis(1),
+            true,
+        );
         let g = states.lock().unwrap();
         assert!(g[&a].next_try.is_none(), "a success clears the backoff");
         assert_eq!(g[&a].failures, 0, "and resets the consecutive count");
@@ -1452,6 +1614,66 @@ mod tests {
         );
     }
 
+    /// The midpoint cut works on the RANGES, not on the blob's end, and the
+    /// offset it reports is request-relative — the two things findings 2 and 3
+    /// were about.
+    #[test]
+    fn split_missing_cuts_the_ranges_not_the_blob_and_reports_a_request_offset() {
+        const SIZE: u64 = 64 * CHUNK_BYTES;
+
+        // Contiguous whole blob: an even cut, and the front offset is half.
+        let whole = ChunkRanges::chunks(..64u64);
+        let s = split_missing_at_midpoint(&whole, SIZE).expect("splittable");
+        assert_eq!(s.charge, 32 * CHUNK_BYTES);
+        assert_eq!(s.split_rel, 32 * CHUNK_BYTES);
+
+        // The shape a cancelled hedge leaves: [0,8) already present, so the
+        // missing set is [8,32) u [48,64) — 40 chunks in two spans. The charge
+        // must be 20 chunks (half the MISSING bytes), NOT `size - split`, which
+        // would bill the 16 present chunks in between.
+        let gapped = ChunkRanges::chunks(8u64..32) | ChunkRanges::chunks(48u64..64);
+        let s = split_missing_at_midpoint(&gapped, SIZE).expect("splittable");
+        assert_eq!(
+            s.charge,
+            20 * CHUNK_BYTES,
+            "the charge is the byte extent of the BACK RANGES"
+        );
+        assert_eq!(
+            s.split_rel,
+            20 * CHUNK_BYTES,
+            "and the offset counts missing bytes only — it is what the \
+             primary's own progress counter is measured in"
+        );
+        // And the back half really is the tail of the missing set.
+        assert!(
+            s.back.is_subset(&gapped),
+            "the hedge must never ask for bytes that are not missing"
+        );
+        assert!(!s.back.is_empty());
+
+        // Degenerate remainders are not worth racing.
+        assert!(split_missing_at_midpoint(&ChunkRanges::empty(), SIZE).is_none());
+        assert!(
+            split_missing_at_midpoint(&ChunkRanges::chunks(0u64..1), SIZE).is_none(),
+            "one chunk left cannot be cut into two non-empty halves"
+        );
+    }
+
+    /// The bucket admits at EXACTLY half the cap (ruling R1): that is where two
+    /// providers splitting a collection evenly land, and a strict `>` refused
+    /// every hedge there.
+    #[test]
+    fn hedge_budget_admits_at_exactly_half_the_cap() {
+        let total = 1024 * 1024u64;
+        let cap = HEDGE_BUDGET_RATIO * total as f64;
+        let mut b = HedgeBudget::new(total);
+        b.tokens = cap / 2.0;
+        assert!(
+            b.try_charge(1),
+            "tokens sitting exactly on cap/2 must still admit a hedge"
+        );
+    }
+
     #[test]
     fn completion_window_keeps_the_last_32_and_reports_the_nearest_rank_p95() {
         let mut w = CompletionWindow::default();
@@ -1498,13 +1720,13 @@ mod tests {
         // a: 1000 B in 1 s ⇒ 1000 B/s on the first sample (no cold start).
         let mut stats = Stats::default();
         stats.counters.payload_bytes_read = 1000;
-        record_success(&states, a, &stats, Duration::from_secs(1));
+        record_success(&states, a, &stats, Duration::from_secs(1), true);
         assert_eq!(ewma_goodput(&states, a), Some(1000.0));
 
         // A second, much faster sample moves it by α = min(1/2, 0.25) = 0.25.
         let mut fast = Stats::default();
         fast.counters.payload_bytes_read = 5000;
-        record_success(&states, a, &fast, Duration::from_secs(1));
+        record_success(&states, a, &fast, Duration::from_secs(1), true);
         let g = ewma_goodput(&states, a).unwrap();
         assert!(
             (g - (1000.0 * 0.75 + 5000.0 * 0.25)).abs() < 1e-6,
@@ -1512,7 +1734,7 @@ mod tests {
         );
 
         // b measured, c not ⇒ c borrows the median of {a, b}.
-        record_success(&states, b, &stats, Duration::from_secs(1));
+        record_success(&states, b, &stats, Duration::from_secs(1), true);
         let median = ewma_goodput(&states, c).expect("c borrows a median");
         assert!(
             median == 1000.0 || (median - g).abs() < 1e-6,

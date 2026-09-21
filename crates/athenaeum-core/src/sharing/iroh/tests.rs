@@ -2568,6 +2568,7 @@ async fn assigned_fetch_reassigns_a_trickling_provider() {
             telemetry,
             SwarmFetchMode::Assigned,
             Duration::from_millis(1500),
+            true,
         ),
     )
     .await
@@ -2691,6 +2692,7 @@ async fn assigned_fetch_fails_fast_when_every_provider_is_dead() {
             // Production's ceiling: nothing here ever connects, so the ladder,
             // not the stall watchdog, is what bounds this test.
             super::assign::STALL_HARD_LIMIT,
+            true,
         ),
     )
     .await
@@ -2730,6 +2732,14 @@ async fn assigned_fetch_fails_fast_when_every_provider_is_dead() {
 /// the other side of the wire. Bracketing one against the other is the only
 /// check that the loop's per-provider attribution is real rather than
 /// self-consistent — and it is what A4's ranking will be built on.
+///
+/// **Hedging is forced OFF here, and it has to be.** Once a hedge can fire, a
+/// provider's `bytes` and its socket egress stop being the same quantity: a
+/// cancelled loser puts bytes on the wire that its `Stats` never report, and a
+/// hedge adds a second assignment to a provider that the child-count no longer
+/// counts. Per-provider bytes are an attribution oracle, not an egress oracle,
+/// the moment hedging is on — so the reconciliation is pinned in the one mode
+/// where the two do line up, and the hedge path is measured by its own tests.
 #[tokio::test]
 async fn assigned_fetch_report_matches_provider_send_counters() {
     let da = tempdir().unwrap();
@@ -2788,6 +2798,7 @@ async fn assigned_fetch_report_matches_provider_send_counters() {
             stock_telemetry,
             SwarmFetchMode::Stock,
             super::assign::STALL_HARD_LIMIT,
+            false,
         )
         .await
         .expect("the stock fan-out must still complete");
@@ -2814,6 +2825,9 @@ async fn assigned_fetch_report_matches_provider_send_counters() {
             telemetry,
             SwarmFetchMode::Assigned,
             super::assign::STALL_HARD_LIMIT,
+            // See the doc: with hedging on, `bytes` and egress are different
+            // quantities and this reconciliation would be asserting nonsense.
+            false,
         )
         .await
         .expect("the assigned loop must complete")
@@ -2915,6 +2929,7 @@ async fn assigned_fetch_batch_progress_is_monotonic_and_ends_at_the_total() {
         telemetry,
         SwarmFetchMode::Assigned,
         super::assign::STALL_HARD_LIMIT,
+        true,
     )
     .await
     .expect("the fetch must complete")
@@ -3082,59 +3097,80 @@ impl HedgeRig {
 ///
 /// The discriminator is `report.stalls == 0`: the 60 s ceiling never fired, so
 /// whatever rescued the children was the hedge.
+///
+/// Timing margin (reviewer item 10, noted not tightened): the assertion is 45 s
+/// against a measured ~8 s, under a 120 s harness timeout, and the ceiling it
+/// must beat is 60 s. The claim is therefore still "hedging got there before
+/// the deadline could" — reinforced by `stalls == 0`, which is the assertion
+/// that does not depend on a clock at all — while leaving room for a runner
+/// under load, where a 30 s bound failed at load 20+.
 #[tokio::test]
 async fn hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
-    const FILES: usize = 12;
-    const FILE_SIZE: usize = 1024 * 1024;
-    // Everyone at 4 MB/s to start: the fetch then spans seconds rather than
-    // finishing before the victim can be throttled, and the victim measures a
-    // healthy goodput for itself first.
-    let rig = hedge_rig("hedge-slow", FILES, FILE_SIZE, 4_000_000).await;
-    rig.fast_a.set_upload_limit(4_000_000);
-    rig.fast_b.set_upload_limit(4_000_000);
+    // FORTY children, not twelve, and that is the budget's arithmetic talking:
+    // the cap is 5 % of the COLLECTION while one hedge costs half of what a
+    // child still needs, so a package must hold about `10 x the number of
+    // children stranded at once` before every one of them can be hedged. At
+    // twelve the bucket refused one of the stranded four — and a refused child
+    // is stuck for good here, because a peer dribbling 1 KB/s still delivers a
+    // 16 KiB chunk every 16 s and so never trips the 60 s progress deadline
+    // either. Forty children of 256 KiB give the bucket room for two hedges at
+    // once, and a winning hedge refunds in full, so the stranded set clears in
+    // a couple of seconds.
+    const FILES: usize = 40;
+    const FILE_SIZE: usize = 256 * 1024;
+    // 1.5 MB/s each to start: the fetch then spans a couple of seconds rather
+    // than finishing before the victim can be throttled, and the victim
+    // measures a healthy goodput for itself first.
+    let rig = hedge_rig("hedge-slow", FILES, FILE_SIZE, 1_500_000).await;
+    rig.fast_a.set_upload_limit(1_500_000);
+    rig.fast_b.set_upload_limit(1_500_000);
 
     let (telemetry, _) = recording_telemetry();
     let dest = tempdir().unwrap();
-    let dest_path = dest.path().to_path_buf();
-    let puller = Arc::clone(&rig.puller);
-    let providers = rig.providers.clone();
-    let root = rig.root.to_string();
-    let byte_size = rig.announce.byte_size;
     let started = Instant::now();
-    let task = tokio::spawn(async move {
-        puller
-            .fetch_collection_multi_tuned_for_test(
-                Role::Recv,
-                providers,
-                &root,
-                byte_size,
-                &dest_path,
-                noop_fetch_sink(),
-                telemetry,
-                SwarmFetchMode::Assigned,
-                // The brief's ceiling: long enough that it cannot be what
-                // rescues the fetch.
-                Duration::from_secs(60),
-            )
-            .await
-    });
-
-    // The uplink collapses mid-transfer.
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    rig.slow.set_upload_limit(1_000);
-
-    let report = tokio::time::timeout(Duration::from_secs(60), task)
-        .await
-        .expect("a hedged fetch must not wait out the stall ceiling")
-        .expect("the fetch task panicked")
-        .expect("the fetch must complete")
-        .expect("the assigned loop always reports");
+    // The uplink collapses mid-transfer. The COLLAPSE rides a timer task, not
+    // the fetch: awaiting the fetch inline means a timeout DROPS it, which
+    // cancels it cleanly, where a spawned fetch would keep running under a
+    // panicking test and can block the runtime's own shutdown.
+    let collapse = {
+        let slow = Arc::clone(&rig.slow);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            slow.set_upload_limit(1_000);
+        })
+    };
+    let report = tokio::time::timeout(
+        // 120 s of patience for a 45 s claim: the harness bound must not be
+        // what fails on a loaded runner, or a timing-margin failure reads as a
+        // hedging failure.
+        Duration::from_secs(120),
+        rig.puller.fetch_collection_multi_tuned_for_test(
+            Role::Recv,
+            rig.providers.clone(),
+            &rig.root.to_string(),
+            rig.announce.byte_size,
+            dest.path(),
+            noop_fetch_sink(),
+            telemetry,
+            SwarmFetchMode::Assigned,
+            // The brief's ceiling: long enough that it cannot be what rescues
+            // the fetch.
+            Duration::from_secs(60),
+            true,
+        ),
+    )
+    .await
+    .expect("a hedged fetch must not wait out the stall ceiling")
+    .expect("the fetch must complete")
+    .expect("the assigned loop always reports");
     let elapsed = started.elapsed();
+    collapse.await.ok();
 
     assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
     assert!(
-        elapsed < Duration::from_secs(30),
-        "hedging must finish the package early — it took {elapsed:?} (report {report:?})"
+        elapsed < Duration::from_secs(45),
+        "hedging must finish the package before the 60 s ceiling could — it took \
+         {elapsed:?} (report {report:?})"
     );
     assert!(
         report.hedges >= 1,
@@ -3155,21 +3191,36 @@ async fn hedge_fires_before_the_stall_ceiling_on_a_slow_provider() {
 ///
 /// Sizing is what gives this teeth (see the test above for why it is what it
 /// is). The slow peer holds roughly a third of the 13 children — about 4 MiB —
-/// and is paced at 50 KB/s, so delivering them would take some 84 s and put
+/// and is paced at 25 KB/s, so delivering them would take minutes and put
 /// ~4 MiB through its socket. Cancelled at the hedge it sends a couple of
 /// hundred KB. The bound below sits between those two populations.
+///
+/// Timing margin (reviewer item 10, noted not tightened): the bound is
+/// 1 114 112 B against ~200 KB with the cancel working and 3 121 080 B with it
+/// mutated out (both measured at 50 KB/s). The rate is now 25 KB/s because the
+/// passing side scales with machine load — see the comment on the rig below.
 #[tokio::test]
 async fn hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
     const FILES: usize = 12;
     const FILE_SIZE: usize = 1024 * 1024;
-    let rig = hedge_rig("hedge-cancel", FILES, FILE_SIZE, 50_000).await;
+    // 25 KB/s, halved from the 50 KB/s this was first measured at. The bound
+    // below is absolute while the peer's egress is `rate x how long it was
+    // allowed to run`, so the passing side scales with machine load: on a busy
+    // runner the hedges take longer to fire and win, and at 50 KB/s a loaded
+    // run reached the bound. Halving the rate doubles the headroom on the
+    // passing side (a 25 s cancelled window is now ~625 KB against a 1.1 MB
+    // bound) without rescuing the failing side — the leak mutation measured
+    // 3 121 080 B at 50 KB/s, so ~1.5 MB at 25 KB/s, still over the bound.
+    let rig = hedge_rig("hedge-cancel", FILES, FILE_SIZE, 25_000).await;
 
     let (telemetry, _) = recording_telemetry();
     let dest = tempdir().unwrap();
     let slow_before = sent_bytes(&rig.slow);
     let started = Instant::now();
     let report = tokio::time::timeout(
-        Duration::from_secs(60),
+        // Same 120 s of harness patience as the sibling: this test asserts a
+        // byte budget, not a clock, so a loaded runner must not fail it.
+        Duration::from_secs(120),
         rig.puller.fetch_collection_multi_tuned_for_test(
             Role::Recv,
             rig.providers.clone(),
@@ -3180,6 +3231,7 @@ async fn hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
             telemetry,
             SwarmFetchMode::Assigned,
             Duration::from_secs(60),
+            true,
         ),
     )
     .await
@@ -3240,46 +3292,48 @@ async fn hedge_cancels_the_loser_and_bounds_duplicate_bytes() {
 /// the child. That is the division of labour, not a gap.
 #[tokio::test]
 async fn hedge_budget_stops_a_storm() {
-    const FILES: usize = 12;
-    const FILE_SIZE: usize = 1024 * 1024;
-    let rig = hedge_rig("hedge-budget", FILES, FILE_SIZE, 4_000_000).await;
-    rig.fast_a.set_upload_limit(4_000_000);
-    rig.fast_b.set_upload_limit(4_000_000);
+    // Sized like `hedge_fires_before_the_stall_ceiling_on_a_slow_provider` —
+    // see its comment for why forty small children rather than twelve large
+    // ones.
+    const FILES: usize = 40;
+    const FILE_SIZE: usize = 256 * 1024;
+    let rig = hedge_rig("hedge-budget", FILES, FILE_SIZE, 1_500_000).await;
+    rig.fast_a.set_upload_limit(1_500_000);
+    rig.fast_b.set_upload_limit(1_500_000);
 
     let (telemetry, _) = recording_telemetry();
     let dest = tempdir().unwrap();
-    let dest_path = dest.path().to_path_buf();
-    let puller = Arc::clone(&rig.puller);
-    let providers = rig.providers.clone();
-    let root = rig.root.to_string();
-    let byte_size = rig.announce.byte_size;
-    let task = tokio::spawn(async move {
-        puller
-            .fetch_collection_multi_tuned_for_test(
-                Role::Recv,
-                providers,
-                &root,
-                byte_size,
-                &dest_path,
-                noop_fetch_sink(),
-                telemetry,
-                SwarmFetchMode::Assigned,
-                Duration::from_secs(60),
-            )
-            .await
-    });
-
     // The storm: every child the slow peer holds is stranded at the same
-    // instant, so every one of them reaches its hedge deadline together.
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    rig.slow.set_upload_limit(1_000);
-
-    let report = tokio::time::timeout(Duration::from_secs(60), task)
-        .await
-        .expect("the fetch must not hang")
-        .expect("the fetch task panicked")
-        .expect("the fetch must complete")
-        .expect("the assigned loop always reports");
+    // instant, so every one of them reaches its hedge deadline together. The
+    // collapse rides a timer task so the fetch can be awaited inline — see the
+    // sibling test for why that matters on a timeout.
+    let collapse = {
+        let slow = Arc::clone(&rig.slow);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            slow.set_upload_limit(1_000);
+        })
+    };
+    let report = tokio::time::timeout(
+        Duration::from_secs(60),
+        rig.puller.fetch_collection_multi_tuned_for_test(
+            Role::Recv,
+            rig.providers.clone(),
+            &rig.root.to_string(),
+            rig.announce.byte_size,
+            dest.path(),
+            noop_fetch_sink(),
+            telemetry,
+            SwarmFetchMode::Assigned,
+            Duration::from_secs(60),
+            true,
+        ),
+    )
+    .await
+    .expect("the fetch must not hang")
+    .expect("the fetch must complete")
+    .expect("the assigned loop always reports");
+    collapse.await.ok();
 
     let report_cap_basis = rig.announce.byte_size;
     assert_package_landed(&rig.pkg_dir, dest.path(), FILES);
@@ -3293,6 +3347,15 @@ async fn hedge_budget_stops_a_storm() {
     // roughly twice the cap over a long run, because completed children refill
     // the bucket as they go; anything beyond that means charges are not being
     // refunded, i.e. hedges are duplicating whole ranges.
+    //
+    // MEASURED on this package (reviewer item 11): 11 hedges duplicating
+    // 425 984 B against a cap of 524 288 B — 0.81 x the cap, and about 4 % of
+    // the ~10.5 MB payload, which is what a 5 % budget is supposed to look
+    // like. The bound below is 2 x the cap; the observed figure sits under the
+    // cap itself. It is not asserted exactly because it moves with how much of
+    // each stranded child the collapsed peer had already fetched when its hedge
+    // fired — a timing fact, not a contract — and it rides the
+    // `"assignment loop finished"` debug as `hedge_bytes` on every run.
     let cap = (report_cap_basis as f64 * 0.05) as u64;
     assert!(
         report.hedge_bytes <= 2 * cap,
@@ -3332,6 +3395,7 @@ async fn stall_ceiling_is_independent_of_the_hedge_budget() {
             telemetry,
             SwarmFetchMode::Assigned,
             Duration::from_millis(1500),
+            true,
         ),
     )
     .await

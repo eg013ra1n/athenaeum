@@ -1205,6 +1205,14 @@ impl SharedIrohNode {
         resolve_served_root_in(&self.served, hash)
     }
 
+    /// Test hook (A2b Step 1): a clone of the live endpoint, so a test can dial
+    /// providers itself and drive `store.remote()` directly — the only way to
+    /// prove what the store tolerates below the assignment loop.
+    #[cfg(test)]
+    pub(crate) fn endpoint_for_test(&self) -> Endpoint {
+        self.endpoint()
+    }
+
     /// Test hook (D3 Task 1): this node's live [`TransportCounters`], so a test
     /// can bracket an operation with two snapshots and assert on the bytes it
     /// actually moved.
@@ -1214,14 +1222,6 @@ impl SharedIrohNode {
     /// per-provider progress items are best-effort and lossy on this iroh-blobs
     /// version (see [`blobs::fetch_collection_multi`]), so a swarm test that
     /// asserts on telemetry alone is asserting on a sample, not on reality.
-    /// Test hook (A2b Step 1): a clone of the live endpoint, so a test can dial
-    /// providers itself and drive `store.remote()` directly — the only way to
-    /// prove what the store tolerates below the assignment loop.
-    #[cfg(test)]
-    pub(crate) fn endpoint_for_test(&self) -> Endpoint {
-        self.endpoint()
-    }
-
     #[cfg(test)]
     pub(crate) fn counters_snapshot_for_test(&self) -> TransportCounters {
         TransportCounters::snapshot(&self.endpoint())
@@ -2159,6 +2159,7 @@ impl SharedIrohNode {
             telemetry,
             assign::swarm_fetch_mode(),
             assign::STALL_HARD_LIMIT,
+            true,
         )
         .await
         .map(|_report| ())
@@ -2168,9 +2169,11 @@ impl SharedIrohNode {
     /// assignment loop's progress deadline chosen by the caller, returning the
     /// [`AssignmentReport`] production discards.
     ///
-    /// A test needs both: a deliberately trickling peer only trips a stall
-    /// ceiling shortened to its own patience, and the report is the only place
-    /// per-provider bytes are visible at all.
+    /// A test needs all three: a deliberately trickling peer only trips a stall
+    /// ceiling shortened to its own patience, the report is the only place
+    /// per-provider bytes are visible at all, and `hedging` has to be
+    /// switchable because a provider's reported bytes and its socket egress are
+    /// the same quantity only while it is off.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fetch_collection_multi_tuned_for_test(
@@ -2184,6 +2187,7 @@ impl SharedIrohNode {
         telemetry: ProviderTelemetrySink,
         mode: SwarmFetchMode,
         stall_hard_limit: std::time::Duration,
+        hedging: bool,
     ) -> Result<Option<AssignmentReport>> {
         self.role_fetch_multi_inner(
             role,
@@ -2195,6 +2199,7 @@ impl SharedIrohNode {
             telemetry,
             mode,
             stall_hard_limit,
+            hedging,
         )
         .await
     }
@@ -2211,6 +2216,7 @@ impl SharedIrohNode {
         telemetry: ProviderTelemetrySink,
         mode: SwarmFetchMode,
         stall_hard_limit: std::time::Duration,
+        hedging: bool,
     ) -> Result<Option<AssignmentReport>> {
         let hash: Hash = root_hash
             .parse()
@@ -2241,6 +2247,7 @@ impl SharedIrohNode {
             telemetry,
             mode,
             stall_hard_limit,
+            hedging,
         )
         .await?;
 
