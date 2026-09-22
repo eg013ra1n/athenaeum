@@ -10,15 +10,15 @@ Website and documentation: [artfrom.space](https://artfrom.space)
 
 ### File Manager
 
-Multi-root directory scanning with automatic FITS/XISF metadata extraction. Browse files with inline metadata display, track missing files, and search across your entire image library. Scanning is multi-threaded using rayon for fast indexing of large collections.
+Multi-root directory scanning with automatic FITS/XISF metadata extraction. Browse files with inline metadata display, track missing files, and search across your entire image library. Scanning is multi-threaded using rayon for fast indexing of large collections. A two-pane file browser handles moves (cross-volume moves are hash-verified), renames, bulk metadata edits and catalog search, keeping the catalog in sync with every operation.
 
 ### Shoot Calendar
 
-Month and year views of imaging sessions grouped by DATE-OBS. See at a glance which nights you captured data, with equipment and target breakdowns per session.
+Month and year views of imaging sessions grouped by imaging night (noon to noon, so a session that crosses midnight stays one night). See at a glance which nights you captured data, with equipment and target breakdowns per session.
 
 ### Objects Library
 
-Automatic frame set grouping by sky coordinates using DBSCAN clustering. Frames with nearby RA/Dec values are grouped into sets representing the same target. Supports merging and splitting sets, manual assignment, and configurable clustering thresholds.
+Automatic frame set grouping by sky coordinates: frames with nearby RA/Dec values are clustered into sets representing the same target. Supports merging and splitting sets, manual assignment, and configurable clustering thresholds.
 
 ### Sky Chart
 
@@ -34,15 +34,27 @@ Fully configurable calibration frame matching with 8 matchable parameters (instr
 
 ### Master Calibration Library
 
-Build master darks, flats, bias and dark-flats in-app from a matched raw calibration set -- no external stacker required. Masters register into the catalog exactly as a scanned file would, every consumer relinks onto them automatically, and the originals can be archived in the same step. Calibrated lights are written as 32-bit float FITS that WBPP or Siril consume with their own calibration step disabled.
+Build master darks, flats, bias and dark-flats in-app from a matched raw calibration set -- no external stacker required. Masters register into the catalog exactly as a scanned file would, every consumer relinks onto them automatically, and the originals can be archived in the same step.
+
+### Stacking
+
+Stack a frame set's lights into its own master light entirely in-app: calibration from the linked masters, hot-pixel correction and VNG debayering, PSF-based frame weighting, quad-seeded registration with polynomial or thin-plate-spline distortion (plate-solve seeded across pixel scales, so a bin-2 group or a second telescope stacks with the rest), local normalization, banded weighted integration with a choice of rejection algorithms, drizzle (including Bayer drizzle for OSC) and FITS or XISF output with WCS. Every per-frame stage is cached on disk, so a re-run only recomputes what changed.
+
+### Export
+
+Four export modes -- lights only, raw frames with their calibration sets, raw frames with masters, or **calibrated lights** generated on the fly as 32-bit float FITS that WBPP or Siril consume with their own calibration step disabled -- laid out in the folder hierarchy and keyword layout PixInsight's WeightedBatchPreprocessing expects, with symlinks instead of copies where the platform supports them. Includes calibration chain visualization showing which calibration frames will accompany each export.
+
+### Transfers
+
+Peer-to-peer transfers between your own devices over [iroh](https://iroh.computer), with per-file progress, resume, deduplication against the receiver's catalog and configurable bandwidth. A frame set can be sent in any export mode straight from the Export tab. **Perseus**, the bundled capture-agent CLI, watches an observatory machine's folders and ships new frames on a schedule.
+
+### Archive
+
+Move a finished frame set into one ZIP per frame type in an archive folder of your choice, keeping all catalog metadata. Restore is reconcile-based: it fills what is missing on disk and never overwrites.
 
 ### Plate Solving
 
 Blind and hinted solving against a tiered Gaia-derived star catalog, with the resulting WCS written back into the frame's metadata and used by the Sky Chart.
-
-### Export
-
-Export for PixInsight's WeightedBatchPreprocessing: files are organized into the folder hierarchy and keyword layout WBPP expects, with symlinks instead of copies where the platform supports them. Includes calibration chain visualization showing which calibration frames will accompany each export.
 
 ### Blink Viewer
 
@@ -70,6 +82,9 @@ Pre-built releases are available at [artfrom.space/releases/download](https://ar
 - **Windows**: MSI installer, EXE (NSIS)
 - **macOS**: DMG (universal binary -- Apple Silicon + Intel)
 - **Linux**: AppImage, DEB
+- **Docker**: `docker pull eg013ra1n/athenaeum` (web build for NAS and home servers)
+
+The desktop app checks for updates itself and installs them in place (signed with minisign).
 
 ## Building from Source
 
@@ -146,12 +161,16 @@ athenaeum/
 │   │       ├── calibration/      # Calibration matching engine and config
 │   │       ├── calibration_library/  # Master creation and light calibration
 │   │       ├── integration/      # Banded frame integration and combiners
+│   │       ├── stacking/         # Light stacking pipeline (measure, register, normalize, drizzle)
+│   │       ├── geometry/         # Pixel maps, distortion models, thin-plate splines
 │   │       ├── plate_solve/      # Plate-solving adapter
 │   │       ├── archive/          # ZIP archive lifecycle
 │   │       ├── file_op/          # Move pipeline with cross-volume verify
 │   │       ├── export/           # WBPP folder/keyword export
 │   │       ├── sync/             # Device-to-device transfers
 │   │       ├── sharing/          # iroh transport and wire protocol
+│   │       ├── collab/           # Collaboration projects (hub client)
+│   │       ├── updates/          # In-app update check
 │   │       └── services/         # ServiceContext, queues, ProgressEmitter
 │   ├── athenaeum-tauri/          # Desktop shell — commands/ wraps core
 │   ├── athenaeum-web/            # Axum HTTP/SSE server — routes/ mirrors commands
@@ -166,16 +185,28 @@ athenaeum/
 │   ├── pages/                    # One per view
 │   ├── hooks/                    # Custom React hooks
 │   └── types/                    # TypeScript mirrors of the Rust models
-└── docs/                         # Design documents and references
+└── docs/                         # Per-subsystem references, design specs, plans, research
 ```
+
+## Documentation
+
+- **Users**: [artfrom.space](https://artfrom.space) -- guides, release posts, downloads.
+- **Contributors**: [`CLAUDE.md`](./CLAUDE.md) is the map of the codebase -- the
+  rules, the workspace layout and a one-paragraph summary per subsystem with a
+  link to its reference. The references live under `docs/`
+  (`docs/stacking/README.md`, `docs/transfers/README.md`,
+  `docs/export/README.md`, `docs/masters/README.md`, `docs/catalog/README.md`,
+  …) and hold the details, the design rulings and the acceptance history.
+  Design specs, plans and research notes are in `docs/superpowers/`.
+  [`CONTRIBUTING.md`](./CONTRIBUTING.md) covers the pull-request process.
 
 ## Architecture
 
 Athenaeum runs on two backends over one shared library. `athenaeum-core` holds
 everything that is not transport: the SQLite catalog, FITS/XISF parsing,
-frame-set clustering, calibration matching, master creation, archiving, export
-and peer-to-peer transfers. The desktop shell is **Tauri 2**, exposing 232
-commands across 23 domain modules over Tauri's IPC; the web build is an **Axum**
+frame-set clustering, calibration matching, master creation, stacking,
+archiving, export and peer-to-peer transfers. The desktop shell is **Tauri 2**,
+exposing 259 commands across 24 domain modules over Tauri's IPC; the web build is an **Axum**
 server whose routes mirror those commands one-for-one and stream progress over
 SSE. The React frontend reaches whichever is active through a single `api`
 object, so no component knows which host it is running under.
@@ -188,11 +219,9 @@ against a Gaia-derived star catalog.
 
 ## Roadmap
 
-- Code-signing certificates for Windows and macOS
+- Code-signing certificate for Windows (macOS builds are signed and notarized)
 - Automated panoramic acquisitions grouping
-- Dockerized version for NAS deployment (Synology, Unraid, TrueNAS)
-- Internal stacking with modern algorithms
-- Online collaboration with download client
+- Online collaboration: shared projects with multi-source distribution (hub in private beta)
 - Planning and acquisition software integrations
 
 ## License

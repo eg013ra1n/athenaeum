@@ -275,14 +275,14 @@ export's own destination tree. There is still no token-templating engine here
   so it serializes with master builds and analysis rather than running
   concurrently with them.
 - The same generation logic runs during a frame-set **send** in this mode
-  (Transfers) instead of at folder-export time — see CLAUDE.md's
-  "Calibrated-Lights Export" section for the send-side and receiver behavior,
+  (Transfers) instead of at folder-export time — see
+  `docs/export/calibrated-lights.md` for the send-side and receiver behavior,
   which is out of scope for this file.
 
 Engine internals (the calibration formula itself, CFA flat handling, header
 whitelist, BITPIX-aware scaling) live in
 `crates/athenaeum-core/src/calibration_library/` and are documented in
-CLAUDE.md, not repeated here — this file covers only how the *export* feature
+`docs/export/calibrated-lights.md`, not repeated here — this file covers only how the *export* feature
 drives them.
 
 ## Project-scoped export (collab)

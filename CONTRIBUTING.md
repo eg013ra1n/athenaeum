@@ -90,10 +90,12 @@ Commit messages follow Conventional Commits — `feat:`, `fix:`, `docs:`,
 | `src/` | React/TypeScript frontend |
 | `docs/superpowers/specs/` | Design documents for the larger subsystems |
 
-`CLAUDE.md` at the repository root is the long-form architecture reference —
-subsystem by subsystem, with the invariants. It is written as guidance for an
-agent working in the repository, but it is the most complete description of how
-the system fits together and is worth reading before a substantial change.
+`CLAUDE.md` at the repository root holds the rules, the workspace map and a
+"Docs map" pointing at the per-subsystem references under `docs/` (stacking,
+transfers, export, masters, archive, catalog, …). Those references are written
+as guidance for an agent working in the repository, but together they are the
+most complete description of how the system fits together and are worth reading
+before a substantial change.
 
 ## Reporting bugs
 

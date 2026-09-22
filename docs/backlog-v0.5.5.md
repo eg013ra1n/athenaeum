@@ -223,8 +223,7 @@ solver could not tell a star from a streak. Fixed in `rustafits` (measure it,
 with a stamp that follows the star's size), `solvemyastro` (drop streaks
 before ranking) and `athenaeum-core` (feed the header scale to the acceptance
 gate that already knew how to use it, plus the analysis-based input gate the
-item originally asked for). Full reasoning in CLAUDE.md -> "Plate-solve input
-and acceptance gates".
+item originally asked for). Full reasoning in `docs/platesolving/input-and-acceptance-gates.md`.
 
 Verified: all four false solutions became refusals, both correct solutions
 kept their scale, and across a 29-frame test set 28 verdicts were unchanged

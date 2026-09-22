@@ -677,8 +677,9 @@ catalog has no artifact for)",
     // `stack_frames`, matching this probe's own ordering — the brief's
     // "first included frame"). Matches either the CALIBRATED file's own
     // stem (`c_<stem>`) or the original frame's (the calibrated-lights
-    // export convention strips a `c_` prefix — see CLAUDE.md's Calibrated-
-    // Lights Export section), so `--frame f0` and `--frame c_f0` both work.
+    // export convention strips a `c_` prefix — see
+    // `docs/export/calibrated-lights.md`), so `--frame f0` and `--frame c_f0`
+    // both work.
     let target_index = match &args.frame {
         Some(want) => candidates
             .iter()
