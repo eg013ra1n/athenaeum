@@ -57,6 +57,20 @@ pub struct ThresholdRuleView {
     pub value: serde_json::Value,
 }
 
+/// The threshold metric registry (collab v3 spec §6.3) — the app's copy. The
+/// hub's `src/collab_rules.rs` and the portal's `metrics.ts` are the other two;
+/// the test `registry_matches_the_evaluator` pins this one to the match arms
+/// below. `lte`/`gte` compare a number; `reject_if` takes the literal `true`.
+pub const METRIC_REGISTRY: &[(&str, &[&str])] = &[
+    ("fwhm_arcsec", &["lte", "gte"]),
+    ("eccentricity", &["lte", "gte"]),
+    ("stars_detected", &["lte", "gte"]),
+    ("median_snr", &["lte", "gte"]),
+    ("snr_weight", &["lte", "gte"]),
+    ("frame_snr", &["lte", "gte"]),
+    ("not_trailed", &["reject_if"]),
+];
+
 /// Everything the gate needs about one frame, resolved by the caller.
 pub struct GateFrameInput {
     pub frame_id: i64,
@@ -341,5 +355,29 @@ mod tests {
         .unwrap();
         let row = evaluate_frame(&input(Some(a)), &target(), &r);
         assert!(!row.publishable);
+    }
+
+    /// The registry constant and the match arms in `evaluate_frame` are two
+    /// statements of the same fact; this test makes them one. Every registry
+    /// metric with a satisfiable value must produce a failure when the rule is
+    /// violated, and a key outside the registry must be skipped.
+    #[test]
+    fn registry_matches_the_evaluator() {
+        assert_eq!(
+            METRIC_REGISTRY.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            ["fwhm_arcsec", "eccentricity", "stars_detected", "median_snr", "snr_weight", "frame_snr", "not_trailed"]
+        );
+        let mut a = analysis(1.2, 0.4, 400, true);
+        a.median_snr = 1.0;
+        a.snr_weight = 1.0;
+        a.frame_snr = 1.0;
+        for (key, ops) in METRIC_REGISTRY {
+            for op in *ops {
+                let value = if *key == "not_trailed" { serde_json::json!(true) } else if *op == "lte" { serde_json::json!(0.0001) } else { serde_json::json!(1_000_000) };
+                let rule: ThresholdRuleView = serde_json::from_value(serde_json::json!({"metricKey": key, "op": op, "value": value})).unwrap();
+                let row = evaluate_frame(&input(Some(a.clone())), &target(), &[rule]);
+                assert!(!row.publishable, "{key} {op} must be enforceable, failures: {:?}", row.failures);
+            }
+        }
     }
 }
