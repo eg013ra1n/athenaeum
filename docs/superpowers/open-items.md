@@ -202,6 +202,26 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Collab v3 wave 0 (2026-09-23)
+
+Spec `docs/superpowers/specs/2026-09-23-collab-v3-per-frame-model-design.md` §6.3, plan
+`docs/superpowers/plans/2026-09-23-collab-v3-wave0-portal-thresholds-plan.md`. The portal
+threshold editor (dropdowns for metric/op, unit-aware value parsing), the hub's
+`collab_rules.rs` metric registry gating `POST /projects/{id}/thresholds`, the door fields
+in Admin and the members & roles editor.
+
+- **Owed**: portal click-through on the test hub after deploy
+  (`hub_artifact_ref=collab-v3-wave0`) — Admin → Quality thresholds: add a rule, type `0.6`
+  into eccentricity, save, see v2 in "Previous versions"; grant a member `thresholds.edit`,
+  sign in as them, see the editor and no settings; change the door from Admin; Members &
+  roles: change a role and a capability; zero console errors. Not run locally.
+- **Owed**: test-hub deploy of `collab-v3-wave0` and the post-deploy check that
+  `POST /projects/{id}/thresholds` with `{"metricKey":"fwhm"}` answers 400
+  `unknown metric "fwhm"`.
+- **Do NOT re-flag**: `zero_point` is deliberately absent from all three registry copies
+  (hub `collab_rules.rs`, portal `metrics.ts`, app `collab/gate.rs::METRIC_REGISTRY`) until
+  wave 3 (spec §6.3).
+
 ### Stacking perf Tier C (2026-09-20)
 
 Spec `docs/superpowers/specs/2026-09-20-stacking-compute-tierC-design.md`, plan
