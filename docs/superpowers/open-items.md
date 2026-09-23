@@ -202,6 +202,43 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Collab v3 wave 1 (2026-09-24)
+
+Spec `docs/superpowers/specs/2026-09-23-collab-v3-per-frame-model-design.md` §4, plan
+`docs/superpowers/plans/2026-09-23-collab-v3-wave1-hub-per-frame-model-plan.md`. Hub-only:
+replaces the package-centred collaboration API with a per-frame one — announce (batch ≤500,
+8 MB body cap), `GET manifest?since&after&limit` keyset delta, `POST …/frames/{uuid}/version`
+in-place content supersede, `PATCH …/frames/{uuid}` accept/exclude + filter remap, `POST
+…/approve {trust}` / `POST …/reject {reason}` (refused once seeded elsewhere, R13), per-device
+holder reporting (`PUT …/holders/self`) and per-frame holder reads, a versioned filter
+dictionary, direct `trusted_publisher` grant/revoke, the project's canonical registration grid,
+and `GET /me/project-versions` (in-process cache, the one poll every device repeats every 15 s).
+Migration `0022_per_frame_model.sql` drops the package tables outright — refuses to run at all
+on a database that still holds a `package_announcements` row. The app repo's own client does not
+speak this surface yet (that is wave 2) — every request the desktop app makes to a wave-1 hub
+still hits the OLD package routes, which now answer `409 collab_api_outdated` instead of doing
+package work. Hub `README.md` rewritten to match (route table + "Frames, the manifest and
+holders" section).
+
+- **Verified by the controller**: migration replay on a scratch DB — 0001–0021 applied cleanly,
+  then 0022 against a `package_announcements` table holding one row refused with the exact §11
+  message (`"package_announcements is not empty; collab v3 does not migrate packages (spec
+  §11)"`); the row deleted, 0022 re-run, success — `project_frames` present, `package_announcements`
+  gone. Full hub suite green at `6761b09` (202/0), portal suite green at `ac704d5` (214/0), tsc +
+  build clean, hub release build 0 warnings.
+- **Owed**: test-hub deploy of `collab-v3-wave1`
+  (`ansible-playbook deploy_athenaeum_hub.yml -e hub_target=athenaeum_hub_test -e
+  hub_artifact_ref=collab-v3-wave1 -e @~/.config/athenaeum-hub/smtp.yml`) and, after it lands,
+  three checks against the test DB/host: `SELECT count(*) FROM project_frames;` comes back
+  non-negative (table exists, migration applied); `curl` the retired
+  `POST https://test-hub.artfrom.space/api/v1/projects/{id}/announcements` (any body) answers
+  `409 {"error":"collab_api_outdated"}`; `curl -H "Authorization: Bearer <deviceToken>"
+  https://test-hub.artfrom.space/api/v1/me/project-versions` answers `200` with `[]` (no
+  memberships) or a `[{projectId,version}, …]` list, never an error.
+- **Do NOT re-flag**: the desktop app talking to a wave-1-or-later hub and getting
+  `409 collab_api_outdated` on every collaboration call is EXPECTED until the app's own wave 2
+  client ships — it is the compat gate working as designed (spec §11), not a hub regression.
+
 ### Collab v3 wave 0 (2026-09-23)
 
 Spec `docs/superpowers/specs/2026-09-23-collab-v3-per-frame-model-design.md` §6.3, plan
