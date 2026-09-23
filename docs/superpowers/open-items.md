@@ -212,8 +212,12 @@ in Admin and the members & roles editor.
 
 - **Owed**: portal click-through on the test hub after deploy
   (`hub_artifact_ref=collab-v3-wave0`) — Admin → Quality thresholds: add a rule, type `0.6`
-  into eccentricity, save, see v2 in "Previous versions"; grant a member `thresholds.edit`,
-  sign in as them, see the editor and no settings; change the door from Admin; Members &
+  into eccentricity, save, see v1 (not v2 — the current version is filtered out) under
+  "Previous versions"; grant a member `thresholds.edit` ALONE (no `members.manage`), sign in
+  as them, see the editor and neither the queue nor the roster nor settings, AND confirm the
+  project page now offers them a "Manage" entry link to Admin (final-review finding 1 — the
+  page gate and the entry links both admit any of `members.manage`/`invites.manage`/
+  `thresholds.edit`, not `members.manage` alone); change the door from Admin; Members &
   roles: change a role and a capability; zero console errors. Not run locally.
 - **Owed**: test-hub deploy of `collab-v3-wave0` and the post-deploy check that
   `POST /projects/{id}/thresholds` with `{"metricKey":"fwhm"}` answers 400

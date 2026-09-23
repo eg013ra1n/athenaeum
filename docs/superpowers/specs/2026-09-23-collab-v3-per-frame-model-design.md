@@ -346,7 +346,7 @@ One registry, three copies that must agree, pinned by tests on each side:
 App: `collab/gate.rs` keeps the match; unknown rules are still skipped with a
 `warn!` (defence in depth) but the hub no longer stores them. Hub:
 `validate_rules` rejects unknown keys, ops and value kinds with a message
-naming the rule. Portal: `METRICS` constant in `portal/src/types.ts` drives
+naming the rule. Portal: `METRICS` constant in `portal/src/metrics.ts` drives
 three `Select`s and a number input with the unit as suffix; the value field
 keeps the raw string while editing and parses on blur (fixes `0.6`).
 

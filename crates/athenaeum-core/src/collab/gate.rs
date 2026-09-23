@@ -360,7 +360,8 @@ mod tests {
     /// The registry constant and the match arms in `evaluate_frame` are two
     /// statements of the same fact; this test makes them one. Every registry
     /// metric with a satisfiable value must produce a failure when the rule is
-    /// violated, and a key outside the registry must be skipped.
+    /// violated, and a key outside the registry must be skipped, not merged
+    /// into the enforceable set above by mistake.
     #[test]
     fn registry_matches_the_evaluator() {
         assert_eq!(
@@ -379,5 +380,17 @@ mod tests {
                 assert!(!row.publishable, "{key} {op} must be enforceable, failures: {:?}", row.failures);
             }
         }
+
+        // A key outside the registry, appended to an otherwise-passing rule
+        // set, must be skipped rather than blocking the frame.
+        let mut r = rules();
+        r.push(
+            serde_json::from_value(serde_json::json!(
+                {"metricKey": "made_up", "op": "lte", "value": 1.0}
+            ))
+            .unwrap(),
+        );
+        let row = evaluate_frame(&input(Some(analysis(1.2, 0.4, 400, false))), &target(), &r);
+        assert!(row.publishable, "a key outside the registry must not block: {:?}", row.failures);
     }
 }
