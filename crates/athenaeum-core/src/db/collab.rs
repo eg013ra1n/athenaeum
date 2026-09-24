@@ -126,7 +126,7 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
 /// A refresh of a project marked lost ([`mark_lost`]) is a re-join: it clears
 /// `lost_at`.
 ///
-/// Six columns are deliberately NOT in the list, each written only by its own
+/// Nine columns are deliberately NOT in the list, each written only by its own
 /// setter so a wholesale poll refresh can never clobber it:
 /// `auto_replicate`/`policy_json`/`replication_paused`/`auto_publish` are LOCAL
 /// preferences; `hub_version`/`manifest_cursor`/`synced_caps_json` are the

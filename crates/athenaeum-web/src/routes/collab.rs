@@ -239,8 +239,8 @@ pub async fn set_project_auto_publish(
 
 /// D3 §3.3 "Sync now": run one auto-replication pass for this project
 /// immediately, with the toggle forced on (an explicit user act). Returns as soon
-/// as the pass is spawned — progress rides the usual `local_status` +
-/// `project-download-progress` / `sync-finished` SSE events.
+/// as the pass is spawned — its outcomes ride the `collab-frames-landed` and
+/// `collab-replication-paused` SSE events.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn sync_project_now(
     State(state): State<WebAppState>,

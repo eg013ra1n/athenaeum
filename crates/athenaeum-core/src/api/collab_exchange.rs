@@ -1066,6 +1066,9 @@ pub struct DiskTruth {
     /// and took their shared store entry with it (P20/P24): their file is
     /// fine, but the store cannot serve it until GC drops the dead entry.
     pub parked: Vec<String>,
+    /// Present frames seeded again because no seed tag of theirs was left
+    /// (final review I2, defence in depth).
+    pub reseeded: Vec<String>,
 }
 
 /// What one [`fetch_frames`] call did.
@@ -1250,8 +1253,11 @@ async fn unseed_frame(
 /// in-flight sweep on one side and a landing on the other (ruling R18). Disk
 /// truth holds it per row, a landing per frame, and nobody ever holds it
 /// across a network fetch — so the maintenance loop and a multi-hour fetch
-/// interleave frame by frame. Keyed by catalog + project.
-fn project_disk_lock(
+/// interleave frame by frame. Keyed by catalog + project. The publish run
+/// holds it too, per frame, across rename → seed → own-row write (final
+/// review I2), so disk truth never sees a regenerated file its row does not
+/// describe yet.
+pub(crate) fn project_disk_lock(
     ctx: &ServiceContext,
     project_id: &str,
 ) -> Result<Arc<tokio::sync::Mutex<()>>, ApiError> {
@@ -1269,7 +1275,13 @@ fn project_disk_lock(
 /// The designated Collaboration root, without the "required" warning (a
 /// caller that already required it, or one where it is optional).
 fn collaboration_root_quiet(ctx: &ServiceContext) -> Option<PathBuf> {
-    let db = db(ctx).ok()?;
+    let db = match db(ctx) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(error = %e, "read collaboration root failed: catalog unavailable");
+            return None;
+        }
+    };
     let conn = db.conn();
     match crate::db::scan_root_path_of_kind(&conn, "collaboration") {
         Ok(p) => p.map(PathBuf::from),
@@ -1294,6 +1306,89 @@ fn mounted_collaboration_root(ctx: &ServiceContext) -> Option<PathBuf> {
             "collaboration folder is not reachable; replication skipped"
         );
         None
+    }
+}
+
+/// How long a failed lazy mount waits before the next attempt (I3).
+const COLLAB_MOUNT_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per catalog: when the last lazy mount attempt ran, and whether its failure
+/// was already logged at `warn!` (the latch — later failures log at `debug!`
+/// until a mount succeeds).
+static COLLAB_MOUNT_ATTEMPTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>,
+> = std::sync::OnceLock::new();
+
+/// The collab store of the bound node, mounting it lazily when the
+/// Collaboration root exists but the store is not mounted (final review I3):
+/// a root that appeared after startup (a volume plugged in late) or whose
+/// mount at bind failed is otherwise never retried. Rate-limited to one
+/// attempt per [`COLLAB_MOUNT_RETRY`] per catalog; the first failure logs a
+/// `warn!`, later ones `debug!`, until a mount succeeds. Never binds a node.
+/// `None` = no node, no root, or still unmounted — the caller must then
+/// neither report holds nor fetch nor publish (the device cannot serve).
+pub(crate) async fn ensure_collab_store(ctx: &ServiceContext) -> Option<iroh_blobs::api::Store> {
+    let node = bound_node(ctx).await?;
+    if let Some(store) = node.collab_store() {
+        return Some(store);
+    }
+    let root = collaboration_root_quiet(ctx)?;
+    if !root.is_dir() {
+        return None;
+    }
+    let key = match db(ctx) {
+        Ok(db) => db.path().display().to_string(),
+        Err(e) => {
+            tracing::warn!(error = %e, "lazy collab store mount skipped: catalog unavailable");
+            return None;
+        }
+    };
+    let already_warned = {
+        let mut attempts = COLLAB_MOUNT_ATTEMPTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match attempts.get(&key) {
+            Some((at, _)) if at.elapsed() < COLLAB_MOUNT_RETRY => return None,
+            Some((_, warned)) => {
+                let warned = *warned;
+                attempts.insert(key.clone(), (std::time::Instant::now(), warned));
+                warned
+            }
+            None => {
+                attempts.insert(key.clone(), (std::time::Instant::now(), false));
+                false
+            }
+        }
+    };
+    match node.set_collab_root(Some(&root)).await {
+        Ok(()) => {
+            if let Some(attempts) = COLLAB_MOUNT_ATTEMPTS.get() {
+                attempts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&key);
+            }
+            tracing::info!(path = %root.display(), "collab store mounted lazily");
+            node.collab_store()
+        }
+        Err(e) => {
+            if already_warned {
+                tracing::debug!(path = %root.display(), error = %format!("{e:#}"), "lazy collab store mount failed again");
+            } else {
+                tracing::warn!(path = %root.display(), error = %format!("{e:#}"), "lazy collab store mount failed; holds, fetch and publish wait for it");
+                if let Some(attempts) = COLLAB_MOUNT_ATTEMPTS.get() {
+                    if let Some(entry) = attempts
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get_mut(&key)
+                    {
+                        entry.1 = true;
+                    }
+                }
+            }
+            None
+        }
     }
 }
 
@@ -1419,6 +1514,9 @@ pub(crate) async fn disk_truth(
             }
         };
         if present {
+            if reseed_if_untagged(node.as_ref(), project_id, &row, path).await {
+                truth.reseeded.push(row.frame_uuid.clone());
+            }
             truth
                 .present
                 .push((row.frame_uuid.clone(), row.content_version));
@@ -1496,6 +1594,52 @@ pub(crate) async fn disk_truth(
         "disk truth"
     );
     Ok(truth)
+}
+
+/// Defence in depth (final review I2): a present frame — its file matches
+/// the row — must be seeded, or the device reports a hold it cannot serve.
+/// When NO seed tag of the frame is left, seed the file again at the row's
+/// content version; the store must hash it to the row's BLAKE3, else that
+/// tag is dropped again (`warn!`). A frame tagged at another version is left
+/// alone: a publish is moving it to a new version right now. Called under
+/// the project's disk lock. `true` when a tag was restored.
+async fn reseed_if_untagged(
+    node: Option<&Arc<crate::sharing::iroh::node::SharedIrohNode>>,
+    project_id: &str,
+    row: &LocalFrameRow,
+    path: &Path,
+) -> bool {
+    let Some(node) = node else { return false };
+    let Some(store) = node.collab_store() else {
+        return false;
+    };
+    match node.project_frame_tags(project_id, &row.frame_uuid).await {
+        Ok(tags) if tags.is_empty() => {}
+        // Tagged (at this version, or a publish is moving it): nothing to do.
+        Ok(_) => return false,
+        // Logged inside; retried on the next walk.
+        Err(_) => return false,
+    }
+    let hash = match node
+        .seed_project_frame(project_id, &row.frame_uuid, row.content_version, path)
+        .await
+    {
+        Ok(hash) => hash,
+        // Logged inside `seed_project_frame`; retried on the next walk.
+        Err(_) => return false,
+    };
+    if hash.to_hex().to_string() != row.blake3 {
+        let tag = crate::sharing::iroh::node::project_frame_tag(
+            project_id,
+            &row.frame_uuid,
+            row.content_version,
+        );
+        tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %path.display(), hash = %hash, "present frame hashes to other content than its row; not re-seeded");
+        drop_tag(&store, &tag).await;
+        return false;
+    }
+    tracing::warn!(project_id, frame_uuid = %row.frame_uuid, content_version = row.content_version, path = %path.display(), "present frame had no seed tag; seeded again");
+    true
 }
 
 /// Re-admit a frame whose file is back at its landed path (a rescan's
@@ -1708,8 +1852,11 @@ pub(crate) struct MaintenanceOutcome {
 /// [`report_holders`] — for every role, a `send` member still holds its own
 /// frames — then the parked-frame recheck (P20) and the in-flight sweep
 /// (R23). Signed out, no Collaboration root, or a root that is not reachable
-/// ⇒ nothing (one `warn!`). Never returns an error: each project's failure
-/// is logged and stepped over.
+/// ⇒ nothing (one `warn!`). A collab store that is not mounted is mounted
+/// lazily first ([`ensure_collab_store`]); while it stays unmounted the holder
+/// report is skipped — a device that cannot serve must not claim holds (final
+/// review I3). Never returns an error: each project's failure is logged and
+/// stepped over.
 pub(crate) async fn run_maintenance(
     ctx: &ServiceContext,
     scope: Option<&str>,
@@ -1726,6 +1873,13 @@ pub(crate) async fn run_maintenance(
     }
     if mounted_collaboration_root(ctx).is_none() {
         return outcome;
+    }
+    let store_mounted = ensure_collab_store(ctx).await.is_some();
+    if !store_mounted {
+        tracing::warn!(
+            outcome = "collab_store_unmounted",
+            "collab maintenance: the collab store is not mounted; holder reports skipped"
+        );
     }
     let projects = match db(ctx).and_then(|d| Ok(crate::db::collab::list_projects(&d.conn())?)) {
         Ok(rows) => rows,
@@ -1754,7 +1908,11 @@ pub(crate) async fn run_maintenance(
             }
         }
         // The truth goes to the hub either way — a paused project still stops
-        // advertising what it lost.
+        // advertising what it lost. Not while the store is unmounted (I3):
+        // nothing could be served, so no hold is claimed.
+        if !store_mounted {
+            continue;
+        }
         // N2: what is on disk NOW — a frame landed while the walk ran is
         // held too.
         let present = match db(ctx)
@@ -2121,10 +2279,15 @@ pub(crate) async fn fetch_frames_gated(
         tracing::warn!(project_id, error = %e, "replication fetch refused");
         return Err(e);
     };
-    let Some(store) = node.collab_store() else {
-        let e = ApiError::Internal("the collaboration store is not mounted".into());
-        tracing::warn!(project_id, error = %e, "replication fetch refused");
-        return Err(e);
+    // I3: mount lazily; while the store stays unmounted the fetch is
+    // skipped (nothing could land by reference), never an error per pass.
+    let Some(store) = ensure_collab_store(ctx).await else {
+        tracing::warn!(
+            project_id,
+            outcome = "collab_store_unmounted",
+            "replication fetch skipped: the collab store is not mounted"
+        );
+        return Ok(outcome);
     };
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
         tracing::debug!(project_id, "replication fetch skipped: signed out");
@@ -2458,10 +2621,12 @@ async fn prepare_batch(
         };
         let providers: Vec<(NodeId, Option<String>)> = holders
             .iter()
-            .filter_map(|h| {
-                pairing::node_id_from_pubkey_b64(&h.pubkey)
-                    .ok()
-                    .map(|n| (n, h.relay_url.clone()))
+            .filter_map(|h| match pairing::node_id_from_pubkey_b64(&h.pubkey) {
+                Ok(n) => Some((n, h.relay_url.clone())),
+                Err(e) => {
+                    tracing::warn!(project_id = pid, frame_uuid = %uuid, error = %format!("{e:#}"), "holder pubkey does not decode; holder skipped");
+                    None
+                }
             })
             .filter(|(n, _)| *n != env.own)
             .collect();
@@ -2727,17 +2892,26 @@ fn new_landing_path(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<PathBuf, 
 ///   `unique_path` first — it becomes an inert foreign file (R24, R18).
 ///
 /// Anything else goes to [`new_landing_path`].
-async fn landing_target(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<PathBuf, String> {
+///
+/// Returns the target and whether the file already there holds this frame's
+/// content (size + xxh3) — then the caller must NOT export over it (final
+/// review C1: `export_child` clears its target first, and when that file is
+/// the store entry's only data the export destroys the frame).
+async fn landing_target(
+    env: &FetchEnv<'_>,
+    row: &LocalFrameRow,
+) -> Result<(PathBuf, bool), String> {
     let existing = row
         .landed_path
         .as_deref()
         .map(PathBuf::from)
         .filter(|p| inside_root(Some(&env.collab_root), row, p));
     let Some(dest) = existing else {
-        return new_landing_path(env, row);
+        return new_landing_path(env, row).map(|p| (p, false));
     };
     unseed_frame(Some(&env.node), env.pid(), &row.frame_uuid).await;
-    if row.size_mtime_seen.is_some() && dest.exists() && !holds_frame_content(&dest, row).await {
+    let holds = dest.exists() && holds_frame_content(&dest, row).await;
+    if row.size_mtime_seen.is_some() && dest.exists() && !holds {
         let aside = crate::sync::ingest::unique_path(&dest);
         std::fs::rename(&dest, &aside).map_err(|e| {
             format!(
@@ -2754,7 +2928,7 @@ async fn landing_target(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<PathB
             "edited replica kept beside the re-fetched frame"
         );
     }
-    Ok(dest)
+    Ok((dest, holds))
 }
 
 /// Does the file at `path` already hold this frame's content (size first,
@@ -2797,7 +2971,7 @@ async fn land_frame(env: &FetchEnv<'_>, row: &LocalFrameRow, hash: iroh_blobs::H
             return Landed::Failed;
         }
     };
-    let dest = match landing_target(env, &row).await {
+    let (dest, holds) = match landing_target(env, &row).await {
         Ok(d) => d,
         Err(msg) => {
             fail(msg);
@@ -2812,7 +2986,17 @@ async fn land_frame(env: &FetchEnv<'_>, row: &LocalFrameRow, hash: iroh_blobs::H
             return Landed::Failed;
         }
     }
-    match blobs::export_child(&env.store, hash, &dest).await {
+    // C1: the file at the target already IS this content (a version bump
+    // with identical bytes, or a same-version re-land over an intact copy).
+    // Exporting would clear the target first and — when that file is the
+    // store entry's only data — destroy the frame. Tag and record it as is.
+    let exported = if holds {
+        tracing::info!(project_id = pid, frame_uuid = uuid, path = %dest.display(), "landed file already holds the frame; no export");
+        Ok(Ok(()))
+    } else {
+        blobs::export_child(&env.store, hash, &dest).await
+    };
+    match exported {
         Err(e) => {
             fail(format!("export to {}: {e:#}", dest.display()));
             drop_tag(&env.store, &in_flight).await;
@@ -2844,7 +3028,9 @@ async fn land_frame(env: &FetchEnv<'_>, row: &LocalFrameRow, hash: iroh_blobs::H
         .await
     {
         fail(format!("seed tag {tag}: {e}"));
-        remove_landed(&dest);
+        if !holds {
+            remove_landed(&dest);
+        }
         drop_tag(&env.store, &in_flight).await;
         return Landed::Failed;
     }
@@ -2860,7 +3046,9 @@ async fn land_frame(env: &FetchEnv<'_>, row: &LocalFrameRow, hash: iroh_blobs::H
         }
         Err(e) => {
             fail(format!("record landing: {e:#}"));
-            remove_landed(&dest);
+            if !holds {
+                remove_landed(&dest);
+            }
             unseed_frame(Some(&env.node), pid, uuid).await;
             Landed::Failed
         }
@@ -2878,15 +3066,22 @@ async fn forget_stale_landing(env: &FetchEnv<'_>, row: &LocalFrameRow, tag: &str
         "frame changed while landing; left for the next pass"
     );
     drop_tag(&env.store, tag).await;
-    let referenced = db(env.ctx)
-        .ok()
-        .and_then(|db| {
-            crate::db::collab_frames::get(&db.conn(), env.pid(), &row.frame_uuid)
-                .ok()
-                .flatten()
-        })
-        .and_then(|r| r.landed_path)
-        .is_some_and(|p| Path::new(&p) == dest);
+    // M3: a failed read must never pick the destructive default — keep the
+    // file (at worst an inert leftover) and log.
+    let current = match db(env.ctx) {
+        Ok(db) => crate::db::collab_frames::get(&db.conn(), env.pid(), &row.frame_uuid)
+            .map_err(|e| format!("{e:#}")),
+        Err(e) => Err(e.to_string()),
+    };
+    let referenced = match current {
+        Ok(current) => current
+            .and_then(|r| r.landed_path)
+            .is_some_and(|p| Path::new(&p) == dest),
+        Err(e) => {
+            tracing::warn!(project_id = env.pid(), frame_uuid = %row.frame_uuid, path = %dest.display(), error = %e, "stale landing: re-reading the frame failed; the file is kept");
+            true
+        }
+    };
     if !referenced {
         remove_landed(dest);
     }
@@ -2965,7 +3160,7 @@ async fn link_identical(env: &FetchEnv<'_>, row: &LocalFrameRow, src: &Path) -> 
     };
     tracing::warn!(project_id = pid, frame_uuid = uuid, path = %src.display(), "identical frame content in project");
     let dest = match landing_target(env, &row).await {
-        Ok(d) => d,
+        Ok((d, _)) => d,
         Err(msg) => {
             fail(msg);
             return Landed::Failed;
@@ -3617,6 +3812,9 @@ pub fn set_project_auto_replicate(
 ) -> Result<(), ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
+    // R14: a lost project is not a live one — same check as every other
+    // project-scoped command.
+    live_project(&conn, project_id)?;
     let updated = crate::db::collab::set_auto_replicate(&conn, project_id, enabled)?;
     if updated == 0 {
         return Err(ApiError::Invalid(format!("unknown project {project_id}")));
@@ -4251,6 +4449,18 @@ mod tests {
             set_project_auto_replicate(&ctx, "no-such-project", false).is_err(),
             "an unknown project is a user-visible error, not a silent no-op"
         );
+
+        // Final review M4 (R14): a lost project is refused like every other
+        // project-scoped command, and its stored preference is left alone.
+        {
+            let conn = db(&ctx).unwrap().conn();
+            crate::db::collab::mark_lost(&conn, "p-auto").unwrap();
+        }
+        match set_project_auto_replicate(&ctx, "p-auto", false) {
+            Err(ApiError::NotFound(m)) => assert_eq!(m, "project no longer joined"),
+            other => panic!("expected the lost-project refusal, got {other:?}"),
+        }
+        assert!(toggle(&ctx), "a lost project's preference is untouched");
     }
 
     // ── Task 8 (wave 2): version poll + manifest delta, against the fake hub ──
@@ -5684,6 +5894,101 @@ mod tests {
 
         // ── disk truth ───────────────────────────────────────────────────────
 
+        /// Final review M3: a stale landing whose row cannot be re-read keeps
+        /// its file (never the destructive default); once the row reads and
+        /// does not reference the file, the file goes.
+        #[tokio::test]
+        async fn a_stale_landing_keeps_its_file_when_the_row_cannot_be_read() {
+            let r = rfx("send_receive").await;
+            let node = bind_receiver(&r).await;
+            land_file(&r, "f1", FrameOrigin::Replica, &pattern(1, 256));
+            let row = row(&r.ctx, "f1").unwrap();
+            let stale = r.collab.join("m31").join("other").join("stale.fits");
+            std::fs::write(&stale, b"stale bytes").unwrap();
+            let project = {
+                let conn = db(&r.ctx).unwrap().conn();
+                crate::db::collab::get_project(&conn, PID).unwrap().unwrap()
+            };
+            let env = FetchEnv {
+                ctx: &r.ctx,
+                store: node.collab_store().unwrap(),
+                client: CollabClient::new(&r.hub.uri()).unwrap(),
+                token: "tok".into(),
+                relay_urls: Vec::new(),
+                own: node.node_id(),
+                project,
+                collab_root: r.collab.clone(),
+                started_at: crate::sync::now_iso(),
+                forced: false,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                lock: project_disk_lock(&r.ctx, PID).unwrap(),
+                node: Arc::clone(&node),
+            };
+            let tag = crate::sharing::iroh::node::project_frame_tag(PID, "f1", 1);
+            let rename = |from: &str, to: &str| {
+                db(&r.ctx)
+                    .unwrap()
+                    .conn()
+                    .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))
+                    .unwrap();
+            };
+
+            rename("project_frames_local", "pfl_aside");
+            forget_stale_landing(&env, &row, &tag, &stale).await;
+            assert!(stale.exists(), "an unreadable row keeps the file");
+
+            rename("pfl_aside", "project_frames_local");
+            forget_stale_landing(&env, &row, &tag, &stale).await;
+            assert!(!stale.exists(), "an unreferenced stale file goes");
+            node.shutdown().await;
+        }
+
+        /// Final review I2 (defence in depth): a present frame whose seed
+        /// tag is gone is seeded again at its version — only when the file
+        /// hashes to the row's BLAKE3, and never while the frame is tagged at
+        /// another version (a publish moving it right now).
+        #[tokio::test]
+        async fn a_present_untagged_frame_is_seeded_again() {
+            let r = rfx("send_receive").await;
+            let node = bind_receiver(&r).await;
+            land_file(&r, "f1", FrameOrigin::Replica, &pattern(1, 64 * 1024));
+            let wrong = land_file(&r, "f2", FrameOrigin::Own, &pattern(2, 64 * 1024));
+            let moving = land_file(&r, "f3", FrameOrigin::Own, &pattern(3, 64 * 1024));
+            {
+                // f2's row names other content than its (intact) file.
+                let conn = db(&r.ctx).unwrap().conn();
+                conn.execute(
+                    "UPDATE project_frames_local SET blake3 = ?1 WHERE frame_uuid = 'f2'",
+                    [blake3::hash(b"something else").to_hex().to_string()],
+                )
+                .unwrap();
+            }
+            // f3 is being moved to version 2 by a publish.
+            node.seed_project_frame(PID, "f3", 2, &moving)
+                .await
+                .unwrap();
+
+            let truth = disk_truth(&r.ctx, PID).await.unwrap();
+            assert_eq!(truth.reseeded, vec!["f1".to_string()], "{truth:?}");
+            assert_eq!(collab_tags(&node, "project/p1/f1/1").await, 1);
+            assert_eq!(
+                collab_tags(&node, "project/p1/f2/").await,
+                0,
+                "wrong content: not re-seeded"
+            );
+            assert_eq!(
+                collab_tags(&node, "project/p1/f3/1").await,
+                0,
+                "a moving frame is left alone"
+            );
+            assert_eq!(collab_tags(&node, "project/p1/f3/2").await, 1);
+            assert!(std::fs::metadata(&wrong).is_ok(), "no file is touched");
+
+            let again = disk_truth(&r.ctx, PID).await.unwrap();
+            assert!(again.reseeded.is_empty(), "tagged now: {again:?}");
+            node.shutdown().await;
+        }
+
         /// A deleted replica is missing: `on_disk` drops, its seed tags go,
         /// and its store entry (dead now) makes it wait for GC (P20).
         #[tokio::test]
@@ -5978,6 +6283,8 @@ mod tests {
         #[tokio::test]
         async fn full_report_carries_only_present_frames() {
             let r = rfx("send_receive").await;
+            // I3: holds are reported only with the collab store mounted.
+            let node = bind_receiver(&r).await;
             r.hub.seed_frames(PID, "acc-me", &["f1", "f2"], "published");
             sync_rows(&r).await;
             let me = B64.encode(own_node_for(&r.ctx));
@@ -6018,6 +6325,7 @@ mod tests {
             );
             assert!(r.hub.holders_of(PID, "f2").is_empty(), "no phantom holder");
             assert_eq!(r.hub.holders_of(PID, "f1"), vec![me]);
+            node.shutdown().await;
         }
 
         /// P8: above 10 000 held frames the first chunk goes `full`, the rest
@@ -6048,6 +6356,8 @@ mod tests {
         #[tokio::test]
         async fn a_fetch_pass_walks_no_disk_and_sends_no_full_report() {
             let r = rfx("send_receive").await;
+            // I3: holds are reported only with the collab store mounted.
+            let node = bind_receiver(&r).await;
             r.hub.seed_frames(PID, "acc-o", &["n1"], "published");
             sync_rows(&r).await;
             let path = land_file(&r, "f1", FrameOrigin::Replica, &pattern(1, 256));
@@ -6071,6 +6381,7 @@ mod tests {
             assert!(!row(&r.ctx, "f1").unwrap().on_disk);
             let reqs = r.hub.server.received_requests().await.unwrap();
             assert_eq!(holder_puts(&reqs[from..]).len(), 1);
+            node.shutdown().await;
         }
 
         /// A `send` member replicates nothing (but still reports what it
@@ -6079,6 +6390,8 @@ mod tests {
         #[tokio::test]
         async fn the_role_gate_holds_and_only_a_forced_pass_overrides_the_toggle() {
             let send = rfx("send").await;
+            // I3: holds are reported only with the collab store mounted.
+            let send_node = bind_receiver(&send).await;
             send.hub.seed_frames(PID, "acc-o", &["n1"], "published");
             sync_rows(&send).await;
             let rec = Arc::new(FetchRecorder::default());
@@ -6103,6 +6416,7 @@ mod tests {
             assert_eq!(out.projects, 1);
             let out = pass_with(&off.ctx, &rec, PassKind::Forced, Some("other"), None).await;
             assert_eq!(out.projects, 0, "a scoped pass touches only its project");
+            send_node.shutdown().await;
         }
 
         /// Signed out, no Collaboration root, or a root that is not
@@ -6451,6 +6765,167 @@ mod tests {
             recv.shutdown().await;
         }
 
+        /// A relay-disabled node installed on `r.ctx` WITHOUT mounting the
+        /// collab store — a bind whose mount failed, or a Collaboration root
+        /// that was not there yet.
+        async fn bind_unmounted(r: &RFx) -> Arc<SharedIrohNode> {
+            let dirs = crate::api::sync::sync_dirs(&r.ctx).unwrap();
+            std::fs::create_dir_all(&dirs.identity_dir).unwrap();
+            std::fs::create_dir_all(&dirs.working_dir).unwrap();
+            let node = SharedIrohNode::bind_with(
+                &dirs.identity_dir,
+                &dirs.working_dir,
+                iroh::RelayMode::Disabled,
+                crate::sharing::iroh::node::NodeOptions::default(),
+            )
+            .await
+            .expect("bind relay-disabled node");
+            *r.ctx.iroh_node.lock().await = Some(Arc::clone(&node));
+            node
+        }
+
+        /// Final review I3: a Collaboration root that was not there at bind
+        /// (a volume plugged in later) is mounted by the next maintenance,
+        /// which then reports holds as usual.
+        #[tokio::test]
+        async fn a_root_that_appears_after_startup_is_mounted_by_maintenance() {
+            let r = rfx("send_receive").await;
+            land_file(&r, "mine", FrameOrigin::Own, &pattern(1, 256));
+            let kept = r.tmp.path().join("kept-aside");
+            std::fs::rename(&r.collab, &kept).unwrap();
+            let node = bind_unmounted(&r).await;
+            assert!(node.collab_store().is_none());
+            assert_eq!(
+                run_maintenance(&r.ctx, None, None).await,
+                MaintenanceOutcome::default(),
+                "no root on disk: nothing runs"
+            );
+            assert!(node.collab_store().is_none());
+
+            std::fs::rename(&kept, &r.collab).unwrap();
+            let from = request_count(&r.hub).await;
+            let m = run_maintenance(&r.ctx, None, None).await;
+            assert!(node.collab_store().is_some(), "mounted lazily");
+            assert_eq!(m.reported, 1);
+            let reqs = r.hub.server.received_requests().await.unwrap();
+            let puts = holder_puts(&reqs[from..]);
+            assert_eq!(puts.len(), 1);
+            assert_eq!(
+                puts[0]["add"],
+                serde_json::json!([{ "frameUuid": "mine", "contentVersion": 1 }])
+            );
+            node.shutdown().await;
+        }
+
+        /// Final review I3: while the collab store cannot be mounted, the
+        /// maintenance still walks the disk but claims no holds (no holder
+        /// PUT at all), the fetch is skipped, and the mount is retried at
+        /// most once per interval.
+        #[tokio::test]
+        async fn no_holder_report_and_no_fetch_while_the_store_is_unmounted() {
+            let r = rfx("send_receive").await;
+            r.hub.seed_frames(PID, "acc-o", &["n1"], "published");
+            sync_rows(&r).await;
+            land_file(&r, "mine", FrameOrigin::Own, &pattern(1, 256));
+            // A file where the store's folder must go: every mount fails.
+            std::fs::write(r.collab.join(".athenaeum"), b"not a folder").unwrap();
+            let node = bind_unmounted(&r).await;
+
+            let from = request_count(&r.hub).await;
+            for _ in 0..2 {
+                let m = run_maintenance(&r.ctx, None, None).await;
+                assert_eq!(m.reported, 0, "{m:?}");
+                assert_eq!(m.projects, 1, "the disk walk still runs");
+            }
+            assert!(node.collab_store().is_none());
+            let out = real_pass(&r, PassKind::Fetch).await;
+            assert_eq!((out.landed, out.failed), (0, 0), "{out:?}");
+            let reqs = r.hub.server.received_requests().await.unwrap();
+            assert!(
+                holder_puts(&reqs[from..]).is_empty(),
+                "no hold is claimed while nothing can be served"
+            );
+            assert!(
+                !reqs[from..]
+                    .iter()
+                    .any(|q| q.url.path().ends_with("/holders")),
+                "no holder lookup: the fetch was skipped"
+            );
+            node.shutdown().await;
+        }
+
+        /// Final review C1(b): a version bump with the SAME bytes (two
+        /// overlapping publish runs posted identical content twice) must not
+        /// export over the landed file — `export_child` clears its target
+        /// first, and that file is the store entry's only data. The file
+        /// survives untouched (same inode, same bytes), nothing is fetched,
+        /// and the frame is tagged and recorded at the new version.
+        #[tokio::test]
+        async fn a_same_content_version_bump_keeps_the_landed_file() {
+            let r = rfx("send_receive").await;
+            let recv = bind_receiver(&r).await;
+            let pub_dir = tempfile::tempdir().unwrap();
+            let publisher = peer_node(pub_dir.path()).await;
+            pair(&recv, &publisher).await;
+            let v1 = pattern(1, 256 * 1024);
+            publish_on(&r, &publisher, "f1", "c_x.fits", &v1).await;
+            sync_rows(&r).await;
+            assert_eq!(real_cycle(&r).await.landed, 1);
+            let dest = r.collab.join("m31").join("other").join("c_x.fits");
+            #[cfg(unix)]
+            let inode = {
+                use std::os::unix::fs::MetadataExt as _;
+                std::fs::metadata(&dest).unwrap().ino()
+            };
+
+            // Version 2, identical bytes.
+            r.hub.update_frame(PID, "f1", |f| f.content_version = 2);
+            sync_rows(&r).await;
+            assert!(
+                !row(&r.ctx, "f1").unwrap().on_disk,
+                "the bump makes the frame needed again"
+            );
+
+            let sent_before = {
+                let c = publisher.counters_snapshot_for_test();
+                c.send_direct_bytes.saturating_add(c.send_relay_bytes)
+            };
+            let out = real_pass(&r, PassKind::Fetch).await;
+            assert_eq!((out.landed, out.failed), (1, 0), "{out:?}");
+            assert_eq!(std::fs::read(&dest).unwrap(), v1, "the file survives");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                assert_eq!(
+                    std::fs::metadata(&dest).unwrap().ino(),
+                    inode,
+                    "no export replaced the file"
+                );
+            }
+            let sent = {
+                let c = publisher.counters_snapshot_for_test();
+                c.send_direct_bytes.saturating_add(c.send_relay_bytes)
+            }
+            .saturating_sub(sent_before);
+            assert!(
+                sent < v1.len() as u64 / 4,
+                "nothing re-downloaded: the publisher sent {sent} B"
+            );
+            assert_eq!(collab_tags(&recv, "project/p1/f1/1").await, 0);
+            assert_eq!(collab_tags(&recv, "project/p1/f1/2").await, 1);
+            let hash: iroh_blobs::Hash = row(&r.ctx, "f1").unwrap().blake3.parse().unwrap();
+            assert_eq!(
+                recv.collab_blob_health(hash).await.unwrap(),
+                crate::sharing::iroh::node::BlobHealth::Readable
+            );
+            let row = row(&r.ctx, "f1").unwrap();
+            assert!(row.on_disk);
+            assert_eq!(row.content_version, 2);
+            assert_eq!(row.landed_path.as_deref(), Some(&*dest.to_string_lossy()));
+            publisher.shutdown().await;
+            recv.shutdown().await;
+        }
+
         /// P11 isolation: a frame no holder can serve fails alone; its sibling
         /// lands. The failed frame keeps its in-flight tag while it is still
         /// wanted and loses it to the maintenance sweep once it is not (R23).
@@ -6766,6 +7241,8 @@ mod tests {
         #[tokio::test]
         async fn maintenance_reports_while_a_fetch_is_in_flight() {
             let r = rfx("send_receive").await;
+            // I3: holds are reported only with the collab store mounted.
+            let node = bind_receiver(&r).await;
             r.hub.seed_frames(PID, "acc-o", &["n1"], "published");
             sync_rows(&r).await;
             land_file(&r, "mine", FrameOrigin::Own, &pattern(1, 256));
@@ -6800,6 +7277,7 @@ mod tests {
             let puts = holder_puts(&reqs[from..]);
             assert_eq!(puts.len(), 1);
             assert_eq!(puts[0]["full"], true);
+            node.shutdown().await;
         }
 
         /// R19: a cancel lands between batches — the running batch finishes,

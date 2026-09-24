@@ -223,7 +223,7 @@ Device-to-device transfers over iroh: `crates/athenaeum-core/src/sync/` (engine/
 - **One copy per transfer, both ends**: `ImportMode::TryReference` on the sender, `ExportMode::TryReference` + hard-link-or-copy landing on the receiver; a staged payload is never edited in place; confirm runs protect → cleanup → release.
 - **Folders**: `api::sync::sync_dirs` → `SyncDirs { identity_dir (never moves), packages_dir, working_dir, db_path }`; `validate_transfer_dir` is the one gate for both folders and both backends (no scan-root overlap).
 - **Retention is Perseus-only** — the app never deletes a sent source. Frame-set send from the Export tab reuses the export pipeline and `check_mode_ready`.
-- **Collab v3**: per-frame exchange, collab store under the Collaboration root on its own ALPN; a project frame's path lives only in `project_frames_local` (P26).
+- **Collab v3**: per-frame exchange, collab store under the Collaboration root on its own ALPN; a project frame's path lives only in `project_frames_local` (P26). One publish run per project at a time — a second (manual or auto) is refused, never run beside it; no holds are reported while the collab store is unmounted.
 
 Frontend: `src/pages/Transfers.tsx` (one row per transfer FROM THE MODEL), `src/hooks/useTransferQueue.ts`, Settings → Transfers (`components/settings/TransfersSection.tsx`).
 

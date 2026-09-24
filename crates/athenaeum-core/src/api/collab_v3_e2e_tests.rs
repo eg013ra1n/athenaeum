@@ -34,7 +34,8 @@ use crate::api::collab::tests::publish::{
 };
 use crate::api::collab::tests::seed_plate_solve;
 use crate::api::collab::{
-    approve_collab_frame, link_frame_set, list_moderation_queue, publish_collab_frames,
+    approve_collab_frame, auto_publish_collab_frames, link_frame_set, list_moderation_queue,
+    publish_collab_frames, republish_collab_frames, PublishResult, PUBLISH_BUSY_MSG,
 };
 use crate::api::collab_exchange::{
     export_project_for_wbpp, poll_versions_once, replication_pass, resolve_collab_loss,
@@ -793,6 +794,99 @@ async fn step8_new_version_lands_over_the_old(w: &mut World, declined: &HashSet<
     );
 }
 
+/// Run a manual Republish and an auto-publish of the project on A at the
+/// same time (final review C1): exactly one runs, the other is refused with
+/// the busy Conflict. Returns the run that went through.
+async fn overlapping_publishes_on_a(w: &World, step: &str) -> PublishResult {
+    let (manual, auto) = tokio::join!(
+        republish_collab_frames(&w.a.ctx, PID, None),
+        auto_publish_collab_frames(&w.a.ctx, PID, None)
+    );
+    let (ran, refused) = match (manual, auto) {
+        (Ok(r), Err(e)) | (Err(e), Ok(r)) => (r, e),
+        other => panic!("{step}: exactly one publish run must go through: {other:?}"),
+    };
+    match refused {
+        crate::api::ApiError::Conflict(m) => assert_eq!(m, PUBLISH_BUSY_MSG, "{step}"),
+        other => panic!("{step}: expected the busy Conflict, got {other:?}"),
+    }
+    assert!(ran.held_back.is_empty(), "{step}: {:?}", ran.held_back);
+    ran
+}
+
+/// Step 8b (final review C1): overlapping Republish + auto-publish on A
+/// never version the same bytes twice. With changed pixels exactly ONE new
+/// version per frame reaches the hub (v3, never a v4 of identical bytes) and
+/// B lands it once; with nothing changed, no version at all — and B's next
+/// pass re-downloads nothing, its replicas intact (the pre-fix receiver
+/// deleted its own replica on an identical-bytes bump).
+async fn step8b_overlapping_publishes_never_double_version(w: &World, declined: &HashSet<String>) {
+    let held: Vec<&String> = w
+        .set
+        .uuids
+        .iter()
+        .filter(|u| !declined.contains(*u))
+        .collect();
+
+    write_dark(&w.set.master, 320.0);
+    set_mtime(&w.set.master, 240);
+    let ran = overlapping_publishes_on_a(w, "step 8b (changed)").await;
+    assert_eq!(ran.updated, N, "step 8b: {ran:?}");
+    for uuid in &w.set.uuids {
+        assert_eq!(
+            w.hub.frame(PID, uuid).unwrap().content_version,
+            3,
+            "step 8b: one new version of {uuid}, not two"
+        );
+    }
+    poll(&w.b).await;
+    let out = fetch_pass(&w.b).await;
+    assert_eq!(
+        (out.landed, out.failed),
+        (held.len(), 0),
+        "step 8b: B lands v3 once: {out:?}"
+    );
+
+    let ran = overlapping_publishes_on_a(w, "step 8b (unchanged)").await;
+    assert_eq!((ran.announced, ran.updated), (0, 0), "step 8b: {ran:?}");
+    let before: HashMap<&String, String> =
+        held.iter().map(|u| (*u, xxh3_of(&w.b.landed(u)))).collect();
+    let sent_before = sent_bytes(&w.a.node);
+    poll(&w.b).await;
+    maintenance(&w.b, None).await;
+    let out = fetch_pass(&w.b).await;
+    assert_eq!(
+        (out.attempted, out.landed, out.failed),
+        (0, 0, 0),
+        "step 8b: nothing to fetch: {out:?}"
+    );
+    let sent = sent_bytes(&w.a.node).saturating_sub(sent_before);
+    assert!(
+        sent * 100 < w.payload,
+        "step 8b: A served {sent} B — nothing may be re-downloaded"
+    );
+    for uuid in &held {
+        let row = w.b.row(uuid);
+        assert!(row.on_disk, "step 8b: {uuid} still held");
+        assert_eq!(row.content_version, 3, "step 8b: {uuid}");
+        let path = w.b.landed(uuid);
+        assert_eq!(
+            xxh3_of(&path),
+            before[uuid],
+            "step 8b: {uuid} replica intact"
+        );
+        assert_eq!(
+            xxh3_of(&path),
+            xxh3_of(&w.a.landed(uuid)),
+            "step 8b: {uuid} = A's v3"
+        );
+        assert!(
+            w.hub.holders_of(PID, uuid).contains(&w.b.pubkey()),
+            "step 8b: B still holds {uuid}"
+        );
+    }
+}
+
 /// Step 9: after the coordinator excludes one held frame, B's WBPP project
 /// export carries exactly the frames that are on disk AND accepted.
 async fn step9_export_carries_on_disk_accepted_frames(w: &World, declined: &HashSet<String>) {
@@ -844,6 +938,7 @@ async fn three_instances_exchange_frames_with_one_copy_per_machine() {
     step6_one_deleted_replica_comes_back_from_c(&w).await;
     let declined = step7_mass_loss_trips_the_guard(&w).await;
     step8_new_version_lands_over_the_old(&mut w, &declined).await;
+    step8b_overlapping_publishes_never_double_version(&w, &declined).await;
     step9_export_carries_on_disk_accepted_frames(&w, &declined).await;
     for m in [&w.a, &w.b, &w.c] {
         m.node.shutdown().await;

@@ -590,6 +590,64 @@ pub fn set_own_version(
     )?)
 }
 
+/// The local half of a new own content version, written the moment the
+/// regenerated file replaced the landed one and was seeded — BEFORE the hub
+/// confirms the version (final-review I2). Only the columns that describe the
+/// file on disk move (`xxh3`, `byte_size`, `size_mtime_seen`, `on_disk = 1`,
+/// `awaiting_gc = 0`), so disk truth sees the new file as present instead of
+/// "edited". The hub-confirmed columns (`content_version`, `blake3`,
+/// `recipe_hash`) stay until [`set_own_version`]: the unchanged recipe is the
+/// marker that the version is not confirmed yet, so a run that dies here
+/// regenerates, finds bytes the hub does not have, and posts the version
+/// again. Only a row still landed at `landed_path` is touched. Returns the
+/// rows touched.
+pub fn stage_own_file(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    landed_path: &str,
+    xxh3: &str,
+    byte_size: i64,
+    size_mtime_seen: Option<&str>,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local
+         SET xxh3 = ?4, byte_size = ?5, size_mtime_seen = ?6, on_disk = 1, awaiting_gc = 0,
+             updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own' AND landed_path = ?3",
+        params![
+            project_id,
+            frame_uuid,
+            landed_path,
+            xxh3,
+            byte_size,
+            size_mtime_seen
+        ],
+    )?)
+}
+
+/// Undo [`stage_own_file`] after the hub refused the new version: the file
+/// at the landed path now holds bytes the hub never took, so the row goes
+/// back to the hub's content keys and is marked NOT on disk (the old version
+/// is gone). Disk truth then rejects the file (its size / xxh3 no longer
+/// match), and the next publish run regenerates and posts again. Returns the
+/// rows touched.
+pub fn unstage_own_file(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    hub_xxh3: &str,
+    hub_byte_size: i64,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local
+         SET xxh3 = ?3, byte_size = ?4, size_mtime_seen = NULL, on_disk = 0, awaiting_gc = 0,
+             updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own'",
+        params![project_id, frame_uuid, hub_xxh3, hub_byte_size],
+    )?)
+}
+
 /// Bind an own frame the hub already knows (a manifest-delivered row, or one
 /// the hub refused as "already announced") to the local frame it was
 /// generated from: `source_frame_id`, `landed_path`, `recipe_hash`,

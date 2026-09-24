@@ -10,8 +10,11 @@
 //! [`AUTO_PUBLISH_DEBOUNCE`] (so a scan and its immediately-following
 //! analysis coalesce into one run), drains the dirty state into the
 //! `auto_publish = 1` projects that have at least one linked set, and runs
-//! [`crate::api::collab::publish_collab_frames`] for each, SEQUENTIALLY (the
-//! compute queue already serializes the heavy part). A request that arrives
+//! [`crate::api::collab::auto_publish_collab_frames`] for each, SEQUENTIALLY
+//! (the compute queue already serializes the heavy part). A project with a
+//! publish run in progress right then (a manual one) is NOT run in parallel:
+//! it is marked dirty again and kicked, so it runs after that run ends
+//! (final review C1, owner decision 2026-09-24). A request that arrives
 //! DURING a run marks its project dirty again and is picked up by the next
 //! run — the loop re-arms itself via [`tokio::sync::Notify`]'s single stored
 //! permit, the same mechanism [`super::collab_exchange::auto_sync_kick`]
@@ -28,7 +31,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::account::client::COLLAB_API_OUTDATED_MSG;
-use crate::api::collab::{publish_collab_frames, PublishResult};
+use crate::api::collab::{auto_publish_collab_frames, PublishResult, PUBLISH_BUSY_MSG};
 use crate::api::{db, ApiError};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
@@ -198,7 +201,7 @@ fn drain_due_projects(ctx: &ServiceContext) -> Vec<String> {
 
 /// One coalesced publish run over `due` projects (worker steps 4-7). Calls
 /// `publish` once per project, sequentially — production binds a closure
-/// around [`publish_collab_frames`] (`spawn_auto_publish_worker`); tests
+/// around [`auto_publish_collab_frames`] (`spawn_auto_publish_worker`); tests
 /// inject a recorder.
 ///
 /// `publish` takes an owned `project_id: String` and closes over `ctx`
@@ -270,6 +273,16 @@ async fn run_publish_pass<F, Fut>(
                     "auto-publish run complete"
                 );
             }
+            Err(ApiError::Conflict(msg)) if msg == PUBLISH_BUSY_MSG => {
+                // C1: another publish run of this project holds its lock —
+                // never run beside it. Re-mark and kick: the next drained run
+                // (after the debounce) picks it up on the state it leaves.
+                tracing::info!(
+                    project_id = %project_id,
+                    "auto-publish: a publish of this project is running; re-queued"
+                );
+                request_auto_publish(Some(&project_id));
+            }
             Err(ApiError::Conflict(msg)) if msg == COLLAB_API_OUTDATED_MSG => {
                 tracing::warn!(
                     project_id = %project_id,
@@ -340,7 +353,7 @@ pub(crate) fn spawn_auto_publish_worker(
                 let publish_ctx = Arc::clone(&ctx);
                 run_publish_pass(&ctx, emitter, due, move |project_id, emitter| {
                     let ctx = Arc::clone(&publish_ctx);
-                    async move { publish_collab_frames(&ctx, &project_id, emitter).await }
+                    async move { auto_publish_collab_frames(&ctx, &project_id, emitter).await }
                 })
                 .await;
             }
@@ -639,6 +652,60 @@ mod tests {
             dirty().lock().unwrap().contains("p-remark"),
             "re-marked dirty for the next trigger"
         );
+    }
+
+    /// Final review C1 (owner decision 2026-09-24): while a publish run of
+    /// the project holds its lock, the worker's real entry point is refused
+    /// at once — nothing runs beside it — and the project is marked dirty
+    /// again, so it runs after the current run ends.
+    #[tokio::test]
+    async fn a_busy_project_is_re_dirtied_not_run_in_parallel() {
+        let _guard = test_lock();
+        reset_dirty_state();
+        let (tmp, ctx) = test_ctx();
+        crate::api::account::store_token_for_test(&ctx, "test-token").unwrap();
+        let root = tmp.path().join("collab-root");
+        std::fs::create_dir_all(&root).unwrap();
+        crate::api::scan_roots::set_collaboration_dir(
+            &ctx,
+            root.to_string_lossy().to_string(),
+            &crate::api::PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+
+        let lock = crate::api::collab::publish_lock(&ctx, "p-busy").unwrap();
+        let held = lock.lock().await;
+        let results: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&results);
+        let ctx_ref = &ctx;
+        run_publish_pass(
+            &ctx,
+            None,
+            vec!["p-busy".to_string()],
+            move |project_id, emitter| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let r = auto_publish_collab_frames(ctx_ref, &project_id, emitter).await;
+                    seen.lock().unwrap().push(format!("{r:?}"));
+                    r
+                }
+            },
+        )
+        .await;
+        drop(held);
+
+        let results = results.lock().unwrap().clone();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].contains(PUBLISH_BUSY_MSG),
+            "refused, not run: {results:?}"
+        );
+        assert!(
+            dirty().lock().unwrap().contains("p-busy"),
+            "re-dirtied so it runs after the current run"
+        );
+        reset_dirty_state();
     }
 
     // ── auto_publish_loop_inner ──────────────────────────────────────────────

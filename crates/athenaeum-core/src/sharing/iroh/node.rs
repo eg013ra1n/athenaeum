@@ -3043,6 +3043,51 @@ impl SharedIrohNode {
         }
     }
 
+    /// Every seed tag of ONE frame in the COLLAB store, as
+    /// `(content_version, hash)` — what disk truth reads to tell a present
+    /// frame whose permanent tag went missing (re-seed it) from one a publish
+    /// is moving to a new version right now (leave it). A tag name that does
+    /// not end in a version number is skipped with a `warn!`.
+    pub async fn project_frame_tags(
+        &self,
+        project_id: &str,
+        frame_uuid: &str,
+    ) -> Result<Vec<(i32, Hash)>> {
+        use n0_future::StreamExt as _;
+        let Some(store) = self.collab_store() else {
+            let e = anyhow!("no Collaboration root mounted");
+            tracing::warn!(project_id, frame_uuid, error = %e, "list project frame tags skipped");
+            return Err(e);
+        };
+        let prefix = project_frame_prefix(project_id, frame_uuid);
+        let mut stream = store
+            .tags()
+            .list_prefix(prefix.as_bytes())
+            .await
+            .map_err(|e| {
+                tracing::warn!(project_id, frame_uuid, error = %e, "list project frame tags failed");
+                anyhow!("list project frame tags of {frame_uuid}: {e}")
+            })?;
+        let mut out = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let info = entry.map_err(|e| {
+                tracing::warn!(project_id, frame_uuid, error = %e, "list project frame tags failed");
+                anyhow!("list project frame tag of {frame_uuid}: {e}")
+            })?;
+            let name = String::from_utf8_lossy(info.name.as_ref()).to_string();
+            match name
+                .strip_prefix(&prefix)
+                .and_then(|v| v.parse::<i32>().ok())
+            {
+                Some(version) => out.push((version, info.hash)),
+                None => {
+                    tracing::warn!(project_id, frame_uuid, tag = %name, "project frame tag without a version skipped")
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Report one hash's health in the COLLAB store (Task 5).
     ///
     /// `Missing` when [`BlobStatus::NotFound`], `Partial` when
