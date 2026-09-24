@@ -12,11 +12,11 @@ pub mod spatial;
 // Calendar month aggregation. Ungated: db/models/coordinates only.
 pub mod calendar;
 // Frame-set workflows (auto-generate clustering + session detection + the
-// collab project-match suggestion). Render-gated ONLY because it calls
-// `api::collab::find_matching_projects` and `api::collab` is render-gated;
-// nothing here touches the image pipeline. Both transports build core with
-// default features, so the gate is invisible to them.
-#[cfg(feature = "render")]
+// collab project-match suggestion). Gated ONLY because it calls
+// `api::collab::find_matching_projects` and `api::collab` is render+solver-gated
+// (wave 2 Task 6); nothing here touches the image pipeline. Both transports
+// build core with default features, so the gate is invisible to them.
+#[cfg(all(feature = "render", feature = "solver"))]
 pub mod frame_sets;
 // Personal-sync commands (Stage I, task A7). Ungated: uses only db/sharing/sync.
 pub mod sync;
@@ -56,15 +56,15 @@ pub mod masters;
 #[cfg(feature = "render")]
 pub mod export;
 // Stage-II collaboration orchestration (slice 3, Task 4): linking, ranked
-// suggestions, per-frame gate report, portal deep-link intents. The old
-// rationale — an `api::lights` import for `frame_cal_status` — no longer holds:
-// the gate's calibration status is a constant while collab publish is deferred
-// (spec 2026-08-31 §8a, rework pending). What still forces the gate is
-// `publish_collab_frames`'s call into the render-gated
-// `api::sync::unique_rel_path`; the `crate::collab` core module and `db::collab`
-// stay ungated. Keeping this gated preserves
+// suggestions, per-frame gate report, portal deep-link intents. Render+solver
+// (bumped from render-only in wave 2 Task 6): the per-frame calibrated
+// verdict (P7) calls the render-gated `api::lights::check_mode_ready`, and the
+// manifest `meta` builder (`collab::frame_meta`) reads plate-solve records,
+// which only exist under `solver` too. `publish_collab_frames`'s call into
+// `api::sync::unique_rel_path` already needed `render`; the `crate::collab`
+// core module and `db::collab` stay ungated. Keeping this gated preserves
 // `cargo build -p perseus --no-default-features`.
-#[cfg(feature = "render")]
+#[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab;
 
 // M1 stacking pipeline command layer (Plan 5a Task 9): plan/start/cancel a
@@ -84,9 +84,9 @@ pub mod settings;
 
 // Slice-5 capstone: the three-instance collaboration E2E (publish → moderation →
 // swarm delivery → project WBPP export) exercised in one process over the
-// in-memory loopback transport. Test-only, and additionally render-gated because
-// it drives `publish_collab_frames` (render-gated in `api::collab`).
-#[cfg(all(test, feature = "render"))]
+// in-memory loopback transport. Test-only, and gated the same as `api::collab`
+// (render+solver, wave 2 Task 6) because it drives `publish_collab_frames`.
+#[cfg(all(test, feature = "render", feature = "solver"))]
 mod collab_e2e_tests;
 
 // Task 9: the C1 relay-eviction regression canary — one `#[ignore]`d test binding

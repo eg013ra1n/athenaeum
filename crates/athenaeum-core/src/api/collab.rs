@@ -6,16 +6,20 @@
 //! - **Suggestions** — rank every non-archived frame set by angular distance to
 //!   a project's target, flagging within-radius and already-linked sets.
 //! - **Gate report** — assemble each linked LIGHT frame's gate inputs from
-//!   `frames`/`plate_solves`/`frame_analysis` and run the pure
-//!   [`crate::collab::gate`] engine over the union.
+//!   `frames`/`plate_solves`/`frame_analysis`/the project's cached filter
+//!   dictionary, resolve the per-frame calibrated verdict (P7,
+//!   [`frame_cal_verdict`]) and run the pure [`crate::collab::gate`] engine
+//!   over the union.
 //! - **Portal deep-link intent** — record a "publish as project" intent for a
 //!   set and build the portal `/new` URL prefilled from its target.
 //! - **Match** — cached projects whose target radius contains a point and that
 //!   aren't already linked to a set (the Task-6 auto-link hook).
 //!
-//! Render-gated (`api/mod.rs`) because [`publish_collab_frames`] calls the
-//! render-gated `api::sync::unique_rel_path` (the old reason — an `api::lights`
-//! import for `frame_cal_status` — went away with spec 2026-08-31 §8a); the
+//! Render+solver-gated (`api/mod.rs`, bumped in wave 2 Task 6): the P7
+//! calibrated verdict calls the render-gated `api::lights::check_mode_ready`,
+//! and [`publish_collab_frames`] calls the render-gated
+//! `api::sync::unique_rel_path`; `crate::collab::frame_meta` (the manifest
+//! `meta` builder) reads plate-solve records, which need `solver` too. The
 //! `crate::collab` core module and `db::collab` stay ungated so the
 //! headless/perseus `--no-default-features` build compiles.
 
@@ -27,9 +31,11 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::account::keys::{device_key_path, DeviceKey};
 use crate::api::collab_exchange::ensure_collab_sender_engine;
+use crate::api::lights::{check_mode_ready, compute_export_readiness_for_frames};
 use crate::api::{db, ApiError};
+use crate::collab::filters::{match_filter, DictionaryEntry};
 use crate::collab::gate::{
-    evaluate_frame, FrameGateRow, GateFrameInput, LightCalStatus, ProjectTarget, ThresholdRuleView,
+    evaluate_frame, FrameGateRow, GateFrameInput, ProjectTarget, ThresholdRuleView,
 };
 use crate::collab::hub_client::{AnnounceRequest, CollabClient};
 use crate::collab::snapshot::{member_node_ids, own_display_name, SnapshotMember};
@@ -42,6 +48,7 @@ use crate::db::collab_exchange::{
     PackageRow,
 };
 use crate::events::ProgressEmitter;
+use crate::export::models::{CalibratedLightOptions, ExportMode};
 use crate::fits_writer::{stamp_extra_card, Card, CardValue};
 use crate::models::FrameAnalysis;
 use crate::package::{
@@ -232,8 +239,8 @@ fn light_count(conn: &Connection, frames_set_id: i64) -> anyhow::Result<i64> {
     Ok(n)
 }
 
-/// The union of LIGHT `(frame_id, filename)` across many frame sets, de-duped by
-/// frame id — `api/lights.rs::load_light_members` generalized to
+/// The union of LIGHT `(frame_id, filename)` across many frame sets, de-duped
+/// by frame id — `api/lights.rs::load_light_members` generalized to
 /// `ino.frames_set_id IN (…)` with `SELECT DISTINCT`.
 fn union_light_frames(
     conn: &rusqlite::Connection,
@@ -262,7 +269,48 @@ fn union_light_frames(
     Ok(rows)
 }
 
-/// Raw `frames` columns needed for the gate's center/scale precedence.
+/// One `frames_set` id per LIGHT frame id, over the SAME set ids
+/// [`union_light_frames`] unions — [`frame_gate_inputs`]'s per-frame
+/// calibrated verdict (P7) needs the set a frame belongs to, not just its id,
+/// because `api::lights::compute_export_readiness_for_frames` reads its
+/// calibration links through `calibration_set_to_frames`, which is keyed by
+/// frame, not by set — but the readiness WALK it drives
+/// (`export::collect_export_data`) still wants a `set_id` to scope by.
+/// `MIN(frames_set_id)` when a frame is (rarely) linked into the project
+/// through more than one linked set, so the choice is deterministic — the
+/// union's own dedup-by-frame-id (one [`GateFrameInput`] per frame,
+/// regardless of how many linked sets share it) is untouched by this map.
+fn frame_set_ids(
+    conn: &rusqlite::Connection,
+    set_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, i64>> {
+    if set_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = vec!["?"; set_ids.len()].join(",");
+    let sql = format!(
+        "SELECT sm.frame_id, MIN(ino.frames_set_id) \
+         FROM session_members sm \
+         JOIN sessions s ON s.id = sm.session_id \
+         JOIN imaging_nights ino ON ino.id = s.imaging_night_id \
+         JOIN frames f ON f.id = sm.frame_id \
+         WHERE ino.frames_set_id IN ({placeholders}) AND f.imagetyp = 'Light' \
+         GROUP BY sm.frame_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(set_ids.iter()), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (frame_id, set_id) = row?;
+        out.insert(frame_id, set_id);
+    }
+    Ok(out)
+}
+
+/// Raw `frames` columns needed for the gate's center/scale precedence, plus
+/// P3's filter and P18's uuid.
 struct FrameRow {
     ra: Option<f64>,
     dec: Option<f64>,
@@ -270,17 +318,57 @@ struct FrameRow {
     objctdec: Option<String>,
     xpixsz: Option<f64>,
     focallen: Option<f64>,
+    filter: Option<String>,
+    uuid: Option<String>,
 }
 
-/// Batch-assemble one [`GateFrameInput`] per `(frame_id, filename)` — conn-only,
-/// so the self-consistency cal-status policy needs no settings. Reads
-/// `plate_solves`, `frames`, and the analyses in three batched queries, then
-/// resolves each frame's center (crval → ra/dec → parsed objctra/objctdec) and
-/// pixel scale (plate-solve → header `atan(xpixsz/focallen)`, no binning
-/// multiply) and its self-consistency cal status.
+/// The per-frame "calibrated" verdict (P7): `Ok` when this frame, run alone
+/// through the calibrated-lights export readiness gate, is ready —
+/// `Err(sentence)` otherwise, where `sentence` is the exact text
+/// `check_mode_ready` would show the Export tab under a disabled Calibrated
+/// Lights mode for a frame set containing only this frame. Replaces decision
+/// C's `LightCalStatus::NotCalibrated` constant (spec 2026-08-31 §8a).
+pub(crate) fn frame_cal_verdict(
+    conn: &Connection,
+    set_id: i64,
+    frame_id: i64,
+) -> Result<(), String> {
+    let readiness = compute_export_readiness_for_frames(conn, set_id, &[frame_id]).map_err(|e| {
+        tracing::warn!(set_id, frame_id, error = %e, "export readiness check failed for the collab gate; treating as not calibrated");
+        format!("could not verify calibration: {e}")
+    })?;
+    check_mode_ready(&readiness, ExportMode::CalibratedLights)
+}
+
+/// P6: the fixed calibration options a wave-2 publish generates its
+/// calibrated pixels with — OSC ships as a CFA float FITS (`debayer_osc =
+/// false`, R21 `splitOsc = false`), never split into per-channel outputs.
+/// `format` is `CalibratedLightOptions::default`'s own default, spelled out
+/// here for the reader.
+///
+/// Not yet called outside tests — Task 7 wires it into the pixel-generation
+/// phase of `publish_collab_frames`.
+#[allow(dead_code)]
+pub(crate) fn publish_options() -> CalibratedLightOptions {
+    CalibratedLightOptions {
+        debayer_osc: false,
+        format: crate::fits_writer::OutputFormat::Fits,
+        ..Default::default()
+    }
+}
+
+/// Batch-assemble one [`GateFrameInput`] per `(frame_id, filename)` —
+/// conn-only, no settings needed. Reads `plate_solves`, `frames`, and the
+/// analyses in three batched queries, then resolves each frame's center
+/// (crval → ra/dec → parsed objctra/objctdec), pixel scale (plate-solve →
+/// header `atan(xpixsz/focallen)`, no binning multiply), P7's per-frame
+/// calibrated verdict (via `frame_set_ids`), and P3's dictionary filter
+/// match.
 fn frame_gate_inputs(
     conn: &rusqlite::Connection,
     frames: &[(i64, String)],
+    dictionary: &[DictionaryEntry],
+    frame_set_ids: &HashMap<i64, i64>,
 ) -> anyhow::Result<Vec<GateFrameInput>> {
     if frames.is_empty() {
         return Ok(Vec::new());
@@ -314,7 +402,7 @@ fn frame_gate_inputs(
     let mut rows_by_id: HashMap<i64, FrameRow> = HashMap::new();
     {
         let sql = format!(
-            "SELECT id, ra, dec, objctra, objctdec, xpixsz, focallen \
+            "SELECT id, ra, dec, objctra, objctdec, xpixsz, focallen, filter, uuid \
              FROM frames WHERE id IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -328,6 +416,8 @@ fn frame_gate_inputs(
                     objctdec: r.get(4)?,
                     xpixsz: r.get(5)?,
                     focallen: r.get(6)?,
+                    filter: r.get(7)?,
+                    uuid: r.get(8)?,
                 },
             ))
         })?;
@@ -389,16 +479,43 @@ fn frame_gate_inputs(
                 })
             });
 
+        let filter_raw = frow
+            .and_then(|f| f.filter.clone())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let filter_canonical = match_filter(&filter_raw, dictionary);
+        let uuid = frow
+            .and_then(|f| f.uuid.clone())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // P7: the real gate, replacing decision C's constant.
+        let cal_blocker = match frame_set_ids.get(frame_id) {
+            Some(&set_id) => frame_cal_verdict(conn, set_id, *frame_id).err(),
+            None => {
+                // Every frame here came from `union_light_frames` over the
+                // SAME set ids `frame_set_ids` was built from, so this is
+                // unreachable in practice — logged rather than panicking, in
+                // case a future caller ever hands mismatched inputs.
+                tracing::warn!(
+                    frame_id,
+                    "frame has no resolvable frames_set for the collab gate"
+                );
+                Some("frame set unresolved".to_string())
+            }
+        };
+
         out.push(GateFrameInput {
             frame_id: *frame_id,
             filename: filename.clone(),
             center,
             pixel_scale_arcsec,
-            // Decision C (spec 2026-08-31 §8a): light-cal artifacts are gone —
-            // collab publish rework is a named follow-up. Until then no frame
-            // passes layer 1.
-            cal_status: LightCalStatus::NotCalibrated,
+            cal_blocker,
             analysis: analyses.get(frame_id).cloned(),
+            filter_raw,
+            filter_canonical,
+            uuid,
         });
     }
     Ok(out)
@@ -549,10 +666,26 @@ pub fn evaluate_project_gate(
             .unwrap_or_default(),
         None => Vec::new(),
     };
+    // P3: a NULL or unparsed dictionary maps to an empty list, so every frame
+    // fails the filter precondition with its own raw name in the reason —
+    // never a silent pass. The dictionary is filled by the version poll
+    // (Task 8); until a project has one, nothing here can pass this
+    // precondition, which is the correct fail-closed default for a hub field
+    // this build hasn't fetched yet.
+    let dictionary: Vec<DictionaryEntry> = match &project.dictionary_json {
+        Some(json) => serde_json::from_str(json)
+            .map_err(|e| {
+                tracing::warn!(project_id, error = %e, "cached filter dictionary does not parse — every frame will fail the filter check");
+                e
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
 
     let set_ids = crate::db::collab::linked_set_ids(&conn, project_id).map_err(internal)?;
     let frames = union_light_frames(&conn, &set_ids).map_err(internal)?;
-    let inputs = frame_gate_inputs(&conn, &frames).map_err(internal)?;
+    let frame_sets = frame_set_ids(&conn, &set_ids).map_err(internal)?;
+    let inputs = frame_gate_inputs(&conn, &frames, &dictionary, &frame_sets).map_err(internal)?;
 
     let rows: Vec<_> = inputs
         .iter()
@@ -1982,7 +2115,9 @@ mod tests {
     }
 
     /// Cached project fixture: target M101 (210.8, +54.35), radius 1.5°, one
-    /// threshold rule (reject trailed frames).
+    /// threshold rule (reject trailed frames), a dictionary that recognizes
+    /// `seed_set`'s `L` filter (P3) so the gate tests below aren't ALSO
+    /// blocked by an unmapped filter.
     fn cached_project(conn: &rusqlite::Connection) {
         crate::db::collab::upsert_project(
             conn,
@@ -2013,8 +2148,10 @@ mod tests {
                 synced_caps_json: "[]".into(),
                 hub_version: 0,
                 manifest_cursor: 0,
-                dictionary_version: None,
-                dictionary_json: None,
+                dictionary_version: Some(1),
+                dictionary_json: Some(
+                    r#"[{"canonical":"L","aliases":[],"kind":"broadband"}]"#.into(),
+                ),
                 policy_json: r#"{"mode":"all"}"#.into(),
                 replication_paused: false,
                 auto_publish: true,
@@ -2075,9 +2212,9 @@ mod tests {
             // xpixsz (µm, already binned) + focallen (mm) give the header
             // pixel-scale fallback: (3.76/1000 / 1000).atan() ≈ 0.776″/px.
             conn.execute(
-                "INSERT INTO frames (file_id, imagetyp, object, instrume, ra, dec, xpixsz, focallen, exptime, filter) \
-                 VALUES (?1, 'Light', 'M101', 'ASI2600MM', ?2, ?3, 3.76, 1000.0, 300.0, 'L')",
-                rusqlite::params![file_id, ra_deg, dec_deg],
+                "INSERT INTO frames (file_id, imagetyp, object, instrume, ra, dec, xpixsz, focallen, exptime, filter, uuid) \
+                 VALUES (?1, 'Light', 'M101', 'ASI2600MM', ?2, ?3, 3.76, 1000.0, 300.0, 'L', ?4)",
+                rusqlite::params![file_id, ra_deg, dec_deg, format!("uuid-seed-{name}-{i}")],
             )
             .unwrap();
             let frame_id = conn.last_insert_rowid();
@@ -2131,7 +2268,8 @@ mod tests {
         assert_eq!(report.rows.len(), 2);
         assert_eq!(
             report.publishable, 0,
-            "decision C (spec 2026-08-31 §8a): every frame resolves NotCalibrated"
+            "P7: neither frame has a calibration link, so both fail the real \
+             readiness gate"
         );
 
         // Frame 0: blocked only by calibration. Frame 1: calibration + trailed.
@@ -2141,7 +2279,9 @@ mod tests {
             .find(|r| r.frame_id == frames[0])
             .unwrap();
         assert!(
-            row0.failures.iter().any(|f| f.contains("not calibrated")),
+            row0.failures
+                .iter()
+                .any(|f| f.contains("calibration links")),
             "{:?}",
             row0.failures
         );
@@ -2683,6 +2823,51 @@ mod tests {
         set_id
     }
 
+    /// One shared `MasterDark` calibration set — no on-disk master file needed
+    /// (mirrors `api::lights::tests::seed_masters` + `add_link`): the export
+    /// readiness gate only counts a master path as "missing" once
+    /// `resolve_master` actually resolves one, and it resolves `None` for a
+    /// master shell with no `calibration_set_frames` member, so an unresolved
+    /// link is never counted as missing — it just makes `check_mode_ready`'s
+    /// `unlinked_lights`/`raw_sets_without_master` counts both zero, which is
+    /// exactly what P7's calibrated verdict needs to pass.
+    fn link_shared_master_dark(conn: &rusqlite::Connection, set_id: i64, frame_ids: &[i64]) {
+        let master_set_id = 9_000_000 + set_id;
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library) \
+             VALUES (?1, 'MasterDark', '2026-07-01', 1)",
+            [master_set_id],
+        )
+        .unwrap();
+        for frame_id in frame_ids {
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames \
+                 (source_id, source_type, calibration_set_id, calibration_type, matched_at) \
+                 VALUES (?1, 'frame', ?2, 'Dark', '2026-07-01T00:00:00Z')",
+                rusqlite::params![frame_id, master_set_id],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Every LIGHT frame id of a set, in `id` order — for wiring up
+    /// [`link_shared_master_dark`] after [`seed_publishable_set`].
+    fn light_frame_ids_of(conn: &rusqlite::Connection, set_id: i64) -> Vec<i64> {
+        conn.prepare(
+            "SELECT DISTINCT sm.frame_id FROM session_members sm \
+             JOIN sessions s ON s.id = sm.session_id \
+             JOIN imaging_nights ino ON ino.id = s.imaging_night_id \
+             JOIN frames f ON f.id = sm.frame_id \
+             WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light' \
+             ORDER BY sm.frame_id",
+        )
+        .unwrap()
+        .query_map([set_id], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<i64>, _>>()
+        .unwrap()
+    }
+
     /// Point `ctx`'s account hub at `uri` and store a device token.
     ///
     /// Also caches a bogus relay map: publishing binds the shared iroh node (D3
@@ -3193,44 +3378,79 @@ mod tests {
         node.shutdown().await;
     }
 
-    /// Decision C (spec 2026-08-31 §8a) is PINNED here, not merely documented:
-    /// a set whose frames satisfy every OTHER layer-1 precondition — on target,
-    /// known pixel scale, analyzed, not trailed, no threshold rules — is still
-    /// refused, and the calibration precondition is the ONLY reason given.
-    ///
-    /// Two assertions carry the pin:
-    ///   1. every gate row fails with EXACTLY one reason, the calibration one —
-    ///      so the block is the constant, not some other precondition quietly
-    ///      doing the work;
-    ///   2. publish fails with the gate-level `"no publishable frames"`, not the
-    ///      artifact-level `"no publishable frames — every calibrated artifact
-    ///      is missing on disk"` that a `Calibrated` constant would produce.
-    ///
-    /// Flipping the constant to `Calibrated` (or restoring a resolver that says
-    /// so) turns this red on assertion 2. No hub is wired: the gate rejects
-    /// above the announce call, and nothing here reads a tracking row — the
-    /// pin survived the removal of the whole standalone flow unchanged.
+    /// P7: the per-frame calibrated verdict is the real export-readiness
+    /// gate, not a constant. A set whose lights are linked to a usable master
+    /// passes the calibration precondition — and, with the project's
+    /// dictionary carrying the frames' `L` filter (P3) and every frame
+    /// carrying a uuid (P18), every other precondition too.
     #[tokio::test]
-    async fn decision_c_blocks_publish_of_gate_eligible_frames() {
+    async fn gate_passes_a_frame_whose_set_has_usable_masters() {
         let (_tmp, ctx) = test_ctx();
         let out_dir = _tmp.path().join("cal_out");
         let set_id = {
             let conn = crate::api::db(&ctx).unwrap().conn();
             seed_publish_project(&conn, "p-1", "[]");
-            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-dc-1", "uuid-dc-2"])
+            crate::db::collab::set_dictionary(
+                &conn,
+                "p-1",
+                Some(1),
+                Some(r#"[{"canonical":"L","aliases":[],"kind":"broadband"}]"#),
+            )
+            .unwrap();
+            let set_id =
+                seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-pass-1", "uuid-pass-2"]);
+            let frame_ids = light_frame_ids_of(&conn, set_id);
+            link_shared_master_dark(&conn, set_id, &frame_ids);
+            set_id
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert_eq!(report.total, 2, "both LIGHT frames are candidates");
+        assert_eq!(report.publishable, 2, "{:?}", report.rows);
+        for row in &report.rows {
+            assert!(
+                row.publishable,
+                "frame {}: {:?}",
+                row.frame_id, row.failures
+            );
+            assert!(row.failures.is_empty(), "{:?}", row.failures);
+        }
+    }
+
+    /// P7: a set whose lights have no calibration links at all fails with
+    /// EXACTLY the sentence `check_mode_ready(CalibratedLights)` would show
+    /// the Export tab for that one frame — never a constant enum
+    /// debug-print, and never some OTHER precondition quietly doing the
+    /// work (the dictionary and every uuid are seeded so this is isolated).
+    #[tokio::test]
+    async fn gate_blocks_a_frame_whose_set_lacks_masters_with_the_readiness_sentence() {
+        let (_tmp, ctx) = test_ctx();
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+            crate::db::collab::set_dictionary(
+                &conn,
+                "p-1",
+                Some(1),
+                Some(r#"[{"canonical":"L","aliases":[],"kind":"broadband"}]"#),
+            )
+            .unwrap();
+            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-fail-1", "uuid-fail-2"])
         };
         link_frame_set(&ctx, "p-1", set_id).unwrap();
 
         // 1. The frames are gate-eligible in every respect but calibration.
         let report = evaluate_project_gate(&ctx, "p-1").unwrap();
         assert_eq!(report.total, 2, "both LIGHT frames are candidates");
-        assert_eq!(report.publishable, 0, "decision C blocks all of them");
+        assert_eq!(report.publishable, 0, "no calibration links anywhere");
         for row in &report.rows {
             assert_eq!(
                 row.failures,
-                vec!["not calibrated (NotCalibrated)".to_string()],
-                "calibration must be the SOLE failure — otherwise this test is \
-                 pinning some other precondition; frame {} got {:?}",
+                vec!["1 light has no calibration links".to_string()],
+                "the readiness sentence must be the SOLE failure — otherwise \
+                 this test is pinning some other precondition; frame {} got {:?}",
                 row.frame_id,
                 row.failures
             );
@@ -3240,15 +3460,22 @@ mod tests {
         let sender = crate::sync::SyncSenderRuntime::new();
         let err = publish_collab_frames(&ctx, &sender, "p-1", None)
             .await
-            .expect_err("decision C must block publishing");
+            .expect_err("an unlinked set must block publishing");
         match err {
             ApiError::Invalid(msg) => assert_eq!(
                 msg, "no publishable frames",
-                "the GATE-level refusal, not the artifact-level one a \
-                 `Calibrated` status would reach"
+                "the GATE-level refusal, not some artifact-level one"
             ),
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    /// P6: OSC never gets debayered on a wave-2 publish.
+    #[test]
+    fn publish_options_ships_osc_as_cfa_never_debayered() {
+        let opts = publish_options();
+        assert!(!opts.debayer_osc);
+        assert_eq!(opts.format, crate::fits_writer::OutputFormat::Fits);
     }
 
     /// An empty gate (no publishable frames) is an `Invalid`, never a panic.

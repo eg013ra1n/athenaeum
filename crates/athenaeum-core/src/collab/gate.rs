@@ -4,34 +4,21 @@
 //! layering two checks:
 //!
 //! - **Layer 1 — hard preconditions** (always on, evaluated in order, all
-//!   recorded): the frame must be calibrated, carry an analysis row, have a
-//!   known pixel scale, and sit within the project's target radius. A frame can
-//!   fail several at once — every reason is collected.
+//!   recorded): the frame must be calibrated, carry a uuid, use a filter the
+//!   project's dictionary recognizes, carry an analysis row, have a known
+//!   pixel scale, and sit within the project's target radius. A frame can fail
+//!   several at once — every reason is collected.
 //! - **Layer 2 — threshold rules** (a per-project registry, run only when their
 //!   inputs exist): metric-vs-limit comparisons resolved through a small,
 //!   extensible metric registry. Unknown metrics/ops are skipped with a
 //!   `tracing::warn!`, never fatal.
 //!
-//! This module holds no DB or HTTP access by design — Task 4 wires it to the
-//! catalog. The caller resolves the frame's center, pixel scale, calibration
-//! status, and analysis, then hands them here as a [`GateFrameInput`].
+//! This module holds no DB or HTTP access by design — `api::collab` wires it
+//! to the catalog. The caller resolves the frame's center, pixel scale,
+//! calibration verdict, filter match, uuid and analysis, then hands them here
+//! as a [`GateFrameInput`].
 
 use crate::models::FrameAnalysis;
-
-/// A frame's light-calibration status, as layer-1 precondition (1) reads it.
-///
-/// Lives here (not in `db::`) because the gate is DB-free by design and this is
-/// the only surface that still consumes the status: light calibration moved
-/// into export and its tracking table is gone (spec 2026-08-31 §8a). The
-/// collab-publish rework — the named follow-up that gives this enum a real
-/// resolver again — will decide what "calibrated" means for a project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LightCalStatus {
-    NotCalibrated,
-    Calibrated,
-    Partial,
-    Stale,
-}
 
 /// The project's target field: a center and an acceptance radius (decimal
 /// degrees). A frame whose resolved center lies farther than `radius_deg` from
@@ -78,8 +65,25 @@ pub struct GateFrameInput {
     /// Resolved center, decimal degrees (precedence handled by the caller).
     pub center: Option<(f64, f64)>,
     pub pixel_scale_arcsec: Option<f64>,
-    pub cal_status: LightCalStatus,
+    /// The per-frame calibrated verdict (plan ruling P7): `None` when the
+    /// frame passes `api::lights::check_mode_ready(.., CalibratedLights)` run
+    /// over just this frame; `Some(sentence)` — the exact `Err` text that call
+    /// produced, which is also what the Export tab shows under a disabled
+    /// Calibrated Lights mode — otherwise. Replaces the old
+    /// `LightCalStatus::NotCalibrated` constant (decision C, spec 2026-08-31
+    /// §8a).
+    pub cal_blocker: Option<String>,
     pub analysis: Option<FrameAnalysis>,
+    /// The frame's trimmed `FILTER` header, as read from the catalog.
+    pub filter_raw: String,
+    /// `filter_raw` matched against the project's cached dictionary (plan
+    /// ruling P3, `collab::filters::match_filter`) — the dictionary's own
+    /// canonical spelling on a hit, `None` on no match (or an empty
+    /// dictionary).
+    pub filter_canonical: Option<String>,
+    /// `frames.uuid` (plan ruling P18 — also `ATH_CSRC`). Empty when the
+    /// frame carries none.
+    pub uuid: String,
 }
 
 /// The gate's verdict for one frame: echoed metrics, the publishable flag, and
@@ -96,9 +100,11 @@ pub struct FrameGateRow {
     pub stars_detected: Option<i64>,
     pub trailed: Option<bool>,
     pub publishable: bool,
-    /// Human-readable failure reasons, empty when publishable
-    /// (e.g. `FWHM 3.4″ > 3.0″`, `not calibrated (Stale)`, `no analysis`,
-    /// `unknown pixel scale`, `outside target radius (2.1° > 1.5°)`).
+    /// Human-readable failure reasons, empty when publishable (e.g.
+    /// `FWHM 3.4″ > 3.0″`, the caller's `cal_blocker` sentence verbatim, `frame
+    /// has no uuid`, `filter "OIII" is not in the project dictionary`,
+    /// `no analysis`, `unknown pixel scale`,
+    /// `outside target radius (2.1° > 1.5°)`).
     pub failures: Vec<String>,
 }
 
@@ -114,8 +120,17 @@ pub fn evaluate_frame(
 ) -> FrameGateRow {
     let mut failures: Vec<String> = Vec::new();
 
-    if input.cal_status != LightCalStatus::Calibrated {
-        failures.push(format!("not calibrated ({:?})", input.cal_status));
+    if let Some(blocker) = &input.cal_blocker {
+        failures.push(blocker.clone());
+    }
+    if input.uuid.trim().is_empty() {
+        failures.push("frame has no uuid".to_string());
+    }
+    if input.filter_canonical.is_none() {
+        failures.push(format!(
+            "filter \"{}\" is not in the project dictionary",
+            input.filter_raw
+        ));
     }
     let analysis = input.analysis.as_ref();
     if analysis.is_none() {
@@ -254,13 +269,20 @@ mod tests {
             filename: "L_0001.fits".into(),
             center: Some((210.8, 54.35)),
             pixel_scale_arcsec: Some(2.0),
-            cal_status: LightCalStatus::Calibrated,
+            cal_blocker: None,
             analysis: analysis_opt,
+            filter_raw: "L".into(),
+            filter_canonical: Some("L".into()),
+            uuid: "11111111-1111-1111-1111-111111111111".into(),
         }
     }
 
     fn target() -> ProjectTarget {
-        ProjectTarget { ra_deg: 210.8, dec_deg: 54.35, radius_deg: 1.5 }
+        ProjectTarget {
+            ra_deg: 210.8,
+            dec_deg: 54.35,
+            radius_deg: 1.5,
+        }
     }
 
     fn rules() -> Vec<ThresholdRuleView> {
@@ -276,7 +298,11 @@ mod tests {
     #[test]
     fn passing_frame_is_publishable_with_converted_units() {
         // 1.2 px × 2.0 ″/px = 2.4″ ≤ 3.0″ — the unit conversion is the point.
-        let row = evaluate_frame(&input(Some(analysis(1.2, 0.4, 400, false))), &target(), &rules());
+        let row = evaluate_frame(
+            &input(Some(analysis(1.2, 0.4, 400, false))),
+            &target(),
+            &rules(),
+        );
         assert!(row.publishable, "failures: {:?}", row.failures);
         assert_eq!(row.fwhm_arcsec, Some(2.4));
         assert_eq!(row.trailed, Some(false));
@@ -286,10 +312,14 @@ mod tests {
     fn each_precondition_fails_with_its_reason() {
         // Not calibrated.
         let mut i = input(Some(analysis(1.2, 0.4, 400, false)));
-        i.cal_status = LightCalStatus::Stale;
+        i.cal_blocker = Some("not calibrated".to_string());
         let row = evaluate_frame(&i, &target(), &rules());
         assert!(!row.publishable);
-        assert!(row.failures.iter().any(|f| f.contains("not calibrated")), "{:?}", row.failures);
+        assert!(
+            row.failures.iter().any(|f| f.contains("not calibrated")),
+            "{:?}",
+            row.failures
+        );
 
         // No analysis.
         let row = evaluate_frame(&input(None), &target(), &rules());
@@ -299,35 +329,124 @@ mod tests {
         let mut i = input(Some(analysis(1.2, 0.4, 400, false)));
         i.pixel_scale_arcsec = None;
         let row = evaluate_frame(&i, &target(), &rules());
-        assert!(row.failures.iter().any(|f| f.contains("unknown pixel scale")));
+        assert!(row
+            .failures
+            .iter()
+            .any(|f| f.contains("unknown pixel scale")));
 
         // Off target (2° away > 1.5° radius) and no coordinates.
         let mut i = input(Some(analysis(1.2, 0.4, 400, false)));
         i.center = Some((210.8, 56.35));
         let row = evaluate_frame(&i, &target(), &rules());
-        assert!(row.failures.iter().any(|f| f.contains("outside target radius")));
+        assert!(row
+            .failures
+            .iter()
+            .any(|f| f.contains("outside target radius")));
         let mut i = input(Some(analysis(1.2, 0.4, 400, false)));
         i.center = None;
         let row = evaluate_frame(&i, &target(), &rules());
         assert!(row.failures.iter().any(|f| f == "no coordinates"));
     }
 
+    /// P3: an unmapped filter fails with its own raw name quoted, not a
+    /// generic sentence — the operator has to see WHICH filter didn't map.
+    #[test]
+    fn unmapped_filter_fails_with_its_name() {
+        let mut i = input(Some(analysis(1.2, 0.4, 400, false)));
+        i.filter_raw = "OIII".to_string();
+        i.filter_canonical = None;
+        let row = evaluate_frame(&i, &target(), &rules());
+        assert!(!row.publishable);
+        assert!(
+            row.failures
+                .iter()
+                .any(|f| f == "filter \"OIII\" is not in the project dictionary"),
+            "{:?}",
+            row.failures
+        );
+    }
+
+    /// P18: a frame with no `frames.uuid` fails the gate — it could never be
+    /// announced (`frameUuid` is required) or identified as `ATH_CSRC` on
+    /// republish.
+    #[test]
+    fn empty_uuid_fails() {
+        let mut i = input(Some(analysis(1.2, 0.4, 400, false)));
+        i.uuid = String::new();
+        let row = evaluate_frame(&i, &target(), &rules());
+        assert!(!row.publishable);
+        assert!(
+            row.failures.iter().any(|f| f == "frame has no uuid"),
+            "{:?}",
+            row.failures
+        );
+    }
+
+    /// P7: the calibration failure is EXACTLY the caller's `cal_blocker`
+    /// sentence — no "not calibrated (...)" wrapping, so it reads identically
+    /// to what the Export tab shows for the same frame set under a disabled
+    /// Calibrated Lights mode.
+    #[test]
+    fn cal_blocker_sentence_is_the_failure_text() {
+        let mut i = input(Some(analysis(1.2, 0.4, 400, false)));
+        i.cal_blocker = Some("2 lights have no calibration links".to_string());
+        let row = evaluate_frame(&i, &target(), &rules());
+        assert!(!row.publishable);
+        assert_eq!(
+            row.failures
+                .iter()
+                .filter(|f| f.as_str() == "2 lights have no calibration links")
+                .count(),
+            1,
+            "{:?}",
+            row.failures
+        );
+    }
+
     #[test]
     fn each_rule_fails_with_its_reason() {
         // FWHM: 2.0 px × 2.0 = 4.0″ > 3.0″.
-        let row = evaluate_frame(&input(Some(analysis(2.0, 0.4, 400, false))), &target(), &rules());
-        assert!(row.failures.iter().any(|f| f.contains("FWHM") && f.contains("3.00")), "{:?}", row.failures);
+        let row = evaluate_frame(
+            &input(Some(analysis(2.0, 0.4, 400, false))),
+            &target(),
+            &rules(),
+        );
+        assert!(
+            row.failures
+                .iter()
+                .any(|f| f.contains("FWHM") && f.contains("3.00")),
+            "{:?}",
+            row.failures
+        );
 
         // Eccentricity 0.7 > 0.6.
-        let row = evaluate_frame(&input(Some(analysis(1.2, 0.7, 400, false))), &target(), &rules());
-        assert!(row.failures.iter().any(|f| f.to_lowercase().contains("eccentricity")));
+        let row = evaluate_frame(
+            &input(Some(analysis(1.2, 0.7, 400, false))),
+            &target(),
+            &rules(),
+        );
+        assert!(row
+            .failures
+            .iter()
+            .any(|f| f.to_lowercase().contains("eccentricity")));
 
         // Stars 120 < 150.
-        let row = evaluate_frame(&input(Some(analysis(1.2, 0.4, 120, false))), &target(), &rules());
-        assert!(row.failures.iter().any(|f| f.contains("120") && f.contains("150")));
+        let row = evaluate_frame(
+            &input(Some(analysis(1.2, 0.4, 120, false))),
+            &target(),
+            &rules(),
+        );
+        assert!(row
+            .failures
+            .iter()
+            .any(|f| f.contains("120") && f.contains("150")));
 
         // Trailed.
-        let row = evaluate_frame(&input(Some(analysis(1.2, 0.4, 400, true))), &target(), &rules());
+        let row = evaluate_frame(
+            &input(Some(analysis(1.2, 0.4, 400, true))),
+            &target(),
+            &rules(),
+        );
         assert!(row.failures.iter().any(|f| f.contains("trailed")));
         assert_eq!(row.trailed, Some(true));
     }
@@ -342,7 +461,11 @@ mod tests {
             .unwrap(),
         );
         let row = evaluate_frame(&input(Some(analysis(1.2, 0.4, 400, false))), &target(), &r);
-        assert!(row.publishable, "unknown metric must not block: {:?}", row.failures);
+        assert!(
+            row.publishable,
+            "unknown metric must not block: {:?}",
+            row.failures
+        );
     }
 
     #[test]
@@ -366,7 +489,15 @@ mod tests {
     fn registry_matches_the_evaluator() {
         assert_eq!(
             METRIC_REGISTRY.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
-            ["fwhm_arcsec", "eccentricity", "stars_detected", "median_snr", "snr_weight", "frame_snr", "not_trailed"]
+            [
+                "fwhm_arcsec",
+                "eccentricity",
+                "stars_detected",
+                "median_snr",
+                "snr_weight",
+                "frame_snr",
+                "not_trailed"
+            ]
         );
         let mut a = analysis(1.2, 0.4, 400, true);
         a.median_snr = 1.0;
@@ -374,10 +505,23 @@ mod tests {
         a.frame_snr = 1.0;
         for (key, ops) in METRIC_REGISTRY {
             for op in *ops {
-                let value = if *key == "not_trailed" { serde_json::json!(true) } else if *op == "lte" { serde_json::json!(0.0001) } else { serde_json::json!(1_000_000) };
-                let rule: ThresholdRuleView = serde_json::from_value(serde_json::json!({"metricKey": key, "op": op, "value": value})).unwrap();
+                let value = if *key == "not_trailed" {
+                    serde_json::json!(true)
+                } else if *op == "lte" {
+                    serde_json::json!(0.0001)
+                } else {
+                    serde_json::json!(1_000_000)
+                };
+                let rule: ThresholdRuleView = serde_json::from_value(
+                    serde_json::json!({"metricKey": key, "op": op, "value": value}),
+                )
+                .unwrap();
                 let row = evaluate_frame(&input(Some(a.clone())), &target(), &[rule]);
-                assert!(!row.publishable, "{key} {op} must be enforceable, failures: {:?}", row.failures);
+                assert!(
+                    !row.publishable,
+                    "{key} {op} must be enforceable, failures: {:?}",
+                    row.failures
+                );
             }
         }
 
@@ -391,6 +535,10 @@ mod tests {
             .unwrap(),
         );
         let row = evaluate_frame(&input(Some(analysis(1.2, 0.4, 400, false))), &target(), &r);
-        assert!(row.publishable, "a key outside the registry must not block: {:?}", row.failures);
+        assert!(
+            row.publishable,
+            "a key outside the registry must not block: {:?}",
+            row.failures
+        );
     }
 }
