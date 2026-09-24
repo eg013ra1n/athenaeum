@@ -743,7 +743,11 @@ impl CollabClient {
     /// `POST /projects/{id}/frames/{uuid}/approve` — first-publication
     /// moderation. Always sends `{"trust": trust}`; `trust` also marks the
     /// publisher trusted for future first-publications (the portal's default
-    /// on approve). Returns the project's new `version`.
+    /// on approve) and can retroactively publish every OTHER pending frame
+    /// from the same publisher in the same call. Returns how many frames the
+    /// hub actually published as a result of this call (the hub's
+    /// `{"published": N}`; without `trust` that's the one requested frame,
+    /// with it, N can be greater).
     pub async fn approve_frame(
         &self,
         token: &str,
@@ -752,9 +756,8 @@ impl CollabClient {
         trust: bool,
     ) -> Result<u64, AccountClientError> {
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
         struct ApproveReply {
-            project_version: u64,
+            published: u64,
         }
         let resp = self
             .http
@@ -771,7 +774,7 @@ impl CollabClient {
             return resp
                 .json::<ApproveReply>()
                 .await
-                .map(|r| r.project_version)
+                .map(|r| r.published)
                 .map_err(|e| AccountClientError::Network(format!("decode approve frame: {e}")));
         }
         Err(classify(status, resp, "approve frame").await)
@@ -1418,5 +1421,127 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // ---- per-frame api, wire shapes pinned against the hub (fix round 1) ----
+
+    /// `approve_frame` always sends `{"trust": trust}` and decodes the hub's
+    /// `{"published": N}` reply — under `trust` the hub can publish more than
+    /// the one requested frame (every other pending frame from the same
+    /// publisher), so the count is NOT pinned to 1.
+    #[tokio::test]
+    async fn approve_frame_sends_trust_and_returns_published_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/projects/p1/frames/u1/approve"))
+            .and(header("authorization", "Bearer t"))
+            .and(body_json(json!({ "trust": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "published": 3 })))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let published = c.approve_frame("t", "p1", "u1", true).await.unwrap();
+        assert_eq!(published, 3);
+    }
+
+    /// `reject_frame` sends `{"reason": reason}`; the hub's `{"state":
+    /// "rejected"}` reply carries no data this client reads (`Result<(), _>`).
+    #[tokio::test]
+    async fn reject_frame_sends_reason_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/projects/p1/frames/u1/reject"))
+            .and(body_json(json!({ "reason": "bad focus" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "state": "rejected" })))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        c.reject_frame("t", "p1", "u1", "bad focus").await.unwrap();
+    }
+
+    /// `new_frame_version` sends `{blake3, byteSize, xxh3}` and decodes
+    /// `{contentVersion, projectVersion}`.
+    #[tokio::test]
+    async fn new_frame_version_sends_body_and_decodes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/projects/p1/frames/u1/version"))
+            .and(body_json(json!({
+                "blake3": "a".repeat(64), "byteSize": 100, "xxh3": "0123456789abcdef"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "contentVersion": 2, "projectVersion": 11
+            })))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let v = c
+            .new_frame_version("t", "p1", "u1", &"a".repeat(64), 100, "0123456789abcdef")
+            .await
+            .unwrap();
+        assert_eq!(v.content_version, 2);
+        assert_eq!(v.project_version, 11);
+    }
+
+    /// `frame_holders` decodes the hub's holder list — same shape as an
+    /// announcement's `holders` (pubkey/displayName/lastSeenAt/relayUrl).
+    #[tokio::test]
+    async fn frame_holders_decodes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/frames/u1/holders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "pubkey": "cHVia2V5", "displayName": "Vilen",
+                  "lastSeenAt": "2026-09-24T00:00:00Z",
+                  "relayUrl": "https://relay.example.org/" }
+            ])))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let holders = c.frame_holders("t", "p1", "u1").await.unwrap();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].display_name, "Vilen");
+        assert_eq!(
+            holders[0].relay_url.as_deref(),
+            Some("https://relay.example.org/")
+        );
+    }
+
+    /// `dictionary` decodes a present current set — ignoring the hub's extra
+    /// `createdAt`/top-level `history` fields this client doesn't read — and
+    /// an absent one (`current: null`).
+    #[tokio::test]
+    async fn dictionary_decodes_present_and_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/dictionary"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "current": {
+                    "version": 2,
+                    "entries": [{ "canonical": "Ha", "aliases": ["H-alpha"], "kind": "narrowband" }],
+                    "createdAt": "2026-09-24T00:00:00Z"
+                },
+                "history": []
+            })))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let dict = c.dictionary("t", "p1").await.unwrap();
+        let current = dict.current.unwrap();
+        assert_eq!(current.version, 2);
+        assert_eq!(current.entries[0].canonical, "Ha");
+        assert_eq!(current.entries[0].aliases, vec!["H-alpha".to_string()]);
+
+        let server2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/dictionary"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "current": null, "history": [] })),
+            )
+            .mount(&server2)
+            .await;
+        let c2 = CollabClient::new(server2.uri()).unwrap();
+        let dict2 = c2.dictionary("t", "p1").await.unwrap();
+        assert!(dict2.current.is_none());
     }
 }
