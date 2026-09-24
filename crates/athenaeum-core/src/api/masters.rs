@@ -1793,16 +1793,22 @@ fn run_master_build_thread(
     // `cfg`-scoped here.
     #[cfg(feature = "solver")]
     if success {
-        let consumers = db(&ctx).ok().and_then(|d| {
-            crate::db::calibration_links::get_calibration_set_consumers(&d.conn(), set_id)
-                .map_err(|error| {
-                    tracing::warn!(set_id, %error, "auto-publish: failed to resolve master-build consumers");
-                })
-                .ok()
-        });
-        if let Some(consumers) = consumers {
-            let set_ids: Vec<i64> = consumers.iter().map(|c| c.frame_set_id).collect();
-            crate::api::collab_autopublish::request_auto_publish_for_sets(&set_ids);
+        match db(&ctx) {
+            Ok(d) => {
+                match crate::db::calibration_links::get_calibration_set_consumers(&d.conn(), set_id)
+                {
+                    Ok(consumers) => {
+                        let set_ids: Vec<i64> = consumers.iter().map(|c| c.frame_set_id).collect();
+                        crate::api::collab_autopublish::request_auto_publish_for_sets(&set_ids);
+                    }
+                    Err(error) => {
+                        tracing::warn!(set_id, %error, "auto-publish: failed to resolve master-build consumers");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(set_id, %error, "auto-publish: database unavailable; failed to resolve master-build consumers");
+            }
         }
     }
 }

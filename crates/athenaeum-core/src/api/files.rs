@@ -129,8 +129,15 @@ pub fn bulk_update_frame_metadata(
     // the frame sets these frames belonged to before the edit are exactly
     // the ones whose gate eligibility might have just changed.
     #[cfg(all(feature = "render", feature = "solver"))]
-    let affected_sets = crate::db::calibration_links::frame_set_ids_for_frames(&conn, &frame_ids)
-        .unwrap_or_default();
+    let affected_sets = match crate::db::calibration_links::frame_set_ids_for_frames(
+        &conn, &frame_ids,
+    ) {
+        Ok(set_ids) => set_ids,
+        Err(error) => {
+            tracing::warn!(%error, "auto-publish: failed to resolve frame sets for bulk metadata edit");
+            Vec::new()
+        }
+    };
 
     let updated = crate::db::bulk_update_frame_metadata(&conn, &frame_ids, &edits)?;
 

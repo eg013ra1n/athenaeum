@@ -168,6 +168,22 @@ fn drain_due_projects(ctx: &ServiceContext) -> Vec<String> {
         if !project.auto_publish {
             continue;
         }
+        // R14: `get_project` still reads a lost project (only `list_projects`
+        // filters it), and `project_links` survives a loss (only the replica
+        // rows and collab-store tags are dropped) — so both DIRTY (a direct
+        // mark, e.g. a stale `link_frame_set` before the next poll notices
+        // the loss) and DIRTY_SETS (`project_ids_for_sets` reads
+        // `project_links` raw, no `lost_at` join) can carry a lost project's
+        // id here even though ALL_DIRTY's `list_projects` never would. Same
+        // check `collab_exchange::live_project` uses.
+        match crate::db::collab::lost_at(&conn, &project_id) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(project_id = %project_id, error = %error, "auto-publish: lost-project lookup failed");
+                continue;
+            }
+        }
         match crate::db::collab::linked_set_ids(&conn, &project_id) {
             Ok(links) if !links.is_empty() => due.push(project_id),
             Ok(_) => {}
@@ -212,14 +228,22 @@ async fn run_publish_pass<F, Fut>(
         return;
     }
 
+    // Every early-return below (run-wide skip, or an outdated hub mid-loop)
+    // re-marks whatever it didn't process dirty WITHOUT kicking (see
+    // `remark_dirty_no_kick`): the condition is local/account-level, not
+    // per-project, so busy-looping the debounce again right now would just
+    // hit it again — the project is retried on the next real trigger, once
+    // the condition has had a chance to clear.
     match crate::api::account::hub_credentials(ctx) {
         Ok(Some(_)) => {}
         Ok(None) => {
             tracing::warn!(count = due.len(), "auto-publish: signed out; run skipped");
+            due.iter().for_each(|id| remark_dirty_no_kick(id));
             return;
         }
         Err(error) => {
             tracing::warn!(count = due.len(), error = %error, "auto-publish: account read failed; run skipped");
+            due.iter().for_each(|id| remark_dirty_no_kick(id));
             return;
         }
     }
@@ -228,10 +252,12 @@ async fn run_publish_pass<F, Fut>(
             count = due.len(),
             "auto-publish: no Collaboration root; run skipped"
         );
+        due.iter().for_each(|id| remark_dirty_no_kick(id));
         return;
     }
 
-    for project_id in due {
+    let mut remaining = due.into_iter();
+    while let Some(project_id) = remaining.next() {
         let result = publish(project_id.clone(), emitter.clone()).await;
         match result {
             Ok(result) => {
@@ -249,12 +275,28 @@ async fn run_publish_pass<F, Fut>(
                     project_id = %project_id,
                     "auto-publish: hub API outdated; skipping the rest of this run"
                 );
+                // This project (its publish attempt hit the hub) and every
+                // project this run never got to are re-marked dirty for a
+                // later trigger, once the app is updated.
+                remark_dirty_no_kick(&project_id);
+                remaining.for_each(|id| remark_dirty_no_kick(&id));
                 return;
             }
             Err(error) => {
                 tracing::warn!(project_id = %project_id, error = %error, "auto-publish failed");
             }
         }
+    }
+}
+
+/// Re-marks a project dirty without waking the worker — the `DIRTY`-only
+/// half of [`request_auto_publish`], for [`run_publish_pass`]'s run-wide
+/// skip paths (signed out, no Collaboration root, `CollabApiOutdated`): the
+/// project needs to run again once the condition clears, but kicking here
+/// would just re-run the debounce immediately into the same condition.
+fn remark_dirty_no_kick(project_id: &str) {
+    if let Ok(mut set) = dirty().lock() {
+        set.insert(project_id.to_string());
     }
 }
 
@@ -456,6 +498,33 @@ mod tests {
         assert_eq!(drain_due_projects(&ctx), vec!["p-thr".to_string()]);
     }
 
+    /// R14: `get_project` still reads a lost project (only `list_projects`
+    /// filters it) and `project_links` survives a loss — so a lost project
+    /// must never come out of `drain_due_projects` via EITHER path: a direct
+    /// mark (`DIRTY`, e.g. a stale trigger that raced the loss) or a
+    /// set-scoped mark (`DIRTY_SETS` → `project_ids_for_sets`, which reads
+    /// `project_links` raw, no `lost_at` join).
+    #[test]
+    fn a_lost_project_is_never_due_via_either_path() {
+        let _guard = test_lock();
+        reset_dirty_state();
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (99, 'S')", [])
+            .unwrap();
+        crate::db::collab::upsert_project(&conn, &sample_project("p-lost", true)).unwrap();
+        crate::db::collab::link_set(&conn, "p-lost", 99).unwrap();
+        assert_eq!(crate::db::collab::mark_lost(&conn, "p-lost").unwrap(), 1);
+        drop(conn);
+
+        request_auto_publish(Some("p-lost"));
+        request_auto_publish_for_sets(&[99]);
+        assert!(
+            drain_due_projects(&ctx).is_empty(),
+            "a lost project is never due, dirtied directly or via its set"
+        );
+    }
+
     // ── run_publish_pass ─────────────────────────────────────────────────────
 
     /// A per-project failure (not signed-out / no-root / outdated-hub) is
@@ -534,6 +603,42 @@ mod tests {
         )
         .await;
         assert_eq!(calls.load(Ordering::SeqCst), 0, "signed out; nothing ran");
+    }
+
+    /// A run-wide skip (signed out here) re-marks every drained-but-unprocessed
+    /// project dirty — via [`remark_dirty_no_kick`], never
+    /// [`request_auto_publish`] — so the fix (sign back in) is picked up on
+    /// the next real trigger instead of the project being lost until
+    /// something else happens to dirty it again. `remark_dirty_no_kick`
+    /// never touches `KICK`, so this cannot itself re-arm the debounce loop
+    /// into busy-looping the same condition (pinned structurally, not by a
+    /// synchronous `Notify` probe — `Notify` has no non-consuming peek API).
+    #[tokio::test]
+    async fn signed_out_remarks_the_drained_projects_dirty() {
+        let _guard = test_lock();
+        reset_dirty_state();
+        let (_tmp, ctx) = test_ctx();
+        // No `store_token_for_test` — this ctx is signed out.
+        run_publish_pass(
+            &ctx,
+            None,
+            vec!["p-remark".to_string()],
+            move |_project_id, _emitter| async move {
+                Ok(PublishResult {
+                    announced: 0,
+                    updated: 0,
+                    state: None,
+                    held_back: Vec::new(),
+                    unchanged: 0,
+                })
+            },
+        )
+        .await;
+
+        assert!(
+            dirty().lock().unwrap().contains("p-remark"),
+            "re-marked dirty for the next trigger"
+        );
     }
 
     // ── auto_publish_loop_inner ──────────────────────────────────────────────
