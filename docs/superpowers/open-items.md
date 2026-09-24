@@ -130,22 +130,18 @@ LF working tree; the Windows box agrees with macOS *because* of the forced
 Windows clone that does not honour `.gitattributes` should not be assumed to
 give the same reading.
 
-**Windows runs ZERO collab tests, and the dead-code warnings are the only sign
-of it.** 11 collab tests are `#[cfg(unix)]` (8 in `api/collab_exchange.rs`, 3 in
-`api/collab_e2e_tests.rs`), so on Windows they do not compile and their ~17
-helper functions warn as never-used — that is 17 of the 28 warnings the Windows
-job emits, against 3 on Linux. The stated reason for the gate is "a multi-thread
-runtime, because the loopback engines/receivers run their event loops on
-background tasks", which Tokio supports on Windows, so the gate looks historical
-rather than reasoned. Nobody has tried removing it.
-
-**Do not "clean up" those warnings by deleting the helpers or adding
-`#[allow(dead_code)]`** — that erases the only signal that a whole subsystem is
-unmeasured on a platform whose CI job is now blocking. The two honest moves are
-to make the tests run on Windows (gaining real coverage, and the warnings go
-away as a side effect) or to put the same `#[cfg(unix)]` on the helpers and keep
-this entry. Note collab coverage is already thin: 9 further collab tests are
-`#[ignore]`d pending the publish rework (calibrated-export v2 §8a, decision C).
+**Windows collab coverage (updated 2026-09-24, collab v3 wave 2).** The 11
+package-era `#[cfg(unix)]` collab tests and the 9 `#[ignore]`d publish tests went
+with the package layer (plan P15: deleted, replaced by the per-frame tests of
+tasks 7–12). The per-frame tests in `api/collab.rs` and `api/collab_exchange.rs`
+carry no platform gate, so Windows now runs them. The ONE remaining unix-gated
+collab test is the three-instance e2e (`api/collab_v3_e2e_tests.rs`, a whole
+`#[cfg(all(test, unix, …))]` module, gated like the package-era e2e it replaces);
+its helpers live inside the gated module, so it adds no never-used warning. The
+"17 of the 28 Windows warnings" figure above predates this and is stale —
+re-count on the next Windows run. Removing the e2e's unix gate is untried; the
+old reason ("loopback engines on background tasks") no longer applies — it
+runs real iroh nodes on a multi-thread runtime, which Tokio supports on Windows.
 
 **The two `--skip`s in the Windows CI job are load-bearing, not cosmetic.**
 `ingest_releases_conn_between_frames` is not fixed, it is skipped — measured
@@ -201,6 +197,99 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### Collab v3 wave 2 — the app on the per-frame model (2026-09-24)
+
+Spec `docs/superpowers/specs/2026-09-23-collab-v3-per-frame-model-design.md` (§5, §15
+subset, amendments A1–A3), plan
+`docs/superpowers/plans/2026-09-24-collab-v3-wave2-app-exchange-plan.md` (P1–P26),
+branch `collab-v3-wave2`. The app speaks the wave-1 hub: per-frame publish into
+`<Collaboration root>/<project>/<me>/`, a collab blob store under the root on its own
+ALPN, the 15 s version poll, per-frame replication with disk truth, a loss guard and a
+local policy, and the package layer retired. Reference: `docs/transfers/README.md`,
+"Collab v3 — per-frame exchange". In-process proof:
+`api::collab_v3_e2e_tests::three_instances_exchange_frames_with_one_copy_per_machine`
+(three contexts, three relay-disabled iroh nodes, one fake hub; the plan's nine steps
+and a one-copy disk ledger).
+
+- **Owed — three-machine acceptance** (after the wave-1 test-hub deploy owed below):
+  1. Deploy nothing new to the hub; the test hub runs wave 1 after its owed deploy.
+  2. Three machines: this Mac, a second account's device, and the Linux runner or a
+     VM. Test relay. One project with `requireApproval`.
+  3. Walk the §15 subset:
+     - publish 20 frames;
+     - approve with trust;
+     - replication with `filters = [R]`;
+     - 10 more frames after a scan (auto-publish announces within 15 s of the scan's
+       analysis and solve);
+     - delete 3 replicas, then delete 15 at once;
+     - exclusion shows as `Excluded` on B.
+  4. Measure `du -sh` of each Collaboration root and of each working dir's `blobs/`
+     before and after. The expected ledger: the collab root is the payload plus under
+     1 %, and personal `blobs/` is unchanged. Measure the "before" AFTER the stores
+     exist: each store's `blobs.db` is a preallocated 1 MiB redb file whatever it
+     holds (the in-process ledger measures growth over that zero for the same reason —
+     6 MiB of test frames cannot absorb 2 MiB of fixed databases at 1 %).
+  5. Also record the relay-byte fraction (spec §12).
+- **Owed — desktop click-through** of the adapted collab UI (Projects page on
+  frames, "Update required", Receive tab policy + loss banner, moderation queue,
+  app-root collab notifications R29).
+- **Owed before push — the full core suite on an idle machine.**
+  `sync::ingest_tests::ingest_releases_conn_between_frames` fails under full-suite
+  load on the dev Mac and passes alone (adjudicated as load in tasks 2 and 12; the
+  diff touches no ingest locking). Two stacking tests did the same once in task 2
+  (`writer_output_matches_…` with an integer-overflow panic in
+  `geometry/pixel_map.rs`, and `a_tps_run_never_holds_…`) — a load-dependent
+  overflow panic is suspicious and worth one look of its own.
+- **Owner decisions to confirm**:
+  - **R24** — a user-edited replica is renamed aside (kept as an inert foreign file)
+    before a same-version re-land, instead of spec §5.5's silent re-fetch over it.
+    Version bumps still land over the old path. Cost if wrong: an extra file the
+    user must remove.
+  - **R31** — the project WBPP export takes published ∧ accepted ∧ on disk ∧ not
+    awaiting GC, so a contributor's own pending/rejected frames are NOT in it (their
+    own frame-set export still is). Cost if wrong: no project export of own pending
+    frames.
+- **Follow-ups (not smokes)**:
+  - Hub batch holders endpoint: replication asks `GET …/frames/{uuid}/holders` once
+    per frame today (serial, m8).
+  - `holderCount == 0` pre-filter: an unservable frame still costs one holders GET
+    per pass — needed for the 78-member target.
+  - Leftover collab `sync_outbound` rows on dev installs from the package era (M10).
+  - Old `files`/`frames` rows under a Collaboration root that was promoted from a
+    normal scan root are never cleaned.
+  - Duplicate-branch files (a second copy of a known frame in the root) are re-hashed
+    and `warn!`ed on every scan — there is no row to cache their `size:mtime`.
+  - Deferred minors from the task reviews, recorded not re-verified: publish Adopt
+    targets not reserved in the run's `claimed` set (a same-run collision could bind
+    a hash the file no longer has — data-integrity, triage first); the publish
+    split's per-candidate work on the async worker; the outdated path emits
+    `collab-published` before returning `Conflict`; the update path unseeds and
+    renames before `…/version` (a failed version call leaves this device listed on
+    vanished old bytes); a land-over can make a byte-identical sibling's store entry
+    dead (m3); a cross-project same-hash landing race (m6); `Restore` holds the
+    request for the whole rescan (m7); the in-flight sweep keeps partial bytes when
+    auto-replicate is off for good (N5); a concurrent forced pass and maintenance can
+    each stay under the loss guard (N7); a non-404 holders error stops the pass
+    (revisit if the hub adds per-frame 400/409); `request_auto_publish(None)` on scan
+    dirties every auto-publish project; the backoff entry survives a project loss;
+    a whole-refresh failure flaps the "poll down" warn every 20 min; the scanner's
+    walk drops unreadable entries silently, so the foreign-file prune can drop a row
+    for an unreadable-but-present file; the ATH_PRJ divert outside the root can
+    repoint a replica outside it; the `db/collab.rs::upsert_project` doc says "Six
+    columns" and lists nine; the dead `OverlapRule::Skip => {}` arm in
+    `api/sync.rs`; `hub_client.rs` size; the Receive tab's `formatGb` duplicates
+    `formatBytes`; "Your publications" lost its published-at timestamp.
+- **Do NOT re-flag**:
+  - An mtime-only touch of a source or master sends no new version (P19): the frame
+    is regenerated, the bytes come out identical, only the recipe is stored. A new
+    version needs changed pixels — or `republish_collab_frames` after an engine
+    change (the recipe excludes the engine version, R3).
+  - A deleted replica is re-fetched only after the collab store's GC drops its dead
+    entry (P20, 900 s, no shorter interval this wave) — up to two maintenance ticks.
+  - A lost project keeps its own rows and files (R14); only replicas' rows go.
+  - `StopHolding` survives a new content version: a declined frame stays declined
+    (the manifest upsert never touches `locally_declined`).
 
 ### Collab v3 wave 1 (2026-09-24)
 
@@ -1232,16 +1321,6 @@ owner run through the shipped Export tab or Transfers yet.
 
 #### Follow-ups surfaced by review (not smokes)
 
-- **Collab publish rework — its own cycle.** Publishing a device's own lights is
-  currently blocked unconditionally (spec §8a, decision C: the project gate's
-  `LightCalStatus` resolves to `NotCalibrated` for every frame, so
-  `publish_collab_frames` always fails with "no publishable frames"). The rework
-  is generate-at-publish with a masters-built gate, mirroring this cycle's export
-  gate. It must also un-ignore the 9 collab tests `#[ignore]`d pending it
-  (`api/collab.rs` ×7, `api/collab_e2e_tests.rs` ×2, all tagged "collab publish
-  rework pending — calibrated-export-v2 spec §8a") — they were rewritten to assert
-  the blocked behavior, not deleted, specifically so the rework has something to
-  flip back.
 - CFA-mismatch advisories (light vs. master Bayer phase) used to surface through
   the old standalone dialog's readiness call; that dialog is gone and nothing
   replaced the surface — the per-frame engine-side logging still runs, but the

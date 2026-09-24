@@ -96,6 +96,13 @@ pub mod stacking;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod settings;
 
+// Collab v3 wave 2 capstone (Task 13, P16): three contexts, three real
+// relay-disabled iroh nodes, one stateful fake hub, and a one-copy disk
+// ledger. Unix + a multi-thread runtime like the package-era e2e it replaces;
+// render+solver because it drives `api::collab`.
+#[cfg(all(test, unix, feature = "render", feature = "solver"))]
+mod collab_v3_e2e_tests;
+
 // Task 9: the C1 relay-eviction regression canary — one `#[ignore]`d test binding
 // two endpoints with the SAME device secret against a real relay (from
 // `ATHENAEUM_TEST_RELAY`) and asserting the first observes the eviction. Owner-run

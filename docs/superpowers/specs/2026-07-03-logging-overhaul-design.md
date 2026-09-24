@@ -165,6 +165,26 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 
 **Dictionary extension (the hub's hourly scheduler, `athenaeum-hub` `scheduler`, collab v2 wave 2 Task 6, 2026-09-21):** two new names on the per-tick `"scheduler tick"` info (`debug` when both are zero): **`stale_marked`** (u64; `asked` join requests flipped to `stale` by this tick's 30-day sweep) and **`digests_sent`** (usize; Monday digest mails handed to `notify` this tick — handed off, not delivered). The tick-failed/panicked errors carry the canonical `error`.
 
+**Dictionary extension (collab v3 per-frame exchange, `api::collab` + `api::collab_exchange` + `api::collab_autopublish` + `sharing::iroh::node`, collab v3 wave 2, 2026-09-24):** the names this wave's publish, poll, replication and maintenance events carry. `bytes` (generic byte count of the event's subject — here the generated frame, or the missing replicas' bytes on the loss guard) and `missing` (a count of missing things — here missing frames on disk truth and the loss guard) are reused in their existing senses. New:
+
+- **`project_id`** (string; the hub project uuid a collab event is about — already reused by the hub-governance entry above, defined here).
+- **`frame_uuid`** (string; a project frame's uuid, the hub's `frameUuid` and the frame's `frames.uuid` / `ATH_CSRC` — deliberately distinct from the numeric `frame_id`).
+- **`content_version`** (i32; a project frame's content version, 1 at announce, +1 per `…/version`).
+- **`holders`** (usize; the number of fresh holders of a frame — the hub's `holderCount`; reserved by the plan, not emitted by any event yet).
+- **`holder`** (short hex node id of ONE holder a replication fetch dialled or tried — the per-frame sibling of the swarm loop's `provider`).
+- **`xxh3`** (16-hex XXH3-64 of a file's content, on the "landed frame was edited" warn).
+- **`held_back`** (usize; frames a publish run held back — gate failures or per-frame generation errors — on the run's summary).
+- **`announced`** (usize; frames a publish run announced as new, on the auto-publish summary).
+- **`landed`** (usize; frames a replication fetch or pass landed, fetched or linked).
+- **`awaiting_gc`** (usize; frames parked until the collab store's GC drops a dead entry, plan P20).
+- **`rehashed`** (usize; files disk truth re-hashed because their `size:mtime` moved).
+- **`pass`** (`"fetch"` | `"forced"`; the replication pass kind on its summary).
+- **`paused`** (bool; the project's `replication_paused` flag on the need-set decision).
+- **`tags_removed`** (u64; collab-store tags an unseed deleted).
+- **`reported`** (usize; full holder reports a maintenance tick sent).
+- **`cleared`** (usize; parked frames the maintenance recheck released because GC dropped their entry).
+- **`trust`** (bool; an approval that also trusts the publisher) and **`published`** (u64; frames the hub published by that approval — the hub's `{published}`).
+
 **Dictionary note (master-light catalog rows and previews, `api::stacking` + `api::files`, M4d Task 3, rulings R-M4d-4/5, 2026-09-12):** adds NO field name, but extends `kind`'s value set with a third sense: on every master-preview event it is the `master_lights.kind` column — `"master"` | `"drizzle"` | `"weight_map"` — the output a preview was asked for, disambiguated (like the sync and stage-0.5 senses before it) by the event and the module. `get_master_light_preview`'s two debug lines (`"master preview served from cache"`, `"master preview rendered"`) carry it alongside the already-canonical `run_id`/`group_key`/`path` (the cache file's path on the first, the master's own on the second), and its three cache warns (`"cached master preview is empty; re-rendering"`, `"cached master preview could not be read; re-rendering"`, `"master preview could not be cached; the bytes were still rendered"`) carry `run_id`/`path`/`error` only — a cache miss is never an outcome the user sees, so none of them mints a field. `api::files::render_preview_from_path`'s own failure line (`"preview render failed"`) carries the canonical `path`/`error`. The rows stage 9 writes emit no event of their own: they ride the `"master written"` / `"drizzled master written"` infos that already report the same paths.
 
 **Dictionary note (fix round 2, 2026-09-06):** the `MasterBuildProgressEvent` `master-build-progress` payload — a `ProgressEmitter` event, not a `tracing` field, so it carries no dictionary entry of its own — now ticks far more often than once per band: `EngineProgress::on_band` fires once per FRAME as `BandSource::read_band_with_progress` reads it (in addition to the existing end-of-band call), and for a FLAT also during pass 1 (`band_index_1based` pinned at `0`). See `EngineProgress::on_band`'s own doc comment in `engine.rs` for the exact contract — this is a UI-progress mechanism change, not a new log field, so it lives there rather than being duplicated into this dictionary.

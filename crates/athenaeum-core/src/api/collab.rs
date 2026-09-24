@@ -3174,7 +3174,7 @@ pub(crate) use crate::api::collab_exchange::COLLABORATION_ROOT_REQUIRED;
 pub(crate) use crate::api::collab_exchange::{publisher_folder, require_collaboration_root};
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// P25: without a Collaboration root, the collab paths refuse with the
@@ -3447,7 +3447,7 @@ mod tests {
     /// Insert a fully-populated `plate_solves` row (every NOT NULL column) for
     /// one frame, with an explicit pixel scale and crval center so the gate's
     /// precedence branches are observable.
-    fn seed_plate_solve(
+    pub(crate) fn seed_plate_solve(
         conn: &rusqlite::Connection,
         frame_id: i64,
         pixel_scale_arcsec: f64,
@@ -4651,7 +4651,7 @@ mod tests {
 
     // ── Publish per frame (wave 2 Task 7) ───────────────────────────────────
 
-    mod publish {
+    pub(crate) mod publish {
         use super::*;
         use std::path::PathBuf;
         use wiremock::matchers::path_regex as wm_path_regex;
@@ -4708,7 +4708,7 @@ mod tests {
         }
 
         /// A master dark with a spread and two spikes, offset by `level`.
-        fn write_dark(path: &Path, level: f32) {
+        pub(crate) fn write_dark(path: &Path, level: f32) {
             write_plane(path, |x, y| {
                 if (x, y) == (5, 5) || (x, y) == (9, 9) {
                     5000.0
@@ -4829,7 +4829,7 @@ mod tests {
             fx.collab.join("m31").join("me-myself")
         }
 
-        fn set_mtime(path: &Path, ahead_secs: u64) {
+        pub(crate) fn set_mtime(path: &Path, ahead_secs: u64) {
             let t = std::time::SystemTime::now() + std::time::Duration::from_secs(ahead_secs);
             std::fs::File::options()
                 .write(true)
@@ -4841,6 +4841,137 @@ mod tests {
 
         fn mtime(path: &Path) -> std::time::SystemTime {
             std::fs::metadata(path).unwrap().modified().unwrap()
+        }
+
+        /// What [`seed_real_light_set`] wrote.
+        pub(crate) struct RealLightSet {
+            pub set_id: i64,
+            pub frame_ids: Vec<i64>,
+            pub lights: Vec<PathBuf>,
+            pub master: PathBuf,
+            pub uuids: Vec<String>,
+        }
+
+        /// One frame set of `n` gate-passing LIGHT frames (FILTER `filter`,
+        /// on the M31 target, analyzed, uuid `uuid-pub-<i>`), each a real
+        /// `W`×`H` FITS under `<root>/src/`, all linked to ONE real master
+        /// dark at `<root>/masters/master_dark.fits` (calibration set 700).
+        /// The caller links the set to its project. Shared with the
+        /// three-instance e2e (`api::collab_v3_e2e_tests`).
+        pub(crate) fn seed_real_light_set(
+            conn: &rusqlite::Connection,
+            root: &Path,
+            n: usize,
+            filter: &str,
+        ) -> RealLightSet {
+            let master = root.join("masters").join("master_dark.fits");
+            write_dark(&master, 300.0);
+            let mut lights = Vec::new();
+            let mut uuids = Vec::new();
+            let mut frame_ids = Vec::new();
+            conn.execute(
+                "INSERT INTO frames_set (name, objctra, objctdec) VALUES ('M31 Set', '00:42:44', '+41:16:09')",
+                [],
+            )
+            .unwrap();
+            let set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
+                 VALUES (?1, '2026-07-01T20:00:00Z', '2026-07-02T03:00:00Z')",
+                [set_id],
+            )
+            .unwrap();
+            let night_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'ASI2600MM')",
+                [night_id],
+            )
+            .unwrap();
+            let session_id = conn.last_insert_rowid();
+
+            // The built master dark, with a real member file.
+            conn.execute(
+                "INSERT INTO calibration_set (id, imagetyp, date, is_master_library) \
+                 VALUES (700, 'MasterDark', '2026-07-01', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) \
+                 VALUES (?1, 'master_dark.fits', 0, '2026-07-01T00:00:00Z', 'FITS')",
+                [master.to_string_lossy()],
+            )
+            .unwrap();
+            let mfile = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, is_master) VALUES (?1, 'MasterDark', 1)",
+                [mfile],
+            )
+            .unwrap();
+            let mframe = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (700, ?1)",
+                [mframe],
+            )
+            .unwrap();
+
+            for i in 0..n {
+                let name = format!("L_{i:04}.fits");
+                let light = root.join("src").join(&name);
+                // Distinct pixels per frame, so no two outputs share a hash.
+                write_plane(&light, |x, y| {
+                    1000.0 + (i * 10) as f32 + ((x * 7 + y) % 13) as f32
+                });
+                let uuid = format!("uuid-pub-{i}");
+                conn.execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format) \
+                     VALUES (?1, ?2, 1000, '2026-07-01T21:00:00Z', 'FITS')",
+                    rusqlite::params![light.to_string_lossy(), name],
+                )
+                .unwrap();
+                let file_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO frames (file_id, imagetyp, object, instrume, ra, dec, xpixsz, focallen, \
+                                         exptime, filter, uuid, date_obs) \
+                     VALUES (?1, 'Light', 'M31', 'ASI2600MM', 10.68, 41.27, 3.76, 1000.0, 300.0, ?3, ?2, \
+                             '2026-07-01T21:00:00Z')",
+                    rusqlite::params![file_id, uuid, filter],
+                )
+                .unwrap();
+                let frame_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                    rusqlite::params![session_id, frame_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO frame_analysis \
+                     (frame_id, file_id, stars_detected, median_fwhm, median_eccentricity, median_snr, \
+                      median_hfr, frame_snr, snr_weight, psf_signal, background, noise, \
+                      detection_threshold, width, height, source_channels, trail_r_squared, possibly_trailed) \
+                     VALUES (?1, ?2, 400, 2.0, 0.4, 10.0, 2.0, 10.0, 1.0, 100.0, 10.0, 1.0, 5.0, \
+                             512, 512, 1, 0.0, 0)",
+                    rusqlite::params![frame_id, file_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO calibration_set_to_frames \
+                     (source_id, source_type, calibration_set_id, calibration_type, matched_at) \
+                     VALUES (?1, 'frame', 700, 'Dark', '2026-07-01T00:00:00Z')",
+                    [frame_id],
+                )
+                .unwrap();
+                lights.push(light);
+                uuids.push(uuid);
+                frame_ids.push(frame_id);
+            }
+            RealLightSet {
+                set_id,
+                frame_ids,
+                lights,
+                master,
+                uuids,
+            }
         }
 
         /// A signed-in context with a bound node, a mounted Collaboration
@@ -4872,12 +5003,7 @@ mod tests {
             .unwrap()
             .node_id();
 
-            let master = tmp.path().join("masters").join("master_dark.fits");
-            write_dark(&master, 300.0);
-            let mut lights = Vec::new();
-            let mut uuids = Vec::new();
-            let mut frame_ids = Vec::new();
-            let set_id = {
+            {
                 let conn = crate::api::db(&ctx).unwrap().conn();
                 let members =
                     serde_json::json!([member_json("Me Myself", "send_receive", false, &me)]);
@@ -4923,116 +5049,22 @@ mod tests {
                     Some(r#"[{"canonical":"L","aliases":["Lum"],"kind":"broadband"}]"#),
                 )
                 .unwrap();
-
-                conn.execute(
-                    "INSERT INTO frames_set (name, objctra, objctdec) VALUES ('M31 Set', '00:42:44', '+41:16:09')",
-                    [],
-                )
-                .unwrap();
-                let set_id = conn.last_insert_rowid();
-                conn.execute(
-                    "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
-                     VALUES (?1, '2026-07-01T20:00:00Z', '2026-07-02T03:00:00Z')",
-                    [set_id],
-                )
-                .unwrap();
-                let night_id = conn.last_insert_rowid();
-                conn.execute(
-                    "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'ASI2600MM')",
-                    [night_id],
-                )
-                .unwrap();
-                let session_id = conn.last_insert_rowid();
-
-                // The built master dark, with a real member file.
-                conn.execute(
-                    "INSERT INTO calibration_set (id, imagetyp, date, is_master_library) \
-                     VALUES (700, 'MasterDark', '2026-07-01', 1)",
-                    [],
-                )
-                .unwrap();
-                conn.execute(
-                    "INSERT INTO files (path, filename, size, modified_at, format) \
-                     VALUES (?1, 'master_dark.fits', 0, '2026-07-01T00:00:00Z', 'FITS')",
-                    [master.to_string_lossy()],
-                )
-                .unwrap();
-                let mfile = conn.last_insert_rowid();
-                conn.execute(
-                    "INSERT INTO frames (file_id, imagetyp, is_master) VALUES (?1, 'MasterDark', 1)",
-                    [mfile],
-                )
-                .unwrap();
-                let mframe = conn.last_insert_rowid();
-                conn.execute(
-                    "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (700, ?1)",
-                    [mframe],
-                )
-                .unwrap();
-
-                for i in 0..n {
-                    let name = format!("L_{i:04}.fits");
-                    let light = tmp.path().join("src").join(&name);
-                    // Distinct pixels per frame, so no two outputs share a hash.
-                    write_plane(&light, |x, y| {
-                        1000.0 + (i * 10) as f32 + ((x * 7 + y) % 13) as f32
-                    });
-                    let uuid = format!("uuid-pub-{i}");
-                    conn.execute(
-                        "INSERT INTO files (path, filename, size, modified_at, format) \
-                         VALUES (?1, ?2, 1000, '2026-07-01T21:00:00Z', 'FITS')",
-                        rusqlite::params![light.to_string_lossy(), name],
-                    )
-                    .unwrap();
-                    let file_id = conn.last_insert_rowid();
-                    conn.execute(
-                        "INSERT INTO frames (file_id, imagetyp, object, instrume, ra, dec, xpixsz, focallen, \
-                                             exptime, filter, uuid, date_obs) \
-                         VALUES (?1, 'Light', 'M31', 'ASI2600MM', 10.68, 41.27, 3.76, 1000.0, 300.0, 'L', ?2, \
-                                 '2026-07-01T21:00:00Z')",
-                        rusqlite::params![file_id, uuid],
-                    )
-                    .unwrap();
-                    let frame_id = conn.last_insert_rowid();
-                    conn.execute(
-                        "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
-                        rusqlite::params![session_id, frame_id],
-                    )
-                    .unwrap();
-                    conn.execute(
-                        "INSERT INTO frame_analysis \
-                         (frame_id, file_id, stars_detected, median_fwhm, median_eccentricity, median_snr, \
-                          median_hfr, frame_snr, snr_weight, psf_signal, background, noise, \
-                          detection_threshold, width, height, source_channels, trail_r_squared, possibly_trailed) \
-                         VALUES (?1, ?2, 400, 2.0, 0.4, 10.0, 2.0, 10.0, 1.0, 100.0, 10.0, 1.0, 5.0, \
-                                 512, 512, 1, 0.0, 0)",
-                        rusqlite::params![frame_id, file_id],
-                    )
-                    .unwrap();
-                    conn.execute(
-                        "INSERT INTO calibration_set_to_frames \
-                         (source_id, source_type, calibration_set_id, calibration_type, matched_at) \
-                         VALUES (?1, 'frame', 700, 'Dark', '2026-07-01T00:00:00Z')",
-                        [frame_id],
-                    )
-                    .unwrap();
-                    lights.push(light);
-                    uuids.push(uuid);
-                    frame_ids.push(frame_id);
-                }
-                set_id
+            }
+            let set = {
+                let conn = crate::api::db(&ctx).unwrap().conn();
+                seed_real_light_set(&conn, tmp.path(), n, "L")
             };
-            link_frame_set(&ctx, PID, set_id).unwrap();
+            link_frame_set(&ctx, PID, set.set_id).unwrap();
             PubFx {
                 tmp,
                 ctx,
                 server,
                 node,
                 collab,
-                frame_ids,
-                lights,
-                master,
-                uuids,
+                frame_ids: set.frame_ids,
+                lights: set.lights,
+                master: set.master,
+                uuids: set.uuids,
             }
         }
 

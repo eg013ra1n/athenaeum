@@ -75,7 +75,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 **`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `paths`, `fingerprint`, `db`, `fits_parser`, `fits_writer`, `clustering`, `settings`, `sessions`, `scanner`, `monitor`, `duplicates`, `calibration`, `calibration_library`, `archive`, `file_op`, `export`, `analysis`, `flat_analysis`, `plate_solve`, `registration`, `catalog`, `auto_merge`, `relinking`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`, `geometry`, `resample`, `integration`, `stacking`, `package`, `sharing`, `sync`, `collab`, `account`, `updates`, `ts_export`, plus `api/` — the command-facing orchestration layer both hosts call. `integration` is `#[cfg(feature = "render")]` and `stacking` is `render + solver`: `cargo check --no-default-features` compiles neither, so the headless gate is not coverage for them.
 
-**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 259 `#[tauri::command]` functions across 24 modules (counted 2026-09-22; `cache` is an empty placeholder still declared in `mod.rs`). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
+**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 264 `#[tauri::command]` functions across 24 modules (counted 2026-09-24; `cache` is an empty placeholder still declared in `mod.rs`). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
 
 `account` `analysis` `archive` `cache` `calendar` `calibration` `collab` `compute` `content_index` `core` `duplicates` `export` `files` `frame_sets` `masters` `missing_files` `plate_solve` `registration` `scan_roots` `settings` `spatial` `stacking` `sync` `updates`
 
@@ -223,6 +223,7 @@ Device-to-device transfers over iroh: `crates/athenaeum-core/src/sync/` (engine/
 - **One copy per transfer, both ends**: `ImportMode::TryReference` on the sender, `ExportMode::TryReference` + hard-link-or-copy landing on the receiver; a staged payload is never edited in place; confirm runs protect → cleanup → release.
 - **Folders**: `api::sync::sync_dirs` → `SyncDirs { identity_dir (never moves), packages_dir, working_dir, db_path }`; `validate_transfer_dir` is the one gate for both folders and both backends (no scan-root overlap).
 - **Retention is Perseus-only** — the app never deletes a sent source. Frame-set send from the Export tab reuses the export pipeline and `check_mode_ready`.
+- **Collab v3**: per-frame exchange, collab store under the Collaboration root on its own ALPN; a project frame's path lives only in `project_frames_local` (P26).
 
 Frontend: `src/pages/Transfers.tsx` (one row per transfer FROM THE MODEL), `src/hooks/useTransferQueue.ts`, Settings → Transfers (`components/settings/TransfersSection.tsx`).
 
