@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams, useSearchParams } from 'react-router-dom';
 import { ExternalLink, Loader2, Plus, RefreshCw, Send, Target } from 'lucide-react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
@@ -23,6 +23,10 @@ import type {
 
 type Tab = 'contribute' | 'receive' | 'moderation' | 'overview';
 
+function isTab(v: string | null): v is Tab {
+  return v === 'contribute' || v === 'receive' || v === 'moderation' || v === 'overview';
+}
+
 // Rough per-frame size for the PRE-publish confirm estimate only (a calibrated
 // 32-bit-float light frame). The exact size is measured when each frame is
 // calibrated; the dialog labels this figure "estimated" so it never reads as
@@ -44,6 +48,19 @@ export default function ProjectDetail() {
   // Session-scoped so stepping into a linked object and back returns to the
   // tab you were on.
   const [tab, setTab] = useSessionState<Tab>('projectDetail.tab', 'contribute');
+  // `?tab=receive` (from a collab notification's link, e.g. a replication
+  // pause or a landed-frames toast — see `useCollabNotifications`) jumps to
+  // that tab on arrival, then cleans the URL. Mirrors `FrameSetDetail`'s
+  // `?tab=…` pattern.
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    const tabParam = searchParams.get('tab');
+    if (!isTab(tabParam)) return;
+    setTab(tabParam);
+    const next = new URLSearchParams(searchParams);
+    next.delete('tab');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams, setTab]);
   const [linkOpen, setLinkOpen] = useState(false);
   const [missing, setMissing] = useState(false);
   const [updateRequired, setUpdateRequired] = useState(false);

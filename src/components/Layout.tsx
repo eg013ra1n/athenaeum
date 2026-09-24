@@ -29,6 +29,7 @@ import { UpdatesProvider } from '../contexts/UpdatesContext';
 import { UpdateDialog } from './updates/UpdateDialog';
 import { AutoUpdateCheck } from './AutoUpdateCheck';
 import { useProjectMatches } from '../hooks/useProjectMatches';
+import { useCollabNotifications } from '../hooks/useCollabNotifications';
 import { useContentIndexNotifications } from '../hooks/useContentIndex';
 import Logo from '../assets/athenaeum.png';
 
@@ -37,6 +38,15 @@ import Logo from '../assets/athenaeum.png';
  * has its context; the Layout body itself runs above the provider. */
 function ProjectMatchesListener() {
   useProjectMatches();
+  return null;
+}
+
+/** Mounts every live collab notification listener (R29): replication-paused,
+ * frames-changed, published, frames-landed. App-root, same reason as
+ * `ProjectMatchesListener` — a data-loss-risk or background outcome must
+ * reach `notify()` regardless of which page is open. */
+function CollabNotificationsListener() {
+  useCollabNotifications();
   return null;
 }
 
@@ -171,6 +181,7 @@ export default function Layout() {
           <TransfersPanel />
           <AutoUpdateCheck />
           <ProjectMatchesListener />
+          <CollabNotificationsListener />
           <ContentIndexListener />
           <GlobalNavKeys />
         </div>

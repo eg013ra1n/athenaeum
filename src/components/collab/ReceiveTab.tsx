@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { FolderOpen, FolderOutput, Loader2, RefreshCw } from 'lucide-react';
 import { api } from '../../api';
 import ProjectExportDialog from './ProjectExportDialog';
+import { formatGb } from './format';
 import type { CollabReplicationPaused, LossAction, ProjectFrameView } from '../../types/models';
 
 /**
@@ -246,10 +247,6 @@ function groupByPublisher(frames: ProjectFrameView[]): [string, ProjectFrameView
     else map.set(f.publisher, [f]);
   }
   return Array.from(map.entries());
-}
-
-function formatGb(bytes: number): string {
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 /** On-disk state, driven entirely by the stored row (S6, never optimistic). */
