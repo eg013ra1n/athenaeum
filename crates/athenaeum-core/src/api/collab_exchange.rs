@@ -1675,6 +1675,36 @@ pub fn list_project_packages(
     Ok(rows.into_iter().map(ProjectPackageView::from).collect())
 }
 
+/// Decode a cached row's retained manifest JSON back into the
+/// [`FrameViewWire`](crate::collab::hub_client::FrameViewWire) it was
+/// written from (`db::collab_frames::upsert_from_manifest` always writes
+/// `serde_json::to_string` of a decoded one) — the shared parse-with-warn
+/// every cache-only view built from `project_frames_local` uses for the
+/// fields beyond the reliable local columns ([`ProjectFrameView`],
+/// `api::collab::list_moderation_queue`'s `ModerationFrameView`). A parse
+/// failure never should happen; it is `None` + a `warn!` naming `caller`,
+/// never a hard error that would drop the row from its list.
+pub(crate) fn parse_manifest_wire(
+    project_id: &str,
+    frame_uuid: &str,
+    manifest_json: &str,
+    caller: &str,
+) -> Option<crate::collab::hub_client::FrameViewWire> {
+    match serde_json::from_str(manifest_json) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::warn!(
+                project_id,
+                frame_uuid,
+                error = %e,
+                caller,
+                "manifest_json did not parse — some fields omitted"
+            );
+            None
+        }
+    }
+}
+
 /// One cached per-frame manifest row of a project (mine or a peer's),
 /// projected for the frames list (wave 2 Task 11). Replaces
 /// [`ProjectPackageView`]/[`list_project_packages`] for the frontend, which
@@ -1723,19 +1753,12 @@ impl ProjectFrameView {
     /// [`FrameViewWire`]) still returns a view, with those fields empty and
     /// a `warn!` — never a lost frame from the list.
     fn from_local_row(row: LocalFrameRow) -> Self {
-        let wire: Option<crate::collab::hub_client::FrameViewWire> =
-            match serde_json::from_str(&row.manifest_json) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    tracing::warn!(
-                        project_id = %row.project_id,
-                        frame_uuid = %row.frame_uuid,
-                        error = %e,
-                        "list_project_frames: manifest_json did not parse — some fields omitted"
-                    );
-                    None
-                }
-            };
+        let wire = parse_manifest_wire(
+            &row.project_id,
+            &row.frame_uuid,
+            &row.manifest_json,
+            "list_project_frames",
+        );
         let (exptime_sec, date_obs, accepted_reason, fwhm_arcsec, eccentricity, stars_detected) =
             match &wire {
                 Some(w) => (
@@ -1987,8 +2010,11 @@ pub async fn seed_ingested_package(ctx: &ServiceContext, package_id: &str) {
 /// so its post-ingest seed is skipped; approval is the moment it becomes
 /// servable to the project, and nothing else would seed it (the need diff only
 /// pulls packages that are NOT locally complete, so no later pass revisits it).
-/// Called from `api::collab::decide_announcement`'s approve branch AFTER the row
-/// flips to `published`.
+/// Package-era: `api::collab::decide_announcement`, the caller this doc
+/// described, was replaced by the per-frame `approve_collab_frame`/
+/// `reject_collab_frame` in wave 2 Task 11; this fn now has no production
+/// caller and is test-only until Task 12 removes it along with the rest of
+/// the package machinery.
 ///
 /// Best-effort with the ingest hook's exact contract: an unknown announcement, a
 /// package that is not locally complete, and a failed import are each a log line,
@@ -8419,8 +8445,10 @@ mod tests {
     /// straight out of the blob store to anyone past the connect gate, with none
     /// of `authorize_and_reconstruct_serve`'s pending ⇒ coordinator-only check —
     /// which is exactly the rule spec §6 claims still governs who may pull. The
-    /// copy becomes servable the moment the coordinator approves it, through the
-    /// same seed path `decide_announcement` calls.
+    /// copy becomes servable the moment the coordinator approves it, through
+    /// [`seed_approved_announcement`]'s seed path (package-era, test-only —
+    /// its production caller `decide_announcement` was replaced in wave 2
+    /// Task 11, called here directly to exercise the same seed path).
     #[cfg(unix)]
     #[tokio::test]
     async fn pending_review_copy_is_seeded_only_after_approval() {

@@ -3039,19 +3039,12 @@ pub fn list_moderation_queue(
         if row.state != "pending" {
             continue;
         }
-        let wire: Option<crate::collab::hub_client::FrameViewWire> =
-            match serde_json::from_str(&row.manifest_json) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    tracing::warn!(
-                        project_id,
-                        frame_uuid = %row.frame_uuid,
-                        error = %e,
-                        "moderation queue: manifest_json did not parse — some fields omitted"
-                    );
-                    None
-                }
-            };
+        let wire = crate::api::collab_exchange::parse_manifest_wire(
+            project_id,
+            &row.frame_uuid,
+            &row.manifest_json,
+            "list_moderation_queue",
+        );
         let (created_at, exptime_sec, fwhm_arcsec) = match &wire {
             Some(w) => (
                 w.created_at.clone(),
