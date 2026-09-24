@@ -479,6 +479,7 @@ pub async fn plate_solve_batch(
                 })
                 .unwrap_or_default(),
             });
+            athenaeum_core::api::plate_solve::on_batch_finished(&ctx);
         }));
         if let Err(panic) = outcome {
             let msg = panic
@@ -498,6 +499,7 @@ pub async fn plate_solve_batch(
                 })
                 .unwrap_or_default(),
             });
+            athenaeum_core::api::plate_solve::on_batch_finished(&cleanup_ctx);
         }
     });
 

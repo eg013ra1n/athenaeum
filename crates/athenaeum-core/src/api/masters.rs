@@ -1783,6 +1783,28 @@ fn run_master_build_thread(
             warning,
         },
     );
+
+    // Auto-publish trigger (collab v3 wave 2, Task 10): a new master can turn
+    // previously-uncalibratable lights publishable. `set_id` is the SOURCE
+    // calibration set the master was built from; its consumers are the
+    // frame sets whose lights actually use it (transitively, e.g. a Bias
+    // used only via a Dark). Render+solver-gated (drives
+    // `publish_collab_frames`); this module is render-only, so the call is
+    // `cfg`-scoped here.
+    #[cfg(feature = "solver")]
+    if success {
+        let consumers = db(&ctx).ok().and_then(|d| {
+            crate::db::calibration_links::get_calibration_set_consumers(&d.conn(), set_id)
+                .map_err(|error| {
+                    tracing::warn!(set_id, %error, "auto-publish: failed to resolve master-build consumers");
+                })
+                .ok()
+        });
+        if let Some(consumers) = consumers {
+            let set_ids: Vec<i64> = consumers.iter().map(|c| c.frame_set_id).collect();
+            crate::api::collab_autopublish::request_auto_publish_for_sets(&set_ids);
+        }
+    }
 }
 
 // ── Public start/batch/rebuild/cancel/provenance API ─────────────────────────

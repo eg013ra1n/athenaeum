@@ -122,9 +122,24 @@ pub fn bulk_update_frame_metadata(
 ) -> Result<usize, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    Ok(crate::db::bulk_update_frame_metadata(
-        &conn, &frame_ids, &edits,
-    )?)
+
+    // Auto-publish trigger (collab v3 wave 2, Task 10): resolved BEFORE the
+    // cascade runs, since the cascade (`db::bulk_update_frame_metadata`)
+    // can sever the very calibration/session junctions this join walks —
+    // the frame sets these frames belonged to before the edit are exactly
+    // the ones whose gate eligibility might have just changed.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    let affected_sets = crate::db::calibration_links::frame_set_ids_for_frames(&conn, &frame_ids)
+        .unwrap_or_default();
+
+    let updated = crate::db::bulk_update_frame_metadata(&conn, &frame_ids, &edits)?;
+
+    #[cfg(all(feature = "render", feature = "solver"))]
+    if updated > 0 {
+        crate::api::collab_autopublish::request_auto_publish_for_sets(&affected_sets);
+    }
+
+    Ok(updated)
 }
 
 /// Re-decode the originally-scanned header values for the given frames out

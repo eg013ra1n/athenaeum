@@ -580,6 +580,7 @@ pub fn link_frame_set(
 
     crate::db::collab::link_set(&conn, project_id, frames_set_id).map_err(internal)?;
     tracing::info!(project_id, frames_set_id, "linked frame set to project");
+    crate::api::collab_autopublish::request_auto_publish(Some(project_id));
     Ok(())
 }
 
@@ -600,6 +601,29 @@ pub fn unlink_frame_set(
         removed,
         "unlinked frame set from project"
     );
+    Ok(())
+}
+
+/// Set one project's auto-publish preference (P13, R16): whether a coalesced
+/// publish run fires for this project on scan/analysis/solve/link/master/
+/// calibration-link triggers. Local-only, like `set_project_auto_replicate`
+/// (`api::collab_exchange`) — the hub never learns of it, and `NotFound` when
+/// the project isn't cached (a toggle for a project this device doesn't
+/// know about is a caller bug, not a silent no-op).
+pub async fn set_project_auto_publish(
+    ctx: &ServiceContext,
+    project_id: &str,
+    on: bool,
+) -> Result<(), ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let updated = crate::db::collab::set_auto_publish(&conn, project_id, on).map_err(internal)?;
+    if updated == 0 {
+        return Err(ApiError::NotFound(format!(
+            "project {project_id} is not cached — refresh first"
+        )));
+    }
+    tracing::info!(project_id, on, "collab auto-publish toggled");
     Ok(())
 }
 
@@ -1244,9 +1268,15 @@ pub(crate) struct RefreshReport {
 /// THE one entry point for "a project's thresholds or dictionary moved"
 /// (ruling R11), called by every refresh path — the project list refresh and
 /// the version poll — so a change is acted on once, whichever path absorbed
-/// it. A no-op until auto-publish (Task 10) replaces the body.
+/// it. Dirties the project for auto-publish (Task 10, R16): a tightened
+/// threshold or a dictionary change can turn a previously-refused frame
+/// publishable. May fire twice for one change (a UI refresh and the version
+/// poll overlapping) — the auto-publish worker's dirty-set + kick + debounce
+/// design collapses that into one run (see
+/// `collab_autopublish::two_gate_moves_for_the_same_project_drain_to_one_entry`).
 pub(crate) fn on_thresholds_or_dictionary_moved(_ctx: &ServiceContext, project_id: &str) {
     tracing::debug!(project_id, "thresholds or dictionary moved");
+    crate::api::collab_autopublish::request_auto_publish(Some(project_id));
     #[cfg(test)]
     GATE_MOVES_SEEN.with(|seen| seen.borrow_mut().push(project_id.to_string()));
 }

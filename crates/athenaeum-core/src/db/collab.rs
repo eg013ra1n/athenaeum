@@ -277,13 +277,15 @@ pub fn set_replication_paused(conn: &Connection, project_id: &str, paused: bool)
 }
 
 /// Set the LOCAL auto-publish preference (P13). The ONLY writer of
-/// `auto_publish`.
-pub fn set_auto_publish(conn: &Connection, project_id: &str, on: bool) -> Result<()> {
-    conn.execute(
+/// `auto_publish`. Returns the number of rows updated (0 when the project
+/// isn't cached), same contract as [`set_auto_replicate`] — the api layer's
+/// `set_project_auto_publish` uses it to refuse an unknown project.
+pub fn set_auto_publish(conn: &Connection, project_id: &str, on: bool) -> Result<usize> {
+    let updated = conn.execute(
         "UPDATE collab_projects SET auto_publish = ?2 WHERE project_id = ?1",
         params![project_id, on as i64],
     )?;
-    Ok(())
+    Ok(updated)
 }
 
 /// All cached projects I am still a member of, ordered by title. Projects
@@ -372,6 +374,31 @@ pub fn is_set_linked(conn: &Connection, project_id: &str, frames_set_id: i64) ->
         |r| r.get(0),
     )?;
     Ok(exists)
+}
+
+/// Every project id linked to any of the given frame sets, deduplicated
+/// (collab v3 wave 2, Task 10, R16): `request_auto_publish_for_sets` stores
+/// the raw set ids without a DB handle at the call site, so the auto-publish
+/// worker resolves them to projects here at drain time.
+pub fn project_ids_for_sets(conn: &Connection, set_ids: &[i64]) -> Result<Vec<String>> {
+    if set_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: Vec<String> = set_ids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "SELECT DISTINCT project_id FROM project_links WHERE frames_set_id IN ({})",
+        placeholders.join(", ")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<Box<dyn rusqlite::ToSql>> = set_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let ids = stmt
+        .query_map(param_refs.as_slice(), |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(ids)
 }
 
 /// Record a "publish as project" intent for a set (its target RA/Dec captured at
@@ -523,7 +550,10 @@ mod tests {
         assert_eq!((row.hub_version, row.manifest_cursor), (0, 0));
 
         upsert_project(&conn, &sample_row("p-1")).unwrap();
-        assert!(lost_at(&conn, "p-1").unwrap().is_none(), "a re-join clears it");
+        assert!(
+            lost_at(&conn, "p-1").unwrap().is_none(),
+            "a re-join clears it"
+        );
         assert_eq!(list_projects(&conn).unwrap().len(), 1);
     }
 
@@ -573,11 +603,13 @@ mod tests {
         assert_eq!(row.title, "Refreshed", "the hub-mirrored column DID update");
         assert!(!row.auto_publish, "auto_publish must survive the poll");
         assert_eq!(
-            row.policy_json,
-            r#"{"mode":"filter","filters":["R"]}"#,
+            row.policy_json, r#"{"mode":"filter","filters":["R"]}"#,
             "policy_json must survive the poll"
         );
-        assert!(row.replication_paused, "replication_paused must survive the poll");
+        assert!(
+            row.replication_paused,
+            "replication_paused must survive the poll"
+        );
     }
 
     /// v3 (Task 2): a catalog created before the rename still has
@@ -652,14 +684,18 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(pending, 3, "the existing moderation count survives the rename");
+        assert_eq!(
+            pending, 3,
+            "the existing moderation count survives the rename"
+        );
     }
 
     #[test]
     fn links_and_intents_respect_fk_cascade() {
         let conn = test_conn();
         // A real frames_set row for the FK.
-        conn.execute("INSERT INTO frames_set (name) VALUES ('S1')", []).unwrap();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('S1')", [])
+            .unwrap();
         let set_id = conn.last_insert_rowid();
 
         link_set(&conn, "p-1", set_id).unwrap();
@@ -674,17 +710,51 @@ mod tests {
 
         // Deleting the set cascades the link away.
         add_link_intent(&conn, set_id, 1.0, 2.0).unwrap();
-        conn.execute("DELETE FROM frames_set WHERE id = ?1", [set_id]).unwrap();
+        conn.execute("DELETE FROM frames_set WHERE id = ?1", [set_id])
+            .unwrap();
         assert!(linked_set_ids(&conn, "p-1").unwrap().is_empty());
         assert!(list_link_intents(&conn).unwrap().is_empty());
 
         assert_eq!(unlink_set(&conn, "p-1", set_id).unwrap(), 0, "already gone");
     }
 
+    /// [`project_ids_for_sets`] feeds the auto-publish worker's set→project
+    /// resolution (collab v3 wave 2, Task 10): two sets, one shared between
+    /// two projects, one unlinked; dedup and the unrelated project are both
+    /// pinned.
+    #[test]
+    fn project_ids_for_sets_dedups_and_ignores_unlinked() {
+        let conn = test_conn();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('S1')", [])
+            .unwrap();
+        let set_a = conn.last_insert_rowid();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('S2')", [])
+            .unwrap();
+        let set_b = conn.last_insert_rowid();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('S3')", [])
+            .unwrap();
+        let set_unlinked = conn.last_insert_rowid();
+        let _ = set_unlinked;
+
+        link_set(&conn, "p-1", set_a).unwrap();
+        link_set(&conn, "p-2", set_a).unwrap();
+        link_set(&conn, "p-1", set_b).unwrap();
+
+        let mut ids = project_ids_for_sets(&conn, &[set_a, set_b]).unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["p-1".to_string(), "p-2".to_string()]);
+
+        assert!(project_ids_for_sets(&conn, &[set_unlinked])
+            .unwrap()
+            .is_empty());
+        assert!(project_ids_for_sets(&conn, &[]).unwrap().is_empty());
+    }
+
     #[test]
     fn expires_only_stale_link_intents() {
         let conn = test_conn();
-        conn.execute("INSERT INTO frames_set (name) VALUES ('S1')", []).unwrap();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('S1')", [])
+            .unwrap();
         let set_id = conn.last_insert_rowid();
 
         // One fresh intent (created_at = now via the column default).
@@ -700,8 +770,11 @@ mod tests {
         let removed = delete_intents_older_than(&conn, 7).unwrap();
         assert_eq!(removed, 1, "only the 8-day-old intent expires");
 
-        let remaining: Vec<i64> =
-            list_link_intents(&conn).unwrap().into_iter().map(|(id, ..)| id).collect();
+        let remaining: Vec<i64> = list_link_intents(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
         assert_eq!(remaining, vec![fresh], "the fresh intent survives");
     }
 }

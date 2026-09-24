@@ -5793,6 +5793,13 @@ pub fn spawn_collab_auto_sync(
         tracing::debug!("collab auto-sync already armed; not spawning a second loop");
         return None;
     }
+    // Task 10: the coalesced auto-publish worker shares this arming guard
+    // rather than getting its own — the first (and only) caller to win the
+    // swap above arms BOTH loops for the process. Render+solver-gated (it
+    // drives `publish_collab_frames`); this module stays ungated, so the
+    // call is `cfg`-scoped here rather than at every `ensure_started` site.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_autopublish::spawn_auto_publish_worker(Arc::clone(&ctx), emitter.clone());
     Some(tokio::spawn(run_collab_auto_sync_loop(
         ctx,
         sync,

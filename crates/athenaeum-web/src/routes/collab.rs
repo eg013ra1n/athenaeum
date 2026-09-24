@@ -50,6 +50,13 @@ pub struct AutoReplicateArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AutoPublishArgs {
+    project_id: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PolicyArgs {
     project_id: String,
     policy: exchange::ReplicationPolicy,
@@ -231,6 +238,19 @@ pub async fn set_project_auto_replicate(
     Json(args): Json<AutoReplicateArgs>,
 ) -> Result<Json<()>, (axum::http::StatusCode, String)> {
     exchange::set_project_auto_replicate(&state.ctx, &args.project_id, args.enabled)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Collab v3 wave 2 Task 10 (R16, P13): turn this project's coalesced
+/// auto-publish on or off (local preference — the hub never learns of it).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_project_auto_publish(
+    State(state): State<WebAppState>,
+    Json(args): Json<AutoPublishArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    api::set_project_auto_publish(&state.ctx, &args.project_id, args.enabled)
+        .await
         .map(Json)
         .map_err(api_err)
 }

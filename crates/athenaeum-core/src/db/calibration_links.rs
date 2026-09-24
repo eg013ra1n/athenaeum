@@ -464,6 +464,36 @@ pub fn get_calibration_set_consumers(
     rows.collect()
 }
 
+/// The frame sets that own the given frames, via `session_members` →
+/// `sessions` → `imaging_nights` (the same chain [`get_calibration_set_consumers`]
+/// walks), deduplicated. Feeds the auto-publish trigger (collab v3 wave 2,
+/// Task 10): a manual Lights→calibration link/unlink touches frame ids
+/// directly, not calibration sets, so it needs this instead.
+pub fn frame_set_ids_for_frames(conn: &Connection, frame_ids: &[i64]) -> Result<Vec<i64>> {
+    if frame_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "SELECT DISTINCT n.frames_set_id
+           FROM session_members sm
+           JOIN sessions s ON s.id = sm.session_id
+           JOIN imaging_nights n ON n.id = s.imaging_night_id
+          WHERE sm.frame_id IN ({})",
+        placeholders.join(", ")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<Box<dyn rusqlite::ToSql>> = frame_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let ids = stmt
+        .query_map(param_refs.as_slice(), |row| row.get(0))?
+        .collect::<Result<Vec<i64>>>()?;
+    Ok(ids)
+}
+
 pub fn link_exists(
     conn: &Connection,
     source_id: i64,
@@ -1276,7 +1306,12 @@ pub fn get_calibration_hierarchy_for_frame_set(
     // Sort nights in descending order (most recent first), by when they began.
     let mut dates: Vec<&i64> = date_map.keys().collect();
     dates.sort_by(|a, b| {
-        let key = |id: &i64| night_spans.get(id).map(|(s, _)| s.clone()).unwrap_or_default();
+        let key = |id: &i64| {
+            night_spans
+                .get(id)
+                .map(|(s, _)| s.clone())
+                .unwrap_or_default()
+        };
         key(b).cmp(&key(a))
     });
 
@@ -1592,7 +1627,12 @@ fn format_night_display(start: &str, end: &str) -> String {
             a.format("%Y")
         )
     } else {
-        format!("{} – {}, {}", a.format("%B %-d"), b.format("%B %-d"), b.format("%Y"))
+        format!(
+            "{} – {}, {}",
+            a.format("%B %-d"),
+            b.format("%B %-d"),
+            b.format("%Y")
+        )
     }
 }
 
@@ -1854,7 +1894,13 @@ mod night_grouping_tests {
     }
 
     /// One imaging night holding `frames` — `(frame_id, date_obs)`.
-    fn night_with_lights(conn: &Connection, set_id: i64, start: &str, end: &str, frames: &[(i64, &str)]) {
+    fn night_with_lights(
+        conn: &Connection,
+        set_id: i64,
+        start: &str,
+        end: &str,
+        frames: &[(i64, &str)],
+    ) {
         let night_id = crate::db::create_imaging_night(conn, set_id, start, end).unwrap();
         let session_id =
             crate::db::create_session(conn, night_id, "CamA", frames.len() as i32, None).unwrap();
@@ -1882,7 +1928,11 @@ mod night_grouping_tests {
     #[test]
     fn hierarchy_groups_by_night_not_by_calendar_date() {
         let conn = db();
-        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'LDN 1272')", []).unwrap();
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (1, 'LDN 1272')",
+            [],
+        )
+        .unwrap();
         night_with_lights(
             &conn,
             1,
@@ -1920,7 +1970,8 @@ mod night_grouping_tests {
     #[test]
     fn a_night_inside_one_date_keeps_the_single_date_label() {
         let conn = db();
-        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'X')", []).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'X')", [])
+            .unwrap();
         night_with_lights(
             &conn,
             1,
@@ -1931,5 +1982,46 @@ mod night_grouping_tests {
         let view = get_calibration_hierarchy_for_frame_set(&conn, 1).unwrap();
         assert_eq!(view.date_groups.len(), 1);
         assert_eq!(view.date_groups[0].date_display, "October 18, 2025");
+    }
+
+    /// [`frame_set_ids_for_frames`] feeds the auto-publish trigger (collab v3
+    /// wave 2, Task 10): frames from two sets resolve to both, a frame that
+    /// belongs to neither night is ignored, and dedup applies within a set.
+    #[test]
+    fn frame_set_ids_for_frames_resolves_and_dedups() {
+        let conn = db();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'S1')", [])
+            .unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (2, 'S2')", [])
+            .unwrap();
+        night_with_lights(
+            &conn,
+            1,
+            "2025-10-18T18:00:00Z",
+            "2025-10-18T23:30:00Z",
+            &[(10, "2025-10-18T18:00:00Z"), (11, "2025-10-18T23:30:00Z")],
+        );
+        night_with_lights(
+            &conn,
+            2,
+            "2025-11-01T18:00:00Z",
+            "2025-11-01T23:30:00Z",
+            &[(20, "2025-11-01T18:00:00Z")],
+        );
+
+        let mut ids = super::frame_set_ids_for_frames(&conn, &[10, 11, 20]).unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+
+        assert_eq!(
+            super::frame_set_ids_for_frames(&conn, &[10]).unwrap(),
+            vec![1]
+        );
+        assert!(super::frame_set_ids_for_frames(&conn, &[])
+            .unwrap()
+            .is_empty());
+        assert!(super::frame_set_ids_for_frames(&conn, &[999])
+            .unwrap()
+            .is_empty());
     }
 }

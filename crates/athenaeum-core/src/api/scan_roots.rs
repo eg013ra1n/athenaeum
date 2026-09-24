@@ -1660,6 +1660,17 @@ pub fn start_scan_with_progress<E: crate::events::ProgressEmitter>(
         "scan complete"
     );
 
+    // Auto-publish trigger (collab v3 wave 2, Task 10): a scan can create
+    // sessions, re-cluster frame sets and change a camera, so a change that
+    // matters to a linked project's gate is possible whenever the scan
+    // actually processed something. Render+solver-gated (it drives
+    // `publish_collab_frames`); this module stays ungated, so the call is
+    // `cfg`-scoped here rather than at the module level.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    if !result.cancelled && result.files_processed > 0 {
+        crate::api::collab_autopublish::request_auto_publish_for_scan(root_id);
+    }
+
     Ok(ScanResultDto {
         files_found: result.files_found,
         files_processed: result.files_processed,
@@ -3331,13 +3342,19 @@ mod overview_tests {
             .to_string();
         // Sibling-ness is in the leaf name ("myXastro" vs "my_astro"), not in a
         // missing separator before the suffix — this join creates a true filesystem child.
-        let sibling = Path::new(&parent).join("myXastro").to_string_lossy().to_string();
+        let sibling = Path::new(&parent)
+            .join("myXastro")
+            .to_string_lossy()
+            .to_string();
         {
             let db = ctx.db.get().unwrap();
             let conn = db.conn();
             for (path, name, size) in [
                 (
-                    Path::new(&root).join("a.fits").to_string_lossy().to_string(),
+                    Path::new(&root)
+                        .join("a.fits")
+                        .to_string_lossy()
+                        .to_string(),
                     "a.fits",
                     100_i64,
                 ),

@@ -208,6 +208,13 @@ pub fn analyze_frame_set(
                     cancelled: true,
                 },
             );
+            // Auto-publish trigger (collab v3 wave 2, Task 10). Nothing was
+            // analyzed here (cancelled before admission), but a coalesced
+            // run over this set is cheap when nothing changed (Task 7), and
+            // keeping one call site per `analysis-complete` emission is
+            // simpler than special-casing the early-cancel branch.
+            #[cfg(feature = "solver")]
+            crate::api::collab_autopublish::request_auto_publish_for_sets(&[frame_set_id]);
             return Ok(AnalyzeFrameSetResult {
                 analyzed: 0,
                 skipped: 0,
@@ -412,6 +419,10 @@ pub fn analyze_frame_set(
             cancelled: was_cancelled,
         },
     );
+    // Auto-publish trigger (collab v3 wave 2, Task 10): fresh analysis can
+    // move a frame's per-frame gate verdict (eccentricity, trail rejection).
+    #[cfg(feature = "solver")]
+    crate::api::collab_autopublish::request_auto_publish_for_sets(&[frame_set_id]);
 
     Ok(AnalyzeFrameSetResult {
         analyzed,

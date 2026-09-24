@@ -474,6 +474,7 @@ pub async fn plate_solve_batch(
             total_time_ms: start.elapsed().as_millis() as u64,
         },
     );
+    athenaeum_core::api::plate_solve::on_batch_finished(&state.ctx);
 
     Ok(())
 }

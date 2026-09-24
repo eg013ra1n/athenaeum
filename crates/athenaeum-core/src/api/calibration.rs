@@ -592,6 +592,18 @@ pub fn manual_assign_calibration(
         "manually assigned calibration set to frames"
     );
 
+    // Auto-publish trigger (collab v3 wave 2, Task 10): a manual
+    // Lights→calibration assignment can turn a frame publishable.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    {
+        match crate::db::calibration_links::frame_set_ids_for_frames(&conn, &frame_ids) {
+            Ok(set_ids) => crate::api::collab_autopublish::request_auto_publish_for_sets(&set_ids),
+            Err(error) => {
+                tracing::warn!(%error, "auto-publish: failed to resolve frame sets for manual calibration assignment");
+            }
+        }
+    }
+
     Ok(assigned_count)
 }
 
@@ -617,6 +629,18 @@ pub fn clear_manual_calibration_override(
         frames = frame_ids.len(),
         "cleared manual calibration override(s)"
     );
+
+    // Auto-publish trigger (collab v3 wave 2, Task 10): clearing an override
+    // lets auto-find reassign, which can also change gate eligibility.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    {
+        match crate::db::calibration_links::frame_set_ids_for_frames(&conn, &frame_ids) {
+            Ok(set_ids) => crate::api::collab_autopublish::request_auto_publish_for_sets(&set_ids),
+            Err(error) => {
+                tracing::warn!(%error, "auto-publish: failed to resolve frame sets for cleared calibration override");
+            }
+        }
+    }
 
     Ok(deleted)
 }
@@ -670,7 +694,17 @@ pub fn refresh_calibration_library_for_camera(
 ) -> Result<CalibrationScanResult, ApiError> {
     let db = db(ctx)?;
     let mut conn = db.conn();
-    refresh_calibration_library_inner(&mut conn, &instrume)
+    let result = refresh_calibration_library_inner(&mut conn, &instrume)?;
+
+    // Auto-publish trigger (collab v3 wave 2, Task 10): a whole-camera
+    // re-link can change gate eligibility for any number of frame sets;
+    // mapping that precisely from a full recluster isn't cheap, so this
+    // dirties every auto-publish-enabled project instead (same fallback the
+    // scan-completion and plate-solve-batch triggers use).
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_autopublish::request_auto_publish(None);
+
+    Ok(result)
 }
 
 pub(crate) fn refresh_calibration_library_inner(
@@ -1082,6 +1116,23 @@ pub fn manual_assign_subcalibration(
         "manually assigned sub-calibration"
     );
 
+    // Auto-publish trigger (collab v3 wave 2, Task 10): a sub-calibration
+    // link (e.g. a Bias assigned to a Dark) can complete a Lights→Flat/Dark/
+    // Bias chain further down, changing gate eligibility for the frame sets
+    // that ultimately consume `source_set_id`.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    {
+        match crate::db::calibration_links::get_calibration_set_consumers(&conn, source_set_id) {
+            Ok(consumers) => {
+                let set_ids: Vec<i64> = consumers.iter().map(|c| c.frame_set_id).collect();
+                crate::api::collab_autopublish::request_auto_publish_for_sets(&set_ids);
+            }
+            Err(error) => {
+                tracing::warn!(source_set_id, %error, "auto-publish: failed to resolve sub-calibration consumers");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1112,6 +1163,22 @@ pub fn clear_subcalibration_override(
         set_id = source_set_id,
         "cleared sub-calibration link(s)"
     );
+
+    // Auto-publish trigger (collab v3 wave 2, Task 10): see
+    // `manual_assign_subcalibration` above — clearing a sub-cal link can
+    // also change gate eligibility further down the chain.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    {
+        match crate::db::calibration_links::get_calibration_set_consumers(&conn, source_set_id) {
+            Ok(consumers) => {
+                let set_ids: Vec<i64> = consumers.iter().map(|c| c.frame_set_id).collect();
+                crate::api::collab_autopublish::request_auto_publish_for_sets(&set_ids);
+            }
+            Err(error) => {
+                tracing::warn!(source_set_id, %error, "auto-publish: failed to resolve sub-calibration consumers");
+            }
+        }
+    }
 
     Ok(deleted)
 }

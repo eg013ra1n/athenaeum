@@ -67,6 +67,19 @@ pub mod export;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab;
 
+// Coalesced auto-publish per project (collab v3 wave 2, Task 10; R16, §5.2
+// triggers; P13): one debounced, re-armed publish run per project, kicked by
+// scan/analysis/plate-solve completion, frame-set linking, master
+// build/rebuild and calibration-link changes. Gated the same as
+// `api::collab` (render+solver) — it drives `publish_collab_frames`.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod collab_autopublish;
+// Trigger-only shim: `on_batch_finished` marks every auto-publish project
+// dirty after a plate-solve batch completes (Task 10). Gated the same as
+// `collab_autopublish`, which it calls.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod plate_solve;
+
 // M1 stacking pipeline command layer (Plan 5a Task 9): plan/start/cancel a
 // run, run history/detail, per-set config + global defaults, working/output
 // folders. Gated on the same two features `stacking`/`ServiceContext::active_stacks`

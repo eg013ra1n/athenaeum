@@ -507,6 +507,7 @@ pub fn run() {
             commands::list_collab_packages,
             commands::download_collab_package,
             commands::set_project_auto_replicate,
+            commands::set_project_auto_publish,
             commands::sync_project_now,
             commands::get_collab_policy,
             commands::set_collab_policy,

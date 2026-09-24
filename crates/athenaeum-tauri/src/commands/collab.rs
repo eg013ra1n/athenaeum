@@ -178,6 +178,20 @@ pub async fn set_project_auto_replicate(
         .map_err(|e| e.to_string())
 }
 
+/// Collab v3 wave 2 Task 10 (R16, P13): turn this project's coalesced
+/// auto-publish on or off (local preference — the hub never learns of it).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_project_auto_publish(
+    state: State<'_, AppState>,
+    project_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    api::set_project_auto_publish(&state.ctx, &project_id, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// D3 §3.3 "Sync now": run one auto-replication pass for this project
 /// immediately, with the toggle forced on (an explicit user act). Returns as soon
 /// as the pass is spawned — progress rides the usual `local_status` +
