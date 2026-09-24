@@ -149,6 +149,11 @@ pub struct ProjectCard {
     /// D3 §3.3: this device auto-downloads the project's published contributions
     /// (default ON). Local preference — `set_project_auto_replicate` writes it.
     pub auto_replicate: bool,
+    /// Collab v3 wave 2 Task 10 (R16, P13): this device coalesces and
+    /// auto-publishes its own passing frames on scan/analysis/solve/link/
+    /// threshold changes (default ON). Local preference —
+    /// `set_project_auto_publish` writes it.
+    pub auto_publish: bool,
     pub fetched_at: String,
 }
 
@@ -928,6 +933,7 @@ fn card_from_row(ctx: &ServiceContext, row: CollabProjectRow) -> Result<ProjectC
         candidates: gate.total,
         publishable: gate.publishable,
         auto_replicate: row.auto_replicate,
+        auto_publish: row.auto_publish,
         fetched_at: row.fetched_at,
     })
 }

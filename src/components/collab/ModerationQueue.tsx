@@ -2,18 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, Loader2, X } from 'lucide-react';
 import { api } from '../../api';
 import { formatTimestamp } from '../../utils/dateFormatting';
-import { formatBytes } from './format';
-import type { ModerationItem } from '../../types/models';
+import type { ModerationFrameView } from '../../types/models';
 
-const POLL_MS = 4_000;
 const REASON_MAX = 500;
 
 /**
  * Coordinator review queue (visible only when the parent decides
- * `coordinator && requireApproval`). Every pending package with its landed
- * review copy: a per-frame metrics table once the copy is complete, otherwise
- * an honest "receiving review copy…" line. Approve / reject both call
- * `decide_collab_announcement`; reject requires a reason (≤500). Errors surface
+ * `coordinator && requireApproval`). Every pending frame, cache-only
+ * (`list_collab_moderation`) — the per-frame model has no batch/review-copy
+ * step any more. Approve calls `approve_collab_frame` with a "Trust this
+ * publisher" checkbox (on by default, spec §9); reject calls
+ * `reject_collab_frame` with a reason (≤500, required). Errors surface
  * inline (S6) and the list re-fetches on any decision.
  */
 export default function ModerationQueue({
@@ -23,10 +22,10 @@ export default function ModerationQueue({
   projectId: string;
   onDecided: () => void;
 }) {
-  const [items, setItems] = useState<ModerationItem[] | null>(null);
+  const [items, setItems] = useState<ModerationFrameView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<Set<string>>(new Set());
-  const [rejectFor, setRejectFor] = useState<ModerationItem | null>(null);
+  const [rejectFor, setRejectFor] = useState<ModerationFrameView | null>(null);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -38,7 +37,7 @@ export default function ModerationQueue({
 
   const load = useCallback(async () => {
     try {
-      const next = await api.invoke<ModerationItem[]>('list_collab_moderation', { projectId });
+      const next = await api.invoke<ModerationFrameView[]>('list_collab_moderation', { projectId });
       if (mounted.current) setItems(next);
     } catch (err) {
       // S6 — surface a failed load rather than showing a stale/empty queue silently.
@@ -52,38 +51,45 @@ export default function ModerationQueue({
     void load();
   }, [load]);
 
-  // Poll while any review copy is still landing so its metrics table appears
-  // without a manual refresh.
-  const anyIncomplete = (items ?? []).some((i) => !i.reviewCopyComplete);
-  useEffect(() => {
-    if (!anyIncomplete) return;
-    const timer = setInterval(() => void load(), POLL_MS);
-    return () => clearInterval(timer);
-  }, [anyIncomplete, load]);
-
-  const decide = useCallback(
-    async (announcementId: string, approve: boolean, reason?: string) => {
+  const withBusy = useCallback(
+    async (frameUuid: string, fn: () => Promise<void>) => {
       setError(null);
-      setBusy((prev) => new Set(prev).add(announcementId));
+      setBusy((prev) => new Set(prev).add(frameUuid));
       try {
-        await api.invoke('decide_collab_announcement', { announcementId, approve, reason });
-        setRejectFor(null);
+        await fn();
         await load();
         onDecided();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error('[moderation] decide_collab_announcement failed:', err);
+        console.error('[moderation] decision failed:', err);
         if (mounted.current) setError(msg);
       } finally {
         if (mounted.current)
           setBusy((prev) => {
             const next = new Set(prev);
-            next.delete(announcementId);
+            next.delete(frameUuid);
             return next;
           });
       }
     },
     [load, onDecided],
+  );
+
+  const approve = useCallback(
+    (frameUuid: string, trust: boolean) =>
+      void withBusy(frameUuid, () =>
+        api.invoke('approve_collab_frame', { projectId, frameUuid, trust }),
+      ),
+    [projectId, withBusy],
+  );
+
+  const reject = useCallback(
+    (frameUuid: string, reason: string) =>
+      void withBusy(frameUuid, async () => {
+        await api.invoke('reject_collab_frame', { projectId, frameUuid, reason });
+        setRejectFor(null);
+      }),
+    [projectId, withBusy],
   );
 
   return (
@@ -95,102 +101,85 @@ export default function ModerationQueue({
       ) : items.length === 0 ? (
         <p className="text-sm text-content-muted">Nothing waiting for review.</p>
       ) : (
-        <ul className="space-y-3">
-          {items.map((item) => {
-            const itemBusy = busy.has(item.announcementId);
-            return (
-              <li key={item.announcementId} className="rounded border border-border p-3 text-sm">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-medium text-content">{item.publisher}</span>
-                  <span className="text-xs text-content-muted">
-                    {item.frameCount} frames · {formatBytes(item.byteSize)} ·{' '}
-                    {formatTimestamp(item.createdAt)}
-                  </span>
-                  <span className="ml-auto flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void decide(item.announcementId, true)}
-                      disabled={itemBusy}
-                      className="inline-flex items-center gap-1 rounded bg-accent px-2.5 py-1 text-xs text-surface transition-colors hover:bg-accent-hover disabled:opacity-50"
-                    >
-                      {itemBusy ? (
-                        <Loader2 size={12} className="animate-spin" />
-                      ) : (
-                        <Check size={12} />
-                      )}{' '}
-                      Approve
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setRejectFor(item)}
-                      disabled={itemBusy}
-                      className="inline-flex items-center gap-1 rounded border border-error/50 px-2.5 py-1 text-xs text-error transition-colors hover:bg-error/10 disabled:opacity-50"
-                    >
-                      <X size={12} /> Reject
-                    </button>
-                  </span>
-                </div>
-
-                {item.reviewCopyComplete ? (
-                  <ReviewFrames item={item} />
-                ) : (
-                  <p className="mt-2 inline-flex items-center gap-1 text-xs text-content-muted">
-                    <Loader2 size={12} className="animate-spin" /> receiving review copy…
-                  </p>
-                )}
-              </li>
-            );
-          })}
+        <ul className="space-y-2">
+          {items.map((item) => (
+            <ModerationRow
+              key={item.frameUuid}
+              item={item}
+              busy={busy.has(item.frameUuid)}
+              onApprove={(trust) => approve(item.frameUuid, trust)}
+              onRejectRequested={() => setRejectFor(item)}
+            />
+          ))}
         </ul>
       )}
 
       {rejectFor && (
         <RejectDialog
           item={rejectFor}
-          busy={busy.has(rejectFor.announcementId)}
+          busy={busy.has(rejectFor.frameUuid)}
           onCancel={() => setRejectFor(null)}
-          onReject={(reason) => void decide(rejectFor.announcementId, false, reason)}
+          onReject={(reason) => reject(rejectFor.frameUuid, reason)}
         />
       )}
     </div>
   );
 }
 
-/** Per-frame metrics table for a fully-landed review copy. */
-function ReviewFrames({ item }: { item: ModerationItem }) {
-  if (item.frames.length === 0)
-    return <p className="mt-2 text-xs text-content-muted">No frame metrics available.</p>;
+/** One pending frame with its own "trust this publisher" checkbox (default on)
+ *  and approve/reject actions. */
+function ModerationRow({
+  item,
+  busy,
+  onApprove,
+  onRejectRequested,
+}: {
+  item: ModerationFrameView;
+  busy: boolean;
+  onApprove: (trust: boolean) => void;
+  onRejectRequested: () => void;
+}) {
+  const [trust, setTrust] = useState(true);
   return (
-    <div className="mt-2 overflow-x-auto">
-      <table className="w-full text-left text-xs">
-        <thead className="text-content-muted">
-          <tr>
-            <th className="py-1 pr-3 font-normal">Frame</th>
-            <th className="pr-3 font-normal">FWHM</th>
-            <th className="pr-3 font-normal">Ecc</th>
-            <th className="pr-3 font-normal">Stars</th>
-            <th className="font-normal">SNR</th>
-          </tr>
-        </thead>
-        <tbody>
-          {item.frames.map((f) => (
-            <tr key={f.frameUuid} className="border-t border-border/50">
-              <td className="max-w-[16rem] truncate py-1 pr-3 text-content" title={f.relPath}>
-                {f.relPath}
-              </td>
-              <td className="pr-3 text-content-secondary">
-                {f.fwhm != null ? f.fwhm.toFixed(2) : '—'}
-              </td>
-              <td className="pr-3 text-content-secondary">
-                {f.eccentricity != null ? f.eccentricity.toFixed(2) : '—'}
-              </td>
-              <td className="pr-3 text-content-secondary">{f.stars ?? '—'}</td>
-              <td className="text-content-secondary">{f.snr != null ? f.snr.toFixed(1) : '—'}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <li className="rounded border border-border p-3 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="max-w-[16rem] truncate font-medium text-content" title={item.fileName}>
+          {item.fileName}
+        </span>
+        <span className="text-xs text-content-muted">
+          {item.publisher} · {item.filter} · {item.exptimeSec.toFixed(1)}s
+          {item.fwhmArcsec != null ? ` · FWHM ${item.fwhmArcsec.toFixed(2)}″` : ''} ·{' '}
+          {formatTimestamp(item.createdAt)}
+        </span>
+        <span className="ml-auto flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => onApprove(trust)}
+            disabled={busy}
+            className="inline-flex items-center gap-1 rounded bg-accent px-2.5 py-1 text-xs text-surface transition-colors hover:bg-accent-hover disabled:opacity-50"
+          >
+            {busy ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />} Approve
+          </button>
+          <button
+            type="button"
+            onClick={onRejectRequested}
+            disabled={busy}
+            className="inline-flex items-center gap-1 rounded border border-error/50 px-2.5 py-1 text-xs text-error transition-colors hover:bg-error/10 disabled:opacity-50"
+          >
+            <X size={12} /> Reject
+          </button>
+        </span>
+      </div>
+      <label className="mt-1.5 flex items-center gap-1.5 text-xs text-content-muted">
+        <input
+          type="checkbox"
+          checked={trust}
+          onChange={(e) => setTrust(e.target.checked)}
+          className="h-3.5 w-3.5 rounded border-border bg-surface-hover text-accent focus:ring-accent"
+        />
+        Trust this publisher
+      </label>
+    </li>
   );
 }
 
@@ -201,7 +190,7 @@ function RejectDialog({
   onCancel,
   onReject,
 }: {
-  item: ModerationItem;
+  item: ModerationFrameView;
   busy: boolean;
   onCancel: () => void;
   onReject: (reason: string) => void;
@@ -219,7 +208,7 @@ function RejectDialog({
       >
         <div className="mb-2 flex items-center gap-2">
           <X size={16} className="text-error" />
-          <h2 className="font-medium text-content">Reject contribution</h2>
+          <h2 className="font-medium text-content">Reject frame</h2>
           <button
             onClick={onCancel}
             className="ml-auto text-content-muted transition-colors hover:text-content"
@@ -229,14 +218,14 @@ function RejectDialog({
           </button>
         </div>
         <p className="mb-2 text-xs text-content-muted">
-          {item.publisher} · {item.frameCount} frames. The reason is sent to the publisher.
+          {item.fileName} · {item.publisher}. The reason is sent to the publisher.
         </p>
         <textarea
           value={reason}
           onChange={(e) => setReason(e.target.value)}
           rows={4}
           autoFocus
-          placeholder="Why is this contribution rejected?"
+          placeholder="Why is this frame rejected?"
           className="w-full resize-none rounded border border-border bg-surface-elevated p-2 text-sm text-content placeholder:text-content-muted focus:border-accent focus:outline-none"
         />
         <div className="mt-1 flex items-center justify-between text-xs">

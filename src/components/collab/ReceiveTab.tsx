@@ -1,47 +1,38 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Download, FolderOpen, FolderOutput, Loader2, RotateCw } from 'lucide-react';
+import { FolderOpen, FolderOutput, Loader2, RefreshCw } from 'lucide-react';
 import { api } from '../../api';
-import { formatTimestamp } from '../../utils/dateFormatting';
-import { formatBytes } from './format';
 import ProjectExportDialog from './ProjectExportDialog';
-import type { ProjectPackageView } from '../../types/models';
-
-const POLL_MS = 3_000;
+import type { CollabReplicationPaused, LossAction, ProjectFrameView } from '../../types/models';
 
 /**
- * Receive tab — the swarm-download surface for send_receive / coordinator
- * members (visibility is decided by the parent from `card.dataRole`). Lists
- * non-own announced packages; every chip derives from the stored `localStatus`
- * (S6 — never optimistic). A `download_collab_package` spawn returns instantly;
- * the terminal state arrives via `localStatus` on a re-list, so this tab polls
- * `reload` while anything is still downloading.
+ * Receive tab — the per-frame replication surface for send_receive /
+ * coordinator members (visibility decided by the parent from `card.dataRole`).
+ * Lists non-own frames grouped by publisher; every on-disk badge is read
+ * straight off the stored row (`onDisk`/`awaitingGc`/`locallyDeclined` — S6,
+ * never optimistic). There is no per-frame download any more — replication is
+ * project-wide, so the one action here is "Sync now" (`sync_project_now`). A
+ * loss-guard pause (P14) shows inline with Restore / Stop keeping
+ * (`resolve_collab_loss`).
  */
 export default function ReceiveTab({
   projectId,
   projectTitle,
-  packages,
+  frames,
   reload,
-  downloadSources,
 }: {
   projectId: string;
   projectTitle?: string;
-  packages: ProjectPackageView[] | null;
+  frames: ProjectFrameView[] | null;
   reload: () => void;
-  /**
-   * D3 §3.1.3: packageId → the number of holders the running swarm fetch was
-   * handed. Owned by the parent page (the event outlives this tab's mount) and
-   * populated only while a fetch is in flight — manual or auto-replicated.
-   */
-  downloadSources?: Map<string, number>;
 }) {
   // `undefined` = still loading the folder setting; `null` = unset (banner).
   const [collabDir, setCollabDir] = useState<string | null | undefined>(undefined);
-  const [busy, setBusy] = useState<Set<string>>(new Set());
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
-  const reloadRef = useRef(reload);
-  reloadRef.current = reload;
+  const [paused, setPaused] = useState<CollabReplicationPaused | null>(null);
+  const [lossBusy, setLossBusy] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -59,76 +50,97 @@ export default function ReceiveTab({
     };
   }, []);
 
-  const others = (packages ?? []).filter((p) => !p.own);
-  const anyDownloading = others.some((p) => p.localStatus === 'downloading') || busy.size > 0;
-
-  // Poll the stored package list while a download is in flight so the chip
-  // settles from `downloading` → `complete`/`failed` without a manual refresh.
+  // StrictMode-safe listener pattern (CLAUDE.md): a cancelled flag guards the
+  // async `listen`, never an awaited unlisten.
   useEffect(() => {
-    if (!anyDownloading) return;
-    const timer = setInterval(() => reloadRef.current(), POLL_MS);
-    return () => clearInterval(timer);
-  }, [anyDownloading]);
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<CollabReplicationPaused>('collab-replication-paused', (p) => {
+        if (cancelled || p.projectId !== projectId) return;
+        setPaused(p);
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[receive] replication-paused listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [projectId]);
 
-  // `busy` bridges the gap between the download command returning (it only
-  // spawns) and the backend flipping `local_status` off `none`. Clear a
-  // package from `busy` once its STORED status is observed to have moved, so
-  // the spinner + polling are driven by real rows (S6), never guesswork.
-  useEffect(() => {
-    if (busy.size === 0 || packages === null) return;
-    const settled = packages.filter((p) => busy.has(p.packageId) && p.localStatus !== 'none');
-    if (settled.length === 0) return;
-    setBusy((prev) => {
-      const next = new Set(prev);
-      for (const p of settled) next.delete(p.packageId);
-      return next;
-    });
-  }, [packages, busy]);
+  const syncNow = async () => {
+    setSyncing(true);
+    setError(null);
+    try {
+      await api.invoke('sync_project_now', { projectId });
+      reload();
+    } catch (err) {
+      // S6 — a failed sync surfaces inline, never silently swallowed.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[receive] sync_project_now failed:', err);
+      setError(msg);
+    } finally {
+      setSyncing(false);
+    }
+  };
 
-  const startDownload = useCallback(
-    async (packageId: string) => {
-      setError(null);
-      setBusy((prev) => new Set(prev).add(packageId));
-      try {
-        await api.invoke('download_collab_package', { projectId, packageId });
-        // Re-list to pick up `downloading` promptly; the effect above releases
-        // `busy` once the stored status confirms the transition.
-        reloadRef.current();
-      } catch (err) {
-        // S6 — a failed hub/download start is surfaced, never silently caught.
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error('[receive] download_collab_package failed:', err);
-        setError(msg);
-        setBusy((prev) => {
-          const next = new Set(prev);
-          next.delete(packageId);
-          return next;
-        });
-      }
-    },
-    [projectId],
-  );
+  const resolveLoss = async (action: LossAction) => {
+    setLossBusy(true);
+    setError(null);
+    try {
+      await api.invoke('resolve_collab_loss', { projectId, action });
+      setPaused(null);
+      reload();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[receive] resolve_collab_loss failed:', err);
+      setError(msg);
+    } finally {
+      setLossBusy(false);
+    }
+  };
 
   const dirUnset = collabDir === null;
+  const others = (frames ?? []).filter((f) => !f.own);
+  const groups = groupByPublisher(others);
 
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-sm font-medium text-content">Received contributions</span>
-        <button
-          type="button"
-          onClick={() => setExportOpen(true)}
-          className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover"
-          title="Organize the project's frames into a PixInsight WBPP folder tree"
-        >
-          <FolderOutput size={14} /> Export for WBPP
-        </button>
+        <span className="text-sm font-medium text-content">Received frames</span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void syncNow()}
+            disabled={syncing}
+            className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+            title="Download every published contribution this device is missing"
+          >
+            {syncing ? (
+              <Loader2 size={14} className="animate-spin" />
+            ) : (
+              <RefreshCw size={14} />
+            )}
+            Sync now
+          </button>
+          <button
+            type="button"
+            onClick={() => setExportOpen(true)}
+            className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover"
+            title="Organize the project's frames into a PixInsight WBPP folder tree"
+          >
+            <FolderOutput size={14} /> Export for WBPP
+          </button>
+        </div>
       </div>
 
       {dirUnset && (
         <div className="flex flex-wrap items-center gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-content-secondary">
           <FolderOpen size={14} className="shrink-0 text-warning" />
-          <span>Set a Collaboration folder first — downloads land there.</span>
+          <span>Set a Collaboration folder first — synced frames land there.</span>
           <Link
             to="/files"
             className="ml-auto rounded border border-border px-2 py-0.5 text-xs text-content-secondary transition-colors hover:bg-surface-hover"
@@ -138,50 +150,81 @@ export default function ReceiveTab({
         </div>
       )}
 
+      {paused && (
+        <div className="flex flex-wrap items-center gap-2 rounded border border-error/40 bg-error/10 px-3 py-2 text-sm text-content-secondary">
+          <span>
+            Replication paused: {paused.missing} frames missing ({formatGb(paused.missingBytes)})
+          </span>
+          <span className="ml-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void resolveLoss('restore')}
+              disabled={lossBusy}
+              className="rounded border border-border px-2 py-1 text-xs text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
+            >
+              Restore
+            </button>
+            <button
+              type="button"
+              onClick={() => void resolveLoss('stopHolding')}
+              disabled={lossBusy}
+              className="rounded border border-error/50 px-2 py-1 text-xs text-error transition-colors hover:bg-error/10 disabled:opacity-50"
+            >
+              Stop keeping
+            </button>
+          </span>
+        </div>
+      )}
+
       {error && <p className="text-sm text-error">{error}</p>}
 
-      {packages === null ? (
+      {frames === null ? (
         <p className="text-sm text-content-muted">Loading…</p>
       ) : others.length === 0 ? (
         <p className="text-sm text-content-muted">
-          No packages announced yet — published contributions from other members appear here.
+          No frames from other members yet — published contributions appear here.
         </p>
       ) : (
-        <ul className="space-y-2">
-          {others.map((p) => (
-            <li
-              key={p.packageId}
-              className={`rounded border border-border px-3 py-2 text-sm ${
-                p.superseded ? 'opacity-50' : ''
-              }`}
-            >
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-medium text-content">{p.publisher}</span>
-                <span className="text-xs text-content-muted">
-                  {p.frameCount} frames · {formatBytes(p.byteSize)}
-                </span>
-                {p.superseded && (
-                  <span className="rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-content-muted">
-                    superseded
-                  </span>
-                )}
-                <span className="ml-auto">
-                  <ReceiveAction
-                    pkg={p}
-                    busy={busy.has(p.packageId)}
-                    disabledDir={dirUnset}
-                    collabDir={collabDir ?? null}
-                    sources={downloadSources?.get(p.packageId) ?? null}
-                    onDownload={() => void startDownload(p.packageId)}
-                  />
-                </span>
+        <div className="space-y-4">
+          {groups.map(([publisher, rows]) => (
+            <div key={publisher}>
+              <p className="mb-1 text-xs font-medium text-content-secondary">{publisher}</p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="text-content-muted">
+                    <tr>
+                      <th className="py-1 pr-3 font-normal">File</th>
+                      <th className="pr-3 font-normal">Filter</th>
+                      <th className="pr-3 font-normal">Exposure</th>
+                      <th className="pr-3 font-normal">Holders</th>
+                      <th className="font-normal">On disk</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((f) => (
+                      <tr key={f.frameUuid} className="border-t border-border/50">
+                        <td
+                          className="max-w-[16rem] truncate py-1 pr-3 text-content"
+                          title={f.fileName}
+                        >
+                          {f.fileName}
+                        </td>
+                        <td className="pr-3 text-content-secondary">{f.filter}</td>
+                        <td className="pr-3 text-content-secondary">
+                          {f.exptimeSec.toFixed(1)}s
+                        </td>
+                        <td className="pr-3 text-content-secondary">{f.holderCount}</td>
+                        <td>
+                          <OnDiskBadge frame={f} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
-              <p className="mt-0.5 text-[11px] text-content-muted">
-                held by {p.holderCount} ({p.onlineCount} online) · {formatTimestamp(p.createdAt)}
-              </p>
-            </li>
+            </div>
           ))}
-        </ul>
+        </div>
       )}
 
       {exportOpen && (
@@ -195,75 +238,29 @@ export default function ReceiveTab({
   );
 }
 
-/** Right-aligned per-package action, driven entirely by the stored localStatus. */
-function ReceiveAction({
-  pkg,
-  busy,
-  disabledDir,
-  collabDir,
-  sources,
-  onDownload,
-}: {
-  pkg: ProjectPackageView;
-  busy: boolean;
-  disabledDir: boolean;
-  collabDir: string | null;
-  /** Providers the running swarm fetch was handed; `null` when none is running. */
-  sources: number | null;
-  onDownload: () => void;
-}) {
-  if (pkg.localStatus === 'downloading' || busy) {
+function groupByPublisher(frames: ProjectFrameView[]): [string, ProjectFrameView[]][] {
+  const map = new Map<string, ProjectFrameView[]>();
+  for (const f of frames) {
+    const list = map.get(f.publisher);
+    if (list) list.push(f);
+    else map.set(f.publisher, [f]);
+  }
+  return Array.from(map.entries());
+}
+
+function formatGb(bytes: number): string {
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+/** On-disk state, driven entirely by the stored row (S6, never optimistic). */
+function OnDiskBadge({ frame }: { frame: ProjectFrameView }) {
+  if (frame.locallyDeclined) return <span className="text-content-muted">Not kept</span>;
+  if (frame.awaitingGc) return <span className="text-warning">Waiting for cleanup</span>;
+  if (frame.onDisk)
     return (
-      <span className="inline-flex items-center gap-1 text-xs text-accent">
-        <Loader2 size={12} className="animate-spin" /> Downloading…
-        {sources !== null && sources > 0 && (
-          <span className="text-content-muted">
-            from {sources} source{sources === 1 ? '' : 's'}
-          </span>
-        )}
+      <span className="inline-flex items-center gap-1 text-success">
+        <FolderOpen size={11} /> On disk
       </span>
     );
-  }
-  if (pkg.localStatus === 'complete') {
-    return (
-      <span
-        className="inline-flex items-center gap-1 text-xs text-success"
-        title={collabDir ? `Landed in ${collabDir}` : undefined}
-      >
-        <FolderOpen size={12} /> Downloaded
-      </span>
-    );
-  }
-  if (pkg.localStatus === 'failed') {
-    return (
-      <button
-        type="button"
-        onClick={onDownload}
-        disabled={disabledDir}
-        className="inline-flex items-center gap-1 rounded border border-error/50 px-2 py-1 text-xs text-error transition-colors hover:bg-error/10 disabled:cursor-not-allowed disabled:opacity-50"
-        title={disabledDir ? 'Set a Collaboration folder first' : 'Download failed — retry'}
-      >
-        <RotateCw size={12} /> Retry
-      </button>
-    );
-  }
-  // localStatus === 'none' → available
-  const noHolders = pkg.holderCount === 0;
-  const disabled = disabledDir || noHolders;
-  const title = disabledDir
-    ? 'Set a Collaboration folder first'
-    : noHolders
-      ? 'No online holders'
-      : undefined;
-  return (
-    <button
-      type="button"
-      onClick={onDownload}
-      disabled={disabled}
-      className="inline-flex items-center gap-1 rounded bg-accent px-2 py-1 text-xs text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-      title={title}
-    >
-      <Download size={12} /> Download
-    </button>
-  );
+  return <span className="text-content-muted">Not on disk</span>;
 }

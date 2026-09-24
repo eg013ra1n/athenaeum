@@ -1533,7 +1533,14 @@ export type ProjectCard = { projectId: string, slug: string, title: string, data
  * D3 §3.3: this device auto-downloads the project's published contributions
  * (default ON). Local preference — `set_project_auto_replicate` writes it.
  */
-autoReplicate: boolean, fetchedAt: string, };
+autoReplicate: boolean, 
+/**
+ * Collab v3 wave 2 Task 10 (R16, P13): this device coalesces and
+ * auto-publishes its own passing frames on scan/analysis/solve/link/
+ * threshold changes (default ON). Local preference —
+ * `set_project_auto_publish` writes it.
+ */
+autoPublish: boolean, fetchedAt: string, };
 
 export type ProjectDetail = { card: ProjectCard, members: Array<ProjectMemberView>, thresholdsVersion: number | null, thresholds: Array<ThresholdRuleView>, links: Array<LinkedSetView>, portalBase: string, };
 

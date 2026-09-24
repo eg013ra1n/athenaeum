@@ -2,9 +2,10 @@ import { RefreshCw, Target, Users } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useProjects } from '../hooks/useProjects';
 import { HistoryNav } from '../components/HistoryNav';
+import UpdateRequired from '../components/collab/UpdateRequired';
 
 export default function Projects() {
-  const { projects, loading, refreshing, signedOut, refresh } = useProjects();
+  const { projects, loading, refreshing, signedOut, updateRequired, refresh } = useProjects();
 
   if (loading) return <p className="p-6 text-content-muted">Loading projects…</p>;
 
@@ -23,6 +24,8 @@ export default function Projects() {
           Refresh
         </button>
       </div>
+
+      {updateRequired && <UpdateRequired />}
 
       {signedOut && (
         <p className="text-sm text-content-muted">

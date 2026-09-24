@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { ExternalLink, Loader2, Plus, Send, Target } from 'lucide-react';
+import { ExternalLink, Loader2, Plus, RefreshCw, Send, Target } from 'lucide-react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
 import { useSessionState } from '../contexts/SessionStateContext';
@@ -11,14 +11,13 @@ import AutoReplicateBar from '../components/collab/AutoReplicateBar';
 import LinkObjectDialog from '../components/collab/LinkObjectDialog';
 import ReceiveTab from '../components/collab/ReceiveTab';
 import ModerationQueue from '../components/collab/ModerationQueue';
+import UpdateRequired from '../components/collab/UpdateRequired';
 import { formatBytes } from '../components/collab/format';
-import { formatTimestamp } from '../utils/dateFormatting';
 import type {
   FrameGateRow,
   GateReport,
   ProjectDetail as Detail,
-  ProjectDownloadProgress,
-  ProjectPackageView,
+  ProjectFrameView,
   PublishResult,
 } from '../types/models';
 
@@ -29,6 +28,12 @@ type Tab = 'contribute' | 'receive' | 'moderation' | 'overview';
 // calibrated; the dialog labels this figure "estimated" so it never reads as
 // an authoritative stored value (S6).
 const APPROX_FRAME_BYTES = 45 * 1024 * 1024;
+
+/** A hub call refused this build with the stable `collab_api_outdated`
+ *  prefix (P17). */
+function isOutdated(msg: string): boolean {
+  return msg.startsWith('collab_api_outdated');
+}
 
 export default function ProjectDetail() {
   const { id } = useParams();
@@ -41,15 +46,15 @@ export default function ProjectDetail() {
   const [tab, setTab] = useSessionState<Tab>('projectDetail.tab', 'contribute');
   const [linkOpen, setLinkOpen] = useState(false);
   const [missing, setMissing] = useState(false);
-  const [packages, setPackages] = useState<ProjectPackageView[] | null>(null);
-  const [packagesError, setPackagesError] = useState(false);
+  const [updateRequired, setUpdateRequired] = useState(false);
+  const [frames, setFrames] = useState<ProjectFrameView[] | null>(null);
+  const [framesError, setFramesError] = useState(false);
   const [publishConfirm, setPublishConfirm] = useState(false);
   const [publishBusy, setPublishBusy] = useState(false);
   const [publishError, setPublishError] = useState<string | null>(null);
-  // D3 §3.1.3 live swarm figure: packageId → the provider count the fan-out was
-  // launched with. Filled on `stage: 'fetching'`, dropped on `stage: 'done'`, so
-  // a row only carries the line while its fetch is actually running.
-  const [downloadSources, setDownloadSources] = useState<Map<string, number>>(new Map());
+  const [republishConfirm, setRepublishConfirm] = useState(false);
+  const [republishBusy, setRepublishBusy] = useState(false);
+  const [republishError, setRepublishError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -79,62 +84,24 @@ export default function ProjectDetail() {
     }
   }, [id]);
 
-  const loadPackages = useCallback(async () => {
+  const loadFrames = useCallback(async () => {
     if (!id) return;
-    setPackagesError(false);
+    setFramesError(false);
     try {
-      setPackages(await api.invoke<ProjectPackageView[]>('list_collab_packages', { projectId: id }));
+      setFrames(await api.invoke<ProjectFrameView[]>('list_collab_frames', { projectId: id }));
     } catch (err) {
-      console.error('[projects] list packages failed:', err);
-      setPackagesError(true);
+      console.error('[projects] list frames failed:', err);
+      setFramesError(true);
     }
   }, [id]);
-
-  const loadPackagesRef = useRef(loadPackages);
-  loadPackagesRef.current = loadPackages;
 
   useEffect(() => {
     void load();
   }, [load]);
 
   useEffect(() => {
-    void loadPackages();
-  }, [loadPackages]);
-
-  // `project-download-progress` rides both the manual Download click and the
-  // auto-replication worker, so it is listened for at page level (it must
-  // survive tab switches) and handed down to the Receive tab. The event only
-  // carries the source count — the row's status still comes from the stored
-  // `local_status`, so each edge also re-lists the packages: that is what flips
-  // an auto-started download to `downloading` in the UI (and settles it back
-  // afterwards) without waiting for a poll to be armed.
-  useEffect(() => {
-    if (!id) return;
-    // Navigating to another project drops whatever was in flight for the old one.
-    setDownloadSources((prev) => (prev.size === 0 ? prev : new Map()));
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    api
-      .listen<ProjectDownloadProgress>('project-download-progress', (p) => {
-        if (cancelled || p.projectId !== id) return;
-        setDownloadSources((prev) => {
-          const next = new Map(prev);
-          if (p.stage === 'fetching') next.set(p.packageId, p.sources);
-          else next.delete(p.packageId);
-          return next;
-        });
-        void loadPackagesRef.current();
-      })
-      .then((fn) => {
-        if (cancelled) fn();
-        else unlisten = fn;
-      })
-      .catch((err) => console.error('[projects] download-progress listen failed:', err));
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [id]);
+    void loadFrames();
+  }, [loadFrames]);
 
   const openPortal = async (path: string) => {
     if (!detail) return;
@@ -153,47 +120,82 @@ export default function ProjectDetail() {
     await openUrl(safe);
   };
 
+  /** Shared publish-outcome handling for both the Publish and the
+   *  "Recalibrate and republish all" flows (P19). */
+  const notifyPublished = (res: PublishResult) => {
+    const sent = res.announced + res.updated;
+    const heldBackCount = res.heldBack.length;
+    let title: string;
+    let tone: 'info' | 'success' | 'warning' = 'success';
+    if (sent === 0) {
+      title = 'Nothing new to publish';
+      tone = heldBackCount > 0 ? 'warning' : 'info';
+    } else if (res.state === 'pending') {
+      title = `Sent ${sent} frames for approval · ${heldBackCount} held back`;
+      tone = 'info';
+    } else {
+      title = `Published ${sent} frames · ${heldBackCount} held back`;
+      tone = 'success';
+    }
+    const parts = [`${res.announced} new`, `${res.updated} updated`];
+    if (res.unchanged > 0) parts.push(`${res.unchanged} unchanged`);
+    notify({
+      title,
+      detail: parts.join(' · '),
+      kind: 'project',
+      tone,
+      hasErrors: heldBackCount > 0,
+      link: `/projects/${id}`,
+      dedupeKey: `publish-${id}-${Date.now()}`,
+    });
+  };
+
   const doPublish = async () => {
     if (!id) return;
     setPublishBusy(true);
     setPublishError(null);
     try {
-      const res = await api.invoke<PublishResult>('publish_collab_package', { projectId: id });
+      const res = await api.invoke<PublishResult>('publish_collab_frames', { projectId: id });
       setPublishConfirm(false);
-      // Message reflects the hub-returned state and the real counts, never
-      // optimistic (S6).
-      const sent = res.announced + res.updated;
-      let title: string;
-      let tone: 'info' | 'success' | 'warning' = 'info';
-      if (sent === 0) {
-        title = 'Nothing new to publish';
-        if (res.heldBack.length > 0) tone = 'warning';
-      } else if (res.state === 'pending') {
-        title = 'Frames sent for approval';
-      } else {
-        title = 'Frames published';
-        tone = 'success';
-      }
-      const parts = [`${res.announced} new`, `${res.updated} updated`];
-      if (res.unchanged > 0) parts.push(`${res.unchanged} unchanged`);
-      if (res.heldBack.length > 0) parts.push(`${res.heldBack.length} held back`);
-      notify({
-        title,
-        detail: parts.join(' · '),
-        kind: 'project',
-        tone,
-        hasErrors: res.heldBack.length > 0,
-        link: `/projects/${id}`,
-      });
-      await loadPackages();
+      notifyPublished(res);
+      await loadFrames();
       await load();
     } catch (err) {
       // S6 — a failed publish surfaces inline, never silently swallowed.
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[projects] publish failed:', err);
-      setPublishError(msg);
+      if (isOutdated(msg)) {
+        setPublishConfirm(false);
+        setUpdateRequired(true);
+      } else {
+        setPublishError(msg);
+      }
     } finally {
       setPublishBusy(false);
+    }
+  };
+
+  const doRepublish = async () => {
+    if (!id) return;
+    setRepublishBusy(true);
+    setRepublishError(null);
+    try {
+      const res = await api.invoke<PublishResult>('republish_collab_frames', { projectId: id });
+      setRepublishConfirm(false);
+      notifyPublished(res);
+      await loadFrames();
+      await load();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[projects] republish failed:', err);
+      if (isOutdated(msg)) {
+        setRepublishConfirm(false);
+        setUpdateRequired(true);
+      } else {
+        setRepublishError(msg);
+      }
+    } finally {
+      setRepublishBusy(false);
     }
   };
 
@@ -228,14 +230,11 @@ export default function ProjectDetail() {
     : publishable === 0
       ? 'No passing frames to publish yet'
       : undefined;
-  // The project's published volume, client-side from the rows already listed:
-  // every announcement that survived moderation and has not been superseded.
+  const own = frames?.filter((f) => f.own) ?? [];
+  // The project's published volume, client-side from the rows already listed.
   const publishedBytes =
-    packages === null
-      ? null
-      : packages
-          .filter((p) => p.state === 'published' && !p.superseded)
-          .reduce((sum, p) => sum + p.byteSize, 0);
+    frames === null ? null : own.filter((f) => f.state === 'published').reduce((sum, f) => sum + f.byteSize, 0);
+  const canRepublish = own.length > 0;
 
   const tabs: Tab[] = [
     'contribute',
@@ -264,6 +263,8 @@ export default function ProjectDetail() {
         </button>
       </div>
 
+      {updateRequired && <UpdateRequired />}
+
       {/* Auto-replication is role-gated in core (`role_allows_replication`:
           coordinator or send_receive) exactly like the Receive tab, so the bar
           shows on the same condition — a send-only member has nothing to pull. */}
@@ -271,9 +272,10 @@ export default function ProjectDetail() {
         <AutoReplicateBar
           projectId={id}
           autoReplicate={c.autoReplicate}
+          autoPublish={c.autoPublish}
           publishedBytes={publishedBytes}
           onToggled={() => void load()}
-          onSynced={() => void loadPackages()}
+          onSynced={() => void loadFrames()}
         />
       )}
 
@@ -333,40 +335,52 @@ export default function ProjectDetail() {
             <GateTable gate={gate} />
           )}
 
-          <div className="space-y-1">
-            <button
-              onClick={() => {
-                setPublishError(null);
-                setPublishConfirm(true);
-              }}
-              disabled={publishable === 0}
-              className="inline-flex items-center gap-1.5 rounded bg-accent px-4 py-2 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-              title={publishTooltip}
-            >
-              <Send size={14} /> Publish {publishable} passing frames
-            </button>
-            {/* Honest line near the button (D-2, review fix) — the tooltip alone
-                is easy to miss on a dead-looking disabled button, and decision C
-                means this is not a temporary/data-dependent state a user could
-                fix by linking more objects or waiting for analysis. */}
-            {publishBlockedByCalibration && (
-              <p className="text-xs text-content-muted">{publishTooltip}</p>
-            )}
-            {publishError && !publishConfirm && <p className="text-sm text-error">{publishError}</p>}
-          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="space-y-1">
+              <button
+                onClick={() => {
+                  setPublishError(null);
+                  setPublishConfirm(true);
+                }}
+                disabled={publishable === 0}
+                className="inline-flex items-center gap-1.5 rounded bg-accent px-4 py-2 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+                title={publishTooltip}
+              >
+                <Send size={14} /> Publish {publishable} passing frames
+              </button>
+              {/* Honest line near the button (D-2, review fix) — the tooltip alone
+                  is easy to miss on a dead-looking disabled button, and decision C
+                  means this is not a temporary/data-dependent state a user could
+                  fix by linking more objects or waiting for analysis. */}
+              {publishBlockedByCalibration && (
+                <p className="text-xs text-content-muted">{publishTooltip}</p>
+              )}
+              {publishError && !publishConfirm && <p className="text-sm text-error">{publishError}</p>}
+            </div>
 
-          <PublicationHistory packages={packages} error={packagesError} />
+            {canRepublish && (
+              <button
+                onClick={() => {
+                  setRepublishError(null);
+                  setRepublishConfirm(true);
+                }}
+                className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm text-content-secondary transition-colors hover:bg-surface-hover"
+                title="Regenerate every one of your published frames as a new content version"
+              >
+                <RefreshCw size={14} /> Recalibrate and republish all
+              </button>
+            )}
+          </div>
+          {republishError && !republishConfirm && (
+            <p className="text-sm text-error">{republishError}</p>
+          )}
+
+          <PublicationHistory frames={own} error={framesError} loaded={frames !== null} />
         </div>
       )}
 
       {activeTab === 'receive' && id && (
-        <ReceiveTab
-          projectId={id}
-          projectTitle={c.title}
-          packages={packages}
-          reload={loadPackages}
-          downloadSources={downloadSources}
-        />
+        <ReceiveTab projectId={id} projectTitle={c.title} frames={frames} reload={loadFrames} />
       )}
 
       {activeTab === 'moderation' && id && (
@@ -374,7 +388,7 @@ export default function ProjectDetail() {
           projectId={id}
           onDecided={() => {
             void load();
-            void loadPackages();
+            void loadFrames();
           }}
         />
       )}
@@ -440,12 +454,12 @@ export default function ProjectDetail() {
               <h2 className="font-medium text-content">Publish to {c.title}</h2>
             </div>
             <p className="mb-2 text-sm text-content-secondary">
-              {publishable} passing {publishable === 1 ? 'frame' : 'frames'} will be packaged and
+              {publishable} passing {publishable === 1 ? 'frame' : 'frames'} will be calibrated and
               announced to the project.
             </p>
             <p className="mb-2 text-xs text-content-muted">
               Estimated size ≈ {formatBytes(publishable * APPROX_FRAME_BYTES)} — the exact size is
-              measured when the package is built.
+              measured when each frame is generated.
             </p>
             {needsApproval && (
               <p className="mb-2 text-xs text-warning">
@@ -475,17 +489,62 @@ export default function ProjectDetail() {
           </div>
         </div>
       )}
+
+      {republishConfirm && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+          onClick={() => !republishBusy && setRepublishConfirm(false)}
+        >
+          <div
+            className="w-[30rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-2 flex items-center gap-2">
+              <RefreshCw size={16} className="text-accent" />
+              <h2 className="font-medium text-content">Recalibrate and republish all</h2>
+            </div>
+            <p className="mb-2 text-sm text-content-secondary">
+              Every one of your published frames is regenerated and, where the bytes changed, posted
+              as a new content version.
+            </p>
+            <p className="mb-2 text-xs text-warning">
+              Every processor holding one of your frames re-downloads it once this finishes.
+            </p>
+            {republishError && <p className="mb-2 text-sm text-error">{republishError}</p>}
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setRepublishConfirm(false)}
+                disabled={republishBusy}
+                className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void doRepublish()}
+                disabled={republishBusy}
+                className="inline-flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {republishBusy && <Loader2 size={12} className="animate-spin" />} Republish
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-/** Own publications with their hub-mirrored state + replication line. */
+/** Own frames with their hub-mirrored state. */
 function PublicationHistory({
-  packages,
+  frames,
   error,
+  loaded,
 }: {
-  packages: ProjectPackageView[] | null;
+  frames: ProjectFrameView[];
   error: boolean;
+  loaded: boolean;
 }) {
   if (error)
     return (
@@ -494,36 +553,31 @@ function PublicationHistory({
         <p className="text-sm text-error">Could not load your publications — see console.</p>
       </div>
     );
-  if (packages === null) return null;
-  const own = packages.filter((p) => p.own);
+  if (!loaded) return null;
   return (
     <div className="space-y-2">
       <h2 className="text-sm font-medium text-content">Your publications</h2>
-      {own.length === 0 ? (
+      {frames.length === 0 ? (
         <p className="text-sm text-content-muted">Nothing published yet.</p>
       ) : (
         <ul className="space-y-1.5">
-          {own.map((p) => (
-            <li
-              key={p.packageId}
-              className={`rounded border border-border px-3 py-2 text-sm ${
-                p.superseded ? 'opacity-50' : ''
-              }`}
-            >
+          {frames.map((f) => (
+            <li key={f.frameUuid} className="rounded border border-border px-3 py-2 text-sm">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs text-content-muted">{formatTimestamp(p.createdAt)}</span>
-                <span className="text-xs text-content-secondary">
-                  {p.frameCount} frames · {formatBytes(p.byteSize)}
+                <span
+                  className="max-w-[16rem] truncate text-xs text-content-secondary"
+                  title={f.fileName}
+                >
+                  {f.fileName}
                 </span>
-                <StateChip state={p.state} rejectReason={p.rejectReason} />
-                {p.superseded && (
-                  <span className="rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-content-muted">
-                    superseded
-                  </span>
-                )}
+                <span className="text-xs text-content-muted">
+                  v{f.contentVersion} · {formatBytes(f.byteSize)}
+                </span>
+                <StateChip state={f.state} rejectReason={f.acceptedReason} />
               </div>
               <p className="mt-0.5 text-[11px] text-content-muted">
-                held by {p.holderCount} ({p.onlineCount} online)
+                held by {f.holderCount}
+                {f.lastError ? ` · ${f.lastError}` : ''}
               </p>
             </li>
           ))}
