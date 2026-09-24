@@ -65,6 +65,20 @@ pub enum AccountClientError {
 pub const COLLAB_API_OUTDATED_MSG: &str =
     "collab_api_outdated: this hub needs a newer Athenaeum — update to keep collaborating";
 
+/// Log the `collab_api_outdated` refusal once per process: the version poll
+/// runs every 15 s and would otherwise flood the log with the same fact.
+/// Shared by every `AccountClientError → ApiError` mapper so the one warning
+/// is process-wide, whichever call hit it first.
+pub fn warn_collab_api_outdated_once() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            outcome = "collab_api_outdated",
+            "hub refused an outdated collab api"
+        );
+    });
+}
+
 impl std::fmt::Display for AccountClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -728,11 +728,10 @@ fn client_err(e: crate::account::AccountClientError) -> ApiError {
         E::Forbidden => {
             ApiError::Forbidden("The account's role may not perform this action.".into())
         }
-        // This module's calls are all the deprecated package-api methods
-        // (removed wave 2 Task 11), which never produce this variant — only
-        // the per-frame calls in `collab::hub_client::CollabClient` do (see
-        // `api::collab::client_err`) — but the match must stay exhaustive.
+        // The per-frame calls here (the version poll, the manifest sync)
+        // produce this variant; the deprecated package-api ones never do.
         E::CollabApiOutdated => {
+            crate::account::client::warn_collab_api_outdated_once();
             ApiError::Conflict(crate::account::client::COLLAB_API_OUTDATED_MSG.into())
         }
         E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
@@ -942,6 +941,503 @@ fn kick_auto_sync_if_changed(changes: &[PackageStateChange]) -> bool {
         "collab auto-sync kicked by a package-set change"
     );
     true
+}
+
+// ── Version poll + manifest delta (collab v3 wave 2, Task 8; R19, P9) ────────
+//
+// The hub keeps one `version` per project, bumped by every change a device
+// must see (a manifest row, membership, caps, thresholds, dictionary). The
+// auto-sync worker asks `GET /me/project-versions` every
+// [`COLLAB_VERSION_POLL_INTERVAL`]; a project whose version differs from the
+// cached `hub_version` gets ONE project refresh (joins, losses, caps,
+// thresholds, dictionary) and a paged manifest delta from its cursor. A quiet
+// poll is one request.
+
+/// How often the auto-sync worker asks the hub whether any project moved.
+pub const COLLAB_VERSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Grace before the FIRST version poll of a session (the pass waits 90 s).
+const COLLAB_VERSION_POLL_STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Rows per manifest page — the hub's cap.
+const MANIFEST_PAGE_LIMIT: u32 = 1000;
+
+/// The per-kind outcome event of a manifest sync ([`CollabFramesChange`]).
+pub const COLLAB_FRAMES_CHANGED_EVENT: &str = "collab-frames-changed";
+
+/// What a manifest delta changed, from this device's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum FramesChangeKind {
+    /// Another member's frame became visible as published.
+    NewFrames,
+    /// Another member's frame awaits moderation (visible to moderators only).
+    PendingFrames,
+    /// My pending frame was published.
+    Approved,
+    /// My frame was rejected.
+    Rejected,
+    /// A frame was excluded from the project (`accepted` true → false).
+    Excluded,
+    /// Another member published a new content version of a frame.
+    NewVersions,
+}
+
+impl FramesChangeKind {
+    /// The wire spelling (the serde name), for logs.
+    fn as_str(self) -> &'static str {
+        match self {
+            FramesChangeKind::NewFrames => "newFrames",
+            FramesChangeKind::PendingFrames => "pendingFrames",
+            FramesChangeKind::Approved => "approved",
+            FramesChangeKind::Rejected => "rejected",
+            FramesChangeKind::Excluded => "excluded",
+            FramesChangeKind::NewVersions => "newVersions",
+        }
+    }
+}
+
+/// One `collab-frames-changed` event: how many rows of one kind a manifest
+/// sync applied for one project. Emitted once per non-zero kind.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabFramesChange {
+    pub project_id: String,
+    pub kind: FramesChangeKind,
+    pub count: usize,
+}
+
+/// Classify one manifest row against the local row it replaces (`None` =
+/// never seen). Pure. A row can carry more than one kind (an exclusion and a
+/// new version in one delta).
+pub(crate) fn classify_frame_change(
+    prev: Option<&crate::db::collab_frames::LocalFrameRow>,
+    v: &crate::collab::hub_client::FrameViewWire,
+) -> Vec<FramesChangeKind> {
+    use FramesChangeKind as K;
+    let mut out = Vec::new();
+    let prev_state = prev.map(|p| p.state.as_str());
+    if v.own {
+        // Only a row this device already tracked: a first sync of an old
+        // account must not replay every historical decision as news.
+        if prev_state == Some("pending") && v.state == "published" {
+            out.push(K::Approved);
+        }
+        if prev.is_some() && prev_state != Some("rejected") && v.state == "rejected" {
+            out.push(K::Rejected);
+        }
+    } else {
+        if v.state == "published" && prev_state != Some("published") {
+            out.push(K::NewFrames);
+        } else if prev.is_some_and(|p| v.content_version > p.content_version) {
+            out.push(K::NewVersions);
+        }
+        // Pending rows of another member reach only a moderator's manifest.
+        if v.state == "pending" && prev_state != Some("pending") {
+            out.push(K::PendingFrames);
+        }
+    }
+    if prev.is_some_and(|p| p.accepted) && !v.accepted {
+        out.push(K::Excluded);
+    }
+    out
+}
+
+/// Pull one project's manifest delta into `project_frames_local` (P9).
+///
+/// 1. The cursor is `manifest_cursor`, or 0 with a prune when the caps the
+///    last sync saw (`synced_caps_json`) differ from the current ones
+///    (`gov_caps_json`, written by the project refresh) — the hub README's
+///    client caps rule.
+/// 2. Pages of 1000 are followed through `next` until `hasMore` is false;
+///    each row is classified against the local row, then upserted (an own
+///    row takes the hub's columns and keeps its local ones).
+/// 3. On a caps change, every replica row the fresh fetch did not return is
+///    deleted; own rows never are.
+/// 4. The sync state records the LAST page's project version, the highest
+///    `manifestVersion` applied, and the caps this sync ran under.
+/// 5. `collab-frames-changed` is emitted once per non-zero kind — also for
+///    the rows a failed sync applied before it stopped (they are applied
+///    locally, and the retry will not see them as changes again).
+///
+/// A failure leaves the sync state untouched, so the next sync starts from
+/// the same cursor; the upserts it already made are idempotent.
+///
+/// `hub_version` advances to the manifest's project version, which also
+/// covers the changes only the project refresh picks up (membership, caps,
+/// thresholds, dictionary). A caller outside the version poll should
+/// therefore refresh first — or call [`poll_versions_once`], which does both.
+pub async fn sync_manifest(
+    ctx: &ServiceContext,
+    project_id: &str,
+    emitter: Option<&dyn ProgressEmitter>,
+) -> Result<Vec<CollabFramesChange>, ApiError> {
+    use crate::db::collab_frames as frames_db;
+
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        tracing::warn!(project_id, "manifest sync refused: signed out");
+        return Err(ApiError::SignedOut(
+            "Sign in to use collaboration projects.".into(),
+        ));
+    };
+    let project = {
+        let database = db(ctx)?;
+        let conn = database.conn();
+        crate::db::collab::get_project(&conn, project_id)?
+    };
+    let Some(project) = project else {
+        tracing::warn!(project_id, "manifest sync refused: project is not cached");
+        return Err(ApiError::NotFound(format!(
+            "project {project_id} is not cached — refresh first"
+        )));
+    };
+    let client = CollabClient::new(&hub_url).map_err(|e| {
+        let e = client_err(e);
+        tracing::error!(project_id, error = %e, "manifest sync: hub client failed");
+        e
+    })?;
+
+    let caps_changed = project.gov_caps_json != project.synced_caps_json;
+    let start = if caps_changed {
+        0
+    } else {
+        project.manifest_cursor
+    };
+    let mut counts: std::collections::BTreeMap<FramesChangeKind, usize> =
+        std::collections::BTreeMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut max_mv = project.manifest_cursor;
+    let mut hub_version = project.hub_version;
+    let mut applied = 0usize;
+
+    let fetched: Result<(), ApiError> = async {
+        let mut since = start;
+        let mut after: Option<String> = None;
+        loop {
+            let page = client
+                .manifest_page(
+                    &token,
+                    project_id,
+                    since,
+                    after.as_deref(),
+                    MANIFEST_PAGE_LIMIT,
+                )
+                .await
+                .map_err(client_err)?;
+            hub_version = page.project_version;
+            {
+                let database = db(ctx)?;
+                let conn = database.conn();
+                let tx = conn.unchecked_transaction()?;
+                for v in &page.rows {
+                    let prev = frames_db::get(&tx, project_id, &v.frame_uuid)?;
+                    for kind in classify_frame_change(prev.as_ref(), v) {
+                        *counts.entry(kind).or_default() += 1;
+                    }
+                    frames_db::upsert_from_manifest(&tx, project_id, v)?;
+                    seen.insert(v.frame_uuid.clone());
+                    max_mv = max_mv.max(v.manifest_version);
+                }
+                tx.commit()?;
+            }
+            applied += page.rows.len();
+            if !page.has_more {
+                return Ok(());
+            }
+            match page.next {
+                Some(next) => {
+                    since = next.since;
+                    after = Some(next.after);
+                }
+                None => {
+                    return Err(ApiError::Internal(
+                        "hub manifest page has more rows but no cursor".into(),
+                    ))
+                }
+            }
+        }
+    }
+    .await;
+
+    let changes: Vec<CollabFramesChange> = counts
+        .into_iter()
+        .map(|(kind, count)| CollabFramesChange {
+            project_id: project_id.to_string(),
+            kind,
+            count,
+        })
+        .collect();
+    for change in &changes {
+        tracing::info!(
+            project_id,
+            count = change.count,
+            kind = change.kind.as_str(),
+            "manifest delta applied"
+        );
+        if let Some(em) = emitter {
+            crate::events::emit_event(em, COLLAB_FRAMES_CHANGED_EVENT, change);
+        }
+    }
+
+    if let Err(e) = fetched {
+        tracing::warn!(
+            project_id,
+            count = applied,
+            error = %e,
+            "manifest sync failed; the next sync resumes from the stored cursor"
+        );
+        return Err(e);
+    }
+
+    let pruned = {
+        let database = db(ctx)?;
+        let conn = database.conn();
+        let pruned = if caps_changed {
+            frames_db::delete_not_in(&conn, project_id, &seen)?
+        } else {
+            0
+        };
+        crate::db::collab::set_sync_state(
+            &conn,
+            project_id,
+            hub_version,
+            max_mv,
+            &project.gov_caps_json,
+        )?;
+        pruned
+    };
+    tracing::debug!(
+        project_id,
+        count = applied,
+        pruned,
+        caps_changed,
+        hub_version,
+        manifest_cursor = max_mv,
+        "manifest synced"
+    );
+    Ok(changes)
+}
+
+/// Hooks the version poll calls (Task 10 plugs auto-publish in here).
+#[cfg(all(feature = "render", feature = "solver"))]
+pub(crate) struct VersionPollHooks {
+    /// A moved project's thresholds or dictionary version changed during the
+    /// refresh. Called after its manifest sync, with the project id.
+    pub on_thresholds_or_dictionary_moved: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+#[cfg(all(feature = "render", feature = "solver"))]
+impl Default for VersionPollHooks {
+    fn default() -> Self {
+        VersionPollHooks {
+            on_thresholds_or_dictionary_moved: Box::new(|_| {}),
+        }
+    }
+}
+
+/// One version poll with the default hooks. See [`poll_versions_with`].
+#[cfg(all(feature = "render", feature = "solver"))]
+pub async fn poll_versions_once(
+    ctx: &ServiceContext,
+    emitter: Option<&dyn ProgressEmitter>,
+) -> Result<Vec<String>, ApiError> {
+    poll_versions_with(ctx, emitter, &VersionPollHooks::default()).await
+}
+
+/// One version poll (R19).
+///
+/// - Signed out → `Ok(vec![])`, as the pass does.
+/// - `GET /me/project-versions`. When every listed project is cached at the
+///   same `hub_version` and no cached project is missing from the list,
+///   that is the whole poll: one request.
+/// - Otherwise ONE [`crate::api::collab::refresh_projects`] (it handles
+///   joins, losses, caps, thresholds and the dictionary), then
+///   [`sync_manifest`] for each moved project the refresh actually
+///   refreshed — a project whose refresh or sync failed is logged and
+///   retried by the next poll, since its `hub_version` did not advance. When a moved project's thresholds or dictionary version changed
+///   during the refresh, the hook fires after its sync.
+/// - Returns the moved project ids (joins included, losses not); the caller
+///   kicks the pass when the list is non-empty.
+/// - A `collab_api_outdated` refusal is the P17 `Conflict`, logged once.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub(crate) async fn poll_versions_with(
+    ctx: &ServiceContext,
+    emitter: Option<&dyn ProgressEmitter>,
+    hooks: &VersionPollHooks,
+) -> Result<Vec<String>, ApiError> {
+    use std::collections::HashMap;
+
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        tracing::debug!("collab version poll: signed out; skipped");
+        return Ok(Vec::new());
+    };
+    let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    let versions = client.project_versions(&token).await.map_err(client_err)?;
+
+    let cached: HashMap<String, crate::db::collab::CollabProjectRow> = {
+        let database = db(ctx)?;
+        let conn = database.conn();
+        crate::db::collab::list_projects(&conn)?
+            .into_iter()
+            .map(|r| (r.project_id.clone(), r))
+            .collect()
+    };
+    let listed: HashSet<&str> = versions.iter().map(|v| v.project_id.as_str()).collect();
+    let moved: Vec<String> = versions
+        .iter()
+        .filter(|v| {
+            cached
+                .get(&v.project_id)
+                .is_none_or(|row| row.hub_version != v.version)
+        })
+        .map(|v| v.project_id.clone())
+        .collect();
+    let lost = cached
+        .keys()
+        .filter(|id| !listed.contains(id.as_str()))
+        .count();
+    if moved.is_empty() && lost == 0 {
+        tracing::debug!("collab version poll: nothing moved");
+        return Ok(Vec::new());
+    }
+    tracing::debug!(
+        count = moved.len(),
+        lost,
+        "collab version poll: versions moved; refreshing projects"
+    );
+
+    let refreshed_ids = crate::api::collab::refresh_projects_reporting(ctx).await?;
+
+    let refreshed: HashMap<String, crate::db::collab::CollabProjectRow> = {
+        let database = db(ctx)?;
+        let conn = database.conn();
+        crate::db::collab::list_projects(&conn)?
+            .into_iter()
+            .map(|r| (r.project_id.clone(), r))
+            .collect()
+    };
+    for project_id in &moved {
+        // A project the refresh did not refresh keeps its old `hub_version`
+        // and is retried by the next poll: syncing its manifest now would
+        // advance `hub_version` past a caps / thresholds / dictionary change
+        // the cache never saw.
+        let Some(now) = refreshed
+            .get(project_id)
+            .filter(|_| refreshed_ids.contains(project_id))
+        else {
+            if note_poll_failure(project_id) {
+                tracing::warn!(
+                    project_id = %project_id,
+                    "collab version poll: moved project was not refreshed; manifest sync deferred to the next poll"
+                );
+            } else {
+                tracing::debug!(
+                    project_id = %project_id,
+                    "collab version poll: moved project still not refreshed"
+                );
+            }
+            continue;
+        };
+        match sync_manifest(ctx, project_id, emitter).await {
+            Ok(_) => {
+                if clear_poll_failure(project_id) {
+                    tracing::info!(project_id = %project_id, "collab version poll: manifest sync recovered");
+                }
+            }
+            Err(e) => {
+                if note_poll_failure(project_id) {
+                    tracing::warn!(project_id = %project_id, error = %e, "collab version poll: manifest sync failed; retried on the next poll");
+                } else {
+                    tracing::debug!(project_id = %project_id, error = %e, "collab version poll: manifest sync still failing");
+                }
+            }
+        }
+        let (thresholds_before, dictionary_before) =
+            cached.get(project_id).map_or((None, None), |r| {
+                (r.thresholds_version, r.dictionary_version)
+            });
+        if thresholds_before != now.thresholds_version
+            || dictionary_before != now.dictionary_version
+        {
+            tracing::debug!(
+                project_id = %project_id,
+                "collab version poll: thresholds or dictionary moved"
+            );
+            (hooks.on_thresholds_or_dictionary_moved)(project_id);
+        }
+    }
+    Ok(moved)
+}
+
+/// Keys (a project id, or `""` for the whole poll) whose last version-poll
+/// step failed — so a hub outage logs one `warn!` when it starts and one
+/// `info!` when it ends, not one per 15 s tick.
+#[cfg(all(feature = "render", feature = "solver"))]
+static POLL_FAILING: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(feature = "render", feature = "solver"))]
+fn poll_failing() -> std::sync::MutexGuard<'static, HashSet<String>> {
+    POLL_FAILING
+        .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record a failure of `key`; `true` when it was not already failing.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn note_poll_failure(key: &str) -> bool {
+    poll_failing().insert(key.to_string())
+}
+
+/// Record a success of `key`; `true` when it was failing until now.
+#[cfg(all(feature = "render", feature = "solver"))]
+fn clear_poll_failure(key: &str) -> bool {
+    poll_failing().remove(key)
+}
+
+/// Kick the pass iff the poll saw a version move. Returns whether it kicked
+/// (the unit-test oracle). Same stored-permit semantics as
+/// [`kick_auto_sync_if_changed`].
+#[cfg(all(feature = "render", feature = "solver"))]
+fn kick_if_versions_moved(moved: &[String]) -> bool {
+    if moved.is_empty() {
+        return false;
+    }
+    auto_sync_kick().notify_one();
+    tracing::debug!(
+        count = moved.len(),
+        "collab auto-sync kicked by a project version move"
+    );
+    true
+}
+
+/// One tick of the version poll, bound to the worker's context and emitter.
+/// Logged at `debug` (it runs 5 760 times a day); a failure that starts or
+/// ends is logged once at `warn!` / `info!`.
+async fn version_poll_tick(ctx: Arc<ServiceContext>, emitter: Option<Arc<dyn ProgressEmitter>>) {
+    #[cfg(all(feature = "render", feature = "solver"))]
+    match poll_versions_once(&ctx, emitter.as_deref()).await {
+        Ok(moved) => {
+            if clear_poll_failure("") {
+                tracing::info!("collab version poll recovered");
+            }
+            kick_if_versions_moved(&moved);
+        }
+        Err(e) => {
+            if note_poll_failure("") {
+                tracing::warn!(error = %e, "collab version poll failed; retrying every tick");
+            } else {
+                tracing::debug!(error = %e, "collab version poll still failing");
+            }
+        }
+    }
+    #[cfg(not(all(feature = "render", feature = "solver")))]
+    {
+        // The project refresh lives in the render+solver-gated `api::collab`;
+        // a headless build has no version poll.
+        let _ = (ctx, emitter);
+    }
 }
 
 /// All cached projects (the poll-cadence entry point). A per-project failure is
@@ -2797,9 +3293,11 @@ async fn auto_sync_pass(
 }
 
 /// The auto-replication loop (spec §3.3): a pass every `interval` OR as soon as a
-/// hub poll changes a project's package set, after a short startup grace. Each
-/// pass runs on its own task so a panic anywhere below is logged and the loop
-/// survives it (a background loop that dies is a feature that silently stops).
+/// hub change arrives, after a short startup grace; and, in between, the
+/// version poll every [`COLLAB_VERSION_POLL_INTERVAL`] (R19), which kicks the
+/// pass when a project version moved. Each pass and each poll runs on its own
+/// task so a panic anywhere below is logged and the loop survives it (a
+/// background loop that dies is a feature that silently stops).
 pub async fn run_collab_auto_sync_loop(
     ctx: Arc<ServiceContext>,
     sync: Arc<crate::sync::SyncRuntime>,
@@ -2808,11 +3306,28 @@ pub async fn run_collab_auto_sync_loop(
 ) {
     tracing::info!(
         interval_secs = interval.as_secs(),
+        poll_secs = COLLAB_VERSION_POLL_INTERVAL.as_secs(),
         "collab auto-sync loop armed"
     );
+    let poll = {
+        let ctx = Arc::clone(&ctx);
+        let emitter = emitter.clone();
+        move || {
+            let ctx = Arc::clone(&ctx);
+            let emitter = emitter.clone();
+            async move {
+                let tick = tokio::spawn(version_poll_tick(ctx, emitter));
+                if let Err(error) = tick.await {
+                    tracing::error!(%error, "collab version poll task panicked");
+                }
+            }
+        }
+    };
     auto_sync_loop_inner(
         COLLAB_AUTO_SYNC_STARTUP_DELAY.min(interval),
         interval,
+        COLLAB_VERSION_POLL_STARTUP_DELAY,
+        COLLAB_VERSION_POLL_INTERVAL,
         move || {
             let ctx = Arc::clone(&ctx);
             let sync = Arc::clone(&sync);
@@ -2824,37 +3339,63 @@ pub async fn run_collab_auto_sync_loop(
                 }
             }
         },
+        poll,
     )
     .await
 }
 
-/// The loop's shape, with the pass injected (the production binding is
-/// [`run_collab_auto_sync_loop`]; tests pass a counter).
+/// The loop's shape, with the pass and the poll injected (the production
+/// binding is [`run_collab_auto_sync_loop`]; tests pass counters). Three arms:
 ///
-/// The startup grace is deliberately NOT interruptible: it exists so bulk pulls
-/// don't compete with app start (receiver boot, initial scan, first render), and
-/// a hub poll during those 90 seconds is exactly the traffic it protects against.
-/// A kick that lands inside the grace — or during a running pass — is not lost:
-/// [`tokio::sync::Notify::notify_one`] stores ONE permit when nobody is waiting,
-/// so the wait below returns immediately the next time round and produces exactly
-/// one follow-up pass no matter how many kicks arrived. Overlapping per-package
+/// - the pass timer: the first pass after `startup_delay`, then every
+///   `interval` after the last pass (the retry and disk-truth cadence);
+/// - the kick: a pass right away, once the first pass has run;
+/// - the poll tick: every `poll_interval`, starting after
+///   `poll_startup_delay` — during the pass's startup grace too, so the
+///   catalog learns about hub changes within seconds of app start.
+///
+/// The pass's startup grace is deliberately NOT interruptible by a kick: it
+/// exists so bulk pulls don't compete with app start (receiver boot, initial
+/// scan, first render). A kick that lands inside the grace — or during a
+/// running pass — is not lost: [`tokio::sync::Notify::notify_one`] stores ONE
+/// permit when nobody is waiting, so the kick arm fires the next time round
+/// and produces exactly one follow-up pass no matter how many kicks arrived.
+/// The arms are serial: a poll never overlaps a pass. Overlapping per-package
 /// work between a kicked pass and its predecessor is prevented by
 /// [`IN_FLIGHT_PACKAGE_PULLS`], not by the cadence.
-async fn auto_sync_loop_inner<F, Fut>(
+async fn auto_sync_loop_inner<F, Fut, P, PFut>(
     startup_delay: std::time::Duration,
     interval: std::time::Duration,
+    poll_startup_delay: std::time::Duration,
+    poll_interval: std::time::Duration,
     run_pass: F,
+    run_poll: P,
 ) where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = ()>,
+    P: Fn() -> PFut,
+    PFut: std::future::Future<Output = ()>,
 {
-    tokio::time::sleep(startup_delay).await;
+    let start = tokio::time::Instant::now();
+    let pass_due = tokio::time::sleep_until(start + startup_delay);
+    tokio::pin!(pass_due);
+    let mut poll_tick = tokio::time::interval_at(start + poll_startup_delay, poll_interval);
+    poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut started = false;
     loop {
-        run_pass().await;
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            _ = auto_sync_kick().notified() => {
-                tracing::info!("collab auto-sync: package set changed; running a pass now");
+            _ = &mut pass_due => {
+                run_pass().await;
+                started = true;
+                pass_due.as_mut().reset(tokio::time::Instant::now() + interval);
+            }
+            _ = auto_sync_kick().notified(), if started => {
+                tracing::info!("collab auto-sync: a hub change arrived; running a pass now");
+                run_pass().await;
+                pass_due.as_mut().reset(tokio::time::Instant::now() + interval);
+            }
+            _ = poll_tick.tick() => {
+                run_poll().await;
             }
         }
     }
@@ -6218,12 +6759,19 @@ mod tests {
         let task = tokio::spawn({
             let passes = Arc::clone(&passes);
             async move {
-                auto_sync_loop_inner(Duration::ZERO, Duration::from_secs(3600), move || {
-                    let passes = Arc::clone(&passes);
-                    async move {
-                        passes.fetch_add(1, Ordering::SeqCst);
-                    }
-                })
+                auto_sync_loop_inner(
+                    Duration::ZERO,
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                    Duration::from_secs(3600),
+                    move || {
+                        let passes = Arc::clone(&passes);
+                        async move {
+                            passes.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                    || async {},
+                )
                 .await
             }
         });
@@ -6269,5 +6817,754 @@ mod tests {
             set_project_auto_replicate(&ctx, "no-such-project", false).is_err(),
             "an unknown project is a user-visible error, not a silent no-op"
         );
+    }
+
+    // ── Task 8 (wave 2): version poll + manifest delta, against the fake hub ──
+
+    /// Shared fixture for the `poll` / `manifest` tests: one app context signed
+    /// in to ONE stateful fake hub as `acc-me`, plus a second member `acc-o`.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    mod v3_fx {
+        use super::*;
+        pub(super) use crate::collab::fake_hub::FakeHub;
+        pub(super) use crate::collab::hub_client::FrameViewWire;
+        pub(super) use crate::db::collab_frames::{self as frames_db, FrameOrigin, LocalFrameRow};
+
+        pub(super) const PID: &str = "p1";
+
+        pub(super) struct Fx {
+            pub tmp: tempfile::TempDir,
+            pub ctx: ServiceContext,
+            pub hub: FakeHub,
+        }
+
+        /// `acc-me` (this context, token `tok`) is a `role` member; `acc-o` a
+        /// `send_receive` member. The project starts at version 1 with the
+        /// fake's default dictionary (version 1) and no thresholds.
+        pub(super) async fn fx(role: &str, coordinator: bool, require_approval: bool) -> Fx {
+            let hub = FakeHub::start().await;
+            let (tmp, ctx) = test_ctx();
+            wire_hub(&ctx, &hub.uri());
+            hub.add_account("tok", "acc-me", "Me", &B64.encode(own_node_for(&ctx)), None);
+            hub.add_account("tok-o", "acc-o", "Other", &B64.encode([0x55u8; 32]), None);
+            hub.add_project(
+                PID,
+                "m31",
+                &[
+                    ("acc-me", role, coordinator),
+                    ("acc-o", "send_receive", false),
+                ],
+                require_approval,
+            );
+            Fx { tmp, ctx, hub }
+        }
+
+        pub(super) fn rows(ctx: &ServiceContext) -> Vec<LocalFrameRow> {
+            frames_db::list_for_project(&db(ctx).unwrap().conn(), PID).unwrap()
+        }
+
+        pub(super) fn row(ctx: &ServiceContext, uuid: &str) -> Option<LocalFrameRow> {
+            frames_db::get(&db(ctx).unwrap().conn(), PID, uuid).unwrap()
+        }
+
+        pub(super) fn project(ctx: &ServiceContext) -> Option<CollabProjectRow> {
+            crate::db::collab::get_project(&db(ctx).unwrap().conn(), PID).unwrap()
+        }
+
+        pub(super) async fn request_count(hub: &FakeHub) -> usize {
+            hub.server.received_requests().await.unwrap().len()
+        }
+
+        /// `(method, path)` of every request after the first `from`.
+        pub(super) async fn requests_since(hub: &FakeHub, from: usize) -> Vec<(String, String)> {
+            hub.server.received_requests().await.unwrap()[from..]
+                .iter()
+                .map(|r| (r.method.to_string(), r.url.path().to_string()))
+                .collect()
+        }
+
+        /// `(since, after)` of every manifest request after the first `from`.
+        pub(super) async fn manifest_queries(
+            hub: &FakeHub,
+            from: usize,
+        ) -> Vec<(i64, Option<String>)> {
+            hub.server.received_requests().await.unwrap()[from..]
+                .iter()
+                .filter(|r| r.url.path().ends_with("/manifest"))
+                .map(|r| {
+                    let q = |k: &str| {
+                        r.url
+                            .query_pairs()
+                            .find(|(key, _)| key == k)
+                            .map(|(_, v)| v.into_owned())
+                    };
+                    (q("since").unwrap().parse().unwrap(), q("after"))
+                })
+                .collect()
+        }
+
+        /// Records every emitted event.
+        #[derive(Default)]
+        pub(super) struct RecordingEmitter {
+            pub events: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+        }
+
+        impl ProgressEmitter for RecordingEmitter {
+            fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push((event_name.to_string(), payload));
+            }
+        }
+
+        impl RecordingEmitter {
+            /// `(kind, count)` of every `collab-frames-changed` event, sorted.
+            pub(super) fn frame_changes(&self) -> Vec<(String, u64)> {
+                let mut out: Vec<(String, u64)> = self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(name, _)| name == "collab-frames-changed")
+                    .map(|(_, p)| {
+                        assert_eq!(p["projectId"], PID);
+                        (
+                            p["kind"].as_str().unwrap().to_string(),
+                            p["count"].as_u64().unwrap(),
+                        )
+                    })
+                    .collect();
+                out.sort();
+                out
+            }
+        }
+
+        /// A real relay-disabled node installed on `ctx`, with the
+        /// Collaboration root `<tmp>/Collab` mounted. Returns the node and the
+        /// stored root.
+        pub(super) async fn bind_node_with_collab_root(
+            fx: &Fx,
+        ) -> (Arc<crate::sharing::iroh::node::SharedIrohNode>, PathBuf) {
+            let dirs = crate::api::sync::sync_dirs(&fx.ctx).unwrap();
+            std::fs::create_dir_all(&dirs.identity_dir).unwrap();
+            std::fs::create_dir_all(&dirs.working_dir).unwrap();
+            let node = crate::sharing::iroh::node::SharedIrohNode::bind_with(
+                &dirs.identity_dir,
+                &dirs.working_dir,
+                iroh::RelayMode::Disabled,
+                crate::sharing::iroh::node::NodeOptions::default(),
+            )
+            .await
+            .expect("bind relay-disabled node");
+            *fx.ctx.iroh_node.lock().await = Some(Arc::clone(&node));
+            let requested = fx.tmp.path().join("Collab");
+            std::fs::create_dir_all(&requested).unwrap();
+            let collab = PathBuf::from(
+                crate::api::scan_roots::set_collaboration_dir(
+                    &fx.ctx,
+                    requested.to_string_lossy().to_string(),
+                    &crate::api::PathPolicy::AllowAll,
+                )
+                .await
+                .unwrap(),
+            );
+            assert!(node.collab_store().is_some(), "the collab store is mounted");
+            (node, collab)
+        }
+
+        /// Tags under `project/<PID>/` in the collab store.
+        pub(super) async fn collab_project_tags(
+            node: &crate::sharing::iroh::node::SharedIrohNode,
+        ) -> usize {
+            use n0_future::StreamExt as _;
+            let store = node.collab_store().expect("collab store mounted");
+            let prefix = format!("project/{PID}/");
+            let mut stream = store.tags().list_prefix(prefix.as_bytes()).await.unwrap();
+            let mut n = 0;
+            while let Some(item) = stream.next().await {
+                item.unwrap();
+                n += 1;
+            }
+            n
+        }
+
+        /// An own row as the publish path records it (R8 adoption shape when
+        /// `state = "unknown"`).
+        pub(super) fn own_row(uuid: &str, state: &str, landed: &str) -> LocalFrameRow {
+            LocalFrameRow {
+                project_id: PID.into(),
+                frame_uuid: uuid.into(),
+                content_version: 1,
+                origin: FrameOrigin::Own,
+                publisher_account_id: "acc-me".into(),
+                publisher_display: "Me".into(),
+                file_name: format!("{uuid}.fits"),
+                filter_canonical: "L".into(),
+                state: state.into(),
+                accepted: true,
+                byte_size: 7,
+                xxh3: "0".repeat(16),
+                blake3: "0".repeat(64),
+                holder_count: 0,
+                manifest_version: 0,
+                manifest_json: "{}".into(),
+                landed_path: Some(landed.into()),
+                size_mtime_seen: Some("7:1".into()),
+                on_disk: true,
+                locally_declined: false,
+                awaiting_gc: false,
+                source_frame_id: Some(42),
+                recipe_hash: Some("recipe".into()),
+                last_error: None,
+                updated_at: String::new(),
+            }
+        }
+    }
+
+    #[cfg(all(feature = "render", feature = "solver"))]
+    mod poll {
+        use super::v3_fx::*;
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Once the project is joined and synced, a poll where nothing moved
+        /// costs exactly ONE hub request: `/me/project-versions`.
+        #[tokio::test]
+        async fn version_poll_is_quiet_when_nothing_moved() {
+            let fx = fx("send_receive", false, false).await;
+            fx.hub.seed_frames(PID, "acc-o", &["f1"], "published");
+
+            let moved = poll_versions_once(&fx.ctx, None).await.unwrap();
+            assert_eq!(moved, vec![PID.to_string()], "the join moves the project");
+            assert_eq!(rows(&fx.ctx).len(), 1);
+
+            for _ in 0..2 {
+                let before = request_count(&fx.hub).await;
+                let moved = poll_versions_once(&fx.ctx, None).await.unwrap();
+                assert!(moved.is_empty(), "nothing moved: {moved:?}");
+                assert_eq!(
+                    requests_since(&fx.hub, before).await,
+                    vec![("GET".to_string(), "/api/v1/me/project-versions".to_string())],
+                    "a quiet poll is one request"
+                );
+            }
+        }
+
+        /// A moved version pulls only the delta: the manifest request carries
+        /// `since=<old cursor>` and the local rows grow by exactly the new ones.
+        #[tokio::test]
+        async fn moved_version_pulls_only_the_delta() {
+            let fx = fx("send_receive", false, false).await;
+            fx.hub
+                .seed_frames(PID, "acc-o", &["f1", "f2", "f3"], "published");
+            poll_versions_once(&fx.ctx, None).await.unwrap();
+            assert_eq!(rows(&fx.ctx).len(), 3);
+            let cursor = project(&fx.ctx).unwrap().manifest_cursor;
+            assert_eq!(cursor, fx.hub.frame(PID, "f1").unwrap().manifest_version);
+
+            fx.hub.seed_frames(PID, "acc-o", &["f4", "f5"], "published");
+            let before = request_count(&fx.hub).await;
+            let moved = poll_versions_once(&fx.ctx, None).await.unwrap();
+            assert_eq!(moved, vec![PID.to_string()]);
+            assert_eq!(
+                manifest_queries(&fx.hub, before).await,
+                vec![(cursor, None)],
+                "one manifest request, from the old cursor"
+            );
+            assert_eq!(rows(&fx.ctx).len(), 5, "the local rows grow by 2");
+            let p = project(&fx.ctx).unwrap();
+            assert_eq!(
+                p.manifest_cursor,
+                fx.hub.frame(PID, "f4").unwrap().manifest_version
+            );
+            assert_eq!(
+                p.hub_version,
+                fx.hub.state.lock().unwrap().projects[PID].version
+            );
+        }
+
+        /// The project disappears from my lists: its collab-store tags go, its
+        /// replica rows go, and my own file stays on disk.
+        #[tokio::test]
+        async fn lost_project_unseeds_and_keeps_own_files() {
+            let fx = fx("send_receive", false, false).await;
+            let (node, collab) = bind_node_with_collab_root(&fx).await;
+            fx.hub.seed_frames(PID, "acc-o", &["fr"], "published");
+            poll_versions_once(&fx.ctx, None).await.unwrap();
+            assert!(row(&fx.ctx, "fr").is_some());
+
+            // An own file + a landed replica, both seeded into the collab store.
+            let own_path = collab.join("m31").join("me").join("own.fits");
+            let rep_path = collab.join("m31").join("other").join("fr.fits");
+            for (p, byte) in [(&own_path, 1u8), (&rep_path, 2u8)] {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, vec![byte; 32 * 1024]).unwrap();
+            }
+            node.seed_project_frame(PID, "fm", 1, &own_path)
+                .await
+                .unwrap();
+            node.seed_project_frame(PID, "fr", 1, &rep_path)
+                .await
+                .unwrap();
+            {
+                let conn = db(&fx.ctx).unwrap().conn();
+                frames_db::record_own(
+                    &conn,
+                    &own_row("fm", "published", own_path.to_str().unwrap()),
+                )
+                .unwrap();
+            }
+            assert_eq!(collab_project_tags(&node).await, 2);
+
+            fx.hub.remove_member(PID, "acc-me");
+            let moved = poll_versions_once(&fx.ctx, None).await.unwrap();
+            assert!(moved.is_empty(), "a lost project is not a moved one");
+
+            assert_eq!(
+                collab_project_tags(&node).await,
+                0,
+                "every collab-store tag of the lost project is gone"
+            );
+            assert!(row(&fx.ctx, "fr").is_none(), "replica rows are deleted");
+            assert!(project(&fx.ctx).is_none(), "the project is pruned");
+            assert!(own_path.exists(), "my own file stays on disk");
+            node.shutdown().await;
+        }
+
+        /// The hook fires when the thresholds version changes, and not on a
+        /// move that changed neither thresholds nor dictionary.
+        #[tokio::test]
+        async fn threshold_move_calls_the_hook() {
+            let fx = fx("send_receive", false, false).await;
+            let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let hooks = VersionPollHooks {
+                on_thresholds_or_dictionary_moved: Box::new({
+                    let calls = Arc::clone(&calls);
+                    move |pid: &str| calls.lock().unwrap().push(pid.to_string())
+                }),
+            };
+
+            poll_versions_with(&fx.ctx, None, &hooks).await.unwrap();
+            let after_join = calls.lock().unwrap().len();
+
+            fx.hub.bump(PID);
+            let moved = poll_versions_with(&fx.ctx, None, &hooks).await.unwrap();
+            assert_eq!(moved, vec![PID.to_string()]);
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                after_join,
+                "a plain bump is not a thresholds/dictionary move"
+            );
+
+            fx.hub.set_thresholds_version(PID, 3);
+            poll_versions_with(&fx.ctx, None, &hooks).await.unwrap();
+            let calls = calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), after_join + 1, "the hook fires once");
+            assert_eq!(calls.last().unwrap(), PID);
+            assert_eq!(project(&fx.ctx).unwrap().thresholds_version, Some(3));
+        }
+
+        /// A moved project whose refresh failed keeps its old `hub_version`:
+        /// its manifest sync waits for a poll whose refresh succeeds, so the
+        /// thresholds change behind the move is never skipped.
+        #[tokio::test]
+        async fn a_failed_refresh_defers_the_manifest_sync() {
+            let fx = fx("send_receive", false, false).await;
+            poll_versions_once(&fx.ctx, None).await.unwrap();
+            let synced = project(&fx.ctx).unwrap().hub_version;
+
+            fx.hub.set_thresholds_version(PID, 2);
+            fx.hub
+                .set_failing(&format!("/projects/{PID}/thresholds"), true);
+            let before = request_count(&fx.hub).await;
+            poll_versions_once(&fx.ctx, None).await.unwrap();
+            assert!(
+                manifest_queries(&fx.hub, before).await.is_empty(),
+                "no manifest sync after a failed refresh"
+            );
+            assert_eq!(project(&fx.ctx).unwrap().hub_version, synced);
+
+            fx.hub
+                .set_failing(&format!("/projects/{PID}/thresholds"), false);
+            poll_versions_once(&fx.ctx, None).await.unwrap();
+            let p = project(&fx.ctx).unwrap();
+            assert_eq!(p.thresholds_version, Some(2));
+            assert_eq!(
+                p.hub_version,
+                fx.hub.state.lock().unwrap().projects[PID].version
+            );
+        }
+
+        /// A dictionary move reaches the cache through the refresh the poll
+        /// runs, and fires the hook once.
+        #[tokio::test]
+        async fn dictionary_move_is_refetched_and_calls_the_hook() {
+            use crate::collab::filters::DictionaryEntry;
+            let fx = fx("send_receive", false, false).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let hooks = VersionPollHooks {
+                on_thresholds_or_dictionary_moved: Box::new({
+                    let calls = Arc::clone(&calls);
+                    move |_: &str| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            };
+            poll_versions_with(&fx.ctx, None, &hooks).await.unwrap();
+            assert_eq!(project(&fx.ctx).unwrap().dictionary_version, Some(1));
+            let after_join = calls.load(Ordering::SeqCst);
+
+            fx.hub.set_dictionary(
+                PID,
+                2,
+                vec![DictionaryEntry {
+                    canonical: "Sii".into(),
+                    aliases: vec!["S2".into()],
+                    kind: "narrowband".into(),
+                }],
+            );
+            poll_versions_with(&fx.ctx, None, &hooks).await.unwrap();
+            let p = project(&fx.ctx).unwrap();
+            assert_eq!(p.dictionary_version, Some(2));
+            let dict: Vec<DictionaryEntry> =
+                serde_json::from_str(p.dictionary_json.as_deref().unwrap()).unwrap();
+            assert_eq!(dict.len(), 1);
+            assert_eq!(dict[0].canonical, "Sii");
+            assert_eq!(calls.load(Ordering::SeqCst), after_join + 1);
+        }
+
+        /// Signed out: the poll is a silent `Ok(vec![])`.
+        #[tokio::test]
+        async fn poll_is_a_no_op_when_signed_out() {
+            let (_tmp, ctx) = test_ctx();
+            assert!(poll_versions_once(&ctx, None).await.unwrap().is_empty());
+        }
+
+        /// Only a poll that moved something kicks the pass.
+        #[test]
+        fn poll_kicks_the_pass_only_when_a_version_moved() {
+            assert!(!kick_if_versions_moved(&[]));
+            assert!(kick_if_versions_moved(&["p1".to_string()]));
+        }
+
+        /// The version tick runs during the pass's startup grace (5 s vs 90 s
+        /// in production) and never runs a pass by itself.
+        #[tokio::test]
+        async fn poll_ticks_during_the_startup_grace() {
+            let passes = Arc::new(AtomicUsize::new(0));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let task = tokio::spawn({
+                let passes = Arc::clone(&passes);
+                let polls = Arc::clone(&polls);
+                async move {
+                    auto_sync_loop_inner(
+                        Duration::from_secs(3600),
+                        Duration::from_secs(3600),
+                        Duration::ZERO,
+                        Duration::from_millis(10),
+                        move || {
+                            let passes = Arc::clone(&passes);
+                            async move {
+                                passes.fetch_add(1, Ordering::SeqCst);
+                            }
+                        },
+                        move || {
+                            let polls = Arc::clone(&polls);
+                            async move {
+                                polls.fetch_add(1, Ordering::SeqCst);
+                            }
+                        },
+                    )
+                    .await
+                }
+            });
+            wait_until(|| polls.load(Ordering::SeqCst) >= 3, Duration::from_secs(5)).await;
+            assert_eq!(
+                passes.load(Ordering::SeqCst),
+                0,
+                "the grace still holds the pass"
+            );
+            task.abort();
+        }
+    }
+
+    #[cfg(all(feature = "render", feature = "solver"))]
+    mod manifest {
+        use super::v3_fx::*;
+        use super::*;
+
+        /// Page size 2, five frames sharing ONE manifest version: one
+        /// `sync_manifest` follows `next` (the `after` tiebreaker) to the end.
+        #[tokio::test]
+        async fn paging_follows_next() {
+            let fx = fx("send_receive", false, false).await;
+            fx.hub.set_page_size(2);
+            fx.hub
+                .seed_frames(PID, "acc-o", &["f1", "f2", "f3", "f4", "f5"], "published");
+            crate::api::collab::refresh_projects(&fx.ctx).await.unwrap();
+
+            let before = request_count(&fx.hub).await;
+            sync_manifest(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(rows(&fx.ctx).len(), 5, "all five stored");
+            let mv = fx.hub.frame(PID, "f1").unwrap().manifest_version;
+            assert_eq!(
+                manifest_queries(&fx.hub, before).await,
+                vec![
+                    (0, None),
+                    (mv, Some("f2".to_string())),
+                    (mv, Some("f4".to_string())),
+                ]
+            );
+            assert_eq!(project(&fx.ctx).unwrap().manifest_cursor, mv);
+        }
+
+        /// Losing `data.moderate` re-fetches from 0 and prunes the pending row
+        /// of another member I can no longer see; own rows survive.
+        #[tokio::test]
+        async fn caps_change_refetches_from_zero_and_prunes() {
+            let fx = fx("send_receive", false, true).await;
+            fx.hub.set_caps(PID, "acc-me", &["data.moderate"]);
+            fx.hub.seed_frames(PID, "acc-o", &["fp"], "pending");
+            fx.hub.seed_frames(PID, "acc-o", &["fo"], "published");
+            fx.hub.seed_frames(PID, "acc-me", &["fm"], "published");
+
+            poll_versions_once(&fx.ctx, None).await.unwrap();
+            assert!(
+                row(&fx.ctx, "fp").is_some(),
+                "a moderator sees the pending row"
+            );
+            assert_eq!(
+                project(&fx.ctx).unwrap().synced_caps_json,
+                r#"["data.moderate"]"#
+            );
+            // An own row the hub does not list (yet) must survive the prune too.
+            {
+                let conn = db(&fx.ctx).unwrap().conn();
+                frames_db::record_own(&conn, &own_row("fx", "unknown", "/nowhere/fx.fits"))
+                    .unwrap();
+            }
+
+            fx.hub.set_caps(PID, "acc-me", &[]);
+            let before = request_count(&fx.hub).await;
+            let moved = poll_versions_once(&fx.ctx, None).await.unwrap();
+            assert_eq!(moved, vec![PID.to_string()]);
+            assert_eq!(
+                manifest_queries(&fx.hub, before).await,
+                vec![(0, None)],
+                "a caps change refetches from 0"
+            );
+            assert!(row(&fx.ctx, "fp").is_none(), "the pending row is pruned");
+            assert!(row(&fx.ctx, "fo").is_some());
+            assert_eq!(row(&fx.ctx, "fm").unwrap().origin, FrameOrigin::Own);
+            assert!(row(&fx.ctx, "fx").is_some(), "own rows are never pruned");
+            assert_eq!(project(&fx.ctx).unwrap().synced_caps_json, "[]");
+        }
+
+        /// The refresh stores the hub's pending count and this member's caps.
+        #[tokio::test]
+        async fn refresh_stores_pending_frames_and_caps() {
+            let fx = fx("send_receive", false, true).await;
+            fx.hub.set_caps(PID, "acc-me", &["data.moderate"]);
+            fx.hub.seed_frames(PID, "acc-o", &["p1", "p2"], "pending");
+            crate::api::collab::refresh_projects(&fx.ctx).await.unwrap();
+            let p = project(&fx.ctx).unwrap();
+            assert_eq!(p.pending_frames, 2);
+            assert_eq!(p.gov_caps_json, r#"["data.moderate"]"#);
+            assert_eq!(p.synced_caps_json, "[]", "only a manifest sync writes it");
+        }
+
+        /// A coordinator carries a `"coordinator"` caps element, so a
+        /// coordinator flip is a caps change too.
+        #[tokio::test]
+        async fn coordinator_is_part_of_the_caps() {
+            let fx = fx("send_receive", true, false).await;
+            crate::api::collab::refresh_projects(&fx.ctx).await.unwrap();
+            assert_eq!(
+                project(&fx.ctx).unwrap().gov_caps_json,
+                r#"["coordinator"]"#
+            );
+        }
+
+        /// Every `FramesChangeKind` driven through the fake, each emitted once
+        /// with its count.
+        #[tokio::test]
+        async fn change_kinds_are_classified() {
+            let fx = fx("send_receive", false, true).await;
+            fx.hub.set_caps(PID, "acc-me", &["data.moderate"]);
+            fx.hub.seed_frames(PID, "acc-me", &["a", "b"], "pending");
+            fx.hub.seed_frames(PID, "acc-o", &["c", "d"], "published");
+            crate::api::collab::refresh_projects(&fx.ctx).await.unwrap();
+
+            let first = RecordingEmitter::default();
+            sync_manifest(&fx.ctx, PID, Some(&first)).await.unwrap();
+            assert_eq!(first.frame_changes(), vec![("newFrames".to_string(), 2)]);
+
+            fx.hub.seed_frames(PID, "acc-o", &["e"], "published");
+            fx.hub.seed_frames(PID, "acc-o", &["f"], "pending");
+            fx.hub
+                .update_frame(PID, "a", |f| f.state = "published".into());
+            fx.hub.update_frame(PID, "b", |f| {
+                f.state = "rejected".into();
+                f.reject_reason = Some("soft".into());
+            });
+            fx.hub.set_accepted(PID, "d", false, Some("trailing"));
+            fx.hub.update_frame(PID, "c", |f| {
+                f.content_version = 2;
+                f.blake3 = "c".repeat(64);
+            });
+
+            let rec = RecordingEmitter::default();
+            let changes = sync_manifest(&fx.ctx, PID, Some(&rec)).await.unwrap();
+            let expected: Vec<(String, u64)> = [
+                "approved",
+                "excluded",
+                "newFrames",
+                "newVersions",
+                "pendingFrames",
+                "rejected",
+            ]
+            .iter()
+            .map(|k| (k.to_string(), 1))
+            .collect();
+            assert_eq!(rec.frame_changes(), expected, "one event per kind");
+            assert_eq!(changes.len(), 6);
+            assert!(changes.iter().all(|c| c.count == 1 && c.project_id == PID));
+        }
+
+        /// R8: an adopted own row (state `unknown`, LOCAL hashes at v1) takes
+        /// the hub's columns from the manifest while its local columns stay.
+        #[tokio::test]
+        async fn manifest_sync_corrects_an_adopted_own_row() {
+            let fx = fx("send_receive", false, false).await;
+            fx.hub.seed_frames(PID, "acc-me", &["fa"], "published");
+            fx.hub.update_frame(PID, "fa", |f| {
+                f.content_version = 2;
+                f.byte_size = 4242;
+            });
+            crate::api::collab::refresh_projects(&fx.ctx).await.unwrap();
+            {
+                let conn = db(&fx.ctx).unwrap().conn();
+                frames_db::record_own(&conn, &own_row("fa", "unknown", "/landed/fa.fits")).unwrap();
+            }
+
+            sync_manifest(&fx.ctx, PID, None).await.unwrap();
+
+            let hub = fx.hub.frame(PID, "fa").unwrap();
+            let r = row(&fx.ctx, "fa").unwrap();
+            assert_eq!(r.origin, FrameOrigin::Own);
+            assert_eq!(r.state, "published");
+            assert_eq!(r.content_version, 2);
+            assert_eq!(r.blake3, hub.blake3);
+            assert_eq!(r.xxh3, hub.xxh3);
+            assert_eq!(r.byte_size, 4242);
+            assert_eq!(r.manifest_version, hub.manifest_version);
+            assert_eq!(r.landed_path.as_deref(), Some("/landed/fa.fits"));
+            assert_eq!(r.source_frame_id, Some(42));
+            assert_eq!(r.recipe_hash.as_deref(), Some("recipe"));
+            assert!(r.on_disk, "an own row keeps on_disk across a version move");
+        }
+
+        /// The pure classifier, one row at a time.
+        #[test]
+        fn classify_frame_change_rules() {
+            use FramesChangeKind as K;
+            let view = |own: bool, state: &str, accepted: bool, cv: i32| FrameViewWire {
+                frame_uuid: "u".into(),
+                publisher_account_id: "a".into(),
+                publisher_display_name: "A".into(),
+                own,
+                file_name: "u.fits".into(),
+                content_version: cv,
+                blake3: "0".repeat(64),
+                byte_size: 1,
+                xxh3: "0".repeat(16),
+                filter_raw: "L".into(),
+                filter_canonical: "L".into(),
+                channel: "mono".into(),
+                exptime_sec: 1.0,
+                date_obs: None,
+                meta: serde_json::json!({}),
+                gate_version: 0,
+                accepted,
+                accepted_reason: None,
+                state: state.into(),
+                reject_reason: None,
+                manifest_version: 1,
+                created_at: String::new(),
+                holder_count: 0,
+            };
+            let prev = |origin: FrameOrigin, state: &str, accepted: bool, cv: i32| {
+                let mut r = own_row("u", state, "/x");
+                r.origin = origin;
+                r.accepted = accepted;
+                r.content_version = cv;
+                r
+            };
+            let rep = FrameOrigin::Replica;
+            let own = FrameOrigin::Own;
+
+            assert_eq!(
+                classify_frame_change(None, &view(false, "published", true, 1)),
+                vec![K::NewFrames]
+            );
+            assert_eq!(
+                classify_frame_change(None, &view(false, "pending", true, 1)),
+                vec![K::PendingFrames]
+            );
+            assert!(classify_frame_change(None, &view(true, "published", true, 1)).is_empty());
+            assert_eq!(
+                classify_frame_change(
+                    Some(&prev(rep, "pending", true, 1)),
+                    &view(false, "published", true, 1)
+                ),
+                vec![K::NewFrames],
+                "a pending row another moderator approved is new to me"
+            );
+            assert_eq!(
+                classify_frame_change(
+                    Some(&prev(own, "pending", true, 1)),
+                    &view(true, "published", true, 1)
+                ),
+                vec![K::Approved]
+            );
+            assert_eq!(
+                classify_frame_change(
+                    Some(&prev(own, "pending", true, 1)),
+                    &view(true, "rejected", true, 1)
+                ),
+                vec![K::Rejected]
+            );
+            assert_eq!(
+                classify_frame_change(
+                    Some(&prev(rep, "published", true, 1)),
+                    &view(false, "published", false, 1)
+                ),
+                vec![K::Excluded]
+            );
+            assert_eq!(
+                classify_frame_change(
+                    Some(&prev(rep, "published", true, 1)),
+                    &view(false, "published", true, 2)
+                ),
+                vec![K::NewVersions]
+            );
+            assert!(
+                classify_frame_change(
+                    Some(&prev(own, "published", true, 1)),
+                    &view(true, "published", true, 2)
+                )
+                .is_empty(),
+                "my own new version is not news to me"
+            );
+            assert!(
+                classify_frame_change(
+                    Some(&prev(rep, "published", true, 1)),
+                    &view(false, "published", true, 1)
+                )
+                .is_empty(),
+                "an unchanged row is no change"
+            );
+        }
     }
 }

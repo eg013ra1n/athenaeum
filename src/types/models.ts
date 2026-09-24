@@ -1649,6 +1649,10 @@ export type ContributionView = { packageId: string, frameUuid: string, publisher
  */
 superseded: boolean, createdAt: string, };
 
+export type FramesChangeKind = "newFrames" | "pendingFrames" | "approved" | "rejected" | "excluded" | "newVersions";
+
+export type CollabFramesChange = { projectId: string, kind: FramesChangeKind, count: number, };
+
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**
  * Human-readable failure reasons, empty when publishable (e.g.

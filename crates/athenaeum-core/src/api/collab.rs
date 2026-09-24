@@ -852,10 +852,6 @@ pub fn find_matching_projects(
 /// that never compiles this render-gated module still shares one message.
 pub const COLLAB_API_OUTDATED_MSG: &str = crate::account::client::COLLAB_API_OUTDATED_MSG;
 
-/// Logs the `collab_api_outdated` refusal once per process (the poll runs
-/// every ~15s and would otherwise flood the log with the same fact).
-static COLLAB_API_OUTDATED_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
 /// `AccountClientError → ApiError`, a local copy of the private
 /// `api::account::map_client_err` (keep the two in sync). A `401` surfaces as
 /// [`ApiError::SignedOut`] so the frontend re-shows the sign-in flow.
@@ -875,12 +871,7 @@ fn client_err(e: crate::account::AccountClientError) -> ApiError {
             ApiError::Forbidden("The account's role may not perform this action.".into())
         }
         E::CollabApiOutdated => {
-            COLLAB_API_OUTDATED_WARNED.get_or_init(|| {
-                tracing::warn!(
-                    outcome = "collab_api_outdated",
-                    "hub refused an outdated collab api"
-                );
-            });
+            crate::account::client::warn_collab_api_outdated_once();
             ApiError::Conflict(COLLAB_API_OUTDATED_MSG.into())
         }
         E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
@@ -1052,7 +1043,8 @@ async fn fetch_one_project(
     token: &str,
     pinned: &str,
     p: &crate::collab::hub_client::MyProjectWire,
-) -> Result<CollabProjectRow, FetchError> {
+    prev: Option<&CollabProjectRow>,
+) -> Result<FetchedProject, FetchError> {
     let page = client
         .project_page(&p.id)
         .await
@@ -1075,6 +1067,38 @@ async fn fetch_one_project(
         .await
         .map_err(|e| FetchError::Transport(e.into()))?;
 
+    // The dictionary is fetched when it is unknown or the project version
+    // moved since the last manifest sync (an older hub without a version:
+    // every refresh). A dictionary change always bumps the version.
+    let dictionary_due = prev.is_none_or(|r| {
+        r.dictionary_version.is_none() || page.project.version != Some(r.hub_version)
+    });
+    let dictionary = if dictionary_due {
+        let wire = client
+            .dictionary(token, &p.id)
+            .await
+            .map_err(|e| FetchError::Transport(e.into()))?;
+        Some(match wire.current {
+            Some(set) => {
+                let entries: Vec<crate::collab::filters::DictionaryEntry> = set
+                    .entries
+                    .into_iter()
+                    .map(|e| crate::collab::filters::DictionaryEntry {
+                        canonical: e.canonical,
+                        aliases: e.aliases,
+                        kind: e.kind,
+                    })
+                    .collect();
+                let json =
+                    serde_json::to_string(&entries).map_err(|e| FetchError::Transport(e.into()))?;
+                (Some(set.version), Some(json))
+            }
+            None => (None, None),
+        })
+    } else {
+        None
+    };
+
     let members_json =
         serde_json::to_string(&verified.members).map_err(|e| FetchError::Transport(e.into()))?;
     let (thresholds_version, thresholds_rules_json) = match thresholds.current {
@@ -1086,7 +1110,7 @@ async fn fetch_one_project(
         None => (None, None),
     };
 
-    Ok(CollabProjectRow {
+    let row = CollabProjectRow {
         project_id: p.id.clone(),
         slug: p.slug.clone(),
         title: p.title.clone(),
@@ -1110,9 +1134,8 @@ async fn fetch_one_project(
         members_json,
         thresholds_version,
         thresholds_rules_json,
-        // TODO(wave-2 later task): populate from the hub's per-account caps
-        // once the caps endpoint is wired up; schema default until then.
-        gov_caps_json: "[]".into(),
+        // The caps rule (P9) compares these against `synced_caps_json`.
+        gov_caps_json: gov_caps_json(&p.gov_caps, p.coordinator),
         // all ignored on write (local preference / sync-state / dictionary) —
         // upsert_project leaves these six alone entirely.
         auto_replicate: true,
@@ -1125,7 +1148,29 @@ async fn fetch_one_project(
         replication_paused: false,
         auto_publish: true,
         fetched_at: String::new(), // filled by SQL
-    })
+    };
+    Ok(FetchedProject { row, dictionary })
+}
+
+/// One project as a refresh fetched it: the cache row, plus the dictionary
+/// when it was due (`Some((version, entries JSON))`, both `None` when the
+/// hub has no dictionary).
+struct FetchedProject {
+    row: CollabProjectRow,
+    dictionary: Option<(Option<i32>, Option<String>)>,
+}
+
+/// This member's caps as the caps rule (P9) compares them: the hub's
+/// `govCaps` plus a `"coordinator"` element for a coordinator, sorted and
+/// deduplicated so an order change on the hub is not a caps change.
+fn gov_caps_json(caps: &[String], coordinator: bool) -> String {
+    let mut all: Vec<&str> = caps.iter().map(String::as_str).collect();
+    if coordinator {
+        all.push("coordinator");
+    }
+    all.sort_unstable();
+    all.dedup();
+    serde_json::to_string(&all).expect("a list of strings serializes")
 }
 
 /// TOFU: return the pinned snapshot pubkey for this hub host. First call fetches
@@ -1172,6 +1217,18 @@ async fn pinned_pubkey(
 ///
 /// Returns the refreshed cards (== [`list_projects`]).
 pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, ApiError> {
+    refresh_projects_reporting(ctx).await?;
+    list_projects(ctx)
+}
+
+/// [`refresh_projects`], reporting the ids whose cache row this refresh
+/// actually rewrote — a project whose fetch failed keeps its stale row and is
+/// not in the set. The version poll uses it to hold back a manifest sync
+/// whose project refresh failed.
+pub(crate) async fn refresh_projects_reporting(
+    ctx: &ServiceContext,
+) -> Result<std::collections::HashSet<String>, ApiError> {
+    let mut refreshed = std::collections::HashSet::new();
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
         return Err(ApiError::SignedOut(
             "Sign in to use collaboration projects.".into(),
@@ -1182,15 +1239,16 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
     let pinned = pinned_pubkey(ctx, &hub_url, &client).await?;
     let mine = client.my_projects(&token).await.map_err(client_err)?;
 
-    let previous_ids: std::collections::HashSet<String> = {
+    let previous: std::collections::HashMap<String, CollabProjectRow> = {
         let db = db(ctx)?;
         let conn = db.conn();
         crate::db::collab::list_projects(&conn)
             .map_err(internal)?
             .into_iter()
-            .map(|p| p.project_id)
+            .map(|p| (p.project_id.clone(), p))
             .collect()
     };
+    let previous_ids: std::collections::HashSet<String> = previous.keys().cloned().collect();
 
     // `keep` = every project the hub still lists (whether or not its fetch
     // succeeded); `new_targets` = only those that appeared this refresh, for the
@@ -1199,8 +1257,8 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
     let mut new_targets: Vec<(String, f64, f64)> = Vec::new();
     for p in &mine {
         keep.push(p.id.clone());
-        match fetch_one_project(&client, &token, &pinned, p).await {
-            Ok(row) => {
+        match fetch_one_project(&client, &token, &pinned, p, previous.get(&p.id)).await {
+            Ok(FetchedProject { row, dictionary }) => {
                 if !previous_ids.contains(&row.project_id) {
                     new_targets.push((
                         row.project_id.clone(),
@@ -1211,6 +1269,16 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
                 let db = db(ctx)?;
                 let conn = db.conn();
                 crate::db::collab::upsert_project(&conn, &row).map_err(internal)?;
+                if let Some((version, entries)) = dictionary {
+                    crate::db::collab::set_dictionary(
+                        &conn,
+                        &row.project_id,
+                        version,
+                        entries.as_deref(),
+                    )
+                    .map_err(internal)?;
+                }
+                refreshed.insert(row.project_id.clone());
             }
             Err(FetchError::Verify(err)) => {
                 tracing::error!(
@@ -1232,6 +1300,20 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
     {
         let db = db(ctx)?;
         let conn = db.conn();
+        // A lost project's replica rows go. Own rows are never deleted here
+        // (`delete_not_in` spares them) and my own files stay on disk — but
+        // the prune below cascades every remaining row of the project away
+        // with its cache row (FK `ON DELETE CASCADE`); a re-join re-adopts
+        // them from the hub (R8).
+        for lost in previous_ids.iter().filter(|id| !keep.contains(id)) {
+            let removed = crate::db::collab_frames::delete_not_in(
+                &conn,
+                lost,
+                &std::collections::HashSet::new(),
+            )
+            .map_err(internal)?;
+            tracing::info!(project_id = %lost, count = removed, "lost project: replica frame rows deleted");
+        }
         crate::db::collab::prune_projects_not_in(&conn, &keep).map_err(internal)?;
         // Expire stale intents first: a "publish as project" intent that never
         // matched a new project must not silently auto-link an unrelated project
@@ -1267,7 +1349,7 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
         crate::api::collab_exchange::unseed_project_local_data(ctx, lost).await;
     }
 
-    list_projects(ctx)
+    Ok(refreshed)
 }
 
 // ── Publish (Task 7): per frame — write once, seed by reference, announce ────
@@ -3723,6 +3805,16 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/dictionary"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "current": {"version": 3,
+                            "entries": [{"canonical": "L", "aliases": ["Lum"], "kind": "broadband"}],
+                            "createdAt": "2026-07-13T00:00:00Z"},
+                "history": []
+            })))
+            .mount(&server)
+            .await;
         // Membership: K-signed, served ONCE so the second refresh falls through
         // to the K2-signed mock mounted later.
         Mock::given(method("GET"))
@@ -3768,6 +3860,13 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(row.membership_version, 7);
+            // Task 8: caps (+ the coordinator element) and the dictionary.
+            assert_eq!(row.gov_caps_json, r#"["coordinator"]"#);
+            assert_eq!(row.dictionary_version, Some(3));
+            let dict: Vec<crate::collab::filters::DictionaryEntry> =
+                serde_json::from_str(row.dictionary_json.as_deref().unwrap()).unwrap();
+            assert_eq!(dict[0].canonical, "L");
+            assert_eq!(dict[0].aliases, vec!["Lum".to_string()]);
             let members: Vec<ProjectMemberView> = serde_json::from_str(&row.members_json).unwrap();
             assert_eq!(members.len(), 1);
             assert_eq!(members[0].display_name, "Vilen");

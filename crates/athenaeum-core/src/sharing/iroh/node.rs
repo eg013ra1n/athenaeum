@@ -3019,6 +3019,12 @@ impl SharedIrohNode {
     /// [`unseed_project_package`](Self::unseed_project_package), for
     /// leave-project / delete-project-data. Scoped to `project/<project_id>/`, so
     /// another project's seeds survive. Same best-effort semantics.
+    ///
+    /// The same prefix is also deleted in the COLLAB store when one is mounted
+    /// (collab v3 wave 2): every per-frame tag
+    /// ([`project_frame_tag`]) of the project sits under it, so a device that
+    /// left a project stops serving its frames. The files the tags referenced
+    /// are never touched.
     pub async fn unseed_project(&self, project_id: &str) {
         let prefix = project_seed_prefix(project_id);
         self.forget_served_prefix(&prefix);
@@ -3031,6 +3037,20 @@ impl SharedIrohNode {
                 error = %e,
                 "delete project seed tags failed"
             ),
+        }
+        if let Some(collab) = self.collab_store() {
+            match collab.tags().delete_prefix(prefix.as_bytes()).await {
+                Ok(removed) => tracing::info!(
+                    project_id,
+                    tags_removed = removed,
+                    "project unseeded from the collab store"
+                ),
+                Err(e) => tracing::warn!(
+                    project_id,
+                    error = %e,
+                    "delete project collab seed tags failed"
+                ),
+            }
         }
     }
 

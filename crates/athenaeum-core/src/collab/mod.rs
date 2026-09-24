@@ -2,6 +2,9 @@
 //! and the quality gate. Catalog-side only — the exchange layer is slice 4.
 
 pub mod authz;
+// A stateful fake of the hub's collab v3 api for tests (plan P16).
+#[cfg(test)]
+pub mod fake_hub;
 // Automatic filter-name matching against a project's cached dictionary (P3).
 // Pure and ungated — no render/solver dependency — so the headless build
 // still carries it.

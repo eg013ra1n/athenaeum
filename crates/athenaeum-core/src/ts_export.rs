@@ -228,6 +228,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::collab_exchange::ProjectPackageView,
             crate::api::collab_exchange::ProjectDownloadProgress,
             crate::api::collab_exchange::ContributionView,
+            crate::api::collab_exchange::FramesChangeKind,
+            crate::api::collab_exchange::CollabFramesChange,
             crate::collab::gate::FrameGateRow,
             crate::collab::gate::ThresholdRuleView,
             crate::updates::manifest::Channel,
