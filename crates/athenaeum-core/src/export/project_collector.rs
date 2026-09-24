@@ -1,63 +1,61 @@
-//! Project-scoped WBPP export collector (Stage II collaboration "processor
-//! payoff", slice 5): merge the received collab contributions with the
-//! processor's OWN calibrated-light outputs into one [`ExportData`] per
-//! publisher, so the WBPP organizer can lay a per-publisher folder tree under a
-//! single project-titled root.
+//! Project-scoped WBPP export collector (collab v3 wave 2, plan P26 / spec
+//! amendment A1): every project frame this device holds — the frames I
+//! published (`own`) and the replicas I pulled (`replica`) — read from
+//! `project_frames_local`, one [`ExportData`] per publisher, so the WBPP
+//! organizer can lay a per-publisher folder tree under a single
+//! project-titled root. The WBPP hierarchy itself is unchanged in this wave.
 //!
-//! Pure catalog/db read — no hub I/O — so it lives in the ungated `export`
-//! module and compiles in the headless (`--no-default-features`) build. It
-//! reproduces the LIGHT-frames union SQL from the render-gated `api::collab`
-//! (rather than importing the private original) for the same reason.
+//! The path of a project frame comes ONLY from its row's `landed_path` (an
+//! own frame may live outside the Collaboration root), and its metadata only
+//! from the row's manifest JSON — never a header card, never the folder
+//! layout. Pure catalog/db read — no hub I/O — so it lives in the ungated
+//! `export` module and compiles in the headless (`--no-default-features`)
+//! build.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 
-use crate::db::collab::{get_project, linked_set_ids};
-use crate::db::collab_exchange::contributions_for_project;
+use crate::db::collab::get_project;
+use crate::db::collab_frames::{list_for_project, FrameOrigin, LocalFrameRow};
 use crate::export::models::{
     CalibrationSubgroup, CalibrationSummary, CameraType, ExportData, ExportFrame, ExportGroup,
     MasterCreationPlan,
 };
 
-/// Д1/Д2: one [`ExportData`] per publisher — received (non-superseded)
-/// contributions grouped by `publisher_display`, plus one dataset for the
-/// processor's own calibrated outputs (key = `own_display`). Pure catalog/db
-/// read — no hub I/O, ungated.
+/// One [`ExportData`] per publisher: my own frames under `own_display`, then
+/// each replica publisher under its display name.
 ///
-/// BINDING for Tasks 2/4 — do not change the shape without updating the runner
-/// and command layers.
+/// BINDING for the runner and command layers — do not change the shape
+/// without updating them.
 #[derive(Debug, Clone)]
 pub struct ProjectExportData {
     /// The project title → the export root folder.
     pub title: String,
-    /// `(publisher display → folder, dataset)`, own-first then received in
-    /// contribution (oldest-first) order.
+    /// `(publisher display → folder, dataset)`, own first, then replica
+    /// publishers in first-seen order.
     pub publishers: Vec<(String, ExportData)>,
-    /// Human-readable, one-per-skip notes for frames the collector dropped (an
-    /// own LIGHT with no calibrated output, a calibrated output missing on disk,
-    /// or a received contribution with unreadable metadata). The runner prepends
-    /// these to the organizer warnings so `ExportResult.warnings` — and thus the
-    /// export dialog — tells the user which expected frames were omitted rather
-    /// than silently reporting a smaller file count.
+    /// Human-readable, one-per-skip notes for frames the collector dropped (a
+    /// row whose manifest JSON is unreadable). The runner prepends these to
+    /// the organizer warnings so `ExportResult.warnings` — and thus the export
+    /// dialog — names the omitted frames instead of silently reporting a
+    /// smaller file count.
     pub warnings: Vec<String>,
 }
 
-/// Collect a project's exportable frames: the processor's own calibrated LIGHT
-/// outputs (from the project's linked sets) unioned with every received
-/// (non-superseded) contribution, partitioned into one dataset per publisher
-/// display name.
+/// Collect a project's exportable frames: every `project_frames_local` row
+/// with `on_disk = 1` and `accepted = 1`, own and replica alike, at its
+/// `landed_path` (P26), partitioned into one dataset per publisher display.
 ///
-/// `own_display` is resolved by the runner from the cached membership snapshot;
-/// it is the folder/dataset key for the processor's own outputs. A received
-/// publisher whose display name equals `own_display` merges into the same
-/// dataset (dedup rule below still applies per `frame_uuid`).
+/// `own_display` is resolved by the runner from the cached membership
+/// snapshot; it is the folder/dataset key for my own frames. A replica
+/// publisher whose display equals it merges into the same dataset.
 ///
-/// Errors: the project row must be in the local cache (`get_project`) — missing
-/// ⇒ "project not in the local cache"; a project with no own frames AND no
-/// received contributions ⇒ "nothing to export for this project".
+/// Errors: the project row must be in the local cache (`get_project`) —
+/// missing ⇒ "project not in the local cache"; no exportable frame ⇒
+/// "nothing to export for this project".
 pub fn collect_project_export_data(
     conn: &Connection,
     project_id: &str,
@@ -68,89 +66,46 @@ pub fn collect_project_export_data(
     let title = project.title;
     let object_name = project.target_name;
 
-    // display name → its frames, insertion-ordered (own first, then received in
-    // oldest-first contribution order). A received publisher whose display
-    // equals `own_display` merges into the same bucket.
+    let mut rows: Vec<LocalFrameRow> = list_for_project(conn, project_id)?
+        .into_iter()
+        .filter(|r| r.on_disk && r.accepted && r.landed_path.is_some())
+        .collect();
+    // Own first (stable: the table's order within each origin is kept).
+    rows.sort_by_key(|r| r.origin != FrameOrigin::Own);
+
+    // display name → its frames, insertion-ordered.
     let mut order: Vec<String> = Vec::new();
     let mut by_display: HashMap<String, Vec<ExportFrame>> = HashMap::new();
-    // Every `frame_uuid` already placed — own frames win, so they are added
-    // first; a received contribution repeating one is dropped (rule 4).
-    let mut seen_uuids: HashSet<String> = HashSet::new();
-    // One human-readable note per dropped frame — mirrors the `warn!`/`debug!`
-    // below so the skips reach `ExportResult.warnings` (the export dialog).
     let mut warnings: Vec<String> = Vec::new();
 
-    // ── Own side (rule 3/4): the linked sets' LIGHT frames. Decision C (spec
-    // 2026-08-31 §8a): there is no calibrated artifact to attach any more —
-    // light calibration moved into export and its tracking table is gone — so
-    // every own frame is skipped, loudly, until the collab rework lands. The
-    // received side below is unaffected. ────────────────────────────────────
-    // `own_display` names the dataset the own side lands in. It stays in the
-    // signature for the pending rework; with the own side blocked nothing is
-    // added under it, and a received publisher of the same name simply owns
-    // that bucket outright.
-    let _ = own_display;
-    let set_ids = linked_set_ids(conn, project_id)?;
-    for (frame_id, filename) in union_light_frames(conn, &set_ids)? {
-        tracing::warn!(
-            frame_id,
-            "calibrated artifact unavailable — light calibration moved into export (collab rework pending)"
-        );
-        warnings.push(format!("skipped {filename}: no calibrated output"));
-    }
-
-    // ── Received side (rule 2): non-superseded contributions, partitioned by
-    // publisher display, deduped against own frames by frame_uuid. ──────────
-    for c in contributions_for_project(conn, project_id)? {
-        if c.superseded {
-            continue;
-        }
-        if !c.frame_uuid.is_empty() && seen_uuids.contains(&c.frame_uuid) {
-            tracing::debug!(
-                frame_uuid = %c.frame_uuid,
-                publisher = %c.publisher_display,
-                "project export: received frame already covered by an own output — skipping"
-            );
-            continue;
-        }
-        let meta: serde_json::Value = match serde_json::from_str(&c.frame_meta) {
+    for row in rows {
+        let display = match row.origin {
+            FrameOrigin::Own => own_display.to_string(),
+            FrameOrigin::Replica => row.publisher_display.clone(),
+        };
+        let manifest: serde_json::Value = match serde_json::from_str(&row.manifest_json) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    frame_uuid = %c.frame_uuid,
-                    publisher = %c.publisher_display,
+                    project_id,
+                    frame_uuid = %row.frame_uuid,
                     error = %e,
-                    "project export: contribution frame_meta is not valid json — skipping row"
+                    "project export: manifest row is not valid json; frame skipped"
                 );
                 warnings.push(format!(
-                    "skipped a contribution from {}: unreadable frame metadata",
-                    c.publisher_display
+                    "skipped {}: unreadable frame metadata",
+                    row.file_name
                 ));
                 continue;
             }
         };
-        let ef = ExportFrame {
-            frame_id: -1,
-            file_id: -1,
-            file_path: c.landed_path.clone(),
-            filename: basename(&c.landed_path),
-            exptime: meta_f64(&meta, "exptime"),
-            filter: meta_str(&meta, "filter"),
-            ccd_temp: meta_f64(&meta, "ccd_temp"),
-            gain: meta_f64(&meta, "gain"),
-            offset: meta_f64(&meta, "offset"),
-            binning: meta_str(&meta, "binning"),
-            date_obs: meta_str(&meta, "date_obs"),
-            focallen: meta_f64(&meta, "focallen"),
-            xpixsz: meta_f64(&meta, "xpixsz"),
-            bayerpat: meta_str(&meta, "bayerpat"),
-            instrume: meta_str(&meta, "instrume"),
-            debayer_calibrated: None,
-        };
-        if !c.frame_uuid.is_empty() {
-            seen_uuids.insert(c.frame_uuid.clone());
-        }
-        add_frame(&mut order, &mut by_display, &c.publisher_display, ef);
+        let landed = row.landed_path.clone().unwrap_or_default();
+        add_frame(
+            &mut order,
+            &mut by_display,
+            &display,
+            export_frame(&landed, &manifest),
+        );
     }
 
     if order.is_empty() {
@@ -174,6 +129,40 @@ pub fn collect_project_export_data(
         publishers,
         warnings,
     })
+}
+
+/// One [`ExportFrame`] for a project frame: the file at `landed`, its
+/// metadata from the manifest row (top-level `filterRaw`/`exptimeSec`/
+/// `dateObs`, the rest from `meta`). Project frames carry no catalog ids.
+fn export_frame(landed: &str, manifest: &serde_json::Value) -> ExportFrame {
+    let meta = manifest
+        .get("meta")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let filter = meta_str(manifest, "filterRaw")
+        .filter(|f| !f.is_empty())
+        .or_else(|| meta_str(manifest, "filterCanonical").filter(|f| !f.is_empty()));
+    ExportFrame {
+        frame_id: -1,
+        file_id: -1,
+        file_path: landed.to_string(),
+        filename: basename(landed),
+        exptime: meta_f64(manifest, "exptimeSec"),
+        filter,
+        ccd_temp: None,
+        gain: None,
+        offset: None,
+        binning: meta
+            .get("xbinning")
+            .and_then(|b| b.as_i64())
+            .map(|b| format!("{b}x{b}")),
+        date_obs: meta_str(manifest, "dateObs"),
+        focallen: meta_f64(&meta, "focalLen"),
+        xpixsz: None,
+        bayerpat: meta_str(&meta, "bayerpat"),
+        instrume: meta_str(&meta, "instrume"),
+        debayer_calibrated: None,
+    }
 }
 
 /// Append `ef` to the bucket for `display`, registering the display's insertion
@@ -283,79 +272,6 @@ fn build_dataset(display: &str, object_name: &str, frames: Vec<ExportFrame>) -> 
     }
 }
 
-/// Build one own-side [`ExportFrame`] from the `frames` row, with the calibrated
-/// output as its file path/name. Returns `(frame, frame_uuid)` — the uuid feeds
-/// the own-wins dedup.
-///
-/// Unreachable while the own side is blocked (decision C, spec 2026-08-31 §8a);
-/// kept for the pending collab rework, which restores the own-side branch.
-#[allow(dead_code)]
-fn own_export_frame(
-    conn: &Connection,
-    frame_id: i64,
-    output_path: &str,
-) -> Result<(ExportFrame, Option<String>)> {
-    let filename = basename(output_path);
-    let row = conn.query_row(
-        "SELECT f.file_id, f.exptime, f.filter, f.ccd_temp, f.gain, f.offset, \
-                f.binning, f.date_obs, f.focallen, f.xpixsz, f.bayerpat, f.instrume, f.uuid \
-         FROM frames f WHERE f.id = ?1",
-        [frame_id],
-        |row| {
-            let uuid: Option<String> = row.get(12)?;
-            Ok((
-                ExportFrame {
-                    frame_id,
-                    file_id: row.get(0)?,
-                    file_path: output_path.to_string(),
-                    filename: filename.clone(),
-                    exptime: row.get(1)?,
-                    filter: row.get(2)?,
-                    ccd_temp: row.get(3)?,
-                    gain: row.get(4)?,
-                    offset: row.get(5)?,
-                    binning: row.get(6)?,
-                    date_obs: row.get(7)?,
-                    focallen: row.get(8)?,
-                    xpixsz: row.get(9)?,
-                    bayerpat: row.get(10)?,
-                    instrume: row.get(11)?,
-                    debayer_calibrated: None,
-                },
-                uuid,
-            ))
-        },
-    )?;
-    Ok(row)
-}
-
-/// The union of LIGHT `(frame_id, filename)` across many frame sets, deduped by
-/// frame id. Reproduced from the render-gated `api::collab::union_light_frames`
-/// (this module is ungated and must not import it).
-fn union_light_frames(conn: &Connection, set_ids: &[i64]) -> Result<Vec<(i64, String)>> {
-    if set_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders = vec!["?"; set_ids.len()].join(",");
-    let sql = format!(
-        "SELECT DISTINCT sm.frame_id, fi.filename \
-         FROM session_members sm \
-         JOIN sessions s ON s.id = sm.session_id \
-         JOIN imaging_nights ino ON ino.id = s.imaging_night_id \
-         JOIN frames f ON f.id = sm.frame_id \
-         JOIN files fi ON fi.id = f.file_id \
-         WHERE ino.frames_set_id IN ({placeholders}) AND f.imagetyp = 'Light' \
-         ORDER BY sm.frame_id"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(set_ids.iter()), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
 /// The trailing path component of `path`, or the whole string when it has none.
 fn basename(path: &str) -> String {
     Path::new(path)
@@ -377,11 +293,8 @@ fn meta_str(v: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::collab::{link_set, upsert_project, CollabProjectRow};
-    use crate::db::collab_exchange::{
-        insert_contribution, upsert_package, ContributionRow, PackageRow,
-    };
-    use rusqlite::params;
+    use crate::db::collab::{upsert_project, CollabProjectRow};
+    use crate::db::collab_frames::{record_own, FrameOrigin, LocalFrameRow};
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -430,124 +343,55 @@ mod tests {
         .unwrap();
     }
 
-    /// Upsert the parent package row a contribution's FK requires.
-    fn mk_pkg(conn: &Connection, project_id: &str, package_id: &str, publisher: &str) {
-        upsert_package(
-            conn,
-            &PackageRow {
-                package_id: package_id.into(),
-                project_id: project_id.into(),
-                announcement_id: format!("ann-{package_id}"),
-                publisher_display: publisher.into(),
-                own: false,
-                root_hash: "rh".into(),
-                byte_size: 0,
-                frame_count: 1,
-                manifest_xxh3: None,
-                aggregate_stats: "{}".into(),
-                supersedes: "[]".into(),
-                state: "published".into(),
-                reject_reason: None,
-                superseded: false,
-                origin: "remote".into(),
-                local_dir: None,
-                manifest_ndjson: None,
-                local_status: "none".into(),
-                holder_count: 0,
-                online_count: 0,
-                created_at: "2026-07-13 00:00:00".into(),
-                decided_at: None,
-                fetched_at: String::new(),
-            },
-        )
-        .unwrap();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn mk_contrib(
+    /// One `project_frames_local` row: landed at `landed`, `on_disk`,
+    /// `accepted`, with `manifest` as its verbatim manifest JSON.
+    fn mk_frame(
         conn: &Connection,
         project_id: &str,
-        package_id: &str,
+        uuid: &str,
+        origin: FrameOrigin,
         publisher: &str,
-        uuid: &str,
-        landed_path: &str,
-        frame_meta: &str,
-        superseded: bool,
-    ) {
-        insert_contribution(
-            conn,
-            &ContributionRow {
-                id: 0,
-                project_id: project_id.into(),
-                package_id: package_id.into(),
-                frame_uuid: uuid.into(),
-                publisher_display: publisher.into(),
-                rel_path: format!("{publisher}/{uuid}.fits"),
-                landed_path: landed_path.into(),
-                byte_size: 1,
-                xxh3: format!("h-{uuid}"),
-                frame_meta: frame_meta.into(),
-                analysis: None,
-                superseded,
-                created_at: String::new(),
-            },
-        )
-        .unwrap();
+        landed: Option<&str>,
+        manifest: serde_json::Value,
+    ) -> LocalFrameRow {
+        let row = LocalFrameRow {
+            project_id: project_id.into(),
+            frame_uuid: uuid.into(),
+            content_version: 1,
+            origin,
+            publisher_account_id: format!("acc-{publisher}"),
+            publisher_display: publisher.into(),
+            file_name: format!("{uuid}.fits"),
+            filter_canonical: "L".into(),
+            state: "published".into(),
+            accepted: true,
+            byte_size: 1,
+            xxh3: format!("h-{uuid}"),
+            blake3: "b".repeat(64),
+            holder_count: 1,
+            manifest_version: 1,
+            manifest_json: manifest.to_string(),
+            landed_path: landed.map(str::to_string),
+            size_mtime_seen: None,
+            on_disk: landed.is_some(),
+            locally_declined: false,
+            awaiting_gc: false,
+            source_frame_id: None,
+            recipe_hash: None,
+            last_error: None,
+            updated_at: String::new(),
+        };
+        record_own(conn, &row).unwrap();
+        row
     }
 
-    /// A single linked own set with one imaging night + session, returns the
-    /// (set_id, session_id) so the caller can add frames.
-    fn seed_own_set(conn: &Connection) -> (i64, i64) {
-        conn.execute(
-            "INSERT INTO frames_set (name, objctra, objctdec) VALUES ('Own Set', '05:35:00', '-05:23:00')",
-            [],
-        )
-        .unwrap();
-        let set_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
-             VALUES (?1, '2026-07-01T20:00:00Z', '2026-07-02T03:00:00Z')",
-            [set_id],
-        )
-        .unwrap();
-        let night = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'CamA')",
-            [night],
-        )
-        .unwrap();
-        let session = conn.last_insert_rowid();
-        (set_id, session)
-    }
-
-    /// Add a LIGHT frame to a session; returns its frame id.
-    fn add_own_frame(
-        conn: &Connection,
-        session: i64,
-        uuid: &str,
-        instrume: &str,
-        filter: &str,
-    ) -> i64 {
-        conn.execute(
-            "INSERT INTO files (path, filename, size, modified_at, format) \
-             VALUES (?1, ?2, 1000, '2026-07-01T21:00:00Z', 'FITS')",
-            params![format!("/raw/{uuid}.fits"), format!("{uuid}.fits")],
-        )
-        .unwrap();
-        let file_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO frames (file_id, imagetyp, object, instrume, exptime, filter, uuid) \
-             VALUES (?1, 'Light', 'M42', ?2, 300.0, ?3, ?4)",
-            params![file_id, instrume, filter, uuid],
-        )
-        .unwrap();
-        let frame_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
-            params![session, frame_id],
-        )
-        .unwrap();
-        frame_id
+    fn manifest(filter: &str, instrume: &str) -> serde_json::Value {
+        serde_json::json!({
+            "filterRaw": filter,
+            "exptimeSec": 300.0,
+            "dateObs": "2026-07-01T21:00:00Z",
+            "meta": {"instrume": instrume, "xbinning": 1, "focalLen": 530.0}
+        })
     }
 
     fn find<'a>(data: &'a ProjectExportData, display: &str) -> &'a ExportData {
@@ -572,251 +416,189 @@ mod tests {
             .collect()
     }
 
-    // (a) two publishers, same basename → two datasets, filenames unprefixed.
+    // Two publishers, same basename → two datasets, filenames unprefixed, the
+    // file path taken from the row's `landed_path` (P26).
     #[test]
     fn two_publishers_same_basename_land_in_two_datasets() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = test_conn();
         seed_project(&conn, "p-1");
-        mk_pkg(&conn, "p-1", "pkg-a", "Alice");
-        mk_pkg(&conn, "p-1", "pkg-b", "Bob");
-        let a_landed = tmp.path().join("Alice").join("L_0001.fits");
-        let b_landed = tmp.path().join("Bob").join("L_0001.fits");
-        mk_contrib(
+        let a = tmp.path().join("Alice").join("L_0001.fits");
+        let b = tmp.path().join("Bob").join("L_0001.fits");
+        let (a, b) = (a.to_string_lossy(), b.to_string_lossy());
+        let m = manifest("L", "CamA");
+        mk_frame(
             &conn,
             "p-1",
-            "pkg-a",
-            "Alice",
             "u-a",
-            &a_landed.to_string_lossy(),
-            r#"{"instrume":"CamA","filter":"L","exptime":300.0}"#,
-            false,
+            FrameOrigin::Replica,
+            "Alice",
+            Some(&a),
+            m.clone(),
         );
-        mk_contrib(
+        mk_frame(
             &conn,
             "p-1",
-            "pkg-b",
-            "Bob",
             "u-b",
-            &b_landed.to_string_lossy(),
-            r#"{"instrume":"CamB","filter":"L","exptime":300.0}"#,
-            false,
+            FrameOrigin::Replica,
+            "Bob",
+            Some(&b),
+            m,
         );
 
         let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
         assert_eq!(data.title, "Proj Title");
         assert_eq!(data.publishers.len(), 2, "one dataset per publisher");
-
         let alice = find(&data, "Alice");
-        assert_eq!(
-            alice.frame_set_name, "Alice",
-            "dataset folder = publisher display"
-        );
+        assert_eq!(alice.frame_set_name, "Alice");
         let af = all_frames(alice);
         assert_eq!(af.len(), 1);
-        assert_eq!(
-            af[0].filename, "L_0001.fits",
-            "publisher basename, unprefixed"
-        );
-        assert_eq!(af[0].file_path, a_landed.to_string_lossy());
-        assert_eq!(af[0].frame_id, -1, "received frames use sentinel ids");
-
-        let bob = find(&data, "Bob");
-        assert_eq!(all_frames(bob)[0].filename, "L_0001.fits");
-        assert_eq!(all_frames(bob)[0].file_path, b_landed.to_string_lossy());
+        assert_eq!(af[0].filename, "L_0001.fits");
+        assert_eq!(af[0].file_path, a);
+        assert_eq!(af[0].frame_id, -1, "project frames use sentinel ids");
+        assert_eq!(all_frames(find(&data, "Bob"))[0].file_path, b);
     }
 
-    // (a2) one publisher, two filters → two (filter, camera) groups.
+    // Own frames export too — under `own_display`, first, from wherever they
+    // live (an own frame may sit outside the Collaboration root, A1).
     #[test]
-    fn one_publisher_two_filters_two_groups() {
+    fn own_and_replica_frames_are_both_exported() {
         let conn = test_conn();
         seed_project(&conn, "p-1");
-        mk_pkg(&conn, "p-1", "pkg-a", "Alice");
-        mk_contrib(
+        mk_frame(
             &conn,
             "p-1",
-            "pkg-a",
+            "r-1",
+            FrameOrigin::Replica,
             "Alice",
-            "u-1",
-            "/land/Alice/l.fits",
-            r#"{"instrume":"CamA","filter":"L"}"#,
-            false,
+            Some("/collab/m42/Alice/r1.fits"),
+            manifest("L", "CamA"),
         );
-        mk_contrib(
+        mk_frame(
             &conn,
             "p-1",
-            "pkg-a",
-            "Alice",
-            "u-2",
-            "/land/Alice/r.fits",
-            r#"{"instrume":"CamA","filter":"R"}"#,
-            false,
+            "o-1",
+            FrameOrigin::Own,
+            "My Name",
+            Some("/elsewhere/originals/o1.fits"),
+            manifest("L", "CamMe"),
         );
 
         let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
-        assert_eq!(data.publishers.len(), 1);
+        let order: Vec<&str> = data.publishers.iter().map(|(d, _)| d.as_str()).collect();
+        assert_eq!(order, vec!["Me", "Alice"], "own first, under own_display");
+        let mine = all_frames(find(&data, "Me"));
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].file_path, "/elsewhere/originals/o1.fits");
+        assert!(data.warnings.is_empty(), "{:?}", data.warnings);
+    }
+
+    // Only frames on disk AND accepted by the gate export; a row with no
+    // landed path, one not on disk and a gate-rejected one are skipped.
+    #[test]
+    fn only_on_disk_accepted_frames_are_exported() {
+        let conn = test_conn();
+        seed_project(&conn, "p-1");
+        let m = manifest("L", "CamA");
+        mk_frame(
+            &conn,
+            "p-1",
+            "live",
+            FrameOrigin::Replica,
+            "Alice",
+            Some("/c/live.fits"),
+            m.clone(),
+        );
+        mk_frame(
+            &conn,
+            "p-1",
+            "pending",
+            FrameOrigin::Replica,
+            "Alice",
+            None,
+            m.clone(),
+        );
+        mk_frame(
+            &conn,
+            "p-1",
+            "gone",
+            FrameOrigin::Replica,
+            "Alice",
+            Some("/c/gone.fits"),
+            m.clone(),
+        );
+        mk_frame(
+            &conn,
+            "p-1",
+            "rejected",
+            FrameOrigin::Replica,
+            "Alice",
+            Some("/c/rej.fits"),
+            m,
+        );
+        conn.execute(
+            "UPDATE project_frames_local SET on_disk = 0 WHERE frame_uuid = 'gone'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE project_frames_local SET accepted = 0 WHERE frame_uuid = 'rejected'",
+            [],
+        )
+        .unwrap();
+
+        let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
+        let frames = all_frames(find(&data, "Alice"));
+        let names: Vec<&str> = frames.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(names, vec!["live.fits"]);
+    }
+
+    // Frame metadata comes from the manifest row, never a header card: one
+    // publisher with two filters lands in two (filter, camera) groups, and the
+    // numeric/camera fields are read from `meta`.
+    #[test]
+    fn metadata_comes_from_the_manifest_row() {
+        let conn = test_conn();
+        seed_project(&conn, "p-1");
+        mk_frame(
+            &conn,
+            "p-1",
+            "u-l",
+            FrameOrigin::Replica,
+            "Alice",
+            Some("/c/l.fits"),
+            manifest("L", "CamA"),
+        );
+        let mut osc = manifest("R", "CamA");
+        osc["meta"]["bayerpat"] = serde_json::json!("RGGB");
+        mk_frame(
+            &conn,
+            "p-1",
+            "u-r",
+            FrameOrigin::Replica,
+            "Alice",
+            Some("/c/r.fits"),
+            osc,
+        );
+
+        let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
         let alice = find(&data, "Alice");
-        assert_eq!(alice.groups.len(), 2, "two filters → two groups");
         let mut keys: Vec<_> = alice.groups.iter().map(|g| g.group_key.clone()).collect();
         keys.sort();
-        assert_eq!(keys, vec!["L_Mono".to_string(), "R_Mono".to_string()]);
+        assert_eq!(keys, vec!["L_Mono".to_string(), "R_OSC".to_string()]);
+        let l = all_frames(alice)
+            .into_iter()
+            .find(|f| f.filename == "l.fits")
+            .unwrap();
+        assert_eq!(l.exptime, Some(300.0));
+        assert_eq!(l.filter.as_deref(), Some("L"));
+        assert_eq!(l.instrume.as_deref(), Some("CamA"));
+        assert_eq!(l.focallen, Some(530.0));
+        assert_eq!(l.date_obs.as_deref(), Some("2026-07-01T21:00:00Z"));
+        assert_eq!(l.binning.as_deref(), Some("1x1"));
+        assert_eq!(alice.total_light_frames, 2);
     }
 
-    // (b) superseded contribution excluded.
-    #[test]
-    fn superseded_contribution_excluded() {
-        let conn = test_conn();
-        seed_project(&conn, "p-1");
-        mk_pkg(&conn, "p-1", "pkg-a", "Alice");
-        mk_contrib(
-            &conn,
-            "p-1",
-            "pkg-a",
-            "Alice",
-            "u-live",
-            "/land/Alice/live.fits",
-            r#"{"instrume":"CamA","filter":"L"}"#,
-            false,
-        );
-        mk_contrib(
-            &conn,
-            "p-1",
-            "pkg-a",
-            "Alice",
-            "u-old",
-            "/land/Alice/old.fits",
-            r#"{"instrume":"CamA","filter":"L"}"#,
-            true,
-        );
-
-        let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
-        let alice = find(&data, "Alice");
-        let frames = all_frames(alice);
-        assert_eq!(frames.len(), 1, "the superseded row is excluded");
-        assert_eq!(frames[0].filename, "live.fits");
-    }
-
-    // (c) Decision C (spec 2026-08-31 §8a): the own side is blocked — every
-    // linked LIGHT is skipped with a warning and no own dataset is produced.
-    // A project with ONLY own frames therefore has nothing to export.
-    #[test]
-    fn own_side_is_blocked_until_the_collab_rework() {
-        let conn = test_conn();
-        seed_project(&conn, "p-1");
-        let (set_id, session) = seed_own_set(&conn);
-        add_own_frame(&conn, session, "own-a", "CamA", "L");
-        add_own_frame(&conn, session, "own-b", "CamA", "L");
-        link_set(&conn, "p-1", set_id).unwrap();
-
-        let err = collect_project_export_data(&conn, "p-1", "Me").unwrap_err();
-        assert!(
-            err.to_string().contains("nothing to export"),
-            "own frames alone no longer produce a dataset; got {err}"
-        );
-    }
-
-    // (c2) With a received contribution present the collector still succeeds —
-    // only the own frames drop out, each with its own warning so the export
-    // dialog reports the omission instead of silently shrinking.
-    #[test]
-    fn own_frames_are_skipped_with_a_warning_each() {
-        let conn = test_conn();
-        seed_project(&conn, "p-1");
-        let (set_id, session) = seed_own_set(&conn);
-        add_own_frame(&conn, session, "own-a", "CamA", "L");
-        add_own_frame(&conn, session, "own-b", "CamA", "L");
-        link_set(&conn, "p-1", set_id).unwrap();
-
-        mk_pkg(&conn, "p-1", "pkg-a", "Alice");
-        mk_contrib(
-            &conn,
-            "p-1",
-            "pkg-a",
-            "Alice",
-            "u-a",
-            "/land/Alice/L_0001.fits",
-            r#"{"instrume":"CamA","filter":"L","exptime":300.0}"#,
-            false,
-        );
-
-        let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
-        assert!(
-            data.publishers.iter().all(|(d, _)| d != "Me"),
-            "no own dataset while the own side is blocked; got {:?}",
-            data.publishers.iter().map(|(d, _)| d).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            all_frames(find(&data, "Alice")).len(),
-            1,
-            "received side unaffected"
-        );
-        assert_eq!(
-            data.warnings.len(),
-            2,
-            "one warning per skipped own frame; got {:?}",
-            data.warnings
-        );
-        assert!(
-            data.warnings
-                .iter()
-                .all(|w| w.contains("no calibrated output")),
-            "each skip names the missing artifact; got {:?}",
-            data.warnings
-        );
-    }
-
-    // (d) malformed frame_meta skips only that row.
-    #[test]
-    fn malformed_frame_meta_skips_only_that_row() {
-        let conn = test_conn();
-        seed_project(&conn, "p-1");
-        mk_pkg(&conn, "p-1", "pkg-a", "Alice");
-        mk_contrib(
-            &conn,
-            "p-1",
-            "pkg-a",
-            "Alice",
-            "u-bad",
-            "/land/Alice/bad.fits",
-            "{ this is not valid json",
-            false,
-        );
-        mk_contrib(
-            &conn,
-            "p-1",
-            "pkg-a",
-            "Alice",
-            "u-ok",
-            "/land/Alice/ok.fits",
-            r#"{"instrume":"CamA","filter":"L"}"#,
-            false,
-        );
-
-        let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
-        let alice = find(&data, "Alice");
-        let frames = all_frames(alice);
-        assert_eq!(
-            frames.len(),
-            1,
-            "the malformed row is skipped, the valid one survives"
-        );
-        assert_eq!(frames[0].filename, "ok.fits");
-
-        // The skipped row surfaces one warning naming the publisher.
-        assert_eq!(
-            data.warnings.len(),
-            1,
-            "one warning for the malformed contribution; got {:?}",
-            data.warnings
-        );
-        assert!(
-            data.warnings[0].contains("Alice") && data.warnings[0].contains("unreadable"),
-            "warning names the publisher + unreadable metadata; got {:?}",
-            data.warnings
-        );
-    }
-
-    // (e) empty project → error.
     #[test]
     fn empty_project_errors() {
         let conn = test_conn();
@@ -825,54 +607,13 @@ mod tests {
         assert!(err.to_string().contains("nothing to export"), "got {err}");
     }
 
-    // Rule 1: a project not in the local cache errors distinctly.
     #[test]
     fn missing_project_errors() {
         let conn = test_conn();
-        let err = collect_project_export_data(&conn, "no-such", "Me").unwrap_err();
+        let err = collect_project_export_data(&conn, "nope", "Me").unwrap_err();
         assert!(
             err.to_string().contains("not in the local cache"),
             "got {err}"
-        );
-    }
-
-    // Own + received sharing a frame_uuid. The own-wins dedup (rule 4) is
-    // dormant while the own side is blocked (decision C, spec 2026-08-31 §8a):
-    // with no own frame placed, nothing claims the uuid, so the received copy
-    // is the one that survives. Rewritten from `own_wins_over_received_duplicate_uuid`
-    // — the rework restores the own-wins assertion together with the own side.
-    #[test]
-    fn received_copy_survives_while_the_own_side_is_blocked() {
-        let conn = test_conn();
-        seed_project(&conn, "p-1");
-        let (set_id, session) = seed_own_set(&conn);
-        add_own_frame(&conn, session, "shared-uuid", "CamA", "L");
-        link_set(&conn, "p-1", set_id).unwrap();
-
-        // A received contribution for the SAME uuid, under the same display "Me".
-        mk_pkg(&conn, "p-1", "pkg-a", "Me");
-        mk_contrib(
-            &conn,
-            "p-1",
-            "pkg-a",
-            "Me",
-            "shared-uuid",
-            "/land/Me/dup.fits",
-            r#"{"instrume":"CamA","filter":"L"}"#,
-            false,
-        );
-
-        let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
-        let me = find(&data, "Me");
-        let frames = all_frames(me);
-        assert_eq!(frames.len(), 1, "exactly the received copy");
-        assert_eq!(
-            frames[0].filename, "dup.fits",
-            "the received copy, not an own output"
-        );
-        assert_eq!(
-            frames[0].frame_id, -1,
-            "received frames carry no catalog id"
         );
     }
 }

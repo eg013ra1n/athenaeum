@@ -95,7 +95,6 @@ pub fn run() {
                 monitor: athenaeum_core::monitor::MonitorService::new(),
                 sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
                 sync_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
-                collab_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
                 update_in_flight: std::sync::atomic::AtomicBool::new(false),
             }
         })

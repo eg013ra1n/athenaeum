@@ -525,38 +525,17 @@ fn connect_gate(
     })))
 }
 
-/// The receiver's per-announce project-membership gate (collab exchange,
-/// slice 4): an inbound `ProjectAnnounceReceived` is accepted only from a
-/// verified current member of that project
-/// ([`collab::authz::may_accept_announce`](crate::collab::authz::may_accept_announce)),
-/// re-read live per announce. Always installed and fail-closed by construction —
-/// a node with no matching membership row simply drops every project announce.
-fn project_announce_gate(
-    ctx: &ServiceContext,
-) -> Result<crate::sync::ProjectAnnounceGate, ApiError> {
-    let db = db(ctx)?.clone();
-    Ok(Arc::new(move |from: &NodeId, project_id: &str| {
-        let conn = db.conn();
-        crate::collab::authz::may_accept_announce(&conn, project_id, from)
-    }))
-}
-
-/// Assemble the slice-4 [`ReceiverHooks`](crate::sync::ReceiverHooks) that both
+/// Assemble the [`ReceiverHooks`](crate::sync::ReceiverHooks) that both
 /// `ensure_started` callers pass: the composite connect gate (installed only when
-/// signed in) plus the always-on project announce gate, the task-6 holder-side
-/// serve handler that answers inbound project pull requests, and the task-8
-/// announcements-refresh + post-ingest report-have hooks.
+/// signed in) and the persisted receive-concurrency cap. The package-era project
+/// hooks (announce gate, request handler, announcements refresh, post-ingest
+/// report) are retired (collab v3 wave 2, P12).
 fn receiver_hooks(
     ctx: &Arc<ServiceContext>,
     refusal: Arc<RefusalRefresher>,
-    request_handler: Option<crate::sync::ProjectRequestHandler>,
 ) -> Result<crate::sync::ReceiverHooks, ApiError> {
     Ok(crate::sync::ReceiverHooks {
         connect_gate: connect_gate(ctx, refusal)?,
-        project_gate: Some(project_announce_gate(ctx)?),
-        announcements_refresher: Some(announcements_refresher(Arc::clone(ctx))),
-        on_project_ingested: Some(on_project_ingested_hook(Arc::clone(ctx))),
-        project_request_handler: request_handler,
         // W2 T2.7: the persisted receive-concurrency cap travels with the hooks
         // because `sync::` has no `ServiceContext` to read it from — see the
         // field's doc. `ensure_started` applies it before the loop spawns.
@@ -589,95 +568,6 @@ fn configured_max_concurrent_receives(ctx: &ServiceContext) -> Option<usize> {
             None
         }
     }
-}
-
-/// Build the task-8 [`ProjectAnnouncementsRefresher`](crate::sync::ProjectAnnouncementsRefresher)
-/// the receiver invokes when an inbound project announce names a package whose hub
-/// row we don't yet know. The hook is synchronous by contract, so it
-/// `tokio::spawn`s the async hub poll (the house pattern — see
-/// [`project_request_handler`]) and returns immediately; the receive loop never
-/// blocks. The receiver's immediate re-check may miss the still-in-flight poll,
-/// but the sender's announce retry lands once the row appears.
-fn announcements_refresher(ctx: Arc<ServiceContext>) -> crate::sync::ProjectAnnouncementsRefresher {
-    Arc::new(move |project_id: &str| {
-        let ctx = Arc::clone(&ctx);
-        let project_id = project_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) =
-                crate::api::collab_exchange::refresh_project_packages(&ctx, &project_id).await
-            {
-                tracing::warn!(project_id = %project_id, error = %format!("{e}"), "announcements refresh failed");
-            }
-        });
-    })
-}
-
-/// Build the task-8 [`ProjectIngestedHook`](crate::sync::ProjectIngestedHook)
-/// fired after a project package ingests + acks: seed the package (D3 T4), then a
-/// best-effort report-have so the hub adds this device to the package's swarm.
-/// `tokio::spawn`ed off the receive loop; a failure only means the hub doesn't
-/// list us as a holder yet.
-///
-/// Seed BEFORE report-have (D3 §3.4): `report_have` is what makes other members'
-/// swarm fetches dial this device, so advertising first would publish a holder
-/// whose blobs are not servable yet. The seed is best-effort — a failed seed still
-/// reports have, because a landed package is still servable through the on-demand
-/// `handle_project_request` path (exactly the pre-D3 semantics).
-fn on_project_ingested_hook(ctx: Arc<ServiceContext>) -> crate::sync::ProjectIngestedHook {
-    Arc::new(move |project_id: String, package_id: String| {
-        let ctx = Arc::clone(&ctx);
-        tokio::spawn(async move {
-            crate::api::collab_exchange::seed_ingested_package(&ctx, &package_id).await;
-            if let Err(e) =
-                crate::api::collab_exchange::report_have_after_ingest(&ctx, &package_id).await
-            {
-                tracing::warn!(project_id = %project_id, package_id = %package_id, error = %format!("{e}"), "post-ingest report_have failed");
-            }
-        });
-    })
-}
-
-/// Build the holder-side [`ProjectRequestHandler`](crate::sync::ProjectRequestHandler)
-/// the receiver invokes on an inbound `ProjectRequestReceived` (task 6). The
-/// closure is `'static` — it captures a cloned `Arc<ServiceContext>`, the
-/// host-owned collab sender map, and the host emitter — and `tokio::spawn`s
-/// [`handle_project_request`](crate::api::collab_exchange::handle_project_request)
-/// so the synchronous receive loop never blocks on the serve. An authorization
-/// failure inside `handle_project_request` is a silent (warn-logged) drop; a real
-/// error is logged here.
-///
-/// `collab_sender` is the DEDICATED collab sender map (a SECOND
-/// [`SyncSenderRuntime`](crate::sync::SyncSenderRuntime), distinct from the
-/// personal-sync `sync_sender` — collab serves ride a dedicated `blobs_collab`
-/// store, audit m7). Task 11 hoists it to `AppState.collab_sender` /
-/// `WebAppState.collab_sender` so the Transfers UI can roll up collab transfers;
-/// both host state constructors build it beside `sync_sender`.
-fn project_request_handler(
-    ctx: Arc<ServiceContext>,
-    collab_sender: Arc<SyncSenderRuntime>,
-    emitter: Arc<dyn ProgressEmitter>,
-) -> crate::sync::ProjectRequestHandler {
-    Arc::new(
-        move |from: NodeId, project_id: String, package_id: String| {
-            let ctx = Arc::clone(&ctx);
-            let sender = Arc::clone(&collab_sender);
-            let emitter = Arc::clone(&emitter);
-            tokio::spawn(async move {
-                if let Err(e) = crate::api::collab_exchange::handle_project_request(
-                    &ctx,
-                    &sender,
-                    from,
-                    project_id,
-                    package_id,
-                    Some(emitter),
-                )
-                .await
-                {
-                    tracing::error!(error = %format!("{e:#}"), "collab request-to-serve failed");
-                }
-            });
-        },
-    )
 }
 
 /// Refresh the cached authorized-peer allow-list from the hub device list
@@ -888,32 +778,29 @@ fn start_node_relay_refresh(ctx: Arc<ServiceContext>, node: &Arc<SharedIrohNode>
 
 /// Install the node's transport-level wake hook (T6, sync delivery-forever). On a
 /// home-relay **reconnect** transition or an **applied relay-map change** the node
-/// fires this hook; it kicks every pending outbound package — personal AND collab
-/// — out of its backoff so it re-announces the instant the node is reachable
-/// again, instead of waiting out the exponential retry window.
+/// fires this hook; it kicks every pending outbound package out of its backoff
+/// so it re-announces the instant the node is reachable again, instead of
+/// waiting out the exponential retry window.
 ///
 /// The node is a process singleton and every start entry point installs the SAME
-/// two host-global sender maps, so `set_wake_hook`'s last-writer-wins is benign
-/// (each install is an identical hook). The closure is `'static` — it owns cloned
-/// `Arc<SyncSenderRuntime>` handles — and `tokio::spawn`s the fire-and-forget
+/// host-global sender map, so `set_wake_hook`'s last-writer-wins is benign
+/// (each install is an identical hook). The closure is `'static` — it owns a
+/// cloned `Arc<SyncSenderRuntime>` handle — and `tokio::spawn`s the fire-and-forget
 /// `kick_all` fan-out so the hook itself returns promptly (it runs on the node's
 /// relay-watcher / refresh task, which must not block).
 fn install_node_wake_hook(
     ctx: &Arc<ServiceContext>,
     node: &Arc<SharedIrohNode>,
     sync_sender: Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
 ) {
     let ctx = Arc::clone(ctx);
     let node_for_beacon = Arc::clone(node);
     node.set_wake_hook(Arc::new(move || {
         let sync_sender = Arc::clone(&sync_sender);
-        let collab_sender = Arc::clone(&collab_sender);
         let ctx = Arc::clone(&ctx);
         let node = Arc::clone(&node_for_beacon);
         tokio::spawn(async move {
             sync_sender.kick_all().await;
-            collab_sender.kick_all().await;
             // Edge 2 of 2 (D1 §3.1): our relay just reconnected, which is the same
             // fact as "we are reachable again" — so tell the peers that may be
             // parked waiting for us. Costs one beacon per account device per
@@ -984,7 +871,6 @@ fn has_pending_rows_for(ctx: &ServiceContext, peer: NodeId) -> bool {
 pub async fn handle_peer_presence(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
-    collab_sender: &Arc<SyncSenderRuntime>,
     sync: &SyncRuntime,
     emitter: Option<Arc<dyn ProgressEmitter>>,
     from: NodeId,
@@ -1004,15 +890,10 @@ pub async fn handle_peer_presence(
     }
     if sender.current_for(&from).await.is_none() {
         if let Err(e) = ensure_sender_engine(
-            ctx,
-            sender,
-            Arc::clone(collab_sender),
-            sync,
-            from,
+            ctx, sender, sync, from,
             // No reported address needed: the beacon just proved the peer is
             // dialable on the path it arrived by.
-            None,
-            emitter,
+            None, emitter,
         )
         .await
         {
@@ -1022,7 +903,6 @@ pub async fn handle_peer_presence(
     }
     tracing::info!(peer = %hex, "peer presence; resuming its queue");
     sender.kick_peer(&from).await;
-    collab_sender.kick_peer(&from).await;
 }
 
 /// Announce our presence to every authorized ACCOUNT device (D1 §3.1).
@@ -1095,26 +975,22 @@ fn install_presence_wiring(
     node: &Arc<SharedIrohNode>,
     sync: &Arc<SyncRuntime>,
     sync_sender: &Arc<SyncSenderRuntime>,
-    collab_sender: &Arc<SyncSenderRuntime>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) {
     {
         let ctx = Arc::clone(ctx);
         let sync = Arc::clone(sync);
         let sync_sender = Arc::clone(sync_sender);
-        let collab_sender = Arc::clone(collab_sender);
         let emitter = emitter.clone();
         node.set_presence_hook(Arc::new(move |from| {
             let ctx = Arc::clone(&ctx);
             let sync = Arc::clone(&sync);
             let sync_sender = Arc::clone(&sync_sender);
-            let collab_sender = Arc::clone(&collab_sender);
             let emitter = emitter.clone();
             // The hook runs on the control accept loop: hand the work to its own
             // task so a beacon can never stall the loop that receives announces.
             tokio::spawn(async move {
-                handle_peer_presence(&ctx, &sync_sender, &collab_sender, &sync, emitter, from)
-                    .await;
+                handle_peer_presence(&ctx, &sync_sender, &sync, emitter, from).await;
             });
         }));
     }
@@ -1262,6 +1138,9 @@ pub(crate) async fn ensure_iroh_node(
     // They only ever existed under `<db dir>/sync`, i.e. the identity dir — a
     // configurable working folder is newer than they are.
     cleanup_orphan_blob_stores(&dirs.identity_dir);
+    // The retired collab package layer's leftovers (collab v3 wave 2, Task 12):
+    // once per start, beside the per-role store cleanup above.
+    remove_legacy_collab_data(&dirs.working_dir, node.store()).await;
     // The collab store (collab v3 wave 2, P1): a configured Collaboration root is
     // mounted right after bind, so its ALPN serves from the first connection.
     // A failure never fails the bind — personal sync must not depend on the
@@ -1323,6 +1202,52 @@ fn cleanup_orphan_blob_stores(identity_dir: &Path) {
     }
 }
 
+/// The working-dir folders of the retired collab package layer (collab v3
+/// wave 2, Task 12): publications, reconstructed serve dirs, downloader seeds
+/// and swarm staging.
+const LEGACY_COLLAB_DIRS: [&str; 4] = ["collab_pub", "collab_serve", "collab_seed", "collab_swarm"];
+
+/// The tag namespaces the package layer wrote in the PERSONAL store: package
+/// seeds (`project/<pid>/<package>`) and the collab sender role's package
+/// tags (`collab/pkg/…`). Per-frame project seeds live in the COLLAB store
+/// and are never touched here.
+const LEGACY_COLLAB_TAG_PREFIXES: [&str; 2] = ["project/", "collab/"];
+
+/// Remove the package layer's leftovers — the [`LEGACY_COLLAB_DIRS`] under
+/// `working_dir` and every [`LEGACY_COLLAB_TAG_PREFIXES`] tag in the personal
+/// `store` — once per start (the bind). Best-effort: a failure is logged and
+/// the rest continues; nothing personal sync owns is touched. Returns how many
+/// folders and tags went.
+async fn remove_legacy_collab_data(working_dir: &Path, store: &iroh_blobs::api::Store) -> usize {
+    let mut count = 0usize;
+    for name in LEGACY_COLLAB_DIRS {
+        let dir = working_dir.join(name);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => count += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "remove legacy collab folder failed"
+            ),
+        }
+    }
+    for prefix in LEGACY_COLLAB_TAG_PREFIXES {
+        match store.tags().delete_prefix(prefix.as_bytes()).await {
+            Ok(removed) => count += removed as usize,
+            Err(e) => tracing::warn!(
+                tag = prefix,
+                error = %e,
+                "delete legacy collab tags failed"
+            ),
+        }
+    }
+    if count > 0 {
+        tracing::info!(count, "legacy collab data removed");
+    }
+    count
+}
+
 /// Local-state-only "is this node signed in" check for [`autostart_if_enabled`]:
 /// the persisted `ACCOUNT_DEVICE_ID` the app writes on sign-in / clears on
 /// sign-out by `clear_local_session`. Every signed-in Athenaeum node is a full
@@ -1360,11 +1285,10 @@ pub async fn autostart_if_enabled(
     ctx: Arc<ServiceContext>,
     sync: Arc<SyncRuntime>,
     sync_sender: Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<bool, ApiError> {
-    // Own the Arc (the request-to-serve handler clones it into a `'static`
-    // closure) and borrow it for the rest of the body unchanged.
+    // Own the Arc (the node hooks clone it into `'static` closures) and
+    // borrow it for the rest of the body unchanged.
     let ctx_arc = ctx;
     let ctx: &ServiceContext = &ctx_arc;
     // Above the gate on purpose (transfer-prepare spec §3.6): a `preparing` row
@@ -1390,13 +1314,8 @@ pub async fn autostart_if_enabled(
     // loop at boot (idempotent).
     start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
     // Wake event → kick pending packages (T6): relay reconnect / relay-map change
-    // fans a fire-and-forget kick_all over the personal + collab sender maps.
-    install_node_wake_hook(
-        &ctx_arc,
-        &node,
-        Arc::clone(&sync_sender),
-        Arc::clone(&collab_sender),
-    );
+    // fans a fire-and-forget kick_all over the personal sender map.
+    install_node_wake_hook(&ctx_arc, &node, Arc::clone(&sync_sender));
     // Peer reachability (D1): install the inbound-beacon hook and fire our own
     // first beacon — edge 1 of 2, "we just came online".
     install_presence_wiring(
@@ -1404,7 +1323,6 @@ pub async fn autostart_if_enabled(
         &node,
         &sync,
         &sync_sender,
-        &collab_sender,
         Some(Arc::clone(&emitter)),
     );
     // Periodic authorized-peers refresh (task 7): install the hourly hub re-pull
@@ -1415,15 +1333,7 @@ pub async fn autostart_if_enabled(
     // starts accepting, then enforce it live per-package (finding H1).
     refresh_authorized_peers(ctx).await;
     let authorized = peer_authorizer(&ctx_arc, Arc::clone(&sync.refusal))?;
-    let hooks = receiver_hooks(
-        &ctx_arc,
-        Arc::clone(&sync.refusal),
-        Some(project_request_handler(
-            Arc::clone(&ctx_arc),
-            Arc::clone(&collab_sender),
-            Arc::clone(&emitter),
-        )),
-    )?;
+    let hooks = receiver_hooks(&ctx_arc, Arc::clone(&sync.refusal))?;
     // Clone the emitter for the resurrection + auto-sync spawns before
     // `ensure_started` moves it.
     let emitter_for_resurrect = Arc::clone(&emitter);
@@ -1448,7 +1358,6 @@ pub async fn autostart_if_enabled(
     tokio::spawn(resurrect_pending_senders(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync_sender),
-        Arc::clone(&collab_sender),
         Arc::clone(&sync),
         emitter_for_resurrect,
     ));
@@ -1460,12 +1369,12 @@ pub async fn autostart_if_enabled(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync),
     ));
-    // D3 §3.3: arm the collab auto-replication worker — published contributions
-    // of every auto-enabled project download themselves. Armed here (and at the
+    // D3 §3.3: arm the collab auto-replication worker — published frames of
+    // every auto-enabled project replicate themselves. Armed here (and at the
     // other `ensure_started` site) rather than in each host's startup: the pass
-    // pulls through `download_project_package`, which needs exactly the started
-    // `SyncRuntime` this function just produced. Idempotent — the FIRST call
-    // spawns the one loop and every later one no-ops.
+    // needs exactly the started `SyncRuntime` this function just produced.
+    // Idempotent — the FIRST call spawns the one loop and every later one
+    // no-ops.
     crate::api::collab_exchange::spawn_collab_auto_sync(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync),
@@ -1517,9 +1426,10 @@ fn distinct_pending_peers(rows: &[OutboundRow]) -> Vec<NodeId> {
 
 /// Restrict a resurrection peer set to same-account devices (tv2 follow-up,
 /// review fix). `sync_outbound` has no personal/project discriminator — the
-/// dedicated collab sender writes the very same table — so
-/// [`distinct_pending_peers`] can enumerate a peer whose only pending rows are
-/// COLLAB/project rows, including a cross-account collaborator. Resurrection
+/// retired collab package sender wrote the very same table, and an old
+/// catalog may still hold its rows — so [`distinct_pending_peers`] can
+/// enumerate a peer whose only pending rows are COLLAB/project rows, including
+/// a cross-account collaborator. Resurrection
 /// only ever builds a personal-role engine (see [`resurrect_pending_senders`]),
 /// which such a peer's own receiver would refuse: not a corruption, but a
 /// pointless forever-retry loop this filter avoids by construction. A peer not
@@ -1673,7 +1583,6 @@ where
 pub async fn resurrect_pending_senders(
     ctx: Arc<ServiceContext>,
     sender: Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
     sync: Arc<SyncRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) {
@@ -1700,11 +1609,10 @@ pub async fn resurrect_pending_senders(
     let build = |peer: NodeId| {
         let ctx = Arc::clone(&ctx);
         let sender = Arc::clone(&sender);
-        let collab = Arc::clone(&collab_sender);
         let sync = Arc::clone(&sync);
         let emitter = Arc::clone(&emitter);
         async move {
-            ensure_sender_engine(&ctx, &sender, collab, &sync, peer, None, Some(emitter))
+            ensure_sender_engine(&ctx, &sender, &sync, peer, None, Some(emitter))
                 .await
                 .map(|_| ())
         }
@@ -1727,11 +1635,10 @@ pub async fn get_pairing_ticket(
     ctx: Arc<ServiceContext>,
     sync: Arc<SyncRuntime>,
     sync_sender: Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<String, ApiError> {
-    // Own the Arc (the request-to-serve handler clones it into a `'static`
-    // closure) and borrow it for the rest of the body unchanged.
+    // Own the Arc (the node hooks clone it into `'static` closures) and
+    // borrow it for the rest of the body unchanged.
     let ctx_arc = ctx;
     let ctx: &ServiceContext = &ctx_arc;
     // Dev-gate first; resolve paths and drop the DB borrow before awaiting.
@@ -1749,13 +1656,8 @@ pub async fn get_pairing_ticket(
     // loop (idempotent).
     start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
     // Wake event → kick pending packages (T6): relay reconnect / relay-map change
-    // fans a fire-and-forget kick_all over the personal + collab sender maps.
-    install_node_wake_hook(
-        &ctx_arc,
-        &node,
-        Arc::clone(&sync_sender),
-        Arc::clone(&collab_sender),
-    );
+    // fans a fire-and-forget kick_all over the personal sender map.
+    install_node_wake_hook(&ctx_arc, &node, Arc::clone(&sync_sender));
     // Peer reachability (D1): install the inbound-beacon hook and fire our own
     // first beacon — edge 1 of 2, "we just came online".
     install_presence_wiring(
@@ -1763,7 +1665,6 @@ pub async fn get_pairing_ticket(
         &node,
         &sync,
         &sync_sender,
-        &collab_sender,
         Some(Arc::clone(&emitter)),
     );
     // Periodic authorized-peers refresh (task 7): install the hourly hub re-pull
@@ -1774,15 +1675,7 @@ pub async fn get_pairing_ticket(
     // primary that also flips the dev flag still enforces its account list.
     refresh_authorized_peers(ctx).await;
     let authorized = peer_authorizer(&ctx_arc, Arc::clone(&sync.refusal))?;
-    let hooks = receiver_hooks(
-        &ctx_arc,
-        Arc::clone(&sync.refusal),
-        Some(project_request_handler(
-            Arc::clone(&ctx_arc),
-            Arc::clone(&collab_sender),
-            Arc::clone(&emitter),
-        )),
-    )?;
+    let hooks = receiver_hooks(&ctx_arc, Arc::clone(&sync.refusal))?;
 
     // Clone the emitter for the resurrection + auto-sync spawns before
     // `ensure_started` moves it.
@@ -1807,7 +1700,6 @@ pub async fn get_pairing_ticket(
     tokio::spawn(resurrect_pending_senders(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync_sender),
-        Arc::clone(&collab_sender),
         Arc::clone(&sync),
         emitter_for_resurrect,
     ));
@@ -2901,7 +2793,6 @@ fn sender_packages_dir(ctx: &ServiceContext) -> Result<PathBuf, ApiError> {
 pub async fn ensure_sender_engine(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
     sync: &SyncRuntime,
     dest: NodeId,
     dest_endpoint_addr: Option<&crate::account::EndpointAddrReport>,
@@ -2936,7 +2827,7 @@ pub async fn ensure_sender_engine(
     // Wake event → kick pending packages (T6): install here too so a sender-first
     // bind (send before the receiver autostarted) still wakes both sender maps on
     // a relay reconnect / relay-map change.
-    install_node_wake_hook(ctx, &node, Arc::clone(sender), Arc::clone(&collab_sender));
+    install_node_wake_hook(ctx, &node, Arc::clone(sender));
     // Peer reachability (D1) is deliberately NOT installed here. This path holds
     // `sync` as a borrow, and the hook needs a `'static` handle — but more to the
     // point it would be dead wiring: a process that reached a sender-first bind
@@ -3735,7 +3626,6 @@ async fn enqueue_planned(
 pub async fn enqueue_sync_selection(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
     sync: &SyncRuntime,
     dest: ResolvedDest,
     frame_ids: Vec<i64>,
@@ -3758,7 +3648,6 @@ pub async fn enqueue_sync_selection(
     let (engine, origin_device) = ensure_sender_engine(
         ctx,
         sender,
-        collab_sender,
         sync,
         dest.node,
         dest.endpoint_addr.as_ref(),
@@ -3801,7 +3690,6 @@ pub async fn enqueue_sync_selection(
 pub async fn enqueue_frame_set_send(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
     sync: &SyncRuntime,
     dest: ResolvedDest,
     frame_set_id: i64,
@@ -3850,7 +3738,6 @@ pub async fn enqueue_frame_set_send(
     let (engine, origin_device) = ensure_sender_engine(
         ctx,
         sender,
-        collab_sender,
         sync,
         dest.node,
         dest.endpoint_addr.as_ref(),
@@ -3983,7 +3870,6 @@ async fn active_engine_for_row(
 pub async fn resend_transfer(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
     sync: &SyncRuntime,
     id: i64,
     emitter: Option<Arc<dyn ProgressEmitter>>,
@@ -4025,8 +3911,7 @@ pub async fn resend_transfer(
     if row.state == OutboundState::Cancelled
         && row.last_error.as_deref() == Some(CANCELLED_BY_RECEIVER_DETAIL)
     {
-        return resend_declined_as_new_transfer(ctx, sender, collab_sender, sync, &row, emitter)
-            .await;
+        return resend_declined_as_new_transfer(ctx, sender, sync, &row, emitter).await;
     }
     // §D1: mint a fresh per-attempt wire id and reset the SAME row in place (the B2
     // bridge — attempts++, files → pending, error/retry/confirm cleared). The row
@@ -4052,8 +3937,7 @@ pub async fn resend_transfer(
         Some((engine, _)) => engine,
         None => {
             let (engine, _origin) =
-                ensure_sender_engine(ctx, sender, collab_sender, sync, row.peer, None, emitter)
-                    .await?;
+                ensure_sender_engine(ctx, sender, sync, row.peer, None, emitter).await?;
             engine
         }
     };
@@ -4099,7 +3983,6 @@ pub async fn resend_transfer(
 async fn resend_declined_as_new_transfer(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
     sync: &SyncRuntime,
     row: &OutboundRow,
     emitter: Option<Arc<dyn ProgressEmitter>>,
@@ -4167,8 +4050,7 @@ async fn resend_declined_as_new_transfer(
         Some((engine, _)) => engine,
         None => {
             let (engine, _origin) =
-                ensure_sender_engine(ctx, sender, collab_sender, sync, row.peer, None, emitter)
-                    .await?;
+                ensure_sender_engine(ctx, sender, sync, row.peer, None, emitter).await?;
             engine
         }
     };
@@ -4252,12 +4134,11 @@ async fn resend_declined_as_new_transfer(
 pub async fn retry_sync_package(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
-    collab_sender: Arc<SyncSenderRuntime>,
     sync: &SyncRuntime,
     id: i64,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<i64, ApiError> {
-    resend_transfer(ctx, sender, collab_sender, sync, id, emitter).await
+    resend_transfer(ctx, sender, sync, id, emitter).await
 }
 
 /// Send-now a live outbound package: collapse its retry backoff so the owning
@@ -5750,6 +5631,65 @@ pub async fn set_sync_max_concurrent_receives(
 mod tests {
     use super::*;
 
+    /// Task 12: the retired package layer's working-dir folders and its
+    /// `project/` / `collab/` tags in the PERSONAL store go on the first run;
+    /// personal sync's own folders and role tags stay; a second run finds
+    /// nothing to remove.
+    #[tokio::test]
+    async fn legacy_collab_dirs_and_tags_are_removed_once() {
+        use n0_future::StreamExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let working = tmp.path();
+        for name in LEGACY_COLLAB_DIRS
+            .iter()
+            .chain(["packages", "incoming"].iter())
+        {
+            let dir = working.join(name).join("pkg-1");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.fits"), b"x").unwrap();
+        }
+        let store = crate::sharing::iroh::node::open_fs_store(&working.join("blobs"))
+            .await
+            .unwrap();
+        let blob = store
+            .blobs()
+            .add_bytes(b"payload".to_vec())
+            .temp_tag()
+            .await
+            .unwrap();
+        for tag in [
+            "project/p1/pkg-1",
+            "collab/pkg/pkg-2",
+            "recv/pkg/pkg-3",
+            "out/pkg/pkg-4",
+        ] {
+            store.tags().set(tag, blob.hash_and_format()).await.unwrap();
+        }
+
+        assert_eq!(remove_legacy_collab_data(working, &store).await, 4 + 2);
+        for name in LEGACY_COLLAB_DIRS {
+            assert!(!working.join(name).exists(), "{name} removed");
+        }
+        assert!(
+            working.join("packages").join("pkg-1").exists(),
+            "personal folders stay"
+        );
+        assert!(working.join("incoming").join("pkg-1").exists());
+        let mut left = Vec::new();
+        let mut tags = store.tags().list().await.unwrap();
+        while let Some(t) = tags.next().await {
+            left.push(String::from_utf8(t.unwrap().name.0.to_vec()).unwrap());
+        }
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["out/pkg/pkg-4".to_string(), "recv/pkg/pkg-3".to_string()]
+        );
+
+        assert_eq!(remove_legacy_collab_data(working, &store).await, 0, "once");
+        store.shutdown().await.unwrap();
+    }
+
     /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
     /// involved anywhere) for exercising the settings-backed sync caches
     /// directly. Mirrors the construction pattern in `api::masters` tests.
@@ -5859,7 +5799,7 @@ mod tests {
         let sync = Arc::new(SyncRuntime::default());
         let stranger: NodeId = [0x77; 32];
 
-        handle_peer_presence(&ctx, &sender, &sender, &sync, None, stranger).await;
+        handle_peer_presence(&ctx, &sender, &sync, None, stranger).await;
 
         assert!(
             sender.started_peers().await.is_empty(),
@@ -5890,7 +5830,7 @@ mod tests {
         let sender = Arc::new(SyncSenderRuntime::new());
         let sync = Arc::new(SyncRuntime::default());
 
-        handle_peer_presence(&ctx, &sender, &sender, &sync, None, peer).await;
+        handle_peer_presence(&ctx, &sender, &sync, None, peer).await;
 
         assert!(
             sender.started_peers().await.is_empty(),
@@ -7153,7 +7093,6 @@ mod tests {
             staging,
             incoming,
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&ep) as Arc<dyn SharingTransport>,
             Arc::new(crate::events::NullEmitter),
@@ -7220,7 +7159,6 @@ mod tests {
             staging,
             incoming,
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&ep) as Arc<dyn SharingTransport>,
             Arc::new(crate::events::NullEmitter),
@@ -8695,26 +8633,16 @@ mod tests {
         // builds a `'static` retry address-refresher from it, T8).
         let ctx = Arc::new(ctx);
         let sender = Arc::new(SyncSenderRuntime::new());
-        let collab_sender = Arc::new(SyncSenderRuntime::new());
         let sync = SyncRuntime::new();
         let dest = ResolvedDest {
             node: [7u8; 32],
             endpoint_addr: None,
         };
 
-        let result = enqueue_sync_selection(
-            &ctx,
-            &sender,
-            collab_sender,
-            &sync,
-            dest,
-            Vec::new(),
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let result =
+            enqueue_sync_selection(&ctx, &sender, &sync, dest, Vec::new(), None, None, None)
+                .await
+                .unwrap();
         assert_eq!(result.enqueued_count, 0);
         assert_eq!(result.eligible_count, 0);
         assert_eq!(result.total_count, 0);
@@ -8830,7 +8758,6 @@ mod tests {
         let display = "M42 — resend batch".to_string();
 
         let (sender, peer) = loopback_sender_for(&db_path).await;
-        let collab_sender = Arc::new(SyncSenderRuntime::new());
         let sync = SyncRuntime::new();
 
         // Enqueue WITH a name + file rows, then cancel → terminal Cancelled.
@@ -8858,7 +8785,7 @@ mod tests {
         assert!(old_wire.is_some(), "the first attempt persisted a wire id");
 
         // Resend → the SAME id back, NOT a new row.
-        let same_id = resend_transfer(&ctx, &sender, Arc::clone(&collab_sender), &sync, id, None)
+        let same_id = resend_transfer(&ctx, &sender, &sync, id, None)
             .await
             .unwrap();
         assert_eq!(
@@ -8958,7 +8885,6 @@ mod tests {
         let db_path = db(&ctx).unwrap().path().to_path_buf();
 
         let (sender, peer) = loopback_sender_for(&db_path).await;
-        let collab_sender = Arc::new(SyncSenderRuntime::new());
         let sync = SyncRuntime::new();
 
         // Enqueue but do NOT cancel — the row is non-terminal (Queued/Announced).
@@ -8968,7 +8894,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = resend_transfer(&ctx, &sender, collab_sender, &sync, id, None)
+        let err = resend_transfer(&ctx, &sender, &sync, id, None)
             .await
             .unwrap_err();
         assert!(
@@ -9019,7 +8945,6 @@ mod tests {
         let display = "M42 — declined batch".to_string();
 
         let (sender, peer) = loopback_sender_for(&db_path).await;
-        let collab_sender = Arc::new(SyncSenderRuntime::new());
         let sync = SyncRuntime::new();
 
         // Seed the declined row DIRECTLY under the loopback peer, then stamp the
@@ -9046,16 +8971,9 @@ mod tests {
             id
         };
         // Resend → a NEW transfer.
-        let new_id = resend_transfer(
-            &ctx,
-            &sender,
-            Arc::clone(&collab_sender),
-            &sync,
-            old_id,
-            None,
-        )
-        .await
-        .unwrap();
+        let new_id = resend_transfer(&ctx, &sender, &sync, old_id, None)
+            .await
+            .unwrap();
         assert_ne!(
             new_id, old_id,
             "a receiver-declined resend mints a NEW transfer"
@@ -9173,7 +9091,7 @@ mod tests {
         }
 
         // A SECOND Resend of the OLD id now errors honestly — its payload is gone.
-        let err = resend_transfer(&ctx, &sender, collab_sender, &sync, old_id, None)
+        let err = resend_transfer(&ctx, &sender, &sync, old_id, None)
             .await
             .unwrap_err();
         assert!(
@@ -9858,7 +9776,6 @@ mod tests {
             Arc::new(ctx),
             Arc::clone(&sync),
             Arc::new(SyncSenderRuntime::new()),
-            Arc::new(SyncSenderRuntime::new()),
             Arc::new(crate::events::NullEmitter),
         )
         .await
@@ -9896,7 +9813,6 @@ mod tests {
         let started = autostart_if_enabled(
             Arc::new(ctx),
             Arc::clone(&sync),
-            Arc::new(SyncSenderRuntime::new()),
             Arc::new(SyncSenderRuntime::new()),
             Arc::new(crate::events::NullEmitter),
         )
@@ -11422,7 +11338,6 @@ mod tests {
         let started = autostart_if_enabled(
             Arc::new(ctx),
             Arc::new(SyncRuntime::default()),
-            Arc::new(SyncSenderRuntime::new()),
             Arc::new(SyncSenderRuntime::new()),
             Arc::new(RecordingEmitter::default()) as Arc<dyn crate::events::ProgressEmitter>,
         )

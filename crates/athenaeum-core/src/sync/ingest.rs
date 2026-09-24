@@ -91,10 +91,9 @@ use super::models::{Direction, HistoryRow};
 
 /// How an ingest reaches the catalog connection (W2 T2.1).
 ///
-/// [`ingest_package`] (and [`ingest_project_package`](super::project_ingest::ingest_project_package))
-/// acquire the connection **per unit of work** — the prologue reads, then one
-/// acquisition per frame, then the epilogue — instead of borrowing it once for the
-/// whole package. Every other user of the store (a second transfer's fetch-sink
+/// [`ingest_package`] acquires the connection **per unit of work** — the
+/// prologue reads, then one acquisition per frame, then the epilogue — instead
+/// of borrowing it once for the whole package. Every other user of the store (a second transfer's fetch-sink
 /// state writes, its own ingest, the receiver's own bookkeeping) therefore waits at
 /// most ONE frame's hash + copy + transaction, not the minutes a multi-GB package
 /// takes. Per-frame atomicity is unchanged: the guard spans a whole frame, so the
@@ -1156,8 +1155,8 @@ fn format_of(rel_path: &str) -> FileFormat {
 }
 
 /// Return `base` if free, else `base` with a `_2`, `_3`, … suffix inserted before
-/// the extension, until an unused path is found. `pub(crate)` so the sibling
-/// [`project_ingest`](super::project_ingest) landing path reuses the exact
+/// the extension, until an unused path is found. `pub(crate)` so the collab
+/// replication landing (`api::collab_exchange`) reuses the exact
 /// collision-suffix logic.
 pub(crate) fn unique_path(base: &Path) -> PathBuf {
     if !base.exists() {

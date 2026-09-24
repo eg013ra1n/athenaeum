@@ -63,7 +63,6 @@ pub mod engine;
 pub mod ingest;
 pub mod models;
 pub mod pairing;
-pub mod project_ingest;
 pub mod receiver;
 pub mod refusal;
 pub mod responder;
@@ -91,15 +90,12 @@ pub use models::{
     Direction, HistoryQuery, HistoryRow, InboundFileRow, InboundFileState, InboundRow,
     InboundState, OutboundFileRow, OutboundFileState, OutboundRow, OutboundState, SyncEventRow,
 };
-pub use project_ingest::{ingest_project_package, ProjectIngestOutcome};
 pub use refusal::RefusalRefresher;
 pub use retention::{
     disk_usage_pct, evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy,
 };
 pub use receiver::{
-    allow_all_peers, InboundControl, IncomingResolver, PeerAuthorizer, ProjectAnnounceGate,
-    ProjectAnnouncementsRefresher, ProjectIngestedHook, ProjectReceiveHooks, ProjectRequestHandler,
-    QueuedAnnounce, QueuedAnnounceEntry, ReceiveGate, ReceiverHooks, SyncFinishedEvent,
+    allow_all_peers, InboundControl, IncomingResolver, PeerAuthorizer, QueuedAnnounce, QueuedAnnounceEntry, ReceiveGate, ReceiverHooks, SyncFinishedEvent,
     SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime,
     DEFAULT_MAX_CONCURRENT_RECEIVES,
 };

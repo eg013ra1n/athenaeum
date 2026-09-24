@@ -2476,81 +2476,25 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // ---- Stage II collaboration (slice 4): known packages + received contributions ----
-    // Every collaboration package I know about — mine, received, or merely seen in
-    // the hub list. Mirrors the hub-anchored decision state (`state`) alongside
-    // local-only progress (`local_status`, `local_dir`, `manifest_ndjson`). The
-    // retained `manifest_ndjson` bytes (mine + fully-received) let me re-serve a
-    // package byte-identically (Д2) without re-deriving the manifest.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS project_packages (
-            package_id      TEXT PRIMARY KEY,
-            project_id      TEXT NOT NULL,
-            announcement_id TEXT NOT NULL UNIQUE,
-            publisher_display TEXT NOT NULL,
-            own             INTEGER NOT NULL DEFAULT 0,
-            root_hash       TEXT NOT NULL,
-            byte_size       INTEGER NOT NULL,
-            frame_count     INTEGER NOT NULL,
-            manifest_xxh3   TEXT,
-            aggregate_stats TEXT NOT NULL DEFAULT '{}',
-            supersedes      TEXT NOT NULL DEFAULT '[]',
-            state           TEXT NOT NULL,
-            reject_reason   TEXT,
-            superseded      INTEGER NOT NULL DEFAULT 0,
-            origin          TEXT NOT NULL,
-            local_dir       TEXT,
-            manifest_ndjson BLOB,
-            local_status    TEXT NOT NULL DEFAULT 'none',
-            holder_count    INTEGER NOT NULL DEFAULT 0,
-            online_count    INTEGER NOT NULL DEFAULT 0,
-            created_at      TEXT NOT NULL,
-            decided_at      TEXT,
-            fetched_at      TEXT NOT NULL DEFAULT (datetime('now'))
-        )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_project_packages_project ON project_packages(project_id)",
-        [],
-    )?;
+    // ---- Collab v3 wave 2 (Task 12): the package layer is retired ----
+    // The package-era tables (`project_packages`, and `project_contributions`
+    // hanging off it) are gone: a project frame's path now lives only in
+    // `project_frames_local` (plan P26, spec amendment A1). Child first, so the
+    // drop never trips its foreign key.
+    conn.execute("DROP TABLE IF EXISTS project_contributions", [])?;
+    conn.execute("DROP TABLE IF EXISTS project_packages", [])?;
 
-    // Received frames (contributions) — these NEVER enter `files`/`frames`; they
-    // land under a managed per-project root and are tracked here only. Cascades
-    // away with its parent package.
+    // Files under the Collaboration root that match no project frame (P26
+    // "unknown" branch): listed inert for R18's "not part of the project"
+    // list, never catalogued. `project_id` is the file's `ATH_PRJ` stamp when
+    // it carries one; no foreign key — the stamp may name a project this
+    // device never cached.
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS project_contributions (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id      TEXT NOT NULL,
-            package_id      TEXT NOT NULL REFERENCES project_packages(package_id) ON DELETE CASCADE,
-            frame_uuid      TEXT NOT NULL,
-            publisher_display TEXT NOT NULL,
-            rel_path        TEXT NOT NULL,
-            landed_path     TEXT NOT NULL UNIQUE,
-            byte_size       INTEGER NOT NULL,
-            xxh3            TEXT NOT NULL,
-            frame_meta      TEXT NOT NULL DEFAULT '{}',
-            analysis        TEXT,
-            superseded      INTEGER NOT NULL DEFAULT 0,
-            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        "CREATE TABLE IF NOT EXISTS collab_foreign_files (
+            path       TEXT PRIMARY KEY,
+            project_id TEXT,
+            seen_at    TEXT NOT NULL DEFAULT (datetime('now'))
         )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_project_contributions_project ON project_contributions(project_id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_project_contributions_uuid ON project_contributions(frame_uuid)",
-        [],
-    )?;
-    // Wave 1 final review item 4: `find_contribution_by_project_and_hash`
-    // (`db/collab_exchange.rs`) runs once per manifest record per held
-    // package per `report_held_set` pass, filtering on exactly these two
-    // columns — with no supporting index it was a full scan of the table on
-    // every call.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_project_contributions_project_hash ON project_contributions(project_id, xxh3)",
         [],
     )?;
 
@@ -2596,7 +2540,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         // an index on (operation_id, operation_file_id), whose leftmost column
         // cannot serve this FK, and `IF NOT EXISTS` would silently do nothing.
         "CREATE INDEX IF NOT EXISTS idx_file_op_steps_op_file_id ON file_operation_steps(operation_file_id)",
-        "CREATE INDEX IF NOT EXISTS idx_project_contributions_package ON project_contributions(package_id)",
         "CREATE INDEX IF NOT EXISTS idx_project_link_intents_frames_set ON project_link_intents(frames_set_id)",
         "CREATE INDEX IF NOT EXISTS idx_project_links_frames_set ON project_links(frames_set_id)",
     ] {

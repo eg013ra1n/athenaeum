@@ -388,12 +388,7 @@ async fn inject_sender_engine(
     capture_db: &Path,
     peer: NodeId,
     ack_timeout: Duration,
-) -> (
-    Arc<SyncEngineHandle>,
-    Arc<SyncSenderRuntime>,
-    Arc<SyncSenderRuntime>,
-    SyncRuntime,
-) {
+) -> (Arc<SyncEngineHandle>, Arc<SyncSenderRuntime>, SyncRuntime) {
     let sender_ep = net.endpoint();
     let sender_node = sender_ep.node_id();
     let engine_store = Arc::new(CatalogSyncStore::open(capture_db).unwrap());
@@ -404,7 +399,6 @@ async fn inject_sender_engine(
         SyncConfig { ack_timeout },
     ));
     let sender = Arc::new(SyncSenderRuntime::new());
-    let collab_sender = Arc::new(SyncSenderRuntime::new());
     let sync = SyncRuntime::new();
     {
         let mut guard = sender.lock_inner().await;
@@ -417,7 +411,7 @@ async fn inject_sender_engine(
             },
         );
     }
-    (engine, sender, collab_sender, sync)
+    (engine, sender, sync)
 }
 
 /// Terminal states that crash-resume must not re-drive (mirrors
@@ -570,7 +564,6 @@ async fn two_instance_sync_e2e() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(), // no project announce gate in this test
         Arc::new(athenaeum_core::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -590,9 +583,6 @@ async fn two_instance_sync_e2e() {
         receiver_node,
     ));
     let sender = Arc::new(SyncSenderRuntime::new());
-    // T6 wake-hook plumbing: the collab sender map is threaded alongside the
-    // personal one; unused by this personal-sync e2e (no collab engines started).
-    let collab_sender = Arc::new(SyncSenderRuntime::new());
     // T7: `enqueue_sync_selection` threads a SyncRuntime (only touched when
     // `ensure_sender_engine` has to build an engine; here the engine is pre-injected
     // above, so the peers-refresh-timer install is short-circuited and `sync` is
@@ -643,7 +633,6 @@ async fn two_instance_sync_e2e() {
     let r1 = enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -752,7 +741,6 @@ async fn two_instance_sync_e2e() {
     let r2 = enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -945,7 +933,6 @@ async fn resend_transfers_only_new_frames() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(), // no project announce gate in this test
         Arc::new(athenaeum_core::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -966,9 +953,6 @@ async fn resend_transfers_only_new_frames() {
         Some(Arc::clone(&emitter) as Arc<dyn ProgressEmitter>),
     ));
     let sender = Arc::new(SyncSenderRuntime::new());
-    // T6 wake-hook plumbing: the collab sender map is threaded alongside the
-    // personal one; unused by this personal-sync e2e (no collab engines started).
-    let collab_sender = Arc::new(SyncSenderRuntime::new());
     // T7: `enqueue_sync_selection` threads a SyncRuntime (only touched when
     // `ensure_sender_engine` has to build an engine; here the engine is pre-injected
     // above, so the peers-refresh-timer install is short-circuited and `sync` is
@@ -1004,7 +988,6 @@ async fn resend_transfers_only_new_frames() {
     let r1 = enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -1049,7 +1032,6 @@ async fn resend_transfers_only_new_frames() {
     let r2 = enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -1099,7 +1081,6 @@ async fn resend_transfers_only_new_frames() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -1187,7 +1168,7 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
     let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
 
     // Short-ack-timeout sender engine (ms-scale rungs), injected as the host would.
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
 
     // Seed 6 fixture frames on the capture node.
@@ -1203,7 +1184,6 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
     let r1 = enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -1253,7 +1233,6 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -1376,7 +1355,6 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::clone(&control),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -1384,7 +1362,7 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     .await
     .expect("spawn primary receiver");
 
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
 
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
@@ -1397,7 +1375,6 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     let _r = enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -1493,16 +1470,9 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     // `last_error = "cancelled by receiver"`, so this diverts into
     // `resend_declined_as_new_transfer`: a NEW `sync_outbound` row (new dir basename
     // ⇒ new wire `batch_uuid`) rather than a reset of the SAME row.
-    let new_id = retry_sync_package(
-        &capture_ctx,
-        &sender,
-        Arc::clone(&collab_sender),
-        &sync,
-        old_id,
-        None,
-    )
-    .await
-    .expect("resend a receiver-declined package as a new transfer");
+    let new_id = retry_sync_package(&capture_ctx, &sender, &sync, old_id, None)
+        .await
+        .expect("resend a receiver-declined package as a new transfer");
     assert_ne!(
         new_id, old_id,
         "a receiver-declined resend mints a NEW transfer row"
@@ -1633,7 +1603,6 @@ async fn sender_cancel_then_resend_delivers() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -1641,7 +1610,7 @@ async fn sender_cancel_then_resend_delivers() {
     .await
     .expect("spawn primary receiver");
 
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
 
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
@@ -1654,7 +1623,6 @@ async fn sender_cancel_then_resend_delivers() {
     let _r = enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -1711,16 +1679,9 @@ async fn sender_cancel_then_resend_delivers() {
     // Disarm the fault and resend via the sanctioned command: the SAME row resets
     // and this time the transfer must DELIVER.
     receiver_ep.set_fault(FaultPlan::default());
-    let resend_id = retry_sync_package(
-        &capture_ctx,
-        &sender,
-        Arc::clone(&collab_sender),
-        &sync,
-        old_id,
-        None,
-    )
-    .await
-    .expect("resend a sender-cancelled package");
+    let resend_id = retry_sync_package(&capture_ctx, &sender, &sync, old_id, None)
+        .await
+        .expect("resend a sender-cancelled package");
     assert_eq!(resend_id, old_id, "resend-as-reset returns the SAME row");
 
     wait_until(|| outbound_state(cdb, old_id) == "confirmed", WAIT).await;
@@ -1813,7 +1774,6 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -1821,7 +1781,7 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
     .await
     .expect("spawn primary receiver");
 
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
 
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
@@ -1834,7 +1794,6 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -2036,7 +1995,6 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
         a_dir.clone(),
         incoming_a,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&recv_ep_a) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder_a) as Arc<dyn ProgressEmitter>,
@@ -2049,7 +2007,6 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
         b_dir.clone(),
         incoming_b,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&recv_ep_b) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder_b) as Arc<dyn ProgressEmitter>,
@@ -2060,9 +2017,9 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     // ── One send engine per instance, targeting the peer's receiver node. A long
     // ack_timeout keeps the paced fetch from triggering a premature retry — both
     // peers are already online, so delivery succeeds on the first attempt. ────────
-    let (engine_a, sender_a, collab_a, sync_a) =
+    let (engine_a, sender_a, sync_a) =
         inject_sender_engine(&net, &a_db, node_b_recv, Duration::from_secs(30)).await;
-    let (engine_b, sender_b, collab_b, sync_b) =
+    let (engine_b, sender_b, sync_b) =
         inject_sender_engine(&net, &b_db, node_a_recv, Duration::from_secs(30)).await;
 
     // Seed N frames on each instance (own files dir + catalog). A's frames carry
@@ -2080,7 +2037,6 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     let ra = enqueue_sync_selection(
         &ctx_a,
         &sender_a,
-        Arc::clone(&collab_a),
         &sync_a,
         ResolvedDest {
             node: node_b_recv,
@@ -2096,7 +2052,6 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     let rb = enqueue_sync_selection(
         &ctx_b,
         &sender_b,
-        Arc::clone(&collab_b),
         &sync_b,
         ResolvedDest {
             node: node_a_recv,
@@ -2441,7 +2396,6 @@ async fn manifest_visible_before_payload_then_structured_batch_lands() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -2453,7 +2407,7 @@ async fn manifest_visible_before_payload_then_structured_batch_lands() {
     // (each retry re-records the manifest, the re-armed abort keeps the payload from
     // landing). Retries stay far slower than the 25ms poll re-arm, so no fetch can
     // ever slip through disarmed under CI load — the manifest hold is deterministic.
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(300)).await;
 
     // Nested source-relative layout: a common ancestor of `<capture_files>/proj`
@@ -2480,7 +2434,6 @@ async fn manifest_visible_before_payload_then_structured_batch_lands() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -2651,7 +2604,6 @@ async fn restart_resumes_per_file_picture_then_confirms() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -2661,7 +2613,7 @@ async fn restart_resumes_per_file_picture_then_confirms() {
 
     // Long ack timeout: the first engine must NOT time out while the ack is held —
     // it should rest in Delivered until we kill it.
-    let (engine_a, sender, collab_sender, sync) =
+    let (engine_a, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
 
     let mut frame_ids = Vec::with_capacity(N);
@@ -2671,7 +2623,6 @@ async fn restart_resumes_per_file_picture_then_confirms() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -2842,7 +2793,6 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -2851,7 +2801,7 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
     .expect("spawn primary receiver");
 
     // The pre-crash engine (long ack timeout so it rests in Delivered, not retry).
-    let (engine_a, sender, collab_sender, sync) =
+    let (engine_a, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
 
     let mut frame_ids = Vec::with_capacity(N);
@@ -2861,7 +2811,6 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -3004,7 +2953,6 @@ async fn cancel_succeeds_on_resurrected_sender_row() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -3012,7 +2960,7 @@ async fn cancel_succeeds_on_resurrected_sender_row() {
     .await
     .expect("spawn primary receiver");
 
-    let (engine_a, sender, collab_sender, sync) =
+    let (engine_a, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(60)).await;
 
     let mut frame_ids = Vec::with_capacity(N);
@@ -3022,7 +2970,6 @@ async fn cancel_succeeds_on_resurrected_sender_row() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -3118,7 +3065,6 @@ async fn receiver_cancel_records_v2_history_files_and_both_journals() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::clone(&control),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -3126,7 +3072,7 @@ async fn receiver_cancel_records_v2_history_files_and_both_journals() {
     .await
     .expect("spawn primary receiver");
 
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
 
     let mut frame_ids = Vec::with_capacity(N);
@@ -3136,7 +3082,6 @@ async fn receiver_cancel_records_v2_history_files_and_both_journals() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -3277,7 +3222,6 @@ async fn ack_timeout_waiting_then_recovery_clears_error_at_serving_stage() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -3285,7 +3229,7 @@ async fn ack_timeout_waiting_then_recovery_clears_error_at_serving_stage() {
     .await
     .expect("spawn primary receiver");
 
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(600)).await;
 
     let mut frame_ids = Vec::with_capacity(N);
@@ -3295,7 +3239,6 @@ async fn ack_timeout_waiting_then_recovery_clears_error_at_serving_stage() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -3434,7 +3377,6 @@ async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -3442,7 +3384,7 @@ async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
     .await
     .expect("spawn primary receiver");
 
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
 
     // Two lights (camera "C") + a Dark master they consume — the object-send WBPP
@@ -3501,7 +3443,6 @@ async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -3718,12 +3659,7 @@ async fn inject_sender_engine_with_emitter(
     peer: NodeId,
     ack_timeout: Duration,
     emitter: Arc<dyn ProgressEmitter>,
-) -> (
-    Arc<SyncEngineHandle>,
-    Arc<SyncSenderRuntime>,
-    Arc<SyncSenderRuntime>,
-    SyncRuntime,
-) {
+) -> (Arc<SyncEngineHandle>, Arc<SyncSenderRuntime>, SyncRuntime) {
     let sender_ep = net.endpoint();
     let sender_node = sender_ep.node_id();
     let engine_store = Arc::new(CatalogSyncStore::open(capture_db).unwrap());
@@ -3735,7 +3671,6 @@ async fn inject_sender_engine_with_emitter(
         Some(emitter),
     ));
     let sender = Arc::new(SyncSenderRuntime::new());
-    let collab_sender = Arc::new(SyncSenderRuntime::new());
     let sync = SyncRuntime::new();
     {
         let mut guard = sender.lock_inner().await;
@@ -3748,7 +3683,7 @@ async fn inject_sender_engine_with_emitter(
             },
         );
     }
-    (engine, sender, collab_sender, sync)
+    (engine, sender, sync)
 }
 
 /// B8 scenario 1 — **sender cancel stops the receiver promptly (two-engine)**. The
@@ -3807,7 +3742,6 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -3817,7 +3751,7 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
 
     // Long ack timeout so the sender rests in Transferring (awaiting the never-coming
     // ack) rather than re-announcing during the paced fetch.
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
 
     let mut frame_ids = Vec::with_capacity(N);
@@ -3827,7 +3761,6 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -4003,7 +3936,6 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -4015,7 +3947,7 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
     // sender rests in Transferring and does NOT re-announce on its own — so the
     // receiver row is reset EXACTLY once (by the resend) → generation 2, deterministic.
     let emitter = Arc::new(RecordingEmitter::default());
-    let (engine, sender, collab_sender, sync) = inject_sender_engine_with_emitter(
+    let (engine, sender, sync) = inject_sender_engine_with_emitter(
         &net,
         &capture_db,
         receiver_node,
@@ -4036,7 +3968,6 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -4070,7 +4001,6 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -4144,16 +4074,9 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
 
     // ── Resend: rotates the wire id (generation 2) and re-drives; the one-shot abort
     // already fired, so this fetch delivers. ──
-    let resend_id = retry_sync_package(
-        &capture_ctx,
-        &sender,
-        Arc::clone(&collab_sender),
-        &sync,
-        out_id,
-        None,
-    )
-    .await
-    .expect("resend the failed transfer");
+    let resend_id = retry_sync_package(&capture_ctx, &sender, &sync, out_id, None)
+        .await
+        .expect("resend the failed transfer");
     assert_eq!(
         resend_id, out_id,
         "resend-as-reset returns the SAME outbound row"
@@ -4372,7 +4295,6 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -4382,7 +4304,7 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
 
     // ── Session 1: want-all announce → Transferring; held fetch keeps the receiver
     // row non-terminal. Long ack timeout so the sender rests (doesn't re-announce). ──
-    let (engine1, sender, collab_sender, sync) =
+    let (engine1, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
     let mut frame_ids = Vec::with_capacity(N);
     for idx in 0..N {
@@ -4391,7 +4313,6 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -4536,7 +4457,7 @@ async fn restart_mid_resend_resumes_same_row_and_confirms() {
     let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
 
     // Short ack timeout → ms-scale retries against the offline peer.
-    let (engine1, sender, collab_sender, sync) =
+    let (engine1, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
 
     let mut frame_ids = Vec::with_capacity(N);
@@ -4546,7 +4467,6 @@ async fn restart_mid_resend_resumes_same_row_and_confirms() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -4580,16 +4500,9 @@ async fn restart_mid_resend_resumes_same_row_and_confirms() {
     wait_until(|| outbound_state(cdb, id) == "cancelled", WAIT).await;
 
     // Resend → the SAME row, generation 2, re-driving (still offline).
-    let resend_id = retry_sync_package(
-        &capture_ctx,
-        &sender,
-        Arc::clone(&collab_sender),
-        &sync,
-        id,
-        None,
-    )
-    .await
-    .expect("resend the cancelled package");
+    let resend_id = retry_sync_package(&capture_ctx, &sender, &sync, id, None)
+        .await
+        .expect("resend the cancelled package");
     assert_eq!(resend_id, id, "resend-as-reset returns the SAME row");
     wait_until(
         || outbound_generation(cdb, id) == 2 && !is_terminal_state(&outbound_state(cdb, id)),
@@ -4618,7 +4531,6 @@ async fn restart_mid_resend_resumes_same_row_and_confirms() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -4712,7 +4624,6 @@ async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -4720,7 +4631,7 @@ async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
     .await
     .expect("spawn primary receiver");
 
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
 
     // 5 distinct frames: batch 1 = {0,1,2}, batch 2 = {3,4}. No dedup (distinct uuids).
@@ -4733,7 +4644,6 @@ async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -4756,7 +4666,6 @@ async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -4992,7 +4901,6 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::clone(&control),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
@@ -5000,7 +4908,7 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
     .await
     .expect("spawn primary receiver");
 
-    let (engine, sender, collab_sender, sync) =
+    let (engine, sender, sync) =
         inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
 
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
@@ -5012,7 +4920,6 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
     let _r = enqueue_sync_selection(
         &capture_ctx,
         &sender,
-        Arc::clone(&collab_sender),
         &sync,
         ResolvedDest {
             node: receiver_node,
@@ -5273,7 +5180,6 @@ async fn two_senders_one_receiver_fetch_windows_overlap() {
         recv_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::clone(&control),
         Arc::clone(&recv_ep) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -5284,9 +5190,9 @@ async fn two_senders_one_receiver_fetch_windows_overlap() {
     // Two independent senders, each its own engine on its own loopback endpoint (⇒
     // its own node id ⇒ its own receive lane). Long ack timeout: both peers are
     // online, the paced fetch must not trip a premature re-announce.
-    let (engine1, sender1, collab1, sync1) =
+    let (engine1, sender1, sync1) =
         inject_sender_engine(&net, &s1_db, recv_node, Duration::from_secs(30)).await;
-    let (engine2, sender2, collab2, sync2) =
+    let (engine2, sender2, sync2) =
         inject_sender_engine(&net, &s2_db, recv_node, Duration::from_secs(30)).await;
 
     // Disjoint index ranges ⇒ distinct uuids (per-catalog trigger), distinct
@@ -5307,7 +5213,6 @@ async fn two_senders_one_receiver_fetch_windows_overlap() {
     let r1 = enqueue_sync_selection(
         &ctx_s1,
         &sender1,
-        Arc::clone(&collab1),
         &sync1,
         ResolvedDest {
             node: recv_node,
@@ -5323,7 +5228,6 @@ async fn two_senders_one_receiver_fetch_windows_overlap() {
     let r2 = enqueue_sync_selection(
         &ctx_s2,
         &sender2,
-        Arc::clone(&collab2),
         &sync2,
         ResolvedDest {
             node: recv_node,
@@ -5559,7 +5463,6 @@ async fn revoke_processes_promptly_while_other_peer_transfer_runs() {
         recv_dir.clone(),
         incoming,
         allow_all_peers(),
-        Default::default(),
         Arc::new(InboundControl::new()),
         Arc::clone(&recv_ep) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -5567,9 +5470,9 @@ async fn revoke_processes_promptly_while_other_peer_transfer_runs() {
     .await
     .expect("spawn the receiver");
 
-    let (engine_a, sender_a, collab_a, sync_a) =
+    let (engine_a, sender_a, sync_a) =
         inject_sender_engine(&net, &a_db, recv_node, Duration::from_secs(30)).await;
-    let (engine_b, sender_b, collab_b, sync_b) =
+    let (engine_b, sender_b, sync_b) =
         inject_sender_engine(&net, &b_db, recv_node, Duration::from_secs(30)).await;
 
     // Disjoint index ranges ⇒ distinct content, so B's payload is never dedup'd
@@ -5587,7 +5490,6 @@ async fn revoke_processes_promptly_while_other_peer_transfer_runs() {
     enqueue_sync_selection(
         &ctx_a,
         &sender_a,
-        Arc::clone(&collab_a),
         &sync_a,
         ResolvedDest {
             node: recv_node,
@@ -5625,7 +5527,6 @@ async fn revoke_processes_promptly_while_other_peer_transfer_runs() {
     enqueue_sync_selection(
         &ctx_b,
         &sender_b,
-        Arc::clone(&collab_b),
         &sync_b,
         ResolvedDest {
             node: recv_node,

@@ -37,7 +37,6 @@ pub async fn get_sync_pairing_ticket(
         Arc::clone(&state.ctx),
         Arc::clone(&state.sync),
         Arc::clone(&state.sync_sender),
-        Arc::clone(&state.collab_sender),
         emitter,
     )
     .await
@@ -174,7 +173,6 @@ pub async fn enqueue_sync_selection(
     api::enqueue_sync_selection(
         &state.ctx,
         &state.sync_sender,
-        Arc::clone(&state.collab_sender),
         &state.sync,
         dest,
         args.frame_ids,
@@ -235,7 +233,6 @@ pub async fn enqueue_frame_set_send(
     api::enqueue_frame_set_send(
         &state.ctx,
         &state.sync_sender,
-        Arc::clone(&state.collab_sender),
         &state.sync,
         dest,
         args.frame_set_id,
@@ -273,7 +270,6 @@ pub async fn retry_sync_package(
     api::retry_sync_package(
         &state.ctx,
         &state.sync_sender,
-        Arc::clone(&state.collab_sender),
         &state.sync,
         args.id,
         Some(emitter),

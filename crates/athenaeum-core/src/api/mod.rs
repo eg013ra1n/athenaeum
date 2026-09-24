@@ -31,9 +31,10 @@ pub mod frame_set_send;
 pub mod content_index;
 // Account commands (Stage II, task B4). Ungated: db/settings/account only.
 pub mod account;
-// Stage-II collaboration package exchange — holder-side request-to-serve (slice 4,
-// task 6): serve-dir reconstruction + authorize + enqueue. UNGATED (no render
-// gate) — uses only db/sync/sharing/collab, so it compiles headless.
+// The collab v3 per-frame exchange (wave 2): version poll + manifest delta,
+// the replication pass, the auto-sync worker, loss/policy commands and the
+// project WBPP export. UNGATED at module level (items that need the render
+// pipeline are gated individually) — it compiles headless.
 pub mod collab_exchange;
 // These handler modules drive the render-only image pipeline (analysis,
 // master integration, light calibration) and are gated with it.
@@ -94,14 +95,6 @@ pub mod stacking;
 // already inside the same feature combo here.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod settings;
-
-// The slice-5 capstone (`collab_e2e_tests`, publish → package-era moderation →
-// swarm delivery → project WBPP export) drove the OLD package/announcement
-// moderation queue this file's `list_moderation_queue`/`decide_announcement`
-// have been replaced by wave 2 Task 11's per-frame `approve_collab_frame`/
-// `reject_collab_frame` — its premise no longer compiles against this api and
-// the plan already scheduled its removal in Task 12, so it is deleted here
-// instead of left broken. A per-frame capstone E2E is Task 12/13's to write.
 
 // Task 9: the C1 relay-eviction regression canary — one `#[ignore]`d test binding
 // two endpoints with the SAME device secret against a real relay (from

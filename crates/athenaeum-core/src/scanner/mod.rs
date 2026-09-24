@@ -191,6 +191,31 @@ pub fn scan_directory(
         });
     }
 
+    // P26: the Collaboration root is reconciled against the project-frame
+    // table, never catalogued — checked before any per-file work.
+    match is_collaboration_root(conn, root_id) {
+        Ok(true) => {
+            let total = files.len();
+            reconcile_collaboration_root(conn, &files, root_id, &mut result, |idx, path| {
+                if let Some(ref cb) = progress_callback {
+                    cb(ScanProgress {
+                        current: idx + 1,
+                        total,
+                        current_file: Some(path.to_string_lossy().to_string()),
+                    });
+                }
+                true
+            });
+            return result;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(root_id, error = %e, "read scan root kind failed; scan aborted");
+            result.errors.push(format!("Failed to read the scan root kind: {e}"));
+            return result;
+        }
+    }
+
     // Process files
     let errors = Arc::new(Mutex::new(Vec::new()));
     let processed = Arc::new(Mutex::new(0usize));
@@ -441,12 +466,12 @@ fn process_file(
     if let Some(ref header) = header_text {
         let keys = parse_stored_header_keys(format.clone(), header);
         if let Some(identity) = calibrated_light_identity(&keys) {
-            // A received project contribution (slice 4) carries an ATH_PRJ stamp
-            // ON TOP of the calibrated-light cards — route it to the sibling
-            // project-contribution reconcile instead. Checked FIRST: the file
-            // also satisfies `calibrated_light_identity`.
-            if identity.project_id.is_some() {
-                reconcile_project_contribution(conn, path, &current_path, &identity, root_id)?;
+            // Outside the Collaboration root, a file stamped ATH_PRJ (on top of
+            // the calibrated-light cards) is still diverted to the project-frame
+            // reconcile (P26, defence in depth). Checked FIRST: the file also
+            // satisfies `calibrated_light_identity`.
+            if let Some(project_id) = identity.project_id.as_deref() {
+                reconcile_project_file(conn, path, &current_path, Some(project_id), root_id)?;
                 return Ok(None);
             }
             tracing::debug!(
@@ -620,108 +645,193 @@ fn process_file(
     Ok(imagetyp.map(|it| (frame_id, it)))
 }
 
-/// Reconcile a received project-contribution artifact (Stage-II collaboration,
-/// slice 4, spec §7) against the `project_contributions` tracking table. Runs
-/// INSTEAD of the plain calibrated-artifact skip when the file carries an
-/// `ATH_PRJ` project stamp (a published contribution is a calibrated light, so
-/// it also carries `ATH_CSRC` — the project card is checked first). Like every
-/// calibrated artifact it stays out of the catalog: it NEVER registers a
-/// `files`/`frames` row on any branch. Four branches, keyed on the
-/// contribution table:
+/// Reconcile one file against `project_frames_local` — the ONE source of a
+/// project frame's path (collab v3 wave 2, plan P26, spec amendment A1, spec
+/// §5.6). Called for EVERY file under the Collaboration root (both walkers
+/// check the root kind first, whatever the header carries: a replica of an
+/// externally calibrated original has no stamp at all), and outside the root
+/// for a file stamped `ATH_PRJ` (defence in depth). No branch ever creates a
+/// `files`/`frames` row. Four branches:
 ///
-/// 1. **Known** — a row's `landed_path` equals the scanned path → no-op.
-/// 2. **Moved** — a row matches `(project_id, xxh3-of-file)` and its
-///    `landed_path` no longer exists on disk → repair `landed_path`, `info!`.
-/// 3. **Duplicate** — a row matches `(project_id, xxh3)` and its `landed_path`
-///    ALSO still exists → `warn!`, row untouched (a second copy of the bytes).
-/// 4. **Unknown** — no row matches → `warn!` and defer. NEVER auto-insert: a
-///    contribution row requires hub-anchored package context we don't have at
-///    scan time (re-download via the project page). Idempotent on re-scan.
-fn reconcile_project_contribution(
+/// 1. **Known** — a row's `landed_path` is this path → no-op.
+/// 2. **Moved** — a row matches `(project, xxh3-of-file)` and its recorded
+///    path no longer exists → repair `landed_path`, `info!`.
+/// 3. **Duplicate** — a row matches `(project, xxh3)` and its recorded path
+///    still exists → a second copy, `warn!`, row untouched.
+/// 4. **Unknown** — nothing matches → `warn!` and list the file inert in
+///    `collab_foreign_files` (R18). A frame row is never invented here: only
+///    publish (own) and replication (replica) create them.
+///
+/// `stamp` is the header's `ATH_PRJ` when the caller already parsed it;
+/// `None` reads it lazily, and only for a file the path lookup did not know.
+/// The `(project, xxh3)` lookup is scoped to the stamp's project when there
+/// is one, else it walks every cached project. Idempotent on re-scan.
+fn reconcile_project_file(
     conn: &Connection,
     path: &Path,
     current_path: &str,
-    identity: &CalibratedIdentity,
+    stamp: Option<&str>,
     root_id: i64,
 ) -> anyhow::Result<()> {
-    use crate::db::collab_exchange::{
-        find_contribution_by_landed_path, find_contribution_by_project_and_hash,
-        update_contribution_landed_path,
-    };
+    use crate::db::collab_frames as frames_db;
 
-    // Guaranteed Some by the caller's `identity.project_id.is_some()` route, but
-    // stay defensive: an empty id can't scope a lookup, so leave the file be.
-    let Some(project_id) = identity.project_id.as_deref() else {
-        return Ok(());
-    };
-
-    // Branch 1 (known): a row already tracks this exact path. Cheaper than the
-    // content hash and must run first — a hash lookup would also match the
-    // known file and mis-classify it as a duplicate.
-    if find_contribution_by_landed_path(conn, current_path)?.is_some() {
+    // Branch 1 (known): cheaper than the content hash and must run first — a
+    // hash lookup would also match the known file and call it a duplicate.
+    if let Some(row) = frames_db::find_by_landed_path(conn, current_path)? {
+        frames_db::forget_foreign_file(conn, current_path)?;
         tracing::debug!(
             root_id,
             path = %current_path,
-            project_id,
-            "known project contribution — skipping ingestion"
+            project_id = %row.project_id,
+            frame_uuid = %row.frame_uuid,
+            "known project frame"
         );
         return Ok(());
     }
 
-    // Full-content hash (the manifest-anchored key — NOT the sampling hash).
-    // A read failure means we can't classify moved-vs-duplicate-vs-unknown, so
-    // defer rather than risk a wrong branch; the file still never enters the
-    // catalog. Idempotent once the read succeeds on a later scan.
+    // Full-content hash (the manifest's key — NOT the sampling hash). A read
+    // failure cannot tell moved from duplicate from unknown, so the file is
+    // left for a later scan rather than risk a wrong branch.
     let xxh3 = match crate::package::xxh3_full_file(path) {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(
                 root_id,
                 path = %current_path,
-                project_id,
                 error = %e,
-                "project contribution hash failed — leaving untouched"
+                "hash of a file in a project folder failed; left untouched"
             );
             return Ok(());
         }
     };
 
-    match find_contribution_by_project_and_hash(conn, project_id, &xxh3)? {
-        Some(row) => {
-            if !Path::new(&row.landed_path).exists() {
-                // Branch 2 (moved): the tracked copy is gone from its old
-                // location and this is it under a new path — repair the pointer.
-                update_contribution_landed_path(conn, row.id, current_path)?;
-                tracing::info!(
-                    root_id,
-                    old_path = %row.landed_path,
-                    path = %current_path,
-                    project_id,
-                    "project contribution moved — landed_path repaired"
-                );
-            } else {
-                // Branch 3 (duplicate): the tracked copy still exists elsewhere,
-                // so this is a second copy. Leave the tracking row untouched.
-                tracing::warn!(
-                    root_id,
-                    kept = %row.landed_path,
-                    duplicate = %current_path,
-                    project_id,
-                    "duplicate project contribution copy"
-                );
-            }
-        }
-        None => {
-            // Branch 4 (unknown): no tracking row. NEVER auto-insert — a
-            // contribution row needs hub package context we don't have here.
-            tracing::warn!(
-                path = %current_path,
-                project_id,
-                "project contribution without a tracking row — leaving untouched (re-download via the project page)"
-            );
+    let stamp = match stamp {
+        Some(p) => Some(p.to_string()),
+        None => read_project_stamp(path),
+    };
+    let projects = match &stamp {
+        Some(p) => vec![p.clone()],
+        None => frames_db::project_ids(conn)?,
+    };
+    let mut candidates = Vec::new();
+    for project_id in &projects {
+        candidates.extend(frames_db::find_by_project_and_xxh3(conn, project_id, &xxh3)?);
+    }
+
+    // Branch 2 (moved): the recorded copy is gone and this is it, elsewhere.
+    if let Some(row) = candidates
+        .iter()
+        .find(|r| r.landed_path.as_deref().is_some_and(|p| !Path::new(p).exists()))
+    {
+        frames_db::update_landed_path(conn, &row.project_id, &row.frame_uuid, current_path)?;
+        frames_db::forget_foreign_file(conn, current_path)?;
+        tracing::info!(
+            root_id,
+            src = row.landed_path.as_deref().unwrap_or_default(),
+            path = %current_path,
+            project_id = %row.project_id,
+            frame_uuid = %row.frame_uuid,
+            "project frame moved; path repaired"
+        );
+        return Ok(());
+    }
+
+    // Branch 3 (duplicate): the recorded copy still exists elsewhere.
+    if let Some(row) = candidates.iter().find(|r| r.landed_path.is_some()) {
+        frames_db::forget_foreign_file(conn, current_path)?;
+        tracing::warn!(
+            root_id,
+            src = row.landed_path.as_deref().unwrap_or_default(),
+            path = %current_path,
+            project_id = %row.project_id,
+            frame_uuid = %row.frame_uuid,
+            "duplicate copy of a project frame"
+        );
+        return Ok(());
+    }
+
+    // Branch 4 (unknown): inert, listed for R18.
+    tracing::warn!(
+        root_id,
+        path = %current_path,
+        project_id = stamp.as_deref().unwrap_or_default(),
+        "file is not part of any project; listed as foreign"
+    );
+    frames_db::record_foreign_file(conn, current_path, stamp.as_deref())?;
+    Ok(())
+}
+
+/// The `ATH_PRJ` card of a file's header, if it has one. Best-effort: the
+/// Collaboration root may hold anything, so an unreadable header is simply
+/// "no stamp" (debug-logged), never a scan error.
+fn read_project_stamp(path: &Path) -> Option<String> {
+    let xisf = path
+        .extension()
+        .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("xisf"));
+    let (format, header) = if xisf {
+        (FileFormat::XISF, extract_xisf_header(path))
+    } else {
+        (FileFormat::FITS, crate::fits_parser::extract_fits_header(path))
+    };
+    match header {
+        Ok(h) => parse_stored_header_keys(format, &h)
+            .get("ATH_PRJ")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "no readable header; no project stamp");
+            None
         }
     }
-    Ok(())
+}
+
+/// Is `root_id` THE Collaboration root (plan P26)? Its files are reconciled
+/// against `project_frames_local`, never catalogued.
+fn is_collaboration_root(conn: &Connection, root_id: i64) -> anyhow::Result<bool> {
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT kind FROM scan_roots WHERE id = ?1",
+            [root_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(kind.as_deref() == Some("collaboration"))
+}
+
+/// Reconcile every discovered file of the Collaboration root (P26) — the
+/// whole scan of that root. `progress(index)` is called before each file;
+/// returning `false` cancels the rest.
+fn reconcile_collaboration_root(
+    conn: &Connection,
+    files: &[PathBuf],
+    root_id: i64,
+    result: &mut ScanResult,
+    mut progress: impl FnMut(usize, &Path) -> bool,
+) {
+    tracing::info!(root_id, count = files.len(), "reconciling the collaboration folder");
+    for (idx, path) in files.iter().enumerate() {
+        if !progress(idx, path) {
+            result.cancelled = true;
+            break;
+        }
+        let outcome = path_to_utf8(path)
+            .and_then(|current| reconcile_project_file(conn, path, &current, None, root_id));
+        match outcome {
+            Ok(()) => result.files_processed += 1,
+            Err(e) => {
+                tracing::error!(
+                    root_id,
+                    path = %path.display(),
+                    error = %e,
+                    "project frame reconcile failed"
+                );
+                result
+                    .errors
+                    .push(format!("{}: project frame reconcile failed: {}", path.display(), e));
+            }
+        }
+    }
 }
 
 /// Re-parse a file whose on-disk metadata has drifted from the catalog and
@@ -1332,6 +1442,36 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         return result;
     }
 
+    // P26: the Collaboration root is reconciled against the project-frame
+    // table, never catalogued — checked before the parse/insert phases.
+    match is_collaboration_root(conn, root_id) {
+        Ok(true) => {
+            let total = files.len();
+            reconcile_collaboration_root(conn, &files, root_id, &mut result, |idx, path| {
+                if idx % 50 == 0 {
+                    emit_progress(
+                        emitter,
+                        root_id,
+                        idx + 1,
+                        total,
+                        path.file_name().map(|n| n.to_string_lossy().to_string()),
+                        "processing",
+                    );
+                }
+                !(idx % 10 == 0 && cancel_flag.load(Ordering::SeqCst))
+            });
+            emit_scan_complete(emitter, root_id, &result);
+            return result;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(root_id, error = %e, "read scan root kind failed; scan aborted");
+            result.errors.push(format!("Failed to read the scan root kind: {e}"));
+            emit_scan_complete(emitter, root_id, &result);
+            return result;
+        }
+    }
+
     if files.is_empty() {
         // Emit progress showing discovery complete with 0 files
         emit_progress(emitter, root_id, 0, 0, None, "processing");
@@ -1596,27 +1736,27 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         // decision runs here, inside the batch transaction, BEFORE any
         // move/insert logic.
         if let Some(ref identity) = file_result.calibrated_identity {
-            // A received project contribution (slice 4) carries an ATH_PRJ stamp
-            // on top of the calibrated-light cards — divert to the sibling
-            // project-contribution reconcile. Checked FIRST (it also satisfies
-            // `calibrated_light_identity`); like a calibrated light it never
-            // registers a `files`/`frames` row.
-            if identity.project_id.is_some() {
-                if let Err(e) = reconcile_project_contribution(
+            // Outside the Collaboration root, a file stamped ATH_PRJ on top of
+            // the calibrated-light cards is diverted to the project-frame
+            // reconcile (P26, defence in depth). Checked FIRST (it also
+            // satisfies `calibrated_light_identity`); like a calibrated light
+            // it never registers a `files`/`frames` row.
+            if let Some(project_id) = identity.project_id.as_deref() {
+                if let Err(e) = reconcile_project_file(
                     conn,
                     Path::new(&file_result.file.path),
                     &file_result.file.path,
-                    identity,
+                    Some(project_id),
                     root_id,
                 ) {
                     tracing::error!(
                         root_id,
                         path = %file_result.file.path,
                         error = %e,
-                        "project-contribution reconcile failed"
+                        "project frame reconcile failed"
                     );
                     result.errors.push(format!(
-                        "{}: project-contribution reconcile failed: {}",
+                        "{}: project frame reconcile failed: {}",
                         file_result.file.path, e
                     ));
                 }
@@ -3240,20 +3380,18 @@ mod calibrated_light_scan_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Project-contribution reconcile (slice 4, spec §7): a stamped received
-    // contribution carries ATH_PRJ on top of the calibrated-light cards, so the
-    // scanner diverts it to `reconcile_project_contribution` (sibling of the
-    // light-cal reconcile) — it NEVER enters `files`/`frames` on any branch.
+    // Project frames (collab v3 wave 2, P26 / spec amendment A1): the path of a
+    // project frame lives only in `project_frames_local`. EVERY file under the
+    // Collaboration root is reconciled against that table — whatever its
+    // header carries — and outside the root a file stamped `ATH_PRJ` is
+    // diverted to the same reconcile. No branch creates `files`/`frames` rows.
     // -----------------------------------------------------------------------
 
-    use crate::db::collab_exchange::{
-        find_contribution_by_landed_path, insert_contribution, upsert_package, ContributionRow,
-        PackageRow,
-    };
+    use crate::db::collab_frames::{self as frames_db, FrameOrigin, LocalFrameRow};
 
-    /// Write a project-contribution FITS: the SAME calibrated-light cards
-    /// production stamps, PLUS the `ATH_PRJ` project card publish appends. The
-    /// file therefore carries CALSTAT + ATH_CSRC + ATH_PRJ.
+    /// Write a project-frame FITS: the SAME calibrated-light cards production
+    /// stamps, PLUS an `ATH_PRJ` project card. The file therefore carries
+    /// CALSTAT + ATH_CSRC + ATH_PRJ.
     fn write_project_contribution(path: &Path, source_uuid: &str, filename: &str, project_id: &str) {
         let inputs = LightCalCardInputs {
             source_uuid: source_uuid.to_string(),
@@ -3276,182 +3414,263 @@ mod calibrated_light_scan_tests {
         write_fits_f32(path, 4, 4, 1, &data, &cards).unwrap();
     }
 
-    /// Minimal parent package row (the contribution FK target).
-    fn seed_package(conn: &Connection, package_id: &str, project_id: &str) {
-        let row = PackageRow {
-            package_id: package_id.to_string(),
-            project_id: project_id.to_string(),
-            announcement_id: format!("ann-{package_id}"),
-            publisher_display: "Alice".into(),
-            own: false,
-            root_hash: "rh".into(),
-            byte_size: 0,
-            frame_count: 0,
-            manifest_xxh3: None,
-            aggregate_stats: "{}".into(),
-            supersedes: "[]".into(),
-            state: "published".into(),
-            reject_reason: None,
-            superseded: false,
-            origin: "received".into(),
-            local_dir: None,
-            manifest_ndjson: None,
-            local_status: "complete".into(),
-            holder_count: 0,
-            online_count: 0,
-            created_at: "2026-07-14 00:00:00".into(),
-            decided_at: None,
-            fetched_at: String::new(),
-        };
-        upsert_package(conn, &row).unwrap();
+    /// A plain LIGHT with no Athenaeum stamp at all — what a replica of an
+    /// externally calibrated original looks like (A1). `seed` varies the
+    /// pixels, so two seeds never share a content hash.
+    fn write_plain_light(path: &Path, seed: u8) {
+        let cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Light".into())).unwrap(),
+            Card::new("OBJECT", CardValue::Str("M31".into())).unwrap(),
+        ];
+        let data = vec![f32::from(seed); 4 * 4];
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_fits_f32(path, 4, 4, 1, &data, &cards).unwrap();
     }
 
-    /// Seed a contribution tracking row (parent package auto-seeded) with a
-    /// specific `landed_path` and full-content `xxh3`.
-    fn seed_contribution(
+    /// A DB whose root `root_id` is THE Collaboration root, plus a cached
+    /// project `p1`.
+    fn collab_db(root: &Path, root_id: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path, kind) VALUES (?1, ?2, 'collaboration')",
+            params![root_id, root.to_str().unwrap()],
+        )
+        .unwrap();
+        seed_project(&conn, "p1");
+        conn
+    }
+
+    fn seed_project(conn: &Connection, project_id: &str) {
+        conn.execute(
+            "INSERT INTO collab_projects
+                (project_id, slug, title, data_role, target_name, target_ra_deg, target_dec_deg,
+                 target_radius_deg, membership_version, snapshot_payload_b64,
+                 snapshot_signature_b64, members_json)
+             VALUES (?1, ?1, 'M31', 'send_receive', 'M31', 10.7, 41.3, 1.5, 1, 'x', 'x', '[]')",
+            params![project_id],
+        )
+        .unwrap();
+    }
+
+    /// Record a landed frame row for `path` (content hash taken from the file
+    /// when it exists, else `xxh3`).
+    fn seed_frame(
         conn: &Connection,
         project_id: &str,
-        package_id: &str,
-        landed_path: &str,
+        uuid: &str,
+        origin: FrameOrigin,
+        landed: &Path,
         xxh3: &str,
     ) {
-        seed_package(conn, package_id, project_id);
-        let row = ContributionRow {
-            id: 0,
+        let row = LocalFrameRow {
             project_id: project_id.to_string(),
-            package_id: package_id.to_string(),
-            frame_uuid: "u-1".into(),
-            publisher_display: "Alice".into(),
-            rel_path: "Alice/c.fits".into(),
-            landed_path: landed_path.to_string(),
+            frame_uuid: uuid.to_string(),
+            content_version: 1,
+            origin,
+            publisher_account_id: "acc-o".into(),
+            publisher_display: "Other".into(),
+            file_name: landed.file_name().unwrap().to_string_lossy().into_owned(),
+            filter_canonical: "L".into(),
+            state: "published".into(),
+            accepted: true,
             byte_size: 0,
             xxh3: xxh3.to_string(),
-            frame_meta: "{}".into(),
-            analysis: None,
-            superseded: false,
-            created_at: String::new(),
+            blake3: "b".repeat(64),
+            holder_count: 1,
+            manifest_version: 1,
+            manifest_json: "{}".into(),
+            landed_path: Some(landed.to_string_lossy().into_owned()),
+            size_mtime_seen: Some("0:0".into()),
+            on_disk: true,
+            locally_declined: false,
+            awaiting_gc: false,
+            source_frame_id: None,
+            recipe_hash: None,
+            last_error: None,
+            updated_at: String::new(),
         };
-        insert_contribution(conn, &row).unwrap();
+        frames_db::record_own(conn, &row).unwrap();
     }
 
-    fn contributions_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM project_contributions", [], |r| r.get(0))
+    fn landed(conn: &Connection, uuid: &str) -> Option<String> {
+        frames_db::get(conn, "p1", uuid).unwrap().unwrap().landed_path
+    }
+
+    fn catalog_rows(conn: &Connection) -> (i64, i64) {
+        let files: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        let frames: i64 = conn
+            .query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))
+            .unwrap();
+        (files, frames)
+    }
+
+    /// `(path, project_id)` of every listed foreign file, by path.
+    fn foreign(conn: &Connection) -> Vec<(String, Option<String>)> {
+        let mut stmt = conn
+            .prepare("SELECT path, project_id FROM collab_foreign_files ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
     }
 
-    /// Known: a tracking row's `landed_path` equals the scanned path — no-op.
-    /// Never registered as a frame, tracking row untouched.
-    #[test]
-    fn scan_skips_known_project_contribution() {
-        for parallel in [false, true] {
-            let root = TempDir::new().unwrap();
-            let cal = root.path().join("proj").join("Alice").join("c_L_0001.fits");
-            write_project_contribution(&cal, "uuid-k", "L_0001.fits", "proj-1");
-            let cal_str = cal.to_str().unwrap().to_string();
-            let xxh3 = crate::package::xxh3_full_file(&cal).unwrap();
-
-            let conn = fresh_db(root.path(), 1);
-            seed_contribution(&conn, "proj-1", "pkg-1", &cal_str, &xxh3);
-
-            let result = run_scan(parallel, root.path(), &conn, 1);
-            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
-            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: never registered");
-            assert_eq!(contributions_count(&conn), 1, "parallel={parallel}: no new tracking row");
-            let row = find_contribution_by_landed_path(&conn, &cal_str).unwrap().unwrap();
-            assert_eq!(row.landed_path, cal_str, "parallel={parallel}: landed_path unchanged");
-        }
+    fn s(p: &Path) -> String {
+        p.to_str().unwrap().to_string()
     }
 
-    /// Moved: a row matches `(project_id, xxh3)` and its `landed_path` is gone
-    /// from disk — repair the pointer to the new location.
+    /// A1: a file under the Collaboration root with NO stamp (a replica of an
+    /// externally calibrated original) is reconciled against the frame table,
+    /// never catalogued — the known one is a no-op, the unknown one is listed.
     #[test]
-    fn scan_repairs_moved_project_contribution() {
+    fn collab_root_file_without_stamp_is_reconciled_not_catalogued() {
         for parallel in [false, true] {
             let root = TempDir::new().unwrap();
-            let cal = root.path().join("proj").join("Alice").join("c_L_0002.fits");
-            write_project_contribution(&cal, "uuid-m", "L_0002.fits", "proj-1");
-            let cal_str = cal.to_str().unwrap().to_string();
-            let xxh3 = crate::package::xxh3_full_file(&cal).unwrap();
+            let known = root.path().join("m31").join("Other").join("L_0001.fits");
+            write_plain_light(&known, 1);
+            let stray = root.path().join("m31").join("Other").join("L_0002.fits");
+            write_plain_light(&stray, 2);
 
-            let conn = fresh_db(root.path(), 1);
-            // Old landed_path does not exist on disk.
-            let gone = root.path().join("old").join("gone").join("c_L_0002.fits");
-            seed_contribution(&conn, "proj-1", "pkg-1", gone.to_str().unwrap(), &xxh3);
+            let conn = collab_db(root.path(), 1);
+            let xxh3 = crate::package::xxh3_full_file(&known).unwrap();
+            seed_frame(&conn, "p1", "k", FrameOrigin::Replica, &known, &xxh3);
 
             let result = run_scan(parallel, root.path(), &conn, 1);
             assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
-            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: never registered");
-            assert_eq!(contributions_count(&conn), 1, "parallel={parallel}: repaired in place");
-            let row = find_contribution_by_landed_path(&conn, &cal_str).unwrap().unwrap();
-            assert_eq!(row.landed_path, cal_str, "parallel={parallel}: landed_path repaired");
-        }
-    }
-
-    /// Duplicate: a row matches `(project_id, xxh3)` but its `landed_path` STILL
-    /// exists — this is a second copy. Leave the row untouched; never register.
-    #[test]
-    fn scan_leaves_duplicate_project_contribution() {
-        for parallel in [false, true] {
-            let root = TempDir::new().unwrap();
-            // Kept (tracked) copy lives OUTSIDE the scan root and stays on disk.
-            let kept_dir = TempDir::new().unwrap();
-            let kept = kept_dir.path().join("c_L_0003.fits");
-            write_project_contribution(&kept, "uuid-d", "L_0003.fits", "proj-1");
-            let kept_str = kept.to_str().unwrap().to_string();
-            let xxh3 = crate::package::xxh3_full_file(&kept).unwrap();
-
-            // The duplicate copy sits inside the scan root (byte-identical).
-            let dup = root.path().join("proj").join("Alice").join("c_L_0003.fits");
-            write_project_contribution(&dup, "uuid-d", "L_0003.fits", "proj-1");
-            let dup_str = dup.to_str().unwrap().to_string();
-
-            let conn = fresh_db(root.path(), 1);
-            seed_contribution(&conn, "proj-1", "pkg-1", &kept_str, &xxh3);
-
-            let result = run_scan(parallel, root.path(), &conn, 1);
-            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
-            assert_eq!(files_count(&conn, &dup_str), 0, "parallel={parallel}: dup never registered");
-            assert_eq!(contributions_count(&conn), 1, "parallel={parallel}: no new tracking row");
-            let row = find_contribution_by_landed_path(&conn, &kept_str).unwrap().unwrap();
-            assert_eq!(row.landed_path, kept_str, "parallel={parallel}: tracking row unchanged");
-            assert!(
-                find_contribution_by_landed_path(&conn, &dup_str).unwrap().is_none(),
-                "parallel={parallel}: the duplicate copy is not tracked"
+            assert_eq!(catalog_rows(&conn), (0, 0), "parallel={parallel}: nothing catalogued");
+            assert_eq!(landed(&conn, "k"), Some(s(&known)), "parallel={parallel}: known is a no-op");
+            assert_eq!(
+                foreign(&conn),
+                vec![(s(&stray), None)],
+                "parallel={parallel}: only the unknown file is listed"
             );
         }
     }
 
-    /// Unknown: no tracking row (hand-dropped stamped file, or the package is
-    /// gone) — leave it untouched and defer. Nothing enters `files`/`frames`,
-    /// and NO contribution row is auto-inserted (a row needs hub context).
+    /// Moved: a row matches `(project, xxh3)` and its recorded path is gone →
+    /// the recorded path is repaired to the file's new location.
     #[test]
-    fn scan_leaves_unknown_project_contribution() {
+    fn moved_replica_is_repaired() {
         for parallel in [false, true] {
             let root = TempDir::new().unwrap();
-            let cal = root.path().join("proj").join("Alice").join("c_L_orphan.fits");
-            write_project_contribution(&cal, "uuid-o", "L_orphan.fits", "proj-1");
-            let cal_str = cal.to_str().unwrap().to_string();
+            let now = root.path().join("m31").join("Moved").join("L_0003.fits");
+            write_plain_light(&now, 3);
+            let gone = root.path().join("m31").join("Other").join("L_0003.fits");
 
-            // No package, no contribution rows at all.
-            let conn = fresh_db(root.path(), 1);
-            // A cataloged source frame carrying the same filename — proves the
-            // ATH_PRJ divert wins and the artifact never enters the catalog.
-            conn.execute(
-                "INSERT INTO files (id, path, filename, size, modified_at, format)
-                 VALUES (900, '/src/L_orphan.fits', 'L_orphan.fits', 0, '2025-01-01T00:00:00Z', 'FITS')",
-                [],
-            )
-            .unwrap();
-            conn.execute("INSERT INTO frames (id, file_id) VALUES (900, 900)", []).unwrap();
+            let conn = collab_db(root.path(), 1);
+            let xxh3 = crate::package::xxh3_full_file(&now).unwrap();
+            seed_frame(&conn, "p1", "m", FrameOrigin::Replica, &gone, &xxh3);
 
             let result = run_scan(parallel, root.path(), &conn, 1);
             assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
-            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: never registered");
-            assert_eq!(contributions_count(&conn), 0, "parallel={parallel}: no auto-inserted row");
-            // The only file row is the pre-seeded source frame; the artifact is absent.
-            let total_files: i64 =
-                conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
-            assert_eq!(total_files, 1, "parallel={parallel}: artifact contributed no files row");
+            assert_eq!(landed(&conn, "m"), Some(s(&now)), "parallel={parallel}: path repaired");
+            assert_eq!(catalog_rows(&conn), (0, 0), "parallel={parallel}");
+            assert!(foreign(&conn).is_empty(), "parallel={parallel}: a moved frame is not foreign");
+        }
+    }
+
+    /// Duplicate: a row matches `(project, xxh3)` but its recorded path still
+    /// exists → a second copy; warned about, the row untouched, nothing listed
+    /// or catalogued.
+    #[test]
+    fn duplicate_warns() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let kept = root.path().join("m31").join("Other").join("L_0004.fits");
+            write_plain_light(&kept, 4);
+            let dup = root.path().join("m31").join("Copy").join("L_0004.fits");
+            write_plain_light(&dup, 4);
+
+            let conn = collab_db(root.path(), 1);
+            let xxh3 = crate::package::xxh3_full_file(&kept).unwrap();
+            seed_frame(&conn, "p1", "d", FrameOrigin::Replica, &kept, &xxh3);
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(landed(&conn, "d"), Some(s(&kept)), "parallel={parallel}: row untouched");
+            assert_eq!(catalog_rows(&conn), (0, 0), "parallel={parallel}");
+            assert!(foreign(&conn).is_empty(), "parallel={parallel}: a duplicate is not listed");
+        }
+    }
+
+    /// Unknown: nothing matches → listed inert in `collab_foreign_files` (with
+    /// the stamp's project when the header carries `ATH_PRJ`), never
+    /// catalogued. A re-scan keeps one row per path.
+    #[test]
+    fn unknown_file_is_listed_inert() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let plain = root.path().join("m31").join("Other").join("L_0005.fits");
+            write_plain_light(&plain, 5);
+            let stamped = root.path().join("m31").join("Other").join("c_L_0006.fits");
+            write_project_contribution(&stamped, "uuid-6", "L_0006.fits", "p1");
+
+            let conn = collab_db(root.path(), 1);
+            let first = run_scan(parallel, root.path(), &conn, 1);
+            assert!(first.errors.is_empty(), "parallel={parallel}: {:?}", first.errors);
+            let again = run_scan(parallel, root.path(), &conn, 1);
+            assert!(again.errors.is_empty(), "parallel={parallel}: {:?}", again.errors);
+
+            assert_eq!(catalog_rows(&conn), (0, 0), "parallel={parallel}: nothing catalogued");
+            assert_eq!(
+                foreign(&conn),
+                vec![(s(&plain), None), (s(&stamped), Some("p1".to_string()))],
+                "parallel={parallel}"
+            );
+        }
+    }
+
+    /// P26: an own frame may live outside the Collaboration root. The root's
+    /// walk never touches its row — a byte-identical copy inside the root is
+    /// a duplicate (the original still exists), not a move.
+    #[test]
+    fn own_frame_outside_the_root_is_untouched_by_the_root_walk() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let elsewhere = TempDir::new().unwrap();
+            let original = elsewhere.path().join("L_0007.fits");
+            write_plain_light(&original, 7);
+            let copy = root.path().join("m31").join("Me").join("L_0007.fits");
+            write_plain_light(&copy, 7);
+
+            let conn = collab_db(root.path(), 1);
+            let xxh3 = crate::package::xxh3_full_file(&original).unwrap();
+            seed_frame(&conn, "p1", "own", FrameOrigin::Own, &original, &xxh3);
+            let before = frames_db::get(&conn, "p1", "own").unwrap().unwrap();
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            let after = frames_db::get(&conn, "p1", "own").unwrap().unwrap();
+            assert_eq!(after.landed_path, before.landed_path, "parallel={parallel}");
+            assert_eq!(after.on_disk, before.on_disk, "parallel={parallel}");
+            assert_eq!(catalog_rows(&conn), (0, 0), "parallel={parallel}");
+            assert!(foreign(&conn).is_empty(), "parallel={parallel}");
+        }
+    }
+
+    /// Outside the Collaboration root the `ATH_PRJ` divert stays (defence in
+    /// depth): a stamped file in an ordinary root goes through the same
+    /// reconcile — here the moved branch — and is never catalogued.
+    #[test]
+    fn stamped_file_outside_the_root_is_diverted_to_the_reconcile() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let now = root.path().join("lights").join("c_L_0008.fits");
+            write_project_contribution(&now, "uuid-8", "L_0008.fits", "p1");
+            let gone = root.path().join("was").join("c_L_0008.fits");
+
+            let conn = fresh_db(root.path(), 1);
+            seed_project(&conn, "p1");
+            let xxh3 = crate::package::xxh3_full_file(&now).unwrap();
+            seed_frame(&conn, "p1", "st", FrameOrigin::Replica, &gone, &xxh3);
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(landed(&conn, "st"), Some(s(&now)), "parallel={parallel}");
+            assert_eq!(files_count(&conn, &s(&now)), 0, "parallel={parallel}");
         }
     }
 }

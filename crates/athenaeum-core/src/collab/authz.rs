@@ -22,12 +22,11 @@ use crate::collab::snapshot::SnapshotMember;
 use crate::sharing::types::NodeId;
 
 /// The membership facts about one project member, resolved from the cached
-/// snapshot. Enough to answer every serve/announce authorization question
-/// without re-reading the row.
+/// snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberIdentity {
     pub display_name: String,
-    /// `"send"` (contributor: push-seed only) or `"send_receive"` (may pull).
+    /// `"send"` (contributor: publishes only) or `"send_receive"` (may pull).
     pub data_role: String,
     pub coordinator: bool,
 }
@@ -74,31 +73,6 @@ pub fn node_in_any_project(conn: &rusqlite::Connection, node: &NodeId) -> bool {
     projects
         .iter()
         .any(|row| parse_members(&row.members_json).iter().any(|m| member_owns_node(m, node, &mut warned)))
-}
-
-/// May `node` be SERVED `package` of `project_id`? A `send_receive` member or the
-/// coordinator may be served a published package; a still-pending package may be
-/// served ONLY to the coordinator (they decide it). Fail-closed on an unknown
-/// project / non-member.
-pub fn may_serve_package(
-    conn: &rusqlite::Connection,
-    project_id: &str,
-    package_pending: bool,
-    node: &NodeId,
-) -> bool {
-    match member_for_node(conn, project_id, node) {
-        Some(id) if package_pending => id.coordinator,
-        Some(id) => id.coordinator || id.data_role == "send_receive",
-        None => false,
-    }
-}
-
-/// May an inbound PROJECT announce from `node` for `project_id` be accepted? Any
-/// current member role qualifies — a send-only contributor push-seeds its frames
-/// to the swarm, so it too must be allowed to announce. Fail-closed on a
-/// non-member.
-pub fn may_accept_announce(conn: &rusqlite::Connection, project_id: &str, node: &NodeId) -> bool {
-    member_for_node(conn, project_id, node).is_some()
 }
 
 /// Parse the cached `members_json` blob (a serialized `Vec<SnapshotMember>`).
@@ -248,42 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn may_serve_package_published_needs_send_receive_or_coordinator() {
-        let conn = test_conn();
-        seed_project(&conn, "p-1", &two_member_json());
-
-        // Published (not pending): A (coordinator + send_receive) yes, B (send
-        // only) no, stranger no.
-        assert!(may_serve_package(&conn, "p-1", false, &NODE_A));
-        assert!(!may_serve_package(&conn, "p-1", false, &NODE_B));
-        assert!(!may_serve_package(&conn, "p-1", false, &STRANGER));
-    }
-
-    #[test]
-    fn may_serve_package_pending_is_coordinator_only() {
-        let conn = test_conn();
-        seed_project(&conn, "p-1", &two_member_json());
-
-        // Pending: only the coordinator (A). B is send_receive-less anyway, but
-        // even a send_receive non-coordinator would be refused a pending package.
-        assert!(may_serve_package(&conn, "p-1", true, &NODE_A));
-        assert!(!may_serve_package(&conn, "p-1", true, &NODE_B));
-        assert!(!may_serve_package(&conn, "p-1", true, &STRANGER));
-    }
-
-    #[test]
-    fn may_accept_announce_allows_any_member() {
-        let conn = test_conn();
-        seed_project(&conn, "p-1", &two_member_json());
-
-        // Both members (send-only B included — it push-seeds) may announce; a
-        // stranger may not.
-        assert!(may_accept_announce(&conn, "p-1", &NODE_A));
-        assert!(may_accept_announce(&conn, "p-1", &NODE_B));
-        assert!(!may_accept_announce(&conn, "p-1", &STRANGER));
-    }
-
-    #[test]
     fn node_in_any_project_scans_every_snapshot() {
         let conn = test_conn();
         seed_project(&conn, "p-1", &two_member_json());
@@ -298,9 +236,6 @@ mod tests {
         let conn = test_conn();
         // No projects cached at all: every question answers deny.
         assert!(member_for_node(&conn, "p-1", &NODE_A).is_none());
-        assert!(!may_serve_package(&conn, "p-1", false, &NODE_A));
-        assert!(!may_serve_package(&conn, "p-1", true, &NODE_A));
-        assert!(!may_accept_announce(&conn, "p-1", &NODE_A));
         assert!(!node_in_any_project(&conn, &NODE_A));
     }
 
@@ -320,13 +255,12 @@ mod tests {
         ])
         .to_string();
         seed_project(&conn, "p-1", &json);
-        assert!(may_accept_announce(&conn, "p-1", &NODE_B));
-        assert!(!may_accept_announce(&conn, "p-1", &NODE_A));
+        assert!(member_for_node(&conn, "p-1", &NODE_B).is_some());
+        assert!(member_for_node(&conn, "p-1", &NODE_A).is_none());
 
         // A members_json that does not parse ⇒ that project authorizes nobody
         // (fail-closed), independent of any other cached project.
         seed_project(&conn, "p-2", "{ this is not a member array");
-        assert!(!may_accept_announce(&conn, "p-2", &NODE_B));
         assert!(member_for_node(&conn, "p-2", &NODE_B).is_none());
     }
 }

@@ -1,5 +1,5 @@
 // collab_frames: catalog-side storage for the collab v3 per-frame exchange
-// (wave 2). One table, owned here:
+// (wave 2). Two tables, owned here:
 //
 //   * `project_frames_local` — the local cache of every frame in a project's
 //     manifest, mine or a peer's, plus the local-only fields that track where
@@ -13,6 +13,10 @@
 //     mine; never pruned by `delete_not_in` (R12: a caps/manifest refresh
 //     must never make my own publication disappear locally).
 //   - `'replica'` — a frame a peer published, pulled down by my client.
+//
+//   * `collab_foreign_files` — files under the Collaboration root the scanner
+//     matched to no row above (P26 "unknown"): listed inert for R18's "not
+//     part of the project" list, never catalogued.
 //
 // House idiom (mirrors `db/collab.rs`): a `SELECT_COLS` const paired with an
 // index-based row mapper so `row.get(N)` can't drift out of sync with the
@@ -613,6 +617,39 @@ pub fn adopt_own(
             recipe_hash,
             size_mtime_seen
         ],
+    )?)
+}
+
+/// Every project id cached on this device — the scope the scanner's
+/// `(project, xxh3)` lookup walks when a file carries no `ATH_PRJ` stamp.
+pub fn project_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT project_id FROM collab_projects ORDER BY project_id")?;
+    let ids = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(ids)
+}
+
+/// List `path` as a foreign file under the Collaboration root (P26 "unknown",
+/// R18), with the project its `ATH_PRJ` stamp names, if any. Idempotent: a
+/// re-scan refreshes `seen_at` and the stamp, one row per path.
+pub fn record_foreign_file(conn: &Connection, path: &str, project_id: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO collab_foreign_files (path, project_id, seen_at)
+         VALUES (?1, ?2, datetime('now'))
+         ON CONFLICT(path) DO UPDATE SET project_id = excluded.project_id,
+                                         seen_at = excluded.seen_at",
+        params![path, project_id],
+    )?;
+    Ok(())
+}
+
+/// Drop `path` from the foreign list — the scanner matched it to a frame row
+/// after all (known or moved). Returns the rows removed.
+pub fn forget_foreign_file(conn: &Connection, path: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM collab_foreign_files WHERE path = ?1",
+        params![path],
     )?)
 }
 

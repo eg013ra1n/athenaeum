@@ -293,8 +293,8 @@ pub async fn reject_collab_frame(
 
 // ── Project-scoped WBPP export (slice 5, "processor payoff") ─────────────────
 
-/// Organize the project's received contributions ∪ own calibrated outputs into a
-/// WBPP folder tree — one subtree per publisher under the project title (Д2). The
+/// Organize the project's frames (own and replica, from `project_frames_local`)
+/// into a WBPP folder tree — one subtree per publisher under the project title (Д2). The
 /// runner rides the standard export events with the Д3 sentinel `frame_set_id = -1`
 /// and registers its cancel flag under that key, so the EXISTING `cancel_export`
 /// command cancels a running project export (frontend: `api.invoke('cancel_export',

@@ -59,11 +59,11 @@ pub struct CalibratedIdentity {
     pub cfa_scaling_applied: Option<bool>,
     /// `ATH_CVER` — engine version the file was built with.
     pub engine_version: Option<i64>,
-    /// `ATH_PRJ` — Stage-II project id stamped at publish (slice 4). Present ONLY
-    /// on a received project contribution; `None` for a personal calibrated
-    /// light. Its presence diverts the scanner onto the project-contribution
-    /// reconcile (sibling of the light-cal reconcile) instead of frame-registering
-    /// or light-cal-adopting the file. `None` when the card is absent/empty.
+    /// `ATH_PRJ` — a project id stamped on a project frame; `None` for a
+    /// personal calibrated light. Outside the Collaboration root its presence
+    /// diverts the scanner onto the project-frame reconcile (plan P26) instead
+    /// of frame-registering the file; under the root every file is reconciled
+    /// whatever its header says. `None` when the card is absent/empty.
     pub project_id: Option<String>,
 }
 

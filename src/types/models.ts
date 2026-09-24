@@ -1596,42 +1596,6 @@ export type ModerationFrameView = { frameUuid: string, fileName: string, publish
  */
 fwhmArcsec: number | null, createdAt: string, };
 
-export type PackageStateChange = { projectId: string, packageId: string, 
-/**
- * `newPackage` | `approved` | `rejected` | `downloadFailed` | `awaitingApproval`.
- */
-kind: string, detail: string | null, };
-
-export type ProjectPackageView = { 
-/**
- * HUB package uuid (the `project_packages` row key).
- */
-packageId: string, 
-/**
- * Hub-mirrored decision: `pending` | `published` | `rejected`.
- */
-state: string, 
-/**
- * Local fetch progress: `none` | `downloading` | `complete` | `failed`.
- */
-localStatus: string, 
-/**
- * I published this package.
- */
-own: boolean, publisher: string, byteSize: number, frameCount: number, createdAt: string, rejectReason: string | null, 
-/**
- * Another announcement supersedes this one.
- */
-superseded: boolean, 
-/**
- * Holders the hub listed at poll time.
- */
-holderCount: number, 
-/**
- * Of those holders, how many the hub last saw within the online window.
- */
-onlineCount: number, };
-
 export type ProjectFrameView = { frameUuid: string, fileName: string, publisher: string, 
 /**
  * I published this frame.
@@ -1666,22 +1630,6 @@ eccentricity: number | null,
  * Parsed from `meta.starsDetected`.
  */
 starsDetected: number | null, };
-
-export type ProjectDownloadProgress = { projectId: string, packageId: string, 
-/**
- * How many holders the fan-out was handed.
- */
-sources: number, 
-/**
- * `fetching` | `done`.
- */
-stage: string, };
-
-export type ContributionView = { packageId: string, frameUuid: string, publisher: string, relPath: string, byteSize: number, 
-/**
- * A newer contribution for the same frame uuid supersedes this one.
- */
-superseded: boolean, createdAt: string, };
 
 export type FramesChangeKind = "newFrames" | "pendingFrames" | "approved" | "rejected" | "excluded" | "newVersions";
 

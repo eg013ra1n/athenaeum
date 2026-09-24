@@ -340,19 +340,6 @@ pub fn set_auto_replicate(conn: &Connection, project_id: &str, enabled: bool) ->
     Ok(updated)
 }
 
-/// Delete every cache row whose `project_id` is NOT in `keep_ids` (the ids the
-/// latest poll still returned). An empty list clears the whole cache. Returns
-/// the number of rows removed.
-pub fn prune_projects_not_in(conn: &Connection, keep_ids: &[String]) -> Result<usize> {
-    if keep_ids.is_empty() {
-        return Ok(conn.execute("DELETE FROM collab_projects", [])?);
-    }
-    let placeholders = vec!["?"; keep_ids.len()].join(", ");
-    let sql = format!("DELETE FROM collab_projects WHERE project_id NOT IN ({placeholders})");
-    let removed = conn.execute(&sql, rusqlite::params_from_iter(keep_ids.iter()))?;
-    Ok(removed)
-}
-
 /// Link a frame set to a project locally (idempotent — a repeated link is a
 /// no-op). NEVER sent to the hub.
 pub fn link_set(conn: &Connection, project_id: &str, frames_set_id: i64) -> Result<()> {
@@ -576,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_upsert_list_prune_roundtrip() {
+    fn cache_upsert_list_roundtrip() {
         let conn = test_conn();
         upsert_project(&conn, &sample_row("p-1")).unwrap();
         upsert_project(&conn, &sample_row("p-2")).unwrap();
@@ -593,11 +580,6 @@ mod tests {
         assert_eq!(p1.title, "Renamed");
         assert_eq!(p1.membership_version, 5);
         assert!(!p1.fetched_at.is_empty());
-
-        // Prune keeps only the listed ids.
-        let removed = prune_projects_not_in(&conn, &["p-2".to_string()]).unwrap();
-        assert_eq!(removed, 1);
-        assert!(get_project(&conn, "p-1").unwrap().is_none());
     }
 
     /// v3 (Task 2): a wholesale poll refresh ([`upsert_project`]) must never

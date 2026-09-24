@@ -11,7 +11,6 @@ pub mod analysis;
 pub mod master_provenance;
 pub mod master_unregister;
 pub mod collab;
-pub mod collab_exchange;
 pub mod collab_frames;
 pub mod stacking;
 

@@ -34,7 +34,7 @@ use crate::sharing::types::{
     AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
     ReceiptOutcome, RevokeReason, StartInfo, TransportEvent,
 };
-use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
+use crate::sharing::{FetchSink, SharingTransport};
 
 use super::ingest::{self, IngestOutcome};
 use super::models::Direction;
@@ -80,63 +80,11 @@ pub fn allow_all_peers() -> PeerAuthorizer {
     Arc::new(|_| true)
 }
 
-/// Decides whether an inbound PROJECT announce (collab exchange, slice 4) from
-/// `node` for `project_id` may be accepted. Evaluated **live, per announce** so a
-/// membership-snapshot refresh takes effect on the next event without a transport
-/// restart. Wired by the host to
-/// [`collab::authz::may_accept_announce`](crate::collab::authz::may_accept_announce)
-/// — a verified current member of the project. Returns `true` to accept, `false`
-/// to drop fail-closed. A missing gate is treated as "deny": a project announce
-/// is only ever accepted when a real membership check passes.
-pub type ProjectAnnounceGate = Arc<dyn Fn(&NodeId, &str) -> bool + Send + Sync>;
-
-/// Refresh this device's cached announcements for a project (collab exchange,
-/// slice 4, task 5). Invoked with the `project_id` when an inbound project
-/// announce names a package whose `project_packages` row we do not yet know:
-/// Task 8 wires it to a hub poll so the row appears, and the receiver re-checks
-/// before deciding to drop fail-closed. Synchronous by contract (called on the
-/// receiver loop); an implementation doing async hub I/O bridges it internally.
-pub type ProjectAnnouncementsRefresher = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Post-ingest callback (collab exchange, slice 4, task 5): invoked with
-/// `(project_id, hub_package_id)` after a project package has been ingested and
-/// acked. Task 8 wires it to report-have + notification data; absent = no-op.
-pub type ProjectIngestedHook = Arc<dyn Fn(String, String) + Send + Sync>;
-
-/// Holder-side handler for an inbound project pull request (slice 4, task 6):
-/// invoked with `(from, project_id, hub_package_id)` when a member asks us to
-/// serve a project package. The host wires it to
-/// [`collab_exchange::handle_project_request`](crate::api::collab_exchange::handle_project_request)
-/// — authorize (`may_serve_package`) → reconstruct the serve dir → enqueue an
-/// explicit-target serve back to `from` through the collab sender map. Absent ⇒
-/// the request is logged and dropped (the pre-task-6 behavior). Synchronous by
-/// contract (called on the receiver loop); the host closure `tokio::spawn`s the
-/// actual async serve so the receive loop never blocks.
-pub type ProjectRequestHandler = Arc<dyn Fn(NodeId, String, String) + Send + Sync>;
-
-/// The project-exchange receive hooks [`SyncReceiver::spawn`] threads into its
-/// loop (slice 4): the per-announce membership gate plus the Task-8 refresher /
-/// post-ingest callbacks. `Default` = "no project support installed" (every field
-/// `None`), so a personal-sync-only caller passes `Default::default()`.
-#[derive(Clone, Default)]
-pub struct ProjectReceiveHooks {
-    /// Per-announce project-membership gate. Absent or refusing ⇒ the announce is
-    /// dropped fail-closed.
-    pub gate: Option<ProjectAnnounceGate>,
-    /// Refresh announcements when a project package's row is unknown (task 8).
-    pub announcements_refresher: Option<ProjectAnnouncementsRefresher>,
-    /// Fired after a project package is ingested + acked (task 8).
-    pub on_project_ingested: Option<ProjectIngestedHook>,
-    /// Holder-side serve handler for inbound project pull requests (task 6).
-    /// Absent ⇒ an inbound request is logged and dropped.
-    pub request_handler: Option<ProjectRequestHandler>,
-}
-
 /// Optional receive-side hooks the host threads into
-/// [`SyncRuntime::ensure_started`] (collab exchange, slice 4). Every field is
-/// optional and the whole struct is `Default` ("nothing installed"), so a caller
-/// wires only what it needs and the transport keeps its pre-slice-4 behavior when
-/// a hook is absent. Introduced with room for the Task-5/6/8 hooks.
+/// [`SyncRuntime::ensure_started`]. Every field is optional and the whole struct
+/// is `Default` ("nothing installed"), so a caller wires only what it needs and
+/// the transport keeps its default behavior when a hook is absent. (The
+/// package-era project hooks were retired in collab v3 wave 2, plan P12.)
 #[derive(Clone, Default)]
 pub struct ReceiverHooks {
     /// Connection-level authorization predicate installed on the iroh transport
@@ -144,21 +92,6 @@ pub struct ReceiverHooks {
     /// the composite account-allow-list ∪ project-member gate. Absent ⇒ the
     /// transport admits every connection (today's behavior).
     pub connect_gate: Option<crate::sharing::iroh::ConnectGate>,
-    /// Per-announce project-membership gate for inbound `ProjectAnnounceReceived`
-    /// events. Absent or refusing ⇒ the announce is dropped fail-closed.
-    pub project_gate: Option<ProjectAnnounceGate>,
-    /// Refresh cached announcements when a project package's hub row is unknown
-    /// (task 5 flow; Task 8 wires it to the hub poll). Absent ⇒ an unknown-row
-    /// announce is dropped fail-closed without a refresh attempt.
-    pub announcements_refresher: Option<ProjectAnnouncementsRefresher>,
-    /// Post-ingest callback (task 5 flow; Task 8 wires report-have + notification
-    /// data). Absent = no-op.
-    pub on_project_ingested: Option<ProjectIngestedHook>,
-    /// Holder-side serve handler for inbound `ProjectRequestReceived` events
-    /// (task 6): the host wires it to
-    /// [`collab_exchange::handle_project_request`](crate::api::collab_exchange::handle_project_request).
-    /// Absent ⇒ the request is logged and dropped (pre-task-6 behavior).
-    pub project_request_handler: Option<ProjectRequestHandler>,
     /// Cap on simultaneous incoming transfers to start the receiver's
     /// [`ReceiveGate`] at (W2 T2.7) — the host's persisted
     /// `sync.max_concurrent_receives`. A number rather than a callback, but it
@@ -703,9 +636,7 @@ impl InboundControl {
     /// A re-announce under a fresh wire id is a fresh park of a fresh row; there is
     /// nothing to collapse.
     ///
-    /// Personal sync only. `handle_project_announce` also waits on the same gate, but
-    /// a project push writes no `sync_inbound` row at all, so an entry for one could
-    /// never match anything the mapping reads — see the comment at its `acquire`.
+    /// Personal sync only.
     pub fn note_parked_for_slot(&self, package_id: &str) {
         self.parked_for_slot
             .lock()
@@ -828,7 +759,6 @@ impl SyncReceiver {
         staging_root: PathBuf,
         incoming: IncomingResolver,
         authorized: PeerAuthorizer,
-        project: ProjectReceiveHooks,
         control: Arc<InboundControl>,
         transport: Arc<dyn SharingTransport>,
         emitter: Arc<dyn ProgressEmitter>,
@@ -839,13 +769,6 @@ impl SyncReceiver {
             .context("start receiver transport")?;
         std::fs::create_dir_all(&staging_root)
             .with_context(|| format!("create staging root {}", staging_root.display()))?;
-
-        let ProjectReceiveHooks {
-            gate: project_gate,
-            announcements_refresher,
-            on_project_ingested,
-            request_handler,
-        } = project;
 
         let raw_events = transport.events().await;
 
@@ -909,10 +832,6 @@ impl SyncReceiver {
             staging_root: staging_root.clone(),
             incoming,
             authorized,
-            project_gate,
-            announcements_refresher,
-            on_project_ingested,
-            request_handler,
             control,
             transport: Arc::clone(&transport),
             emitter,
@@ -988,13 +907,12 @@ impl SyncReceiver {
                 // The lane clears the entry the moment it starts processing it.
                 //
                 // `AnnounceReceived` ONLY, deliberately: this feeds the PERSONAL
-                // transfers list. `ProjectAnnounceReceived` is the collab-exchange
-                // path with its own rows and its own surface — out of scope here.
+                // transfers list. `ProjectAnnounceReceived` is a retired collab
+                // message (P12) the lane only logs and drops.
                 //
                 // AUTHORIZED peers only (review fix). Connection admission is wider
                 // than personal authorization — a verified collab-project member can
-                // deliver an `Announce3` too, and its lane can be busy for MINUTES
-                // with a project ingest — so an ungated insert would render a
+                // deliver an `Announce3` too — so an ungated insert would render a
                 // phantom row with PEER-CHOSEN text (batch name) for a transfer the
                 // lane will silently drop. The authorizer's only side effect on
                 // refusal is the debounced hub refresh, which is the same kick the
@@ -1063,10 +981,6 @@ struct ReceiverLaneDeps {
     staging_root: PathBuf,
     incoming: IncomingResolver,
     authorized: PeerAuthorizer,
-    project_gate: Option<ProjectAnnounceGate>,
-    announcements_refresher: Option<ProjectAnnouncementsRefresher>,
-    on_project_ingested: Option<ProjectIngestedHook>,
-    request_handler: Option<ProjectRequestHandler>,
     control: Arc<InboundControl>,
     transport: Arc<dyn SharingTransport>,
     emitter: Arc<dyn ProgressEmitter>,
@@ -1193,10 +1107,6 @@ async fn process_receiver_event(ev: TransportEvent, deps: &ReceiverLaneDeps) {
         staging_root,
         incoming,
         authorized,
-        project_gate,
-        announcements_refresher,
-        on_project_ingested,
-        request_handler,
         control,
         transport,
         emitter,
@@ -1272,95 +1182,34 @@ async fn process_receiver_event(ev: TransportEvent, deps: &ReceiverLaneDeps) {
                 "sync receiver announce handled"
             );
         }
-        // Collab exchange (slice 4): an inbound PROJECT package
-        // advertisement. The ROW KEY is the event's hub `package_id`
-        // (audit B1) while fetch/ack use the wire `announce.package_id`.
+        // The package-era collab messages (P12): the `Msg` variants stay on the
+        // frozen wire, but push-seed and pull-request serving are retired —
+        // project frames move per frame over the collab ALPN. Logged and dropped.
         TransportEvent::ProjectAnnounceReceived {
             from,
             project_id,
             package_id,
-            announce,
+            ..
         } => {
-            // The hub package id is peer-controlled — reject anything
-            // that is not a single safe path segment BEFORE the gate
-            // (same C1 guard as personal sync).
-            if let Err(e) = crate::package::validate_package_id(&package_id) {
-                tracing::warn!(
-                    from = %super::node_id_hex(&from),
-                    project_id,
-                    package_id,
-                    error = %e,
-                    "project announce rejected: unsafe package_id"
-                );
-                return;
-            }
-            // Cross-account trust: only a verified current member of
-            // `project_id` may push-seed to us. Gate absent or
-            // refusing ⇒ drop (fail-closed — never accept-all).
-            let accepted = project_gate
-                .as_ref()
-                .map(|gate| gate(&from, &project_id))
-                .unwrap_or(false);
-            if !accepted {
-                tracing::warn!(
-                    from = %super::node_id_hex(&from),
-                    project_id,
-                    package_id,
-                    "project announce dropped: sender is not an authorized project member"
-                );
-                return;
-            }
-            if let Err(e) = handle_project_announce(
-                store,
-                staging_root,
-                transport.as_ref(),
-                emitter.as_ref(),
-                // Only the gate, not the whole control: the project path has no
-                // cancel/revoke surface of its own, so it borrows the one signal it
-                // actually uses.
-                &control.receive_gate,
-                announcements_refresher.as_ref(),
-                on_project_ingested.as_ref(),
-                from,
+            tracing::warn!(
+                from = %super::node_id_hex(&from),
                 project_id,
                 package_id,
-                announce,
-            )
-            .await
-            {
-                tracing::error!(error = %format!("{e:#}"), "sync receiver project announce handling failed");
-            }
+                "retired collab message ignored"
+            );
         }
-        // Collab exchange (slice 4, task 6): a member asked us (a
-        // holder) to serve a project package. Dispatch to the host's
-        // serve handler, which authorizes (`may_serve_package`),
-        // reconstructs the serve dir, and enqueues an explicit-target
-        // serve back to `from` through the collab sender map. The
-        // handler `tokio::spawn`s the async work, so this stays
-        // non-blocking. Absent handler ⇒ log + drop (pre-task-6).
         TransportEvent::ProjectRequestReceived {
             from,
             project_id,
             package_id,
-        } => match request_handler {
-            Some(handler) => {
-                tracing::info!(
-                    from = %super::node_id_hex(&from),
-                    project_id,
-                    package_id,
-                    "project package requested — dispatching serve"
-                );
-                handler(from, project_id, package_id);
-            }
-            None => {
-                tracing::warn!(
-                    from = %super::node_id_hex(&from),
-                    project_id,
-                    package_id,
-                    "project package requested but no serve handler installed; dropping"
-                );
-            }
-        },
+        } => {
+            tracing::warn!(
+                from = %super::node_id_hex(&from),
+                project_id,
+                package_id,
+                "retired collab message ignored"
+            );
+        }
         // A sender revoked an outstanding announce (spec §D2, B4): abort
         // any in-flight fetch, drive the row to an honest terminal, settle
         // file rows, release in-flight tags, and write history + journal.
@@ -3365,207 +3214,6 @@ async fn handle_revoke(
     );
 }
 
-/// Handle one authorized PROJECT announce (collab exchange, slice 4): resolve the
-/// hub package row (refreshing announcements once if unknown), fetch into staging,
-/// ingest the contributions, ack the receipts, and emit `sync-progress` /
-/// `sync-finished` carrying the `project_id`.
-///
-/// `hub_package_id` is the event's hub uuid (the `project_packages` row key);
-/// `announce.package_id` is the engine-minted wire id used for fetch/ack. The
-/// gate + hub-id `validate_package_id` already ran in the loop.
-#[allow(clippy::too_many_arguments)]
-async fn handle_project_announce(
-    store: &Arc<CatalogSyncStore>,
-    staging_root: &Path,
-    transport: &dyn SharingTransport,
-    emitter: &dyn ProgressEmitter,
-    receive_gate: &ReceiveGate,
-    announcements_refresher: Option<&super::ProjectAnnouncementsRefresher>,
-    on_project_ingested: Option<&super::ProjectIngestedHook>,
-    from: NodeId,
-    project_id: String,
-    hub_package_id: String,
-    announce: PackageAnnounce,
-) -> Result<()> {
-    let peer_device = super::node_id_hex(&from);
-    let wire_package_id = announce.package_id.0.clone();
-
-    // Row-key check on the HUB package id: unknown ⇒ ask the refresher to poll
-    // the hub once, then re-check. Still unknown ⇒ drop fail-closed (we never
-    // fetch a package we can't anchor).
-    let known = |store: &Arc<CatalogSyncStore>| -> Result<bool> {
-        let conn = store.lock_conn();
-        Ok(crate::db::collab_exchange::get_package(&conn, &hub_package_id)?.is_some())
-    };
-    if !known(store)? {
-        if let Some(refresh) = announcements_refresher {
-            refresh(&project_id);
-        }
-        if !known(store)? {
-            tracing::warn!(
-                from = %peer_device,
-                project_id,
-                package_id = %hub_package_id,
-                "project announce dropped: package row unknown after refresh"
-            );
-            return Ok(());
-        }
-    }
-
-    // The WIRE package id builds the staging path — guard it (C1) before the join.
-    if let Err(e) = crate::package::validate_package_id(&wire_package_id) {
-        tracing::warn!(
-            from = %peer_device,
-            project_id,
-            package_id = %wire_package_id,
-            error = %e,
-            "project announce rejected: unsafe wire package_id"
-        );
-        return Ok(());
-    }
-
-    emit_event(
-        emitter,
-        "sync-progress",
-        &SyncProgressEvent {
-            package_id: hub_package_id.clone(),
-            direction: super::Direction::Received,
-            stage: "received".to_string(),
-            peer_device: peer_device.clone(),
-            frame_count: announce.frame_count,
-            project_id: Some(project_id.clone()),
-            bytes_done: None,
-            bytes_total: None,
-        },
-    );
-
-    // Receive gate (W2 T2.4) — same placement rule as personal sync: taken only
-    // once this announce is committed to moving bytes, i.e. AFTER both cheap
-    // fail-closed gates above (the unknown-hub-row drop, which may poll the hub, and
-    // the wire-id validation) and before the fetch. A project push shares the one
-    // disk with personal transfers, so it shares the one cap; held through ingest and
-    // ack, released on return.
-    //
-    // The wait is bare here, unlike personal sync's interruptible one: a project
-    // push has no cancel/revoke surface of its own (no `sync_inbound` row, no
-    // `InboundControl` signal keyed on it), so there is nothing a parked lane could
-    // re-check. NAMED FOLLOW-UP, not fixed here (W2 review, Minor): the permit is
-    // held across `transport.fetch` with no abort path at all, so a stalled project
-    // push occupies a receive slot until the transport itself gives up.
-    //
-    // For the same reason it carries no variant-C parked marker: that marker exists
-    // to relabel a `sync_inbound` row's display state, and a project push has no such
-    // row for an entry to ever match. It would also need `InboundControl` threaded in
-    // here, which this handler deliberately does not take — only the gate. A project
-    // push waiting for a slot is invisible in the Transfers UI because a project push
-    // is invisible in the Transfers UI, which is the collab surface's own question.
-    let _receive_permit = receive_gate.acquire().await;
-
-    // Fetch into a per-package staging dir keyed by the WIRE id (mirrors personal
-    // sync — out of the user-visible landing tree).
-    let staging = staging_root.join("staging").join(&wire_package_id);
-    emit_event(
-        emitter,
-        "sync-progress",
-        &SyncProgressEvent {
-            package_id: hub_package_id.clone(),
-            direction: super::Direction::Received,
-            stage: "fetching".to_string(),
-            peer_device: peer_device.clone(),
-            frame_count: announce.frame_count,
-            project_id: Some(project_id.clone()),
-            bytes_done: None,
-            bytes_total: None,
-        },
-    );
-    // I2 (T7): relay dial hint for the holder we're about to pull from (relay-only
-    // — cross-account safe; the node's hint never carries direct addrs).
-    transport.add_peer_dial_hint(from);
-    transport
-        .fetch(from, &announce, &staging, noop_fetch_sink())
-        .await
-        .with_context(|| format!("fetch project package {wire_package_id}"))?;
-
-    // Ingest on a blocking thread (file I/O + SQLite).
-    emit_event(
-        emitter,
-        "sync-progress",
-        &SyncProgressEvent {
-            package_id: hub_package_id.clone(),
-            direction: super::Direction::Received,
-            stage: "ingesting".to_string(),
-            peer_device: peer_device.clone(),
-            frame_count: announce.frame_count,
-            project_id: Some(project_id.clone()),
-            bytes_done: None,
-            bytes_total: None,
-        },
-    );
-    let outcome = {
-        let store = Arc::clone(store);
-        let staging_for_ingest = staging.clone();
-        let project_id = project_id.clone();
-        let hub_package_id = hub_package_id.clone();
-        let peer_device = peer_device.clone();
-        tokio::task::spawn_blocking(move || -> Result<super::ProjectIngestOutcome> {
-            // Per-frame connection locking (W2 T2.1), same as personal ingest.
-            super::project_ingest::ingest_project_package(
-                super::ingest::IngestConn::Shared(store.as_ref()),
-                &staging_for_ingest,
-                &project_id,
-                &hub_package_id,
-                &peer_device,
-            )
-        })
-        .await
-        .context("project ingest join")??
-    };
-
-    // Ack the per-frame receipts to the serving peer, keyed by the WIRE id.
-    transport
-        .ack(from, &announce.package_id, outcome.receipts.clone())
-        .await
-        .with_context(|| format!("ack project package {wire_package_id}"))?;
-
-    // Terminal: drop the fetched blobs (best-effort, idempotent).
-    if let Err(e) = transport.release(&announce.package_id).await {
-        tracing::warn!(package_id = %wire_package_id, error = %format!("{e:#}"), "receiver blob release failed");
-    }
-    // Best-effort staging cleanup.
-    if let Err(e) = std::fs::remove_dir_all(&staging) {
-        tracing::debug!(error = %e, path = %staging.display(), "project ingest staging cleanup skipped");
-    }
-
-    let finished_outcome = if outcome.failed.is_empty() {
-        "ingested"
-    } else if outcome.ok_count == 0 {
-        "failed"
-    } else {
-        "partial"
-    };
-    emit_event(
-        emitter,
-        "sync-finished",
-        &SyncFinishedEvent {
-            package_id: hub_package_id.clone(),
-            direction: super::Direction::Received,
-            outcome: finished_outcome.to_string(),
-            peer_device,
-            ok_count: outcome.ok_count as u32,
-            failed: outcome.failed,
-            new_count: 0,
-            duplicate_count: 0,
-            project_id: Some(project_id.clone()),
-        },
-    );
-
-    // Post-ingest hook (Task 8 wires report-have + notification data; None = no-op).
-    if let Some(hook) = on_project_ingested {
-        hook(project_id, hub_package_id);
-    }
-    Ok(())
-}
-
 // ── App-lifecycle runtime holder ────────────────────────────────────────────
 
 /// One started-transport bundle held by [`SyncRuntime`]. `transport` is the
@@ -3762,12 +3410,6 @@ impl SyncRuntime {
             working_dir.clone(),
             incoming,
             authorized,
-            ProjectReceiveHooks {
-                gate: hooks.project_gate,
-                announcements_refresher: hooks.announcements_refresher,
-                on_project_ingested: hooks.on_project_ingested,
-                request_handler: hooks.project_request_handler,
-            },
             Arc::clone(&control),
             Arc::clone(&transport),
             emitter,
@@ -3923,7 +3565,6 @@ mod tests {
             staging_root,
             incoming,
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             transport,
             Arc::new(RecordingEmitter::default()),
@@ -4040,7 +3681,6 @@ mod tests {
             staging_root,
             incoming,
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             transport,
             Arc::new(RecordingEmitter::default()),
@@ -4088,62 +3728,56 @@ mod tests {
         assert_eq!(zombie.last_error.as_deref(), Some("interrupted by restart"));
     }
 
-    /// Poll until the recorded gate-call log reaches `n` entries (or time out).
-    async fn wait_for_calls(seen: &Arc<Mutex<Vec<(NodeId, String)>>>, n: usize) {
-        for _ in 0..200 {
-            if seen.lock().unwrap().len() >= n {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for {n} project-gate call(s)");
-    }
-
-    /// Slice-4 receiver gate: an inbound project announce is validated (an unsafe
-    /// hub `package_id` is refused BEFORE the gate) and then routed through the
-    /// project gate. Task 4 only logs+drops, so the gate call itself — with the
-    /// transport-authenticated `from` and the project id — is the observable that
-    /// the announce reached the gate; the flippable verdict distinguishes the
-    /// dropped-unauthorized path from the accepted (info!) path.
+    /// P12: the package-era project messages are retired. The `Msg` variants
+    /// stay on the frozen wire, but the receiver drops both — one `warn!`
+    /// each — and neither touches the inbound table.
     #[tokio::test]
-    async fn project_announce_is_validated_then_routed_through_the_project_gate() {
+    async fn retired_project_messages_are_dropped() {
         use crate::sharing::SharingTransport;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Warnings(Arc<Mutex<Vec<String>>>);
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut msg = Message(String::new());
+                    event.record(&mut msg);
+                    self.0.lock().unwrap().push(msg.0);
+                }
+            }
+        }
+        let warnings = Warnings::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+        tracing::callsite::rebuild_interest_cache();
 
         let tmp = tempfile::tempdir().unwrap();
         let net = LoopbackNetwork::new();
         let sender = net.endpoint();
         let receiver_ep = net.endpoint();
-        let sender_node = sender.node_id();
         let receiver_node = receiver_ep.node_id();
 
         let store = Arc::new(CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap());
-        let staging = tmp.path().join("stage");
         let incoming_root = tmp.path().join("incoming");
         let incoming: IncomingResolver = Arc::new(move || incoming_root.clone());
-
-        // Recording gate: logs every (from, project_id) it is asked about and
-        // answers from a flippable verdict.
-        let seen: Arc<Mutex<Vec<(NodeId, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let verdict = Arc::new(AtomicBool::new(false));
-        let project_gate: ProjectAnnounceGate = {
-            let seen = Arc::clone(&seen);
-            let verdict = Arc::clone(&verdict);
-            Arc::new(move |from: &NodeId, project_id: &str| {
-                seen.lock().unwrap().push((*from, project_id.to_string()));
-                verdict.load(Ordering::SeqCst)
-            })
-        };
-
         let (_info, _handle) = SyncReceiver::spawn(
-            store,
-            staging,
+            Arc::clone(&store),
+            tmp.path().join("stage"),
             incoming,
             allow_all_peers(),
-            ProjectReceiveHooks {
-                gate: Some(project_gate),
-                ..Default::default()
-            },
             Arc::new(InboundControl::new()),
             Arc::new(receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -4157,43 +3791,36 @@ mod tests {
             byte_size: 0,
             frame_count: 1,
         };
-
-        // (1) Unsafe hub package_id: refused before the gate is ever consulted.
-        sender
-            .announce_project(receiver_node, "proj-1", "../evil", &announce)
-            .await
-            .expect("deliver unsafe project announce");
-        // (2) Safe hub package_id, verdict=false: reaches the gate, then dropped
-        //     as unauthorized — but the gate WAS consulted with the real sender.
         sender
             .announce_project(receiver_node, "proj-1", "hub-pkg-1", &announce)
             .await
-            .expect("deliver unauthorized project announce");
-
-        wait_for_calls(&seen, 1).await;
-        {
-            let s = seen.lock().unwrap();
-            assert_eq!(
-                s.len(),
-                1,
-                "the unsafe package_id never reached the gate; the safe one did"
-            );
-            assert_eq!(s[0], (sender_node, "proj-1".to_string()));
-        }
-
-        // (3) Authorize: a safe announce now passes the gate (reaches the info!
-        //     path). Same authenticated sender, a different project id.
-        verdict.store(true, Ordering::SeqCst);
+            .expect("deliver a project announce");
         sender
-            .announce_project(receiver_node, "proj-2", "hub-pkg-2", &announce)
+            .request_project(receiver_node, "proj-1", "hub-pkg-1")
             .await
-            .expect("deliver authorized project announce");
-        wait_for_calls(&seen, 2).await;
-        {
-            let s = seen.lock().unwrap();
-            assert_eq!(s.len(), 2);
-            assert_eq!(s[1], (sender_node, "proj-2".to_string()));
+            .expect("deliver a project request");
+
+        let retired = || {
+            warnings
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.as_str() == "retired collab message ignored")
+                .count()
+        };
+        for _ in 0..200 {
+            if retired() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert_eq!(retired(), 2, "one warn per retired message");
+        let conn = store.lock_conn();
+        let inbound: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_inbound", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(inbound, 0, "a retired message never writes an inbound row");
     }
 
     /// Build a one-frame fixture package (real 4x4 FITS payload + a manifest with
@@ -4274,7 +3901,6 @@ mod tests {
             sync_dir.clone(),
             Arc::new(move || incoming.clone()) as IncomingResolver,
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -4388,7 +4014,6 @@ mod tests {
             sync_dir.clone(),
             Arc::new(move || incoming.clone()) as IncomingResolver,
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -4453,7 +4078,6 @@ mod tests {
             sync_dir.clone(),
             Arc::new(move || incoming.clone()) as IncomingResolver,
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -4520,7 +4144,6 @@ mod tests {
             sync_dir.clone(),
             Arc::new(move || incoming.clone()) as IncomingResolver,
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -4616,7 +4239,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -4802,7 +4424,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -5335,7 +4956,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -5521,7 +5141,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -5716,7 +5335,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -5786,7 +5404,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -6148,7 +5765,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -6256,7 +5872,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -6346,7 +5961,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -6518,7 +6132,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -6643,7 +6256,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -6799,7 +6411,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -6927,7 +6538,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -7059,7 +6669,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -7556,7 +7165,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -7623,7 +7231,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             authorizer,
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -7722,7 +7329,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -8307,7 +7913,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -8508,7 +8113,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -8648,7 +8252,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -8742,7 +8345,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -8884,7 +8486,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -9031,7 +8632,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
@@ -9259,7 +8859,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -9410,7 +9009,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
@@ -9580,7 +9178,6 @@ mod tests {
                 Arc::new(move || incoming.clone()) as IncomingResolver
             },
             allow_all_peers(),
-            Default::default(),
             Arc::clone(&control),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),

@@ -3205,7 +3205,6 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
 
-    use crate::db::collab_exchange::{upsert_package, PackageRow};
     use crate::sharing::types::NodeId;
 
     /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
@@ -4351,75 +4350,31 @@ mod tests {
         assert_eq!(res.state, None);
     }
 
-    // ── Moderation (Task 9): package-era fixtures still exercised by the R14
-    // pruning test below (`pruning_a_lost_project_unseeds_all_its_packages`,
-    // package machinery not removed until Task 12) ──────────────────────────
+    // ── Unseeding at the project-data deletion site ──────────────────────────
 
-    /// Insert a package row with a given decision `state` + local fetch status
-    /// (fresh `package_id` ⇒ an INSERT, so `local_status` is honored).
-    fn seed_moderation_package(
-        conn: &rusqlite::Connection,
-        project_id: &str,
-        package_id: &str,
-        announcement_id: &str,
-        state: &str,
-        local_status: &str,
-        frame_count: i64,
-    ) {
-        upsert_package(
-            conn,
-            &PackageRow {
-                package_id: package_id.into(),
-                project_id: project_id.into(),
-                announcement_id: announcement_id.into(),
-                publisher_display: "Alice".into(),
-                own: false,
-                root_hash: "r".into(),
-                byte_size: 4096,
-                frame_count,
-                manifest_xxh3: None,
-                aggregate_stats: "{}".into(),
-                supersedes: "[]".into(),
-                state: state.into(),
-                reject_reason: None,
-                superseded: false,
-                origin: "remote".into(),
-                local_dir: None,
-                manifest_ndjson: None,
-                local_status: local_status.into(),
-                holder_count: 0,
-                online_count: 0,
-                created_at: "2026-07-13T00:00:00Z".into(),
-                decided_at: None,
-                fetched_at: String::new(),
-            },
-        )
-        .unwrap();
-    }
-
-    // ── D3 T4: unseeding at every project-data deletion site ─────────────────
-
-    /// Seed `package_id` for `project_id` on `ctx`'s node from a throwaway one-file
-    /// package dir, binding the node if the test has not already. Returns the node.
-    ///
-    /// The seed's CONTENT is irrelevant to a deletion test — what is asserted is
-    /// that the tag lives and dies with the project data — so this skips the
-    /// (heavier) real reconstruct and imports a minimal dir directly.
-    async fn seed_package_on_node(
+    /// Pin a throwaway blob under `project/<project_id>/<frame>/1` in `ctx`'s
+    /// node store, binding the node if the test has not already. The seed's
+    /// CONTENT is irrelevant to a deletion test — what is asserted is that the
+    /// tag lives and dies with the project data. Returns the node.
+    async fn seed_tag_on_node(
         ctx: &ServiceContext,
-        dir_root: &std::path::Path,
         project_id: &str,
-        package_id: &str,
+        frame: &str,
     ) -> std::sync::Arc<crate::sharing::iroh::node::SharedIrohNode> {
         let node = crate::api::sync::ensure_iroh_node(ctx).await.unwrap();
-        let pkg_dir = dir_root.join(format!("seed-{project_id}-{package_id}"));
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(
-            pkg_dir.join(crate::package::MANIFEST_FILENAME),
-            format!("{project_id}/{package_id}\n").as_bytes(),
-        )
-        .unwrap();
-        node.seed_project_collection(project_id, package_id, &pkg_dir)
+        let tt = node
+            .store()
+            .blobs()
+            .add_bytes(format!("{project_id}/{frame}").into_bytes())
+            .temp_tag()
+            .await
+            .unwrap();
+        node.store()
+            .tags()
+            .set(
+                format!("project/{project_id}/{frame}/1"),
+                tt.hash_and_format(),
+            )
             .await
             .unwrap();
         node
@@ -4428,23 +4383,23 @@ mod tests {
     async fn seed_tag_present(
         node: &crate::sharing::iroh::node::SharedIrohNode,
         project_id: &str,
-        package_id: &str,
+        frame: &str,
     ) -> bool {
         node.store()
             .tags()
-            .get(format!("project/{project_id}/{package_id}").as_bytes())
+            .get(format!("project/{project_id}/{frame}/1").as_bytes())
             .await
             .unwrap()
             .is_some()
     }
 
-    /// Deletion site 3 (D3 T4): a project the hub no longer lists (left, removed,
-    /// archived) is marked lost (R14) — this device is not a member any more,
-    /// so it must stop seeding EVERY package of that project. The `p-stays` seed
-    /// is the scope control: unseeding is per project id, never a `project/`
-    /// prefix sweep, so a project this prune did not name keeps every seed.
+    /// A project the hub no longer lists (left, removed, archived) is marked
+    /// lost (R14) — this device is not a member any more, so it must stop
+    /// seeding EVERY frame of that project. The `p-stays` seed is the scope
+    /// control: unseeding is per project id, never a `project/` prefix sweep,
+    /// so a project this prune did not name keeps every seed.
     #[tokio::test]
-    async fn pruning_a_lost_project_unseeds_all_its_packages() {
+    async fn pruning_a_lost_project_unseeds_all_its_frames() {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine;
         use ed25519_dalek::SigningKey;
@@ -4470,28 +4425,10 @@ mod tests {
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
             seed_publish_project(&conn, "p-gone", "[]");
-            seed_moderation_package(
-                &conn,
-                "p-gone",
-                "pkg-a",
-                "ann-a",
-                "published",
-                "complete",
-                1,
-            );
-            seed_moderation_package(
-                &conn,
-                "p-gone",
-                "pkg-b",
-                "ann-b",
-                "published",
-                "complete",
-                1,
-            );
         }
-        let node = seed_package_on_node(&ctx, _tmp.path(), "p-gone", "pkg-a").await;
-        seed_package_on_node(&ctx, _tmp.path(), "p-gone", "pkg-b").await;
-        seed_package_on_node(&ctx, _tmp.path(), "p-stays", "pkg-c").await;
+        let node = seed_tag_on_node(&ctx, "p-gone", "f-a").await;
+        seed_tag_on_node(&ctx, "p-gone", "f-b").await;
+        seed_tag_on_node(&ctx, "p-stays", "f-c").await;
 
         refresh_projects(&ctx).await.unwrap();
 
@@ -4509,12 +4446,12 @@ mod tests {
             );
         }
         assert!(
-            !seed_tag_present(&node, "p-gone", "pkg-a").await
-                && !seed_tag_present(&node, "p-gone", "pkg-b").await,
-            "every package of a project I am no longer in stops seeding"
+            !seed_tag_present(&node, "p-gone", "f-a").await
+                && !seed_tag_present(&node, "p-gone", "f-b").await,
+            "every frame of a project I am no longer in stops seeding"
         );
         assert!(
-            seed_tag_present(&node, "p-stays", "pkg-c").await,
+            seed_tag_present(&node, "p-stays", "f-c").await,
             "a project I am still in keeps seeding"
         );
         node.shutdown().await;
@@ -5124,10 +5061,6 @@ mod tests {
                 .iter()
                 .map(|n| std::fs::metadata(own_dir(&fx).join(n)).unwrap().len())
                 .sum();
-
-            // No package staging anywhere.
-            let dirs = crate::api::sync::sync_dirs(&fx.ctx).unwrap();
-            assert!(!dirs.working_dir.join("collab_pub").exists());
 
             // Reference import: the store holds outboards, never the bytes.
             let grown = dir_bytes(&store_dir).saturating_sub(store_before);
