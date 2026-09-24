@@ -123,6 +123,8 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
 
 /// Insert or refresh the cache row for one project. Keyed on `project_id`; every
 /// non-PK column is overwritten and `fetched_at` is stamped `datetime('now')`.
+/// A refresh of a project marked lost ([`mark_lost`]) is a re-join: it clears
+/// `lost_at`.
 ///
 /// Six columns are deliberately NOT in the list, each written only by its own
 /// setter so a wholesale poll refresh can never clobber it:
@@ -158,6 +160,7 @@ pub fn upsert_project(conn: &Connection, row: &CollabProjectRow) -> Result<()> {
             thresholds_version = excluded.thresholds_version,
             thresholds_rules_json = excluded.thresholds_rules_json,
             gov_caps_json = excluded.gov_caps_json,
+            lost_at = NULL,
             fetched_at = datetime('now')",
         params![
             row.project_id,
@@ -184,25 +187,56 @@ pub fn upsert_project(conn: &Connection, row: &CollabProjectRow) -> Result<()> {
     Ok(())
 }
 
-/// Record the manifest-sync cursor after a successful (possibly partial) fetch
-/// (P9): the highest `manifestVersion` applied (`manifest_cursor`), the last
-/// fully-applied `projects.version` (`hub_version`), and the caps as of that
-/// sync (`synced_caps_json`). The ONLY writer of these three columns — a
-/// wholesale [`upsert_project`] poll refresh never touches them.
+/// Record the manifest-sync cursor after a successful fetch (P9): the highest
+/// `manifestVersion` applied (`manifest_cursor`) and the caps as of that sync
+/// (`synced_caps_json`); plus the `projects.version` the version poll vouched
+/// for (`hub_version`) — `None` leaves `hub_version` as it is (ruling R12: a
+/// sync outside the poll never vouches for a version). The writer of these
+/// three columns besides [`mark_lost`], which resets them — a wholesale
+/// [`upsert_project`] poll refresh never touches them.
 pub fn set_sync_state(
     conn: &Connection,
     project_id: &str,
-    hub_version: i64,
+    hub_version: Option<i64>,
     manifest_cursor: i64,
     synced_caps_json: &str,
 ) -> Result<()> {
     conn.execute(
         "UPDATE collab_projects
-         SET hub_version = ?2, manifest_cursor = ?3, synced_caps_json = ?4
+         SET hub_version = COALESCE(?2, hub_version), manifest_cursor = ?3,
+             synced_caps_json = ?4
          WHERE project_id = ?1",
         params![project_id, hub_version, manifest_cursor, synced_caps_json],
     )?;
     Ok(())
+}
+
+/// Mark a project lost — the hub no longer lists it for me (R14). The row is
+/// kept (my own frame rows hang off it) but hidden from [`list_projects`];
+/// the sync state resets so a re-join fetches the whole manifest again (the
+/// replica rows were deleted with the loss). A no-op on a row already lost.
+/// Returns the rows updated.
+pub fn mark_lost(conn: &Connection, project_id: &str) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE collab_projects
+         SET lost_at = datetime('now'), hub_version = 0, manifest_cursor = 0,
+             synced_caps_json = '[]'
+         WHERE project_id = ?1 AND lost_at IS NULL",
+        params![project_id],
+    )?;
+    Ok(n)
+}
+
+/// When a project was marked lost, or `None` when it is live (or unknown).
+pub fn lost_at(conn: &Connection, project_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT lost_at FROM collab_projects WHERE project_id = ?1",
+            params![project_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// Record the project's filter dictionary (version + entries JSON), or clear it
@@ -252,10 +286,12 @@ pub fn set_auto_publish(conn: &Connection, project_id: &str, on: bool) -> Result
     Ok(())
 }
 
-/// All cached projects, ordered by title.
+/// All cached projects I am still a member of, ordered by title. Projects
+/// marked lost ([`mark_lost`]) are left out; [`get_project`] still reads them.
 pub fn list_projects(conn: &Connection) -> Result<Vec<CollabProjectRow>> {
-    let mut stmt =
-        conn.prepare(&format!("SELECT {SELECT_COLS} FROM collab_projects ORDER BY title"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM collab_projects WHERE lost_at IS NULL ORDER BY title"
+    ))?;
     let rows = stmt
         .query_map([], row_from_sql)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -465,6 +501,30 @@ mod tests {
             0,
             "an unknown project touches nothing"
         );
+    }
+
+    /// R14: a lost project is hidden, keeps its row and resets its sync
+    /// state; a refresh upsert (re-join) clears the stamp. R12: a sync that
+    /// vouches for no version leaves `hub_version` alone.
+    #[test]
+    fn mark_lost_hides_resets_and_a_rejoin_clears() {
+        let conn = test_conn();
+        upsert_project(&conn, &sample_row("p-1")).unwrap();
+        set_sync_state(&conn, "p-1", Some(9), 7, r#"["x"]"#).unwrap();
+        set_sync_state(&conn, "p-1", None, 8, "[]").unwrap();
+        let row = get_project(&conn, "p-1").unwrap().unwrap();
+        assert_eq!((row.hub_version, row.manifest_cursor), (9, 8));
+
+        assert_eq!(mark_lost(&conn, "p-1").unwrap(), 1);
+        assert_eq!(mark_lost(&conn, "p-1").unwrap(), 0, "already lost");
+        assert!(lost_at(&conn, "p-1").unwrap().is_some());
+        assert!(list_projects(&conn).unwrap().is_empty(), "hidden");
+        let row = get_project(&conn, "p-1").unwrap().unwrap();
+        assert_eq!((row.hub_version, row.manifest_cursor), (0, 0));
+
+        upsert_project(&conn, &sample_row("p-1")).unwrap();
+        assert!(lost_at(&conn, "p-1").unwrap().is_none(), "a re-join clears it");
+        assert_eq!(list_projects(&conn).unwrap().len(), 1);
     }
 
     #[test]

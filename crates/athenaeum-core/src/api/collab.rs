@@ -1210,25 +1210,77 @@ async fn pinned_pubkey(
 /// - TOFU-pins the hub's snapshot pubkey per host (see [`pinned_pubkey`]).
 /// - Per-project isolation: a failed fetch keeps the stale cache row and
 ///   continues (`warn!`, or `error!` for a snapshot verification failure).
-/// - Prunes cache rows for projects no longer returned by the hub (a failed
-///   fetch still counts as "still mine" and is kept).
+/// - Marks lost every cached project the hub no longer returns (a failed
+///   fetch still counts as "still mine" and is kept); see
+///   [`refresh_projects_reporting`].
 /// - Auto-links any pending portal deep-link intent whose target matches a
 ///   project that appeared for the FIRST time this refresh (≤ 0.1°).
+/// - Fires [`on_thresholds_or_dictionary_moved`] for every project whose
+///   thresholds or dictionary version this refresh changed.
 ///
 /// Returns the refreshed cards (== [`list_projects`]).
 pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, ApiError> {
-    refresh_projects_reporting(ctx).await?;
+    let report = refresh_projects_reporting(ctx, None).await?;
+    for project_id in &report.gate_moved {
+        on_thresholds_or_dictionary_moved(ctx, project_id);
+    }
     list_projects(ctx)
 }
 
-/// [`refresh_projects`], reporting the ids whose cache row this refresh
-/// actually rewrote — a project whose fetch failed keeps its stale row and is
-/// not in the set. The version poll uses it to hold back a manifest sync
-/// whose project refresh failed.
+/// What one [`refresh_projects_reporting`] did.
+#[derive(Debug, Default)]
+pub(crate) struct RefreshReport {
+    /// Ids whose cache row this refresh rewrote — a project whose fetch
+    /// failed keeps its stale row and is not in the set.
+    pub refreshed: std::collections::HashSet<String>,
+    /// Ids whose thresholds or dictionary version this refresh changed
+    /// (a first sight counts: nothing → something). The caller fires
+    /// [`on_thresholds_or_dictionary_moved`] for each.
+    pub gate_moved: Vec<String>,
+    /// Ids marked lost by this refresh.
+    pub lost: Vec<String>,
+}
+
+/// THE one entry point for "a project's thresholds or dictionary moved"
+/// (ruling R11), called by every refresh path — the project list refresh and
+/// the version poll — so a change is acted on once, whichever path absorbed
+/// it. A no-op until auto-publish (Task 10) replaces the body.
+pub(crate) fn on_thresholds_or_dictionary_moved(_ctx: &ServiceContext, project_id: &str) {
+    tracing::debug!(project_id, "thresholds or dictionary moved");
+    #[cfg(test)]
+    GATE_MOVES_SEEN.with(|seen| seen.borrow_mut().push(project_id.to_string()));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every [`on_thresholds_or_dictionary_moved`] call on this thread (a
+    /// `#[tokio::test]` runs its whole body on one thread).
+    static GATE_MOVES_SEEN: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The project ids [`on_thresholds_or_dictionary_moved`] saw on this thread,
+/// drained.
+#[cfg(test)]
+pub(crate) fn take_gate_moves_seen() -> Vec<String> {
+    GATE_MOVES_SEEN.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
+}
+
+/// [`refresh_projects`] without the hook, reporting what it did.
+///
+/// `only` limits the per-project fetch to those ids (the version poll passes
+/// the projects that moved or appeared); every project `/me/projects` lists
+/// still counts as mine, so a loss is detected from the list either way.
+///
+/// A lost project (cached, no longer listed) is marked lost, never deleted
+/// (ruling R14): its replica rows are deleted, its collab-store tags are
+/// dropped, and my own rows and files stay. A later refresh that finds it
+/// listed again is a re-join and clears the mark.
 pub(crate) async fn refresh_projects_reporting(
     ctx: &ServiceContext,
-) -> Result<std::collections::HashSet<String>, ApiError> {
-    let mut refreshed = std::collections::HashSet::new();
+    only: Option<&std::collections::HashSet<String>>,
+) -> Result<RefreshReport, ApiError> {
+    let mut report = RefreshReport::default();
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
         return Err(ApiError::SignedOut(
             "Sign in to use collaboration projects.".into(),
@@ -1239,6 +1291,8 @@ pub(crate) async fn refresh_projects_reporting(
     let pinned = pinned_pubkey(ctx, &hub_url, &client).await?;
     let mine = client.my_projects(&token).await.map_err(client_err)?;
 
+    // Live projects only: a project marked lost that the hub lists again is a
+    // re-join, i.e. new.
     let previous: std::collections::HashMap<String, CollabProjectRow> = {
         let db = db(ctx)?;
         let conn = db.conn();
@@ -1257,7 +1311,11 @@ pub(crate) async fn refresh_projects_reporting(
     let mut new_targets: Vec<(String, f64, f64)> = Vec::new();
     for p in &mine {
         keep.push(p.id.clone());
-        match fetch_one_project(&client, &token, &pinned, p, previous.get(&p.id)).await {
+        if only.is_some_and(|ids| !ids.contains(&p.id)) {
+            continue;
+        }
+        let prev = previous.get(&p.id);
+        match fetch_one_project(&client, &token, &pinned, p, prev).await {
             Ok(FetchedProject { row, dictionary }) => {
                 if !previous_ids.contains(&row.project_id) {
                     new_targets.push((
@@ -1265,6 +1323,17 @@ pub(crate) async fn refresh_projects_reporting(
                         row.target_ra_deg,
                         row.target_dec_deg,
                     ));
+                }
+                let (thresholds_before, dictionary_before) = prev.map_or((None, None), |r| {
+                    (r.thresholds_version, r.dictionary_version)
+                });
+                let dictionary_now = dictionary
+                    .as_ref()
+                    .map_or(dictionary_before, |(version, _)| *version);
+                if thresholds_before != row.thresholds_version
+                    || dictionary_before != dictionary_now
+                {
+                    report.gate_moved.push(row.project_id.clone());
                 }
                 let db = db(ctx)?;
                 let conn = db.conn();
@@ -1278,7 +1347,7 @@ pub(crate) async fn refresh_projects_reporting(
                     )
                     .map_err(internal)?;
                 }
-                refreshed.insert(row.project_id.clone());
+                report.refreshed.insert(row.project_id.clone());
             }
             Err(FetchError::Verify(err)) => {
                 tracing::error!(
@@ -1297,24 +1366,27 @@ pub(crate) async fn refresh_projects_reporting(
         }
     }
 
+    report.lost = previous_ids
+        .iter()
+        .filter(|id| !keep.contains(id))
+        .cloned()
+        .collect();
     {
         let db = db(ctx)?;
         let conn = db.conn();
-        // A lost project's replica rows go. Own rows are never deleted here
-        // (`delete_not_in` spares them) and my own files stay on disk — but
-        // the prune below cascades every remaining row of the project away
-        // with its cache row (FK `ON DELETE CASCADE`); a re-join re-adopts
-        // them from the hub (R8).
-        for lost in previous_ids.iter().filter(|id| !keep.contains(id)) {
+        // A lost project is marked, never deleted (R14): its replica rows go,
+        // my own rows stay with the row they hang off (a delete would cascade
+        // them away), and my own files are never touched.
+        for lost in &report.lost {
             let removed = crate::db::collab_frames::delete_not_in(
                 &conn,
                 lost,
                 &std::collections::HashSet::new(),
             )
             .map_err(internal)?;
-            tracing::info!(project_id = %lost, count = removed, "lost project: replica frame rows deleted");
+            crate::db::collab::mark_lost(&conn, lost).map_err(internal)?;
+            tracing::info!(project_id = %lost, count = removed, "project lost: marked, replica frame rows deleted");
         }
-        crate::db::collab::prune_projects_not_in(&conn, &keep).map_err(internal)?;
         // Expire stale intents first: a "publish as project" intent that never
         // matched a new project must not silently auto-link an unrelated project
         // that appears weeks later.
@@ -1337,19 +1409,19 @@ pub(crate) async fn refresh_projects_reporting(
         }
     }
 
-    // Stop seeding every project the hub no longer lists (D3 T4). This prune is
-    // the ONE place local project membership ends — a project I left, was removed
+    // Stop seeding every project the hub no longer lists (D3 T4). This is the
+    // ONE place local project membership ends — a project I left, was removed
     // from, or that was archived — and a device that is not a member has no
     // business advertising or serving that project's blobs. Only a SUCCESSFUL
     // `my_projects` reaches here (a failed list returns above) and a per-project
     // fetch failure still counts as "still mine", so this can never fire on a hub
-    // blip. Scoped per project id, never a prefix sweep. Re-joining and
-    // re-downloading re-seeds.
-    for lost in previous_ids.iter().filter(|id| !keep.contains(id)) {
+    // blip. Scoped per project id, never a prefix sweep; it covers both stores
+    // and the collab store's in-flight tags. Re-joining re-seeds.
+    for lost in &report.lost {
         crate::api::collab_exchange::unseed_project_local_data(ctx, lost).await;
     }
 
-    Ok(refreshed)
+    Ok(report)
 }
 
 // ── Publish (Task 7): per frame — write once, seed by reference, announce ────
@@ -4803,7 +4875,7 @@ mod tests {
     }
 
     /// Deletion site 3 (D3 T4): a project the hub no longer lists (left, removed,
-    /// archived) is pruned from the cache — this device is not a member any more,
+    /// archived) is marked lost (R14) — this device is not a member any more,
     /// so it must stop seeding EVERY package of that project. The `p-stays` seed
     /// is the scope control: unseeding is per project id, never a `project/`
     /// prefix sweep, so a project this prune did not name keeps every seed.
@@ -4859,12 +4931,19 @@ mod tests {
 
         refresh_projects(&ctx).await.unwrap();
 
-        assert!(
-            crate::db::collab::get_project(&crate::api::db(&ctx).unwrap().conn(), "p-gone")
-                .unwrap()
-                .is_none(),
-            "the lost project was pruned (the real deletion this hangs off)"
-        );
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            assert!(
+                crate::db::collab::lost_at(&conn, "p-gone")
+                    .unwrap()
+                    .is_some(),
+                "the lost project is marked lost (R14: kept, never deleted)"
+            );
+            assert!(
+                crate::db::collab::list_projects(&conn).unwrap().is_empty(),
+                "and hidden from the project list"
+            );
+        }
         assert!(
             !seed_tag_present(&node, "p-gone", "pkg-a").await
                 && !seed_tag_present(&node, "p-gone", "pkg-b").await,

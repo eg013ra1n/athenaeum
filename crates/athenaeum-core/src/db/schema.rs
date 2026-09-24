@@ -2381,6 +2381,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // Wave-2 Task 8 (ruling R14): a project the hub no longer lists is marked
+    // lost instead of deleted, so my own frame rows (and the files they
+    // track) survive the loss. `list_projects` hides lost rows; a re-join
+    // clears the stamp (`upsert_project`).
+    if !column_exists(conn, "collab_projects", "lost_at")? {
+        conn.execute("ALTER TABLE collab_projects ADD COLUMN lost_at TEXT", [])?;
+    }
 
     // v3 per-frame local cache (wave-2 Task 2, spec amendment A1/P26): the ONE
     // source of a project frame's on-disk path — disk truth, holder reports,

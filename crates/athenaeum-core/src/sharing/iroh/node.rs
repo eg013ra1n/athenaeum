@@ -3023,8 +3023,10 @@ impl SharedIrohNode {
     /// The same prefix is also deleted in the COLLAB store when one is mounted
     /// (collab v3 wave 2): every per-frame tag
     /// ([`project_frame_tag`]) of the project sits under it, so a device that
-    /// left a project stops serving its frames. The files the tags referenced
-    /// are never touched.
+    /// left a project stops serving its frames — and so is its in-flight twin
+    /// (`in-flight/project/<project_id>/`, P22), so a download the loss
+    /// interrupted pins nothing. The files the tags referenced are never
+    /// touched.
     pub async fn unseed_project(&self, project_id: &str) {
         let prefix = project_seed_prefix(project_id);
         self.forget_served_prefix(&prefix);
@@ -3039,17 +3041,22 @@ impl SharedIrohNode {
             ),
         }
         if let Some(collab) = self.collab_store() {
-            match collab.tags().delete_prefix(prefix.as_bytes()).await {
-                Ok(removed) => tracing::info!(
-                    project_id,
-                    tags_removed = removed,
-                    "project unseeded from the collab store"
-                ),
-                Err(e) => tracing::warn!(
-                    project_id,
-                    error = %e,
-                    "delete project collab seed tags failed"
-                ),
+            let in_flight = blobs::in_flight_tag(&prefix);
+            for scope in [&prefix, &in_flight] {
+                match collab.tags().delete_prefix(scope.as_bytes()).await {
+                    Ok(removed) => tracing::info!(
+                        project_id,
+                        tag = %scope,
+                        tags_removed = removed,
+                        "project unseeded from the collab store"
+                    ),
+                    Err(e) => tracing::warn!(
+                        project_id,
+                        tag = %scope,
+                        error = %e,
+                        "delete project collab seed tags failed"
+                    ),
+                }
             }
         }
     }

@@ -116,7 +116,8 @@ impl FakeProject {
         self.members.iter().find(|m| m.account_id == account_id)
     }
 
-    fn bump(&mut self) -> i64 {
+    /// `version += 1`; returns the new version.
+    pub fn bump(&mut self) -> i64 {
         self.version += 1;
         self.version
     }
@@ -133,7 +134,14 @@ pub struct FakeHubState {
     /// Request paths (suffix match) answered with a 500 — a hub fault
     /// injected by a test.
     pub failing: HashSet<String>,
+    /// One-shot state changes applied just before the next request whose
+    /// path ends with the suffix is answered (a change landing "between" two
+    /// app calls).
+    pub triggers: Vec<(String, StateChange)>,
 }
+
+/// A test's one-shot change to the hub's state.
+pub type StateChange = Box<dyn FnOnce(&mut FakeHubState) + Send>;
 
 impl FakeHubState {
     /// device pubkey (base64) → account id.
@@ -212,6 +220,7 @@ impl FakeHub {
             tokens: HashMap::new(),
             page_size: MANIFEST_PAGE,
             failing: HashSet::new(),
+            triggers: Vec::new(),
         }));
         let key = SigningKey::from_bytes(&[7u8; 32]);
         Mock::given(any())
@@ -327,6 +336,40 @@ impl FakeHub {
         } else {
             st.failing.remove(suffix);
         }
+    }
+
+    /// Apply `change` just before the next request whose path ends with
+    /// `suffix` is answered (once).
+    pub fn before_next(
+        &self,
+        suffix: &str,
+        change: impl FnOnce(&mut FakeHubState) + Send + 'static,
+    ) {
+        self.lock()
+            .triggers
+            .push((suffix.to_string(), Box::new(change)));
+    }
+
+    /// Add (or re-add) a member. Bumps both versions, as the hub does.
+    pub fn add_member(
+        &self,
+        project_id: &str,
+        account_id: &str,
+        data_role: &str,
+        coordinator: bool,
+    ) {
+        self.with_project(project_id, |p| {
+            p.members.retain(|m| m.account_id != account_id);
+            p.members.push(FakeMember {
+                account_id: account_id.to_string(),
+                data_role: data_role.to_string(),
+                coordinator,
+                gov_caps: Vec::new(),
+                trusted: false,
+            });
+            p.membership_version += 1;
+            p.bump();
+        });
     }
 
     /// Replace a member's governance caps. Bumps, as the hub does.
@@ -546,6 +589,14 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
     let Some(rest) = path.strip_prefix("/api/v1") else {
         return empty(404);
     };
+    if let Some(i) = st
+        .triggers
+        .iter()
+        .position(|(suffix, _)| path.ends_with(suffix.as_str()))
+    {
+        let (_, change) = st.triggers.remove(i);
+        change(st);
+    }
     if st
         .failing
         .iter()
