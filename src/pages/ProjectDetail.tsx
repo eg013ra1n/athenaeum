@@ -137,48 +137,29 @@ export default function ProjectDetail() {
     await openUrl(safe);
   };
 
-  /** Shared publish-outcome handling for both the Publish and the
-   *  "Recalibrate and republish all" flows (P19). */
-  const notifyPublished = (res: PublishResult) => {
-    const sent = res.announced + res.updated;
-    const heldBackCount = res.heldBack.length;
-    let title: string;
-    let tone: 'info' | 'success' | 'warning' = 'success';
-    if (sent === 0) {
-      title = 'Nothing new to publish';
-      tone = heldBackCount > 0 ? 'warning' : 'info';
-    } else if (res.state === 'pending') {
-      title = `Sent ${sent} frames for approval · ${heldBackCount} held back`;
-      tone = 'info';
-    } else {
-      title = `Published ${sent} frames · ${heldBackCount} held back`;
-      tone = 'success';
-    }
-    const parts = [`${res.announced} new`, `${res.updated} updated`];
-    if (res.unchanged > 0) parts.push(`${res.unchanged} unchanged`);
-    notify({
-      title,
-      detail: parts.join(' · '),
-      kind: 'project',
-      tone,
-      hasErrors: heldBackCount > 0,
-      link: `/projects/${id}`,
-      dedupeKey: `publish-${id}-${Date.now()}`,
-    });
-  };
+  // R29 fix round 2: the backend always emits `collab-published` on a
+  // successful publish/republish (manual or auto), and the app-root
+  // `useCollabNotifications` hook is the one place that turns it into a
+  // toast — a second, inline success notify here would double-toast on
+  // every manual click. `doPublish`/`doRepublish` below do their own local
+  // UI work (close the confirm dialog, reload the frames/detail) and raise
+  // a notify() only for a failed invoke, which the backend never emits an
+  // event for — nothing else would ever tell the user. That error toast's
+  // `publish-failed-`/`republish-failed-` dedupeKey prefix can never collide
+  // with the live listener's `publish-live-` key.
 
   const doPublish = async () => {
     if (!id) return;
     setPublishBusy(true);
     setPublishError(null);
     try {
-      const res = await api.invoke<PublishResult>('publish_collab_frames', { projectId: id });
+      await api.invoke<PublishResult>('publish_collab_frames', { projectId: id });
       setPublishConfirm(false);
-      notifyPublished(res);
       await loadFrames();
       await load();
     } catch (err) {
-      // S6 — a failed publish surfaces inline, never silently swallowed.
+      // S6 — a failed publish surfaces inline AND as a toast, never silently
+      // swallowed (the backend raises no event to notify from otherwise).
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[projects] publish failed:', err);
       if (isOutdated(msg)) {
@@ -186,6 +167,15 @@ export default function ProjectDetail() {
         setUpdateRequired(true);
       } else {
         setPublishError(msg);
+        notify({
+          title: 'Publish failed',
+          detail: msg,
+          kind: 'project',
+          tone: 'warning',
+          hasErrors: true,
+          link: `/projects/${id}`,
+          dedupeKey: `publish-failed-${id}-${Date.now()}`,
+        });
       }
     } finally {
       setPublishBusy(false);
@@ -197,9 +187,8 @@ export default function ProjectDetail() {
     setRepublishBusy(true);
     setRepublishError(null);
     try {
-      const res = await api.invoke<PublishResult>('republish_collab_frames', { projectId: id });
+      await api.invoke<PublishResult>('republish_collab_frames', { projectId: id });
       setRepublishConfirm(false);
-      notifyPublished(res);
       await loadFrames();
       await load();
     } catch (err) {
@@ -210,6 +199,15 @@ export default function ProjectDetail() {
         setUpdateRequired(true);
       } else {
         setRepublishError(msg);
+        notify({
+          title: 'Republish failed',
+          detail: msg,
+          kind: 'project',
+          tone: 'warning',
+          hasErrors: true,
+          link: `/projects/${id}`,
+          dedupeKey: `republish-failed-${id}-${Date.now()}`,
+        });
       }
     } finally {
       setRepublishBusy(false);
