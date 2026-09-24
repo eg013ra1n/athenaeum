@@ -450,6 +450,92 @@ pub fn publisher_dir(
     Ok(landed.and_then(|p| PathBuf::from(p).parent().map(PathBuf::from)))
 }
 
+/// Store a new recipe hash on an own frame whose regeneration came out
+/// byte-identical (P19). Column-targeted: every hub-owned column a concurrent
+/// manifest sync may have written (`state`, `accepted`, `manifest_version`,
+/// `holder_count`, …) is left alone. Returns the rows touched.
+pub fn set_recipe_hash(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    recipe_hash: &str,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local SET recipe_hash = ?3, updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2",
+        params![project_id, frame_uuid, recipe_hash],
+    )?)
+}
+
+/// Record a new content version of an own frame (P19): the version, its
+/// hashes and size, the recipe that produced it, the landed file's
+/// `size:mtime`, and the same content keys inside `manifest_json`.
+/// Column-targeted like [`set_recipe_hash`] — hub-owned columns survive.
+#[allow(clippy::too_many_arguments)]
+pub fn set_own_version(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    content_version: i32,
+    blake3: &str,
+    xxh3: &str,
+    byte_size: i64,
+    recipe_hash: &str,
+    size_mtime_seen: Option<&str>,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local
+         SET content_version = ?3, blake3 = ?4, xxh3 = ?5, byte_size = ?6, recipe_hash = ?7,
+             size_mtime_seen = ?8, on_disk = 1, awaiting_gc = 0, last_error = NULL,
+             manifest_json = CASE WHEN json_valid(manifest_json)
+                 THEN json_set(manifest_json, '$.contentVersion', ?3, '$.blake3', ?4,
+                               '$.xxh3', ?5, '$.byteSize', ?6)
+                 ELSE manifest_json END,
+             updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2",
+        params![
+            project_id,
+            frame_uuid,
+            content_version,
+            blake3,
+            xxh3,
+            byte_size,
+            recipe_hash,
+            size_mtime_seen
+        ],
+    )?)
+}
+
+/// Bind an own frame the hub already knows (a manifest-delivered row, or one
+/// the hub refused as "already announced") to the local frame it was
+/// generated from: `source_frame_id`, `landed_path`, `recipe_hash`,
+/// `size_mtime_seen`, `on_disk = 1`. Column-targeted — hub-owned columns
+/// survive. Returns the rows touched.
+pub fn adopt_own(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    source_frame_id: i64,
+    landed_path: &str,
+    recipe_hash: &str,
+    size_mtime_seen: Option<&str>,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local
+         SET source_frame_id = ?3, landed_path = ?4, recipe_hash = ?5, size_mtime_seen = ?6,
+             on_disk = 1, awaiting_gc = 0, last_error = NULL, updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own'",
+        params![
+            project_id,
+            frame_uuid,
+            source_frame_id,
+            landed_path,
+            recipe_hash,
+            size_mtime_seen
+        ],
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +659,67 @@ mod tests {
             own_after.on_disk,
             "an own row's disk state is not manifest-driven"
         );
+    }
+
+    /// R10: the publish write-backs touch only their own columns — a
+    /// `state`/`accepted`/`manifest_version` written by a concurrent manifest
+    /// sync survives all three.
+    #[test]
+    fn own_write_backs_leave_hub_columns_alone() {
+        let c = conn();
+        upsert_from_manifest(&c, "p1", &view("u1", 1)).unwrap();
+        let mut own = get(&c, "p1", "u1").unwrap().unwrap();
+        own.origin = FrameOrigin::Own;
+        own.source_frame_id = None;
+        record_own(&c, &own).unwrap();
+        c.execute(
+            "UPDATE project_frames_local SET state = 'rejected', accepted = 0, manifest_version = 42",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            adopt_own(&c, "p1", "u1", 7, "/c/m31/me/c_u1.fits", "r0", Some("1:2")).unwrap(),
+            1
+        );
+        assert_eq!(set_recipe_hash(&c, "p1", "u1", "r1").unwrap(), 1);
+        assert_eq!(
+            set_own_version(
+                &c,
+                "p1",
+                "u1",
+                2,
+                &"c".repeat(64),
+                "fedcba9876543210",
+                555,
+                "r2",
+                Some("555:9")
+            )
+            .unwrap(),
+            1
+        );
+        let r = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.accepted, r.manifest_version),
+            ("rejected", false, 42)
+        );
+        assert_eq!(r.source_frame_id, Some(7));
+        assert_eq!(r.landed_path.as_deref(), Some("/c/m31/me/c_u1.fits"));
+        assert_eq!(r.content_version, 2);
+        assert_eq!(r.recipe_hash.as_deref(), Some("r2"));
+        assert_eq!(r.byte_size, 555);
+        assert!(r.on_disk);
+        let m: serde_json::Value = serde_json::from_str(&r.manifest_json).unwrap();
+        assert_eq!(m["contentVersion"], 2);
+        assert_eq!(m["byteSize"], 555);
+        assert_eq!(m["xxh3"], "fedcba9876543210");
+        assert_eq!(
+            m["state"], "published",
+            "manifest_json keeps its other keys"
+        );
+
+        // adopt_own never touches a replica row.
+        upsert_from_manifest(&c, "p1", &view("u2", 1)).unwrap();
+        assert_eq!(adopt_own(&c, "p1", "u2", 8, "/x", "r", None).unwrap(), 0);
     }
 }

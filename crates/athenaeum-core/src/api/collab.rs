@@ -1364,8 +1364,32 @@ pub(crate) fn recipe_hash(
     spec: &crate::export::GenerationSpec,
     source_path: &Path,
 ) -> anyhow::Result<String> {
+    recipe_hash_for(conn, crate::export::spec_master_paths(spec), source_path)
+}
+
+/// [`recipe_hash`] from the catalog links alone (no flat read, no compute
+/// permit) — what the pre-permit split (ruling R9) decides with. Same master
+/// rule ([`crate::export::master_paths_read`]), so the two always agree for
+/// the same links.
+fn recipe_hash_of_inputs(
+    conn: &Connection,
+    resolved: &crate::calibration_library::light_resolve::ResolvedFrameInputs,
+) -> anyhow::Result<String> {
+    let masters = crate::export::master_paths_read(
+        resolved.dark.as_ref().map(|m| Path::new(m.path.as_str())),
+        resolved.flat.as_ref().map(|m| Path::new(m.path.as_str())),
+        resolved.bias.as_ref().map(|m| Path::new(m.path.as_str())),
+    );
+    recipe_hash_for(conn, masters, &resolved.light_path)
+}
+
+fn recipe_hash_for(
+    conn: &Connection,
+    master_paths: std::collections::BTreeSet<std::path::PathBuf>,
+    source_path: &Path,
+) -> anyhow::Result<String> {
     let mut masters = Vec::new();
-    for path in crate::export::spec_master_paths(spec) {
+    for path in master_paths {
         let path_str = path.to_string_lossy().to_string();
         let strong: Option<String> = conn
             .query_row(
@@ -1403,11 +1427,49 @@ fn blake3_file(path: &Path) -> anyhow::Result<String> {
 }
 
 /// Header WCS keywords P4 strips before the plate solve's own WCS goes in:
-/// every keyword `wcs_cards` can emit, plus the pole keywords a copy-through
-/// header may carry alongside them.
+/// every keyword `wcs_cards` can emit (incl. `CDELTi`/`CROTAi`), the pole
+/// keywords, and the `PCi_j` matrix — so the file never carries both a CD and
+/// a PC matrix.
 fn is_header_wcs_keyword(keyword: &str) -> bool {
     crate::stacking::master_cards::is_wcs_keyword(keyword)
         || matches!(keyword, "LONPOLE" | "LATPOLE")
+        || is_pc_matrix_keyword(keyword)
+}
+
+/// `^PC\d+_\d+$` — one element of a FITS WCS `PCi_j` matrix.
+fn is_pc_matrix_keyword(keyword: &str) -> bool {
+    let Some(rest) = keyword.strip_prefix("PC") else {
+        return false;
+    };
+    let mut parts = rest.split('_');
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    matches!((parts.next(), parts.next(), parts.next()), (Some(i), Some(j), None) if digits(i) && digits(j))
+}
+
+/// The hub's `fileName` rule (hub contract): non-empty, at most 255 bytes, no
+/// surrounding whitespace, not `.`/`..`, none of `/ \ :`, NUL or control
+/// characters. A name that breaks it would refuse the whole atomic batch, so
+/// the frame is held back up front instead.
+fn hub_file_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("empty file name");
+    }
+    if name.len() > 255 {
+        return Some("file name longer than 255 bytes");
+    }
+    if name.trim() != name {
+        return Some("file name has surrounding whitespace");
+    }
+    if name == "." || name == ".." {
+        return Some("file name is . or ..");
+    }
+    if name
+        .chars()
+        .any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
+    {
+        return Some("file name contains / \\ : or a control character");
+    }
+    None
 }
 
 /// The publish stamps on one frame's header: `ATH_PRJ` and `ATH_FILT`, and
@@ -1549,11 +1611,33 @@ struct PublishCandidate {
     filter_canonical: String,
 }
 
-/// A frame that must be (re)generated: first publication, or an own frame
-/// whose recipe moved (or a forced republish).
+/// What a publish run does with one frame, decided by the pre-permit split.
 enum PublishKind {
+    /// First publication.
     New,
+    /// An own frame whose recipe moved (or a forced republish, P19).
     Update(crate::db::collab_frames::LocalFrameRow),
+    /// A frame the hub already knows as mine but that has no local binding
+    /// (an own row the manifest delivered, `source_frame_id` NULL — ruling
+    /// R8b): regenerated, checked against the hub's BLAKE3, then bound —
+    /// never announced again.
+    Adopt(crate::db::collab_frames::LocalFrameRow),
+}
+
+impl PublishKind {
+    fn row(&self) -> Option<&crate::db::collab_frames::LocalFrameRow> {
+        match self {
+            PublishKind::New => None,
+            PublishKind::Update(r) | PublishKind::Adopt(r) => Some(r),
+        }
+    }
+}
+
+/// One frame the split sends to generation, with its landing path.
+struct PlannedFrame {
+    cand: PublishCandidate,
+    kind: PublishKind,
+    target: std::path::PathBuf,
 }
 
 /// A generated frame on disk, ready to seed.
@@ -1566,13 +1650,16 @@ struct WrittenFrame {
     /// Where the frame lives once published.
     target: std::path::PathBuf,
     /// Where the generator wrote it: `target` for a new frame, the sibling
-    /// temp for an update.
+    /// temp for an update or an adoption.
     staged: std::path::PathBuf,
     recipe: String,
     xxh3: String,
     byte_size: u64,
-    /// Manifest fields for a new frame's announce; `None` for an update.
+    /// Manifest fields for a new frame's announce; `None` otherwise.
     meta: Option<crate::collab::frame_meta::FrameMeta>,
+    /// An adoption whose regenerated bytes equal the hub's current content:
+    /// bound and seeded at the hub's version, no new version.
+    identical: bool,
 }
 
 /// What the generation phase hands back to the async publish phase.
@@ -1589,9 +1676,7 @@ struct GenerationJob {
     pool: Arc<rayon::ThreadPool>,
     project_id: String,
     label: String,
-    own_dir: std::path::PathBuf,
-    candidates: Vec<PublishCandidate>,
-    force: bool,
+    plans: Vec<PlannedFrame>,
 }
 
 fn held(frame_id: i64, filename: &str, reason: String) -> HeldBackFrame {
@@ -1602,13 +1687,24 @@ fn held(frame_id: i64, filename: &str, reason: String) -> HeldBackFrame {
     }
 }
 
+/// Remove a regeneration temp; a failure is logged, never silent (a missing
+/// file is not a failure).
+fn remove_temp(project_id: &str, path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(project_id, path = %path.display(), error = %e, "publish: removing a regeneration temp failed");
+        }
+    }
+}
+
 /// The generation phase of a publish run, on a blocking thread under ONE
-/// `ComputeQueue` permit (the `sync_prepare::open_generation` pattern):
-/// resolve every candidate in one catalog borrow, split it into new / update
-/// / unchanged by its recipe (P19), stat the masters it reads, then calibrate
-/// each frame to be sent exactly once — a new frame straight into its landing
-/// path, an update into a sibling temp whose BLAKE3 decides whether anything
-/// changed. A failing frame is held back with its reason; the run goes on.
+/// `ComputeQueue` permit (the `sync_prepare::open_generation` pattern). Only
+/// entered when the split found something to generate (ruling R9). Resolves
+/// every planned frame in one catalog borrow, stats the masters it reads,
+/// then calibrates each exactly once — a new frame straight into its landing
+/// path, an update or adoption into a sibling temp whose BLAKE3 decides
+/// whether anything changed. A failing frame is held back with its reason;
+/// the run goes on.
 fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiError> {
     use crate::services::compute_queue::ComputeJobKind;
 
@@ -1630,25 +1726,19 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     let scratch_dir = std::env::temp_dir();
     let mut held_back: Vec<HeldBackFrame> = Vec::new();
     let mut unchanged = 0usize;
-    let mut plans: Vec<(
-        PublishCandidate,
-        PublishKind,
+    let mut prepared: Vec<(
+        PlannedFrame,
         crate::export::GenerationSpec,
         String,
-        std::path::PathBuf,
         Option<crate::collab::frame_meta::FrameMeta>,
     )> = Vec::new();
     {
         let conn = job.db.conn();
-        let own = crate::db::collab_frames::own_by_source_frame(&conn, pid).map_err(|e| {
-            tracing::error!(project_id = pid, error = %format!("{e:#}"), "publish: read own frames failed");
-            internal(e)
-        })?;
         let mut divisors = crate::export::DivisorCache::new();
-        let mut claimed: HashSet<std::path::PathBuf> = HashSet::new();
         let mut master_ok: HashMap<std::path::PathBuf, bool> = HashMap::new();
-        for cand in job.candidates {
-            let fid = cand.frame_id;
+        for plan in job.plans {
+            let fid = plan.cand.frame_id;
+            let name = plan.cand.filename.clone();
             let mut spec = match crate::export::resolve_generation_cached(
                 &conn,
                 fid,
@@ -1659,33 +1749,21 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(project_id = pid, frame_id = fid, error = %format!("{e:#}"), "publish: cannot calibrate this light");
-                    held_back.push(held(
-                        fid,
-                        &cand.filename,
-                        format!("cannot calibrate: {e:#}"),
-                    ));
+                    held_back.push(held(fid, &name, format!("cannot calibrate: {e:#}")));
                     continue;
                 }
             };
+            // The recipe of what is actually generated (equal to the split's
+            // by construction; stored with the frame).
             let recipe = match recipe_hash(&conn, &spec, &spec.inputs.light_path) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(project_id = pid, frame_id = fid, error = %format!("{e:#}"), "publish: recipe hash failed");
                     held_back.push(held(
                         fid,
-                        &cand.filename,
+                        &name,
                         format!("cannot read the calibration inputs: {e:#}"),
                     ));
-                    continue;
-                }
-            };
-            let kind = match own.get(&fid) {
-                None => PublishKind::New,
-                Some(row) if job.force || row.recipe_hash.as_deref() != Some(recipe.as_str()) => {
-                    PublishKind::Update(row.clone())
-                }
-                Some(_) => {
-                    unchanged += 1;
                     continue;
                 }
             };
@@ -1697,7 +1775,7 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
                 tracing::error!(project_id = pid, frame_id = fid, path = %path.display(), "publish: master file missing");
                 held_back.push(held(
                     fid,
-                    &cand.filename,
+                    &name,
                     format!(
                         "master file missing on disk: {} (archived or moved — restore it, then publish again)",
                         path.display()
@@ -1705,76 +1783,49 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
                 ));
                 continue;
             }
-            if let Err(e) = stamp_publish_cards(&conn, &mut spec, pid, fid, &cand.filter_canonical)
+            if let Err(e) =
+                stamp_publish_cards(&conn, &mut spec, pid, fid, &plan.cand.filter_canonical)
             {
                 tracing::error!(project_id = pid, frame_id = fid, error = %format!("{e:#}"), "publish: header stamping failed");
-                held_back.push(held(
-                    fid,
-                    &cand.filename,
-                    format!("cannot build the header: {e:#}"),
-                ));
+                held_back.push(held(fid, &name, format!("cannot build the header: {e:#}")));
                 continue;
             }
-            let (target, meta) = match &kind {
-                PublishKind::New => {
-                    let meta = match crate::collab::frame_meta::build_frame_meta(&conn, fid) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!(project_id = pid, frame_id = fid, error = %format!("{e:#}"), "publish: frame meta failed");
-                            held_back.push(held(
-                                fid,
-                                &cand.filename,
-                                format!("cannot read frame metadata: {e:#}"),
-                            ));
-                            continue;
-                        }
-                    };
-                    let name = spec.output_filename(&cand.filename);
-                    match new_frame_target(&conn, &job.own_dir, &name, &mut claimed) {
-                        Ok(t) => (t, Some(meta)),
-                        Err(e) => {
-                            tracing::error!(project_id = pid, frame_id = fid, error = %format!("{e:#}"), "publish: no landing path");
-                            held_back.push(held(
-                                fid,
-                                &cand.filename,
-                                format!("no landing path: {e:#}"),
-                            ));
-                            continue;
-                        }
-                    }
-                }
-                PublishKind::Update(row) => match &row.landed_path {
-                    Some(p) => (std::path::PathBuf::from(p), None),
-                    None => {
-                        tracing::error!(project_id = pid, frame_id = fid, frame_uuid = %row.frame_uuid, "publish: own frame has no landed path");
+            let meta = match plan.kind {
+                PublishKind::New => match crate::collab::frame_meta::build_frame_meta(&conn, fid) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        tracing::error!(project_id = pid, frame_id = fid, error = %format!("{e:#}"), "publish: frame meta failed");
                         held_back.push(held(
                             fid,
-                            &cand.filename,
-                            "own frame has no file path".into(),
+                            &name,
+                            format!("cannot read frame metadata: {e:#}"),
                         ));
                         continue;
                     }
                 },
+                _ => None,
             };
-            plans.push((cand, kind, spec, recipe, target, meta));
+            prepared.push((plan, spec, recipe, meta));
         }
     }
     tracing::info!(
         project_id = pid,
-        count = plans.len(),
-        unchanged,
+        count = prepared.len(),
         "publish: calibrated-light generation planned"
     );
 
     // Pixel phase: no catalog connection held.
     let mut hot_maps = HashMap::new();
     let mut written: Vec<WrittenFrame> = Vec::new();
-    let mut identical: Vec<(crate::db::collab_frames::LocalFrameRow, String)> = Vec::new();
-    for (cand, kind, spec, recipe, target, meta) in plans {
+    let mut identical: Vec<(String, String)> = Vec::new();
+    for (plan, spec, recipe, meta) in prepared {
+        let PlannedFrame { cand, kind, target } = plan;
         let fid = cand.frame_id;
-        let staged = match &kind {
-            PublishKind::New => target.clone(),
-            PublishKind::Update(_) => update_temp_path(&target),
+        let is_temp = kind.row().is_some();
+        let staged = if is_temp {
+            update_temp_path(&target)
+        } else {
+            target.clone()
         };
         let generated = match crate::export::execute_generation(
             &spec,
@@ -1805,6 +1856,9 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             Ok(h) => h,
             Err(e) => {
                 tracing::error!(project_id = pid, frame_id = fid, path = %staged.display(), error = %format!("{e:#}"), "publish: hashing the calibrated light failed");
+                if is_temp {
+                    remove_temp(pid, &staged);
+                }
                 held_back.push(held(
                     fid,
                     &cand.filename,
@@ -1813,21 +1867,13 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
                 continue;
             }
         };
-        if let PublishKind::Update(row) = &kind {
+        let mut same_as_hub = false;
+        if let Some(row) = kind.row() {
             match blake3_file(&staged) {
-                Ok(b) if b == row.blake3 => {
-                    // P19: identical pixels — only the recipe moves. No
-                    // version, no re-seed, no holder change.
-                    if let Err(e) = std::fs::remove_file(&staged) {
-                        tracing::warn!(project_id = pid, path = %staged.display(), error = %e, "publish: removing the identical regeneration failed");
-                    }
-                    identical.push((row.clone(), recipe));
-                    continue;
-                }
-                Ok(_) => {}
+                Ok(b) => same_as_hub = b == row.blake3,
                 Err(e) => {
                     tracing::error!(project_id = pid, frame_id = fid, path = %staged.display(), error = %format!("{e:#}"), "publish: hashing the regenerated light failed");
-                    let _ = std::fs::remove_file(&staged);
+                    remove_temp(pid, &staged);
                     held_back.push(held(
                         fid,
                         &cand.filename,
@@ -1835,6 +1881,15 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
                     ));
                     continue;
                 }
+            }
+        }
+        if same_as_hub {
+            if let PublishKind::Update(row) = &kind {
+                // P19: identical pixels — only the recipe moves. No version,
+                // no re-seed, no holder change.
+                remove_temp(pid, &staged);
+                identical.push((row.frame_uuid.clone(), recipe));
+                continue;
             }
         }
         tracing::debug!(
@@ -1847,10 +1902,10 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
         written.push(WrittenFrame {
             frame_id: fid,
             filename: cand.filename,
-            // An update keeps the uuid the hub knows the frame by.
-            uuid: match &kind {
-                PublishKind::Update(row) => row.frame_uuid.clone(),
-                PublishKind::New => cand.uuid,
+            // An update or adoption keeps the uuid the hub knows the frame by.
+            uuid: match kind.row() {
+                Some(row) => row.frame_uuid.clone(),
+                None => cand.uuid,
             },
             filter_canonical: cand.filter_canonical,
             kind,
@@ -1860,16 +1915,18 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             xxh3,
             byte_size: generated.byte_size,
             meta,
+            identical: same_as_hub,
         });
     }
     drop(permit);
 
     if !identical.is_empty() {
         let conn = job.db.conn();
-        for (mut row, recipe) in identical {
-            row.recipe_hash = Some(recipe);
-            if let Err(e) = crate::db::collab_frames::record_own(&conn, &row) {
-                tracing::error!(project_id = pid, frame_uuid = %row.frame_uuid, error = %format!("{e:#}"), "publish: storing the new recipe failed");
+        for (frame_uuid, recipe) in identical {
+            if let Err(e) =
+                crate::db::collab_frames::set_recipe_hash(&conn, pid, &frame_uuid, &recipe)
+            {
+                tracing::error!(project_id = pid, frame_uuid = %frame_uuid, error = %format!("{e:#}"), "publish: storing the new recipe failed");
             }
             unchanged += 1;
         }
@@ -1882,7 +1939,7 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     })
 }
 
-/// A frame seeded and ready to announce or version.
+/// A frame seeded and ready to announce, version or bind.
 struct SeededFrame {
     written: WrittenFrame,
     blake3: String,
@@ -1933,6 +1990,34 @@ fn is_stale_gate_refusal(e: &crate::account::AccountClientError) -> bool {
         if m.contains("gate version") && m.contains("is stale"))
 }
 
+/// Indices of the batch frames a 409 `frame {uuid} already announced; use
+/// /version …` names (ruling R8a). Empty for any other refusal.
+fn already_announced_in(
+    e: &crate::account::AccountClientError,
+    batch: &[SeededFrame],
+) -> Vec<usize> {
+    let crate::account::AccountClientError::Network(m) = e else {
+        return Vec::new();
+    };
+    batch
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| m.contains(&format!("frame {} already announced", f.written.uuid)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Split announce-ready frames into hub batches of at most [`ANNOUNCE_BATCH`].
+fn announce_batches<T>(mut rest: Vec<T>) -> std::collections::VecDeque<Vec<T>> {
+    let mut batches = std::collections::VecDeque::new();
+    while !rest.is_empty() {
+        let tail = rest.split_off(rest.len().min(ANNOUNCE_BATCH));
+        batches.push_back(rest);
+        rest = tail;
+    }
+    batches
+}
+
 /// Re-fetch a project's thresholds and write them into the cache (the
 /// stale-gate retry). Returns the refreshed row.
 async fn refresh_project_thresholds(
@@ -1948,8 +2033,12 @@ async fn refresh_project_thresholds(
     let db = db(ctx)?;
     let conn = db.conn();
     let mut row = crate::db::collab::get_project(&conn, project_id)
-        .map_err(internal)?
+        .map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the project failed");
+            internal(e)
+        })?
         .ok_or_else(|| {
+            tracing::error!(project_id, "publish: project vanished from the cache");
             ApiError::NotFound(format!(
                 "project {project_id} is not cached — refresh first"
             ))
@@ -1957,10 +2046,10 @@ async fn refresh_project_thresholds(
     match wire.current {
         Some(set) => {
             row.thresholds_version = Some(set.version);
-            row.thresholds_rules_json = Some(
-                serde_json::to_string(&set.rules)
-                    .map_err(|e| ApiError::Internal(format!("encode threshold rules: {e}")))?,
-            );
+            row.thresholds_rules_json = Some(serde_json::to_string(&set.rules).map_err(|e| {
+                tracing::error!(project_id, error = %e, "publish: encoding threshold rules failed");
+                ApiError::Internal(format!("encode threshold rules: {e}"))
+            })?);
         }
         None => {
             row.thresholds_version = None;
@@ -1979,7 +2068,24 @@ async fn refresh_project_thresholds(
     Ok(row)
 }
 
-/// Drop every seed tag this run created (the outdated-hub rollback).
+/// Re-run the gate for the stale-gate retry: frame id → verdict.
+fn regate(
+    ctx: &ServiceContext,
+    project: &CollabProjectRow,
+) -> Result<HashMap<i64, FrameGateRow>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    Ok(project_gate(&conn, project)
+        .map_err(|e| {
+            tracing::error!(project_id = %project.project_id, error = %e, "publish: re-running the gate failed");
+            e
+        })?
+        .into_iter()
+        .map(|(_, r)| (r.frame_id, r))
+        .collect())
+}
+
+/// Drop every seed tag of these frames.
 async fn unseed_all(
     node: &crate::sharing::iroh::node::SharedIrohNode,
     project_id: &str,
@@ -1987,8 +2093,27 @@ async fn unseed_all(
 ) {
     for f in frames {
         if let Err(e) = node.unseed_project_frame(project_id, &f.written.uuid).await {
-            tracing::warn!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: rollback unseed failed");
+            tracing::warn!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: unseed failed");
         }
+    }
+}
+
+/// Unseed and hold back every frame of a failed batch (F5).
+async fn fail_batch(
+    node: &crate::sharing::iroh::node::SharedIrohNode,
+    project_id: &str,
+    batch: &[SeededFrame],
+    reason: &str,
+    held_back: &mut Vec<HeldBackFrame>,
+) {
+    let refs: Vec<&SeededFrame> = batch.iter().collect();
+    unseed_all(node, project_id, &refs).await;
+    for f in batch {
+        held_back.push(held(
+            f.written.frame_id,
+            &f.written.filename,
+            reason.to_string(),
+        ));
     }
 }
 
@@ -2003,7 +2128,7 @@ pub async fn publish_collab_frames(
     project_id: &str,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<PublishResult, ApiError> {
-    run_publish(ctx, project_id, emitter, false).await
+    run_publish(ctx, project_id, emitter, false, None).await
 }
 
 /// The manual re-publish (P19): every own frame is regenerated as an
@@ -2015,16 +2140,22 @@ pub async fn republish_collab_frames(
     project_id: &str,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<PublishResult, ApiError> {
-    run_publish(ctx, project_id, emitter, true).await
+    run_publish(ctx, project_id, emitter, true, None).await
 }
+
+/// A test seam run right after the split, with the catalog connection — how
+/// a test stands in for a manifest sync landing between split and write-back.
+type AfterSplit<'a> = Option<&'a (dyn Fn(&Connection) + Sync)>;
 
 async fn run_publish(
     ctx: &ServiceContext,
     project_id: &str,
     emitter: Option<Arc<dyn ProgressEmitter>>,
     force: bool,
+    after_split: AfterSplit<'_>,
 ) -> Result<PublishResult, ApiError> {
     use crate::account::AccountClientError as E;
+    use crate::db::collab_frames::{self as frames_db, FrameOrigin};
 
     // ── 1. Collaboration root, then the gate ─────────────────────────────────
     let collab_root = require_collaboration_root(ctx)?;
@@ -2120,41 +2251,173 @@ async fn run_publish(
             }
         }
     };
-    let own_dir = {
+
+    // ── 3. The split (ruling R9: before any compute permit) ─────────────────
+    let opts = publish_options();
+    let mut unchanged = 0usize;
+    let mut plans: Vec<PlannedFrame> = Vec::new();
+    {
         let db = db(ctx)?;
         let conn = db.conn();
-        own_publisher_dir(&conn, &collab_root, &project, &account_id, &display).map_err(|e| {
-            tracing::error!(project_id, error = %format!("{e:#}"), "publish: own folder failed");
+        let own_dir = own_publisher_dir(&conn, &collab_root, &project, &account_id, &display)
+            .map_err(|e| {
+                tracing::error!(project_id, error = %format!("{e:#}"), "publish: own folder failed");
+                internal(e)
+            })?;
+        let own = frames_db::own_by_source_frame(&conn, project_id).map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
             internal(e)
-        })?
-    };
+        })?;
+        let mut claimed: HashSet<std::path::PathBuf> = HashSet::new();
+        for cand in candidates {
+            let fid = cand.frame_id;
+            let resolved = match crate::calibration_library::light_resolve::resolve_frame_inputs(
+                &conn,
+                fid,
+                opts.flat_norm,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: cannot resolve this light");
+                    held_back.push(held(
+                        fid,
+                        &cand.filename,
+                        format!("cannot calibrate: {e:#}"),
+                    ));
+                    continue;
+                }
+            };
+            let recipe = match recipe_hash_of_inputs(&conn, &resolved) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: recipe hash failed");
+                    held_back.push(held(
+                        fid,
+                        &cand.filename,
+                        format!("cannot read the calibration inputs: {e:#}"),
+                    ));
+                    continue;
+                }
+            };
+            let kind = match own.get(&fid) {
+                Some(row) if force || row.recipe_hash.as_deref() != Some(recipe.as_str()) => {
+                    PublishKind::Update(row.clone())
+                }
+                Some(_) => {
+                    unchanged += 1;
+                    continue;
+                }
+                None => match frames_db::get(&conn, project_id, &cand.uuid) {
+                    Ok(Some(row))
+                        if row.origin == FrameOrigin::Own && row.source_frame_id.is_none() =>
+                    {
+                        PublishKind::Adopt(row)
+                    }
+                    Ok(_) => PublishKind::New,
+                    Err(e) => {
+                        tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: read frame row failed");
+                        held_back.push(held(
+                            fid,
+                            &cand.filename,
+                            format!("cannot read the frame's project row: {e:#}"),
+                        ));
+                        continue;
+                    }
+                },
+            };
+            let target = match &kind {
+                PublishKind::New => {
+                    let name = crate::export::calibrated_output_filename(
+                        &cand.filename,
+                        opts.debayer_osc && resolved.cfa_geometry.is_some(),
+                        opts.format,
+                    );
+                    let target = match new_frame_target(&conn, &own_dir, &name, &mut claimed) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: no landing path");
+                            held_back.push(held(
+                                fid,
+                                &cand.filename,
+                                format!("no landing path: {e:#}"),
+                            ));
+                            continue;
+                        }
+                    };
+                    let file_name = target
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if let Some(problem) = hub_file_name_problem(&file_name) {
+                        tracing::warn!(project_id, frame_id = fid, path = %target.display(), reason = problem, "publish: file name breaks the hub rule");
+                        held_back.push(held(
+                            fid,
+                            &cand.filename,
+                            format!("the hub refuses this file name ({problem}): {file_name}"),
+                        ));
+                        continue;
+                    }
+                    target
+                }
+                PublishKind::Update(row) => match &row.landed_path {
+                    Some(p) => std::path::PathBuf::from(p),
+                    None => {
+                        tracing::error!(project_id, frame_id = fid, frame_uuid = %row.frame_uuid, "publish: own frame has no landed path");
+                        held_back.push(held(
+                            fid,
+                            &cand.filename,
+                            "own frame has no file path".into(),
+                        ));
+                        continue;
+                    }
+                },
+                PublishKind::Adopt(row) => row
+                    .landed_path
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| own_dir.join(&row.file_name)),
+            };
+            plans.push(PlannedFrame { cand, kind, target });
+        }
+        if let Some(hook) = after_split {
+            hook(&conn);
+        }
+    }
 
-    // ── 3–4. Generation: one compute permit, on a blocking thread ────────────
-    let job = GenerationJob {
-        db: db(ctx)?.clone(),
-        queue: ctx.compute_queue.clone(),
-        pool: Arc::clone(&ctx.image_pool),
-        project_id: project_id.to_string(),
-        label: format!("collab publish {}", project.title),
-        own_dir,
-        candidates,
-        force,
+    // ── 4. Generation: one compute permit, only when there is work ───────────
+    let outcome = if plans.is_empty() {
+        GenerationOutcome {
+            written: Vec::new(),
+            unchanged: 0,
+            held_back: Vec::new(),
+        }
+    } else {
+        let job = GenerationJob {
+            db: db(ctx)?.clone(),
+            queue: ctx.compute_queue.clone(),
+            pool: Arc::clone(&ctx.image_pool),
+            project_id: project_id.to_string(),
+            label: format!("collab publish {}", project.title),
+            plans,
+        };
+        tokio::task::spawn_blocking(move || run_publish_generation(job))
+            .await
+            .map_err(|e| {
+                tracing::error!(project_id, error = %e, "publish: generation task failed");
+                ApiError::Internal(format!("publish generation task: {e}"))
+            })??
     };
-    let outcome = tokio::task::spawn_blocking(move || run_publish_generation(job))
-        .await
-        .map_err(|e| {
-            tracing::error!(project_id, error = %e, "publish: generation task failed");
-            ApiError::Internal(format!("publish generation task: {e}"))
-        })??;
     held_back.extend(outcome.held_back);
-    let unchanged = outcome.unchanged;
+    unchanged += outcome.unchanged;
 
     // ── Seed by reference ────────────────────────────────────────────────────
     let mut new_frames: Vec<SeededFrame> = Vec::new();
     let mut updates: Vec<SeededFrame> = Vec::new();
+    let mut bound: Vec<SeededFrame> = Vec::new();
     for w in outcome.written {
-        match &w.kind {
-            PublishKind::New => match node
+        let prior_version = w.kind.row().map(|r| r.content_version);
+        let Some(prior_version) = prior_version else {
+            match node
                 .seed_project_frame(project_id, &w.uuid, 1, &w.target)
                 .await
             {
@@ -2171,42 +2434,52 @@ async fn run_publish(
                         format!("seeding failed: {e:#}"),
                     ));
                 }
-            },
-            PublishKind::Update(row) => {
-                let version = row.content_version + 1;
-                // The old tag must not pin the old content once the landed
-                // file is replaced.
-                if let Err(e) = node.unseed_project_frame(project_id, &w.uuid).await {
-                    tracing::warn!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: unseeding the previous version failed");
+            }
+            continue;
+        };
+        let version = if w.identical {
+            prior_version
+        } else {
+            // The old tag must not pin the old content once the landed file
+            // is replaced.
+            if let Err(e) = node.unseed_project_frame(project_id, &w.uuid).await {
+                tracing::warn!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: unseeding the previous version failed");
+            }
+            prior_version + 1
+        };
+        if let Err(e) = std::fs::rename(&w.staged, &w.target) {
+            tracing::error!(project_id, frame_uuid = %w.uuid, src = %w.staged.display(), dest = %w.target.display(), error = %e, "publish: replacing the landed frame failed");
+            remove_temp(project_id, &w.staged);
+            held_back.push(held(
+                w.frame_id,
+                &w.filename,
+                format!("cannot replace the published file: {e}"),
+            ));
+            continue;
+        }
+        match node
+            .seed_project_frame(project_id, &w.uuid, version, &w.target)
+            .await
+        {
+            Ok(hash) => {
+                let f = SeededFrame {
+                    blake3: hash.to_hex().to_string(),
+                    content_version: version,
+                    written: w,
+                };
+                if f.written.identical {
+                    bound.push(f);
+                } else {
+                    updates.push(f);
                 }
-                if let Err(e) = std::fs::rename(&w.staged, &w.target) {
-                    tracing::error!(project_id, frame_uuid = %w.uuid, src = %w.staged.display(), dest = %w.target.display(), error = %e, "publish: replacing the landed frame failed");
-                    let _ = std::fs::remove_file(&w.staged);
-                    held_back.push(held(
-                        w.frame_id,
-                        &w.filename,
-                        format!("cannot replace the published file: {e}"),
-                    ));
-                    continue;
-                }
-                match node
-                    .seed_project_frame(project_id, &w.uuid, version, &w.target)
-                    .await
-                {
-                    Ok(hash) => updates.push(SeededFrame {
-                        blake3: hash.to_hex().to_string(),
-                        content_version: version,
-                        written: w,
-                    }),
-                    Err(e) => {
-                        tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: seeding a new version failed");
-                        held_back.push(held(
-                            w.frame_id,
-                            &w.filename,
-                            format!("seeding failed: {e:#}"),
-                        ));
-                    }
-                }
+            }
+            Err(e) => {
+                tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: seeding failed");
+                held_back.push(held(
+                    w.frame_id,
+                    &w.filename,
+                    format!("seeding failed: {e:#}"),
+                ));
             }
         }
     }
@@ -2215,19 +2488,12 @@ async fn run_publish(
     let mut gate_version: i32 = project.thresholds_version.unwrap_or(0);
     let mut state: Option<String> = None;
     let mut announced: Vec<(SeededFrame, String, i32)> = Vec::new();
+    let mut hub_adopted: Vec<(SeededFrame, i32)> = Vec::new();
     let mut first_err: Option<ApiError> = None;
     let mut stale_retried = false;
-    let mut batches: std::collections::VecDeque<Vec<SeededFrame>> =
-        std::collections::VecDeque::new();
-    {
-        let mut rest = new_frames;
-        while !rest.is_empty() {
-            let tail = rest.split_off(rest.len().min(ANNOUNCE_BATCH));
-            batches.push_back(rest);
-            rest = tail;
-        }
-    }
-    while let Some(mut batch) = batches.pop_front() {
+    let mut outdated = false;
+    let mut batches = announce_batches(new_frames);
+    'batches: while let Some(mut batch) = batches.pop_front() {
         loop {
             if batch.is_empty() {
                 break;
@@ -2248,67 +2514,88 @@ async fn run_publish(
                     break;
                 }
                 Err(E::CollabApiOutdated) => {
-                    tracing::error!(project_id, outcome = "collab_api_outdated", "publish: hub refused an outdated collab api; rolling back this run's seeds");
-                    let mut all: Vec<&SeededFrame> = batch.iter().collect();
-                    all.extend(batches.iter().flatten());
-                    all.extend(announced.iter().map(|(f, _, _)| f));
-                    all.extend(updates.iter());
-                    unseed_all(&node, project_id, &all).await;
-                    return Err(client_err(E::CollabApiOutdated));
+                    // Nothing more goes out: roll back every seed that is not
+                    // yet announced; what the hub already took is recorded
+                    // below so it never becomes an orphan.
+                    tracing::error!(
+                        project_id,
+                        outcome = "collab_api_outdated",
+                        "publish: hub refused an outdated collab api; rolling back unsent seeds"
+                    );
+                    outdated = true;
+                    let mut unsent: Vec<&SeededFrame> = batch.iter().collect();
+                    unsent.extend(batches.iter().flatten());
+                    unsent.extend(updates.iter());
+                    unseed_all(&node, project_id, &unsent).await;
+                    break 'batches;
+                }
+                Err(e) if !already_announced_in(&e, &batch).is_empty() => {
+                    // R8a: the hub already holds these uuids as mine (an
+                    // announce whose reply was lost, or whose row was never
+                    // recorded). Adopt them and retry the rest — each retry
+                    // drops at least one frame, so the loop is bounded by the
+                    // batch size.
+                    let named = already_announced_in(&e, &batch);
+                    tracing::warn!(project_id, count = named.len(), error = %e, "publish: frames already announced; adopting them and retrying the rest");
+                    let mut i = 0usize;
+                    let mut keep = Vec::with_capacity(batch.len());
+                    for f in batch.drain(..) {
+                        if named.contains(&i) {
+                            hub_adopted.push((f, gate_version));
+                        } else {
+                            keep.push(f);
+                        }
+                        i += 1;
+                    }
+                    batch = keep;
                 }
                 Err(e) if !stale_retried && is_stale_gate_refusal(&e) => {
                     stale_retried = true;
                     tracing::warn!(project_id, version = gate_version, error = %e, "publish: stale gate version; refreshing thresholds and retrying once");
-                    let refreshed = match refresh_project_thresholds(
-                        ctx, &client, &token, project_id,
-                    )
-                    .await
-                    {
-                        Ok(row) => row,
-                        Err(err) => {
-                            for f in &batch {
-                                if let Err(ue) =
-                                    node.unseed_project_frame(project_id, &f.written.uuid).await
-                                {
-                                    tracing::warn!(project_id, frame_uuid = %f.written.uuid, error = %format!("{ue:#}"), "publish: unseed after a failed announce failed");
-                                }
-                                held_back.push(held(
-                                    f.written.frame_id,
-                                    &f.written.filename,
-                                    format!("announce failed: {err}"),
-                                ));
+                    let verdicts =
+                        match refresh_project_thresholds(ctx, &client, &token, project_id).await {
+                            Ok(refreshed) => {
+                                gate_version = refreshed.thresholds_version.unwrap_or(0);
+                                regate(ctx, &refreshed)
                             }
+                            Err(err) => Err(err),
+                        };
+                    let verdicts = match verdicts {
+                        Ok(v) => v,
+                        Err(err) => {
+                            fail_batch(
+                                &node,
+                                project_id,
+                                &batch,
+                                &format!("announce failed: {err}"),
+                                &mut held_back,
+                            )
+                            .await;
                             first_err.get_or_insert(err);
                             break;
                         }
                     };
-                    gate_version = refreshed.thresholds_version.unwrap_or(0);
-                    // Re-run the gate under the new thresholds; a frame that
-                    // no longer passes leaves the batch.
-                    let verdicts: HashMap<i64, FrameGateRow> = {
-                        let db = db(ctx)?;
-                        let conn = db.conn();
-                        project_gate(&conn, &refreshed)
-                            .map_err(|e| {
-                                tracing::error!(project_id, error = %e, "publish: re-running the gate failed");
-                                e
-                            })?
-                            .into_iter()
-                            .map(|(_, r)| (r.frame_id, r))
-                            .collect()
+                    // The refreshed verdicts apply to this batch AND every
+                    // queued one: a frame that no longer passes leaves.
+                    let passes = |f: &SeededFrame| {
+                        verdicts
+                            .get(&f.written.frame_id)
+                            .is_some_and(|r| r.publishable)
                     };
-                    let (keep, drop_now): (Vec<SeededFrame>, Vec<SeededFrame>) =
-                        batch.into_iter().partition(|f| {
-                            verdicts
-                                .get(&f.written.frame_id)
-                                .is_some_and(|r| r.publishable)
-                        });
-                    for f in drop_now {
-                        if let Err(ue) =
-                            node.unseed_project_frame(project_id, &f.written.uuid).await
-                        {
-                            tracing::warn!(project_id, frame_uuid = %f.written.uuid, error = %format!("{ue:#}"), "publish: unseed of a newly failing frame failed");
-                        }
+                    let mut dropped: Vec<SeededFrame> = Vec::new();
+                    let (keep, drop_now): (Vec<_>, Vec<_>) =
+                        batch.into_iter().partition(|f| passes(f));
+                    batch = keep;
+                    dropped.extend(drop_now);
+                    for queued in batches.iter_mut() {
+                        let (keep, drop_now): (Vec<_>, Vec<_>) =
+                            std::mem::take(queued).into_iter().partition(|f| passes(f));
+                        *queued = keep;
+                        dropped.extend(drop_now);
+                    }
+                    let refs: Vec<&SeededFrame> = dropped.iter().collect();
+                    unseed_all(&node, project_id, &refs).await;
+                    for f in &dropped {
                         let reasons = verdicts
                             .get(&f.written.frame_id)
                             .map(|r| r.failures.clone())
@@ -2322,26 +2609,20 @@ async fn run_publish(
                             reasons,
                         });
                     }
-                    batch = keep;
                 }
                 Err(e) => {
                     // F5: nothing of this batch is announced — stop seeding
                     // it. The files stay; own rows are recorded only after a
                     // successful announce, so the next run re-announces them.
                     tracing::error!(project_id, count = batch.len(), error = %e, "publish: announce failed");
-                    let reason = format!("announce failed: {e}");
-                    for f in &batch {
-                        if let Err(ue) =
-                            node.unseed_project_frame(project_id, &f.written.uuid).await
-                        {
-                            tracing::warn!(project_id, frame_uuid = %f.written.uuid, error = %format!("{ue:#}"), "publish: unseed after a failed announce failed");
-                        }
-                        held_back.push(held(
-                            f.written.frame_id,
-                            &f.written.filename,
-                            reason.clone(),
-                        ));
-                    }
+                    fail_batch(
+                        &node,
+                        project_id,
+                        &batch,
+                        &format!("announce failed: {e}"),
+                        &mut held_back,
+                    )
+                    .await;
                     first_err.get_or_insert(client_err(e));
                     break;
                 }
@@ -2351,67 +2632,81 @@ async fn run_publish(
 
     // ── 6. New content versions ──────────────────────────────────────────────
     let mut versioned: Vec<SeededFrame> = Vec::new();
-    let mut outdated = false;
-    for mut f in updates {
-        if outdated {
-            unseed_all(&node, project_id, &[&f]).await;
-            continue;
-        }
-        match client
-            .new_frame_version(
-                &token,
-                project_id,
-                &f.written.uuid,
-                &f.blake3,
-                f.written.byte_size as i64,
-                &f.written.xxh3,
-            )
-            .await
-        {
-            Ok(v) => {
-                if v.content_version != f.content_version {
-                    tracing::warn!(project_id, frame_uuid = %f.written.uuid, content_version = v.content_version, expected = f.content_version, "publish: hub assigned a different content version; re-tagging");
-                    if let Err(e) = node
-                        .seed_project_frame(
-                            project_id,
-                            &f.written.uuid,
-                            v.content_version,
-                            &f.written.target,
-                        )
-                        .await
-                    {
-                        tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: re-tagging under the hub's version failed");
+    if !outdated {
+        let mut pending = updates.into_iter();
+        while let Some(mut f) = pending.next() {
+            match client
+                .new_frame_version(
+                    &token,
+                    project_id,
+                    &f.written.uuid,
+                    &f.blake3,
+                    f.written.byte_size as i64,
+                    &f.written.xxh3,
+                )
+                .await
+            {
+                Ok(v) => {
+                    if v.content_version != f.content_version {
+                        tracing::warn!(project_id, frame_uuid = %f.written.uuid, content_version = v.content_version, expected = f.content_version, "publish: hub assigned a different content version; re-tagging");
+                        if let Err(e) = node
+                            .seed_project_frame(
+                                project_id,
+                                &f.written.uuid,
+                                v.content_version,
+                                &f.written.target,
+                            )
+                            .await
+                        {
+                            tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: re-tagging under the hub's version failed");
+                        }
+                        f.content_version = v.content_version;
                     }
-                    f.content_version = v.content_version;
+                    tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = f.content_version, "publish: new frame version");
+                    versioned.push(f);
                 }
-                tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = f.content_version, "publish: new frame version");
-                versioned.push(f);
-            }
-            Err(e) => {
-                tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %e, "publish: new frame version failed");
-                unseed_all(&node, project_id, &[&f]).await;
-                held_back.push(held(
-                    f.written.frame_id,
-                    &f.written.filename,
-                    format!("new version failed: {e}"),
-                ));
-                if matches!(e, E::CollabApiOutdated) {
-                    outdated = true;
+                Err(e) => {
+                    tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %e, "publish: new frame version failed");
+                    unseed_all(&node, project_id, &[&f]).await;
+                    held_back.push(held(
+                        f.written.frame_id,
+                        &f.written.filename,
+                        format!("new version failed: {e}"),
+                    ));
+                    if matches!(e, E::CollabApiOutdated) {
+                        outdated = true;
+                        let rest: Vec<SeededFrame> = pending.by_ref().collect();
+                        let refs: Vec<&SeededFrame> = rest.iter().collect();
+                        unseed_all(&node, project_id, &refs).await;
+                    }
+                    first_err.get_or_insert(client_err(e));
                 }
-                first_err.get_or_insert(client_err(e));
             }
         }
     }
 
-    // ── 7. Own rows, then the holder delta ───────────────────────────────────
+    // ── 7. Own rows, per frame (never aborts the run), then holders ──────────
+    let mut holders: Vec<crate::collab::hub_client::HolderRefWire> = Vec::new();
+    let mut announced_n = 0usize;
+    let mut updated_n = 0usize;
     {
         let db = db(ctx)?;
         let conn = db.conn();
-        for (f, frame_state, gv) in &announced {
+        let mut record_failed = |f: &SeededFrame, what: &str, e: &anyhow::Error| {
+            tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: recording the own frame failed");
+            held_back.push(held(
+                f.written.frame_id,
+                &f.written.filename,
+                format!("{what}, but recording it locally failed: {e:#}"),
+            ));
+        };
+        let new_row = |f: &SeededFrame, frame_state: &str, gv: i32, accepted: bool| {
             let w = &f.written;
-            let wire = frame_in_wire(f, *gv);
-            let mut manifest =
-                serde_json::to_value(&wire).unwrap_or_else(|_| serde_json::json!({}));
+            let wire = frame_in_wire(f, gv);
+            let mut manifest = serde_json::to_value(&wire).unwrap_or_else(|e| {
+                tracing::error!(project_id, frame_uuid = %w.uuid, error = %e, "publish: encoding the manifest row failed");
+                serde_json::json!({})
+            });
             if let Some(obj) = manifest.as_object_mut() {
                 obj.insert("publisherAccountId".into(), serde_json::json!(account_id));
                 obj.insert("publisherDisplayName".into(), serde_json::json!(display));
@@ -2420,7 +2715,7 @@ async fn run_publish(
                     "contentVersion".into(),
                     serde_json::json!(f.content_version),
                 );
-                obj.insert("accepted".into(), serde_json::json!(true));
+                obj.insert("accepted".into(), serde_json::json!(accepted));
                 obj.insert("state".into(), serde_json::json!(frame_state));
                 obj.insert("manifestVersion".into(), serde_json::json!(0));
                 obj.insert(
@@ -2429,17 +2724,17 @@ async fn run_publish(
                 );
                 obj.insert("holderCount".into(), serde_json::json!(1));
             }
-            let row = crate::db::collab_frames::LocalFrameRow {
+            frames_db::LocalFrameRow {
                 project_id: project_id.to_string(),
                 frame_uuid: w.uuid.clone(),
                 content_version: f.content_version,
-                origin: crate::db::collab_frames::FrameOrigin::Own,
+                origin: FrameOrigin::Own,
                 publisher_account_id: account_id.clone(),
                 publisher_display: display.clone(),
                 file_name: wire.file_name.clone(),
                 filter_canonical: w.filter_canonical.clone(),
-                state: frame_state.clone(),
-                accepted: true,
+                state: frame_state.to_string(),
+                accepted,
                 byte_size: w.byte_size as i64,
                 xxh3: w.xxh3.clone(),
                 blake3: f.blake3.clone(),
@@ -2455,56 +2750,97 @@ async fn run_publish(
                 recipe_hash: Some(w.recipe.clone()),
                 last_error: None,
                 updated_at: String::new(),
+            }
+        };
+        let adopt = |f: &SeededFrame| -> anyhow::Result<()> {
+            let w = &f.written;
+            let n = frames_db::adopt_own(
+                &conn,
+                project_id,
+                &w.uuid,
+                w.frame_id,
+                &w.target.to_string_lossy(),
+                &w.recipe,
+                size_mtime_seen(&w.target).as_deref(),
+            )?;
+            if n == 0 {
+                anyhow::bail!("no own row for frame {} to bind", w.uuid);
+            }
+            Ok(())
+        };
+        let holder = |f: &SeededFrame| crate::collab::hub_client::HolderRefWire {
+            frame_uuid: f.written.uuid.clone(),
+            content_version: f.content_version,
+        };
+
+        for (f, frame_state, gv) in &announced {
+            match frames_db::record_own(&conn, &new_row(f, frame_state, *gv, true)) {
+                Ok(()) => {
+                    holders.push(holder(f));
+                    announced_n += 1;
+                }
+                Err(e) => record_failed(f, "announced", &e),
+            }
+        }
+        // R8a: the hub already had these as mine. Bind an existing own row
+        // (a manifest sync got there first), else record one from the local
+        // plan with the state unknown — the manifest sync sets the hub truth.
+        for (f, gv) in &hub_adopted {
+            let result = match frames_db::get(&conn, project_id, &f.written.uuid) {
+                Ok(Some(row)) if row.origin == FrameOrigin::Own => adopt(f),
+                Ok(Some(_)) => Err(anyhow::anyhow!(
+                    "frame {} is cached as another publisher's",
+                    f.written.uuid
+                )),
+                Ok(None) => frames_db::record_own(&conn, &new_row(f, "unknown", *gv, false)),
+                Err(e) => Err(e),
             };
-            crate::db::collab_frames::record_own(&conn, &row).map_err(|e| {
-                tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: recording the own frame failed");
-                internal(e)
-            })?;
+            match result {
+                Ok(()) => {
+                    holders.push(holder(f));
+                    announced_n += 1;
+                }
+                Err(e) => record_failed(f, "already announced", &e),
+            }
+        }
+        // R8b, identical bytes: bound and seeded at the hub's version.
+        for f in &bound {
+            match adopt(f) {
+                Ok(()) => {
+                    holders.push(holder(f));
+                    unchanged += 1;
+                }
+                Err(e) => record_failed(f, "already published", &e),
+            }
         }
         for f in &versioned {
             let w = &f.written;
-            let PublishKind::Update(old) = &w.kind else {
-                continue;
-            };
-            let mut row = old.clone();
-            row.content_version = f.content_version;
-            row.blake3 = f.blake3.clone();
-            row.xxh3 = w.xxh3.clone();
-            row.byte_size = w.byte_size as i64;
-            row.recipe_hash = Some(w.recipe.clone());
-            row.size_mtime_seen = size_mtime_seen(&w.target);
-            row.on_disk = true;
-            row.awaiting_gc = false;
-            row.last_error = None;
-            if let Ok(mut manifest) = serde_json::from_str::<serde_json::Value>(&row.manifest_json)
-            {
-                if let Some(obj) = manifest.as_object_mut() {
-                    obj.insert(
-                        "contentVersion".into(),
-                        serde_json::json!(f.content_version),
-                    );
-                    obj.insert("blake3".into(), serde_json::json!(f.blake3));
-                    obj.insert("xxh3".into(), serde_json::json!(w.xxh3));
-                    obj.insert("byteSize".into(), serde_json::json!(w.byte_size));
+            if matches!(w.kind, PublishKind::Adopt(_)) {
+                if let Err(e) = adopt(f) {
+                    record_failed(f, "versioned", &e);
+                    continue;
                 }
-                row.manifest_json = manifest.to_string();
             }
-            crate::db::collab_frames::record_own(&conn, &row).map_err(|e| {
-                tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: recording the new version failed");
-                internal(e)
-            })?;
+            match frames_db::set_own_version(
+                &conn,
+                project_id,
+                &w.uuid,
+                f.content_version,
+                &f.blake3,
+                &w.xxh3,
+                w.byte_size as i64,
+                &w.recipe,
+                size_mtime_seen(&w.target).as_deref(),
+            ) {
+                Ok(_) => {
+                    holders.push(holder(f));
+                    updated_n += 1;
+                }
+                Err(e) => record_failed(f, "versioned", &e),
+            }
         }
     }
 
-    let holders: Vec<crate::collab::hub_client::HolderRefWire> = announced
-        .iter()
-        .map(|(f, _, _)| f)
-        .chain(versioned.iter())
-        .map(|f| crate::collab::hub_client::HolderRefWire {
-            frame_uuid: f.written.uuid.clone(),
-            content_version: f.content_version,
-        })
-        .collect();
     if !holders.is_empty() {
         // Folded after logging: the 20-minute full holder report repairs a
         // missed delta (P8).
@@ -2513,17 +2849,6 @@ async fn run_publish(
             .await
         {
             tracing::warn!(project_id, count = holders.len(), error = %e, "publish: holder delta failed");
-        }
-    }
-
-    let announced_n = announced.len();
-    let updated_n = versioned.len();
-    if outdated {
-        return Err(client_err(E::CollabApiOutdated));
-    }
-    if announced_n == 0 && updated_n == 0 {
-        if let Some(err) = first_err {
-            return Err(err);
         }
     }
 
@@ -2547,6 +2872,14 @@ async fn run_publish(
         unchanged,
         "frames published"
     );
+    if outdated {
+        return Err(client_err(E::CollabApiOutdated));
+    }
+    if announced_n == 0 && updated_n == 0 {
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+    }
     Ok(PublishResult {
         announced: announced_n,
         updated: updated_n,
@@ -3550,12 +3883,14 @@ mod tests {
         })
     }
 
-    /// A frame set of on-target, analyzed, not-trailed LIGHT frames, each with a
-    /// real tiny calibrated FITS artifact on disk. Returns the set id.
+    /// A frame set of on-target, analyzed, not-trailed LIGHT frames (filter
+    /// `L`, each with a uuid) for the GATE tests. Returns the set id.
     ///
-    /// Gate-PASSING until decision C (spec 2026-08-31 §8a) — the calibration
-    /// precondition is now a constant `NotCalibrated`, so every consumer of this
-    /// fixture is `#[ignore]`d pending the collab publish rework.
+    /// Gate-passing only once the caller adds calibration links
+    /// ([`link_shared_master_dark`]) and a dictionary carrying `L`. The tiny
+    /// FITS written under `out_dir` are not the frames' source files (those
+    /// paths are fictitious), so this fixture cannot drive a real publish —
+    /// the publish tests use `publish::fixture` instead.
     fn seed_publishable_set(
         conn: &rusqlite::Connection,
         out_dir: &std::path::Path,
@@ -5211,6 +5546,259 @@ mod tests {
                 other => panic!("expected the P25 refusal, got {other:?}"),
             }
             assert!(ctx.iroh_node.lock().await.is_none(), "no node was bound");
+        }
+
+        /// R8a: a hub 409 "frame … already announced" adopts that frame from
+        /// the local plan (state unknown until the manifest sync) and retries
+        /// the rest of the batch.
+        #[tokio::test]
+        async fn hub_already_announced_frame_is_adopted_and_the_rest_retried() {
+            let fx = fixture(2).await;
+            Mock::given(wm_method("POST"))
+                .and(wm_path(format!("/api/v1/projects/{PID}/frames")))
+                .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                    "error": format!("frame {} already announced; use /version", fx.uuids[0])
+                })))
+                .up_to_n_times(1)
+                .mount(&fx.server)
+                .await;
+            mount_hub(&fx.server, "published").await;
+
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 2, "{res:?}");
+            assert!(res.held_back.is_empty(), "{:?}", res.held_back);
+            let bodies = announce_bodies(&fx.server).await;
+            assert_eq!(bodies.len(), 2);
+            assert_eq!(bodies[1]["frames"].as_array().unwrap().len(), 1);
+            assert_eq!(bodies[1]["frames"][0]["frameUuid"], fx.uuids[1].as_str());
+
+            let adopted = own_row(&fx, &fx.uuids[0]).expect("adopted own row");
+            assert_eq!(adopted.state, "unknown");
+            assert_eq!(adopted.content_version, 1);
+            assert_eq!(adopted.source_frame_id, Some(fx.frame_ids[0]));
+            assert!(adopted.on_disk && adopted.recipe_hash.is_some());
+            assert!(tag_present(&fx, &fx.uuids[0], 1).await);
+            assert_eq!(own_row(&fx, &fx.uuids[1]).unwrap().state, "published");
+
+            // The adopted frame is now an ordinary own frame: nothing to do.
+            let again = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!((again.announced, again.updated, again.unchanged), (0, 0, 2));
+        }
+
+        /// R8c: a row write that fails for one frame is held back with its
+        /// reason; the other frame is recorded and its holder delta sent.
+        #[tokio::test]
+        async fn a_failed_record_does_not_abort_the_run() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER fail_one BEFORE INSERT ON project_frames_local \
+                     WHEN NEW.frame_uuid = '{}' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                    fx.uuids[1]
+                ))
+                .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{res:?}");
+            assert_eq!(res.held_back.len(), 1);
+            assert_eq!(res.held_back[0].frame_id, fx.frame_ids[1]);
+            assert!(
+                res.held_back[0].reasons[0].contains("recording it locally failed"),
+                "{:?}",
+                res.held_back[0].reasons
+            );
+            assert!(own_row(&fx, &fx.uuids[0]).is_some());
+            assert!(own_row(&fx, &fx.uuids[1]).is_none());
+            let puts: Vec<_> = requests(&fx.server)
+                .await
+                .into_iter()
+                .filter(|(m, _, _)| m == "PUT")
+                .collect();
+            assert_eq!(puts.len(), 1);
+            assert_eq!(puts[0].2["add"].as_array().unwrap().len(), 1);
+        }
+
+        /// R9: a run with nothing to generate never asks for the compute
+        /// slot, so it cannot queue behind a stacking run holding it.
+        #[tokio::test]
+        async fn unchanged_run_takes_no_compute_permit() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (permit, _) = fx
+                .ctx
+                .compute_queue
+                .acquire(
+                    crate::services::compute_queue::ComputeJobKind::LightCalibration,
+                    "a long stacking run",
+                    flag,
+                )
+                .unwrap();
+            let run = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                publish_collab_frames(&fx.ctx, PID, None),
+            )
+            .await;
+            drop(permit);
+            let res = run
+                .expect("an unchanged run must not wait for the compute slot")
+                .unwrap();
+            assert_eq!(res.unchanged, 2);
+        }
+
+        /// R10: the identical-output and the new-version write-backs are
+        /// column-targeted — a hub state a manifest sync wrote between the
+        /// split and the write-back survives both.
+        #[tokio::test]
+        async fn write_backs_keep_hub_state_written_mid_run() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let hook = |conn: &Connection| {
+                conn.execute(
+                    "UPDATE project_frames_local SET state = 'hub-truth', manifest_version = 42",
+                    [],
+                )
+                .unwrap();
+            };
+
+            // Identical output: only the recipe moves.
+            set_mtime(&fx.lights[0], 120);
+            let res = run_publish(&fx.ctx, PID, None, false, Some(&hook))
+                .await
+                .unwrap();
+            assert_eq!(res.unchanged, 1, "{res:?}");
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(
+                (row.state.as_str(), row.manifest_version),
+                ("hub-truth", 42)
+            );
+
+            // New version.
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute("UPDATE project_frames_local SET state = 'published'", [])
+                    .unwrap();
+            }
+            write_dark(&fx.master, 310.0);
+            set_mtime(&fx.master, 240);
+            let res = run_publish(&fx.ctx, PID, None, false, Some(&hook))
+                .await
+                .unwrap();
+            assert_eq!(res.updated, 1, "{res:?}");
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(row.content_version, 2);
+            assert_eq!(
+                (row.state.as_str(), row.manifest_version),
+                ("hub-truth", 42)
+            );
+            let m: serde_json::Value = serde_json::from_str(&row.manifest_json).unwrap();
+            assert_eq!(m["contentVersion"], 2);
+            assert_eq!(m["blake3"], row.blake3.as_str());
+        }
+
+        /// R8b: an own row the manifest delivered (no local binding) is bound
+        /// to its source frame after a verifying regeneration — never
+        /// announced again, no version when the bytes match.
+        #[tokio::test]
+        async fn manifest_delivered_own_row_is_bound_not_reannounced() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let before = own_row(&fx, &fx.uuids[0]).unwrap();
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute(
+                    "UPDATE project_frames_local SET source_frame_id = NULL, recipe_hash = NULL, \
+                     landed_path = NULL, on_disk = 0",
+                    [],
+                )
+                .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(
+                (res.announced, res.updated, res.unchanged),
+                (0, 0, 1),
+                "{res:?}"
+            );
+            assert_eq!(
+                announce_bodies(&fx.server).await.len(),
+                1,
+                "no second announce"
+            );
+            assert!(version_calls(&fx.server).await.is_empty());
+            let after = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(after.source_frame_id, Some(fx.frame_ids[0]));
+            assert_eq!(after.landed_path, before.landed_path);
+            assert!(after.on_disk && after.recipe_hash.is_some());
+            assert_eq!(after.content_version, 1);
+            assert!(tag_present(&fx, &fx.uuids[0], 1).await);
+            assert_eq!(
+                std::fs::read_dir(own_dir(&fx)).unwrap().count(),
+                1,
+                "no temp left"
+            );
+        }
+
+        /// A frame that fails to calibrate is held back; the others go out.
+        #[tokio::test]
+        async fn partial_run_holds_back_the_failed_frame_and_announces_the_rest() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            std::fs::write(&fx.lights[1], b"not a FITS file at all").unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{res:?}");
+            assert_eq!(res.held_back.len(), 1);
+            assert_eq!(res.held_back[0].frame_id, fx.frame_ids[1]);
+            let bodies = announce_bodies(&fx.server).await;
+            assert_eq!(bodies[0]["frames"].as_array().unwrap().len(), 1);
+            assert!(own_row(&fx, &fx.uuids[1]).is_none());
+        }
+
+        /// The hub caps a batch at 500 frames.
+        #[test]
+        fn announce_batches_split_at_500() {
+            let sizes: Vec<usize> = announce_batches((0..1001).collect::<Vec<_>>())
+                .iter()
+                .map(Vec::len)
+                .collect();
+            assert_eq!(sizes, vec![500, 500, 1]);
+            assert!(announce_batches(Vec::<u8>::new()).is_empty());
+        }
+
+        /// The hub's fileName rule, checked before a name can refuse a batch.
+        #[test]
+        fn hub_file_name_rule() {
+            assert_eq!(hub_file_name_problem("c_L_0001.fits"), None);
+            for bad in [
+                "", " c.fits", ".", "..", "a:b.fits", "a\\b", "a/b", "a\u{1}b",
+            ] {
+                assert!(hub_file_name_problem(bad).is_some(), "{bad:?}");
+            }
+            assert!(hub_file_name_problem(&"a".repeat(256)).is_some());
+        }
+
+        /// P4: a PC matrix is stripped with the rest of the header WCS.
+        #[test]
+        fn header_wcs_strip_covers_pc_cdelt_crota() {
+            for k in [
+                "PC1_1",
+                "PC2_1",
+                "PC001_002",
+                "CDELT1",
+                "CROTA2",
+                "CD1_1",
+                "LONPOLE",
+            ] {
+                assert!(is_header_wcs_keyword(k), "{k}");
+            }
+            for k in ["PC", "PC1", "PCX_1", "PC1_1_1", "EXPTIME", "PCOUNT"] {
+                assert!(!is_header_wcs_keyword(k), "{k}");
+            }
         }
 
         /// P17: `409 collab_api_outdated` is a Conflict with the stable

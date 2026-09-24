@@ -448,11 +448,28 @@ pub fn resolved_master_paths(
 /// [`resolved_master_paths`] (same dark-gated bias rule), for a caller that
 /// needs a single frame's masters (collab publish's recipe hash, P19).
 pub fn spec_master_paths(spec: &GenerationSpec) -> std::collections::BTreeSet<PathBuf> {
+    master_paths_read(
+        spec.inputs.dark_path.as_deref(),
+        spec.inputs.flat_path.as_deref(),
+        spec.inputs.bias_path.as_deref(),
+    )
+}
+
+/// The ONE rule for which masters a generation reads, from the resolved
+/// dark/flat/bias paths: dark and flat when present, bias only when no dark
+/// applies (the raw-master-dark convention, review fix #1). Shared by
+/// [`spec_master_paths`] and callers that resolved the links without a full
+/// spec (collab publish's pre-permit recipe split, P19).
+pub fn master_paths_read(
+    dark: Option<&Path>,
+    flat: Option<&Path>,
+    bias: Option<&Path>,
+) -> std::collections::BTreeSet<PathBuf> {
     let mut paths = std::collections::BTreeSet::new();
-    paths.extend(spec.inputs.dark_path.clone());
-    paths.extend(spec.inputs.flat_path.clone());
-    if spec.inputs.dark_path.is_none() {
-        paths.extend(spec.inputs.bias_path.clone());
+    paths.extend(dark.map(Path::to_path_buf));
+    paths.extend(flat.map(Path::to_path_buf));
+    if dark.is_none() {
+        paths.extend(bias.map(Path::to_path_buf));
     }
     paths
 }
