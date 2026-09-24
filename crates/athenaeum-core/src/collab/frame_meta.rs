@@ -14,6 +14,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
 
+use crate::collab::gate::header_pixel_scale_arcsec;
 use crate::db::analysis::get_frame_analyses_by_ids;
 use crate::fits_writer::keywords::Bayer;
 use crate::plate_solve::storage::get_plate_solve;
@@ -66,21 +67,6 @@ fn load_frame_row(conn: &Connection, frame_id: i64) -> Result<FrameRow> {
             })
         },
     )?)
-}
-
-/// Header-fallback pixel scale — the SAME formula as
-/// `api::collab::frame_gate_inputs`'s own fallback, duplicated rather than
-/// shared because the two live on opposite sides of the `solver` feature
-/// gate (this module; that one is render-only). `None` for a placeholder
-/// `xpixsz = 0.0`/`focallen = 0.0`, the same sentinel `plate_solve::hints`
-/// treats as "not actually set".
-fn header_pixel_scale_arcsec(xpixsz: Option<f64>, focallen: Option<f64>) -> Option<f64> {
-    match (xpixsz, focallen) {
-        (Some(xpixsz), Some(focallen)) if focallen > 0.0 && xpixsz > 0.0 => {
-            Some(((xpixsz / 1000.0) / focallen).atan().to_degrees() * 3600.0)
-        }
-        _ => None,
-    }
 }
 
 /// Build the manifest `meta` for one frame — the DB-wiring counterpart of the

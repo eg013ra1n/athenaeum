@@ -31,11 +31,12 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::account::keys::{device_key_path, DeviceKey};
 use crate::api::collab_exchange::ensure_collab_sender_engine;
-use crate::api::lights::{check_mode_ready, compute_export_readiness_for_frames};
+use crate::api::lights::check_mode_ready;
 use crate::api::{db, ApiError};
 use crate::collab::filters::{match_filter, DictionaryEntry};
 use crate::collab::gate::{
-    evaluate_frame, FrameGateRow, GateFrameInput, ProjectTarget, ThresholdRuleView,
+    evaluate_frame, header_pixel_scale_arcsec, FrameGateRow, GateFrameInput, ProjectTarget,
+    ThresholdRuleView,
 };
 use crate::collab::hub_client::{AnnounceRequest, CollabClient};
 use crate::collab::snapshot::{member_node_ids, own_display_name, SnapshotMember};
@@ -328,15 +329,23 @@ struct FrameRow {
 /// `check_mode_ready` would show the Export tab under a disabled Calibrated
 /// Lights mode for a frame set containing only this frame. Replaces decision
 /// C's `LightCalStatus::NotCalibrated` constant (spec 2026-08-31 §8a).
+///
+/// Takes the set's `ExportData` BY REFERENCE, already collected by the caller
+/// (fix round 1, ruling R7) — `api::lights::readiness_from_data` filters it
+/// down to just `frame_id` itself, so this never re-walks `set_id`'s whole
+/// export tree. The caller (`frame_gate_inputs`) collects one `ExportData`
+/// per linked set and calls this once per LIGHT of that set.
 pub(crate) fn frame_cal_verdict(
     conn: &Connection,
     set_id: i64,
     frame_id: i64,
+    data: &crate::export::models::ExportData,
 ) -> Result<(), String> {
-    let readiness = compute_export_readiness_for_frames(conn, set_id, &[frame_id]).map_err(|e| {
-        tracing::warn!(set_id, frame_id, error = %e, "export readiness check failed for the collab gate; treating as not calibrated");
-        format!("could not verify calibration: {e}")
-    })?;
+    let readiness =
+        crate::api::lights::readiness_from_data(conn, set_id, &[frame_id], data).map_err(|e| {
+            tracing::warn!(set_id, frame_id, error = %e, "export readiness check failed for the collab gate; treating as not calibrated");
+            format!("could not verify calibration: {e}")
+        })?;
     check_mode_ready(&readiness, ExportMode::CalibratedLights)
 }
 
@@ -362,13 +371,14 @@ pub(crate) fn publish_options() -> CalibratedLightOptions {
 /// analyses in three batched queries, then resolves each frame's center
 /// (crval → ra/dec → parsed objctra/objctdec), pixel scale (plate-solve →
 /// header `atan(xpixsz/focallen)`, no binning multiply), P7's per-frame
-/// calibrated verdict (via `frame_set_ids`), and P3's dictionary filter
+/// calibrated verdict (via `frame_set_id_by_frame`, one `collect_export_data`
+/// per DISTINCT set — fix round 1, ruling R7), and P3's dictionary filter
 /// match.
 fn frame_gate_inputs(
     conn: &rusqlite::Connection,
     frames: &[(i64, String)],
     dictionary: &[DictionaryEntry],
-    frame_set_ids: &HashMap<i64, i64>,
+    frame_set_id_by_frame: &HashMap<i64, i64>,
 ) -> anyhow::Result<Vec<GateFrameInput>> {
     if frames.is_empty() {
         return Ok(Vec::new());
@@ -433,23 +443,28 @@ fn frame_gate_inputs(
         analyses.insert(a.frame_id, a);
     }
 
+    // Fix round 1 (ruling R7): one `collect_export_data` per DISTINCT linked
+    // set, cached here and reused by [`frame_cal_verdict`] for every LIGHT of
+    // that set — never once per frame, which was O(frames²) DB round trips
+    // per set (`collect_export_data` walks the whole set every call). A
+    // collect failure is cached too (as the blocker text every frame of that
+    // set will carry), so a broken set is only logged once, not once per
+    // frame.
+    let mut export_data_cache: HashMap<i64, Result<crate::export::models::ExportData, String>> =
+        HashMap::new();
+
     let mut out = Vec::with_capacity(frames.len());
     for (frame_id, filename) in frames {
         let solve = solves.get(frame_id);
         let frow = rows_by_id.get(frame_id);
 
         // Scale precedence: plate-solve pixel scale, else the header fallback
-        // atan(xpixsz_mm / focallen_mm) when both present and positive
-        // (mirrors plate_solve/hints.rs — a 0.0 xpixsz is a placeholder, not
-        // a real pixel size, and must yield "unknown scale", not 0.0).
-        let pixel_scale_arcsec = solve.map(|(s, _, _)| *s).or_else(|| {
-            frow.and_then(|f| match (f.xpixsz, f.focallen) {
-                (Some(xpixsz), Some(focallen)) if focallen > 0.0 && xpixsz > 0.0 => {
-                    Some(((xpixsz / 1000.0) / focallen).atan().to_degrees() * 3600.0)
-                }
-                _ => None,
-            })
-        });
+        // (fix round 1: the formula itself now lives ONCE, in
+        // `collab::gate::header_pixel_scale_arcsec`, shared with
+        // `collab::frame_meta::build_frame_meta`).
+        let pixel_scale_arcsec = solve
+            .map(|(s, _, _)| *s)
+            .or_else(|| frow.and_then(|f| header_pixel_scale_arcsec(f.xpixsz, f.focallen)));
 
         // Center precedence: plate-solve crval → frames ra/dec → parsed
         // objctra/objctdec strings. A real solve's crval is authoritative and
@@ -491,13 +506,25 @@ fn frame_gate_inputs(
             .trim()
             .to_string();
         // P7: the real gate, replacing decision C's constant.
-        let cal_blocker = match frame_set_ids.get(frame_id) {
-            Some(&set_id) => frame_cal_verdict(conn, set_id, *frame_id).err(),
+        let cal_blocker = match frame_set_id_by_frame.get(frame_id) {
+            Some(&set_id) => {
+                let data = export_data_cache.entry(set_id).or_insert_with(|| {
+                    crate::export::collect_export_data(conn, set_id).map_err(|e| {
+                        tracing::warn!(set_id, error = %e, "collect export data failed for the collab gate; every frame in this set is treated as not calibrated");
+                        format!("could not verify calibration: {e}")
+                    })
+                });
+                match data {
+                    Ok(data) => frame_cal_verdict(conn, set_id, *frame_id, data).err(),
+                    Err(msg) => Some(msg.clone()),
+                }
+            }
             None => {
                 // Every frame here came from `union_light_frames` over the
-                // SAME set ids `frame_set_ids` was built from, so this is
-                // unreachable in practice — logged rather than panicking, in
-                // case a future caller ever hands mismatched inputs.
+                // SAME set ids `frame_set_id_by_frame` was built from, so
+                // this is unreachable in practice — logged rather than
+                // panicking, in case a future caller ever hands mismatched
+                // inputs.
                 tracing::warn!(
                     frame_id,
                     "frame has no resolvable frames_set for the collab gate"
@@ -2850,6 +2877,54 @@ mod tests {
         }
     }
 
+    /// A `MasterDark` calibration set WITH an on-disk file that is never
+    /// actually written — the "archived or moved" shape
+    /// (`api::lights::tests::seed_master_with_file` + `add_link`) — linked to
+    /// ONE frame's Dark. Unlike [`link_shared_master_dark`], `resolve_master`
+    /// DOES resolve this one (it has a `calibration_set_frames` member), so
+    /// its missing file counts in `ExportReadiness::missing_master_files` and
+    /// blocks P7's calibrated verdict with the "restore from archive"
+    /// sentence — the fix-round-1 equivalence test's third calibration state.
+    fn link_missing_master_file(
+        conn: &rusqlite::Connection,
+        set_id: i64,
+        frame_id: i64,
+        path: &std::path::Path,
+    ) {
+        let master_set_id = 9_500_000 + set_id * 1000 + frame_id;
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library) \
+             VALUES (?1, 'MasterDark', '2026-07-01', 1)",
+            [master_set_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format) \
+             VALUES (?1, 'master_dark_missing.fits', 0, '2026-07-01T00:00:00Z', 'FITS')",
+            rusqlite::params![path.to_string_lossy()],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp, is_master) VALUES (?1, 'MasterDark', 1)",
+            [file_id],
+        )
+        .unwrap();
+        let master_frame_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![master_set_id, master_frame_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames \
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at) \
+             VALUES (?1, 'frame', ?2, 'Dark', '2026-07-01T00:00:00Z')",
+            rusqlite::params![frame_id, master_set_id],
+        )
+        .unwrap();
+    }
+
     /// Every LIGHT frame id of a set, in `id` order — for wiring up
     /// [`link_shared_master_dark`] after [`seed_publishable_set`].
     fn light_frame_ids_of(conn: &rusqlite::Connection, set_id: i64) -> Vec<i64> {
@@ -3468,6 +3543,126 @@ mod tests {
             ),
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    /// Fix round 1 (ruling R7) equivalence: the gate's per-frame verdict —
+    /// now routed through one `ExportData` collected per LINKED SET and
+    /// reused for every frame of it — must match EXACTLY what calling the
+    /// old, un-cached per-frame `compute_export_readiness_for_frames` would
+    /// have given, across a set mixing all three calibration states: no
+    /// links, a usable (unresolved-on-disk) master, and a master whose file
+    /// is missing.
+    #[tokio::test]
+    async fn gate_verdicts_match_the_old_per_frame_readiness_call() {
+        let (_tmp, ctx) = test_ctx();
+        let out_dir = _tmp.path().join("cal_out");
+        let missing_master_path = _tmp.path().join("missing_master_dark.fits");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+            crate::db::collab::set_dictionary(
+                &conn,
+                "p-1",
+                Some(1),
+                Some(r#"[{"canonical":"L","aliases":[],"kind":"broadband"}]"#),
+            )
+            .unwrap();
+            let set_id = seed_publishable_set(
+                &conn,
+                &out_dir,
+                "Mixed Set",
+                &[
+                    "uuid-mix-1",
+                    "uuid-mix-2",
+                    "uuid-mix-3",
+                    "uuid-mix-4",
+                    "uuid-mix-5",
+                ],
+            );
+            let frame_ids = light_frame_ids_of(&conn, set_id);
+            assert_eq!(frame_ids.len(), 5);
+            // frame_ids[0]: left completely unlinked.
+            // frame_ids[1], [3], [4]: linked to a usable (unresolved-on-disk) master.
+            link_shared_master_dark(&conn, set_id, &[frame_ids[1], frame_ids[3], frame_ids[4]]);
+            // frame_ids[2]: linked to a master whose file is missing on disk.
+            link_missing_master_file(&conn, set_id, frame_ids[2], &missing_master_path);
+            set_id
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert_eq!(report.total, 5);
+        // Sanity: the mix is real — not all three states collapsed into one.
+        assert_eq!(report.publishable, 3, "{:?}", report.rows);
+
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        for row in &report.rows {
+            let old = crate::api::lights::compute_export_readiness_for_frames(
+                &conn,
+                set_id,
+                &[row.frame_id],
+            )
+            .unwrap();
+            match check_mode_ready(&old, ExportMode::CalibratedLights) {
+                Ok(()) => assert!(
+                    row.failures.is_empty(),
+                    "frame {}: gate said {:?}, old per-frame call said Ok",
+                    row.frame_id,
+                    row.failures
+                ),
+                Err(msg) => assert_eq!(
+                    row.failures,
+                    vec![msg],
+                    "frame {} verdict mismatch between the gate and the old per-frame call",
+                    row.frame_id
+                ),
+            }
+        }
+    }
+
+    /// Fix round 1 (ruling R7): evaluating a project's gate collects each
+    /// linked set's `ExportData` EXACTLY ONCE no matter how many lights it
+    /// has — never once per frame (which was the O(frames²) DB-round-trip
+    /// bug this fix closes).
+    #[tokio::test]
+    async fn gate_collects_export_data_once_per_linked_set() {
+        let (_tmp, ctx) = test_ctx();
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+            crate::db::collab::set_dictionary(
+                &conn,
+                "p-1",
+                Some(1),
+                Some(r#"[{"canonical":"L","aliases":[],"kind":"broadband"}]"#),
+            )
+            .unwrap();
+            seed_publishable_set(
+                &conn,
+                &out_dir,
+                "Count Set",
+                &[
+                    "uuid-cnt-1",
+                    "uuid-cnt-2",
+                    "uuid-cnt-3",
+                    "uuid-cnt-4",
+                    "uuid-cnt-5",
+                ],
+            )
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let before = crate::export::data_collector::collect_export_data_calls_on_this_thread();
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        let after = crate::export::data_collector::collect_export_data_calls_on_this_thread();
+
+        assert_eq!(report.total, 5);
+        assert_eq!(
+            after - before,
+            1,
+            "one linked set of 5 frames must collect its export tree exactly once"
+        );
     }
 
     /// P6: OSC never gets debayered on a wave-2 publish.

@@ -44,6 +44,35 @@ pub struct ThresholdRuleView {
     pub value: serde_json::Value,
 }
 
+/// The header pixel-scale fallback used when there is no plate solve:
+/// `atan(xpixsz_um / 1000 / focallen_mm)` in arcsec, only when both are
+/// present and strictly positive — a `0.0` `xpixsz`/`focallen` is FITS's
+/// "not actually set" placeholder (see `plate_solve::hints::is_sentinel_position`'s
+/// sibling reasoning for coordinates), not a real value, and must yield
+/// `None` ("unknown scale"), never `0.0`. No binning multiply.
+///
+/// Lives here (pure, DB-free, no feature gate) rather than in either caller
+/// so it has exactly one definition: `api::collab::frame_gate_inputs` (the
+/// gate's own precedence: plate-solve scale, else this) and
+/// `collab::frame_meta::build_frame_meta` (the manifest's `pixelScaleArcsec`/
+/// `fwhmArcsec`, same precedence) each read `frames.xpixsz`/`frames.focallen`
+/// through their own query and call this with the result — duplicating the
+/// formula itself, rather than this function, was fix round 1's finding.
+///
+/// `#[allow(dead_code)]`: both callers are `render`+`solver`-gated, so under
+/// `--no-default-features` (the headless build, where this ungated module
+/// still compiles) nothing in the crate calls this — same reasoning as
+/// `api::collab::publish_options`'s allow.
+#[allow(dead_code)]
+pub(crate) fn header_pixel_scale_arcsec(xpixsz: Option<f64>, focallen: Option<f64>) -> Option<f64> {
+    match (xpixsz, focallen) {
+        (Some(xpixsz), Some(focallen)) if focallen > 0.0 && xpixsz > 0.0 => {
+            Some(((xpixsz / 1000.0) / focallen).atan().to_degrees() * 3600.0)
+        }
+        _ => None,
+    }
+}
+
 /// The threshold metric registry (collab v3 spec §6.3) — the app's copy. The
 /// hub's `src/collab_rules.rs` and the portal's `metrics.ts` are the other two;
 /// the test `registry_matches_the_evaluator` pins this one to the match arms
@@ -230,6 +259,28 @@ pub fn evaluate_frame(
 mod tests {
     use super::*;
     use crate::models::FrameAnalysis;
+
+    /// Fix round 1: the one shared definition, exercised directly (both
+    /// callers now just forward their own `xpixsz`/`focallen` read here).
+    #[test]
+    fn header_pixel_scale_arcsec_matches_the_known_formula_and_treats_zero_as_unset() {
+        // 3.76 um / 1000.0 mm focal length ≈ 0.776 ″/px.
+        let scale = header_pixel_scale_arcsec(Some(3.76), Some(1000.0)).unwrap();
+        assert!((scale - 0.7755556714854275).abs() < 1e-9, "{scale}");
+
+        assert_eq!(header_pixel_scale_arcsec(None, Some(1000.0)), None);
+        assert_eq!(header_pixel_scale_arcsec(Some(3.76), None), None);
+        assert_eq!(
+            header_pixel_scale_arcsec(Some(0.0), Some(1000.0)),
+            None,
+            "a 0.0 xpixsz is the FITS not-actually-set placeholder"
+        );
+        assert_eq!(
+            header_pixel_scale_arcsec(Some(3.76), Some(0.0)),
+            None,
+            "a 0.0 focallen is the FITS not-actually-set placeholder"
+        );
+    }
 
     /// `FrameAnalysis` fields are NOT `Option` (see `models.rs`): `median_fwhm:
     /// f64`, `stars_detected: i64`, `possibly_trailed: bool`, … Only

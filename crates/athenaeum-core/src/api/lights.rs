@@ -267,6 +267,35 @@ pub(crate) fn compute_export_readiness_for_frames(
     set_id: i64,
     light_frame_ids: &[i64],
 ) -> Result<ExportReadiness, ApiError> {
+    let data = crate::export::collect_export_data(conn, set_id)
+        .map_err(|e| ApiError::Internal(format!("collect export data for readiness: {e:#}")))?;
+    readiness_from_data(conn, set_id, light_frame_ids, &data)
+}
+
+/// [`compute_export_readiness_for_frames`]'s worker over an ALREADY-COLLECTED
+/// export tree (fix round 1, collab v3 wave 2 Task 6, ruling R7).
+///
+/// `collect_export_data` walks the WHOLE frame set (multiple DB round trips)
+/// and is the expensive half of this computation; `compute_export_readiness_for_frames`
+/// used to run it itself on every call, which was fine for its two ORIGINAL
+/// callers (one call per set, whole-set or stacking-plan-filtered) but not
+/// for the collab gate, which evaluates every LIGHT of every linked set one
+/// frame at a time — collecting per frame turned one project's gate report
+/// into O(frames²) DB round trips per linked set. Splitting the collect out
+/// lets a caller collect ONCE per `set_id` and pass the SAME `&ExportData` to
+/// one `readiness_from_data` call per frame — `data` is a shared reference on
+/// purpose, so a caller iterating many frames of one set never re-collects
+/// (or needs to re-own) it.
+///
+/// Behaviour for the two original callers is UNCHANGED: this is exactly the
+/// body `compute_export_readiness_for_frames` used to run right after its own
+/// `collect_export_data` call, now reached through that thin wrapper above.
+pub(crate) fn readiness_from_data(
+    conn: &Connection,
+    set_id: i64,
+    light_frame_ids: &[i64],
+    data: &ExportData,
+) -> Result<ExportReadiness, ApiError> {
     let total = light_frame_ids.len() as i64;
 
     // A light with no links of ANY type: nothing to subtract, nothing to
@@ -420,8 +449,6 @@ pub(crate) fn compute_export_readiness_for_frames(
         }
     }
 
-    let data = crate::export::collect_export_data(conn, set_id)
-        .map_err(|e| ApiError::Internal(format!("collect export data for readiness: {e:#}")))?;
     // Ruling R-T6-6: filter the export tree down to the given light subset
     // BEFORE deriving raw-set readiness from it — a `CalibrationSubgroup`
     // whose lights are entirely outside `light_frame_ids` is dropped, so
@@ -431,7 +458,8 @@ pub(crate) fn compute_export_readiness_for_frames(
     // (`light_frame_ids` there covers every light `collect_export_data`
     // itself would have found, so no subgroup's member list changes and
     // none is ever dropped) — see [`filter_export_data_to_frames`]'s own
-    // doc for why.
+    // doc for why. `data` is the CALLER's — a shared, already-collected tree
+    // (fix round 1) — so this filters a fresh clone rather than mutating it.
     let frame_id_set: HashSet<i64> = light_frame_ids.iter().copied().collect();
     let data = filter_export_data_to_frames(data, &frame_id_set);
     let raw_set_ids_without_master =
@@ -498,11 +526,10 @@ pub(crate) fn compute_export_readiness_for_frames(
 }
 
 /// Ruling R-T6-6: filter `data`'s export groups down to only the LIGHT
-/// frames named by `frame_ids` — used by
-/// [`compute_export_readiness_for_frames`] to derive masters/links
-/// readiness over the frames a stacking run will actually touch, without
-/// touching `export::collect_export_data` itself (which every OTHER export
-/// caller still walks unfiltered).
+/// frames named by `frame_ids` — used by [`readiness_from_data`] to derive
+/// masters/links readiness over the frames a stacking run will actually
+/// touch, without touching `export::collect_export_data` itself (which every
+/// OTHER export caller still walks unfiltered).
 ///
 /// A `CalibrationSubgroup` — the collector's own unit of "lights sharing
 /// one exact combination of calibration links" — is dropped entirely when
@@ -520,7 +547,18 @@ pub(crate) fn compute_export_readiness_for_frames(
 /// exactly [`compute_export_readiness`]'s own case, which is how the
 /// whole-set caller and the frame-filtered one can share this one filter
 /// without the whole-set behaviour changing.
-fn filter_export_data_to_frames(mut data: ExportData, frame_ids: &HashSet<i64>) -> ExportData {
+///
+/// Takes `&ExportData` (fix round 1, ruling R7): the collab gate collects
+/// ONE `ExportData` per linked set and calls [`readiness_from_data`] once per
+/// LIGHT of that set, so this must never consume/mutate the caller's shared
+/// copy — it clones once (in-memory only, no DB access; the tree is already
+/// collected) and prunes the clone. A bigger set with many subgroups could in
+/// principle build the one-frame view by reference instead of cloning the
+/// whole tree first, but the clone here is pure `Vec`/`String` copying, not
+/// the O(frames) DB round trips `collect_export_data` makes — that DB cost is
+/// what ruling R7 is about, and it is now paid exactly once per set.
+fn filter_export_data_to_frames(data: &ExportData, frame_ids: &HashSet<i64>) -> ExportData {
+    let mut data = data.clone();
     for group in &mut data.groups {
         group.subgroups.retain_mut(|subgroup| {
             subgroup.frames.retain(|f| frame_ids.contains(&f.frame_id));

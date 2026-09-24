@@ -1648,9 +1648,11 @@ superseded: boolean, createdAt: string, };
 
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**
- * Human-readable failure reasons, empty when publishable
- * (e.g. `FWHM 3.4″ > 3.0″`, `not calibrated (Stale)`, `no analysis`,
- * `unknown pixel scale`, `outside target radius (2.1° > 1.5°)`).
+ * Human-readable failure reasons, empty when publishable (e.g.
+ * `FWHM 3.4″ > 3.0″`, the caller's `cal_blocker` sentence verbatim, `frame
+ * has no uuid`, `filter "OIII" is not in the project dictionary`,
+ * `no analysis`, `unknown pixel scale`,
+ * `outside target radius (2.1° > 1.5°)`).
  */
 failures: Array<string>, };
 

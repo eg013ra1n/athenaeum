@@ -16,11 +16,31 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`collect_export_data`] on this thread — collab v3 wave 2
+    /// Task 6 fix round 1 (ruling R7): the collab gate must collect ONE
+    /// `ExportData` per linked set (not once per frame), and this is how a
+    /// test proves it. Thread-local rather than a global atomic for the same
+    /// reason `sharing::iroh::assign::POOLS_OPENED` is: the lib's tests run
+    /// in parallel, and several of them collect export data, so a global
+    /// counter's delta would be another test's noise.
+    static COLLECT_EXPORT_DATA_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook: [`collect_export_data`] calls on the calling thread so far.
+#[cfg(test)]
+pub(crate) fn collect_export_data_calls_on_this_thread() -> usize {
+    COLLECT_EXPORT_DATA_CALLS.with(|c| c.get())
+}
+
 /// Collect all export data for a frame set
 ///
 /// This traverses the frame set hierarchy to get all light frames,
 /// groups them by filter and camera type, and retrieves their calibration links.
 pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<ExportData> {
+    #[cfg(test)]
+    COLLECT_EXPORT_DATA_CALLS.with(|c| c.set(c.get() + 1));
     tracing::debug!(frame_set_id, "collecting export data");
 
     // Get frame set info
