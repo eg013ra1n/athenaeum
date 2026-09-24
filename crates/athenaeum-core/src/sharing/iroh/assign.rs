@@ -26,6 +26,18 @@
 //! byte, never restarts the frame), and the full provider set available to
 //! every child.
 //!
+//! ## Independent items
+//!
+//! The engine runs over [`FetchItem`]s — each with its own `GetRequest`, hash
+//! and provider list — through [`fetch_items_assigned`]. A collection is the
+//! special case [`fetch_children_assigned`] builds: every child addressed
+//! through its root, one shared provider list, the personal ALPN, and
+//! [`FailMode::FailFast`]. A batch of collab frames is raw blob items with
+//! per-frame holders on the collab ALPN under [`FailMode::Isolate`], where one
+//! item's failure is its own result and never aborts a sibling. Per-provider
+//! state stays run-wide either way: one pool, one ledger, one backoff ladder
+//! per provider, whichever items it serves.
+//!
 //! ## Hedging
 //!
 //! Task 8 added the second, racing assignment: while a child's primary
@@ -384,6 +396,88 @@ pub(crate) struct AssignmentOptions {
     /// Per-provider attempt telemetry, the same sink the stock path feeds from
     /// the download stream's `TryProvider`/`ProviderFailed` items.
     pub telemetry: ProviderTelemetrySink,
+    /// The ALPN the run's one connection pool dials — `iroh_blobs::ALPN` for
+    /// the personal store, [`COLLAB_BLOBS_ALPN`](super::COLLAB_BLOBS_ALPN) for
+    /// the collab store. [`fetch_children_assigned`] forces the former.
+    pub alpn: &'static [u8],
+    /// What one item's failure does to the rest of the call.
+    /// [`fetch_children_assigned`] forces [`FailMode::FailFast`].
+    pub fail_mode: FailMode,
+}
+
+/// What one item exhausting its ladder does to the rest of the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailMode {
+    /// The first failed item fails the whole call and aborts its siblings —
+    /// the collection contract: a package missing one child is worthless.
+    FailFast,
+    /// A failed item records its error and the call goes on; every item gets
+    /// its own result. Independent frames (P11): one frame failing never
+    /// aborts its siblings.
+    Isolate,
+}
+
+/// One independently fetched blob: its own request, its own provider list,
+/// its own result.
+///
+/// `request` is `GetRequest::blob(hash)` for a raw blob, or
+/// `GetRequest::builder().child(i, ChunkRanges::all()).build(root)` for a
+/// collection child — the engine never builds a request itself, it only
+/// narrows this one's ranges for a hedge ([`hedge_back_half_request`]).
+/// `hash` is the blob the request lands (the child's own hash for a child
+/// request), which the hedge observes. `size` is the caller's announced size,
+/// informational only (`0` when unknown): the hedge budget's base is
+/// [`AssignmentOptions::total_bytes`].
+pub(crate) struct FetchItem {
+    /// The caller's id for the item (a frame uuid; a child index for the
+    /// collection wrapper), echoed in the results.
+    pub key: String,
+    pub request: GetRequest,
+    pub hash: Hash,
+    pub size: u64,
+    /// The providers this item may be assigned to. Per-provider state
+    /// (backoff, load, goodput) is shared across every item of the call.
+    pub providers: Arc<Vec<EndpointId>>,
+}
+
+impl FetchItem {
+    /// How error messages name the item. A child keeps the exact wording the
+    /// collection path always used (`child {index} of {root}`).
+    fn describe(&self) -> String {
+        if self.request.ranges.is_blob() {
+            format!("blob {} ({})", self.key, self.hash)
+        } else {
+            format!("child {} of {}", self.key, self.request.hash)
+        }
+    }
+}
+
+/// Per-item results of one call, in input order.
+pub(crate) type ItemResults = Vec<(String, Result<()>)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Connection pools opened by [`run_items`] on this thread.
+    ///
+    /// Thread-local rather than a process-wide atomic on purpose: the lib's
+    /// tests run in parallel, and several of them open pools, so a global
+    /// counter's delta would be another test's noise. `#[tokio::test]` drives
+    /// its future with `block_on` on the test's own thread, and the pool is
+    /// opened in the call's synchronous prelude, so the thread IS the call.
+    static POOLS_OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook: pools opened on the calling thread so far.
+#[cfg(test)]
+pub(crate) fn pools_opened_on_this_thread() -> usize {
+    POOLS_OPENED.with(|c| c.get())
+}
+
+/// The run's one connection pool on `alpn`.
+fn open_pool(endpoint: &Endpoint, alpn: &'static [u8]) -> ConnectionPool {
+    #[cfg(test)]
+    POOLS_OPENED.with(|c| c.set(c.get() + 1));
+    ConnectionPool::new(endpoint.clone(), alpn, PoolOptions::default())
 }
 
 /// Why one assignment ended without the child's bytes.
@@ -500,6 +594,12 @@ impl Drop for InflightGuard {
 /// its ladder fails the whole call and aborts its siblings; partial bytes stay
 /// in the store (the caller's in-flight tag protects them), so a retry — even
 /// against an entirely different provider set — resumes.
+///
+/// A thin wrapper over the item engine ([`fetch_items_assigned`]): each child
+/// becomes a [`FetchItem`] keyed by its index and sharing ONE provider list,
+/// on `iroh_blobs::ALPN` under [`FailMode::FailFast`] — both forced here,
+/// whatever `opts` carries, so a collection can never be fetched isolated or
+/// from the collab store by accident.
 pub(crate) async fn fetch_children_assigned(
     store: &Store,
     endpoint: &Endpoint,
@@ -512,19 +612,71 @@ pub(crate) async fn fetch_children_assigned(
         !providers.is_empty(),
         "assignment loop needs at least one provider"
     );
+    let providers = Arc::new(providers);
+    let items = children
+        .into_iter()
+        .map(|(index, hash)| FetchItem {
+            key: index.to_string(),
+            request: GetRequest::builder()
+                .child(index, ChunkRanges::all())
+                .build(root),
+            hash,
+            // A collection child's size is not known here; the budget's base
+            // is `opts.total_bytes`, the collection's announced size.
+            size: 0,
+            providers: Arc::clone(&providers),
+        })
+        .collect();
+    let opts = AssignmentOptions {
+        alpn: iroh_blobs::ALPN,
+        fail_mode: FailMode::FailFast,
+        ..opts
+    };
+    let (report, _results) = run_items(store, endpoint, items, opts, Some(root)).await?;
+    Ok(report)
+}
 
+/// Fetch a set of INDEPENDENT items, each from its own provider list, in one
+/// assignment run: one connection pool on `opts.alpn`, one hedge ledger, one
+/// per-provider state shared by every item.
+///
+/// Per item, the behaviour is exactly the collection child's: a progress
+/// deadline, the backoff ladder, hedging of the back half, and byte-level
+/// resume from `local_for_request(item.request)`. `opts.fail_mode` decides
+/// what a failed item does to the others; under [`FailMode::Isolate`] the call
+/// itself only fails for a reason no item owns, and every item's outcome is in
+/// the returned results, in input order.
+#[allow(dead_code)] // consumed by the collab replication pass (wave 2, Task 9)
+pub(crate) async fn fetch_items_assigned(
+    store: &Store,
+    endpoint: &Endpoint,
+    items: Vec<FetchItem>,
+    opts: AssignmentOptions,
+) -> Result<(AssignmentReport, ItemResults)> {
+    run_items(store, endpoint, items, opts, None).await
+}
+
+/// The engine behind both entry points. `batch_root` is the collection root
+/// the collection wrapper logs its run under; `None` for a set of raw items.
+async fn run_items(
+    store: &Store,
+    endpoint: &Endpoint,
+    items: Vec<FetchItem>,
+    opts: AssignmentOptions,
+    batch_root: Option<Hash>,
+) -> Result<(AssignmentReport, ItemResults)> {
     // Our own pool, not the downloader's: `Downloader` owns its pool privately
-    // and hands out no handle. Same ALPN, same defaults (1 s connect timeout,
-    // 5 s idle) — a connection stays warm across the children assigned to one
-    // provider, which is the whole reason to pool at all.
-    let pool = ConnectionPool::new(endpoint.clone(), iroh_blobs::ALPN, PoolOptions::default());
+    // and hands out no handle. Same defaults (1 s connect timeout, 5 s idle) —
+    // a connection stays warm across the items assigned to one provider, which
+    // is the whole reason to pool at all. ONE pool per call, whatever the item
+    // count.
+    let pool = open_pool(endpoint, opts.alpn);
     let remote: Remote = store.remote().clone();
     let blobs: Blobs = store.blobs().clone();
-    let providers = Arc::new(providers);
 
     // One hedge ledger for the run: the budget, the p95 window and the report
-    // counters. `total_bytes` is the collection's announced payload size, so
-    // the cap is 5 % of what this fetch is worth — not of what one child is.
+    // counters. `total_bytes` is the batch's announced payload size, so the
+    // cap is 5 % of what this fetch is worth — not of what one item is.
     let ledger: Ledger = Arc::new(Mutex::new(HedgeLedger {
         budget: HedgeBudget::new(opts.total_bytes),
         completions: CompletionWindow::default(),
@@ -532,67 +684,114 @@ pub(crate) async fn fetch_children_assigned(
         hedge_bytes: 0,
     }));
 
+    // Per-provider state is GLOBAL to the run — the union of every item's
+    // providers — so a provider's backoff, load and goodput follow it across
+    // items; each item only chooses among its own list.
     let states: States = Arc::new(Mutex::new(
-        providers
+        items
             .iter()
-            .map(|p| (*p, ProviderState::default()))
+            .flat_map(|item| item.providers.iter().copied())
+            .map(|p| (p, ProviderState::default()))
             .collect(),
     ));
 
-    let child_count = children.len();
-    let mut pending = children.into_iter();
+    let item_count = items.len();
+    let labels: Vec<(String, u64)> = items.iter().map(|i| (i.key.clone(), i.size)).collect();
+    let mut results: Vec<Option<Result<()>>> = (0..item_count).map(|_| None).collect();
+    let mut slot_of: HashMap<tokio::task::Id, usize> = HashMap::new();
+    let mut pending = items.into_iter().enumerate();
     let mut set = tokio::task::JoinSet::new();
 
-    // Spawn and drain in the SAME loop rather than spawning all children behind
-    // a semaphore: a permit taken before `spawn` bounds concurrency just as
-    // well, but it leaves every not-yet-spawned child queued behind a swarm
-    // that is already failing, so a dead swarm would walk the backoff ladder
-    // once per child instead of once. Draining here also means the first
-    // child's error reaches us immediately, and dropping the `JoinSet` on the
-    // way out aborts every sibling.
+    // Spawn and drain in the SAME loop rather than spawning all items behind a
+    // semaphore: a permit taken before `spawn` bounds concurrency just as well,
+    // but it leaves every not-yet-spawned item queued behind a swarm that is
+    // already failing, so a dead swarm would walk the backoff ladder once per
+    // item instead of once. Draining here also means the first item's error
+    // reaches us immediately, and under `FailFast` dropping the `JoinSet` on
+    // the way out aborts every sibling.
     loop {
         while set.len() < MAX_IN_FLIGHT {
-            let Some((index, hash)) = pending.next() else {
+            let Some((slot, item)) = pending.next() else {
                 break;
             };
-            set.spawn(run_child(
+            if item.providers.is_empty() {
+                let e = anyhow::anyhow!("{}: no provider to assign it to", item.describe());
+                match opts.fail_mode {
+                    FailMode::FailFast => return Err(fail_with_report(&states, batch_root, e)),
+                    FailMode::Isolate => {
+                        results[slot] = Some(Err(isolated_failure(&labels[slot], e)));
+                        continue;
+                    }
+                }
+            }
+            let handle = set.spawn(run_child(
                 pool.clone(),
                 remote.clone(),
                 blobs.clone(),
                 Arc::clone(&states),
                 Arc::clone(&ledger),
-                Arc::clone(&providers),
-                root,
-                index,
-                hash,
+                item,
                 opts.clone(),
             ));
+            slot_of.insert(handle.id(), slot);
         }
-        match set.join_next().await {
-            Some(Ok(Ok(()))) => {}
-            Some(Ok(Err(e))) => return Err(fail_with_report(&states, root, e)),
-            Some(Err(join)) => {
-                return Err(fail_with_report(
-                    &states,
-                    root,
-                    anyhow::Error::new(join).context("assignment task panicked"),
-                ))
-            }
+        let (id, outcome) = match set.join_next_with_id().await {
+            Some(Ok((id, outcome))) => (id, outcome),
+            Some(Err(join)) => (
+                join.id(),
+                Err(anyhow::Error::new(join).context("assignment task panicked")),
+            ),
             None => break,
+        };
+        let slot = slot_of
+            .remove(&id)
+            .expect("every spawned assignment task is registered under its id");
+        match outcome {
+            Ok(()) => {
+                if opts.fail_mode == FailMode::Isolate {
+                    let (key, bytes) = &labels[slot];
+                    tracing::debug!(frame_uuid = %key, bytes = *bytes, outcome = "ok", "blob fetch finished");
+                }
+                results[slot] = Some(Ok(()));
+            }
+            Err(e) => match opts.fail_mode {
+                FailMode::FailFast => return Err(fail_with_report(&states, batch_root, e)),
+                FailMode::Isolate => {
+                    results[slot] = Some(Err(isolated_failure(&labels[slot], e)));
+                }
+            },
         }
     }
 
     let report = report_from_with_ledger(&states, &ledger);
     tracing::debug!(
-        root_hash = %root,
-        count = child_count,
+        root_hash = batch_root.map(tracing::field::display),
+        count = item_count,
         providers = report.per_provider.len(),
         stalls = report.stalls,
         hedges = report.hedges,
         bytes = report.total_bytes(),
         "assignment loop finished"
     );
-    Ok(report)
+    let results = labels
+        .into_iter()
+        .zip(results)
+        .map(|((key, _), r)| {
+            (
+                key,
+                r.unwrap_or_else(|| Err(anyhow::anyhow!("assignment item produced no result"))),
+            )
+        })
+        .collect();
+    Ok((report, results))
+}
+
+/// Log one item's failure under [`FailMode::Isolate`] and hand the error back
+/// for its result slot.
+fn isolated_failure((key, bytes): &(String, u64), e: anyhow::Error) -> anyhow::Error {
+    tracing::warn!(frame_uuid = %key, error = %format!("{e:#}"), "blob fetch failed");
+    tracing::debug!(frame_uuid = %key, bytes = *bytes, outcome = "failed", "blob fetch finished");
+    e
 }
 
 /// Log the per-provider picture the run ended on, and give the caller's error
@@ -601,11 +800,11 @@ pub(crate) async fn fetch_children_assigned(
 /// A bare "every provider exhausted" says nothing a user or a log reader can
 /// act on; the swarm's own last real cause (a refused dial, a reset stream)
 /// does, and it is already on the state we are about to drop.
-fn fail_with_report(states: &States, root: Hash, err: anyhow::Error) -> anyhow::Error {
+fn fail_with_report(states: &States, root: Option<Hash>, err: anyhow::Error) -> anyhow::Error {
     let report = report_from(states);
     let cause = last_failure_cause(states);
     tracing::error!(
-        root_hash = %root,
+        root_hash = root.map(tracing::field::display),
         providers = report.per_provider.len(),
         stalls = report.stalls,
         bytes = report.total_bytes(),
@@ -638,15 +837,17 @@ async fn run_child(
     blobs: Blobs,
     states: States,
     ledger: Ledger,
-    providers: Arc<Vec<EndpointId>>,
-    root: Hash,
-    index: u64,
-    hash: Hash,
+    item: FetchItem,
     opts: AssignmentOptions,
 ) -> Result<()> {
-    let request = GetRequest::builder()
-        .child(index, ChunkRanges::all())
-        .build(root);
+    let request = item.request.clone();
+    // Log fields keep the collection path's names: `root_hash` is the hash the
+    // request addresses (the collection root, or the raw blob itself), `child`
+    // is the item's key (the child index for a collection).
+    let root = item.request.hash;
+    let index = item.key.as_str();
+    let hash = item.hash;
+    let providers = Arc::clone(&item.providers);
     let mut rounds = 0u32;
     // Set when a hedge wins: the rest of this child goes to the provider that
     // just proved it can move bytes, not back to the one we gave up on.
@@ -658,7 +859,7 @@ async fn run_child(
         let local = remote
             .local_for_request(request.clone())
             .await
-            .map_err(|e| anyhow::anyhow!("local info for child {index} of {root}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("local info for {}: {e}", item.describe()))?;
         if local.is_complete() {
             return Ok(());
         }
@@ -670,7 +871,8 @@ async fn run_child(
             rounds += 1;
             if rounds > MAX_BACKOFF_ROUNDS {
                 anyhow::bail!(
-                    "child {index} of {root}: every provider exhausted after {rounds} rounds"
+                    "{}: every provider exhausted after {rounds} rounds",
+                    item.describe()
                 );
             }
             let wait = earliest_wait(&states);
@@ -860,11 +1062,8 @@ async fn run_child(
                         &blobs,
                         &states,
                         &ledger,
-                        &providers,
                         &opts,
-                        root,
-                        index,
-                        hash,
+                        &item,
                         provider,
                         started,
                         &primary_progress,
@@ -1013,6 +1212,28 @@ fn split_missing_at_midpoint(missing: &ChunkRanges, size: u64) -> Option<Missing
     })
 }
 
+/// The hedge's request: `request` narrowed to the `back` ranges of the blob it
+/// lands.
+///
+/// A raw blob request (`GetRequest::blob`) becomes
+/// `GetRequest::blob_ranges(hash, back)`; a collection child
+/// (`child(i).build(root)`, i.e. one non-empty range at offset `i + 1`) keeps
+/// the builder shape the collection path always sent,
+/// `child(i, back).build(root)`. Any other shape is not an item this engine
+/// builds, and gets no hedge (`None`) rather than a guessed request.
+pub(crate) fn hedge_back_half_request(
+    request: &GetRequest,
+    hash: Hash,
+    back: ChunkRanges,
+) -> Option<GetRequest> {
+    if request.ranges.is_blob() {
+        return Some(GetRequest::blob_ranges(hash, back));
+    }
+    let (offset, _) = request.ranges.as_single()?;
+    let index = offset.checked_sub(1)?;
+    Some(GetRequest::builder().child(index, back).build(request.hash))
+}
+
 /// A hedge assignment in flight beside its primary.
 struct HedgeRun {
     provider: EndpointId,
@@ -1107,15 +1328,15 @@ async fn try_arm_hedge(
     blobs: &Blobs,
     states: &States,
     ledger: &Ledger,
-    providers: &[EndpointId],
     opts: &AssignmentOptions,
-    root: Hash,
-    index: u64,
-    hash: Hash,
+    item: &FetchItem,
     primary: EndpointId,
     started: Instant,
     primary_progress: &Arc<AtomicU64>,
 ) -> Option<HedgeRun> {
+    let providers: &[EndpointId] = &item.providers;
+    let index = item.key.as_str();
+    let hash = item.hash;
     // What is still missing, from the progress truth (`store.observe`) rather
     // than from the primary's stream.
     // The local bitfield carries no size until the store flushes its first
@@ -1183,6 +1404,9 @@ async fn try_arm_hedge(
     let missing_ranges = ChunkRanges::bytes(0..size) - bitfield.ranges.clone();
     let split = split_missing_at_midpoint(&missing_ranges, size)?;
     let charge = split.charge;
+    // Built BEFORE the charge, so a request shape we cannot narrow costs the
+    // budget nothing.
+    let request = hedge_back_half_request(&item.request, hash, split.back)?;
 
     if !ledger
         .lock()
@@ -1194,7 +1418,6 @@ async fn try_arm_hedge(
     }
 
     let hedge_provider = claim.provider();
-    let request = GetRequest::builder().child(index, split.back).build(root);
     let progress = Arc::new(AtomicU64::new(0));
     let fut: BoxedTransfer = Box::pin(transfer_once(
         pool.clone(),

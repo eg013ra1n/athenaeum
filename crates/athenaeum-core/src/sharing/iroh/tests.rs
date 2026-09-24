@@ -4601,3 +4601,360 @@ async fn re_export_into_the_same_staging_target_does_not_truncate_it() {
     assert_eq!(std::fs::read(&t1).unwrap(), bytes);
     assert_eq!(std::fs::read(&t2).unwrap(), bytes);
 }
+
+// ─── collab v3 wave 2, Task 4: the assignment engine over independent blobs ───
+//
+// `fetch_items_assigned` carries each item's own `GetRequest`, hash and
+// provider list, and reports per item. These tests run real relay-disabled
+// nodes with mounted collab stores, served on `COLLAB_BLOBS_ALPN`.
+
+use super::assign::{FailMode, FetchItem};
+use super::blobs::FrameFetch;
+use super::COLLAB_BLOBS_ALPN;
+
+/// Engine knobs for a raw-item test run: collab ALPN, no hedging, a short
+/// stall ceiling so a wedged provider cannot outlast a test's patience.
+fn raw_item_opts(
+    fail_mode: FailMode,
+    total_bytes: u64,
+    telemetry: ProviderTelemetrySink,
+) -> super::assign::AssignmentOptions {
+    super::assign::AssignmentOptions {
+        stall_hard_limit: Duration::from_millis(1500),
+        hedging: false,
+        total_bytes,
+        telemetry,
+        alpn: COLLAB_BLOBS_ALPN,
+        fail_mode,
+    }
+}
+
+/// A provider node (started `Out`, collab store mounted at `collab_root`)
+/// paired both ways with `receiver`.
+async fn collab_provider(
+    dir: &Path,
+    collab_root: &Path,
+    receiver: &Arc<SharedIrohNode>,
+    receiver_ticket: &str,
+) -> (Arc<SharedIrohNode>, NodeId) {
+    let node = bind_disabled(dir).await;
+    let info = node.handle(Role::Out).start().await.unwrap();
+    node.add_peer_ticket(receiver_ticket).unwrap();
+    receiver.add_peer_ticket(&info.pairing_ticket).unwrap();
+    node.set_collab_root(Some(collab_root))
+        .await
+        .expect("mount the provider's collab store");
+    (node, info.node_id)
+}
+
+/// Distinct, non-repeating bytes per `seed`.
+fn raw_blob_bytes(seed: usize, len: usize) -> Vec<u8> {
+    (0..len).map(|j| ((j + seed * 97) % 251) as u8).collect()
+}
+
+/// Add `bytes` to `store` and pin them under `tag`; returns the hash.
+async fn seed_raw(store: &Store, bytes: Vec<u8>, tag: &str) -> Hash {
+    let tt = store.blobs().add_bytes(bytes).temp_tag().await.unwrap();
+    let hash = tt.hash();
+    store
+        .tags()
+        .set(tag, iroh_blobs::HashAndFormat::raw(hash))
+        .await
+        .unwrap();
+    drop(tt);
+    hash
+}
+
+/// Two providers each hold a DIFFERENT blob; one call fetches both, each from
+/// its own provider list, and both succeed. Driven through the collab caller
+/// (`fetch_blobs_assigned`), which also sets every in-flight tag up front and
+/// leaves them for the landing step.
+#[tokio::test]
+async fn raw_items_fetch_from_per_item_providers() {
+    let (dr, dp1, dp2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+    let (rr, rp1, rp2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+
+    let r = bind_disabled(dr.path()).await;
+    let r_info = r.handle(Role::Recv).start().await.unwrap();
+    r.set_collab_root(Some(rr.path())).await.unwrap();
+    let (p1, p1_id) = collab_provider(dp1.path(), rp1.path(), &r, &r_info.pairing_ticket).await;
+    let (p2, p2_id) = collab_provider(dp2.path(), rp2.path(), &r, &r_info.pairing_ticket).await;
+
+    const SIZE: usize = 96 * 1024;
+    let h1 = seed_raw(
+        &p1.collab_store().unwrap(),
+        raw_blob_bytes(1, SIZE),
+        "project/p/f1/1",
+    )
+    .await;
+    let h2 = seed_raw(
+        &p2.collab_store().unwrap(),
+        raw_blob_bytes(2, SIZE),
+        "project/p/f2/1",
+    )
+    .await;
+
+    let r_store = r.collab_store().unwrap();
+    let frames = vec![
+        FrameFetch {
+            key: "f1".to_string(),
+            hash: h1,
+            size: SIZE as u64,
+            providers: vec![endpoint_id(p1_id)],
+            in_flight_tag: "in-flight/project/p/f1/1".to_string(),
+        },
+        FrameFetch {
+            key: "f2".to_string(),
+            hash: h2,
+            size: SIZE as u64,
+            providers: vec![endpoint_id(p2_id)],
+            in_flight_tag: "in-flight/project/p/f2/1".to_string(),
+        },
+    ];
+    let (telemetry, _seen) = recording_telemetry();
+    let results = tokio::time::timeout(
+        Duration::from_secs(60),
+        super::blobs::fetch_blobs_assigned(&r_store, &r.endpoint(), frames, telemetry),
+    )
+    .await
+    .expect("two small blobs must not take a minute")
+    .expect("the batch call itself succeeds");
+
+    assert_eq!(results.len(), 2, "one result per item");
+    assert_eq!(results[0].0, "f1", "keys are echoed in input order");
+    assert_eq!(results[1].0, "f2");
+    for (key, res) in &results {
+        assert!(
+            res.is_ok(),
+            "{key} must be fetched from its own provider: {res:?}"
+        );
+    }
+    for h in [h1, h2] {
+        assert!(
+            r_store.blobs().has(h).await.unwrap(),
+            "the receiver's collab store holds {h} complete"
+        );
+    }
+    for tag in ["in-flight/project/p/f1/1", "in-flight/project/p/f2/1"] {
+        assert!(
+            tag_present(&r_store, tag).await,
+            "the in-flight tag {tag} stays in place for the landing step"
+        );
+    }
+
+    p1.shutdown().await;
+    p2.shutdown().await;
+    r.shutdown().await;
+}
+
+/// `FailMode::Isolate`: an item whose only provider does not hold its hash
+/// fails ALONE — its sibling on another provider still lands.
+#[tokio::test]
+async fn isolate_mode_keeps_siblings_alive() {
+    let (dr, dp1, dp2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+    let (rr, rp1, rp2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+
+    let r = bind_disabled(dr.path()).await;
+    let r_info = r.handle(Role::Recv).start().await.unwrap();
+    r.set_collab_root(Some(rr.path())).await.unwrap();
+    let (p1, p1_id) = collab_provider(dp1.path(), rp1.path(), &r, &r_info.pairing_ticket).await;
+    let (p2, p2_id) = collab_provider(dp2.path(), rp2.path(), &r, &r_info.pairing_ticket).await;
+
+    const SIZE: usize = 64 * 1024;
+    let absent = Hash::new(raw_blob_bytes(7, SIZE));
+    let present = seed_raw(
+        &p2.collab_store().unwrap(),
+        raw_blob_bytes(8, SIZE),
+        "project/p/f2/1",
+    )
+    .await;
+
+    let items = vec![
+        FetchItem {
+            key: "missing".to_string(),
+            request: GetRequest::blob(absent),
+            hash: absent,
+            size: SIZE as u64,
+            providers: Arc::new(vec![endpoint_id(p1_id)]),
+        },
+        FetchItem {
+            key: "present".to_string(),
+            request: GetRequest::blob(present),
+            hash: present,
+            size: SIZE as u64,
+            providers: Arc::new(vec![endpoint_id(p2_id)]),
+        },
+    ];
+    let r_store = r.collab_store().unwrap();
+    let (telemetry, _seen) = recording_telemetry();
+    let (_report, results) = tokio::time::timeout(
+        // The missing item walks the whole backoff ladder (≈ 32 s) before it
+        // gives up; see `assigned_fetch_fails_fast_when_every_provider_is_dead`.
+        Duration::from_secs(120),
+        super::assign::fetch_items_assigned(
+            &r_store,
+            &r.endpoint(),
+            items,
+            raw_item_opts(FailMode::Isolate, 2 * SIZE as u64, telemetry),
+        ),
+    )
+    .await
+    .expect("an isolated failure must end inside the ladder")
+    .expect("isolate mode never fails the whole call");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, "missing");
+    assert!(
+        results[0].1.is_err(),
+        "an item whose only provider lacks the hash fails: {:?}",
+        results[0].1
+    );
+    assert_eq!(results[1].0, "present");
+    assert!(
+        results[1].1.is_ok(),
+        "its sibling must not be aborted by that failure: {:?}",
+        results[1].1
+    );
+    assert!(r_store.blobs().has(present).await.unwrap());
+    assert!(!r_store.blobs().has(absent).await.unwrap());
+
+    p1.shutdown().await;
+    p2.shutdown().await;
+    r.shutdown().await;
+}
+
+/// The collection caller keeps `FailMode::FailFast`: one child the provider
+/// cannot serve fails the WHOLE call, exactly as before the generalization.
+#[tokio::test]
+async fn fail_fast_still_applies_to_collections() {
+    let (dp, dr) = (tempdir().unwrap(), tempdir().unwrap());
+    let p = bind_disabled(dp.path()).await;
+    let r = bind_disabled(dr.path()).await;
+    let p_info = p.handle(Role::Out).start().await.unwrap();
+    let r_info = r.handle(Role::Recv).start().await.unwrap();
+    r.add_peer_ticket(&p_info.pairing_ticket).unwrap();
+    p.add_peer_ticket(&r_info.pairing_ticket).unwrap();
+
+    // A hash sequence [held, missing] on the provider's personal store, which
+    // `iroh_blobs::ALPN` serves. The receiver needs the sequence itself
+    // locally to address children through it (phase 1's job in production).
+    let held = seed_raw(p.store(), raw_blob_bytes(3, 64 * 1024), "t/held").await;
+    let missing = Hash::new(raw_blob_bytes(4, 64 * 1024));
+    let seq: iroh_blobs::hashseq::HashSeq = [held, missing].into_iter().collect();
+    let seq_bytes = seq.into_inner();
+    let root = seed_raw(p.store(), seq_bytes.to_vec(), "t/root").await;
+    assert_eq!(
+        seed_raw(r.store(), seq_bytes.to_vec(), "t/root").await,
+        root
+    );
+
+    let (telemetry, _seen) = recording_telemetry();
+    let res = tokio::time::timeout(
+        Duration::from_secs(120),
+        super::assign::fetch_children_assigned(
+            r.store(),
+            &r.endpoint(),
+            vec![endpoint_id(p_info.node_id)],
+            root,
+            vec![(0, held), (1, missing)],
+            // The wrapper forces the personal ALPN and fail-fast whatever
+            // these say.
+            raw_item_opts(FailMode::Isolate, 128 * 1024, telemetry),
+        ),
+    )
+    .await
+    .expect("a missing child must fail inside the ladder, never hang");
+    assert!(
+        res.is_err(),
+        "a collection with one unservable child fails as a whole: {res:?}"
+    );
+
+    p.shutdown().await;
+    r.shutdown().await;
+}
+
+/// The hedge's back-half request: a raw item asks for `blob_ranges` of its own
+/// hash; a collection child keeps the old `child(i).build(root)` shape.
+#[test]
+fn raw_item_hedge_uses_blob_ranges() {
+    let h = Hash::new(b"raw frame");
+    let root = Hash::new(b"hash seq root");
+    let back = ChunkRanges::chunks(32u64..);
+
+    let raw = super::assign::hedge_back_half_request(&GetRequest::blob(h), h, back.clone());
+    assert_eq!(raw, Some(GetRequest::blob_ranges(h, back.clone())));
+
+    for index in [0u64, 1, 7] {
+        let child = GetRequest::builder()
+            .child(index, ChunkRanges::all())
+            .build(root);
+        let got = super::assign::hedge_back_half_request(&child, h, back.clone());
+        assert_eq!(
+            got,
+            Some(GetRequest::builder().child(index, back.clone()).build(root)),
+            "child {index} keeps the collection builder output"
+        );
+    }
+}
+
+/// One `fetch_items_assigned` call opens ONE connection pool, however many
+/// items it carries.
+#[tokio::test]
+async fn one_pool_per_call() {
+    let (dr, dp, rr, rp) = (
+        tempdir().unwrap(),
+        tempdir().unwrap(),
+        tempdir().unwrap(),
+        tempdir().unwrap(),
+    );
+    let r = bind_disabled(dr.path()).await;
+    let r_info = r.handle(Role::Recv).start().await.unwrap();
+    r.set_collab_root(Some(rr.path())).await.unwrap();
+    let (p, p_id) = collab_provider(dp.path(), rp.path(), &r, &r_info.pairing_ticket).await;
+
+    const ITEMS: usize = 20;
+    const SIZE: usize = 8 * 1024;
+    let p_store = p.collab_store().unwrap();
+    let providers = Arc::new(vec![endpoint_id(p_id)]);
+    let mut items = Vec::with_capacity(ITEMS);
+    for i in 0..ITEMS {
+        let hash = seed_raw(
+            &p_store,
+            raw_blob_bytes(100 + i, SIZE),
+            &format!("project/p/{i}/1"),
+        )
+        .await;
+        items.push(FetchItem {
+            key: format!("frame-{i:02}"),
+            request: GetRequest::blob(hash),
+            hash,
+            size: SIZE as u64,
+            providers: Arc::clone(&providers),
+        });
+    }
+
+    let before = super::assign::pools_opened_on_this_thread();
+    let (telemetry, _seen) = recording_telemetry();
+    let (_report, results) = tokio::time::timeout(
+        Duration::from_secs(60),
+        super::assign::fetch_items_assigned(
+            &r.collab_store().unwrap(),
+            &r.endpoint(),
+            items,
+            raw_item_opts(FailMode::Isolate, (ITEMS * SIZE) as u64, telemetry),
+        ),
+    )
+    .await
+    .expect("twenty small blobs must not take a minute")
+    .expect("the batch call succeeds");
+    assert_eq!(
+        super::assign::pools_opened_on_this_thread() - before,
+        1,
+        "one call opens exactly one pool"
+    );
+    assert_eq!(results.len(), ITEMS);
+    assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+
+    p.shutdown().await;
+    r.shutdown().await;
+}

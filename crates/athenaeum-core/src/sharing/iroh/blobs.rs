@@ -26,7 +26,9 @@ use iroh_blobs::protocol::{ChunkRanges, GetRequest};
 use iroh_blobs::{BlobFormat, Hash, HashAndFormat};
 use n0_future::StreamExt as _;
 
-use super::assign::{self, AssignmentOptions, AssignmentReport, SwarmFetchMode};
+use super::assign::{
+    self, AssignmentOptions, AssignmentReport, FailMode, FetchItem, ItemResults, SwarmFetchMode,
+};
 use crate::package::{read_manifest, validate_rel_path, ManifestRecord, MANIFEST_FILENAME};
 use crate::sharing::types::{FetchChildrenFault, FetchEvent, LocalFault};
 use crate::sharing::{FetchSink, ImportProgressSink, ProviderEvent, ProviderTelemetrySink};
@@ -1304,6 +1306,10 @@ pub(crate) async fn fetch_collection_multi(
                         hedging,
                         total_bytes: byte_size,
                         telemetry,
+                        // Forced by `fetch_children_assigned` anyway; spelled
+                        // out so this literal reads as the collection path.
+                        alpn: iroh_blobs::ALPN,
+                        fail_mode: FailMode::FailFast,
                     },
                 )
                 .await?;
@@ -1415,6 +1421,114 @@ pub(crate) async fn fetch_collection_multi(
         "collection fetched from multiple providers to package dir"
     );
     Ok(report)
+}
+
+/// One collab frame to fetch as a raw blob (collab v3 wave 2, P11).
+///
+/// `providers` are that frame's own holders (self excluded, dialled
+/// relay-only by the caller's address hints); `in_flight_tag` is the P22 name
+/// `in-flight/project/<pid>/<uuid>/<ver>` that protects its bytes from GC while
+/// they move.
+#[allow(dead_code)] // consumed by the collab replication pass (wave 2, Task 9)
+pub(crate) struct FrameFetch {
+    pub key: String,
+    pub hash: Hash,
+    pub size: u64,
+    pub providers: Vec<EndpointId>,
+    pub in_flight_tag: String,
+}
+
+/// Fetch a batch of independent collab frames into `store` (the collab
+/// store) in ONE assignment run, on
+/// [`COLLAB_BLOBS_ALPN`](super::COLLAB_BLOBS_ALPN) under
+/// [`FailMode::Isolate`] — one frame failing never aborts its siblings (P11).
+///
+/// Every frame's in-flight tag (`HashAndFormat::raw`) is set BEFORE any byte
+/// moves, and is left in place whatever the outcome: on success the caller
+/// exports, sets the permanent seed tag and only then deletes it (P21/P22); on
+/// failure it keeps the verified partial bytes for the next attempt, and the
+/// collab store's open sweeps stale ones. A frame whose tag cannot be set is
+/// NOT fetched — unprotected bytes could be collected mid-transfer — and gets
+/// that error as its result.
+///
+/// Returns one result per frame, keyed by `FrameFetch::key`, in input order.
+#[allow(dead_code)] // consumed by the collab replication pass (wave 2, Task 9)
+pub(crate) async fn fetch_blobs_assigned(
+    store: &Store,
+    endpoint: &Endpoint,
+    frames: Vec<FrameFetch>,
+    telemetry: ProviderTelemetrySink,
+) -> Result<ItemResults> {
+    let mut results: Vec<Option<Result<()>>> = (0..frames.len()).map(|_| None).collect();
+    let keys: Vec<String> = frames.iter().map(|f| f.key.clone()).collect();
+    let mut items = Vec::with_capacity(frames.len());
+    let mut slots = Vec::with_capacity(frames.len());
+    let mut total_bytes = 0u64;
+    for (slot, frame) in frames.into_iter().enumerate() {
+        if let Err(e) = store
+            .tags()
+            .set(&frame.in_flight_tag, HashAndFormat::raw(frame.hash))
+            .await
+        {
+            let e =
+                anyhow::Error::new(e).context(format!("set in-flight tag {}", frame.in_flight_tag));
+            tracing::error!(
+                frame_uuid = %frame.key,
+                error = %format!("{e:#}"),
+                "set in-flight tag before blob fetch failed"
+            );
+            results[slot] = Some(Err(e));
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(frame.size);
+        slots.push(slot);
+        items.push(FetchItem {
+            key: frame.key,
+            request: GetRequest::blob(frame.hash),
+            hash: frame.hash,
+            size: frame.size,
+            providers: Arc::new(frame.providers),
+        });
+    }
+
+    if !items.is_empty() {
+        let opts = AssignmentOptions {
+            stall_hard_limit: assign::STALL_HARD_LIMIT,
+            hedging: true,
+            total_bytes,
+            telemetry,
+            alpn: super::COLLAB_BLOBS_ALPN,
+            fail_mode: FailMode::Isolate,
+        };
+        let (report, fetched) = assign::fetch_items_assigned(store, endpoint, items, opts)
+            .await
+            .inspect_err(|e| {
+                tracing::error!(error = %format!("{e:#}"), "assigned blob fetch failed");
+            })?;
+        let failed = fetched.iter().filter(|(_, r)| r.is_err()).count();
+        tracing::info!(
+            providers = report.per_provider.len(),
+            stalls = report.stalls,
+            count = fetched.len(),
+            bytes = report.total_bytes(),
+            outcome = if failed == 0 { "ok" } else { "partial" },
+            "assigned blob fetch complete"
+        );
+        for (slot, (_key, r)) in slots.into_iter().zip(fetched) {
+            results[slot] = Some(r);
+        }
+    }
+
+    Ok(keys
+        .into_iter()
+        .zip(results)
+        .map(|(key, r)| {
+            (
+                key,
+                r.unwrap_or_else(|| Err(anyhow::anyhow!("blob fetch produced no result"))),
+            )
+        })
+        .collect())
 }
 
 /// Fetch ONLY the package manifest (`manifest.ndjson`) of the collection at
