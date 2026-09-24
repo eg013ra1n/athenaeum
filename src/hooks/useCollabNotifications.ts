@@ -20,23 +20,19 @@ interface CollabPublishedEvent {
   heldBack: number;
 }
 
-/** One stable dedupe key per (project, kind, count) — the same delta can
- *  reach the frontend twice (a manual poll's own return value AND the live
- *  event it emits internally), so both paths would route through this key
- *  and a second delivery is swallowed by the notification history's dedupe
- *  set. `useProjects`'s manual refresh no longer notifies at all (R29) —
- *  this hook is the one place `collab-frames-changed` reaches `notify()` —
- *  but the key stays collision-proof against any future second caller. */
-function frameChangeDedupeKey(change: CollabFramesChange): string {
-  return `frames-${change.kind}-${change.projectId}-${change.count}`;
-}
+/* No `dedupeKey` on any collab live notification (final review I4): the
+ * dedupe set persists in localStorage, so a content-shaped key such as
+ * `frames-<kind>-<project>-<count>` or `paused-<project>-<missing>` would
+ * swallow a later, genuine outcome that happens to carry the same numbers —
+ * days later, forever. Each event is one discrete outcome, and this hook is
+ * the ONE place each of these events reaches `notify()` (R29; the manual
+ * refresh no longer notifies), so there is no second delivery to collapse. */
 
 function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title: string) {
   if (change.count === 0) return;
   const link = `/projects/${change.projectId}`;
   const n = change.count;
   const plural = n === 1 ? 'frame' : 'frames';
-  const dedupeKey = frameChangeDedupeKey(change);
   switch (change.kind) {
     case 'newFrames':
       notify({
@@ -44,7 +40,6 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
         detail: 'Open the project to see them.',
         kind: 'project',
         link,
-        dedupeKey,
       });
       break;
     case 'pendingFrames':
@@ -55,7 +50,6 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
         kind: 'project',
         tone: 'info',
         link,
-        dedupeKey,
       });
       break;
     case 'approved':
@@ -65,7 +59,6 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
         kind: 'project',
         tone: 'success',
         link,
-        dedupeKey,
       });
       break;
     case 'rejected':
@@ -76,7 +69,6 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
         tone: 'warning',
         hasErrors: true,
         link,
-        dedupeKey,
       });
       break;
     case 'excluded':
@@ -86,7 +78,6 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
         kind: 'project',
         tone: 'warning',
         link,
-        dedupeKey,
       });
       break;
     case 'newVersions':
@@ -95,7 +86,6 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
         detail: 'A member republished a new version.',
         kind: 'project',
         link,
-        dedupeKey,
       });
       break;
     default:
@@ -157,7 +147,6 @@ export function useCollabNotifications() {
           tone: 'warning',
           hasErrors: true,
           link: `/projects/${p.projectId}?tab=receive`,
-          dedupeKey: `paused-${p.projectId}-${p.missing}`,
         });
       })
       .then((fn) => {
@@ -215,7 +204,6 @@ export function useCollabNotifications() {
           tone: sent === 0 ? 'warning' : 'success',
           hasErrors: res.heldBack > 0,
           link,
-          dedupeKey: `publish-live-${res.projectId}-${res.announced}-${res.updated}-${res.heldBack}`,
         });
       })
       .then((fn) => {
@@ -253,7 +241,6 @@ export function useCollabNotifications() {
           tone: l.failed > 0 ? 'warning' : 'success',
           hasErrors: l.failed > 0,
           link,
-          dedupeKey: `landed-${l.projectId}-${l.landed}-${l.failed}-${l.awaitingGc}`,
         });
       })
       .then((fn) => {

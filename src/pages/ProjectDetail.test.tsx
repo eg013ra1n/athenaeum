@@ -185,4 +185,41 @@ describe('ProjectDetail manual publish', () => {
     expect(toasts).toHaveLength(1);
     expect(toasts[0]).toHaveTextContent('Publish failed');
   });
+
+  it('a publish refused because another run is in progress reads as "already running", not a failure', async () => {
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      switch (command) {
+        case 'get_collab_project_detail':
+          return Promise.resolve(detailFixture());
+        case 'evaluate_collab_gate':
+          return Promise.resolve(gateFixture());
+        case 'list_collab_frames':
+          return Promise.resolve([] as ProjectFrameView[]);
+        case 'list_collab_projects':
+          return Promise.resolve([projectCard()]);
+        case 'publish_collab_frames':
+          // Both hosts reject with the backend's message as a plain string.
+          return Promise.reject('publication of this project is already running');
+        default:
+          return Promise.resolve(null);
+      }
+    }) as never);
+
+    renderProjectDetail();
+
+    const publishButton = await screen.findByRole('button', { name: /Publish 2 passing frames/ });
+    fireEvent.click(publishButton);
+    const confirmButton = await screen.findByRole('button', { name: 'Publish' });
+    fireEvent.click(confirmButton);
+
+    expect(
+      await screen.findByText(
+        'Publication of this project is already running — wait for it to finish, then try again.',
+      ),
+    ).toBeInTheDocument();
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Publication already running');
+    expect(toasts[0]).not.toHaveTextContent('Publish failed');
+  });
 });

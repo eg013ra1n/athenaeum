@@ -72,7 +72,7 @@ function renderHarness() {
 }
 
 describe('useCollabNotifications', () => {
-  it('collab-replication-paused produces exactly one toast with the link, and a repeated identical event dedupes', async () => {
+  it('collab-replication-paused produces exactly one toast with the link, and a repeated identical event is a new toast', async () => {
     renderHarness();
 
     // Let the mount-time `list_collab_projects` fetch and the `api.listen`
@@ -97,16 +97,47 @@ describe('useCollabNotifications', () => {
     });
     expect(linkButton).toBeInTheDocument();
 
-    // A repeated, identical event must not add a second toast — the stable
-    // `paused-<projectId>-<missing>` dedupe key collapses it.
+    // Final review I4: each event is one discrete outcome (this hook is the
+    // only place it reaches notify()), so a second pause with the same
+    // numbers is a second, genuine outcome — never swallowed.
     act(() => {
       pausedListener?.({ projectId: 'proj-1', missing: 5, missingBytes: 2 * 1024 * 1024 * 1024 });
     });
 
-    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect(screen.getAllByRole('status')).toHaveLength(2);
   });
 
-  it('a different missing count is a new, undeduped toast', async () => {
+  it('an identical outcome days later — after a reload, with the persisted history — still notifies', async () => {
+    const first = renderHarness();
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => {
+      pausedListener?.({ projectId: 'proj-1', missing: 5, missingBytes: 2 * 1024 * 1024 * 1024 });
+    });
+    expect(await screen.findAllByRole('status')).toHaveLength(1);
+    first.unmount();
+
+    // The app restarts: the notification history (and any dedupe set) is
+    // read back from localStorage, which this test deliberately keeps.
+    pausedListener = undefined;
+    renderHarness();
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(pausedListener).toBeDefined();
+    act(() => {
+      pausedListener?.({ projectId: 'proj-1', missing: 5, missingBytes: 2 * 1024 * 1024 * 1024 });
+    });
+
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Replication paused: 5 frames missing (2.00 GB)');
+  });
+
+  it('a different missing count is a new toast too', async () => {
     renderHarness();
     await act(async () => {
       await Promise.resolve();

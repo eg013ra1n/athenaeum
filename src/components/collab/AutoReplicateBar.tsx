@@ -93,7 +93,6 @@ export default function AutoReplicateBar({
         tone: 'warning',
         hasErrors: true,
         link: `/projects/${projectId}`,
-        dedupeKey: `sync-now-failed-${projectId}`,
       });
       setError(msg);
     } finally {

@@ -39,6 +39,21 @@ function isOutdated(msg: string): boolean {
   return msg.startsWith('collab_api_outdated');
 }
 
+/** The backend's refusal while another publish run of the same project
+ *  (manual, republish or the background auto-publish) is in progress —
+ *  `api::collab::PUBLISH_BUSY_MSG`, owner decision 2026-09-24: refused,
+ *  never queued. */
+const PUBLISH_BUSY = 'publication of this project is already running';
+
+function isPublishBusy(msg: string): boolean {
+  return msg.includes(PUBLISH_BUSY);
+}
+
+/** Inline text + toast for a busy refusal: not a failure of the user's
+ *  data, just "try again once the running one ends". */
+const PUBLISH_BUSY_INLINE =
+  'Publication of this project is already running — wait for it to finish, then try again.';
+
 export default function ProjectDetail() {
   const { id } = useParams();
   const { notify } = useNotifications();
@@ -144,9 +159,11 @@ export default function ProjectDetail() {
   // every manual click. `doPublish`/`doRepublish` below do their own local
   // UI work (close the confirm dialog, reload the frames/detail) and raise
   // a notify() only for a failed invoke, which the backend never emits an
-  // event for — nothing else would ever tell the user. That error toast's
-  // `publish-failed-`/`republish-failed-` dedupeKey prefix can never collide
-  // with the live listener's `publish-live-` key.
+  // event for — nothing else would ever tell the user. The live listener
+  // sets no dedupeKey at all (final review I4), and these error toasts use a
+  // per-click `Date.now()` key, so neither can swallow the other. A busy
+  // refusal (another run of this project in progress) is an info toast, not
+  // a failure.
 
   const doPublish = async () => {
     if (!id) return;
@@ -165,6 +182,16 @@ export default function ProjectDetail() {
       if (isOutdated(msg)) {
         setPublishConfirm(false);
         setUpdateRequired(true);
+      } else if (isPublishBusy(msg)) {
+        setPublishError(PUBLISH_BUSY_INLINE);
+        notify({
+          title: 'Publication already running',
+          detail: 'Wait for the current run of this project to finish, then publish again.',
+          kind: 'project',
+          tone: 'info',
+          link: `/projects/${id}`,
+          dedupeKey: `publish-busy-${id}-${Date.now()}`,
+        });
       } else {
         setPublishError(msg);
         notify({
@@ -197,6 +224,16 @@ export default function ProjectDetail() {
       if (isOutdated(msg)) {
         setRepublishConfirm(false);
         setUpdateRequired(true);
+      } else if (isPublishBusy(msg)) {
+        setRepublishError(PUBLISH_BUSY_INLINE);
+        notify({
+          title: 'Publication already running',
+          detail: 'Wait for the current run of this project to finish, then republish again.',
+          kind: 'project',
+          tone: 'info',
+          link: `/projects/${id}`,
+          dedupeKey: `republish-busy-${id}-${Date.now()}`,
+        });
       } else {
         setRepublishError(msg);
         notify({
