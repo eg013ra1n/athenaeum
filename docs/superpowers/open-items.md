@@ -241,8 +241,8 @@ holders" section).
 - **PROD deploy is gated on an app release, on top of the test-hub check above.** The hub's
   final-review wave (2026-09-24) found the CURRENT app has no handling for `409
   collab_api_outdated` at all — it surfaces to the user as a plain "unexpected status 409" — and
-  the shipped app's `MyProjectWire` requires `pendingFrames` with no serde default, a field name
-  collab v3 only introduced this same wave (the old wire name was `pendingAnnouncements`). The hub
+  the shipped app's `MyProjectWire` requires `pendingAnnouncements` with no serde default — the
+  field collab v3 renamed to `pendingFrames` this same wave. The hub
   side of that second gap is already closed (`pendingAnnouncements` kept as a deprecated alias of
   `pendingFrames`, same value, so `/me/projects` still decodes against an app on the old wire
   shape) — this note is the reminder that the APP side is not: do not deploy `collab-v3-wave1` (or
