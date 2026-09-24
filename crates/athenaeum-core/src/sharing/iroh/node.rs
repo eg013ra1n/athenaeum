@@ -1553,11 +1553,13 @@ impl SharedIrohNode {
     /// A clone of the mounted collab store, or `None` when no Collaboration root
     /// is mounted.
     pub fn collab_store(&self) -> Option<Store> {
-        self.collab
-            .read()
-            .expect("collab slot poisoned")
-            .as_ref()
-            .map(|m| m.store.clone())
+        match self.collab.read() {
+            Ok(slot) => slot.as_ref().map(|m| m.store.clone()),
+            Err(e) => {
+                tracing::error!(error = %e, "collab store slot poisoned; reporting no store");
+                None
+            }
+        }
     }
 
     /// Mount the collab store of the Collaboration root `root` — the store at

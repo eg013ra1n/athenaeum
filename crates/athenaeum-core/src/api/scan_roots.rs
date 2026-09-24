@@ -188,6 +188,15 @@ pub(crate) fn classify_folder_candidate(
     for root in crate::db::get_scan_roots(conn)?.iter() {
         let existing = canonical_or_raw(&root.path);
         if candidate == existing {
+            // R5: `set_collaboration_dir` promotes a monitored folder in place
+            // when it was a Collaboration root before or nothing is cataloged
+            // under it — the dry run answers the same way.
+            if kind == "collaboration"
+                && root.kind == "normal"
+                && collab_promotion_allowed(conn, root, candidate)?
+            {
+                return Ok(verdict_ok(None));
+            }
             return Ok(if is_calibration {
                 verdict_ok(Some("covered"))
             } else {
@@ -837,12 +846,13 @@ pub fn get_collaboration_dir(ctx: &ServiceContext) -> Result<Option<String>, Api
 /// with `OverlapRule::Skip` (collab v3 wave 2, P25): absolute path, path
 /// policy, create, write probe — but no overlap check, because the
 /// Collaboration root IS a scan root. A folder already monitored as a normal
-/// scan root (for instance one a previous clear demoted) is promoted in place;
-/// a new folder becomes its own root under the usual scan-root rules (outside
-/// every other root, one Collaboration root at most).
+/// scan root is promoted in place only under ruling R5
+/// ([`collab_promotion_allowed`]); a new folder becomes its own root under the
+/// usual scan-root rules (outside every other root, one Collaboration root at
+/// most).
 ///
-/// The designation is persisted before the mount: a mount failure is returned
-/// as an error, but the folder stays designated and the next bind mounts it.
+/// Contract: `Err` ⇒ nothing changed. A mount failure undoes exactly what the
+/// designation did (R5 fix option a) before the error is returned.
 pub async fn set_collaboration_dir(
     ctx: &ServiceContext,
     path: String,
@@ -850,7 +860,7 @@ pub async fn set_collaboration_dir(
 ) -> Result<String, ApiError> {
     let candidate = std::path::PathBuf::from(path.trim());
     let existed = candidate.is_absolute() && candidate.exists();
-    let stored = {
+    let (stored, designation) = {
         let db = db(ctx)?;
         let conn = db.conn();
         let (dir, _) = crate::api::sync::validate_transfer_dir(
@@ -861,33 +871,131 @@ pub async fn set_collaboration_dir(
             crate::api::sync::OverlapRule::Skip,
         )?;
         match designate_collaboration_root(&conn, &dir) {
-            Ok(stored) => stored,
+            Ok(done) => done,
             Err(e) => {
                 tracing::warn!(path = %dir.display(), error = %e, "collaboration folder designation refused");
-                // Leaf-only cleanup of a folder the validation just created, as
-                // `validate_transfer_dir` does for its own rejections.
-                if !existed {
-                    if let Err(e2) = std::fs::remove_dir(&candidate) {
-                        tracing::debug!(path = %candidate.display(), error = %e2, "rejected collaboration folder left in place");
-                    }
-                }
+                remove_created_folder(&candidate, existed);
                 return Err(e);
             }
         }
     };
-    mount_collab_store(ctx, Some(Path::new(&stored))).await?;
+    if let Err(e) = mount_collab_store(ctx, Some(Path::new(&stored))).await {
+        tracing::error!(path = %stored, error = %e, "collaboration store mount failed; undoing the designation");
+        undo_collaboration_designation(ctx, &designation);
+        remove_created_folder(&candidate, existed);
+        return Err(e);
+    }
     Ok(stored)
 }
 
-/// Record `dir` (validated, canonical) as THE `collaboration` scan root.
-/// Exact match with a registered root: `collaboration` → kept as is;
-/// `normal` → promoted in place (the one-per-kind rule still applies); any
-/// other special kind → `Conflict`. No match: inserted as a new root, which
-/// must not sit inside or contain another root.
+/// Leaf-only, best-effort removal of a folder THIS call created (as
+/// `validate_transfer_dir` does for its own rejections): a non-empty folder is
+/// always left alone.
+fn remove_created_folder(candidate: &Path, existed: bool) {
+    if existed {
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir(candidate) {
+        tracing::debug!(path = %candidate.display(), error = %e, "rejected collaboration folder left in place");
+    }
+}
+
+/// A scan root's behaviour switches, captured before a promotion so a failed
+/// mount can restore them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootSwitches {
+    enabled: bool,
+    find_duplicates: bool,
+    unique_camera: bool,
+    monitor_enabled: bool,
+}
+
+impl RootSwitches {
+    fn of(root: &ScanRoot) -> Self {
+        Self {
+            enabled: root.enabled,
+            find_duplicates: root.find_duplicates,
+            unique_camera: root.unique_camera,
+            monitor_enabled: root.monitor_enabled,
+        }
+    }
+
+    /// What a freshly added Collaboration root gets (`upsert_scan_root` +
+    /// column defaults); `unique_camera` has no switch for the role
+    /// (`roleMeta.ts`), so it must not survive a promotion.
+    const FRESH_COLLABORATION: Self = Self {
+        enabled: true,
+        find_duplicates: true,
+        unique_camera: false,
+        monitor_enabled: false,
+    };
+
+    fn write(self, conn: &rusqlite::Connection, id: i64, kind: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            "UPDATE scan_roots
+             SET kind = ?1, enabled = ?2, find_duplicates = ?3, unique_camera = ?4, monitor_enabled = ?5
+             WHERE id = ?6",
+            rusqlite::params![
+                kind,
+                self.enabled,
+                self.find_duplicates,
+                self.unique_camera,
+                self.monitor_enabled,
+                id
+            ],
+        )
+    }
+}
+
+/// What [`designate_collaboration_root`] did, so a failed mount can undo
+/// exactly that.
+#[derive(Debug)]
+enum CollabDesignation {
+    /// The folder already was the Collaboration root — nothing written.
+    Kept,
+    /// A new `collaboration` row.
+    Inserted { id: i64 },
+    /// A `normal` row promoted in place; its previous switches.
+    Promoted { id: i64, previous: RootSwitches },
+}
+
+/// Ruling R5: a monitored (`normal`) folder may become the Collaboration root
+/// only when it was one before (`<root>/.athenaeum/blobs` exists — the
+/// release → re-assign case) or when nothing is cataloged under it. Otherwise
+/// promoting it would stop cataloging a user's library (the scanner never
+/// catalogs under the Collaboration root).
+fn collab_promotion_allowed(
+    conn: &rusqlite::Connection,
+    root: &ScanRoot,
+    canonical: &Path,
+) -> Result<bool, ApiError> {
+    if canonical.join(".athenaeum").join("blobs").is_dir() {
+        return Ok(true);
+    }
+    let (pred, values) =
+        crate::db::scan_root_prefix_predicate("path", std::slice::from_ref(&root.path));
+    let cataloged: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM files WHERE {pred})"),
+        rusqlite::params_from_iter(values.iter()),
+        |r| r.get(0),
+    )?;
+    Ok(!cataloged)
+}
+
+/// The refusal R5 gives for a monitored library folder.
+const MONITORED_LIBRARY_FOLDER: &str =
+    "This folder is already monitored as a library folder — pick a separate folder for collaboration.";
+
+/// Record `dir` (validated, canonical) as THE `collaboration` scan root and
+/// report what was written. Exact match with a registered root:
+/// `collaboration` → kept; `normal` → promoted in place when
+/// [`collab_promotion_allowed`] (switches reset to a fresh Collaboration
+/// root's), else `Conflict`; any other special kind → `Conflict`. No match:
+/// inserted as a new root, which must not sit inside or contain another root.
 fn designate_collaboration_root(
     conn: &rusqlite::Connection,
     dir: &Path,
-) -> Result<String, ApiError> {
+) -> Result<(String, CollabDesignation), ApiError> {
     const KIND: &str = "collaboration";
     let existing = crate::db::get_scan_roots(conn)?
         .into_iter()
@@ -895,19 +1003,20 @@ fn designate_collaboration_root(
     match existing {
         Some(root) if root.kind == KIND => {
             tracing::info!(path = %root.path, kind = KIND, "special scan root designated");
-            Ok(root.path)
+            Ok((root.path, CollabDesignation::Kept))
         }
         Some(root) if root.kind == "normal" => {
             check_special_root_uniqueness(conn, KIND)?;
+            if !collab_promotion_allowed(conn, &root, dir)? {
+                return Err(ApiError::Conflict(MONITORED_LIBRARY_FOLDER.to_string()));
+            }
             let id = root
                 .id
                 .ok_or_else(|| ApiError::Internal("scan root has no id".to_string()))?;
-            conn.execute(
-                "UPDATE scan_roots SET kind = ?1 WHERE id = ?2",
-                rusqlite::params![KIND, id],
-            )?;
+            let previous = RootSwitches::of(&root);
+            RootSwitches::FRESH_COLLABORATION.write(conn, id, KIND)?;
             tracing::info!(path = %root.path, kind = KIND, "monitored folder promoted to special scan root");
-            Ok(root.path)
+            Ok((root.path, CollabDesignation::Promoted { id, previous }))
         }
         Some(root) => Err(ApiError::Conflict(format!(
             "This folder is already the {}",
@@ -917,13 +1026,41 @@ fn designate_collaboration_root(
             check_scan_root_overlap(conn, dir)?;
             check_special_root_uniqueness(conn, KIND)?;
             let path_str = dir.to_string_lossy().to_string();
-            crate::db::upsert_scan_root(conn, &path_str, KIND).map_err(|e| {
+            let id = crate::db::upsert_scan_root(conn, &path_str, KIND).map_err(|e| {
                 tracing::error!(path = %path_str, error = %e, "failed to add scan root");
                 e
             })?;
             tracing::info!(path = %path_str, kind = KIND, "special scan root designated");
-            Ok(path_str)
+            Ok((path_str, CollabDesignation::Inserted { id }))
         }
+    }
+}
+
+/// Undo a designation after its mount failed: delete the inserted row, or
+/// restore the promoted row to `normal` with its previous switches. A failure
+/// here is logged at `error!` — the caller is already returning the mount
+/// error.
+fn undo_collaboration_designation(ctx: &ServiceContext, designation: &CollabDesignation) {
+    let undo = || -> Result<(), ApiError> {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        match designation {
+            CollabDesignation::Kept => {}
+            CollabDesignation::Inserted { id } => {
+                conn.execute(
+                    "DELETE FROM scan_roots WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+            }
+            CollabDesignation::Promoted { id, previous } => {
+                previous.write(&conn, *id, "normal")?;
+            }
+        }
+        Ok(())
+    };
+    match undo() {
+        Ok(()) => tracing::info!(outcome = "undone", "collaboration designation undone"),
+        Err(e) => tracing::error!(error = %e, "undo of the collaboration designation failed"),
     }
 }
 
@@ -2151,6 +2288,208 @@ mod special_root_tests {
             set_collaboration_dir(&ctx, "relative/collab".to_string(), &PathPolicy::AllowAll).await,
             Err(ApiError::Invalid(_))
         ));
+    }
+
+    /// The row of `path` as `(kind, enabled, find_duplicates, unique_camera,
+    /// monitor_enabled)`, or `None` when no such row exists.
+    fn row_of(ctx: &ServiceContext, path: &str) -> Option<(String, bool, bool, bool, bool)> {
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT kind, enabled, find_duplicates, unique_camera, monitor_enabled
+             FROM scan_roots WHERE path = ?1",
+            rusqlite::params![path],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .ok()
+    }
+
+    /// Register `folder` as a normal scan root with non-default switches,
+    /// optionally with one cataloged file under it. Returns the stored path.
+    fn monitored_folder(ctx: &ServiceContext, folder: &Path, with_file: bool) -> String {
+        let root = add_scan_root(
+            ctx,
+            folder.to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+            None,
+        )
+        .unwrap();
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE scan_roots SET find_duplicates = 0, unique_camera = 1, monitor_enabled = 1
+             WHERE path = ?1",
+            rusqlite::params![root.path],
+        )
+        .unwrap();
+        if with_file {
+            let file = Path::new(&root.path).join("M31").join("L_001.fits");
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, 'L_001.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![file.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        root.path
+    }
+
+    /// R5: a monitored folder with cataloged frames is a user's library;
+    /// making it the Collaboration root would stop cataloging it. Refused,
+    /// and the row is untouched.
+    #[tokio::test]
+    async fn set_collaboration_dir_refuses_a_monitored_library_folder() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let folder = TempDir::new().unwrap();
+        let stored = monitored_folder(&ctx, folder.path(), true);
+        let before = row_of(&ctx, &stored);
+
+        match set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        {
+            Err(ApiError::Conflict(m)) => assert_eq!(m, MONITORED_LIBRARY_FOLDER),
+            other => panic!("expected the R5 Conflict, got {other:?}"),
+        }
+        assert_eq!(
+            row_of(&ctx, &stored),
+            before,
+            "the library row is untouched"
+        );
+        assert_eq!(get_collaboration_dir(&ctx).unwrap(), None);
+    }
+
+    /// R5: a folder that was a Collaboration root before (its store dir is
+    /// still there) is promoted even with cataloged files, and gets a fresh
+    /// Collaboration root's switches.
+    #[tokio::test]
+    async fn set_collaboration_dir_promotes_a_previously_released_collab_folder() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let folder = TempDir::new().unwrap();
+        std::fs::create_dir_all(folder.path().join(".athenaeum").join("blobs")).unwrap();
+        let stored = monitored_folder(&ctx, folder.path(), true);
+
+        let got = set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .expect("a released Collaboration root is re-assignable");
+        assert_eq!(got, stored);
+        assert_eq!(
+            row_of(&ctx, &stored),
+            Some(("collaboration".to_string(), true, true, false, false)),
+            "promoted, with a fresh Collaboration root's switches"
+        );
+    }
+
+    /// The Add-Folder dry run and the set agree on both sides of R5.
+    #[tokio::test]
+    async fn dry_run_and_set_agree_on_a_monitored_folder() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let library = TempDir::new().unwrap();
+        let empty = TempDir::new().unwrap();
+        monitored_folder(&ctx, library.path(), true);
+        let empty_stored = monitored_folder(&ctx, empty.path(), false);
+
+        let dry = |p: &Path| {
+            validate_folder_candidate(
+                &ctx,
+                "collaboration".to_string(),
+                p.to_string_lossy().to_string(),
+                &PathPolicy::AllowAll,
+            )
+            .unwrap()
+        };
+
+        let v = dry(library.path());
+        assert!(!v.ok);
+        assert_eq!(v.reason.as_deref(), Some("already_monitored"));
+        assert!(matches!(
+            set_collaboration_dir(
+                &ctx,
+                library.path().to_string_lossy().to_string(),
+                &PathPolicy::AllowAll
+            )
+            .await,
+            Err(ApiError::Conflict(_))
+        ));
+
+        let v = dry(empty.path());
+        assert!(
+            v.ok,
+            "an empty monitored folder may become the Collaboration root: {v:?}"
+        );
+        set_collaboration_dir(
+            &ctx,
+            empty.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .expect("the set agrees with the dry run");
+        assert_eq!(get_collaboration_dir(&ctx).unwrap(), Some(empty_stored));
+    }
+
+    /// Contract `Err ⇒ nothing changed`: when the store cannot be mounted on
+    /// the bound node, the inserted row is deleted and a promoted row is
+    /// restored to `normal` with its previous switches. The mount is forced to
+    /// fail by a regular FILE named `.athenaeum` in the folder, so the store
+    /// dir cannot be created.
+    #[tokio::test]
+    async fn mount_failure_rolls_back_the_designation() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let node_dir = TempDir::new().unwrap();
+        let node = crate::sharing::iroh::node::SharedIrohNode::bind(
+            node_dir.path(),
+            iroh::RelayMode::Disabled,
+        )
+        .await
+        .unwrap();
+        *ctx.iroh_node.lock().await = Some(std::sync::Arc::clone(&node));
+
+        // Inserted → deleted.
+        let fresh = TempDir::new().unwrap();
+        std::fs::write(fresh.path().join(".athenaeum"), b"not a dir").unwrap();
+        let err = set_collaboration_dir(
+            &ctx,
+            fresh.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Internal(_)), "{err:?}");
+        assert_eq!(get_collaboration_dir(&ctx).unwrap(), None);
+        let rows = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::get_scan_roots(&conn).unwrap().len()
+        };
+        assert_eq!(rows, 0, "the inserted row is deleted again");
+
+        // Promoted → restored with its previous switches.
+        let monitored = TempDir::new().unwrap();
+        let stored = monitored_folder(&ctx, monitored.path(), false);
+        let before = row_of(&ctx, &stored);
+        std::fs::write(monitored.path().join(".athenaeum"), b"not a dir").unwrap();
+        assert!(set_collaboration_dir(
+            &ctx,
+            monitored.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .is_err());
+        assert_eq!(row_of(&ctx, &stored), before, "kind and switches restored");
+        assert!(node.collab_store().is_none(), "nothing mounted");
+
+        node.shutdown().await;
     }
 
     /// The write probe still guards the Collaboration root.
