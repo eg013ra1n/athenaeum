@@ -46,9 +46,24 @@ pub enum AccountClientError {
     BadRequest(String),
     /// 403 — the account's role may not perform this action.
     Forbidden,
+    /// 409 on a collab v3 (per-frame) endpoint whose body is exactly
+    /// `{"error":"collab_api_outdated"}` — the hub refusing a client that
+    /// predates the per-frame api. Distinct from every other 409 (a stale gate
+    /// version, a closed project, …), which stays in the `Network` bucket with
+    /// the hub's message.
+    CollabApiOutdated,
     /// Transport / unexpected-status / decode failure.
     Network(String),
 }
+
+/// The actionable message for [`AccountClientError::CollabApiOutdated`],
+/// shared by every `AccountClientError → ApiError` mapping in the crate
+/// (`api::collab::client_err`, `api::collab_exchange::client_err`,
+/// `api::account::map_client_err`) so they say the same thing whether or not
+/// `api::collab` (render-gated) is compiled in. `api::collab` re-exports this
+/// as `COLLAB_API_OUTDATED_MSG`.
+pub const COLLAB_API_OUTDATED_MSG: &str =
+    "collab_api_outdated: this hub needs a newer Athenaeum — update to keep collaborating";
 
 impl std::fmt::Display for AccountClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,6 +80,7 @@ impl std::fmt::Display for AccountClientError {
             AccountClientError::Forbidden => {
                 f.write_str("the account's role may not perform this action")
             }
+            AccountClientError::CollabApiOutdated => f.write_str("collab_api_outdated"),
             AccountClientError::SecondPrimary(m)
             | AccountClientError::DeviceConflict(m)
             | AccountClientError::PeerValidation(m)

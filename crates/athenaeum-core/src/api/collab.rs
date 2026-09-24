@@ -660,6 +660,16 @@ pub fn find_matching_projects(
 
 // ── Hub poll: cards, detail, refresh ─────────────────────────────────────────
 
+/// User-facing message for a hub `409 collab_api_outdated` refusal — this
+/// client speaks a stale collab api and the hub has moved past it. Re-exports
+/// the canonical string from `account::client` (ungated) so a headless build
+/// that never compiles this render-gated module still shares one message.
+pub const COLLAB_API_OUTDATED_MSG: &str = crate::account::client::COLLAB_API_OUTDATED_MSG;
+
+/// Logs the `collab_api_outdated` refusal once per process (the poll runs
+/// every ~15s and would otherwise flood the log with the same fact).
+static COLLAB_API_OUTDATED_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 /// `AccountClientError → ApiError`, a local copy of the private
 /// `api::account::map_client_err` (keep the two in sync). A `401` surfaces as
 /// [`ApiError::SignedOut`] so the frontend re-shows the sign-in flow.
@@ -677,6 +687,15 @@ fn client_err(e: crate::account::AccountClientError) -> ApiError {
         E::DuplicateName => ApiError::Invalid("name already in use".into()),
         E::Forbidden => {
             ApiError::Forbidden("The account's role may not perform this action.".into())
+        }
+        E::CollabApiOutdated => {
+            COLLAB_API_OUTDATED_WARNED.get_or_init(|| {
+                tracing::warn!(
+                    outcome = "collab_api_outdated",
+                    "hub refused an outdated collab api"
+                );
+            });
+            ApiError::Conflict(COLLAB_API_OUTDATED_MSG.into())
         }
         E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
@@ -891,7 +910,10 @@ async fn fetch_one_project(
         // fields (they travel together in the signed payload; slice-4 enforces
         // the signed `require_approval`).
         require_approval: verified.require_approval,
-        pending_announcements: p.pending_announcements,
+        // R1 (wave-2 Task 1): the wire field is `pendingFrames` (v3); the DB
+        // row field keeps its `pending_announcements` name until Task 2 renames
+        // it — this is the one place that bridges the two.
+        pending_announcements: p.pending_frames,
         project_status: page.project.status,
         target_name: page.project.target.name,
         target_ra_deg: page.project.target.ra_deg,
@@ -1435,6 +1457,7 @@ pub async fn publish_collab_frames(
         aggregate_stats: aggregate_stats.clone(),
         supersedes: supersedes.clone(),
     };
+    #[allow(deprecated)] // collab v3: `announce` removed in wave 2 Task 11
     let resp = match client.announce(&token, project_id, &req).await {
         Ok(r) => r,
         Err(e) => {
@@ -1758,6 +1781,7 @@ pub async fn decide_announcement(
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
 
     if approve {
+        #[allow(deprecated)] // collab v3: `approve_announcement` removed in wave 2 Task 11
         let resp = client
             .approve_announcement(&token, announcement_id)
             .await
@@ -1785,6 +1809,7 @@ pub async fn decide_announcement(
         crate::api::collab_exchange::seed_approved_announcement(ctx, announcement_id).await;
     } else {
         let reason = reason.expect("the reject path validates a reason above");
+        #[allow(deprecated)] // collab v3: `reject_announcement` removed in wave 2 Task 11
         let resp = client
             .reject_announcement(&token, announcement_id, &reason)
             .await

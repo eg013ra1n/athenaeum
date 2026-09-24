@@ -728,6 +728,13 @@ fn client_err(e: crate::account::AccountClientError) -> ApiError {
         E::Forbidden => {
             ApiError::Forbidden("The account's role may not perform this action.".into())
         }
+        // This module's calls are all the deprecated package-api methods
+        // (removed wave 2 Task 11), which never produce this variant — only
+        // the per-frame calls in `collab::hub_client::CollabClient` do (see
+        // `api::collab::client_err`) — but the match must stay exhaustive.
+        E::CollabApiOutdated => {
+            ApiError::Conflict(crate::account::client::COLLAB_API_OUTDATED_MSG.into())
+        }
         E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
 }
@@ -872,6 +879,7 @@ async fn poll_project_announcements(
         return Ok((Vec::new(), Vec::new()));
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    #[allow(deprecated)] // collab v3: `list_announcements` removed in wave 2 Task 11
     let anns = client
         .list_announcements(&token, project_id)
         .await
@@ -1120,6 +1128,7 @@ pub async fn report_have_after_ingest(
         row.announcement_id
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    #[allow(deprecated)] // collab v3: `report_have` removed in wave 2 Task 11
     client
         .report_have(&token, &announcement_id)
         .await
@@ -1158,6 +1167,7 @@ pub async fn report_held_set(ctx: &ServiceContext, project_id: &str) -> Result<u
             .map_err(|e| ApiError::Internal(format!("held package ids: {e:#}")))?
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    #[allow(deprecated)] // collab v3: `report_have_set` removed in wave 2 Task 11
     match client
         .report_have_set(&token, project_id, &package_ids)
         .await
@@ -1809,6 +1819,7 @@ pub async fn download_project_package(
         ));
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    #[allow(deprecated)] // collab v3: `list_announcements` removed in wave 2 Task 11
     let anns = match client.list_announcements(&token, project_id).await {
         Ok(a) => a,
         Err(e) => {
@@ -1939,6 +1950,7 @@ pub async fn download_project_package(
                 // outbound row, and no holder enqueued one — nobody was asked to
                 // serve. `report_have` is this path's completion signal, exactly
                 // as it is the sequential loop's.
+                #[allow(deprecated)] // collab v3: `report_have` removed in wave 2 Task 11
                 if let Err(e) = client.report_have(&token, &ann.id).await {
                     tracing::warn!(announcement_id = %ann.id, error = %format!("{e}"), "swarm download: report_have failed after ingest");
                 }
@@ -2055,6 +2067,7 @@ pub async fn download_project_package(
             // pre-D3 semantics: a landed package is servable through
             // `handle_project_request` whether or not the seed has landed yet.
             // Report-have (device bearer) so the hub adds us to the swarm.
+            #[allow(deprecated)] // collab v3: `report_have` removed in wave 2 Task 11
             if let Err(e) = client.report_have(&token, &ann.id).await {
                 tracing::warn!(announcement_id = %ann.id, error = %format!("{e}"), "download: report_have failed after ingest");
             }

@@ -172,6 +172,12 @@ fn map_client_err(e: AccountClientError) -> ApiError {
         AccountClientError::Forbidden => {
             ApiError::Forbidden("The account's role may not perform this action.".into())
         }
+        // `HubClient` (this module's account api) never produces this variant —
+        // only `collab::hub_client::CollabClient`'s per-frame calls do (see
+        // `api::collab::client_err`) — but the match must stay exhaustive.
+        AccountClientError::CollabApiOutdated => {
+            ApiError::Conflict(crate::account::client::COLLAB_API_OUTDATED_MSG.into())
+        }
         AccountClientError::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
 }
