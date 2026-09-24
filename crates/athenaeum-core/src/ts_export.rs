@@ -221,6 +221,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::collab::ProjectSetMatchEvent,
             crate::api::collab::PortalNewProjectLink,
             crate::api::collab::PublishResult,
+            crate::api::collab::HeldBackFrame,
             crate::api::collab::ModerationFrame,
             crate::api::collab::ModerationItem,
             crate::api::collab_exchange::PackageStateChange,

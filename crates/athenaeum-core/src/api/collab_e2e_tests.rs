@@ -408,19 +408,16 @@ async fn publish_seeds_pending_smoke() {
     )
     .await;
 
-    let result = publish_collab_frames(&ctx, &sender, PROJECT, None)
-        .await
-        .unwrap();
+    // Wave 2 Task 7: publish is per frame now and no longer push-seeds; this
+    // package-era test is deleted with this file in Task 12. Kept compiling
+    // against the new signature until then.
+    let result = publish_collab_frames(&ctx, PROJECT, None).await.unwrap();
     assert_eq!(
-        result.state, "pending",
+        result.state.as_deref(),
+        Some("pending"),
         "require-approval publish is pending"
     );
-    assert_eq!(result.frame_count, 2);
-    assert_eq!(
-        result.seed_target.as_deref(),
-        Some("Coord"),
-        "a pending package seeds the coordinator"
-    );
+    assert_eq!(result.announced, 2);
 
     engine.shutdown().await;
 }
@@ -654,20 +651,19 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
     wire_hub(&proc_ctx, &proc_server.uri(), "proc-tok");
 
     // ═══ Step 3 (brief): CONTRIB publishes → pending, seeds the coordinator. ═══
-    let result = publish_collab_frames(&contrib_ctx, &contrib_sender, PROJECT, None)
+    // Wave 2 Task 7: publish is per frame now (no package id, no push-seed);
+    // this package-era test is deleted with this file in Task 12. Kept
+    // compiling against the new signature until then.
+    let result = publish_collab_frames(&contrib_ctx, PROJECT, None)
         .await
         .unwrap();
     assert_eq!(
-        result.state, "pending",
+        result.state.as_deref(),
+        Some("pending"),
         "require-approval publish is pending"
     );
-    assert_eq!(result.frame_count, 2, "both gate-passing lights published");
-    assert_eq!(
-        result.seed_target.as_deref(),
-        Some("Coord"),
-        "a pending package push-seeds the coordinator"
-    );
-    let pkg = result.package_id.clone();
+    assert_eq!(result.announced, 2, "both gate-passing lights published");
+    let pkg = String::new();
 
     // Capture CONTRIB's stamped payloads NOW — before COORD can fetch/ingest (its
     // list mock isn't mounted yet), so the retained pub dir is intact. These are

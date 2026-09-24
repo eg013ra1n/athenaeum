@@ -84,9 +84,9 @@ pub async fn create_collab_link_intent(
 
 // ── Exchange (Task 11): publish, poll, list, download, moderate ──────────────
 
-/// Build + announce a stamped package of the project's gate-passing calibrated
-/// lights, record it locally (with Д9 supersedes), and push-seed the first
-/// receive-capable member. Rides the host-owned collab sender map.
+/// Publish the project's gate-passing calibrated lights per frame: calibrate
+/// once into the Collaboration folder, seed by reference, announce. The
+/// command keeps its package-era name until the frontend switch (Task 11).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn publish_collab_package(
@@ -95,7 +95,22 @@ pub async fn publish_collab_package(
     project_id: String,
 ) -> Result<PublishResult, String> {
     let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
-    api::publish_collab_frames(&state.ctx, &state.collab_sender, &project_id, Some(emitter))
+    api::publish_collab_frames(&state.ctx, &project_id, Some(emitter))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Re-publish every own frame of the project (P19): regenerate each one and
+/// post a new content version only where the bytes changed.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn republish_collab_frames(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+) -> Result<PublishResult, String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    api::republish_collab_frames(&state.ctx, &project_id, Some(emitter))
         .await
         .map_err(|e| e.to_string())
 }

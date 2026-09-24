@@ -3228,29 +3228,6 @@ fn resolve_batch_name(
     format!("{file_count} files — {}", local_now_short())
 }
 
-/// A collision-free package `rel_path` for a payload. Uses the source filename;
-/// on a duplicate basename within one package it disambiguates with the frame id
-/// (and, in the pathological case, a uuid) so no two payloads overwrite.
-/// Sole remaining caller is the render-gated `api::collab` publish path (the
-/// send path moved to structured WBPP rel_paths), so gate it the same way to
-/// keep the headless (`default-features = false`) build warning-free.
-#[cfg(feature = "render")]
-pub(crate) fn unique_rel_path(filename: &str, frame_id: i64, used: &mut HashSet<String>) -> String {
-    let base = if filename.trim().is_empty() {
-        format!("frame_{frame_id}.fits")
-    } else {
-        filename.to_string()
-    };
-    if used.insert(base.clone()) {
-        return base;
-    }
-    let mut candidate = format!("{frame_id}_{base}");
-    while !used.insert(candidate.clone()) {
-        candidate = format!("{}_{base}", uuid::Uuid::new_v4());
-    }
-    candidate
-}
-
 /// Write the full hashes the preparation worker's staging pass already computed
 /// into `files.strong_hash`, one transaction for the batch. Best-effort by design:
 /// the package is the product, the banked hash is a by-product — an error is

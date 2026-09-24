@@ -502,6 +502,7 @@ pub fn run() {
             commands::set_collab_link,
             commands::create_collab_link_intent,
             commands::publish_collab_package,
+            commands::republish_collab_frames,
             commands::refresh_collab_packages,
             commands::list_collab_packages,
             commands::download_collab_package,

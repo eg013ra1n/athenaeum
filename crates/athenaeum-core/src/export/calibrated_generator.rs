@@ -439,11 +439,20 @@ pub fn resolved_master_paths(
 ) -> std::collections::BTreeSet<PathBuf> {
     let mut paths = std::collections::BTreeSet::new();
     for spec in specs.values() {
-        paths.extend(spec.inputs.dark_path.clone());
-        paths.extend(spec.inputs.flat_path.clone());
-        if spec.inputs.dark_path.is_none() {
-            paths.extend(spec.inputs.bias_path.clone());
-        }
+        paths.extend(spec_master_paths(spec));
+    }
+    paths
+}
+
+/// The master paths ONE resolved spec reads — the per-spec half of
+/// [`resolved_master_paths`] (same dark-gated bias rule), for a caller that
+/// needs a single frame's masters (collab publish's recipe hash, P19).
+pub fn spec_master_paths(spec: &GenerationSpec) -> std::collections::BTreeSet<PathBuf> {
+    let mut paths = std::collections::BTreeSet::new();
+    paths.extend(spec.inputs.dark_path.clone());
+    paths.extend(spec.inputs.flat_path.clone());
+    if spec.inputs.dark_path.is_none() {
+        paths.extend(spec.inputs.bias_path.clone());
     }
     paths
 }

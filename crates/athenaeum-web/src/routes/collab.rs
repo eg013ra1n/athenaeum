@@ -140,7 +140,20 @@ pub async fn publish_collab_package(
 ) -> Result<Json<api::PublishResult>, (axum::http::StatusCode, String)> {
     let emitter: Arc<dyn ProgressEmitter> =
         Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    api::publish_collab_frames(&state.ctx, &state.collab_sender, &args.project_id, Some(emitter))
+    api::publish_collab_frames(&state.ctx, &args.project_id, Some(emitter))
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn republish_collab_frames(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<api::PublishResult>, (axum::http::StatusCode, String)> {
+    let emitter: Arc<dyn ProgressEmitter> =
+        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    api::republish_collab_frames(&state.ctx, &args.project_id, Some(emitter))
         .await
         .map(Json)
         .map_err(api_err)

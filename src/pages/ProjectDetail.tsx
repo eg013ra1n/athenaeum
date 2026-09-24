@@ -25,9 +25,9 @@ import type {
 type Tab = 'contribute' | 'receive' | 'moderation' | 'overview';
 
 // Rough per-frame size for the PRE-publish confirm estimate only (a calibrated
-// 32-bit-float light frame). The exact size is measured when the package is
-// built and reported back in `PublishResult.byteSize`; the dialog labels this
-// figure "estimated" so it never reads as an authoritative stored value (S6).
+// 32-bit-float light frame). The exact size is measured when each frame is
+// calibrated; the dialog labels this figure "estimated" so it never reads as
+// an authoritative stored value (S6).
 const APPROX_FRAME_BYTES = 45 * 1024 * 1024;
 
 export default function ProjectDetail() {
@@ -160,24 +160,30 @@ export default function ProjectDetail() {
     try {
       const res = await api.invoke<PublishResult>('publish_collab_package', { projectId: id });
       setPublishConfirm(false);
-      // Message reflects the hub-returned state + seed target, never optimistic (S6).
+      // Message reflects the hub-returned state and the real counts, never
+      // optimistic (S6).
+      const sent = res.announced + res.updated;
       let title: string;
       let tone: 'info' | 'success' | 'warning' = 'info';
-      if (res.seedTarget == null) {
-        title = 'Announced — waiting for a receive-capable member';
-      } else if (res.state === 'published') {
-        title = `Publication announced — seeding to ${res.seedTarget}`;
-        tone = 'success';
+      if (sent === 0) {
+        title = 'Nothing new to publish';
+        if (res.heldBack.length > 0) tone = 'warning';
+      } else if (res.state === 'pending') {
+        title = 'Frames sent for approval';
       } else {
-        title = `Sent for approval to ${res.seedTarget}`;
+        title = 'Frames published';
+        tone = 'success';
       }
+      const parts = [`${res.announced} new`, `${res.updated} updated`];
+      if (res.unchanged > 0) parts.push(`${res.unchanged} unchanged`);
+      if (res.heldBack.length > 0) parts.push(`${res.heldBack.length} held back`);
       notify({
         title,
-        detail: `${res.frameCount} frames · ${formatBytes(res.byteSize)}`,
+        detail: parts.join(' · '),
         kind: 'project',
         tone,
+        hasErrors: res.heldBack.length > 0,
         link: `/projects/${id}`,
-        dedupeKey: `publish-${res.packageId}`,
       });
       await loadPackages();
       await load();

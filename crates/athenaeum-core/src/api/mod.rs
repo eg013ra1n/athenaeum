@@ -60,9 +60,9 @@ pub mod export;
 // (bumped from render-only in wave 2 Task 6): the per-frame calibrated
 // verdict (P7) calls the render-gated `api::lights::check_mode_ready`, and the
 // manifest `meta` builder (`collab::frame_meta`) reads plate-solve records,
-// which only exist under `solver` too. `publish_collab_frames`'s call into
-// `api::sync::unique_rel_path` already needed `render`; the `crate::collab`
-// core module and `db::collab` stay ungated. Keeping this gated preserves
+// which only exist under `solver` too. `publish_collab_frames` drives the
+// render-gated calibrated-light generator; the `crate::collab` core module
+// and `db::collab` stay ungated. Keeping this gated preserves
 // `cargo build -p perseus --no-default-features`.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab;

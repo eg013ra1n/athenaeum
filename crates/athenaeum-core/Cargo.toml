@@ -117,6 +117,11 @@ hostname = "0.4"
 # the filesystem cannot clone (ext4, exFAT, cross-device), which is a plain
 # `Err` from `reflink`, never a panic.
 reflink-copy = "0.1"
+# Streamed BLAKE3 of a regenerated collab frame (collab v3 wave 2, P19): the
+# same hash the collab blob store assigns a raw blob, computed without importing
+# the file. Already in the build graph transitively under iroh-blobs — single
+# 1.8 version, no new dependency tree.
+blake3 = "1.8"
 # Unix statvfs for the retention disk-usage probe (task M4). Already in the build
 # graph transitively (rusqlite/tokio); named directly, single 0.2 version, so the
 # `disk_pct` retention policy can measure free space without a new dependency tree.
