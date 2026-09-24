@@ -1656,7 +1656,11 @@ awaits):
       return.
    2. Take one `ReceiveGate` permit (`sync.inbound_control().await.map(|c| c.receive_gate.acquire())`,
       as today).
-   3. For each frame (max 200 per batch, the rest on the next pass),
+   3. Work in batches of 200 frames, taken ONE AFTER ANOTHER inside the same
+      pass until the need set is empty, the pass is cancelled, or a batch lands
+      nothing (no providers/all failed) — never "the rest on the next pass",
+      which would stretch a 10 000-frame first replication over ~50 passes.
+      For each frame of a batch
       call `frame_holders` and map them to `EndpointId`s minus self. Add
       a relay-only dial hint per provider, reusing CE:2132-2149.
    4. Frames with no provider are skipped with
