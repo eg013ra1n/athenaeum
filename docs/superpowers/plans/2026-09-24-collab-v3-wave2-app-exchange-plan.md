@@ -393,15 +393,24 @@ the collab store holds own AND replica frames.
   opens the updates dialog.
 - **P18 — Frame uuid = `frames.uuid`.** It is also `ATH_CSRC`. A frame with
   an empty uuid fails the gate with `frame has no uuid`.
-- **P19 — "Update pending".** For an own frame, `recipe_hash` is the xxh3 of
-  these, in order:
-  - the resolved master (path, strong hash or `size:mtime`) pairs;
-  - `LIGHT_CAL_ENGINE_VERSION`;
-  - the source `size:mtime`;
-  - the P6 options JSON.
+- **P19 — "Update pending" (owner-approved 2026-09-24).** For an own frame,
+  `recipe_hash` is the xxh3 of what the USER changed, in order:
+  - the resolved master (path, strong hash or `size:mtime`) pairs, which
+    change when masters are rebuilt or relinked;
+  - the source `size:mtime`.
 
-  A publish run that computes a different hash regenerates the frame and
-  posts `…/version`.
+  It deliberately EXCLUDES `LIGHT_CAL_ENGINE_VERSION` and the P6 options.
+  Otherwise an app release that bumps the engine or a default would
+  re-version every published frame of every member, and every processor
+  would re-download the whole project. Re-publishing after such a release
+  is a manual action: `republish_collab_frames { projectId }` forces
+  regeneration of every own frame (Task 7, command in Task 11).
+
+  A publish run that computes a different hash regenerates the frame. If
+  the new BLAKE3 equals the old one (identical pixels, for example after an
+  archive round-trip changed the mtime), the run only stores the new
+  `recipe_hash`. There is NO `…/version`, no re-seed and no holder change.
+  Otherwise it posts `…/version`.
 - **P20 — Dead entries (iroh-blobs 0.103 has no public blob delete; a
   re-fetch over a vanished external file panics, B:703-709).**
   - **Probe first.** Before fetching or seeding a hash whose entry is
@@ -1315,6 +1324,7 @@ fn matches_canonical_and_aliases_case_insensitively() {
 - Produces:
   ```rust
   pub async fn publish_collab_frames(ctx: &ServiceContext, project_id: &str, emitter: Option<Arc<dyn ProgressEmitter>>) -> Result<PublishResult, ApiError>;
+  pub async fn republish_collab_frames(ctx: &ServiceContext, project_id: &str, emitter: Option<Arc<dyn ProgressEmitter>>) -> Result<PublishResult, ApiError>; // P19 manual: every own frame treated as `update` (then the same-hash rule applies)
   pub(crate) fn recipe_hash(conn: &Connection, spec: &GenerationSpec, source_path: &Path) -> anyhow::Result<String>; // P19
   ```
 - Consumes:
@@ -1355,8 +1365,13 @@ awaits):
    - `xxh3 = package::xxh3_full_file(target)`;
    - `hash = node.seed_project_frame(pid, uuid, ver, target)`, with
      `ver = 1` for `new` and `own.content_version + 1` for `update`;
-   - for `update`, first `unseed_project_frame(pid, uuid)` so the old tag
-     does not pin the old content.
+   - for `update`, generate into a sibling temp path first
+     (`<target>.athtmp`) and compute its BLAKE3 (`iroh_blobs::Hash` over
+     the file, streamed). If it equals the own row's `blake3`, delete the
+     temp, store the new `recipe_hash`, count the frame as `unchanged`,
+     and stop (P19). Otherwise run `unseed_project_frame(pid, uuid)` so the
+     old tag does not pin the old content, rename the temp over `target`,
+     then seed.
 
    After generation the permit is dropped.
 5. Announce the `new` frames in batches of at most 500 (`FrameInWire`,
@@ -1405,6 +1420,15 @@ awaits):
     announce returns 409 "gate version 0 is stale, current is 1" and the
     thresholds route returns version 1. The second announce carries
     `gateVersion: 1`.
+  - `touched_source_with_identical_output_sends_no_version`: touch the
+    source (mtime only) and publish again. There is no `…/version` call,
+    the tag `…/1` is still present and `recipe_hash` is updated.
+  - `engine_version_is_not_part_of_the_recipe`: `recipe_hash` is unchanged
+    when computed with a different `LIGHT_CAL_ENGINE_VERSION` value (inject
+    it as a parameter of a pure helper `recipe_hash_from(parts)`).
+  - `republish_forces_regeneration_but_respects_identical_output`:
+    `republish_collab_frames` regenerates every own frame and sends
+    `…/version` only for frames whose bytes changed.
   - `changed_master_publishes_a_new_version`:
     1. Publish.
     2. Touch the master file (mtime change).
@@ -1683,9 +1707,14 @@ awaits):
    4. Set the tag `project/<pid>/<uuid>/<ver>` and delete the in-flight
       tag.
    5. In one DB tx: `set_landed` plus a `sync_history` row, the way
-      `process_project_frame` writes it today. When the new version of a
-      frame replaces an older landed file, delete the old file after the
-      commit.
+      `process_project_frame` writes it today.
+
+      A NEW VERSION lands OVER the old file under the same name. It never
+      becomes `c_x (1).fits`. For a row that already has a `landed_path`,
+      `dest` is that path, not `unique_path(...)`. Before the export, drop
+      the old version's tags, which leaves the old entry untagged for GC.
+      Then `export_child`, which already removes the stale target and
+      renames the new data into place.
    6. On tx error, remove `dest`, unseed, and log `error!`.
    7. After the batch, send `put_holders(full = false, add = landed)`.
 
@@ -1780,6 +1809,15 @@ awaits):
     (`crates/athenaeum-tauri/src/commands/plate_solve.rs` `plate_solve_batch`
     ~134 and its web mirror);
   - `api/collab.rs::link_frame_set` C:411;
+  - the end of every master build and rebuild: the completion path of
+    `api/masters.rs`, where the master-build completion event is emitted.
+    Call `request_auto_publish_for_sets` with the frame sets whose lights
+    link to the built master's calibration set, or `request_auto_publish(None)`
+    when that mapping is not cheap;
+  - every change of a set's calibration links: the link, unlink and
+    auto-link commands in `api/calibration.rs` and `bulk_update_frame_metadata`'s
+    junction cascade. Call `request_auto_publish_for_sets` for the affected
+    sets;
   - the Task 8 hook.
 - Modify: `api/collab.rs` — `set_project_auto_publish` plus its commands on
   both hosts.
@@ -1863,6 +1901,7 @@ awaits):
 | `list_collab_moderation { projectId }` | pending frames → `Vec<ModerationFrameView>` | same name, new shape |
 | `approve_collab_frame { projectId, frameUuid, trust }`, `reject_collab_frame { projectId, frameUuid, reason }` | Task 1 client calls + a `sync_manifest` | replace `decide_collab_announcement` |
 | `get_collab_policy`, `set_collab_policy`, `preview_collab_policy`, `resolve_collab_loss`, `set_project_auto_publish` | Tasks 9 and 10 | new |
+| `republish_collab_frames { projectId }` | Task 7 `republish_collab_frames` | new (P19 manual re-publish; the frontend shows it as "Recalibrate and republish all" in the Contribute tab behind a confirm that states the re-download cost) |
 | `download_collab_package`, `list_collab_contributions` | — | removed (the frontend switches to `sync_project_now`; contributions had no caller) |
 
 ```rust
