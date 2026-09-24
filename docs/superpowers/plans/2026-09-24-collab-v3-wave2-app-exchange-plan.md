@@ -284,11 +284,17 @@ the collab store holds own AND replica frames.
     `spawn_provider_events`, sharing the ONE `UploadPacer`. The device-wide
     upload cap therefore covers both stores, and every throttle request is
     still answered (the M:~575 rule).
-  - **Root changes.** A router cannot add protocols after spawn. Setting,
-    changing or clearing the Collaboration root rebuilds the router through
-    the path relay changes already use (`apply_relay_change`, N:1641). The
-    store handle lives in an `Arc<RwLock<Option<Store>>>` slot on the node;
-    `None` means the ALPN is not mounted.
+  - **Root changes (amended 2026-09-24, controller ruling R4).** The router
+    is NEVER rebuilt: `Router::shutdown` closes the endpoint and dropping a
+    router aborts every in-flight handler, and `apply_relay_change` swaps
+    relays in place without a rebuild. `COLLAB_BLOBS_ALPN` is mounted ONCE
+    at bind. Its handler reads an `Arc<RwLock<Option<mount>>>` slot on the
+    node: it runs the connect gate, then hands the connection to an
+    unchanged `GatedBlobs`, or closes it with "not mounted" when the slot
+    is empty. The second `EventSender` and its consumer are created once
+    at bind. `set_collab_root` is serialized by its own async mutex and
+    does: open, sweep, swap the slot, shut the old store. It never touches
+    personal-sync connections, pinned by a test.
   - **Shutdown** flushes both stores.
   - **Verified in iroh-blobs 0.103:**
     - `BlobsProtocol::new(&Store, Option<EventSender>)`;
