@@ -59,9 +59,9 @@ export default function Projects() {
               {p.publishable} publishable of {p.candidates}
               {p.linkedSets === 0 ? ' — link an object to start' : ` · ${p.linkedSets} linked set${p.linkedSets === 1 ? '' : 's'}`}
             </p>
-            {p.coordinator && p.pendingAnnouncements > 0 && (
+            {p.coordinator && p.pendingFrames > 0 && (
               <p className="mt-1 text-xs text-warning">
-                {p.pendingAnnouncements} contribution{p.pendingAnnouncements === 1 ? '' : 's'} awaiting approval
+                {p.pendingFrames} contribution{p.pendingFrames === 1 ? '' : 's'} awaiting approval
               </p>
             )}
           </Link>

@@ -2306,6 +2306,132 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // v3 (wave-2 Task 2): the hub-side counter is now `pendingFrames`, not
+    // `pendingAnnouncements`. Renamed in place so existing moderation counts
+    // survive; guarded both ways so a catalog already on the new name (or one
+    // created fresh after this lands) is a no-op.
+    if column_exists(conn, "collab_projects", "pending_announcements")?
+        && !column_exists(conn, "collab_projects", "pending_frames")?
+    {
+        conn.execute(
+            "ALTER TABLE collab_projects RENAME COLUMN pending_announcements TO pending_frames",
+            [],
+        )?;
+    }
+
+    // v3 per-project columns (wave-2 Task 2). `gov_caps_json` has no dedicated
+    // setter — it is wholesale-refreshed by `db::collab::upsert_project`
+    // alongside the rest of the poll snapshot. `synced_caps_json`,
+    // `hub_version` and `manifest_cursor` are the manifest-sync cursor
+    // (`db::collab::set_sync_state`, P9); `dictionary_version`/`dictionary_json`
+    // are `set_dictionary`'s. `policy_json`, `replication_paused` (P14) and
+    // `auto_publish` (P13, default 1) are LOCAL preferences, like
+    // `auto_replicate` above — `upsert_project` never writes any of these six.
+    if !column_exists(conn, "collab_projects", "gov_caps_json")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN gov_caps_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "collab_projects", "synced_caps_json")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN synced_caps_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "collab_projects", "hub_version")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN hub_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "collab_projects", "manifest_cursor")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN manifest_cursor INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "collab_projects", "dictionary_version")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN dictionary_version INTEGER",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "collab_projects", "dictionary_json")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN dictionary_json TEXT",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "collab_projects", "policy_json")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN policy_json TEXT NOT NULL DEFAULT '{\"mode\":\"all\"}'",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "collab_projects", "replication_paused")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN replication_paused INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "collab_projects", "auto_publish")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN auto_publish INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+
+    // v3 per-frame local cache (wave-2 Task 2, spec amendment A1/P26): the ONE
+    // source of a project frame's on-disk path — disk truth, holder reports,
+    // seeding, stacking and the scanner all read it from here, never from the
+    // folder layout or a header card. `origin='own'` rows are never pruned by
+    // `db::collab_frames::delete_not_in` (R12); `source_frame_id` deliberately
+    // has no FOREIGN KEY (a deleted source frame must not delete a published
+    // one — the publish run treats a dangling id as "source gone").
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS project_frames_local (
+            project_id           TEXT NOT NULL,
+            frame_uuid           TEXT NOT NULL,
+            content_version      INTEGER NOT NULL,
+            origin               TEXT NOT NULL CHECK (origin IN ('own','replica')),
+            publisher_account_id TEXT NOT NULL,
+            publisher_display    TEXT NOT NULL,
+            file_name             TEXT NOT NULL,
+            filter_canonical      TEXT NOT NULL,
+            state                 TEXT NOT NULL,
+            accepted              INTEGER NOT NULL DEFAULT 1,
+            byte_size             INTEGER NOT NULL,
+            xxh3                  TEXT NOT NULL,
+            blake3                TEXT NOT NULL,
+            holder_count          INTEGER NOT NULL DEFAULT 0,
+            manifest_version      INTEGER NOT NULL DEFAULT 0,
+            manifest_json         TEXT NOT NULL DEFAULT '{}',
+            landed_path           TEXT UNIQUE,
+            size_mtime_seen       TEXT,
+            on_disk               INTEGER NOT NULL DEFAULT 0,
+            locally_declined      INTEGER NOT NULL DEFAULT 0,
+            awaiting_gc           INTEGER NOT NULL DEFAULT 0,
+            source_frame_id       INTEGER,
+            recipe_hash           TEXT,
+            last_error            TEXT,
+            updated_at            TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (project_id, frame_uuid),
+            FOREIGN KEY (project_id) REFERENCES collab_projects(project_id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_frames_local_project_xxh3 \
+         ON project_frames_local(project_id, xxh3)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_frames_local_source \
+         ON project_frames_local(source_frame_id)",
+        [],
+    )?;
+
     // Local project↔frame-set links. NEVER sent to the hub (spec §7).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS project_links (

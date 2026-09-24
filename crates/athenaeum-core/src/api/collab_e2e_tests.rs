@@ -160,7 +160,7 @@ fn seed_project(conn: &Connection, project_id: &str, members_json: &str, require
             data_role: "send_receive".into(),
             is_coordinator: true,
             require_approval,
-            pending_announcements: 0,
+            pending_frames: 0,
             project_status: "active".into(),
             target_name: "M101".into(),
             target_ra_deg: 210.8,
@@ -172,8 +172,17 @@ fn seed_project(conn: &Connection, project_id: &str, members_json: &str, require
             members_json: members_json.into(),
             thresholds_version: Some(4),
             thresholds_rules_json: None,
-            // local preference — ignored on write
+            gov_caps_json: "[]".into(),
+            // all ignored on write (local preference / sync-state / dictionary)
             auto_replicate: true,
+            synced_caps_json: "[]".into(),
+            hub_version: 0,
+            manifest_cursor: 0,
+            dictionary_version: None,
+            dictionary_json: None,
+            policy_json: r#"{"mode":"all"}"#.into(),
+            replication_paused: false,
+            auto_publish: true,
             fetched_at: String::new(),
         },
     )

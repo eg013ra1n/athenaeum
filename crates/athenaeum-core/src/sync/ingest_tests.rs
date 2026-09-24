@@ -2492,7 +2492,7 @@ fn e2e_project_row(project_id: &str, slug: &str) -> crate::db::collab::CollabPro
         data_role: "contribute".to_string(),
         is_coordinator: false,
         require_approval: false,
-        pending_announcements: 0,
+        pending_frames: 0,
         project_status: "active".to_string(),
         target_name: "M42".to_string(),
         target_ra_deg: 83.8,
@@ -2504,8 +2504,17 @@ fn e2e_project_row(project_id: &str, slug: &str) -> crate::db::collab::CollabPro
         members_json: "[]".to_string(),
         thresholds_version: None,
         thresholds_rules_json: None,
-        // local preference — ignored on write
+        gov_caps_json: "[]".into(),
+        // all ignored on write (local preference / sync-state / dictionary)
         auto_replicate: true,
+        synced_caps_json: "[]".into(),
+        hub_version: 0,
+        manifest_cursor: 0,
+        dictionary_version: None,
+        dictionary_json: None,
+        policy_json: r#"{"mode":"all"}"#.into(),
+        replication_paused: false,
+        auto_publish: true,
         fetched_at: String::new(),
     }
 }

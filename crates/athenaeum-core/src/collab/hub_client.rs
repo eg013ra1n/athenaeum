@@ -183,7 +183,11 @@ pub struct ProjectVersionWire {
 
 /// One row of `GET /projects/{id}/manifest` — a published (or moderation-
 /// pending) frame from ANY member, never the local file itself.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Also `Serialize`: `db::collab_frames::upsert_from_manifest` round-trips the
+/// whole row into `project_frames_local.manifest_json` so the local cache can
+/// answer from disk without re-fetching the manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameViewWire {
     pub frame_uuid: String,

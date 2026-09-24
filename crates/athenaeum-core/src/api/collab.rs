@@ -134,7 +134,7 @@ pub struct ProjectCard {
     pub data_role: String,
     pub coordinator: bool,
     pub require_approval: bool,
-    pub pending_announcements: i64,
+    pub pending_frames: i64,
     pub project_status: String,
     pub target_name: String,
     pub target_ra_deg: f64,
@@ -729,7 +729,7 @@ fn card_from_row(ctx: &ServiceContext, row: CollabProjectRow) -> Result<ProjectC
         data_role: row.data_role,
         coordinator: row.is_coordinator,
         require_approval: row.require_approval,
-        pending_announcements: row.pending_announcements,
+        pending_frames: row.pending_frames,
         project_status: row.project_status,
         target_name: row.target_name,
         target_ra_deg: row.target_ra_deg,
@@ -910,10 +910,9 @@ async fn fetch_one_project(
         // fields (they travel together in the signed payload; slice-4 enforces
         // the signed `require_approval`).
         require_approval: verified.require_approval,
-        // R1 (wave-2 Task 1): the wire field is `pendingFrames` (v3); the DB
-        // row field keeps its `pending_announcements` name until Task 2 renames
-        // it — this is the one place that bridges the two.
-        pending_announcements: p.pending_frames,
+        // v3: the wire field is `pendingFrames`, and the DB row field is
+        // renamed to match (Task 2).
+        pending_frames: p.pending_frames,
         project_status: page.project.status,
         target_name: page.project.target.name,
         target_ra_deg: page.project.target.ra_deg,
@@ -925,8 +924,20 @@ async fn fetch_one_project(
         members_json,
         thresholds_version,
         thresholds_rules_json,
-        // local preference — ignored on write
+        // TODO(wave-2 later task): populate from the hub's per-account caps
+        // once the caps endpoint is wired up; schema default until then.
+        gov_caps_json: "[]".into(),
+        // all ignored on write (local preference / sync-state / dictionary) —
+        // upsert_project leaves these six alone entirely.
         auto_replicate: true,
+        synced_caps_json: "[]".into(),
+        hub_version: 0,
+        manifest_cursor: 0,
+        dictionary_version: None,
+        dictionary_json: None,
+        policy_json: r#"{"mode":"all"}"#.into(),
+        replication_paused: false,
+        auto_publish: true,
         fetched_at: String::new(), // filled by SQL
     })
 }
@@ -1927,7 +1938,7 @@ mod tests {
                 data_role: "send_receive".into(),
                 is_coordinator: true,
                 require_approval: false,
-                pending_announcements: 0,
+                pending_frames: 0,
                 project_status: "active".into(),
                 target_name: "M101".into(),
                 target_ra_deg: 210.8,
@@ -1941,8 +1952,17 @@ mod tests {
                 thresholds_rules_json: Some(
                     r#"[{"metricKey":"not_trailed","op":"reject_if","value":true}]"#.into(),
                 ),
-                // local preference — ignored on write
+                gov_caps_json: "[]".into(),
+                // all ignored on write (local preference / sync-state / dictionary)
                 auto_replicate: true,
+                synced_caps_json: "[]".into(),
+                hub_version: 0,
+                manifest_cursor: 0,
+                dictionary_version: None,
+                dictionary_json: None,
+                policy_json: r#"{"mode":"all"}"#.into(),
+                replication_paused: false,
+                auto_publish: true,
                 fetched_at: String::new(), // filled by SQL
             },
         )
@@ -2488,7 +2508,7 @@ mod tests {
                 data_role: "send_receive".into(),
                 is_coordinator: true,
                 require_approval: false,
-                pending_announcements: 0,
+                pending_frames: 0,
                 project_status: "active".into(),
                 target_name: "M101".into(),
                 target_ra_deg: 210.8,
@@ -2500,8 +2520,17 @@ mod tests {
                 members_json: members_json.into(),
                 thresholds_version: Some(4),
                 thresholds_rules_json: None,
-                // local preference — ignored on write
+                gov_caps_json: "[]".into(),
+                // all ignored on write (local preference / sync-state / dictionary)
                 auto_replicate: true,
+                synced_caps_json: "[]".into(),
+                hub_version: 0,
+                manifest_cursor: 0,
+                dictionary_version: None,
+                dictionary_json: None,
+                policy_json: r#"{"mode":"all"}"#.into(),
+                replication_paused: false,
+                auto_publish: true,
                 fetched_at: String::new(),
             },
         )

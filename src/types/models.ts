@@ -1528,7 +1528,7 @@ capability: DeviceCapability,
  */
 hubUrl: string, };
 
-export type ProjectCard = { projectId: string, slug: string, title: string, dataRole: string, coordinator: boolean, requireApproval: boolean, pendingAnnouncements: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
+export type ProjectCard = { projectId: string, slug: string, title: string, dataRole: string, coordinator: boolean, requireApproval: boolean, pendingFrames: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
 /**
  * D3 §3.3: this device auto-downloads the project's published contributions
  * (default ON). Local preference — `set_project_auto_replicate` writes it.

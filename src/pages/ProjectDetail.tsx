@@ -283,9 +283,9 @@ export default function ProjectDetail() {
             }`}
           >
             {t}
-            {t === 'moderation' && c.pendingAnnouncements > 0 && (
+            {t === 'moderation' && c.pendingFrames > 0 && (
               <span className="rounded-full bg-warning/20 px-1.5 text-[10px] font-medium text-warning">
-                {c.pendingAnnouncements}
+                {c.pendingFrames}
               </span>
             )}
           </button>
