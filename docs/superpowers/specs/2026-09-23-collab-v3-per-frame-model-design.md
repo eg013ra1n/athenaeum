@@ -231,7 +231,8 @@ arrive while running).
 Per frame that passes the gate and is `Not published` or `Update pending`:
 
 1. **Obtain the calibrated artifact.** Attested-external set: the source file
-   itself. Otherwise: calibrate on the fly from linked masters exactly as the
+   itself, seeded **in place** — steps 2 and 3 do not apply to it: no copy,
+   no stamps, the local row's path is the original's path (amendment A1). Otherwise: calibrate on the fly from linked masters exactly as the
    calibrated-lights export does (`export::calibrated_generator`), including
    hot-pixel map and OSC handling per the project's `splitOsc` option (R21:
    with `splitOsc = false` the OSC frame ships as a CFA float FITS with
@@ -284,7 +285,7 @@ one permit per frame.
 ### 5.4 Local storage (app DB)
 
 `project_frames_local (project_id, frame_uuid, content_version, origin own|replica,
-landed_path UNIQUE, byte_size, xxh3, blake3, size_mtime_seen, on_disk bool,
+landed_path UNIQUE (for an own frame it may lie outside the Collaboration root, A1), byte_size, xxh3, blake3, size_mtime_seen, on_disk bool,
 locally_declined bool, manifest_json, updated_at)` replaces
 `project_contributions` and `project_packages`. Analysis for Lights comes from
 `manifest_json` (every member sees the whole project's metrics without
@@ -301,8 +302,11 @@ so a deleted file made a phantom holder).
 
 ### 5.6 Scanner
 
-The Collaboration root is walked as today: a file with `ATH_PRJ` goes through
-the reconcile branch — *known* no-op, *moved* repairs `landed_path`,
+The Collaboration root is walked as today, and **every** file under it goes
+through the reconcile branch against `project_frames_local` — by path, then by
+`(project, xxh3)` — whatever its header carries (amendment A1: a replica of an
+externally calibrated original has no `ATH_PRJ`); outside the root a file with
+`ATH_PRJ` is still diverted to the same branch — *known* no-op, *moved* repairs `landed_path`,
 *duplicate* warns, *unknown* warns and is listed in Lights as "not part of the
 project" (R18). No `files`/`frames` rows on any branch. The scanner never
 creates a project frame; only publish (own) and receive (replica) do.
@@ -367,8 +371,10 @@ warning "exposure equivalence unknown for N frames — grouped by seconds".
 
 ## 7. Stacking a project
 
-- The plan gate for a project skips Masters and Calibrate (frames carry
-  `CALSTAT`), so the blockers `masters | links | masterFiles` never apply; new
+- The plan gate for a project skips Masters and Calibrate because every
+  project frame is calibrated by definition — decided from
+  `project_frames_local`, never from a `CALSTAT` card (amendment A1); paths,
+  WCS, filter and exposure come from the local row and its manifest, so the blockers `masters | links | masterFiles` never apply; new
   blocker `grid` when the canonical grid is unset.
 - Groups: colour mode × canonical filter × exposure class (class width in
   stops, default ±1, `grouping.exposureMode = strict | equivalent | none`, also
@@ -537,3 +543,32 @@ one frame with a reason → B's stacking plan shows 29 frames; contributor C
 attests an externally calibrated XISF set and publishes; B stacks the project
 onto the canonical grid with two pixel scales and reads the coverage map; the
 project WBPP export lands `<title>/<publisher>/<camera>/<filter>/`.
+
+## 16. Amendments
+
+- **A1 (2026-09-24, owner) — the path of a project frame lives only in
+  `project_frames_local`.**
+  - **Own frames can live anywhere.** An own frame may live outside the
+    Collaboration root. The externally calibrated original (R3) is seeded in
+    place by reference, with no copy and no stamps. Reference import works
+    across volumes; only a receiver's landing needs the collab store's
+    volume.
+  - **Consumers read the table.** Disk truth, holder reports, seeding,
+    stacking (§7), the project export and the scanner (§5.6) take paths
+    from the table, never from the folder layout or a header card.
+  - **Scanner.** The scanner never creates catalog rows under the
+    Collaboration root, and reconciles every file there against the table.
+  - **Calibration and metadata.** "Is calibrated" for a project frame is
+    implied by its row. Frame metadata comes from the manifest.
+  - **Plan ruling.** The wave-2 plan records it as P26.
+- **A2 (2026-09-24) — the collab blob store is served on its own ALPN**
+  (`athenaeum/collab-blobs/1`), so §11's "the wire between apps is
+  unchanged" reads "`Msg` is unchanged; one ALPN is added".
+  - **Why.** iroh-blobs 0.103 serves one store per protocol handler.
+    Landing by rename needs the store on the Collaboration root's volume:
+    a cross-volume rename fails outright on Windows (os error 17 is not the
+    `EXDEV` 18 that iroh falls back on).
+  - **Reference.** Wave-2 plan P1 and its reuse audit.
+- **A3 (2026-09-24) — holder reports.** A full report is sent on every
+  replication pass (20 min), not every 6 h (§4.2), because the hub counts a
+  holder fresh for 75 min.
