@@ -2438,6 +2438,16 @@ pub fn init_db(conn: &Connection) -> Result<()> {
          ON project_frames_local(source_frame_id)",
         [],
     )?;
+    // Wave-2 Task 9 fix round (R21): the `size:mtime` of a file at a row's
+    // landed path whose content re-admission rejected (a version-bumped
+    // replica's old file, an edited one). Disk truth skips the re-hash while
+    // the file's `size:mtime` still equals it; a landing clears it.
+    if !column_exists(conn, "project_frames_local", "rejected_size_mtime")? {
+        conn.execute(
+            "ALTER TABLE project_frames_local ADD COLUMN rejected_size_mtime TEXT",
+            [],
+        )?;
+    }
 
     // Local project↔frame-set links. NEVER sent to the hub (spec §7).
     conn.execute(

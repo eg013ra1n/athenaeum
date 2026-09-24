@@ -1385,6 +1385,7 @@ pub(crate) async fn refresh_projects_reporting(
             )
             .map_err(internal)?;
             crate::db::collab::mark_lost(&conn, lost).map_err(internal)?;
+            crate::api::collab_exchange::cancel_project_fetch(ctx, lost);
             tracing::info!(project_id = %lost, count = removed, "project lost: marked, replica frame rows deleted");
         }
         // Expire stale intents first: a "publish as project" intent that never

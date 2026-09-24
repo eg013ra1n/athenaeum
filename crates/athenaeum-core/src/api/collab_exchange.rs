@@ -1473,11 +1473,11 @@ async fn version_poll_tick(ctx: Arc<ServiceContext>, emitter: Option<Arc<dyn Pro
     }
 }
 
-/// The version poll's own loop (ruling R15): first tick after
-/// `startup_delay`, then every `interval` (a slow tick delays the next
-/// instead of bursting). It only ever kicks the pass; it never waits for
-/// one, so a long pass does not pause it.
-async fn version_poll_loop<P, PFut>(
+/// A loop of its own for a periodic job — the version poll (ruling R15) and
+/// the maintenance (R18): first tick after `startup_delay`, then every
+/// `interval` (a slow tick delays the next instead of bursting). Neither job
+/// ever waits for a pass, so a long pass pauses neither.
+async fn tick_loop<P, PFut>(
     startup_delay: std::time::Duration,
     interval: std::time::Duration,
     run_poll: P,
@@ -3145,38 +3145,34 @@ pub const COLLAB_FRAMES_LANDED_EVENT: &str = "collab-frames-landed";
 /// The hub's cap on `add` (and `remove`) per `PUT …/holders/self` (P8).
 const HOLDERS_CHUNK: usize = 10_000;
 
-/// Frames per assignment run. Batches run back to back inside one pass until
-/// the need set is empty or a batch lands nothing.
+/// Frames WITH providers per assignment run (ruling R16: a frame no holder
+/// can serve never takes a slot). Batches run back to back inside one fetch
+/// until the need set is empty or a batch that attempted fetches landed
+/// nothing.
 const FETCH_BATCH: usize = 200;
 
-/// Which pass is running (spec §5.5, ruling R15).
+/// Which replication pass is running (spec §5.5, rulings R15/R18).
 ///
-/// - `Cadence` — the minutes timer: disk truth, the loss guard and the FULL
-///   holder report, then the need set.
-/// - `Kicked` — a version moved (the 15 s poll already applied the manifest):
-///   manifest-driven work only — need set, fetch, land, holder delta. Never a
-///   stat walk and never a full report.
-/// - `Forced` — "Sync now": everything `Cadence` does, one project, the
-///   auto-replicate toggle forced on (the role gate never is).
+/// - `Fetch` — the pass loop, on its timer (the retry cadence) or on a kick
+///   (a version moved; the 15 s poll already applied the manifest): need
+///   set, fetch, land, holder delta. Never a stat walk, never a full report —
+///   those run on their own loop ([`run_maintenance`]), so a multi-hour fetch
+///   cannot starve them past the hub's 75-minute holder freshness.
+/// - `Forced` — "Sync now": [`run_maintenance`] for the project first, then
+///   the fetch, with the auto-replicate toggle forced on (the role gate
+///   never is).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PassKind {
-    Cadence,
-    Kicked,
+    Fetch,
     Forced,
 }
 
 impl PassKind {
     fn as_str(self) -> &'static str {
         match self {
-            PassKind::Cadence => "cadence",
-            PassKind::Kicked => "kicked",
+            PassKind::Fetch => "fetch",
             PassKind::Forced => "forced",
         }
-    }
-
-    /// Disk truth, the loss guard and the full holder report run here.
-    fn walks_disk(self) -> bool {
-        !matches!(self, PassKind::Kicked)
     }
 }
 
@@ -3457,17 +3453,79 @@ async fn unseed_frame(
     }
 }
 
-/// Disk truth for one project (spec §5.5). For every row with a landed path:
+/// The per-project lock between disk truth / the parked-frame recheck / the
+/// in-flight sweep on one side and a landing on the other (ruling R18). Disk
+/// truth holds it per row, a landing per frame, and nobody ever holds it
+/// across a network fetch — so the maintenance loop and a multi-hour fetch
+/// interleave frame by frame. Keyed by catalog + project.
+fn project_disk_lock(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<Arc<tokio::sync::Mutex<()>>, ApiError> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let key = format!("{}|{project_id}", db(ctx)?.path().display());
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok(Arc::clone(locks.entry(key).or_default()))
+}
+
+/// The designated Collaboration root, without the "required" warning (a
+/// caller that already required it, or one where it is optional).
+fn collaboration_root_quiet(ctx: &ServiceContext) -> Option<PathBuf> {
+    let db = db(ctx).ok()?;
+    let conn = db.conn();
+    match crate::db::scan_root_path_of_kind(&conn, "collaboration") {
+        Ok(p) => p.map(PathBuf::from),
+        Err(e) => {
+            tracing::warn!(error = %e, "read collaboration root failed");
+            None
+        }
+    }
+}
+
+/// The Collaboration root, required AND present on disk (m5). A root on an
+/// unmounted volume answers `None` with one `warn!`, so a pass never counts
+/// every landed file as missing, and never lands into a phantom folder.
+fn mounted_collaboration_root(ctx: &ServiceContext) -> Option<PathBuf> {
+    let root = require_collaboration_root(ctx).ok()?;
+    if root.is_dir() {
+        Some(root)
+    } else {
+        tracing::warn!(
+            path = %root.display(),
+            outcome = "collaboration_root_unavailable",
+            "collaboration folder is not reachable; replication skipped"
+        );
+        None
+    }
+}
+
+/// A replica's landed path must lie under the current Collaboration root;
+/// one outside it (a root that moved) counts as missing (m5). Own frames may
+/// live anywhere (P26).
+fn inside_root(root: Option<&Path>, row: &LocalFrameRow, path: &Path) -> bool {
+    row.origin == FrameOrigin::Own || root.is_none_or(|r| path.starts_with(r))
+}
+
+/// Disk truth for one project (spec §5.5). For every row with a landed path,
+/// re-read under the project's disk lock (R18):
 ///
-/// - on disk: `stat` it; gone → MISSING. A `size:mtime` that moved →
-///   re-hash; a different xxh3 is an edit and counts as MISSING, the same one
-///   stores the new `size:mtime`. A missing frame is marked (`on_disk = 0`),
-///   its seed tags are dropped, and a replica's `awaiting_gc` records whether
-///   its store entry is already gone (`Missing`) or must be collected first
-///   (anything else, P20 — never fetch over a live or dead entry).
+/// - on disk: `stat` it; gone (or a replica outside the Collaboration root)
+///   → MISSING. A `size:mtime` that moved → re-hash; a different xxh3 is an
+///   edit and counts as MISSING, the same one stores the new `size:mtime`. A
+///   missing frame is marked (`on_disk = 0`), its seed tags are dropped, and
+///   a replica's `awaiting_gc` records whether its store entry is already
+///   gone (`Missing`) or must be collected first (anything else, P20 — never
+///   fetch over a live or dead entry).
 /// - not on disk (lost earlier, or put back by a rescan): when the file at
 ///   the path has the recorded size and xxh3 and the store can take it
-///   (entry `Missing` or `Readable`), it is seeded again and re-admitted.
+///   (entry `Missing` or `Readable`), it is seeded again and re-admitted. A
+///   file whose content was rejected is not hashed again while its
+///   `size:mtime` stays the same (R21: a version-bumped replica's old file).
 ///
 /// A present frame whose byte-identical sibling went missing may have lost
 /// its readable path with it (the store reads one path per entry, P24); such
@@ -3476,26 +3534,39 @@ pub(crate) async fn disk_truth(
     ctx: &ServiceContext,
     project_id: &str,
 ) -> Result<DiskTruth, ApiError> {
-    let rows = {
+    let uuids: Vec<String> = {
         let db = db(ctx)?;
         let conn = db.conn();
         crate::db::collab_frames::list_for_project(&conn, project_id)?
+            .into_iter()
+            .filter(|r| r.landed_path.is_some())
+            .map(|r| r.frame_uuid)
+            .collect()
     };
     let node = bound_node(ctx).await;
+    let root = collaboration_root_quiet(ctx);
+    let lock = project_disk_lock(ctx, project_id)?;
     let mut truth = DiskTruth::default();
-    let mut lost: Vec<&LocalFrameRow> = Vec::new();
-    let mut present_rows: Vec<&LocalFrameRow> = Vec::new();
+    let mut lost_hashes: HashSet<String> = HashSet::new();
+    let mut present_rows: Vec<LocalFrameRow> = Vec::new();
 
-    for row in &rows {
-        let Some(landed) = row.landed_path.as_deref() else {
+    for uuid in uuids {
+        let _guard = lock.lock().await;
+        let row = {
+            let db = db(ctx)?;
+            let conn = db.conn();
+            crate::db::collab_frames::get(&conn, project_id, &uuid)?
+        };
+        let Some(row) = row else { continue };
+        let Some(landed) = row.landed_path.clone() else {
             continue;
         };
-        let path = Path::new(landed);
+        let path = Path::new(&landed);
         if !row.on_disk {
-            if row.locally_declined {
+            if row.locally_declined || !inside_root(root.as_deref(), &row, path) {
                 continue;
             }
-            if readmit(ctx, node.as_ref(), row, path).await? {
+            if readmit(ctx, node.as_ref(), &row, path, &mut truth.rehashed).await? {
                 tracing::info!(project_id, frame_uuid = %row.frame_uuid, path = %landed, "frame re-admitted from disk");
                 truth
                     .present
@@ -3507,62 +3578,65 @@ pub(crate) async fn disk_truth(
         if row.origin == FrameOrigin::Replica {
             truth.held_replicas += 1;
         }
-        let meta = match tokio::fs::metadata(path).await {
-            Ok(meta) if meta.is_file() => meta,
-            Ok(_) => {
-                tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, "landed frame path is not a file");
-                lost.push(row);
-                continue;
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    tracing::debug!(project_id, frame_uuid = %row.frame_uuid, path = %landed, "landed frame is gone");
-                } else {
-                    tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, error = %e, "stat of a landed frame failed; counted missing");
+        let present = if !inside_root(root.as_deref(), &row, path) {
+            tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, "landed replica lies outside the collaboration folder; counted missing");
+            false
+        } else {
+            match tokio::fs::metadata(path).await {
+                Ok(meta) if meta.is_file() => {
+                    let sm = size_mtime_from(&meta);
+                    if row.size_mtime_seen.as_deref() == Some(sm.as_str()) {
+                        true
+                    } else {
+                        truth.rehashed += 1;
+                        match xxh3_on_blocking(path).await {
+                            Ok(h) if h == row.xxh3 => {
+                                let db = db(ctx)?;
+                                crate::db::collab_frames::set_size_mtime_seen(
+                                    &db.conn(),
+                                    project_id,
+                                    &row.frame_uuid,
+                                    &sm,
+                                )?;
+                                true
+                            }
+                            Ok(h) => {
+                                tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, xxh3 = %h, "landed frame was edited; counted missing");
+                                false
+                            }
+                            Err(e) => {
+                                tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, error = %format!("{e:#}"), "re-hash of a landed frame failed; counted missing");
+                                false
+                            }
+                        }
+                    }
                 }
-                lost.push(row);
-                continue;
+                Ok(_) => {
+                    tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, "landed frame path is not a file");
+                    false
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        tracing::debug!(project_id, frame_uuid = %row.frame_uuid, path = %landed, "landed frame is gone");
+                    } else {
+                        tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, error = %e, "stat of a landed frame failed; counted missing");
+                    }
+                    false
+                }
             }
         };
-        let sm = size_mtime_from(&meta);
-        if row.size_mtime_seen.as_deref() == Some(sm.as_str()) {
+        if present {
             truth
                 .present
                 .push((row.frame_uuid.clone(), row.content_version));
             present_rows.push(row);
             continue;
         }
-        truth.rehashed += 1;
-        match xxh3_on_blocking(path).await {
-            Ok(h) if h == row.xxh3 => {
-                let db = db(ctx)?;
-                crate::db::collab_frames::set_size_mtime_seen(
-                    &db.conn(),
-                    project_id,
-                    &row.frame_uuid,
-                    &sm,
-                )?;
-                truth
-                    .present
-                    .push((row.frame_uuid.clone(), row.content_version));
-                present_rows.push(row);
-            }
-            Ok(h) => {
-                tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, xxh3 = %h, "landed frame was edited; counted missing");
-                lost.push(row);
-            }
-            Err(e) => {
-                tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, error = %format!("{e:#}"), "re-hash of a landed frame failed; counted missing");
-                lost.push(row);
-            }
-        }
-    }
 
-    for row in &lost {
+        // Missing. Conservative first: `awaiting_gc` until the store says
+        // the entry is gone.
         {
             let db = db(ctx)?;
-            // Conservative first: `awaiting_gc` until the store says the
-            // entry is gone.
             crate::db::collab_frames::set_missing(
                 &db.conn(),
                 project_id,
@@ -3571,10 +3645,11 @@ pub(crate) async fn disk_truth(
             )?;
         }
         unseed_frame(node.as_ref(), project_id, &row.frame_uuid).await;
+        lost_hashes.insert(row.blake3.clone());
         match row.origin {
             FrameOrigin::Own => truth.missing_own.push(row.frame_uuid.clone()),
             FrameOrigin::Replica => {
-                if frame_health(node.as_ref(), row).await
+                if frame_health(node.as_ref(), &row).await
                     == Some(crate::sharing::iroh::node::BlobHealth::Missing)
                 {
                     let db = db(ctx)?;
@@ -3592,12 +3667,12 @@ pub(crate) async fn disk_truth(
     }
 
     // P24: a present frame that shares its content with a lost one.
-    let lost_hashes: HashSet<&str> = lost.iter().map(|r| r.blake3.as_str()).collect();
     for row in present_rows {
-        if !lost_hashes.contains(row.blake3.as_str()) {
+        if !lost_hashes.contains(&row.blake3) {
             continue;
         }
-        if frame_health(node.as_ref(), row).await
+        let _guard = lock.lock().await;
+        if frame_health(node.as_ref(), &row).await
             != Some(crate::sharing::iroh::node::BlobHealth::Dead)
         {
             continue;
@@ -3625,18 +3700,29 @@ pub(crate) async fn disk_truth(
 /// Re-admit a frame whose file is back at its landed path (a rescan's
 /// "moved" repair, a restored folder): right size, right xxh3, and a store
 /// that can take it (entry `Missing` or `Readable` — never over a `Dead` or
-/// `Partial` one, P20). Seeds it and marks it landed. `true` when re-admitted.
+/// `Partial` one, P20). Seeds it and marks it landed. `true` when
+/// re-admitted. A rejected file's `size:mtime` is remembered so an unchanged
+/// file is not hashed again (R21); `rehashed` counts the hashes taken.
 async fn readmit(
     ctx: &ServiceContext,
     node: Option<&Arc<crate::sharing::iroh::node::SharedIrohNode>>,
     row: &LocalFrameRow,
     path: &Path,
+    rehashed: &mut usize,
 ) -> Result<bool, ApiError> {
     use crate::sharing::iroh::node::BlobHealth;
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return Ok(false);
     };
     if !meta.is_file() || meta.len() as i64 != row.byte_size {
+        return Ok(false);
+    }
+    let sm = size_mtime_from(&meta);
+    let rejected = {
+        let db = db(ctx)?;
+        crate::db::collab_frames::rejected_size_mtime(&db.conn(), &row.project_id, &row.frame_uuid)?
+    };
+    if rejected.as_deref() == Some(sm.as_str()) {
         return Ok(false);
     }
     let Some(node) = node else {
@@ -3648,9 +3734,19 @@ async fn readmit(
     ) {
         return Ok(false);
     }
+    *rehashed += 1;
     match xxh3_on_blocking(path).await {
         Ok(h) if h == row.xxh3 => {}
-        Ok(_) => return Ok(false),
+        Ok(_) => {
+            let db = db(ctx)?;
+            crate::db::collab_frames::set_rejected_size_mtime(
+                &db.conn(),
+                &row.project_id,
+                &row.frame_uuid,
+                &sm,
+            )?;
+            return Ok(false);
+        }
         Err(e) => {
             tracing::debug!(frame_uuid = %row.frame_uuid, error = %format!("{e:#}"), "re-admission hash failed");
             return Ok(false);
@@ -3664,7 +3760,6 @@ async fn readmit(
         // Logged inside; a Dead entry is parked by the next pass.
         return Ok(false);
     }
-    let sm = size_mtime_from(&meta);
     let db = db(ctx)?;
     crate::db::collab_frames::set_landed(
         &db.conn(),
@@ -3677,14 +3772,16 @@ async fn readmit(
 }
 
 /// Clear `awaiting_gc` on every parked replica whose store entry is gone
-/// (`Missing`) or only partial — the need set may fetch it again (P20). Runs
-/// in every pass kind: it is one store lookup per parked row, no disk walk.
+/// (`Missing`) or only partial — the need set may fetch it again (P20). Part
+/// of maintenance only (m2).
 async fn recheck_awaiting_gc(ctx: &ServiceContext, project_id: &str) -> Result<usize, ApiError> {
     use crate::sharing::iroh::node::BlobHealth;
     let node = bound_node(ctx).await;
     if node.as_ref().and_then(|n| n.collab_store()).is_none() {
         return Ok(0);
     }
+    let lock = project_disk_lock(ctx, project_id)?;
+    let _guard = lock.lock().await;
     let parked: Vec<LocalFrameRow> = {
         let db = db(ctx)?;
         let conn = db.conn();
@@ -3712,6 +3809,172 @@ async fn recheck_awaiting_gc(ctx: &ServiceContext, project_id: &str) -> Result<u
         );
     }
     Ok(cleared)
+}
+
+/// Would a fetch of this project take `row` at `version`, pause, toggle and
+/// budget aside? The in-flight sweep's keep rule (R23).
+fn still_wanted(row: &LocalFrameRow, version: i32, policy: &ReplicationPolicy) -> bool {
+    replicable(row)
+        && !row.on_disk
+        && !row.awaiting_gc
+        && row.content_version == version
+        && policy_matches(row, policy)
+}
+
+/// Delete the project's `in-flight/project/<pid>/<uuid>/<ver>` tags whose
+/// frame is no longer wanted (R23): a transfer failure keeps its tag so the
+/// next fetch resumes from the verified partial bytes, and this sweep is what
+/// lets GC have them once the frame leaves the need set. Skipped while a
+/// fetch of the project runs — its tags are live. Returns the tags removed.
+async fn sweep_in_flight(ctx: &ServiceContext, project_id: &str) -> Result<usize, ApiError> {
+    use n0_future::StreamExt as _;
+    let Some(store) = bound_node(ctx).await.and_then(|n| n.collab_store()) else {
+        return Ok(0);
+    };
+    if fetch_in_progress(ctx, project_id)? {
+        return Ok(0);
+    }
+    let lock = project_disk_lock(ctx, project_id)?;
+    let _guard = lock.lock().await;
+    let (rows, policy) = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let project = live_project(&conn, project_id)?;
+        let rows: std::collections::HashMap<String, LocalFrameRow> =
+            crate::db::collab_frames::list_for_project(&conn, project_id)?
+                .into_iter()
+                .map(|r| (r.frame_uuid.clone(), r))
+                .collect();
+        (rows, read_policy(&project))
+    };
+    let prefix = crate::sharing::iroh::blobs::in_flight_tag(&format!("project/{project_id}/"));
+    let mut stale: Vec<String> = Vec::new();
+    let mut stream = store
+        .tags()
+        .list_prefix(prefix.as_bytes())
+        .await
+        .map_err(|e| ApiError::Internal(format!("list in-flight tags: {e}")))?;
+    while let Some(item) = stream.next().await {
+        let info = match item {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!(project_id, error = %e, "list in-flight tags failed");
+                return Ok(0);
+            }
+        };
+        let name = String::from_utf8_lossy(info.name.as_ref()).to_string();
+        let keep = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(uuid, ver)| Some((rows.get(uuid)?, ver.parse::<i32>().ok()?)))
+            .is_some_and(|(row, ver)| still_wanted(row, ver, &policy));
+        if !keep {
+            stale.push(name);
+        }
+    }
+    for tag in &stale {
+        drop_tag(&store, tag).await;
+    }
+    if !stale.is_empty() {
+        tracing::info!(
+            project_id,
+            count = stale.len(),
+            "stale in-flight tags swept"
+        );
+    }
+    Ok(stale.len())
+}
+
+/// What one maintenance run did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MaintenanceOutcome {
+    /// Projects walked.
+    pub projects: usize,
+    /// Full holder reports sent.
+    pub reported: usize,
+    /// Replicas found missing (fetchable once their entry is gone).
+    pub missing: usize,
+    /// Parked frames made fetchable again.
+    pub cleared: usize,
+}
+
+/// The maintenance of every live project (or `scope`), on its own loop
+/// (ruling R18) and before a "Sync now" fetch: [`disk_truth`], the
+/// [`loss_guard`] (skipped when already paused), the FULL
+/// [`report_holders`] — for every role, a `send` member still holds its own
+/// frames — then the parked-frame recheck (P20) and the in-flight sweep
+/// (R23). Signed out, no Collaboration root, or a root that is not reachable
+/// ⇒ nothing (one `warn!`). Never returns an error: each project's failure
+/// is logged and stepped over.
+pub(crate) async fn run_maintenance(
+    ctx: &ServiceContext,
+    scope: Option<&str>,
+    emitter: Option<&dyn ProgressEmitter>,
+) -> MaintenanceOutcome {
+    let mut outcome = MaintenanceOutcome::default();
+    match crate::api::account::hub_credentials(ctx) {
+        Ok(Some(_)) => {}
+        Ok(None) => return outcome,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e}"), "collab maintenance: account read failed; skipped");
+            return outcome;
+        }
+    }
+    if mounted_collaboration_root(ctx).is_none() {
+        return outcome;
+    }
+    let projects = match db(ctx).and_then(|d| Ok(crate::db::collab::list_projects(&d.conn())?)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "collab maintenance: project list failed; skipped");
+            return outcome;
+        }
+    };
+    for project in projects {
+        if scope.is_some_and(|only| only != project.project_id) {
+            continue;
+        }
+        let pid = project.project_id.as_str();
+        outcome.projects += 1;
+        let truth = match disk_truth(ctx, pid).await {
+            Ok(truth) => truth,
+            Err(e) => {
+                tracing::warn!(project_id = pid, error = %e, "collab maintenance: disk truth failed; project skipped");
+                continue;
+            }
+        };
+        outcome.missing += truth.missing_replicas.len();
+        if !project.replication_paused {
+            if let Err(e) = loss_guard(ctx, pid, &truth, emitter) {
+                tracing::warn!(project_id = pid, error = %e, "collab maintenance: loss guard failed");
+            }
+        }
+        // The truth goes to the hub either way — a paused project still stops
+        // advertising what it lost.
+        match report_holders(ctx, pid, &truth.present).await {
+            Ok(_) => outcome.reported += 1,
+            Err(e) => {
+                tracing::warn!(project_id = pid, error = %e, "collab maintenance: holder report failed")
+            }
+        }
+        match recheck_awaiting_gc(ctx, pid).await {
+            Ok(n) => outcome.cleared += n,
+            Err(e) => {
+                tracing::warn!(project_id = pid, error = %e, "collab maintenance: parked-frame recheck failed")
+            }
+        }
+        if let Err(e) = sweep_in_flight(ctx, pid).await {
+            tracing::warn!(project_id = pid, error = %e, "collab maintenance: in-flight sweep failed");
+        }
+    }
+    tracing::info!(
+        projects = outcome.projects,
+        reported = outcome.reported,
+        missing = outcome.missing,
+        cleared = outcome.cleared,
+        "collab maintenance complete"
+    );
+    outcome
 }
 
 /// The loss guard (P14): when this pass's missing replicas exceed
@@ -3860,6 +4123,72 @@ impl Drop for FramePullClaim {
     }
 }
 
+/// `catalog|project` — the key of every per-project fetch registry.
+fn fetch_key(ctx: &ServiceContext, project_id: &str) -> Result<String, ApiError> {
+    Ok(format!("{}|{project_id}", db(ctx)?.path().display()))
+}
+
+/// Is a fetch of this project running in this process right now?
+fn fetch_in_progress(ctx: &ServiceContext, project_id: &str) -> Result<bool, ApiError> {
+    let key = fetch_key(ctx, project_id)?;
+    Ok(IN_FLIGHT_FRAME_PULLS
+        .get()
+        .and_then(|set| set.lock().ok().map(|set| set.contains(&key)))
+        .unwrap_or(false))
+}
+
+/// The cancel flag of each running fetch (ruling R19), checked between
+/// batches.
+static FETCH_CANCELS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+> = std::sync::OnceLock::new();
+
+/// A running fetch's registered cancel flag; unregistered on drop.
+struct CancelRegistration(String, Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelRegistration {
+    fn register(key: &str) -> Self {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Ok(mut map) = FETCH_CANCELS.get_or_init(Default::default).lock() {
+            map.insert(key.to_string(), Arc::clone(&flag));
+        }
+        CancelRegistration(key.to_string(), flag)
+    }
+}
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        if let Some(map) = FETCH_CANCELS.get() {
+            if let Ok(mut map) = map.lock() {
+                if map.get(&self.0).is_some_and(|f| Arc::ptr_eq(f, &self.1)) {
+                    map.remove(&self.0);
+                }
+            }
+        }
+    }
+}
+
+/// Ask a running fetch of `project_id` to stop after its current batch
+/// (R19). Returns whether one was running. Called when auto-replication is
+/// turned off and when the project is lost; the between-batch re-check
+/// covers both too, this only makes the stop explicit.
+pub(crate) fn cancel_project_fetch(ctx: &ServiceContext, project_id: &str) -> bool {
+    let Ok(key) = fetch_key(ctx, project_id) else {
+        return false;
+    };
+    let flag = FETCH_CANCELS
+        .get()
+        .and_then(|m| m.lock().ok().and_then(|m| m.get(&key).cloned()));
+    match flag {
+        Some(flag) => {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!(project_id, "replication fetch cancel requested");
+            true
+        }
+        None => false,
+    }
+}
+
 /// Record a frame-level failure on its row (logged by the caller).
 fn record_frame_error(ctx: &ServiceContext, project_id: &str, frame_uuid: &str, error: &str) {
     match db(ctx) {
@@ -3883,43 +4212,95 @@ struct FetchEnv<'a> {
     token: String,
     relay_urls: Vec<String>,
     own: NodeId,
+    /// The project row at fetch start (its id and slug name the landing
+    /// folder); the live state is re-read between batches.
     project: crate::db::collab::CollabProjectRow,
     collab_root: PathBuf,
     started_at: String,
+    /// "Sync now": the auto-replicate toggle does not stop this fetch.
+    forced: bool,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// The project's disk lock (R18), held per frame while it lands.
+    lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-/// Fetch and land `need` (P11, P21, P24): batches of [`FETCH_BATCH`] frames
-/// back to back until the set is empty or a batch lands nothing. Each batch
-/// is ONE assignment run on the collab ALPN, every frame with its own fresh
-/// holders (minus this device) dialled relay-only; one frame failing never
-/// aborts its siblings. One `ReceiveGate` permit covers the whole fetch
-/// (ruling R2).
-///
-/// Before a frame is fetched its store entry is checked (P20): a `Dead`
-/// entry is parked for GC (a fetch over it would panic iroh-blobs 0.103); a
-/// `Readable` one whose content another frame of the project already landed
-/// is linked from that file instead (P24). After each batch the landed frames
-/// go to the hub as one holder `add` (P8).
+impl FetchEnv<'_> {
+    fn pid(&self) -> &str {
+        &self.project.project_id
+    }
+
+    fn in_flight_tag(&self, row: &LocalFrameRow) -> String {
+        crate::sharing::iroh::blobs::in_flight_tag(&crate::sharing::iroh::node::project_frame_tag(
+            self.pid(),
+            &row.frame_uuid,
+            row.content_version,
+        ))
+    }
+}
+
+/// Fetch and land `need` (P11, P21, P24). Resolves the receive gate and runs
+/// [`fetch_frames_gated`].
 pub(crate) async fn fetch_frames(
     ctx: &ServiceContext,
     sync: &crate::sync::SyncRuntime,
     project_id: &str,
     need: Vec<LocalFrameRow>,
+    forced: bool,
+    emitter: Option<&dyn ProgressEmitter>,
+) -> Result<FetchOutcome, ApiError> {
+    let control = sync.inbound_control().await;
+    fetch_frames_gated(
+        ctx,
+        control.as_ref().map(|c| &c.receive_gate),
+        project_id,
+        need,
+        forced,
+        emitter,
+    )
+    .await
+}
+
+/// The fetch loop. Batches of up to [`FETCH_BATCH`] frames that HAVE fresh
+/// holders run back to back (a frame no holder serves is skipped without
+/// taking a slot, R16) until the queue is empty or a batch that attempted
+/// fetches landed nothing. Each batch is ONE assignment run on the collab
+/// ALPN under ONE `ReceiveGate` permit, released between batches so a
+/// personal-sync receive gets its turn (R17). Before each batch the project
+/// is re-read — lost, paused, auto-replicate turned off (unless `forced`),
+/// cancelled — and the queue is re-filtered against the current rows and
+/// policy (R19).
+///
+/// Before a frame is fetched its store entry is checked (P20): a `Dead`
+/// entry is parked for GC (a fetch over it would panic iroh-blobs 0.103); a
+/// `Readable` one whose content another frame of the project already landed
+/// is linked from that file instead (P24). After each batch the landed
+/// frames go to the hub as one holder `add` (P8).
+pub(crate) async fn fetch_frames_gated(
+    ctx: &ServiceContext,
+    gate: Option<&crate::sync::ReceiveGate>,
+    project_id: &str,
+    need: Vec<LocalFrameRow>,
+    forced: bool,
     emitter: Option<&dyn ProgressEmitter>,
 ) -> Result<FetchOutcome, ApiError> {
     let mut outcome = FetchOutcome::default();
     if need.is_empty() {
         return Ok(outcome);
     }
-    let claim_key = format!("{}|{project_id}", db(ctx)?.path().display());
-    let Some(_claim) = FramePullClaim::acquire(&claim_key) else {
+    let key = fetch_key(ctx, project_id)?;
+    let Some(_claim) = FramePullClaim::acquire(&key) else {
         tracing::info!(
             project_id,
             "replication skipped: a fetch of this project is already running"
         );
         return Ok(outcome);
     };
+    let cancel = CancelRegistration::register(&key);
     let collab_root = require_collaboration_root(ctx)?;
+    if !collab_root.is_dir() {
+        tracing::warn!(project_id, path = %collab_root.display(), "collaboration folder is not reachable; replication fetch skipped");
+        return Ok(outcome);
+    }
     let project = {
         let db = db(ctx)?;
         let conn = db.conn();
@@ -3944,14 +4325,6 @@ pub(crate) async fn fetch_frames(
     // refresh) completes each holder's hint; no hub round trip here.
     let relay_urls = node.relay_urls();
     let own = node.node_id();
-
-    // Ruling R2: one permit for the project's whole fetch. No receiver
-    // started ⇒ no competing receives to be fair to.
-    let _receive_permit = match sync.inbound_control().await {
-        Some(control) => Some(control.receive_gate.acquire().await),
-        None => None,
-    };
-
     let env = FetchEnv {
         ctx,
         node,
@@ -3963,17 +4336,43 @@ pub(crate) async fn fetch_frames(
         project,
         collab_root,
         started_at: crate::sync::now_iso(),
+        forced,
+        cancel: Arc::clone(&cancel.1),
+        lock: project_disk_lock(ctx, project_id)?,
     };
+
     let total = need.len();
     tracing::info!(project_id, count = total, "replication fetch started");
     let mut queue: std::collections::VecDeque<LocalFrameRow> = need.into();
     let mut hinted: HashSet<NodeId> = HashSet::new();
-    while !queue.is_empty() {
-        let take = queue.len().min(FETCH_BATCH);
-        let batch: Vec<LocalFrameRow> = queue.drain(..take).collect();
-        let b = fetch_batch(&env, batch, &mut hinted).await?;
-        outcome += b;
-        if b.landed == 0 {
+    loop {
+        if !between_batches(&env, &mut queue)? || queue.is_empty() {
+            break;
+        }
+        let mut batch = prepare_batch(&env, &mut queue, &mut hinted, &mut outcome).await?;
+        let attempted = batch.fetches.len() + batch.local.len();
+        let fetched_landed = if attempted > 0 {
+            // R17: one permit per batch, never across batches.
+            let _permit = match gate {
+                Some(gate) => Some(gate.acquire().await),
+                None => None,
+            };
+            run_batch(&env, &mut batch, &mut outcome).await
+        } else {
+            0
+        };
+        if !batch.landed.is_empty() {
+            // Folded after logging: the maintenance loop's full report
+            // repairs a missed delta (P8).
+            if let Err(e) = env
+                .client
+                .put_holders(&env.token, project_id, false, &batch.landed, &[])
+                .await
+            {
+                tracing::warn!(project_id, count = batch.landed.len(), error = %e, "holder delta after landing failed");
+            }
+        }
+        if attempted > 0 && fetched_landed == 0 {
             if !queue.is_empty() {
                 tracing::info!(
                     project_id,
@@ -3993,7 +4392,7 @@ pub(crate) async fn fetch_frames(
         "replication fetch finished"
     );
     if let Some(em) = emitter {
-        if outcome.landed + outcome.failed + outcome.awaiting_gc > 0 {
+        if outcome.landed > 0 {
             crate::events::emit_event(
                 em,
                 COLLAB_FRAMES_LANDED_EVENT,
@@ -4009,8 +4408,76 @@ pub(crate) async fn fetch_frames(
     Ok(outcome)
 }
 
-/// The project row, refusing an unknown or lost project (R14: a lost project
-/// is never acted on).
+/// The re-check before every batch (R19). `false` = stop: cancelled, the
+/// Collaboration folder unreachable, the project lost or paused, its role no
+/// longer replicating, or auto-replicate turned off (unless forced).
+/// Otherwise the queue keeps only frames still wanted at the queued version
+/// and content under the current policy.
+fn between_batches(
+    env: &FetchEnv<'_>,
+    queue: &mut std::collections::VecDeque<LocalFrameRow>,
+) -> Result<bool, ApiError> {
+    let pid = env.pid();
+    if env.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::info!(
+            project_id = pid,
+            count = queue.len(),
+            "replication fetch cancelled"
+        );
+        return Ok(false);
+    }
+    if !env.collab_root.is_dir() {
+        tracing::warn!(project_id = pid, path = %env.collab_root.display(), "collaboration folder is not reachable; replication fetch stops");
+        return Ok(false);
+    }
+    let db = db(env.ctx)?;
+    let conn = db.conn();
+    let project = match live_project(&conn, pid) {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::info!(
+                project_id = pid,
+                "project no longer joined; replication fetch stops"
+            );
+            return Ok(false);
+        }
+    };
+    let stop = if project.replication_paused {
+        Some("paused")
+    } else if !role_allows_replication(&project.data_role, project.is_coordinator) {
+        Some("role")
+    } else if !env.forced && !project.auto_replicate {
+        Some("auto_replicate_off")
+    } else {
+        None
+    };
+    if let Some(outcome) = stop {
+        tracing::info!(project_id = pid, outcome, "replication fetch stops");
+        return Ok(false);
+    }
+    let policy = read_policy(&project);
+    let rows: std::collections::HashMap<String, LocalFrameRow> =
+        crate::db::collab_frames::list_for_project(&conn, pid)?
+            .into_iter()
+            .map(|r| (r.frame_uuid.clone(), r))
+            .collect();
+    let before = queue.len();
+    queue.retain(|q| {
+        rows.get(&q.frame_uuid)
+            .is_some_and(|r| still_wanted(r, q.content_version, &policy) && r.blake3 == q.blake3)
+    });
+    if queue.len() != before {
+        tracing::debug!(
+            project_id = pid,
+            count = before - queue.len(),
+            "frames no longer wanted dropped from the fetch"
+        );
+    }
+    Ok(true)
+}
+
+/// A project, the live one, or an error for an unknown or lost project (R14:
+/// a lost project is never acted on).
 fn live_project(
     conn: &rusqlite::Connection,
     project_id: &str,
@@ -4038,27 +4505,38 @@ fn identical_landed(
     )
 }
 
-/// One batch of [`fetch_frames`].
-async fn fetch_batch(
+/// One batch, prepared: what to fetch, what to land straight from the store,
+/// and who follows whom (identical content, fetched once).
+#[derive(Default)]
+struct Batch {
+    fetches: Vec<crate::sharing::iroh::blobs::FrameFetch>,
+    rows: std::collections::HashMap<String, (LocalFrameRow, iroh_blobs::Hash)>,
+    followers: std::collections::HashMap<String, Vec<LocalFrameRow>>,
+    local: Vec<(LocalFrameRow, iroh_blobs::Hash)>,
+    /// Holder entries for everything landed in this batch (links included).
+    landed: Vec<crate::collab::hub_client::HolderRefWire>,
+}
+
+/// Fill one batch from the queue (R16): pop frames until [`FETCH_BATCH`] of
+/// them are to be fetched or landed from the store, or the queue is empty.
+/// A frame with no fresh holder is skipped (`debug!`) and takes no slot; a
+/// dead entry is parked (P20); identical content already on disk is linked
+/// right here (P24).
+async fn prepare_batch(
     env: &FetchEnv<'_>,
-    batch: Vec<LocalFrameRow>,
+    queue: &mut std::collections::VecDeque<LocalFrameRow>,
     hinted: &mut HashSet<NodeId>,
-) -> Result<FetchOutcome, ApiError> {
-    use crate::collab::hub_client::HolderRefWire;
-    use crate::sharing::iroh::blobs::{self, FrameFetch};
-    use crate::sharing::iroh::node::{project_frame_tag, BlobHealth};
+    outcome: &mut FetchOutcome,
+) -> Result<Batch, ApiError> {
+    use crate::sharing::iroh::blobs::FrameFetch;
+    use crate::sharing::iroh::node::BlobHealth;
 
-    let pid = env.project.project_id.as_str();
-    let mut outcome = FetchOutcome::default();
-    let mut landed: Vec<HolderRefWire> = Vec::new();
-    let mut fetches: Vec<FrameFetch> = Vec::new();
-    let mut fetch_rows: std::collections::HashMap<String, (LocalFrameRow, iroh_blobs::Hash)> =
-        Default::default();
+    let pid = env.pid().to_string();
+    let pid = pid.as_str();
+    let mut batch = Batch::default();
     let mut rep_of_hash: std::collections::HashMap<iroh_blobs::Hash, String> = Default::default();
-    let mut followers: std::collections::HashMap<String, Vec<LocalFrameRow>> = Default::default();
-    let mut local: Vec<(LocalFrameRow, iroh_blobs::Hash)> = Vec::new();
-
-    for row in batch {
+    while batch.fetches.len() + batch.local.len() < FETCH_BATCH {
+        let Some(row) = queue.pop_front() else { break };
         let uuid = row.frame_uuid.clone();
         let hash = match row.blake3.parse::<iroh_blobs::Hash>() {
             Ok(h) => h,
@@ -4071,7 +4549,7 @@ async fn fetch_batch(
             }
         };
         if let Some(rep) = rep_of_hash.get(&hash) {
-            followers.entry(rep.clone()).or_default().push(row);
+            batch.followers.entry(rep.clone()).or_default().push(row);
             continue;
         }
         let health = match env.node.collab_blob_health(hash).await {
@@ -4086,6 +4564,7 @@ async fn fetch_batch(
             BlobHealth::Dead => {
                 // P20: never fetch over a dead entry. Park until GC.
                 tracing::warn!(project_id = pid, frame_uuid = %uuid, "frame content is a dead store entry; waiting for GC");
+                let _guard = env.lock.lock().await;
                 unseed_frame(Some(&env.node), pid, &uuid).await;
                 let db = db(env.ctx)?;
                 crate::db::collab_frames::set_missing(&db.conn(), pid, &uuid, true)?;
@@ -4095,18 +4574,19 @@ async fn fetch_batch(
             BlobHealth::Readable => {
                 if let Some(src) = identical_landed(env.ctx, &row)? {
                     match link_identical(env, &row, &src).await {
-                        Some(r) => {
-                            landed.push(r);
+                        Landed::Yes(_) => {
+                            batch.landed.push(holder_ref(&row));
                             outcome.landed += 1;
                         }
-                        None => outcome.failed += 1,
+                        Landed::Failed => outcome.failed += 1,
+                        Landed::AwaitingGc | Landed::Stale => {}
                     }
                     continue;
                 }
                 // Complete in the store already (a fetch that died before
                 // its landing): land it straight from the store.
                 rep_of_hash.insert(hash, uuid.clone());
-                local.push((row, hash));
+                batch.local.push((row, hash));
                 continue;
             }
             BlobHealth::Missing | BlobHealth::Partial => {}
@@ -4162,33 +4642,41 @@ async fn fetch_batch(
                 ),
             }
         }
-        let endpoints: Vec<iroh::EndpointId> = providers
-            .iter()
-            .filter_map(|(n, _)| iroh::EndpointId::from_bytes(n).ok())
-            .collect();
-        fetches.push(FrameFetch {
+        batch.fetches.push(FrameFetch {
             key: uuid.clone(),
             hash,
             size: row.byte_size.max(0) as u64,
-            providers: endpoints,
-            in_flight_tag: blobs::in_flight_tag(&project_frame_tag(
-                pid,
-                &uuid,
-                row.content_version,
-            )),
+            providers: providers
+                .iter()
+                .filter_map(|(n, _)| iroh::EndpointId::from_bytes(n).ok())
+                .collect(),
+            in_flight_tag: env.in_flight_tag(&row),
         });
         rep_of_hash.insert(hash, uuid.clone());
-        fetch_rows.insert(uuid, (row, hash));
+        batch.rows.insert(uuid, (row, hash));
     }
+    Ok(batch)
+}
 
-    // Frames already complete in the store: protect, then land.
+fn holder_ref(row: &LocalFrameRow) -> crate::collab::hub_client::HolderRefWire {
+    crate::collab::hub_client::HolderRefWire {
+        frame_uuid: row.frame_uuid.clone(),
+        content_version: row.content_version,
+    }
+}
+
+/// Run one prepared batch: fetch, then land every fetched (or store-local)
+/// frame and link its followers. Returns how many frames landed. A transfer
+/// failure keeps the frame's in-flight tag — the next fetch resumes from
+/// its verified partial bytes (P22, R23) — and a whole-batch failure still
+/// lands what is already complete (m1).
+async fn run_batch(env: &FetchEnv<'_>, batch: &mut Batch, outcome: &mut FetchOutcome) -> usize {
+    let pid = env.pid().to_string();
+    let pid = pid.as_str();
+    let mut landed = 0;
     let mut to_land: Vec<(LocalFrameRow, iroh_blobs::Hash)> = Vec::new();
-    for (row, hash) in local {
-        let tag = blobs::in_flight_tag(&project_frame_tag(
-            pid,
-            &row.frame_uuid,
-            row.content_version,
-        ));
+    for (row, hash) in std::mem::take(&mut batch.local) {
+        let tag = env.in_flight_tag(&row);
         if let Err(e) = env
             .store
             .tags()
@@ -4204,6 +4692,7 @@ async fn fetch_batch(
         to_land.push((row, hash));
     }
 
+    let fetches = std::mem::take(&mut batch.fetches);
     if !fetches.is_empty() {
         let telemetry: ProviderTelemetrySink = {
             let pid = pid.to_string();
@@ -4216,8 +4705,7 @@ async fn fetch_batch(
                 }
             })
         };
-        let tags: Vec<String> = fetches.iter().map(|f| f.in_flight_tag.clone()).collect();
-        let results = match blobs::fetch_blobs_assigned(
+        match crate::sharing::iroh::blobs::fetch_blobs_assigned(
             &env.store,
             &env.node.endpoint(),
             fetches,
@@ -4225,39 +4713,28 @@ async fn fetch_batch(
         )
         .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(project_id = pid, error = %format!("{e:#}"), "replication batch fetch failed");
-                for tag in &tags {
-                    drop_tag(&env.store, tag).await;
-                }
-                for (uuid, _) in fetch_rows.drain() {
-                    record_frame_error(env.ctx, pid, &uuid, &format!("{e:#}"));
-                    outcome.failed += 1 + followers.remove(&uuid).map_or(0, |f| f.len());
-                }
-                return Ok(outcome);
-            }
-        };
-        for (uuid, r) in results {
-            let Some((row, hash)) = fetch_rows.remove(&uuid) else {
-                continue;
-            };
-            match r {
-                Ok(()) => to_land.push((row, hash)),
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    tracing::warn!(project_id = pid, frame_uuid = %uuid, error = %msg, "frame fetch failed");
-                    record_frame_error(env.ctx, pid, &uuid, &msg);
-                    drop_tag(
-                        &env.store,
-                        &blobs::in_flight_tag(&project_frame_tag(pid, &uuid, row.content_version)),
-                    )
-                    .await;
-                    outcome.failed += 1;
-                    for f in followers.remove(&uuid).unwrap_or_default() {
-                        record_frame_error(env.ctx, pid, &f.frame_uuid, &msg);
-                        outcome.failed += 1;
+            Ok(results) => {
+                for (uuid, r) in results {
+                    let Some((row, hash)) = batch.rows.remove(&uuid) else {
+                        continue;
+                    };
+                    match r {
+                        Ok(()) => to_land.push((row, hash)),
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            tracing::warn!(project_id = pid, frame_uuid = %uuid, error = %msg, "frame fetch failed; its partial bytes stay for the next attempt");
+                            fail_with_followers(env, batch, &uuid, &msg, outcome);
+                        }
                     }
+                }
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::error!(project_id = pid, error = %msg, "replication batch fetch failed");
+                let uuids: Vec<String> = batch.rows.keys().cloned().collect();
+                for uuid in uuids {
+                    batch.rows.remove(&uuid);
+                    fail_with_followers(env, batch, &uuid, &msg, outcome);
                 }
             }
         }
@@ -4265,118 +4742,204 @@ async fn fetch_batch(
 
     for (row, hash) in to_land {
         let uuid = row.frame_uuid.clone();
+        let followers = batch.followers.remove(&uuid).unwrap_or_default();
         match land_frame(env, &row, hash).await {
             Landed::Yes(dest) => {
-                landed.push(HolderRefWire {
-                    frame_uuid: uuid.clone(),
-                    content_version: row.content_version,
-                });
+                batch.landed.push(holder_ref(&row));
                 outcome.landed += 1;
-                for f in followers.remove(&uuid).unwrap_or_default() {
+                landed += 1;
+                for f in followers {
                     match link_identical(env, &f, &dest).await {
-                        Some(r) => {
-                            landed.push(r);
+                        Landed::Yes(_) => {
+                            batch.landed.push(holder_ref(&f));
                             outcome.landed += 1;
+                            landed += 1;
                         }
-                        None => outcome.failed += 1,
+                        Landed::Failed => outcome.failed += 1,
+                        Landed::AwaitingGc | Landed::Stale => {}
                     }
                 }
             }
             Landed::AwaitingGc => {
                 outcome.awaiting_gc += 1;
-                outcome.failed += followers.remove(&uuid).map_or(0, |f| f.len());
             }
+            Landed::Stale => {}
             Landed::Failed => {
-                outcome.failed += 1 + followers.remove(&uuid).map_or(0, |f| f.len());
+                outcome.failed += 1 + followers.len();
+                for f in followers {
+                    record_frame_error(
+                        env.ctx,
+                        pid,
+                        &f.frame_uuid,
+                        "identical frame failed to land",
+                    );
+                }
             }
         }
     }
-
-    if !landed.is_empty() {
-        // Folded after logging: the cadence pass's full report repairs a
-        // missed delta (P8).
-        if let Err(e) = env
-            .client
-            .put_holders(&env.token, pid, false, &landed, &[])
-            .await
-        {
-            tracing::warn!(project_id = pid, count = landed.len(), error = %e, "holder delta after landing failed");
-        }
-    }
-    Ok(outcome)
+    landed
 }
 
-/// Delete one tag, logging a failure (the store's open sweep reclaims a
-/// stale in-flight tag).
+/// Record a transfer failure on a frame and on every frame that was to be
+/// linked from it.
+fn fail_with_followers(
+    env: &FetchEnv<'_>,
+    batch: &mut Batch,
+    uuid: &str,
+    msg: &str,
+    outcome: &mut FetchOutcome,
+) {
+    let pid = env.pid();
+    record_frame_error(env.ctx, pid, uuid, msg);
+    outcome.failed += 1;
+    for f in batch.followers.remove(uuid).unwrap_or_default() {
+        record_frame_error(env.ctx, pid, &f.frame_uuid, msg);
+        outcome.failed += 1;
+    }
+}
+
+/// Delete one tag, logging a failure (the store's open sweep and the
+/// maintenance sweep reclaim a stale in-flight tag).
 async fn drop_tag(store: &iroh_blobs::api::Store, tag: &str) {
     if let Err(e) = store.tags().delete(tag).await {
         tracing::warn!(tag, error = %e, "delete tag failed");
     }
 }
 
-/// What landing one frame did.
+/// What landing (or linking) one frame did.
 enum Landed {
     Yes(PathBuf),
     /// The store's data went away under us (export found no source): the
     /// tags are dropped and the frame waits for GC (P20). Not a failure.
     AwaitingGc,
+    /// The row moved on (a new version, other content) while the bytes were
+    /// in flight (R20): nothing recorded, left for the next pass.
+    Stale,
     /// Logged and recorded on the row.
     Failed,
 }
 
-/// Land one fetched frame (P21): `export_child` straight to its final path —
-/// a rename of the store's data file, so the landed file IS the seed — then
-/// the permanent seed tag, then the in-flight tag goes, then one DB
-/// transaction (row + `sync_history`).
+/// The row as it is NOW, or `None` (logged) when it no longer describes the
+/// bytes in hand — a manifest sync moved its version or content, or it went
+/// away (R20).
+fn fresh_row(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<Option<LocalFrameRow>, ApiError> {
+    let db = db(env.ctx)?;
+    let fresh = crate::db::collab_frames::get(&db.conn(), env.pid(), &row.frame_uuid)?;
+    match fresh {
+        Some(f) if f.content_version == row.content_version && f.blake3 == row.blake3 => {
+            Ok(Some(f))
+        }
+        _ => {
+            tracing::info!(
+                project_id = env.pid(),
+                frame_uuid = %row.frame_uuid,
+                content_version = row.content_version,
+                "frame changed while in flight; left for the next pass"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Where a NEW landing goes (P10, P21): `unique_path(<Collab>/<project>/
+/// <publisher>/<fileName>)`, the file name checked first.
+fn new_landing_path(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<PathBuf, String> {
+    crate::package::validate_rel_path(&row.file_name)
+        .map_err(|e| format!("unsafe file name {:?}: {e:#}", row.file_name))?;
+    let dir = db(env.ctx)
+        .map_err(anyhow::Error::from)
+        .and_then(|db| {
+            publisher_folder(
+                &db.conn(),
+                &env.collab_root,
+                &env.project,
+                &row.publisher_account_id,
+                &row.publisher_display,
+                "publisher",
+            )
+        })
+        .map_err(|e| format!("publisher folder: {e:#}"))?;
+    Ok(crate::sync::ingest::unique_path(&dir.join(
+        crate::sync::ingest::native_rel_path(&row.file_name),
+    )))
+}
+
+/// The target of a landing (fetched or linked). A row that already has a
+/// path inside the Collaboration root lands there, its old tags dropped
+/// first:
 ///
-/// The path: a row that already has one (a new content version, or a frame
-/// fetched again after it went missing) lands OVER it under the same name —
-/// the old version's tags are dropped first so its entry is left to GC, and
-/// `export_child` removes the stale file. Otherwise
-/// `unique_path(<Collab>/<project>/<publisher>/<fileName>)`.
+/// - a NEW VERSION (a version bump clears `size_mtime_seen`) lands OVER the
+///   old file under the same name (plan step 7.5, owner-approved);
+/// - a SAME-VERSION re-land (the file went missing or was edited) never
+///   destroys what is there: a file at the path is renamed aside to
+///   `unique_path` first — it becomes an inert foreign file (R24, R18).
+///
+/// Anything else goes to [`new_landing_path`].
+async fn landing_target(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<PathBuf, String> {
+    let existing = row
+        .landed_path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|p| inside_root(Some(&env.collab_root), row, p));
+    let Some(dest) = existing else {
+        return new_landing_path(env, row);
+    };
+    unseed_frame(Some(&env.node), env.pid(), &row.frame_uuid).await;
+    if row.size_mtime_seen.is_some() && dest.exists() {
+        let aside = crate::sync::ingest::unique_path(&dest);
+        std::fs::rename(&dest, &aside).map_err(|e| {
+            format!(
+                "keep the edited file {} aside as {}: {e}",
+                dest.display(),
+                aside.display()
+            )
+        })?;
+        tracing::info!(
+            project_id = env.pid(),
+            frame_uuid = %row.frame_uuid,
+            path = %dest.display(),
+            dest = %aside.display(),
+            "edited replica kept beside the re-fetched frame"
+        );
+    }
+    Ok(dest)
+}
+
+/// Land one fetched frame (P21), under the project's disk lock: re-read the
+/// row (R20), pick the target, `export_child` straight to it — a rename of
+/// the store's data file, so the landed file IS the seed — then the
+/// permanent seed tag, then the in-flight tag goes, then one DB transaction
+/// (row + `sync_history`) that only lands on the same version and content.
+/// A stale landing drops its tags and removes nothing the row references.
 async fn land_frame(env: &FetchEnv<'_>, row: &LocalFrameRow, hash: iroh_blobs::Hash) -> Landed {
     use crate::sharing::iroh::blobs;
     use crate::sharing::iroh::node::project_frame_tag;
 
-    let pid = env.project.project_id.as_str();
+    let pid = env.pid();
     let uuid = row.frame_uuid.as_str();
-    let in_flight = blobs::in_flight_tag(&project_frame_tag(pid, uuid, row.content_version));
+    let in_flight = env.in_flight_tag(row);
     let fail = |msg: String| {
         tracing::error!(project_id = pid, frame_uuid = uuid, error = %msg, "frame landing failed");
         record_frame_error(env.ctx, pid, uuid, &msg);
     };
-
-    let dest = match row.landed_path.as_deref() {
-        Some(existing) => {
-            unseed_frame(Some(&env.node), pid, uuid).await;
-            PathBuf::from(existing)
+    let _guard = env.lock.lock().await;
+    let row = match fresh_row(env, row) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            drop_tag(&env.store, &in_flight).await;
+            return Landed::Stale;
         }
-        None => {
-            if let Err(e) = crate::package::validate_rel_path(&row.file_name) {
-                fail(format!("unsafe file name {:?}: {e:#}", row.file_name));
-                drop_tag(&env.store, &in_flight).await;
-                return Landed::Failed;
-            }
-            let dir = match db(env.ctx).map_err(anyhow::Error::from).and_then(|db| {
-                publisher_folder(
-                    &db.conn(),
-                    &env.collab_root,
-                    &env.project,
-                    &row.publisher_account_id,
-                    &row.publisher_display,
-                    "publisher",
-                )
-            }) {
-                Ok(dir) => dir,
-                Err(e) => {
-                    fail(format!("publisher folder: {e:#}"));
-                    drop_tag(&env.store, &in_flight).await;
-                    return Landed::Failed;
-                }
-            };
-            crate::sync::ingest::unique_path(
-                &dir.join(crate::sync::ingest::native_rel_path(&row.file_name)),
-            )
+        Err(e) => {
+            fail(format!("re-read the frame: {e}"));
+            return Landed::Failed;
+        }
+    };
+    let dest = match landing_target(env, &row).await {
+        Ok(d) => d,
+        Err(msg) => {
+            fail(msg);
+            drop_tag(&env.store, &in_flight).await;
+            return Landed::Failed;
         }
     };
     if let Some(parent) = dest.parent() {
@@ -4423,10 +4986,14 @@ async fn land_frame(env: &FetchEnv<'_>, row: &LocalFrameRow, hash: iroh_blobs::H
         return Landed::Failed;
     }
     drop_tag(&env.store, &in_flight).await;
-    match record_landing(env, row, &dest) {
-        Ok(()) => {
+    match record_landing(env, &row, &dest) {
+        Ok(true) => {
             tracing::info!(project_id = pid, frame_uuid = uuid, path = %dest.display(), "frame landed");
             Landed::Yes(dest)
+        }
+        Ok(false) => {
+            forget_stale_landing(env, &row, &tag, &dest).await;
+            Landed::Stale
         }
         Err(e) => {
             fail(format!("record landing: {e:#}"));
@@ -4437,6 +5004,31 @@ async fn land_frame(env: &FetchEnv<'_>, row: &LocalFrameRow, hash: iroh_blobs::H
     }
 }
 
+/// A landing the row moved away from while it was written (R20): drop the
+/// seed tag it set, and remove the file only when the row does not reference
+/// that path.
+async fn forget_stale_landing(env: &FetchEnv<'_>, row: &LocalFrameRow, tag: &str, dest: &Path) {
+    tracing::info!(
+        project_id = env.pid(),
+        frame_uuid = %row.frame_uuid,
+        path = %dest.display(),
+        "frame changed while landing; left for the next pass"
+    );
+    drop_tag(&env.store, tag).await;
+    let referenced = db(env.ctx)
+        .ok()
+        .and_then(|db| {
+            crate::db::collab_frames::get(&db.conn(), env.pid(), &row.frame_uuid)
+                .ok()
+                .flatten()
+        })
+        .and_then(|r| r.landed_path)
+        .is_some_and(|p| Path::new(&p) == dest);
+    if !referenced {
+        remove_landed(dest);
+    }
+}
+
 /// Remove a landed file after a failed step, logging a failure.
 fn remove_landed(path: &Path) {
     if let Err(e) = std::fs::remove_file(path) {
@@ -4444,22 +5036,28 @@ fn remove_landed(path: &Path) {
     }
 }
 
-/// One transaction: the row is landed and a `sync_history` row records the
-/// receive, the way the package ingest wrote it.
-fn record_landing(env: &FetchEnv<'_>, row: &LocalFrameRow, dest: &Path) -> Result<()> {
+/// One transaction: the row is landed — only while it still describes these
+/// bytes (R20) — and a `sync_history` row records the receive, the way the
+/// package ingest wrote it. `Ok(false)` = stale, nothing written.
+fn record_landing(env: &FetchEnv<'_>, row: &LocalFrameRow, dest: &Path) -> Result<bool> {
     let meta = std::fs::metadata(dest).with_context(|| format!("stat {}", dest.display()))?;
     let sm = size_mtime_from(&meta);
     let db = db(env.ctx).map_err(|e| anyhow!("{e}"))?;
     let conn = db.conn();
     let tx = conn.unchecked_transaction().context("begin landing tx")?;
-    crate::db::collab_frames::set_landed(
+    let n = crate::db::collab_frames::set_landed_if(
         &tx,
         &row.project_id,
         &row.frame_uuid,
         &dest.to_string_lossy(),
         &sm,
+        row.content_version,
+        &row.blake3,
     )
     .context("mark frame landed")?;
+    if n == 0 {
+        return Ok(false);
+    }
     crate::sync::store::insert_history_row(
         &tx,
         &crate::sync::HistoryRow {
@@ -4480,69 +5078,49 @@ fn record_landing(env: &FetchEnv<'_>, row: &LocalFrameRow, dest: &Path) -> Resul
     )
     .context("insert sync_history row")?;
     tx.commit().context("commit landing tx")?;
-    Ok(())
+    Ok(true)
 }
 
 /// P24: land a frame whose content another frame of the project already has
 /// on disk — link (or copy) that file, seed it by reference, record it. No
-/// fetch. Returns the holder entry on success; failures are logged and
-/// recorded on the row.
-async fn link_identical(
-    env: &FetchEnv<'_>,
-    row: &LocalFrameRow,
-    src: &Path,
-) -> Option<crate::collab::hub_client::HolderRefWire> {
-    let pid = env.project.project_id.as_str();
+/// fetch. Under the project's disk lock, on the row as it is now (R20).
+async fn link_identical(env: &FetchEnv<'_>, row: &LocalFrameRow, src: &Path) -> Landed {
+    let pid = env.pid();
     let uuid = row.frame_uuid.as_str();
     let fail = |msg: String| {
         tracing::warn!(project_id = pid, frame_uuid = uuid, error = %msg, "identical frame landing failed");
         record_frame_error(env.ctx, pid, uuid, &msg);
     };
-    tracing::warn!(project_id = pid, frame_uuid = uuid, path = %src.display(), "identical frame content in project");
-    let dest = match row.landed_path.as_deref() {
-        Some(p) => {
-            unseed_frame(Some(&env.node), pid, uuid).await;
-            let p = PathBuf::from(p);
-            if p != src {
-                if let Err(e) = std::fs::remove_file(&p) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        fail(format!("remove stale {}: {e}", p.display()));
-                        return None;
-                    }
-                }
-            }
-            p
-        }
-        None => {
-            if let Err(e) = crate::package::validate_rel_path(&row.file_name) {
-                fail(format!("unsafe file name {:?}: {e:#}", row.file_name));
-                return None;
-            }
-            let dir = match db(env.ctx).map_err(anyhow::Error::from).and_then(|db| {
-                publisher_folder(
-                    &db.conn(),
-                    &env.collab_root,
-                    &env.project,
-                    &row.publisher_account_id,
-                    &row.publisher_display,
-                    "publisher",
-                )
-            }) {
-                Ok(dir) => dir,
-                Err(e) => {
-                    fail(format!("publisher folder: {e:#}"));
-                    return None;
-                }
-            };
-            crate::sync::ingest::unique_path(
-                &dir.join(crate::sync::ingest::native_rel_path(&row.file_name)),
-            )
+    let _guard = env.lock.lock().await;
+    let row = match fresh_row(env, row) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Landed::Stale,
+        Err(e) => {
+            fail(format!("re-read the frame: {e}"));
+            return Landed::Failed;
         }
     };
+    tracing::warn!(project_id = pid, frame_uuid = uuid, path = %src.display(), "identical frame content in project");
+    let dest = match landing_target(env, &row).await {
+        Ok(d) => d,
+        Err(msg) => {
+            fail(msg);
+            return Landed::Failed;
+        }
+    };
+    // A new version lands over the old file: clear it for the link.
+    if dest != src {
+        if let Err(e) = std::fs::remove_file(&dest) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                fail(format!("remove stale {}: {e}", dest.display()));
+                return Landed::Failed;
+            }
+        }
+    }
     if let Some(parent) = dest.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             fail(format!("create {}: {e}", parent.display()));
-            return None;
+            return Landed::Failed;
         }
     }
     if let Err(e) = crate::sync::ingest::link_or_copy(src, &dest, false) {
@@ -4551,7 +5129,7 @@ async fn link_identical(
             src.display(),
             dest.display()
         ));
-        return None;
+        return Landed::Failed;
     }
     if let Err(e) = env
         .node
@@ -4560,19 +5138,25 @@ async fn link_identical(
     {
         fail(format!("seed {}: {e:#}", dest.display()));
         remove_landed(&dest);
-        return None;
+        return Landed::Failed;
     }
-    if let Err(e) = record_landing(env, row, &dest) {
-        fail(format!("record landing: {e:#}"));
-        remove_landed(&dest);
-        unseed_frame(Some(&env.node), pid, uuid).await;
-        return None;
+    match record_landing(env, &row, &dest) {
+        Ok(true) => {
+            tracing::info!(project_id = pid, frame_uuid = uuid, path = %dest.display(), "frame landed");
+            Landed::Yes(dest)
+        }
+        Ok(false) => {
+            let tag = crate::sharing::iroh::node::project_frame_tag(pid, uuid, row.content_version);
+            forget_stale_landing(env, &row, &tag, &dest).await;
+            Landed::Stale
+        }
+        Err(e) => {
+            fail(format!("record landing: {e:#}"));
+            remove_landed(&dest);
+            unseed_frame(Some(&env.node), pid, uuid).await;
+            Landed::Failed
+        }
     }
-    tracing::info!(project_id = pid, frame_uuid = uuid, path = %dest.display(), "frame landed");
-    Some(crate::collab::hub_client::HolderRefWire {
-        frame_uuid: row.frame_uuid.clone(),
-        content_version: row.content_version,
-    })
 }
 
 // ── Replication policy + loss commands ───────────────────────────────────────
@@ -4692,8 +5276,9 @@ impl ProgressEmitter for OptEmitter {
 /// - `Restore`: rescan the Collaboration root with the same entry the
 ///   Rescan button uses (the scanner repairs moved files), run disk truth
 ///   again so the found files are re-admitted, unpause and kick the worker.
-/// - `StopHolding`: decline every replica that is still missing, then
-///   unpause. Nothing is deleted.
+/// - `StopHolding`: decline every replica whose landed file is really gone
+///   or edited (never one waiting for a new version, R22), then unpause.
+///   Nothing is deleted.
 ///
 /// `_sync` keeps the command surface uniform with the other replication
 /// commands; the resumed pass runs on the worker, kicked.
@@ -4746,19 +5331,31 @@ pub async fn resolve_collab_loss(
             auto_sync_kick().notify_one();
         }
         LossAction::StopHolding => {
-            let db = db(&ctx)?;
-            let conn = db.conn();
-            let missing: Vec<String> =
-                crate::db::collab_frames::list_for_project(&conn, project_id)?
+            // R22: decline only what is really lost — a landed replica whose
+            // file is gone or no longer its content. A row waiting for a new
+            // version (a bump clears `size_mtime_seen`) is not a loss, and an
+            // intact file is left for re-admission.
+            let candidates: Vec<LocalFrameRow> = {
+                let db = db(&ctx)?;
+                crate::db::collab_frames::list_for_project(&db.conn(), project_id)?
                     .into_iter()
                     .filter(|r| {
                         r.origin == FrameOrigin::Replica
                             && !r.on_disk
-                            && r.landed_path.is_some()
                             && !r.locally_declined
+                            && r.landed_path.is_some()
+                            && r.size_mtime_seen.is_some()
                     })
-                    .map(|r| r.frame_uuid)
-                    .collect();
+                    .collect()
+            };
+            let mut missing: Vec<String> = Vec::new();
+            for row in candidates {
+                if replica_file_lost(&row).await {
+                    missing.push(row.frame_uuid);
+                }
+            }
+            let db = db(&ctx)?;
+            let conn = db.conn();
             crate::db::collab_frames::set_declined(&conn, project_id, &missing, true)?;
             crate::db::collab::set_replication_paused(&conn, project_id, false)?;
             tracing::info!(
@@ -4769,6 +5366,29 @@ pub async fn resolve_collab_loss(
         }
     }
     Ok(())
+}
+
+/// Is a landed replica's file really lost — gone, or no longer its content
+/// (R22)? An unchanged `size:mtime` or a matching xxh3 says it is intact.
+async fn replica_file_lost(row: &LocalFrameRow) -> bool {
+    let Some(landed) = row.landed_path.as_deref() else {
+        return true;
+    };
+    let path = Path::new(landed);
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_file() => m,
+        _ => return true,
+    };
+    if row.size_mtime_seen.as_deref() == Some(size_mtime_from(&meta).as_str()) {
+        return false;
+    }
+    match xxh3_on_blocking(path).await {
+        Ok(h) => h != row.xxh3,
+        Err(e) => {
+            tracing::warn!(frame_uuid = %row.frame_uuid, path = %landed, error = %format!("{e:#}"), "hash of a lost frame failed; counted lost");
+            true
+        }
+    }
 }
 
 /// How often the auto-replication worker sweeps every auto-enabled project
@@ -4800,7 +5420,7 @@ pub struct AutoSyncPassOutcome {
     pub failed: usize,
     /// Frames parked until the collab store's GC drops a dead entry (P20).
     pub awaiting_gc: usize,
-    /// Full holder reports sent (cadence and forced passes only, P8).
+    /// Full holder reports sent by the maintenance a forced pass runs first.
     pub reported: usize,
 }
 
@@ -4812,25 +5432,21 @@ fn role_allows_replication(data_role: &str, is_coordinator: bool) -> bool {
     is_coordinator || data_role == "send_receive"
 }
 
-/// One replication pass (spec §5.3, §5.5).
+/// One replication pass (spec §5.3).
 ///
 /// `scope` limits it to one project ("Sync now"); `None` sweeps every live
-/// project (a lost project is never listed, R14). Per project, in order:
+/// project (a lost project is never listed, R14). A `Forced` pass first runs
+/// [`run_maintenance`] for its scope (disk truth, loss guard, full holder
+/// report); a `Fetch` pass never walks the disk — that is the maintenance
+/// loop's job (R18). Per project: [`frame_need`] under the project's policy,
+/// the role gate, the toggle (`Forced` turns it on; the role gate is
+/// authorization and never is) and the pause, then `fetch` — production
+/// binds [`fetch_frames`]; tests inject a recorder.
 ///
-/// 1. `Cadence` / `Forced` only: [`disk_truth`], then the [`loss_guard`]
-///    (skipped when already paused), then the FULL [`report_holders`] — for
-///    every role, since a `send` member still holds its own frames. A
-///    `Kicked` pass never walks the disk and never sends a full report.
-/// 2. Parked frames whose store entry is gone become fetchable again.
-/// 3. [`frame_need`] under the project's policy, the role gate, the toggle
-///    (`Forced` turns it on; the role gate is authorization and never is) and
-///    the pause.
-/// 4. `fetch` — production binds [`fetch_frames`]; tests inject a recorder.
-///
-/// No Collaboration root ⇒ one `warn!` and every project is skipped (P25).
-/// Never returns an error: signed out, an unreadable catalog, a failing
-/// project are each logged and stepped over, because the caller is a loop
-/// that must survive all of them.
+/// No Collaboration root (or one that is not reachable) ⇒ one `warn!` and
+/// every project is skipped (P25, m5). Never returns an error: signed out,
+/// an unreadable catalog, a failing project are each logged and stepped
+/// over, because the caller is a loop that must survive all of them.
 async fn run_auto_sync_pass<F, Fut>(
     ctx: &ServiceContext,
     kind: PassKind,
@@ -4855,9 +5471,11 @@ where
             return outcome;
         }
     }
-    // P25: the one warn of this pass is `require_collaboration_root`'s own.
-    if require_collaboration_root(ctx).is_err() {
+    if mounted_collaboration_root(ctx).is_none() {
         return outcome;
+    }
+    if kind == PassKind::Forced {
+        outcome.reported = run_maintenance(ctx, scope, emitter).await.reported;
     }
 
     let projects = {
@@ -4884,39 +5502,7 @@ where
         let pid = project.project_id.clone();
         let role_allows = role_allows_replication(&project.data_role, project.is_coordinator);
         let auto_on = kind == PassKind::Forced || project.auto_replicate;
-        let mut paused = project.replication_paused;
-
-        if kind.walks_disk() {
-            let truth = match disk_truth(ctx, &pid).await {
-                Ok(truth) => truth,
-                Err(e) => {
-                    tracing::warn!(project_id = %pid, error = %e, "collab auto-sync: disk truth failed; project skipped this pass");
-                    continue;
-                }
-            };
-            if !paused {
-                match loss_guard(ctx, &pid, &truth, emitter) {
-                    Ok(tripped) => paused = tripped,
-                    Err(e) => {
-                        tracing::warn!(project_id = %pid, error = %e, "collab auto-sync: loss guard failed; project skipped this pass");
-                        continue;
-                    }
-                }
-            }
-            // The truth goes to the hub either way — a paused project still
-            // stops advertising what it lost.
-            match report_holders(ctx, &pid, &truth.present).await {
-                Ok(_) => outcome.reported += 1,
-                Err(e) => {
-                    tracing::warn!(project_id = %pid, error = %e, "collab auto-sync: holder report failed")
-                }
-            }
-        }
-
-        if let Err(e) = recheck_awaiting_gc(ctx, &pid).await {
-            tracing::warn!(project_id = %pid, error = %e, "collab auto-sync: parked-frame recheck failed");
-        }
-
+        let paused = project.replication_paused;
         let rows = {
             let database = match db(ctx) {
                 Ok(database) => database,
@@ -4980,9 +5566,16 @@ pub(crate) async fn replication_pass(
     scope: Option<&str>,
     emitter: Option<&dyn ProgressEmitter>,
 ) -> AutoSyncPassOutcome {
-    run_auto_sync_pass(ctx, kind, scope, emitter, move |project_id, need| async move {
-        fetch_frames(ctx, sync, &project_id, need, emitter).await
-    })
+    let forced = kind == PassKind::Forced;
+    run_auto_sync_pass(
+        ctx,
+        kind,
+        scope,
+        emitter,
+        move |project_id, need| async move {
+            fetch_frames(ctx, sync, &project_id, need, forced, emitter).await
+        },
+    )
     .await
 }
 
@@ -4998,13 +5591,27 @@ async fn auto_sync_pass(
     replication_pass(&ctx, &sync, kind, scope.as_deref(), emitter.as_deref()).await
 }
 
-/// The auto-replication loop (spec §3.3): a pass every `interval` OR as soon as a
-/// hub change arrives, after a short startup grace. Beside it, on its own
-/// task, the version poll (R19, ruling R15) asks the hub every
-/// [`COLLAB_VERSION_POLL_INTERVAL`] whether a project moved and only kicks
-/// the pass when one did. Each pass and each poll tick runs on its own task,
-/// so a panic anywhere below is logged and the loops survive it (a background
+/// One tick of the maintenance loop (R18): [`run_maintenance`] over every
+/// live project, then a kick of the pass loop when frames became fetchable
+/// (a replica found missing, a parked one collected).
+async fn maintenance_tick(ctx: Arc<ServiceContext>, emitter: Option<Arc<dyn ProgressEmitter>>) {
+    let m = run_maintenance(&ctx, None, emitter.as_deref()).await;
+    if m.missing + m.cleared > 0 {
+        auto_sync_kick().notify_one();
+    }
+}
+
+/// The auto-replication worker: three loops, each tick on its own task, so a
+/// panic anywhere below is logged and the loops survive it (a background
 /// loop that dies is a feature that silently stops).
+///
+/// - the version poll (R19, ruling R15), every
+///   [`COLLAB_VERSION_POLL_INTERVAL`], kicks the pass when a project moved;
+/// - the maintenance loop (ruling R18), every `interval`: disk truth, the
+///   loss guard, the full holder report — never behind a long fetch, so the
+///   hub's 75-minute holder freshness always holds;
+/// - the pass loop: a [`PassKind::Fetch`] pass every `interval` (the retry
+///   cadence) or as soon as a kick arrives.
 pub async fn run_collab_auto_sync_loop(
     ctx: Arc<ServiceContext>,
     sync: Arc<crate::sync::SyncRuntime>,
@@ -5016,7 +5623,7 @@ pub async fn run_collab_auto_sync_loop(
         poll_secs = COLLAB_VERSION_POLL_INTERVAL.as_secs(),
         "collab auto-sync loop armed"
     );
-    tokio::spawn(version_poll_loop(
+    tokio::spawn(tick_loop(
         COLLAB_VERSION_POLL_STARTUP_DELAY,
         COLLAB_VERSION_POLL_INTERVAL,
         {
@@ -5032,16 +5639,32 @@ pub async fn run_collab_auto_sync_loop(
             }
         },
     ));
+    tokio::spawn(tick_loop(
+        COLLAB_AUTO_SYNC_STARTUP_DELAY.min(interval),
+        interval,
+        {
+            let ctx = Arc::clone(&ctx);
+            let emitter = emitter.clone();
+            move || {
+                let tick = tokio::spawn(maintenance_tick(Arc::clone(&ctx), emitter.clone()));
+                async move {
+                    if let Err(error) = tick.await {
+                        tracing::error!(%error, "collab maintenance task panicked");
+                    }
+                }
+            }
+        },
+    ));
     auto_sync_loop_inner(
         COLLAB_AUTO_SYNC_STARTUP_DELAY.min(interval),
         interval,
         auto_sync_kick(),
-        move |kind| {
+        move || {
             let ctx = Arc::clone(&ctx);
             let sync = Arc::clone(&sync);
             let emitter = emitter.clone();
             async move {
-                let pass = tokio::spawn(auto_sync_pass(ctx, sync, emitter, None, kind));
+                let pass = tokio::spawn(auto_sync_pass(ctx, sync, emitter, None, PassKind::Fetch));
                 if let Err(error) = pass.await {
                     tracing::error!(%error, "collab auto-sync pass task panicked");
                 }
@@ -5051,9 +5674,9 @@ pub async fn run_collab_auto_sync_loop(
     .await
 }
 
-/// The loop's shape, with the pass and the kick injected (the production
-/// binding is [`run_collab_auto_sync_loop`] with [`auto_sync_kick`]; tests
-/// pass a counter and their own `Notify`).
+/// The pass loop's shape, with the pass and the kick injected (the
+/// production binding is [`run_collab_auto_sync_loop`] with
+/// [`auto_sync_kick`]; tests pass a counter and their own `Notify`).
 ///
 /// The startup grace is deliberately NOT interruptible: it exists so bulk pulls
 /// don't compete with app start (receiver boot, initial scan, first render). A
@@ -5064,19 +5687,15 @@ pub async fn run_collab_auto_sync_loop(
 /// stored BEFORE a timer pass (e.g. a version move during the grace) is
 /// drained when that pass starts — the pass about to run already covers it,
 /// so it must not buy a second pass right after. Overlapping per-project work
-/// between a kicked pass and a "Sync now" is prevented by the fetch's
-/// per-project claim, not by the cadence.
-///
-/// A timer pass is [`PassKind::Cadence`] (disk truth + the full holder
-/// report); a kicked one is [`PassKind::Kicked`] (manifest-driven work only,
-/// spec §5.5).
+/// between a pass and a "Sync now" is prevented by the fetch's per-project
+/// claim, not by the cadence.
 async fn auto_sync_loop_inner<F, Fut>(
     startup_delay: std::time::Duration,
     interval: std::time::Duration,
     kick: &tokio::sync::Notify,
     run_pass: F,
 ) where
-    F: Fn(PassKind) -> Fut,
+    F: Fn() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     tokio::time::sleep(startup_delay).await;
@@ -5086,12 +5705,7 @@ async fn auto_sync_loop_inner<F, Fut>(
             // Polling `notified()` once consumes a stored permit, if any.
             let _ = tokio::time::timeout(std::time::Duration::ZERO, kick.notified()).await;
         }
-        run_pass(if timer_pass {
-            PassKind::Cadence
-        } else {
-            PassKind::Kicked
-        })
-        .await;
+        run_pass().await;
         tokio::select! {
             _ = tokio::time::sleep(interval) => timer_pass = true,
             _ = kick.notified() => {
@@ -5124,9 +5738,8 @@ pub fn spawn_collab_auto_sync(
 }
 
 /// Set one project's auto-replication preference (D3 §3.3). Local-only — the hub
-/// never learns of it. The worker reads the column at the start of every pass,
-/// so there is nothing to live-apply: turning it off stops the NEXT pass, and a
-/// download already in flight is finished (it is a receive like any other).
+/// never learns of it. The worker reads the column at the start of every pass;
+/// turning it off also stops a running fetch after its current batch (R19).
 pub fn set_project_auto_replicate(
     ctx: &ServiceContext,
     project_id: &str,
@@ -5139,6 +5752,9 @@ pub fn set_project_auto_replicate(
         return Err(ApiError::Invalid(format!("unknown project {project_id}")));
     }
     tracing::info!(project_id, enabled, "collab auto-replication toggled");
+    if !enabled {
+        cancel_project_fetch(ctx, project_id);
+    }
     Ok(())
 }
 
@@ -7923,7 +8539,7 @@ mod tests {
                     Duration::ZERO,
                     Duration::from_secs(3600),
                     auto_sync_kick(),
-                    move |_kind| {
+                    move || {
                         let passes = Arc::clone(&passes);
                         async move {
                             passes.fetch_add(1, Ordering::SeqCst);
@@ -8590,7 +9206,7 @@ mod tests {
             let polls = Arc::new(AtomicUsize::new(0));
             let task = tokio::spawn({
                 let polls = Arc::clone(&polls);
-                version_poll_loop(Duration::ZERO, Duration::from_millis(10), move || {
+                tick_loop(Duration::ZERO, Duration::from_millis(10), move || {
                     let polls = Arc::clone(&polls);
                     async move {
                         polls.fetch_add(1, Ordering::SeqCst);
@@ -8607,23 +9223,19 @@ mod tests {
         #[tokio::test]
         async fn a_kick_before_a_timer_pass_buys_no_second_pass() {
             let passes = Arc::new(AtomicUsize::new(0));
-            let kinds = Arc::new(std::sync::Mutex::new(Vec::new()));
             let kick = Arc::new(tokio::sync::Notify::new());
             kick.notify_one();
             let task = tokio::spawn({
                 let passes = Arc::clone(&passes);
-                let kinds = Arc::clone(&kinds);
                 let kick = Arc::clone(&kick);
                 async move {
                     auto_sync_loop_inner(
                         Duration::from_millis(20),
                         Duration::from_secs(3600),
                         &kick,
-                        move |kind| {
+                        move || {
                             let passes = Arc::clone(&passes);
-                            let kinds = Arc::clone(&kinds);
                             async move {
-                                kinds.lock().unwrap().push(kind);
                                 passes.fetch_add(1, Ordering::SeqCst);
                             }
                         },
@@ -8645,11 +9257,6 @@ mod tests {
             )
             .await;
             task.abort();
-            assert_eq!(
-                *kinds.lock().unwrap(),
-                vec![PassKind::Cadence, PassKind::Kicked],
-                "the timer pass walks the disk; the kicked one is manifest-driven only"
-            );
         }
     }
 
@@ -9404,6 +10011,13 @@ mod tests {
             .expect("a replication pass must not take two minutes")
         }
 
+        /// What the worker does on a timer tick: maintenance, then a fetch
+        /// pass.
+        pub(super) async fn real_cycle(r: &RFx) -> AutoSyncPassOutcome {
+            run_maintenance(&r.ctx, None, None).await;
+            real_pass(r, PassKind::Fetch).await
+        }
+
         pub(super) async fn sync_rows(r: &RFx) {
             sync_manifest(&r.ctx, PID, None, None).await.unwrap();
         }
@@ -9531,7 +10145,7 @@ mod tests {
             let r = rfx("send_receive").await;
             land_and_lose(&r, 3, 1, 256);
             let em = RecordingEmitter::default();
-            pass_with(&r.ctx, &Arc::default(), PassKind::Cadence, None, Some(&em)).await;
+            run_maintenance(&r.ctx, None, Some(&em)).await;
             assert!(!paused(&r));
             assert!(paused_events(&em).is_empty());
             assert!(!row(&r.ctx, "f00").unwrap().on_disk, "still missing");
@@ -9544,7 +10158,7 @@ mod tests {
             land_and_lose(&r, 18, 2, 256);
             let em = RecordingEmitter::default();
             let logs = capture_logs();
-            pass_with(&r.ctx, &Arc::default(), PassKind::Cadence, None, Some(&em)).await;
+            run_maintenance(&r.ctx, None, Some(&em)).await;
             assert!(paused(&r));
             let events = paused_events(&em);
             assert_eq!(events.len(), 1);
@@ -9560,7 +10174,7 @@ mod tests {
             let em2 = RecordingEmitter::default();
             std::fs::remove_file(row(&r.ctx, "f05").unwrap().landed_path.unwrap()).unwrap();
             std::fs::remove_file(row(&r.ctx, "f06").unwrap().landed_path.unwrap()).unwrap();
-            pass_with(&r.ctx, &Arc::default(), PassKind::Cadence, None, Some(&em2)).await;
+            run_maintenance(&r.ctx, None, Some(&em2)).await;
             assert!(paused_events(&em2).is_empty());
         }
 
@@ -9577,17 +10191,39 @@ mod tests {
                     .unwrap();
             }
             land_and_lose(&r, 30, 2, 64);
-            pass_with(&r.ctx, &Arc::default(), PassKind::Cadence, None, None).await;
+            run_maintenance(&r.ctx, None, None).await;
             assert!(paused(&r), "128 bytes missing > 100");
         }
 
-        /// "Stop holding" declines exactly the missing replicas and unpauses.
+        /// "Stop holding" declines exactly the replicas whose file is really
+        /// lost, never a row waiting for a new version or an intact file
+        /// (R22), and unpauses.
         #[tokio::test]
         async fn stop_holding_declines_the_missing_and_unpauses() {
             let r = rfx("send_receive").await;
             land_and_lose(&r, 18, 2, 256);
-            pass_with(&r.ctx, &Arc::default(), PassKind::Cadence, None, None).await;
+            run_maintenance(&r.ctx, None, None).await;
             assert!(paused(&r));
+
+            // R22: two not-on-disk rows that are NOT losses — one waiting for
+            // a new version with its old file intact, one whose file is
+            // intact (a parked or not-yet-re-admitted frame).
+            land_file(&r, "vp", FrameOrigin::Replica, &pattern(40, 256));
+            land_file(&r, "ok1", FrameOrigin::Replica, &pattern(41, 256));
+            {
+                let conn = db(&r.ctx).unwrap().conn();
+                conn.execute(
+                    "UPDATE project_frames_local SET content_version = 2, on_disk = 0,
+                         size_mtime_seen = NULL WHERE frame_uuid = 'vp'",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE project_frames_local SET on_disk = 0 WHERE frame_uuid = 'ok1'",
+                    [],
+                )
+                .unwrap();
+            }
 
             resolve_collab_loss(
                 Arc::clone(&r.ctx),
@@ -9660,7 +10296,7 @@ mod tests {
             std::fs::remove_file(dir.join("f2.fits")).unwrap();
 
             let from = request_count(&r.hub).await;
-            let out = pass_with(&r.ctx, &Arc::default(), PassKind::Cadence, None, None).await;
+            let out = run_maintenance(&r.ctx, None, None).await;
             assert_eq!(out.reported, 1);
             let reqs = r.hub.server.received_requests().await.unwrap();
             let puts = holder_puts(&reqs[from..]);
@@ -9696,10 +10332,11 @@ mod tests {
 
         // ── pass kinds and gates ─────────────────────────────────────────────
 
-        /// Spec §5.5 / R15: a kicked pass does manifest-driven work only — no
-        /// stat walk, no full holder report. The cadence pass does both.
+        /// Spec §5.5 / R15 / R18: a fetch pass (timer or kick) does
+        /// manifest-driven work only — no stat walk, no full holder report.
+        /// The maintenance does both.
         #[tokio::test]
-        async fn a_kicked_pass_walks_no_disk_and_sends_no_full_report() {
+        async fn a_fetch_pass_walks_no_disk_and_sends_no_full_report() {
             let r = rfx("send_receive").await;
             r.hub.seed_frames(PID, "acc-o", &["n1"], "published");
             sync_rows(&r).await;
@@ -9708,7 +10345,7 @@ mod tests {
 
             let rec = Arc::new(FetchRecorder::default());
             let from = request_count(&r.hub).await;
-            let out = pass_with(&r.ctx, &rec, PassKind::Kicked, None, None).await;
+            let out = pass_with(&r.ctx, &rec, PassKind::Fetch, None, None).await;
             assert_eq!(out.reported, 0);
             assert!(row(&r.ctx, "f1").unwrap().on_disk, "no stat walk");
             let reqs = r.hub.server.received_requests().await.unwrap();
@@ -9719,13 +10356,15 @@ mod tests {
                 "the need set still goes to the fetch"
             );
 
-            let out = pass_with(&r.ctx, &rec, PassKind::Cadence, None, None).await;
-            assert_eq!(out.reported, 1);
+            let m = run_maintenance(&r.ctx, None, None).await;
+            assert_eq!(m.reported, 1);
             assert!(!row(&r.ctx, "f1").unwrap().on_disk);
+            let reqs = r.hub.server.received_requests().await.unwrap();
+            assert_eq!(holder_puts(&reqs[from..]).len(), 1);
         }
 
         /// A `send` member replicates nothing (but still reports what it
-        /// holds); a project with auto-replicate off is skipped by the timer
+        /// holds); a project with auto-replicate off is skipped by a fetch
         /// pass and synced by a forced one.
         #[tokio::test]
         async fn the_role_gate_holds_and_only_a_forced_pass_overrides_the_toggle() {
@@ -9733,10 +10372,13 @@ mod tests {
             send.hub.seed_frames(PID, "acc-o", &["n1"], "published");
             sync_rows(&send).await;
             let rec = Arc::new(FetchRecorder::default());
-            for kind in [PassKind::Cadence, PassKind::Forced] {
-                let out = pass_with(&send.ctx, &rec, kind, None, None).await;
-                assert_eq!(out.reported, 1, "a send member still reports its holds");
-            }
+            assert_eq!(
+                run_maintenance(&send.ctx, None, None).await.reported,
+                1,
+                "a send member still reports its holds"
+            );
+            let out = pass_with(&send.ctx, &rec, PassKind::Forced, None, None).await;
+            assert_eq!(out.reported, 1, "a forced pass runs the maintenance first");
             assert!(rec.projects().is_empty(), "the role gate is never forced");
 
             let off = rfx("send_receive").await;
@@ -9744,8 +10386,7 @@ mod tests {
             sync_rows(&off).await;
             set_project_auto_replicate(&off.ctx, PID, false).unwrap();
             let rec = Arc::new(FetchRecorder::default());
-            pass_with(&off.ctx, &rec, PassKind::Cadence, None, None).await;
-            pass_with(&off.ctx, &rec, PassKind::Kicked, None, None).await;
+            pass_with(&off.ctx, &rec, PassKind::Fetch, None, None).await;
             assert!(rec.projects().is_empty(), "the toggle is off");
             let out = pass_with(&off.ctx, &rec, PassKind::Forced, Some(PID), None).await;
             assert_eq!(rec.projects(), vec![PID.to_string()]);
@@ -9754,7 +10395,8 @@ mod tests {
             assert_eq!(out.projects, 0, "a scoped pass touches only its project");
         }
 
-        /// Signed out, or no Collaboration root: the pass does nothing.
+        /// Signed out, no Collaboration root, or a root that is not
+        /// reachable (m5): the pass and the maintenance do nothing.
         #[tokio::test]
         async fn the_pass_is_a_no_op_signed_out_or_without_a_collaboration_root() {
             let Fx {
@@ -9767,8 +10409,12 @@ mod tests {
             sync_manifest(&ctx, PID, None, None).await.unwrap();
             let rec = Arc::new(FetchRecorder::default());
             let from = request_count(&hub).await;
-            let out = pass_with(&ctx, &rec, PassKind::Cadence, None, None).await;
+            let out = pass_with(&ctx, &rec, PassKind::Fetch, None, None).await;
             assert_eq!(out, AutoSyncPassOutcome::default());
+            assert_eq!(
+                run_maintenance(&ctx, None, None).await,
+                MaintenanceOutcome::default()
+            );
             assert!(rec.projects().is_empty());
             assert_eq!(
                 request_count(&hub).await,
@@ -9787,8 +10433,24 @@ mod tests {
                 )
                 .unwrap();
             }
-            let out = pass_with(&r.ctx, &rec, PassKind::Cadence, None, None).await;
+            let out = pass_with(&r.ctx, &rec, PassKind::Fetch, None, None).await;
             assert_eq!(out, AutoSyncPassOutcome::default());
+
+            // Signed in, but the Collaboration folder's volume is gone: no
+            // landed file may be counted missing, nothing is fetched.
+            let r = rfx("send_receive").await;
+            r.hub.seed_frames(PID, "acc-o", &["n1"], "published");
+            sync_rows(&r).await;
+            land_file(&r, "f1", FrameOrigin::Replica, &pattern(1, 256));
+            std::fs::remove_dir_all(&r.collab).unwrap();
+            assert_eq!(
+                run_maintenance(&r.ctx, None, None).await,
+                MaintenanceOutcome::default()
+            );
+            let out = pass_with(&r.ctx, &rec, PassKind::Forced, None, None).await;
+            assert_eq!(out, AutoSyncPassOutcome::default());
+            assert!(rec.projects().is_empty());
+            assert!(row(&r.ctx, "f1").unwrap().on_disk, "not counted missing");
         }
 
         /// One project's failing fetch never ends the pass.
@@ -9811,7 +10473,7 @@ mod tests {
             sync_manifest(&r.ctx, "p2", None, None).await.unwrap();
             let rec = Arc::new(FetchRecorder::default());
             rec.fail.lock().unwrap().insert(PID.to_string());
-            let out = pass_with(&r.ctx, &rec, PassKind::Cadence, None, None).await;
+            let out = pass_with(&r.ctx, &rec, PassKind::Fetch, None, None).await;
             let mut projects = rec.projects();
             projects.sort();
             assert_eq!(projects, vec![PID.to_string(), "p2".to_string()]);
@@ -9898,7 +10560,7 @@ mod tests {
             let hash = publish_on(&r, &publisher, "f1", "c_x.fits", &bytes).await;
             sync_rows(&r).await;
 
-            let out = real_pass(&r, PassKind::Cadence).await;
+            let out = real_cycle(&r).await;
             assert_eq!((out.landed, out.failed), (1, 0), "{out:?}");
 
             let dest = r.collab.join("m31").join("other").join("c_x.fits");
@@ -9971,12 +10633,12 @@ mod tests {
             let bytes = pattern(3, SIZE);
             let hash = publish_on(&r, &publisher, "f1", "c_x.fits", &bytes).await;
             sync_rows(&r).await;
-            assert_eq!(real_pass(&r, PassKind::Cadence).await.landed, 1);
+            assert_eq!(real_cycle(&r).await.landed, 1);
 
             let dest = PathBuf::from(row(&r.ctx, "f1").unwrap().landed_path.unwrap());
             std::fs::remove_file(&dest).unwrap();
             let before = sent_bytes(&publisher);
-            let out = real_pass(&r, PassKind::Cadence).await;
+            let out = real_cycle(&r).await;
             assert_eq!(out.attempted, 0, "{out:?}");
             let row1 = row(&r.ctx, "f1").unwrap();
             assert!(!row1.on_disk && row1.awaiting_gc);
@@ -9997,7 +10659,7 @@ mod tests {
             }
             gc_open.store(false, Ordering::SeqCst);
 
-            let out = real_pass(&r, PassKind::Cadence).await;
+            let out = real_cycle(&r).await;
             assert_eq!(out.landed, 1, "{out:?}");
             assert_eq!(std::fs::read(&dest).unwrap(), bytes, "the frame is back");
             assert!(row(&r.ctx, "f1").unwrap().on_disk);
@@ -10018,7 +10680,7 @@ mod tests {
             let v1 = pattern(1, 256 * 1024);
             publish_on(&r, &publisher, "f1", "c_x.fits", &v1).await;
             sync_rows(&r).await;
-            assert_eq!(real_pass(&r, PassKind::Cadence).await.landed, 1);
+            assert_eq!(real_cycle(&r).await.landed, 1);
             let dest = r.collab.join("m31").join("other").join("c_x.fits");
             assert_eq!(std::fs::read(&dest).unwrap(), v1);
 
@@ -10057,7 +10719,7 @@ mod tests {
                 "a new version is needed"
             );
 
-            let out = real_pass(&r, PassKind::Kicked).await;
+            let out = real_pass(&r, PassKind::Fetch).await;
             assert_eq!(out.landed, 1, "{out:?}");
             assert_eq!(std::fs::read(&dest).unwrap(), v2, "v2 over v1, same path");
             assert!(!r
@@ -10080,7 +10742,8 @@ mod tests {
         }
 
         /// P11 isolation: a frame no holder can serve fails alone; its sibling
-        /// lands, and the failed frame's in-flight tag is gone.
+        /// lands. The failed frame keeps its in-flight tag while it is still
+        /// wanted and loses it to the maintenance sweep once it is not (R23).
         #[tokio::test]
         async fn fetch_failure_of_one_frame_lands_the_others() {
             let r = rfx("send_receive").await;
@@ -10104,12 +10767,31 @@ mod tests {
             });
             sync_rows(&r).await;
 
-            let out = real_pass(&r, PassKind::Cadence).await;
+            let out = real_cycle(&r).await;
             assert_eq!((out.landed, out.failed), (1, 1), "{out:?}");
             assert!(row(&r.ctx, "good").unwrap().on_disk);
             let ghost_row = row(&r.ctx, "ghost").unwrap();
             assert!(!ghost_row.on_disk);
             assert!(ghost_row.last_error.is_some());
+            assert_eq!(
+                collab_tags(&recv, "in-flight/").await,
+                1,
+                "a transfer failure keeps its in-flight tag for the resume (R23)"
+            );
+            assert_eq!(collab_tags(&recv, "in-flight/project/p1/ghost/1").await, 1);
+
+            // Still wanted: the maintenance sweep keeps it.
+            run_maintenance(&r.ctx, None, None).await;
+            assert_eq!(collab_tags(&recv, "in-flight/").await, 1);
+            // Declined: the frame left the need set, the sweep drops the tag.
+            frames_db::set_declined(
+                &db(&r.ctx).unwrap().conn(),
+                PID,
+                &["ghost".to_string()],
+                true,
+            )
+            .unwrap();
+            run_maintenance(&r.ctx, None, None).await;
             assert_eq!(collab_tags(&recv, "in-flight/").await, 0);
             publisher.shutdown().await;
             recv.shutdown().await;
@@ -10128,7 +10810,7 @@ mod tests {
             let bytes = pattern(5, SIZE);
             let hash = publish_on(&r, &publisher, "f1", "c_x.fits", &bytes).await;
             sync_rows(&r).await;
-            assert_eq!(real_pass(&r, PassKind::Cadence).await.landed, 1);
+            assert_eq!(real_cycle(&r).await.landed, 1);
 
             r.hub.seed_frames(PID, "acc-o", &["f2"], "published");
             let x = hash_bytes(&bytes);
@@ -10140,7 +10822,7 @@ mod tests {
             });
             sync_rows(&r).await;
             let before = sent_bytes(&publisher);
-            let out = real_pass(&r, PassKind::Kicked).await;
+            let out = real_pass(&r, PassKind::Fetch).await;
             assert_eq!(out.landed, 1, "{out:?}");
             let dest = r.collab.join("m31").join("other").join("c_y.fits");
             assert_eq!(std::fs::read(&dest).unwrap(), bytes);
@@ -10175,7 +10857,7 @@ mod tests {
             });
             sync_rows(&r).await;
             let before = sent_bytes(&publisher);
-            let out = real_pass(&r, PassKind::Kicked).await;
+            let out = real_pass(&r, PassKind::Fetch).await;
             assert_eq!((out.landed, out.failed), (2, 0), "{out:?}");
             for name in ["t_1.fits", "t_2.fits"] {
                 let p = r.collab.join("m31").join("other").join(name);
@@ -10185,6 +10867,536 @@ mod tests {
             assert!(
                 served < (SIZE as u64) * 3 / 2,
                 "the content moved once for both frames: {served} B"
+            );
+            publisher.shutdown().await;
+            recv.shutdown().await;
+        }
+
+        // ── fix round 1 (R16–R24, m5, m10) ───────────────────────────────────
+
+        /// `acc-o` publishes every uuid (1 KiB each, distinct bytes), seeded
+        /// on `publisher`, listed by the hub in one batch.
+        pub(super) async fn publish_many(
+            r: &RFx,
+            publisher: &Arc<SharedIrohNode>,
+            uuids: &[String],
+            size: usize,
+        ) {
+            set_publisher_key(r, publisher);
+            let dir = r.tmp.path().join("pub-many");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut facts = Vec::new();
+            for (i, u) in uuids.iter().enumerate() {
+                let bytes = pattern(1000 + i, size);
+                let path = dir.join(format!("{u}.fits"));
+                std::fs::write(&path, &bytes).unwrap();
+                let hash = publisher
+                    .seed_project_frame(PID, u, 1, &path)
+                    .await
+                    .unwrap();
+                facts.push((u.clone(), hash.to_hex().to_string(), hash_bytes(&bytes)));
+            }
+            let refs: Vec<&str> = uuids.iter().map(String::as_str).collect();
+            r.hub.seed_frames(PID, "acc-o", &refs, "published");
+            let mut st = r.hub.state.lock().unwrap();
+            let p = st.projects.get_mut(PID).unwrap();
+            for (u, b3, x) in facts {
+                let f = p.frames.get_mut(&u).unwrap();
+                f.file_name = format!("{u}.fits");
+                f.blake3 = b3;
+                f.xxh3 = x;
+                f.byte_size = size as i64;
+            }
+        }
+
+        /// A receiver, a publisher and `n` published frames: `f000…` and a
+        /// last one, `z-last`, which sorts after every other.
+        pub(super) async fn many_rig(
+            n: usize,
+        ) -> (
+            RFx,
+            Arc<SharedIrohNode>,
+            Arc<SharedIrohNode>,
+            tempfile::TempDir,
+        ) {
+            let r = rfx("send_receive").await;
+            let recv = bind_receiver(&r).await;
+            let pub_dir = tempfile::tempdir().unwrap();
+            let publisher = peer_node(pub_dir.path()).await;
+            pair(&recv, &publisher).await;
+            let mut uuids: Vec<String> = (0..n - 1).map(|i| format!("f{i:03}")).collect();
+            uuids.push("z-last".into());
+            publish_many(&r, &publisher, &uuids, 1024).await;
+            sync_rows(&r).await;
+            (r, recv, publisher, pub_dir)
+        }
+
+        /// The need set through the gated fetch, as the pass would run it.
+        pub(super) async fn fetch_all(
+            r: &RFx,
+            gate: Option<&crate::sync::ReceiveGate>,
+        ) -> FetchOutcome {
+            let need = frame_need(
+                &rows(&r.ctx),
+                &ReplicationPolicy::default(),
+                true,
+                true,
+                false,
+            );
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                fetch_frames_gated(&r.ctx, gate, PID, need, false, None),
+            )
+            .await
+            .expect("a fetch must not take two minutes")
+            .unwrap()
+        }
+
+        pub(super) async fn holder_lookups(r: &RFx, uuid: &str) -> usize {
+            let suffix = format!("/frames/{uuid}/holders");
+            r.hub
+                .server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|q| q.url.path().ends_with(&suffix))
+                .count()
+        }
+
+        /// A second catalog connection (another writer, e.g. a manifest sync
+        /// on the poll's task).
+        pub(super) fn side_conn(r: &RFx) -> rusqlite::Connection {
+            let c = rusqlite::Connection::open(db(&r.ctx).unwrap().path()).unwrap();
+            c.busy_timeout(Duration::from_secs(5)).unwrap();
+            c
+        }
+
+        /// R16: frames no holder can serve never take a batch slot — 201 of
+        /// them ahead (rarest first: nobody holds them) must not stop the one
+        /// servable frame behind them from landing in the same pass.
+        #[tokio::test]
+        async fn unservable_frames_ahead_never_block_a_servable_one() {
+            let r = rfx("send_receive").await;
+            let recv = bind_receiver(&r).await;
+            let pub_dir = tempfile::tempdir().unwrap();
+            let publisher = peer_node(pub_dir.path()).await;
+            pair(&recv, &publisher).await;
+            // Published by an account with no device: no holder, ever.
+            let orphans: Vec<String> = (0..=FETCH_BATCH).map(|i| format!("o{i:03}")).collect();
+            let refs: Vec<&str> = orphans.iter().map(String::as_str).collect();
+            r.hub.seed_frames(PID, "acc-x", &refs, "published");
+            publish_on(&r, &publisher, "good", "good.fits", &pattern(3, 4096)).await;
+            sync_rows(&r).await;
+            let need = frame_need(
+                &rows(&r.ctx),
+                &ReplicationPolicy::default(),
+                true,
+                true,
+                false,
+            );
+            assert_eq!(
+                need.last().unwrap().frame_uuid,
+                "good",
+                "the orphans come first"
+            );
+
+            let out = real_pass(&r, PassKind::Fetch).await;
+            assert_eq!((out.landed, out.failed), (1, 0), "{out:?}");
+            assert!(row(&r.ctx, "good").unwrap().on_disk);
+            publisher.shutdown().await;
+            recv.shutdown().await;
+        }
+
+        /// R17: the receive permit is taken per batch. A personal-sync
+        /// receive that asks for the (one-lane) gate while the second batch
+        /// is being prepared gets it — and finishes — before the fetch ends.
+        #[tokio::test]
+        async fn a_personal_receive_gets_the_gate_between_batches() {
+            let (r, recv, publisher, _pub_dir) = many_rig(FETCH_BATCH + 1).await;
+            let gate = Arc::new(crate::sync::ReceiveGate::new(1));
+            let acquired = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+            let released = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+            {
+                let handle = tokio::runtime::Handle::current();
+                let (gate, acquired, released) = (
+                    Arc::clone(&gate),
+                    Arc::clone(&acquired),
+                    Arc::clone(&released),
+                );
+                r.hub.before_next("/frames/z-last/holders", move |_| {
+                    handle.spawn(async move {
+                        let permit = gate.acquire().await;
+                        *acquired.lock().unwrap() = Some(std::time::Instant::now());
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        drop(permit);
+                        *released.lock().unwrap() = Some(std::time::Instant::now());
+                    });
+                });
+            }
+            let out = fetch_all(&r, Some(&gate)).await;
+            let end = std::time::Instant::now();
+            assert_eq!(out.landed, FETCH_BATCH + 1, "{out:?}");
+            assert!(
+                acquired.lock().unwrap().is_some(),
+                "the personal receive got a lane"
+            );
+            let released = released
+                .lock()
+                .unwrap()
+                .expect("…and was done with it before the collab fetch ended");
+            assert!(released <= end);
+            publisher.shutdown().await;
+            recv.shutdown().await;
+        }
+
+        /// R18: the maintenance never waits for a fetch — while one is in
+        /// flight (held here by the seam), a maintenance run still walks the
+        /// disk and sends the full holder report.
+        #[tokio::test]
+        async fn maintenance_reports_while_a_fetch_is_in_flight() {
+            let r = rfx("send_receive").await;
+            r.hub.seed_frames(PID, "acc-o", &["n1"], "published");
+            sync_rows(&r).await;
+            land_file(&r, "mine", FrameOrigin::Own, &pattern(1, 256));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let from = request_count(&r.hub).await;
+            let pass = {
+                let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+                run_auto_sync_pass(&r.ctx, PassKind::Fetch, None, None, move |_pid, _need| {
+                    let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(FetchOutcome::default())
+                    }
+                })
+            };
+            let maintenance = async {
+                entered.notified().await;
+                let m = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    run_maintenance(&r.ctx, None, None),
+                )
+                .await
+                .expect("the maintenance never waits for a running fetch");
+                release.notify_one();
+                m
+            };
+            let (_out, m) = tokio::join!(pass, maintenance);
+            assert_eq!(m.reported, 1);
+            let reqs = r.hub.server.received_requests().await.unwrap();
+            let puts = holder_puts(&reqs[from..]);
+            assert_eq!(puts.len(), 1);
+            assert_eq!(puts[0]["full"], true);
+        }
+
+        /// R19: a cancel lands between batches — the running batch finishes,
+        /// the next one never starts.
+        #[tokio::test]
+        async fn a_cancel_stops_the_fetch_between_batches() {
+            let (r, recv, publisher, _pub_dir) = many_rig(FETCH_BATCH + 1).await;
+            let was_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let (ctx, was_running) = (Arc::clone(&r.ctx), Arc::clone(&was_running));
+                r.hub.before_next("/frames/f000/holders", move |_| {
+                    was_running.store(
+                        cancel_project_fetch(&ctx, PID),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                });
+            }
+            let out = fetch_all(&r, None).await;
+            assert!(was_running.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(out.landed, FETCH_BATCH, "the first batch finishes");
+            assert!(!row(&r.ctx, "z-last").unwrap().on_disk);
+            assert_eq!(
+                holder_lookups(&r, "z-last").await,
+                0,
+                "the second never starts"
+            );
+            assert!(!cancel_project_fetch(&r.ctx, PID), "unregistered once done");
+            publisher.shutdown().await;
+            recv.shutdown().await;
+        }
+
+        /// R19: between batches the queue is re-read — a frame declined while
+        /// the first batch ran is dropped before its own batch.
+        #[tokio::test]
+        async fn a_frame_declined_mid_fetch_is_dropped_before_its_batch() {
+            let (r, recv, publisher, _pub_dir) = many_rig(FETCH_BATCH + 1).await;
+            let conn = std::sync::Mutex::new(side_conn(&r));
+            r.hub.before_next("/frames/f000/holders", move |_| {
+                conn.lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE project_frames_local SET locally_declined = 1
+                         WHERE frame_uuid = 'z-last'",
+                        [],
+                    )
+                    .unwrap();
+            });
+            let out = fetch_all(&r, None).await;
+            assert_eq!(out.landed, FETCH_BATCH);
+            assert!(!row(&r.ctx, "z-last").unwrap().on_disk);
+            assert_eq!(holder_lookups(&r, "z-last").await, 0);
+            publisher.shutdown().await;
+            recv.shutdown().await;
+        }
+
+        /// R20: a manifest sync that moves a frame to a new version while its
+        /// old bytes are in flight — the landing is stale: the old bytes are
+        /// never recorded as the new version, no tag and no file remain.
+        #[tokio::test]
+        async fn a_version_bump_while_in_flight_is_not_recorded_as_landed() {
+            let r = rfx("send_receive").await;
+            let recv = bind_receiver(&r).await;
+            let pub_dir = tempfile::tempdir().unwrap();
+            let publisher = peer_node(pub_dir.path()).await;
+            pair(&recv, &publisher).await;
+            publish_on(&r, &publisher, "f1", "c_x.fits", &pattern(1, 64 * 1024)).await;
+            sync_rows(&r).await;
+            let v2 = pattern(2, 64 * 1024);
+            let (b3, x) = (blake3::hash(&v2).to_hex().to_string(), hash_bytes(&v2));
+            let conn = std::sync::Mutex::new(side_conn(&r));
+            r.hub.before_next("/frames/f1/holders", move |_| {
+                conn.lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE project_frames_local SET content_version = 2, blake3 = ?1,
+                             xxh3 = ?2, on_disk = 0, size_mtime_seen = NULL
+                         WHERE frame_uuid = 'f1'",
+                        rusqlite::params![b3, x],
+                    )
+                    .unwrap();
+            });
+
+            let out = real_pass(&r, PassKind::Fetch).await;
+            assert_eq!(out.landed, 0, "{out:?}");
+            let row = row(&r.ctx, "f1").unwrap();
+            assert_eq!(row.content_version, 2);
+            assert!(!row.on_disk);
+            assert!(row.landed_path.is_none(), "v1 bytes were not recorded");
+            assert!(!r.collab.join("m31").join("other").join("c_x.fits").exists());
+            assert_eq!(collab_tags(&recv, "project/p1/f1/").await, 0);
+            assert_eq!(collab_tags(&recv, "in-flight/").await, 0);
+            let history: i64 = db(&r.ctx)
+                .unwrap()
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_history WHERE frame_uuid = 'f1'",
+                    [],
+                    |q| q.get(0),
+                )
+                .unwrap();
+            assert_eq!(history, 0);
+            publisher.shutdown().await;
+            recv.shutdown().await;
+        }
+
+        /// R21: a version-bumped replica's old file (same size) is hashed
+        /// once; while its `size:mtime` stays the same it is not hashed again.
+        #[tokio::test]
+        async fn a_rejected_old_file_is_not_hashed_again() {
+            let r = rfx("send_receive").await;
+            let node = bind_receiver(&r).await;
+            let path = land_file(&r, "f1", FrameOrigin::Replica, &pattern(1, 4096));
+            let v2 = pattern(2, 4096);
+            db(&r.ctx)
+                .unwrap()
+                .conn()
+                .execute(
+                    "UPDATE project_frames_local SET content_version = 2, blake3 = ?1,
+                         xxh3 = ?2, on_disk = 0, size_mtime_seen = NULL
+                     WHERE frame_uuid = 'f1'",
+                    rusqlite::params![blake3::hash(&v2).to_hex().to_string(), hash_bytes(&v2)],
+                )
+                .unwrap();
+
+            let t1 = disk_truth(&r.ctx, PID).await.unwrap();
+            assert_eq!(t1.rehashed, 1);
+            assert!(t1.present.is_empty() && t1.missing_replicas.is_empty());
+            let t2 = disk_truth(&r.ctx, PID).await.unwrap();
+            assert_eq!(t2.rehashed, 0, "the rejected file is not hashed again");
+            bump_mtime(&path, 10);
+            let t3 = disk_truth(&r.ctx, PID).await.unwrap();
+            assert_eq!(t3.rehashed, 1, "a touched file is looked at again");
+            node.shutdown().await;
+        }
+
+        /// m5: a replica recorded outside the current Collaboration folder
+        /// counts as missing; an own frame may live anywhere (P26).
+        #[tokio::test]
+        async fn a_replica_outside_the_collaboration_folder_counts_missing() {
+            let r = rfx("send_receive").await;
+            land_file(&r, "in", FrameOrigin::Replica, &pattern(1, 256));
+            let elsewhere = r.tmp.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            for (uuid, origin, seed) in [
+                ("out", FrameOrigin::Replica, 2),
+                ("mine", FrameOrigin::Own, 3),
+            ] {
+                let inside = land_file(&r, uuid, origin, &pattern(seed, 256));
+                let moved = elsewhere.join(format!("{uuid}.fits"));
+                std::fs::rename(&inside, &moved).unwrap();
+                let sm = size_mtime_from(&std::fs::metadata(&moved).unwrap());
+                let conn = db(&r.ctx).unwrap().conn();
+                frames_db::update_landed_path(&conn, PID, uuid, &moved.to_string_lossy()).unwrap();
+                frames_db::set_size_mtime_seen(&conn, PID, uuid, &sm).unwrap();
+            }
+            let truth = disk_truth(&r.ctx, PID).await.unwrap();
+            assert_eq!(truth.missing_replicas, vec!["out".to_string()]);
+            let mut present: Vec<String> = truth.present.into_iter().map(|(u, _)| u).collect();
+            present.sort();
+            assert_eq!(present, vec!["in".to_string(), "mine".to_string()]);
+        }
+
+        /// P24/P20 (m10): two own frames share one store entry; deleting the
+        /// one whose path the store reads leaves the other unservable — it is
+        /// parked, and re-admitted from its own intact file once GC dropped
+        /// the dead entry.
+        #[tokio::test]
+        async fn a_survivor_of_a_deleted_identical_frame_is_parked_then_readmitted() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let r = rfx("send_receive").await;
+            let gc_open = Arc::new(AtomicBool::new(false));
+            crate::sharing::iroh::node::test_gc::arm(Some(Arc::clone(&gc_open)));
+            let node = bind_receiver(&r).await;
+            crate::sharing::iroh::node::test_gc::arm(None);
+            let bytes = pattern(5, 64 * 1024);
+            let p1 = land_file(&r, "f1", FrameOrigin::Own, &bytes);
+            let p2 = land_file(&r, "f2", FrameOrigin::Own, &bytes);
+            let hash = node.seed_project_frame(PID, "f1", 1, &p1).await.unwrap();
+            node.seed_project_frame(PID, "f2", 1, &p2).await.unwrap();
+
+            std::fs::remove_file(&p1).unwrap();
+            let truth = disk_truth(&r.ctx, PID).await.unwrap();
+            assert_eq!(truth.missing_own, vec!["f1".to_string()]);
+            assert_eq!(truth.parked, vec!["f2".to_string()]);
+            assert!(
+                truth.present.is_empty(),
+                "f2 is not advertised while unservable"
+            );
+            let f2 = row(&r.ctx, "f2").unwrap();
+            assert!(!f2.on_disk && f2.awaiting_gc);
+            assert_eq!(collab_tags(&node, "project/p1/").await, 0);
+
+            gc_open.store(true, Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while node.collab_blob_health(hash).await.unwrap() != BlobHealth::Missing {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "GC never dropped the entry"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            gc_open.store(false, Ordering::SeqCst);
+
+            let truth = disk_truth(&r.ctx, PID).await.unwrap();
+            assert_eq!(truth.present, vec![("f2".to_string(), 1)]);
+            assert!(row(&r.ctx, "f2").unwrap().on_disk);
+            assert_eq!(collab_tags(&node, "project/p1/f2/1").await, 1);
+            assert_eq!(
+                node.collab_blob_health(hash).await.unwrap(),
+                BlobHealth::Readable
+            );
+            node.shutdown().await;
+        }
+
+        /// R24: a same-version re-land never destroys an edited replica —
+        /// the edited file is kept beside the frame fetched again.
+        #[tokio::test]
+        async fn an_edited_replica_is_kept_beside_the_refetched_frame() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            const SIZE: usize = 256 * 1024;
+            let r = rfx("send_receive").await;
+            let gc_open = Arc::new(AtomicBool::new(false));
+            crate::sharing::iroh::node::test_gc::arm(Some(Arc::clone(&gc_open)));
+            let recv = bind_receiver(&r).await;
+            crate::sharing::iroh::node::test_gc::arm(None);
+            let pub_dir = tempfile::tempdir().unwrap();
+            let publisher = peer_node(pub_dir.path()).await;
+            pair(&recv, &publisher).await;
+            let original = pattern(4, SIZE);
+            let hash = publish_on(&r, &publisher, "f1", "c_x.fits", &original).await;
+            sync_rows(&r).await;
+            assert_eq!(real_cycle(&r).await.landed, 1);
+
+            let dest = r.collab.join("m31").join("other").join("c_x.fits");
+            let edited = pattern(9, SIZE);
+            std::fs::write(&dest, &edited).unwrap();
+            bump_mtime(&dest, 10);
+            run_maintenance(&r.ctx, None, None).await;
+            assert!(
+                !row(&r.ctx, "f1").unwrap().on_disk,
+                "the edit counts missing"
+            );
+
+            gc_open.store(true, Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while recv.collab_blob_health(hash).await.unwrap() != BlobHealth::Missing {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "GC never dropped the entry"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            gc_open.store(false, Ordering::SeqCst);
+
+            let out = real_cycle(&r).await;
+            assert_eq!(out.landed, 1, "{out:?}");
+            assert_eq!(std::fs::read(&dest).unwrap(), original, "the frame is back");
+            let aside = r.collab.join("m31").join("other").join("c_x_2.fits");
+            assert_eq!(std::fs::read(&aside).unwrap(), edited, "the edit is kept");
+            publisher.shutdown().await;
+            recv.shutdown().await;
+        }
+
+        /// R23: a transfer interrupted mid-frame keeps its in-flight tag and
+        /// verified partial bytes; the next pass resumes instead of starting
+        /// over.
+        #[tokio::test]
+        async fn an_interrupted_transfer_resumes_from_its_partial_bytes() {
+            const SIZE: usize = 3 * 1024 * 1024;
+            let r = rfx("send_receive").await;
+            let recv = bind_receiver(&r).await;
+            let pub_dir = tempfile::tempdir().unwrap();
+            let publisher = peer_node(pub_dir.path()).await;
+            pair(&recv, &publisher).await;
+            let bytes = pattern(6, SIZE);
+            let hash = publish_on(&r, &publisher, "f1", "c_x.fits", &bytes).await;
+            sync_rows(&r).await;
+
+            publisher.set_upload_limit(256_000);
+            let killer = {
+                let publisher = Arc::clone(&publisher);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    publisher.shutdown().await;
+                })
+            };
+            let out = real_pass(&r, PassKind::Fetch).await;
+            killer.await.unwrap();
+            assert_eq!((out.landed, out.failed), (0, 1), "{out:?}");
+            assert_eq!(
+                recv.collab_blob_health(hash).await.unwrap(),
+                BlobHealth::Partial
+            );
+            assert_eq!(collab_tags(&recv, "in-flight/project/p1/f1/1").await, 1);
+
+            // The publisher comes back (same identity, same store).
+            drop(publisher);
+            let publisher = peer_node(pub_dir.path()).await;
+            pair(&recv, &publisher).await;
+            let out = real_pass(&r, PassKind::Fetch).await;
+            assert_eq!(out.landed, 1, "{out:?}");
+            let dest = r.collab.join("m31").join("other").join("c_x.fits");
+            assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+            let served = sent_bytes(&publisher);
+            assert!(
+                served < SIZE as u64,
+                "resumed, not restarted: the publisher sent {served} B of {SIZE}"
             );
             publisher.shutdown().await;
             recv.shutdown().await;

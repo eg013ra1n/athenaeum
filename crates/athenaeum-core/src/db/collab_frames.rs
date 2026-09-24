@@ -285,7 +285,8 @@ pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
 }
 
 /// Mark a frame landed on disk: sets `landed_path`/`size_mtime_seen`,
-/// `on_disk = 1`, `awaiting_gc = 0`, and clears `last_error`.
+/// `on_disk = 1`, `awaiting_gc = 0`, and clears `last_error` and
+/// `rejected_size_mtime`.
 pub fn set_landed(
     conn: &Connection,
     project_id: &str,
@@ -296,9 +297,72 @@ pub fn set_landed(
     conn.execute(
         "UPDATE project_frames_local
          SET landed_path = ?3, size_mtime_seen = ?4, on_disk = 1, awaiting_gc = 0,
-             last_error = NULL, updated_at = datetime('now')
+             last_error = NULL, rejected_size_mtime = NULL, updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2",
         params![project_id, frame_uuid, landed_path, size_mtime],
+    )?;
+    Ok(())
+}
+
+/// [`set_landed`] only while the row still describes the bytes that landed —
+/// the same `content_version` AND `blake3` (a manifest sync can move either
+/// while a fetch runs, ruling R20). Returns the rows touched: 0 means the
+/// landing is stale and nothing was written.
+#[allow(clippy::too_many_arguments)]
+pub fn set_landed_if(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    landed_path: &str,
+    size_mtime: &str,
+    content_version: i32,
+    blake3: &str,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local
+         SET landed_path = ?3, size_mtime_seen = ?4, on_disk = 1, awaiting_gc = 0,
+             last_error = NULL, rejected_size_mtime = NULL, updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2 AND content_version = ?5 AND blake3 = ?6",
+        params![
+            project_id,
+            frame_uuid,
+            landed_path,
+            size_mtime,
+            content_version,
+            blake3
+        ],
+    )?)
+}
+
+/// The `size:mtime` of the file at the row's landed path that re-admission
+/// last rejected (R21), if any.
+pub fn rejected_size_mtime(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT rejected_size_mtime FROM project_frames_local
+             WHERE project_id = ?1 AND frame_uuid = ?2",
+            params![project_id, frame_uuid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Remember that re-admission rejected the file at `size_mtime` (R21).
+pub fn set_rejected_size_mtime(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    size_mtime: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE project_frames_local SET rejected_size_mtime = ?3
+         WHERE project_id = ?1 AND frame_uuid = ?2",
+        params![project_id, frame_uuid, size_mtime],
     )?;
     Ok(())
 }
@@ -737,5 +801,67 @@ mod tests {
         // adopt_own never touches a replica row.
         upsert_from_manifest(&c, "p1", &view("u2", 1)).unwrap();
         assert_eq!(adopt_own(&c, "p1", "u2", 8, "/x", "r", None).unwrap(), 0);
+    }
+
+    /// R20: `set_landed_if` lands only on the version and content it was
+    /// asked for; a moved row stays untouched.
+    #[test]
+    fn set_landed_if_refuses_a_moved_version() {
+        let c = conn();
+        upsert_from_manifest(&c, "p1", &view("u1", 1)).unwrap();
+        let r = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(
+            set_landed_if(
+                &c,
+                "p1",
+                "u1",
+                "/x/a.fits",
+                "1:1",
+                r.content_version + 1,
+                &r.blake3
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            set_landed_if(
+                &c,
+                "p1",
+                "u1",
+                "/x/a.fits",
+                "1:1",
+                r.content_version,
+                "f00d"
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!get(&c, "p1", "u1").unwrap().unwrap().on_disk);
+        set_rejected_size_mtime(&c, "p1", "u1", "9:9").unwrap();
+        assert_eq!(
+            rejected_size_mtime(&c, "p1", "u1").unwrap().as_deref(),
+            Some("9:9")
+        );
+        assert_eq!(
+            set_landed_if(
+                &c,
+                "p1",
+                "u1",
+                "/x/a.fits",
+                "1:1",
+                r.content_version,
+                &r.blake3
+            )
+            .unwrap(),
+            1
+        );
+        let landed = get(&c, "p1", "u1").unwrap().unwrap();
+        assert!(landed.on_disk);
+        assert_eq!(landed.landed_path.as_deref(), Some("/x/a.fits"));
+        assert_eq!(
+            rejected_size_mtime(&c, "p1", "u1").unwrap(),
+            None,
+            "a landing clears it"
+        );
     }
 }
