@@ -3672,6 +3672,14 @@ pub(crate) async fn disk_truth(
             continue;
         }
         let _guard = lock.lock().await;
+        let row = {
+            let db = db(ctx)?;
+            let fresh = crate::db::collab_frames::get(&db.conn(), project_id, &row.frame_uuid)?;
+            match fresh {
+                Some(f) if f.on_disk && f.blake3 == row.blake3 => f,
+                _ => continue,
+            }
+        };
         if frame_health(node.as_ref(), &row).await
             != Some(crate::sharing::iroh::node::BlobHealth::Dead)
         {
@@ -3824,16 +3832,19 @@ fn still_wanted(row: &LocalFrameRow, version: i32, policy: &ReplicationPolicy) -
 /// Delete the project's `in-flight/project/<pid>/<uuid>/<ver>` tags whose
 /// frame is no longer wanted (R23): a transfer failure keeps its tag so the
 /// next fetch resumes from the verified partial bytes, and this sweep is what
-/// lets GC have them once the frame leaves the need set. Skipped while a
-/// fetch of the project runs — its tags are live. Returns the tags removed.
+/// lets GC have them once the frame leaves the need set. Holds the project's
+/// fetch claim throughout, and is skipped while a fetch of the project runs —
+/// its tags are live. Returns the tags removed.
 async fn sweep_in_flight(ctx: &ServiceContext, project_id: &str) -> Result<usize, ApiError> {
     use n0_future::StreamExt as _;
     let Some(store) = bound_node(ctx).await.and_then(|n| n.collab_store()) else {
         return Ok(0);
     };
-    if fetch_in_progress(ctx, project_id)? {
+    // N4: hold the project's fetch claim for the whole sweep, so no fetch can
+    // set a tag this sweep would judge stale.
+    let Some(_claim) = FramePullClaim::acquire(&fetch_key(ctx, project_id)?) else {
         return Ok(0);
-    }
+    };
     let lock = project_disk_lock(ctx, project_id)?;
     let _guard = lock.lock().await;
     let (rows, policy) = {
@@ -3951,7 +3962,22 @@ pub(crate) async fn run_maintenance(
         }
         // The truth goes to the hub either way — a paused project still stops
         // advertising what it lost.
-        match report_holders(ctx, pid, &truth.present).await {
+        // N2: what is on disk NOW — a frame landed while the walk ran is
+        // held too.
+        let present = match db(ctx)
+            .and_then(|d| Ok(crate::db::collab_frames::list_for_project(&d.conn(), pid)?))
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|r| r.on_disk)
+                .map(|r| (r.frame_uuid, r.content_version))
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::warn!(project_id = pid, error = %e, "collab maintenance: frame list failed; holder report skipped");
+                continue;
+            }
+        };
+        match report_holders(ctx, pid, &present).await {
             Ok(_) => outcome.reported += 1,
             Err(e) => {
                 tracing::warn!(project_id = pid, error = %e, "collab maintenance: holder report failed")
@@ -4126,15 +4152,6 @@ impl Drop for FramePullClaim {
 /// `catalog|project` — the key of every per-project fetch registry.
 fn fetch_key(ctx: &ServiceContext, project_id: &str) -> Result<String, ApiError> {
     Ok(format!("{}|{project_id}", db(ctx)?.path().display()))
-}
-
-/// Is a fetch of this project running in this process right now?
-fn fetch_in_progress(ctx: &ServiceContext, project_id: &str) -> Result<bool, ApiError> {
-    let key = fetch_key(ctx, project_id)?;
-    Ok(IN_FLIGHT_FRAME_PULLS
-        .get()
-        .and_then(|set| set.lock().ok().map(|set| set.contains(&key)))
-        .unwrap_or(false))
 }
 
 /// The cancel flag of each running fetch (ruling R19), checked between
@@ -4372,6 +4389,9 @@ pub(crate) async fn fetch_frames_gated(
                 tracing::warn!(project_id, count = batch.landed.len(), error = %e, "holder delta after landing failed");
             }
         }
+        if batch.hub_failed {
+            break;
+        }
         if attempted > 0 && fetched_landed == 0 {
             if !queue.is_empty() {
                 tracing::info!(
@@ -4434,11 +4454,15 @@ fn between_batches(
     let conn = db.conn();
     let project = match live_project(&conn, pid) {
         Ok(p) => p,
-        Err(_) => {
+        Err(ApiError::Invalid(_)) => {
             tracing::info!(
                 project_id = pid,
                 "project no longer joined; replication fetch stops"
             );
+            return Ok(false);
+        }
+        Err(e) => {
+            tracing::warn!(project_id = pid, error = %e, "catalog read failed; replication fetch stops this pass");
             return Ok(false);
         }
     };
@@ -4515,6 +4539,16 @@ struct Batch {
     local: Vec<(LocalFrameRow, iroh_blobs::Hash)>,
     /// Holder entries for everything landed in this batch (links included).
     landed: Vec<crate::collab::hub_client::HolderRefWire>,
+    /// A holder lookup failed hub-wide (R25): this batch is the fetch's last.
+    hub_failed: bool,
+}
+
+/// Is a holder-lookup failure about THIS frame only — the hub answers 404
+/// for a frame it no longer shows this device? Everything else (transport,
+/// 5xx, 429, 401/403, …) is the hub failing and stops the fetch (R25).
+fn holder_lookup_is_frame_level(e: &crate::account::AccountClientError) -> bool {
+    matches!(e, crate::account::AccountClientError::Network(m)
+        if m.starts_with("hub returned 404"))
 }
 
 /// Fill one batch from the queue (R16): pop frames until [`FETCH_BATCH`] of
@@ -4565,6 +4599,9 @@ async fn prepare_batch(
                 // P20: never fetch over a dead entry. Park until GC.
                 tracing::warn!(project_id = pid, frame_uuid = %uuid, "frame content is a dead store entry; waiting for GC");
                 let _guard = env.lock.lock().await;
+                if fresh_row(env, &row)?.is_none() {
+                    continue;
+                }
                 unseed_frame(Some(&env.node), pid, &uuid).await;
                 let db = db(env.ctx)?;
                 crate::db::collab_frames::set_missing(&db.conn(), pid, &uuid, true)?;
@@ -4598,12 +4635,26 @@ async fn prepare_batch(
                     crate::account::AccountClientError::CollabApiOutdated,
                 ));
             }
-            Err(e) => {
+            Err(e) if holder_lookup_is_frame_level(&e) => {
+                // The hub no longer shows this one frame (hidden, rejected):
+                // skip it alone.
                 let msg = format!("holder lookup failed: {e}");
                 tracing::warn!(project_id = pid, frame_uuid = %uuid, error = %e, "frame holder lookup failed");
                 record_frame_error(env.ctx, pid, &uuid, &msg);
                 outcome.failed += 1;
                 continue;
+            }
+            Err(e) => {
+                // R25: the hub itself is failing (transport, 5xx, 429, auth).
+                // Asking it again for every other frame would cost one
+                // request, one warn and one row error per frame per pass:
+                // stop preparing, fetch what is ready, leave the rest.
+                let msg = format!("holder lookup failed: {e}");
+                tracing::warn!(project_id = pid, frame_uuid = %uuid, count = queue.len(), error = %e, "hub holder lookups failing; the rest of the need set waits for the next pass");
+                record_frame_error(env.ctx, pid, &uuid, &msg);
+                outcome.failed += 1;
+                batch.hub_failed = true;
+                break;
             }
         };
         let providers: Vec<(NodeId, Option<String>)> = holders
@@ -4820,13 +4871,15 @@ enum Landed {
 }
 
 /// The row as it is NOW, or `None` (logged) when it no longer describes the
-/// bytes in hand — a manifest sync moved its version or content, or it went
-/// away (R20).
+/// bytes in hand — a manifest sync moved its version or content, it went
+/// away (R20), or it is already on disk (re-admitted meanwhile, N3).
 fn fresh_row(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<Option<LocalFrameRow>, ApiError> {
     let db = db(env.ctx)?;
     let fresh = crate::db::collab_frames::get(&db.conn(), env.pid(), &row.frame_uuid)?;
     match fresh {
-        Some(f) if f.content_version == row.content_version && f.blake3 == row.blake3 => {
+        Some(f)
+            if f.content_version == row.content_version && f.blake3 == row.blake3 && !f.on_disk =>
+        {
             Ok(Some(f))
         }
         _ => {
@@ -4885,7 +4938,7 @@ async fn landing_target(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<PathB
         return new_landing_path(env, row);
     };
     unseed_frame(Some(&env.node), env.pid(), &row.frame_uuid).await;
-    if row.size_mtime_seen.is_some() && dest.exists() {
+    if row.size_mtime_seen.is_some() && dest.exists() && !holds_frame_content(&dest, row).await {
         let aside = crate::sync::ingest::unique_path(&dest);
         std::fs::rename(&dest, &aside).map_err(|e| {
             format!(
@@ -4903,6 +4956,17 @@ async fn landing_target(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<PathB
         );
     }
     Ok(dest)
+}
+
+/// Does the file at `path` already hold this frame's content (size first,
+/// then xxh3)? Then a re-land simply goes over it — a byte-identical copy is
+/// no edit worth keeping aside (N3).
+async fn holds_frame_content(path: &Path, row: &LocalFrameRow) -> bool {
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_file() && m.len() as i64 == row.byte_size => {}
+        _ => return false,
+    }
+    matches!(xxh3_on_blocking(path).await, Ok(h) if h == row.xxh3)
 }
 
 /// Land one fetched frame (P21), under the project's disk lock: re-read the
@@ -11349,7 +11413,112 @@ mod tests {
             assert_eq!(std::fs::read(&dest).unwrap(), original, "the frame is back");
             let aside = r.collab.join("m31").join("other").join("c_x_2.fits");
             assert_eq!(std::fs::read(&aside).unwrap(), edited, "the edit is kept");
+
+            // N3: a re-land over a file that already IS the frame goes over
+            // it — no byte-identical copy is kept aside.
+            db(&r.ctx)
+                .unwrap()
+                .conn()
+                .execute(
+                    "UPDATE project_frames_local SET on_disk = 0 WHERE frame_uuid = 'f1'",
+                    [],
+                )
+                .unwrap();
+            recv.unseed_project_frame(PID, "f1").await.unwrap();
+            gc_open.store(true, Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while recv.collab_blob_health(hash).await.unwrap() != BlobHealth::Missing {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "GC never dropped the entry"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            gc_open.store(false, Ordering::SeqCst);
+            let out = real_pass(&r, PassKind::Fetch).await;
+            assert_eq!(out.landed, 1, "{out:?}");
+            assert_eq!(std::fs::read(&dest).unwrap(), original);
+            assert!(
+                !r.collab
+                    .join("m31")
+                    .join("other")
+                    .join("c_x_3.fits")
+                    .exists(),
+                "no byte-identical copy aside"
+            );
             publisher.shutdown().await;
+            recv.shutdown().await;
+        }
+
+        /// R25: a hub failing its holder lookups (here a 503) costs ONE
+        /// lookup per pass, not one per frame — the rest of the need set
+        /// waits for the next pass, untouched.
+        #[tokio::test]
+        async fn a_failing_hub_costs_one_holder_lookup_per_pass() {
+            let r = rfx("send_receive").await;
+            let recv = bind_receiver(&r).await;
+            r.hub
+                .seed_frames(PID, "acc-o", &["n1", "n2", "n3", "n4", "n5"], "published");
+            sync_rows(&r).await;
+            r.hub.set_failing("/holders", true);
+
+            let from = request_count(&r.hub).await;
+            let out = real_pass(&r, PassKind::Fetch).await;
+            let reqs = r.hub.server.received_requests().await.unwrap();
+            let lookups = reqs[from..]
+                .iter()
+                .filter(|q| q.method.as_str() == "GET" && q.url.path().ends_with("/holders"))
+                .count();
+            assert_eq!(lookups, 1, "one failed lookup stops the fetch");
+            assert_eq!(out.failed, 1, "{out:?}");
+            let errored = rows(&r.ctx)
+                .iter()
+                .filter(|x| x.last_error.is_some())
+                .count();
+            assert_eq!(errored, 1, "no mass row error");
+            recv.shutdown().await;
+        }
+
+        /// R25: a 404 is about one frame (the hub no longer shows it to this
+        /// device) — that frame is skipped and the next one is still looked
+        /// up.
+        #[tokio::test]
+        async fn a_frame_the_hub_no_longer_shows_is_skipped_alone() {
+            let r = rfx("send_receive").await;
+            let recv = bind_receiver(&r).await;
+            // Published by an account with no device: looked up, no holder.
+            r.hub.seed_frames(PID, "acc-x", &["n1"], "published");
+            sync_rows(&r).await;
+            // A cached row the hub does not know (holder count 0: first).
+            land_file(&r, "gone", FrameOrigin::Replica, &pattern(1, 256));
+            db(&r.ctx)
+                .unwrap()
+                .conn()
+                .execute(
+                    "UPDATE project_frames_local SET on_disk = 0, landed_path = NULL,
+                         size_mtime_seen = NULL, holder_count = 0
+                     WHERE frame_uuid = 'gone'",
+                    [],
+                )
+                .unwrap();
+            let need = frame_need(
+                &rows(&r.ctx),
+                &ReplicationPolicy::default(),
+                true,
+                true,
+                false,
+            );
+            assert_eq!(need[0].frame_uuid, "gone");
+
+            let out = real_pass(&r, PassKind::Fetch).await;
+            assert_eq!(holder_lookups(&r, "gone").await, 1);
+            assert_eq!(
+                holder_lookups(&r, "n1").await,
+                1,
+                "the next frame is still asked"
+            );
+            assert_eq!(out.failed, 1, "{out:?}");
+            assert!(row(&r.ctx, "gone").unwrap().last_error.is_some());
             recv.shutdown().await;
         }
 
