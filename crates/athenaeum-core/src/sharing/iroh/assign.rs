@@ -696,7 +696,14 @@ async fn run_items(
     ));
 
     let item_count = items.len();
-    let labels: Vec<(String, u64)> = items.iter().map(|i| (i.key.clone(), i.size)).collect();
+    let labels: Vec<ItemLabel> = items
+        .iter()
+        .map(|i| ItemLabel {
+            key: i.key.clone(),
+            bytes: i.size,
+            providers: Arc::clone(&i.providers),
+        })
+        .collect();
     let mut results: Vec<Option<Result<()>>> = (0..item_count).map(|_| None).collect();
     let mut slot_of: HashMap<tokio::task::Id, usize> = HashMap::new();
     let mut pending = items.into_iter().enumerate();
@@ -719,7 +726,7 @@ async fn run_items(
                 match opts.fail_mode {
                     FailMode::FailFast => return Err(fail_with_report(&states, batch_root, e)),
                     FailMode::Isolate => {
-                        results[slot] = Some(Err(isolated_failure(&labels[slot], e)));
+                        results[slot] = Some(Err(isolated_failure(&states, &labels[slot], e)));
                         continue;
                     }
                 }
@@ -749,15 +756,20 @@ async fn run_items(
         match outcome {
             Ok(()) => {
                 if opts.fail_mode == FailMode::Isolate {
-                    let (key, bytes) = &labels[slot];
-                    tracing::debug!(frame_uuid = %key, bytes = *bytes, outcome = "ok", "blob fetch finished");
+                    let label = &labels[slot];
+                    tracing::debug!(
+                        frame_uuid = %label.key,
+                        bytes = label.bytes,
+                        outcome = "ok",
+                        "blob fetch finished"
+                    );
                 }
                 results[slot] = Some(Ok(()));
             }
             Err(e) => match opts.fail_mode {
                 FailMode::FailFast => return Err(fail_with_report(&states, batch_root, e)),
                 FailMode::Isolate => {
-                    results[slot] = Some(Err(isolated_failure(&labels[slot], e)));
+                    results[slot] = Some(Err(isolated_failure(&states, &labels[slot], e)));
                 }
             },
         }
@@ -776,21 +788,44 @@ async fn run_items(
     let results = labels
         .into_iter()
         .zip(results)
-        .map(|((key, _), r)| {
-            (
-                key,
-                r.unwrap_or_else(|| Err(anyhow::anyhow!("assignment item produced no result"))),
-            )
+        .map(|(label, r)| {
+            let r = r.unwrap_or_else(|| {
+                // Unreachable: every item is either spawned (and joined) or
+                // failed before spawning. Loud if that ever stops being true.
+                debug_assert!(false, "assignment item {} produced no result", label.key);
+                tracing::error!(frame_uuid = %label.key, "assignment item produced no result");
+                Err(anyhow::anyhow!("assignment item produced no result"))
+            });
+            (label.key, r)
         })
         .collect();
     Ok((report, results))
 }
 
+/// What the result loop keeps of an item once the item itself has moved into
+/// its task.
+struct ItemLabel {
+    key: String,
+    bytes: u64,
+    providers: Arc<Vec<EndpointId>>,
+}
+
 /// Log one item's failure under [`FailMode::Isolate`] and hand the error back
-/// for its result slot.
-fn isolated_failure((key, bytes): &(String, u64), e: anyhow::Error) -> anyhow::Error {
-    tracing::warn!(frame_uuid = %key, error = %format!("{e:#}"), "blob fetch failed");
-    tracing::debug!(frame_uuid = %key, bytes = *bytes, outcome = "failed", "blob fetch finished");
+/// for its result slot — carrying the last provider fault among the ITEM's own
+/// providers, the per-item counterpart of what [`fail_with_report`] attaches
+/// to a fail-fast error.
+fn isolated_failure(states: &States, label: &ItemLabel, e: anyhow::Error) -> anyhow::Error {
+    let e = match last_failure_cause(states, Some(&label.providers)) {
+        Some(c) => e.context(format!("last provider fault: {c}")),
+        None => e,
+    };
+    tracing::warn!(frame_uuid = %label.key, error = %format!("{e:#}"), "blob fetch failed");
+    tracing::debug!(
+        frame_uuid = %label.key,
+        bytes = label.bytes,
+        outcome = "failed",
+        "blob fetch finished"
+    );
     e
 }
 
@@ -802,7 +837,7 @@ fn isolated_failure((key, bytes): &(String, u64), e: anyhow::Error) -> anyhow::E
 /// does, and it is already on the state we are about to drop.
 fn fail_with_report(states: &States, root: Option<Hash>, err: anyhow::Error) -> anyhow::Error {
     let report = report_from(states);
-    let cause = last_failure_cause(states);
+    let cause = last_failure_cause(states, None);
     tracing::error!(
         root_hash = root.map(tracing::field::display),
         providers = report.per_provider.len(),
@@ -818,11 +853,16 @@ fn fail_with_report(states: &States, root: Option<Hash>, err: anyhow::Error) -> 
     }
 }
 
-/// The most recently recorded `TransferFault::Failed` cause across providers.
-fn last_failure_cause(states: &States) -> Option<String> {
+/// The most recently recorded `TransferFault::Failed` cause across providers
+/// — every provider of the run (`None`), or only `among`.
+fn last_failure_cause(states: &States, among: Option<&[EndpointId]>) -> Option<String> {
     let guard = states.lock().expect("assignment states mutex poisoned");
-    guard
-        .values()
+    let scoped: Vec<&ProviderState> = match among {
+        None => guard.values().collect(),
+        Some(ids) => ids.iter().filter_map(|p| guard.get(p)).collect(),
+    };
+    scoped
+        .into_iter()
         .filter_map(|st| Some((st.last_error_at?, st.last_error.clone()?)))
         .max_by_key(|(at, _)| *at)
         .map(|(_, cause)| cause)
@@ -875,7 +915,7 @@ async fn run_child(
                     item.describe()
                 );
             }
-            let wait = earliest_wait(&states);
+            let wait = earliest_wait(&states, &providers);
             tracing::debug!(
                 root_hash = %root,
                 child = index,
@@ -1591,13 +1631,20 @@ fn pick_provider(
         .map(|(_, _, _, id)| id)
 }
 
-/// How long until the earliest provider leaves backoff.
-fn earliest_wait(states: &States) -> Duration {
+/// How long until the earliest of `providers` leaves backoff.
+///
+/// Scoped to the ITEM's own providers, never the run-wide union: under
+/// per-item provider lists a sibling's provider whose backoff has already
+/// elapsed would otherwise read as "wait 0", and an item whose only holder is
+/// parked would burn every round of its ladder in a few milliseconds. For a
+/// collection every child shares the full list, so this is the same minimum it
+/// always took.
+fn earliest_wait(states: &States, providers: &[EndpointId]) -> Duration {
     let now = Instant::now();
     let guard = states.lock().expect("assignment states mutex poisoned");
-    guard
-        .values()
-        .filter_map(|st| st.next_try)
+    providers
+        .iter()
+        .filter_map(|p| guard.get(p)?.next_try)
         .map(|t| t.saturating_duration_since(now))
         .min()
         .unwrap_or(BACKOFF_BASE)
@@ -2112,6 +2159,38 @@ mod tests {
             median == 1000.0 || (median - g).abs() < 1e-6,
             "the fallback must be one of the measured values, got {median}"
         );
+    }
+
+    /// An item waits for ITS OWN providers' backoff, not for a sibling's
+    /// already-elapsed one — otherwise a parked sole holder spins its ladder.
+    #[test]
+    fn earliest_wait_is_scoped_to_the_items_providers() {
+        let (own, other) = (distinct_id(), distinct_id());
+        let now = Instant::now();
+        let states: States = Arc::new(Mutex::new(states_of(vec![
+            (
+                own,
+                ProviderState {
+                    next_try: Some(now + Duration::from_secs(2)),
+                    ..Default::default()
+                },
+            ),
+            (
+                other,
+                ProviderState {
+                    next_try: Some(now - Duration::from_secs(1)),
+                    ..Default::default()
+                },
+            ),
+        ])));
+        let wait = earliest_wait(&states, &[own]);
+        assert!(
+            wait > Duration::from_millis(1500) && wait <= Duration::from_secs(2),
+            "the item waits for its own parked provider, not a sibling's elapsed backoff: {wait:?}"
+        );
+        // The union still sees the elapsed backoff — floored, never zero.
+        assert_eq!(earliest_wait(&states, &[own, other]), MIN_BACKOFF_SLEEP);
+        assert_eq!(earliest_wait(&states, &[other]), MIN_BACKOFF_SLEEP);
     }
 
     #[test]

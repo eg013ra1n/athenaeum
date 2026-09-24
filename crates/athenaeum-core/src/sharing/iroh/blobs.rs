@@ -1523,10 +1523,13 @@ pub(crate) async fn fetch_blobs_assigned(
         .into_iter()
         .zip(results)
         .map(|(key, r)| {
-            (
-                key,
-                r.unwrap_or_else(|| Err(anyhow::anyhow!("blob fetch produced no result"))),
-            )
+            let r = r.unwrap_or_else(|| {
+                // Unreachable: every frame is either tag-failed or fetched.
+                debug_assert!(false, "blob fetch for {key} produced no result");
+                tracing::error!(frame_uuid = %key, "blob fetch produced no result");
+                Err(anyhow::anyhow!("blob fetch produced no result"))
+            });
+            (key, r)
         })
         .collect())
 }
