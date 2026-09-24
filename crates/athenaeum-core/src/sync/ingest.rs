@@ -753,7 +753,7 @@ fn content_mismatch_warns(existing_hash: Option<&str>, incoming_hash: &str) -> b
 /// platform/volume refuses (`EXDEV`, SMB/NFS/exFAT, permission), copy. `force_copy`
 /// is the test seam for the fallback branch. Never fails a landing for a link
 /// refusal — copy was the behavior before transfer-prepare spec §5.2.
-fn link_or_copy(src: &Path, dest: &Path, force_copy: bool) -> Result<()> {
+pub(crate) fn link_or_copy(src: &Path, dest: &Path, force_copy: bool) -> Result<()> {
     if !force_copy {
         match std::fs::hard_link(src, dest) {
             Ok(()) => return Ok(()),

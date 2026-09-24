@@ -121,6 +121,14 @@ pub mod defaults {
     // `SettingsManager::get_sync_max_concurrent_receives`).
     pub const SYNC_MAX_CONCURRENT_RECEIVES: &str = "2";
 
+    // Collab replication loss guard (collab v3 wave 2, P14). Disk truth that
+    // finds more than this fraction of the held replicas missing, OR more
+    // than this many bytes of them, pauses the project's replication instead
+    // of re-downloading what looks like a folder moved away. The Settings UI
+    // for both lands in wave 4.
+    pub const COLLAB_LOSS_GUARD_FRACTION: &str = "0.10";
+    pub const COLLAB_LOSS_GUARD_BYTES: &str = "10737418240";
+
     // Account layer (task B4). Base URL of the athenaeum-hub. The device token
     // lives in the OS keychain (never here), keyed per hub host — so the prod
     // and test sign-ins coexist and switching is safe.
@@ -205,6 +213,14 @@ pub mod defaults {
             (
                 super::keys::SYNC_MAX_CONCURRENT_RECEIVES,
                 SYNC_MAX_CONCURRENT_RECEIVES,
+            ),
+            (
+                super::keys::COLLAB_LOSS_GUARD_FRACTION,
+                COLLAB_LOSS_GUARD_FRACTION,
+            ),
+            (
+                super::keys::COLLAB_LOSS_GUARD_BYTES,
+                COLLAB_LOSS_GUARD_BYTES,
             ),
             (super::keys::BLINK_RESOLUTION, BLINK_RESOLUTION),
             (
@@ -349,6 +365,13 @@ pub mod keys {
     /// every `api::sync::set_sync_max_concurrent_receives` — a change never
     /// interrupts a transfer already in flight.
     pub const SYNC_MAX_CONCURRENT_RECEIVES: &str = "sync.max_concurrent_receives";
+
+    /// Collab replication loss guard (P14): the fraction of held replicas
+    /// whose loss in one disk-truth pass pauses the project's replication.
+    pub const COLLAB_LOSS_GUARD_FRACTION: &str = "collab.loss_guard_fraction";
+    /// Collab replication loss guard (P14): the bytes of held replicas whose
+    /// loss in one disk-truth pass pauses the project's replication.
+    pub const COLLAB_LOSS_GUARD_BYTES: &str = "collab.loss_guard_bytes";
 
     /// Absolute path of the folder that holds prepared outgoing packages
     /// (`<dir>/<uuid>/…`). Empty/unset = `<identity_dir>/packages`
@@ -738,6 +761,33 @@ impl SettingsManager {
         let n: usize = value.parse()?;
         Ok(n.clamp(1, 8))
     }
+
+    /// The collab loss guard's fraction (P14), clamped to `0.0..=1.0`. A
+    /// value that does not parse is an error for the caller to log; the
+    /// guard then falls back to the default.
+    pub fn get_collab_loss_guard_fraction(&self, conn: &Connection) -> Result<f64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::COLLAB_LOSS_GUARD_FRACTION,
+            defaults::COLLAB_LOSS_GUARD_FRACTION,
+        )?;
+        let f: f64 = value.trim().parse()?;
+        if !f.is_finite() {
+            anyhow::bail!("collab.loss_guard_fraction is not finite: {value}");
+        }
+        Ok(f.clamp(0.0, 1.0))
+    }
+
+    /// The collab loss guard's byte threshold (P14); negative clamps to 0.
+    pub fn get_collab_loss_guard_bytes(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::COLLAB_LOSS_GUARD_BYTES,
+            defaults::COLLAB_LOSS_GUARD_BYTES,
+        )?;
+        let n: i64 = value.trim().parse()?;
+        Ok(n.max(0))
+    }
 }
 
 #[cfg(test)]
@@ -762,6 +812,8 @@ mod tests {
             keys::UPDATES_AUTO_CHECK,
             keys::FLAT_CONTOUR_CONTOURS,
             keys::BLINK_RESOLUTION,
+            keys::COLLAB_LOSS_GUARD_FRACTION,
+            keys::COLLAB_LOSS_GUARD_BYTES,
         ] {
             assert!(
                 listed.contains(key),
@@ -773,6 +825,36 @@ mod tests {
             defaults::all().len(),
             "duplicate key in defaults::all()"
         );
+    }
+
+    /// P14: the loss guard reads its two keys with the documented defaults,
+    /// honours a stored value, and clamps out-of-range ones.
+    #[test]
+    fn collab_loss_guard_getters_default_and_clamp() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+        assert_eq!(manager.get_collab_loss_guard_fraction(&conn).unwrap(), 0.10);
+        assert_eq!(
+            manager.get_collab_loss_guard_bytes(&conn).unwrap(),
+            10_737_418_240
+        );
+        manager
+            .persist_setting(&conn, keys::COLLAB_LOSS_GUARD_FRACTION, "0.25")
+            .unwrap();
+        manager
+            .persist_setting(&conn, keys::COLLAB_LOSS_GUARD_BYTES, "-5")
+            .unwrap();
+        assert_eq!(manager.get_collab_loss_guard_fraction(&conn).unwrap(), 0.25);
+        assert_eq!(manager.get_collab_loss_guard_bytes(&conn).unwrap(), 0);
+        manager
+            .persist_setting(&conn, keys::COLLAB_LOSS_GUARD_FRACTION, "7")
+            .unwrap();
+        assert_eq!(manager.get_collab_loss_guard_fraction(&conn).unwrap(), 1.0);
+        manager
+            .persist_setting(&conn, keys::COLLAB_LOSS_GUARD_FRACTION, "lots")
+            .unwrap();
+        assert!(manager.get_collab_loss_guard_fraction(&conn).is_err());
     }
 
     #[test]

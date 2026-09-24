@@ -50,6 +50,20 @@ pub struct AutoReplicateArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PolicyArgs {
+    project_id: String,
+    policy: exchange::ReplicationPolicy,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LossArgs {
+    project_id: String,
+    action: exchange::LossAction,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DecideArgs {
     announcement_id: String,
     approve: bool,
@@ -238,6 +252,63 @@ pub async fn sync_project_now(
         &args.project_id,
         Some(emitter),
     )
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// The project's local replication policy (collab v3, spec §5.3).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_collab_policy(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<exchange::ReplicationPolicy>, (axum::http::StatusCode, String)> {
+    exchange::get_collab_policy(&state.ctx, &args.project_id)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Store the project's replication policy; returns what it selects.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_collab_policy(
+    State(state): State<WebAppState>,
+    Json(args): Json<PolicyArgs>,
+) -> Result<Json<exchange::PolicyPreview>, (axum::http::StatusCode, String)> {
+    exchange::set_collab_policy(&state.ctx, &args.project_id, args.policy)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// What a replication policy would select, without storing it.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn preview_collab_policy(
+    State(state): State<WebAppState>,
+    Json(args): Json<PolicyArgs>,
+) -> Result<Json<exchange::PolicyPreview>, (axum::http::StatusCode, String)> {
+    exchange::preview_collab_policy(&state.ctx, &args.project_id, args.policy)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Answer a project the loss guard paused (P14): restore (rescan the
+/// Collaboration folder) or stop holding the missing frames.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn resolve_collab_loss(
+    State(state): State<WebAppState>,
+    Json(args): Json<LossArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    let emitter: Arc<dyn ProgressEmitter> =
+        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    exchange::resolve_collab_loss(
+        Arc::clone(&state.ctx),
+        Arc::clone(&state.sync),
+        &args.project_id,
+        args.action,
+        Some(emitter),
+    )
+    .await
     .map(Json)
     .map_err(api_err)
 }

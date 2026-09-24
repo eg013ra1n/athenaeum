@@ -199,6 +199,66 @@ pub async fn sync_project_now(
     .map_err(|e| e.to_string())
 }
 
+/// The project's local replication policy (collab v3, spec §5.3).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_collab_policy(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<exchange::ReplicationPolicy, String> {
+    exchange::get_collab_policy(&state.ctx, &project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Store the project's replication policy; returns what it selects.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_collab_policy(
+    state: State<'_, AppState>,
+    project_id: String,
+    policy: exchange::ReplicationPolicy,
+) -> Result<exchange::PolicyPreview, String> {
+    exchange::set_collab_policy(&state.ctx, &project_id, policy)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// What a replication policy would select, without storing it.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn preview_collab_policy(
+    state: State<'_, AppState>,
+    project_id: String,
+    policy: exchange::ReplicationPolicy,
+) -> Result<exchange::PolicyPreview, String> {
+    exchange::preview_collab_policy(&state.ctx, &project_id, policy)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Answer a project the loss guard paused (P14): restore (rescan the
+/// Collaboration folder) or stop holding the missing frames.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn resolve_collab_loss(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+    action: exchange::LossAction,
+) -> Result<(), String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    exchange::resolve_collab_loss(
+        Arc::clone(&state.ctx),
+        Arc::clone(&state.sync),
+        &project_id,
+        action,
+        Some(emitter),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Every received contribution for a project (cache-only — no hub call).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]

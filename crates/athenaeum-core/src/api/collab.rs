@@ -1653,57 +1653,6 @@ fn stamp_publish_cards(
     Ok(())
 }
 
-/// My own publisher folder in a project (P10): the folder my own rows already
-/// use, else `<Collab>/<project slug>/<my display name>`, sanitized and made
-/// unique against every other publisher's folder in the project.
-fn own_publisher_dir(
-    conn: &Connection,
-    collab_root: &Path,
-    project: &CollabProjectRow,
-    account_id: &str,
-    display: &str,
-) -> anyhow::Result<std::path::PathBuf> {
-    if !account_id.is_empty() {
-        if let Some(dir) =
-            crate::db::collab_frames::publisher_dir(conn, &project.project_id, account_id)?
-        {
-            return Ok(dir);
-        }
-    }
-    let project_dir = collab_root.join(crate::sync::ingest::sanitize_slug(&project.slug));
-    let taken: HashSet<std::path::PathBuf> = {
-        let mut stmt = conn.prepare(
-            "SELECT landed_path FROM project_frames_local
-             WHERE project_id = ?1 AND publisher_account_id != ?2 AND landed_path IS NOT NULL",
-        )?;
-        let paths = stmt
-            .query_map(rusqlite::params![project.project_id, account_id], |r| {
-                r.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        paths
-            .into_iter()
-            .filter_map(|p| Path::new(&p).parent().map(Path::to_path_buf))
-            .collect()
-    };
-    let base = crate::sync::ingest::sanitize_slug(if display.is_empty() { "own" } else { display });
-    for n in 1..10_000 {
-        let name = if n == 1 {
-            base.clone()
-        } else {
-            format!("{base}_{n}")
-        };
-        let candidate = project_dir.join(name);
-        if !taken.contains(&candidate) {
-            return Ok(candidate);
-        }
-    }
-    anyhow::bail!(
-        "no free publisher folder name under {}",
-        project_dir.display()
-    )
-}
-
 /// The landing path of a NEW own frame: `<dir>/<name>`, else `<stem>_2`, … —
 /// the first spelling that is neither claimed earlier in this run nor any
 /// cached frame's `landed_path`. A file already there that no row references
@@ -2413,7 +2362,7 @@ async fn run_publish(
     {
         let db = db(ctx)?;
         let conn = db.conn();
-        let own_dir = own_publisher_dir(&conn, &collab_root, &project, &account_id, &display)
+        let own_dir = publisher_folder(&conn, &collab_root, &project, &account_id, &display, "own")
             .map_err(|e| {
                 tracing::error!(project_id, error = %format!("{e:#}"), "publish: own folder failed");
                 internal(e)
@@ -3291,37 +3240,11 @@ pub async fn decide_announcement(
     Ok(())
 }
 
-/// The message every publish and replication path refuses with when no
-/// Collaboration folder is set (collab v3 wave 2, P25). No silent fallback to
-/// the working dir.
-pub(crate) const COLLABORATION_ROOT_REQUIRED: &str =
-    "set a Collaboration folder in File Manager → Folders first";
-
-/// The configured Collaboration root — required for any collab receive or
-/// publish (P25). Absent ⇒ `ApiError::Invalid` carrying
-/// [`COLLABORATION_ROOT_REQUIRED`], logged at `warn!`.
-// Consumed by publish (Task 7) and the replication pass (Task 9).
-#[allow(dead_code)]
-pub(crate) fn require_collaboration_root(
-    ctx: &ServiceContext,
-) -> Result<std::path::PathBuf, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    match crate::db::scan_root_path_of_kind(&conn, "collaboration") {
-        Ok(Some(path)) => Ok(std::path::PathBuf::from(path)),
-        Ok(None) => {
-            tracing::warn!(
-                outcome = "no_collaboration_root",
-                "collaboration root required"
-            );
-            Err(ApiError::Invalid(COLLABORATION_ROOT_REQUIRED.to_string()))
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "read collaboration root failed");
-            Err(ApiError::Internal(format!("read collaboration root: {e}")))
-        }
-    }
-}
+// The Collaboration-root guard (P25) lives beside the replication pass, which
+// compiles headless; publish uses it through this re-export.
+#[cfg(test)]
+pub(crate) use crate::api::collab_exchange::COLLABORATION_ROOT_REQUIRED;
+pub(crate) use crate::api::collab_exchange::{publisher_folder, require_collaboration_root};
 
 #[cfg(test)]
 mod tests {

@@ -1653,6 +1653,51 @@ export type FramesChangeKind = "newFrames" | "pendingFrames" | "approved" | "rej
 
 export type CollabFramesChange = { projectId: string, kind: FramesChangeKind, count: number, };
 
+export type ReplicationPolicy = { 
+/**
+ * Canonical filters to replicate (the dictionary's `canonical`).
+ */
+filters: Array<string>, 
+/**
+ * Publisher account ids to replicate.
+ */
+publishers: Array<string>, 
+/**
+ * Only frames whose manifest `meta.fwhmArcsec` is at most this. A frame
+ * without the measurement does not match a set bound.
+ */
+maxFwhmArcsec: number | null, 
+/**
+ * Only frames whose manifest `meta.starsDetected` is at least this. A
+ * frame without the measurement does not match a set bound.
+ */
+minStars: number | null, 
+/**
+ * At most this many bytes of this project's replicas on disk, counting
+ * the ones already held.
+ */
+byteBudget: number | null, };
+
+export type PolicyPreview = { 
+/**
+ * Published, accepted, not-declined peer frames the policy matches.
+ */
+frames: number, bytes: number, 
+/**
+ * Of those, already on disk.
+ */
+alreadyHeld: number, 
+/**
+ * What the next pass would fetch (byte budget applied).
+ */
+toFetch: number, toFetchBytes: number, };
+
+export type CollabReplicationPaused = { projectId: string, missing: number, missingBytes: number, };
+
+export type CollabFramesLanded = { projectId: string, landed: number, failed: number, awaitingGc: number, };
+
+export type LossAction = "restore" | "stopHolding";
+
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**
  * Human-readable failure reasons, empty when publishable (e.g.

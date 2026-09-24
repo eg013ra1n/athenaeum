@@ -321,6 +321,22 @@ pub fn set_missing(
     Ok(())
 }
 
+/// Record a new `size:mtime` for a landed file whose content re-hashed to
+/// the recorded `xxh3` (disk truth, spec §5.5: touched but identical).
+/// Column-targeted; returns the rows touched.
+pub fn set_size_mtime_seen(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    size_mtime: &str,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local SET size_mtime_seen = ?3, updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2",
+        params![project_id, frame_uuid, size_mtime],
+    )?)
+}
+
 /// Set (or clear) `locally_declined` on a batch of frames of one project — the
 /// loss guard's "stop holding" step (P14) and any future manual decline.
 pub fn set_declined(

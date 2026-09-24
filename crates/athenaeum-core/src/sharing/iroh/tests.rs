@@ -4823,6 +4823,129 @@ async fn isolate_mode_keeps_siblings_alive() {
     r.shutdown().await;
 }
 
+/// Hedging on RAW items, over the network (collab v3 wave 2, Task 9 — the
+/// Task 4 unit tests covered the raw-item back half only in isolation).
+///
+/// The collab replication batch runs with `hedging: true`, and a raw item's
+/// hedge is `GetRequest::blob_ranges` over the back half of what is still
+/// missing. This is `hedge_fires_before_the_stall_ceiling_on_a_slow_provider`
+/// rebuilt on raw blobs served from three collab stores: every provider
+/// paced the same, then one collapses to 1 KB/s mid-transfer. The items it
+/// was serving must be rescued by hedges, not by the 60 s stall ceiling —
+/// and every item lands intact.
+#[tokio::test]
+async fn hedge_fires_on_raw_items_before_the_stall_ceiling() {
+    // Same budget arithmetic as the collection test: forty 256 KiB items.
+    const ITEMS: usize = 40;
+    const SIZE: usize = 256 * 1024;
+    let dirs: Vec<_> = (0..7).map(|_| tempdir().unwrap()).collect();
+    let r = bind_disabled(dirs[0].path()).await;
+    let r_info = r.handle(Role::Recv).start().await.unwrap();
+    r.set_collab_root(Some(dirs[1].path())).await.unwrap();
+    let (a, a_id) =
+        collab_provider(dirs[2].path(), dirs[3].path(), &r, &r_info.pairing_ticket).await;
+    let (b, b_id) =
+        collab_provider(dirs[4].path(), dirs[5].path(), &r, &r_info.pairing_ticket).await;
+    let slow_root = dirs[6].path().join("collab");
+    std::fs::create_dir_all(&slow_root).unwrap();
+    let (s, s_id) = collab_provider(
+        &dirs[6].path().join("node"),
+        &slow_root,
+        &r,
+        &r_info.pairing_ticket,
+    )
+    .await;
+
+    let mut hashes = Vec::with_capacity(ITEMS);
+    for i in 0..ITEMS {
+        let bytes = raw_blob_bytes(100 + i, SIZE);
+        let mut h = None;
+        for p in [&a, &b, &s] {
+            h = Some(
+                seed_raw(
+                    &p.collab_store().unwrap(),
+                    bytes.clone(),
+                    &format!("project/p/f{i}/1"),
+                )
+                .await,
+            );
+        }
+        hashes.push(h.unwrap());
+    }
+    for p in [&a, &b, &s] {
+        p.set_upload_limit(400_000);
+    }
+    let providers = Arc::new(vec![
+        endpoint_id(a_id),
+        endpoint_id(b_id),
+        endpoint_id(s_id),
+    ]);
+    let items: Vec<FetchItem> = hashes
+        .iter()
+        .enumerate()
+        .map(|(i, h)| FetchItem {
+            key: format!("f{i}"),
+            request: GetRequest::blob(*h),
+            hash: *h,
+            size: SIZE as u64,
+            providers: Arc::clone(&providers),
+        })
+        .collect();
+    let (telemetry, _) = recording_telemetry();
+    let opts = super::assign::AssignmentOptions {
+        stall_hard_limit: Duration::from_secs(60),
+        hedging: true,
+        total_bytes: (ITEMS * SIZE) as u64,
+        telemetry,
+        alpn: COLLAB_BLOBS_ALPN,
+        fail_mode: FailMode::Isolate,
+    };
+    let collapse = {
+        let slow = Arc::clone(&s);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            slow.set_upload_limit(1_000);
+        })
+    };
+    let r_store = r.collab_store().unwrap();
+    let started = Instant::now();
+    let (report, results) = tokio::time::timeout(
+        Duration::from_secs(120),
+        super::assign::fetch_items_assigned(&r_store, &r.endpoint(), items, opts),
+    )
+    .await
+    .expect("a hedged raw fetch must not wait out the stall ceiling")
+    .expect("the assigned loop always reports");
+    let elapsed = started.elapsed();
+    collapse.await.ok();
+
+    for (key, res) in &results {
+        assert!(res.is_ok(), "{key}: {res:?}");
+    }
+    for h in &hashes {
+        assert!(
+            r_store.blobs().has(*h).await.unwrap(),
+            "{h} landed complete"
+        );
+    }
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "hedging must finish before the 60 s ceiling could — took {elapsed:?} ({report:?})"
+    );
+    assert!(
+        report.hedges >= 1,
+        "a raw item must have been hedged: {report:?}"
+    );
+    assert_eq!(
+        report.stalls, 0,
+        "the ceiling must not be what rescued it: {report:?}"
+    );
+
+    for n in [a, b, s, r] {
+        n.shutdown().await;
+    }
+}
+
 /// The collection caller keeps `FailMode::FailFast`: one child the provider
 /// cannot serve fails the WHOLE call, exactly as before the generalization.
 #[tokio::test]

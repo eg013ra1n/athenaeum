@@ -980,11 +980,60 @@ pub(crate) async fn open_fs_store(dir: &Path) -> Result<Store> {
         interval: GC_INTERVAL,
         add_protected: None,
     });
+    #[cfg(test)]
+    if let Some(gc) = test_gc::config_for_next_store() {
+        options.gc = Some(gc);
+    }
     let store: Store = FsStore::load_with_opts(db_path, options)
         .await
         .with_context(|| format!("open blob store {}", dir.display()))?
         .into();
     Ok(store)
+}
+
+/// Test-only control of the stores' GC (iroh-blobs 0.103 has no public "run
+/// GC now"): a test arms a gate, and every store opened afterwards ON THE SAME
+/// THREAD runs GC every 100 ms, but only while the gate is open — each run
+/// asks the gate first and is aborted while it is closed. So a test decides
+/// exactly when an untagged entry may be collected. Production never compiles
+/// this; its interval stays [`GC_INTERVAL`] (plan P20: no shorter collab GC in
+/// wave 2).
+#[cfg(test)]
+pub(crate) mod test_gc {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use iroh_blobs::store::{GcConfig, ProtectOutcome};
+
+    thread_local! {
+        static GATE: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    }
+
+    /// Arm (`Some`) or disarm (`None`) the gate for stores opened later on
+    /// this thread. Returns nothing; the caller keeps its `Arc` to open or
+    /// close the gate.
+    pub(crate) fn arm(gate: Option<Arc<AtomicBool>>) {
+        GATE.with(|g| *g.borrow_mut() = gate);
+    }
+
+    pub(super) fn config_for_next_store() -> Option<GcConfig> {
+        let gate = GATE.with(|g| g.borrow().clone())?;
+        Some(GcConfig {
+            interval: Duration::from_millis(100),
+            add_protected: Some(Arc::new(move |_live| {
+                let open = gate.load(Ordering::SeqCst);
+                Box::pin(async move {
+                    if open {
+                        ProtectOutcome::Continue
+                    } else {
+                        ProtectOutcome::Abort
+                    }
+                })
+            })),
+        })
+    }
 }
 
 /// Host-chosen node behavior (transfer-prepare spec §4.1).
