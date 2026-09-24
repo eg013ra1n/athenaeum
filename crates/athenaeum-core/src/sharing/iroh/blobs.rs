@@ -205,12 +205,10 @@ impl ImportProgressMeter {
 /// store-owned copy of a frame the app itself is not the sole custodian of —
 /// there, a dead path is reported as a failure and left for the caller to
 /// re-seed from scratch (or, on the receive side, re-fetch), never silently
-/// copied. `add_path_child` takes the same flag purely so one `CopyRepair`
-/// value threads through the whole import pair for a caller; the import
-/// itself never falls back to `Copy` on its own (a failed
-/// `AddProgressItem::Error` is already a hard `Err` regardless of this flag) —
-/// only `ensure_child_readable`'s post-import readability check branches on
-/// it.
+/// copied. Only [`ensure_child_readable`]'s post-import readability check
+/// branches on it — [`add_path_child`]'s own import never falls back to
+/// `Copy` on its own (a failed `AddProgressItem::Error` is already a hard
+/// `Err` regardless), so it does not take this flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CopyRepair {
     Allow,
@@ -231,12 +229,7 @@ pub(crate) async fn add_path_child(
     child_len: u64,
     mode: ImportMode,
     meter: &mut ImportProgressMeter,
-    repair: CopyRepair,
 ) -> Result<TempTag> {
-    // Accepted for symmetry with `ensure_child_readable` (see `CopyRepair`);
-    // this import never falls back to `Copy` on its own regardless of the
-    // value.
-    let _ = repair;
     let mut stream = store
         .blobs()
         .add_path_with_opts(AddPathOptions {
@@ -297,7 +290,7 @@ pub(crate) async fn add_path_child(
 /// `Refuse` (the collab store, Task 5, P20) never does — it returns `Err`
 /// instead, so a dead reference is reported, not quietly turned into a
 /// second, store-owned copy.
-async fn ensure_child_readable(
+pub(crate) async fn ensure_child_readable(
     store: &Store,
     abs: &Path,
     hash: Hash,
@@ -426,7 +419,7 @@ pub async fn import_package_collection_with_mode(
     // attribution map for Task 2.2.
     let mut entries: Vec<(String, u64)> = Vec::with_capacity(count);
     for f in &files {
-        let tt = add_path_child(store, &f.abs, f.len, mode, &mut meter, CopyRepair::Allow).await?;
+        let tt = add_path_child(store, &f.abs, f.len, mode, &mut meter).await?;
         let hash = tt.hash();
         // A referenced child must be readable before we hand its hash to a peer.
         let tt =
@@ -587,8 +580,7 @@ pub async fn import_subset_collection(
                 (tt, size)
             }
             Src::Payload { abs, size } => {
-                let tt =
-                    add_path_child(store, &abs, size, mode, &mut meter, CopyRepair::Allow).await?;
+                let tt = add_path_child(store, &abs, size, mode, &mut meter).await?;
                 // Same guard as the full-package path: a referenced child must be
                 // readable before its hash goes into the served collection.
                 let hash = tt.hash();

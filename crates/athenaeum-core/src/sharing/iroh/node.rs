@@ -3083,12 +3083,36 @@ impl SharedIrohNode {
             }
         };
         let mut meter = blobs::ImportProgressMeter::new(None, size);
-        let tt = match blobs::add_path_child(
+        let tt =
+            match blobs::add_path_child(&store, path, size, ImportMode::TryReference, &mut meter)
+                .await
+            {
+                Ok(tt) => tt,
+                Err(e) => {
+                    tracing::error!(
+                        project_id,
+                        frame_uuid,
+                        content_version,
+                        path = %path.display(),
+                        error = %format!("{e:#}"),
+                        "seed project frame failed"
+                    );
+                    return Err(e);
+                }
+            };
+        let hash = tt.hash();
+        // `Refuse`: a dead reference (including the P20 stale-union case,
+        // where the import itself succeeds but the store still reads through
+        // an earlier, now-dead external path for this hash) is reported and
+        // left for the caller to re-seed — never silently repaired into a
+        // second, store-owned copy.
+        let tt = match blobs::ensure_child_readable(
             &store,
             path,
+            hash,
             size,
             ImportMode::TryReference,
-            &mut meter,
+            tt,
             blobs::CopyRepair::Refuse,
         )
         .await
@@ -3100,27 +3124,15 @@ impl SharedIrohNode {
                     frame_uuid,
                     content_version,
                     path = %path.display(),
+                    hash = %hash,
                     error = %format!("{e:#}"),
-                    "seed project frame failed"
+                    "seed project frame failed: reference import reads a dead path"
                 );
-                return Err(e);
+                return Err(e.context(format!(
+                    "seed project frame {path:?}: unreadable after import"
+                )));
             }
         };
-        let hash = tt.hash();
-        if let Err(e) = blobs::probe_first_byte(&store, hash).await {
-            tracing::error!(
-                project_id,
-                frame_uuid,
-                content_version,
-                path = %path.display(),
-                hash = %hash,
-                error = %e,
-                "seed project frame failed: reference import reads a dead path"
-            );
-            return Err(e.context(format!(
-                "seed project frame {path:?}: unreadable after import"
-            )));
-        }
         let tag = project_frame_tag(project_id, frame_uuid, content_version);
         if let Err(e) = store.tags().set(&tag, HashAndFormat::raw(hash)).await {
             tracing::error!(
@@ -3211,13 +3223,17 @@ impl SharedIrohNode {
         Ok(match status {
             BlobStatus::NotFound => BlobHealth::Missing,
             BlobStatus::Partial { .. } => BlobHealth::Partial,
-            BlobStatus::Complete { .. } => {
-                if blobs::probe_first_byte(&store, hash).await.is_ok() {
-                    BlobHealth::Readable
-                } else {
+            BlobStatus::Complete { .. } => match blobs::probe_first_byte(&store, hash).await {
+                Ok(()) => BlobHealth::Readable,
+                Err(e) => {
+                    tracing::warn!(
+                        hash = %hash,
+                        error = %format!("{e:#}"),
+                        "collab blob probe failed"
+                    );
                     BlobHealth::Dead
                 }
-            }
+            },
         })
     }
 
@@ -4069,8 +4085,10 @@ mod tests {
         node.shutdown().await;
     }
 
-    /// Total bytes of every regular file under `dir` (D3 T2 store-growth oracle).
-    fn dir_size(dir: &Path) -> u64 {
+    /// Total bytes of every regular file under `dir` (D3 T2 store-growth
+    /// oracle; also reused by the sibling `collab_store_tests` module, hence
+    /// `pub(super)`).
+    pub(super) fn dir_size(dir: &Path) -> u64 {
         walkdir::WalkDir::new(dir)
             .into_iter()
             .flatten()
@@ -6364,19 +6382,6 @@ mod collab_store_tests {
         root.join(".athenaeum").join("blobs")
     }
 
-    /// Total bytes of every regular file under `dir` — the store-growth
-    /// oracle a reference import must stay far below (mirrors `dir_size` in
-    /// the sibling `tests` module, duplicated here because the two `#[cfg(test)]`
-    /// modules do not share private items).
-    fn store_dir_size(dir: &Path) -> u64 {
-        walkdir::WalkDir::new(dir)
-            .into_iter()
-            .flatten()
-            .filter(|e| e.file_type().is_file())
-            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
-            .sum()
-    }
-
     /// A frame seeded by reference costs the store metadata only: the store
     /// dir grows by far less than the 2 MiB payload (the outboard tree is
     /// ~0.4% of the payload, a few KiB here), never a second copy of the
@@ -6391,7 +6396,7 @@ mod collab_store_tests {
         let frame = root.path().join("p").join("me").join("c_x.fits");
         let bytes = write_file(&frame, 2 * 1024 * 1024);
         let store_dir = collab_blobs_dir(root.path());
-        let before = store_dir_size(&store_dir);
+        let before = super::tests::dir_size(&store_dir);
 
         let hash = node
             .seed_project_frame("p", "u1", 1, &frame)
@@ -6399,7 +6404,7 @@ mod collab_store_tests {
             .expect("seed project frame");
         assert_eq!(hash, Hash::new(&bytes));
 
-        let after = store_dir_size(&store_dir);
+        let after = super::tests::dir_size(&store_dir);
         assert!(
             after.saturating_sub(before) < 64 * 1024,
             "collab store dir grew by {} bytes for a 2 MiB reference import — \
@@ -6419,34 +6424,75 @@ mod collab_store_tests {
     /// `seed_project_frame` call (same uuid/version, same now-dead path)
     /// returns `Err`, and the store dir does not grow by the file's size —
     /// proof that no `Copy` fallback ran (P20).
+    ///
+    /// The REAL P20 scenario (not just "the source vanished before import
+    /// even starts", which `add_path_child`'s own `AddProgressItem::Error`
+    /// already refuses on its own): frame A is seeded, its file is deleted,
+    /// and a BYTE-IDENTICAL file is then written at a DIFFERENT path B that
+    /// sorts AFTER A. Importing B by reference now succeeds — the store
+    /// reads B live to confirm the hash and unions B into the existing
+    /// entry's external-path list — but iroh-blobs 0.103 sorts that union and
+    /// always reads through `paths.first()` (`store/fs/entry_state.rs:44`),
+    /// which is still A: dead. So `seed_project_frame(.., B)` must still
+    /// fail, from `ensure_child_readable`'s post-import probe, and the store
+    /// must end up with NO owned copy of the bytes anywhere — only the two
+    /// external references, one live and one dead.
     #[tokio::test]
     async fn seed_frame_refuses_a_dead_path_instead_of_copying() {
+        use iroh_blobs::store::fs::options::PathOptions;
+
         let (node_dir, root) = (tempdir().unwrap(), tempdir().unwrap());
         let node = bind_disabled(node_dir.path()).await;
         node.set_collab_root(Some(root.path())).await.unwrap();
 
-        let frame = root.path().join("p").join("me").join("c_y.fits");
-        write_file(&frame, 2 * 1024 * 1024);
-        node.seed_project_frame("p", "u2", 1, &frame)
+        // Above `blobs::INLINE_BLOB_MAX_BYTES` (16 KiB), so the store
+        // actually references the file instead of inlining it.
+        let frame_a = root.path().join("p").join("me").join("frame_a.fits");
+        let bytes = write_file(&frame_a, 64 * 1024);
+        node.seed_project_frame("p", "u1", 1, &frame_a)
             .await
-            .expect("first seed");
+            .expect("seed frame A");
+        std::fs::remove_file(&frame_a).unwrap();
 
-        std::fs::remove_file(&frame).unwrap();
+        // Byte-identical content at a path that sorts AFTER `frame_a.fits` in
+        // the same directory, so the union's `paths.first()` after sort is
+        // still the dead `frame_a.fits`.
+        let frame_b = root.path().join("p").join("me").join("frame_b.fits");
+        std::fs::write(&frame_b, &bytes).unwrap();
+        assert!(frame_a.as_os_str() < frame_b.as_os_str());
+
         let store_dir = collab_blobs_dir(root.path());
-        let before = store_dir_size(&store_dir);
+        let before = super::tests::dir_size(&store_dir);
 
-        let result = node.seed_project_frame("p", "u2", 1, &frame).await;
+        let hash = Hash::new(&bytes);
+        let result = node.seed_project_frame("p", "u2", 1, &frame_b).await;
         assert!(
             result.is_err(),
-            "re-seeding a deleted path must refuse, not succeed"
+            "seeding a byte-identical file at a path that sorts after a dead \
+             one must still refuse, not succeed"
         );
 
-        let after = store_dir_size(&store_dir);
+        let after = super::tests::dir_size(&store_dir);
         assert!(
             after.saturating_sub(before) < 64 * 1024,
-            "collab store dir grew by {} bytes after a refused dead-path seed — \
+            "collab store dir grew by {} bytes after a refused dead-union seed — \
              looks like a copy repair ran",
             after.saturating_sub(before)
+        );
+
+        let data_path = PathOptions::new(&store_dir).data_path(&hash);
+        assert!(
+            !data_path.exists(),
+            "the store must hold no OWNED data file for {hash} ({}), only \
+             external references",
+            data_path.display()
+        );
+
+        assert_eq!(
+            node.collab_blob_health(hash).await.unwrap(),
+            BlobHealth::Dead,
+            "the entry is Complete per the metadata (frame B's import \
+             registered it) but still reads through the dead frame A path"
         );
 
         node.shutdown().await;
