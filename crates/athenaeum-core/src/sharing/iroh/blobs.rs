@@ -142,7 +142,7 @@ pub(crate) async fn probe_first_byte(store: &Store, hash: Hash) -> Result<()> {
 /// Done`), so a naive `before + offset` would rewind once per child under
 /// [`ImportMode::Copy`]. `reported` is the floor that keeps a bar from walking
 /// backwards.
-struct ImportProgressMeter {
+pub(crate) struct ImportProgressMeter {
     sink: Option<ImportProgressSink>,
     /// Every byte this import will read off disk (all children summed).
     total: u64,
@@ -154,7 +154,7 @@ struct ImportProgressMeter {
 }
 
 impl ImportProgressMeter {
-    fn new(sink: Option<ImportProgressSink>, total: u64) -> Self {
+    pub(crate) fn new(sink: Option<ImportProgressSink>, total: u64) -> Self {
         Self {
             sink,
             total,
@@ -195,6 +195,28 @@ impl ImportProgressMeter {
     }
 }
 
+/// Whether [`ensure_child_readable`] may repair a dead reference-imported
+/// child by re-importing it under [`ImportMode::Copy`] (collab v3 wave 2,
+/// Task 5, plan P20).
+///
+/// `Allow` is the personal-sync/legacy-collab behaviour, unchanged: a dead
+/// external path is repaired by giving the store its own copy of the bytes.
+/// `Refuse` is for the collab store, which must never grow a second,
+/// store-owned copy of a frame the app itself is not the sole custodian of —
+/// there, a dead path is reported as a failure and left for the caller to
+/// re-seed from scratch (or, on the receive side, re-fetch), never silently
+/// copied. `add_path_child` takes the same flag purely so one `CopyRepair`
+/// value threads through the whole import pair for a caller; the import
+/// itself never falls back to `Copy` on its own (a failed
+/// `AddProgressItem::Error` is already a hard `Err` regardless of this flag) —
+/// only `ensure_child_readable`'s post-import readability check branches on
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyRepair {
+    Allow,
+    Refuse,
+}
+
 /// Import ONE payload file as a blob, streaming the import so its copy/outboard
 /// offsets reach `meter`, and return the child's temp tag.
 ///
@@ -203,13 +225,18 @@ impl ImportProgressMeter {
 /// intermediate items are observed instead of discarded. A stream that ends with
 /// neither `Done` nor `Error` violates the iroh-blobs contract — it fails loudly
 /// rather than silently importing nothing.
-async fn add_path_child(
+pub(crate) async fn add_path_child(
     store: &Store,
     abs: &Path,
     child_len: u64,
     mode: ImportMode,
     meter: &mut ImportProgressMeter,
+    repair: CopyRepair,
 ) -> Result<TempTag> {
+    // Accepted for symmetry with `ensure_child_readable` (see `CopyRepair`);
+    // this import never falls back to `Copy` on its own regardless of the
+    // value.
+    let _ = repair;
     let mut stream = store
         .blobs()
         .add_path_with_opts(AddPathOptions {
@@ -264,6 +291,12 @@ async fn add_path_child(
 /// Costs one byte per child on the happy path. `Copy` mode needs no probe (it
 /// never produces an external entry), and a zero-byte payload has no byte to
 /// read — both return the original tag untouched.
+///
+/// `repair` ([`CopyRepair`]) governs what happens when the probe fails:
+/// `Allow` repairs the entry with a fresh `Copy` import, as documented above;
+/// `Refuse` (the collab store, Task 5, P20) never does — it returns `Err`
+/// instead, so a dead reference is reported, not quietly turned into a
+/// second, store-owned copy.
 async fn ensure_child_readable(
     store: &Store,
     abs: &Path,
@@ -271,12 +304,24 @@ async fn ensure_child_readable(
     size: u64,
     mode: ImportMode,
     tt: TempTag,
+    repair: CopyRepair,
 ) -> Result<TempTag> {
     if !matches!(mode, ImportMode::TryReference) || size == 0 {
         return Ok(tt);
     }
     if probe_first_byte(store, hash).await.is_ok() {
         return Ok(tt);
+    }
+    if matches!(repair, CopyRepair::Refuse) {
+        tracing::error!(
+            hash = %hash,
+            path = %abs.display(),
+            "reference import reads a dead path; refusing (copy repair disabled for this caller)"
+        );
+        anyhow::bail!(
+            "{} is unreadable through the store and copy repair is disabled for this caller",
+            abs.display()
+        );
     }
     tracing::warn!(
         hash = %hash,
@@ -381,10 +426,11 @@ pub async fn import_package_collection_with_mode(
     // attribution map for Task 2.2.
     let mut entries: Vec<(String, u64)> = Vec::with_capacity(count);
     for f in &files {
-        let tt = add_path_child(store, &f.abs, f.len, mode, &mut meter).await?;
+        let tt = add_path_child(store, &f.abs, f.len, mode, &mut meter, CopyRepair::Allow).await?;
         let hash = tt.hash();
         // A referenced child must be readable before we hand its hash to a peer.
-        let tt = ensure_child_readable(store, &f.abs, hash, f.len, mode, tt).await?;
+        let tt =
+            ensure_child_readable(store, &f.abs, hash, f.len, mode, tt, CopyRepair::Allow).await?;
         items.push((f.name.clone(), hash));
         entries.push((f.name.clone(), f.len));
         child_tags.push(tt);
@@ -541,11 +587,14 @@ pub async fn import_subset_collection(
                 (tt, size)
             }
             Src::Payload { abs, size } => {
-                let tt = add_path_child(store, &abs, size, mode, &mut meter).await?;
+                let tt =
+                    add_path_child(store, &abs, size, mode, &mut meter, CopyRepair::Allow).await?;
                 // Same guard as the full-package path: a referenced child must be
                 // readable before its hash goes into the served collection.
                 let hash = tt.hash();
-                let tt = ensure_child_readable(store, &abs, hash, size, mode, tt).await?;
+                let tt =
+                    ensure_child_readable(store, &abs, hash, size, mode, tt, CopyRepair::Allow)
+                        .await?;
                 (tt, size)
             }
         };

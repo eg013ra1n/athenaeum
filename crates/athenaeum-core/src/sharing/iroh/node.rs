@@ -48,12 +48,13 @@ use iroh::endpoint::{presets, Connection};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher};
 use iroh_blobs::api::blobs::ImportMode;
+use iroh_blobs::api::proto::BlobStatus;
 use iroh_blobs::api::Store;
 use iroh_blobs::provider::events::EventSender;
 use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::GcConfig;
-use iroh_blobs::Hash;
+use iroh_blobs::{Hash, HashAndFormat};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
@@ -304,6 +305,39 @@ fn project_seed_tag(project_id: &str, package_id: &str) -> String {
 /// scope of [`SharedIrohNode::unseed_project`].
 fn project_seed_prefix(project_id: &str) -> String {
     format!("{PROJECT_SEED_PREFIX}{project_id}/")
+}
+
+/// The seeding tag for ONE frame's ONE content version in the COLLAB store
+/// (collab v3 wave 2, Task 5): `project/<project_id>/<frame_uuid>/<content_version>`.
+/// Same `project/` namespace as [`project_seed_tag`] (the legacy, package-
+/// scoped seed), but one path segment deeper — a single frame version, never
+/// a whole package — so [`SharedIrohNode::seed_project_frame`] and
+/// [`SharedIrohNode::seed_project_collection`] can never collide on a tag
+/// name even for the same project.
+pub fn project_frame_tag(project_id: &str, frame_uuid: &str, content_version: i32) -> String {
+    format!("{PROJECT_SEED_PREFIX}{project_id}/{frame_uuid}/{content_version}")
+}
+
+/// The tag prefix covering every content version ever seeded for ONE frame —
+/// the delete scope of [`SharedIrohNode::unseed_project_frame`].
+fn project_frame_prefix(project_id: &str, frame_uuid: &str) -> String {
+    format!("{PROJECT_SEED_PREFIX}{project_id}/{frame_uuid}/")
+}
+
+/// The health of one hash in the collab store
+/// ([`SharedIrohNode::collab_blob_health`], collab v3 wave 2, Task 5, plan
+/// P20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobHealth {
+    /// Not stored at all ([`BlobStatus::NotFound`]).
+    Missing,
+    /// Partially stored — an in-flight download ([`BlobStatus::Partial`]).
+    Partial,
+    /// Stored complete and its first byte reads back fine.
+    Readable,
+    /// Stored complete per the metadata, but the readability probe failed —
+    /// typically a referenced external path that has since vanished.
+    Dead,
 }
 
 /// If `tag` is a receiver-side in-flight download tag
@@ -2998,6 +3032,193 @@ impl SharedIrohNode {
                 "delete project seed tags failed"
             ),
         }
+    }
+
+    // ----- per-frame seeding into the collab store (collab v3 wave 2, Task 5) --
+
+    /// Import `path` into the COLLAB store by reference (never a copy), probe
+    /// its readability, and pin it under
+    /// `project/<project_id>/<frame_uuid>/<content_version>`
+    /// ([`project_frame_tag`]). Returns the blob's [`Hash`] (its BLAKE3).
+    ///
+    /// Errs when no Collaboration root is mounted, when `path` cannot be
+    /// imported (including a path that no longer exists), or when the
+    /// post-import readability probe fails. A dead path is reported and
+    /// refused — never silently repaired into a second, store-owned copy
+    /// ([`blobs::CopyRepair::Refuse`], plan ruling P20): this store holds
+    /// nothing but references into the Collaboration root, and a second copy
+    /// there would defeat the entire point of a reference import.
+    pub async fn seed_project_frame(
+        &self,
+        project_id: &str,
+        frame_uuid: &str,
+        content_version: i32,
+        path: &Path,
+    ) -> Result<Hash> {
+        let Some(store) = self.collab_store() else {
+            let e = anyhow!("no Collaboration root mounted");
+            tracing::error!(
+                project_id,
+                frame_uuid,
+                content_version,
+                path = %path.display(),
+                error = %e,
+                "seed project frame failed"
+            );
+            return Err(e);
+        };
+        let size = match tokio::fs::metadata(path).await {
+            Ok(meta) => meta.len(),
+            Err(e) => {
+                let e = anyhow::Error::from(e).context(format!("stat {}", path.display()));
+                tracing::error!(
+                    project_id,
+                    frame_uuid,
+                    content_version,
+                    path = %path.display(),
+                    error = %format!("{e:#}"),
+                    "seed project frame failed"
+                );
+                return Err(e);
+            }
+        };
+        let mut meter = blobs::ImportProgressMeter::new(None, size);
+        let tt = match blobs::add_path_child(
+            &store,
+            path,
+            size,
+            ImportMode::TryReference,
+            &mut meter,
+            blobs::CopyRepair::Refuse,
+        )
+        .await
+        {
+            Ok(tt) => tt,
+            Err(e) => {
+                tracing::error!(
+                    project_id,
+                    frame_uuid,
+                    content_version,
+                    path = %path.display(),
+                    error = %format!("{e:#}"),
+                    "seed project frame failed"
+                );
+                return Err(e);
+            }
+        };
+        let hash = tt.hash();
+        if let Err(e) = blobs::probe_first_byte(&store, hash).await {
+            tracing::error!(
+                project_id,
+                frame_uuid,
+                content_version,
+                path = %path.display(),
+                hash = %hash,
+                error = %e,
+                "seed project frame failed: reference import reads a dead path"
+            );
+            return Err(e.context(format!(
+                "seed project frame {path:?}: unreadable after import"
+            )));
+        }
+        let tag = project_frame_tag(project_id, frame_uuid, content_version);
+        if let Err(e) = store.tags().set(&tag, HashAndFormat::raw(hash)).await {
+            tracing::error!(
+                project_id,
+                frame_uuid,
+                content_version,
+                tag,
+                error = %e,
+                "seed project frame failed: tag write failed"
+            );
+            return Err(anyhow!("tag project frame {tag}: {e}"));
+        }
+        drop(tt);
+        tracing::debug!(
+            project_id,
+            frame_uuid,
+            content_version,
+            path = %path.display(),
+            hash = %hash,
+            "frame seeded"
+        );
+        Ok(hash)
+    }
+
+    /// Stop seeding ONE frame across every content version ever seeded for it:
+    /// deletes every tag under `project/<project_id>/<frame_uuid>/`
+    /// ([`project_frame_prefix`]) — a sibling frame's and every other
+    /// project's tags are untouched. Best-effort against the underlying store
+    /// call (mirrors [`unseed_project_package`](Self::unseed_project_package)
+    /// / [`unseed_project`](Self::unseed_project)): a failure is logged and
+    /// returned, never silently dropped, but leaves nothing worse behind than
+    /// a pinned blob over a frame that is about to disappear from the
+    /// catalog — a failing GET, never a wrong one. Returns the number of tags
+    /// removed.
+    pub async fn unseed_project_frame(&self, project_id: &str, frame_uuid: &str) -> Result<usize> {
+        let Some(store) = self.collab_store() else {
+            let e = anyhow!("no Collaboration root mounted");
+            tracing::warn!(project_id, frame_uuid, error = %e, "unseed project frame skipped");
+            return Err(e);
+        };
+        let prefix = project_frame_prefix(project_id, frame_uuid);
+        match store.tags().delete_prefix(prefix.as_bytes()).await {
+            Ok(removed) => {
+                tracing::info!(
+                    project_id,
+                    frame_uuid,
+                    tags_removed = removed,
+                    "project frame unseeded"
+                );
+                Ok(removed as usize)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    project_id,
+                    frame_uuid,
+                    error = %e,
+                    "delete project frame seed tags failed"
+                );
+                Err(anyhow!(
+                    "delete project frame seed tags for {frame_uuid}: {e}"
+                ))
+            }
+        }
+    }
+
+    /// Report one hash's health in the COLLAB store (Task 5).
+    ///
+    /// `Missing` when [`BlobStatus::NotFound`], `Partial` when
+    /// [`BlobStatus::Partial`] (an in-flight download), `Readable` when
+    /// [`BlobStatus::Complete`] AND [`blobs::probe_first_byte`] reads its
+    /// first byte back, `Dead` when `Complete` per the metadata but the probe
+    /// fails — a referenced external path that has since vanished (plan
+    /// P20).
+    pub async fn collab_blob_health(&self, hash: Hash) -> Result<BlobHealth> {
+        let Some(store) = self.collab_store() else {
+            let e = anyhow!("no Collaboration root mounted");
+            tracing::error!(hash = %hash, error = %e, "collab blob health check failed");
+            return Err(e);
+        };
+        let status = match store.blobs().status(hash).await {
+            Ok(status) => status,
+            Err(e) => {
+                let e = anyhow!("status of {hash}: {e}");
+                tracing::error!(hash = %hash, error = %e, "collab blob health check failed");
+                return Err(e);
+            }
+        };
+        Ok(match status {
+            BlobStatus::NotFound => BlobHealth::Missing,
+            BlobStatus::Partial { .. } => BlobHealth::Partial,
+            BlobStatus::Complete { .. } => {
+                if blobs::probe_first_byte(&store, hash).await.is_ok() {
+                    BlobHealth::Readable
+                } else {
+                    BlobHealth::Dead
+                }
+            }
+        })
     }
 
     /// Drop one tag's `served` + `served_files` entries in lock-step (the two maps
@@ -5756,7 +5977,7 @@ mod tests {
 /// connection. Real nodes, relay disabled.
 #[cfg(test)]
 mod collab_store_tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use iroh_blobs::api::blobs::AddPathOptions;
     use iroh_blobs::protocol::GetRequest;
@@ -6134,5 +6355,178 @@ mod collab_store_tests {
 
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    // ----- Task 5: seed/unseed one frame by reference, blob health ----------
+
+    /// `<root>/.athenaeum/blobs` for a mounted collab root.
+    fn collab_blobs_dir(root: &Path) -> PathBuf {
+        root.join(".athenaeum").join("blobs")
+    }
+
+    /// Total bytes of every regular file under `dir` — the store-growth
+    /// oracle a reference import must stay far below (mirrors `dir_size` in
+    /// the sibling `tests` module, duplicated here because the two `#[cfg(test)]`
+    /// modules do not share private items).
+    fn store_dir_size(dir: &Path) -> u64 {
+        walkdir::WalkDir::new(dir)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum()
+    }
+
+    /// A frame seeded by reference costs the store metadata only: the store
+    /// dir grows by far less than the 2 MiB payload (the outboard tree is
+    /// ~0.4% of the payload, a few KiB here), never a second copy of the
+    /// bytes. The returned hash is the plain BLAKE3 of the file, and the
+    /// per-frame tag exists afterward.
+    #[tokio::test]
+    async fn seed_frame_references_and_does_not_copy() {
+        let (node_dir, root) = (tempdir().unwrap(), tempdir().unwrap());
+        let node = bind_disabled(node_dir.path()).await;
+        node.set_collab_root(Some(root.path())).await.unwrap();
+
+        let frame = root.path().join("p").join("me").join("c_x.fits");
+        let bytes = write_file(&frame, 2 * 1024 * 1024);
+        let store_dir = collab_blobs_dir(root.path());
+        let before = store_dir_size(&store_dir);
+
+        let hash = node
+            .seed_project_frame("p", "u1", 1, &frame)
+            .await
+            .expect("seed project frame");
+        assert_eq!(hash, Hash::new(&bytes));
+
+        let after = store_dir_size(&store_dir);
+        assert!(
+            after.saturating_sub(before) < 64 * 1024,
+            "collab store dir grew by {} bytes for a 2 MiB reference import — \
+             looks like a copy, not a reference",
+            after.saturating_sub(before)
+        );
+
+        assert!(
+            tag_present(&node.collab_store().unwrap(), "project/p/u1/1").await,
+            "project/p/u1/1 tag missing after seed"
+        );
+
+        node.shutdown().await;
+    }
+
+    /// A vanished source file is refused, never copy-repaired: the second
+    /// `seed_project_frame` call (same uuid/version, same now-dead path)
+    /// returns `Err`, and the store dir does not grow by the file's size —
+    /// proof that no `Copy` fallback ran (P20).
+    #[tokio::test]
+    async fn seed_frame_refuses_a_dead_path_instead_of_copying() {
+        let (node_dir, root) = (tempdir().unwrap(), tempdir().unwrap());
+        let node = bind_disabled(node_dir.path()).await;
+        node.set_collab_root(Some(root.path())).await.unwrap();
+
+        let frame = root.path().join("p").join("me").join("c_y.fits");
+        write_file(&frame, 2 * 1024 * 1024);
+        node.seed_project_frame("p", "u2", 1, &frame)
+            .await
+            .expect("first seed");
+
+        std::fs::remove_file(&frame).unwrap();
+        let store_dir = collab_blobs_dir(root.path());
+        let before = store_dir_size(&store_dir);
+
+        let result = node.seed_project_frame("p", "u2", 1, &frame).await;
+        assert!(
+            result.is_err(),
+            "re-seeding a deleted path must refuse, not succeed"
+        );
+
+        let after = store_dir_size(&store_dir);
+        assert!(
+            after.saturating_sub(before) < 64 * 1024,
+            "collab store dir grew by {} bytes after a refused dead-path seed — \
+             looks like a copy repair ran",
+            after.saturating_sub(before)
+        );
+
+        node.shutdown().await;
+    }
+
+    /// `collab_blob_health` distinguishes a live seed (`Readable`), a seed
+    /// whose file has since vanished (`Dead` — `Complete` per the metadata but
+    /// the probe fails), and a hash never stored at all (`Missing`).
+    #[tokio::test]
+    async fn blob_health_reports_dead_after_delete() {
+        let (node_dir, root) = (tempdir().unwrap(), tempdir().unwrap());
+        let node = bind_disabled(node_dir.path()).await;
+        node.set_collab_root(Some(root.path())).await.unwrap();
+
+        // Above `blobs::INLINE_BLOB_MAX_BYTES` (16 KiB): an inlined payload has
+        // no external path and can never go dead, which would make this test
+        // vacuous.
+        let frame = root.path().join("p").join("me").join("c_z.fits");
+        write_file(&frame, 64 * 1024);
+        let hash = node
+            .seed_project_frame("p", "u3", 1, &frame)
+            .await
+            .expect("seed project frame");
+
+        assert_eq!(
+            node.collab_blob_health(hash).await.unwrap(),
+            BlobHealth::Readable
+        );
+
+        std::fs::remove_file(&frame).unwrap();
+        assert_eq!(
+            node.collab_blob_health(hash).await.unwrap(),
+            BlobHealth::Dead
+        );
+
+        let unknown = Hash::new(b"never stored");
+        assert_eq!(
+            node.collab_blob_health(unknown).await.unwrap(),
+            BlobHealth::Missing
+        );
+
+        node.shutdown().await;
+    }
+
+    /// Unseeding one frame deletes only ITS tags (every content version under
+    /// its own `project/<pid>/<uuid>/` prefix) — a sibling frame of the same
+    /// project keeps its tag.
+    #[tokio::test]
+    async fn unseed_frame_deletes_only_that_frame() {
+        let (node_dir, root) = (tempdir().unwrap(), tempdir().unwrap());
+        let node = bind_disabled(node_dir.path()).await;
+        node.set_collab_root(Some(root.path())).await.unwrap();
+
+        let frame1 = root.path().join("p").join("me").join("frame1.fits");
+        let frame2 = root.path().join("p").join("me").join("frame2.fits");
+        write_file(&frame1, 4096);
+        write_file(&frame2, 4096);
+        node.seed_project_frame("p", "u1", 1, &frame1)
+            .await
+            .expect("seed u1");
+        node.seed_project_frame("p", "u2", 1, &frame2)
+            .await
+            .expect("seed u2");
+
+        let removed = node
+            .unseed_project_frame("p", "u1")
+            .await
+            .expect("unseed u1");
+        assert_eq!(removed, 1);
+
+        let store = node.collab_store().unwrap();
+        assert!(
+            !tag_present(&store, "project/p/u1/1").await,
+            "u1's tag must be gone"
+        );
+        assert!(
+            tag_present(&store, "project/p/u2/1").await,
+            "u2's tag must survive u1's unseed"
+        );
+
+        node.shutdown().await;
     }
 }
