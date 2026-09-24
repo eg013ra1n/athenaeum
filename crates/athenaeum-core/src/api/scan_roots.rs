@@ -1083,10 +1083,24 @@ async fn mount_collab_store(ctx: &ServiceContext, root: Option<&Path>) -> Result
         .map_err(|e| ApiError::Internal(format!("mount the collaboration store: {e:#}")))
 }
 
-/// Clear the collaboration folder (demotes to a normal monitored directory)
-/// and unmount its collab blob store from the bound iroh node.
+/// Clear the collaboration folder (demotes to a normal monitored directory),
+/// drop its foreign-file list (R18 — the files under a folder that is no
+/// longer the Collaboration root are nobody's "not part of the project"), and
+/// unmount its collab blob store from the bound iroh node.
 pub async fn clear_collaboration_dir(ctx: &ServiceContext) -> Result<(), ApiError> {
+    let previous = get_special_root_dir(ctx, "collaboration")?;
     clear_special_root_dir(ctx, "collaboration")?;
+    if let Some(root) = previous {
+        let db = db(ctx)?;
+        let removed = crate::db::collab_frames::delete_foreign_files_under(&db.conn(), &root)
+            .map_err(|e| {
+                tracing::error!(path = %root, error = %e, "drop the foreign file list failed");
+                e
+            })?;
+        if removed > 0 {
+            tracing::info!(path = %root, count = removed, "foreign file list dropped with the collaboration folder");
+        }
+    }
     mount_collab_store(ctx, None).await
 }
 
@@ -2299,6 +2313,48 @@ mod special_root_tests {
             set_collaboration_dir(&ctx, "relative/collab".to_string(), &PathPolicy::AllowAll).await,
             Err(ApiError::Invalid(_))
         ));
+    }
+
+    /// M2 (R18): clearing the Collaboration root drops its foreign-file list —
+    /// every row under the old root — and leaves a row outside it (an
+    /// `ATH_PRJ`-stamped file elsewhere) alone.
+    #[tokio::test]
+    async fn clearing_the_collaboration_root_drops_its_foreign_list() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let folder = TempDir::new().unwrap();
+        let stored = set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+        let inside = Path::new(&stored).join("m31").join("stray.fits");
+        let elsewhere = "/somewhere/else/c_x.fits";
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            for path in [inside.to_string_lossy().as_ref(), elsewhere] {
+                crate::db::collab_frames::record_foreign_file(&conn, path, None, Some("1:1"))
+                    .unwrap();
+            }
+        }
+
+        clear_collaboration_dir(&ctx).await.unwrap();
+
+        let listed: Vec<String> = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let mut stmt = conn
+                .prepare("SELECT path FROM collab_foreign_files")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(listed, vec![elsewhere.to_string()]);
     }
 
     /// The row of `path` as `(kind, enabled, find_duplicates, unique_camera,

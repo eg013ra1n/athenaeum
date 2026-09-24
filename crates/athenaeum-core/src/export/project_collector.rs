@@ -46,8 +46,9 @@ pub struct ProjectExportData {
 }
 
 /// Collect a project's exportable frames: every `project_frames_local` row
-/// with `on_disk = 1` and `accepted = 1`, own and replica alike, at its
-/// `landed_path` (P26), partitioned into one dataset per publisher display.
+/// that is published, accepted, on disk and not awaiting GC (R31), own and
+/// replica alike, at its `landed_path` (P26), partitioned into one dataset
+/// per publisher display.
 ///
 /// `own_display` is resolved by the runner from the cached membership
 /// snapshot; it is the folder/dataset key for my own frames. A replica
@@ -68,7 +69,7 @@ pub fn collect_project_export_data(
 
     let mut rows: Vec<LocalFrameRow> = list_for_project(conn, project_id)?
         .into_iter()
-        .filter(|r| r.on_disk && r.accepted && r.landed_path.is_some())
+        .filter(exportable)
         .collect();
     // Own first (stable: the table's order within each origin is kept).
     rows.sort_by_key(|r| r.origin != FrameOrigin::Own);
@@ -129,6 +130,13 @@ pub fn collect_project_export_data(
         publishers,
         warnings,
     })
+}
+
+/// Is a frame part of the project export (R31)? Published by the project
+/// (never an own pending or rejected frame), accepted by the gate, on disk at
+/// a recorded path, and not waiting for store GC.
+fn exportable(r: &LocalFrameRow) -> bool {
+    r.state == "published" && r.accepted && r.on_disk && !r.awaiting_gc && r.landed_path.is_some()
 }
 
 /// One [`ExportFrame`] for a project frame: the file at `landed`, its
@@ -493,10 +501,11 @@ mod tests {
         assert!(data.warnings.is_empty(), "{:?}", data.warnings);
     }
 
-    // Only frames on disk AND accepted by the gate export; a row with no
-    // landed path, one not on disk and a gate-rejected one are skipped.
+    // Only published frames on disk AND accepted by the gate export (R31): a
+    // row with no landed path, one not on disk, a gate-rejected one, one
+    // awaiting GC, and an own pending or moderator-rejected frame are skipped.
     #[test]
-    fn only_on_disk_accepted_frames_are_exported() {
+    fn only_published_on_disk_accepted_frames_are_exported() {
         let conn = test_conn();
         seed_project(&conn, "p-1");
         let m = manifest("L", "CamA");
@@ -546,11 +555,91 @@ mod tests {
             [],
         )
         .unwrap();
+        for (uuid, path) in [
+            ("gc", "/c/gc.fits"),
+            ("own-pending", "/o/pending.fits"),
+            ("own-rejected", "/o/rejected.fits"),
+        ] {
+            let origin = if uuid == "gc" {
+                FrameOrigin::Replica
+            } else {
+                FrameOrigin::Own
+            };
+            mk_frame(
+                &conn,
+                "p-1",
+                uuid,
+                origin,
+                "Alice",
+                Some(path),
+                manifest("L", "CamA"),
+            );
+        }
+        conn.execute(
+            "UPDATE project_frames_local SET awaiting_gc = 1 WHERE frame_uuid = 'gc'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE project_frames_local SET state = 'pending' WHERE frame_uuid = 'own-pending'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE project_frames_local SET state = 'rejected' WHERE frame_uuid = 'own-rejected'",
+            [],
+        )
+        .unwrap();
+
+        let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
+        assert_eq!(
+            data.publishers.len(),
+            1,
+            "no own dataset: nothing own is published"
+        );
+        let frames = all_frames(find(&data, "Alice"));
+        let names: Vec<&str> = frames.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(names, vec!["live.fits"]);
+    }
+
+    // A row whose manifest JSON does not parse is skipped — only that row —
+    // with one warning naming it, so the export dialog reports the omission.
+    #[test]
+    fn malformed_manifest_row_skips_only_that_row() {
+        let conn = test_conn();
+        seed_project(&conn, "p-1");
+        mk_frame(
+            &conn,
+            "p-1",
+            "good",
+            FrameOrigin::Replica,
+            "Alice",
+            Some("/c/good.fits"),
+            manifest("L", "CamA"),
+        );
+        mk_frame(
+            &conn,
+            "p-1",
+            "bad",
+            FrameOrigin::Replica,
+            "Alice",
+            Some("/c/bad.fits"),
+            manifest("L", "CamA"),
+        );
+        conn.execute(
+            "UPDATE project_frames_local SET manifest_json = '{not json' WHERE frame_uuid = 'bad'",
+            [],
+        )
+        .unwrap();
 
         let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
         let frames = all_frames(find(&data, "Alice"));
         let names: Vec<&str> = frames.iter().map(|f| f.filename.as_str()).collect();
-        assert_eq!(names, vec!["live.fits"]);
+        assert_eq!(names, vec!["good.fits"]);
+        assert_eq!(
+            data.warnings,
+            vec!["skipped bad.fits: unreadable frame metadata".to_string()]
+        );
     }
 
     // Frame metadata comes from the manifest row, never a header card: one

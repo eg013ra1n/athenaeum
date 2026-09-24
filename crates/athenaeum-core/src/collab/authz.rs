@@ -9,7 +9,7 @@
 //! raw ed25519 pubkey.
 //!
 //! **Fail-closed, always.** A missing project row, a `members_json` that does not
-//! parse, a DB read error, or simply no matching node ⇒ `None` / `false`. Node
+//! parse, a DB read error, or simply no matching node ⇒ `false`. Node
 //! matching decodes each member's base64 `nodes[]` into 32 raw bytes and compares
 //! those bytes to the [`NodeId`] — never the base64 strings (two different base64
 //! encodings could name the same key). Malformed node entries are skipped with a
@@ -20,43 +20,6 @@ use base64::Engine;
 
 use crate::collab::snapshot::SnapshotMember;
 use crate::sharing::types::NodeId;
-
-/// The membership facts about one project member, resolved from the cached
-/// snapshot.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MemberIdentity {
-    pub display_name: String,
-    /// `"send"` (contributor: publishes only) or `"send_receive"` (may pull).
-    pub data_role: String,
-    pub coordinator: bool,
-}
-
-/// The member (if any) that `node` belongs to in `project_id`'s cached snapshot.
-/// Fail-closed: no row / parse error / no match ⇒ `None`.
-pub fn member_for_node(
-    conn: &rusqlite::Connection,
-    project_id: &str,
-    node: &NodeId,
-) -> Option<MemberIdentity> {
-    let row = match crate::db::collab::get_project(conn, project_id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return None,
-        Err(e) => {
-            tracing::warn!(project_id, error = %e, "collab authz: project read failed; deny");
-            return None;
-        }
-    };
-    let members = parse_members(&row.members_json);
-    let mut warned = false;
-    members
-        .into_iter()
-        .find(|m| member_owns_node(m, node, &mut warned))
-        .map(|m| MemberIdentity {
-            display_name: m.display_name,
-            data_role: m.data_role,
-            coordinator: m.coordinator,
-        })
-}
 
 /// True when `node` appears in ANY cached project snapshot. This is the
 /// connect-gate feed: a peer is allowed to open a connection when it is a member
@@ -194,34 +157,6 @@ mod tests {
     }
 
     #[test]
-    fn member_for_node_resolves_each_role_and_none_for_stranger() {
-        let conn = test_conn();
-        seed_project(&conn, "p-1", &two_member_json());
-
-        let a = member_for_node(&conn, "p-1", &NODE_A).expect("node A resolves");
-        assert_eq!(
-            a,
-            MemberIdentity {
-                display_name: "Alice".into(),
-                data_role: "send_receive".into(),
-                coordinator: true
-            }
-        );
-        let b = member_for_node(&conn, "p-1", &NODE_B).expect("node B resolves");
-        assert_eq!(
-            b,
-            MemberIdentity {
-                display_name: "Bob".into(),
-                data_role: "send".into(),
-                coordinator: false
-            }
-        );
-        assert!(member_for_node(&conn, "p-1", &STRANGER).is_none());
-        // Unknown project id is fail-closed too.
-        assert!(member_for_node(&conn, "no-such-project", &NODE_A).is_none());
-    }
-
-    #[test]
     fn node_in_any_project_scans_every_snapshot() {
         let conn = test_conn();
         seed_project(&conn, "p-1", &two_member_json());
@@ -235,7 +170,6 @@ mod tests {
     fn empty_table_is_fail_closed() {
         let conn = test_conn();
         // No projects cached at all: every question answers deny.
-        assert!(member_for_node(&conn, "p-1", &NODE_A).is_none());
         assert!(!node_in_any_project(&conn, &NODE_A));
     }
 
@@ -255,12 +189,13 @@ mod tests {
         ])
         .to_string();
         seed_project(&conn, "p-1", &json);
-        assert!(member_for_node(&conn, "p-1", &NODE_B).is_some());
-        assert!(member_for_node(&conn, "p-1", &NODE_A).is_none());
+        assert!(node_in_any_project(&conn, &NODE_B));
+        assert!(!node_in_any_project(&conn, &NODE_A));
 
         // A members_json that does not parse ⇒ that project authorizes nobody
-        // (fail-closed), independent of any other cached project.
+        // (fail-closed).
+        let conn = test_conn();
         seed_project(&conn, "p-2", "{ this is not a member array");
-        assert!(member_for_node(&conn, "p-2", &NODE_B).is_none());
+        assert!(!node_in_any_project(&conn, &NODE_B));
     }
 }

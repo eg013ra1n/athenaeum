@@ -196,7 +196,7 @@ pub fn scan_directory(
     match is_collaboration_root(conn, root_id) {
         Ok(true) => {
             let total = files.len();
-            reconcile_collaboration_root(conn, &files, root_id, &mut result, |idx, path| {
+            reconcile_collaboration_root(conn, root_path, &files, root_id, &mut result, |idx, path| {
                 if let Some(ref cb) = progress_callback {
                     cb(ScanProgress {
                         current: idx + 1,
@@ -689,9 +689,22 @@ fn reconcile_project_file(
         return Ok(());
     }
 
+    // R30: a file already listed as foreign whose `size:mtime` has not moved
+    // was hashed and classified before — no re-hash, no repeated warn.
+    let size_mtime = std::fs::metadata(path).ok().map(|m| size_mtime_of(&m));
+    if let Some(sm) = size_mtime.as_deref() {
+        if frames_db::foreign_file_size_mtime(conn, current_path)?.flatten().as_deref() == Some(sm)
+        {
+            tracing::debug!(root_id, path = %current_path, "unchanged foreign file; not re-hashed");
+            return Ok(());
+        }
+    }
+
     // Full-content hash (the manifest's key — NOT the sampling hash). A read
     // failure cannot tell moved from duplicate from unknown, so the file is
     // left for a later scan rather than risk a wrong branch.
+    #[cfg(test)]
+    reconcile_hash_seam::count();
     let xxh3 = match crate::package::xxh3_full_file(path) {
         Ok(h) => h,
         Err(e) => {
@@ -757,8 +770,40 @@ fn reconcile_project_file(
         project_id = stamp.as_deref().unwrap_or_default(),
         "file is not part of any project; listed as foreign"
     );
-    frames_db::record_foreign_file(conn, current_path, stamp.as_deref())?;
+    frames_db::record_foreign_file(conn, current_path, stamp.as_deref(), size_mtime.as_deref())?;
     Ok(())
+}
+
+/// `"size:mtime_secs"` — the same shape disk truth records in
+/// `project_frames_local.size_mtime_seen`.
+fn size_mtime_of(meta: &std::fs::Metadata) -> String {
+    let secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}:{secs}", meta.len())
+}
+
+/// Test seam: how many full-content hashes [`reconcile_project_file`] took on
+/// THIS thread (both walkers reconcile on the calling thread).
+#[cfg(test)]
+pub(crate) mod reconcile_hash_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HASHES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn count() {
+        HASHES.with(|h| h.set(h.get() + 1));
+    }
+
+    /// The hashes taken on this thread since the last `take`.
+    pub(crate) fn take() -> usize {
+        HASHES.with(|h| h.replace(0))
+    }
 }
 
 /// The `ATH_PRJ` card of a file's header, if it has one. Best-effort: the
@@ -801,9 +846,12 @@ fn is_collaboration_root(conn: &Connection, root_id: i64) -> anyhow::Result<bool
 
 /// Reconcile every discovered file of the Collaboration root (P26) — the
 /// whole scan of that root. `progress(index)` is called before each file;
-/// returning `false` cancels the rest.
+/// returning `false` cancels the rest. A COMPLETED walk then drops every
+/// listed foreign file under `root_path` it did not see; a cancelled one
+/// prunes nothing (it did not see everything).
 fn reconcile_collaboration_root(
     conn: &Connection,
+    root_path: &Path,
     files: &[PathBuf],
     root_id: i64,
     result: &mut ScanResult,
@@ -830,6 +878,24 @@ fn reconcile_collaboration_root(
                     .errors
                     .push(format!("{}: project frame reconcile failed: {}", path.display(), e));
             }
+        }
+    }
+    if result.cancelled {
+        return;
+    }
+    let seen: std::collections::HashSet<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let root = root_path.to_string_lossy();
+    match crate::db::collab_frames::prune_foreign_files_under(conn, &root, &seen) {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(root_id, count, "foreign files no longer on disk unlisted"),
+        Err(e) => {
+            tracing::error!(root_id, error = %e, "prune of the foreign file list failed");
+            result
+                .errors
+                .push(format!("Failed to prune the foreign file list: {e}"));
         }
     }
 }
@@ -1447,7 +1513,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     match is_collaboration_root(conn, root_id) {
         Ok(true) => {
             let total = files.len();
-            reconcile_collaboration_root(conn, &files, root_id, &mut result, |idx, path| {
+            reconcile_collaboration_root(conn, root_path, &files, root_id, &mut result, |idx, path| {
                 if idx % 50 == 0 {
                     emit_progress(
                         emitter,
@@ -3620,6 +3686,126 @@ mod calibrated_light_scan_tests {
                 vec![(s(&plain), None), (s(&stamped), Some("p1".to_string()))],
                 "parallel={parallel}"
             );
+        }
+    }
+
+    /// `(level, message)` of every WARN event on this thread while alive.
+    struct WarnCapture {
+        seen: Arc<Mutex<Vec<String>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    fn capture_warns() -> WarnCapture {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Seen(Arc<Mutex<Vec<String>>>);
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut msg = Message(String::new());
+                    event.record(&mut msg);
+                    self.0.lock().unwrap().push(msg.0);
+                }
+            }
+        }
+        let seen = Seen::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(seen.clone()));
+        tracing::callsite::rebuild_interest_cache();
+        WarnCapture {
+            seen: seen.0,
+            _guard: guard,
+        }
+    }
+
+    impl WarnCapture {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.seen.lock().unwrap())
+        }
+    }
+
+    /// R30: a foreign file is hashed and warned about once; a re-scan with its
+    /// `size:mtime` unchanged takes no hash and logs no warn; an edit makes it
+    /// new again.
+    #[test]
+    fn unchanged_foreign_file_is_not_rehashed() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let stray = root.path().join("m31").join("Other").join("L_0009.fits");
+            write_plain_light(&stray, 9);
+            let conn = collab_db(root.path(), 1);
+            let warns = capture_warns();
+            reconcile_hash_seam::take();
+
+            assert!(run_scan(parallel, root.path(), &conn, 1).errors.is_empty());
+            assert_eq!(reconcile_hash_seam::take(), 1, "parallel={parallel}: first scan hashes");
+            assert!(
+                warns.take().iter().any(|m| m.contains("not part of any project")),
+                "parallel={parallel}: first scan warns"
+            );
+
+            assert!(run_scan(parallel, root.path(), &conn, 1).errors.is_empty());
+            assert_eq!(reconcile_hash_seam::take(), 0, "parallel={parallel}: no re-hash");
+            assert!(warns.take().is_empty(), "parallel={parallel}: no repeated warn");
+            assert_eq!(foreign(&conn), vec![(s(&stray), None)], "parallel={parallel}: row kept");
+
+            // An edit (new size and mtime) makes it a new foreign file again.
+            let later = std::fs::metadata(&stray).unwrap().modified().unwrap()
+                + std::time::Duration::from_secs(5);
+            write_plain_light(&stray, 10);
+            std::fs::File::options()
+                .write(true)
+                .open(&stray)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+            assert!(run_scan(parallel, root.path(), &conn, 1).errors.is_empty());
+            assert_eq!(reconcile_hash_seam::take(), 1, "parallel={parallel}: re-hashed");
+            assert!(!warns.take().is_empty(), "parallel={parallel}: warned again");
+        }
+    }
+
+    /// M2: a completed walk of the Collaboration root unlists every foreign
+    /// file it did not see; a cancelled walk prunes nothing.
+    #[test]
+    fn a_completed_walk_unlists_foreign_files_gone_from_disk() {
+        let root = TempDir::new().unwrap();
+        let keep = root.path().join("m31").join("keep.fits");
+        let gone = root.path().join("m31").join("gone.fits");
+        write_plain_light(&keep, 11);
+        write_plain_light(&gone, 12);
+        let conn = collab_db(root.path(), 1);
+        assert!(run_scan(true, root.path(), &conn, 1).errors.is_empty());
+        assert_eq!(foreign(&conn).len(), 2);
+
+        std::fs::remove_file(&gone).unwrap();
+        let cancelled = scan_directory_parallel(
+            root.path(),
+            1,
+            &conn,
+            &NullEmitter,
+            Arc::new(AtomicBool::new(true)),
+            false,
+        );
+        assert!(cancelled.cancelled);
+        assert_eq!(foreign(&conn).len(), 2, "a cancelled walk prunes nothing");
+
+        for parallel in [false, true] {
+            assert!(run_scan(parallel, root.path(), &conn, 1).errors.is_empty());
+            assert_eq!(foreign(&conn), vec![(s(&keep), None)], "parallel={parallel}");
         }
     }
 

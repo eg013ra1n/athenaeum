@@ -4352,27 +4352,31 @@ mod tests {
 
     // ── Unseeding at the project-data deletion site ──────────────────────────
 
-    /// Pin a throwaway blob under `project/<project_id>/<frame>/1` in `ctx`'s
-    /// node store, binding the node if the test has not already. The seed's
+    /// Pin a throwaway blob under `project/<project_id>/<frame>/1` in the
+    /// COLLAB store of `ctx`'s node — where per-frame seeds live — binding the
+    /// node and mounting `collab_root` if the test has not already. The seed's
     /// CONTENT is irrelevant to a deletion test — what is asserted is that the
     /// tag lives and dies with the project data. Returns the node.
     async fn seed_tag_on_node(
         ctx: &ServiceContext,
+        collab_root: &std::path::Path,
         project_id: &str,
         frame: &str,
     ) -> std::sync::Arc<crate::sharing::iroh::node::SharedIrohNode> {
         let node = crate::api::sync::ensure_iroh_node(ctx).await.unwrap();
-        let tt = node
-            .store()
+        std::fs::create_dir_all(collab_root).unwrap();
+        node.set_collab_root(Some(collab_root)).await.unwrap();
+        let store = node.collab_store().expect("collab store mounted");
+        let tt = store
             .blobs()
             .add_bytes(format!("{project_id}/{frame}").into_bytes())
             .temp_tag()
             .await
             .unwrap();
-        node.store()
+        store
             .tags()
             .set(
-                format!("project/{project_id}/{frame}/1"),
+                crate::sharing::iroh::node::project_frame_tag(project_id, frame, 1),
                 tt.hash_and_format(),
             )
             .await
@@ -4385,9 +4389,10 @@ mod tests {
         project_id: &str,
         frame: &str,
     ) -> bool {
-        node.store()
+        node.collab_store()
+            .expect("collab store mounted")
             .tags()
-            .get(format!("project/{project_id}/{frame}/1").as_bytes())
+            .get(crate::sharing::iroh::node::project_frame_tag(project_id, frame, 1).as_bytes())
             .await
             .unwrap()
             .is_some()
@@ -4426,9 +4431,10 @@ mod tests {
             let conn = crate::api::db(&ctx).unwrap().conn();
             seed_publish_project(&conn, "p-gone", "[]");
         }
-        let node = seed_tag_on_node(&ctx, "p-gone", "f-a").await;
-        seed_tag_on_node(&ctx, "p-gone", "f-b").await;
-        seed_tag_on_node(&ctx, "p-stays", "f-c").await;
+        let collab_root = _tmp.path().join("Collab");
+        let node = seed_tag_on_node(&ctx, &collab_root, "p-gone", "f-a").await;
+        seed_tag_on_node(&ctx, &collab_root, "p-gone", "f-b").await;
+        seed_tag_on_node(&ctx, &collab_root, "p-stays", "f-c").await;
 
         refresh_projects(&ctx).await.unwrap();
 

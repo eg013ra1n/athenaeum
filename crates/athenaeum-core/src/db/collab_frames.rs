@@ -631,17 +631,36 @@ pub fn project_ids(conn: &Connection) -> Result<Vec<String>> {
 }
 
 /// List `path` as a foreign file under the Collaboration root (P26 "unknown",
-/// R18), with the project its `ATH_PRJ` stamp names, if any. Idempotent: a
-/// re-scan refreshes `seen_at` and the stamp, one row per path.
-pub fn record_foreign_file(conn: &Connection, path: &str, project_id: Option<&str>) -> Result<()> {
+/// R18), with the project its `ATH_PRJ` stamp names, if any, and the
+/// `size:mtime` it was hashed at (R30). Idempotent: a re-scan refreshes
+/// `seen_at`, the stamp and `size_mtime`, one row per path.
+pub fn record_foreign_file(
+    conn: &Connection,
+    path: &str,
+    project_id: Option<&str>,
+    size_mtime: Option<&str>,
+) -> Result<()> {
     conn.execute(
-        "INSERT INTO collab_foreign_files (path, project_id, seen_at)
-         VALUES (?1, ?2, datetime('now'))
+        "INSERT INTO collab_foreign_files (path, project_id, size_mtime, seen_at)
+         VALUES (?1, ?2, ?3, datetime('now'))
          ON CONFLICT(path) DO UPDATE SET project_id = excluded.project_id,
+                                         size_mtime = excluded.size_mtime,
                                          seen_at = excluded.seen_at",
-        params![path, project_id],
+        params![path, project_id, size_mtime],
     )?;
     Ok(())
+}
+
+/// The `size:mtime` a listed foreign file was hashed at: `None` when `path`
+/// is not listed, `Some(None)` for a row without one.
+pub fn foreign_file_size_mtime(conn: &Connection, path: &str) -> Result<Option<Option<String>>> {
+    conn.query_row(
+        "SELECT size_mtime FROM collab_foreign_files WHERE path = ?1",
+        params![path],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Drop `path` from the foreign list — the scanner matched it to a frame row
@@ -650,6 +669,43 @@ pub fn forget_foreign_file(conn: &Connection, path: &str) -> Result<usize> {
     Ok(conn.execute(
         "DELETE FROM collab_foreign_files WHERE path = ?1",
         params![path],
+    )?)
+}
+
+/// After a COMPLETED walk of the Collaboration root `root`: drop every listed
+/// foreign file under it that the walk did not see (deleted or moved away).
+/// Returns the rows removed.
+pub fn prune_foreign_files_under(
+    conn: &Connection,
+    root: &str,
+    seen: &HashSet<String>,
+) -> Result<usize> {
+    let (pred, values) =
+        crate::db::scan_root_prefix_predicate("path", std::slice::from_ref(&root.to_string()));
+    let listed: Vec<String> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT path FROM collab_foreign_files WHERE {pred}"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        rows
+    };
+    let mut removed = 0;
+    for path in listed.iter().filter(|p| !seen.contains(*p)) {
+        removed += forget_foreign_file(conn, path)?;
+    }
+    Ok(removed)
+}
+
+/// Drop every listed foreign file under `root` — the Collaboration root was
+/// cleared, so its list no longer means anything. Returns the rows removed.
+pub fn delete_foreign_files_under(conn: &Connection, root: &str) -> Result<usize> {
+    let (pred, values) =
+        crate::db::scan_root_prefix_predicate("path", std::slice::from_ref(&root.to_string()));
+    Ok(conn.execute(
+        &format!("DELETE FROM collab_foreign_files WHERE {pred}"),
+        rusqlite::params_from_iter(values.iter()),
     )?)
 }
 

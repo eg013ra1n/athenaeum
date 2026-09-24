@@ -7,8 +7,7 @@
 //!
 //! The engine only ever sees an [`anyhow`] error chain through the
 //! [`SharingTransport`](crate::sharing::SharingTransport) trait — never a typed
-//! iroh error — so classification is purely string-based, generalizing the
-//! connect-error classifier in `sharing::iroh::node` (`classify_connect_err`).
+//! iroh error — so classification is purely string-based.
 //! A class is a best-effort diagnostic hint, never an authorization signal.
 
 /// Coarse cause of a failed serve/announce attempt, derived from its error text.

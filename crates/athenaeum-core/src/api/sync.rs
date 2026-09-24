@@ -1208,10 +1208,11 @@ fn cleanup_orphan_blob_stores(identity_dir: &Path) {
 const LEGACY_COLLAB_DIRS: [&str; 4] = ["collab_pub", "collab_serve", "collab_seed", "collab_swarm"];
 
 /// The tag namespaces the package layer wrote in the PERSONAL store: package
-/// seeds (`project/<pid>/<package>`) and the collab sender role's package
-/// tags (`collab/pkg/…`). Per-frame project seeds live in the COLLAB store
-/// and are never touched here.
-const LEGACY_COLLAB_TAG_PREFIXES: [&str; 2] = ["project/", "collab/"];
+/// seeds (`project/<pid>/<package>`), the collab sender role's package tags
+/// (`collab/pkg/…`) and the retired swarm download's in-flight tags
+/// (`in-flight/collab/pkg/…`). Per-frame project seeds live in the COLLAB
+/// store and are never touched here.
+const LEGACY_COLLAB_TAG_PREFIXES: [&str; 3] = ["project/", "collab/", "in-flight/collab/"];
 
 /// Remove the package layer's leftovers — the [`LEGACY_COLLAB_DIRS`] under
 /// `working_dir` and every [`LEGACY_COLLAB_TAG_PREFIXES`] tag in the personal
@@ -5660,13 +5661,15 @@ mod tests {
         for tag in [
             "project/p1/pkg-1",
             "collab/pkg/pkg-2",
+            "in-flight/collab/pkg/pkg-5",
+            "in-flight/recv/pkg/pkg-6",
             "recv/pkg/pkg-3",
             "out/pkg/pkg-4",
         ] {
             store.tags().set(tag, blob.hash_and_format()).await.unwrap();
         }
 
-        assert_eq!(remove_legacy_collab_data(working, &store).await, 4 + 2);
+        assert_eq!(remove_legacy_collab_data(working, &store).await, 4 + 3);
         for name in LEGACY_COLLAB_DIRS {
             assert!(!working.join(name).exists(), "{name} removed");
         }
@@ -5683,7 +5686,11 @@ mod tests {
         left.sort();
         assert_eq!(
             left,
-            vec!["out/pkg/pkg-4".to_string(), "recv/pkg/pkg-3".to_string()]
+            vec![
+                "in-flight/recv/pkg/pkg-6".to_string(),
+                "out/pkg/pkg-4".to_string(),
+                "recv/pkg/pkg-3".to_string()
+            ]
         );
 
         assert_eq!(remove_legacy_collab_data(working, &store).await, 0, "once");

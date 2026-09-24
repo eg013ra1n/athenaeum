@@ -2488,11 +2488,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // "unknown" branch): listed inert for R18's "not part of the project"
     // list, never catalogued. `project_id` is the file's `ATH_PRJ` stamp when
     // it carries one; no foreign key — the stamp may name a project this
-    // device never cached.
+    // device never cached. `size_mtime` (`"size:mtime_secs"`, the disk-truth
+    // format) lets a re-scan skip re-hashing an unchanged foreign file (R30).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS collab_foreign_files (
             path       TEXT PRIMARY KEY,
             project_id TEXT,
+            size_mtime TEXT,
             seen_at    TEXT NOT NULL DEFAULT (datetime('now'))
         )",
         [],
