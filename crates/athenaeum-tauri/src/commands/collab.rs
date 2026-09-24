@@ -5,17 +5,17 @@ use std::sync::Arc;
 
 use athenaeum_core::api::collab as api;
 use athenaeum_core::api::collab::{
-    GateReport, LinkSuggestion, ModerationItem, PortalNewProjectLink, ProjectCard, ProjectDetail,
-    PublishResult,
+    GateReport, LinkSuggestion, ModerationFrameView, PortalNewProjectLink, ProjectCard,
+    ProjectDetail, PublishResult,
 };
 use athenaeum_core::api::collab_exchange as exchange;
-use athenaeum_core::api::collab_exchange::{ContributionView, PackageStateChange, ProjectPackageView};
+use athenaeum_core::api::collab_exchange::{CollabFramesChange, ProjectFrameView};
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::export::models::ExportResult;
 use tauri::{AppHandle, State};
 
-use crate::tauri_events::TauriProgressEmitter;
-use super::AppState; // AppState lives in commands/mod.rs and is NOT re-exported at the crate root
+use super::AppState;
+use crate::tauri_events::TauriProgressEmitter; // AppState lives in commands/mod.rs and is NOT re-exported at the crate root
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
@@ -28,7 +28,9 @@ pub async fn list_collab_projects(state: State<'_, AppState>) -> Result<Vec<Proj
 pub async fn refresh_collab_projects(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProjectCard>, String> {
-    api::refresh_projects(&state.ctx).await.map_err(|e| e.to_string())
+    api::refresh_projects(&state.ctx)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -85,11 +87,10 @@ pub async fn create_collab_link_intent(
 // ── Exchange (Task 11): publish, poll, list, download, moderate ──────────────
 
 /// Publish the project's gate-passing calibrated lights per frame: calibrate
-/// once into the Collaboration folder, seed by reference, announce. The
-/// command keeps its package-era name until the frontend switch (Task 11).
+/// once into the Collaboration folder, seed by reference, announce.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn publish_collab_package(
+pub async fn publish_collab_frames(
     state: State<'_, AppState>,
     app: AppHandle,
     project_id: String,
@@ -115,53 +116,30 @@ pub async fn republish_collab_frames(
         .map_err(|e| e.to_string())
 }
 
-/// Poll every cached project's announcements into `project_packages`, returning
-/// the state changes the frontend turns into `notify()` calls.
+/// Poll every cached project's version (wave 2 Task 11): one version-poll
+/// tick, returning every `collab-frames-changed` it applied — the events
+/// themselves still reach the frontend live via the usual event; this is the
+/// "refresh" button's plain return value.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn refresh_collab_packages(
+pub async fn refresh_collab_frames(
     state: State<'_, AppState>,
-) -> Result<Vec<PackageStateChange>, String> {
-    exchange::refresh_all_project_packages(&state.ctx)
+    app: AppHandle,
+) -> Result<Vec<CollabFramesChange>, String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    exchange::refresh_collab_frames(&state.ctx, Some(emitter.as_ref()))
         .await
         .map_err(|e| e.to_string())
 }
 
-/// Every known package for a project (cache-only — no hub call).
+/// Every cached frame of a project (cache-only — no hub call).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn list_collab_packages(
+pub async fn list_collab_frames(
     state: State<'_, AppState>,
     project_id: String,
-) -> Result<Vec<ProjectPackageView>, String> {
-    exchange::list_project_packages(&state.ctx, &project_id).map_err(|e| e.to_string())
-}
-
-/// Start the download of a project package: the D3 swarm fetch across every
-/// holder, falling back to the Д6 sequential-holder pull in the same call. Spawns
-/// the pull and returns immediately — the terminal `local_status` +
-/// `sync-finished` event carry the outcome, and the swarm path's live source
-/// count rides `project-download-progress`.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn download_collab_package(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    project_id: String,
-    package_id: String,
-) -> Result<(), String> {
-    let ctx = Arc::clone(&state.ctx);
-    let sync = Arc::clone(&state.sync);
-    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
-    tokio::spawn(async move {
-        if let Err(e) =
-            exchange::download_project_package(&ctx, &sync, &project_id, &package_id, Some(emitter))
-                .await
-        {
-            tracing::error!(error = %format!("{e}"), "collab package download failed");
-        }
-    });
-    Ok(())
+) -> Result<Vec<ProjectFrameView>, String> {
+    exchange::list_project_frames(&state.ctx, &project_id).map_err(|e| e.to_string())
 }
 
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
@@ -273,39 +251,42 @@ pub async fn resolve_collab_loss(
     .map_err(|e| e.to_string())
 }
 
-/// Every received contribution for a project (cache-only — no hub call).
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn list_collab_contributions(
-    state: State<'_, AppState>,
-    project_id: String,
-) -> Result<Vec<ContributionView>, String> {
-    exchange::list_contributions(&state.ctx, &project_id).map_err(|e| e.to_string())
-}
-
-/// The coordinator's review queue: every PENDING package with its landed review
-/// frames + parsed metrics (cache-only).
+/// The coordinator's review queue: every PENDING frame (cache-only).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn list_collab_moderation(
     state: State<'_, AppState>,
     project_id: String,
-) -> Result<Vec<ModerationItem>, String> {
+) -> Result<Vec<ModerationFrameView>, String> {
     api::list_moderation_queue(&state.ctx, &project_id).map_err(|e| e.to_string())
 }
 
-/// Decide a pending announcement (coordinator only — enforced by the hub).
-/// `approve` ⇒ hub approve + flip local state; reject ⇒ `reason` required, hub
-/// reject, then remove the local review copy.
+/// Approve a pending frame (coordinator only — enforced by the hub): hub
+/// approve, then a manifest sync so the local cache picks up the new state.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn decide_collab_announcement(
+pub async fn approve_collab_frame(
     state: State<'_, AppState>,
-    announcement_id: String,
-    approve: bool,
-    reason: Option<String>,
+    project_id: String,
+    frame_uuid: String,
+    trust: bool,
 ) -> Result<(), String> {
-    api::decide_announcement(&state.ctx, &announcement_id, approve, reason)
+    api::approve_collab_frame(&state.ctx, &project_id, &frame_uuid, trust)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Reject a pending frame (coordinator only — enforced by the hub); `reason`
+/// required, hub reject, then a manifest sync.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn reject_collab_frame(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame_uuid: String,
+    reason: String,
+) -> Result<(), String> {
+    api::reject_collab_frame(&state.ctx, &project_id, &frame_uuid, reason)
         .await
         .map_err(|e| e.to_string())
 }
@@ -328,7 +309,13 @@ pub async fn export_collab_project(
     use_symlinks: bool,
 ) -> Result<ExportResult, String> {
     let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
-    exchange::export_project_for_wbpp(&state.ctx, &project_id, &output_dir, use_symlinks, Some(emitter))
-        .await
-        .map_err(|e| e.to_string())
+    exchange::export_project_for_wbpp(
+        &state.ctx,
+        &project_id,
+        &output_dir,
+        use_symlinks,
+        Some(emitter),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }

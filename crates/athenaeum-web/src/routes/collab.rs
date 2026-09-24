@@ -36,13 +36,6 @@ pub struct IntentArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DownloadArgs {
-    project_id: String,
-    package_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AutoReplicateArgs {
     project_id: String,
     enabled: bool,
@@ -71,10 +64,18 @@ pub struct LossArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DecideArgs {
-    announcement_id: String,
-    approve: bool,
-    reason: Option<String>,
+pub struct ApproveFrameArgs {
+    project_id: String,
+    frame_uuid: String,
+    trust: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectFrameArgs {
+    project_id: String,
+    frame_uuid: String,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -96,7 +97,10 @@ pub async fn list_collab_projects(
 pub async fn refresh_collab_projects(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<api::ProjectCard>>, (axum::http::StatusCode, String)> {
-    api::refresh_projects(&state.ctx).await.map(Json).map_err(api_err)
+    api::refresh_projects(&state.ctx)
+        .await
+        .map(Json)
+        .map_err(api_err)
 }
 
 #[tracing::instrument(skip_all, err(Debug))]
@@ -155,7 +159,7 @@ pub async fn create_collab_link_intent(
 // ── Exchange (Task 11): publish, poll, list, download, moderate ──────────────
 
 #[tracing::instrument(skip_all, err(Debug))]
-pub async fn publish_collab_package(
+pub async fn publish_collab_frames(
     State(state): State<WebAppState>,
     Json(args): Json<ProjectIdArgs>,
 ) -> Result<Json<api::PublishResult>, (axum::http::StatusCode, String)> {
@@ -180,53 +184,31 @@ pub async fn republish_collab_frames(
         .map_err(api_err)
 }
 
+/// Poll every cached project's version (wave 2 Task 11): one version-poll
+/// tick, returning every `collab-frames-changed` it applied — the events
+/// themselves still reach the frontend live via SSE; this is the "refresh"
+/// button's plain return value.
 #[tracing::instrument(skip_all, err(Debug))]
-pub async fn refresh_collab_packages(
+pub async fn refresh_collab_frames(
     State(state): State<WebAppState>,
-) -> Result<Json<Vec<exchange::PackageStateChange>>, (axum::http::StatusCode, String)> {
-    exchange::refresh_all_project_packages(&state.ctx)
-        .await
-        .map(Json)
-        .map_err(api_err)
-}
-
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn list_collab_packages(
-    State(state): State<WebAppState>,
-    Json(args): Json<ProjectIdArgs>,
-) -> Result<Json<Vec<exchange::ProjectPackageView>>, (axum::http::StatusCode, String)> {
-    exchange::list_project_packages(&state.ctx, &args.project_id)
-        .map(Json)
-        .map_err(api_err)
-}
-
-/// Spawns the D3 swarm download (falling back to the Д6 sequential pull in the
-/// same call) and returns immediately — the terminal `local_status` +
-/// `sync-finished` SSE event carry the outcome, and the swarm path's live source
-/// count rides `project-download-progress`.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn download_collab_package(
-    State(state): State<WebAppState>,
-    Json(args): Json<DownloadArgs>,
-) -> Result<Json<()>, (axum::http::StatusCode, String)> {
-    let ctx = Arc::clone(&state.ctx);
-    let sync = Arc::clone(&state.sync);
+) -> Result<Json<Vec<exchange::CollabFramesChange>>, (axum::http::StatusCode, String)> {
     let emitter: Arc<dyn ProgressEmitter> =
         Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    tokio::spawn(async move {
-        if let Err(e) = exchange::download_project_package(
-            &ctx,
-            &sync,
-            &args.project_id,
-            &args.package_id,
-            Some(emitter),
-        )
+    exchange::refresh_collab_frames(&state.ctx, Some(emitter.as_ref()))
         .await
-        {
-            tracing::error!(error = %format!("{e}"), "collab package download failed");
-        }
-    });
-    Ok(Json(()))
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Every cached frame of a project (cache-only — no hub call).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn list_collab_frames(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<Vec<exchange::ProjectFrameView>>, (axum::http::StatusCode, String)> {
+    exchange::list_project_frames(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
@@ -333,32 +315,38 @@ pub async fn resolve_collab_loss(
     .map_err(api_err)
 }
 
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn list_collab_contributions(
-    State(state): State<WebAppState>,
-    Json(args): Json<ProjectIdArgs>,
-) -> Result<Json<Vec<exchange::ContributionView>>, (axum::http::StatusCode, String)> {
-    exchange::list_contributions(&state.ctx, &args.project_id)
-        .map(Json)
-        .map_err(api_err)
-}
-
+/// The coordinator's review queue: every PENDING frame (cache-only).
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_collab_moderation(
     State(state): State<WebAppState>,
     Json(args): Json<ProjectIdArgs>,
-) -> Result<Json<Vec<api::ModerationItem>>, (axum::http::StatusCode, String)> {
+) -> Result<Json<Vec<api::ModerationFrameView>>, (axum::http::StatusCode, String)> {
     api::list_moderation_queue(&state.ctx, &args.project_id)
         .map(Json)
         .map_err(api_err)
 }
 
+/// Approve a pending frame (coordinator only — enforced by the hub): hub
+/// approve, then a manifest sync so the local cache picks up the new state.
 #[tracing::instrument(skip_all, err(Debug))]
-pub async fn decide_collab_announcement(
+pub async fn approve_collab_frame(
     State(state): State<WebAppState>,
-    Json(args): Json<DecideArgs>,
+    Json(args): Json<ApproveFrameArgs>,
 ) -> Result<Json<()>, (axum::http::StatusCode, String)> {
-    api::decide_announcement(&state.ctx, &args.announcement_id, args.approve, args.reason)
+    api::approve_collab_frame(&state.ctx, &args.project_id, &args.frame_uuid, args.trust)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Reject a pending frame (coordinator only — enforced by the hub); `reason`
+/// required, hub reject, then a manifest sync.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn reject_collab_frame(
+    State(state): State<WebAppState>,
+    Json(args): Json<RejectFrameArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    api::reject_collab_frame(&state.ctx, &args.project_id, &args.frame_uuid, args.reason)
         .await
         .map(Json)
         .map_err(api_err)
@@ -386,7 +374,10 @@ pub async fn export_collab_project(
                 files_organized: 0,
                 scripts_generated: Vec::new(),
                 warnings: Vec::new(),
-                error: Some(format!("Export path must be within {}", export_dir.display())),
+                error: Some(format!(
+                    "Export path must be within {}",
+                    export_dir.display()
+                )),
             }));
         }
     }

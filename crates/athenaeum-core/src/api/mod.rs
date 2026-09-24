@@ -95,12 +95,13 @@ pub mod stacking;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod settings;
 
-// Slice-5 capstone: the three-instance collaboration E2E (publish → moderation →
-// swarm delivery → project WBPP export) exercised in one process over the
-// in-memory loopback transport. Test-only, and gated the same as `api::collab`
-// (render+solver, wave 2 Task 6) because it drives `publish_collab_frames`.
-#[cfg(all(test, feature = "render", feature = "solver"))]
-mod collab_e2e_tests;
+// The slice-5 capstone (`collab_e2e_tests`, publish → package-era moderation →
+// swarm delivery → project WBPP export) drove the OLD package/announcement
+// moderation queue this file's `list_moderation_queue`/`decide_announcement`
+// have been replaced by wave 2 Task 11's per-frame `approve_collab_frame`/
+// `reject_collab_frame` — its premise no longer compiles against this api and
+// the plan already scheduled its removal in Task 12, so it is deleted here
+// instead of left broken. A per-frame capstone E2E is Task 12/13's to write.
 
 // Task 9: the C1 relay-eviction regression canary — one `#[ignore]`d test binding
 // two endpoints with the SAME device secret against a real relay (from

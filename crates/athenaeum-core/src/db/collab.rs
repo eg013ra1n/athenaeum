@@ -311,6 +311,24 @@ pub fn get_project(conn: &Connection, project_id: &str) -> Result<Option<CollabP
     .map_err(Into::into)
 }
 
+/// The lost-aware read (R14, carried from the Task 8 review to wave 2 Task
+/// 11): `None` when the project was never cached, OR when it is marked lost
+/// (`lost_at` set — this device is no longer a member). Every ACTION path
+/// that takes a project id (publish, link, sync, approve/reject, policy,
+/// resolve-loss, auto-publish toggle) reads through here instead of
+/// [`get_project`], so a lost project's id can no longer be used to act on
+/// it; [`list_projects`] already hides lost projects from the card list, and
+/// a read-only detail lookup keeps using [`get_project`] directly.
+pub fn get_live_project(conn: &Connection, project_id: &str) -> Result<Option<CollabProjectRow>> {
+    let Some(row) = get_project(conn, project_id)? else {
+        return Ok(None);
+    };
+    if lost_at(conn, project_id)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(row))
+}
+
 /// Set one project's auto-replication preference (D3 §3.3) — the ONLY writer of
 /// `collab_projects.auto_replicate`. Returns the number of rows updated (0 when
 /// the project isn't cached, e.g. a membership pruned between read and write).

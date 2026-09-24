@@ -1583,19 +1583,11 @@ unchanged: number, };
 
 export type HeldBackFrame = { frameId: number, filename: string, reasons: Array<string>, };
 
-export type ModerationFrame = { frameUuid: string, relPath: string, 
+export type ModerationFrameView = { frameUuid: string, fileName: string, publisher: string, publisherAccountId: string, filter: string, exptimeSec: number, 
 /**
- * Absolute on-disk path of the landed review copy; `None` when the
- * contribution row carries no landed path.
+ * Parsed from the manifest row's `meta.fwhmArcsec` (`build_frame_meta`).
  */
-landedPath: string | null, byteSize: number, fwhm: number | null, eccentricity: number | null, stars: number | null, snr: number | null, };
-
-export type ModerationItem = { announcementId: string, packageId: string, publisher: string, frameCount: number, byteSize: number, createdAt: string, 
-/**
- * The push-seed review copy has fully landed (`local_status == "complete"`);
- * `false` while the coordinator is still receiving it.
- */
-reviewCopyComplete: boolean, frames: Array<ModerationFrame>, };
+fwhmArcsec: number | null, createdAt: string, };
 
 export type PackageStateChange = { projectId: string, packageId: string, 
 /**
@@ -1632,6 +1624,41 @@ holderCount: number,
  * Of those holders, how many the hub last saw within the online window.
  */
 onlineCount: number, };
+
+export type ProjectFrameView = { frameUuid: string, fileName: string, publisher: string, 
+/**
+ * I published this frame.
+ */
+own: boolean, filter: string, exptimeSec: number, dateObs: string | null, 
+/**
+ * Hub-mirrored state: `pending` | `published` | `rejected`.
+ */
+state: string, accepted: boolean, acceptedReason: string | null, 
+/**
+ * Holders the hub last reported.
+ */
+holderCount: number, onDisk: boolean, 
+/**
+ * A newer content version superseded this landed copy — kept until GC.
+ */
+awaitingGc: boolean, 
+/**
+ * This device chose not to keep the frame (policy narrowed, or the loss
+ * guard's "stop holding" answer).
+ */
+locallyDeclined: boolean, byteSize: number, contentVersion: number, lastError: string | null, 
+/**
+ * Parsed from the manifest row's `meta.fwhmArcsec` (`build_frame_meta`).
+ */
+fwhmArcsec: number | null, 
+/**
+ * Parsed from `meta.eccentricity`.
+ */
+eccentricity: number | null, 
+/**
+ * Parsed from `meta.starsDetected`.
+ */
+starsDetected: number | null, };
 
 export type ProjectDownloadProgress = { projectId: string, packageId: string, 
 /**

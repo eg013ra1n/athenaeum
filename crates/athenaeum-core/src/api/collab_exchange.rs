@@ -968,7 +968,19 @@ const MANIFEST_PAGE_LIMIT: u32 = 1000;
 pub const COLLAB_FRAMES_CHANGED_EVENT: &str = "collab-frames-changed";
 
 /// What a manifest delta changed, from this device's point of view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, ts_rs::TS)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    ts_rs::TS,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum FramesChangeKind {
     /// Another member's frame became visible as published.
@@ -1000,8 +1012,10 @@ impl FramesChangeKind {
 }
 
 /// One `collab-frames-changed` event: how many rows of one kind a manifest
-/// sync applied for one project. Emitted once per non-zero kind.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+/// sync applied for one project. Emitted once per non-zero kind. Also
+/// `Deserialize`: [`ChangeCollector`] decodes it back out of its own emitted
+/// JSON to build `refresh_collab_frames`'s return value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CollabFramesChange {
     pub project_id: String,
@@ -1126,12 +1140,7 @@ async fn sync_manifest_serialized(
     let project = {
         let database = db(ctx)?;
         let conn = database.conn();
-        crate::db::collab::get_project(&conn, project_id)?
-    };
-    let Some(project) = project else {
-        return Err(ApiError::NotFound(format!(
-            "project {project_id} is not cached — refresh first"
-        )));
+        live_project(&conn, project_id)?
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
 
@@ -1352,6 +1361,54 @@ pub async fn poll_versions_once(
         crate::api::collab::on_thresholds_or_dictionary_moved(ctx, project_id);
     }
     Ok(synced)
+}
+
+/// Tees a [`CollabFramesChange`] event into a caller-supplied `Vec` while
+/// still forwarding every event (this one and any other) to the real
+/// emitter, if there is one — [`refresh_collab_frames`]'s command wrapper
+/// still wants `collab-frames-changed` to reach the frontend live, on top of
+/// the plain return value this collects.
+struct ChangeCollector<'a> {
+    inner: Option<&'a dyn ProgressEmitter>,
+    changes: std::sync::Mutex<Vec<CollabFramesChange>>,
+}
+
+impl ProgressEmitter for ChangeCollector<'_> {
+    fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+        if event_name == COLLAB_FRAMES_CHANGED_EVENT {
+            if let Ok(change) = serde_json::from_value::<CollabFramesChange>(payload.clone()) {
+                self.changes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(change);
+            }
+        }
+        if let Some(inner) = self.inner {
+            inner.emit_json(event_name, payload);
+        }
+    }
+}
+
+/// Poll every cached project's version (Task 11 command surface): one
+/// [`poll_versions_once`] tick, returning every `collab-frames-changed` it
+/// applied — the frontend's `refresh_collab_frames` replacement for the
+/// package-era `refresh_all_project_packages`. The events themselves still
+/// reach `emitter` live, exactly as an unattended poll tick would; this only
+/// adds the plain return value a manual "refresh" button wants.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub async fn refresh_collab_frames(
+    ctx: &ServiceContext,
+    emitter: Option<&dyn ProgressEmitter>,
+) -> Result<Vec<CollabFramesChange>, ApiError> {
+    let collector = ChangeCollector {
+        inner: emitter,
+        changes: std::sync::Mutex::new(Vec::new()),
+    };
+    poll_versions_once(ctx, Some(&collector)).await?;
+    Ok(collector
+        .changes
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner()))
 }
 
 /// Per-project back-off (ruling R13): `catalog|hub|project` → the instant before
@@ -1616,6 +1673,124 @@ pub fn list_project_packages(
     let conn = db.conn();
     let rows = list_packages(&conn, project_id)?;
     Ok(rows.into_iter().map(ProjectPackageView::from).collect())
+}
+
+/// One cached per-frame manifest row of a project (mine or a peer's),
+/// projected for the frames list (wave 2 Task 11). Replaces
+/// [`ProjectPackageView`]/[`list_project_packages`] for the frontend, which
+/// switches to this in the same task (Task 12 drops the package view).
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFrameView {
+    pub frame_uuid: String,
+    pub file_name: String,
+    pub publisher: String,
+    /// I published this frame.
+    pub own: bool,
+    pub filter: String,
+    pub exptime_sec: f64,
+    pub date_obs: Option<String>,
+    /// Hub-mirrored state: `pending` | `published` | `rejected`.
+    pub state: String,
+    pub accepted: bool,
+    pub accepted_reason: Option<String>,
+    /// Holders the hub last reported.
+    pub holder_count: i64,
+    pub on_disk: bool,
+    /// A newer content version superseded this landed copy — kept until GC.
+    pub awaiting_gc: bool,
+    /// This device chose not to keep the frame (policy narrowed, or the loss
+    /// guard's "stop holding" answer).
+    pub locally_declined: bool,
+    pub byte_size: i64,
+    pub content_version: i32,
+    pub last_error: Option<String>,
+    /// Parsed from the manifest row's `meta.fwhmArcsec` (`build_frame_meta`).
+    pub fwhm_arcsec: Option<f64>,
+    /// Parsed from `meta.eccentricity`.
+    pub eccentricity: Option<f64>,
+    /// Parsed from `meta.starsDetected`.
+    pub stars_detected: Option<i64>,
+}
+
+impl ProjectFrameView {
+    /// Combines the reliable local columns (state/accepted/holder_count/
+    /// on_disk/… — kept current by the manifest sync and the replication
+    /// pass) with the fields only the retained manifest row carries
+    /// (exptime/dateObs/acceptedReason/meta metrics). A row whose
+    /// `manifest_json` fails to parse (it never should — this cache only
+    /// ever writes it via `serde_json::to_string` of a decoded
+    /// [`FrameViewWire`]) still returns a view, with those fields empty and
+    /// a `warn!` — never a lost frame from the list.
+    fn from_local_row(row: LocalFrameRow) -> Self {
+        let wire: Option<crate::collab::hub_client::FrameViewWire> =
+            match serde_json::from_str(&row.manifest_json) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %row.project_id,
+                        frame_uuid = %row.frame_uuid,
+                        error = %e,
+                        "list_project_frames: manifest_json did not parse — some fields omitted"
+                    );
+                    None
+                }
+            };
+        let (exptime_sec, date_obs, accepted_reason, fwhm_arcsec, eccentricity, stars_detected) =
+            match &wire {
+                Some(w) => (
+                    w.exptime_sec,
+                    w.date_obs.clone(),
+                    w.accepted_reason.clone(),
+                    w.meta.get("fwhmArcsec").and_then(serde_json::Value::as_f64),
+                    w.meta
+                        .get("eccentricity")
+                        .and_then(serde_json::Value::as_f64),
+                    w.meta
+                        .get("starsDetected")
+                        .and_then(serde_json::Value::as_i64),
+                ),
+                None => (0.0, None, None, None, None, None),
+            };
+        ProjectFrameView {
+            frame_uuid: row.frame_uuid,
+            file_name: row.file_name,
+            publisher: row.publisher_display,
+            own: row.origin == FrameOrigin::Own,
+            filter: row.filter_canonical,
+            exptime_sec,
+            date_obs,
+            state: row.state,
+            accepted: row.accepted,
+            accepted_reason,
+            holder_count: row.holder_count,
+            on_disk: row.on_disk,
+            awaiting_gc: row.awaiting_gc,
+            locally_declined: row.locally_declined,
+            byte_size: row.byte_size,
+            content_version: row.content_version,
+            last_error: row.last_error,
+            fwhm_arcsec,
+            eccentricity,
+            stars_detected,
+        }
+    }
+}
+
+/// Every cached frame of a project (cache-only — no hub call), ordered by
+/// frame uuid (the `list_for_project` order). The manifest sync (Task 8) and
+/// the replication pass (Task 9) keep the cache current; this never fetches.
+pub fn list_project_frames(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<Vec<ProjectFrameView>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let rows = crate::db::collab_frames::list_for_project(&conn, project_id)?;
+    Ok(rows
+        .into_iter()
+        .map(ProjectFrameView::from_local_row)
+        .collect())
 }
 
 /// Every received contribution for a project (cache-only — no hub call), oldest
@@ -4500,17 +4675,23 @@ fn between_batches(
     Ok(true)
 }
 
-/// A project, the live one, or an error for an unknown or lost project (R14:
-/// a lost project is never acted on).
-fn live_project(
+/// A project, the live one, or `NotFound` for an unknown or lost project
+/// (R14: a lost project is never acted on) — every ACTION path that takes a
+/// project id reads through here (carried from the Task 8 review to wave 2
+/// Task 11), with a message that tells the two refusals apart: an id this
+/// device never cached still says "refresh first"; one it was removed from
+/// says so distinctly, via [`crate::db::collab::get_live_project`].
+pub(crate) fn live_project(
     conn: &rusqlite::Connection,
     project_id: &str,
 ) -> Result<crate::db::collab::CollabProjectRow, ApiError> {
-    let row = crate::db::collab::get_project(conn, project_id)?;
-    match row {
-        Some(row) if crate::db::collab::lost_at(conn, project_id)?.is_none() => Ok(row),
-        _ => Err(ApiError::Invalid(format!("unknown project {project_id}"))),
+    if crate::db::collab::get_project(conn, project_id)?.is_none() {
+        return Err(ApiError::NotFound(format!(
+            "project {project_id} is not cached — refresh first"
+        )));
     }
+    crate::db::collab::get_live_project(conn, project_id)?
+        .ok_or_else(|| ApiError::NotFound("project no longer joined".into()))
 }
 
 /// A landed, on-disk frame of the same project with this content (P24).
@@ -6700,6 +6881,61 @@ mod tests {
         assert_eq!(hub1.online_count, 2, "Task-3 online count surfaced");
         assert_eq!(hub1.publisher, "Alice");
         assert_eq!(hub1.state, "published");
+    }
+
+    /// `list_project_frames` (wave 2 Task 11) reads the reliable local columns
+    /// AND parses `meta.fwhmArcsec`/`meta.eccentricity`/`meta.starsDetected`
+    /// out of the retained manifest row (`build_frame_meta`'s camelCase keys)
+    /// — the metrics the frames table shows without a second query. Scoped to
+    /// the requested project, like every other cache-only list view.
+    #[test]
+    fn list_project_frames_reads_metrics_from_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let view: crate::collab::hub_client::FrameViewWire = serde_json::from_value(serde_json::json!({
+            "frameUuid": "u-1", "publisherAccountId": "acc-alice", "publisherDisplayName": "Alice",
+            "own": false, "fileName": "c_u-1.fits", "contentVersion": 1, "blake3": "b".repeat(64),
+            "byteSize": 4096, "xxh3": "0123456789abcdef", "filterRaw": "Red", "filterCanonical": "R",
+            "channel": "mono", "exptimeSec": 300.0, "dateObs": "2026-07-01T21:00:00Z",
+            "meta": {"fwhmArcsec": 2.4, "eccentricity": 0.35, "starsDetected": 512},
+            "gateVersion": 0, "accepted": true, "state": "published", "manifestVersion": 1,
+            "createdAt": "2026-07-13T00:00:00Z", "holderCount": 2
+        }))
+        .unwrap();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            seed_project(&conn, "p-1", &members_json());
+            seed_project(&conn, "p-OTHER", &members_json());
+            crate::db::collab_frames::upsert_from_manifest(&conn, "p-1", &view).unwrap();
+            // A different project must not leak into the list.
+            let mut other = view.clone();
+            other.frame_uuid = "u-2".into();
+            crate::db::collab_frames::upsert_from_manifest(&conn, "p-OTHER", &other).unwrap();
+        }
+
+        let views = list_project_frames(&ctx, "p-1").unwrap();
+        assert_eq!(views.len(), 1, "scoped to p-1");
+        let f = &views[0];
+        assert_eq!(f.frame_uuid, "u-1");
+        assert_eq!(f.file_name, "c_u-1.fits");
+        assert_eq!(f.publisher, "Alice");
+        assert!(!f.own);
+        assert_eq!(f.filter, "R");
+        assert_eq!(f.exptime_sec, 300.0);
+        assert_eq!(f.date_obs.as_deref(), Some("2026-07-01T21:00:00Z"));
+        assert_eq!(f.state, "published");
+        assert!(f.accepted);
+        assert_eq!(f.holder_count, 2);
+        assert_eq!(f.byte_size, 4096);
+        assert_eq!(f.content_version, 1);
+        assert_eq!(f.fwhm_arcsec, Some(2.4), "parsed from meta.fwhmArcsec");
+        assert_eq!(f.eccentricity, Some(0.35), "parsed from meta.eccentricity");
+        assert_eq!(
+            f.stars_detected,
+            Some(512),
+            "parsed from meta.starsDetected"
+        );
     }
 
     /// `list_contributions` returns every received frame for a project (oldest
