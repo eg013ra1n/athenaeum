@@ -238,6 +238,18 @@ holders" section).
 - **Do NOT re-flag**: the desktop app talking to a wave-1-or-later hub and getting
   `409 collab_api_outdated` on every collaboration call is EXPECTED until the app's own wave 2
   client ships — it is the compat gate working as designed (spec §11), not a hub regression.
+- **PROD deploy is gated on an app release, on top of the test-hub check above.** The hub's
+  final-review wave (2026-09-24) found the CURRENT app has no handling for `409
+  collab_api_outdated` at all — it surfaces to the user as a plain "unexpected status 409" — and
+  the shipped app's `MyProjectWire` requires `pendingFrames` with no serde default, a field name
+  collab v3 only introduced this same wave (the old wire name was `pendingAnnouncements`). The hub
+  side of that second gap is already closed (`pendingAnnouncements` kept as a deprecated alias of
+  `pendingFrames`, same value, so `/me/projects` still decodes against an app on the old wire
+  shape) — this note is the reminder that the APP side is not: do not deploy `collab-v3-wave1` (or
+  later) to PROD until an app release ships that (a) treats `collab_api_outdated` as an actionable
+  "update required" signal rather than a raw unexpected-status error and (b) reads `pendingFrames`
+  instead of the now-deprecated `pendingAnnouncements`. The test-hub deploy in the "Owed" bullet
+  above is unaffected by this gate — only PROD is held.
 
 ### Collab v3 wave 0 (2026-09-23)
 
