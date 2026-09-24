@@ -39,7 +39,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -96,6 +96,13 @@ use proto::{announce_received_from_msg, Msg, OfferEntry};
 /// new golden set. Additive-only changes (appending a new `Msg` variant at the
 /// END, as `ProjectAnnounce`/`ProjectRequest` were) do not require a bump.
 pub const SYNC_ALPN: &[u8] = b"athenaeum/sync/1";
+
+/// ALPN of the collab blob store (collab v3 wave 2, P1): the second iroh-blobs
+/// store under `<Collaboration root>/.athenaeum/blobs`, served by the same node
+/// beside the personal store's [`iroh_blobs::ALPN`]. A distinct ALPN keeps the
+/// two stores' hash spaces apart: a GET on one never reads the other. The
+/// protocol spoken on it is stock iroh-blobs, unchanged.
+pub const COLLAB_BLOBS_ALPN: &[u8] = b"athenaeum/collab-blobs/1";
 
 /// Deterministic blob-store tag for a package collection. `release` deletes by
 /// this exact name, so both the import (serve) and download (fetch) sides pin
@@ -504,6 +511,9 @@ fn connect_gate_admits(gate: &SharedConnectGate, from: &NodeId) -> bool {
 /// - `flush_store_on_shutdown` — `true` only for [`IrohTransport`], whose router
 ///   teardown IS its store flush; `false` for the shared node, whose store is
 ///   shared across relay rebuilds and flushed explicitly at node shutdown (T8).
+/// - `collab` — the shared node's [`CollabSlotBlobs`], mounted on
+///   [`COLLAB_BLOBS_ALPN`] for the node's lifetime (collab v3 wave 2, P1/R4);
+///   `None` for the legacy transport, which serves no collab store.
 ///
 /// The `gate` and `responder` slots are cloned in (late-bindable), and the store
 /// is borrowed (the caller keeps ownership for its own struct field). Behaviour
@@ -522,7 +532,52 @@ pub(crate) fn build_router(
     serve_resolver: ServeRootResolver,
     serve_file_resolver: ServeFileResolver,
     pacer: Arc<UploadPacer>,
+    collab: Option<CollabSlotBlobs>,
 ) -> Router {
+    // Provider upload events (Task 13): the masked channel and its consumer are
+    // factored into `provider_event_channel` / `spawn_provider_events` so the
+    // collab store's provider (collab v3 wave 2, P1) gets the SAME mask and the
+    // SAME consumer — sharing this one `pacer` — without a second copy of either.
+    let (events, rx) = provider_event_channel();
+    // Wrap the blobs provider so an ungated peer never receives a blob byte:
+    // `GatedBlobs` checks the connect gate against the dialing node id before
+    // delegating to the inner `iroh_blobs` handler (finding F5 hardening).
+    let blobs = GatedBlobs {
+        inner: BlobsProtocol::new(store, Some(events)),
+        gate: Arc::clone(gate),
+        flush_store_on_shutdown,
+    };
+
+    // The provider-events consumer (see `spawn_provider_events` for the
+    // load-bearing drain + throttle-reply rules).
+    spawn_provider_events(rx, pacer, sink.clone(), serve_resolver, serve_file_resolver);
+
+    let control = SyncControlProtocol {
+        sink,
+        presence,
+        responder,
+        gate: Arc::clone(gate),
+    };
+    // Both protocols on one router; `spawn` registers every ALPN on the endpoint.
+    // The collab-blobs ALPN (collab v3 wave 2, P1/R4) is mounted HERE, once, for
+    // the node's lifetime: a router cannot add protocols after spawn, and
+    // rebuilding one closes the endpoint (iroh `Router::shutdown`) or aborts every
+    // live handler (dropping it). So the handler reads a slot instead, and a
+    // Collaboration-root change swaps the slot, never the router.
+    let builder = Router::builder(endpoint)
+        .accept(iroh_blobs::ALPN, blobs)
+        .accept(SYNC_ALPN, control);
+    match collab {
+        Some(handler) => builder.accept(COLLAB_BLOBS_ALPN, handler),
+        None => builder,
+    }
+    .spawn()
+}
+
+/// The masked provider-event channel every blobs provider on this node uses
+/// (the personal store's in [`build_router`], the collab store's in
+/// [`node::SharedIrohNode::bind_with`]). One mask, one definition.
+pub(crate) fn provider_event_channel() -> (EventSender, mpsc::Receiver<ProviderMessage>) {
     // Provider upload events (Task 13): a masked `EventSender` feeds a per-process
     // consumer that turns a peer's collection pull into outgoing byte progress.
     // Mask: `Notify` on connect + `NotifyLog` on get (per-request transfer events);
@@ -546,7 +601,7 @@ pub(crate) fn build_router(
     // upload, shared across every peer and every concurrent GET, which is exactly
     // what the setting promises (and what keeps an observatory's uplink usable
     // while N peers pull at once).
-    let (events, mut rx) = EventSender::channel(
+    EventSender::channel(
         PROVIDER_EVENT_CAPACITY,
         EventMask {
             connected: ConnectMode::Notify,
@@ -554,40 +609,49 @@ pub(crate) fn build_router(
             throttle: ThrottleMode::Intercept,
             ..EventMask::DEFAULT
         },
-    );
-    // Wrap the blobs provider so an ungated peer never receives a blob byte:
-    // `GatedBlobs` checks the connect gate against the dialing node id before
-    // delegating to the inner `iroh_blobs` handler (finding F5 hardening).
-    let blobs = GatedBlobs {
-        inner: BlobsProtocol::new(store, Some(events)),
-        gate: Arc::clone(gate),
-        flush_store_on_shutdown,
-    };
+    )
+}
 
-    // The provider-events consumer lives beside the router (never woven into the
-    // node internals): one task drains the masked event stream and, per GET
-    // request, spawns a detached drain task.
-    //
-    // LOAD-BEARING SAFETY RULE: every request-update receiver (`m.rx`) MUST be
-    // drained for the whole life of its transfer. `iroh-blobs` sends transfer
-    // progress with `try_send(..).await?` into that channel; a DROPPED receiver
-    // makes the next send error and that `?` aborts the PEER'S DOWNLOAD. So every
-    // rx-carrying message gets a detached drain task unconditionally — even an
-    // unmapped/foreign hash, even the Push*/Observe* notify messages a 0.103 mask
-    // quirk can deliver despite the mask — and we never block, never drop early.
-    //
-    // The `Throttle` reply oneshot (`m.tx`) is load-bearing THE SAME WAY, and is
-    // the reason this rule now has teeth on the hot path: with
-    // `ThrottleMode::Intercept` the provider's writer awaits our reply before
-    // every ~16 KiB payload write. ALWAYS reply, and always reply `Ok(())` — a
-    // DROPPED `tx` errors the writer and an `Err(AbortReason::…)` reply
-    // deliberately kills the transfer, so neither is ever a valid way to say
-    // "slow down". The DELAY before the reply IS the throttle. And that delay is
-    // slept on a SPAWNED task, never here: this consumer task also carries the
-    // GET-request messages whose drain tasks keep every other in-flight transfer
-    // alive, so sleeping inline would stall the whole node's uploads for one
-    // paced chunk.
-    let consumer_sink = sink.clone();
+/// Spawn the consumer that drains one provider's event stream: per-GET upload
+/// progress (resolved through `serve_resolver` / `serve_file_resolver` and
+/// routed into `consumer_sink`) and the upload throttle, paced by `pacer`.
+///
+/// Shared by both stores on the shared node (collab v3 wave 2, P1): the
+/// personal store's consumer is spawned in [`build_router`]; the collab
+/// store's in [`node::SharedIrohNode::bind_with`], with the SAME `pacer` (so
+/// the device-wide upload cap covers both stores) and resolvers that resolve
+/// nothing (collab uploads route no package progress).
+///
+/// The provider-events consumer lives beside the router (never woven into the
+/// node internals): one task drains the masked event stream and, per GET
+/// request, spawns a detached drain task.
+///
+/// LOAD-BEARING SAFETY RULE: every request-update receiver (`m.rx`) MUST be
+/// drained for the whole life of its transfer. `iroh-blobs` sends transfer
+/// progress with `try_send(..).await?` into that channel; a DROPPED receiver
+/// makes the next send error and that `?` aborts the PEER'S DOWNLOAD. So every
+/// rx-carrying message gets a detached drain task unconditionally — even an
+/// unmapped/foreign hash, even the Push*/Observe* notify messages a 0.103 mask
+/// quirk can deliver despite the mask — and we never block, never drop early.
+///
+/// The `Throttle` reply oneshot (`m.tx`) is load-bearing THE SAME WAY, and is
+/// the reason this rule now has teeth on the hot path: with
+/// `ThrottleMode::Intercept` the provider's writer awaits our reply before
+/// every ~16 KiB payload write. ALWAYS reply, and always reply `Ok(())` — a
+/// DROPPED `tx` errors the writer and an `Err(AbortReason::…)` reply
+/// deliberately kills the transfer, so neither is ever a valid way to say
+/// "slow down". The DELAY before the reply IS the throttle. And that delay is
+/// slept on a SPAWNED task, never here: this consumer task also carries the
+/// GET-request messages whose drain tasks keep every other in-flight transfer
+/// alive, so sleeping inline would stall the whole node's uploads for one
+/// paced chunk.
+pub(crate) fn spawn_provider_events(
+    mut rx: mpsc::Receiver<ProviderMessage>,
+    pacer: Arc<UploadPacer>,
+    consumer_sink: EventSink,
+    serve_resolver: ServeRootResolver,
+    serve_file_resolver: ServeFileResolver,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // A detached pure-drain task for any rx-carrying message we don't emit for
         // (mask-quirk defense): keep reading until the sender drops, never abort.
@@ -785,19 +849,7 @@ pub(crate) fn build_router(
                 | ProviderMessage::ConnectionClosed(_) => {}
             }
         }
-    });
-
-    let control = SyncControlProtocol {
-        sink,
-        presence,
-        responder,
-        gate: Arc::clone(gate),
-    };
-    // Both protocols on one router; `spawn` registers both ALPNs on the endpoint.
-    Router::builder(endpoint)
-        .accept(iroh_blobs::ALPN, blobs)
-        .accept(SYNC_ALPN, control)
-        .spawn()
+    })
 }
 
 /// Where an [`IrohTransport`] keeps downloaded/served blob content.
@@ -971,6 +1023,8 @@ impl IrohTransport {
             serve_resolver,
             serve_file_resolver,
             Arc::clone(&upload_pacer),
+            // The legacy transport serves no collab store.
+            None,
         );
 
         let endpoint = router.endpoint().clone();
@@ -1942,7 +1996,7 @@ impl ProtocolHandler for SyncControlProtocol {
 /// peer's node id and only then delegates to the inner `iroh_blobs` handler, so
 /// an ungated peer never receives a single blob byte (finding F5 hardening).
 /// With no gate installed it delegates unconditionally — today's behavior.
-struct GatedBlobs {
+pub(crate) struct GatedBlobs {
     inner: BlobsProtocol,
     gate: SharedConnectGate,
     /// Whether a router shutdown should flush the backing blob store (iroh
@@ -1992,6 +2046,88 @@ impl ProtocolHandler for GatedBlobs {
             <BlobsProtocol as ProtocolHandler>::shutdown(&self.inner).await
         }
     }
+}
+
+/// The collab store currently mounted on the shared node (collab v3 wave 2,
+/// P1/R4): the store handle and the unchanged [`GatedBlobs`] provider that
+/// serves it. Lives in a [`SharedCollabSlot`]; swapped whole on a
+/// Collaboration-root change.
+pub(crate) struct CollabMount {
+    /// The Collaboration root this store was opened under (the store itself is
+    /// `<root>/.athenaeum/blobs`).
+    pub(crate) root: PathBuf,
+    pub(crate) store: Store,
+    pub(crate) blobs: Arc<GatedBlobs>,
+}
+
+/// The node's collab-store slot. `None` ⇒ no Collaboration root mounted, and
+/// [`CollabSlotBlobs`] refuses every connection. Never held across an await:
+/// readers clone what they need out.
+pub(crate) type SharedCollabSlot = Arc<RwLock<Option<CollabMount>>>;
+
+/// Build the provider for a freshly opened collab store: stock
+/// [`BlobsProtocol`] fed by the node's collab event sender (whose consumer shares
+/// the device-wide pacer), wrapped in the same [`GatedBlobs`] as the personal
+/// store. `flush_store_on_shutdown: false` — the node shuts the collab store
+/// down itself (on a swap and at node shutdown), never a router teardown.
+pub(crate) fn collab_gated_blobs(
+    store: &Store,
+    events: EventSender,
+    gate: &SharedConnectGate,
+) -> GatedBlobs {
+    GatedBlobs {
+        inner: BlobsProtocol::new(store, Some(events)),
+        gate: Arc::clone(gate),
+        flush_store_on_shutdown: false,
+    }
+}
+
+/// The [`COLLAB_BLOBS_ALPN`] handler, mounted ONCE at bind (ruling R4). A router
+/// cannot add protocols after spawn, and rebuilding one would close the endpoint
+/// or abort every live personal-sync handler, so this handler reads the node's
+/// [`SharedCollabSlot`] per connection instead: the connect gate first (a refused
+/// peer is refused whether or not a store is mounted), then the mounted store's
+/// [`GatedBlobs`], or a close with `not mounted` when the slot is empty.
+///
+/// A connection accepted before a swap keeps the provider it started with; its
+/// later requests fail once the old store is shut down, and the peer retries.
+pub(crate) struct CollabSlotBlobs {
+    pub(crate) slot: SharedCollabSlot,
+    pub(crate) gate: SharedConnectGate,
+}
+
+impl std::fmt::Debug for CollabSlotBlobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollabSlotBlobs").finish()
+    }
+}
+
+impl ProtocolHandler for CollabSlotBlobs {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let from: NodeId = *connection.remote_id().as_bytes();
+        if !connect_gate_admits(&self.gate, &from) {
+            tracing::warn!(from = %hex32(&from), "collab connection refused by connect gate");
+            connection.close(0u32.into(), b"unauthorized");
+            return Ok(());
+        }
+        let blobs = match self.slot.read() {
+            Ok(guard) => guard.as_ref().map(|m| Arc::clone(&m.blobs)),
+            Err(e) => {
+                tracing::error!(error = %e, "collab store slot poisoned; refusing connection");
+                None
+            }
+        };
+        match blobs {
+            Some(blobs) => <GatedBlobs as ProtocolHandler>::accept(&blobs, connection).await,
+            None => {
+                tracing::debug!(from = %hex32(&from), "collab connection refused: store not mounted");
+                connection.close(0u32.into(), b"collab store not mounted");
+                Ok(())
+            }
+        }
+    }
+    // `shutdown` stays the default no-op: the node flushes the collab store
+    // itself, and a mounted provider never owns the store's lifetime.
 }
 
 /// Encode a reply [`Msg`] and write it back on an accept-side bidi stream,

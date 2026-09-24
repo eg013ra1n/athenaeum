@@ -126,6 +126,17 @@ pub struct ScanCompleteEvent {
     pub cancelled: bool,
 }
 
+/// The app's own per-root metadata directory. The collab blob store lives at
+/// `<Collaboration root>/.athenaeum/blobs` (collab v3 wave 2, P1/P23): its
+/// contents are store data, never frames, so neither walker descends into it.
+const APP_METADATA_DIR: &str = ".athenaeum";
+
+/// `walkdir` `filter_entry` predicate: true for an `.athenaeum` directory below
+/// the walk root, which is then skipped with everything under it.
+fn is_app_metadata_dir(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() > 0 && entry.file_type().is_dir() && entry.file_name() == APP_METADATA_DIR
+}
+
 /// Scan a directory for FITS/XISF files
 pub fn scan_directory(
     root_path: &Path,
@@ -156,6 +167,7 @@ pub fn scan_directory(
         .follow_links(true)
         .max_depth(64)
         .into_iter()
+        .filter_entry(|e| !is_app_metadata_dir(e))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| {
@@ -1277,6 +1289,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         .follow_links(true)
         .max_depth(64)
         .into_iter()
+        .filter_entry(|e| !is_app_metadata_dir(e))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
@@ -3440,5 +3453,62 @@ mod calibrated_light_scan_tests {
                 conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
             assert_eq!(total_files, 1, "parallel={parallel}: artifact contributed no files row");
         }
+    }
+}
+
+/// P23: the collab blob store lives at `<Collaboration root>/.athenaeum/blobs`,
+/// and neither walker ever descends into `.athenaeum/`.
+#[cfg(test)]
+mod app_metadata_dir_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use crate::events::NullEmitter;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    #[test]
+    fn scanner_skips_the_collab_store_dir() {
+        let root = TempDir::new().unwrap();
+        crate::archive::restore::tests::write_minimal_fits(&root.path().join("L_001.fits"));
+        let hidden = root.path().join(".athenaeum").join("blobs");
+        std::fs::create_dir_all(&hidden).unwrap();
+        crate::archive::restore::tests::write_minimal_fits(&hidden.join("L_002.fits"));
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [root.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        let parallel = scan_directory_parallel(
+            root.path(),
+            1,
+            &conn,
+            &NullEmitter,
+            Arc::new(AtomicBool::new(false)),
+            false,
+        );
+        assert_eq!(
+            parallel.files_found, 1,
+            "the batch walker skips .athenaeum/"
+        );
+        assert_eq!(parallel.files_processed, 1);
+
+        let sequential = scan_directory(root.path(), &conn, None, false, 1);
+        assert_eq!(
+            sequential.files_found, 1,
+            "the sequential walker skips .athenaeum/"
+        );
+
+        let under_store: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path LIKE '%.athenaeum%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(under_store, 0, "nothing under .athenaeum/ is cataloged");
     }
 }

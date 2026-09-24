@@ -828,18 +828,129 @@ pub fn get_collaboration_dir(ctx: &ServiceContext) -> Result<Option<String>, Api
     get_special_root_dir(ctx, "collaboration")
 }
 
-/// Designate the collaboration folder. See [`set_special_root_dir`].
-pub fn set_collaboration_dir(
+/// Designate the Collaboration folder, then mount its collab blob store
+/// (`<root>/.athenaeum/blobs`) on the iroh node when one is bound — an unbound
+/// node mounts it at bind (`api::sync::ensure_iroh_node`). Returns the
+/// normalized path.
+///
+/// Validation is [`validate_transfer_dir`](crate::api::sync::validate_transfer_dir)
+/// with `OverlapRule::Skip` (collab v3 wave 2, P25): absolute path, path
+/// policy, create, write probe — but no overlap check, because the
+/// Collaboration root IS a scan root. A folder already monitored as a normal
+/// scan root (for instance one a previous clear demoted) is promoted in place;
+/// a new folder becomes its own root under the usual scan-root rules (outside
+/// every other root, one Collaboration root at most).
+///
+/// The designation is persisted before the mount: a mount failure is returned
+/// as an error, but the folder stays designated and the next bind mounts it.
+pub async fn set_collaboration_dir(
     ctx: &ServiceContext,
     path: String,
     policy: &PathPolicy,
 ) -> Result<String, ApiError> {
-    set_special_root_dir(ctx, path, policy, "collaboration")
+    let candidate = std::path::PathBuf::from(path.trim());
+    let existed = candidate.is_absolute() && candidate.exists();
+    let stored = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let (dir, _) = crate::api::sync::validate_transfer_dir(
+            &conn,
+            policy,
+            &path,
+            "Collaboration folder",
+            crate::api::sync::OverlapRule::Skip,
+        )?;
+        match designate_collaboration_root(&conn, &dir) {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), error = %e, "collaboration folder designation refused");
+                // Leaf-only cleanup of a folder the validation just created, as
+                // `validate_transfer_dir` does for its own rejections.
+                if !existed {
+                    if let Err(e2) = std::fs::remove_dir(&candidate) {
+                        tracing::debug!(path = %candidate.display(), error = %e2, "rejected collaboration folder left in place");
+                    }
+                }
+                return Err(e);
+            }
+        }
+    };
+    mount_collab_store(ctx, Some(Path::new(&stored))).await?;
+    Ok(stored)
 }
 
-/// Clear the collaboration folder (demotes to a normal monitored directory).
-pub fn clear_collaboration_dir(ctx: &ServiceContext) -> Result<(), ApiError> {
-    clear_special_root_dir(ctx, "collaboration")
+/// Record `dir` (validated, canonical) as THE `collaboration` scan root.
+/// Exact match with a registered root: `collaboration` → kept as is;
+/// `normal` → promoted in place (the one-per-kind rule still applies); any
+/// other special kind → `Conflict`. No match: inserted as a new root, which
+/// must not sit inside or contain another root.
+fn designate_collaboration_root(
+    conn: &rusqlite::Connection,
+    dir: &Path,
+) -> Result<String, ApiError> {
+    const KIND: &str = "collaboration";
+    let existing = crate::db::get_scan_roots(conn)?
+        .into_iter()
+        .find(|r| canonical_or_raw(&r.path) == dir);
+    match existing {
+        Some(root) if root.kind == KIND => {
+            tracing::info!(path = %root.path, kind = KIND, "special scan root designated");
+            Ok(root.path)
+        }
+        Some(root) if root.kind == "normal" => {
+            check_special_root_uniqueness(conn, KIND)?;
+            let id = root
+                .id
+                .ok_or_else(|| ApiError::Internal("scan root has no id".to_string()))?;
+            conn.execute(
+                "UPDATE scan_roots SET kind = ?1 WHERE id = ?2",
+                rusqlite::params![KIND, id],
+            )?;
+            tracing::info!(path = %root.path, kind = KIND, "monitored folder promoted to special scan root");
+            Ok(root.path)
+        }
+        Some(root) => Err(ApiError::Conflict(format!(
+            "This folder is already the {}",
+            special_root_label(&root.kind)
+        ))),
+        None => {
+            check_scan_root_overlap(conn, dir)?;
+            check_special_root_uniqueness(conn, KIND)?;
+            let path_str = dir.to_string_lossy().to_string();
+            crate::db::upsert_scan_root(conn, &path_str, KIND).map_err(|e| {
+                tracing::error!(path = %path_str, error = %e, "failed to add scan root");
+                e
+            })?;
+            tracing::info!(path = %path_str, kind = KIND, "special scan root designated");
+            Ok(path_str)
+        }
+    }
+}
+
+/// Mount (`Some`) or unmount (`None`) the collab blob store on the bound iroh
+/// node. No node bound yet ⇒ nothing to do: `ensure_iroh_node` mounts the
+/// configured root at bind. `set_collab_root` logs its own failures.
+async fn mount_collab_store(ctx: &ServiceContext, root: Option<&Path>) -> Result<(), ApiError> {
+    let node = ctx
+        .iroh_node
+        .lock()
+        .await
+        .as_ref()
+        .map(std::sync::Arc::clone);
+    let Some(node) = node else {
+        tracing::debug!("iroh node not bound; the collab store mounts at bind");
+        return Ok(());
+    };
+    node.set_collab_root(root)
+        .await
+        .map_err(|e| ApiError::Internal(format!("mount the collaboration store: {e:#}")))
+}
+
+/// Clear the collaboration folder (demotes to a normal monitored directory)
+/// and unmount its collab blob store from the bound iroh node.
+pub async fn clear_collaboration_dir(ctx: &ServiceContext) -> Result<(), ApiError> {
+    clear_special_root_dir(ctx, "collaboration")?;
+    mount_collab_store(ctx, None).await
 }
 
 /// Best-effort canonicalize for path comparison: falls back to the raw path
@@ -1951,8 +2062,8 @@ mod special_root_tests {
         assert_eq!(kind_of(&ctx, &stored).as_deref(), Some("normal"));
     }
 
-    #[test]
-    fn collaboration_root_uniqueness_independent_of_sync_incoming() {
+    #[tokio::test]
+    async fn collaboration_root_uniqueness_independent_of_sync_incoming() {
         let db_dir = TempDir::new().unwrap();
         let ctx = test_ctx(&db_dir);
         let sync_dir = TempDir::new().unwrap();
@@ -1971,6 +2082,7 @@ mod special_root_tests {
             collab_dir.path().to_string_lossy().to_string(),
             &PathPolicy::AllowAll,
         )
+        .await
         .unwrap();
         assert!(get_sync_incoming_dir(&ctx).unwrap().is_some());
         assert!(get_collaboration_dir(&ctx).unwrap().is_some());
@@ -1981,9 +2093,89 @@ mod special_root_tests {
                 &ctx,
                 collab_dir2.path().to_string_lossy().to_string(),
                 &PathPolicy::AllowAll,
-            ),
+            )
+            .await,
             Err(ApiError::Conflict(_))
         ));
+    }
+
+    /// P25: the Collaboration root IS a scan root, so designating it validates
+    /// with `OverlapRule::Skip` — a folder already monitored as a normal scan
+    /// root (e.g. one a previous clear demoted) is accepted and promoted in
+    /// place. The absolute-path and write-probe checks still refuse.
+    #[tokio::test]
+    async fn set_collaboration_dir_accepts_a_scan_root_path() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let folder = TempDir::new().unwrap();
+
+        let normal = add_scan_root(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+            None,
+        )
+        .unwrap();
+        assert_eq!(normal.kind, "normal");
+
+        let stored = set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .expect("an already-monitored folder is accepted as the Collaboration root");
+        assert_eq!(stored, normal.path);
+        assert_eq!(kind_of(&ctx, &stored).as_deref(), Some("collaboration"));
+        let rows = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::get_scan_roots(&conn).unwrap().len()
+        };
+        assert_eq!(rows, 1, "promoted in place, never a second row");
+
+        // Clear demotes it; designating the same folder again is accepted.
+        clear_collaboration_dir(&ctx).await.unwrap();
+        assert_eq!(kind_of(&ctx, &stored).as_deref(), Some("normal"));
+        set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .expect("re-designation after a clear");
+        assert_eq!(get_collaboration_dir(&ctx).unwrap(), Some(stored.clone()));
+
+        // Still refused: a relative path.
+        assert!(matches!(
+            set_collaboration_dir(&ctx, "relative/collab".to_string(), &PathPolicy::AllowAll).await,
+            Err(ApiError::Invalid(_))
+        ));
+    }
+
+    /// The write probe still guards the Collaboration root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_collaboration_dir_refuses_an_unwritable_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let parent = TempDir::new().unwrap();
+        let ro = parent.path().join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let got = set_collaboration_dir(
+            &ctx,
+            ro.to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await;
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(got, Err(ApiError::Invalid(ref m)) if m.contains("not writable")),
+            "{got:?}"
+        );
+        assert_eq!(get_collaboration_dir(&ctx).unwrap(), None);
     }
 
     #[test]

@@ -228,6 +228,7 @@ pub async fn set_collaboration_dir(
 ) -> Result<Json<String>, (StatusCode, String)> {
     let policy = allowed_roots_policy(&state.allowed_paths);
     api::set_collaboration_dir(&state.ctx, args.path, &policy)
+        .await
         .map(Json)
         .map_err(api_err)
 }
@@ -238,7 +239,10 @@ pub async fn clear_collaboration_dir(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    api::clear_collaboration_dir(&state.ctx).map(Json).map_err(api_err)
+    api::clear_collaboration_dir(&state.ctx)
+        .await
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/validate_folder_candidate

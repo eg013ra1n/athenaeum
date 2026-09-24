@@ -197,7 +197,11 @@ pub(crate) fn sync_dirs(ctx: &ServiceContext) -> Result<SyncDirs, ApiError> {
 /// would be) returns the overlapping scan root's own path as a non-fatal
 /// fact instead, leaving the caller to word its own warning (a stacking
 /// folder is not a transfer folder — "the scanner would ingest transfer
-/// copies" is the wrong reason for a stacking caller to give).
+/// copies" is the wrong reason for a stacking caller to give). `Skip`
+/// (collab v3 wave 2, P25 — used only by `set_collaboration_dir`) does not
+/// run the overlap check at all: the Collaboration root IS a scan root, so
+/// overlapping one is its normal state. The absolute-path, policy and
+/// write-probe checks still apply.
 pub(crate) enum OverlapRule {
     Reject,
     // Only constructed by `stacking::paths::validate_dirs`, gated
@@ -205,6 +209,7 @@ pub(crate) enum OverlapRule {
     // flagged dead code) under `--no-default-features`.
     #[allow(dead_code)]
     Warn,
+    Skip,
 }
 
 /// Validate (and create) a transfer folder the operator typed or picked
@@ -261,7 +266,13 @@ pub(crate) fn validate_transfer_dir(
         )?);
         policy.check(&path)?;
         let mut overlap_warning = None;
-        if let Err(e) = crate::api::scan_roots::check_scan_root_overlap(conn, &path) {
+        let overlap_result = match overlap {
+            OverlapRule::Skip => Ok(()),
+            OverlapRule::Reject | OverlapRule::Warn => {
+                crate::api::scan_roots::check_scan_root_overlap(conn, &path)
+            }
+        };
+        if let Err(e) = overlap_result {
             match e {
                 ApiError::Conflict(ref msg) => {
                     tracing::warn!(path = %path.display(), error = %msg, "transfer folder overlaps a scan root");
@@ -280,6 +291,8 @@ pub(crate) fn validate_transfer_dir(
                             // itself, which `overlap_root_path` falls back to.
                             overlap_warning = Some(overlap_root_path(msg, &path));
                         }
+                        // Never reached: the check is not run under Skip.
+                        OverlapRule::Skip => {}
                     }
                 }
                 other => return Err(other),
@@ -1249,6 +1262,12 @@ pub(crate) async fn ensure_iroh_node(
     // They only ever existed under `<db dir>/sync`, i.e. the identity dir — a
     // configurable working folder is newer than they are.
     cleanup_orphan_blob_stores(&dirs.identity_dir);
+    // The collab store (collab v3 wave 2, P1): a configured Collaboration root is
+    // mounted right after bind, so its ALPN serves from the first connection.
+    // A failure never fails the bind — personal sync must not depend on the
+    // Collaboration folder — it is logged, and the next designation of the
+    // folder (or the next bind) mounts again.
+    mount_configured_collab_root(ctx, &node).await;
     // Report THIS device's dialable endpoint address to the hub (finding H1, T7):
     // a fire-and-forget task that polls the node's address and PUTs it on change.
     // Only when signed in (a pure dev-ticket node has no hub to report to); never
@@ -1258,6 +1277,27 @@ pub(crate) async fn ensure_iroh_node(
     }
     *guard = Some(Arc::clone(&node));
     Ok(node)
+}
+
+/// Mount the configured Collaboration root's collab store on a freshly bound
+/// node (see [`ensure_iroh_node`]). Best-effort by contract: every failure is
+/// logged and folded, never returned.
+async fn mount_configured_collab_root(ctx: &ServiceContext, node: &SharedIrohNode) {
+    let root = match db(ctx).and_then(|d| {
+        let conn = d.conn();
+        crate::db::scan_root_path_of_kind(&conn, "collaboration")
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }) {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::warn!(error = %e, "read collaboration root at bind failed; collab store not mounted");
+            return;
+        }
+    };
+    let Some(root) = root else { return };
+    if let Err(e) = node.set_collab_root(Some(Path::new(&root))).await {
+        tracing::warn!(path = %root, error = %format!("{e:#}"), "collab store not mounted at bind");
+    }
 }
 
 /// Delete the now-orphaned per-role blob-store directories left by the
@@ -7815,6 +7855,53 @@ mod tests {
 
         let taken3 = ctx.iroh_node.lock().await.take().expect("node3 present");
         taken3.shutdown().await;
+    }
+
+    /// Task 3 (collab v3 wave 2): a configured Collaboration root is mounted
+    /// on the node right at bind, and designating / clearing the folder on a
+    /// bound node mounts / unmounts the collab store — no rebind.
+    #[tokio::test]
+    async fn collab_store_follows_the_collaboration_root() {
+        let (_tmp, ctx) = test_ctx();
+        store_cached_relays(&ctx, &["https://relay.invalid".to_string()]);
+        let root = tempfile::tempdir().unwrap();
+        let root2 = tempfile::tempdir().unwrap();
+        crate::api::scan_roots::set_collaboration_dir(
+            &ctx,
+            root.path().to_string_lossy().to_string(),
+            &crate::api::PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+
+        let node = ensure_iroh_node(&ctx).await.expect("bind");
+        assert!(
+            node.collab_store().is_some(),
+            "a configured Collaboration root is mounted at bind"
+        );
+
+        crate::api::scan_roots::clear_collaboration_dir(&ctx)
+            .await
+            .unwrap();
+        assert!(node.collab_store().is_none(), "clear unmounts");
+
+        crate::api::scan_roots::set_collaboration_dir(
+            &ctx,
+            root2.path().to_string_lossy().to_string(),
+            &crate::api::PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+        assert!(node.collab_store().is_some(), "set on a bound node mounts");
+        assert!(root2
+            .path()
+            .join(".athenaeum")
+            .join("blobs")
+            .join("blobs.db")
+            .exists());
+
+        let taken = ctx.iroh_node.lock().await.take().expect("node present");
+        taken.shutdown().await;
     }
 
     /// Sync 2C, task 3: the sender runtime holds ONE engine per destination

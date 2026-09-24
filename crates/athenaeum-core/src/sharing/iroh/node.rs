@@ -1,8 +1,12 @@
 //! The single process-wide iroh node (iroh hardening C1/§1–§2).
 //!
 //! [`SharedIrohNode`] owns **one** iroh [`Endpoint`], **one** [`Router`] with
-//! both ALPNs mounted once, and **one** [`FsStore`] — and hands out per-role
-//! [`SharingTransport`] handles ([`Role::Recv`]/[`Role::Out`]/[`Role::Collab`]).
+//! every ALPN mounted once, and **one** personal [`FsStore`] — and hands out
+//! per-role [`SharingTransport`] handles ([`Role::Recv`]/[`Role::Out`]/
+//! [`Role::Collab`]). A second, optional store — the collab store under the
+//! Collaboration root — is swapped in a slot behind the collab-blobs ALPN
+//! ([`set_collab_root`](SharedIrohNode::set_collab_root)); the router never
+//! changes.
 //! Before this, production bound up to three endpoints from the SAME device key
 //! (personal sender + collab sender + receiver); a relay permits exactly one
 //! active connection per node id, so they evicted each other and inbound
@@ -45,6 +49,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher};
 use iroh_blobs::api::blobs::ImportMode;
 use iroh_blobs::api::Store;
+use iroh_blobs::provider::events::EventSender;
 use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::GcConfig;
@@ -67,10 +72,11 @@ use super::pacer::UploadPacer;
 use super::proto::{self, Msg, OfferEntry};
 use super::telemetry::{peer_conn_path, TransportCounters};
 use super::{
-    blobs, build_router, hex32, spawn_conn_path_diagnostics, ConnectGate, Delivery, EventSink,
-    PresenceHook, ServeFileResolver, ServeRootResolver, SharedConnectGate, SharedPresenceHook,
-    SharedResponder, CONTROL_SEND_TIMEOUT, EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES,
-    ONLINE_TIMEOUT, SYNC_ALPN,
+    blobs, build_router, collab_gated_blobs, hex32, provider_event_channel,
+    spawn_conn_path_diagnostics, spawn_provider_events, CollabMount, CollabSlotBlobs, ConnectGate,
+    Delivery, EventSink, PresenceHook, ServeFileResolver, ServeRootResolver, SharedCollabSlot,
+    SharedConnectGate, SharedPresenceHook, SharedResponder, CONTROL_SEND_TIMEOUT,
+    EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
 };
 
 /// Upper bound on the graceful `endpoint.close()` at shutdown (I1). A clean
@@ -907,6 +913,44 @@ pub struct SharedIrohNode {
     /// How [`serve`](SharingTransport::serve) imports a package dir into the blob
     /// store; chosen by the host at bind, see [`NodeOptions`].
     serve_import_mode: ImportMode,
+    /// The collab store slot (collab v3 wave 2, P1/R4), read per connection by
+    /// the [`CollabSlotBlobs`] handler mounted at bind. `None` ⇒ no
+    /// Collaboration root mounted.
+    collab: SharedCollabSlot,
+    /// Provider-event sender every collab mount's `BlobsProtocol` clones; its one
+    /// consumer (spawned at bind) shares [`upload_pacer`](Self::upload_pacer).
+    collab_events: EventSender,
+    /// Serializes [`set_collab_root`](Self::set_collab_root) calls (open → sweep
+    /// → swap → shut old) and fences them against [`shutdown`](Self::shutdown).
+    collab_mount: tokio::sync::Mutex<()>,
+}
+
+/// Tag prefix of the collab store's in-flight fetches (plan P22:
+/// `in-flight/project/<pid>/<uuid>/<ver>`). Every such tag present when the
+/// store is opened is stale — its fetch died with the process or the previous
+/// mount — so [`SharedIrohNode::set_collab_root`] sweeps the prefix on open.
+const COLLAB_IN_FLIGHT_PREFIX: &str = "in-flight/project/";
+
+/// Open (creating the dir) a persistent blob store at `dir` — the one opener
+/// both of the node's stores use (the personal `<working_dir>/blobs` and the
+/// collab `<Collaboration root>/.athenaeum/blobs`, plan P1).
+///
+/// Mirrors `FsStore::load`'s internals but with GC on (load() hardcodes gc:
+/// None, so released blobs would leak forever). Interval is slack (see
+/// `GC_INTERVAL`) so an in-flight transfer never races collection.
+pub(crate) async fn open_fs_store(dir: &Path) -> Result<Store> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create blob dir {}", dir.display()))?;
+    let db_path = dir.join("blobs.db");
+    let mut options = FsOptions::new(dir);
+    options.gc = Some(GcConfig {
+        interval: GC_INTERVAL,
+        add_protected: None,
+    });
+    let store: Store = FsStore::load_with_opts(db_path, options)
+        .await
+        .with_context(|| format!("open blob store {}", dir.display()))?
+        .into();
+    Ok(store)
 }
 
 /// Host-chosen node behavior (transfer-prepare spec §4.1).
@@ -954,7 +998,8 @@ impl SharedIrohNode {
     /// error, I4/S2); builds the endpoint (`presets::Minimal` + secret +
     /// `relay_mode` + [`MemoryLookup`](iroh::address_lookup::memory::MemoryLookup));
     /// opens the single [`FsStore`] at `<working_dir>/blobs` (GC enabled once);
-    /// mounts the [`Router`] with both ALPNs once; spawns the home-relay-status
+    /// mounts the [`Router`] with every ALPN once (the collab-blobs one reads an
+    /// initially empty slot); spawns the home-relay-status
     /// watcher. `relay_mode` is [`RelayMode::Default`] for production or
     /// [`RelayMode::Disabled`] for direct-only / in-process tests.
     pub async fn bind_with(
@@ -1005,23 +1050,9 @@ impl SharedIrohNode {
             "shared iroh node relay configuration"
         );
 
-        // One `FsStore` at `<working_dir>/blobs` for all roles (spec §2). Mirror
-        // `FsStore::load`'s internals but with GC on (load() hardcodes gc: None,
-        // so released blobs would leak forever). Interval is slack (see
-        // `GC_INTERVAL`) so an in-flight transfer never races collection.
-        let blob_dir = working_dir.join("blobs");
-        std::fs::create_dir_all(&blob_dir)
-            .with_context(|| format!("create blob dir {}", blob_dir.display()))?;
-        let db_path = blob_dir.join("blobs.db");
-        let mut options = FsOptions::new(&blob_dir);
-        options.gc = Some(GcConfig {
-            interval: GC_INTERVAL,
-            add_protected: None,
-        });
-        let store: Store = FsStore::load_with_opts(db_path, options)
-            .await
-            .with_context(|| format!("open blob store {}", blob_dir.display()))?
-            .into();
+        // One `FsStore` at `<working_dir>/blobs` for all roles (spec §2), GC on
+        // (see `open_fs_store`).
+        let store = open_fs_store(&working_dir.join("blobs")).await?;
 
         // Shared connect gate: unset at construction, installed later by the host
         // (`set_connect_gate`). Cloned into BOTH handlers so a single install
@@ -1062,6 +1093,23 @@ impl SharedIrohNode {
         // consults it for every ~16 KiB payload chunk. Bound unlimited (rate 0) —
         // the host applies the persisted setting afterwards via `set_upload_limit`.
         let upload_pacer = Arc::new(UploadPacer::new(0));
+        // The collab store (collab v3 wave 2, P1/R4): its ALPN is mounted on the
+        // router below ONCE, reading this slot, so a Collaboration-root change
+        // swaps the slot and never rebuilds the router. Its provider-event
+        // sender and consumer are also created once, here: every mount builds its
+        // `BlobsProtocol` from a clone of `collab_events`, and the ONE consumer
+        // drains them all with the SAME pacer (so the device-wide upload cap
+        // covers both stores and every throttle is answered). Collab uploads
+        // route no package progress, so its resolvers resolve nothing.
+        let collab: SharedCollabSlot = Arc::new(RwLock::new(None));
+        let (collab_events, collab_rx) = provider_event_channel();
+        spawn_provider_events(
+            collab_rx,
+            Arc::clone(&upload_pacer),
+            EventSink::Demux(Arc::clone(&demux)),
+            Arc::new(|_: Hash| -> Option<PackageId> { None }),
+            Arc::new(|_: Hash, _: u64| -> Option<(String, u64)> { None }),
+        );
         // Shared node: `EventSink::Demux` (inbound events fan out through the demux,
         // Task 2/Д4, not a single shared stream), and `flush_store_on_shutdown:
         // false` so a router teardown never tears down the store — the node flushes
@@ -1077,6 +1125,10 @@ impl SharedIrohNode {
             serve_resolver,
             serve_file_resolver,
             Arc::clone(&upload_pacer),
+            Some(CollabSlotBlobs {
+                slot: Arc::clone(&collab),
+                gate: Arc::clone(&connect_gate),
+            }),
         );
 
         let endpoint = router.endpoint().clone();
@@ -1136,6 +1188,9 @@ impl SharedIrohNode {
             upload_pacer,
             working_dir: working_dir.to_path_buf(),
             serve_import_mode: opts.serve_import_mode,
+            collab,
+            collab_events,
+            collab_mount: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -1154,7 +1209,7 @@ impl SharedIrohNode {
 
     /// A clone of the current endpoint handle (cheap, Arc-backed). Never holds the
     /// `net` lock across an await — callers use the returned clone.
-    fn endpoint(&self) -> Endpoint {
+    pub fn endpoint(&self) -> Endpoint {
         self.net
             .lock()
             .expect("net mutex poisoned")
@@ -1493,6 +1548,112 @@ impl SharedIrohNode {
         &self.store
     }
 
+    // ----- the collab store (collab v3 wave 2, P1/R4) --------------------------
+
+    /// A clone of the mounted collab store, or `None` when no Collaboration root
+    /// is mounted.
+    pub fn collab_store(&self) -> Option<Store> {
+        self.collab
+            .read()
+            .expect("collab slot poisoned")
+            .as_ref()
+            .map(|m| m.store.clone())
+    }
+
+    /// Mount the collab store of the Collaboration root `root` — the store at
+    /// `<root>/.athenaeum/blobs`, served on
+    /// [`COLLAB_BLOBS_ALPN`](super::COLLAB_BLOBS_ALPN) — or unmount it (`None`).
+    ///
+    /// Serialized by its own async mutex: open the new store → sweep its stale
+    /// `in-flight/project/` tags (P22) → swap the slot → shut the old store down.
+    /// The router is never touched (ruling R4), so no personal-sync connection
+    /// notices. Re-mounting the root that is already mounted is a no-op (the
+    /// store's database lock would refuse a second open of the same dir). On any
+    /// error the previous mount stays in place, and the error is logged and
+    /// returned.
+    pub async fn set_collab_root(&self, root: Option<&Path>) -> Result<()> {
+        let _serial = self.collab_mount.lock().await;
+        if self.shutdown_done.load(Ordering::SeqCst) {
+            let e = anyhow!("iroh node is shut down");
+            tracing::error!(error = %e, "collab store mount refused");
+            return Err(e);
+        }
+        let Some(root) = root else {
+            let old = self.collab.write().expect("collab slot poisoned").take();
+            if let Some(old) = old {
+                shut_collab_store(old).await;
+            }
+            tracing::info!("collab store unmounted");
+            return Ok(());
+        };
+        let current = self
+            .collab
+            .read()
+            .expect("collab slot poisoned")
+            .as_ref()
+            .map(|m| m.root.clone());
+        if current.as_deref().is_some_and(|cur| same_dir(cur, root)) {
+            tracing::debug!(path = %root.display(), "collab store already mounted");
+            return Ok(());
+        }
+        // Never create a phantom tree: a root on an unmounted volume must fail
+        // here, not have `create_dir_all` build `<root>/.athenaeum` somewhere else.
+        if !root.is_dir() {
+            let e = anyhow!(
+                "collaboration root is not an existing folder: {}",
+                root.display()
+            );
+            tracing::error!(path = %root.display(), error = %e, "collab store mount failed");
+            return Err(e);
+        }
+        let dir = root.join(".athenaeum").join("blobs");
+        let store = match open_fs_store(&dir).await {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::error!(path = %dir.display(), error = %format!("{e:#}"), "collab store open failed");
+                return Err(e);
+            }
+        };
+        match store
+            .tags()
+            .delete_prefix(COLLAB_IN_FLIGHT_PREFIX.as_bytes())
+            .await
+        {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(
+                path = %dir.display(),
+                count = removed,
+                "collab store swept stale in-flight tags"
+            ),
+            Err(e) => {
+                tracing::error!(path = %dir.display(), error = %e, "collab store in-flight sweep failed");
+                if let Err(e2) = store.shutdown().await {
+                    tracing::warn!(path = %dir.display(), error = %e2, "collab store shutdown after failed sweep");
+                }
+                return Err(anyhow!("sweep in-flight tags of {}: {e}", dir.display()));
+            }
+        }
+        let blobs = Arc::new(collab_gated_blobs(
+            &store,
+            self.collab_events.clone(),
+            &self.connect_gate,
+        ));
+        let old = self
+            .collab
+            .write()
+            .expect("collab slot poisoned")
+            .replace(CollabMount {
+                root: root.to_path_buf(),
+                store,
+                blobs,
+            });
+        if let Some(old) = old {
+            shut_collab_store(old).await;
+        }
+        tracing::info!(path = %root.display(), "collab store mounted");
+        Ok(())
+    }
+
     /// Gracefully tear down the node (I1): abort the relay refresh loop + relay
     /// watcher, then `Router::shutdown().await` → store shutdown → bounded
     /// `endpoint.close()`, then release the device-key lock. Idempotent — a second
@@ -1545,6 +1706,17 @@ impl SharedIrohNode {
         // so a later re-bind over the same dir can reopen it).
         if let Err(e) = self.store.shutdown().await {
             tracing::warn!(error = %e, "shared iroh node blob store shutdown");
+        }
+        // Then the collab store (P1: shutdown flushes both stores). Taken under
+        // the mount mutex, so a `set_collab_root` racing this teardown either
+        // finished before (and its store is shut here) or sees `shutdown_done`
+        // and refuses.
+        {
+            let _serial = self.collab_mount.lock().await;
+            let mounted = self.collab.write().expect("collab slot poisoned").take();
+            if let Some(mounted) = mounted {
+                shut_collab_store(mounted).await;
+            }
         }
         if tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, endpoint.close())
             .await
@@ -3196,6 +3368,28 @@ impl SharingTransport for RoleHandle {
         // lifecycle and calls `SharedIrohNode::shutdown` directly (Task 3 wiring).
         // Tearing the whole node down from one role handle would kill its
         // siblings, so this is intentionally a no-op.
+    }
+}
+
+/// Flush and close an unmounted collab store (a swap's old store, or the mount
+/// at node shutdown). A failure is logged: the store is already out of the slot,
+/// so nothing new reaches it either way.
+async fn shut_collab_store(mount: CollabMount) {
+    if let Err(e) = mount.store.shutdown().await {
+        tracing::warn!(path = %mount.root.display(), error = %e, "collab store shutdown failed");
+    }
+}
+
+/// Whether `a` and `b` name the same directory: equal as given, or equal once
+/// both resolve (a symlinked or differently spelled Collaboration root must
+/// not re-open a store that is already open).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
     }
 }
 
@@ -5548,5 +5742,395 @@ mod tests {
                 fields: collector.fields,
             });
         }
+    }
+}
+
+/// The collab blob store (collab v3 wave 2, Task 3; plan P1 as amended by
+/// controller ruling R4): a second store under
+/// `<Collaboration root>/.athenaeum/blobs`, served on
+/// [`COLLAB_BLOBS_ALPN`](super::COLLAB_BLOBS_ALPN) by the one node. The ALPN is
+/// mounted once at bind and reads a slot, so mounting, re-rooting and
+/// unmounting never touch the router — and so never a personal-sync
+/// connection. Real nodes, relay disabled.
+#[cfg(test)]
+mod collab_store_tests {
+    use std::path::Path;
+
+    use iroh_blobs::api::blobs::AddPathOptions;
+    use iroh_blobs::protocol::GetRequest;
+    use iroh_blobs::util::connection_pool::{ConnectionPool, Options as PoolOptions};
+    use iroh_blobs::{BlobFormat, HashAndFormat};
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::sharing::iroh::COLLAB_BLOBS_ALPN;
+
+    /// How long a GET that must FAIL is given before the test calls it failed.
+    /// A refused or not-mounted connection closes within milliseconds; the cap
+    /// only keeps a regression from hanging the suite.
+    const MUST_FAIL_WITHIN: Duration = Duration::from_secs(10);
+
+    async fn bind_disabled(dir: &Path) -> Arc<SharedIrohNode> {
+        SharedIrohNode::bind(dir, RelayMode::Disabled)
+            .await
+            .expect("bind relay-disabled node")
+    }
+
+    /// Two relay-disabled nodes that can dial each other (pairing tickets carry
+    /// the direct addresses).
+    async fn two_nodes(
+        da: &Path,
+        db: &Path,
+    ) -> (
+        Arc<SharedIrohNode>,
+        Arc<SharedIrohNode>,
+        StartInfo,
+        StartInfo,
+    ) {
+        let a = bind_disabled(da).await;
+        let b = bind_disabled(db).await;
+        let a_info = a.handle(Role::Out).start().await.unwrap();
+        let b_info = b.handle(Role::Recv).start().await.unwrap();
+        a.add_peer_ticket(&b_info.pairing_ticket)
+            .expect("a pairs b");
+        b.add_peer_ticket(&a_info.pairing_ticket)
+            .expect("b pairs a");
+        (a, b, a_info, b_info)
+    }
+
+    /// Write `len` deterministic bytes to `path`.
+    fn write_file(path: &Path, len: usize) -> Vec<u8> {
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    /// Import `path` into `store` by reference and pin it under `tag`.
+    async fn add_by_reference(store: &Store, path: &Path, tag: &str) -> Hash {
+        let tt = store
+            .blobs()
+            .add_path_with_opts(AddPathOptions {
+                path: path.to_path_buf(),
+                format: BlobFormat::Raw,
+                mode: ImportMode::TryReference,
+            })
+            .temp_tag()
+            .await
+            .expect("import by reference");
+        let hash = tt.hash();
+        store
+            .tags()
+            .set(tag, HashAndFormat::raw(hash))
+            .await
+            .expect("set tag");
+        drop(tt);
+        hash
+    }
+
+    /// One raw-blob GET from `provider` over `alpn`, landing in `puller`'s
+    /// personal store. A fresh pool per call, so a connection a refusing or
+    /// unmounted provider closed is never reused.
+    async fn get_blob(
+        puller: &SharedIrohNode,
+        provider: NodeId,
+        alpn: &[u8],
+        hash: Hash,
+    ) -> Result<()> {
+        let pool = ConnectionPool::new(puller.endpoint(), alpn, PoolOptions::default());
+        let conn = pool
+            .get_or_connect(EndpointId::from_bytes(&provider).unwrap())
+            .await
+            .map_err(|e| anyhow!("dial: {e:?}"))?;
+        let remote = puller.store().remote().clone();
+        remote
+            .execute_get((*conn).clone(), GetRequest::blob(hash))
+            .await
+            .map_err(|e| anyhow!("get: {e:?}"))?;
+        Ok(())
+    }
+
+    async fn tag_present(store: &Store, name: &str) -> bool {
+        store
+            .tags()
+            .get(name.as_bytes())
+            .await
+            .expect("tags().get")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn collab_store_is_served_on_its_own_alpn() {
+        let (da, db, root) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let (a, b, a_info, _) = two_nodes(da.path(), db.path()).await;
+
+        a.set_collab_root(Some(root.path())).await.expect("mount");
+        let store = a.collab_store().expect("mounted store");
+        let frame = root.path().join("p").join("me").join("frame_0001.fits");
+        let bytes = write_file(&frame, 64 * 1024);
+        let hash = add_by_reference(&store, &frame, "project/p/u/1").await;
+        assert_eq!(hash, Hash::new(&bytes));
+
+        // The personal ALPN serves the personal store, which has no such hash:
+        // the GET fails and nothing lands. Run FIRST, before B holds the blob.
+        let personal = tokio::time::timeout(
+            MUST_FAIL_WITHIN,
+            get_blob(&b, a_info.node_id, iroh_blobs::ALPN, hash),
+        )
+        .await;
+        assert!(
+            !matches!(personal, Ok(Ok(()))),
+            "the personal ALPN must not serve a collab-store blob"
+        );
+        assert!(!b.store().blobs().has(hash).await.unwrap());
+
+        get_blob(&b, a_info.node_id, COLLAB_BLOBS_ALPN, hash)
+            .await
+            .expect("collab GET succeeds");
+        assert!(
+            b.store().blobs().has(hash).await.unwrap(),
+            "B holds the blob after the collab GET"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn collab_alpn_honours_the_connect_gate() {
+        let (da, db, root) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let (a, b, a_info, _) = two_nodes(da.path(), db.path()).await;
+
+        a.set_collab_root(Some(root.path())).await.expect("mount");
+        let frame = root.path().join("frame.fits");
+        write_file(&frame, 64 * 1024);
+        let hash = add_by_reference(&a.collab_store().unwrap(), &frame, "project/p/u/1").await;
+
+        let refused = b.node_id();
+        a.set_connect_gate(Arc::new(move |from: &NodeId| *from != refused));
+
+        let got = tokio::time::timeout(
+            MUST_FAIL_WITHIN,
+            get_blob(&b, a_info.node_id, COLLAB_BLOBS_ALPN, hash),
+        )
+        .await;
+        assert!(
+            !matches!(got, Ok(Ok(()))),
+            "a peer the gate refuses must not get a collab blob"
+        );
+        assert!(!b.store().blobs().has(hash).await.unwrap());
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn collab_get_fails_unmounted_and_succeeds_after_mounting() {
+        let (da, db, root) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let (a, b, a_info, _) = two_nodes(da.path(), db.path()).await;
+        let frame = root.path().join("frame.fits");
+        let bytes = write_file(&frame, 64 * 1024);
+        let hash = Hash::new(&bytes);
+
+        assert!(a.collab_store().is_none(), "nothing mounted at bind");
+        let unmounted = tokio::time::timeout(
+            MUST_FAIL_WITHIN,
+            get_blob(&b, a_info.node_id, COLLAB_BLOBS_ALPN, hash),
+        )
+        .await;
+        assert!(
+            !matches!(unmounted, Ok(Ok(()))),
+            "a collab GET with no store mounted must fail"
+        );
+        assert!(!b.store().blobs().has(hash).await.unwrap());
+
+        a.set_collab_root(Some(root.path())).await.expect("mount");
+        add_by_reference(&a.collab_store().unwrap(), &frame, "project/p/u/1").await;
+        get_blob(&b, a_info.node_id, COLLAB_BLOBS_ALPN, hash)
+            .await
+            .expect("the same GET succeeds once the store is mounted");
+        assert!(b.store().blobs().has(hash).await.unwrap());
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn collab_root_change_remounts_and_sweeps_in_flight() {
+        let (dn, r1, r2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let node = bind_disabled(dn.path()).await;
+
+        node.set_collab_root(Some(r1.path()))
+            .await
+            .expect("mount R1");
+        let s1 = node.collab_store().expect("Some after R1");
+        assert!(
+            r1.path()
+                .join(".athenaeum")
+                .join("blobs")
+                .join("blobs.db")
+                .exists(),
+            "the store lives under <root>/.athenaeum/blobs"
+        );
+        let tt = s1
+            .blobs()
+            .add_bytes(b"frame".to_vec())
+            .temp_tag()
+            .await
+            .unwrap();
+        s1.tags()
+            .set("in-flight/project/p/u/1", tt.hash_and_format())
+            .await
+            .unwrap();
+        s1.tags()
+            .set("project/p/u/1", tt.hash_and_format())
+            .await
+            .unwrap();
+        drop(tt);
+
+        node.set_collab_root(Some(r2.path()))
+            .await
+            .expect("mount R2");
+        assert!(node.collab_store().is_some(), "Some after R2");
+        node.set_collab_root(Some(r1.path()))
+            .await
+            .expect("re-mount R1");
+        let again = node.collab_store().expect("Some after R1 again");
+        assert!(
+            !tag_present(&again, "in-flight/project/p/u/1").await,
+            "a re-open sweeps stale in-flight/project/ tags"
+        );
+        assert!(
+            tag_present(&again, "project/p/u/1").await,
+            "the sweep is scoped: the permanent seed tag survives the re-open"
+        );
+
+        node.set_collab_root(None).await.expect("unmount");
+        assert!(node.collab_store().is_none(), "None after unmount");
+
+        node.shutdown().await;
+    }
+
+    /// One personal-sync announce→ack round trip over the pooled control
+    /// connections, asserting both legs arrive.
+    struct RoundTrip {
+        out: Arc<dyn SharingTransport>,
+        recv: Arc<dyn SharingTransport>,
+        s_id: NodeId,
+        r_id: NodeId,
+        id: &'static str,
+    }
+
+    impl RoundTrip {
+        async fn run(
+            self,
+            r_ev: &mut mpsc::Receiver<TransportEvent>,
+            acks: &mut mpsc::Receiver<TransportEvent>,
+        ) {
+            let pkg = PackageAnnounce {
+                package_id: PackageId(self.id.to_string()),
+                root_hash: "placeholder".to_string(),
+                byte_size: 0,
+                frame_count: 0,
+            };
+            self.out
+                .announce(self.r_id, &pkg, "", "", &[], PackageLayout::Batch)
+                .await
+                .expect("announce");
+            let pid = match tokio::time::timeout(Duration::from_secs(10), r_ev.recv()).await {
+                Ok(Some(TransportEvent::AnnounceReceived { announce, .. })) => announce.package_id,
+                other => panic!("{}: expected AnnounceReceived, got {other:?}", self.id),
+            };
+            self.recv
+                .ack(self.s_id, &pid, Vec::new())
+                .await
+                .expect("ack");
+            match tokio::time::timeout(Duration::from_secs(10), acks.recv()).await {
+                Ok(Some(TransportEvent::AckReceived { package_id, .. })) => {
+                    assert_eq!(package_id, pkg.package_id)
+                }
+                other => panic!("{}: expected AckReceived, got {other:?}", self.id),
+            }
+        }
+    }
+
+    /// Mounting, re-rooting and unmounting the collab store leave the live
+    /// personal-sync control connection alone: the pooled connection opened
+    /// before is reused after (no re-dial), and an announce→ack round trip
+    /// still completes (ruling R4 — the router is never rebuilt).
+    #[tokio::test]
+    async fn personal_control_connection_survives_set_collab_root() {
+        let (ds, dr) = (tempdir().unwrap(), tempdir().unwrap());
+        let (r1, r2) = (tempdir().unwrap(), tempdir().unwrap());
+        let (s, r, s_info, r_info) = two_nodes(ds.path(), dr.path()).await;
+        let out = s.handle(Role::Out);
+        let recv = r.handle(Role::Recv);
+        let mut acks = out.events().await;
+        let mut r_ev = recv.events().await;
+
+        let rt = |id: &'static str| RoundTrip {
+            out: Arc::clone(&out),
+            recv: Arc::clone(&recv),
+            s_id: s_info.node_id,
+            r_id: r_info.node_id,
+            id,
+        };
+
+        rt("before").run(&mut r_ev, &mut acks).await;
+        let (s_dials, r_dials) = (s.control_pool_dials(), r.control_pool_dials());
+
+        // Mount and re-root on BOTH ends, then unmount one.
+        s.set_collab_root(Some(r1.path())).await.unwrap();
+        r.set_collab_root(Some(r2.path())).await.unwrap();
+        s.set_collab_root(None).await.unwrap();
+        r.set_collab_root(None).await.unwrap();
+        s.set_collab_root(Some(r2.path())).await.unwrap();
+        r.set_collab_root(Some(r1.path())).await.unwrap();
+
+        rt("after").run(&mut r_ev, &mut acks).await;
+        assert_eq!(
+            (s.control_pool_dials(), r.control_pool_dials()),
+            (s_dials, r_dials),
+            "the pooled control connections must survive set_collab_root (no re-dial)"
+        );
+
+        s.shutdown().await;
+        r.shutdown().await;
+    }
+
+    /// The ONE device-wide pacer caps the collab store's uploads too: the
+    /// second provider-event consumer answers every throttle with the same
+    /// `UploadPacer` delay the personal consumer applies.
+    #[tokio::test]
+    async fn upload_pacer_covers_the_collab_store() {
+        let (da, db, root) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let (a, b, a_info, _) = two_nodes(da.path(), db.path()).await;
+        a.set_collab_root(Some(root.path())).await.expect("mount");
+        let frame = root.path().join("frame.fits");
+        let bytes = write_file(&frame, 1024 * 1024);
+        let hash = add_by_reference(&a.collab_store().unwrap(), &frame, "project/p/u/1").await;
+
+        // 512 KB/s, armed on the provider before B pulls a byte.
+        a.set_upload_limit(512_000);
+        let t0 = std::time::Instant::now();
+        get_blob(&b, a_info.node_id, COLLAB_BLOBS_ALPN, hash)
+            .await
+            .expect("a paced collab transfer still completes");
+        let elapsed = t0.elapsed();
+        assert!(b.store().blobs().has(hash).await.unwrap());
+        assert_eq!(hash, Hash::new(&bytes));
+
+        // 1 MiB at 512 KB/s ⇒ ~2.05 s in theory. The floor is ~2/3 of that, as
+        // in `upload_pacer_limits_real_transfer_wall_clock`: jitter and the
+        // first unpaced chunk never flake it, while an unthrottled localhost
+        // pull (well under a second) fails it decisively. No upper bound.
+        assert!(
+            elapsed >= Duration::from_millis(1300),
+            "paced 1 MiB collab transfer at 512 KB/s finished in {elapsed:?} — \
+             the pacer is not covering the collab store"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
     }
 }

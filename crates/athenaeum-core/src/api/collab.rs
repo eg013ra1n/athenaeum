@@ -1872,9 +1872,64 @@ pub async fn decide_announcement(
     Ok(())
 }
 
+/// The message every publish and replication path refuses with when no
+/// Collaboration folder is set (collab v3 wave 2, P25). No silent fallback to
+/// the working dir.
+pub(crate) const COLLABORATION_ROOT_REQUIRED: &str =
+    "set a Collaboration folder in File Manager → Folders first";
+
+/// The configured Collaboration root — required for any collab receive or
+/// publish (P25). Absent ⇒ `ApiError::Invalid` carrying
+/// [`COLLABORATION_ROOT_REQUIRED`], logged at `warn!`.
+// Consumed by publish (Task 7) and the replication pass (Task 9).
+#[allow(dead_code)]
+pub(crate) fn require_collaboration_root(
+    ctx: &ServiceContext,
+) -> Result<std::path::PathBuf, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    match crate::db::scan_root_path_of_kind(&conn, "collaboration") {
+        Ok(Some(path)) => Ok(std::path::PathBuf::from(path)),
+        Ok(None) => {
+            tracing::warn!(
+                outcome = "no_collaboration_root",
+                "collaboration root required"
+            );
+            Err(ApiError::Invalid(COLLABORATION_ROOT_REQUIRED.to_string()))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "read collaboration root failed");
+            Err(ApiError::Internal(format!("read collaboration root: {e}")))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P25: without a Collaboration root, the collab paths refuse with the
+    /// one actionable message; with one, they get its path.
+    #[tokio::test]
+    async fn require_collaboration_root_refuses_until_one_is_set() {
+        let (_tmp, ctx) = test_ctx();
+        match require_collaboration_root(&ctx) {
+            Err(ApiError::Invalid(m)) => assert_eq!(m, COLLABORATION_ROOT_REQUIRED),
+            other => panic!("expected Invalid(P25 message), got {other:?}"),
+        }
+        let root = tempfile::tempdir().unwrap();
+        let stored = crate::api::scan_roots::set_collaboration_dir(
+            &ctx,
+            root.path().to_string_lossy().to_string(),
+            &crate::api::PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            require_collaboration_root(&ctx).unwrap(),
+            std::path::PathBuf::from(stored)
+        );
+    }
     // The production module no longer imports base64 (the `member_node_ids`
     // helper that used it moved to `crate::collab::snapshot`); the tests still
     // encode node ids into snapshot fixtures.

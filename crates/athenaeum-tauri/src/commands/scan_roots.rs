@@ -110,7 +110,9 @@ pub async fn get_collaboration_dir(state: State<'_, AppState>) -> Result<Option<
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn set_collaboration_dir(path: String, state: State<'_, AppState>) -> Result<String, String> {
-    api::set_collaboration_dir(&state.ctx, path, &PathPolicy::AllowAll).map_err(|e| e.to_string())
+    api::set_collaboration_dir(&state.ctx, path, &PathPolicy::AllowAll)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Clear the collaboration folder (demotes the root to a normal monitored
@@ -118,7 +120,9 @@ pub async fn set_collaboration_dir(path: String, state: State<'_, AppState>) -> 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn clear_collaboration_dir(state: State<'_, AppState>) -> Result<(), String> {
-    api::clear_collaboration_dir(&state.ctx).map_err(|e| e.to_string())
+    api::clear_collaboration_dir(&state.ctx)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Dry-run placement validation for the Add Folder dialog (spec §8.2).
