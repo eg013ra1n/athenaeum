@@ -312,6 +312,11 @@ pub struct FakeHubState {
     pub projects: HashMap<String, FakeProject>,
     /// device token → the account + device it authenticates.
     pub tokens: HashMap<String, FakeAccount>,
+    /// account id → display name, kept apart from `tokens` (T4 ruling): a
+    /// revoke removes only the token, never the account's display name, so a
+    /// member who still has other devices — or is simply not the one just
+    /// revoked — never renders as "former member".
+    pub account_displays: HashMap<String, String>,
     /// Manifest (and holders-delta) page size (the hub's is
     /// [`MANIFEST_PAGE`]); tests lower it to exercise `next` paging.
     pub page_size: usize,
@@ -354,10 +359,9 @@ impl FakeHubState {
     }
 
     fn display_of(&self, account_id: &str) -> String {
-        self.tokens
-            .values()
-            .find(|a| a.account_id == account_id)
-            .map(|a| a.display.clone())
+        self.account_displays
+            .get(account_id)
+            .cloned()
             .unwrap_or_else(|| "former member".to_string())
     }
 
@@ -492,6 +496,15 @@ impl FakeHubState {
     /// the new one, and builds the `hello` payload. Returns the serialized
     /// `hello` JSON, a feed subscription, this session's kill switch, the
     /// keepalive interval, the account id and the new session id.
+    ///
+    /// T4 fake fidelity ruling: a replacing stream of a STILL-VISIBLE device
+    /// (one whose old session is found here — no offline event has been
+    /// published for it, since that only happens via the presence ticker's
+    /// expiry or a revoke, both of which remove the session themselves)
+    /// carries the old session's `serving`/`relay_url` forward and publishes
+    /// NO presence note (hub `Presence::open` treats it as the same online
+    /// device, not a fresh connect). A genuinely new device still gets the
+    /// `connected: true` broadcast.
     fn open_session(
         &mut self,
         acct: &FakeAccount,
@@ -503,13 +516,13 @@ impl FakeHubState {
         String,
         String,
     ) {
-        if let Some(old_id) = self
+        let existing = self
             .sessions
             .iter()
             .find(|(_, s)| s.device == acct.device_pubkey_b64)
-            .map(|(id, _)| id.clone())
-        {
-            if let Some(old) = self.sessions.remove(&old_id) {
+            .map(|(id, s)| (id.clone(), s.serving.clone(), s.relay_url.clone()));
+        if let Some((old_id, _, _)) = &existing {
+            if let Some(old) = self.sessions.remove(old_id) {
                 let _ = old.kill.send(true);
             }
         }
@@ -520,13 +533,17 @@ impl FakeHubState {
         );
         let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
         let feed_rx = self.feed.subscribe();
+        let (serving, relay_url) = match &existing {
+            Some((_, serving, relay_url)) => (serving.clone(), relay_url.clone()),
+            None => (BTreeMap::new(), acct.relay_url.clone()),
+        };
         self.sessions.insert(
             session_id.clone(),
             FakeSession {
                 device: acct.device_pubkey_b64.clone(),
                 account_id: acct.account_id.clone(),
-                serving: BTreeMap::new(),
-                relay_url: acct.relay_url.clone(),
+                serving,
+                relay_url: relay_url.clone(),
                 last_beat: Instant::now(),
                 detached_at: None,
                 kill: kill_tx,
@@ -540,24 +557,26 @@ impl FakeHubState {
             "projects": projects,
         })
         .to_string();
-        // Presence::open (hub) — the device is now online: tell every other
-        // stream on this account's projects at once.
-        let pids: Vec<String> = self
-            .projects
-            .iter()
-            .filter(|(_, p)| p.member(&acct.account_id).is_some())
-            .map(|(pid, _)| pid.clone())
-            .collect();
-        for pid in &pids {
-            self.publish(
-                pid,
-                "presence",
-                json!({
-                    "projectId": pid,
-                    "replace": false,
-                    "changes": [{ "device": acct.device_pubkey_b64, "connected": true, "serving": false, "relayUrl": acct.relay_url }],
-                }),
-            );
+        if existing.is_none() {
+            // Presence::open (hub) — the device is now online: tell every
+            // other stream on this account's projects at once.
+            let pids: Vec<String> = self
+                .projects
+                .iter()
+                .filter(|(_, p)| p.member(&acct.account_id).is_some())
+                .map(|(pid, _)| pid.clone())
+                .collect();
+            for pid in &pids {
+                self.publish(
+                    pid,
+                    "presence",
+                    json!({
+                        "projectId": pid,
+                        "replace": false,
+                        "changes": [{ "device": acct.device_pubkey_b64, "connected": true, "serving": false, "relayUrl": relay_url }],
+                    }),
+                );
+            }
         }
         (
             hello,
@@ -629,6 +648,7 @@ impl FakeHub {
         let state = Arc::new(Mutex::new(FakeHubState {
             projects: HashMap::new(),
             tokens: HashMap::new(),
+            account_displays: HashMap::new(),
             page_size: MANIFEST_PAGE,
             failing: HashSet::new(),
             triggers: Vec::new(),
@@ -706,7 +726,8 @@ impl FakeHub {
         device_pubkey_b64: &str,
         relay_url: Option<&str>,
     ) {
-        self.lock().tokens.insert(
+        let mut st = self.lock();
+        st.tokens.insert(
             token.to_string(),
             FakeAccount {
                 account_id: account_id.to_string(),
@@ -715,6 +736,8 @@ impl FakeHub {
                 relay_url: relay_url.map(str::to_string),
             },
         );
+        st.account_displays
+            .insert(account_id.to_string(), display.to_string());
     }
 
     /// Create an active project at version 1 with the [`default_dictionary`]
@@ -3338,5 +3361,79 @@ mod tests {
         assert_eq!(r.status(), 401);
         let snap = c.holders_snapshot("tok-o", "p1").await.unwrap();
         assert!(!snap.devices.iter().any(|d| d.device == "AAA="));
+    }
+
+    /// T4 fake fidelity ruling: a second stream from a device that never went
+    /// offline (no revoke, no ticker expiry) is a replace, not a fresh
+    /// connect — the watcher sees no new presence note, and the state
+    /// (serving, relay) carries over into the new session's own `hello`.
+    #[tokio::test]
+    async fn a_replacing_stream_of_a_still_visible_device_publishes_no_note() {
+        let hub = hub_with_member().await;
+        let mut watcher = open(&hub, "tok-o").await;
+        let mut wbuf = String::new();
+        let (_, _hello_o) = next_event(&mut watcher, &mut wbuf).await;
+
+        let mut me = open(&hub, "tok").await;
+        let mut mbuf = String::new();
+        let (_, hello_me) = next_event(&mut me, &mut mbuf).await;
+        let session_id = hello_me["sessionId"].as_str().unwrap().to_string();
+        let ev = next_presence_for(&mut watcher, &mut wbuf, "AAA=").await;
+        assert_eq!(ev["changes"][0]["connected"], true);
+
+        let c = CollabClient::new(hub.uri()).unwrap();
+        c.presence_beat(&BeatWire {
+            session_id,
+            serving: [("p1".to_string(), true)].into_iter().collect(),
+            relay_url: Some("https://relay.example".into()),
+        })
+        .await
+        .unwrap();
+        let ev = next_presence_for(&mut watcher, &mut wbuf, "AAA=").await;
+        assert_eq!(ev["changes"][0]["serving"], true);
+
+        // A second stream, same device, no revoke: a replace.
+        let mut me2 = open(&hub, "tok").await;
+        let mut mbuf2 = String::new();
+        let (_, hello_me2) = next_event(&mut me2, &mut mbuf2).await;
+        let presence_me2 = hello_me2["projects"]["p1"]["presence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["device"] == "AAA=")
+            .unwrap()
+            .clone();
+        assert_eq!(presence_me2["serving"], true);
+        assert_eq!(presence_me2["relayUrl"], "https://relay.example");
+
+        let no_note = tokio::time::timeout(
+            Duration::from_millis(300),
+            next_presence_for(&mut watcher, &mut wbuf, "AAA="),
+        )
+        .await;
+        assert!(
+            no_note.is_err(),
+            "a replacing stream of a still-visible device must publish no presence note"
+        );
+    }
+
+    /// T4 fake fidelity ruling: revoking an account's only device drops its
+    /// token, but the member (and its real display name) stays on the
+    /// project — display names live apart from tokens.
+    #[tokio::test]
+    async fn revoking_the_only_device_keeps_the_members_display_name() {
+        let hub = hub_with_member().await;
+        hub.revoke_device("AAA=", true);
+        let c = CollabClient::new(hub.uri()).unwrap();
+        let snap = c.membership_snapshot("tok-o", "p1").await.unwrap();
+        let payload = B64.decode(&snap.payload).unwrap();
+        let payload: Value = serde_json::from_slice(&payload).unwrap();
+        let member = payload["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["accountId"] == "acc-me")
+            .unwrap();
+        assert_eq!(member["displayName"], "Me");
     }
 }

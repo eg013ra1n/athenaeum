@@ -891,6 +891,10 @@ pub struct SharedIrohNode {
     /// Serializes [`set_collab_root`](Self::set_collab_root) calls (open → sweep
     /// → swap → shut old) and fences them against [`shutdown`](Self::shutdown).
     collab_mount: tokio::sync::Mutex<()>,
+    /// The [`home_relay_watch`](Self::home_relay_watch) watcher's sender, lazily
+    /// spawned on first call (live exchange presence beat, spec §4.2). `None`
+    /// until then; every later call subscribes to the same task.
+    home_relay_tx: Mutex<Option<tokio::sync::watch::Sender<Option<String>>>>,
 }
 
 /// Tag prefix of the collab store's in-flight fetches (plan P22:
@@ -1208,6 +1212,7 @@ impl SharedIrohNode {
             collab,
             collab_events,
             collab_mount: tokio::sync::Mutex::new(()),
+            home_relay_tx: Mutex::new(None),
         }))
     }
 
@@ -1339,6 +1344,50 @@ impl SharedIrohNode {
     /// current relay set (a hot-swap re-homes the same endpoint in place).
     pub fn endpoint_addr(&self) -> EndpointAddr {
         self.endpoint().addr()
+    }
+
+    /// The home relay URL the endpoint currently advertises (`None` with the
+    /// relay disabled or before the first home relay). Sent in the presence
+    /// beat so a device that re-homes stays dialable (spec §4.2, C40).
+    pub fn home_relay_url(&self) -> Option<String> {
+        self.endpoint()
+            .addr()
+            .relay_urls()
+            .next()
+            .map(|u| u.to_string())
+    }
+
+    /// Changes of [`Self::home_relay_url`], deduplicated. One watcher task per
+    /// node, spawned on first call and ended with the node's endpoint.
+    pub fn home_relay_watch(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        let mut slot = self
+            .home_relay_tx
+            .lock()
+            .expect("home relay watch poisoned");
+        if let Some(tx) = slot.as_ref() {
+            return tx.subscribe();
+        }
+        let (tx, rx) = tokio::sync::watch::channel(self.home_relay_url());
+        let endpoint = self.endpoint();
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            use iroh::Watcher as _;
+            let mut addrs = endpoint.watch_addr().stream();
+            while let Some(addr) = n0_future::StreamExt::next(&mut addrs).await {
+                let url = addr.relay_urls().next().map(|u| u.to_string());
+                tx2.send_if_modified(|cur| {
+                    if *cur != url {
+                        *cur = url;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            tracing::debug!("home relay watch ended");
+        });
+        *slot = Some(tx);
+        rx
     }
 
     /// The relay URLs the endpoint currently carries (H1 groundwork, Task 7).

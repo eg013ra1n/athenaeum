@@ -2142,6 +2142,17 @@ async fn bind_disabled(dir: &Path) -> Arc<SharedIrohNode> {
         .expect("bind relay-disabled node")
 }
 
+/// A node bound with the relay disabled has no home relay, and its watch
+/// starts at `None` too (live exchange presence beat, spec §4.2, task T4).
+#[tokio::test]
+async fn home_relay_url_and_watch_start_at_none_with_relay_disabled() {
+    let dir = tempdir().unwrap();
+    let node = bind_disabled(dir.path()).await;
+    assert_eq!(node.home_relay_url(), None);
+    let watch = node.home_relay_watch();
+    assert_eq!(*watch.borrow(), None);
+}
+
 async fn tag_present(store: &Store, name: &str) -> bool {
     store
         .tags()
