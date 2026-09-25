@@ -302,7 +302,7 @@ fn meta_str(v: &serde_json::Value, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::db::collab::{upsert_project, CollabProjectRow};
-    use crate::db::collab_frames::{record_own, FrameOrigin, LocalFrameRow};
+    use crate::db::collab_frames::{record_own, FrameOrigin, LocalFrameRow, LocalState};
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -346,6 +346,8 @@ mod tests {
                 replication_paused: false,
                 auto_publish: true,
                 fetched_at: String::new(),
+                feed_epoch: None,
+                holder_seq: -1,
             },
         )
         .unwrap();
@@ -388,6 +390,13 @@ mod tests {
             recipe_hash: None,
             last_error: None,
             updated_at: String::new(),
+            local_state: match (origin, landed.is_some()) {
+                (FrameOrigin::Own, true) => LocalState::OwnHeld,
+                (FrameOrigin::Own, false) => LocalState::OwnMissing,
+                (FrameOrigin::Replica, true) => LocalState::Held,
+                (FrameOrigin::Replica, false) => LocalState::Wanted,
+            },
+            frame_seq: None,
         };
         record_own(conn, &row).unwrap();
         row

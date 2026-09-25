@@ -4093,6 +4093,7 @@ pub async fn export_project_for_wbpp(
 mod tests {
     use super::*;
     use crate::db::collab::{upsert_project, CollabProjectRow};
+    use crate::db::collab_frames::LocalState;
     use crate::sharing::iroh::node::Role;
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
@@ -4153,6 +4154,8 @@ mod tests {
                 replication_paused: false,
                 auto_publish: true,
                 fetched_at: String::new(),
+                feed_epoch: None,
+                holder_seq: -1,
             },
         )
         .unwrap();
@@ -4722,6 +4725,8 @@ mod tests {
                 recipe_hash: Some("recipe".into()),
                 last_error: None,
                 updated_at: String::new(),
+                local_state: LocalState::OwnHeld,
+                frame_seq: None,
             }
         }
     }
@@ -5483,6 +5488,8 @@ mod tests {
                 recipe_hash: None,
                 last_error: None,
                 updated_at: String::new(),
+                local_state: LocalState::Wanted,
+                frame_seq: None,
             }
         }
 

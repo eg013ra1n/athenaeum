@@ -414,6 +414,8 @@ mod tests {
             replication_paused: false,
             auto_publish,
             fetched_at: String::new(),
+            feed_epoch: None,
+            holder_seq: -1,
         }
     }
 

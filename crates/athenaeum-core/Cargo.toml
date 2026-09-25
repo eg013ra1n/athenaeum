@@ -17,7 +17,7 @@ walkdir = "2"
 anyhow = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 quick-xml = "0.41"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 # SemVer 2.0 precedence for the update check (moved here from athenaeum-tauri
 # so both hosts compare versions with one function).
 semver = "1"
@@ -56,6 +56,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "form",
     "query",
+    "stream",
 ] }
 # "rt-multi-thread" is needed for `tokio::task::block_in_place` (used by
 # `api::account::status` to keep the bounded keychain probe's blocking FFI off
@@ -122,6 +123,19 @@ reflink-copy = "0.1"
 # the file. Already in the build graph transitively under iroh-blobs — single
 # 1.8 version, no new dependency tree.
 blake3 = "1.8"
+# Filesystem watcher for the collab v3 live-exchange storage state machine
+# (collab::storage::watch, wave 3): aggregates OS-native change events (FSEvents /
+# ReadDirectoryChangesW / inotify) so a deletion is only reported once it settles.
+# Same crate and version as `crates/perseus/Cargo.toml:70` — one version in the
+# tree.
+notify = "8"
+# Cross-platform "move to trash" for the collab v3 live-exchange deletion flow
+# (a locally-declined replica's file goes to the OS trash, not `remove_file`):
+# `NSFileManager` on macOS, the shell API (default COM apartment mode) on
+# Windows, the freedesktop trash spec on Linux. Only `trash::delete(path) ->
+# Result<(), trash::Error>` is called; the default `chrono` feature is kept —
+# chrono is already in the tree.
+trash = "5"
 # Unix statvfs for the retention disk-usage probe (task M4). Already in the build
 # graph transitively (rusqlite/tokio); named directly, single 0.2 version, so the
 # `disk_pct` retention policy can measure free space without a new dependency tree.
@@ -204,3 +218,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 imageproc = { version = "0.27", default-features = false }
 # Mock HTTP server for the account hub-client tests (task B4).
 wiremock = "0.6"
+# Fake hub event-stream front for the collab v3 live-exchange session tests
+# (wave 3): already in `Cargo.lock` transitively (axum-based web server), pinned
+# directly here as a dev-only front end.
+axum = "0.8"

@@ -35,7 +35,8 @@ use crate::collab::hub_client::FrameViewWire;
 const SELECT_COLS: &str = "project_id, frame_uuid, content_version, origin, publisher_account_id, \
     publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3, blake3, \
     holder_count, manifest_version, manifest_json, landed_path, size_mtime_seen, on_disk, \
-    locally_declined, awaiting_gc, source_frame_id, recipe_hash, last_error, updated_at";
+    locally_declined, awaiting_gc, source_frame_id, recipe_hash, last_error, updated_at, \
+    local_state, frame_seq";
 
 /// Whether a `project_frames_local` row is a frame I published, or a peer's
 /// that I've pulled down. Stored as `'own'` / `'replica'` (schema CHECK).
@@ -62,6 +63,96 @@ impl FrameOrigin {
             _ => FrameOrigin::Replica,
         }
     }
+}
+
+/// The wave-3 per-frame local state machine (plan P8): where a cached frame
+/// stands relative to my disk, independent of the hub's own `state`
+/// (moderation) column. `on_disk` is kept in lockstep with [`servable`] —
+/// [`set_local_state`] is the ONE writer that moves both together (plus the
+/// claim/outbox change a servability flip causes, C24); the wave-2 writers
+/// (`set_landed`, `set_missing`, `set_declined`, `record_own`) still move
+/// `on_disk` directly, in step with `local_state`, until Tasks 9/11/15
+/// replace them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocalState {
+    /// A replica frame I don't have and haven't declined — the need set.
+    Wanted,
+    /// On disk, servable to the hub/peers.
+    Held,
+    /// Was on disk, isn't any more (GC'd, deleted, disk truth found it gone).
+    Missing,
+    /// A version bump landed while the old file was quarantined/edited; the
+    /// user must resolve which content to keep.
+    AwaitingChoice,
+    /// Disk truth found the landed file changed in place (size/hash mismatch
+    /// against what I fetched) — the Changed files list (L5).
+    Quarantined,
+    /// Locally declined ("stop holding") — never fetched again until undone.
+    NotKept,
+    /// Not part of my replication scope right now (caps-excluded, not yet
+    /// published/accepted) — nothing to do.
+    Idle,
+    /// My own frame, on disk.
+    OwnHeld,
+    /// My own frame, not on disk (the source file is gone/moved).
+    OwnMissing,
+    /// My own frame, staged with new bytes the hub hasn't confirmed yet.
+    OwnChanged,
+}
+
+impl LocalState {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            LocalState::Wanted => "wanted",
+            LocalState::Held => "held",
+            LocalState::Missing => "missing",
+            LocalState::AwaitingChoice => "awaiting_choice",
+            LocalState::Quarantined => "quarantined",
+            LocalState::NotKept => "not_kept",
+            LocalState::Idle => "idle",
+            LocalState::OwnHeld => "own_held",
+            LocalState::OwnMissing => "own_missing",
+            LocalState::OwnChanged => "own_changed",
+        }
+    }
+
+    /// An unrecognized value (a corrupt row, or a state name from a future
+    /// version this build doesn't know) never panics and never silently
+    /// picks a servable state — it defaults to `Wanted` and logs so the drift
+    /// is visible instead of swallowed.
+    pub fn from_db_str(s: &str) -> LocalState {
+        match s {
+            "wanted" => LocalState::Wanted,
+            "held" => LocalState::Held,
+            "missing" => LocalState::Missing,
+            "awaiting_choice" => LocalState::AwaitingChoice,
+            "quarantined" => LocalState::Quarantined,
+            "not_kept" => LocalState::NotKept,
+            "idle" => LocalState::Idle,
+            "own_held" => LocalState::OwnHeld,
+            "own_missing" => LocalState::OwnMissing,
+            "own_changed" => LocalState::OwnChanged,
+            other => {
+                tracing::warn!(value = %other, "unknown local_state value, defaulting to wanted");
+                LocalState::Wanted
+            }
+        }
+    }
+
+    /// Whether this state means the frame's bytes are servable to the hub and
+    /// to peers right now. Kept equal to `on_disk` by every writer.
+    pub fn servable(self) -> bool {
+        matches!(self, LocalState::Held | LocalState::OwnHeld)
+    }
+}
+
+/// The result of a [`set_local_state`] transition: the state moved from/to,
+/// and the claim-set change it caused (`None` when servability didn't flip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateWrite {
+    pub from: LocalState,
+    pub to: LocalState,
+    pub claim: Option<crate::db::collab_live::ClaimOp>,
 }
 
 /// One cached project frame — a manifest row (mine or a peer's) plus the
@@ -104,6 +195,14 @@ pub struct LocalFrameRow {
     pub recipe_hash: Option<String>,
     pub last_error: Option<String>,
     pub updated_at: String,
+    /// The wave-3 local state machine (P8). Written only by the functions
+    /// documented on [`LocalState`]; a manifest fetch ([`upsert_from_manifest`])
+    /// only sets it for a brand-new row (see that function's docs).
+    pub local_state: LocalState,
+    /// This device's position in the project's holder-map sequence — `None`
+    /// until the hub assigns one (announce/confirm). Set only by
+    /// [`set_frame_seq`].
+    pub frame_seq: Option<i32>,
 }
 
 fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LocalFrameRow> {
@@ -133,6 +232,10 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LocalFrameRow> {
         recipe_hash: row.get(22)?,
         last_error: row.get(23)?,
         updated_at: row.get(24)?,
+        local_state: LocalState::from_db_str(
+            &row.get::<_, Option<String>>(25)?.unwrap_or_default(),
+        ),
+        frame_seq: row.get(26)?,
     })
 }
 
@@ -156,8 +259,12 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
         "INSERT INTO project_frames_local
             (project_id, frame_uuid, content_version, origin, publisher_account_id,
              publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3,
-             blake3, holder_count, manifest_version, manifest_json, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, datetime('now'))
+             blake3, holder_count, manifest_version, manifest_json, local_state, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 CASE WHEN ?4 = 'own' THEN 'own_held'
+                      WHEN ?9 = 'published' AND ?10 = 1 THEN 'wanted'
+                      ELSE 'idle' END,
+                 datetime('now'))
          ON CONFLICT(project_id, frame_uuid) DO UPDATE SET
             content_version = excluded.content_version,
             origin = excluded.origin,
@@ -176,6 +283,16 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
             on_disk = CASE
                 WHEN origin = 'replica' AND excluded.content_version > content_version THEN 0
                 ELSE on_disk
+            END,
+            -- Interim rule (Task 9 replaces this with the full edge set): a
+            -- version bump only ever downgrades a currently-`held` replica
+            -- back to `wanted` (new bytes to fetch); every other state
+            -- (`missing`, `awaiting_choice`, `quarantined`, `not_kept`,
+            -- `idle`, `wanted` itself) is untouched by a manifest refresh.
+            local_state = CASE
+                WHEN origin = 'replica' AND excluded.content_version > content_version
+                     AND local_state = 'held' THEN 'wanted'
+                ELSE local_state
             END,
             size_mtime_seen = CASE
                 WHEN origin = 'replica' AND excluded.content_version > content_version THEN NULL
@@ -202,6 +319,63 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
         ],
     )?;
     Ok(())
+}
+
+/// Move a frame to `to`, keeping `on_disk` equal to "servable" and appending
+/// the claim change to the outbox when servability flips (plan P8, C24).
+/// Returns the transition, or `None` when the row does not exist. The caller
+/// supplies the transaction; nothing is committed here — a caller that wants
+/// the state change and its claim/outbox row atomic passes a
+/// [`rusqlite::Transaction`] and commits (or rolls back) itself.
+pub fn set_local_state(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    to: LocalState,
+) -> Result<Option<StateWrite>> {
+    let Some((from_raw, cv)): Option<(Option<String>, i32)> = conn
+        .query_row(
+            "SELECT local_state, content_version FROM project_frames_local WHERE project_id = ?1 AND frame_uuid = ?2",
+            params![project_id, frame_uuid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let from = LocalState::from_db_str(from_raw.as_deref().unwrap_or("wanted"));
+    conn.execute(
+        "UPDATE project_frames_local SET local_state = ?3, on_disk = ?4,
+            state_changed_at = datetime('now'), updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2",
+        params![project_id, frame_uuid, to.as_db_str(), to.servable()],
+    )?;
+    let claim = match (from.servable(), to.servable()) {
+        (false, true) => Some(crate::db::collab_live::ClaimOp::Add {
+            content_version: cv,
+        }),
+        (true, false) => Some(crate::db::collab_live::ClaimOp::Remove),
+        _ => None,
+    };
+    if let Some(op) = claim {
+        crate::db::collab_live::record_claim_change(conn, project_id, frame_uuid, op)?;
+    }
+    Ok(Some(StateWrite { from, to, claim }))
+}
+
+/// Set this device's holder-map sequence for a frame (P8: the number the hub
+/// assigns on announce/confirm). Column-targeted; returns the rows touched.
+pub fn set_frame_seq(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    frame_seq: i32,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local SET frame_seq = ?3, updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2",
+        params![project_id, frame_uuid, frame_seq],
+    )?)
 }
 
 /// One cached frame, if present.
@@ -249,15 +423,30 @@ pub fn delete_not_in(conn: &Connection, project_id: &str, keep: &HashSet<String>
 /// fields (`landed_path`, `source_frame_id`, `recipe_hash`, …) that a
 /// manifest fetch never has.
 pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
+    // `INSERT OR REPLACE` resets every column left out of the list to its
+    // schema default, so `frame_seq` and `local_state` — real columns since
+    // wave 3 — MUST be carried through explicitly or a re-publish of an
+    // already-published frame would silently wipe them back to NULL.
+    // `local_state` is derived fresh from `on_disk` (and `origin`, for the
+    // rare test fixture that seeds a 'replica' row through this path), not
+    // copied from `row.local_state`: this is the interim rule until Task 9's
+    // full edge set (an own row is exactly `own_held`/`own_missing` by its
+    // `on_disk`, mirroring `set_landed`/`set_missing`'s own/replica split).
+    let local_state = match (row.origin, row.on_disk) {
+        (FrameOrigin::Own, true) => LocalState::OwnHeld,
+        (FrameOrigin::Own, false) => LocalState::OwnMissing,
+        (FrameOrigin::Replica, true) => LocalState::Held,
+        (FrameOrigin::Replica, false) => LocalState::Missing,
+    };
     conn.execute(
         "INSERT OR REPLACE INTO project_frames_local
             (project_id, frame_uuid, content_version, origin, publisher_account_id,
              publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3,
              blake3, holder_count, manifest_version, manifest_json, landed_path, size_mtime_seen,
              on_disk, locally_declined, awaiting_gc, source_frame_id, recipe_hash, last_error,
-             updated_at)
+             local_state, frame_seq, state_changed_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                 ?19, ?20, ?21, ?22, ?23, ?24, datetime('now'))",
+                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, datetime('now'), datetime('now'))",
         params![
             row.project_id,
             row.frame_uuid,
@@ -283,6 +472,8 @@ pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
             row.source_frame_id,
             row.recipe_hash,
             row.last_error,
+            local_state.as_db_str(),
+            row.frame_seq,
         ],
     )?;
     Ok(())
@@ -301,7 +492,9 @@ pub fn set_landed(
     conn.execute(
         "UPDATE project_frames_local
          SET landed_path = ?3, size_mtime_seen = ?4, on_disk = 1, awaiting_gc = 0,
-             last_error = NULL, rejected_size_mtime = NULL, updated_at = datetime('now')
+             last_error = NULL, rejected_size_mtime = NULL,
+             local_state = CASE WHEN origin = 'own' THEN 'own_held' ELSE 'held' END,
+             updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2",
         params![project_id, frame_uuid, landed_path, size_mtime],
     )?;
@@ -325,7 +518,9 @@ pub fn set_landed_if(
     Ok(conn.execute(
         "UPDATE project_frames_local
          SET landed_path = ?3, size_mtime_seen = ?4, on_disk = 1, awaiting_gc = 0,
-             last_error = NULL, rejected_size_mtime = NULL, updated_at = datetime('now')
+             last_error = NULL, rejected_size_mtime = NULL,
+             local_state = CASE WHEN origin = 'own' THEN 'own_held' ELSE 'held' END,
+             updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND content_version = ?5 AND blake3 = ?6",
         params![
             project_id,
@@ -382,7 +577,9 @@ pub fn set_missing(
     awaiting_gc: bool,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE project_frames_local SET on_disk = 0, awaiting_gc = ?3, updated_at = datetime('now')
+        "UPDATE project_frames_local SET on_disk = 0, awaiting_gc = ?3,
+             local_state = CASE WHEN origin = 'own' THEN 'own_missing' ELSE 'missing' END,
+             updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2",
         params![project_id, frame_uuid, awaiting_gc],
     )?;
@@ -416,13 +613,24 @@ pub fn set_declined(
     if frame_uuids.is_empty() {
         return Ok(());
     }
+    // Interim rule (Task 15 replaces this with the full state machine):
+    // declining moves straight to `not_kept`; undoing a decline moves back to
+    // `wanted` — this is the loss guard's own "stop holding"/"resume" toggle,
+    // never called on an own row.
+    let local_state = if declined {
+        LocalState::NotKept
+    } else {
+        LocalState::Wanted
+    };
+    let local_state_str = local_state.as_db_str();
     let placeholders = vec!["?"; frame_uuids.len()].join(", ");
     let sql = format!(
-        "UPDATE project_frames_local SET locally_declined = ?, updated_at = datetime('now') \
+        "UPDATE project_frames_local SET locally_declined = ?, local_state = ?, updated_at = datetime('now') \
          WHERE project_id = ? AND frame_uuid IN ({placeholders})"
     );
-    let mut vals: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(frame_uuids.len() + 2);
+    let mut vals: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(frame_uuids.len() + 3);
     vals.push(&declined);
+    vals.push(&local_state_str);
     vals.push(&project_id);
     for u in frame_uuids {
         vals.push(u);
@@ -1016,6 +1224,65 @@ mod tests {
             rejected_size_mtime(&c, "p1", "u1").unwrap(),
             None,
             "a landing clears it"
+        );
+    }
+
+    #[test]
+    fn set_local_state_writes_on_disk_and_the_claim_in_one_transaction() {
+        let conn = conn();
+        upsert_from_manifest(&conn, "p1", &view("u1", 1)).unwrap();
+        assert_eq!(
+            get(&conn, "p1", "u1").unwrap().unwrap().local_state,
+            LocalState::Wanted
+        );
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let w = set_local_state(&tx, "p1", "u1", LocalState::Held)
+            .unwrap()
+            .unwrap();
+        assert_eq!((w.from, w.to), (LocalState::Wanted, LocalState::Held));
+        assert_eq!(
+            w.claim,
+            Some(crate::db::collab_live::ClaimOp::Add { content_version: 1 })
+        );
+        tx.rollback().unwrap();
+        // rolled back together: no state change, no outbox row
+        assert_eq!(
+            get(&conn, "p1", "u1").unwrap().unwrap().local_state,
+            LocalState::Wanted
+        );
+        assert_eq!(crate::db::collab_live::outbox_len(&conn, "p1").unwrap(), 0);
+
+        set_local_state(&conn, "p1", "u1", LocalState::Held).unwrap();
+        let row = get(&conn, "p1", "u1").unwrap().unwrap();
+        assert!(row.on_disk);
+        // non-servable → non-servable writes no claim
+        set_local_state(&conn, "p1", "u1", LocalState::Missing).unwrap();
+        let w = set_local_state(&conn, "p1", "u1", LocalState::AwaitingChoice)
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.claim, None);
+        assert!(!get(&conn, "p1", "u1").unwrap().unwrap().on_disk);
+        assert_eq!(crate::db::collab_live::outbox_len(&conn, "p1").unwrap(), 2);
+        // add, remove
+    }
+
+    #[test]
+    fn unpublished_or_excluded_replicas_start_idle() {
+        let conn = conn();
+        let mut v = view("u2", 1);
+        v.accepted = false;
+        upsert_from_manifest(&conn, "p1", &v).unwrap();
+        assert_eq!(
+            get(&conn, "p1", "u2").unwrap().unwrap().local_state,
+            LocalState::Idle
+        );
+        let mut p = view("u3", 1);
+        p.state = "pending".into();
+        upsert_from_manifest(&conn, "p1", &p).unwrap();
+        assert_eq!(
+            get(&conn, "p1", "u3").unwrap().unwrap().local_state,
+            LocalState::Idle
         );
     }
 }

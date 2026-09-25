@@ -2449,6 +2449,135 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // ── collab v3 wave 3 (live exchange) ─────────────────────────────────────
+    // `feed_epoch`/`holder_seq`: the project's live-feed cursor (P5) —
+    // `db::collab::set_feed_version`/`set_holder_seq` are the only writers;
+    // `upsert_project`'s wholesale poll refresh never touches them, and
+    // `mark_lost` resets them like the rest of the sync cursor.
+    for (col, ddl) in [
+        (
+            "feed_epoch",
+            "ALTER TABLE collab_projects ADD COLUMN feed_epoch TEXT",
+        ),
+        (
+            "holder_seq",
+            "ALTER TABLE collab_projects ADD COLUMN holder_seq INTEGER NOT NULL DEFAULT -1",
+        ),
+    ] {
+        if !column_exists(conn, "collab_projects", col)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    // `local_state`/`frame_seq`/`state_changed_at`: the per-frame local state
+    // machine (P8) — `db::collab_frames::set_local_state` is the ONLY writer
+    // of `on_disk` going forward (the wave-2 writers keep writing it
+    // directly, in step with `local_state`, until Tasks 9/11/15 replace them).
+    for (col, ddl) in [
+        (
+            "local_state",
+            "ALTER TABLE project_frames_local ADD COLUMN local_state TEXT",
+        ),
+        (
+            "frame_seq",
+            "ALTER TABLE project_frames_local ADD COLUMN frame_seq INTEGER",
+        ),
+        (
+            "state_changed_at",
+            "ALTER TABLE project_frames_local ADD COLUMN state_changed_at TEXT",
+        ),
+    ] {
+        if !column_exists(conn, "project_frames_local", col)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    // One-time backfill (idempotent: only rows that never had a state) of
+    // every wave-2 row into its wave-3 `local_state`. `on_disk` is kept in
+    // lockstep with the new state for the two non-servable branches this
+    // backfill can actually flip (`idle`, `not_kept`) — the invariant
+    // `on_disk == servable` must hold from the moment `local_state` exists,
+    // and a caps-excluded or locally-declined row can carry a stale
+    // `on_disk = 1` from before the exclusion/decline (R14/P14 muted the
+    // written flag; nothing round-tripped `on_disk` at the time). `own` rows
+    // are left alone — their `on_disk` already IS the disk truth.
+    conn.execute(
+        "UPDATE project_frames_local SET
+            local_state = CASE
+                WHEN origin = 'own' AND on_disk = 1 THEN 'own_held'
+                WHEN origin = 'own' THEN 'own_missing'
+                WHEN locally_declined = 1 THEN 'not_kept'
+                WHEN state <> 'published' OR accepted = 0 THEN 'idle'
+                WHEN on_disk = 1 THEN 'held'
+                ELSE 'wanted' END,
+            on_disk = CASE
+                WHEN origin = 'own' THEN on_disk
+                WHEN locally_declined = 1 THEN 0
+                WHEN state <> 'published' OR accepted = 0 THEN 0
+                ELSE on_disk END,
+            state_changed_at = datetime('now')
+         WHERE local_state IS NULL",
+        [],
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_project_frames_local_blake3 ON project_frames_local(blake3);
+         CREATE INDEX IF NOT EXISTS idx_project_frames_local_state ON project_frames_local(project_id, local_state);
+         CREATE TABLE IF NOT EXISTS collab_live_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS collab_my_claims (
+            project_id TEXT NOT NULL,
+            frame_uuid TEXT NOT NULL,
+            content_version INTEGER NOT NULL,
+            PRIMARY KEY (project_id, frame_uuid),
+            FOREIGN KEY (project_id) REFERENCES collab_projects(project_id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS collab_outbox (
+            seq INTEGER PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            frame_uuid TEXT NOT NULL,
+            op TEXT NOT NULL CHECK (op IN ('add','rm')),
+            content_version INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (project_id) REFERENCES collab_projects(project_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_collab_outbox_project ON collab_outbox(project_id);
+         CREATE TABLE IF NOT EXISTS collab_holder_devices (
+            project_id TEXT NOT NULL,
+            device TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            relay_url TEXT,
+            PRIMARY KEY (project_id, device),
+            FOREIGN KEY (project_id) REFERENCES collab_projects(project_id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS collab_holder_claims (
+            project_id TEXT NOT NULL,
+            device TEXT NOT NULL,
+            frame_seq INTEGER NOT NULL,
+            content_version INTEGER NOT NULL,
+            PRIMARY KEY (project_id, device, frame_seq),
+            FOREIGN KEY (project_id) REFERENCES collab_projects(project_id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS collab_deletions (
+            id INTEGER PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            frame_uuid TEXT NOT NULL,
+            settled_at_ms INTEGER NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES collab_projects(project_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_collab_deletions_project ON collab_deletions(project_id);
+         CREATE INDEX IF NOT EXISTS idx_collab_deletions_settled ON collab_deletions(settled_at_ms);
+         CREATE TABLE IF NOT EXISTS collab_quarantine (
+            project_id TEXT NOT NULL,
+            frame_uuid TEXT NOT NULL,
+            path TEXT NOT NULL,
+            detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+            quarantined_version INTEGER NOT NULL,
+            observed_size_mtime TEXT,
+            PRIMARY KEY (project_id, frame_uuid),
+            FOREIGN KEY (project_id, frame_uuid) REFERENCES project_frames_local(project_id, frame_uuid) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_collab_quarantine_frame_uuid ON collab_quarantine(frame_uuid);",
+    )?;
+
     // Local project↔frame-set links. NEVER sent to the hub (spec §7).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS project_links (
@@ -2979,6 +3108,81 @@ mod membership_count_tests {
             )
             .unwrap();
         assert_eq!(before, after, "an in-sync row must not be rewritten");
+    }
+}
+
+#[cfg(test)]
+mod collab_live_schema_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// The wave-3 backfill (P8) maps every wave-2 `project_frames_local` row
+    /// to a `local_state` exactly once: own rows by `on_disk`, a declined
+    /// replica to `not_kept`, a caps-excluded or unpublished replica to
+    /// `idle` (with `on_disk` forced to 0 — the invariant `on_disk ==
+    /// servable` must hold from the moment `local_state` exists, even for a
+    /// row whose flag went stale before this backfill ran), a landed replica
+    /// to `held`, everything else to `wanted`. A second `init_db` run never
+    /// re-derives an already-set state.
+    #[test]
+    fn wave3_backfill_maps_wave2_rows_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO collab_projects (project_id, slug, title, data_role, target_name,
+               target_ra_deg, target_dec_deg, target_radius_deg, membership_version,
+               snapshot_payload_b64, snapshot_signature_b64, members_json)
+             VALUES ('p1','m31','M31','send_receive','M31',10.0,41.0,1.0,1,'','','[]');
+             INSERT INTO project_frames_local (project_id, frame_uuid, content_version, origin,
+               publisher_account_id, publisher_display, file_name, filter_canonical, state,
+               accepted, byte_size, xxh3, blake3, on_disk, locally_declined)
+             VALUES
+               ('p1','own-on',1,'own','me','Me','a.fits','R','published',1,1,'x','b',1,0),
+               ('p1','own-off',1,'own','me','Me','b.fits','R','published',1,1,'x','b',0,0),
+               ('p1','rep-held',1,'replica','o','O','c.fits','R','published',1,1,'x','b',1,0),
+               ('p1','rep-declined',1,'replica','o','O','d.fits','R','published',1,1,'x','b',0,1),
+               ('p1','rep-want',1,'replica','o','O','e.fits','R','published',1,1,'x','b',0,0),
+               ('p1','rep-excl',1,'replica','o','O','f.fits','R','published',0,1,'x','b',1,0);
+             UPDATE project_frames_local SET local_state = NULL;",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        let state = |u: &str| -> String {
+            conn.query_row(
+                "SELECT local_state FROM project_frames_local WHERE frame_uuid = ?1",
+                [u],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let on_disk = |u: &str| -> bool {
+            conn.query_row(
+                "SELECT on_disk FROM project_frames_local WHERE frame_uuid = ?1",
+                [u],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                != 0
+        };
+        assert_eq!(state("own-on"), "own_held");
+        assert_eq!(state("own-off"), "own_missing");
+        assert_eq!(state("rep-held"), "held");
+        assert_eq!(state("rep-declined"), "not_kept");
+        assert_eq!(state("rep-want"), "wanted");
+        assert_eq!(state("rep-excl"), "idle");
+        assert!(
+            !on_disk("rep-excl"),
+            "idle rows get on_disk=0 (on_disk = servable)"
+        );
+        assert!(!on_disk("rep-declined"), "not_kept rows get on_disk=0");
+        // a second init changes nothing
+        conn.execute(
+            "UPDATE project_frames_local SET local_state = 'missing' WHERE frame_uuid = 'rep-want'",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(state("rep-want"), "missing");
     }
 }
 

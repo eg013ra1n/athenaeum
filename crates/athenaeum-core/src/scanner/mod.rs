@@ -3555,6 +3555,11 @@ mod calibrated_light_scan_tests {
             recipe_hash: None,
             last_error: None,
             updated_at: String::new(),
+            local_state: match origin {
+                FrameOrigin::Own => crate::db::collab_frames::LocalState::OwnHeld,
+                FrameOrigin::Replica => crate::db::collab_frames::LocalState::Held,
+            },
+            frame_seq: None,
         };
         frames_db::record_own(conn, &row).unwrap();
     }

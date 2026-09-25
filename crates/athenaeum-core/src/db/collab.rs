@@ -22,7 +22,7 @@ const SELECT_COLS: &str = "project_id, slug, title, data_role, is_coordinator, r
     target_radius_deg, membership_version, snapshot_payload_b64, snapshot_signature_b64, \
     members_json, thresholds_version, thresholds_rules_json, auto_replicate, gov_caps_json, \
     synced_caps_json, hub_version, manifest_cursor, dictionary_version, dictionary_json, \
-    policy_json, replication_paused, auto_publish, fetched_at";
+    policy_json, replication_paused, auto_publish, fetched_at, feed_epoch, holder_seq";
 
 /// One cached collaboration project (poll snapshot, refreshed wholesale).
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +85,16 @@ pub struct CollabProjectRow {
     pub auto_publish: bool,
     /// Set by SQL (`datetime('now')`); ignored on write, populated on read.
     pub fetched_at: String,
+    /// The live feed's epoch cursor (wave 3, plan P5), paired with
+    /// `hub_version` (`db::collab::set_feed_version`). `None` before the live
+    /// session has ever synced this project. Written only by
+    /// [`set_feed_version`]/[`set_holder_seq`]; [`upsert_project`] leaves it
+    /// untouched, and [`mark_lost`] resets it like the rest of the sync state.
+    pub feed_epoch: Option<String>,
+    /// The device's position in the project's holder-map delta sequence
+    /// (wave 3, plan P5/§6.1); `-1` means "no local holder map yet". Written
+    /// only by [`set_holder_seq`]/[`set_feed_version`].
+    pub holder_seq: i64,
 }
 
 fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
@@ -118,6 +128,8 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
         replication_paused: row.get::<_, i64>(26)? != 0,
         auto_publish: row.get::<_, i64>(27)? != 0,
         fetched_at: row.get(28)?,
+        feed_epoch: row.get(29)?,
+        holder_seq: row.get(30)?,
     })
 }
 
@@ -126,13 +138,15 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
 /// A refresh of a project marked lost ([`mark_lost`]) is a re-join: it clears
 /// `lost_at`.
 ///
-/// Nine columns are deliberately NOT in the list, each written only by its own
-/// setter so a wholesale poll refresh can never clobber it:
+/// Eleven columns are deliberately NOT in the list, each written only by its
+/// own setter so a wholesale poll refresh can never clobber it:
 /// `auto_replicate`/`policy_json`/`replication_paused`/`auto_publish` are LOCAL
 /// preferences; `hub_version`/`manifest_cursor`/`synced_caps_json` are the
 /// manifest-sync cursor ([`set_sync_state`], P9); `dictionary_version`/
-/// `dictionary_json` are the filter dictionary ([`set_dictionary`]). A freshly
-/// inserted row takes each column's schema default.
+/// `dictionary_json` are the filter dictionary ([`set_dictionary`]);
+/// `feed_epoch`/`holder_seq` are the wave-3 live-feed cursor
+/// ([`set_feed_version`]/[`set_holder_seq`]). A freshly inserted row takes
+/// each column's schema default.
 pub fn upsert_project(conn: &Connection, row: &CollabProjectRow) -> Result<()> {
     conn.execute(
         "INSERT INTO collab_projects
@@ -214,13 +228,14 @@ pub fn set_sync_state(
 /// Mark a project lost — the hub no longer lists it for me (R14). The row is
 /// kept (my own frame rows hang off it) but hidden from [`list_projects`];
 /// the sync state resets so a re-join fetches the whole manifest again (the
-/// replica rows were deleted with the loss). A no-op on a row already lost.
-/// Returns the rows updated.
+/// replica rows were deleted with the loss), including the wave-3 live-feed
+/// cursor (`feed_epoch`/`holder_seq`) — a re-join is a fresh live session too.
+/// A no-op on a row already lost. Returns the rows updated.
 pub fn mark_lost(conn: &Connection, project_id: &str) -> Result<usize> {
     let n = conn.execute(
         "UPDATE collab_projects
          SET lost_at = datetime('now'), hub_version = 0, manifest_cursor = 0,
-             synced_caps_json = '[]'
+             synced_caps_json = '[]', feed_epoch = NULL, holder_seq = -1
          WHERE project_id = ?1 AND lost_at IS NULL",
         params![project_id],
     )?;
@@ -254,6 +269,35 @@ pub fn set_dictionary(
         params![project_id, version, entries_json],
     )?;
     Ok(())
+}
+
+/// Advance the feed's version cursor (plan P5: `hub_version` is that cursor).
+/// The ONLY writer of `feed_epoch` besides [`set_holder_seq`] and
+/// [`mark_lost`] (which resets both).
+pub fn set_feed_version(
+    conn: &Connection,
+    project_id: &str,
+    epoch: &str,
+    version: i64,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE collab_projects SET feed_epoch = ?2, hub_version = ?3 WHERE project_id = ?1",
+        params![project_id, epoch, version],
+    )?)
+}
+
+/// Advance the holder cursor; `-1` means "no local holder map". The ONLY
+/// writer of `holder_seq` besides [`mark_lost`] (which resets it).
+pub fn set_holder_seq(
+    conn: &Connection,
+    project_id: &str,
+    epoch: &str,
+    holder_seq: i64,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE collab_projects SET feed_epoch = ?2, holder_seq = ?3 WHERE project_id = ?1",
+        params![project_id, epoch, holder_seq],
+    )?)
 }
 
 /// Set the LOCAL replication policy (JSON, e.g. `{"mode":"all"}`). The ONLY
@@ -498,6 +542,8 @@ mod tests {
             replication_paused: false,
             auto_publish: true,
             fetched_at: String::new(), // set by SQL
+            feed_epoch: None,
+            holder_seq: -1,
         }
     }
 
@@ -544,6 +590,10 @@ mod tests {
         upsert_project(&conn, &sample_row("p-1")).unwrap();
         set_sync_state(&conn, "p-1", Some(9), 7, r#"["x"]"#).unwrap();
         set_sync_state(&conn, "p-1", None, 8, "[]").unwrap();
+        // `set_feed_version` also advances `hub_version` (P5: it IS that
+        // cursor) — pass the same value `set_sync_state` already vouched for
+        // so this doesn't disturb the assertion right below.
+        set_feed_version(&conn, "p-1", "epoch-1", 9).unwrap();
         let row = get_project(&conn, "p-1").unwrap().unwrap();
         assert_eq!((row.hub_version, row.manifest_cursor), (9, 8));
 
@@ -553,6 +603,11 @@ mod tests {
         assert!(list_projects(&conn).unwrap().is_empty(), "hidden");
         let row = get_project(&conn, "p-1").unwrap().unwrap();
         assert_eq!((row.hub_version, row.manifest_cursor), (0, 0));
+        assert_eq!(
+            (row.feed_epoch, row.holder_seq),
+            (None, -1),
+            "the live-feed cursor resets with the rest of the sync state"
+        );
 
         upsert_project(&conn, &sample_row("p-1")).unwrap();
         assert!(
@@ -585,6 +640,9 @@ mod tests {
     /// v3 (Task 2): a wholesale poll refresh ([`upsert_project`]) must never
     /// clobber the LOCAL columns — `auto_publish`, `policy_json` and
     /// `replication_paused` — any more than it clobbers `auto_replicate`.
+    /// Wave 3 (Task 1): the same holds for the live-feed cursor
+    /// (`feed_epoch`/`holder_seq`), set by [`set_feed_version`]/
+    /// [`set_holder_seq`].
     #[test]
     fn upsert_project_preserves_local_columns() {
         let conn = test_conn();
@@ -593,6 +651,8 @@ mod tests {
         set_auto_publish(&conn, "p-1", false).unwrap();
         set_policy(&conn, "p-1", r#"{"mode":"filter","filters":["R"]}"#).unwrap();
         set_replication_paused(&conn, "p-1", true).unwrap();
+        set_feed_version(&conn, "p-1", "epoch-1", 9).unwrap();
+        set_holder_seq(&conn, "p-1", "epoch-1", 3).unwrap();
 
         // A poll re-upserts every hub-mirrored column.
         let mut refreshed = sample_row("p-1");
@@ -609,6 +669,11 @@ mod tests {
         assert!(
             row.replication_paused,
             "replication_paused must survive the poll"
+        );
+        assert_eq!(
+            (row.feed_epoch.as_deref(), row.holder_seq),
+            (Some("epoch-1"), 3),
+            "the live-feed cursor must survive the poll"
         );
     }
 

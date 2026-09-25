@@ -1165,6 +1165,8 @@ async fn fetch_one_project(
         replication_paused: false,
         auto_publish: true,
         fetched_at: String::new(), // filled by SQL
+        feed_epoch: None,
+        holder_seq: -1,
     };
     Ok(FetchedProject { row, dictionary })
 }
@@ -3204,6 +3206,8 @@ async fn run_publish(
                 recipe_hash: Some(w.recipe.clone()),
                 last_error: None,
                 updated_at: String::new(),
+                local_state: frames_db::LocalState::OwnHeld,
+                frame_seq: None,
             }
         };
         let adopt = |f: &SeededFrame| -> anyhow::Result<()> {
@@ -3645,6 +3649,8 @@ pub(crate) mod tests {
                 replication_paused: false,
                 auto_publish: true,
                 fetched_at: String::new(), // filled by SQL
+                feed_epoch: None,
+                holder_seq: -1,
             },
         )
         .unwrap();
@@ -4233,6 +4239,8 @@ pub(crate) mod tests {
                 replication_paused: false,
                 auto_publish: true,
                 fetched_at: String::new(),
+                feed_epoch: None,
+                holder_seq: -1,
             },
         )
         .unwrap();
@@ -5454,6 +5462,8 @@ pub(crate) mod tests {
                         replication_paused: false,
                         auto_publish: true,
                         fetched_at: String::new(),
+                        feed_epoch: None,
+                        holder_seq: -1,
                     },
                 )
                 .unwrap();
