@@ -725,6 +725,12 @@ impl FakeHub {
         self.lock().page_size = n.clamp(1, MANIFEST_PAGE);
     }
 
+    /// Override the presence ticker's timings (defaults match the hub's;
+    /// tests shorten them so a smoke doesn't wait 40 real seconds).
+    pub fn set_timings(&self, t: FakeTimings) {
+        self.lock().timings = t;
+    }
+
     /// Answer every request whose path ends with `suffix` with a 500
     /// (`on = true`), or stop doing so.
     pub fn set_failing(&self, suffix: &str, on: bool) {
