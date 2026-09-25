@@ -764,6 +764,17 @@ impl FakeHub {
             .map(|m| serde_json::from_str(&m.data).expect("fake hub event data is valid json"))
     }
 
+    /// The project's current `version` counter, as the hub sees it (test
+    /// helper: lets a test assert a cursor against the hub's REAL state
+    /// instead of a value derived from the test's own arithmetic).
+    pub fn version(&self, project_id: &str) -> i64 {
+        self.lock()
+            .projects
+            .get(project_id)
+            .map(|p| p.version)
+            .unwrap_or(0)
+    }
+
     /// Register a device token for an account.
     pub fn add_account(
         &self,

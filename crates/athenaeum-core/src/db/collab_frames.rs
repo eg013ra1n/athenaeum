@@ -411,6 +411,12 @@ pub fn delete_not_in(conn: &Connection, project_id: &str, keep: &HashSet<String>
         let placeholders = vec!["?"; keep.len()].join(", ");
         format!(" AND frame_uuid NOT IN ({placeholders})")
     };
+    // The claim-rm reads/inserts and the delete itself run as one
+    // transaction (fix round M1): a crash or a concurrent reader must never
+    // observe the rows gone without their claims already dropped, or the
+    // claims dropped while the rows still exist to be re-scanned as "doomed"
+    // a second time.
+    let tx = conn.unchecked_transaction()?;
     // A servable ('held') replica row about to be deleted must drop its
     // local claim too, through the outbox (T5/T9 ruling): otherwise the
     // device keeps reporting a claim on a frame it no longer has any local
@@ -421,13 +427,13 @@ pub fn delete_not_in(conn: &Connection, project_id: &str, keep: &HashSet<String>
              WHERE project_id = ?1 AND origin = 'replica' AND local_state IN ('held', 'own_held'){condition}"
         );
         let params_iter = std::iter::once(project_id.to_string()).chain(keep.iter().cloned());
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = tx.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |r| r.get(0))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     for frame_uuid in &doomed {
         crate::db::collab_live::record_claim_change(
-            conn,
+            &tx,
             project_id,
             frame_uuid,
             crate::db::collab_live::ClaimOp::Remove,
@@ -437,7 +443,8 @@ pub fn delete_not_in(conn: &Connection, project_id: &str, keep: &HashSet<String>
         "DELETE FROM project_frames_local WHERE project_id = ?1 AND origin = 'replica'{condition}"
     );
     let params_iter = std::iter::once(project_id.to_string()).chain(keep.iter().cloned());
-    let removed = conn.execute(&sql, rusqlite::params_from_iter(params_iter))?;
+    let removed = tx.execute(&sql, rusqlite::params_from_iter(params_iter))?;
+    tx.commit()?;
     Ok(removed)
 }
 

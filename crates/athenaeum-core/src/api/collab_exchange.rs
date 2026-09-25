@@ -304,7 +304,14 @@ pub(crate) async fn sync_manifest_inner(
     let mut counts: std::collections::BTreeMap<FramesChangeKind, usize> =
         std::collections::BTreeMap::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut max_mv = project.manifest_cursor;
+    // A full fetch (caps change or force_full — the epoch-reload path) must
+    // never seed this from the OLD cursor (C1 fix round): after a hub
+    // restore, fresh rows can carry a manifestVersion BELOW the stale
+    // pre-restore cursor. Seeding from it would store that stale-high value
+    // right back as the "highest applied" cursor, and a later incremental
+    // fetch (`since = manifest_cursor`) would silently skip every such row
+    // forever. A full fetch's cursor is exactly the highest version IT saw.
+    let mut max_mv = if full { 0 } else { project.manifest_cursor };
     let mut project_version = project.hub_version;
     let mut applied = 0usize;
 
@@ -5254,6 +5261,43 @@ mod tests {
             let p = project(&fx.ctx).unwrap();
             assert_eq!(p.manifest_cursor, mv);
             assert_eq!(p.hub_version, 0, "no vouched version, no hub_version");
+        }
+
+        /// C1 fix round: a full fetch (`sync_manifest_full`, the epoch-reload
+        /// path) must never inherit the OLD `manifest_cursor` into its own
+        /// highest-seen tracker. After a hub restore the fresh manifestVersion
+        /// sequence can start again below the stale pre-restore cursor; if the
+        /// full fetch's tracker started from that stale value instead of 0, it
+        /// would store the SAME stale-high number right back as "highest
+        /// applied", and a later incremental fetch (`since` = that cursor)
+        /// would silently skip every such row forever.
+        #[tokio::test]
+        async fn a_full_resync_never_inherits_the_stale_cursor() {
+            let fx = fx("send_receive", false, false).await;
+            fx.hub.seed_frames(PID, "acc-o", &["f1"], "published");
+            crate::api::collab::refresh_projects(&fx.ctx).await.unwrap();
+            let low_mv = fx.hub.frame(PID, "f1").unwrap().manifest_version;
+
+            // Simulate the stale-high-cursor state a restore leaves behind.
+            let caps = project(&fx.ctx).unwrap().gov_caps_json;
+            {
+                let conn = db(&fx.ctx).unwrap().conn();
+                crate::db::collab::set_sync_state(&conn, PID, None, 999, &caps).unwrap();
+            }
+
+            sync_manifest_full(&fx.ctx, PID, None, None).await.unwrap();
+            assert_eq!(
+                project(&fx.ctx).unwrap().manifest_cursor,
+                low_mv,
+                "the full fetch's own highest row wins, never the stale pre-restore cursor"
+            );
+
+            // A frame whose fresh manifestVersion sits well below the stale
+            // 999 must still be picked up by the next incremental sync — not
+            // silently skipped forever.
+            fx.hub.seed_frames(PID, "acc-o", &["f2"], "published");
+            sync_manifest(&fx.ctx, PID, None, None).await.unwrap();
+            assert!(row(&fx.ctx, "f2").is_some(), "not silently skipped");
         }
 
         /// Losing `data.moderate` re-fetches from 0 and prunes the pending row

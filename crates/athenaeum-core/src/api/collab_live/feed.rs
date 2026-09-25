@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::api::{db, ApiError};
 use crate::collab::hub_client::{CollabClient, FrameInWire};
 use crate::collab::live::cursor::{
-    plan_hello, plan_versions, step, FeedCursor, HolderPlan, Step, VersionsPlan,
+    plan_hello, plan_versions, step, FeedCursor, HelloPlan, HolderPlan, Step, VersionsPlan,
 };
 use crate::collab::live::presence::PresenceBook;
 use crate::collab::live::wire::{
@@ -129,7 +129,14 @@ impl FeedApplier {
             LiveEvent::Hello(h) => self.on_hello(h, holders).await,
             LiveEvent::Project(p) => self.on_project(p).await,
             LiveEvent::Holders(h) => {
-                let epoch = self.epoch.clone().unwrap_or_default();
+                // M7 fix round: never stamp an empty epoch. In real operation
+                // `hello` always precedes every other event; this guard is
+                // defensive (and load-bearing for a test that feeds events
+                // out of order).
+                let Some(epoch) = self.epoch.clone() else {
+                    tracing::debug!(project_id = %h.project_id, "holders event received before the first hello; skipped");
+                    return Ok(vec![]);
+                };
                 holders.on_holders_event(&h, &epoch).await
             }
             LiveEvent::Presence(p) => {
@@ -144,7 +151,10 @@ impl FeedApplier {
             LiveEvent::Resync(r) => match r.what {
                 ResyncWhat::Project => self.catch_up_project(&r.project_id, None, &ALL_KINDS).await,
                 ResyncWhat::Holders => {
-                    let epoch = self.epoch.clone().unwrap_or_default();
+                    let Some(epoch) = self.epoch.clone() else {
+                        tracing::debug!(project_id = %r.project_id, "resync(holders) received before the first hello; skipped");
+                        return Ok(vec![]);
+                    };
                     holders.catch_up(&r.project_id, &epoch).await
                 }
                 ResyncWhat::Unknown => {
@@ -217,15 +227,25 @@ impl FeedApplier {
         // A project in `hello.projects` without a cache row: a fresh join
         // this device never saw the `account: joined` event for (e.g. it
         // happened before this device's first-ever connect). Refresh once so
-        // the per-project plan below has a cursor to compare against.
+        // the per-project plan below has a cursor to compare against, and
+        // report it joined — the brief's "treat as joined" (fix round: this
+        // must actually emit `ProjectJoined`, not just silently fall into the
+        // ordinary per-project plan). I2 fix round: a refresh failure here is
+        // isolated per project — it never aborts the rest of this hello, and
+        // the project (still uncached) is simply retried on the next one.
         for (pid, _) in &hello.projects {
             if self.stored_cursor(pid)?.is_none() {
                 let only: HashSet<String> = [pid.clone()].into_iter().collect();
-                crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await?;
+                match crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await {
+                    Ok(_) => effects.push(FeedEffect::ProjectJoined(pid.clone())),
+                    Err(e) => {
+                        tracing::error!(project_id = %pid, error = %e, "could not refresh a newly seen project; retried on the next hello");
+                    }
+                }
             }
         }
 
-        let mut plans: Vec<(String, HelloProject, crate::collab::live::cursor::HelloPlan)> =
+        let mut plans: Vec<(String, HelloProject, HelloPlan)> =
             Vec::with_capacity(hello.projects.len());
         let mut epoch_changed_any = false;
         for (pid, hp) in &hello.projects {
@@ -246,6 +266,9 @@ impl FeedApplier {
                 .iter()
                 .map(|(pid, hp)| (pid.clone(), hp.version))
                 .collect();
+            // `epoch_change` itself sets `self.epoch` once every reload it
+            // could complete has run (I1 fix round) — nothing left to do here
+            // but return what it collected.
             effects.extend(self.epoch_change(&hello.epoch, &heads, holders).await?);
             return Ok(effects);
         }
@@ -255,18 +278,32 @@ impl FeedApplier {
         // `self.epoch`.
         self.epoch = Some(hello.epoch.clone());
 
+        // I2 fix round: one project's catch-up (or holder hello-sync) failure
+        // must not abort every other project's — and must not repeat forever
+        // on every future hello either. Isolate per project, log, continue;
+        // a project whose catch-up failed simply keeps its old cursor, so
+        // the next `project`/`versions` event (or hello) retries it.
         for (pid, hp, plan) in plans {
             if plan.catch_up_project {
-                effects.extend(
-                    self.catch_up_project(&pid, Some(hp.version), &ALL_KINDS)
-                        .await?,
-                );
+                match self
+                    .catch_up_project(&pid, Some(hp.version), &ALL_KINDS)
+                    .await
+                {
+                    Ok(effs) => effects.extend(effs),
+                    Err(e) => {
+                        tracing::error!(project_id = %pid, error = %e, "hello catch-up failed for this project; retried on the next hello");
+                    }
+                }
             }
-            effects.extend(
-                holders
-                    .on_hello_project(&pid, &hp, plan.holders, &hello.epoch)
-                    .await?,
-            );
+            match holders
+                .on_hello_project(&pid, &hp, plan.holders, &hello.epoch)
+                .await
+            {
+                Ok(effs) => effects.extend(effs),
+                Err(e) => {
+                    tracing::error!(project_id = %pid, error = %e, "holder hello-sync failed for this project");
+                }
+            }
         }
 
         {
@@ -302,7 +339,12 @@ impl FeedApplier {
 
     async fn apply_contiguous(&mut self, ev: ProjectEvent) -> Result<Vec<FeedEffect>, ApiError> {
         let pid = ev.project_id.clone();
-        let epoch = self.epoch.clone().unwrap_or_default();
+        // M7 fix round: never stamp an empty epoch (defensive — `hello`
+        // always precedes a `project` event in real operation).
+        let Some(epoch) = self.epoch.clone() else {
+            tracing::debug!(project_id = %pid, "project event received before the first hello; skipped");
+            return Ok(vec![]);
+        };
         let mut effects = Vec::new();
         let small_docs = ev.kinds.iter().any(|k| {
             matches!(
@@ -327,22 +369,47 @@ impl FeedApplier {
         if ev.kinds.contains(&ChangeKind::Grid) {
             tracing::debug!(project_id = %pid, version = ev.version, "grid change seen; no consumer in this wave");
         }
-        match (ev.kinds.contains(&ChangeKind::Frames), ev.frames) {
-            (true, Some(rows)) if !ev.more => {
-                self.apply_inline(&pid, ev.version, &epoch, rows)?;
-                effects.push(FeedEffect::NeedSetChanged(pid.clone()));
+
+        // I4 fix round: a caps change — possibly just surfaced by the
+        // small-document refresh above, e.g. a `members` event that changed
+        // MY governance caps — needs the full since=0 fetch + prune the caps
+        // rule requires. `apply_inline`'s lightweight write would mark the
+        // caps synced without ever doing that fetch, silently losing rows a
+        // caps-narrowing must prune (or never pulling rows a caps-widening
+        // newly reveals).
+        let caps_changed = {
+            let database = db(&self.ctx)?;
+            let conn = database.conn();
+            let project = crate::api::collab_exchange::live_project(&conn, &pid)?;
+            project.gov_caps_json != project.synced_caps_json
+        };
+        if caps_changed {
+            crate::api::collab_exchange::sync_manifest(
+                &self.ctx,
+                &pid,
+                self.emitter.as_deref(),
+                Some(ev.version),
+            )
+            .await?;
+            effects.push(FeedEffect::NeedSetChanged(pid.clone()));
+        } else {
+            match (ev.kinds.contains(&ChangeKind::Frames), ev.frames) {
+                (true, Some(rows)) if !ev.more => {
+                    self.apply_inline(&pid, ev.version, &epoch, rows)?;
+                    effects.push(FeedEffect::NeedSetChanged(pid.clone()));
+                }
+                (true, _) => {
+                    crate::api::collab_exchange::sync_manifest(
+                        &self.ctx,
+                        &pid,
+                        self.emitter.as_deref(),
+                        Some(ev.version),
+                    )
+                    .await?;
+                    effects.push(FeedEffect::NeedSetChanged(pid.clone()));
+                }
+                (false, _) => {}
             }
-            (true, _) => {
-                crate::api::collab_exchange::sync_manifest(
-                    &self.ctx,
-                    &pid,
-                    self.emitter.as_deref(),
-                    Some(ev.version),
-                )
-                .await?;
-                effects.push(FeedEffect::NeedSetChanged(pid.clone()));
-            }
-            (false, _) => {}
         }
         {
             let database = db(&self.ctx)?;
@@ -354,7 +421,9 @@ impl FeedApplier {
     }
 
     /// Apply a `project` event's inlined frame rows straight from the
-    /// stream, with no manifest read at all.
+    /// stream, with no manifest read at all. Only reached when this
+    /// project's caps are already in sync (see [`Self::apply_contiguous`]'s
+    /// `caps_changed` gate, I4 fix round).
     fn apply_inline(
         &self,
         pid: &str,
@@ -408,19 +477,35 @@ impl FeedApplier {
         Ok(())
     }
 
-    /// Catch a project up over REST: the small documents named in `kinds`
-    /// (membership/thresholds/dictionary/meta), then the manifest delta.
-    /// `version` is the head that triggered this catch-up, logged only —
-    /// the stored cursor becomes the manifest response's OWN
-    /// `projectVersion`, never an event head the fetch might not have
-    /// actually reached (T5 ruling).
+    /// Catch a project up over REST: the manifest delta FIRST (I3 fix
+    /// round), then the small documents named in `kinds`
+    /// (membership/thresholds/dictionary/meta). `version` is the head that
+    /// triggered this catch-up, logged only — the stored cursor becomes the
+    /// manifest response's OWN `projectVersion`, never an event head the
+    /// fetch might not have actually reached (T5 ruling).
+    ///
+    /// Reading the manifest first matters: the old order (small documents,
+    /// then manifest) let a caps/members/thresholds/dictionary change commit
+    /// BETWEEN the two reads. That change's version would already be inside
+    /// the cursor the manifest read then produced, yet this catch-up would
+    /// never have refreshed it — the next hello/versions/project event would
+    /// see the cursor as fully caught up and never ask again. Reading the
+    /// manifest first means whatever cursor this catch-up lands on, the
+    /// small-document refresh that follows picks up AT LEAST that state.
     pub async fn catch_up_project(
         &mut self,
         project_id: &str,
         version: Option<i64>,
         kinds: &[ChangeKind],
     ) -> Result<Vec<FeedEffect>, ApiError> {
-        let epoch = self.epoch.clone().unwrap_or_default();
+        // M7 fix round: never stamp an empty epoch.
+        let Some(epoch) = self.epoch.clone() else {
+            tracing::debug!(
+                project_id,
+                "catch-up requested before the first hello; skipped"
+            );
+            return Ok(vec![]);
+        };
         let mut effects = Vec::new();
         let small_docs = kinds.iter().any(|k| {
             matches!(
@@ -431,17 +516,10 @@ impl FeedApplier {
                     | ChangeKind::Dictionary
             )
         });
-        if small_docs {
-            let only: HashSet<String> = [project_id.to_string()].into_iter().collect();
-            let report =
-                crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await?;
-            for moved in &report.gate_moved {
-                crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
-            }
-            if kinds.contains(&ChangeKind::Members) {
-                effects.push(FeedEffect::MembersChanged(project_id.to_string()));
-            }
-        }
+
+        // M3 fix round: a manifest-sync failure is logged here, at the
+        // applier boundary, before it propagates — every caller of this
+        // function used to fail silently past this point.
         let (_changes, _seen, project_version) = crate::api::collab_exchange::sync_manifest_inner(
             &self.ctx,
             project_id,
@@ -449,7 +527,28 @@ impl FeedApplier {
             None,
             false,
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::warn!(project_id, requested_version = ?version, error = %e, "catch-up manifest sync failed; cursor stays put for a retry");
+            e
+        })?;
+
+        if small_docs {
+            let only: HashSet<String> = [project_id.to_string()].into_iter().collect();
+            let report = crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only))
+                .await
+                .map_err(|e| {
+                    tracing::warn!(project_id, error = %e, "catch-up small-document refresh failed; cursor still advances from the manifest");
+                    e
+                })?;
+            for moved in &report.gate_moved {
+                crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
+            }
+            if kinds.contains(&ChangeKind::Members) {
+                effects.push(FeedEffect::MembersChanged(project_id.to_string()));
+            }
+        }
+
         {
             let database = db(&self.ctx)?;
             let conn = database.conn();
@@ -472,6 +571,13 @@ impl FeedApplier {
         v: VersionsEvent,
         holders: &mut dyn HolderSide,
     ) -> Result<Vec<FeedEffect>, ApiError> {
+        // M7 fix round: a versions-vector epoch change (or any processing at
+        // all) received before the first hello waits for hello — never
+        // stamp an empty epoch string.
+        let Some(epoch) = self.epoch.clone() else {
+            tracing::debug!("versions vector received before the first hello; waiting for hello");
+            return Ok(vec![]);
+        };
         let mut effects = Vec::new();
         let mut epoch_change_needed = false;
         let mut catchups: Vec<(String, i64, bool, bool)> = Vec::new();
@@ -488,7 +594,6 @@ impl FeedApplier {
             }
         }
         if epoch_change_needed {
-            let epoch = self.epoch.clone().unwrap_or_default();
             let heads: std::collections::BTreeMap<String, i64> = v
                 .iter()
                 .map(|(pid, (version, _))| (pid.clone(), *version))
@@ -504,7 +609,6 @@ impl FeedApplier {
                 );
             }
             if needs_holders {
-                let epoch = self.epoch.clone().unwrap_or_default();
                 effects.extend(holders.catch_up(&pid, &epoch).await?);
             }
         }
@@ -519,6 +623,11 @@ impl FeedApplier {
     ) -> Result<Vec<FeedEffect>, ApiError> {
         match ev.kind {
             AccountKind::Joined => {
+                // M7 fix round: never stamp an empty epoch.
+                let Some(epoch) = self.epoch.clone() else {
+                    tracing::debug!(project_id = %ev.project_id, "account-joined received before the first hello; skipped");
+                    return Ok(vec![]);
+                };
                 let only: HashSet<String> = [ev.project_id.clone()].into_iter().collect();
                 let report =
                     crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await?;
@@ -528,7 +637,6 @@ impl FeedApplier {
                 let mut effects = self
                     .catch_up_project(&ev.project_id, None, &ALL_KINDS)
                     .await?;
-                let epoch = self.epoch.clone().unwrap_or_default();
                 effects.extend(holders.reload(&ev.project_id, &epoch).await?);
                 effects.push(FeedEffect::ProjectJoined(ev.project_id));
                 Ok(effects)
@@ -554,10 +662,21 @@ impl FeedApplier {
 
     /// `hello.epoch != stored epoch`, or a hub head below the stored cursor
     /// (a restore): reload every project's snapshot, reconcile holdings, and
-    /// re-announce this device's own frames the hub no longer lists.
-    /// `heads` is the per-project version from the triggering hello or
-    /// versions vector; a live project missing from it keeps whatever
-    /// version its manifest resync lands on.
+    /// re-announce this device's own frames the hub no longer lists. `heads`
+    /// is the per-project version from the triggering hello or versions
+    /// vector; a live project missing from it keeps whatever version its
+    /// manifest resync lands on.
+    ///
+    /// I1/I2 fix round: each project's reload is isolated and, crucially,
+    /// its cursor moves into `new_epoch` ONLY after every step of its own
+    /// reload has already succeeded — one atomic write right at the end.
+    /// A project whose reload fails partway keeps its OLD `feed_epoch`
+    /// stamped, so the next hello or versions check sees it as still on the
+    /// stale epoch and retries the WHOLE reload for it (never a lightweight
+    /// delta catch-up against a manifest cursor from before the restore).
+    /// Other projects' successful reloads are unaffected, and this function
+    /// itself always returns `Ok` — a caller (`on_hello`/`on_versions`) never
+    /// has the whole hello or versions pass aborted by one broken project.
     pub async fn epoch_change(
         &mut self,
         new_epoch: &str,
@@ -568,11 +687,6 @@ impl FeedApplier {
             epoch = new_epoch,
             "hub epoch changed; reloading every project"
         );
-        {
-            let database = db(&self.ctx)?;
-            let conn = database.conn();
-            crate::db::collab_live::meta_set(&conn, crate::db::collab_live::META_EPOCH, new_epoch)?;
-        }
         let live_ids: Vec<String> = {
             let database = db(&self.ctx)?;
             let conn = database.conn();
@@ -583,36 +697,65 @@ impl FeedApplier {
         };
         let mut effects = vec![FeedEffect::EpochChanged];
         for pid in live_ids {
-            {
-                let database = db(&self.ctx)?;
-                let conn = database.conn();
-                crate::db::collab::set_holder_seq(&conn, &pid, new_epoch, -1)?;
-            }
-            let seen = crate::api::collab_exchange::sync_manifest_full(
-                &self.ctx,
-                &pid,
-                self.emitter.as_deref(),
-                None,
-            )
-            .await?;
-            effects.extend(holders.reload(&pid, new_epoch).await?);
-            reannounce_lost_own_frames(&self.ctx, &self.client, &self.token, &pid, &seen).await?;
-            let cursor_version = match heads.get(&pid).copied() {
-                Some(v) => v,
-                None => {
+            let outcome: Result<Vec<FeedEffect>, ApiError> = async {
+                let seen = crate::api::collab_exchange::sync_manifest_full(
+                    &self.ctx,
+                    &pid,
+                    self.emitter.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    tracing::warn!(project_id = %pid, epoch = new_epoch, error = %e, "epoch-reload manifest sync failed");
+                    e
+                })?;
+                let mut effs = holders.reload(&pid, new_epoch).await?;
+                reannounce_lost_own_frames(&self.ctx, &self.client, &self.token, &pid, &seen)
+                    .await?;
+                let cursor_version = match heads.get(&pid).copied() {
+                    Some(v) => v,
+                    None => {
+                        let database = db(&self.ctx)?;
+                        let conn = database.conn();
+                        crate::db::collab::get_project(&conn, &pid)?
+                            .map(|p| p.hub_version)
+                            .unwrap_or(0)
+                    }
+                };
+                // The ONE write that moves this project into the new epoch —
+                // done last, atomically, only once everything above already
+                // succeeded (I1 fix round).
+                {
                     let database = db(&self.ctx)?;
                     let conn = database.conn();
-                    crate::db::collab::get_project(&conn, &pid)?
-                        .map(|p| p.hub_version)
-                        .unwrap_or(0)
+                    let tx = conn.unchecked_transaction()?;
+                    crate::db::collab::set_holder_seq(&tx, &pid, new_epoch, -1)?;
+                    crate::db::collab::set_feed_version(&tx, &pid, new_epoch, cursor_version)?;
+                    tx.commit()?;
                 }
-            };
-            {
-                let database = db(&self.ctx)?;
-                let conn = database.conn();
-                crate::db::collab::set_feed_version(&conn, &pid, new_epoch, cursor_version)?;
+                effs.push(FeedEffect::NeedSetChanged(pid.clone()));
+                Ok(effs)
             }
-            effects.push(FeedEffect::NeedSetChanged(pid));
+            .await;
+            match outcome {
+                Ok(effs) => effects.extend(effs),
+                Err(e) => {
+                    tracing::error!(
+                        project_id = %pid,
+                        epoch = new_epoch,
+                        error = %e,
+                        "epoch reload failed for this project; its cursor stays on the old epoch so the next pass retries it"
+                    );
+                }
+            }
+        }
+        // Written after every project has been attempted (I1 fix round): a
+        // partial failure above never prevented this from being reached, so
+        // the session's own confirmed epoch always tracks the hub's.
+        {
+            let database = db(&self.ctx)?;
+            let conn = database.conn();
+            crate::db::collab_live::meta_set(&conn, crate::db::collab_live::META_EPOCH, new_epoch)?;
         }
         self.epoch = Some(new_epoch.to_string());
         Ok(effects)
@@ -624,6 +767,15 @@ impl FeedApplier {
 /// existing uuids (hub § "Epoch change"; plan P25). Thresholds are
 /// prospective: the current gate version stamps every re-announced frame,
 /// same as any other announce.
+///
+/// I5 fix round (controller ruling, overrides the brief snippet): only a
+/// frame this device actually HOLDS (`LocalState::OwnHeld`) is eligible.
+/// `origin == Own` alone included `own_missing` rows — the hub knows about
+/// them, but this device has no bytes for them — and re-announcing one would
+/// make the hub write an implicit claim for content this device cannot
+/// serve. A 409 "already announced" names specific uuids (R8a's pattern);
+/// this drops just those and retries the rest, rather than abandoning the
+/// whole batch over one frame that turned out not to be lost after all.
 pub(crate) async fn reannounce_lost_own_frames(
     ctx: &ServiceContext,
     client: &CollabClient,
@@ -631,14 +783,14 @@ pub(crate) async fn reannounce_lost_own_frames(
     project_id: &str,
     seen: &HashSet<String>,
 ) -> Result<usize, ApiError> {
-    use crate::db::collab_frames::{self as frames_db, FrameOrigin};
+    use crate::db::collab_frames::{self as frames_db, LocalState};
     let (lost, gate): (Vec<FrameInWire>, i32) = {
         let database = db(ctx)?;
         let conn = database.conn();
         let project = crate::api::collab_exchange::live_project(&conn, project_id)?;
         let lost: Vec<FrameInWire> = frames_db::list_for_project(&conn, project_id)?
             .into_iter()
-            .filter(|r| r.origin == FrameOrigin::Own && !seen.contains(&r.frame_uuid))
+            .filter(|r| r.local_state == LocalState::OwnHeld && !seen.contains(&r.frame_uuid))
             .filter_map(|r| {
                 crate::api::collab_exchange::parse_manifest_wire(
                     project_id,
@@ -671,39 +823,50 @@ pub(crate) async fn reannounce_lost_own_frames(
             // current gate version, same as a first-time announce.
             f.gate_version = gate;
         }
-        match crate::collab::hub_client::with_retry(
-            "reannounce",
-            crate::collab::hub_client::RetryPolicy::Background,
-            || client.announce_frames(token, project_id, &batch),
-        )
-        .await
-        {
-            Ok(resp) => {
-                let database = db(ctx)?;
-                let conn = database.conn();
-                for f in &batch {
-                    crate::db::collab_live::add_implicit_claim(
-                        &conn,
-                        project_id,
-                        &f.frame_uuid,
-                        1,
-                    )?;
-                }
-                announced += resp.announced;
-            }
-            Err(e)
-                if e.hub_text()
-                    .is_some_and(|m| m.contains("already announced")) =>
+        while !batch.is_empty() {
+            match crate::collab::hub_client::with_retry(
+                "reannounce",
+                crate::collab::hub_client::RetryPolicy::Background,
+                || client.announce_frames(token, project_id, &batch),
+            )
+            .await
             {
-                tracing::info!(
-                    project_id,
-                    count = batch.len(),
-                    "own frames already back on the hub"
-                );
-            }
-            Err(e) => {
-                tracing::error!(project_id, count = batch.len(), error = %e, "re-announce of own frames failed");
-                return Err(crate::api::collab_exchange::client_err(e));
+                Ok(resp) => {
+                    let database = db(ctx)?;
+                    let conn = database.conn();
+                    for f in &batch {
+                        crate::db::collab_live::add_implicit_claim(
+                            &conn,
+                            project_id,
+                            &f.frame_uuid,
+                            1,
+                        )?;
+                    }
+                    announced += resp.announced;
+                    break;
+                }
+                Err(e)
+                    if e.hub_text()
+                        .is_some_and(|m| m.contains("already announced")) =>
+                {
+                    let already = already_announced_indices(&e, &batch);
+                    if already.is_empty() {
+                        tracing::warn!(project_id, error = %e, "already-announced refusal named no uuid in this batch; giving up on it");
+                        break;
+                    }
+                    tracing::info!(
+                        project_id,
+                        count = already.len(),
+                        "own frames already back on the hub; retrying the rest of the batch"
+                    );
+                    for &i in already.iter().rev() {
+                        batch.remove(i);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(project_id, count = batch.len(), error = %e, "re-announce of own frames failed");
+                    return Err(crate::api::collab_exchange::client_err(e));
+                }
             }
         }
     }
@@ -717,6 +880,24 @@ pub(crate) async fn reannounce_lost_own_frames(
     Ok(announced)
 }
 
+/// Indices of `batch` a 409 "already announced" refusal names — R8a's
+/// pattern (`api::collab::already_announced_in`), adapted to a re-announce
+/// batch's [`FrameInWire`] shape.
+fn already_announced_indices(
+    e: &crate::account::AccountClientError,
+    batch: &[FrameInWire],
+) -> Vec<usize> {
+    let Some(m) = e.hub_text() else {
+        return Vec::new();
+    };
+    batch
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| m.contains(&format!("frame {} already announced", f.frame_uuid)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +906,7 @@ mod tests {
         AccountEvent, AccountKind, ChangeKind, HoldersEvent, LiveEvent, PresenceEvent,
         ProjectEvent, VersionsEvent,
     };
+    use crate::db::collab_frames::LocalState;
 
     struct NoHolders(Vec<String>);
     #[async_trait::async_trait]
@@ -795,6 +977,25 @@ mod tests {
         let conn = crate::api::db(ctx).unwrap().conn();
         let p = crate::db::collab::get_project(&conn, PID).unwrap().unwrap();
         (p.feed_epoch, p.hub_version)
+    }
+
+    fn project_cursor(ctx: &ServiceContext, project_id: &str) -> (Option<String>, i64) {
+        let conn = crate::api::db(ctx).unwrap().conn();
+        let p = crate::db::collab::get_project(&conn, project_id)
+            .unwrap()
+            .unwrap();
+        (p.feed_epoch, p.hub_version)
+    }
+
+    fn set_own_held(ctx: &ServiceContext, project_id: &str, frame_uuid: &str) {
+        let conn = crate::api::db(ctx).unwrap().conn();
+        crate::db::collab_frames::set_local_state(
+            &conn,
+            project_id,
+            frame_uuid,
+            LocalState::OwnHeld,
+        )
+        .unwrap();
     }
 
     fn hello(hub: &FakeHub, epoch: &str) -> crate::collab::live::wire::HelloEvent {
@@ -903,7 +1104,7 @@ mod tests {
     async fn an_epoch_change_refetches_everything_and_reannounces_lost_own_frames() {
         let (_t, ctx, hub, mut f) = rig().await;
         let mut h = NoHolders(vec![]);
-        // an own frame the hub knows
+        // an own frame the hub knows, actually held on this device's disk
         hub.seed_frames(PID, "acc-me", &["own1"], "published");
         f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
             .await
@@ -911,6 +1112,7 @@ mod tests {
         f.catch_up_project(PID, None, &[ChangeKind::Frames])
             .await
             .unwrap();
+        set_own_held(&ctx, PID, "own1");
         // the hub is restored without it
         hub.forget_frames(PID, &["own1"]);
         let e2 = hub.rotate_epoch();
@@ -931,6 +1133,92 @@ mod tests {
                 .as_deref(),
             Some(e2.as_str())
         );
+        assert_eq!(cursor(&ctx).0.as_deref(), Some(e2.as_str()));
+    }
+
+    /// I1 fix round: a failure partway through one project's epoch reload
+    /// must not be mistaken for done. Its cursor stays on the OLD epoch, so
+    /// the very next hello (even carrying the SAME new epoch again) retries
+    /// the whole reload, never a lightweight delta catch-up against a
+    /// manifest cursor from before the restore.
+    #[tokio::test]
+    async fn an_epoch_change_failure_is_retried_on_the_next_hello() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.seed_frames(PID, "acc-me", &["own1"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        set_own_held(&ctx, PID, "own1");
+        hub.forget_frames(PID, &["own1"]);
+        let e2 = hub.rotate_epoch();
+
+        hub.set_failing("/manifest", true);
+        let effects = f
+            .apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert!(
+            effects.contains(&FeedEffect::EpochChanged),
+            "the epoch change itself is still reported"
+        );
+        assert_eq!(
+            cursor(&ctx).0.as_deref(),
+            Some("e1"),
+            "the failed reload never moved the cursor into the new epoch"
+        );
+        assert!(
+            hub.frame(PID, "own1").is_none(),
+            "not re-announced yet — the manifest fetch failed first"
+        );
+
+        hub.set_failing("/manifest", false);
+        let effects2 = f
+            .apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert!(
+            effects2.contains(&FeedEffect::EpochChanged),
+            "retried on the next hello, not silently skipped"
+        );
+        assert_eq!(cursor(&ctx).0.as_deref(), Some(e2.as_str()));
+        assert!(
+            hub.frame(PID, "own1").is_some(),
+            "re-announced once the retry succeeded"
+        );
+    }
+
+    /// I2 fix round: a project whose epoch reload fails PERMANENTLY must
+    /// never block a healthy sibling project's reload, and every hello must
+    /// still return normally (the feed keeps going live) instead of failing
+    /// outright forever.
+    #[tokio::test]
+    async fn epoch_change_isolates_a_permanently_failing_project() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.add_project("p2", "m42", &[("acc-me", "send_receive", false)], false);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        assert_eq!(project_cursor(&ctx, "p2").0.as_deref(), Some("e1"));
+
+        hub.set_failing("/projects/p2/manifest", true);
+        let e2 = hub.rotate_epoch();
+        let effects = f
+            .apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert!(effects.contains(&FeedEffect::EpochChanged));
+        assert_eq!(
+            cursor(&ctx).0.as_deref(),
+            Some(e2.as_str()),
+            "the healthy project (p1) still reached the new epoch"
+        );
+        assert_eq!(
+            project_cursor(&ctx, "p2").0.as_deref(),
+            Some("e1"),
+            "the permanently failing project (p2) stays on the old epoch, retried later"
+        );
     }
 
     #[tokio::test]
@@ -945,7 +1233,31 @@ mod tests {
         vv.insert(PID.into(), (v + 3, 0));
         hub.seed_frames(PID, "acc-o", &["u5"], "published");
         f.apply(LiveEvent::Versions(vv), &mut h).await.unwrap();
-        assert!(cursor(&ctx).1 > v);
+        assert_eq!(
+            cursor(&ctx).1,
+            hub.version(PID),
+            "the cursor lands on the hub's real version, never the event's manufactured head"
+        );
+    }
+
+    /// M2 fix round: a `versions` head BELOW the stored cursor is an epoch
+    /// change (hub § "Cursor rules"), not merely ignored — even with no
+    /// epoch string change to report (a versions vector never carries one).
+    #[tokio::test]
+    async fn versions_vector_head_below_cursor_is_an_epoch_change() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.seed_frames(PID, "acc-o", &["u1"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        let (_, v) = cursor(&ctx);
+        assert!(v > 0);
+        let mut vv = VersionsEvent::new();
+        vv.insert(PID.into(), (v - 1, 0));
+        let effects = f.apply(LiveEvent::Versions(vv), &mut h).await.unwrap();
+        assert!(effects.contains(&FeedEffect::EpochChanged));
+        assert!(h.0.contains(&"reload p1".to_string()));
     }
 
     /// A `presence` event with no candidacy flip is a no-op effect (the
@@ -969,5 +1281,65 @@ mod tests {
             .await
             .unwrap();
         assert!(effects.is_empty());
+    }
+
+    /// I5 fix round: an `own_missing` row (the hub knows it, this device has
+    /// no bytes for it) must never be re-announced — only `OwnHeld` rows.
+    #[tokio::test]
+    async fn reannounce_only_lifts_locally_held_own_frames() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.seed_frames(
+            PID,
+            "acc-me",
+            &["own_missing_one", "own_held_one"],
+            "published",
+        );
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        set_own_held(&ctx, PID, "own_held_one");
+        hub.forget_frames(PID, &["own_missing_one", "own_held_one"]);
+
+        let client = CollabClient::new(hub.uri()).unwrap();
+        let announced = reannounce_lost_own_frames(&ctx, &client, "tok", PID, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(announced, 1);
+        assert!(
+            hub.frame(PID, "own_held_one").is_some(),
+            "the held frame is re-announced"
+        );
+        assert!(
+            hub.frame(PID, "own_missing_one").is_none(),
+            "an own_missing row is never re-announced — this device cannot serve it"
+        );
+    }
+
+    /// I5 fix round: a 409 "already announced" for one uuid in the batch
+    /// must not abandon the rest — the truly-lost frame still lands.
+    #[tokio::test]
+    async fn reannounce_drops_an_already_announced_uuid_and_retries_the_rest() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.seed_frames(PID, "acc-me", &["still_there", "truly_lost"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        set_own_held(&ctx, PID, "still_there");
+        set_own_held(&ctx, PID, "truly_lost");
+        // Only "truly_lost" is actually forgotten by the hub; "still_there"
+        // stays — as if this device's belief that BOTH are lost were stale.
+        hub.forget_frames(PID, &["truly_lost"]);
+
+        let client = CollabClient::new(hub.uri()).unwrap();
+        let announced = reannounce_lost_own_frames(&ctx, &client, "tok", PID, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            announced, 1,
+            "the truly-lost frame is re-announced despite sharing a batch with an already-announced one"
+        );
+        assert!(hub.frame(PID, "truly_lost").is_some());
     }
 }
