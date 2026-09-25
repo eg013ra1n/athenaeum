@@ -775,6 +775,16 @@ impl FakeHub {
             .unwrap_or(0)
     }
 
+    /// The project's current holder cursor (`holderSeq`), as the hub sees it
+    /// (test helper, like [`Self::version`]).
+    pub fn holder_seq(&self, project_id: &str) -> i64 {
+        self.lock()
+            .projects
+            .get(project_id)
+            .map(|p| p.holder_seq)
+            .unwrap_or(0)
+    }
+
     /// Register a device token for an account.
     pub fn add_account(
         &self,
@@ -1615,9 +1625,14 @@ async fn front_beat(
         session.detached_at = None;
         let relay_changed = session.relay_url != body.relay_url;
         session.relay_url = body.relay_url.clone();
+        // The WHOLE serving map is compared (T6 fidelity ruling): a project
+        // missing from the new map counts as `false`, so one the device was
+        // serving and simply dropped from the beat is a change too.
         let mut changed_pids = HashSet::new();
-        for (pid, val) in &body.serving {
-            if session.serving.get(pid).copied().unwrap_or(false) != *val {
+        for pid in body.serving.keys().chain(session.serving.keys()) {
+            let before = session.serving.get(pid).copied().unwrap_or(false);
+            let after = body.serving.get(pid).copied().unwrap_or(false);
+            if before != after {
                 changed_pids.insert(pid.clone());
             }
         }
@@ -2673,15 +2688,28 @@ fn holders_since(
             json!({ "holderSeq": p.holder_seq, "floor": p.holder_floor }),
         );
     }
-    // The page cursor is `(changed_seq, device, frameSeq)` — one commit can
-    // stamp many rows with the SAME changed_seq, so a plain `changed_seq >
-    // since` filter on the next page would silently skip the rest of that
-    // commit's rows once `since` lands mid-group. `after` breaks the tie.
-    let after = query(req, "after");
-    let after_key: Option<(String, i32)> = after.as_deref().and_then(|a| {
-        let (d, fs) = a.rsplit_once(':')?;
-        fs.parse::<i32>().ok().map(|fs| (d.to_string(), fs))
-    });
+    // The page cursor is the keyset `(changed_seq, device, frameSeq)`,
+    // carried in the opaque `after` string (hub plan P26, `holder_deltas`):
+    // one commit can stamp many rows with the SAME changed_seq, so the key
+    // must break the tie. `since` stays the caller's ORIGINAL cursor on every
+    // page (`next.since` echoes it), exactly as the real hub pages.
+    let after_key: Option<(i64, String, i32)> = match query(req, "after") {
+        None => None,
+        Some(raw) => {
+            let mut parts = raw.splitn(3, ':');
+            let parsed = (|| {
+                Some((
+                    parts.next()?.parse::<i64>().ok()?,
+                    parts.next()?.to_string(),
+                    parts.next()?.parse::<i32>().ok()?,
+                ))
+            })();
+            match parsed {
+                Some(k) => Some(k),
+                None => return error(400, "after is not a cursor this hub issued"),
+            }
+        }
+    };
     let limit = st.page_size.min(MANIFEST_PAGE).max(1);
     let mut rows: Vec<(String, i32, &FakeClaim)> = p
         .claims
@@ -2689,11 +2717,14 @@ fn holders_since(
         .filter_map(|((device, uuid), c)| {
             p.frames.get(uuid).map(|f| (device.clone(), f.frame_seq, c))
         })
-        .filter(|(device, frame_seq, c)| match &after_key {
-            Some((ad, afs)) => {
-                (c.changed_seq, device.as_str(), *frame_seq) > (since, ad.as_str(), *afs)
-            }
-            None => c.changed_seq > since,
+        .filter(|(device, frame_seq, c)| {
+            c.changed_seq > since
+                && match &after_key {
+                    Some((acs, ad, afs)) => {
+                        (c.changed_seq, device.as_str(), *frame_seq) > (*acs, ad.as_str(), *afs)
+                    }
+                    None => true,
+                }
         })
         .collect();
     rows.sort_by(|(d1, fs1, c1), (d2, fs2, c2)| {
@@ -2716,7 +2747,7 @@ fn holders_since(
         .collect();
     let next = if has_more {
         page.last().map(|(device, frame_seq, c)| {
-            json!({ "since": c.changed_seq, "after": format!("{device}:{frame_seq:010}") })
+            json!({ "since": since, "after": format!("{}:{device}:{frame_seq}", c.changed_seq) })
         })
     } else {
         None
@@ -3277,6 +3308,89 @@ mod tests {
             pages >= 3,
             "a page size of 2 over 5 rows takes at least 3 pages"
         );
+    }
+
+    /// T6 fidelity ruling: `next` echoes the ORIGINAL `since` and carries the
+    /// keyset `changed_seq:device:frameSeq` in `after` (the real hub's
+    /// `holder_deltas`); an `after` this hub never issued is a 400.
+    #[tokio::test]
+    async fn holders_since_next_echoes_since_and_rejects_a_foreign_after() {
+        let hub = FakeHub::start().await;
+        hub.add_account("tok", "acc-me", "Me", "AAA=", None);
+        hub.add_account("tok-o", "acc-o", "Other", "BBB=", None);
+        hub.add_project(
+            "p1",
+            "m31",
+            &[("acc-me", "send_receive", false), ("acc-o", "send", false)],
+            false,
+        );
+        hub.seed_frames("p1", "acc-o", &["f1", "f2", "f3"], "published");
+        hub.seed_frames("p1", "acc-o", &["f4", "f5"], "published");
+        hub.set_page_size(2);
+        let c = CollabClient::new(hub.uri()).unwrap();
+        let page = c.holders_since("tok", "p1", 0, None, None).await.unwrap();
+        assert!(page.has_more);
+        let next = page.next.unwrap();
+        assert_eq!(next.since, 0, "next.since is the caller's own cursor");
+        assert_eq!(next.after, "1:BBB=:2");
+        let page2 = c
+            .holders_since("tok", "p1", next.since, Some(&next.after), None)
+            .await
+            .unwrap();
+        let seqs: Vec<i32> = page2
+            .deltas
+            .iter()
+            .flat_map(|d| d.add.iter().map(|a| a.0))
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![3, 4],
+            "the page resumes inside commit 1 and crosses into commit 2"
+        );
+        let bad = c.holders_since("tok", "p1", 0, Some("BBB=:2"), None).await;
+        assert!(
+            matches!(
+                bad,
+                Err(crate::account::AccountClientError::Http { status: 400, .. })
+            ),
+            "{bad:?}"
+        );
+    }
+
+    /// T6 fidelity ruling: the beat compares the WHOLE serving map — a
+    /// project the device was serving and then left out of a beat counts as
+    /// `false`, a change the watcher sees.
+    #[tokio::test]
+    async fn a_project_dropped_from_the_beat_counts_as_no_longer_serving() {
+        let hub = hub_with_member().await;
+        let mut watcher = open(&hub, "tok-o").await;
+        let mut wbuf = String::new();
+        let _ = next_event(&mut watcher, &mut wbuf).await;
+        let mut me = open(&hub, "tok").await;
+        let mut mbuf = String::new();
+        let (_, hello_me) = next_event(&mut me, &mut mbuf).await;
+        let session_id = hello_me["sessionId"].as_str().unwrap().to_string();
+        let _ = next_presence_for(&mut watcher, &mut wbuf, "AAA=").await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        c.presence_beat(&BeatWire {
+            session_id: session_id.clone(),
+            serving: [("p1".to_string(), true)].into_iter().collect(),
+            relay_url: None,
+        })
+        .await
+        .unwrap();
+        let ev = next_presence_for(&mut watcher, &mut wbuf, "AAA=").await;
+        assert_eq!(ev["changes"][0]["serving"], true);
+        c.presence_beat(&BeatWire {
+            session_id,
+            serving: BTreeMap::new(),
+            relay_url: None,
+        })
+        .await
+        .unwrap();
+        let ev = next_presence_for(&mut watcher, &mut wbuf, "AAA=").await;
+        assert_eq!(ev["changes"][0]["serving"], false);
+        assert!(!hub.serving("p1", "AAA="));
     }
 
     #[tokio::test]

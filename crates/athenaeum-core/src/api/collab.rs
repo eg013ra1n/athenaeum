@@ -2325,6 +2325,33 @@ async fn unstage_updates(
     }
 }
 
+/// Re-tag an update's seed under the version the hub already holds for the
+/// same bytes (C1c), dropping the tag of the version this run never posted.
+async fn retag_under_hub_version(
+    node: &crate::sharing::iroh::node::SharedIrohNode,
+    project_id: &str,
+    f: &mut SeededFrame,
+    hub_version: i32,
+) {
+    if let Err(e) = node
+        .seed_project_frame(project_id, &f.written.uuid, hub_version, &f.written.target)
+        .await
+    {
+        tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: re-tagging under the hub's version failed");
+    }
+    let stale = crate::sharing::iroh::node::project_frame_tag(
+        project_id,
+        &f.written.uuid,
+        f.content_version,
+    );
+    if let Some(store) = node.collab_store() {
+        if let Err(e) = store.tags().delete(&stale).await {
+            tracing::warn!(project_id, frame_uuid = %f.written.uuid, tag = %stale, error = %e, "publish: dropping the unposted version tag failed");
+        }
+    }
+    f.content_version = hub_version;
+}
+
 /// Publish a project's gate-passing calibrated lights, one frame at a time
 /// (collab v3 wave 2, §5.2): calibrate each light ONCE straight into my own
 /// folder under the Collaboration root, seed it into the collab store by
@@ -2427,10 +2454,6 @@ pub(crate) const COLLAB_STORE_UNMOUNTED: &str =
 /// a test stands in for a manifest sync landing between split and write-back.
 type AfterSplit<'a> = Option<&'a (dyn Fn(&Connection) + Sync)>;
 
-// `put_holders` is deprecated (collab v3 wave 3, Task 15 removes it); this
-// function's holder-delta report is replaced by the outbox/report_holders
-// path in a later task of this wave.
-#[allow(deprecated)]
 async fn run_publish(
     ctx: &ServiceContext,
     project_id: &str,
@@ -3050,111 +3073,181 @@ async fn run_publish(
     }
 
     // ── 6. New content versions ──────────────────────────────────────────────
+    // Hub rule: any pending outbox entry for a frame is flushed BEFORE its
+    // version call. A failed flush is logged and the versions still go out:
+    // the hub keeps the highest `reportSeq` per frame, so a late flush is
+    // harmless.
     let mut versioned: Vec<SeededFrame> = Vec::new();
     // Frames whose bytes the hub turned out to hold already (C1c): recorded
     // at the hub's version, counted unchanged, no `…/version`.
     let mut already_versioned: Vec<SeededFrame> = Vec::new();
+    // A version conflict: the hub has a newer version than this run based
+    // its update on — held back, and another run is asked for.
+    let mut conflicted = false;
+    if !outdated && !updates.is_empty() {
+        if let Err(e) = crate::api::collab_live::holdings::flush_project_now(ctx, project_id).await
+        {
+            tracing::warn!(project_id, error = %e, "publish: flushing holdings before the versions failed; posting the versions anyway");
+        }
+    }
     if !outdated {
-        let mut pending = updates.into_iter();
-        while let Some(mut f) = pending.next() {
-            // C1c: never post a version whose bytes are the row's CURRENT
-            // content — re-read right before the call.
+        // C1c: never post a version whose bytes are the row's CURRENT
+        // content — re-read right before the call; the re-read row's
+        // version is what the new one supersedes (CAS `expectedVersion`).
+        let mut to_post: Vec<(SeededFrame, i32)> = Vec::new();
+        for mut f in updates {
             let current = {
                 let db = db(ctx)?;
                 let conn = db.conn();
                 frames_db::get(&conn, project_id, &f.written.uuid)
             };
-            match current {
+            let expected = match current {
                 Ok(Some(row)) if row.blake3 == f.blake3 => {
                     tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = row.content_version, "publish: the hub already has these bytes; no new version");
                     if row.content_version != f.content_version {
-                        if let Err(e) = node
-                            .seed_project_frame(
-                                project_id,
-                                &f.written.uuid,
-                                row.content_version,
-                                &f.written.target,
-                            )
-                            .await
-                        {
-                            tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: re-tagging under the hub's version failed");
-                        }
-                        let stale = crate::sharing::iroh::node::project_frame_tag(
-                            project_id,
-                            &f.written.uuid,
-                            f.content_version,
-                        );
-                        if let Some(store) = node.collab_store() {
-                            if let Err(e) = store.tags().delete(&stale).await {
-                                tracing::warn!(project_id, frame_uuid = %f.written.uuid, tag = %stale, error = %e, "publish: dropping the unposted version tag failed");
-                            }
-                        }
-                        f.content_version = row.content_version;
+                        retag_under_hub_version(&node, project_id, &mut f, row.content_version)
+                            .await;
                     }
                     already_versioned.push(f);
                     continue;
                 }
-                Ok(_) => {}
+                Ok(Some(row)) => row.content_version,
+                Ok(None) => {
+                    tracing::warn!(project_id, frame_uuid = %f.written.uuid, "publish: the own frame row vanished before its version; posting against the seeded version");
+                    f.content_version - 1
+                }
                 Err(e) => {
                     // The hub is the arbiter: post, and let it refuse.
                     tracing::warn!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: re-reading the own frame before its version failed");
+                    f.content_version - 1
                 }
-            }
-            match client
-                .new_frame_version(
-                    &token,
-                    project_id,
-                    &f.written.uuid,
-                    f.content_version - 1,
-                    &f.blake3,
-                    f.written.byte_size as i64,
-                    &f.written.xxh3,
-                )
-                .await
-            {
-                Ok(v) => {
-                    if v.content_version != f.content_version {
-                        tracing::warn!(project_id, frame_uuid = %f.written.uuid, content_version = v.content_version, expected = f.content_version, "publish: hub assigned a different content version; re-tagging");
-                        if let Err(e) = node
-                            .seed_project_frame(
-                                project_id,
-                                &f.written.uuid,
-                                v.content_version,
-                                &f.written.target,
-                            )
-                            .await
-                        {
-                            tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: re-tagging under the hub's version failed");
-                        }
-                        f.content_version = v.content_version;
-                    }
-                    tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = f.content_version, "publish: new frame version");
-                    versioned.push(f);
-                }
+            };
+            to_post.push((f, expected));
+        }
+        let mut batches = announce_batches(to_post);
+        while let Some(batch) = batches.pop_front() {
+            let wire: Vec<crate::collab::live::wire::VersionInWire> = batch
+                .iter()
+                .map(|(f, expected)| crate::collab::live::wire::VersionInWire {
+                    uuid: f.written.uuid.clone(),
+                    expected_version: *expected,
+                    blake3: f.blake3.clone(),
+                    byte_size: f.written.byte_size as i64,
+                    xxh3: f.written.xxh3.clone(),
+                })
+                .collect();
+            let reply = crate::collab::hub_client::with_retry(
+                "publish versions",
+                crate::collab::hub_client::RetryPolicy::Interactive,
+                || client.frame_versions(&token, project_id, &wire),
+            )
+            .await;
+            let reply = match reply {
+                Ok(r) => r,
                 Err(e) => {
-                    tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %e, "publish: new frame version failed");
-                    unseed_all(&node, project_id, &[&f]).await;
-                    unstage_updates(ctx, &disk_lock, project_id, &[&f]).await;
-                    held_back.push(held(
-                        f.written.frame_id,
-                        &f.written.filename,
-                        format!("new version failed: {e}"),
-                    ));
+                    tracing::error!(project_id, count = batch.len(), error = %e, "publish: new frame versions failed");
+                    let frames: Vec<SeededFrame> = batch.into_iter().map(|(f, _)| f).collect();
+                    let refs: Vec<&SeededFrame> = frames.iter().collect();
+                    unseed_all(&node, project_id, &refs).await;
+                    unstage_updates(ctx, &disk_lock, project_id, &refs).await;
+                    for f in &frames {
+                        held_back.push(held(
+                            f.written.frame_id,
+                            &f.written.filename,
+                            format!("new version failed: {e}"),
+                        ));
+                    }
                     if matches!(e, E::CollabApiOutdated) {
                         outdated = true;
-                        let rest: Vec<SeededFrame> = pending.by_ref().collect();
+                        let rest: Vec<SeededFrame> =
+                            batches.drain(..).flatten().map(|(f, _)| f).collect();
                         let refs: Vec<&SeededFrame> = rest.iter().collect();
                         unseed_all(&node, project_id, &refs).await;
                         unstage_updates(ctx, &disk_lock, project_id, &refs).await;
                     }
                     first_err.get_or_insert(client_err(e));
+                    if outdated {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let mut results = reply.results.into_iter();
+            for (mut f, expected) in batch {
+                use crate::collab::live::wire::VersionStatus;
+                let result = results.next().filter(|r| r.uuid == f.written.uuid);
+                let outcome = match &result {
+                    Some(r) if r.status == VersionStatus::Ok => Ok(r.content_version),
+                    // A retried call whose first reply was lost: only the
+                    // publisher can bump, so `expected + 1` is our own
+                    // version (T6 ruling) — recorded the same as `ok`.
+                    Some(r)
+                        if r.status == VersionStatus::Conflict
+                            && r.content_version == expected + 1 =>
+                    {
+                        tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = r.content_version, "publish: the hub already took this version (a retried call)");
+                        Ok(r.content_version)
+                    }
+                    Some(r) if r.status == VersionStatus::Conflict => {
+                        tracing::warn!(project_id, frame_uuid = %f.written.uuid, content_version = r.content_version, "publish: version conflict; the hub has a newer version");
+                        conflicted = true;
+                        Err(format!(
+                            "version conflict: the hub has content version {}",
+                            r.content_version
+                        ))
+                    }
+                    Some(r) if r.status == VersionStatus::NotFound => {
+                        tracing::error!(project_id, frame_uuid = %f.written.uuid, "publish: new frame version refused: the hub does not know the frame");
+                        Err("new version failed: the hub does not know this frame".to_string())
+                    }
+                    Some(r) if r.status == VersionStatus::Forbidden => {
+                        tracing::error!(project_id, frame_uuid = %f.written.uuid, "publish: new frame version refused: not the frame's publisher");
+                        Err("new version failed: the hub says this device's account did not publish the frame".to_string())
+                    }
+                    _ => {
+                        tracing::error!(project_id, frame_uuid = %f.written.uuid, "publish: the versions reply has no matching result for this frame");
+                        Err(
+                            "new version failed: the hub's reply did not answer for this frame"
+                                .to_string(),
+                        )
+                    }
+                };
+                match outcome {
+                    Ok(content_version) => {
+                        if content_version != f.content_version {
+                            tracing::warn!(project_id, frame_uuid = %f.written.uuid, content_version, expected = f.content_version, "publish: hub assigned a different content version; re-tagging");
+                            if let Err(e) = node
+                                .seed_project_frame(
+                                    project_id,
+                                    &f.written.uuid,
+                                    content_version,
+                                    &f.written.target,
+                                )
+                                .await
+                            {
+                                tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: re-tagging under the hub's version failed");
+                            }
+                            f.content_version = content_version;
+                        }
+                        tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = f.content_version, "publish: new frame version");
+                        versioned.push(f);
+                    }
+                    Err(reason) => {
+                        unseed_all(&node, project_id, &[&f]).await;
+                        unstage_updates(ctx, &disk_lock, project_id, &[&f]).await;
+                        held_back.push(held(f.written.frame_id, &f.written.filename, reason));
+                    }
                 }
             }
         }
     }
 
-    // ── 7. Own rows, per frame (never aborts the run), then holders ──────────
-    let mut holders: Vec<crate::collab::hub_client::HolderRefWire> = Vec::new();
+    // ── 7. Own rows and their claims, per frame (never aborts the run) ───────
+    // Claims (spec §6.2, hub § "Implicit claims"): an announce made the hub
+    // claim `(uuid, 1)` for this device and a version `(uuid, new)` — both
+    // enter the claim set WITHOUT an outbox row, in the same transaction as
+    // the own row. An adoption (R8a/R8b) may have no hub claim of this
+    // device behind it: `ensure_claimed` adds it through the outbox.
     let mut announced_n = 0usize;
     let mut updated_n = 0usize;
     {
@@ -3222,10 +3315,10 @@ async fn run_publish(
                 frame_seq: None,
             }
         };
-        let adopt = |f: &SeededFrame| -> anyhow::Result<()> {
+        let adopt = |conn: &Connection, f: &SeededFrame| -> anyhow::Result<()> {
             let w = &f.written;
             let n = frames_db::adopt_own(
-                &conn,
+                conn,
                 project_id,
                 &w.uuid,
                 w.frame_id,
@@ -3238,17 +3331,26 @@ async fn run_publish(
             }
             Ok(())
         };
-        let holder = |f: &SeededFrame| crate::collab::hub_client::HolderRefWire {
-            frame_uuid: f.written.uuid.clone(),
-            content_version: f.content_version,
+        // One transaction per frame: the own-row write(s) and the claim.
+        let in_tx = |body: &dyn Fn(&Connection) -> anyhow::Result<()>| -> anyhow::Result<()> {
+            let tx = conn.unchecked_transaction()?;
+            body(&tx)?;
+            tx.commit()?;
+            Ok(())
         };
 
         for (f, frame_state, gv) in &announced {
-            match frames_db::record_own(&conn, &new_row(f, frame_state, *gv, true)) {
-                Ok(()) => {
-                    holders.push(holder(f));
-                    announced_n += 1;
-                }
+            let row = new_row(f, frame_state, *gv, true);
+            match in_tx(&|c| {
+                frames_db::record_own(c, &row)?;
+                crate::db::collab_live::add_implicit_claim(
+                    c,
+                    project_id,
+                    &f.written.uuid,
+                    f.content_version,
+                )
+            }) {
+                Ok(()) => announced_n += 1,
                 Err(e) => record_failed(f, "announced", &e),
             }
         }
@@ -3256,30 +3358,30 @@ async fn run_publish(
         // (a manifest sync got there first), else record one from the local
         // plan with the state unknown — the manifest sync sets the hub truth.
         for (f, gv) in &hub_adopted {
-            let result = match frames_db::get(&conn, project_id, &f.written.uuid) {
-                Ok(Some(row)) if row.origin == FrameOrigin::Own => adopt(f),
-                Ok(Some(_)) => Err(anyhow::anyhow!(
-                    "frame {} is cached as another publisher's",
-                    f.written.uuid
-                )),
-                Ok(None) => frames_db::record_own(&conn, &new_row(f, "unknown", *gv, false)),
-                Err(e) => Err(e),
-            };
-            match result {
-                Ok(()) => {
-                    holders.push(holder(f));
-                    announced_n += 1;
+            let result = in_tx(&|c| {
+                match frames_db::get(c, project_id, &f.written.uuid)? {
+                    Some(row) if row.origin == FrameOrigin::Own => adopt(c, f)?,
+                    Some(_) => {
+                        anyhow::bail!("frame {} is cached as another publisher's", f.written.uuid)
+                    }
+                    None => frames_db::record_own(c, &new_row(f, "unknown", *gv, false))?,
                 }
+                frames_db::ensure_claimed(c, project_id, &f.written.uuid)?;
+                Ok(())
+            });
+            match result {
+                Ok(()) => announced_n += 1,
                 Err(e) => record_failed(f, "already announced", &e),
             }
         }
         // R8b, identical bytes: bound and seeded at the hub's version.
         for f in &bound {
-            match adopt(f) {
-                Ok(()) => {
-                    holders.push(holder(f));
-                    unchanged += 1;
-                }
+            match in_tx(&|c| {
+                adopt(c, f)?;
+                frames_db::ensure_claimed(c, project_id, &f.written.uuid)?;
+                Ok(())
+            }) {
+                Ok(()) => unchanged += 1,
                 Err(e) => record_failed(f, "already published", &e),
             }
         }
@@ -3289,25 +3391,37 @@ async fn run_publish(
             .chain(already_versioned.iter().map(|f| (f, true)))
         {
             let w = &f.written;
-            if matches!(w.kind, PublishKind::Adopt(_)) {
-                if let Err(e) = adopt(f) {
-                    record_failed(f, "versioned", &e);
-                    continue;
+            let result = in_tx(&|c| {
+                if matches!(w.kind, PublishKind::Adopt(_)) {
+                    adopt(c, f)?;
                 }
-            }
-            match frames_db::set_own_version(
-                &conn,
-                project_id,
-                &w.uuid,
-                f.content_version,
-                &f.blake3,
-                &w.xxh3,
-                w.byte_size as i64,
-                &w.recipe,
-                size_mtime_seen(&w.target).as_deref(),
-            ) {
-                Ok(_) => {
-                    holders.push(holder(f));
+                if !already {
+                    // The hub's implicit claim of the new version.
+                    crate::db::collab_live::add_implicit_claim(
+                        c,
+                        project_id,
+                        &w.uuid,
+                        f.content_version,
+                    )?;
+                }
+                frames_db::set_own_version(
+                    c,
+                    project_id,
+                    &w.uuid,
+                    f.content_version,
+                    &f.blake3,
+                    &w.xxh3,
+                    w.byte_size as i64,
+                    &w.recipe,
+                    size_mtime_seen(&w.target).as_deref(),
+                )?;
+                if already {
+                    frames_db::ensure_claimed(c, project_id, &w.uuid)?;
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => {
                     if already {
                         unchanged += 1;
                     } else {
@@ -3318,16 +3432,10 @@ async fn run_publish(
             }
         }
     }
-
-    if !holders.is_empty() {
-        // Folded after logging: the 20-minute full holder report repairs a
-        // missed delta (P8).
-        if let Err(e) = client
-            .put_holders(&token, project_id, false, &holders, &[])
-            .await
-        {
-            tracing::warn!(project_id, count = holders.len(), error = %e, "publish: holder delta failed");
-        }
+    if conflicted {
+        // The hub moved on under this run (another device of this account
+        // versioned the frame): run again against the new version.
+        crate::api::collab_autopublish::request_auto_publish(Some(project_id));
     }
 
     // ── 8. One outcome event + log ───────────────────────────────────────────
@@ -5086,7 +5194,6 @@ pub(crate) mod tests {
     pub(crate) mod publish {
         use super::*;
         use std::path::PathBuf;
-        use wiremock::matchers::path_regex as wm_path_regex;
 
         const PID: &str = "p1";
         /// Big enough that every calibrated frame is an EXTERNAL reference in
@@ -5152,7 +5259,58 @@ pub(crate) mod tests {
             });
         }
 
-        /// Hub routes every run touches: announce, holder delta, version.
+        /// `POST …/frames/versions` answered per entry, in request order:
+        /// `Ok` → `ok` at `expectedVersion + 1`; `Conflict(n)` → `conflict`
+        /// at `n`; `ConflictNext` → `conflict` at `expectedVersion + 1` (a
+        /// retried call whose first reply was lost). Optionally delayed.
+        #[derive(Clone, Copy)]
+        pub(super) enum VersionsMode {
+            Ok,
+            Conflict(i64),
+            ConflictNext,
+        }
+
+        pub(super) struct VersionsReply {
+            pub mode: VersionsMode,
+            pub delay: Option<std::time::Duration>,
+        }
+
+        impl wiremock::Respond for VersionsReply {
+            fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+                let results: Vec<serde_json::Value> = body["versions"]
+                    .as_array()
+                    .map(|vs| {
+                        vs.iter()
+                            .map(|v| {
+                                let expected = v["expectedVersion"].as_i64().unwrap_or(0);
+                                let (status, cv) = match self.mode {
+                                    VersionsMode::Ok => ("ok", expected + 1),
+                                    VersionsMode::Conflict(n) => ("conflict", n),
+                                    VersionsMode::ConflictNext => ("conflict", expected + 1),
+                                };
+                                serde_json::json!({
+                                    "uuid": v["uuid"], "status": status, "contentVersion": cv
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let t = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "projectVersion": 6, "results": results }));
+                match self.delay {
+                    Some(d) => t.set_delay(d),
+                    None => t,
+                }
+            }
+        }
+
+        fn versions_path() -> String {
+            format!("/api/v1/projects/{PID}/frames/versions")
+        }
+
+        /// Hub routes every run touches: announce, holder report, versions.
         async fn mount_hub(server: &MockServer, state: &str) {
             Mock::given(wm_method("POST"))
                 .and(wm_path(format!("/api/v1/projects/{PID}/frames")))
@@ -5167,16 +5325,17 @@ pub(crate) mod tests {
         async fn mount_holders_and_version(server: &MockServer) {
             Mock::given(wm_method("PUT"))
                 .and(wm_path(format!("/api/v1/projects/{PID}/holders/self")))
-                .respond_with(ResponseTemplate::new(204))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "holderSeq": 1, "digestMatch": true, "nextFlushMs": 1000, "refused": []
+                })))
                 .mount(server)
                 .await;
             Mock::given(wm_method("POST"))
-                .and(wm_path_regex(format!(
-                    r"^/api/v1/projects/{PID}/frames/[^/]+/version$"
-                )))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "contentVersion": 2, "projectVersion": 6
-                })))
+                .and(wm_path(versions_path()))
+                .respond_with(VersionsReply {
+                    mode: VersionsMode::Ok,
+                    delay: None,
+                })
                 .mount(server)
                 .await;
         }
@@ -5204,13 +5363,37 @@ pub(crate) mod tests {
                 .collect()
         }
 
+        /// One `…/frames/{uuid}/version` path per versioned frame, across
+        /// every `POST …/frames/versions` batch the hub received.
         async fn version_calls(server: &MockServer) -> Vec<String> {
             requests(server)
                 .await
                 .into_iter()
-                .filter(|(m, p, _)| m == "POST" && p.ends_with("/version"))
-                .map(|(_, p, _)| p)
+                .filter(|(m, p, _)| m == "POST" && p == &versions_path())
+                .flat_map(|(_, _, b)| {
+                    b["versions"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|v| {
+                            format!(
+                                "/api/v1/projects/{PID}/frames/{}/version",
+                                v["uuid"].as_str().unwrap_or_default()
+                            )
+                        })
+                })
                 .collect()
+        }
+
+        fn claims(fx: &PubFx) -> Vec<(String, i32)> {
+            let conn = crate::api::db(&fx.ctx).unwrap().conn();
+            crate::db::collab_live::my_claims(&conn, PID).unwrap()
+        }
+
+        fn outbox_len(fx: &PubFx) -> usize {
+            let conn = crate::api::db(&fx.ctx).unwrap().conn();
+            crate::db::collab_live::outbox_len(&conn, PID).unwrap()
         }
 
         async fn tag_present(fx: &PubFx, uuid: &str, version: i32) -> bool {
@@ -5582,15 +5765,19 @@ pub(crate) mod tests {
                 assert_eq!(header.get_str("ATH_FILT").as_deref(), Some("L"));
             }
 
-            // One holder delta carrying both frames at version 1.
-            let holder_puts: Vec<_> = requests(&fx.server)
-                .await
-                .into_iter()
-                .filter(|(m, _, _)| m == "PUT")
-                .collect();
-            assert_eq!(holder_puts.len(), 1);
-            assert_eq!(holder_puts[0].2["full"], false);
-            assert_eq!(holder_puts[0].2["add"].as_array().unwrap().len(), 2);
+            // The announce claimed both frames at version 1 for this device
+            // (hub § "Implicit claims"): in the claim set, never reported.
+            let mut want: Vec<(String, i32)> = fx.uuids.iter().map(|u| (u.clone(), 1)).collect();
+            want.sort();
+            assert_eq!(claims(&fx), want);
+            assert_eq!(outbox_len(&fx), 0);
+            assert!(
+                requests(&fx.server)
+                    .await
+                    .iter()
+                    .all(|(m, _, _)| m != "PUT"),
+                "no holder report for implicit claims"
+            );
             drop(fx.tmp);
         }
 
@@ -5774,6 +5961,9 @@ pub(crate) mod tests {
             assert_eq!(version_calls(&fx.server).await.len(), 1);
             let after = own_row(&fx, &fx.uuids[0]).unwrap();
             assert_eq!(after.content_version, 2);
+            // The version claimed v2 for this device implicitly: no report.
+            assert_eq!(claims(&fx), vec![(fx.uuids[0].clone(), 2)]);
+            assert_eq!(outbox_len(&fx), 0);
             assert_ne!(after.blake3, before.blake3);
             assert_eq!(after.landed_path, before.landed_path, "same path");
             assert_eq!(
@@ -5894,13 +6084,8 @@ pub(crate) mod tests {
             );
             assert!(own_row(&fx, &fx.uuids[0]).is_some());
             assert!(own_row(&fx, &fx.uuids[1]).is_none());
-            let puts: Vec<_> = requests(&fx.server)
-                .await
-                .into_iter()
-                .filter(|(m, _, _)| m == "PUT")
-                .collect();
-            assert_eq!(puts.len(), 1);
-            assert_eq!(puts[0].2["add"].as_array().unwrap().len(), 1);
+            // The failed frame's row and claim roll back together.
+            assert_eq!(claims(&fx), vec![(fx.uuids[0].clone(), 1)]);
         }
 
         /// R9: a run with nothing to generate never asks for the compute
@@ -6383,16 +6568,11 @@ pub(crate) mod tests {
         async fn disk_truth_mid_update_leaves_the_frame_seeded_and_on_disk() {
             let fx = fixture(1).await;
             Mock::given(wm_method("POST"))
-                .and(wm_path_regex(format!(
-                    r"^/api/v1/projects/{PID}/frames/[^/]+/version$"
-                )))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({
-                            "contentVersion": 2, "projectVersion": 6
-                        }))
-                        .set_delay(std::time::Duration::from_millis(1500)),
-                )
+                .and(wm_path(versions_path()))
+                .respond_with(VersionsReply {
+                    mode: VersionsMode::Ok,
+                    delay: Some(std::time::Duration::from_millis(1500)),
+                })
                 .with_priority(1)
                 .mount(&fx.server)
                 .await;
@@ -6453,10 +6633,11 @@ pub(crate) mod tests {
         async fn a_refused_version_is_unstaged_and_retried() {
             let fx = fixture(1).await;
             Mock::given(wm_method("POST"))
-                .and(wm_path_regex(format!(
-                    r"^/api/v1/projects/{PID}/frames/[^/]+/version$"
-                )))
-                .respond_with(ResponseTemplate::new(500))
+                .and(wm_path(versions_path()))
+                .respond_with(
+                    ResponseTemplate::new(409)
+                        .set_body_json(serde_json::json!({"error": "project is closed"})),
+                )
                 .up_to_n_times(1)
                 .with_priority(1)
                 .mount(&fx.server)
@@ -6491,6 +6672,124 @@ pub(crate) mod tests {
             assert!(tag_present(&fx, &fx.uuids[0], 2).await);
         }
 
+        /// Task 6: a CAS version conflict (the hub holds a newer version
+        /// than the one this run's update superseded) holds the frame back
+        /// with the hub's number, unstages it — its claim leaves through the
+        /// outbox — and asks for another run.
+        #[tokio::test]
+        async fn a_version_conflict_holds_the_frame_back_with_the_hub_version() {
+            let fx = fixture(1).await;
+            Mock::given(wm_method("POST"))
+                .and(wm_path(versions_path()))
+                .respond_with(VersionsReply {
+                    mode: VersionsMode::Conflict(5),
+                    delay: None,
+                })
+                .with_priority(1)
+                .mount(&fx.server)
+                .await;
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(claims(&fx), vec![(fx.uuids[0].clone(), 1)]);
+            write_dark(&fx.master, 310.0);
+            set_mtime(&fx.master, 120);
+
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.updated, 0, "{res:?}");
+            assert_eq!(res.held_back.len(), 1);
+            assert_eq!(
+                res.held_back[0].reasons,
+                vec!["version conflict: the hub has content version 5".to_string()]
+            );
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(row.content_version, 1);
+            assert!(!row.on_disk, "unstaged: the regenerated file is not v1");
+            assert_eq!(
+                row.local_state,
+                crate::db::collab_frames::LocalState::OwnMissing
+            );
+            assert!(
+                !tag_present(&fx, &fx.uuids[0], 2).await,
+                "the unposted tag is gone"
+            );
+            assert!(
+                claims(&fx).is_empty(),
+                "no claim on bytes this device lacks"
+            );
+            assert_eq!(outbox_len(&fx), 1, "the claim's removal is owed to the hub");
+        }
+
+        /// Task 6 ruling: a retried version call whose first reply was lost
+        /// answers `conflict` at `expectedVersion + 1` — only the publisher
+        /// can bump, so it is this run's own version, recorded as `ok`.
+        #[tokio::test]
+        async fn a_conflict_at_the_next_version_is_our_own_lost_reply() {
+            let fx = fixture(1).await;
+            Mock::given(wm_method("POST"))
+                .and(wm_path(versions_path()))
+                .respond_with(VersionsReply {
+                    mode: VersionsMode::ConflictNext,
+                    delay: None,
+                })
+                .with_priority(1)
+                .mount(&fx.server)
+                .await;
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            write_dark(&fx.master, 310.0);
+            set_mtime(&fx.master, 120);
+
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!((res.updated, res.held_back.len()), (1, 0), "{res:?}");
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(row.content_version, 2);
+            assert!(row.on_disk);
+            assert_eq!(claims(&fx), vec![(fx.uuids[0].clone(), 2)]);
+        }
+
+        /// Hub rule: a pending outbox entry is flushed BEFORE the version
+        /// call, and the versions go out as one CAS batch whose
+        /// `expectedVersion` is the re-read row's version.
+        #[tokio::test]
+        async fn the_outbox_is_flushed_before_the_version_batch() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            {
+                // an unsent claim change, as a landing would leave it
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                crate::db::collab_live::record_claim_change(
+                    &conn,
+                    PID,
+                    &fx.uuids[1],
+                    crate::db::collab_live::ClaimOp::Add { content_version: 1 },
+                )
+                .unwrap();
+            }
+            write_dark(&fx.master, 310.0);
+            set_mtime(&fx.master, 120);
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.updated, 2, "{res:?}");
+            let reqs = requests(&fx.server).await;
+            let put = reqs
+                .iter()
+                .position(|(m, _, _)| m == "PUT")
+                .expect("the outbox was flushed");
+            let post = reqs
+                .iter()
+                .position(|(m, p, _)| m == "POST" && p == &versions_path())
+                .expect("the versions were posted");
+            assert!(put < post, "flush first, then the versions");
+            assert_eq!(reqs[put].2["reportSeq"], 1, "the one pending journal entry");
+            let batch = reqs[post].2["versions"].as_array().unwrap().clone();
+            assert_eq!(batch.len(), 2, "one batch for both frames");
+            assert!(batch.iter().all(|v| v["expectedVersion"] == 1));
+            assert_eq!(outbox_len(&fx), 0);
+            let mut want: Vec<(String, i32)> = fx.uuids.iter().map(|u| (u.clone(), 2)).collect();
+            want.sort();
+            assert_eq!(claims(&fx), want);
+        }
+
         /// An update whose run dies between staging the new file and the
         /// hub's `…/version` reply (app quit, lost connection) is posted by
         /// the next PLAIN publish — here the update came from a republish
@@ -6500,16 +6799,11 @@ pub(crate) mod tests {
         async fn an_interrupted_update_is_posted_by_the_next_plain_publish() {
             let fx = fixture(1).await;
             Mock::given(wm_method("POST"))
-                .and(wm_path_regex(format!(
-                    r"^/api/v1/projects/{PID}/frames/[^/]+/version$"
-                )))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({
-                            "contentVersion": 2, "projectVersion": 6
-                        }))
-                        .set_delay(std::time::Duration::from_secs(60)),
-                )
+                .and(wm_path(versions_path()))
+                .respond_with(VersionsReply {
+                    mode: VersionsMode::Ok,
+                    delay: Some(std::time::Duration::from_secs(60)),
+                })
                 .up_to_n_times(1)
                 .with_priority(1)
                 .mount(&fx.server)

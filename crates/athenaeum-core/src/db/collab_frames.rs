@@ -199,9 +199,12 @@ pub struct LocalFrameRow {
     /// documented on [`LocalState`]; a manifest fetch ([`upsert_from_manifest`])
     /// only sets it for a brand-new row (see that function's docs).
     pub local_state: LocalState,
-    /// This device's position in the project's holder-map sequence — `None`
-    /// until the hub assigns one (announce/confirm). Set only by
-    /// [`set_frame_seq`].
+    /// The hub's dense per-project frame ordinal (`frameSeq`: assigned at
+    /// announce, never reused) — the key holder claims, `holders` deltas and
+    /// snapshot runs name a frame by. NOT the holder cursor (`holder_seq`).
+    /// `None` until the manifest or a holder snapshot delivers it; written by
+    /// [`upsert_from_manifest`] and [`set_frame_seq`], and carried through by
+    /// [`record_own`].
     pub frame_seq: Option<i32>,
 }
 
@@ -259,13 +262,14 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
         "INSERT INTO project_frames_local
             (project_id, frame_uuid, content_version, origin, publisher_account_id,
              publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3,
-             blake3, manifest_version, manifest_json, frame_seq, local_state, updated_at)
+             blake3, manifest_version, manifest_json, frame_seq, local_state, state_changed_at,
+             updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  CASE WHEN ?16 > 0 THEN ?16 ELSE NULL END,
                  CASE WHEN ?4 = 'own' THEN 'own_missing'
                       WHEN ?9 = 'published' AND ?10 = 1 THEN 'wanted'
                       ELSE 'idle' END,
-                 datetime('now'))
+                 datetime('now'), datetime('now'))
          ON CONFLICT(project_id, frame_uuid) DO UPDATE SET
             content_version = excluded.content_version,
             origin = excluded.origin,
@@ -294,6 +298,11 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
                 WHEN origin = 'replica' AND excluded.content_version > content_version
                      AND local_state = 'held' THEN 'wanted'
                 ELSE local_state
+            END,
+            state_changed_at = CASE
+                WHEN origin = 'replica' AND excluded.content_version > content_version
+                     AND local_state = 'held' THEN datetime('now')
+                ELSE state_changed_at
             END,
             size_mtime_seen = CASE
                 WHEN origin = 'replica' AND excluded.content_version > content_version THEN NULL
@@ -364,8 +373,9 @@ pub fn set_local_state(
     Ok(Some(StateWrite { from, to, claim }))
 }
 
-/// Set this device's holder-map sequence for a frame (P8: the number the hub
-/// assigns on announce/confirm). Column-targeted; returns the rows touched.
+/// Set a frame's hub frame ordinal (`frameSeq`, the dense per-project number
+/// the hub assigns at announce — what holder claims are keyed by; not the
+/// holder cursor). Column-targeted; returns the rows touched.
 pub fn set_frame_seq(
     conn: &Connection,
     project_id: &str,
@@ -448,10 +458,21 @@ pub fn delete_not_in(conn: &Connection, project_id: &str, keep: &HashSet<String>
     Ok(removed)
 }
 
-/// Record (or fully replace) an own-frame row — the publish path's write,
-/// distinct from [`upsert_from_manifest`] because it carries the local-only
-/// fields (`landed_path`, `source_frame_id`, `recipe_hash`, …) that a
-/// manifest fetch never has.
+/// Record a NEW own-frame row — the publish path's write for a frame it has
+/// just announced (or adopted with no row yet), distinct from
+/// [`upsert_from_manifest`] because it carries the local-only fields
+/// (`landed_path`, `source_frame_id`, `recipe_hash`, …) that a manifest fetch
+/// never has.
+///
+/// New rows only: an EXISTING own row is changed through the column-targeted
+/// writers ([`adopt_own`], [`stage_own_file`], [`set_own_version`],
+/// [`unstage_own_file`]), which move `local_state` through
+/// [`set_local_state`] with its claim/outbox change. This write sets
+/// `local_state` directly and records no claim — the caller owns the claim (an
+/// announce's implicit `(uuid, 1)`, or an adoption's outbox `add`). If a
+/// manifest sync inserted the same row between the announce and this write,
+/// its hub-assigned `frame_seq` survives (`COALESCE`), so a row argument
+/// without one never wipes it.
 pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
     // `INSERT OR REPLACE` resets every column left out of the list to its
     // schema default, so `frame_seq` and `local_state` — real columns since
@@ -476,7 +497,10 @@ pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
              on_disk, locally_declined, awaiting_gc, source_frame_id, recipe_hash, last_error,
              local_state, frame_seq, state_changed_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, datetime('now'), datetime('now'))",
+                 ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                 COALESCE(?26, (SELECT frame_seq FROM project_frames_local
+                                WHERE project_id = ?1 AND frame_uuid = ?2)),
+                 datetime('now'), datetime('now'))",
         params![
             row.project_id,
             row.frame_uuid,
@@ -524,6 +548,9 @@ pub fn set_landed(
          SET landed_path = ?3, size_mtime_seen = ?4, on_disk = 1, awaiting_gc = 0,
              last_error = NULL, rejected_size_mtime = NULL,
              local_state = CASE WHEN origin = 'own' THEN 'own_held' ELSE 'held' END,
+             state_changed_at = CASE
+                 WHEN local_state IS (CASE WHEN origin = 'own' THEN 'own_held' ELSE 'held' END)
+                 THEN state_changed_at ELSE datetime('now') END,
              updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2",
         params![project_id, frame_uuid, landed_path, size_mtime],
@@ -550,6 +577,9 @@ pub fn set_landed_if(
          SET landed_path = ?3, size_mtime_seen = ?4, on_disk = 1, awaiting_gc = 0,
              last_error = NULL, rejected_size_mtime = NULL,
              local_state = CASE WHEN origin = 'own' THEN 'own_held' ELSE 'held' END,
+             state_changed_at = CASE
+                 WHEN local_state IS (CASE WHEN origin = 'own' THEN 'own_held' ELSE 'held' END)
+                 THEN state_changed_at ELSE datetime('now') END,
              updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND content_version = ?5 AND blake3 = ?6",
         params![
@@ -609,6 +639,9 @@ pub fn set_missing(
     conn.execute(
         "UPDATE project_frames_local SET on_disk = 0, awaiting_gc = ?3,
              local_state = CASE WHEN origin = 'own' THEN 'own_missing' ELSE 'missing' END,
+             state_changed_at = CASE
+                 WHEN local_state IS (CASE WHEN origin = 'own' THEN 'own_missing' ELSE 'missing' END)
+                 THEN state_changed_at ELSE datetime('now') END,
              updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2",
         params![project_id, frame_uuid, awaiting_gc],
@@ -655,8 +688,10 @@ pub fn set_declined(
     let local_state_str = local_state.as_db_str();
     let placeholders = vec!["?"; frame_uuids.len()].join(", ");
     let sql = format!(
-        "UPDATE project_frames_local SET locally_declined = ?, local_state = ?, updated_at = datetime('now') \
-         WHERE project_id = ? AND frame_uuid IN ({placeholders})"
+        "UPDATE project_frames_local SET locally_declined = ?, \
+         state_changed_at = CASE WHEN local_state IS ?2 THEN state_changed_at ELSE datetime('now') END, \
+         local_state = ?2, updated_at = datetime('now') \
+         WHERE project_id = ?3 AND frame_uuid IN ({placeholders})"
     );
     let mut vals: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(frame_uuids.len() + 3);
     vals.push(&declined);
@@ -792,7 +827,11 @@ pub fn set_recipe_hash(
 /// Record a new content version of an own frame (P19): the version, its
 /// hashes and size, the recipe that produced it, the landed file's
 /// `size:mtime`, and the same content keys inside `manifest_json`.
-/// Column-targeted like [`set_recipe_hash`] — hub-owned columns survive.
+/// Column-targeted like [`set_recipe_hash`] — hub-owned columns survive. The
+/// row moves to `own_held` through [`set_local_state`] (T1/T6 ruling), in one
+/// savepoint with the column write: a row that was not servable gets its
+/// outbox `add`. The hub's implicit claim on the new version is the caller's
+/// ([`crate::db::collab_live::add_implicit_claim`]).
 #[allow(clippy::too_many_arguments)]
 pub fn set_own_version(
     conn: &Connection,
@@ -805,10 +844,11 @@ pub fn set_own_version(
     recipe_hash: &str,
     size_mtime_seen: Option<&str>,
 ) -> Result<usize> {
-    Ok(conn.execute(
+    let sp = crate::db::operations::SavepointGuard::new(conn, "set_own_version")?;
+    let n = conn.execute(
         "UPDATE project_frames_local
          SET content_version = ?3, blake3 = ?4, xxh3 = ?5, byte_size = ?6, recipe_hash = ?7,
-             size_mtime_seen = ?8, on_disk = 1, awaiting_gc = 0, last_error = NULL,
+             size_mtime_seen = ?8, awaiting_gc = 0, last_error = NULL,
              manifest_json = CASE WHEN json_valid(manifest_json)
                  THEN json_set(manifest_json, '$.contentVersion', ?3, '$.blake3', ?4,
                                '$.xxh3', ?5, '$.byteSize', ?6)
@@ -825,7 +865,12 @@ pub fn set_own_version(
             recipe_hash,
             size_mtime_seen
         ],
-    )?)
+    )?;
+    if n > 0 {
+        move_to_servable(conn, project_id, frame_uuid, true)?;
+    }
+    sp.commit()?;
+    Ok(n)
 }
 
 /// The local half of a new own content version, written the moment the
@@ -839,8 +884,10 @@ pub fn set_own_version(
 /// republish — regenerates the frame, finds bytes the hub does not have, and
 /// posts the version a dead run never confirmed (a republish or a plate solve
 /// moves the bytes without moving the recipe). [`set_own_version`] writes the
-/// recipe back. Only a row still landed at `landed_path` is touched. Returns
-/// the rows touched.
+/// recipe back. Only a row still landed at `landed_path` is touched. The row
+/// is `own_held` afterwards (the file is on disk — the plan's `NewVersion`
+/// edge keeps an own frame's state), moved through [`set_local_state`] in one
+/// savepoint with the column write (T1/T6 ruling). Returns the rows touched.
 pub fn stage_own_file(
     conn: &Connection,
     project_id: &str,
@@ -850,9 +897,10 @@ pub fn stage_own_file(
     byte_size: i64,
     size_mtime_seen: Option<&str>,
 ) -> Result<usize> {
-    Ok(conn.execute(
+    let sp = crate::db::operations::SavepointGuard::new(conn, "stage_own_file")?;
+    let n = conn.execute(
         "UPDATE project_frames_local
-         SET xxh3 = ?4, byte_size = ?5, size_mtime_seen = ?6, on_disk = 1, awaiting_gc = 0,
+         SET xxh3 = ?4, byte_size = ?5, size_mtime_seen = ?6, awaiting_gc = 0,
              recipe_hash = NULL, updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own' AND landed_path = ?3",
         params![
@@ -863,7 +911,12 @@ pub fn stage_own_file(
             byte_size,
             size_mtime_seen
         ],
-    )?)
+    )?;
+    if n > 0 {
+        set_local_state(conn, project_id, frame_uuid, LocalState::OwnHeld)?;
+    }
+    sp.commit()?;
+    Ok(n)
 }
 
 /// Undo [`stage_own_file`] after the hub refused the new version: the file
@@ -871,8 +924,10 @@ pub fn stage_own_file(
 /// back to the hub's content keys and is marked NOT on disk (the old version
 /// is gone). Disk truth then rejects the file (its size / xxh3 no longer
 /// match), and the next publish run regenerates and posts again (the recipe
-/// [`stage_own_file`] cleared stays cleared, so a plain run does). Returns the
-/// rows touched.
+/// [`stage_own_file`] cleared stays cleared, so a plain run does). The row
+/// moves to `own_missing` through [`set_local_state`] in one savepoint with
+/// the column write (T1/T6 ruling): a servable row's claim leaves the claim
+/// set through the outbox. Returns the rows touched.
 pub fn unstage_own_file(
     conn: &Connection,
     project_id: &str,
@@ -880,20 +935,28 @@ pub fn unstage_own_file(
     hub_xxh3: &str,
     hub_byte_size: i64,
 ) -> Result<usize> {
-    Ok(conn.execute(
+    let sp = crate::db::operations::SavepointGuard::new(conn, "unstage_own_file")?;
+    let n = conn.execute(
         "UPDATE project_frames_local
-         SET xxh3 = ?3, byte_size = ?4, size_mtime_seen = NULL, on_disk = 0, awaiting_gc = 0,
+         SET xxh3 = ?3, byte_size = ?4, size_mtime_seen = NULL, awaiting_gc = 0,
              updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own'",
         params![project_id, frame_uuid, hub_xxh3, hub_byte_size],
-    )?)
+    )?;
+    if n > 0 {
+        set_local_state(conn, project_id, frame_uuid, LocalState::OwnMissing)?;
+    }
+    sp.commit()?;
+    Ok(n)
 }
 
 /// Bind an own frame the hub already knows (a manifest-delivered row, or one
 /// the hub refused as "already announced") to the local frame it was
 /// generated from: `source_frame_id`, `landed_path`, `recipe_hash`,
-/// `size_mtime_seen`, `on_disk = 1`. Column-targeted — hub-owned columns
-/// survive. Returns the rows touched.
+/// `size_mtime_seen`, and `own_held` through [`set_local_state`] (one
+/// savepoint with the column write, T1/T6 ruling — a manifest-first
+/// `own_missing` row gets its outbox `add`). Column-targeted — hub-owned
+/// columns survive. Returns the rows touched.
 pub fn adopt_own(
     conn: &Connection,
     project_id: &str,
@@ -903,10 +966,11 @@ pub fn adopt_own(
     recipe_hash: &str,
     size_mtime_seen: Option<&str>,
 ) -> Result<usize> {
-    Ok(conn.execute(
+    let sp = crate::db::operations::SavepointGuard::new(conn, "adopt_own")?;
+    let n = conn.execute(
         "UPDATE project_frames_local
          SET source_frame_id = ?3, landed_path = ?4, recipe_hash = ?5, size_mtime_seen = ?6,
-             on_disk = 1, awaiting_gc = 0, last_error = NULL, updated_at = datetime('now')
+             awaiting_gc = 0, last_error = NULL, updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own'",
         params![
             project_id,
@@ -916,7 +980,90 @@ pub fn adopt_own(
             recipe_hash,
             size_mtime_seen
         ],
-    )?)
+    )?;
+    if n > 0 {
+        set_local_state(conn, project_id, frame_uuid, LocalState::OwnHeld)?;
+    }
+    sp.commit()?;
+    Ok(n)
+}
+
+/// Move a row to its origin's servable state (`own_held` / `held`) through
+/// [`set_local_state`]. `own_only` refuses to touch a replica row (the
+/// own-frame writers are never meant for one) — logged, not an error.
+fn move_to_servable(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    own_only: bool,
+) -> Result<()> {
+    let origin: Option<String> = conn
+        .query_row(
+            "SELECT origin FROM project_frames_local WHERE project_id = ?1 AND frame_uuid = ?2",
+            params![project_id, frame_uuid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let to = match origin.as_deref().map(FrameOrigin::from_db_str) {
+        None => return Ok(()),
+        Some(FrameOrigin::Own) => LocalState::OwnHeld,
+        Some(FrameOrigin::Replica) if own_only => {
+            tracing::warn!(
+                project_id,
+                frame_uuid,
+                "own-frame write on a replica row; local state left alone"
+            );
+            return Ok(());
+        }
+        Some(FrameOrigin::Replica) => LocalState::Held,
+    };
+    set_local_state(conn, project_id, frame_uuid, to)?;
+    Ok(())
+}
+
+/// Make sure a servable row's CURRENT content version is in this device's
+/// claim set, through the outbox when it is not (collision C24: in the
+/// caller's transaction). The publish path's adoptions need it (R8a/R8b): the
+/// hub may hold no claim of this device for a frame another device of the
+/// same account announced, and an adopted row that was already `own_held`
+/// makes no servability flip. Returns the journal sequence written, `None`
+/// when the claim set already agreed (or the row is not servable / absent).
+pub fn ensure_claimed(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+) -> Result<Option<i64>> {
+    let Some((state, cv)): Option<(Option<String>, i32)> = conn
+        .query_row(
+            "SELECT local_state, content_version FROM project_frames_local WHERE project_id = ?1 AND frame_uuid = ?2",
+            params![project_id, frame_uuid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    if !LocalState::from_db_str(state.as_deref().unwrap_or("wanted")).servable() {
+        return Ok(None);
+    }
+    let claimed: Option<i32> = conn
+        .query_row(
+            "SELECT content_version FROM collab_my_claims WHERE project_id = ?1 AND frame_uuid = ?2",
+            params![project_id, frame_uuid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if claimed == Some(cv) {
+        return Ok(None);
+    }
+    Ok(Some(crate::db::collab_live::record_claim_change(
+        conn,
+        project_id,
+        frame_uuid,
+        crate::db::collab_live::ClaimOp::Add {
+            content_version: cv,
+        },
+    )?))
 }
 
 /// Every project id cached on this device — the scope the scanner's
@@ -1361,5 +1508,211 @@ mod tests {
         let row = get(&conn, "p1", "u4").unwrap().unwrap();
         assert_eq!(row.local_state, LocalState::OwnHeld);
         assert!(row.on_disk);
+    }
+
+    fn own_manifest_row(c: &Connection, uuid: &str) {
+        let mut v = view(uuid, 1);
+        v.own = true;
+        upsert_from_manifest(c, "p1", &v).unwrap();
+    }
+
+    fn state_of(c: &Connection, uuid: &str) -> (LocalState, bool) {
+        let r = get(c, "p1", uuid).unwrap().unwrap();
+        (r.local_state, r.on_disk)
+    }
+
+    /// T1/T6 ruling: every publish-path writer of an own row's disk state
+    /// moves it through `set_local_state` — `on_disk` follows the state, and a
+    /// servability flip writes its claim + outbox row in the same savepoint.
+    #[test]
+    fn publish_writers_move_own_rows_through_the_state_machine() {
+        use crate::db::collab_live::{my_claims, outbox, outbox_len, ClaimOp};
+        let c = conn();
+        own_manifest_row(&c, "u1");
+        assert_eq!(state_of(&c, "u1"), (LocalState::OwnMissing, false));
+
+        // adopt: own_missing → own_held, outbox add of the current version
+        assert_eq!(
+            adopt_own(&c, "p1", "u1", 7, "/c/u1.fits", "r0", Some("1:2")).unwrap(),
+            1
+        );
+        assert_eq!(state_of(&c, "u1"), (LocalState::OwnHeld, true));
+        assert_eq!(my_claims(&c, "p1").unwrap(), vec![("u1".to_string(), 1)]);
+        assert_eq!(outbox_len(&c, "p1").unwrap(), 1);
+
+        // stage: stays own_held, no claim change
+        assert_eq!(
+            stage_own_file(
+                &c,
+                "p1",
+                "u1",
+                "/c/u1.fits",
+                "0123456789abcdee",
+                101,
+                Some("101:3")
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(state_of(&c, "u1"), (LocalState::OwnHeld, true));
+        assert_eq!(outbox_len(&c, "p1").unwrap(), 1);
+        // a stage at another path touches nothing
+        assert_eq!(
+            stage_own_file(&c, "p1", "u1", "/elsewhere.fits", "x", 1, None).unwrap(),
+            0
+        );
+
+        // set_own_version on a held row: no flip, no outbox row (the new
+        // version's claim is the hub's implicit one, the caller's to add)
+        assert_eq!(
+            set_own_version(
+                &c,
+                "p1",
+                "u1",
+                2,
+                &"c".repeat(64),
+                "0123456789abcdee",
+                101,
+                "r1",
+                Some("101:3")
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(state_of(&c, "u1"), (LocalState::OwnHeld, true));
+        assert_eq!(outbox_len(&c, "p1").unwrap(), 1);
+
+        // unstage: own_missing, the claim leaves through the outbox
+        assert_eq!(
+            unstage_own_file(&c, "p1", "u1", "0123456789abcdef", 100).unwrap(),
+            1
+        );
+        assert_eq!(state_of(&c, "u1"), (LocalState::OwnMissing, false));
+        assert!(my_claims(&c, "p1").unwrap().is_empty());
+        let rows = outbox(&c, "p1").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].op, ClaimOp::Remove);
+
+        // set_own_version on a missing row lifts it back with the NEW version
+        set_own_version(
+            &c,
+            "p1",
+            "u1",
+            3,
+            &"d".repeat(64),
+            "0123456789abcdee",
+            101,
+            "r2",
+            None,
+        )
+        .unwrap();
+        assert_eq!(state_of(&c, "u1"), (LocalState::OwnHeld, true));
+        assert_eq!(my_claims(&c, "p1").unwrap(), vec![("u1".to_string(), 3)]);
+
+        // a replica row is never touched by the own-frame writers' state move
+        upsert_from_manifest(&c, "p1", &view("u2", 1)).unwrap();
+        set_own_version(
+            &c,
+            "p1",
+            "u2",
+            2,
+            &"e".repeat(64),
+            "0123456789abcdee",
+            1,
+            "r",
+            None,
+        )
+        .unwrap();
+        assert_eq!(state_of(&c, "u2").0, LocalState::Wanted);
+    }
+
+    #[test]
+    fn ensure_claimed_adds_only_a_missing_or_stale_claim_of_a_servable_row() {
+        use crate::db::collab_live::{add_implicit_claim, my_claims, outbox_len};
+        let c = conn();
+        own_manifest_row(&c, "u1");
+        // not servable → nothing
+        assert_eq!(ensure_claimed(&c, "p1", "u1").unwrap(), None);
+        let mut row = get(&c, "p1", "u1").unwrap().unwrap();
+        row.on_disk = true;
+        row.landed_path = Some("/c/u1.fits".into());
+        record_own(&c, &row).unwrap();
+        // own_held without a claim → one outbox add
+        assert!(ensure_claimed(&c, "p1", "u1").unwrap().is_some());
+        assert_eq!(my_claims(&c, "p1").unwrap(), vec![("u1".to_string(), 1)]);
+        assert_eq!(ensure_claimed(&c, "p1", "u1").unwrap(), None);
+        // a stale version in the claim set → re-added at the row's version
+        add_implicit_claim(&c, "p1", "u1", 7).unwrap();
+        assert!(ensure_claimed(&c, "p1", "u1").unwrap().is_some());
+        assert_eq!(my_claims(&c, "p1").unwrap(), vec![("u1".to_string(), 1)]);
+        assert_eq!(outbox_len(&c, "p1").unwrap(), 2);
+        assert_eq!(ensure_claimed(&c, "p1", "nope").unwrap(), None);
+    }
+
+    /// T1 minor carried by Task 6: `record_own` is for new rows, and a
+    /// manifest-assigned `frame_seq` survives a row argument without one.
+    #[test]
+    fn record_own_keeps_a_manifest_frame_seq() {
+        let c = conn();
+        let mut v = view("u1", 1);
+        v.own = true;
+        v.frame_seq = 12;
+        upsert_from_manifest(&c, "p1", &v).unwrap();
+        let mut row = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(row.frame_seq, Some(12));
+        row.frame_seq = None;
+        row.on_disk = true;
+        record_own(&c, &row).unwrap();
+        assert_eq!(get(&c, "p1", "u1").unwrap().unwrap().frame_seq, Some(12));
+        // an explicit value still wins
+        row.frame_seq = Some(13);
+        record_own(&c, &row).unwrap();
+        assert_eq!(get(&c, "p1", "u1").unwrap().unwrap().frame_seq, Some(13));
+    }
+
+    /// T1 minor carried by Task 6: the interim state writers stamp
+    /// `state_changed_at` when (and only when) the state moves.
+    #[test]
+    fn interim_writers_stamp_state_changed_at_on_a_move() {
+        let c = conn();
+        upsert_from_manifest(&c, "p1", &view("u1", 1)).unwrap();
+        let stamp = |c: &Connection| -> Option<String> {
+            c.query_row(
+                "SELECT state_changed_at FROM project_frames_local WHERE frame_uuid = 'u1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(stamp(&c).is_some(), "a new manifest row is stamped");
+        let reset = |c: &Connection| {
+            c.execute(
+                "UPDATE project_frames_local SET state_changed_at = 'old'",
+                [],
+            )
+            .unwrap();
+        };
+        reset(&c);
+        set_landed(&c, "p1", "u1", "/l/u1.fits", "1:1").unwrap();
+        assert_ne!(stamp(&c).as_deref(), Some("old"), "wanted → held");
+        reset(&c);
+        set_landed(&c, "p1", "u1", "/l/u1.fits", "1:2").unwrap();
+        assert_eq!(stamp(&c).as_deref(), Some("old"), "held → held is no move");
+        set_missing(&c, "p1", "u1", false).unwrap();
+        assert_ne!(stamp(&c).as_deref(), Some("old"), "held → missing");
+        reset(&c);
+        set_declined(&c, "p1", &["u1".to_string()], true).unwrap();
+        assert_ne!(stamp(&c).as_deref(), Some("old"), "missing → not_kept");
+        assert_eq!(
+            get(&c, "p1", "u1").unwrap().unwrap().local_state,
+            LocalState::NotKept
+        );
+        reset(&c);
+        set_declined(&c, "p1", &["u1".to_string()], true).unwrap();
+        assert_eq!(
+            stamp(&c).as_deref(),
+            Some("old"),
+            "not_kept → not_kept is no move"
+        );
     }
 }

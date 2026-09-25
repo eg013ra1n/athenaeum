@@ -78,32 +78,61 @@ pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// The device's current journal counter, `0` when never set. A stored value
-/// that fails to parse is NEVER silently treated as merely "unset" — it is
-/// logged (never swallowed, CLAUDE.md rule) and treated as lost, exactly like
-/// a missing row: the caller's session start-up then calls
-/// [`raise_report_seq`] with the hub's `hello.reportSeq`, which recovers the
-/// counter to at least that value (never lower than what a live hub already
-/// saw from us).
+/// The highest journal sequence still in the outbox (any project), `0` when
+/// the outbox is empty — the floor a lost or corrupt counter recovers to.
+fn max_outbox_seq(conn: &Connection) -> Result<i64> {
+    Ok(
+        conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM collab_outbox", [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
+/// The device's current journal counter, `0` when never set (and the outbox
+/// is empty). A stored value that fails to parse is NEVER silently treated as
+/// merely "unset" — it is logged (never swallowed, CLAUDE.md rule) and
+/// recovered to the highest sequence still in the outbox (T1 ruling carried
+/// by Task 6): every outbox row took its sequence from this counter, so the
+/// counter is at least that high, and the caller's session start-up then
+/// raises it further to `hello.reportSeq` ([`raise_report_seq`]) — never
+/// lower than what a live hub already saw from us.
 pub fn current_report_seq(conn: &Connection) -> Result<i64> {
     match meta_get(conn, META_REPORT_SEQ)? {
-        None => Ok(0),
+        None => max_outbox_seq(conn),
         Some(v) => match v.parse::<i64>() {
             Ok(n) => Ok(n),
             Err(error) => {
-                tracing::error!(value = %v, %error, "report_seq value unparseable, treating as lost");
-                Ok(0)
+                let recovered = max_outbox_seq(conn)?;
+                tracing::error!(value = %v, %error, report_seq = recovered, "report_seq value unparseable; recovering it from the outbox");
+                Ok(recovered)
             }
         },
     }
 }
 
 /// The next journal sequence (hub rule: one monotonically increasing counter
-/// per device, never reused, surviving restarts).
+/// per device, never reused, surviving restarts). ONE atomic
+/// `UPSERT … RETURNING` (T1 ruling carried by Task 6): two pooled
+/// connections can never both read `n` and both hand out `n + 1`. A corrupt
+/// stored value recovers inside the same statement to the outbox's highest
+/// sequence (see [`current_report_seq`]), and is logged first.
 pub fn next_report_seq(conn: &Connection) -> Result<i64> {
-    let next = current_report_seq(conn)? + 1;
-    meta_set(conn, META_REPORT_SEQ, &next.to_string())?;
-    Ok(next)
+    if let Some(v) = meta_get(conn, META_REPORT_SEQ)? {
+        if let Err(error) = v.parse::<i64>() {
+            tracing::error!(value = %v, %error, "report_seq value unparseable; recovering it from the outbox");
+        }
+    }
+    Ok(conn.query_row(
+        "INSERT INTO collab_live_meta (key, value)
+         VALUES (?1, CAST((SELECT COALESCE(MAX(seq), 0) FROM collab_outbox) + 1 AS TEXT))
+         ON CONFLICT(key) DO UPDATE SET value = CAST(
+             (CASE WHEN value <> '' AND value NOT GLOB '*[^0-9]*'
+                   THEN CAST(value AS INTEGER)
+                   ELSE (SELECT COALESCE(MAX(seq), 0) FROM collab_outbox) END) + 1 AS TEXT)
+         RETURNING CAST(value AS INTEGER)",
+        [META_REPORT_SEQ],
+        |r| r.get(0),
+    )?)
 }
 
 /// Raise the counter to at least `at_least` (a `hello.reportSeq` above ours
@@ -459,12 +488,37 @@ mod tests {
     #[test]
     fn a_corrupt_report_seq_value_is_never_silently_swallowed() {
         let conn = conn_with_project();
+        for u in ["u1", "u2", "u3"] {
+            record_claim_change(&conn, "p1", u, ClaimOp::Add { content_version: 1 }).unwrap();
+        }
         meta_set(&conn, META_REPORT_SEQ, "not-a-number").unwrap();
-        // Never panics, never propagates a parse error — treated as lost (0),
-        // relying on the caller's `raise_report_seq(hello.reportSeq)` to
-        // recover it to at least what the hub already saw from us.
-        assert_eq!(current_report_seq(&conn).unwrap(), 0);
+        // Never panics, never propagates a parse error, never falls back to
+        // 0 — it recovers to the highest sequence still in the outbox, so
+        // the next sequence can never collide with a pending row.
+        assert_eq!(current_report_seq(&conn).unwrap(), 3);
+        assert_eq!(next_report_seq(&conn).unwrap(), 4);
+        assert_eq!(next_report_seq(&conn).unwrap(), 5);
+        // an empty outbox and a corrupt value → 1
+        conn.execute("DELETE FROM collab_outbox", []).unwrap();
+        meta_set(&conn, META_REPORT_SEQ, "12abc").unwrap();
         assert_eq!(next_report_seq(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn next_report_seq_is_one_statement_over_two_connections() {
+        // Two connections to one file database: the counter never hands out
+        // the same sequence twice, interleaved.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.db");
+        let a = Connection::open(&path).unwrap();
+        init_db(&a).unwrap();
+        let b = Connection::open(&path).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            assert!(seen.insert(next_report_seq(&a).unwrap()));
+            assert!(seen.insert(next_report_seq(&b).unwrap()));
+        }
+        assert_eq!(current_report_seq(&a).unwrap(), 40);
     }
 
     #[test]
