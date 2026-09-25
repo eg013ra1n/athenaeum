@@ -1069,6 +1069,11 @@ pub struct DiskTruth {
     /// Present frames seeded again because no seed tag of theirs was left
     /// (final review I2, defence in depth).
     pub reseeded: Vec<String>,
+    /// Rows this pass skipped outright because their `local_state` is `idle`
+    /// (fix round 1, Important #2): not in replication scope right now, so a
+    /// stale `landed_path`/`on_disk = 0` from before a caps exclusion or an
+    /// unaccepted state is left alone rather than re-admitted.
+    pub skipped_idle: usize,
 }
 
 /// What one [`fetch_frames`] call did.
@@ -1451,6 +1456,16 @@ pub(crate) async fn disk_truth(
         };
         let path = Path::new(&landed);
         if !row.on_disk {
+            if row.local_state == crate::db::collab_frames::LocalState::Idle {
+                // Not in replication scope right now (caps-excluded, not yet
+                // accepted/published) — the wave-3 backfill (Task 1) can
+                // leave one of these with a stale `landed_path` from before
+                // the exclusion. Re-admitting it would flip it to `held` and
+                // re-hash a file nobody wants served; leave it alone.
+                tracing::debug!(project_id, frame_uuid = %row.frame_uuid, "disk truth: skipping an idle row");
+                truth.skipped_idle += 1;
+                continue;
+            }
             if row.locally_declined || !inside_root(root.as_deref(), &row, path) {
                 continue;
             }
@@ -6078,6 +6093,43 @@ mod tests {
             assert!(!rows[0].on_disk);
             assert!(!rows[0].awaiting_gc);
             assert!(frame_need(&rows, &ReplicationPolicy::default(), true, true, false).is_empty());
+        }
+
+        /// Fix round 1, Important #2: a replica the wave-3 backfill (Task 1)
+        /// left `idle` — not in replication scope right now — with a stale
+        /// `landed_path`/`on_disk = 0` from before the exclusion must NOT be
+        /// re-admitted just because its old file still sits at that path
+        /// with matching size/xxh3. Without the skip, `readmit` would seed
+        /// it, hash it and flip it back to `held`/`on_disk = 1` — serving a
+        /// file nobody wants served.
+        #[tokio::test]
+        async fn idle_landed_replica_is_never_readmitted_or_rehashed() {
+            let r = rfx("send_receive").await;
+            let node = bind_receiver(&r).await;
+            let path = land_file(&r, "f1", FrameOrigin::Replica, &pattern(1, 4096));
+            frames_db::set_local_state(&db(&r.ctx).unwrap().conn(), PID, "f1", LocalState::Idle)
+                .unwrap();
+            let before = row(&r.ctx, "f1").unwrap();
+            assert_eq!(before.local_state, LocalState::Idle);
+            assert!(!before.on_disk, "set_local_state keeps on_disk == servable");
+
+            let truth = disk_truth(&r.ctx, PID).await.unwrap();
+            assert_eq!(truth.skipped_idle, 1, "{truth:?}");
+            assert_eq!(
+                truth.rehashed, 0,
+                "an idle row is never opened, let alone hashed"
+            );
+            assert!(truth.present.is_empty());
+            assert!(truth.missing_replicas.is_empty());
+
+            let after = row(&r.ctx, "f1").unwrap();
+            assert_eq!(after.local_state, LocalState::Idle);
+            assert!(!after.on_disk, "still idle: never readmitted");
+            assert!(
+                std::fs::metadata(&path).is_ok(),
+                "the file itself is untouched"
+            );
+            node.shutdown().await;
         }
 
         // ── the loss guard ───────────────────────────────────────────────────

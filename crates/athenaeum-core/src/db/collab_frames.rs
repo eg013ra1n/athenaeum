@@ -261,7 +261,7 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
              publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3,
              blake3, holder_count, manifest_version, manifest_json, local_state, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 CASE WHEN ?4 = 'own' THEN 'own_held'
+                 CASE WHEN ?4 = 'own' THEN 'own_missing'
                       WHEN ?9 = 'published' AND ?10 = 1 THEN 'wanted'
                       ELSE 'idle' END,
                  datetime('now'))
@@ -1284,5 +1284,30 @@ mod tests {
             get(&conn, "p1", "u3").unwrap().unwrap().local_state,
             LocalState::Idle
         );
+    }
+
+    /// Fix round 1, Important #1: a manifest-first own row (R8a — this
+    /// account's own frame, published from another device, arrives here
+    /// before the local publish/adopt path ever runs, e.g. a rebuilt local
+    /// DB) must NOT claim a servable state it can't back. It starts
+    /// `own_missing`/`on_disk = 0`; only [`record_own`] (once the bytes
+    /// really land) moves it to `own_held`/`on_disk = 1`.
+    #[test]
+    fn manifest_first_own_row_starts_own_missing_then_record_own_lands_it() {
+        let conn = conn();
+        let mut v = view("u4", 1);
+        v.own = true;
+        upsert_from_manifest(&conn, "p1", &v).unwrap();
+        let row = get(&conn, "p1", "u4").unwrap().unwrap();
+        assert_eq!(row.local_state, LocalState::OwnMissing);
+        assert!(!row.on_disk);
+
+        let mut landed = row;
+        landed.landed_path = Some("/collab/m31/me/c_u4.fits".into());
+        landed.on_disk = true;
+        record_own(&conn, &landed).unwrap();
+        let row = get(&conn, "p1", "u4").unwrap().unwrap();
+        assert_eq!(row.local_state, LocalState::OwnHeld);
+        assert!(row.on_disk);
     }
 }
