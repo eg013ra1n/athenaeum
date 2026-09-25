@@ -300,6 +300,22 @@ pub fn set_holder_seq(
     )?)
 }
 
+/// Reset the holder cursor to "no local holder map" (`-1`) WITHOUT touching
+/// `feed_epoch` (fix round 2, item 2). An epoch reload's holder-side snapshot
+/// must load fresh BEFORE anything stamps the new epoch: `feed_epoch` moves
+/// only in the caller's own final `set_feed_version` write, once the holder
+/// reload and the own-frame re-announce have both already succeeded — never
+/// bundled into the same write as this reset, or a failure between the two
+/// would leave the epoch already moved while the reload it named never
+/// actually finished (the exact bug `set_holder_seq`'s combined write caused
+/// here before this fix).
+pub fn reset_holder_seq(conn: &Connection, project_id: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE collab_projects SET holder_seq = -1 WHERE project_id = ?1",
+        params![project_id],
+    )?)
+}
+
 /// Set the LOCAL replication policy (JSON, e.g. `{"mode":"all"}`). The ONLY
 /// writer of `policy_json`.
 pub fn set_policy(conn: &Connection, project_id: &str, policy_json: &str) -> Result<()> {
@@ -674,6 +690,25 @@ mod tests {
             (row.feed_epoch.as_deref(), row.holder_seq),
             (Some("epoch-1"), 3),
             "the live-feed cursor must survive the poll"
+        );
+    }
+
+    /// Fix round 2, item 2: `reset_holder_seq` touches ONLY `holder_seq` —
+    /// `feed_epoch` must survive untouched, unlike `set_holder_seq`.
+    #[test]
+    fn reset_holder_seq_never_touches_feed_epoch() {
+        let conn = test_conn();
+        upsert_project(&conn, &sample_row("p-1")).unwrap();
+        set_holder_seq(&conn, "p-1", "epoch-1", 3).unwrap();
+
+        reset_holder_seq(&conn, "p-1").unwrap();
+
+        let row = get_project(&conn, "p-1").unwrap().unwrap();
+        assert_eq!(row.holder_seq, -1, "holder_seq reset");
+        assert_eq!(
+            row.feed_epoch.as_deref(),
+            Some("epoch-1"),
+            "feed_epoch untouched by the reset"
         );
     }
 

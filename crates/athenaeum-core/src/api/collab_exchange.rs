@@ -235,16 +235,20 @@ pub async fn sync_manifest(
 
 /// Refetch the whole manifest from 0 and prune rows the hub no longer lists
 /// (own rows are never pruned, `delete_not_in`). Returns every uuid the hub
-/// listed — the epoch path compares it with the own rows (plan P25).
+/// listed (the epoch path compares it with the own rows, plan P25) and the
+/// manifest's own freshly-fetched `projectVersion` — fix round 2, item 6:
+/// a caller's cursor fallback must read THIS value, never a pre-update DB
+/// row, which can itself be stale (the same bug class as C1, just reached
+/// through a caller-supplied fallback instead of `max_mv`).
 pub(crate) async fn sync_manifest_full(
     ctx: &ServiceContext,
     project_id: &str,
     emitter: Option<&dyn ProgressEmitter>,
     vouched_version: Option<i64>,
-) -> Result<HashSet<String>, ApiError> {
-    let (_changes, seen, _project_version) =
+) -> Result<(HashSet<String>, i64), ApiError> {
+    let (_changes, seen, project_version) =
         sync_manifest_inner(ctx, project_id, emitter, vouched_version, true).await?;
-    Ok(seen)
+    Ok((seen, project_version))
 }
 
 /// The lock for one project's manifest syncs, keyed by hub + project.
