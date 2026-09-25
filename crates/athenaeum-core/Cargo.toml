@@ -222,3 +222,6 @@ wiremock = "0.6"
 # (wave 3): already in `Cargo.lock` transitively (axum-based web server), pinned
 # directly here as a dev-only front end.
 axum = "0.8"
+# The fake hub's axum front binds a `TcpListener`; core's own tokio (above)
+# has no "net" feature, so add it here, dev-only.
+tokio = { version = "1", features = ["net"] }

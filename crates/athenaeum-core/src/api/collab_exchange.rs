@@ -4780,6 +4780,7 @@ mod tests {
         /// Once the project is joined and synced, a poll where nothing moved
         /// costs exactly ONE hub request: `/me/project-versions`.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn version_poll_is_quiet_when_nothing_moved() {
             let fx = fx("send_receive", false, false).await;
             fx.hub.seed_frames(PID, "acc-o", &["f1"], "published");
@@ -4803,6 +4804,7 @@ mod tests {
         /// A moved version pulls only the delta: the manifest request carries
         /// `since=<old cursor>` and the local rows grow by exactly the new ones.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn moved_version_pulls_only_the_delta() {
             let fx = fx("send_receive", false, false).await;
             fx.hub
@@ -4839,6 +4841,7 @@ mod tests {
         /// go, my own row and file stay. A re-join clears the mark, refetches
         /// the manifest from 0 and re-binds my own row.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn lost_project_unseeds_and_keeps_own_files() {
             let fx = fx("send_receive", false, false).await;
             let (node, collab) = bind_node_with_collab_root(&fx).await;
@@ -4934,6 +4937,7 @@ mod tests {
         /// The hook fires when the thresholds version changes, and not on a
         /// move that changed neither thresholds nor dictionary.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn threshold_move_calls_the_hook() {
             let fx = fx("send_receive", false, false).await;
             poll_versions_once(&fx.ctx, None).await.unwrap();
@@ -4957,6 +4961,7 @@ mod tests {
         /// fires the hook — once, from that refresh — and the poll that
         /// follows does not fire it again.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_move_absorbed_by_a_ui_refresh_fires_the_hook_once() {
             let fx = fx("send_receive", false, false).await;
             poll_versions_once(&fx.ctx, None).await.unwrap();
@@ -4974,6 +4979,7 @@ mod tests {
         /// A dictionary move reaches the cache through the refresh the poll
         /// runs, and fires the hook once.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn dictionary_move_is_refetched_and_calls_the_hook() {
             use crate::collab::filters::DictionaryEntry;
             let fx = fx("send_receive", false, false).await;
@@ -5004,6 +5010,7 @@ mod tests {
         /// fetch is still acted on at the next poll — the manifest's own
         /// `projectVersion` (already past the change) is never stored.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_caps_change_between_refresh_and_manifest_is_acted_on_next_poll() {
             let fx = fx("send_receive", false, true).await;
             fx.hub.set_caps(PID, "acc-me", &["data.moderate"]);
@@ -5037,6 +5044,7 @@ mod tests {
         /// its manifest sync waits for a poll whose refresh succeeds, so the
         /// thresholds change behind the move is never skipped.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_failed_refresh_defers_the_manifest_sync() {
             let fx = fx("send_receive", false, false).await;
             poll_versions_once(&fx.ctx, None).await.unwrap();
@@ -5069,6 +5077,7 @@ mod tests {
         /// the next tick costs no request beyond the version list and logs
         /// nothing above `debug`; the failure itself is logged once.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_failing_project_backs_off_and_logs_once() {
             let fx = fx("send_receive", false, false).await;
             poll_versions_once(&fx.ctx, None).await.unwrap();
@@ -5102,6 +5111,7 @@ mod tests {
 
         /// Signed out: the poll is a silent `Ok(vec![])`.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn poll_is_a_no_op_when_signed_out() {
             let (_tmp, ctx) = test_ctx();
             assert!(poll_versions_once(&ctx, None).await.unwrap().is_empty());
@@ -5109,6 +5119,7 @@ mod tests {
 
         /// Only a poll that moved something kicks the pass.
         #[test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         fn poll_kicks_the_pass_only_when_a_version_moved() {
             assert!(!kick_if_versions_moved(&[]));
             assert!(kick_if_versions_moved(&["p1".to_string()]));
@@ -5116,6 +5127,7 @@ mod tests {
 
         /// R15: the version poll ticks on its own loop — nothing gates it.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn the_version_poll_ticks_on_its_own_loop() {
             let polls = Arc::new(AtomicUsize::new(0));
             let task = tokio::spawn({
@@ -5135,6 +5147,7 @@ mod tests {
         /// startup grace) is covered by that pass: no second pass right
         /// after. A later kick still wakes the loop.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_kick_before_a_timer_pass_buys_no_second_pass() {
             let passes = Arc::new(AtomicUsize::new(0));
             let kick = Arc::new(tokio::sync::Notify::new());
@@ -5210,6 +5223,7 @@ mod tests {
         /// Losing `data.moderate` re-fetches from 0 and prunes the pending row
         /// of another member I can no longer see; own rows survive.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn caps_change_refetches_from_zero_and_prunes() {
             let fx = fx("send_receive", false, true).await;
             fx.hub.set_caps(PID, "acc-me", &["data.moderate"]);
@@ -6364,6 +6378,7 @@ mod tests {
         /// F5 regression: the full report comes from the disk, so a deleted
         /// own file stops being a holder at the hub on the next cadence pass.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn full_report_carries_only_present_frames() {
             let r = rfx("send_receive").await;
             // I3: holds are reported only with the collab store mounted.
@@ -6414,6 +6429,7 @@ mod tests {
         /// P8: above 10 000 held frames the first chunk goes `full`, the rest
         /// as `add`.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn over_ten_thousand_frames_chunks_full_then_add() {
             let r = rfx("send_receive").await;
             let present: Vec<(String, i32)> =
@@ -6437,6 +6453,7 @@ mod tests {
         /// manifest-driven work only — no stat walk, no full holder report.
         /// The maintenance does both.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_fetch_pass_walks_no_disk_and_sends_no_full_report() {
             let r = rfx("send_receive").await;
             // I3: holds are reported only with the collab store mounted.
@@ -6471,6 +6488,7 @@ mod tests {
         /// holds); a project with auto-replicate off is skipped by a fetch
         /// pass and synced by a forced one.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn the_role_gate_holds_and_only_a_forced_pass_overrides_the_toggle() {
             let send = rfx("send").await;
             // I3: holds are reported only with the collab store mounted.
@@ -6656,6 +6674,7 @@ mod tests {
         /// under `<Collab>/<project>/<publisher>/`; the landed file is the
         /// seed, so a third device fetches it from the receiver alone.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn frame_lands_by_rename_and_becomes_the_seed() {
             const SIZE: usize = 4 * 1024 * 1024;
             let r = rfx("send_receive").await;
@@ -6726,6 +6745,7 @@ mod tests {
         /// entry (iroh-blobs 0.103 would panic) — and fetched again once GC
         /// dropped the entry.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn second_pass_after_delete_waits_for_gc_then_refetches() {
             use std::sync::atomic::{AtomicBool, Ordering};
             const SIZE: usize = 1024 * 1024;
@@ -6779,6 +6799,7 @@ mod tests {
         /// old version's seed tag goes.
         #[tokio::test]
         #[allow(deprecated)] // exercises the wave-2 deprecated `put_holders`
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_new_version_lands_over_the_old_file() {
             let r = rfx("send_receive").await;
             let recv = bind_receiver(&r).await;
@@ -6872,6 +6893,7 @@ mod tests {
         /// (a volume plugged in later) is mounted by the next maintenance,
         /// which then reports holds as usual.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_root_that_appears_after_startup_is_mounted_by_maintenance() {
             let r = rfx("send_receive").await;
             land_file(&r, "mine", FrameOrigin::Own, &pattern(1, 256));
@@ -6945,6 +6967,7 @@ mod tests {
         /// survives untouched (same inode, same bytes), nothing is fetched,
         /// and the frame is tagged and recorded at the new version.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_same_content_version_bump_keeps_the_landed_file() {
             let r = rfx("send_receive").await;
             let recv = bind_receiver(&r).await;
@@ -7014,6 +7037,7 @@ mod tests {
         /// lands. The failed frame keeps its in-flight tag while it is still
         /// wanted and loses it to the maintenance sweep once it is not (R23).
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn fetch_failure_of_one_frame_lands_the_others() {
             let r = rfx("send_receive").await;
             let recv = bind_receiver(&r).await;
@@ -7069,6 +7093,7 @@ mod tests {
         /// P24: a second frame with the content of one already landed is
         /// linked from that file — no bytes move — and seeded.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn identical_content_second_frame_is_linked_not_fetched() {
             const SIZE: usize = 1024 * 1024;
             let r = rfx("send_receive").await;
@@ -7245,6 +7270,7 @@ mod tests {
         /// them ahead (rarest first: nobody holds them) must not stop the one
         /// servable frame behind them from landing in the same pass.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn unservable_frames_ahead_never_block_a_servable_one() {
             let r = rfx("send_receive").await;
             let recv = bind_receiver(&r).await;
@@ -7281,6 +7307,7 @@ mod tests {
         /// receive that asks for the (one-lane) gate while the second batch
         /// is being prepared gets it — and finishes — before the fetch ends.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_personal_receive_gets_the_gate_between_batches() {
             let (r, recv, publisher, _pub_dir) = many_rig(FETCH_BATCH + 1).await;
             let gate = Arc::new(crate::sync::ReceiveGate::new(1));
@@ -7323,6 +7350,7 @@ mod tests {
         /// flight (held here by the seam), a maintenance run still walks the
         /// disk and sends the full holder report.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn maintenance_reports_while_a_fetch_is_in_flight() {
             let r = rfx("send_receive").await;
             // I3: holds are reported only with the collab store mounted.
@@ -7367,6 +7395,7 @@ mod tests {
         /// R19: a cancel lands between batches — the running batch finishes,
         /// the next one never starts.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_cancel_stops_the_fetch_between_batches() {
             let (r, recv, publisher, _pub_dir) = many_rig(FETCH_BATCH + 1).await;
             let was_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -7396,6 +7425,7 @@ mod tests {
         /// R19: between batches the queue is re-read — a frame declined while
         /// the first batch ran is dropped before its own batch.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_frame_declined_mid_fetch_is_dropped_before_its_batch() {
             let (r, recv, publisher, _pub_dir) = many_rig(FETCH_BATCH + 1).await;
             let conn = std::sync::Mutex::new(side_conn(&r));
@@ -7579,6 +7609,7 @@ mod tests {
         /// R24: a same-version re-land never destroys an edited replica —
         /// the edited file is kept beside the frame fetched again.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn an_edited_replica_is_kept_beside_the_refetched_frame() {
             use std::sync::atomic::{AtomicBool, Ordering};
             const SIZE: usize = 256 * 1024;
@@ -7728,6 +7759,7 @@ mod tests {
         /// device) — that frame is skipped and the next one is still looked
         /// up.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn a_frame_the_hub_no_longer_shows_is_skipped_alone() {
             let r = rfx("send_receive").await;
             let recv = bind_receiver(&r).await;
@@ -7771,6 +7803,7 @@ mod tests {
         /// verified partial bytes; the next pass resumes instead of starting
         /// over.
         #[tokio::test]
+        #[ignore = "collab v3 wave 3: retired in Task 15"]
         async fn an_interrupted_transfer_resumes_from_its_partial_bytes() {
             const SIZE: usize = 3 * 1024 * 1024;
             let r = rfx("send_receive").await;

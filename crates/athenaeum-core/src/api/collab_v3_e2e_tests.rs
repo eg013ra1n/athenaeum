@@ -929,6 +929,7 @@ async fn step9_export_carries_on_disk_accepted_frames(w: &World, declined: &Hash
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "collab v3 wave 3: retired in Task 15"]
 async fn three_instances_exchange_frames_with_one_copy_per_machine() {
     let mut w = step1_rig().await;
     step2_a_publishes(&mut w).await;

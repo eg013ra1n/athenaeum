@@ -1,15 +1,19 @@
-//! A stateful, in-process fake of the hub's collab v3 api (plan P16), for
-//! tests only.
+//! A stateful, in-process fake of the hub's collab v3 live-exchange api (plan
+//! P16, P32, § Hub contract), for tests only.
 //!
 //! ONE `FakeHub` can serve up to three app contexts at once: each context
 //! signs in with its own device token, and the fake resolves that token to an
-//! account and a device. State lives in one `Arc<Mutex<FakeHubState>>` behind
-//! a single catch-all wiremock responder, so tests can both drive the hub
-//! through its HTTP routes (as the app does) and reach into its state
+//! account and a device. State lives in one `Arc<Mutex<FakeHubState>>`,
+//! reachable two ways: a wiremock catch-all responder answers every REST call
+//! exactly as the hub does, and a small axum front sits in front of it,
+//! terminating the SSE event stream and the presence beat itself (proxying
+//! everything else straight through to wiremock). Tests can both drive the
+//! hub through its HTTP routes (as the app does) and reach into its state
 //! directly (as a portal admin or another member would).
 //!
 //! The responders implement the hub rules the app depends on (hub `main`
-//! 6127951, `routes/frames.rs` / `routes/holders.rs`):
+//! 6127951, `routes/frames.rs` / `routes/holders.rs`, amended for the v3
+//! live-exchange wire contract):
 //!
 //! - `gateVersion` must equal the current thresholds version (0 when none):
 //!   409 `gate version X is stale, current is Y`, verbatim;
@@ -22,19 +26,27 @@
 //!   the publisher is neither trusted nor a moderator;
 //! - pending and rejected rows are visible only to their publisher and to
 //!   moderators (`data.moderate`, which a coordinator always has);
-//! - holder reports are filtered per row: `send` members may hold only their
+//! - a claim report is filtered per row: `send` members may hold only their
 //!   own frames, `send_receive` members and moderators any published frame,
-//!   moderators also pending ones; holds on a stale content version drop;
+//!   moderators also pending ones;
 //! - every manifest-visible change bumps the project version and stamps the
-//!   touched rows' `manifestVersion` with it;
+//!   touched rows' `manifestVersion` with it, and every visible claim change
+//!   bumps the project's `holderSeq` once per commit;
 //! - the manifest is ordered by `(manifestVersion, frameUuid)` and paged with
 //!   `next = {since, after}` (page size overridable for tests);
 //! - a frame's `frameSeq` is a dense per-project ordinal, assigned at
-//!   announce/seed, never reused (v3 wave 3: the manifest gains `frameSeq`
-//!   and loses `holderCount`).
+//!   announce/seed, never reused.
 //!
 //! The membership snapshot is signed with a fixed test keypair exactly as the
 //! hub signs it, so the app's TOFU pin + `verify_and_parse` run for real.
+//!
+//! Simplifications versus the real hub (each is deliberate, not a gap this
+//! task forgot): no coalescing windows on the event feed (one event per
+//! commit, always a contiguous `prev`); no flap damping on presence; no 30 s
+//! warm-up (`hello.projects[*].presence` is exact from the first event, never
+//! `[]`); the 60 s `versions` vector is only ever sent on demand via
+//! [`FakeHub::send_versions`]; `GET /projects/{id}/holders` pages by a single
+//! `since` cursor without a real `after` tie-breaker.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -49,9 +61,8 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use crate::collab::filters::DictionaryEntry;
 use crate::collab::hub_client::FrameViewWire;
+use crate::collab::live::digest::{uuid_for_digest, ClaimDigest};
 
-/// The hub's holder freshness window (`HOLDER_FRESH_SQL`).
-pub const HOLDER_FRESH: Duration = Duration::from_secs(75 * 60);
 /// The hub's manifest page cap.
 pub const MANIFEST_PAGE: usize = 1000;
 /// The hub's announce batch cap.
@@ -89,6 +100,62 @@ impl FakeMember {
     }
 }
 
+/// One stored claim row: the hub's per-`(device, frame)` state.
+#[derive(Debug, Clone, Copy)]
+pub struct FakeClaim {
+    pub content_version: i32,
+    pub report_seq: i64,
+    pub removed: bool,
+    /// `holderSeq` at which this claim's visible state (`content_version`,
+    /// `removed`) last changed — what `holders?since=` filters on.
+    pub changed_seq: i64,
+}
+
+/// Timings the presence ticker uses. Defaults match the hub's; tests shorten
+/// them so a smoke doesn't wait 40 real seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct FakeTimings {
+    pub keepalive: Duration,
+    pub grace: Duration,
+    pub silence: Duration,
+}
+
+impl Default for FakeTimings {
+    fn default() -> Self {
+        FakeTimings {
+            keepalive: Duration::from_secs(20),
+            grace: Duration::from_secs(10),
+            silence: Duration::from_secs(40),
+        }
+    }
+}
+
+/// One connected device's presence session, opened by the event stream and
+/// updated by the presence beat.
+pub struct FakeSession {
+    pub device: String,
+    pub account_id: String,
+    /// project id → serving flag, as last reported by a presence beat.
+    pub serving: BTreeMap<String, bool>,
+    pub relay_url: Option<String>,
+    pub last_beat: Instant,
+    /// Set once this session's SSE stream ends; `None` while it is live. The
+    /// presence ticker expires a session `timings.grace` after this is set,
+    /// or `timings.silence` after `last_beat` while it stays `None`.
+    pub detached_at: Option<Instant>,
+    pub kill: tokio::sync::watch::Sender<bool>,
+}
+
+/// One event-feed message, dispatched to every open stream the target
+/// (project or account) reaches.
+#[derive(Clone, Debug)]
+pub struct FeedMsg {
+    pub project_id: Option<String>,
+    pub account_id: Option<String>,
+    pub name: &'static str,
+    pub data: String,
+}
+
 /// One project's hub-side state.
 pub struct FakeProject {
     pub slug: String,
@@ -106,13 +173,24 @@ pub struct FakeProject {
     /// Keyed by frame uuid. `own` is computed per viewer at response time;
     /// the stored value is ignored.
     pub frames: BTreeMap<String, FrameViewWire>,
-    /// frame uuid → device pubkey (base64) → (content version, reported at).
-    pub holders: HashMap<String, HashMap<String, (i32, Instant)>>,
+    /// Keyed by `(device pubkey, frame uuid)` — the hub's per-frame claim
+    /// model (replaces the old 75-minute holder freshness map).
+    pub claims: BTreeMap<(String, String), FakeClaim>,
+    /// Bumped once per commit that visibly changes any claim.
+    pub holder_seq: i64,
+    /// Never advanced by this fake (no route retires old deltas); kept so
+    /// `holders?since=` can enforce the floor check.
+    pub holder_floor: i64,
     pub members: Vec<FakeMember>,
     pub require_approval: bool,
-    /// The hub's dense per-project frame ordinal (§ "Identifiers and
-    /// encodings"): assigned at announce/seed, never reused.
+    /// The hub's dense per-project frame ordinal: assigned at announce/seed,
+    /// never reused.
     pub next_frame_seq: i32,
+    /// The highest `reportSeq` ever stored per device, tracked independently
+    /// of individual claim rows so an implicit claim (announce/version) can
+    /// be stamped correctly even after a report that touched no claim of its
+    /// own (an empty digest-check report still advances this).
+    report_hwm: HashMap<String, i64>,
 }
 
 impl FakeProject {
@@ -132,6 +210,67 @@ impl FakeProject {
         self.next_frame_seq += 1;
         seq
     }
+
+    /// The device's highest stored `reportSeq` in this project (0 if none) —
+    /// what an implicit claim (announce/version) is stamped with.
+    fn highest_report_seq(&self, device: &str) -> i64 {
+        self.report_hwm.get(device).copied().unwrap_or(0)
+    }
+
+    /// Raise the device's stored high-water mark to at least `report_seq`.
+    fn raise_report_hwm(&mut self, device: &str, report_seq: i64) {
+        let e = self.report_hwm.entry(device.to_string()).or_insert(0);
+        if report_seq > *e {
+            *e = report_seq;
+        }
+    }
+
+    /// Write one claim under the report_seq rule; returns true when the
+    /// claim's visible state (content_version, removed) changed.
+    fn write_claim(
+        &mut self,
+        device: &str,
+        uuid: &str,
+        cv: i32,
+        removed: bool,
+        report_seq: i64,
+    ) -> bool {
+        let key = (device.to_string(), uuid.to_string());
+        if let Some(c) = self.claims.get(&key) {
+            if c.report_seq > report_seq || (c.report_seq == report_seq && report_seq != 0) {
+                return false;
+            }
+        }
+        let changed = self.claims.get(&key).map_or(!removed, |c| {
+            c.content_version != cv || c.removed != removed
+        });
+        let changed_seq = if changed {
+            self.holder_seq + 1
+        } else {
+            self.claims.get(&key).map_or(0, |c| c.changed_seq)
+        };
+        self.claims.insert(
+            key,
+            FakeClaim {
+                content_version: cv,
+                report_seq,
+                removed,
+                changed_seq,
+            },
+        );
+        changed
+    }
+
+    /// The order-independent digest of `device`'s current non-removed claims.
+    fn digest_of(&self, device: &str) -> ClaimDigest {
+        let mut d = ClaimDigest::default();
+        for ((dev, uuid), c) in &self.claims {
+            if dev == device && !c.removed {
+                d.add(&uuid_for_digest(uuid), c.content_version as u32);
+            }
+        }
+        d
+    }
 }
 
 /// Everything the fake hub knows.
@@ -139,8 +278,8 @@ pub struct FakeHubState {
     pub projects: HashMap<String, FakeProject>,
     /// device token → the account + device it authenticates.
     pub tokens: HashMap<String, FakeAccount>,
-    /// Manifest page size (the hub's is [`MANIFEST_PAGE`]); tests lower it
-    /// to exercise `next` paging.
+    /// Manifest (and holders-delta) page size (the hub's is
+    /// [`MANIFEST_PAGE`]); tests lower it to exercise `next` paging.
     pub page_size: usize,
     /// Request paths (suffix match) answered with a 500 — a hub fault
     /// injected by a test.
@@ -149,6 +288,23 @@ pub struct FakeHubState {
     /// path ends with the suffix is answered (a change landing "between" two
     /// app calls).
     pub triggers: Vec<(String, StateChange)>,
+    /// Opaque; a restore rotates it (`FakeHub::rotate_epoch`).
+    pub epoch: String,
+    pub timings: FakeTimings,
+    /// sessionId → the connected device's presence session.
+    pub sessions: HashMap<String, FakeSession>,
+    /// The event feed every open SSE stream subscribes to.
+    pub feed: tokio::sync::broadcast::Sender<FeedMsg>,
+    /// Claim rows whose visible state changed, summed across every
+    /// `PUT holders/self` call (test assertion only).
+    pub holder_writes: u64,
+    /// project id → number of upcoming events to swallow instead of
+    /// publishing (a gap the client must detect via `prev`).
+    pub dropped_events: HashMap<String, usize>,
+    /// When set, every v3 route (including the event stream) answers 409
+    /// `collab_api_outdated`, except the two public routes.
+    pub api_outdated: bool,
+    session_seq: u64,
 }
 
 /// A test's one-shot change to the hub's state.
@@ -183,13 +339,200 @@ impl FakeHubState {
         devices.dedup();
         devices
     }
+
+    /// Publish one event to a project's subscribers, unless a test has told
+    /// the fake to drop it (a gap: the next `n` events of that project are
+    /// swallowed instead of delivered).
+    fn publish(&mut self, project_id: &str, name: &'static str, data: Value) {
+        if let Some(n) = self.dropped_events.get_mut(project_id) {
+            if *n > 0 {
+                *n -= 1;
+                return;
+            }
+        }
+        let _ = self.feed.send(FeedMsg {
+            project_id: Some(project_id.to_string()),
+            account_id: None,
+            name,
+            data: data.to_string(),
+        });
+    }
+
+    /// A `project` event for one version bump; frames inlined iff ≤ 50 and
+    /// all published.
+    fn publish_bump(&mut self, pid: &str, prev: i64, kinds: &[&str], frames: &[String]) {
+        let Some(p) = self.projects.get(pid) else {
+            return;
+        };
+        let rows: Vec<&FrameViewWire> = frames.iter().filter_map(|u| p.frames.get(u)).collect();
+        let inline =
+            !rows.is_empty() && rows.len() <= 50 && rows.iter().all(|f| f.state == "published");
+        let mut ev = json!({
+            "projectId": pid,
+            "prev": prev,
+            "version": p.version,
+            "kinds": kinds,
+            "more": !frames.is_empty() && !inline,
+        });
+        if inline {
+            ev["frames"] = Value::Array(
+                rows.iter()
+                    .map(|f| {
+                        let mut v = serde_json::to_value(f).expect("frame view serializes");
+                        v.as_object_mut().expect("object").remove("own");
+                        v
+                    })
+                    .collect(),
+            );
+        }
+        self.publish(pid, "project", ev);
+    }
+
+    /// A `holders` event: `prev` is the cursor before this commit, `deltas`
+    /// the per-device add/rm arrays.
+    fn publish_holders(&mut self, pid: &str, prev: i64, deltas: Value) {
+        let Some(p) = self.projects.get(pid) else {
+            return;
+        };
+        let seq = p.holder_seq;
+        self.publish(
+            pid,
+            "holders",
+            json!({ "projectId": pid, "prev": prev, "seq": seq, "deltas": deltas }),
+        );
+    }
+
+    /// An `account` event: own-account membership changed. Targeted at the
+    /// account, not a project (`projectId: None` on the envelope).
+    fn publish_account(&self, account_id: &str, kind: &str, project_id: &str) {
+        let _ = self.feed.send(FeedMsg {
+            project_id: None,
+            account_id: Some(account_id.to_string()),
+            name: "account",
+            data: json!({ "kind": kind, "projectId": project_id }).to_string(),
+        });
+    }
+
+    /// `hello.projects` for one account's device: exactly its current
+    /// projects, each with its cursors, digest and presence list.
+    fn hello_projects(&self, account_id: &str, device: &str) -> Value {
+        let mut out = serde_json::Map::new();
+        for (pid, p) in &self.projects {
+            if p.member(account_id).is_none() {
+                continue;
+            }
+            let digest = p.digest_of(device);
+            out.insert(
+                pid.clone(),
+                json!({
+                    "version": p.version,
+                    "holderSeq": p.holder_seq,
+                    "claimCount": digest.count,
+                    "claimDigest": digest.hex(),
+                    "reportSeq": p.highest_report_seq(device),
+                    "presence": self.presence_list(pid, p),
+                }),
+            );
+        }
+        Value::Object(out)
+    }
+
+    /// Connected devices of a project's members, own included, with their
+    /// current serving flag and relay url.
+    fn presence_list(&self, pid: &str, p: &FakeProject) -> Vec<Value> {
+        self.sessions
+            .values()
+            .filter(|s| p.member(&s.account_id).is_some())
+            .map(|s| {
+                json!({
+                    "device": s.device,
+                    "serving": s.serving.get(pid).copied().unwrap_or(false),
+                    "relayUrl": s.relay_url,
+                })
+            })
+            .collect()
+    }
+
+    /// Open (or replace) the calling device's session: ends an older session
+    /// of the same device (its kill fires so that stream closes), registers
+    /// the new one, and builds the `hello` payload. Returns the serialized
+    /// `hello` JSON, a feed subscription, this session's kill switch, the
+    /// keepalive interval, the account id and the new session id.
+    fn open_session(
+        &mut self,
+        acct: &FakeAccount,
+    ) -> (
+        String,
+        tokio::sync::broadcast::Receiver<FeedMsg>,
+        tokio::sync::watch::Receiver<bool>,
+        Duration,
+        String,
+        String,
+    ) {
+        if let Some(old_id) = self
+            .sessions
+            .iter()
+            .find(|(_, s)| s.device == acct.device_pubkey_b64)
+            .map(|(id, _)| id.clone())
+        {
+            if let Some(old) = self.sessions.remove(&old_id) {
+                let _ = old.kill.send(true);
+            }
+        }
+        self.session_seq += 1;
+        let session_id = hex_of(
+            &format!("sess-{}-{}", acct.device_pubkey_b64, self.session_seq),
+            32,
+        );
+        let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
+        let feed_rx = self.feed.subscribe();
+        self.sessions.insert(
+            session_id.clone(),
+            FakeSession {
+                device: acct.device_pubkey_b64.clone(),
+                account_id: acct.account_id.clone(),
+                serving: BTreeMap::new(),
+                relay_url: acct.relay_url.clone(),
+                last_beat: Instant::now(),
+                detached_at: None,
+                kill: kill_tx,
+            },
+        );
+        let projects = self.hello_projects(&acct.account_id, &acct.device_pubkey_b64);
+        let hello = json!({
+            "sessionId": session_id,
+            "epoch": self.epoch,
+            "accountId": acct.account_id,
+            "projects": projects,
+        })
+        .to_string();
+        (
+            hello,
+            feed_rx,
+            kill_rx,
+            self.timings.keepalive,
+            acct.account_id.clone(),
+            session_id,
+        )
+    }
 }
 
-/// The fake hub: a wiremock server plus the state its one responder serves.
+/// The fake hub: a wiremock server + an axum front, both driven by the same
+/// state.
 pub struct FakeHub {
     pub server: MockServer,
     pub state: Arc<Mutex<FakeHubState>>,
     key: SigningKey,
+    front_url: String,
+    front_task: tokio::task::JoinHandle<()>,
+    ticker_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FakeHub {
+    fn drop(&mut self) {
+        self.front_task.abort();
+        self.ticker_task.abort();
+    }
 }
 
 /// The standard dictionary every new fake project starts with (version 1),
@@ -212,7 +555,8 @@ pub fn default_dictionary() -> Vec<DictionaryEntry> {
 }
 
 /// A deterministic lowercase-hex digest of `seed`, `len` chars long (the
-/// fake's stand-in blake3/xxh3 for frames it seeds itself).
+/// fake's stand-in blake3/xxh3 for frames it seeds itself, and its session
+/// id generator).
 fn hex_of(seed: &str, len: usize) -> String {
     let full = blake3::hash(seed.as_bytes()).to_hex().to_string();
     full[..len].to_string()
@@ -223,15 +567,26 @@ fn now_rfc3339() -> String {
 }
 
 impl FakeHub {
-    /// Start the server and mount the one catch-all responder.
+    /// Start the wiremock server, mount the one catch-all responder, and
+    /// start the axum front (event stream + presence, everything else
+    /// proxied) plus the presence ticker.
     pub async fn start() -> Self {
         let server = MockServer::start().await;
+        let (feed_tx, _) = tokio::sync::broadcast::channel(1024);
         let state = Arc::new(Mutex::new(FakeHubState {
             projects: HashMap::new(),
             tokens: HashMap::new(),
             page_size: MANIFEST_PAGE,
             failing: HashSet::new(),
             triggers: Vec::new(),
+            epoch: "epoch-1".to_string(),
+            timings: FakeTimings::default(),
+            sessions: HashMap::new(),
+            feed: feed_tx,
+            holder_writes: 0,
+            dropped_events: HashMap::new(),
+            api_outdated: false,
+            session_seq: 0,
         }));
         let key = SigningKey::from_bytes(&[7u8; 32]);
         Mock::given(any())
@@ -241,11 +596,43 @@ impl FakeHub {
             })
             .mount(&server)
             .await;
-        FakeHub { server, state, key }
+        let front = axum::Router::new()
+            .route("/api/v1/me/events", axum::routing::get(front_events))
+            .route(
+                "/api/v1/me/presence",
+                axum::routing::post(front_beat).delete(front_leave),
+            )
+            .fallback(front_proxy)
+            .with_state(FrontState {
+                state: Arc::clone(&state),
+                upstream: server.uri(),
+                http: reqwest::Client::new(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake hub front binds");
+        let front_url = format!("http://{}", listener.local_addr().expect("front addr"));
+        let front_task = tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, front).await {
+                tracing::error!(error = %e, "fake hub front stopped");
+            }
+        });
+        let ticker_state = Arc::clone(&state);
+        let ticker_task = tokio::spawn(presence_ticker(ticker_state));
+        FakeHub {
+            server,
+            state,
+            key,
+            front_url,
+            front_task,
+            ticker_task,
+        }
     }
 
+    /// The axum front's URL — events and presence are answered locally,
+    /// everything else is proxied to the wiremock upstream.
     pub fn uri(&self) -> String {
-        self.server.uri()
+        self.front_url.clone()
     }
 
     /// The snapshot-signing pubkey (base64) — what `/collab/pubkey` serves.
@@ -310,31 +697,30 @@ impl FakeHub {
                 dictionary_version: 1,
                 dictionary: default_dictionary(),
                 frames: BTreeMap::new(),
-                holders: HashMap::new(),
+                claims: BTreeMap::new(),
+                holder_seq: 0,
+                holder_floor: 0,
                 members,
                 require_approval,
                 next_frame_seq: 1,
+                report_hwm: HashMap::new(),
             },
         );
     }
 
-    fn with_project<R>(&self, project_id: &str, f: impl FnOnce(&mut FakeProject) -> R) -> R {
-        let mut st = self.lock();
-        let p = st
-            .projects
-            .get_mut(project_id)
-            .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
-        f(p)
-    }
-
-    /// `version += 1` (any change a device must see).
+    /// `version += 1` (any change a device must see), publishing a `meta`
+    /// bump.
     pub fn bump(&self, project_id: &str) {
-        self.with_project(project_id, |p| {
-            p.bump();
-        });
+        let mut st = self.lock();
+        let Some(p) = st.projects.get_mut(project_id) else {
+            panic!("fake hub: no project {project_id}");
+        };
+        let prev = p.version;
+        p.bump();
+        st.publish_bump(project_id, prev, &["meta"], &[]);
     }
 
-    /// Lower (or restore) the manifest page size.
+    /// Lower (or restore) the manifest/holders-delta page size.
     pub fn set_page_size(&self, n: usize) {
         self.lock().page_size = n.clamp(1, MANIFEST_PAGE);
     }
@@ -362,7 +748,8 @@ impl FakeHub {
             .push((suffix.to_string(), Box::new(change)));
     }
 
-    /// Add (or re-add) a member. Bumps both versions, as the hub does.
+    /// Add (or re-add) a member. Bumps both versions and publishes a
+    /// `members` bump plus an `account` event to the joining account.
     pub fn add_member(
         &self,
         project_id: &str,
@@ -370,7 +757,13 @@ impl FakeHub {
         data_role: &str,
         coordinator: bool,
     ) {
-        self.with_project(project_id, |p| {
+        let mut st = self.lock();
+        let prev = {
+            let p = st
+                .projects
+                .get_mut(project_id)
+                .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
+            let prev = p.version;
             p.members.retain(|m| m.account_id != account_id);
             p.members.push(FakeMember {
                 account_id: account_id.to_string(),
@@ -381,12 +774,21 @@ impl FakeHub {
             });
             p.membership_version += 1;
             p.bump();
-        });
+            prev
+        };
+        st.publish_bump(project_id, prev, &["members"], &[]);
+        st.publish_account(account_id, "joined", project_id);
     }
 
     /// Replace a member's governance caps. Bumps, as the hub does.
     pub fn set_caps(&self, project_id: &str, account_id: &str, caps: &[&str]) {
-        self.with_project(project_id, |p| {
+        let mut st = self.lock();
+        let prev = {
+            let p = st
+                .projects
+                .get_mut(project_id)
+                .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
+            let prev = p.version;
             let m = p
                 .members
                 .iter_mut()
@@ -394,40 +796,69 @@ impl FakeHub {
                 .unwrap_or_else(|| panic!("fake hub: {account_id} is not a member"));
             m.gov_caps = caps.iter().map(|c| c.to_string()).collect();
             p.bump();
-        });
+            prev
+        };
+        st.publish_bump(project_id, prev, &["members"], &[]);
     }
 
-    /// Remove a member (they leave or are removed). Bumps both versions.
+    /// Remove a member (they leave or are removed). Bumps both versions and
+    /// publishes a `members` bump plus an `account` event to that account.
     pub fn remove_member(&self, project_id: &str, account_id: &str) {
-        self.with_project(project_id, |p| {
+        let mut st = self.lock();
+        let prev = {
+            let p = st
+                .projects
+                .get_mut(project_id)
+                .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
+            let prev = p.version;
             p.members.retain(|m| m.account_id != account_id);
             p.membership_version += 1;
             p.bump();
-        });
+            prev
+        };
+        st.publish_bump(project_id, prev, &["members"], &[]);
+        st.publish_account(account_id, "left", project_id);
     }
 
     /// Publish a new thresholds version (with no rules). Bumps.
     pub fn set_thresholds_version(&self, project_id: &str, version: i32) {
-        self.with_project(project_id, |p| {
+        let mut st = self.lock();
+        let prev = {
+            let p = st
+                .projects
+                .get_mut(project_id)
+                .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
+            let prev = p.version;
             p.thresholds_version = version;
             p.bump();
-        });
+            prev
+        };
+        st.publish_bump(project_id, prev, &["thresholds"], &[]);
     }
 
     /// Publish a new dictionary version. Bumps.
     pub fn set_dictionary(&self, project_id: &str, version: i32, entries: Vec<DictionaryEntry>) {
-        self.with_project(project_id, |p| {
+        let mut st = self.lock();
+        let prev = {
+            let p = st
+                .projects
+                .get_mut(project_id)
+                .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
+            let prev = p.version;
             p.dictionary_version = version;
             p.dictionary = entries;
             p.bump();
-        });
+            prev
+        };
+        st.publish_bump(project_id, prev, &["dictionary"], &[]);
     }
 
     /// Insert frames straight into the hub as `publisher_account` in one
     /// batch (one bump), bypassing the announce rules — how a test stands in
-    /// for another member's app. Every device of the publisher holds them at
-    /// content version 1. Defaults: `<uuid>.fits`, filter `L`, mono, 300 s,
-    /// 1000 bytes, hashes derived from the uuid, the current gate version.
+    /// for another member's app. Every device of the publisher implicitly
+    /// claims them at content version 1. Defaults: `<uuid>.fits`, filter `L`,
+    /// mono, 300 s, 1000 bytes, hashes derived from the uuid, the current
+    /// gate version.
     pub fn seed_frames(
         &self,
         project_id: &str,
@@ -438,50 +869,81 @@ impl FakeHub {
         let mut st = self.lock();
         let display = st.display_of(publisher_account);
         let devices = st.devices_of(publisher_account);
-        let p = st
-            .projects
-            .get_mut(project_id)
-            .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
-        let version = p.bump();
-        for uuid in uuids {
-            let seq = p.next_seq();
-            let view = FrameViewWire {
-                frame_uuid: uuid.to_string(),
-                frame_seq: seq,
-                publisher_account_id: publisher_account.to_string(),
-                publisher_display_name: display.clone(),
-                own: false,
-                file_name: format!("{uuid}.fits"),
-                content_version: 1,
-                blake3: hex_of(uuid, 64),
-                byte_size: 1000,
-                xxh3: hex_of(&format!("x{uuid}"), 16),
-                filter_raw: "L".to_string(),
-                filter_canonical: "L".to_string(),
-                channel: "mono".to_string(),
-                exptime_sec: 300.0,
-                date_obs: None,
-                meta: json!({}),
-                gate_version: p.thresholds_version,
-                accepted: true,
-                accepted_reason: None,
-                state: state.to_string(),
-                reject_reason: None,
-                manifest_version: version,
-                created_at: now_rfc3339(),
-            };
-            p.frames.insert(uuid.to_string(), view);
-            let holds = p.holders.entry(uuid.to_string()).or_default();
-            for d in &devices {
-                holds.insert(d.clone(), (1, Instant::now()));
+        let (prev_version, prev_holder_seq, touched, holder_adds) = {
+            let p = st
+                .projects
+                .get_mut(project_id)
+                .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
+            let prev_version = p.version;
+            let prev_holder_seq = p.holder_seq;
+            let version = p.bump();
+            let mut touched = Vec::new();
+            let mut holder_adds: Vec<(String, i32, i32)> = Vec::new();
+            for uuid in uuids {
+                let seq = p.next_seq();
+                let view = FrameViewWire {
+                    frame_uuid: uuid.to_string(),
+                    frame_seq: seq,
+                    publisher_account_id: publisher_account.to_string(),
+                    publisher_display_name: display.clone(),
+                    own: false,
+                    file_name: format!("{uuid}.fits"),
+                    content_version: 1,
+                    blake3: hex_of(uuid, 64),
+                    byte_size: 1000,
+                    xxh3: hex_of(&format!("x{uuid}"), 16),
+                    filter_raw: "L".to_string(),
+                    filter_canonical: "L".to_string(),
+                    channel: "mono".to_string(),
+                    exptime_sec: 300.0,
+                    date_obs: None,
+                    meta: json!({}),
+                    gate_version: p.thresholds_version,
+                    accepted: true,
+                    accepted_reason: None,
+                    state: state.to_string(),
+                    reject_reason: None,
+                    manifest_version: version,
+                    created_at: now_rfc3339(),
+                };
+                p.frames.insert(uuid.to_string(), view);
+                touched.push(uuid.to_string());
+                for device in &devices {
+                    let rs = p.highest_report_seq(device);
+                    if p.write_claim(device, uuid, 1, false, rs) {
+                        holder_adds.push((device.clone(), seq, 1));
+                    }
+                }
             }
+            if !holder_adds.is_empty() {
+                p.holder_seq = prev_holder_seq + 1;
+            }
+            (prev_version, prev_holder_seq, touched, holder_adds)
+        };
+        st.publish_bump(project_id, prev_version, &["frames"], &touched);
+        if !holder_adds.is_empty() {
+            let mut by_device: BTreeMap<String, Vec<[i32; 2]>> = BTreeMap::new();
+            for (d, seq, cv) in holder_adds {
+                by_device.entry(d).or_default().push([seq, cv]);
+            }
+            let deltas: Vec<Value> = by_device
+                .into_iter()
+                .map(|(d, add)| json!({ "device": d, "add": add, "rm": [] }))
+                .collect();
+            st.publish_holders(project_id, prev_holder_seq, Value::Array(deltas));
         }
     }
 
     /// Mutate one frame as a manifest edit: bumps, stamps its
-    /// `manifestVersion`, then applies `f`.
+    /// `manifestVersion`, then applies `f`, and publishes a `frames` bump.
     pub fn update_frame(&self, project_id: &str, uuid: &str, f: impl FnOnce(&mut FrameViewWire)) {
-        self.with_project(project_id, |p| {
+        let mut st = self.lock();
+        let prev = {
+            let p = st
+                .projects
+                .get_mut(project_id)
+                .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
+            let prev = p.version;
             let version = p.bump();
             let frame = p
                 .frames
@@ -489,7 +951,9 @@ impl FakeHub {
                 .unwrap_or_else(|| panic!("fake hub: no frame {uuid}"));
             frame.manifest_version = version;
             f(frame);
-        });
+            prev
+        };
+        st.publish_bump(project_id, prev, &["frames"], &[uuid.to_string()]);
     }
 
     /// Exclude (`false`, with a reason) or restore (`true`) a frame. Bumps.
@@ -514,46 +978,527 @@ impl FakeHub {
         Some(v)
     }
 
-    /// Device pubkeys (base64) that freshly hold the frame's CURRENT content,
-    /// sorted.
+    /// Device pubkeys (base64) with a live (non-removed) claim on the
+    /// frame's CURRENT content version, sorted.
     pub fn holders_of(&self, project_id: &str, uuid: &str) -> Vec<String> {
         let st = self.lock();
-        let dev_acct = st.device_accounts();
         let Some(p) = st.projects.get(project_id) else {
             return Vec::new();
         };
         let Some(f) = p.frames.get(uuid) else {
             return Vec::new();
         };
-        let mut out = fresh_holders(p, &dev_acct, f);
+        let mut out: Vec<String> = p
+            .claims
+            .iter()
+            .filter(|((_, u), c)| u == uuid && !c.removed && c.content_version == f.content_version)
+            .map(|((d, _), _)| d.clone())
+            .collect();
         out.sort();
         out
     }
+
+    /// The stored claim row for `(device, uuid)`, if any.
+    pub fn claim_of(&self, project_id: &str, device: &str, uuid: &str) -> Option<FakeClaim> {
+        let st = self.lock();
+        st.projects
+            .get(project_id)?
+            .claims
+            .get(&(device.to_string(), uuid.to_string()))
+            .copied()
+    }
+
+    /// Claim rows whose visible `(content_version, removed)` changed, summed
+    /// across every `PUT holders/self` call so far.
+    pub fn holder_writes(&self) -> u64 {
+        self.lock().holder_writes
+    }
+
+    /// Devices currently connected (an open event stream) in that project.
+    pub fn connected(&self, project_id: &str) -> Vec<String> {
+        let st = self.lock();
+        let Some(p) = st.projects.get(project_id) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = st
+            .sessions
+            .values()
+            .filter(|s| p.member(&s.account_id).is_some())
+            .map(|s| s.device.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Whether `device`'s session currently reports it is serving that
+    /// project (`false` if not connected, or the project is absent from its
+    /// last beat).
+    pub fn serving(&self, project_id: &str, device: &str) -> bool {
+        let st = self.lock();
+        st.sessions
+            .values()
+            .find(|s| s.device == device)
+            .map(|s| s.serving.get(project_id).copied().unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// The next `n` events of that project are swallowed instead of
+    /// delivered — a gap the client must detect via `prev`.
+    pub fn drop_next_events(&self, project_id: &str, n: usize) {
+        self.lock().dropped_events.insert(project_id.to_string(), n);
+    }
+
+    /// Send a `resync` event telling every stream of that project to catch
+    /// up `what` (`"project"` | `"holders"`) over REST.
+    pub fn send_resync(&self, project_id: &str, what: &str) {
+        self.lock().publish(
+            project_id,
+            "resync",
+            json!({ "projectId": project_id, "what": what }),
+        );
+    }
+
+    /// Send the 60 s `versions` state vector once, on demand.
+    pub fn send_versions(&self) {
+        let st = self.lock();
+        let mut map = serde_json::Map::new();
+        for (pid, p) in &st.projects {
+            map.insert(pid.clone(), json!([p.version, p.holder_seq]));
+        }
+        let _ = st.feed.send(FeedMsg {
+            project_id: None,
+            account_id: None,
+            name: "versions",
+            data: Value::Object(map).to_string(),
+        });
+    }
+
+    /// A hub restart: every stream closes, sessions and presence clear.
+    pub fn kill_streams(&self) {
+        let mut st = self.lock();
+        for (_, s) in st.sessions.drain() {
+            let _ = s.kill.send(true);
+        }
+    }
+
+    /// A restore: rotate to a new epoch, returning it.
+    pub fn rotate_epoch(&self) -> String {
+        let mut st = self.lock();
+        let n: u64 = st
+            .epoch
+            .strip_prefix("epoch-")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        st.epoch = format!("epoch-{}", n + 1);
+        st.epoch.clone()
+    }
+
+    /// A restore that lost these rows entirely: drop the frame and every
+    /// claim on it.
+    pub fn forget_frames(&self, project_id: &str, uuids: &[&str]) {
+        let mut st = self.lock();
+        let Some(p) = st.projects.get_mut(project_id) else {
+            return;
+        };
+        for u in uuids {
+            p.frames.remove(*u);
+            let keys: Vec<(String, String)> =
+                p.claims.keys().filter(|(_, uu)| uu == u).cloned().collect();
+            for k in keys {
+                p.claims.remove(&k);
+            }
+        }
+    }
+
+    /// I11: tombstone the device's claims everywhere it is a member, bump
+    /// `members` on every affected project, and close its stream(s).
+    pub fn revoke_device(&self, device_pubkey_b64: &str, retire: bool) {
+        let _ = retire; // the fake treats revoke and retire identically.
+        let mut st = self.lock();
+        let Some(account) = st.device_accounts().get(device_pubkey_b64).cloned() else {
+            return;
+        };
+        let pids: Vec<String> = st
+            .projects
+            .iter()
+            .filter(|(_, p)| p.member(&account).is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for pid in &pids {
+            let (prev_version, prev_holder_seq, rm) = {
+                let p = st.projects.get_mut(pid).expect("checked above");
+                let touched: Vec<i32> = p
+                    .claims
+                    .iter()
+                    .filter(|((d, _), c)| d == device_pubkey_b64 && !c.removed)
+                    .filter_map(|((_, u), _)| p.frames.get(u).map(|f| f.frame_seq))
+                    .collect();
+                let uuids: Vec<String> = p
+                    .claims
+                    .keys()
+                    .filter(|(d, _)| d == device_pubkey_b64)
+                    .map(|(_, u)| u.clone())
+                    .collect();
+                let prev_holder_seq = p.holder_seq;
+                if !touched.is_empty() {
+                    let seq = prev_holder_seq + 1;
+                    for u in &uuids {
+                        if let Some(c) = p
+                            .claims
+                            .get_mut(&(device_pubkey_b64.to_string(), u.clone()))
+                        {
+                            if !c.removed {
+                                c.removed = true;
+                                c.changed_seq = seq;
+                            }
+                        }
+                    }
+                    p.holder_seq = seq;
+                }
+                let prev_version = p.version;
+                p.membership_version += 1;
+                p.bump();
+                (prev_version, prev_holder_seq, touched)
+            };
+            st.publish_bump(pid, prev_version, &["members"], &[]);
+            if !rm.is_empty() {
+                st.publish_holders(
+                    pid,
+                    prev_holder_seq,
+                    json!([{ "device": device_pubkey_b64, "add": [], "rm": rm }]),
+                );
+            }
+        }
+        let dead: Vec<String> = st
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.device == device_pubkey_b64)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in dead {
+            if let Some(s) = st.sessions.remove(&id) {
+                let _ = s.kill.send(true);
+            }
+        }
+    }
+
+    /// Every v3 route (except `collab/pubkey` and the public project page)
+    /// answers 409 `collab_api_outdated` while `on`.
+    pub fn set_api_outdated(&self, on: bool) {
+        self.lock().api_outdated = on;
+    }
 }
 
-/// Fresh holders of `f`'s current content whose device belongs to a member.
-fn fresh_holders(
-    p: &FakeProject,
-    dev_acct: &HashMap<String, String>,
-    f: &FrameViewWire,
-) -> Vec<String> {
-    let Some(holds) = p.holders.get(&f.frame_uuid) else {
-        return Vec::new();
+/// Expires detached sessions after `timings.grace` and silent (no beat)
+/// sessions after `timings.silence`, publishing a `presence` `connected:
+/// false` for each.
+async fn presence_ticker(state: Arc<Mutex<FakeHubState>>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    loop {
+        tick.tick().await;
+        let mut st = state.lock().expect("fake hub state poisoned");
+        let (grace, silence) = (st.timings.grace, st.timings.silence);
+        let now = Instant::now();
+        let expired: Vec<String> = st
+            .sessions
+            .iter()
+            .filter(|(_, s)| match s.detached_at {
+                Some(at) => now.duration_since(at) >= grace,
+                None => now.duration_since(s.last_beat) >= silence,
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            let Some(s) = st.sessions.remove(&id) else {
+                continue;
+            };
+            let _ = s.kill.send(true);
+            let pids: Vec<String> = st
+                .projects
+                .iter()
+                .filter(|(_, p)| p.member(&s.account_id).is_some())
+                .map(|(pid, _)| pid.clone())
+                .collect();
+            for pid in pids {
+                st.publish(
+                    &pid,
+                    "presence",
+                    json!({
+                        "projectId": pid,
+                        "replace": false,
+                        "changes": [{ "device": s.device, "connected": false, "serving": false, "relayUrl": s.relay_url }],
+                    }),
+                );
+            }
+        }
+    }
+}
+
+// ── The axum front (events, presence; everything else proxied) ─────────────
+
+#[derive(Clone)]
+struct FrontState {
+    state: Arc<Mutex<FakeHubState>>,
+    upstream: String,
+    http: reqwest::Client,
+}
+
+async fn front_proxy(
+    axum::extract::State(fx): axum::extract::State<FrontState>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let (parts, body) = req.into_parts();
+    let path_q = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_default();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "fake hub proxy: request body read failed");
+            return axum::response::Response::builder()
+                .status(502)
+                .body(axum::body::Body::empty())
+                .expect("static response");
+        }
     };
-    holds
-        .iter()
-        .filter(|(dev, (ver, at))| {
-            *ver == f.content_version
-                && at.elapsed() <= HOLDER_FRESH
-                && dev_acct
-                    .get(*dev)
-                    .is_some_and(|acct| p.member(acct).is_some())
-        })
-        .map(|(dev, _)| dev.clone())
-        .collect()
+    let mut up = fx
+        .http
+        .request(parts.method.clone(), format!("{}{}", fx.upstream, path_q))
+        .body(bytes.to_vec());
+    for h in ["authorization", "content-type"] {
+        if let Some(v) = parts.headers.get(h) {
+            up = up.header(h, v.clone());
+        }
+    }
+    match up.send().await {
+        Ok(r) => {
+            let status = r.status();
+            let ct = r.headers().get("content-type").cloned();
+            let body = match r.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(error = %e, "fake hub proxy: upstream body read failed");
+                    return axum::response::Response::builder()
+                        .status(502)
+                        .body(axum::body::Body::empty())
+                        .expect("static response");
+                }
+            };
+            let mut resp = axum::response::Response::new(axum::body::Body::from(body));
+            *resp.status_mut() = status;
+            if let Some(ct) = ct {
+                resp.headers_mut().insert("content-type", ct);
+            }
+            resp
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "fake hub proxy failed");
+            axum::response::Response::builder()
+                .status(502)
+                .body(axum::body::Body::empty())
+                .expect("static response")
+        }
+    }
 }
 
-// ── The responder ────────────────────────────────────────────────────────────
+async fn front_events(
+    axum::extract::State(fx): axum::extract::State<FrontState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let opened = {
+        let mut st = fx.state.lock().expect("fake hub state poisoned");
+        if st.api_outdated {
+            return (
+                axum::http::StatusCode::CONFLICT,
+                axum::Json(json!({"error": "collab_api_outdated"})),
+            )
+                .into_response();
+        }
+        let Some(acct) = token.and_then(|t| st.tokens.get(&t).cloned()) else {
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        };
+        // Ends an older session of the same device, marks this one
+        // connected, and returns (hello, feed rx, kill rx, keepalive,
+        // accountId, sessionId).
+        st.open_session(&acct)
+    };
+    let (hello, mut feed, mut kill, keepalive, account_id, session_id) = opened;
+    let state = Arc::clone(&fx.state);
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(64);
+    tokio::spawn(async move {
+        let first = format!("retry: 3000\nevent: hello\ndata: {hello}\n\n");
+        if tx.send(Ok(first.into())).await.is_err() {
+            return;
+        }
+        let mut tick = tokio::time::interval(keepalive);
+        tick.tick().await;
+        loop {
+            let frame = tokio::select! {
+                _ = kill.changed() => break,
+                _ = tick.tick() => ":\n\n".to_string(),
+                msg = feed.recv() => match msg {
+                    Ok(m) => {
+                        let deliver = {
+                            let st = state.lock().expect("fake hub state poisoned");
+                            match (&m.project_id, &m.account_id) {
+                                (Some(pid), _) => st.projects.get(pid).is_some_and(|p| p.member(&account_id).is_some()),
+                                (None, Some(a)) => a == &account_id,
+                                (None, None) => true,
+                            }
+                        };
+                        if !deliver { continue; }
+                        format!("event: {}\ndata: {}\n\n", m.name, m.data)
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                },
+            };
+            if tx.send(Ok(frame.into())).await.is_err() {
+                break;
+            }
+        }
+        // The stream closed: start this session's grace clock (a reconnect
+        // within `timings.grace` cancels it by opening a fresh session,
+        // which replaces this one before the ticker ever sees it).
+        let mut st = state.lock().expect("fake hub state poisoned");
+        if let Some(s) = st.sessions.get_mut(&session_id) {
+            s.detached_at = Some(Instant::now());
+        }
+    });
+    let stream = n0_future::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(axum::body::Body::from_stream(stream))
+        .expect("static response")
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeatIn {
+    session_id: String,
+    #[serde(default)]
+    serving: BTreeMap<String, bool>,
+    #[serde(default)]
+    relay_url: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaveIn {
+    session_id: String,
+}
+
+async fn front_beat(
+    axum::extract::State(fx): axum::extract::State<FrontState>,
+    axum::Json(body): axum::Json<BeatIn>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !is_lower_hex(&body.session_id, 32) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "bad sessionId"})),
+        )
+            .into_response();
+    }
+    if let Some(url) = &body.relay_url {
+        if !url.starts_with("https://") {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error": "bad relayUrl"})),
+            )
+                .into_response();
+        }
+    }
+    let mut st = fx.state.lock().expect("fake hub state poisoned");
+    let (device, account_id, changed_pids) = {
+        let Some(session) = st.sessions.get_mut(&body.session_id) else {
+            return (
+                axum::http::StatusCode::CONFLICT,
+                axum::Json(json!({"error": "session_gone"})),
+            )
+                .into_response();
+        };
+        session.last_beat = Instant::now();
+        session.detached_at = None;
+        session.relay_url = body.relay_url.clone();
+        let mut changed_pids = Vec::new();
+        for (pid, val) in &body.serving {
+            if session.serving.get(pid).copied().unwrap_or(false) != *val {
+                changed_pids.push(pid.clone());
+            }
+        }
+        session.serving = body.serving.clone();
+        (
+            session.device.clone(),
+            session.account_id.clone(),
+            changed_pids,
+        )
+    };
+    for pid in changed_pids {
+        if st
+            .projects
+            .get(&pid)
+            .is_some_and(|p| p.member(&account_id).is_some())
+        {
+            let serving = *body.serving.get(&pid).unwrap_or(&false);
+            st.publish(
+                &pid,
+                "presence",
+                json!({
+                    "projectId": pid,
+                    "replace": false,
+                    "changes": [{ "device": device, "connected": true, "serving": serving, "relayUrl": body.relay_url }],
+                }),
+            );
+        }
+    }
+    axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+async fn front_leave(
+    axum::extract::State(fx): axum::extract::State<FrontState>,
+    axum::Json(body): axum::Json<LeaveIn>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut st = fx.state.lock().expect("fake hub state poisoned");
+    if let Some(session) = st.sessions.remove(&body.session_id) {
+        let pids: Vec<String> = st
+            .projects
+            .iter()
+            .filter(|(_, p)| p.member(&session.account_id).is_some())
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in pids {
+            st.publish(
+                &pid,
+                "presence",
+                json!({
+                    "projectId": pid,
+                    "replace": false,
+                    "changes": [{ "device": session.device, "connected": false, "serving": false, "relayUrl": session.relay_url }],
+                }),
+            );
+        }
+        let _ = session.kill.send(true);
+    }
+    axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+// ── The wiremock responder (everything but events/presence) ────────────────
 
 struct FakeResponder {
     state: Arc<Mutex<FakeHubState>>,
@@ -577,6 +1522,14 @@ fn empty(code: u16) -> ResponseTemplate {
 
 fn error(code: u16, msg: impl Into<String>) -> ResponseTemplate {
     ResponseTemplate::new(code).set_body_json(json!({ "error": msg.into() }))
+}
+
+fn gone(msg: impl Into<String>, extra: Value) -> ResponseTemplate {
+    let mut body = json!({ "error": msg.into() });
+    if let (Value::Object(b), Value::Object(e)) = (&mut body, extra) {
+        b.extend(e);
+    }
+    ResponseTemplate::new(410).set_body_json(body)
 }
 
 fn not_found_project() -> ResponseTemplate {
@@ -618,7 +1571,8 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
     let segs: Vec<&str> = rest.trim_matches('/').split('/').collect();
     let method = req.method.as_str().to_string();
 
-    // Public routes and the retired package api.
+    // Public routes and every retired route (predates the per-frame api, or
+    // predates the v3 live exchange).
     match (method.as_str(), segs.as_slice()) {
         ("GET", ["collab", "pubkey"]) => {
             return ok(json!({ "pubkey": B64.encode(key.verifying_key().to_bytes()) }))
@@ -626,15 +1580,21 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
         ("GET", ["projects", pid]) => return project_page(st, pid),
         (_, ["announcements", ..])
         | (_, ["projects", _, "announcements", ..])
-        | (_, ["projects", _, "have"]) => return error(409, "collab_api_outdated"),
+        | (_, ["projects", _, "have"])
+        | ("GET", ["me", "project-versions"])
+        | ("GET", ["projects", _, "frames", _, "holders"]) => {
+            return error(409, "collab_api_outdated")
+        }
         _ => {}
+    }
+    if st.api_outdated {
+        return error(409, "collab_api_outdated");
     }
 
     let Some(acct) = bearer(req).and_then(|t| st.tokens.get(&t).cloned()) else {
         return empty(401);
     };
     match (method.as_str(), segs.as_slice()) {
-        ("GET", ["me", "project-versions"]) => my_project_versions(st, &acct),
         ("GET", ["me", "projects"]) => my_projects(st, &acct),
         ("GET", ["projects", pid, "membership"]) => membership(st, key, &acct, pid),
         ("GET", ["projects", pid, "thresholds"]) => thresholds(st, &acct, pid),
@@ -644,14 +1604,16 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
         ("POST", ["projects", pid, "frames", uuid, "version"]) => {
             new_version(st, &acct, pid, uuid, req)
         }
+        ("POST", ["projects", pid, "frames", "versions"]) => {
+            frame_versions_batch(st, &acct, pid, req)
+        }
         ("POST", ["projects", pid, "frames", uuid, "approve"]) => {
             approve(st, &acct, pid, uuid, req)
         }
         ("POST", ["projects", pid, "frames", uuid, "reject"]) => reject(st, &acct, pid, uuid, req),
-        ("PUT", ["projects", pid, "holders", "self"]) => put_holders(st, &acct, pid, req),
-        ("GET", ["projects", pid, "frames", uuid, "holders"]) => {
-            frame_holders(st, &acct, pid, uuid)
-        }
+        ("GET", ["projects", pid, "holders", "snapshot"]) => holders_snapshot(st, &acct, pid),
+        ("GET", ["projects", pid, "holders"]) => holders_since(st, &acct, pid, req),
+        ("PUT", ["projects", pid, "holders", "self"]) => report_holders(st, &acct, pid, req),
         _ => empty(404),
     }
 }
@@ -683,21 +1645,6 @@ fn project_page(st: &FakeHubState, pid: &str) -> ResponseTemplate {
         },
         "members": members,
     }))
-}
-
-fn my_project_versions(st: &FakeHubState, acct: &FakeAccount) -> ResponseTemplate {
-    let mut out: Vec<(String, i64)> = st
-        .projects
-        .iter()
-        .filter(|(_, p)| p.member(&acct.account_id).is_some())
-        .map(|(id, p)| (id.clone(), p.version))
-        .collect();
-    out.sort();
-    ok(Value::Array(
-        out.into_iter()
-            .map(|(id, v)| json!({ "projectId": id, "version": v }))
-            .collect(),
-    ))
 }
 
 fn my_projects(st: &FakeHubState, acct: &FakeAccount) -> ResponseTemplate {
@@ -1037,18 +1984,20 @@ fn announce(
     } else {
         "pending"
     };
+    let device = acct.device_pubkey_b64.clone();
+    let prev_version = p.version;
+    let prev_holder_seq = p.holder_seq;
     let version = p.bump();
     let n = body.frames.len();
+    let mut touched = Vec::new();
+    let mut holder_adds: Vec<[i32; 2]> = Vec::new();
     for f in body.frames {
-        p.holders
-            .entry(f.frame_uuid.clone())
-            .or_default()
-            .insert(acct.device_pubkey_b64.clone(), (1, Instant::now()));
         let seq = p.next_seq();
+        touched.push(f.frame_uuid.clone());
         p.frames.insert(
             f.frame_uuid.clone(),
             FrameViewWire {
-                frame_uuid: f.frame_uuid,
+                frame_uuid: f.frame_uuid.clone(),
                 frame_seq: seq,
                 publisher_account_id: acct.account_id.clone(),
                 publisher_display_name: display.clone(),
@@ -1073,6 +2022,21 @@ fn announce(
                 created_at: now_rfc3339(),
             },
         );
+        let rs = p.highest_report_seq(&device);
+        if p.write_claim(&device, &f.frame_uuid, 1, false, rs) {
+            holder_adds.push([seq, 1]);
+        }
+    }
+    if !holder_adds.is_empty() {
+        p.holder_seq = prev_holder_seq + 1;
+    }
+    st.publish_bump(pid, prev_version, &["frames"], &touched);
+    if !holder_adds.is_empty() {
+        st.publish_holders(
+            pid,
+            prev_holder_seq,
+            json!([{ "device": device, "add": holder_adds, "rm": [] }]),
+        );
     }
     ok(json!({ "state": state, "projectVersion": version, "announced": n }))
 }
@@ -1080,6 +2044,8 @@ fn announce(
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NewVersionBody {
+    #[serde(default)]
+    expected_version: Option<i32>,
     blake3: String,
     byte_size: i64,
     xxh3: String,
@@ -1102,6 +2068,9 @@ fn new_version(
         Ok(b) => b,
         Err(e) => return error(422, format!("bad version body: {e}")),
     };
+    let Some(expected) = body.expected_version else {
+        return error(409, "collab_api_outdated");
+    };
     if !is_lower_hex(&body.blake3, 64) {
         return error(400, "blake3 must be 64 lowercase hex chars");
     }
@@ -1120,6 +2089,13 @@ fn new_version(
     if p.status != "active" {
         return error(409, "project is closed");
     }
+    let current = p.frames.get(uuid).expect("checked above").content_version;
+    if expected != current {
+        return ResponseTemplate::new(409)
+            .set_body_json(json!({ "error": "version_conflict", "contentVersion": current }));
+    }
+    let prev_version = p.version;
+    let prev_holder_seq = p.holder_seq;
     let version = p.bump();
     let f = p.frames.get_mut(uuid).expect("checked above");
     f.content_version += 1;
@@ -1128,11 +2104,127 @@ fn new_version(
     f.xxh3 = body.xxh3;
     f.manifest_version = version;
     let next = f.content_version;
-    // The fresh upload is the only copy that exists right now.
-    let holds = p.holders.entry(uuid.to_string()).or_default();
-    holds.clear();
-    holds.insert(acct.device_pubkey_b64.clone(), (next, Instant::now()));
+    let frame_seq = f.frame_seq;
+    let device = acct.device_pubkey_b64.clone();
+    let rs = p.highest_report_seq(&device);
+    let changed = p.write_claim(&device, uuid, next, false, rs);
+    if changed {
+        p.holder_seq = prev_holder_seq + 1;
+    }
+    st.publish_bump(pid, prev_version, &["frames"], &[uuid.to_string()]);
+    if changed {
+        st.publish_holders(
+            pid,
+            prev_holder_seq,
+            json!([{ "device": device, "add": [[frame_seq, next]], "rm": [] }]),
+        );
+    }
     ok(json!({ "contentVersion": next, "projectVersion": version }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionBatchIn {
+    uuid: String,
+    expected_version: i32,
+    blake3: String,
+    byte_size: i64,
+    xxh3: String,
+}
+
+#[derive(serde::Deserialize)]
+struct VersionsBatchBody {
+    versions: Vec<VersionBatchIn>,
+}
+
+fn frame_versions_batch(
+    st: &mut FakeHubState,
+    acct: &FakeAccount,
+    pid: &str,
+    req: &Request,
+) -> ResponseTemplate {
+    let body: VersionsBatchBody = match req.body_json() {
+        Ok(b) => b,
+        Err(e) => return error(422, format!("bad versions body: {e}")),
+    };
+    if body.versions.is_empty() || body.versions.len() > 500 {
+        return error(400, "versions must contain 1..=500 items");
+    }
+    let Some(p) = st.projects.get_mut(pid) else {
+        return not_found_project();
+    };
+    if p.member(&acct.account_id).is_none() {
+        return empty(403);
+    }
+    if p.status != "active" {
+        return error(409, "project is closed");
+    }
+    let device = acct.device_pubkey_b64.clone();
+    let prev_version = p.version;
+    let prev_holder_seq = p.holder_seq;
+    let mut any_ok = false;
+    let mut any_holder_change = false;
+    let mut results = Vec::new();
+    let mut touched = Vec::new();
+    let mut holder_adds: Vec<Value> = Vec::new();
+    for v in &body.versions {
+        let Some(f) = p.frames.get(&v.uuid) else {
+            results.push(json!({"uuid": v.uuid, "status": "not_found", "contentVersion": 0}));
+            continue;
+        };
+        if f.publisher_account_id != acct.account_id {
+            results.push(
+                json!({"uuid": v.uuid, "status": "forbidden", "contentVersion": f.content_version}),
+            );
+            continue;
+        }
+        if f.content_version != v.expected_version {
+            results.push(
+                json!({"uuid": v.uuid, "status": "conflict", "contentVersion": f.content_version}),
+            );
+            continue;
+        }
+        let frame = p.frames.get_mut(&v.uuid).expect("checked above");
+        frame.content_version += 1;
+        frame.blake3 = v.blake3.clone();
+        frame.byte_size = v.byte_size;
+        frame.xxh3 = v.xxh3.clone();
+        let next = frame.content_version;
+        let frame_seq = frame.frame_seq;
+        any_ok = true;
+        touched.push(v.uuid.clone());
+        let rs = p.highest_report_seq(&device);
+        if p.write_claim(&device, &v.uuid, next, false, rs) {
+            any_holder_change = true;
+            holder_adds.push(json!([frame_seq, next]));
+        }
+        results.push(json!({"uuid": v.uuid, "status": "ok", "contentVersion": next}));
+    }
+    let version = if any_ok {
+        let v = p.bump();
+        for uuid in &touched {
+            if let Some(f) = p.frames.get_mut(uuid) {
+                f.manifest_version = v;
+            }
+        }
+        v
+    } else {
+        p.version
+    };
+    if any_holder_change {
+        p.holder_seq = prev_holder_seq + 1;
+    }
+    if any_ok {
+        st.publish_bump(pid, prev_version, &["frames"], &touched);
+    }
+    if any_holder_change {
+        st.publish_holders(
+            pid,
+            prev_holder_seq,
+            json!([{ "device": device, "add": holder_adds, "rm": [] }]),
+        );
+    }
+    ok(json!({ "projectVersion": version, "results": results }))
 }
 
 #[derive(serde::Deserialize)]
@@ -1171,16 +2263,20 @@ fn approve(
     if state != "pending" {
         return error(409, "frame is not pending");
     }
+    let prev_version = p.version;
     let version = p.bump();
+    let mut touched = vec![uuid.to_string()];
     let published = if body.trust {
         if let Some(m) = p.members.iter_mut().find(|m| m.account_id == publisher) {
             m.trusted = true;
         }
         let mut n = 0;
+        touched.clear();
         for f in p.frames.values_mut() {
             if f.publisher_account_id == publisher && f.state == "pending" {
                 f.state = "published".to_string();
                 f.manifest_version = version;
+                touched.push(f.frame_uuid.clone());
                 n += 1;
             }
         }
@@ -1191,6 +2287,7 @@ fn approve(
         f.manifest_version = version;
         1
     };
+    st.publish_bump(pid, prev_version, &["frames"], &touched);
     ok(json!({ "published": published }))
 }
 
@@ -1230,156 +2327,601 @@ fn reject(
     if f.state != "pending" {
         return error(409, "frame is not pending");
     }
-    // R13: a fresh holder outside the publisher and the moderators blocks it.
-    let foreign = p
-        .holders
-        .get(uuid)
-        .map(|holds| {
-            holds.iter().any(|(dev, (_, at))| {
-                at.elapsed() <= HOLDER_FRESH
-                    && match dev_acct.get(dev) {
-                        Some(a) if *a == f.publisher_account_id => false,
-                        Some(a) => !p.member(a).is_some_and(|m| m.has_cap("data.moderate")),
-                        None => true,
-                    }
-            })
-        })
-        .unwrap_or(false);
+    // R13: a live holder outside the publisher and the moderators blocks it.
+    let foreign = p.claims.iter().any(|((dev, u), c)| {
+        u == uuid
+            && !c.removed
+            && match dev_acct.get(dev) {
+                Some(a) if *a == f.publisher_account_id => false,
+                Some(a) => !p.member(a).is_some_and(|m| m.has_cap("data.moderate")),
+                None => true,
+            }
+    });
     if foreign {
         return error(
             409,
             "frame is already held by other members; exclude it instead",
         );
     }
+    let prev_version = p.version;
     let version = p.bump();
     let frame = p.frames.get_mut(uuid).expect("checked above");
     frame.state = "rejected".to_string();
     frame.reject_reason = Some(reason);
     frame.manifest_version = version;
-    p.holders.remove(uuid);
+    let keys: Vec<(String, String)> = p
+        .claims
+        .keys()
+        .filter(|(_, u)| u == uuid)
+        .cloned()
+        .collect();
+    for k in keys {
+        p.claims.remove(&k);
+    }
+    st.publish_bump(pid, prev_version, &["frames"], &[uuid.to_string()]);
     ok(json!({ "state": "rejected" }))
+}
+
+/// One run-length-encoded claim triple `[startSeq, runLength, contentVersion]`
+/// (hub § "Run-length claims").
+fn run_length_encode(rows: &[(i32, i32)]) -> Vec<[i32; 3]> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let (start, cv) = rows[i];
+        let mut len: i32 = 1;
+        while (i + len as usize) < rows.len()
+            && rows[i + len as usize].0 == start + len
+            && rows[i + len as usize].1 == cv
+        {
+            len += 1;
+        }
+        out.push([start, len, cv]);
+        i += len as usize;
+    }
+    out
+}
+
+fn holders_snapshot(st: &FakeHubState, acct: &FakeAccount, pid: &str) -> ResponseTemplate {
+    let (p, m) = match member_of(st, acct, pid) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let moderator = m.has_cap("data.moderate");
+    let mut frames: Vec<(i32, Value)> = p
+        .frames
+        .values()
+        .filter(|f| visible(f, &acct.account_id, moderator))
+        .map(|f| {
+            (
+                f.frame_seq,
+                json!({ "seq": f.frame_seq, "uuid": f.frame_uuid, "contentVersion": f.content_version }),
+            )
+        })
+        .collect();
+    frames.sort_by_key(|(seq, _)| *seq);
+    let frames: Vec<Value> = frames.into_iter().map(|(_, v)| v).collect();
+
+    let mut devices = Vec::new();
+    for member in &p.members {
+        for device in st.devices_of(&member.account_id) {
+            let mut rows: Vec<(i32, i32)> = p
+                .claims
+                .iter()
+                .filter(|((d, _), c)| d == &device && !c.removed)
+                .filter_map(|((_, u), c)| p.frames.get(u).map(|f| (f.frame_seq, c.content_version)))
+                .collect();
+            rows.sort_by_key(|(seq, _)| *seq);
+            let claims = run_length_encode(&rows);
+            devices.push(json!({
+                "device": device,
+                "displayName": st.display_of(&member.account_id),
+                "relayUrl": st.tokens.values().find(|a| a.device_pubkey_b64 == device).and_then(|a| a.relay_url.clone()),
+                "claims": claims,
+            }));
+        }
+    }
+
+    ok(json!({
+        "epoch": st.epoch,
+        "holderSeq": p.holder_seq,
+        "version": p.version,
+        "frames": frames,
+        "devices": devices,
+    }))
+}
+
+fn holders_since(
+    st: &FakeHubState,
+    acct: &FakeAccount,
+    pid: &str,
+    req: &Request,
+) -> ResponseTemplate {
+    let (p, _) = match member_of(st, acct, pid) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if let Some(epoch) = query(req, "epoch") {
+        if epoch != st.epoch {
+            return gone("epoch_changed", json!({ "epoch": st.epoch }));
+        }
+    }
+    let since: i64 = query(req, "since")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if since < p.holder_floor {
+        return gone("holders_below_floor", json!({ "floor": p.holder_floor }));
+    }
+    if since > p.holder_seq {
+        return gone("holders_cursor_ahead", json!({ "holderSeq": p.holder_seq }));
+    }
+    let limit = st.page_size.min(MANIFEST_PAGE).max(1);
+    let mut rows: Vec<(&(String, String), &FakeClaim)> = p
+        .claims
+        .iter()
+        .filter(|(_, c)| c.changed_seq > since)
+        .collect();
+    rows.sort_by(|((d1, u1), c1), ((d2, u2), c2)| {
+        (c1.changed_seq, d1, u1).cmp(&(c2.changed_seq, d2, u2))
+    });
+    let has_more = rows.len() > limit;
+    let page = &rows[..rows.len().min(limit)];
+    let mut by_device: BTreeMap<String, (Vec<[i32; 2]>, Vec<i32>)> = BTreeMap::new();
+    for ((device, uuid), c) in page {
+        let Some(f) = p.frames.get(uuid) else {
+            continue;
+        };
+        let entry = by_device.entry(device.clone()).or_default();
+        if c.removed {
+            entry.1.push(f.frame_seq);
+        } else {
+            entry.0.push([f.frame_seq, c.content_version]);
+        }
+    }
+    let deltas: Vec<Value> = by_device
+        .into_iter()
+        .map(|(device, (add, rm))| json!({ "device": device, "add": add, "rm": rm }))
+        .collect();
+    let next = if has_more {
+        page.last()
+            .map(|((d, u), c)| json!({ "since": c.changed_seq, "after": format!("{d}:{u}") }))
+    } else {
+        None
+    };
+    ok(json!({
+        "epoch": st.epoch,
+        "holderSeq": p.holder_seq,
+        "floor": p.holder_floor,
+        "deltas": deltas,
+        "hasMore": has_more,
+        "next": next,
+    }))
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct HeldFrame {
-    frame_uuid: String,
+struct ReportAddIn {
+    uuid: String,
     content_version: i32,
 }
 
 #[derive(serde::Deserialize)]
-struct HoldersBody {
+#[serde(rename_all = "camelCase")]
+struct ReportIn {
+    #[serde(default)]
+    report_seq: Option<i64>,
     #[serde(default)]
     full: bool,
     #[serde(default)]
-    add: Vec<HeldFrame>,
+    add: Vec<ReportAddIn>,
     #[serde(default)]
     remove: Vec<String>,
+    #[serde(default)]
+    digest: String,
+    #[serde(default)]
+    count: i64,
 }
 
-fn put_holders(
+fn parse_hex16(hex: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    if hex.len() == 32 {
+        for (i, o) in out.iter_mut().enumerate() {
+            if let Ok(b) = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+                *o = b;
+            }
+        }
+    }
+    out
+}
+
+fn report_holders(
     st: &mut FakeHubState,
     acct: &FakeAccount,
     pid: &str,
     req: &Request,
 ) -> ResponseTemplate {
-    let body: HoldersBody = match req.body_json() {
+    let body: ReportIn = match req.body_json() {
         Ok(b) => b,
-        Err(e) => return error(422, format!("bad holders body: {e}")),
+        Err(e) => return error(422, format!("bad holders report body: {e}")),
     };
+    let Some(report_seq) = body.report_seq else {
+        return error(409, "collab_api_outdated");
+    };
+    if report_seq < 1 {
+        return error(400, "reportSeq must be >= 1");
+    }
+    if body.full && !body.remove.is_empty() {
+        return error(400, "remove must be empty when full is true");
+    }
+    if body.add.len() > 10_000 || body.remove.len() > 10_000 {
+        return error(400, "add/remove must each contain at most 10000 items");
+    }
+    let mut seen = HashSet::new();
+    for a in &body.add {
+        if !seen.insert(a.uuid.clone()) {
+            return error(400, format!("duplicate frameUuid in batch: {}", a.uuid));
+        }
+    }
+    if let Some(both) = body.add.iter().find(|a| body.remove.contains(&a.uuid)) {
+        return error(
+            400,
+            format!("frameUuid {} present in both add and remove", both.uuid),
+        );
+    }
     let Some(p) = st.projects.get_mut(pid) else {
         return not_found_project();
     };
     let Some(member) = p.member(&acct.account_id).cloned() else {
         return empty(403);
     };
-    if body.add.len() > 10_000 || body.remove.len() > 10_000 {
-        return error(400, "add/remove must each contain at most 10000 items");
-    }
-    if body.full && !body.remove.is_empty() {
-        return error(400, "remove must be empty when full is true");
-    }
-    let mut seen = HashSet::new();
-    for f in &body.add {
-        if !seen.insert(f.frame_uuid.clone()) {
-            return error(
-                400,
-                format!("duplicate frameUuid in batch: {}", f.frame_uuid),
-            );
-        }
-    }
-    if let Some(both) = body
-        .add
-        .iter()
-        .find(|f| body.remove.contains(&f.frame_uuid))
-    {
-        return error(
-            400,
-            format!(
-                "frameUuid {} present in both add and remove",
-                both.frame_uuid
-            ),
-        );
-    }
+    p.raise_report_hwm(&acct.device_pubkey_b64, report_seq);
+
     let moderator = member.has_cap("data.moderate");
     let any_frame = member.data_role == "send_receive" || moderator;
     let device = acct.device_pubkey_b64.clone();
-    // Per-row permission filter; a row that fails is silently dropped.
+    let mut refused = Vec::new();
+    let mut accepted: Vec<(String, i32)> = Vec::new();
     for a in &body.add {
-        let Some(f) = p.frames.get(&a.frame_uuid) else {
+        let Some(f) = p.frames.get(&a.uuid) else {
+            refused.push(a.uuid.clone());
             continue;
         };
         let mine = f.publisher_account_id == acct.account_id;
-        let state_ok = f.state == "published" || (f.state == "pending" && (moderator || mine));
-        if a.content_version == f.content_version && state_ok && (any_frame || mine) {
-            p.holders
-                .entry(a.frame_uuid.clone())
-                .or_default()
-                .insert(device.clone(), (a.content_version, Instant::now()));
+        let holdable =
+            mine || (f.state == "published" && any_frame) || (f.state == "pending" && moderator);
+        if a.content_version < 1 || a.content_version > f.content_version || !holdable {
+            refused.push(a.uuid.clone());
+            continue;
+        }
+        accepted.push((a.uuid.clone(), a.content_version));
+    }
+
+    let prev_holder_seq = p.holder_seq;
+    let mut changed_any = false;
+    let mut changed_rows: u64 = 0;
+    let mut add_deltas: Vec<[i32; 2]> = Vec::new();
+    let mut rm_deltas: Vec<i32> = Vec::new();
+
+    for (uuid, cv) in &accepted {
+        if p.write_claim(&device, uuid, *cv, false, report_seq) {
+            changed_any = true;
+            changed_rows += 1;
+            if let Some(f) = p.frames.get(uuid) {
+                add_deltas.push([f.frame_seq, *cv]);
+            }
+        }
+    }
+    // Refused frames: any LIVE claim we already hold is tombstoned.
+    for uuid in &refused {
+        let cv = match p.claims.get(&(device.clone(), uuid.clone())) {
+            Some(c) if !c.removed => c.content_version,
+            _ => continue,
+        };
+        if p.write_claim(&device, uuid, cv, true, report_seq) {
+            changed_any = true;
+            changed_rows += 1;
+            if let Some(f) = p.frames.get(uuid) {
+                rm_deltas.push(f.frame_seq);
+            }
         }
     }
     if body.full {
-        let keep: HashSet<&str> = body.add.iter().map(|a| a.frame_uuid.as_str()).collect();
-        for (uuid, holds) in p.holders.iter_mut() {
-            if !keep.contains(uuid.as_str()) {
-                holds.remove(&device);
+        let keep: HashSet<&str> = accepted.iter().map(|(u, _)| u.as_str()).collect();
+        let to_remove: Vec<(String, i32)> = p
+            .claims
+            .iter()
+            .filter(|((d, u), c)| {
+                d == &device
+                    && !c.removed
+                    && !keep.contains(u.as_str())
+                    && c.report_seq < report_seq
+            })
+            .map(|((_, u), c)| (u.clone(), c.content_version))
+            .collect();
+        for (uuid, cv) in to_remove {
+            if p.write_claim(&device, &uuid, cv, true, report_seq) {
+                changed_any = true;
+                changed_rows += 1;
+                if let Some(f) = p.frames.get(&uuid) {
+                    rm_deltas.push(f.frame_seq);
+                }
             }
         }
     } else {
         for uuid in &body.remove {
-            if let Some(holds) = p.holders.get_mut(uuid) {
-                holds.remove(&device);
+            let cv = p
+                .claims
+                .get(&(device.clone(), uuid.clone()))
+                .map(|c| c.content_version)
+                .or_else(|| p.frames.get(uuid).map(|f| f.content_version))
+                .unwrap_or(0);
+            if p.write_claim(&device, uuid, cv, true, report_seq) {
+                changed_any = true;
+                changed_rows += 1;
+                if let Some(f) = p.frames.get(uuid) {
+                    rm_deltas.push(f.frame_seq);
+                }
             }
         }
     }
-    empty(204)
+
+    if changed_any {
+        p.holder_seq = prev_holder_seq + 1;
+    }
+    st.holder_writes += changed_rows;
+
+    // The wire contract has the client fold every attempted add (including
+    // ones the hub goes on to refuse) into the digest/count it sends, then
+    // drop the refused ones from its own local claim set once the reply
+    // names them (hub § "Holders" — refused keys are removed from OUR
+    // digest before comparing). A well-behaved client's NEXT report already
+    // excludes them, so the digest it sends there compares directly against
+    // our post-report ground truth with no further adjustment here.
+    let client_digest = ClaimDigest {
+        count: body.count,
+        xor: parse_hex16(&body.digest),
+    };
+    let p = st.projects.get(pid).expect("checked above");
+    let server_digest = p.digest_of(&device);
+    let digest_match = client_digest == server_digest;
+    let holder_seq = p.holder_seq;
+
+    if changed_any {
+        let deltas = json!([{ "device": device, "add": add_deltas, "rm": rm_deltas }]);
+        st.publish_holders(pid, prev_holder_seq, deltas);
+    }
+
+    ok(json!({
+        "holderSeq": holder_seq,
+        "digestMatch": digest_match,
+        "nextFlushMs": 1000,
+        "refused": refused,
+    }))
 }
 
-fn frame_holders(st: &FakeHubState, acct: &FakeAccount, pid: &str, uuid: &str) -> ResponseTemplate {
-    let dev_acct = st.device_accounts();
-    let (p, m) = match member_of(st, acct, pid) {
-        Ok(x) => x,
-        Err(r) => return r,
-    };
-    let Some(f) = p.frames.get(uuid) else {
-        return error(404, "frame not found");
-    };
-    if !visible(f, &acct.account_id, m.has_cap("data.moderate")) {
-        return error(404, "frame not found");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collab::hub_client::CollabClient;
+    use crate::collab::live::digest::ClaimDigest;
+    use crate::collab::live::wire::{ClaimWire, HoldersReportWire};
+
+    async fn hub_with_member() -> FakeHub {
+        let hub = FakeHub::start().await;
+        hub.add_account("tok", "acc-me", "Me", "AAA=", None);
+        hub.add_account("tok-o", "acc-o", "Other", "BBB=", None);
+        hub.add_project(
+            "p1",
+            "m31",
+            &[("acc-me", "send_receive", false), ("acc-o", "send", false)],
+            false,
+        );
+        hub.seed_frames("p1", "acc-o", &["u1", "u2"], "published");
+        hub
     }
-    let mut devices = fresh_holders(p, &dev_acct, f);
-    devices.sort();
-    let out: Vec<Value> = devices
-        .into_iter()
-        .map(|dev| {
-            let a = st.tokens.values().find(|a| a.device_pubkey_b64 == dev);
-            json!({
-                "pubkey": dev,
-                "displayName": a.map(|a| a.display.clone()).unwrap_or_default(),
-                "lastSeenAt": Value::Null,
-                "relayUrl": a.and_then(|a| a.relay_url.clone()),
-            })
-        })
-        .collect();
-    ok(Value::Array(out))
+
+    /// Reads SSE frames from the front with reqwest.
+    async fn open(hub: &FakeHub, token: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("{}/api/v1/me/events", hub.uri()))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn next_event(
+        resp: &mut reqwest::Response,
+        buf: &mut String,
+    ) -> (String, serde_json::Value) {
+        loop {
+            if let Some(end) = buf.find("\n\n") {
+                let block: String = buf.drain(..end + 2).collect();
+                let name = block
+                    .lines()
+                    .find_map(|l| l.strip_prefix("event: "))
+                    .map(str::to_string);
+                let data: String = block
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .collect();
+                if let Some(n) = name {
+                    return (n, serde_json::from_str(&data).unwrap());
+                }
+                continue;
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_carries_cursors_digest_and_presence() {
+        let hub = hub_with_member().await;
+        let mut resp = open(&hub, "tok").await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "text/event-stream");
+        let mut buf = String::new();
+        let (name, hello) = next_event(&mut resp, &mut buf).await;
+        assert_eq!(name, "hello");
+        assert_eq!(hello["accountId"], "acc-me");
+        let p = &hello["projects"]["p1"];
+        assert_eq!(p["claimDigest"], crate::collab::live::digest::ZERO_HEX);
+        assert_eq!(p["holderSeq"], 1); // the seeding publisher's implicit claims
+        assert!(p["presence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["device"] == "AAA="));
+    }
+
+    #[tokio::test]
+    async fn a_report_advances_the_holder_cursor_and_streams_a_contiguous_delta() {
+        let hub = hub_with_member().await;
+        let mut resp = open(&hub, "tok").await;
+        let mut buf = String::new();
+        let (_, hello) = next_event(&mut resp, &mut buf).await;
+        let seq0 = hello["projects"]["p1"]["holderSeq"].as_i64().unwrap();
+        let c = CollabClient::new(hub.uri()).unwrap();
+        let digest = ClaimDigest::of_claims([("u1", 1)]).unwrap();
+        let reply = c
+            .report_holders(
+                "tok",
+                "p1",
+                &HoldersReportWire {
+                    report_seq: 1,
+                    full: false,
+                    add: vec![ClaimWire {
+                        uuid: "u1".into(),
+                        content_version: 1,
+                    }],
+                    remove: vec![],
+                    digest: digest.hex(),
+                    count: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(reply.digest_match);
+        assert_eq!(reply.holder_seq, seq0 + 1);
+        let (name, ev) = loop {
+            let e = next_event(&mut resp, &mut buf).await;
+            if e.0 == "holders" {
+                break e;
+            }
+        };
+        assert_eq!(name, "holders");
+        assert_eq!(
+            (ev["prev"].as_i64().unwrap(), ev["seq"].as_i64().unwrap()),
+            (seq0, seq0 + 1)
+        );
+        assert_eq!(ev["deltas"][0]["device"], "AAA=");
+        assert_eq!(hub.holders_of("p1", "u1").len(), 2); // publisher + me
+    }
+
+    #[tokio::test]
+    async fn an_older_report_seq_never_overrides_a_newer_one() {
+        let hub = hub_with_member().await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        let body = |seq: i64, add: bool| HoldersReportWire {
+            report_seq: seq,
+            full: false,
+            add: if add {
+                vec![ClaimWire {
+                    uuid: "u1".into(),
+                    content_version: 1,
+                }]
+            } else {
+                vec![]
+            },
+            remove: if add { vec![] } else { vec!["u1".into()] },
+            digest: crate::collab::live::digest::ZERO_HEX.into(),
+            count: 0,
+        };
+        c.report_holders("tok", "p1", &body(5, false))
+            .await
+            .unwrap();
+        c.report_holders("tok", "p1", &body(4, true)).await.unwrap(); // delayed older add
+        assert!(hub.claim_of("p1", "AAA=", "u1").map_or(true, |c| c.removed));
+    }
+
+    #[tokio::test]
+    async fn refused_claims_and_retired_routes() {
+        let hub = hub_with_member().await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        let reply = c
+            .report_holders(
+                "tok",
+                "p1",
+                &HoldersReportWire {
+                    report_seq: 1,
+                    full: false,
+                    add: vec![
+                        ClaimWire {
+                            uuid: "nope".into(),
+                            content_version: 1,
+                        },
+                        ClaimWire {
+                            uuid: "u2".into(),
+                            content_version: 9,
+                        },
+                    ],
+                    remove: vec![],
+                    digest: crate::collab::live::digest::ZERO_HEX.into(),
+                    count: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.refused.len(), 2);
+        assert!(reply.digest_match); // refused keys are removed from our digest before comparing
+        let r = reqwest::Client::new()
+            .get(format!("{}/api/v1/me/project-versions", hub.uri()))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn versions_compare_and_set_and_revocation_tombstones() {
+        let hub = hub_with_member().await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        let conflict = c
+            .new_frame_version("tok-o", "p1", "u1", 7, &"c".repeat(64), 10, &"0".repeat(16))
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(crate::account::AccountClientError::VersionConflict { content_version: 1 })
+        ));
+        let ok = c
+            .new_frame_version("tok-o", "p1", "u1", 1, &"c".repeat(64), 10, &"0".repeat(16))
+            .await
+            .unwrap();
+        assert_eq!(ok.content_version, 2);
+        assert_eq!(hub.holders_of("p1", "u1"), vec!["BBB=".to_string()]); // implicit claim at v2
+        hub.revoke_device("BBB=", true);
+        assert!(hub.holders_of("p1", "u1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_since_page_current_rows() {
+        let hub = hub_with_member().await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        let snap = c.holders_snapshot("tok", "p1").await.unwrap();
+        assert_eq!(snap.frames.len(), 2);
+        let publisher = snap.devices.iter().find(|d| d.device == "BBB=").unwrap();
+        assert_eq!(publisher.claims, vec![[1, 2, 1]]);
+        let page = c.holders_since("tok", "p1", 0, None, None).await.unwrap();
+        assert_eq!(page.holder_seq, snap.holder_seq);
+        let gone = c.holders_since("tok", "p1", 99, None, None).await;
+        assert!(
+            matches!(gone, Err(crate::account::AccountClientError::Gone(ref e)) if e == "holders_cursor_ahead")
+        );
+    }
 }
