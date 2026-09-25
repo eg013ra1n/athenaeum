@@ -2325,6 +2325,103 @@ async fn unstage_updates(
     }
 }
 
+/// A version the hub took: re-tag the seed when the hub's number differs
+/// from the one this run seeded, and queue the frame for its write-back.
+async fn accept_version(
+    node: &crate::sharing::iroh::node::SharedIrohNode,
+    project_id: &str,
+    mut f: SeededFrame,
+    content_version: i32,
+    versioned: &mut Vec<SeededFrame>,
+) {
+    if content_version != f.content_version {
+        tracing::warn!(project_id, frame_uuid = %f.written.uuid, content_version, expected = f.content_version, "publish: hub assigned a different content version; re-tagging");
+        if let Err(e) = node
+            .seed_project_frame(
+                project_id,
+                &f.written.uuid,
+                content_version,
+                &f.written.target,
+            )
+            .await
+        {
+            tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: re-tagging under the hub's version failed");
+        }
+        f.content_version = content_version;
+    }
+    tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = f.content_version, "publish: new frame version");
+    versioned.push(f);
+}
+
+/// A real version conflict: unseed, unstage, hold the frame back with the
+/// hub's number, and remember it for the post-run manifest check.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_version(
+    ctx: &ServiceContext,
+    node: &crate::sharing::iroh::node::SharedIrohNode,
+    disk_lock: &tokio::sync::Mutex<()>,
+    project_id: &str,
+    f: SeededFrame,
+    hub_version: i32,
+    conflicts: &mut Vec<(String, i32)>,
+    held_back: &mut Vec<HeldBackFrame>,
+) {
+    tracing::warn!(project_id, frame_uuid = %f.written.uuid, content_version = hub_version, "publish: version conflict; the hub has a newer version");
+    unseed_all(node, project_id, &[&f]).await;
+    unstage_updates(ctx, disk_lock, project_id, &[&f]).await;
+    held_back.push(held(
+        f.written.frame_id,
+        &f.written.filename,
+        format!("version conflict: the hub has content version {hub_version}"),
+    ));
+    conflicts.push((f.written.uuid.clone(), hub_version));
+}
+
+/// The hub's `(contentVersion, blake3)` for each of `uuids`, from a manifest
+/// delta read starting at `since` (every changed frame carries a
+/// `manifestVersion` above the row's last-seen one). Stops once every uuid is
+/// found or the manifest ends.
+async fn hub_frame_versions(
+    client: &CollabClient,
+    token: &str,
+    project_id: &str,
+    since: i64,
+    uuids: &HashSet<String>,
+) -> Result<HashMap<String, (i32, String)>, crate::account::AccountClientError> {
+    let mut out = HashMap::new();
+    let mut since = since;
+    let mut after: Option<String> = None;
+    loop {
+        let page = client
+            .manifest_page(token, project_id, since, after.as_deref(), 1000)
+            .await?;
+        for v in page.rows {
+            if uuids.contains(&v.frame_uuid) {
+                out.insert(v.frame_uuid, (v.content_version, v.blake3));
+            }
+        }
+        if out.len() == uuids.len() || !page.has_more {
+            return Ok(out);
+        }
+        match page.next {
+            Some(n) => {
+                since = n.since;
+                after = Some(n.after);
+            }
+            None => {
+                tracing::warn!(project_id, "manifest page says hasMore without a next cursor; stopping the version read here");
+                return Ok(out);
+            }
+        }
+    }
+}
+
+/// A `conflict` at `expected + 1` is our own version (a retried call whose
+/// first reply was lost) only when the hub's bytes for it are ours.
+fn is_own_lost_reply(expected: i32, ours_blake3: &str, hub: Option<&(i32, String)>) -> bool {
+    hub.is_some_and(|(cv, b3)| *cv == expected + 1 && b3 == ours_blake3)
+}
+
 /// Re-tag an update's seed under the version the hub already holds for the
 /// same bytes (C1c), dropping the tag of the version this run never posted.
 async fn retag_under_hub_version(
@@ -3081,9 +3178,14 @@ async fn run_publish(
     // Frames whose bytes the hub turned out to hold already (C1c): recorded
     // at the hub's version, counted unchanged, no `…/version`.
     let mut already_versioned: Vec<SeededFrame> = Vec::new();
-    // A version conflict: the hub has a newer version than this run based
-    // its update on — held back, and another run is asked for.
-    let mut conflicted = false;
+    // Real version conflicts `(uuid, the hub's content version)`: the hub
+    // has a newer version than this run based its update on — held back;
+    // another run is asked for once the local manifest has caught up.
+    let mut conflicts: Vec<(String, i32)> = Vec::new();
+    // `conflict` answers at exactly `expectedVersion + 1`: our own version
+    // whose first reply was lost — or another device of this account's.
+    // Decided after the batches by the hub's BLAKE3 for that version.
+    let mut maybe_ours: Vec<(SeededFrame, i32, i32)> = Vec::new();
     if !outdated && !updates.is_empty() {
         if let Err(e) = crate::api::collab_live::holdings::flush_project_now(ctx, project_id).await
         {
@@ -3173,70 +3275,106 @@ async fn run_publish(
                 }
             };
             let mut results = reply.results.into_iter();
-            for (mut f, expected) in batch {
+            for (f, expected) in batch {
                 use crate::collab::live::wire::VersionStatus;
                 let result = results.next().filter(|r| r.uuid == f.written.uuid);
-                let outcome = match &result {
-                    Some(r) if r.status == VersionStatus::Ok => Ok(r.content_version),
-                    // A retried call whose first reply was lost: only the
-                    // publisher can bump, so `expected + 1` is our own
-                    // version (T6 ruling) — recorded the same as `ok`.
+                match &result {
+                    Some(r) if r.status == VersionStatus::Ok => {
+                        let cv = r.content_version;
+                        accept_version(&node, project_id, f, cv, &mut versioned).await;
+                    }
                     Some(r)
                         if r.status == VersionStatus::Conflict
                             && r.content_version == expected + 1 =>
                     {
-                        tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = r.content_version, "publish: the hub already took this version (a retried call)");
-                        Ok(r.content_version)
+                        maybe_ours.push((f, expected, r.content_version));
                     }
                     Some(r) if r.status == VersionStatus::Conflict => {
-                        tracing::warn!(project_id, frame_uuid = %f.written.uuid, content_version = r.content_version, "publish: version conflict; the hub has a newer version");
-                        conflicted = true;
-                        Err(format!(
-                            "version conflict: the hub has content version {}",
-                            r.content_version
-                        ))
-                    }
-                    Some(r) if r.status == VersionStatus::NotFound => {
-                        tracing::error!(project_id, frame_uuid = %f.written.uuid, "publish: new frame version refused: the hub does not know the frame");
-                        Err("new version failed: the hub does not know this frame".to_string())
-                    }
-                    Some(r) if r.status == VersionStatus::Forbidden => {
-                        tracing::error!(project_id, frame_uuid = %f.written.uuid, "publish: new frame version refused: not the frame's publisher");
-                        Err("new version failed: the hub says this device's account did not publish the frame".to_string())
-                    }
-                    _ => {
-                        tracing::error!(project_id, frame_uuid = %f.written.uuid, "publish: the versions reply has no matching result for this frame");
-                        Err(
-                            "new version failed: the hub's reply did not answer for this frame"
-                                .to_string(),
+                        let n = r.content_version;
+                        refuse_version(
+                            ctx,
+                            &node,
+                            &disk_lock,
+                            project_id,
+                            f,
+                            n,
+                            &mut conflicts,
+                            &mut held_back,
                         )
+                        .await;
                     }
-                };
-                match outcome {
-                    Ok(content_version) => {
-                        if content_version != f.content_version {
-                            tracing::warn!(project_id, frame_uuid = %f.written.uuid, content_version, expected = f.content_version, "publish: hub assigned a different content version; re-tagging");
-                            if let Err(e) = node
-                                .seed_project_frame(
-                                    project_id,
-                                    &f.written.uuid,
-                                    content_version,
-                                    &f.written.target,
-                                )
-                                .await
-                            {
-                                tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: re-tagging under the hub's version failed");
+                    other => {
+                        let reason = match other {
+                            Some(r) if r.status == VersionStatus::NotFound => {
+                                tracing::error!(project_id, frame_uuid = %f.written.uuid, "publish: new frame version refused: the hub does not know the frame");
+                                "new version failed: the hub does not know this frame"
                             }
-                            f.content_version = content_version;
-                        }
-                        tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = f.content_version, "publish: new frame version");
-                        versioned.push(f);
-                    }
-                    Err(reason) => {
+                            Some(r) if r.status == VersionStatus::Forbidden => {
+                                tracing::error!(project_id, frame_uuid = %f.written.uuid, "publish: new frame version refused: not the frame's publisher");
+                                "new version failed: the hub says this device's account did not publish the frame"
+                            }
+                            _ => {
+                                tracing::error!(project_id, frame_uuid = %f.written.uuid, "publish: the versions reply has no matching result for this frame");
+                                "new version failed: the hub's reply did not answer for this frame"
+                            }
+                        };
                         unseed_all(&node, project_id, &[&f]).await;
                         unstage_updates(ctx, &disk_lock, project_id, &[&f]).await;
-                        held_back.push(held(f.written.frame_id, &f.written.filename, reason));
+                        held_back.push(held(
+                            f.written.frame_id,
+                            &f.written.filename,
+                            reason.to_string(),
+                        ));
                     }
+                }
+            }
+        }
+        // A conflict at `expected + 1` is our own lost reply ONLY when the
+        // hub's BLAKE3 for that version is ours (controller ruling): another
+        // device of this account may have bumped it with other bytes. One
+        // manifest delta read decides; a failed read decides "not ours" (the
+        // safe side: the frame is held back and regenerated next run).
+        if !maybe_ours.is_empty() {
+            let uuids: HashSet<String> = maybe_ours
+                .iter()
+                .map(|(f, _, _)| f.written.uuid.clone())
+                .collect();
+            let since = {
+                let db = db(ctx)?;
+                let conn = db.conn();
+                let mut since = i64::MAX;
+                for u in &uuids {
+                    let mv = frames_db::get(&conn, project_id, u)
+                        .ok()
+                        .flatten()
+                        .map_or(0, |r| r.manifest_version);
+                    since = since.min(mv);
+                }
+                since.clamp(0, i64::MAX)
+            };
+            let hub = match hub_frame_versions(&client, &token, project_id, since, &uuids).await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(project_id, error = %e, "publish: reading the hub's versions after a conflict failed; treating the conflicts as real");
+                    HashMap::new()
+                }
+            };
+            for (f, expected, n) in std::mem::take(&mut maybe_ours) {
+                if is_own_lost_reply(expected, &f.blake3, hub.get(&f.written.uuid)) {
+                    tracing::info!(project_id, frame_uuid = %f.written.uuid, content_version = n, "publish: the hub already took this version (a retried call)");
+                    accept_version(&node, project_id, f, n, &mut versioned).await;
+                } else {
+                    refuse_version(
+                        ctx,
+                        &node,
+                        &disk_lock,
+                        project_id,
+                        f,
+                        n,
+                        &mut conflicts,
+                        &mut held_back,
+                    )
+                    .await;
                 }
             }
         }
@@ -3432,10 +3570,34 @@ async fn run_publish(
             }
         }
     }
-    if conflicted {
+    if !conflicts.is_empty() {
         // The hub moved on under this run (another device of this account
-        // versioned the frame): run again against the new version.
-        crate::api::collab_autopublish::request_auto_publish(Some(project_id));
+        // versioned the frame). Asking for another run right away would
+        // regenerate and conflict again until the manifest catches up, so
+        // pull the manifest delta first, and ask only once the local rows
+        // actually carry the hub's newer versions.
+        match crate::api::collab_exchange::sync_manifest(ctx, project_id, None, None).await {
+            Ok(_) => {
+                let caught_up = {
+                    let db = db(ctx)?;
+                    let conn = db.conn();
+                    conflicts.iter().all(|(u, n)| {
+                        frames_db::get(&conn, project_id, u)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|r| r.content_version >= *n)
+                    })
+                };
+                if caught_up {
+                    crate::api::collab_autopublish::request_auto_publish(Some(project_id));
+                } else {
+                    tracing::info!(project_id, count = conflicts.len(), "publish: the manifest does not show the hub's newer versions yet; no new run requested");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(project_id, error = %e, "publish: manifest sync after a version conflict failed; no new run requested");
+            }
+        }
     }
 
     // ── 8. One outcome event + log ───────────────────────────────────────────
@@ -5189,6 +5351,48 @@ pub(crate) mod tests {
         }
     }
 
+    /// Fix round 1, item 10, against the fake hub: the manifest read finds
+    /// the hub's `(contentVersion, blake3)`, and a `conflict` at
+    /// `expected + 1` is ours only when the bytes match.
+    #[tokio::test]
+    async fn a_lost_reply_is_told_apart_from_another_devices_version_by_the_hubs_bytes() {
+        use crate::collab::fake_hub::FakeHub;
+        let hub = FakeHub::start().await;
+        hub.add_account("tok", "acc-me", "Me", "AAA=", None);
+        hub.add_project("p1", "m31", &[("acc-me", "send_receive", false)], false);
+        hub.seed_frames("p1", "acc-me", &["a", "b"], "published");
+        let ours = "c".repeat(64);
+        let theirs = "d".repeat(64);
+        let (o, t) = (ours.clone(), theirs.clone());
+        hub.update_frame("p1", "a", move |f| {
+            f.content_version = 2;
+            f.blake3 = o;
+        });
+        hub.update_frame("p1", "b", move |f| {
+            f.content_version = 2;
+            f.blake3 = t;
+        });
+        let client = CollabClient::new(hub.uri()).unwrap();
+        let uuids: HashSet<String> = ["a".to_string(), "b".to_string()].into();
+        let seen = hub_frame_versions(&client, "tok", "p1", 0, &uuids)
+            .await
+            .unwrap();
+        assert_eq!(seen["a"], (2, ours.clone()));
+        assert!(
+            is_own_lost_reply(1, &ours, seen.get("a")),
+            "our bytes → ours"
+        );
+        assert!(
+            !is_own_lost_reply(1, &ours, seen.get("b")),
+            "other bytes → another device's version"
+        );
+        assert!(
+            !is_own_lost_reply(2, &ours, seen.get("a")),
+            "not expected + 1"
+        );
+        assert!(!is_own_lost_reply(1, &ours, None), "unknown → not ours");
+    }
+
     // ── Publish per frame (wave 2 Task 7) ───────────────────────────────────
 
     pub(crate) mod publish {
@@ -5270,9 +5474,49 @@ pub(crate) mod tests {
             ConflictNext,
         }
 
+        /// uuid → `(expectedVersion, blake3)` of every entry a
+        /// [`VersionsReply`] answered — what [`ManifestEcho`] plays back.
+        pub(super) type SeenVersions = Arc<std::sync::Mutex<HashMap<String, (i64, String)>>>;
+
         pub(super) struct VersionsReply {
             pub mode: VersionsMode,
             pub delay: Option<std::time::Duration>,
+            pub seen: Option<SeenVersions>,
+        }
+
+        /// `GET …/manifest` listing every frame a [`VersionsReply`] saw, at
+        /// `cv` (`None` → `expectedVersion + 1`) and with the posted BLAKE3
+        /// (`same_bytes`) or other bytes — the hub after our own lost reply,
+        /// or after another device's version.
+        pub(super) struct ManifestEcho {
+            pub seen: SeenVersions,
+            pub cv: Option<i64>,
+            pub same_bytes: bool,
+        }
+
+        impl wiremock::Respond for ManifestEcho {
+            fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+                let seen = self.seen.lock().unwrap();
+                let rows: Vec<serde_json::Value> = seen
+                    .iter()
+                    .map(|(uuid, (expected, blake3))| {
+                        serde_json::json!({
+                            "frameUuid": uuid, "frameSeq": 1, "publisherAccountId": "acc-me",
+                            "publisherDisplayName": "Me Myself", "own": true,
+                            "fileName": "c_L_0000.fits",
+                            "contentVersion": self.cv.unwrap_or(expected + 1),
+                            "blake3": if self.same_bytes { blake3.clone() } else { "f".repeat(64) },
+                            "byteSize": 1000, "xxh3": "0123456789abcdef", "filterRaw": "L",
+                            "filterCanonical": "L", "channel": "mono", "exptimeSec": 300.0,
+                            "meta": {}, "gateVersion": 0, "accepted": true, "state": "published",
+                            "manifestVersion": 100, "createdAt": "2026-09-26T00:00:00Z"
+                        })
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "projectVersion": 100, "rows": rows, "hasMore": false, "next": null
+                }))
+            }
         }
 
         impl wiremock::Respond for VersionsReply {
@@ -5285,6 +5529,15 @@ pub(crate) mod tests {
                         vs.iter()
                             .map(|v| {
                                 let expected = v["expectedVersion"].as_i64().unwrap_or(0);
+                                if let Some(seen) = &self.seen {
+                                    seen.lock().unwrap().insert(
+                                        v["uuid"].as_str().unwrap_or_default().to_string(),
+                                        (
+                                            expected,
+                                            v["blake3"].as_str().unwrap_or_default().to_string(),
+                                        ),
+                                    );
+                                }
                                 let (status, cv) = match self.mode {
                                     VersionsMode::Ok => ("ok", expected + 1),
                                     VersionsMode::Conflict(n) => ("conflict", n),
@@ -5335,6 +5588,7 @@ pub(crate) mod tests {
                 .respond_with(VersionsReply {
                     mode: VersionsMode::Ok,
                     delay: None,
+                    seen: None,
                 })
                 .mount(server)
                 .await;
@@ -6572,6 +6826,7 @@ pub(crate) mod tests {
                 .respond_with(VersionsReply {
                     mode: VersionsMode::Ok,
                     delay: Some(std::time::Duration::from_millis(1500)),
+                    seen: None,
                 })
                 .with_priority(1)
                 .mount(&fx.server)
@@ -6674,18 +6929,31 @@ pub(crate) mod tests {
 
         /// Task 6: a CAS version conflict (the hub holds a newer version
         /// than the one this run's update superseded) holds the frame back
-        /// with the hub's number, unstages it — its claim leaves through the
-        /// outbox — and asks for another run.
+        /// with the hub's number and unstages it — its claim leaves through
+        /// the outbox. The manifest delta is pulled at once, so the row
+        /// carries the hub's version before another run is asked for (fix
+        /// round 1, item 6: never a regenerate → conflict loop).
         #[tokio::test]
         async fn a_version_conflict_holds_the_frame_back_with_the_hub_version() {
             let fx = fixture(1).await;
+            let seen: SeenVersions = Default::default();
             Mock::given(wm_method("POST"))
                 .and(wm_path(versions_path()))
                 .respond_with(VersionsReply {
                     mode: VersionsMode::Conflict(5),
                     delay: None,
+                    seen: Some(Arc::clone(&seen)),
                 })
                 .with_priority(1)
+                .mount(&fx.server)
+                .await;
+            Mock::given(wm_method("GET"))
+                .and(wm_path(format!("/api/v1/projects/{PID}/manifest")))
+                .respond_with(ManifestEcho {
+                    seen: Arc::clone(&seen),
+                    cv: Some(5),
+                    same_bytes: false,
+                })
                 .mount(&fx.server)
                 .await;
             mount_hub(&fx.server, "published").await;
@@ -6702,8 +6970,15 @@ pub(crate) mod tests {
                 vec!["version conflict: the hub has content version 5".to_string()]
             );
             let row = own_row(&fx, &fx.uuids[0]).unwrap();
-            assert_eq!(row.content_version, 1);
-            assert!(!row.on_disk, "unstaged: the regenerated file is not v1");
+            assert_eq!(
+                row.content_version, 5,
+                "the manifest caught up in the same run"
+            );
+            assert_eq!(row.blake3, "f".repeat(64));
+            assert!(
+                !row.on_disk,
+                "unstaged: the regenerated file is not the hub's"
+            );
             assert_eq!(
                 row.local_state,
                 crate::db::collab_frames::LocalState::OwnMissing
@@ -6719,19 +6994,32 @@ pub(crate) mod tests {
             assert_eq!(outbox_len(&fx), 1, "the claim's removal is owed to the hub");
         }
 
-        /// Task 6 ruling: a retried version call whose first reply was lost
-        /// answers `conflict` at `expectedVersion + 1` — only the publisher
-        /// can bump, so it is this run's own version, recorded as `ok`.
+        /// Controller ruling (fix round 1, item 10): a retried version call
+        /// whose first reply was lost answers `conflict` at
+        /// `expectedVersion + 1` — ours ONLY when the hub's BLAKE3 for that
+        /// version is the one this run posted (checked by a manifest read);
+        /// then it is recorded as `ok`.
         #[tokio::test]
-        async fn a_conflict_at_the_next_version_is_our_own_lost_reply() {
+        async fn a_conflict_at_the_next_version_with_our_bytes_is_our_own_lost_reply() {
             let fx = fixture(1).await;
+            let seen: SeenVersions = Default::default();
             Mock::given(wm_method("POST"))
                 .and(wm_path(versions_path()))
                 .respond_with(VersionsReply {
                     mode: VersionsMode::ConflictNext,
                     delay: None,
+                    seen: Some(Arc::clone(&seen)),
                 })
                 .with_priority(1)
+                .mount(&fx.server)
+                .await;
+            Mock::given(wm_method("GET"))
+                .and(wm_path(format!("/api/v1/projects/{PID}/manifest")))
+                .respond_with(ManifestEcho {
+                    seen: Arc::clone(&seen),
+                    cv: None,
+                    same_bytes: true,
+                })
                 .mount(&fx.server)
                 .await;
             mount_hub(&fx.server, "published").await;
@@ -6745,6 +7033,53 @@ pub(crate) mod tests {
             assert_eq!(row.content_version, 2);
             assert!(row.on_disk);
             assert_eq!(claims(&fx), vec![(fx.uuids[0].clone(), 2)]);
+        }
+
+        /// The other branch of the same ruling: `conflict` at
+        /// `expectedVersion + 1` with OTHER bytes is another device of this
+        /// account's version — a real conflict, held back.
+        #[tokio::test]
+        async fn a_conflict_at_the_next_version_with_other_bytes_is_a_real_conflict() {
+            let fx = fixture(1).await;
+            let seen: SeenVersions = Default::default();
+            Mock::given(wm_method("POST"))
+                .and(wm_path(versions_path()))
+                .respond_with(VersionsReply {
+                    mode: VersionsMode::ConflictNext,
+                    delay: None,
+                    seen: Some(Arc::clone(&seen)),
+                })
+                .with_priority(1)
+                .mount(&fx.server)
+                .await;
+            Mock::given(wm_method("GET"))
+                .and(wm_path(format!("/api/v1/projects/{PID}/manifest")))
+                .respond_with(ManifestEcho {
+                    seen: Arc::clone(&seen),
+                    cv: None,
+                    same_bytes: false,
+                })
+                .mount(&fx.server)
+                .await;
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            write_dark(&fx.master, 310.0);
+            set_mtime(&fx.master, 120);
+
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!((res.updated, res.held_back.len()), (0, 1), "{res:?}");
+            assert_eq!(
+                res.held_back[0].reasons,
+                vec!["version conflict: the hub has content version 2".to_string()]
+            );
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(
+                row.content_version, 2,
+                "the hub's version, via the manifest"
+            );
+            assert_eq!(row.blake3, "f".repeat(64), "not our bytes");
+            assert!(!row.on_disk);
+            assert!(claims(&fx).is_empty());
         }
 
         /// Hub rule: a pending outbox entry is flushed BEFORE the version
@@ -6803,6 +7138,7 @@ pub(crate) mod tests {
                 .respond_with(VersionsReply {
                     mode: VersionsMode::Ok,
                     delay: Some(std::time::Duration::from_secs(60)),
+                    seen: None,
                 })
                 .up_to_n_times(1)
                 .with_priority(1)

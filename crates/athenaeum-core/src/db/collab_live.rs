@@ -211,6 +211,27 @@ pub fn drop_claims(conn: &Connection, project_id: &str, frame_uuids: &[String]) 
     Ok(n)
 }
 
+/// Drop ONE claim the hub refused (P9) — only while the claim set still
+/// holds it at the refused `content_version` AND no outbox row above
+/// `above_seq` (the refused report's sequence) names the frame. A frame
+/// re-added while the report was in flight keeps its newer claim. No outbox
+/// row: the hub already tombstoned it. Returns whether it was dropped.
+pub fn drop_refused_claim(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    content_version: i32,
+    above_seq: i64,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM collab_my_claims
+         WHERE project_id = ?1 AND frame_uuid = ?2 AND content_version = ?3
+           AND NOT EXISTS (SELECT 1 FROM collab_outbox
+                           WHERE project_id = ?1 AND frame_uuid = ?2 AND seq > ?4)",
+        params![project_id, frame_uuid, content_version, above_seq],
+    )? > 0)
+}
+
 pub fn my_claims(conn: &Connection, project_id: &str) -> Result<Vec<(String, i32)>> {
     let mut stmt = conn.prepare(
         "SELECT frame_uuid, content_version FROM collab_my_claims WHERE project_id = ?1 ORDER BY frame_uuid",
@@ -504,21 +525,38 @@ mod tests {
         assert_eq!(next_report_seq(&conn).unwrap(), 1);
     }
 
+    /// Two threads on two connections to one file database, started
+    /// together: the single-statement counter never hands out a sequence
+    /// twice (a read-then-write would, under this interleaving).
     #[test]
-    fn next_report_seq_is_one_statement_over_two_connections() {
-        // Two connections to one file database: the counter never hands out
-        // the same sequence twice, interleaved.
+    fn next_report_seq_never_repeats_under_concurrent_connections() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.db");
-        let a = Connection::open(&path).unwrap();
-        init_db(&a).unwrap();
-        let b = Connection::open(&path).unwrap();
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..20 {
-            assert!(seen.insert(next_report_seq(&a).unwrap()));
-            assert!(seen.insert(next_report_seq(&b).unwrap()));
+        {
+            let c = Connection::open(&path).unwrap();
+            init_db(&c).unwrap();
         }
-        assert_eq!(current_report_seq(&a).unwrap(), 40);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let (path, barrier) = (path.clone(), std::sync::Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    let c = Connection::open(&path).unwrap();
+                    c.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+                    barrier.wait();
+                    (0..100)
+                        .map(|_| next_report_seq(&c).unwrap())
+                        .collect::<Vec<i64>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<i64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all.sort_unstable();
+        let expected: Vec<i64> = (1..=200).collect();
+        assert_eq!(all, expected, "every sequence exactly once");
     }
 
     #[test]

@@ -28,7 +28,8 @@ use crate::collab::live::digest::ClaimDigest;
 use crate::collab::live::holders::ProjectHolders;
 use crate::collab::live::outbox::{self, FlushClock, DIGEST_CHECK_EVERY};
 use crate::collab::live::wire::{
-    HelloProject, HolderDeltaWire, HoldersEvent, HoldersReportReplyWire, HoldersSnapshotWire,
+    HelloProject, HolderDeltaWire, HoldersEvent, HoldersReportReplyWire, HoldersReportWire,
+    HoldersSnapshotWire,
 };
 use crate::collab::snapshot::SnapshotMember;
 use crate::db::collab::CollabProjectRow;
@@ -300,11 +301,17 @@ impl Holdings {
                     after = Some(n.after);
                 }
                 None => {
-                    tracing::warn!(
+                    // Never move the cursor past rows this catch-up did not
+                    // read: it stays where it was, and the next catch-up
+                    // re-reads from there (re-applying a page is harmless).
+                    tracing::error!(
                         project_id,
-                        "holder delta page says hasMore without a next cursor; stopping here"
+                        holder_seq = stored,
+                        "holder delta page says hasMore without a next cursor; cursor left unchanged"
                     );
-                    break;
+                    return Err(ApiError::Internal(
+                        "hub holder delta page has more rows but no cursor".into(),
+                    ));
                 }
             }
         }
@@ -352,7 +359,7 @@ impl Holdings {
         match report_full(&self.ctx, &self.client, &self.token, project_id).await {
             Ok(next_flush_ms) => {
                 self.needs_full.remove(project_id);
-                self.report_ok(project_id, next_flush_ms);
+                self.report_ok(project_id, Some(next_flush_ms));
                 Ok(())
             }
             Err(e) => {
@@ -390,7 +397,7 @@ impl Holdings {
                 return Err(self.report_failed(project_id, "claim digest check", SendErr::Hub(e)))
             }
         };
-        self.report_ok(project_id, reply.next_flush_ms);
+        self.report_ok(project_id, Some(reply.next_flush_ms));
         if reply.digest_match {
             tracing::debug!(
                 project_id,
@@ -459,6 +466,15 @@ impl Holdings {
                 return vec![];
             }
         };
+        // A clock whose project has nothing pending any more (another path
+        // emptied the outbox: a publish's own flush, a lost project's
+        // cleanup) stops waiting — or `next_deadline` would stay in the past
+        // and a loop sleeping on it would spin.
+        for (pid, clock) in self.clocks.iter_mut() {
+            if !pending.iter().any(|(p, _)| p == pid) {
+                clock.clear();
+            }
+        }
         let mut out = Vec::new();
         for (pid, n) in pending {
             let clock = self.clocks.entry(pid.clone()).or_default();
@@ -522,32 +538,55 @@ impl Holdings {
     }
 
     /// A report went through: reset the project's back-off (logging the
-    /// recovery once) and restart its flush wait at the hub's delay.
-    fn report_ok(&mut self, project_id: &str, next_flush_ms: u64) {
+    /// recovery once) and restart its flush wait — at the hub's new delay
+    /// when the answer carried one (`None`: nothing was sent, the stored
+    /// delay stays). Rows appended while the report was in flight are still
+    /// pending: they start a new wait now, never left without a deadline.
+    fn report_ok(&mut self, project_id: &str, next_flush_ms: Option<u64>) {
         if let Some(r) = self.backoffs.remove(project_id) {
             if r.outage_logged {
                 tracing::info!(project_id, "holder reports recovered");
             }
         }
-        self.clocks
-            .entry(project_id.to_string())
-            .or_default()
-            .flushed(next_flush_ms);
+        let still_pending = match db(&self.ctx)
+            .and_then(|d| Ok(live_db::outbox_len(&d.conn(), project_id)?))
+        {
+            Ok(n) => n > 0,
+            Err(error) => {
+                tracing::warn!(project_id, %error, "reading the claim outbox after a report failed; keeping a flush deadline");
+                true
+            }
+        };
+        let clock = self.clocks.entry(project_id.to_string()).or_default();
+        match next_flush_ms {
+            Some(ms) => clock.flushed(ms),
+            None => clock.clear(),
+        }
+        if still_pending {
+            clock.on_append(Instant::now());
+        }
     }
 
-    /// A report failed: back off (full jitter), `warn!` once per outage, and
-    /// return the error for the caller.
+    /// A report failed — the hub, or the local store: back off (full
+    /// jitter) either way so a persistent failure is not retried every tick,
+    /// log once per outage (`error!` for a local failure, `warn!` for the
+    /// hub), and return the error for the caller.
     fn report_failed(&mut self, project_id: &str, what: &str, e: SendErr) -> ApiError {
+        let r = self.backoffs.entry(project_id.to_string()).or_default();
+        let delay = r.backoff.next_delay();
+        r.retry_at = Some(Instant::now() + delay);
+        let retry_in_ms = delay.as_millis() as u64;
         match e {
             SendErr::Local(e) => {
-                tracing::error!(project_id, command = what, error = %e, "holder report failed locally");
+                if r.outage_logged {
+                    tracing::debug!(project_id, command = what, error = %e, retry_in_ms, "holder report failed locally again");
+                } else {
+                    r.outage_logged = true;
+                    tracing::error!(project_id, command = what, error = %e, retry_in_ms, "holder report failed locally");
+                }
                 e
             }
             SendErr::Hub(e) => {
-                let r = self.backoffs.entry(project_id.to_string()).or_default();
-                let delay = r.backoff.next_delay();
-                r.retry_at = Some(Instant::now() + delay);
-                let retry_in_ms = delay.as_millis() as u64;
                 if r.outage_logged {
                     tracing::debug!(project_id, command = what, error = %e, retry_in_ms, "holder report failed again; the outbox keeps its entries");
                 } else {
@@ -709,7 +748,8 @@ fn apply_deltas(
 /// A successful delta flush: what it did, and the hub's next delay.
 struct Flushed {
     outcome: FlushOutcome,
-    next_flush_ms: u64,
+    /// The hub's `nextFlushMs`; `None` when nothing was sent.
+    next_flush_ms: Option<u64>,
 }
 
 /// Read the outbox and the claim set in ONE read transaction, send them as a
@@ -738,7 +778,7 @@ async fn flush_once(
                 digest_match: true,
                 refused: 0,
             },
-            next_flush_ms: outbox::DEFAULT_FLUSH.as_millis() as u64,
+            next_flush_ms: None,
         });
     }
     let report = outbox::delta_report(&rows, &claims)?;
@@ -747,7 +787,7 @@ async fn flush_once(
         .report_holders(token, project_id, &report)
         .await
         .map_err(SendErr::Hub)?;
-    apply_reply(ctx, project_id, &reply, max_seq)?;
+    apply_reply(ctx, project_id, &report, &reply, max_seq)?;
     let sent = report.add.len() + report.remove.len();
     tracing::debug!(
         project_id,
@@ -764,7 +804,7 @@ async fn flush_once(
             digest_match: reply.digest_match,
             refused: reply.refused.len(),
         },
-        next_flush_ms: reply.next_flush_ms,
+        next_flush_ms: Some(reply.next_flush_ms),
     })
 }
 
@@ -792,7 +832,7 @@ async fn report_full(
         .report_holders(token, project_id, &report)
         .await
         .map_err(SendErr::Hub)?;
-    apply_reply(ctx, project_id, &reply, report_seq)?;
+    apply_reply(ctx, project_id, &report, &reply, report_seq)?;
     if reply.digest_match {
         tracing::info!(
             project_id,
@@ -815,28 +855,50 @@ async fn report_full(
 }
 
 /// Apply a report's answer in one transaction: ack the outbox up to
-/// `ack_up_to`, drop refused claims and mark their rows (P9).
+/// `ack_up_to`, and drop each refused claim (P9) — only while the claim set
+/// still holds exactly what the report sent AND no newer outbox row names the
+/// frame: a frame re-added while the report was in flight keeps its newer
+/// claim (the next flush reports it). A dropped claim marks its row.
 fn apply_reply(
     ctx: &ServiceContext,
     project_id: &str,
+    report: &HoldersReportWire,
     reply: &HoldersReportReplyWire,
     ack_up_to: i64,
 ) -> Result<(), SendErr> {
+    let sent: HashMap<&str, i32> = report
+        .add
+        .iter()
+        .map(|a| (a.uuid.as_str(), a.content_version))
+        .collect();
+    let mut dropped = Vec::new();
+    let mut kept = Vec::new();
     {
         let database = db(ctx)?;
         let conn = database.conn();
         let tx = conn.unchecked_transaction()?;
         live_db::ack_outbox(&tx, project_id, ack_up_to)?;
-        if !reply.refused.is_empty() {
-            live_db::drop_claims(&tx, project_id, &reply.refused)?;
-            for u in &reply.refused {
+        for u in &reply.refused {
+            let Some(cv) = sent.get(u.as_str()) else {
+                // The hub refuses only what a report added; a refusal naming
+                // anything else leaves the claim set alone.
+                tracing::warn!(project_id, frame_uuid = %u, "hub refused a claim this report did not add; ignored");
+                continue;
+            };
+            if live_db::drop_refused_claim(&tx, project_id, u, *cv, ack_up_to)? {
                 crate::db::collab_frames::set_error(&tx, project_id, u, Some(REFUSED_ERROR))?;
+                dropped.push(u);
+            } else {
+                kept.push(u);
             }
         }
         tx.commit()?;
     }
-    for u in &reply.refused {
+    for u in dropped {
         tracing::warn!(project_id, frame_uuid = %u, "claim refused by the hub");
+    }
+    for u in kept {
+        tracing::info!(project_id, frame_uuid = %u, "claim refused by the hub, but re-added since the report; the next flush reports it");
     }
     Ok(())
 }
@@ -1292,6 +1354,196 @@ mod tests {
         assert!(hub.holders_of("p1", "u2").contains(&"AAA=".to_string()));
         let conn = crate::api::db(&ctx).unwrap().conn();
         assert_eq!(live_db::outbox_len(&conn, "p1").unwrap(), 0);
+    }
+
+    /// Fix round 1, item 1: a clock whose outbox another path emptied (a
+    /// publish's own flush) stops waiting at the next `flush_due` — the
+    /// only deadline left is the hourly digest check, never a past instant.
+    #[tokio::test]
+    async fn a_clock_emptied_by_another_path_leaves_no_past_deadline() {
+        let (_t, ctx, _hub, mut h) = rig().await;
+        let t0 = Instant::now();
+        hold(&ctx, "u1");
+        h.note_append("p1", t0);
+        flush_project_now(&ctx, "p1").await.unwrap();
+        let later = t0 + outbox::DEFAULT_FLUSH * 5;
+        assert!(h.flush_due(later).await.is_empty());
+        assert_eq!(
+            h.next_deadline(),
+            Some(h.last_digest_check + DIGEST_CHECK_EVERY),
+            "only the hourly check is left"
+        );
+    }
+
+    /// Fix round 1, item 1: rows appended while a report is in flight keep a
+    /// flush deadline after the report's ack.
+    #[tokio::test]
+    async fn rows_appended_during_a_report_keep_a_deadline() {
+        let (_t, ctx, hub, mut h) = rig().await;
+        hold(&ctx, "u1");
+        let ctx2 = Arc::clone(&ctx);
+        hub.before_next("/holders/self", move |_| hold(&ctx2, "u2"));
+        assert_eq!(h.flush("p1").await.unwrap().sent, 1);
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            assert_eq!(
+                live_db::outbox_len(&conn, "p1").unwrap(),
+                1,
+                "u2 is still pending"
+            );
+        }
+        let d = h.next_deadline().unwrap();
+        assert!(
+            d < h.last_digest_check + DIGEST_CHECK_EVERY,
+            "the pending row has its own flush deadline"
+        );
+        let done = h.flush_due(d).await;
+        assert_eq!(done.len(), 1);
+        assert!(hub.holders_of("p1", "u2").contains(&"AAA=".to_string()));
+    }
+
+    /// Fix round 1, item 3: a frame re-added while the refusing report was
+    /// in flight keeps its newer claim — at another version, or at the same
+    /// version with a newer outbox row.
+    #[tokio::test]
+    async fn a_claim_re_added_during_the_refused_report_survives() {
+        let (_t, ctx, hub, mut h) = rig().await;
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            for g in ["ghost1", "ghost2", "ghost3"] {
+                live_db::record_claim_change(
+                    &conn,
+                    "p1",
+                    g,
+                    live_db::ClaimOp::Add { content_version: 1 },
+                )
+                .unwrap();
+            }
+        }
+        let ctx2 = Arc::clone(&ctx);
+        hub.before_next("/holders/self", move |_| {
+            let conn = crate::api::db(&ctx2).unwrap().conn();
+            live_db::record_claim_change(
+                &conn,
+                "p1",
+                "ghost1",
+                live_db::ClaimOp::Add { content_version: 2 },
+            )
+            .unwrap();
+            live_db::record_claim_change(
+                &conn,
+                "p1",
+                "ghost2",
+                live_db::ClaimOp::Add { content_version: 1 },
+            )
+            .unwrap();
+        });
+        let out = h.flush("p1").await.unwrap();
+        assert_eq!(out.refused, 3);
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        assert_eq!(
+            live_db::my_claims(&conn, "p1").unwrap(),
+            vec![("ghost1".to_string(), 2), ("ghost2".to_string(), 1)],
+            "ghost3 (untouched since the report) is dropped; the re-added ones survive"
+        );
+    }
+
+    /// Fix round 1, item 4: a page claiming more rows but carrying no cursor
+    /// is an error, and the stored cursor does not move past unread rows.
+    #[tokio::test]
+    async fn a_has_more_page_without_next_leaves_the_cursor_alone() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let (_t, ctx, _hub, _h) = rig().await;
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::set_holder_seq_only(&conn, "p1", 3).unwrap();
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/holders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "epoch": "epoch-1", "holderSeq": 9, "floor": 0,
+                "deltas": [{"device": "BBB=", "add": [[5, 1]], "rm": []}],
+                "hasMore": true, "next": null
+            })))
+            .mount(&server)
+            .await;
+        let mut h = Holdings::load(
+            Arc::clone(&ctx),
+            CollabClient::new(server.uri()).unwrap(),
+            "tok".into(),
+            "AAA=".into(),
+        )
+        .unwrap();
+        assert!(h.delta_resume("p1", "epoch-1").await.is_err());
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        assert_eq!(
+            crate::db::collab::get_project(&conn, "p1")
+                .unwrap()
+                .unwrap()
+                .holder_seq,
+            3
+        );
+    }
+
+    /// Fix round 1, item 5: a lost project is not loaded (its holder map,
+    /// clock and hourly check are gone with it) — `list_projects` filters
+    /// `lost_at`.
+    #[tokio::test]
+    async fn a_lost_project_is_not_loaded() {
+        let (_t, ctx, hub, _h) = rig().await;
+        hold(&ctx, "u1");
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::mark_lost(&conn, "p1").unwrap();
+        }
+        let mut h = Holdings::load(
+            Arc::clone(&ctx),
+            CollabClient::new(hub.uri()).unwrap(),
+            "tok".into(),
+            "AAA=".into(),
+        )
+        .unwrap();
+        assert!(h.map("p1").is_none());
+        assert_eq!(
+            h.next_deadline(),
+            Some(h.last_digest_check + DIGEST_CHECK_EVERY),
+            "no flush clock for the lost project's rows"
+        );
+        let before = hub.holder_writes();
+        h.hourly_digest_checks(Instant::now() + DIGEST_CHECK_EVERY)
+            .await;
+        assert_eq!(hub.holder_writes(), before);
+        assert!(!hub.holders_of("p1", "u1").contains(&"AAA=".to_string()));
+    }
+
+    /// Fix round 1, item 9: a full report owed after a failed reload report
+    /// is retried by `flush_due` once the hub is back.
+    #[tokio::test]
+    async fn an_owed_full_report_is_retried_by_flush_due() {
+        let (_t, ctx, hub, mut h) = rig().await;
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            live_db::add_implicit_claim(&conn, "p1", "u2", 1).unwrap();
+        }
+        hub.set_failing("/holders/self", true);
+        h.reload("p1", "epoch-1").await.unwrap(); // snapshot ok, full report owed
+        assert!(!hub.holders_of("p1", "u2").contains(&"AAA=".to_string()));
+        assert!(h
+            .next_deadline()
+            .is_some_and(|d| d < h.last_digest_check + DIGEST_CHECK_EVERY));
+        hub.set_failing("/holders/self", false);
+        let done = h
+            .flush_due(Instant::now() + std::time::Duration::from_secs(120))
+            .await;
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert!(done[0].1.is_ok());
+        assert!(hub.holders_of("p1", "u2").contains(&"AAA=".to_string()));
+        assert!(h
+            .flush_due(Instant::now() + std::time::Duration::from_secs(240))
+            .await
+            .is_empty());
     }
 
     #[test]
