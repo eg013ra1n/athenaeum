@@ -286,8 +286,13 @@ pub fn set_feed_version(
     )?)
 }
 
-/// Advance the holder cursor; `-1` means "no local holder map". The ONLY
-/// writer of `holder_seq` besides [`mark_lost`] (which resets it).
+/// Advance the holder cursor AND stamp `feed_epoch` in the same write. Not
+/// the only writer of either column any more (fix round 3, item 5 fixes this
+/// doc's earlier "ONLY writer" claim): [`set_holder_seq_only`] writes
+/// `holder_seq` alone, and [`mark_lost`] resets both. Callers that must NOT
+/// move `feed_epoch` (an epoch reload's holder-side snapshot loading BEFORE
+/// anything stamps the new epoch — fix round 2, item 2) use
+/// [`set_holder_seq_only`] instead, never this function.
 pub fn set_holder_seq(
     conn: &Connection,
     project_id: &str,
@@ -300,20 +305,28 @@ pub fn set_holder_seq(
     )?)
 }
 
-/// Reset the holder cursor to "no local holder map" (`-1`) WITHOUT touching
-/// `feed_epoch` (fix round 2, item 2). An epoch reload's holder-side snapshot
-/// must load fresh BEFORE anything stamps the new epoch: `feed_epoch` moves
-/// only in the caller's own final `set_feed_version` write, once the holder
-/// reload and the own-frame re-announce have both already succeeded — never
-/// bundled into the same write as this reset, or a failure between the two
-/// would leave the epoch already moved while the reload it named never
-/// actually finished (the exact bug `set_holder_seq`'s combined write caused
-/// here before this fix).
-pub fn reset_holder_seq(conn: &Connection, project_id: &str) -> Result<usize> {
+/// Set ONLY `holder_seq`, never `feed_epoch` (fix round 2, item 2; named and
+/// generalized in fix round 3, item 5 — the [`crate::api::collab_live::feed::HolderSide`]
+/// contract: every implementation persists its own seq through THIS setter
+/// alone, never through [`set_holder_seq`], which would also stamp
+/// `feed_epoch` and reopen the I1 bug one call earlier (a holder-side write
+/// that moves the epoch before its own reload, or a re-announce that follows
+/// it, has actually finished).
+pub fn set_holder_seq_only(conn: &Connection, project_id: &str, holder_seq: i64) -> Result<usize> {
     Ok(conn.execute(
-        "UPDATE collab_projects SET holder_seq = -1 WHERE project_id = ?1",
-        params![project_id],
+        "UPDATE collab_projects SET holder_seq = ?2 WHERE project_id = ?1",
+        params![project_id, holder_seq],
     )?)
+}
+
+/// Reset the holder cursor to "no local holder map" (`-1`) WITHOUT touching
+/// `feed_epoch` (fix round 2, item 2) — [`set_holder_seq_only`] with `-1`.
+/// An epoch reload's holder-side snapshot must load fresh BEFORE anything
+/// stamps the new epoch: `feed_epoch` moves only in the caller's own final
+/// `set_feed_version` write, once the holder reload and the own-frame
+/// re-announce have both already succeeded.
+pub fn reset_holder_seq(conn: &Connection, project_id: &str) -> Result<usize> {
+    set_holder_seq_only(conn, project_id, -1)
 }
 
 /// Set the LOCAL replication policy (JSON, e.g. `{"mode":"all"}`). The ONLY

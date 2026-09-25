@@ -51,6 +51,17 @@ pub enum FeedEffect {
 
 /// The holder side of the feed (Task 6 implements it for `Holdings`). Kept
 /// as a trait so this module never depends on the holder map's internals.
+///
+/// **Contract (fix round 3, item 5):** an implementation persists its own
+/// `holder_seq` ONLY through [`crate::db::collab::set_holder_seq_only`],
+/// never through [`crate::db::collab::set_holder_seq`]. The latter also
+/// stamps `feed_epoch`, and every caller of these trait methods
+/// (`FeedApplier::reload_one_project` in particular) relies on `feed_epoch`
+/// moving in exactly one place — its own final write, after `reload` (and
+/// the re-announce that follows it) have both already succeeded (I1). A
+/// `reload`/`on_hello_project`/`on_holders_event`/`catch_up` implementation
+/// that stamped `feed_epoch` itself would move the epoch before its own work
+/// — the very bug this rule exists to keep out.
 #[async_trait::async_trait]
 pub trait HolderSide: Send {
     async fn on_hello_project(
@@ -164,7 +175,7 @@ impl FeedApplier {
                 if self.project_needs_epoch_reload(&stored) {
                     tracing::warn!(project_id = %h.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "holders event for a project stuck on a different epoch; reloading it fully instead");
                     return match self
-                        .reload_one_project(&h.project_id, &epoch, None, holders)
+                        .reload_one_project(&h.project_id, &epoch, None, &ALL_KINDS, holders)
                         .await
                     {
                         Ok(effs) => Ok(effs),
@@ -185,13 +196,62 @@ impl FeedApplier {
                 })
             }
             LiveEvent::Account(a) => self.on_account(a, holders).await,
+            // Item 1 fix round 3: `resync` names ONE side of ONE project to
+            // catch up over REST — exactly the shape `on_project`/`on_versions`
+            // already guard. Without this, a project stuck on a stale epoch
+            // would delta-fetch from its pre-restore `manifest_cursor` (or run
+            // a holders catch-up against its stale map) and `set_feed_version`
+            // would stamp the CURRENT (new) epoch anyway — losing that
+            // project's reload for good, not just delaying it.
             LiveEvent::Resync(r) => match r.what {
-                ResyncWhat::Project => self.catch_up_project(&r.project_id, None, &ALL_KINDS).await,
+                ResyncWhat::Project => {
+                    let Some(epoch) = self.epoch.clone() else {
+                        tracing::debug!(project_id = %r.project_id, "resync(project) received before the first hello; skipped");
+                        return Ok(vec![]);
+                    };
+                    let stored = self.stored_cursor(&r.project_id)?.unwrap_or(FeedCursor {
+                        epoch: None,
+                        version: 0,
+                        holder_seq: -1,
+                    });
+                    if self.project_needs_epoch_reload(&stored) {
+                        tracing::warn!(project_id = %r.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "resync(project) for a project stuck on a different epoch; reloading it fully instead of a delta");
+                        return match self
+                            .reload_one_project(&r.project_id, &epoch, None, &ALL_KINDS, holders)
+                            .await
+                        {
+                            Ok(effs) => Ok(effs),
+                            Err(e) => {
+                                tracing::error!(project_id = %r.project_id, error = %e, "per-project epoch reload failed (resync); retried next event");
+                                Ok(vec![])
+                            }
+                        };
+                    }
+                    self.catch_up_project(&r.project_id, None, &ALL_KINDS).await
+                }
                 ResyncWhat::Holders => {
                     let Some(epoch) = self.epoch.clone() else {
                         tracing::debug!(project_id = %r.project_id, "resync(holders) received before the first hello; skipped");
                         return Ok(vec![]);
                     };
+                    let stored = self.stored_cursor(&r.project_id)?.unwrap_or(FeedCursor {
+                        epoch: None,
+                        version: 0,
+                        holder_seq: -1,
+                    });
+                    if self.project_needs_epoch_reload(&stored) {
+                        tracing::warn!(project_id = %r.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "resync(holders) for a project stuck on a different epoch; reloading it fully instead of a stale-map catch-up");
+                        return match self
+                            .reload_one_project(&r.project_id, &epoch, None, &ALL_KINDS, holders)
+                            .await
+                        {
+                            Ok(effs) => Ok(effs),
+                            Err(e) => {
+                                tracing::error!(project_id = %r.project_id, error = %e, "per-project epoch reload failed (resync); retried next event");
+                                Ok(vec![])
+                            }
+                        };
+                    }
                     holders.catch_up(&r.project_id, &epoch).await
                 }
                 ResyncWhat::Unknown => {
@@ -305,10 +365,13 @@ impl FeedApplier {
         }
 
         if epoch_changed_any {
-            let heads: std::collections::BTreeMap<String, i64> = hello
+            // Item 2 fix round 3: `epoch_change`'s own regression check needs
+            // both axes (a holder-seq-only regression is an epoch change too,
+            // per `plan_hello`/`plan_versions`), so both are carried through.
+            let heads: std::collections::BTreeMap<String, (i64, i64)> = hello
                 .projects
                 .iter()
-                .map(|(pid, hp)| (pid.clone(), hp.version))
+                .map(|(pid, hp)| (pid.clone(), (hp.version, hp.holder_seq)))
                 .collect();
             // `epoch_change` itself sets `self.epoch` once every reload it
             // could complete has run (I1 fix round) — nothing left to do here
@@ -387,8 +450,12 @@ impl FeedApplier {
         // ever taking `Step::Apply`/`Step::CatchUp`'s delta path.
         if self.project_needs_epoch_reload(&stored) {
             tracing::warn!(project_id = %ev.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "project event for a project stuck on a different epoch; reloading it fully instead of a delta");
+            // Item 3 fix round 3: pass the event's own `kinds` through — a
+            // Members/Thresholds/Dictionary/Meta change this event carries
+            // must still be refreshed and reported (`MembersChanged` etc.),
+            // not silently consumed by the cursor moving past it.
             return match self
-                .reload_one_project(&ev.project_id, &epoch, Some(ev.version), holders)
+                .reload_one_project(&ev.project_id, &epoch, Some(ev.version), &ev.kinds, holders)
                 .await
             {
                 Ok(effs) => Ok(effs),
@@ -731,7 +798,7 @@ impl FeedApplier {
         // (see the `stale_epoch_projects` split above).
         for (pid, head_version) in stale_epoch_projects {
             match self
-                .reload_one_project(&pid, &epoch, Some(head_version), holders)
+                .reload_one_project(&pid, &epoch, Some(head_version), &ALL_KINDS, holders)
                 .await
             {
                 Ok(effs) => effects.extend(effs),
@@ -742,11 +809,10 @@ impl FeedApplier {
         }
 
         if epoch_change_needed {
-            let heads: std::collections::BTreeMap<String, i64> = v
-                .iter()
-                .map(|(pid, (version, _))| (pid.clone(), *version))
-                .collect();
-            effects.extend(self.epoch_change(&epoch, &heads, holders).await?);
+            // Item 2 fix round 3: `v` already carries `(version, holderSeq)`
+            // per project — exactly what `epoch_change`'s own regression
+            // check needs on both axes.
+            effects.extend(self.epoch_change(&epoch, &v, holders).await?);
             return Ok(effects);
         }
         // Item 5 fix round 2: isolate each catch-up — one project's failure
@@ -821,11 +887,11 @@ impl FeedApplier {
     }
 
     /// `hello.epoch != stored epoch`, or a hub head below the stored cursor
-    /// (a restore): reload every project that actually needs it, reconcile
-    /// holdings, and re-announce this device's own frames the hub no longer
-    /// lists. `heads` is the per-project version from the triggering hello
-    /// or versions vector; a live project missing from it keeps whatever
-    /// version its manifest resync lands on.
+    /// on EITHER axis (a restore): reload every project that actually needs
+    /// it, reconcile holdings, and re-announce this device's own frames the
+    /// hub no longer lists. `heads` is the per-project `(version, holderSeq)`
+    /// from the triggering hello or versions vector; a live project missing
+    /// from it keeps whatever version its manifest resync lands on.
     ///
     /// I1/I2 fix round: each project's reload ([`Self::reload_one_project`])
     /// is isolated and, crucially, its cursor moves into `new_epoch` ONLY
@@ -843,11 +909,16 @@ impl FeedApplier {
     /// regression is skipped entirely — a permanently failing sibling must
     /// never force every healthy project through a redundant since=0
     /// fetch + prune + snapshot + re-announce on every single hello or
-    /// versions tick.
+    /// versions tick. Fix round 3, item 2: "no head regression" is checked on
+    /// BOTH axes — `plan_hello`/`plan_versions` (`collab/live/cursor.rs`)
+    /// already declare an epoch change on a holder-seq regression alone (the
+    /// version can be perfectly fine), and this skip must agree, or such a
+    /// project would be skipped here forever while `EpochChanged` keeps
+    /// firing with nothing ever resetting it.
     pub async fn epoch_change(
         &mut self,
         new_epoch: &str,
-        heads: &std::collections::BTreeMap<String, i64>,
+        heads: &std::collections::BTreeMap<String, (i64, i64)>,
         holders: &mut dyn HolderSide,
     ) -> Result<Vec<FeedEffect>, ApiError> {
         tracing::warn!(
@@ -874,14 +945,19 @@ impl FeedApplier {
         let mut effects = vec![FeedEffect::EpochChanged];
         for (pid, stored) in live {
             let already_on_new_epoch = stored.epoch.as_deref() == Some(new_epoch);
-            let head_regressed = heads.get(&pid).is_some_and(|&h| h < stored.version);
-            if already_on_new_epoch && !head_regressed {
+            let head = heads.get(&pid).copied();
+            let version_regressed = head.is_some_and(|(v, _)| v < stored.version);
+            // Same rule as `plan_versions`/`plan_hello`: no local holder map
+            // yet (`< 0`) never counts as a regression.
+            let holder_regressed =
+                head.is_some_and(|(_, h)| stored.holder_seq >= 0 && h < stored.holder_seq);
+            if already_on_new_epoch && !version_regressed && !holder_regressed {
                 // Already reloaded into this exact epoch, no further
-                // regression since — nothing to redo (item 4).
+                // regression on either axis since — nothing to redo (item 4).
                 continue;
             }
             match self
-                .reload_one_project(&pid, new_epoch, heads.get(&pid).copied(), holders)
+                .reload_one_project(&pid, new_epoch, head.map(|(v, _)| v), &ALL_KINDS, holders)
                 .await
             {
                 Ok(effs) => effects.extend(effs),
@@ -907,20 +983,35 @@ impl FeedApplier {
         Ok(effects)
     }
 
-    /// Reload ONE project fully: manifest resync from 0, a holder-seq reset,
-    /// the holder side's own reload, this device's own-frame re-announce,
-    /// then — only once every one of those has already succeeded — the
-    /// single write that moves this project's cursor into `new_epoch`.
-    /// Shared by [`Self::epoch_change`] (every project that needs it, a
-    /// genuine hub-wide epoch rotation) and by [`Self::on_project`]/
-    /// [`Self::on_versions`]/the `holders` event dispatch in [`Self::apply`]
-    /// (fix round 2, item 1) when ONE project's own stored epoch is found
-    /// behind the session's — that project must never take a version-number
-    /// delta decision against a manifest cursor left over from before its
-    /// own restore. `target_version`, when known (the event/tick that
-    /// triggered this), is preferred for the cursor; otherwise the
-    /// manifest's own freshly-fetched `projectVersion` is used (fix round 2,
-    /// item 6 — never a pre-update DB read, which could itself be stale).
+    /// Reload ONE project fully: manifest resync from 0, the small documents
+    /// (membership/thresholds/dictionary/meta, with their own caps re-check —
+    /// fix round 3, item 3), a holder-seq reset, the holder side's own
+    /// reload, this device's own-frame re-announce, then — only once every
+    /// one of those has already succeeded — the single write that moves this
+    /// project's cursor into `new_epoch`. Shared by [`Self::epoch_change`]
+    /// (every project that needs it, a genuine hub-wide epoch rotation) and
+    /// by [`Self::on_project`]/[`Self::on_versions`]/the `holders` and
+    /// `resync` dispatch in [`Self::apply`] (fix round 2 item 1, fix round 3
+    /// item 1) when ONE project's own stored epoch is found behind the
+    /// session's — that project must never take a version-number delta
+    /// decision against a manifest cursor left over from before its own
+    /// restore. `target_version`, when known (the event/tick that triggered
+    /// this), is preferred for the cursor; otherwise the manifest's own
+    /// freshly-fetched `projectVersion` is used (fix round 2, item 6 — never
+    /// a pre-update DB read, which could itself be stale). `kinds` is the
+    /// triggering event's own kinds when known (`on_project`), else
+    /// [`ALL_KINDS`] (a hub-wide epoch change, or a tick/event with no kind
+    /// information of its own) — used only to decide whether to report
+    /// `MembersChanged`; the small-document refresh itself always runs.
+    ///
+    /// Fix round 3, item 3: this reload used to stamp the cursor right after
+    /// the manifest fetch, with NO small-document refresh at all — a
+    /// Members/Thresholds/Dictionary/Meta change carried by the very event
+    /// that routed a stuck project here (or by an ordinary hub-wide epoch
+    /// change) was silently consumed: the cursor moved past it, and it was
+    /// never applied. This now runs the identical refresh-then-caps-recheck
+    /// sequence [`Self::catch_up_project`] runs (item 3, fix round 2) and
+    /// reports the same effects (`MembersChanged`, `on_thresholds_or_dictionary_moved`).
     ///
     /// Fix round 2, item 2: the holder-seq reset happens FIRST, through
     /// [`crate::db::collab::reset_holder_seq`], which touches ONLY
@@ -932,9 +1023,10 @@ impl FeedApplier {
         pid: &str,
         new_epoch: &str,
         target_version: Option<i64>,
+        kinds: &[ChangeKind],
         holders: &mut dyn HolderSide,
     ) -> Result<Vec<FeedEffect>, ApiError> {
-        let (seen, project_version) = crate::api::collab_exchange::sync_manifest_full(
+        let (mut seen, mut project_version) = crate::api::collab_exchange::sync_manifest_full(
             &self.ctx,
             pid,
             self.emitter.as_deref(),
@@ -945,12 +1037,51 @@ impl FeedApplier {
             tracing::warn!(project_id = pid, epoch = new_epoch, error = %e, "epoch-reload manifest sync failed");
             e
         })?;
+
+        let mut effects = Vec::new();
+        {
+            let only: HashSet<String> = [pid.to_string()].into_iter().collect();
+            let report = crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only))
+                .await
+                .map_err(|e| {
+                    tracing::warn!(project_id = pid, epoch = new_epoch, error = %e, "epoch-reload small-document refresh failed");
+                    e
+                })?;
+            for moved in &report.gate_moved {
+                crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
+            }
+            if kinds.contains(&ChangeKind::Members) {
+                effects.push(FeedEffect::MembersChanged(pid.to_string()));
+            }
+            let caps_changed_now = {
+                let database = db(&self.ctx)?;
+                let conn = database.conn();
+                let project = crate::api::collab_exchange::live_project(&conn, pid)?;
+                project.gov_caps_json != project.synced_caps_json
+            };
+            if caps_changed_now {
+                let (seen2, pv2) = crate::api::collab_exchange::sync_manifest_full(
+                    &self.ctx,
+                    pid,
+                    self.emitter.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    tracing::warn!(project_id = pid, epoch = new_epoch, error = %e, "epoch-reload caps-change full resync failed");
+                    e
+                })?;
+                seen = seen2;
+                project_version = pv2;
+            }
+        }
+
         {
             let database = db(&self.ctx)?;
             let conn = database.conn();
             crate::db::collab::reset_holder_seq(&conn, pid)?;
         }
-        let mut effs = holders.reload(pid, new_epoch).await?;
+        effects.extend(holders.reload(pid, new_epoch).await?);
         reannounce_lost_own_frames(&self.ctx, &self.client, &self.token, pid, &seen).await?;
         let cursor_version = target_version.unwrap_or(project_version);
         {
@@ -958,8 +1089,8 @@ impl FeedApplier {
             let conn = database.conn();
             crate::db::collab::set_feed_version(&conn, pid, new_epoch, cursor_version)?;
         }
-        effs.push(FeedEffect::NeedSetChanged(pid.to_string()));
-        Ok(effs)
+        effects.push(FeedEffect::NeedSetChanged(pid.to_string()));
+        Ok(effects)
     }
 }
 
@@ -1180,6 +1311,12 @@ mod tests {
             self.0.push(format!(
                 "reload {pid} epoch_arg={epoch_arg} stored_epoch={stored_epoch:?} holder_seq={holder_seq}"
             ));
+            // Item 4/5 fix round 3: the HolderSide contract — persist the
+            // seq ONLY through the seq-only setter, never `set_holder_seq`
+            // (which would also stamp `feed_epoch`). This write must SURVIVE
+            // whatever `reload_one_project` does after `reload` returns.
+            let conn = crate::api::db(&self.1).unwrap().conn();
+            crate::db::collab::set_holder_seq_only(&conn, pid, 42).unwrap();
             Ok(vec![])
         }
         fn forget(&mut self, pid: &str) {
@@ -1249,6 +1386,18 @@ mod tests {
             .unwrap()
             .unwrap();
         (p.feed_epoch, p.hub_version, p.holder_seq)
+    }
+
+    /// `membership_version` is written only by the small-document refresh
+    /// (`refresh_projects_reporting`/`upsert_project`) — `sync_manifest_full`
+    /// never touches it. A change here is direct evidence that a reload
+    /// actually ran the small-document refresh, not just the frames fetch.
+    fn membership_version(ctx: &ServiceContext, project_id: &str) -> i64 {
+        let conn = crate::api::db(ctx).unwrap().conn();
+        crate::db::collab::get_project(&conn, project_id)
+            .unwrap()
+            .unwrap()
+            .membership_version
     }
 
     fn set_own_held(ctx: &ServiceContext, project_id: &str, frame_uuid: &str) {
@@ -1576,10 +1725,21 @@ mod tests {
         );
     }
 
-    /// Item 2 fix round 2: the holder-seq reset happens before
-    /// `holders.reload` runs, and touches ONLY `holder_seq` — `feed_epoch`
-    /// is still the OLD value at that moment. `feed_epoch` moves only in the
-    /// final write, after `reload` (and the re-announce) already succeeded.
+    /// Item 2 fix round 2, tightened in fix round 3 item 4: the holder-seq
+    /// reset happens before `holders.reload` runs, and touches ONLY
+    /// `holder_seq` — `feed_epoch` is still the OLD value at that moment.
+    /// `feed_epoch` moves only in the final write, after `reload` (and the
+    /// re-announce) already succeeded — and that final write must never
+    /// clobber a seq the holder side itself already persisted during
+    /// `reload` (item 5's seq-only-setter contract).
+    ///
+    /// This test is seeded with a REAL (non-default) `holder_seq` first, so
+    /// the `holder_seq=-1` assertion below actually proves the reset ran:
+    /// the schema default is already -1, so without seeding, that assertion
+    /// would pass even with `FeedApplier::reload_one_project`'s
+    /// `reset_holder_seq` call deleted outright. Verified by hand: removing
+    /// that call makes this test fail with `holder_seq=7` in the recorded
+    /// string instead of `-1` (see the fix round 3 report).
     #[tokio::test]
     async fn epoch_reload_resets_holder_seq_before_reload_without_moving_the_epoch_early() {
         let (_t, ctx, hub, mut f) = rig().await;
@@ -1587,6 +1747,10 @@ mod tests {
         f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
             .await
             .unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::set_holder_seq(&conn, PID, "e1", 7).unwrap();
+        }
         let e2 = hub.rotate_epoch();
         f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
             .await
@@ -1602,10 +1766,17 @@ mod tests {
         );
         assert!(
             seen.contains("holder_seq=-1"),
-            "holder_seq was already reset before reload ran: {seen}"
+            "holder_seq was reset from 7 to -1 before reload ran: {seen}"
         );
-        // and afterward, the final write DID move the epoch
-        assert_eq!(full_cursor(&ctx, PID).0.as_deref(), Some(e2.as_str()));
+        // The final state: the epoch moved, AND the holder side's own seq
+        // write (42, made from inside `reload`) survived — nothing after
+        // `reload` returns touches `holder_seq` again.
+        let (final_epoch, _, final_holder_seq) = full_cursor(&ctx, PID);
+        assert_eq!(final_epoch.as_deref(), Some(e2.as_str()));
+        assert_eq!(
+            final_holder_seq, 42,
+            "the holder side's own seq write survives — no clobber"
+        );
     }
 
     #[tokio::test]
@@ -1845,5 +2016,205 @@ mod tests {
             "the truly-lost frame is re-announced despite sharing a batch with an already-announced one"
         );
         assert!(hub.frame(PID, "truly_lost").is_some());
+    }
+
+    /// Item 1 fix round 3: `resync(project)` for a project stuck on a
+    /// different epoch must reload it fully, never a delta against its
+    /// pre-restore `manifest_cursor` — otherwise `catch_up_project` would
+    /// stamp the CURRENT epoch anyway, losing that project's reload for good
+    /// (not merely delaying it, as every other un-guarded path would).
+    #[tokio::test]
+    async fn resync_project_for_an_epoch_stuck_project_reloads_fully() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+
+        hub.set_failing("/manifest", true);
+        let e2 = hub.rotate_epoch();
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor(&ctx).0.as_deref(),
+            Some("e1"),
+            "stuck on the old epoch"
+        );
+        hub.set_failing("/manifest", false);
+
+        let before = manifest_requests_for(&hub, PID).await;
+        f.apply(
+            LiveEvent::Resync(crate::collab::live::wire::ResyncEvent {
+                project_id: PID.into(),
+                what: ResyncWhat::Project,
+            }),
+            &mut h,
+        )
+        .await
+        .unwrap();
+        assert!(
+            manifest_requests_for(&hub, PID).await > before,
+            "routed to a full reload (a manifest fetch happened), never a bare delta"
+        );
+        assert_eq!(
+            cursor(&ctx).0.as_deref(),
+            Some(e2.as_str()),
+            "resync(project) brought it up to the session's real epoch"
+        );
+    }
+
+    /// Item 1 fix round 3: `resync(holders)` for a project stuck on a
+    /// different epoch must reload it fully, never a `holders.catch_up`
+    /// against its stale holder map.
+    #[tokio::test]
+    async fn resync_holders_for_an_epoch_stuck_project_reloads_fully_instead_of_a_stale_catch_up() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+
+        hub.set_failing("/manifest", true);
+        let e2 = hub.rotate_epoch();
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert_eq!(cursor(&ctx).0.as_deref(), Some("e1"));
+        hub.set_failing("/manifest", false);
+
+        f.apply(
+            LiveEvent::Resync(crate::collab::live::wire::ResyncEvent {
+                project_id: PID.into(),
+                what: ResyncWhat::Holders,
+            }),
+            &mut h,
+        )
+        .await
+        .unwrap();
+        assert!(
+            h.0.contains(&"reload p1".to_string()),
+            "routed to a full reload"
+        );
+        assert!(
+            !h.0.iter().any(|s| s == "catch_up p1"),
+            "never a stale-map catch-up"
+        );
+        assert_eq!(cursor(&ctx).0.as_deref(), Some(e2.as_str()));
+    }
+
+    /// Item 6 fix round 3: a `holders` delta event naming a project stuck on
+    /// a different epoch must reload it fully, never apply the delta against
+    /// its stale holder map.
+    #[tokio::test]
+    async fn a_holders_event_for_an_epoch_stuck_project_reloads_fully() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+
+        hub.set_failing("/manifest", true);
+        let e2 = hub.rotate_epoch();
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert_eq!(cursor(&ctx).0.as_deref(), Some("e1"));
+        hub.set_failing("/manifest", false);
+
+        let holders_ev = HoldersEvent {
+            project_id: PID.into(),
+            prev: 0,
+            seq: 1,
+            deltas: vec![],
+        };
+        f.apply(LiveEvent::Holders(holders_ev), &mut h)
+            .await
+            .unwrap();
+        assert!(
+            h.0.contains(&"reload p1".to_string()),
+            "routed to a full reload"
+        );
+        assert!(
+            !h.0.iter().any(|s| s.starts_with("holders ")),
+            "never applied against the stale map"
+        );
+        assert_eq!(cursor(&ctx).0.as_deref(), Some(e2.as_str()));
+    }
+
+    /// Item 2 fix round 3: `plan_hello`/`plan_versions` declare an epoch
+    /// change on a holder-seq regression ALONE — the version and even the
+    /// epoch string can be unchanged. `epoch_change`'s own skip (fix round 2
+    /// item 4) must agree, or such a project would be skipped forever while
+    /// `EpochChanged` keeps firing with nothing ever resetting it.
+    #[tokio::test]
+    async fn epoch_change_reloads_on_a_holder_seq_regression_even_when_the_epoch_and_version_are_unchanged(
+    ) {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        // A real (non-negative) holder_seq, as if a snapshot had already
+        // loaded once.
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::set_holder_seq(&conn, PID, "e1", 5).unwrap();
+        }
+        let (_, v) = cursor(&ctx);
+        let mut vv = VersionsEvent::new();
+        vv.insert(PID.into(), (v, 2)); // version unchanged, holder_seq regressed 5 -> 2
+        let effects = f.apply(LiveEvent::Versions(vv), &mut h).await.unwrap();
+        assert!(effects.contains(&FeedEffect::EpochChanged));
+        let (_, _, holder_seq_after) = full_cursor(&ctx, PID);
+        assert_eq!(
+            holder_seq_after, -1,
+            "actually reloaded (reset by reload_one_project), not silently skipped"
+        );
+    }
+
+    /// Item 3 fix round 3: a stuck project's own routing event can carry a
+    /// Members/Thresholds/Dictionary/Meta change — `reload_one_project` must
+    /// still refresh the small documents and report the same effects the
+    /// normal (`catch_up_project`) path would, not silently consume the
+    /// change while moving the cursor past it.
+    #[tokio::test]
+    async fn a_stuck_projects_event_carrying_a_members_change_refreshes_it_in_the_same_reload() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+
+        hub.set_failing("/manifest", true);
+        let e2 = hub.rotate_epoch();
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor(&ctx).0.as_deref(),
+            Some("e1"),
+            "stuck on the old epoch"
+        );
+        hub.set_failing("/manifest", false);
+
+        let before_membership = membership_version(&ctx, PID);
+        hub.add_member(PID, "acc-x", "send_receive", false);
+        let ev = project_event_from_hub(&hub, PID);
+        assert!(ev.kinds.contains(&ChangeKind::Members));
+        let effects = f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        assert!(
+            effects.contains(&FeedEffect::MembersChanged(PID.into())),
+            "the members effect is reported even though this project was routed to a full reload"
+        );
+        assert!(
+            membership_version(&ctx, PID) > before_membership,
+            "the small-document refresh actually ran inside reload_one_project"
+        );
+        assert_eq!(
+            cursor(&ctx).0.as_deref(),
+            Some(e2.as_str()),
+            "also reached the session's real epoch"
+        );
     }
 }
