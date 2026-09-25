@@ -5716,7 +5716,7 @@ mod collab_store_tests {
     use std::path::{Path, PathBuf};
 
     use iroh_blobs::api::blobs::AddPathOptions;
-    use iroh_blobs::protocol::GetRequest;
+    use iroh_blobs::protocol::{ChunkRangesSeq, GetRequest, PushRequest};
     use iroh_blobs::util::connection_pool::{ConnectionPool, Options as PoolOptions};
     use iroh_blobs::{BlobFormat, HashAndFormat};
     use tempfile::tempdir;
@@ -5728,6 +5728,12 @@ mod collab_store_tests {
     /// A refused or not-mounted connection closes within milliseconds; the cap
     /// only keeps a regression from hanging the suite.
     const MUST_FAIL_WITHIN: Duration = Duration::from_secs(10);
+
+    /// How long [`wait_for_blob`] polls before it settles on "absent" — a
+    /// generous margin over the milliseconds a real accept-then-import push
+    /// needs on localhost (proven by the RED run: a real import lands well
+    /// under this), without paying `MUST_FAIL_WITHIN`'s 10 s per push.
+    const BLOB_SETTLE_WINDOW: Duration = Duration::from_millis(500);
 
     async fn bind_disabled(dir: &Path) -> Arc<SharedIrohNode> {
         SharedIrohNode::bind(dir, RelayMode::Disabled)
@@ -5816,6 +5822,190 @@ mod collab_store_tests {
             .await
             .expect("tags().get")
             .is_some()
+    }
+
+    /// Poll `store` for `hash` up to `within`. A PUSH's client-side `await`
+    /// returning is not proof the SERVER has finished importing (or refusing)
+    /// it — the two sides are decoupled (see the doc comment on
+    /// `inbound_push_is_refused_on_personal_and_collab_store`) — so a single
+    /// immediate `.has(hash)` check would race an accepted-but-still-importing
+    /// push into a false "absent" pass. Returns the last observed value.
+    async fn wait_for_blob(store: &Store, hash: Hash, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if store.blobs().has(hash).await.unwrap_or(false) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// One raw-blob PUSH from `pusher`'s own store into `provider`'s, over
+    /// `alpn`. Mirrors [`get_blob`] but in the write direction — the shape the
+    /// security-fix acceptance test needs (brief `fix-personal-store-refuse-push`):
+    /// an admitted peer must not be able to write into either store.
+    async fn push_blob(
+        pusher: &SharedIrohNode,
+        provider: NodeId,
+        alpn: &[u8],
+        hash: Hash,
+    ) -> Result<()> {
+        let pool = ConnectionPool::new(pusher.endpoint(), alpn, PoolOptions::default());
+        let conn = pool
+            .get_or_connect(EndpointId::from_bytes(&provider).unwrap())
+            .await
+            .map_err(|e| anyhow!("dial: {e:?}"))?;
+        let remote = pusher.store().remote().clone();
+        remote
+            .execute_push(
+                (*conn).clone(),
+                PushRequest::new(hash, ChunkRangesSeq::root()),
+            )
+            .await
+            .map_err(|e| anyhow!("push: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Security fix (`fix-personal-store-refuse-push`, owner-approved
+    /// 2026-09-25): an admitted peer (the shared connect gate lets it through —
+    /// no gate is installed here) must never be able to WRITE a blob into
+    /// either store on this node by sending a push request. Before the fix,
+    /// `provider_event_channel`'s `get: RequestMode::NotifyLog` mask governed
+    /// EVERY request kind in iroh-blobs 0.103 (a library quirk — `request()`
+    /// only ever reads `self.mask.get`), so a push landed despite the mask's
+    /// `push: RequestMode::Disabled` default and despite the doc comment
+    /// claiming "push disabled". Covers BOTH blob providers the node runs: the
+    /// personal store (`iroh_blobs::ALPN`, mounted in `build_router`) and the
+    /// collab store (`COLLAB_BLOBS_ALPN`, mounted in `bind_with`) — both use
+    /// the SAME masked `EventSender`/consumer pair.
+    ///
+    /// Two independent signals, not one, because iroh-blobs 0.103's PUBLIC
+    /// push API is a client-side blind spot for a payload this small: verified
+    /// empirically (RED run against the pre-fix code, then again post-fix) that
+    /// `Remote::execute_push` returns `Ok(Ok(()))` from the PUSHER's point of
+    /// view REGARDLESS of server-side accept/reject — the client already
+    /// stopped reading its half of the bidi stream (`recv.stop()` in
+    /// `execute_push_sink`) before writing the (well-under-flow-control-window)
+    /// payload, so it never observes the server's `pair.writer.reset(..)`. So
+    /// the return value of `push_blob` is NOT asserted on; the two REAL
+    /// signals are (1) the target store's content — the actual security
+    /// property — and (2) the `warn!("inbound push refused", ..)` this fix
+    /// logs at the point of refusal, captured here the same way
+    /// `relay_refresh_resolver_failure_warns_and_keeps_map` (this file) does.
+    #[tokio::test]
+    async fn inbound_push_is_refused_on_personal_and_collab_store() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let refusals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _guard = tracing_subscriber::registry()
+            .with(PushRefusalCaptureLayer {
+                count: Arc::clone(&refusals),
+            })
+            .set_default();
+
+        let (da, db, root) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let (a, b, a_info, _) = two_nodes(da.path(), db.path()).await;
+        a.set_collab_root(Some(root.path()))
+            .await
+            .expect("mount collab store");
+
+        // B (an admitted peer — no connect gate is installed) pushes into A's
+        // PERSONAL store. B must already hold the bytes locally to push them.
+        let personal_bytes: Vec<u8> = (0..8192).map(|i| (i % 253) as u8).collect();
+        let personal_tag = b
+            .store()
+            .add_bytes(personal_bytes.clone())
+            .await
+            .expect("b holds the bytes it will push");
+        let personal_hash = personal_tag.hash;
+
+        let _ = tokio::time::timeout(
+            MUST_FAIL_WITHIN,
+            push_blob(&b, a_info.node_id, iroh_blobs::ALPN, personal_hash),
+        )
+        .await;
+        assert!(
+            !wait_for_blob(a.store(), personal_hash, BLOB_SETTLE_WINDOW).await,
+            "the pushed blob must NOT land in the personal store"
+        );
+
+        // B pushes into A's COLLAB store the same way.
+        let collab_bytes: Vec<u8> = (0..8192).map(|i| ((i * 7) % 251) as u8).collect();
+        let collab_tag = b
+            .store()
+            .add_bytes(collab_bytes.clone())
+            .await
+            .expect("b holds the bytes it will push");
+        let collab_hash = collab_tag.hash;
+
+        let _ = tokio::time::timeout(
+            MUST_FAIL_WITHIN,
+            push_blob(&b, a_info.node_id, COLLAB_BLOBS_ALPN, collab_hash),
+        )
+        .await;
+        let collab_store = a.collab_store().expect("mounted");
+        assert!(
+            !wait_for_blob(&collab_store, collab_hash, BLOB_SETTLE_WINDOW).await,
+            "the pushed blob must NOT land in the collab store"
+        );
+
+        assert_eq!(
+            refusals.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both pushes must be refused with the `inbound push refused` warn"
+        );
+
+        drop(_guard);
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// Minimal tracing capture scoped to the `inbound push refused` message
+    /// (mirrors `CaptureLayer` in this file's `tests` module, which the
+    /// separate `collab_store_tests` module can't reach directly).
+    #[derive(Default)]
+    struct PushRefusalWarnCollector {
+        message: String,
+    }
+
+    impl tracing::field::Visit for PushRefusalWarnCollector {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct PushRefusalCaptureLayer {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PushRefusalCaptureLayer {
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::WARN)
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut collector = PushRefusalWarnCollector::default();
+            event.record(&mut collector);
+            if collector.message == "inbound push refused" {
+                self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
     }
 
     #[tokio::test]

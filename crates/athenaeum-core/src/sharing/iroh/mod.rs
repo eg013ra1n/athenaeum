@@ -50,7 +50,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_blobs::api::Store;
 use iroh_blobs::protocol::ChunkRangesSeq;
 use iroh_blobs::provider::events::{
-    ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate, ThrottleMode,
+    AbortReason, ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+    ThrottleMode,
 };
 use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
@@ -580,8 +581,22 @@ pub(crate) fn build_router(
 pub(crate) fn provider_event_channel() -> (EventSender, mpsc::Receiver<ProviderMessage>) {
     // Provider upload events (Task 13): a masked `EventSender` feeds a per-process
     // consumer that turns a peer's collection pull into outgoing byte progress.
-    // Mask: `Notify` on connect + `NotifyLog` on get (per-request transfer events);
-    // everything else stays at the default (get_many/observe off, push disabled).
+    //
+    // SECURITY (fix-personal-store-refuse-push, 2026-09-25): `get` is
+    // `InterceptLog`, not the field's own type name — in iroh-blobs 0.103,
+    // `EventSender::request()` (the path shared by get/get_many/push/observe)
+    // matches on `self.mask.get` UNCONDITIONALLY, ignoring `mask.push` /
+    // `mask.get_many` / `mask.observe` entirely (see `provider/events.rs`
+    // `request()` — every request kind is dispatched through that one match).
+    // So `mask.get` governs every request kind on this node, and it MUST be an
+    // `Intercept*` mode or a push is silently admitted regardless of
+    // `mask.push`'s value (this bit us: the mask used to read
+    // `push: RequestMode::Disabled` via `..EventMask::DEFAULT`, and a push
+    // still landed). `InterceptLog` (not plain `Intercept`) keeps the
+    // per-request transfer events GET's upload-progress plumbing depends on.
+    // The consumer (below) now replies `Err(AbortReason::Permission)` to
+    // every `PushRequestReceived` and `Ok(())` to every other request kind —
+    // that reply, not the mask, is what actually refuses a push.
     //
     // `throttle: ThrottleMode::Intercept` is ALWAYS on (W1) — it is never toggled
     // to match whether a limit is currently configured. The provider's writer
@@ -605,7 +620,7 @@ pub(crate) fn provider_event_channel() -> (EventSender, mpsc::Receiver<ProviderM
         PROVIDER_EVENT_CAPACITY,
         EventMask {
             connected: ConnectMode::Notify,
-            get: RequestMode::NotifyLog,
+            get: RequestMode::InterceptLog,
             throttle: ThrottleMode::Intercept,
             ..EventMask::DEFAULT
         },
@@ -631,8 +646,19 @@ pub(crate) fn provider_event_channel() -> (EventSender, mpsc::Receiver<ProviderM
 /// progress with `try_send(..).await?` into that channel; a DROPPED receiver
 /// makes the next send error and that `?` aborts the PEER'S DOWNLOAD. So every
 /// rx-carrying message gets a detached drain task unconditionally — even an
-/// unmapped/foreign hash, even the Push*/Observe* notify messages a 0.103 mask
-/// quirk can deliver despite the mask — and we never block, never drop early.
+/// unmapped/foreign hash, even a Notify-suffixed variant this mask can no
+/// longer produce (kept as dead-code-safe defensive arms) — and we never
+/// block, never drop early.
+///
+/// LOAD-BEARING SAFETY RULE #2: every request-reply oneshot (`m.tx`, on
+/// `GetRequestReceived` / `GetManyRequestReceived` / `PushRequestReceived` /
+/// `ObserveRequestReceived`) MUST get exactly one reply. A DROPPED `tx` aborts
+/// the transfer the same way a dropped `Throttle` `tx` does. `Ok(())` admits
+/// the request; `Err(AbortReason::Permission)` refuses it before any byte is
+/// read or written for it (`provider.rs` checks this reply BEFORE calling into
+/// the store) — that refusal is the ONLY place push requests are actually
+/// rejected; see `provider_event_channel`'s doc for why the mask alone can't
+/// do it in this library version.
 ///
 /// The `Throttle` reply oneshot (`m.tx`) is load-bearing THE SAME WAY, and is
 /// the reason this rule now has teeth on the hot path: with
@@ -663,7 +689,14 @@ pub(crate) fn spawn_provider_events(
         }
         while let Some(msg) = rx.recv().await {
             match msg {
-                ProviderMessage::GetRequestReceivedNotify(m) => {
+                ProviderMessage::GetRequestReceived(m) => {
+                    // Read-only request: admit it immediately. With
+                    // `get: InterceptLog` the provider's own `get_request()`
+                    // await is blocked on this reply (SAFETY RULE #2) — replying
+                    // right away, before any progress bookkeeping, keeps a GET's
+                    // start latency the same as it was under the old
+                    // notify-only mode.
+                    m.tx.send(Ok(())).await.ok();
                     // Collection root + requested ranges of this GET (Task 2.1).
                     // The resolver maps the root to the package we announced, or
                     // `None` (child blob / hash-seq internal / foreign hash — e.g.
@@ -674,8 +707,8 @@ pub(crate) fn spawn_provider_events(
                     // payload-carrying request that resolves to a served package
                     // emits progress or a terminal complete — every other request
                     // is still drained fully (SAFETY RULE), just silently.
-                    let root: Hash = (*m.inner).request.hash;
-                    let payload_carrying = request_is_payload_carrying(&(*m.inner).request.ranges);
+                    let root: Hash = m.inner.request.hash;
+                    let payload_carrying = request_is_payload_carrying(&m.inner.request.ranges);
                     let mut updates = m.rx;
                     let resolver = Arc::clone(&serve_resolver);
                     let file_resolver = Arc::clone(&serve_file_resolver);
@@ -807,14 +840,40 @@ pub(crate) fn spawn_provider_events(
                         }
                     });
                 }
-                // Every other rx-carrying variant: drain-only (SAFETY RULE), no
-                // emit. The masked-off / quirk variants land here.
-                ProviderMessage::GetRequestReceived(m) => drain_only!(m),
-                ProviderMessage::GetManyRequestReceived(m) => drain_only!(m),
+                // Read-only, no progress routing needed: admit immediately
+                // (SAFETY RULE #2), then drain-only (SAFETY RULE #1) — no emit.
+                ProviderMessage::GetManyRequestReceived(m) => {
+                    m.tx.send(Ok(())).await.ok();
+                    drain_only!(m);
+                }
+                ProviderMessage::ObserveRequestReceived(m) => {
+                    m.tx.send(Ok(())).await.ok();
+                    drain_only!(m);
+                }
+                // SECURITY (fix-personal-store-refuse-push): the ONLY place a
+                // push is actually refused — see `provider_event_channel`'s doc
+                // for why the mask itself can't do it in iroh-blobs 0.103. The
+                // reply happens BEFORE `handle_push_impl` ever runs on the
+                // provider side (checked at `push_request()`, ahead of any
+                // store write), so a refused push writes nothing.
+                ProviderMessage::PushRequestReceived(m) => {
+                    tracing::warn!(
+                        connection_id = m.inner.connection_id,
+                        request_id = m.inner.request_id,
+                        hash = %m.inner.request.hash,
+                        "inbound push refused"
+                    );
+                    m.tx.send(Err(AbortReason::Permission)).await.ok();
+                    drain_only!(m);
+                }
+                // Dead-code-safe defensive arms: `get: InterceptLog` never
+                // produces a Notify-suffixed request variant (those are only
+                // sent under `Notify`/`NotifyLog`), but they remain valid
+                // `ProviderMessage` variants type-wise, so drain-only if a
+                // future library version ever surprises us here (SAFETY RULE).
+                ProviderMessage::GetRequestReceivedNotify(m) => drain_only!(m),
                 ProviderMessage::GetManyRequestReceivedNotify(m) => drain_only!(m),
-                ProviderMessage::PushRequestReceived(m) => drain_only!(m),
                 ProviderMessage::PushRequestReceivedNotify(m) => drain_only!(m),
-                ProviderMessage::ObserveRequestReceived(m) => drain_only!(m),
                 ProviderMessage::ObserveRequestReceivedNotify(m) => drain_only!(m),
                 // The upload throttle (W1). The provider is asking permission to
                 // write `size` bytes (~16 KiB) and is BLOCKED on this reply; the
