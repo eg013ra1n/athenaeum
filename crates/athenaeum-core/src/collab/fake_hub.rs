@@ -45,8 +45,7 @@
 //! commit, always a contiguous `prev`); no flap damping on presence; no 30 s
 //! warm-up (`hello.projects[*].presence` is exact from the first event, never
 //! `[]`); the 60 s `versions` vector is only ever sent on demand via
-//! [`FakeHub::send_versions`]; `GET /projects/{id}/holders` pages by a single
-//! `since` cursor without a real `after` tie-breaker.
+//! [`FakeHub::send_versions`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -225,8 +224,12 @@ impl FakeProject {
         }
     }
 
-    /// Write one claim under the report_seq rule; returns true when the
-    /// claim's visible state (content_version, removed) changed.
+    /// Write one CLIENT-REPORTED claim under the report_seq ordering guard.
+    /// Returns `None` when the write was blocked (a stale/duplicate report,
+    /// nothing written — the caller must NOT count this row toward the
+    /// device's report-seq high-water mark), or `Some(changed)` when it went
+    /// through, `changed` true iff the claim's visible state
+    /// (content_version, removed) is now different.
     fn write_claim(
         &mut self,
         device: &str,
@@ -234,11 +237,11 @@ impl FakeProject {
         cv: i32,
         removed: bool,
         report_seq: i64,
-    ) -> bool {
+    ) -> Option<bool> {
         let key = (device.to_string(), uuid.to_string());
         if let Some(c) = self.claims.get(&key) {
             if c.report_seq > report_seq || (c.report_seq == report_seq && report_seq != 0) {
-                return false;
+                return None;
             }
         }
         let changed = self.claims.get(&key).map_or(!removed, |c| {
@@ -255,6 +258,37 @@ impl FakeProject {
                 content_version: cv,
                 report_seq,
                 removed,
+                changed_seq,
+            },
+        );
+        Some(changed)
+    }
+
+    /// Write an implicit, HUB-GENERATED claim (announce, a version bump,
+    /// `seed_frames` standing in for another member's app): ALWAYS applies,
+    /// never blocked by the report_seq ordering guard — that guard exists
+    /// only for client-submitted reports (real hub `plan_hub_claims`,
+    /// `claims/plan.rs`). Stamped with the device's own highest stored
+    /// report_seq (read-only: this never advances the high-water mark
+    /// itself). Returns true iff the claim's visible state changed.
+    fn write_hub_claim(&mut self, device: &str, uuid: &str, cv: i32) -> bool {
+        let report_seq = self.highest_report_seq(device);
+        let key = (device.to_string(), uuid.to_string());
+        let changed = self
+            .claims
+            .get(&key)
+            .map_or(true, |c| c.content_version != cv || c.removed);
+        let changed_seq = if changed {
+            self.holder_seq + 1
+        } else {
+            self.claims.get(&key).map_or(0, |c| c.changed_seq)
+        };
+        self.claims.insert(
+            key,
+            FakeClaim {
+                content_version: cv,
+                report_seq,
+                removed: false,
                 changed_seq,
             },
         );
@@ -506,6 +540,25 @@ impl FakeHubState {
             "projects": projects,
         })
         .to_string();
+        // Presence::open (hub) — the device is now online: tell every other
+        // stream on this account's projects at once.
+        let pids: Vec<String> = self
+            .projects
+            .iter()
+            .filter(|(_, p)| p.member(&acct.account_id).is_some())
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in &pids {
+            self.publish(
+                pid,
+                "presence",
+                json!({
+                    "projectId": pid,
+                    "replace": false,
+                    "changes": [{ "device": acct.device_pubkey_b64, "connected": true, "serving": false, "relayUrl": acct.relay_url }],
+                }),
+            );
+        }
         (
             hello,
             feed_rx,
@@ -915,8 +968,7 @@ impl FakeHub {
                 p.frames.insert(uuid.to_string(), view);
                 touched.push(uuid.to_string());
                 for device in &devices {
-                    let rs = p.highest_report_seq(device);
-                    if p.write_claim(device, uuid, 1, false, rs) {
+                    if p.write_hub_claim(device, uuid, 1) {
                         holder_adds.push((device.clone(), seq, 1));
                     }
                 }
@@ -1067,16 +1119,25 @@ impl FakeHub {
     /// Send the 60 s `versions` state vector once, on demand.
     pub fn send_versions(&self) {
         let st = self.lock();
-        let mut map = serde_json::Map::new();
-        for (pid, p) in &st.projects {
-            map.insert(pid.clone(), json!([p.version, p.holder_seq]));
+        // One message per connected account, listing only THAT account's own
+        // projects — never another account's, even one it shares no project
+        // with.
+        let accounts: HashSet<String> =
+            st.sessions.values().map(|s| s.account_id.clone()).collect();
+        for account_id in accounts {
+            let mut map = serde_json::Map::new();
+            for (pid, p) in &st.projects {
+                if p.member(&account_id).is_some() {
+                    map.insert(pid.clone(), json!([p.version, p.holder_seq]));
+                }
+            }
+            let _ = st.feed.send(FeedMsg {
+                project_id: None,
+                account_id: Some(account_id),
+                name: "versions",
+                data: Value::Object(map).to_string(),
+            });
         }
-        let _ = st.feed.send(FeedMsg {
-            project_id: None,
-            account_id: None,
-            name: "versions",
-            data: Value::Object(map).to_string(),
-        });
     }
 
     /// A hub restart: every stream closes, sessions and presence clear.
@@ -1121,7 +1182,13 @@ impl FakeHub {
     pub fn revoke_device(&self, device_pubkey_b64: &str, retire: bool) {
         let _ = retire; // the fake treats revoke and retire identically.
         let mut st = self.lock();
-        let Some(account) = st.device_accounts().get(device_pubkey_b64).cloned() else {
+        let account = st.device_accounts().get(device_pubkey_b64).cloned();
+        // The device's token(s) die at once: the next authenticated call
+        // gets 401, and it drops out of every `devices_of` (membership
+        // `nodes`, `holders/snapshot`'s `devices`, future implicit claims).
+        st.tokens
+            .retain(|_, a| a.device_pubkey_b64 != device_pubkey_b64);
+        let Some(account) = account else {
             return;
         };
         let pids: Vec<String> = st
@@ -1175,15 +1242,33 @@ impl FakeHub {
                 );
             }
         }
-        let dead: Vec<String> = st
+        let dead_ids: Vec<String> = st
             .sessions
             .iter()
             .filter(|(_, s)| s.device == device_pubkey_b64)
             .map(|(id, _)| id.clone())
             .collect();
-        for id in dead {
-            if let Some(s) = st.sessions.remove(&id) {
-                let _ = s.kill.send(true);
+        for id in dead_ids {
+            let Some(s) = st.sessions.remove(&id) else {
+                continue;
+            };
+            let _ = s.kill.send(true);
+            let pids: Vec<String> = st
+                .projects
+                .iter()
+                .filter(|(_, p)| p.member(&s.account_id).is_some())
+                .map(|(pid, _)| pid.clone())
+                .collect();
+            for pid in pids {
+                st.publish(
+                    &pid,
+                    "presence",
+                    json!({
+                        "projectId": pid,
+                        "replace": false,
+                        "changes": [{ "device": s.device, "connected": false, "serving": false, "relayUrl": s.relay_url }],
+                    }),
+                );
             }
         }
     }
@@ -1430,7 +1515,14 @@ async fn front_beat(
         }
     }
     let mut st = fx.state.lock().expect("fake hub state poisoned");
-    let (device, account_id, changed_pids) = {
+    if st.api_outdated {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({"error": "collab_api_outdated"})),
+        )
+            .into_response();
+    }
+    let (device, account_id, mut changed_pids, relay_changed) = {
         let Some(session) = st.sessions.get_mut(&body.session_id) else {
             return (
                 axum::http::StatusCode::CONFLICT,
@@ -1440,11 +1532,12 @@ async fn front_beat(
         };
         session.last_beat = Instant::now();
         session.detached_at = None;
+        let relay_changed = session.relay_url != body.relay_url;
         session.relay_url = body.relay_url.clone();
-        let mut changed_pids = Vec::new();
+        let mut changed_pids = HashSet::new();
         for (pid, val) in &body.serving {
             if session.serving.get(pid).copied().unwrap_or(false) != *val {
-                changed_pids.push(pid.clone());
+                changed_pids.insert(pid.clone());
             }
         }
         session.serving = body.serving.clone();
@@ -1452,15 +1545,31 @@ async fn front_beat(
             session.device.clone(),
             session.account_id.clone(),
             changed_pids,
+            relay_changed,
         )
     };
+    // The relay changed: every one of the account's projects sees this
+    // device's new relay, not just the ones whose `serving` flag moved.
+    if relay_changed {
+        let member_pids: Vec<String> = st
+            .projects
+            .iter()
+            .filter(|(_, p)| p.member(&account_id).is_some())
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        changed_pids.extend(member_pids);
+    }
     for pid in changed_pids {
         if st
             .projects
             .get(&pid)
             .is_some_and(|p| p.member(&account_id).is_some())
         {
-            let serving = *body.serving.get(&pid).unwrap_or(&false);
+            let serving = st
+                .sessions
+                .get(&body.session_id)
+                .map(|s| s.serving.get(&pid).copied().unwrap_or(false))
+                .unwrap_or(false);
             st.publish(
                 &pid,
                 "presence",
@@ -1481,6 +1590,13 @@ async fn front_leave(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let mut st = fx.state.lock().expect("fake hub state poisoned");
+    if st.api_outdated {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({"error": "collab_api_outdated"})),
+        )
+            .into_response();
+    }
     if let Some(session) = st.sessions.remove(&body.session_id) {
         let pids: Vec<String> = st
             .projects
@@ -2028,8 +2144,7 @@ fn announce(
                 created_at: now_rfc3339(),
             },
         );
-        let rs = p.highest_report_seq(&device);
-        if p.write_claim(&device, &f.frame_uuid, 1, false, rs) {
+        if p.write_hub_claim(&device, &f.frame_uuid, 1) {
             holder_adds.push([seq, 1]);
         }
     }
@@ -2112,8 +2227,7 @@ fn new_version(
     let next = f.content_version;
     let frame_seq = f.frame_seq;
     let device = acct.device_pubkey_b64.clone();
-    let rs = p.highest_report_seq(&device);
-    let changed = p.write_claim(&device, uuid, next, false, rs);
+    let changed = p.write_hub_claim(&device, uuid, next);
     if changed {
         p.holder_seq = prev_holder_seq + 1;
     }
@@ -2199,8 +2313,7 @@ fn frame_versions_batch(
         let frame_seq = frame.frame_seq;
         any_ok = true;
         touched.push(v.uuid.clone());
-        let rs = p.highest_report_seq(&device);
-        if p.write_claim(&device, &v.uuid, next, false, rs) {
+        if p.write_hub_claim(&device, &v.uuid, next) {
             any_holder_change = true;
             holder_adds.push(json!([frame_seq, next]));
         }
@@ -2419,10 +2532,22 @@ fn holders_snapshot(st: &FakeHubState, acct: &FakeAccount, pid: &str) -> Respons
                 .collect();
             rows.sort_by_key(|(seq, _)| *seq);
             let claims = run_length_encode(&rows);
+            // The live presence relay while connected, else the stored one.
+            let relay_url = st
+                .sessions
+                .values()
+                .find(|s| s.device == device)
+                .map(|s| s.relay_url.clone())
+                .unwrap_or_else(|| {
+                    st.tokens
+                        .values()
+                        .find(|a| a.device_pubkey_b64 == device)
+                        .and_then(|a| a.relay_url.clone())
+                });
             devices.push(json!({
                 "device": device,
                 "displayName": st.display_of(&member.account_id),
-                "relayUrl": st.tokens.values().find(|a| a.device_pubkey_b64 == device).and_then(|a| a.relay_url.clone()),
+                "relayUrl": relay_url,
                 "claims": claims,
             }));
         }
@@ -2456,32 +2581,52 @@ fn holders_since(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     if since < p.holder_floor {
-        return gone("holders_below_floor", json!({ "floor": p.holder_floor }));
+        return gone(
+            "holders_below_floor",
+            json!({ "holderSeq": p.holder_seq, "floor": p.holder_floor }),
+        );
     }
     if since > p.holder_seq {
-        return gone("holders_cursor_ahead", json!({ "holderSeq": p.holder_seq }));
+        return gone(
+            "holders_cursor_ahead",
+            json!({ "holderSeq": p.holder_seq, "floor": p.holder_floor }),
+        );
     }
+    // The page cursor is `(changed_seq, device, frameSeq)` — one commit can
+    // stamp many rows with the SAME changed_seq, so a plain `changed_seq >
+    // since` filter on the next page would silently skip the rest of that
+    // commit's rows once `since` lands mid-group. `after` breaks the tie.
+    let after = query(req, "after");
+    let after_key: Option<(String, i32)> = after.as_deref().and_then(|a| {
+        let (d, fs) = a.rsplit_once(':')?;
+        fs.parse::<i32>().ok().map(|fs| (d.to_string(), fs))
+    });
     let limit = st.page_size.min(MANIFEST_PAGE).max(1);
-    let mut rows: Vec<(&(String, String), &FakeClaim)> = p
+    let mut rows: Vec<(String, i32, &FakeClaim)> = p
         .claims
         .iter()
-        .filter(|(_, c)| c.changed_seq > since)
+        .filter_map(|((device, uuid), c)| {
+            p.frames.get(uuid).map(|f| (device.clone(), f.frame_seq, c))
+        })
+        .filter(|(device, frame_seq, c)| match &after_key {
+            Some((ad, afs)) => {
+                (c.changed_seq, device.as_str(), *frame_seq) > (since, ad.as_str(), *afs)
+            }
+            None => c.changed_seq > since,
+        })
         .collect();
-    rows.sort_by(|((d1, u1), c1), ((d2, u2), c2)| {
-        (c1.changed_seq, d1, u1).cmp(&(c2.changed_seq, d2, u2))
+    rows.sort_by(|(d1, fs1, c1), (d2, fs2, c2)| {
+        (c1.changed_seq, d1, fs1).cmp(&(c2.changed_seq, d2, fs2))
     });
     let has_more = rows.len() > limit;
     let page = &rows[..rows.len().min(limit)];
     let mut by_device: BTreeMap<String, (Vec<[i32; 2]>, Vec<i32>)> = BTreeMap::new();
-    for ((device, uuid), c) in page {
-        let Some(f) = p.frames.get(uuid) else {
-            continue;
-        };
+    for (device, frame_seq, c) in page {
         let entry = by_device.entry(device.clone()).or_default();
         if c.removed {
-            entry.1.push(f.frame_seq);
+            entry.1.push(*frame_seq);
         } else {
-            entry.0.push([f.frame_seq, c.content_version]);
+            entry.0.push([*frame_seq, c.content_version]);
         }
     }
     let deltas: Vec<Value> = by_device
@@ -2489,8 +2634,9 @@ fn holders_since(
         .map(|(device, (add, rm))| json!({ "device": device, "add": add, "rm": rm }))
         .collect();
     let next = if has_more {
-        page.last()
-            .map(|((d, u), c)| json!({ "since": c.changed_seq, "after": format!("{d}:{u}") }))
+        page.last().map(|(device, frame_seq, c)| {
+            json!({ "since": c.changed_seq, "after": format!("{device}:{frame_seq:010}") })
+        })
     } else {
         None
     };
@@ -2580,7 +2726,6 @@ fn report_holders(
     let Some(member) = p.member(&acct.account_id).cloned() else {
         return empty(403);
     };
-    p.raise_report_hwm(&acct.device_pubkey_b64, report_seq);
 
     let moderator = member.has_cap("data.moderate");
     let any_frame = member.data_role == "send_receive" || moderator;
@@ -2605,15 +2750,23 @@ fn report_holders(
     let prev_holder_seq = p.holder_seq;
     let mut changed_any = false;
     let mut changed_rows: u64 = 0;
+    // The report-seq high-water mark rises only from rows this report
+    // ACTUALLY WRITES (real hub `store.rs`: `max_report_seq = max over
+    // written rows`); an empty, all-stale or all-refused report writes
+    // nothing and must not advance it.
+    let mut any_written = false;
     let mut add_deltas: Vec<[i32; 2]> = Vec::new();
     let mut rm_deltas: Vec<i32> = Vec::new();
 
     for (uuid, cv) in &accepted {
-        if p.write_claim(&device, uuid, *cv, false, report_seq) {
-            changed_any = true;
-            changed_rows += 1;
-            if let Some(f) = p.frames.get(uuid) {
-                add_deltas.push([f.frame_seq, *cv]);
+        if let Some(changed) = p.write_claim(&device, uuid, *cv, false, report_seq) {
+            any_written = true;
+            if changed {
+                changed_any = true;
+                changed_rows += 1;
+                if let Some(f) = p.frames.get(uuid) {
+                    add_deltas.push([f.frame_seq, *cv]);
+                }
             }
         }
     }
@@ -2623,11 +2776,14 @@ fn report_holders(
             Some(c) if !c.removed => c.content_version,
             _ => continue,
         };
-        if p.write_claim(&device, uuid, cv, true, report_seq) {
-            changed_any = true;
-            changed_rows += 1;
-            if let Some(f) = p.frames.get(uuid) {
-                rm_deltas.push(f.frame_seq);
+        if let Some(changed) = p.write_claim(&device, uuid, cv, true, report_seq) {
+            any_written = true;
+            if changed {
+                changed_any = true;
+                changed_rows += 1;
+                if let Some(f) = p.frames.get(uuid) {
+                    rm_deltas.push(f.frame_seq);
+                }
             }
         }
     }
@@ -2645,51 +2801,69 @@ fn report_holders(
             .map(|((_, u), c)| (u.clone(), c.content_version))
             .collect();
         for (uuid, cv) in to_remove {
-            if p.write_claim(&device, &uuid, cv, true, report_seq) {
-                changed_any = true;
-                changed_rows += 1;
-                if let Some(f) = p.frames.get(&uuid) {
-                    rm_deltas.push(f.frame_seq);
+            if let Some(changed) = p.write_claim(&device, &uuid, cv, true, report_seq) {
+                any_written = true;
+                if changed {
+                    changed_any = true;
+                    changed_rows += 1;
+                    if let Some(f) = p.frames.get(&uuid) {
+                        rm_deltas.push(f.frame_seq);
+                    }
                 }
             }
         }
     } else {
         for uuid in &body.remove {
+            // A remove of a frame the hub has never heard of pins nothing —
+            // no phantom cv-0 tombstone row (hub behaviour: a row only
+            // exists once the frame does).
+            let Some((frame_seq, frame_cv)) =
+                p.frames.get(uuid).map(|f| (f.frame_seq, f.content_version))
+            else {
+                continue;
+            };
             let cv = p
                 .claims
                 .get(&(device.clone(), uuid.clone()))
                 .map(|c| c.content_version)
-                .or_else(|| p.frames.get(uuid).map(|f| f.content_version))
-                .unwrap_or(0);
-            if p.write_claim(&device, uuid, cv, true, report_seq) {
-                changed_any = true;
-                changed_rows += 1;
-                if let Some(f) = p.frames.get(uuid) {
-                    rm_deltas.push(f.frame_seq);
+                .unwrap_or(frame_cv);
+            if let Some(changed) = p.write_claim(&device, uuid, cv, true, report_seq) {
+                any_written = true;
+                if changed {
+                    changed_any = true;
+                    changed_rows += 1;
+                    rm_deltas.push(frame_seq);
                 }
             }
         }
     }
 
+    if any_written {
+        p.raise_report_hwm(&device, report_seq);
+    }
     if changed_any {
         p.holder_seq = prev_holder_seq + 1;
     }
     st.holder_writes += changed_rows;
 
     // The wire contract has the client fold every attempted add (including
-    // ones the hub goes on to refuse) into the digest/count it sends, then
-    // drop the refused ones from its own local claim set once the reply
-    // names them (hub § "Holders" — refused keys are removed from OUR
-    // digest before comparing). A well-behaved client's NEXT report already
-    // excludes them, so the digest it sends there compares directly against
-    // our post-report ground truth with no further adjustment here.
-    let client_digest = ClaimDigest {
+    // ones the hub goes on to refuse) into the digest/count it sends
+    // (hub `holders.rs`): `expected` starts as that declared digest, then
+    // each refused `(uuid, the SENT content_version)` is folded back OUT of
+    // it, and the result must equal the hub's own post-report digest for
+    // this device.
+    let mut expected_digest = ClaimDigest {
         count: body.count,
         xor: parse_hex16(&body.digest),
     };
+    for uuid in &refused {
+        if let Some(a) = body.add.iter().find(|a| &a.uuid == uuid) {
+            expected_digest.remove(&uuid_for_digest(uuid), a.content_version as u32);
+        }
+    }
     let p = st.projects.get(pid).expect("checked above");
     let server_digest = p.digest_of(&device);
-    let digest_match = client_digest == server_digest;
+    let digest_match = expected_digest == server_digest;
     let holder_seq = p.holder_seq;
 
     if changed_any {
@@ -2710,7 +2884,7 @@ mod tests {
     use super::*;
     use crate::collab::hub_client::CollabClient;
     use crate::collab::live::digest::ClaimDigest;
-    use crate::collab::live::wire::{ClaimWire, HoldersReportWire};
+    use crate::collab::live::wire::{BeatWire, ClaimWire, HoldersReportWire};
 
     async fn hub_with_member() -> FakeHub {
         let hub = FakeHub::start().await;
@@ -2762,6 +2936,22 @@ mod tests {
                 .unwrap()
                 .unwrap();
             buf.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+
+    /// Skips every event until a `presence` one naming `device` in its first
+    /// change (the stream may see other devices' presence, or non-presence
+    /// events, interleaved first).
+    async fn next_presence_for(
+        resp: &mut reqwest::Response,
+        buf: &mut String,
+        device: &str,
+    ) -> serde_json::Value {
+        loop {
+            let (name, ev) = next_event(resp, buf).await;
+            if name == "presence" && ev["changes"][0]["device"] == device {
+                return ev;
+            }
         }
     }
 
@@ -2859,6 +3049,11 @@ mod tests {
     async fn refused_claims_and_retired_routes() {
         let hub = hub_with_member().await;
         let c = CollabClient::new(hub.uri()).unwrap();
+        // The client folds every attempted add into the digest/count it
+        // sends, refused ones included; the hub's digestMatch removes each
+        // refused key (at the content version the client SENT) from that
+        // declared digest before comparing to its own ground truth.
+        let digest = ClaimDigest::of_claims([("nope", 1), ("u2", 9)]).unwrap();
         let reply = c
             .report_holders(
                 "tok",
@@ -2877,14 +3072,39 @@ mod tests {
                         },
                     ],
                     remove: vec![],
+                    digest: digest.hex(),
+                    count: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.refused.len(), 2);
+        assert!(reply.digest_match); // both refused keys removed leaves the empty set, matching the hub
+
+        // Negative case: a digest that does NOT already include the refused
+        // entries (e.g. a client that never folded them in) stays mismatched
+        // once the hub subtracts them anyway.
+        let reply2 = c
+            .report_holders(
+                "tok",
+                "p1",
+                &HoldersReportWire {
+                    report_seq: 2,
+                    full: false,
+                    add: vec![ClaimWire {
+                        uuid: "nope".into(),
+                        content_version: 1,
+                    }],
+                    remove: vec![],
                     digest: crate::collab::live::digest::ZERO_HEX.into(),
                     count: 0,
                 },
             )
             .await
             .unwrap();
-        assert_eq!(reply.refused.len(), 2);
-        assert!(reply.digest_match); // refused keys are removed from our digest before comparing
+        assert_eq!(reply2.refused.len(), 1);
+        assert!(!reply2.digest_match);
+
         let r = reqwest::Client::new()
             .get(format!("{}/api/v1/me/project-versions", hub.uri()))
             .bearer_auth("tok")
@@ -2929,5 +3149,194 @@ mod tests {
         assert!(
             matches!(gone, Err(crate::account::AccountClientError::Gone(ref e)) if e == "holders_cursor_ahead")
         );
+    }
+
+    #[tokio::test]
+    async fn holders_since_pages_through_one_commits_many_rows() {
+        let hub = FakeHub::start().await;
+        hub.add_account("tok", "acc-me", "Me", "AAA=", None);
+        hub.add_account("tok-o", "acc-o", "Other", "BBB=", None);
+        hub.add_project(
+            "p1",
+            "m31",
+            &[("acc-me", "send_receive", false), ("acc-o", "send", false)],
+            false,
+        );
+        // One commit: five claim rows for BBB=, all stamped with the SAME
+        // changed_seq. A `since`-only cursor would silently drop rows once
+        // it landed mid-group; `after` must carry the rest of the group.
+        hub.seed_frames("p1", "acc-o", &["f1", "f2", "f3", "f4", "f5"], "published");
+        hub.set_page_size(2);
+        let c = CollabClient::new(hub.uri()).unwrap();
+        let mut seen: HashSet<i32> = HashSet::new();
+        let mut since = 0i64;
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= 10, "paging did not converge");
+            let page = c
+                .holders_since("tok", "p1", since, after.as_deref(), None)
+                .await
+                .unwrap();
+            for d in &page.deltas {
+                for (seq, _cv) in &d.add {
+                    seen.insert(*seq);
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            let next = page.next.expect("hasMore implies next");
+            since = next.since;
+            after = Some(next.after);
+        }
+        assert_eq!(seen.len(), 5, "every row of the one commit, across pages");
+        assert!(
+            pages >= 3,
+            "a page size of 2 over 5 rows takes at least 3 pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn implicit_claims_bypass_the_report_seq_guard() {
+        let hub = FakeHub::start().await;
+        hub.add_account("tok-o", "acc-o", "Other", "BBB=", None);
+        hub.add_project("p1", "m31", &[("acc-o", "send_receive", false)], false);
+        hub.seed_frames("p1", "acc-o", &["u1"], "published");
+        let c = CollabClient::new(hub.uri()).unwrap();
+        // The publisher's own device re-affirms its claim via a full report
+        // at a high report_seq — planting that report_seq on the stored row.
+        let digest = ClaimDigest::of_claims([("u1", 1)]).unwrap();
+        c.report_holders(
+            "tok-o",
+            "p1",
+            &HoldersReportWire {
+                report_seq: 100,
+                full: true,
+                add: vec![ClaimWire {
+                    uuid: "u1".into(),
+                    content_version: 1,
+                }],
+                remove: vec![],
+                digest: digest.hex(),
+                count: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(hub.claim_of("p1", "BBB=", "u1").unwrap().report_seq, 100);
+
+        // A version bump's implicit claim must still take effect even though
+        // the stored report_seq (100) already equals the device's own
+        // high-water mark — that ordering guard is for client-submitted
+        // reports only, never for hub-written implicit claims.
+        let ok = c
+            .new_frame_version("tok-o", "p1", "u1", 1, &"c".repeat(64), 10, &"0".repeat(16))
+            .await
+            .unwrap();
+        assert_eq!(ok.content_version, 2);
+        let claim = hub.claim_of("p1", "BBB=", "u1").unwrap();
+        assert_eq!(
+            claim.content_version, 2,
+            "the implicit claim must track the new version, not be blocked and keep the old cv"
+        );
+        assert_eq!(hub.holders_of("p1", "u1"), vec!["BBB=".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn empty_report_does_not_raise_the_report_seq_high_water_mark() {
+        let hub = hub_with_member().await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        // A pure digest check (empty add/remove) at a very high report_seq
+        // writes nothing, so it must not move the device's stored
+        // high-water mark.
+        c.report_holders(
+            "tok",
+            "p1",
+            &HoldersReportWire {
+                report_seq: 500,
+                full: false,
+                add: vec![],
+                remove: vec![],
+                digest: crate::collab::live::digest::ZERO_HEX.into(),
+                count: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let mut resp = open(&hub, "tok").await;
+        let mut buf = String::new();
+        let (_, hello) = next_event(&mut resp, &mut buf).await;
+        assert_eq!(hello["projects"]["p1"]["reportSeq"], 0);
+
+        // A genuinely fresh report at seq 1 is still accepted (nothing
+        // stale about it — the guard compares per-key, not against a
+        // wrongly-inflated high-water mark).
+        let digest = ClaimDigest::of_claims([("u1", 1)]).unwrap();
+        let reply = c
+            .report_holders(
+                "tok",
+                "p1",
+                &HoldersReportWire {
+                    report_seq: 1,
+                    full: false,
+                    add: vec![ClaimWire {
+                        uuid: "u1".into(),
+                        content_version: 1,
+                    }],
+                    remove: vec![],
+                    digest: digest.hex(),
+                    count: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(reply.digest_match);
+        assert_eq!(hub.claim_of("p1", "AAA=", "u1").unwrap().report_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn presence_broadcasts_on_connect_beat_and_revoke() {
+        let hub = hub_with_member().await;
+        let mut watcher = open(&hub, "tok-o").await;
+        let mut wbuf = String::new();
+        let (_, _hello_o) = next_event(&mut watcher, &mut wbuf).await;
+
+        // Connect: the watcher sees AAA= come online.
+        let mut me = open(&hub, "tok").await;
+        let mut mbuf = String::new();
+        let (_, hello_me) = next_event(&mut me, &mut mbuf).await;
+        let session_id = hello_me["sessionId"].as_str().unwrap().to_string();
+        let ev = next_presence_for(&mut watcher, &mut wbuf, "AAA=").await;
+        assert_eq!(ev["changes"][0]["connected"], true);
+
+        // A beat that only changes the relay (serving unchanged) still
+        // broadcasts.
+        let c = CollabClient::new(hub.uri()).unwrap();
+        c.presence_beat(&BeatWire {
+            session_id: session_id.clone(),
+            serving: BTreeMap::new(),
+            relay_url: Some("https://relay.example".into()),
+        })
+        .await
+        .unwrap();
+        let ev = next_presence_for(&mut watcher, &mut wbuf, "AAA=").await;
+        assert_eq!(ev["changes"][0]["relayUrl"], "https://relay.example");
+
+        // Revoke: the device is told it's gone, drops off the snapshot, and
+        // the watcher sees it go offline.
+        hub.revoke_device("AAA=", true);
+        let ev = next_presence_for(&mut watcher, &mut wbuf, "AAA=").await;
+        assert_eq!(ev["changes"][0]["connected"], false);
+        let r = reqwest::Client::new()
+            .get(format!("{}/api/v1/me/projects", hub.uri()))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        let snap = c.holders_snapshot("tok-o", "p1").await.unwrap();
+        assert!(!snap.devices.iter().any(|d| d.device == "AAA="));
     }
 }
