@@ -1139,7 +1139,7 @@ impl std::ops::AddAssign for FetchOutcome {
 }
 
 /// `"size:mtime_secs"` — the same spelling publish records.
-fn size_mtime_from(meta: &std::fs::Metadata) -> String {
+pub(crate) fn size_mtime_from(meta: &std::fs::Metadata) -> String {
     let secs = meta
         .modified()
         .ok()
@@ -1254,7 +1254,7 @@ pub(crate) fn frame_need(
 }
 
 /// The node bound on the context, if any (never binds one).
-async fn bound_node(
+pub(crate) async fn bound_node(
     ctx: &ServiceContext,
 ) -> Option<Arc<crate::sharing::iroh::node::SharedIrohNode>> {
     ctx.iroh_node.lock().await.clone()
@@ -1279,7 +1279,7 @@ async fn frame_health(
 }
 
 /// Full-file xxh3 on a blocking thread.
-async fn xxh3_on_blocking(path: &Path) -> Result<String> {
+pub(crate) async fn xxh3_on_blocking(path: &Path) -> Result<String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || crate::package::xxh3_full_file(&path))
         .await
@@ -1360,6 +1360,41 @@ fn mounted_collaboration_root(ctx: &ServiceContext) -> Option<PathBuf> {
     }
 }
 
+/// Verify the Collaboration root's storage marker (spec §9.1, plan P22)
+/// against what this device last recorded: refuse another device's disk,
+/// forget a stale record for a path that changed, and persist a fresh or
+/// returning marker. Never mounts or unmounts anything — the caller gates
+/// `set_collab_root`/holds/fetch/publish on the returned state's
+/// `serving()`/`fetching()`. This is the ONE check both
+/// `scan_roots::set_collaboration_dir`'s designation and this module's own
+/// lazy mount ([`ensure_collab_store`]) run, so a folder that fails to
+/// designate can never later be mounted, and vice versa.
+pub(crate) fn check_storage_marker(
+    ctx: &ServiceContext,
+    root: &Path,
+) -> Result<crate::collab::storage::marker::StoreState, ApiError> {
+    use crate::collab::storage::marker::StoreGuard;
+    let me = crate::api::account::own_device_id(ctx)?;
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let root_str = root.to_string_lossy().to_string();
+    let stored_path = crate::db::collab_live::store_marker_path(&conn)?;
+    let recorded = if stored_path.as_deref() == Some(root_str.as_str()) {
+        crate::db::collab_live::recorded_store_marker(&conn)?
+    } else {
+        if stored_path.is_some() {
+            crate::db::collab_live::forget_store_marker(&conn)?;
+        }
+        None
+    };
+    let guard = StoreGuard::new(root.to_path_buf(), me, recorded);
+    let state = guard.check_now();
+    if let Some(m) = guard.take_adoption() {
+        crate::db::collab_live::record_store_marker(&conn, &m, &root_str)?;
+    }
+    Ok(state)
+}
+
 /// How long a failed lazy mount waits before the next attempt (I3).
 const COLLAB_MOUNT_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -1369,6 +1404,21 @@ const COLLAB_MOUNT_RETRY: std::time::Duration = std::time::Duration::from_secs(6
 static COLLAB_MOUNT_ATTEMPTS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>,
 > = std::sync::OnceLock::new();
+
+/// Mark `key`'s latch as already warned (a later failure of the same shape
+/// logs at `debug!` instead of `warn!`, until a mount succeeds and the entry
+/// is dropped).
+fn latch_mount_warned(key: &str) {
+    if let Some(attempts) = COLLAB_MOUNT_ATTEMPTS.get() {
+        if let Some(entry) = attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(key)
+        {
+            entry.1 = true;
+        }
+    }
+}
 
 /// The collab store of the bound node, mounting it lazily when the
 /// Collaboration root exists but the store is not mounted (final review I3):
@@ -1412,6 +1462,27 @@ pub(crate) async fn ensure_collab_store(ctx: &ServiceContext) -> Option<iroh_blo
             }
         }
     };
+    let state = match check_storage_marker(ctx, &root) {
+        Ok(state) => state,
+        Err(e) => {
+            if already_warned {
+                tracing::debug!(path = %root.display(), error = %format!("{e:#}"), "lazy collab store mount skipped again: storage marker check failed");
+            } else {
+                tracing::warn!(path = %root.display(), error = %format!("{e:#}"), "lazy collab store mount skipped: storage marker check failed");
+                latch_mount_warned(&key);
+            }
+            return None;
+        }
+    };
+    if !state.serving() {
+        if already_warned {
+            tracing::debug!(path = %root.display(), state = ?state, "lazy collab store mount skipped again: storage not available");
+        } else {
+            tracing::warn!(path = %root.display(), state = ?state, "lazy collab store mount skipped: storage not available");
+            latch_mount_warned(&key);
+        }
+        return None;
+    }
     match node.set_collab_root(Some(&root)).await {
         Ok(()) => {
             if let Some(attempts) = COLLAB_MOUNT_ATTEMPTS.get() {
@@ -7017,8 +7088,11 @@ mod tests {
             r.hub.seed_frames(PID, "acc-o", &["n1"], "published");
             sync_rows(&r).await;
             land_file(&r, "mine", FrameOrigin::Own, &pattern(1, 256));
-            // A file where the store's folder must go: every mount fails.
-            std::fs::write(r.collab.join(".athenaeum"), b"not a folder").unwrap();
+            // `set_collaboration_dir` already wrote the storage marker under
+            // `.athenaeum/` (T7); block the store's OWN folder underneath it
+            // with a file where the blobs directory must go, so every mount
+            // still fails.
+            std::fs::write(r.collab.join(".athenaeum").join("blobs"), b"not a folder").unwrap();
             let node = bind_unmounted(&r).await;
 
             let from = request_count(&r.hub).await;

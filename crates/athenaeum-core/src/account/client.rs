@@ -275,19 +275,24 @@ impl HubClient {
         }
     }
 
-    /// `POST /devices/{id}/revoke`.
+    /// `POST /devices/{id}/revoke` — revoke a device, or retire it (a
+    /// permanent "will never sign in again" mark the hub keeps distinct from
+    /// a plain revoke — spec §9.5, the device-replace flow). No body for a
+    /// plain revoke; `{"retire":true}` when `retire`.
     pub async fn revoke_device(
         &self,
         token: &str,
         device_id: &str,
+        retire: bool,
     ) -> Result<(), AccountClientError> {
-        let resp = self
+        let mut req = self
             .http
             .post(self.url(&format!("/devices/{device_id}/revoke")))
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(net)?;
+            .bearer_auth(token);
+        if retire {
+            req = req.json(&serde_json::json!({ "retire": true }));
+        }
+        let resp = req.send().await.map_err(net)?;
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),

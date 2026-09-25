@@ -2,7 +2,10 @@
 //!
 //! * `collab_live_meta` — hub-wide values: the device's `report_seq`
 //!   counter (one per device, never goes back), the hub epoch, the account
-//!   id seen in `hello`, the storage marker's store id and device.
+//!   id seen in `hello`, the storage marker's store id, device and path
+//!   (`collab::storage::marker`, T7 ruling: the path is recorded too, so a
+//!   redesignation to a DIFFERENT folder can tell "still the same store" from
+//!   "forget the old record and start fresh").
 //! * `collab_my_claims` / `collab_outbox` — the device's claim set and the
 //!   unsent changes to it. Written ONLY through [`record_claim_change`]
 //!   (inside the same transaction as the local state change that causes it,
@@ -21,6 +24,7 @@ pub const META_EPOCH: &str = "epoch";
 pub const META_ACCOUNT_ID: &str = "account_id";
 pub const META_STORE_ID: &str = "store_id";
 pub const META_STORE_DEVICE: &str = "store_device";
+pub const META_STORE_PATH: &str = "store_path";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimOp {
@@ -74,6 +78,58 @@ pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
         "INSERT INTO collab_live_meta (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![key, value],
+    )?;
+    Ok(())
+}
+
+// ── the storage marker (wave 3 Task 7, `collab::storage::marker`) ──────────
+
+/// The Collaboration root path this device last recorded a storage marker
+/// for — `None` before the first successful designation. Compared against
+/// the path being (re-)designated so a folder change forgets the stale
+/// record instead of comparing a fresh folder's marker against one that
+/// belongs to a different path entirely.
+pub fn store_marker_path(conn: &Connection) -> Result<Option<String>> {
+    meta_get(conn, META_STORE_PATH)
+}
+
+/// This device's recorded storage marker (store id + device), if any. `None`
+/// when either half is missing — a partially-written record is never
+/// treated as a match (the caller re-adopts from scratch).
+pub fn recorded_store_marker(
+    conn: &Connection,
+) -> Result<Option<crate::collab::storage::marker::StoreMarker>> {
+    let store_id = meta_get(conn, META_STORE_ID)?;
+    let device_id = meta_get(conn, META_STORE_DEVICE)?;
+    Ok(match (store_id, device_id) {
+        (Some(store_id), Some(device_id)) => Some(crate::collab::storage::marker::StoreMarker {
+            store_id,
+            device_id,
+        }),
+        _ => None,
+    })
+}
+
+/// Record a storage marker as this device's own, alongside the path it was
+/// read/written at (T7 ruling: `collab_live_meta` records the path too).
+pub fn record_store_marker(
+    conn: &Connection,
+    marker: &crate::collab::storage::marker::StoreMarker,
+    path: &str,
+) -> Result<()> {
+    meta_set(conn, META_STORE_ID, &marker.store_id)?;
+    meta_set(conn, META_STORE_DEVICE, &marker.device_id)?;
+    meta_set(conn, META_STORE_PATH, path)?;
+    Ok(())
+}
+
+/// Forget the recorded storage marker (a Collaboration root cleared, or
+/// about to be redesignated to a different path). The on-disk marker file
+/// itself is never touched — an unmounted store is not deleted.
+pub fn forget_store_marker(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM collab_live_meta WHERE key IN (?1, ?2, ?3)",
+        params![META_STORE_ID, META_STORE_DEVICE, META_STORE_PATH],
     )?;
     Ok(())
 }
@@ -660,5 +716,25 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].quarantined_version, 2);
         assert_eq!(unquarantine(&conn, "p1", "u1").unwrap(), 1);
+    }
+
+    #[test]
+    fn storage_marker_round_trips_and_forgets() {
+        let conn = conn_with_project();
+        assert_eq!(recorded_store_marker(&conn).unwrap(), None);
+        assert_eq!(store_marker_path(&conn).unwrap(), None);
+        let marker = crate::collab::storage::marker::StoreMarker {
+            store_id: "s1".into(),
+            device_id: "ME".into(),
+        };
+        record_store_marker(&conn, &marker, "/collab/root").unwrap();
+        assert_eq!(recorded_store_marker(&conn).unwrap(), Some(marker));
+        assert_eq!(
+            store_marker_path(&conn).unwrap().as_deref(),
+            Some("/collab/root")
+        );
+        forget_store_marker(&conn).unwrap();
+        assert_eq!(recorded_store_marker(&conn).unwrap(), None);
+        assert_eq!(store_marker_path(&conn).unwrap(), None);
     }
 }

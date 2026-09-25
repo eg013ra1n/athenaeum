@@ -8,3 +8,13 @@
 
 pub mod feed;
 pub mod holdings;
+// The storage marker's device-facing half (Task 7): whether a marker names
+// one of this account's OWN devices (offering a replace) and the
+// device-replace core (retire + marker rewrite + re-adoption by hash).
+pub mod replace;
+
+// Fixtures shared by every wave-3 `api::collab_live` test module (Tasks
+// 7-18): a signed-in `ServiceContext` + `FakeHub` + a real relay-disabled
+// iroh node with the Collaboration root mounted.
+#[cfg(test)]
+pub(crate) mod test_support;

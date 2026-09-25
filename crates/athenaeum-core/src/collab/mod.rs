@@ -19,3 +19,7 @@ pub mod hub_client;
 // wire shapes for holders/versions/presence. Pure and ungated.
 pub mod live;
 pub mod snapshot;
+// On-disk state of the Collaboration root itself (wave 3, spec §9): the
+// storage marker (available/read-only/unavailable, another device's disk
+// refused, P22). Pure and ungated — no render/solver dependency.
+pub mod storage;

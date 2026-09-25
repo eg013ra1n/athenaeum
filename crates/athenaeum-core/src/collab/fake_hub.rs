@@ -79,6 +79,20 @@ pub struct FakeAccount {
     pub relay_url: Option<String>,
 }
 
+/// One account-device registry row (`GET /devices` / `POST
+/// /devices/{id}/revoke`, T7) — `id` is the map key in
+/// [`FakeHubState::devices`], distinct from `pubkey` (the marker/claim
+/// identity `FakeAccount` carries).
+#[derive(Debug, Clone)]
+pub struct FakeDeviceRow {
+    pub account_id: String,
+    pub pubkey: String,
+    pub name: String,
+    pub created_at: String,
+    pub last_seen_at: Option<String>,
+    pub retired: bool,
+}
+
 /// One project membership.
 #[derive(Debug, Clone)]
 pub struct FakeMember {
@@ -312,6 +326,11 @@ pub struct FakeHubState {
     pub projects: HashMap<String, FakeProject>,
     /// device token → the account + device it authenticates.
     pub tokens: HashMap<String, FakeAccount>,
+    /// hub device id → the account's device registry row (`GET /devices` /
+    /// `POST /devices/{id}/revoke`, T7). A SEPARATE index from `tokens`: a
+    /// device stays listed (and revocable/retirable) after it signs out or
+    /// its token expires, exactly like a real hub's device registry.
+    pub devices: HashMap<String, FakeDeviceRow>,
     /// account id → display name, kept apart from `tokens` (T4 ruling): a
     /// revoke removes only the token, never the account's display name, so a
     /// member who still has other devices — or is simply not the one just
@@ -663,6 +682,7 @@ impl FakeHub {
         let state = Arc::new(Mutex::new(FakeHubState {
             projects: HashMap::new(),
             tokens: HashMap::new(),
+            devices: HashMap::new(),
             account_displays: HashMap::new(),
             page_size: MANIFEST_PAGE,
             failing: HashSet::new(),
@@ -806,6 +826,40 @@ impl FakeHub {
         );
         st.account_displays
             .insert(account_id.to_string(), display.to_string());
+    }
+
+    /// Register a device in the account's device list (`GET /devices`), T7:
+    /// `id` is the hub device id (what `revoke`/replace take), `pubkey_b64`
+    /// its marker/claim identity. Independent of [`add_account`] — a device
+    /// can be listed, offline, with no live token.
+    pub fn add_device(
+        &self,
+        account_id: &str,
+        pubkey_b64: &str,
+        id: &str,
+        name: &str,
+        last_seen: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.lock().devices.insert(
+            id.to_string(),
+            FakeDeviceRow {
+                account_id: account_id.to_string(),
+                pubkey: pubkey_b64.to_string(),
+                name: name.to_string(),
+                created_at: now_rfc3339(),
+                last_seen_at: last_seen.map(|t| t.to_rfc3339()),
+                retired: false,
+            },
+        );
+    }
+
+    /// Whether `id` (a hub device id) has been revoked with `retire: true`.
+    pub fn device_retired(&self, id: &str) -> bool {
+        self.lock()
+            .devices
+            .get(id)
+            .map(|d| d.retired)
+            .unwrap_or(false)
     }
 
     /// Create an active project at version 1 with the [`default_dictionary`]
@@ -1271,103 +1325,111 @@ impl FakeHub {
     /// I11: tombstone the device's claims everywhere it is a member, bump
     /// `members` on every affected project, and close its stream(s).
     pub fn revoke_device(&self, device_pubkey_b64: &str, retire: bool) {
-        let _ = retire; // the fake treats revoke and retire identically.
-        let mut st = self.lock();
-        let account = st.device_accounts().get(device_pubkey_b64).cloned();
-        // The device's token(s) die at once: the next authenticated call
-        // gets 401, and it drops out of every `devices_of` (membership
-        // `nodes`, `holders/snapshot`'s `devices`, future implicit claims).
-        st.tokens
-            .retain(|_, a| a.device_pubkey_b64 != device_pubkey_b64);
-        let Some(account) = account else {
-            return;
-        };
-        let pids: Vec<String> = st
-            .projects
-            .iter()
-            .filter(|(_, p)| p.member(&account).is_some())
-            .map(|(id, _)| id.clone())
-            .collect();
-        for pid in &pids {
-            let (prev_version, prev_holder_seq, rm) = {
-                let p = st.projects.get_mut(pid).expect("checked above");
-                let touched: Vec<i32> = p
-                    .claims
-                    .iter()
-                    .filter(|((d, _), c)| d == device_pubkey_b64 && !c.removed)
-                    .filter_map(|((_, u), _)| p.frames.get(u).map(|f| f.frame_seq))
-                    .collect();
-                let uuids: Vec<String> = p
-                    .claims
-                    .keys()
-                    .filter(|(d, _)| d == device_pubkey_b64)
-                    .map(|(_, u)| u.clone())
-                    .collect();
-                let prev_holder_seq = p.holder_seq;
-                if !touched.is_empty() {
-                    let seq = prev_holder_seq + 1;
-                    for u in &uuids {
-                        if let Some(c) = p
-                            .claims
-                            .get_mut(&(device_pubkey_b64.to_string(), u.clone()))
-                        {
-                            if !c.removed {
-                                c.removed = true;
-                                c.changed_seq = seq;
-                            }
-                        }
-                    }
-                    p.holder_seq = seq;
-                }
-                let prev_version = p.version;
-                p.membership_version += 1;
-                p.bump();
-                (prev_version, prev_holder_seq, touched)
-            };
-            st.publish_bump(pid, prev_version, &["members"], &[]);
-            if !rm.is_empty() {
-                st.publish_holders(
-                    pid,
-                    prev_holder_seq,
-                    json!([{ "device": device_pubkey_b64, "add": [], "rm": rm }]),
-                );
-            }
-        }
-        let dead_ids: Vec<String> = st
-            .sessions
-            .iter()
-            .filter(|(_, s)| s.device == device_pubkey_b64)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in dead_ids {
-            let Some(s) = st.sessions.remove(&id) else {
-                continue;
-            };
-            let _ = s.kill.send(true);
-            let pids: Vec<String> = st
-                .projects
-                .iter()
-                .filter(|(_, p)| p.member(&s.account_id).is_some())
-                .map(|(pid, _)| pid.clone())
-                .collect();
-            for pid in pids {
-                st.publish(
-                    &pid,
-                    "presence",
-                    json!({
-                        "projectId": pid,
-                        "replace": false,
-                        "changes": [{ "device": s.device, "connected": false, "serving": false, "relayUrl": s.relay_url }],
-                    }),
-                );
-            }
-        }
+        revoke_device_state(&mut self.lock(), device_pubkey_b64, retire);
     }
 
     /// Every v3 route (except `collab/pubkey` and the public project page)
     /// answers 409 `collab_api_outdated` while `on`.
     pub fn set_api_outdated(&self, on: bool) {
         self.lock().api_outdated = on;
+    }
+}
+
+/// The guts of [`FakeHub::revoke_device`] — tombstone the device's claims
+/// everywhere it is a member, bump `members` on every affected project, and
+/// close its stream(s). A free function (not a `FakeHub` method) so the
+/// `POST /devices/{id}/revoke` route handler, which already holds
+/// `&mut FakeHubState` from [`route`], can call it without re-locking.
+fn revoke_device_state(st: &mut FakeHubState, device_pubkey_b64: &str, retire: bool) {
+    let _ = retire; // the fake treats revoke and retire identically.
+    let account = st.device_accounts().get(device_pubkey_b64).cloned();
+    // The device's token(s) die at once: the next authenticated call
+    // gets 401, and it drops out of every `devices_of` (membership
+    // `nodes`, `holders/snapshot`'s `devices`, future implicit claims).
+    st.tokens
+        .retain(|_, a| a.device_pubkey_b64 != device_pubkey_b64);
+    let Some(account) = account else {
+        return;
+    };
+    let pids: Vec<String> = st
+        .projects
+        .iter()
+        .filter(|(_, p)| p.member(&account).is_some())
+        .map(|(id, _)| id.clone())
+        .collect();
+    for pid in &pids {
+        let (prev_version, prev_holder_seq, rm) = {
+            let p = st.projects.get_mut(pid).expect("checked above");
+            let touched: Vec<i32> = p
+                .claims
+                .iter()
+                .filter(|((d, _), c)| d == device_pubkey_b64 && !c.removed)
+                .filter_map(|((_, u), _)| p.frames.get(u).map(|f| f.frame_seq))
+                .collect();
+            let uuids: Vec<String> = p
+                .claims
+                .keys()
+                .filter(|(d, _)| d == device_pubkey_b64)
+                .map(|(_, u)| u.clone())
+                .collect();
+            let prev_holder_seq = p.holder_seq;
+            if !touched.is_empty() {
+                let seq = prev_holder_seq + 1;
+                for u in &uuids {
+                    if let Some(c) = p
+                        .claims
+                        .get_mut(&(device_pubkey_b64.to_string(), u.clone()))
+                    {
+                        if !c.removed {
+                            c.removed = true;
+                            c.changed_seq = seq;
+                        }
+                    }
+                }
+                p.holder_seq = seq;
+            }
+            let prev_version = p.version;
+            p.membership_version += 1;
+            p.bump();
+            (prev_version, prev_holder_seq, touched)
+        };
+        st.publish_bump(pid, prev_version, &["members"], &[]);
+        if !rm.is_empty() {
+            st.publish_holders(
+                pid,
+                prev_holder_seq,
+                json!([{ "device": device_pubkey_b64, "add": [], "rm": rm }]),
+            );
+        }
+    }
+    let dead_ids: Vec<String> = st
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.device == device_pubkey_b64)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in dead_ids {
+        let Some(s) = st.sessions.remove(&id) else {
+            continue;
+        };
+        let _ = s.kill.send(true);
+        let pids: Vec<String> = st
+            .projects
+            .iter()
+            .filter(|(_, p)| p.member(&s.account_id).is_some())
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in pids {
+            st.publish(
+                &pid,
+                "presence",
+                json!({
+                    "projectId": pid,
+                    "replace": false,
+                    "changes": [{ "device": s.device, "connected": false, "serving": false, "relayUrl": s.relay_url }],
+                }),
+            );
+        }
     }
 }
 
@@ -1813,6 +1875,8 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
         return empty(401);
     };
     match (method.as_str(), segs.as_slice()) {
+        ("GET", ["devices"]) => list_devices_route(st, &acct),
+        ("POST", ["devices", id, "revoke"]) => revoke_device_route(st, &acct, id, req),
         ("GET", ["me", "projects"]) => my_projects(st, &acct),
         ("GET", ["projects", pid, "membership"]) => membership(st, key, &acct, pid),
         ("GET", ["projects", pid, "thresholds"]) => thresholds(st, &acct, pid),
@@ -1863,6 +1927,64 @@ fn project_page(st: &FakeHubState, pid: &str) -> ResponseTemplate {
         },
         "members": members,
     }))
+}
+
+/// `GET /devices` — the calling account's own, non-retired devices (T7).
+fn list_devices_route(st: &FakeHubState, acct: &FakeAccount) -> ResponseTemplate {
+    let mut out: Vec<(String, Value)> = st
+        .devices
+        .iter()
+        .filter(|(_, d)| d.account_id == acct.account_id && !d.retired)
+        .map(|(id, d)| {
+            (
+                id.clone(),
+                json!({
+                    "id": id,
+                    "name": d.name,
+                    "pubkey": d.pubkey,
+                    "capability": "athenaeum",
+                    "createdAt": d.created_at,
+                    "lastSeenAt": d.last_seen_at,
+                }),
+            )
+        })
+        .collect();
+    out.sort_by(|(a, _), (b, _)| a.cmp(b));
+    ok(Value::Array(out.into_iter().map(|(_, v)| v).collect()))
+}
+
+/// `POST /devices/{id}/revoke` — optional `{"retire":bool}` body (T7). Scoped
+/// to the calling account: a device id of another account 404s, exactly like
+/// an unknown id.
+fn revoke_device_route(
+    st: &mut FakeHubState,
+    acct: &FakeAccount,
+    id: &str,
+    req: &Request,
+) -> ResponseTemplate {
+    #[derive(serde::Deserialize, Default)]
+    struct RevokeBody {
+        #[serde(default)]
+        retire: bool,
+    }
+    let retire = if req.body.is_empty() {
+        false
+    } else {
+        req.body_json::<RevokeBody>()
+            .map(|b| b.retire)
+            .unwrap_or(false)
+    };
+    let Some(dev) = st.devices.get(id).cloned() else {
+        return error(404, "no such device");
+    };
+    if dev.account_id != acct.account_id {
+        return error(404, "no such device");
+    }
+    if let Some(d) = st.devices.get_mut(id) {
+        d.retired = true;
+    }
+    revoke_device_state(st, &dev.pubkey, retire);
+    empty(204)
 }
 
 fn my_projects(st: &FakeHubState, acct: &FakeAccount) -> ResponseTemplate {

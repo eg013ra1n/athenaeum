@@ -359,20 +359,41 @@ pub async fn list_devices(ctx: &ServiceContext) -> Result<Vec<AccountDevice>, Ap
         .map_err(|e| map_authed_err(ctx, &cfg, e))
 }
 
-/// Revoke a device by id (this device or a peer).
-pub async fn revoke_device(ctx: &ServiceContext, device_id: String) -> Result<(), ApiError> {
+/// Shared body of [`revoke_device`] / [`revoke_device_retire`]: the hub call
+/// plus the self-revoke local-session cleanup. Returns the resolved config
+/// so each caller can log its own distinct message.
+async fn revoke_device_call(
+    ctx: &ServiceContext,
+    device_id: &str,
+    retire: bool,
+) -> Result<AccountConfig, ApiError> {
     let cfg = resolve_config(ctx)?;
     let token = require_token(&cfg)?;
     let client = HubClient::new(&cfg.hub_url).map_err(map_client_err)?;
     client
-        .revoke_device(&token, &device_id)
+        .revoke_device(&token, device_id, retire)
         .await
         .map_err(|e| map_authed_err(ctx, &cfg, e))?;
     // If we just revoked ourselves, reflect it locally.
-    if read_state(ctx, keys::ACCOUNT_DEVICE_ID)?.as_deref() == Some(device_id.as_str()) {
+    if read_state(ctx, keys::ACCOUNT_DEVICE_ID)?.as_deref() == Some(device_id) {
         clear_local_session(ctx, &cfg)?;
     }
+    Ok(cfg)
+}
+
+/// Revoke a device by id (this device or a peer).
+pub async fn revoke_device(ctx: &ServiceContext, device_id: String) -> Result<(), ApiError> {
+    let cfg = revoke_device_call(ctx, &device_id, false).await?;
     tracing::info!(hub = %cfg.hub_host, device_id = %device_id, "device revoked");
+    Ok(())
+}
+
+/// Revoke AND retire a device by id (spec §9.5, the device-replace flow): a
+/// permanent "will never sign in again" mark, distinct from a plain revoke,
+/// so the storage marker's former owner is never re-offered for replace.
+pub async fn revoke_device_retire(ctx: &ServiceContext, device_id: String) -> Result<(), ApiError> {
+    let cfg = revoke_device_call(ctx, &device_id, true).await?;
+    tracing::info!(hub = %cfg.hub_host, device_id = %device_id, retire = true, "device retired");
     Ok(())
 }
 
@@ -406,6 +427,19 @@ pub async fn rename_device(
 // like Perseus. This helper gathers the settings/keychain credentials that
 // resolver needs; it lives here (not in `api::sync`) because it reads the same
 // `AccountConfig` + `TokenStore` the account commands use.
+
+/// This device's id as the hub encodes it: standard base64 of its device
+/// pubkey (P3) — the SAME identity the sync transport binds (`cfg.sync_dir`
+/// == `api::sync::sync_dirs`'s `identity_dir`), so it never diverges from
+/// what the hub's `device` field (and `GET /devices`' `pubkey`) name. Never
+/// requires a bound iroh node — the key is loaded (or created) straight off
+/// disk.
+pub(crate) fn own_device_id(ctx: &ServiceContext) -> Result<String, ApiError> {
+    let cfg = resolve_config(ctx)?;
+    let key = DeviceKey::load_or_create_in(&cfg.sync_dir)
+        .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?;
+    Ok(key.pubkey_base64())
+}
 
 /// The signed-in hub credentials `(hub_url, token)`, or `None` when signed out.
 /// Used to fetch the relay map for the sync transport.

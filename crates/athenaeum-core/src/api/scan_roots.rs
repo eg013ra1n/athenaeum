@@ -852,7 +852,11 @@ pub fn get_collaboration_dir(ctx: &ServiceContext) -> Result<Option<String>, Api
 /// most).
 ///
 /// Contract: `Err` ⇒ nothing changed. A mount failure undoes exactly what the
-/// designation did (R5 fix option a) before the error is returned.
+/// designation did (R5 fix option a) before the error is returned. The
+/// storage marker check (spec §9.1, plan P22) runs after a successful mount
+/// and is undone the same way: a folder another of this account's devices
+/// already claimed refuses the designation with
+/// [`ApiError::Conflict`]`("collab_other_device: …")`.
 pub async fn set_collaboration_dir(
     ctx: &ServiceContext,
     path: String,
@@ -885,7 +889,45 @@ pub async fn set_collaboration_dir(
         remove_created_folder(&candidate, existed);
         return Err(e);
     }
+    if let Err(e) = check_storage_marker_for_designation(ctx, &stored) {
+        undo_collaboration_designation(ctx, &designation);
+        let _ = mount_collab_store(ctx, None).await;
+        remove_created_folder(&candidate, existed);
+        return Err(e);
+    }
     Ok(stored)
+}
+
+/// The storage-marker half of [`set_collaboration_dir`]: refuse another
+/// device's disk, else record a fresh or returning marker. Uses
+/// [`crate::api::collab_exchange::check_storage_marker`] — the same check
+/// `ensure_collab_store`'s lazy mount runs — so a folder that fails to
+/// designate can never later be mounted, and vice versa.
+fn check_storage_marker_for_designation(
+    ctx: &ServiceContext,
+    stored: &str,
+) -> Result<(), ApiError> {
+    use crate::collab::storage::marker::{StoreState, UnavailableReason};
+    let state = crate::api::collab_exchange::check_storage_marker(ctx, Path::new(stored))?;
+    match state {
+        StoreState::Available | StoreState::ReadOnly => Ok(()),
+        StoreState::Unavailable(UnavailableReason::OtherDevice { device_id }) => {
+            tracing::warn!(
+                path = stored,
+                other_device = %device_id,
+                "collaboration folder designation refused: belongs to another device"
+            );
+            Err(ApiError::Conflict(
+                "collab_other_device: this Collaboration folder belongs to another device of your account".to_string(),
+            ))
+        }
+        StoreState::Unavailable(reason) => {
+            tracing::warn!(path = stored, reason = ?reason, "collaboration folder storage check failed");
+            Err(ApiError::Conflict(format!(
+                "collaboration folder is not usable: {reason:?}"
+            )))
+        }
+    }
 }
 
 /// Leaf-only, best-effort removal of a folder THIS call created (as
@@ -1100,6 +1142,10 @@ pub async fn clear_collaboration_dir(ctx: &ServiceContext) -> Result<(), ApiErro
         if removed > 0 {
             tracing::info!(path = %root, count = removed, "foreign file list dropped with the collaboration folder");
         }
+    }
+    {
+        let db = db(ctx)?;
+        crate::db::collab_live::forget_store_marker(&db.conn())?;
     }
     mount_collab_store(ctx, None).await
 }
@@ -2428,6 +2474,51 @@ mod special_root_tests {
             "the library row is untouched"
         );
         assert_eq!(get_collaboration_dir(&ctx).unwrap(), None);
+    }
+
+    /// T7 (spec §9.1, P22): a folder whose on-disk storage marker already
+    /// names a DIFFERENT device (another machine pointed at the same NAS
+    /// share, or a reinstall under a fresh identity) refuses the
+    /// designation outright — the inserted row is undone, exactly like a
+    /// failed mount — with the `collab_other_device` prefix Task 16/17 turn
+    /// into the replace prompt.
+    #[tokio::test]
+    async fn set_collaboration_dir_refuses_another_devices_marker() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let folder = TempDir::new().unwrap();
+        crate::collab::storage::marker::write_marker(
+            folder.path(),
+            &crate::collab::storage::marker::StoreMarker {
+                store_id: "s1".into(),
+                device_id: "OTHER-DEVICE".into(),
+            },
+        )
+        .unwrap();
+
+        let err = set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ApiError::Conflict(m) => assert!(m.starts_with("collab_other_device"), "{m}"),
+            other => panic!("expected a collab_other_device Conflict, got {other:?}"),
+        }
+        assert_eq!(get_collaboration_dir(&ctx).unwrap(), None, "undone");
+        let rows = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::get_scan_roots(&conn).unwrap().len()
+        };
+        assert_eq!(rows, 0, "the inserted row is deleted again");
+        // The refusal never claimed the folder for this device.
+        assert_eq!(
+            crate::db::collab_live::recorded_store_marker(&db(&ctx).unwrap().conn()).unwrap(),
+            None
+        );
     }
 
     /// R5: a folder that was a Collaboration root before (its store dir is
