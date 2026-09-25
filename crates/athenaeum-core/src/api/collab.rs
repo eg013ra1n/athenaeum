@@ -2180,7 +2180,7 @@ fn already_announced_in(
 }
 
 /// Split announce-ready frames into hub batches of at most [`ANNOUNCE_BATCH`].
-fn announce_batches<T>(mut rest: Vec<T>) -> std::collections::VecDeque<Vec<T>> {
+pub(crate) fn announce_batches<T>(mut rest: Vec<T>) -> std::collections::VecDeque<Vec<T>> {
     let mut batches = std::collections::VecDeque::new();
     while !rest.is_empty() {
         let tail = rest.split_off(rest.len().min(ANNOUNCE_BATCH));

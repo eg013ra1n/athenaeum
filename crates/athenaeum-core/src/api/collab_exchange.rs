@@ -29,8 +29,10 @@ use crate::sharing::{ProviderEvent, ProviderTelemetrySink};
 use crate::sync::{node_id_hex, pairing};
 
 /// Map an [`AccountClientError`](crate::account::AccountClientError) onto the api
-/// boundary (mirrors `api::collab::client_err`).
-fn client_err(e: crate::account::AccountClientError) -> ApiError {
+/// boundary (mirrors `api::collab::client_err`). `pub(crate)`: the feed
+/// applier (`api::collab_live::feed`) maps a re-announce failure through the
+/// same rules rather than duplicating them.
+pub(crate) fn client_err(e: crate::account::AccountClientError) -> ApiError {
     use crate::account::AccountClientError as E;
     match e {
         E::RateLimited => {
@@ -128,7 +130,7 @@ pub enum FramesChangeKind {
 
 impl FramesChangeKind {
     /// The wire spelling (the serde name), for logs.
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             FramesChangeKind::NewFrames => "newFrames",
             FramesChangeKind::PendingFrames => "pendingFrames",
@@ -220,7 +222,7 @@ pub async fn sync_manifest(
     emitter: Option<&dyn ProgressEmitter>,
     vouched_version: Option<i64>,
 ) -> Result<Vec<CollabFramesChange>, ApiError> {
-    let result = sync_manifest_serialized(ctx, project_id, emitter, vouched_version).await;
+    let result = sync_manifest_inner(ctx, project_id, emitter, vouched_version, false).await;
     if let Err(e) = &result {
         tracing::warn!(
             project_id,
@@ -228,7 +230,21 @@ pub async fn sync_manifest(
             "manifest sync failed; the next sync resumes from the stored cursor"
         );
     }
-    result
+    result.map(|(changes, _seen, _project_version)| changes)
+}
+
+/// Refetch the whole manifest from 0 and prune rows the hub no longer lists
+/// (own rows are never pruned, `delete_not_in`). Returns every uuid the hub
+/// listed — the epoch path compares it with the own rows (plan P25).
+pub(crate) async fn sync_manifest_full(
+    ctx: &ServiceContext,
+    project_id: &str,
+    emitter: Option<&dyn ProgressEmitter>,
+    vouched_version: Option<i64>,
+) -> Result<HashSet<String>, ApiError> {
+    let (_changes, seen, _project_version) =
+        sync_manifest_inner(ctx, project_id, emitter, vouched_version, true).await?;
+    Ok(seen)
 }
 
 /// The lock for one project's manifest syncs, keyed by hub + project.
@@ -250,12 +266,21 @@ fn poll_scope(ctx: &ServiceContext, hub_url: &str) -> Result<String, ApiError> {
     Ok(format!("{}|{hub_url}|", db(ctx)?.path().display()))
 }
 
-async fn sync_manifest_serialized(
+/// The shared body of [`sync_manifest`]/[`sync_manifest_full`]: pull a
+/// project's manifest delta (or the whole manifest from 0 when `force_full`,
+/// the wave-3 epoch-reload path) into `project_frames_local`. Returns the
+/// per-kind changes, every uuid the hub listed this call (used by the epoch
+/// path to compare against the own rows still cached, plan P25), and the
+/// manifest's own `projectVersion` as of the last page fetched — the
+/// authoritative cursor value for a caller that must not trust an event's
+/// head beyond what the manifest actually confirmed (T5 ruling).
+pub(crate) async fn sync_manifest_inner(
     ctx: &ServiceContext,
     project_id: &str,
     emitter: Option<&dyn ProgressEmitter>,
     vouched_version: Option<i64>,
-) -> Result<Vec<CollabFramesChange>, ApiError> {
+    force_full: bool,
+) -> Result<(Vec<CollabFramesChange>, HashSet<String>, i64), ApiError> {
     use crate::db::collab_frames as frames_db;
 
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
@@ -274,15 +299,13 @@ async fn sync_manifest_serialized(
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
 
     let caps_changed = project.gov_caps_json != project.synced_caps_json;
-    let start = if caps_changed {
-        0
-    } else {
-        project.manifest_cursor
-    };
+    let full = caps_changed || force_full;
+    let start = if full { 0 } else { project.manifest_cursor };
     let mut counts: std::collections::BTreeMap<FramesChangeKind, usize> =
         std::collections::BTreeMap::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut max_mv = project.manifest_cursor;
+    let mut project_version = project.hub_version;
     let mut applied = 0usize;
 
     let fetched: Result<(), ApiError> = async {
@@ -299,6 +322,7 @@ async fn sync_manifest_serialized(
                 )
                 .await
                 .map_err(client_err)?;
+            project_version = page.project_version;
             {
                 let database = db(ctx)?;
                 let conn = database.conn();
@@ -357,7 +381,7 @@ async fn sync_manifest_serialized(
     let pruned = {
         let database = db(ctx)?;
         let conn = database.conn();
-        let pruned = if caps_changed {
+        let pruned = if full {
             frames_db::delete_not_in(&conn, project_id, &seen)?
         } else {
             0
@@ -376,11 +400,12 @@ async fn sync_manifest_serialized(
         count = applied,
         pruned,
         caps_changed,
+        force_full,
         hub_version = ?vouched_version,
         manifest_cursor = max_mv,
         "manifest synced"
     );
-    Ok(changes)
+    Ok((changes, seen, project_version))
 }
 
 /// One version poll (R19).
@@ -4125,8 +4150,74 @@ pub async fn export_project_for_wbpp(
     outcome
 }
 
+/// Test-only fixtures shared with sibling modules (Task 5, wave 3): a
+/// minimal file-backed [`ServiceContext`] and the hub-wiring helper, `pub(crate)`
+/// so `api::collab_live::feed`'s own tests can build the same rig without a
+/// duplicate copy.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A minimal file-backed-`Database` [`ServiceContext`] (no keychain), copied
+    /// from `api::sync` / `api::collab` tests. A tempdir-FILE-backed `Database`
+    /// (not `:memory:`) so the pool + the receiver's own `CatalogSyncStore` see
+    /// one catalog file.
+    pub(crate) fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
+        use crate::cache::MemoryImageCache;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        #[cfg(all(feature = "render", feature = "solver"))]
+        use std::sync::RwLock;
+        use std::sync::{Mutex, OnceLock};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(database);
+        let ctx = ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            active_stacks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            dso_catalog: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        (tmp, ctx)
+    }
+
+    /// Point `ctx`'s account hub at `uri` + store `token` as the device's own
+    /// (mirrors `api::collab::wire_hub`, which keeps its own copy: that
+    /// module's tests also set `SYNC_CACHED_RELAYS`, this one's do not).
+    pub(crate) fn wire_hub(ctx: &ServiceContext, uri: &str, token: &str) {
+        {
+            let conn = db(ctx).unwrap().conn();
+            crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_HUB_URL, uri).unwrap();
+        }
+        crate::api::account::store_token_for_test(ctx, token).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{test_ctx, wire_hub};
     use super::*;
     use crate::db::collab::{upsert_project, CollabProjectRow};
     use crate::db::collab_frames::LocalState;
@@ -4334,61 +4425,6 @@ mod tests {
         }
     }
 
-    /// A minimal file-backed-`Database` [`ServiceContext`] (no keychain), copied
-    /// from `api::sync` / `api::collab` tests. A tempdir-FILE-backed `Database`
-    /// (not `:memory:`) so the pool + the receiver's own `CatalogSyncStore` see
-    /// one catalog file.
-    fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
-        use crate::cache::MemoryImageCache;
-        use crate::services::compute_queue::ComputeQueue;
-        use crate::services::operation_queue::OperationQueue;
-        use crate::settings::SettingsManager;
-        use std::collections::HashMap;
-        #[cfg(all(feature = "render", feature = "solver"))]
-        use std::sync::RwLock;
-        use std::sync::{Mutex, OnceLock};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
-        let db_cell = OnceLock::new();
-        let _ = db_cell.set(database);
-        let ctx = ServiceContext {
-            db: db_cell,
-            settings: Arc::new(SettingsManager::new()),
-            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
-            active_scans: Arc::new(Mutex::new(HashMap::new())),
-            active_exports: Arc::new(Mutex::new(HashMap::new())),
-            active_analyses: Arc::new(Mutex::new(HashMap::new())),
-            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
-            active_archives: Arc::new(Mutex::new(HashMap::new())),
-            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(all(feature = "render", feature = "solver"))]
-            active_stacks: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(all(feature = "render", feature = "solver"))]
-            dso_catalog: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(1)
-                    .build()
-                    .unwrap(),
-            ),
-            operation_queue: OperationQueue::start(),
-            compute_queue: ComputeQueue::new(),
-            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-        };
-        (tmp, ctx)
-    }
-
-    /// Point `ctx`'s account hub at `uri` + store a device token (mirrors
-    /// `api::collab::wire_hub`).
-    fn wire_hub(ctx: &ServiceContext, uri: &str) {
-        {
-            let conn = db(ctx).unwrap().conn();
-            crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_HUB_URL, uri).unwrap();
-        }
-        crate::api::account::store_token_for_test(ctx, "tok").unwrap();
-    }
-
     /// This device's node id for `ctx`'s sync dir — the identity a member's
     /// snapshot entry names.
     fn own_node_for(ctx: &ServiceContext) -> NodeId {
@@ -4530,7 +4566,7 @@ mod tests {
         pub(super) async fn fx(role: &str, coordinator: bool, require_approval: bool) -> Fx {
             let hub = FakeHub::start().await;
             let (tmp, ctx) = test_ctx();
-            wire_hub(&ctx, &hub.uri());
+            wire_hub(&ctx, &hub.uri(), "tok");
             hub.add_account("tok", "acc-me", "Me", &B64.encode(own_node_for(&ctx)), None);
             hub.add_account("tok-o", "acc-o", "Other", &B64.encode([0x55u8; 32]), None);
             hub.add_project(

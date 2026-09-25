@@ -47,7 +47,7 @@
 //! `[]`); the 60 s `versions` vector is only ever sent on demand via
 //! [`FakeHub::send_versions`].
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -344,6 +344,10 @@ pub struct FakeHubState {
     /// `collab_api_outdated`, except the two public routes.
     pub api_outdated: bool,
     session_seq: u64,
+    /// Every event published, oldest first, capped at 256 — test-only,
+    /// `FakeHub::last_event` reads from here so a test can inspect the exact
+    /// payload the fake just sent without re-deriving it (T5 Step 5).
+    event_log: VecDeque<FeedMsg>,
 }
 
 /// A test's one-shot change to the hub's state.
@@ -388,12 +392,23 @@ impl FakeHubState {
                 return;
             }
         }
-        let _ = self.feed.send(FeedMsg {
+        self.record_and_send(FeedMsg {
             project_id: Some(project_id.to_string()),
             account_id: None,
             name,
             data: data.to_string(),
         });
+    }
+
+    /// Append to the bounded test-inspection log, then send. The ONE place
+    /// that touches `self.feed` — every event, dropped or not, that reaches
+    /// a stream goes through here.
+    fn record_and_send(&mut self, msg: FeedMsg) {
+        if self.event_log.len() >= 256 {
+            self.event_log.pop_front();
+        }
+        self.event_log.push_back(msg.clone());
+        let _ = self.feed.send(msg);
     }
 
     /// A `project` event for one version bump; frames inlined iff ≤ 50 and
@@ -442,8 +457,8 @@ impl FakeHubState {
 
     /// An `account` event: own-account membership changed. Targeted at the
     /// account, not a project (`projectId: None` on the envelope).
-    fn publish_account(&self, account_id: &str, kind: &str, project_id: &str) {
-        let _ = self.feed.send(FeedMsg {
+    fn publish_account(&mut self, account_id: &str, kind: &str, project_id: &str) {
+        self.record_and_send(FeedMsg {
             project_id: None,
             account_id: Some(account_id.to_string()),
             name: "account",
@@ -660,6 +675,7 @@ impl FakeHub {
             dropped_events: HashMap::new(),
             api_outdated: false,
             session_seq: 0,
+            event_log: VecDeque::new(),
         }));
         let key = SigningKey::from_bytes(&[7u8; 32]);
         Mock::given(any())
@@ -715,6 +731,37 @@ impl FakeHub {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FakeHubState> {
         self.state.lock().expect("fake hub state poisoned")
+    }
+
+    /// Build the `hello` payload for `token`'s device exactly as
+    /// `open_session` would compose it — same cursors, digest and presence
+    /// list — without opening a session (test helper: a test crafts a
+    /// `LiveEvent::Hello` by hand, e.g. to override `epoch` for an epoch-
+    /// change scenario, rather than driving a real SSE connection).
+    pub fn hello_for(&self, token: &str) -> Value {
+        let st = self.lock();
+        let acct = st
+            .tokens
+            .get(token)
+            .unwrap_or_else(|| panic!("fake hub: unknown token {token}"));
+        let projects = st.hello_projects(&acct.account_id, &acct.device_pubkey_b64);
+        json!({
+            "sessionId": hex_of(&format!("hello-for-{token}"), 32),
+            "epoch": st.epoch,
+            "accountId": acct.account_id,
+            "projects": projects,
+        })
+    }
+
+    /// The last event of `name` published for `project_id`, if any (test
+    /// helper, fed by the bounded 256-entry log every `publish` writes to).
+    pub fn last_event(&self, name: &str, project_id: &str) -> Option<Value> {
+        let st = self.lock();
+        st.event_log
+            .iter()
+            .rev()
+            .find(|m| m.name == name && m.project_id.as_deref() == Some(project_id))
+            .map(|m| serde_json::from_str(&m.data).expect("fake hub event data is valid json"))
     }
 
     /// Register a device token for an account.
@@ -1141,7 +1188,7 @@ impl FakeHub {
 
     /// Send the 60 s `versions` state vector once, on demand.
     pub fn send_versions(&self) {
-        let st = self.lock();
+        let mut st = self.lock();
         // One message per connected account, listing only THAT account's own
         // projects — never another account's, even one it shares no project
         // with.
@@ -1154,7 +1201,7 @@ impl FakeHub {
                     map.insert(pid.clone(), json!([p.version, p.holder_seq]));
                 }
             }
-            let _ = st.feed.send(FeedMsg {
+            st.record_and_send(FeedMsg {
                 project_id: None,
                 account_id: Some(account_id),
                 name: "versions",

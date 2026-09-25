@@ -6,6 +6,7 @@
 //! session.
 
 pub mod backoff;
+pub mod cursor;
 pub mod digest;
 pub mod presence;
 pub mod sse;

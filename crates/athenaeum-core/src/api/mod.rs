@@ -68,6 +68,14 @@ pub mod export;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab;
 
+// The collab v3 wave-3 live exchange (Task 5): the feed applier that drives
+// the hub's `/me/events` stream — cursors, catch-up, resync, the versions
+// vector and epoch change. Gated the same as `api::collab`, which it calls
+// (`refresh_projects_reporting`, `on_thresholds_or_dictionary_moved`) and
+// alongside (the render-gated publish path a re-announce feeds).
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod collab_live;
+
 // Coalesced auto-publish per project (collab v3 wave 2, Task 10; R16, §5.2
 // triggers; P13): one debounced, re-armed publish run per project, kicked by
 // scan/analysis/plate-solve completion, frame-set linking, master

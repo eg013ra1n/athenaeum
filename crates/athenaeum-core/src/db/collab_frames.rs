@@ -259,8 +259,9 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
         "INSERT INTO project_frames_local
             (project_id, frame_uuid, content_version, origin, publisher_account_id,
              publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3,
-             blake3, manifest_version, manifest_json, local_state, updated_at)
+             blake3, manifest_version, manifest_json, frame_seq, local_state, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 CASE WHEN ?16 > 0 THEN ?16 ELSE NULL END,
                  CASE WHEN ?4 = 'own' THEN 'own_missing'
                       WHEN ?9 = 'published' AND ?10 = 1 THEN 'wanted'
                       ELSE 'idle' END,
@@ -279,6 +280,7 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
             blake3 = excluded.blake3,
             manifest_version = excluded.manifest_version,
             manifest_json = excluded.manifest_json,
+            frame_seq = CASE WHEN ?16 > 0 THEN ?16 ELSE frame_seq END,
             on_disk = CASE
                 WHEN origin = 'replica' AND excluded.content_version > content_version THEN 0
                 ELSE on_disk
@@ -314,6 +316,7 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
             v.blake3,
             v.manifest_version,
             manifest_json,
+            v.frame_seq,
         ],
     )?;
     Ok(())
@@ -402,15 +405,37 @@ pub fn list_for_project(conn: &Connection, project_id: &str) -> Result<Vec<Local
 /// `frame_uuid` is NOT in `keep` — an empty set deletes every replica row.
 /// NEVER deletes `origin = 'own'` rows (R12). Returns the number removed.
 pub fn delete_not_in(conn: &Connection, project_id: &str, keep: &HashSet<String>) -> Result<usize> {
-    let sql = if keep.is_empty() {
-        "DELETE FROM project_frames_local WHERE project_id = ?1 AND origin = 'replica'".to_string()
+    let condition = if keep.is_empty() {
+        String::new()
     } else {
         let placeholders = vec!["?"; keep.len()].join(", ");
-        format!(
-            "DELETE FROM project_frames_local \
-             WHERE project_id = ? AND origin = 'replica' AND frame_uuid NOT IN ({placeholders})"
-        )
+        format!(" AND frame_uuid NOT IN ({placeholders})")
     };
+    // A servable ('held') replica row about to be deleted must drop its
+    // local claim too, through the outbox (T5/T9 ruling): otherwise the
+    // device keeps reporting a claim on a frame it no longer has any local
+    // row for at all, and the hub's copy is never told to stop.
+    let doomed: Vec<String> = {
+        let sql = format!(
+            "SELECT frame_uuid FROM project_frames_local \
+             WHERE project_id = ?1 AND origin = 'replica' AND local_state IN ('held', 'own_held'){condition}"
+        );
+        let params_iter = std::iter::once(project_id.to_string()).chain(keep.iter().cloned());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for frame_uuid in &doomed {
+        crate::db::collab_live::record_claim_change(
+            conn,
+            project_id,
+            frame_uuid,
+            crate::db::collab_live::ClaimOp::Remove,
+        )?;
+    }
+    let sql = format!(
+        "DELETE FROM project_frames_local WHERE project_id = ?1 AND origin = 'replica'{condition}"
+    );
     let params_iter = std::iter::once(project_id.to_string()).chain(keep.iter().cloned());
     let removed = conn.execute(&sql, rusqlite::params_from_iter(params_iter))?;
     Ok(removed)
@@ -1038,6 +1063,28 @@ mod tests {
         let n = delete_not_in(&c, "p1", &HashSet::new()).unwrap();
         assert_eq!(n, 1);
         assert!(get(&c, "p1", "u2").unwrap().is_some());
+    }
+
+    /// T5/T9 ruling: a deleted replica row that was `held` (servable) must
+    /// not leak its claim — the removal goes through the outbox like any
+    /// other claim change, so the next report tells the hub to drop it.
+    #[test]
+    fn prune_removes_a_kept_rows_claim_through_the_outbox() {
+        let c = conn();
+        upsert_from_manifest(&c, "p1", &view("u1", 1)).unwrap();
+        upsert_from_manifest(&c, "p1", &view("u2", 1)).unwrap();
+        set_landed(&c, "p1", "u1", "/collab/m31/ann/u1.fits", "100:1").unwrap();
+        set_landed(&c, "p1", "u2", "/collab/m31/ann/u2.fits", "100:1").unwrap();
+        let keep: HashSet<String> = ["u2".to_string()].into_iter().collect();
+        let n = delete_not_in(&c, "p1", &keep).unwrap();
+        assert_eq!(n, 1);
+        assert!(get(&c, "p1", "u1").unwrap().is_none());
+        assert!(get(&c, "p1", "u2").unwrap().is_some(), "kept row untouched");
+        use crate::db::collab_live::{outbox, ClaimOp};
+        let rows = outbox(&c, "p1").unwrap();
+        assert_eq!(rows.len(), 1, "only the deleted row's claim is dropped");
+        assert_eq!(rows[0].frame_uuid, "u1");
+        assert_eq!(rows[0].op, ClaimOp::Remove);
     }
 
     #[test]
