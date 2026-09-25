@@ -595,12 +595,14 @@ pub fn set_own_version(
 /// confirms the version (final-review I2). Only the columns that describe the
 /// file on disk move (`xxh3`, `byte_size`, `size_mtime_seen`, `on_disk = 1`,
 /// `awaiting_gc = 0`), so disk truth sees the new file as present instead of
-/// "edited". The hub-confirmed columns (`content_version`, `blake3`,
-/// `recipe_hash`) stay until [`set_own_version`]: the unchanged recipe is the
-/// marker that the version is not confirmed yet, so a run that dies here
-/// regenerates, finds bytes the hub does not have, and posts the version
-/// again. Only a row still landed at `landed_path` is touched. Returns the
-/// rows touched.
+/// "edited". The hub-confirmed columns (`content_version`, `blake3`) stay
+/// until [`set_own_version`], and `recipe_hash` is cleared: an empty recipe
+/// matches no current recipe, so ANY later publish run — not only a
+/// republish — regenerates the frame, finds bytes the hub does not have, and
+/// posts the version a dead run never confirmed (a republish or a plate solve
+/// moves the bytes without moving the recipe). [`set_own_version`] writes the
+/// recipe back. Only a row still landed at `landed_path` is touched. Returns
+/// the rows touched.
 pub fn stage_own_file(
     conn: &Connection,
     project_id: &str,
@@ -613,7 +615,7 @@ pub fn stage_own_file(
     Ok(conn.execute(
         "UPDATE project_frames_local
          SET xxh3 = ?4, byte_size = ?5, size_mtime_seen = ?6, on_disk = 1, awaiting_gc = 0,
-             updated_at = datetime('now')
+             recipe_hash = NULL, updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own' AND landed_path = ?3",
         params![
             project_id,
@@ -630,7 +632,8 @@ pub fn stage_own_file(
 /// at the landed path now holds bytes the hub never took, so the row goes
 /// back to the hub's content keys and is marked NOT on disk (the old version
 /// is gone). Disk truth then rejects the file (its size / xxh3 no longer
-/// match), and the next publish run regenerates and posts again. Returns the
+/// match), and the next publish run regenerates and posts again (the recipe
+/// [`stage_own_file`] cleared stays cleared, so a plain run does). Returns the
 /// rows touched.
 pub fn unstage_own_file(
     conn: &Connection,

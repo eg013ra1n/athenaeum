@@ -6457,10 +6457,7 @@ pub(crate) mod tests {
                 "the hub's content keys are back"
             );
             assert!(!row.on_disk, "the regenerated file is not v1");
-            assert_eq!(
-                row.recipe_hash, v1.recipe_hash,
-                "the version is unconfirmed"
-            );
+            assert_eq!(row.recipe_hash, None, "the version is unconfirmed");
             assert_eq!(project_tag_count(&fx).await, 0, "nothing advertised");
             let truth = crate::api::collab_exchange::disk_truth(&fx.ctx, PID)
                 .await
@@ -6473,6 +6470,78 @@ pub(crate) mod tests {
             assert_eq!(row.content_version, 2);
             assert!(row.on_disk);
             assert!(tag_present(&fx, &fx.uuids[0], 2).await);
+        }
+
+        /// An update whose run dies between staging the new file and the
+        /// hub's `…/version` reply (app quit, lost connection) is posted by
+        /// the next PLAIN publish — here the update came from a republish
+        /// (a plate solve moved the bytes, not the recipe), so an unchanged
+        /// recipe would call the frame unchanged forever.
+        #[tokio::test]
+        async fn an_interrupted_update_is_posted_by_the_next_plain_publish() {
+            let fx = fixture(1).await;
+            Mock::given(wm_method("POST"))
+                .and(wm_path_regex(format!(
+                    r"^/api/v1/projects/{PID}/frames/[^/]+/version$"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "contentVersion": 2, "projectVersion": 6
+                        }))
+                        .set_delay(std::time::Duration::from_secs(60)),
+                )
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&fx.server)
+                .await;
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let v1 = own_row(&fx, &fx.uuids[0]).unwrap();
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                seed_plate_solve(&conn, fx.frame_ids[0], 0.776, 10.68, 41.27);
+            }
+
+            // The republish stages v2, then waits on `…/version`; the run is
+            // dropped there.
+            let staged = async {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                loop {
+                    let row = own_row(&fx, &fx.uuids[0]).unwrap();
+                    if row.xxh3 != v1.xxh3 && tag_present(&fx, &fx.uuids[0], 2).await {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the republish never staged v2"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            };
+            tokio::select! {
+                res = republish_collab_frames(&fx.ctx, PID, None) => {
+                    panic!("the republish finished before it was interrupted: {res:?}")
+                }
+                () = staged => {}
+            }
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(row.content_version, 1, "the hub never confirmed v2");
+            assert_eq!(
+                row.recipe_hash, None,
+                "a staged file is not a confirmed recipe"
+            );
+
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!((res.updated, res.unchanged), (1, 0), "{res:?}");
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(row.content_version, 2);
+            assert_eq!(
+                row.recipe_hash, v1.recipe_hash,
+                "the recipe is confirmed again"
+            );
+            assert!(row.on_disk);
+            assert!(tag_present(&fx, &fx.uuids[0], 2).await, "seeded at v2");
         }
 
         /// I3: a collab store that cannot be mounted refuses the publish
