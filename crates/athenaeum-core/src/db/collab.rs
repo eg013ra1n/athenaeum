@@ -138,15 +138,18 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
 /// A refresh of a project marked lost ([`mark_lost`]) is a re-join: it clears
 /// `lost_at`.
 ///
-/// Eleven columns are deliberately NOT in the list, each written only by its
-/// own setter so a wholesale poll refresh can never clobber it:
+/// Eleven columns are deliberately NOT in the list, each written only by
+/// dedicated setters so a wholesale poll refresh can never clobber it:
 /// `auto_replicate`/`policy_json`/`replication_paused`/`auto_publish` are LOCAL
-/// preferences; `hub_version`/`manifest_cursor`/`synced_caps_json` are the
-/// manifest-sync cursor ([`set_sync_state`], P9); `dictionary_version`/
+/// preferences; `manifest_cursor`/`synced_caps_json` are the manifest-sync
+/// cursor ([`set_sync_state`], P9); `hub_version` is written by
+/// [`set_sync_state`] AND by the wave-3 feed's [`set_feed_version`] (it is
+/// also the live-feed version cursor, plan P5); `dictionary_version`/
 /// `dictionary_json` are the filter dictionary ([`set_dictionary`]);
 /// `feed_epoch`/`holder_seq` are the wave-3 live-feed cursor
-/// ([`set_feed_version`]/[`set_holder_seq`]). A freshly inserted row takes
-/// each column's schema default.
+/// ([`set_feed_version`], [`set_holder_seq`], [`set_holder_seq_only`],
+/// [`reset_holder_seq`]). [`mark_lost`] resets the cursor columns. A freshly
+/// inserted row takes each column's schema default.
 pub fn upsert_project(conn: &Connection, row: &CollabProjectRow) -> Result<()> {
     conn.execute(
         "INSERT INTO collab_projects
@@ -205,9 +208,11 @@ pub fn upsert_project(conn: &Connection, row: &CollabProjectRow) -> Result<()> {
 /// `manifestVersion` applied (`manifest_cursor`) and the caps as of that sync
 /// (`synced_caps_json`); plus the `projects.version` the version poll vouched
 /// for (`hub_version`) — `None` leaves `hub_version` as it is (ruling R12: a
-/// sync outside the poll never vouches for a version). The writer of these
-/// three columns besides [`mark_lost`], which resets them — a wholesale
-/// [`upsert_project`] poll refresh never touches them.
+/// sync outside the poll never vouches for a version). The only writer of
+/// `manifest_cursor`/`synced_caps_json` besides [`mark_lost`], which resets
+/// them; `hub_version` is ALSO written by [`set_feed_version`] (the wave-3
+/// live-feed version cursor, plan P5). A wholesale [`upsert_project`] poll
+/// refresh never touches any of the three.
 pub fn set_sync_state(
     conn: &Connection,
     project_id: &str,
@@ -271,9 +276,10 @@ pub fn set_dictionary(
     Ok(())
 }
 
-/// Advance the feed's version cursor (plan P5: `hub_version` is that cursor).
-/// The ONLY writer of `feed_epoch` besides [`set_holder_seq`] and
-/// [`mark_lost`] (which resets both).
+/// Advance the feed's version cursor (plan P5: `hub_version` is that cursor)
+/// and stamp `feed_epoch`. The only writer of `feed_epoch` besides
+/// [`set_holder_seq`] and [`mark_lost`] (which resets it); `hub_version` is
+/// also written by [`set_sync_state`].
 pub fn set_feed_version(
     conn: &Connection,
     project_id: &str,

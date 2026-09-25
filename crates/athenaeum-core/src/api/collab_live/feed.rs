@@ -349,7 +349,7 @@ impl FeedApplier {
             }
         }
 
-        let mut plans: Vec<(String, HelloProject, HelloPlan)> =
+        let mut plans: Vec<(String, HelloProject, HelloPlan, FeedCursor)> =
             Vec::with_capacity(hello.projects.len());
         let mut epoch_changed_any = false;
         for (pid, hp) in &hello.projects {
@@ -361,7 +361,7 @@ impl FeedApplier {
             });
             let plan = plan_hello(&stored, &hello.epoch, hp.version, hp.holder_seq);
             epoch_changed_any |= plan.epoch_changed;
-            plans.push((pid.clone(), hp.clone(), plan));
+            plans.push((pid.clone(), hp.clone(), plan, stored));
         }
 
         if epoch_changed_any {
@@ -393,7 +393,7 @@ impl FeedApplier {
         // on every future hello either. Isolate per project, log, continue;
         // a project whose catch-up failed simply keeps its old cursor, so
         // the next `project`/`versions` event (or hello) retries it.
-        for (pid, hp, plan) in plans {
+        for (pid, hp, plan, stored) in plans {
             if plan.catch_up_project {
                 match self
                     .catch_up_project(&pid, Some(hp.version), &ALL_KINDS)
@@ -403,6 +403,22 @@ impl FeedApplier {
                     Err(e) => {
                         tracing::error!(project_id = %pid, error = %e, "hello catch-up failed for this project; retried on the next hello");
                     }
+                }
+            } else if stored.epoch.is_none() {
+                // Fix round 4, finding 3 (controller ruling): a quiet row
+                // never live-fed (`feed_epoch` NULL) that is already in sync
+                // with the head runs no catch-up, and the holder side only
+                // ever persists its seq — nothing would stamp its epoch, so
+                // a later hub epoch change with no regression would go
+                // undetected for it. Stamp the hello epoch with its current
+                // version; no fetch.
+                let stamped = {
+                    let database = db(&self.ctx)?;
+                    let conn = database.conn();
+                    crate::db::collab::set_feed_version(&conn, &pid, &hello.epoch, stored.version)
+                };
+                if let Err(e) = stamped {
+                    tracing::error!(project_id = %pid, error = %e, "stamping the hello epoch on an in-sync project failed; retried on the next hello");
                 }
             }
             match holders
@@ -854,6 +870,27 @@ impl FeedApplier {
                     tracing::debug!(project_id = %ev.project_id, "account-joined received before the first hello; skipped");
                     return Ok(vec![]);
                 };
+                // Fix round 4, finding 2: a LIVE cache row stuck on a
+                // different epoch than the session's must move into it only
+                // through a full reload — the refresh + delta catch-up below
+                // would fetch from its pre-restore `manifest_cursor` and
+                // stamp the new epoch anyway, losing the reload for good.
+                // `reload_one_project` already runs the small-document
+                // refresh and `holders.reload` itself.
+                if let Some(stored) = self.stored_cursor(&ev.project_id)? {
+                    if self.project_needs_epoch_reload(&stored) {
+                        tracing::warn!(project_id = %ev.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "account-joined for a project stuck on a different epoch; reloading it fully instead of a delta");
+                        let mut effects = self
+                            .reload_one_project(&ev.project_id, &epoch, None, &ALL_KINDS, holders)
+                            .await
+                            .map_err(|e| {
+                                tracing::error!(project_id = %ev.project_id, error = %e, "per-project epoch reload failed (account joined); its cursor stays on the old epoch for a retry");
+                                e
+                            })?;
+                        effects.push(FeedEffect::ProjectJoined(ev.project_id));
+                        return Ok(effects);
+                    }
+                }
                 let only: HashSet<String> = [ev.project_id.clone()].into_iter().collect();
                 let report =
                     crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await?;
@@ -1364,6 +1401,36 @@ mod tests {
             .iter()
             .filter(|r| r.url.path().ends_with(&suffix))
             .count()
+    }
+
+    /// The `since` query parameter of every manifest request for
+    /// `project_id`, in the order the hub received them. A full reload's
+    /// first page is `since = 0`; an incremental delta starts at the stored
+    /// `manifest_cursor`.
+    async fn manifest_sinces_for(hub: &FakeHub, project_id: &str) -> Vec<i64> {
+        let suffix = format!("/projects/{project_id}/manifest");
+        hub.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().ends_with(&suffix))
+            .map(|r| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == "since")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .expect("every manifest request carries a numeric since")
+            })
+            .collect()
+    }
+
+    fn manifest_cursor(ctx: &ServiceContext, project_id: &str) -> i64 {
+        let conn = crate::api::db(ctx).unwrap().conn();
+        crate::db::collab::get_project(&conn, project_id)
+            .unwrap()
+            .unwrap()
+            .manifest_cursor
     }
 
     fn cursor(ctx: &ServiceContext) -> (Option<String>, i64) {
@@ -2018,18 +2085,29 @@ mod tests {
         assert!(hub.frame(PID, "truly_lost").is_some());
     }
 
-    /// Item 1 fix round 3: `resync(project)` for a project stuck on a
-    /// different epoch must reload it fully, never a delta against its
-    /// pre-restore `manifest_cursor` — otherwise `catch_up_project` would
-    /// stamp the CURRENT epoch anyway, losing that project's reload for good
-    /// (not merely delaying it, as every other un-guarded path would).
+    /// Item 1 fix round 3, made discriminating in fix round 4 (finding 1):
+    /// `resync(project)` for a project stuck on a different epoch must reload
+    /// it fully, never a delta against its pre-restore `manifest_cursor` —
+    /// otherwise `catch_up_project` would stamp the CURRENT epoch anyway,
+    /// losing that project's reload for good. The epoch stamp alone cannot
+    /// tell the two paths apart (`epoch_change` already moved the session
+    /// epoch, so the unguarded delta stamps it too); what does is the SHAPE
+    /// of the work: the stale cursor is seeded non-zero, and only a full
+    /// reload asks the hub for `since = 0` and reloads the holder side.
+    /// Verified by hand: with the `ResyncWhat::Project` guard removed this
+    /// test fails on the `since = 0` assertion.
     #[tokio::test]
     async fn resync_project_for_an_epoch_stuck_project_reloads_fully() {
         let (_t, ctx, hub, mut f) = rig().await;
         let mut h = NoHolders(vec![]);
+        hub.seed_frames(PID, "acc-o", &["u0"], "published");
         f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
             .await
             .unwrap();
+        assert!(
+            manifest_cursor(&ctx, PID) > 0,
+            "a non-zero stale cursor, so a delta and a full fetch differ on the wire"
+        );
 
         hub.set_failing("/manifest", true);
         let e2 = hub.rotate_epoch();
@@ -2043,7 +2121,8 @@ mod tests {
         );
         hub.set_failing("/manifest", false);
 
-        let before = manifest_requests_for(&hub, PID).await;
+        let before = manifest_sinces_for(&hub, PID).await.len();
+        let calls_before = h.0.len();
         f.apply(
             LiveEvent::Resync(crate::collab::live::wire::ResyncEvent {
                 project_id: PID.into(),
@@ -2053,9 +2132,16 @@ mod tests {
         )
         .await
         .unwrap();
+        let sinces = manifest_sinces_for(&hub, PID).await;
+        assert_eq!(
+            sinces.get(before),
+            Some(&0),
+            "routed to a full reload (since = 0), never a delta from the stale cursor: {sinces:?}"
+        );
         assert!(
-            manifest_requests_for(&hub, PID).await > before,
-            "routed to a full reload (a manifest fetch happened), never a bare delta"
+            h.0[calls_before..].contains(&"reload p1".to_string()),
+            "the holder side was reloaded too: {:?}",
+            &h.0[calls_before..]
         );
         assert_eq!(
             cursor(&ctx).0.as_deref(),
@@ -2216,5 +2302,109 @@ mod tests {
             Some(e2.as_str()),
             "also reached the session's real epoch"
         );
+    }
+
+    /// Fix round 4, finding 2: an `account: joined` event for a project that
+    /// already has a LIVE cache row stuck on a different epoch must reload
+    /// it fully (`reload_one_project`), never refresh + delta-catch-up from
+    /// its pre-restore `manifest_cursor` (which would stamp the new epoch
+    /// and lose the reload for good). The unguarded path also calls
+    /// `holders.reload`, so the discriminator is the manifest's `since`.
+    #[tokio::test]
+    async fn account_joined_for_an_epoch_stuck_live_project_reloads_fully() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.seed_frames(PID, "acc-o", &["u0"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        assert!(manifest_cursor(&ctx, PID) > 0);
+
+        hub.set_failing("/manifest", true);
+        let e2 = hub.rotate_epoch();
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor(&ctx).0.as_deref(),
+            Some("e1"),
+            "stuck on the old epoch"
+        );
+        hub.set_failing("/manifest", false);
+
+        let before = manifest_sinces_for(&hub, PID).await.len();
+        let effects = f
+            .apply(
+                LiveEvent::Account(AccountEvent {
+                    kind: AccountKind::Joined,
+                    project_id: PID.into(),
+                }),
+                &mut h,
+            )
+            .await
+            .unwrap();
+        let sinces = manifest_sinces_for(&hub, PID).await;
+        assert_eq!(
+            sinces.get(before),
+            Some(&0),
+            "a full reload (since = 0), never a delta from the stale cursor: {sinces:?}"
+        );
+        assert!(effects.contains(&FeedEffect::ProjectJoined(PID.into())));
+        assert!(h.0.contains(&"reload p1".to_string()));
+        assert_eq!(cursor(&ctx).0.as_deref(), Some(e2.as_str()));
+    }
+
+    /// Fix round 4, finding 3 (controller ruling): a cached, quiet project
+    /// whose `feed_epoch` is still NULL and whose `hub_version` already
+    /// equals the hello head never runs a catch-up, and a holder side may
+    /// only persist its seq (never the epoch). Without a stamp here its
+    /// `feed_epoch` would stay NULL forever, and a later hub epoch change
+    /// with no version/holder-seq regression would never be detected for it.
+    #[tokio::test]
+    async fn hello_stamps_a_null_epoch_in_sync_row_so_a_later_epoch_change_reloads_it() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let row = crate::db::collab::get_project(&conn, PID).unwrap().unwrap();
+            crate::db::collab::set_sync_state(
+                &conn,
+                PID,
+                Some(hub.version(PID)),
+                row.manifest_cursor,
+                &row.gov_caps_json,
+            )
+            .unwrap();
+        }
+        let (epoch0, v0) = cursor(&ctx);
+        assert_eq!(epoch0, None, "never live-fed");
+        assert_eq!(v0, hub.version(PID), "already in sync with the head");
+
+        let before = manifest_requests_for(&hub, PID).await;
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest_requests_for(&hub, PID).await,
+            before,
+            "an in-sync row is stamped without any fetch"
+        );
+        assert_eq!(
+            cursor(&ctx),
+            (Some("e1".to_string()), v0),
+            "the hello epoch is stamped, the version kept"
+        );
+
+        let e2 = hub.rotate_epoch();
+        let effects = f
+            .apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert!(effects.contains(&FeedEffect::EpochChanged));
+        assert!(
+            h.0.contains(&"reload p1".to_string()),
+            "the epoch change was detected for this quiet row and reloaded it"
+        );
+        assert_eq!(cursor(&ctx).0.as_deref(), Some(e2.as_str()));
     }
 }
