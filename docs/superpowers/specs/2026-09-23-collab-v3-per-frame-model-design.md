@@ -572,3 +572,20 @@ project WBPP export lands `<title>/<publisher>/<camera>/<filter>/`.
 - **A3 (2026-09-24) — holder reports.** A full report is sent on every
   replication pass (20 min), not every 6 h (§4.2), because the hub counts a
   holder fresh for 75 min.
+- **A4 (2026-09-25, owner) — live exchange replaces the wave-2 timing
+  model; waves renumbered.**
+  - **Supersedes.** `2026-09-25-collab-v3-live-exchange-design.md` replaces:
+    - R17's mass-loss pause (now one non-blocking, reversible choice above 10
+      deletions per 60 s);
+    - R19's versioned polling (now a hub event channel with live presence);
+    - §4.2's `GET /me/project-versions` and per-frame holders routes;
+    - §5.3 steps 3–6 and §5.5;
+    - amendment A3.
+  - **Scope.** It brings "hub push over SSE" (§13) into scope. Its rulings
+    are L1–L13 and its invariants I1–I10.
+  - **New wave numbering.**
+    - 3 = live exchange;
+    - 4 = gate and metadata;
+    - 5 = project UI;
+    - 6 = stacking a project;
+    - 7 = portal project page.
