@@ -576,7 +576,7 @@ project WBPP export lands `<title>/<publisher>/<camera>/<filter>/`.
   model; waves renumbered.**
   - **Supersedes.** `2026-09-25-collab-v3-live-exchange-design.md` replaces:
     - R17's mass-loss pause (now one non-blocking, reversible choice above 10
-      deletions per 60 s);
+      deletions in a rolling 5-minute window, each settled for 60 s);
     - R19's versioned polling (now a hub event channel with live presence);
     - §4.2's `GET /me/project-versions` and per-frame holders routes;
     - §5.3 steps 3–6 and §5.5;
