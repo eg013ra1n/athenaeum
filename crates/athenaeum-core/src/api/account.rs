@@ -178,6 +178,15 @@ fn map_client_err(e: AccountClientError) -> ApiError {
         AccountClientError::CollabApiOutdated => {
             ApiError::Conflict(crate::account::client::COLLAB_API_OUTDATED_MSG.into())
         }
+        // Ditto: `Http`/`Gone`/`SessionGone`/`VersionConflict` are collab
+        // v3 live-exchange variants `HubClient` never produces either.
+        AccountClientError::Http { message, .. } | AccountClientError::Gone(message) => {
+            ApiError::Internal(format!("Hub request failed: {message}"))
+        }
+        AccountClientError::SessionGone => ApiError::Internal("hub session expired".into()),
+        AccountClientError::VersionConflict { content_version } => ApiError::Conflict(format!(
+            "version_conflict: the hub has content version {content_version}"
+        )),
         AccountClientError::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
 }

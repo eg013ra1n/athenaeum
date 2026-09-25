@@ -29,8 +29,9 @@
 //!   touched rows' `manifestVersion` with it;
 //! - the manifest is ordered by `(manifestVersion, frameUuid)` and paged with
 //!   `next = {since, after}` (page size overridable for tests);
-//! - `holderCount` counts fresh (75-minute) holders of the CURRENT content
-//!   version whose device still belongs to a member.
+//! - a frame's `frameSeq` is a dense per-project ordinal, assigned at
+//!   announce/seed, never reused (v3 wave 3: the manifest gains `frameSeq`
+//!   and loses `holderCount`).
 //!
 //! The membership snapshot is signed with a fixed test keypair exactly as the
 //! hub signs it, so the app's TOFU pin + `verify_and_parse` run for real.
@@ -102,13 +103,16 @@ pub struct FakeProject {
     /// 0 = the project has no dictionary (`current: null`).
     pub dictionary_version: i32,
     pub dictionary: Vec<DictionaryEntry>,
-    /// Keyed by frame uuid. `own` and `holder_count` are computed per viewer
-    /// at response time; the stored values are ignored.
+    /// Keyed by frame uuid. `own` is computed per viewer at response time;
+    /// the stored value is ignored.
     pub frames: BTreeMap<String, FrameViewWire>,
     /// frame uuid → device pubkey (base64) → (content version, reported at).
     pub holders: HashMap<String, HashMap<String, (i32, Instant)>>,
     pub members: Vec<FakeMember>,
     pub require_approval: bool,
+    /// The hub's dense per-project frame ordinal (§ "Identifiers and
+    /// encodings"): assigned at announce/seed, never reused.
+    pub next_frame_seq: i32,
 }
 
 impl FakeProject {
@@ -120,6 +124,13 @@ impl FakeProject {
     pub fn bump(&mut self) -> i64 {
         self.version += 1;
         self.version
+    }
+
+    /// The next frame ordinal, dense and never reused.
+    fn next_seq(&mut self) -> i32 {
+        let seq = self.next_frame_seq;
+        self.next_frame_seq += 1;
+        seq
     }
 }
 
@@ -302,6 +313,7 @@ impl FakeHub {
                 holders: HashMap::new(),
                 members,
                 require_approval,
+                next_frame_seq: 1,
             },
         );
     }
@@ -432,8 +444,10 @@ impl FakeHub {
             .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
         let version = p.bump();
         for uuid in uuids {
+            let seq = p.next_seq();
             let view = FrameViewWire {
                 frame_uuid: uuid.to_string(),
+                frame_seq: seq,
                 publisher_account_id: publisher_account.to_string(),
                 publisher_display_name: display.clone(),
                 own: false,
@@ -455,7 +469,6 @@ impl FakeHub {
                 reject_reason: None,
                 manifest_version: version,
                 created_at: now_rfc3339(),
-                holder_count: 0,
             };
             p.frames.insert(uuid.to_string(), view);
             let holds = p.holders.entry(uuid.to_string()).or_default();
@@ -491,15 +504,13 @@ impl FakeHub {
         });
     }
 
-    /// One frame as the hub stores it (`own = false`, `holderCount` computed).
+    /// One frame as the hub stores it (`own = false`).
     pub fn frame(&self, project_id: &str, uuid: &str) -> Option<FrameViewWire> {
         let st = self.lock();
-        let dev_acct = st.device_accounts();
         let p = st.projects.get(project_id)?;
         let f = p.frames.get(uuid)?;
         let mut v = f.clone();
         v.own = false;
-        v.holder_count = fresh_holders(p, &dev_acct, f).len() as i64;
         Some(v)
     }
 
@@ -802,16 +813,10 @@ fn dictionary(st: &FakeHubState, acct: &FakeAccount, pid: &str) -> ResponseTempl
     ok(json!({ "current": current, "history": [] }))
 }
 
-/// One row as `viewer` sees it: `own` and `holderCount` filled in.
-fn view_for(
-    p: &FakeProject,
-    dev_acct: &HashMap<String, String>,
-    f: &FrameViewWire,
-    viewer: &str,
-) -> FrameViewWire {
+/// One row as `viewer` sees it: `own` filled in.
+fn view_for(f: &FrameViewWire, viewer: &str) -> FrameViewWire {
     let mut v = f.clone();
     v.own = f.publisher_account_id == viewer;
-    v.holder_count = fresh_holders(p, dev_acct, f).len() as i64;
     v
 }
 
@@ -820,7 +825,6 @@ fn visible(f: &FrameViewWire, viewer: &str, moderator: bool) -> bool {
 }
 
 fn manifest(st: &FakeHubState, acct: &FakeAccount, pid: &str, req: &Request) -> ResponseTemplate {
-    let dev_acct = st.device_accounts();
     let (p, m) = match member_of(st, acct, pid) {
         Ok(x) => x,
         Err(r) => return r,
@@ -858,7 +862,7 @@ fn manifest(st: &FakeHubState, acct: &FakeAccount, pid: &str, req: &Request) -> 
     };
     let rows: Vec<FrameViewWire> = rows
         .into_iter()
-        .map(|f| view_for(p, &dev_acct, f, &acct.account_id))
+        .map(|f| view_for(f, &acct.account_id))
         .collect();
     ok(json!({
         "projectVersion": p.version,
@@ -1040,10 +1044,12 @@ fn announce(
             .entry(f.frame_uuid.clone())
             .or_default()
             .insert(acct.device_pubkey_b64.clone(), (1, Instant::now()));
+        let seq = p.next_seq();
         p.frames.insert(
             f.frame_uuid.clone(),
             FrameViewWire {
                 frame_uuid: f.frame_uuid,
+                frame_seq: seq,
                 publisher_account_id: acct.account_id.clone(),
                 publisher_display_name: display.clone(),
                 own: false,
@@ -1065,7 +1071,6 @@ fn announce(
                 reject_reason: None,
                 manifest_version: version,
                 created_at: now_rfc3339(),
-                holder_count: 0,
             },
         );
     }

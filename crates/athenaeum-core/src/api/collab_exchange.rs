@@ -51,6 +51,13 @@ fn client_err(e: crate::account::AccountClientError) -> ApiError {
             crate::account::client::warn_collab_api_outdated_once();
             ApiError::Conflict(crate::account::client::COLLAB_API_OUTDATED_MSG.into())
         }
+        E::Http { message, .. } | E::Gone(message) => {
+            ApiError::Internal(format!("Hub request failed: {message}"))
+        }
+        E::SessionGone => ApiError::Internal("hub session expired".into()),
+        E::VersionConflict { content_version } => ApiError::Conflict(format!(
+            "version_conflict: the hub has content version {content_version}"
+        )),
         E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
 }
@@ -397,6 +404,9 @@ async fn sync_manifest_serialized(
 ///   losses not); the caller kicks the pass when the list is non-empty.
 /// - A `collab_api_outdated` refusal is the P17 `Conflict`, logged once.
 #[cfg(all(feature = "render", feature = "solver"))]
+// `project_versions` is deprecated (collab v3 wave 3: removed in Task 15);
+// the version poll below is replaced by the event stream in a later task.
+#[allow(deprecated)]
 pub async fn poll_versions_once(
     ctx: &ServiceContext,
     emitter: Option<&dyn ProgressEmitter>,
@@ -2040,6 +2050,11 @@ pub(crate) fn loss_guard(
 /// Signed out ⇒ `Ok(0)`. A 403 folds into `Ok(0)` at `debug!` (a membership
 /// the hub will not take holds from); anything else is returned for the
 /// caller to log and step over.
+///
+/// `put_holders` is deprecated (collab v3 wave 3: removed in Task 15); this
+/// whole-report path is replaced by the outbox/report_holders live-exchange
+/// path in a later task of this wave.
+#[allow(deprecated)]
 pub(crate) async fn report_holders(
     ctx: &ServiceContext,
     project_id: &str,
@@ -2258,6 +2273,10 @@ pub(crate) async fn fetch_frames(
 /// `Readable` one whose content another frame of the project already landed
 /// is linked from that file instead (P24). After each batch the landed
 /// frames go to the hub as one holder `add` (P8).
+// `put_holders`/`frame_holders` are deprecated (collab v3 wave 3: removed in
+// Task 15); this fetch path's holder lookups and after-batch reports are
+// replaced by the live-exchange holder map in a later task of this wave.
+#[allow(deprecated)]
 pub(crate) async fn fetch_frames_gated(
     ctx: &ServiceContext,
     gate: Option<&crate::sync::ReceiveGate>,
@@ -2524,8 +2543,8 @@ struct Batch {
 /// for a frame it no longer shows this device? Everything else (transport,
 /// 5xx, 429, 401/403, …) is the hub failing and stops the fetch (R25).
 fn holder_lookup_is_frame_level(e: &crate::account::AccountClientError) -> bool {
-    matches!(e, crate::account::AccountClientError::Network(m)
-        if m.starts_with("hub returned 404"))
+    e.hub_text()
+        .is_some_and(|m| m.starts_with("hub returned 404"))
 }
 
 /// Fill one batch from the queue (R16): pop frames until [`FETCH_BATCH`] of
@@ -2533,6 +2552,8 @@ fn holder_lookup_is_frame_level(e: &crate::account::AccountClientError) -> bool 
 /// A frame with no fresh holder is skipped (`debug!`) and takes no slot; a
 /// dead entry is parked (P20); identical content already on disk is linked
 /// right here (P24).
+// `frame_holders` is deprecated (collab v3 wave 3: removed in Task 15).
+#[allow(deprecated)]
 async fn prepare_batch(
     env: &FetchEnv<'_>,
     queue: &mut std::collections::VecDeque<LocalFrameRow>,
@@ -4258,7 +4279,7 @@ mod tests {
             "channel": "mono", "exptimeSec": 300.0, "dateObs": "2026-07-01T21:00:00Z",
             "meta": {"fwhmArcsec": 2.4, "eccentricity": 0.35, "starsDetected": 512},
             "gateVersion": 0, "accepted": true, "state": "published", "manifestVersion": 1,
-            "createdAt": "2026-07-13T00:00:00Z", "holderCount": 2
+            "createdAt": "2026-07-13T00:00:00Z"
         }))
         .unwrap();
         {
@@ -4285,7 +4306,10 @@ mod tests {
         assert_eq!(f.date_obs.as_deref(), Some("2026-07-01T21:00:00Z"));
         assert_eq!(f.state, "published");
         assert!(f.accepted);
-        assert_eq!(f.holder_count, 2);
+        // v3 wave 3: a manifest sync no longer writes `holder_count` (the
+        // hub client's `FrameViewWire` dropped the field, P4) — the column
+        // keeps whatever it was, 0 for a brand-new row.
+        assert_eq!(f.holder_count, 0);
         assert_eq!(f.byte_size, 4096);
         assert_eq!(f.content_version, 1);
         assert_eq!(f.fwhm_arcsec, Some(2.4), "parsed from meta.fwhmArcsec");
@@ -5374,6 +5398,7 @@ mod tests {
             use FramesChangeKind as K;
             let view = |own: bool, state: &str, accepted: bool, cv: i32| FrameViewWire {
                 frame_uuid: "u".into(),
+                frame_seq: 0,
                 publisher_account_id: "a".into(),
                 publisher_display_name: "A".into(),
                 own,
@@ -5395,7 +5420,6 @@ mod tests {
                 reject_reason: None,
                 manifest_version: 1,
                 created_at: String::new(),
-                holder_count: 0,
             };
             let prev = |origin: FrameOrigin, state: &str, accepted: bool, cv: i32| {
                 let mut r = own_row("u", state, "/x");
@@ -6754,6 +6778,7 @@ mod tests {
         /// the old file under the same name — never `c_x_2.fits` — and the
         /// old version's seed tag goes.
         #[tokio::test]
+        #[allow(deprecated)] // exercises the wave-2 deprecated `put_holders`
         async fn a_new_version_lands_over_the_old_file() {
             let r = rfx("send_receive").await;
             let recv = bind_receiver(&r).await;

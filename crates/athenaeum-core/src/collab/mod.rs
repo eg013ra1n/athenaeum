@@ -15,4 +15,7 @@ pub mod filters;
 pub mod frame_meta;
 pub mod gate;
 pub mod hub_client;
+// The live exchange (wave 3): retry back-off, the claim digest, and the REST
+// wire shapes for holders/versions/presence. Pure and ungated.
+pub mod live;
 pub mod snapshot;

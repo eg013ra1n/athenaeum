@@ -259,8 +259,8 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
         "INSERT INTO project_frames_local
             (project_id, frame_uuid, content_version, origin, publisher_account_id,
              publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3,
-             blake3, holder_count, manifest_version, manifest_json, local_state, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+             blake3, manifest_version, manifest_json, local_state, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  CASE WHEN ?4 = 'own' THEN 'own_missing'
                       WHEN ?9 = 'published' AND ?10 = 1 THEN 'wanted'
                       ELSE 'idle' END,
@@ -277,7 +277,6 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
             byte_size = excluded.byte_size,
             xxh3 = excluded.xxh3,
             blake3 = excluded.blake3,
-            holder_count = excluded.holder_count,
             manifest_version = excluded.manifest_version,
             manifest_json = excluded.manifest_json,
             on_disk = CASE
@@ -313,7 +312,6 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
             v.byte_size,
             v.xxh3,
             v.blake3,
-            v.holder_count,
             v.manifest_version,
             manifest_json,
         ],

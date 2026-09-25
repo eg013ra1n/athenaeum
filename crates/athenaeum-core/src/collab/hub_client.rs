@@ -9,6 +9,10 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::account::AccountClientError;
+use crate::collab::live::wire::{
+    BeatWire, HolderDeltaPageWire, HoldersReportReplyWire, HoldersReportWire, HoldersSnapshotWire,
+    VersionInWire, VersionsReplyWire,
+};
 
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
@@ -134,12 +138,18 @@ pub struct ProjectVersionWire {
 /// Also `Serialize`: `db::collab_frames::upsert_from_manifest` round-trips the
 /// whole row into `project_frames_local.manifest_json` so the local cache can
 /// answer from disk without re-fetching the manifest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameViewWire {
     pub frame_uuid: String,
+    /// A dense per-project frame ordinal, assigned at announce and never
+    /// reused. Absent on an older hub → `0` (only the v3 wave-2 fixtures that
+    /// predate the field construct one without it).
+    #[serde(default)]
+    pub frame_seq: i32,
     pub publisher_account_id: String,
     pub publisher_display_name: String,
+    #[serde(default)]
     pub own: bool,
     pub file_name: String,
     pub content_version: i32,
@@ -160,10 +170,6 @@ pub struct FrameViewWire {
     pub reject_reason: Option<String>,
     pub manifest_version: i64,
     pub created_at: String,
-    /// How many devices currently report holding this frame's content
-    /// (`put_holders`). Absent on an older hub → `0`.
-    #[serde(default)]
-    pub holder_count: i64,
 }
 
 /// The cursor to resume a paged manifest fetch from (`next` on
@@ -266,38 +272,67 @@ fn net(e: reqwest::Error) -> AccountClientError {
 }
 
 /// One status classifier for every GET/POST/PUT/PATCH call this client makes
-/// against the per-frame api (`get_json` and every new v3 method below —
-/// the old package-api methods keep their own [`unexpected`]): `401` →
-/// `Unauthorized`; `403` → `Forbidden`; a `409` whose body `{error}` is
-/// EXACTLY `"collab_api_outdated"` → `CollabApiOutdated` (this client
-/// predates the per-frame api); everything else → `Network`, carrying the
-/// status, the call (`what`), and the hub's best-effort message.
+/// against the per-frame api (`get_json` and every new v3 method below):
+/// `401` → `Unauthorized`; `403` → `Forbidden`; a `409`/`410` whose body
+/// `{error}` is a recognised typed refusal (`collab_api_outdated`,
+/// `session_gone`, `version_conflict`) → that typed variant; any other `410`
+/// → [`AccountClientError::Gone`] with the hub's `error` string (the caller
+/// reads it via [`AccountClientError::hub_text`] for the specific 410 cases
+/// it handles itself); everything else → [`AccountClientError::Http`],
+/// carrying the status, the call (`what`), and the hub's best-effort message.
 async fn classify(status: StatusCode, resp: reqwest::Response, what: &str) -> AccountClientError {
     match status {
         StatusCode::UNAUTHORIZED => AccountClientError::Unauthorized,
         StatusCode::FORBIDDEN => AccountClientError::Forbidden,
-        StatusCode::CONFLICT => {
-            let msg = body_message(resp).await;
-            if msg == "collab_api_outdated" {
-                AccountClientError::CollabApiOutdated
-            } else {
-                network_status(StatusCode::CONFLICT, what, &msg)
+        StatusCode::CONFLICT | StatusCode::GONE => {
+            let text = resp.text().await.unwrap_or_default();
+            let json: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+            let error = json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            match (status, error.as_str()) {
+                (_, "collab_api_outdated") => AccountClientError::CollabApiOutdated,
+                (_, "session_gone") => AccountClientError::SessionGone,
+                (_, "version_conflict") => AccountClientError::VersionConflict {
+                    content_version: json
+                        .get("contentVersion")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0) as i32,
+                },
+                (StatusCode::GONE, _) => AccountClientError::Gone(error),
+                _ => http_status(
+                    status,
+                    what,
+                    if error.is_empty() {
+                        text.trim()
+                    } else {
+                        &error
+                    },
+                ),
             }
         }
         s => {
             let msg = body_message(resp).await;
-            network_status(s, what, &msg)
+            http_status(s, what, &msg)
         }
     }
 }
 
-/// Shared `Network` message builder for [`classify`]: `hub returned {status}
-/// ({what})` plus `: {msg}` when the hub's best-effort message is non-empty.
-fn network_status(status: StatusCode, what: &str, msg: &str) -> AccountClientError {
-    if msg.is_empty() {
-        AccountClientError::Network(format!("hub returned {status} ({what})"))
+/// [`AccountClientError::Http`] with the wave-2 message text (was
+/// `network_status`): `hub returned {status} ({what})` plus `: {msg}` when
+/// the hub's best-effort message is non-empty.
+fn http_status(status: StatusCode, what: &str, msg: &str) -> AccountClientError {
+    let message = if msg.is_empty() {
+        format!("hub returned {status} ({what})")
     } else {
-        AccountClientError::Network(format!("hub returned {status} ({what}): {msg}"))
+        format!("hub returned {status} ({what}): {msg}")
+    };
+    AccountClientError::Http {
+        status: status.as_u16(),
+        message,
     }
 }
 
@@ -409,6 +444,7 @@ impl CollabClient {
     /// `GET /me/project-versions` — every project I'm a member of, with the
     /// hub's current `version` for each, so the caller can skip a manifest
     /// fetch for a project whose cached version already matches.
+    #[deprecated(note = "collab v3 wave 3: removed in Task 15")]
     pub async fn project_versions(
         &self,
         token: &str,
@@ -483,12 +519,16 @@ impl CollabClient {
 
     /// `POST /projects/{id}/frames/{uuid}/version` — publish a new content
     /// version of an already-published frame (re-calibration); the hub sets
-    /// `supersededBy` on the prior version.
+    /// `supersededBy` on the prior version. `expected_version` is the version
+    /// this update supersedes (optimistic concurrency, hub § "Frames —
+    /// versions"); a mismatch answers `409 version_conflict` →
+    /// [`AccountClientError::VersionConflict`].
     pub async fn new_frame_version(
         &self,
         token: &str,
         project_id: &str,
         frame_uuid: &str,
+        expected_version: i32,
         blake3: &str,
         byte_size: i64,
         xxh3: &str,
@@ -500,6 +540,7 @@ impl CollabClient {
             )))
             .bearer_auth(token)
             .json(&serde_json::json!({
+                "expectedVersion": expected_version,
                 "blake3": blake3,
                 "byteSize": byte_size,
                 "xxh3": xxh3,
@@ -558,7 +599,7 @@ impl CollabClient {
 
     /// `POST /projects/{id}/frames/{uuid}/reject` with body `{reason}` —
     /// refused once any holder other than publisher/coordinator exists (the
-    /// hub enforces this; a 409 there surfaces via `Network`).
+    /// hub enforces this; a 409 there surfaces via `Http`).
     pub async fn reject_frame(
         &self,
         token: &str,
@@ -588,6 +629,7 @@ impl CollabClient {
     /// `remove` as a delta. Always sends all three keys, even when `add`/
     /// `remove` are empty (an empty `add` under `full = true` is a real
     /// statement: "I hold nothing here any more").
+    #[deprecated(note = "collab v3 wave 3: removed in Task 15")]
     pub async fn put_holders(
         &self,
         token: &str,
@@ -613,6 +655,7 @@ impl CollabClient {
 
     /// `GET /projects/{id}/frames/{uuid}/holders` — every device currently
     /// reporting it holds this frame's content.
+    #[deprecated(note = "collab v3 wave 3: removed in Task 15")]
     pub async fn frame_holders(
         &self,
         token: &str,
@@ -641,6 +684,235 @@ impl CollabClient {
             "dictionary",
         )
         .await
+    }
+
+    // ── Live exchange (collab v3, wave 3) ────────────────────────────────────
+
+    /// `GET /projects/{id}/holders/snapshot` — one REPEATABLE READ read of the
+    /// project's whole holder map, and the `(epoch, holderSeq, version)`
+    /// cursors it reflects.
+    pub async fn holders_snapshot(
+        &self,
+        token: &str,
+        project_id: &str,
+    ) -> Result<HoldersSnapshotWire, AccountClientError> {
+        self.get_json(
+            &format!("/projects/{project_id}/holders/snapshot"),
+            Some(token),
+            "holders snapshot",
+        )
+        .await
+    }
+
+    /// `GET /projects/{id}/holders?since=…` — one page of holder changes
+    /// since `since`, resumed via `after` when the previous page's `hasMore`
+    /// was true. `epoch`, when given, asks the hub to answer `410
+    /// epoch_changed` if it no longer matches. A `410` (below the floor,
+    /// ahead of the cursor, or an epoch change) surfaces as
+    /// [`AccountClientError::Gone`] with the hub's `error` string — the
+    /// caller reloads the snapshot in every case.
+    pub async fn holders_since(
+        &self,
+        token: &str,
+        project_id: &str,
+        since: i64,
+        after: Option<&str>,
+        epoch: Option<&str>,
+    ) -> Result<HolderDeltaPageWire, AccountClientError> {
+        let mut query: Vec<(&str, String)> = vec![("since", since.to_string())];
+        if let Some(after) = after {
+            query.push(("after", after.to_string()));
+        }
+        if let Some(epoch) = epoch {
+            query.push(("epoch", epoch.to_string()));
+        }
+        let resp = self
+            .http
+            .get(self.url(&format!("/projects/{project_id}/holders")))
+            .bearer_auth(token)
+            .query(&query)
+            .send()
+            .await
+            .map_err(net)?;
+        let status = resp.status();
+        if status == StatusCode::OK {
+            return resp
+                .json::<HolderDeltaPageWire>()
+                .await
+                .map_err(|e| AccountClientError::Network(format!("decode holders delta: {e}")));
+        }
+        Err(classify(status, resp, "holders delta").await)
+    }
+
+    /// `PUT /projects/{id}/holders/self` — this device's coalesced claim
+    /// report: `full: true` replaces the whole claim set as of `report_seq`,
+    /// `false` applies `add`/`remove` as a delta. `digest`/`count` describe
+    /// the whole claim set AFTER this report (spec §6.3); a `digestMatch:
+    /// false` reply means the caller must send one `full: true` report next.
+    pub async fn report_holders(
+        &self,
+        token: &str,
+        project_id: &str,
+        body: &HoldersReportWire,
+    ) -> Result<HoldersReportReplyWire, AccountClientError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/projects/{project_id}/holders/self")))
+            .bearer_auth(token)
+            .json(body)
+            .send()
+            .await
+            .map_err(net)?;
+        let status = resp.status();
+        if status == StatusCode::OK {
+            return resp.json::<HoldersReportReplyWire>().await.map_err(|e| {
+                AccountClientError::Network(format!("decode holders report reply: {e}"))
+            });
+        }
+        Err(classify(status, resp, "report holders").await)
+    }
+
+    /// `POST /projects/{id}/frames/versions` — a batch (1..=500) of optimistic
+    /// CAS version bumps in request order. Per-entry outcomes come back as
+    /// `status: ok | conflict | not_found | forbidden` in
+    /// [`VersionsReplyWire`]; only a whole-batch failure (bad shape, closed
+    /// project, non-member) is a `Err` here.
+    pub async fn frame_versions(
+        &self,
+        token: &str,
+        project_id: &str,
+        versions: &[VersionInWire],
+    ) -> Result<VersionsReplyWire, AccountClientError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/projects/{project_id}/frames/versions")))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "versions": versions }))
+            .send()
+            .await
+            .map_err(net)?;
+        let status = resp.status();
+        if status == StatusCode::OK {
+            return resp
+                .json::<VersionsReplyWire>()
+                .await
+                .map_err(|e| AccountClientError::Network(format!("decode versions batch: {e}")));
+        }
+        Err(classify(status, resp, "frame versions batch").await)
+    }
+
+    /// `POST /me/presence` — the presence beat. Session-authenticated, no
+    /// bearer (hub § "Presence beat"). `409 {"error":"session_gone"}` →
+    /// [`AccountClientError::SessionGone`]: reopen the event stream at once.
+    pub async fn presence_beat(&self, body: &BeatWire) -> Result<(), AccountClientError> {
+        let resp = self
+            .http
+            .post(self.url("/me/presence"))
+            .json(body)
+            .send()
+            .await
+            .map_err(net)?;
+        let status = resp.status();
+        if status == StatusCode::NO_CONTENT || status == StatusCode::OK {
+            return Ok(());
+        }
+        Err(classify(status, resp, "presence beat").await)
+    }
+
+    /// `DELETE /me/presence` — go offline at once. No bearer; a `204` is
+    /// success even for an unknown session (hub § "Presence beat").
+    pub async fn presence_leave(&self, session_id: &str) -> Result<(), AccountClientError> {
+        let resp = self
+            .http
+            .delete(self.url("/me/presence"))
+            .json(&serde_json::json!({ "sessionId": session_id }))
+            .send()
+            .await
+            .map_err(net)?;
+        let status = resp.status();
+        if status == StatusCode::NO_CONTENT || status == StatusCode::OK {
+            return Ok(());
+        }
+        Err(classify(status, resp, "presence leave").await)
+    }
+
+    /// The hub base URL this client is bound to (no trailing slash).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+/// Whether the caller keeps retrying a failed hub call forever, or gives up
+/// after a bounded number of attempts (spec §4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryPolicy {
+    /// Owned by the live session: retries until it succeeds or the future is
+    /// dropped (the session closing cancels it).
+    Background,
+    /// A user-triggered action: at most [`INTERACTIVE_ATTEMPTS`] attempts,
+    /// so a foreground click doesn't hang indefinitely.
+    Interactive,
+}
+
+pub const INTERACTIVE_ATTEMPTS: u32 = 3;
+
+/// Transport errors, 5xx and 429 retry (spec §4.6); 401/403/409/410 never do
+/// — they are refusals no amount of retrying fixes.
+pub fn is_retryable(e: &AccountClientError) -> bool {
+    match e {
+        AccountClientError::Network(_) | AccountClientError::RateLimited => true,
+        AccountClientError::Http { status, .. } => *status >= 500,
+        _ => false,
+    }
+}
+
+/// Run `op` with full-jitter back-off (spec §4.6) until it succeeds, hits a
+/// non-retryable error, or (under [`RetryPolicy::Interactive`]) exhausts
+/// [`INTERACTIVE_ATTEMPTS`]. A [`crate::collab::live::backoff::reset_all`]
+/// while sleeping restarts the back-off from attempt 0 (Sync now, P26).
+pub async fn with_retry<T, F, Fut>(
+    what: &'static str,
+    policy: RetryPolicy,
+    mut op: F,
+) -> Result<T, AccountClientError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AccountClientError>>,
+{
+    use crate::collab::live::backoff::{reset_signal, sleep_or_reset, Backoff};
+    let mut backoff = Backoff::new();
+    let mut reset = reset_signal();
+    loop {
+        match op().await {
+            Ok(v) => {
+                if backoff.attempt() > 0 {
+                    tracing::info!(
+                        command = what,
+                        attempt = backoff.attempt(),
+                        "hub request recovered"
+                    );
+                }
+                return Ok(v);
+            }
+            Err(e) if is_retryable(&e) => {
+                if policy == RetryPolicy::Interactive
+                    && backoff.attempt() + 1 >= INTERACTIVE_ATTEMPTS
+                {
+                    tracing::warn!(command = what, attempt = backoff.attempt() + 1, error = %e, "hub request failed; giving up");
+                    return Err(e);
+                }
+                let delay = backoff.next_delay();
+                if backoff.attempt() == 1 {
+                    tracing::warn!(command = what, error = %e, retry_in_ms = delay.as_millis() as u64, "hub request failed; retrying");
+                } else {
+                    tracing::debug!(command = what, attempt = backoff.attempt(), error = %e, retry_in_ms = delay.as_millis() as u64, "hub request failed again; retrying");
+                }
+                if sleep_or_reset(delay, &mut reset).await {
+                    backoff.reset();
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -752,7 +1024,7 @@ mod tests {
     }
 
     /// A 409 for any OTHER reason (a stale gate version, not an outdated client)
-    /// must keep surfacing the hub's message via `Network`, never get relabeled
+    /// must keep surfacing the hub's message via `Http`, never get relabeled
     /// as `CollabApiOutdated`.
     #[tokio::test]
     async fn other_409_keeps_the_hub_message() {
@@ -770,7 +1042,8 @@ mod tests {
     }
 
     /// `manifest_page` passes `since`/`after`/`limit` as query params (not a
-    /// body) and decodes the paged rows, including the per-row `holderCount`.
+    /// body) and decodes the paged rows, including the per-row `frameSeq`
+    /// (v3: the manifest gains `frameSeq`, loses `holderCount`).
     #[tokio::test]
     async fn manifest_page_passes_cursor_and_decodes_rows() {
         let server = MockServer::start().await;
@@ -781,12 +1054,12 @@ mod tests {
             .and(query_param("limit", "1000"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "projectVersion": 9, "hasMore": false, "next": null,
-                "rows": [{ "frameUuid":"u10","publisherAccountId":"a","publisherDisplayName":"Ann","own":false,
+                "rows": [{ "frameUuid":"u10","frameSeq":10,"publisherAccountId":"a","publisherDisplayName":"Ann","own":false,
                   "fileName":"c_x.fits","contentVersion":1,"blake3":"b".repeat(64),"byteSize":10,
                   "xxh3":"0123456789abcdef","filterRaw":"Red","filterCanonical":"R","channel":"mono",
                   "exptimeSec":300.0,"dateObs":null,"meta":{},"gateVersion":0,"accepted":true,
                   "acceptedReason":null,"state":"published","rejectReason":null,"manifestVersion":9,
-                  "createdAt":"2026-09-24T00:00:00Z","holderCount":2 }]
+                  "createdAt":"2026-09-24T00:00:00Z" }]
             })))
             .mount(&server)
             .await;
@@ -797,7 +1070,7 @@ mod tests {
             .unwrap();
         assert_eq!(page.project_version, 9);
         assert_eq!(page.rows[0].filter_canonical, "R");
-        assert_eq!(page.rows[0].holder_count, 2);
+        assert_eq!(page.rows[0].frame_seq, 10);
     }
 
     /// `my_projects` reads the v3 `pendingFrames`/`govCaps` fields and no longer
@@ -887,15 +1160,15 @@ mod tests {
         c.reject_frame("t", "p1", "u1", "bad focus").await.unwrap();
     }
 
-    /// `new_frame_version` sends `{blake3, byteSize, xxh3}` and decodes
-    /// `{contentVersion, projectVersion}`.
+    /// `new_frame_version` sends `{expectedVersion, blake3, byteSize, xxh3}`
+    /// and decodes `{contentVersion, projectVersion}`.
     #[tokio::test]
     async fn new_frame_version_sends_body_and_decodes() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/projects/p1/frames/u1/version"))
             .and(body_json(json!({
-                "blake3": "a".repeat(64), "byteSize": 100, "xxh3": "0123456789abcdef"
+                "expectedVersion": 1, "blake3": "a".repeat(64), "byteSize": 100, "xxh3": "0123456789abcdef"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "contentVersion": 2, "projectVersion": 11
@@ -904,7 +1177,7 @@ mod tests {
             .await;
         let c = CollabClient::new(server.uri()).unwrap();
         let v = c
-            .new_frame_version("t", "p1", "u1", &"a".repeat(64), 100, "0123456789abcdef")
+            .new_frame_version("t", "p1", "u1", 1, &"a".repeat(64), 100, "0123456789abcdef")
             .await
             .unwrap();
         assert_eq!(v.content_version, 2);
@@ -971,5 +1244,172 @@ mod tests {
         let c2 = CollabClient::new(server2.uri()).unwrap();
         let dict2 = c2.dictionary("t", "p1").await.unwrap();
         assert!(dict2.current.is_none());
+    }
+
+    // ---- live exchange (collab v3 wave 3, Task 2) ----
+
+    use crate::collab::live::wire::{expand_runs, ClaimWire, VersionStatus};
+
+    #[tokio::test]
+    async fn statuses_are_typed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/me/presence"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({"error":"session_gone"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/projects/p1/frames/u1/version"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(json!({"error":"version_conflict","contentVersion":3})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/holders"))
+            .respond_with(
+                ResponseTemplate::new(410)
+                    .set_body_json(json!({"error":"holders_below_floor","floor":9,"holderSeq":20})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/holders/snapshot"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error":"db down"})))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let beat = BeatWire {
+            session_id: "0".repeat(32),
+            serving: Default::default(),
+            relay_url: None,
+        };
+        assert!(matches!(
+            c.presence_beat(&beat).await,
+            Err(AccountClientError::SessionGone)
+        ));
+        assert!(matches!(
+            c.new_frame_version("t", "p1", "u1", 1, &"b".repeat(64), 10, &"0".repeat(16))
+                .await,
+            Err(AccountClientError::VersionConflict { content_version: 3 })
+        ));
+        assert!(matches!(
+            c.holders_since("t", "p1", 3, None, None).await,
+            Err(AccountClientError::Gone(ref e)) if e == "holders_below_floor"
+        ));
+        let err = c.holders_snapshot("t", "p1").await.unwrap_err();
+        assert!(matches!(err, AccountClientError::Http { status: 503, .. }));
+        assert!(is_retryable(&err));
+        assert!(err.to_string().contains("db down"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn report_holders_sends_the_v3_body_and_decodes_the_reply() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/projects/p1/holders/self"))
+            .and(body_json(json!({"reportSeq":120,"full":false,
+                "add":[{"uuid":"u1","contentVersion":1}],"remove":["u2"],
+                "digest":"d173abce7c5386289c657a8a697518d8","count":2})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "holderSeq":18,"digestMatch":true,"nextFlushMs":1000,"refused":["u9"]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let body = HoldersReportWire {
+            report_seq: 120,
+            full: false,
+            add: vec![ClaimWire {
+                uuid: "u1".into(),
+                content_version: 1,
+            }],
+            remove: vec!["u2".into()],
+            digest: "d173abce7c5386289c657a8a697518d8".into(),
+            count: 2,
+        };
+        let r = c.report_holders("t", "p1", &body).await.unwrap();
+        assert_eq!(
+            (r.holder_seq, r.digest_match, r.next_flush_ms),
+            (18, true, 1000)
+        );
+        assert_eq!(r.refused, vec!["u9".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_runs_expand_and_versions_batch_decodes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/holders/snapshot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "epoch":"e1","holderSeq":17,"version":42,
+                "frames":[{"seq":1,"uuid":"u1","contentVersion":2}],
+                "devices":[{"device":"AAA=","displayName":"Anna","relayUrl":null,
+                            "claims":[[1,3,1],[5,1,2],[6,1,1]]}]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/projects/p1/frames/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "projectVersion":43,"results":[{"uuid":"u1","status":"ok","contentVersion":2},
+                                               {"uuid":"u2","status":"conflict","contentVersion":5}]})))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let s = c.holders_snapshot("t", "p1").await.unwrap();
+        let claims: Vec<_> = expand_runs(&s.devices[0].claims).collect();
+        assert_eq!(claims, vec![(1, 1), (2, 1), (3, 1), (5, 2), (6, 1)]);
+        let v = c.frame_versions("t", "p1", &[]).await.unwrap();
+        assert_eq!(v.results[1].status, VersionStatus::Conflict);
+        assert_eq!(v.results[1].content_version, 5);
+    }
+
+    #[tokio::test]
+    async fn interactive_retry_gives_up_after_three_attempts_and_background_recovers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/holders/snapshot"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(4)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/holders/snapshot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "epoch":"e","holderSeq":0,"version":1,"frames":[],"devices":[]})))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let e = with_retry("snapshot", RetryPolicy::Interactive, || {
+            c.holders_snapshot("t", "p1")
+        })
+        .await;
+        assert!(matches!(
+            e,
+            Err(AccountClientError::Http { status: 503, .. })
+        ));
+        // one 503 left, then 200: the background policy retries through it
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            with_retry("snapshot", RetryPolicy::Background, || {
+                c.holders_snapshot("t", "p1")
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(ok.is_ok());
+    }
+
+    #[tokio::test]
+    async fn frame_view_reads_frame_seq_without_holder_count_or_own() {
+        let v: FrameViewWire = serde_json::from_value(json!({
+            "frameUuid":"u1","frameSeq":12,"publisherAccountId":"a","publisherDisplayName":"Ann",
+            "fileName":"c_x.fits","contentVersion":1,"blake3":"b","byteSize":10,"xxh3":"x",
+            "filterRaw":"Red","filterCanonical":"R","channel":"mono","exptimeSec":300.0,
+            "dateObs":null,"meta":{},"gateVersion":0,"accepted":true,"acceptedReason":null,
+            "state":"published","rejectReason":null,"manifestVersion":9,"createdAt":"2026-09-25T00:00:00Z"}))
+        .unwrap();
+        assert_eq!((v.frame_seq, v.own), (12, false));
     }
 }

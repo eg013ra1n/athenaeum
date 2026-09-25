@@ -890,6 +890,13 @@ fn client_err(e: crate::account::AccountClientError) -> ApiError {
             crate::account::client::warn_collab_api_outdated_once();
             ApiError::Conflict(COLLAB_API_OUTDATED_MSG.into())
         }
+        E::Http { message, .. } | E::Gone(message) => {
+            ApiError::Internal(format!("Hub request failed: {message}"))
+        }
+        E::SessionGone => ApiError::Internal("hub session expired".into()),
+        E::VersionConflict { content_version } => ApiError::Conflict(format!(
+            "version_conflict: the hub has content version {content_version}"
+        )),
         E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
 }
@@ -2151,8 +2158,8 @@ fn size_mtime_seen(path: &Path) -> Option<String> {
 /// Is this hub refusal the stale-gate-version 409 (`gate version X is stale,
 /// current is Y`)?
 fn is_stale_gate_refusal(e: &crate::account::AccountClientError) -> bool {
-    matches!(e, crate::account::AccountClientError::Network(m)
-        if m.contains("gate version") && m.contains("is stale"))
+    e.hub_text()
+        .is_some_and(|m| m.contains("gate version") && m.contains("is stale"))
 }
 
 /// Indices of the batch frames a 409 `frame {uuid} already announced; use
@@ -2161,7 +2168,7 @@ fn already_announced_in(
     e: &crate::account::AccountClientError,
     batch: &[SeededFrame],
 ) -> Vec<usize> {
-    let crate::account::AccountClientError::Network(m) = e else {
+    let Some(m) = e.hub_text() else {
         return Vec::new();
     };
     batch
@@ -2420,6 +2427,10 @@ pub(crate) const COLLAB_STORE_UNMOUNTED: &str =
 /// a test stands in for a manifest sync landing between split and write-back.
 type AfterSplit<'a> = Option<&'a (dyn Fn(&Connection) + Sync)>;
 
+// `put_holders` is deprecated (collab v3 wave 3, Task 15 removes it); this
+// function's holder-delta report is replaced by the outbox/report_holders
+// path in a later task of this wave.
+#[allow(deprecated)]
 async fn run_publish(
     ctx: &ServiceContext,
     project_id: &str,
@@ -3094,6 +3105,7 @@ async fn run_publish(
                     &token,
                     project_id,
                     &f.written.uuid,
+                    f.content_version - 1,
                     &f.blake3,
                     f.written.byte_size as i64,
                     &f.written.xxh3,
@@ -3421,19 +3433,16 @@ pub fn list_moderation_queue(
 /// Map a hub approve/reject error: a 409 (the frame is no longer pending —
 /// already decided by another moderator, or superseded) surfaces as
 /// [`ApiError::Conflict`] so the caller leaves the local row untouched (the next
-/// sync re-syncs it). Everything else goes through [`client_err`]. The collab
-/// client collapses a 409 into `Network("hub returned 409 Conflict…")`, so the
-/// status is detected there.
+/// sync re-syncs it). Everything else goes through [`client_err`]. This 409 is
+/// not one of the collab client's typed refusals, so it decodes as
+/// `Http("hub returned 409 Conflict…")`, and the status is detected there via
+/// [`crate::account::AccountClientError::hub_text`].
 fn decide_err(e: crate::account::AccountClientError) -> ApiError {
-    if let crate::account::AccountClientError::Network(ref msg) = e {
-        // Match the client's stable prefix, not a bare "409" — the message tail
-        // can echo hub-controlled text (e.g. the typed reject reason), and a
-        // literal "409" inside it must not relabel a non-conflict error.
-        if msg.contains("hub returned 409") {
-            return ApiError::Conflict(
-                "This frame was already decided — refresh the queue.".into(),
-            );
-        }
+    // Match the client's stable prefix, not a bare "409" — the message tail
+    // can echo hub-controlled text (e.g. the typed reject reason), and a
+    // literal "409" inside it must not relabel a non-conflict error.
+    if e.hub_text().is_some_and(|m| m.contains("hub returned 409")) {
+        return ApiError::Conflict("This frame was already decided — refresh the queue.".into());
     }
     client_err(e)
 }

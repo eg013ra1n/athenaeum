@@ -52,8 +52,37 @@ pub enum AccountClientError {
     /// version, a closed project, …), which stays in the `Network` bucket with
     /// the hub's message.
     CollabApiOutdated,
+    /// A non-2xx the classifier didn't recognise as one of the typed variants
+    /// above (collab v3 live exchange, wave 3 P4): carries the status and the
+    /// wave-2-shaped message text (`hub returned {status} ({what}): {msg}`),
+    /// so a caller reading `Display` sees the same text it always has.
+    Http { status: u16, message: String },
+    /// 410 on a holder-delta page or a retired route whose body is NOT one of
+    /// the typed 410 cases the caller handles itself (`holders_below_floor`,
+    /// `holders_cursor_ahead`, `epoch_changed` are read via [`Self::hub_text`]
+    /// by the caller, which reloads the snapshot either way) — carries the
+    /// hub's `error` string.
+    Gone(String),
+    /// 409 `{"error":"session_gone"}` on the presence beat — the hub's
+    /// session ended; reopen the event stream at once.
+    SessionGone,
+    /// 409 `{"error":"version_conflict","contentVersion":N}` on a version
+    /// call — the hub's current content version, for the caller to reconcile.
+    VersionConflict { content_version: i32 },
     /// Transport / unexpected-status / decode failure.
     Network(String),
+}
+
+impl AccountClientError {
+    /// The hub's status text for the text matchers that recognise hub
+    /// refusals (stale gate, already announced, already decided).
+    pub fn hub_text(&self) -> Option<&str> {
+        match self {
+            AccountClientError::Network(m) => Some(m),
+            AccountClientError::Http { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 /// The actionable message for [`AccountClientError::CollabApiOutdated`],
@@ -95,6 +124,13 @@ impl std::fmt::Display for AccountClientError {
                 f.write_str("the account's role may not perform this action")
             }
             AccountClientError::CollabApiOutdated => f.write_str("collab_api_outdated"),
+            AccountClientError::Http { message, .. } => f.write_str(message),
+            AccountClientError::Gone(e) => write!(f, "hub answered 410: {e}"),
+            AccountClientError::SessionGone => f.write_str("session_gone"),
+            AccountClientError::VersionConflict { content_version } => write!(
+                f,
+                "version_conflict (hub has content version {content_version})"
+            ),
             AccountClientError::SecondPrimary(m)
             | AccountClientError::DeviceConflict(m)
             | AccountClientError::PeerValidation(m)
