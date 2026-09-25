@@ -58,10 +58,11 @@ pub enum AccountClientError {
     /// so a caller reading `Display` sees the same text it always has.
     Http { status: u16, message: String },
     /// 410 on a holder-delta page or a retired route whose body is NOT one of
-    /// the typed 410 cases the caller handles itself (`holders_below_floor`,
-    /// `holders_cursor_ahead`, `epoch_changed` are read via [`Self::hub_text`]
-    /// by the caller, which reloads the snapshot either way) — carries the
-    /// hub's `error` string.
+    /// the typed 409 cases above — the caller matches `Gone(e)` directly (not
+    /// via [`Self::hub_text`], which returns `None` for it) for the specific
+    /// cases it handles itself (`holders_below_floor`, `holders_cursor_ahead`,
+    /// `epoch_changed`; the caller reloads the snapshot either way) — carries
+    /// the hub's `error` string.
     Gone(String),
     /// 409 `{"error":"session_gone"}` on the presence beat — the hub's
     /// session ended; reopen the event stream at once.
@@ -69,7 +70,15 @@ pub enum AccountClientError {
     /// 409 `{"error":"version_conflict","contentVersion":N}` on a version
     /// call — the hub's current content version, for the caller to reconcile.
     VersionConflict { content_version: i32 },
-    /// Transport / unexpected-status / decode failure.
+    /// A 2xx response whose body did not decode into the expected type
+    /// (`reqwest::Error::is_decode()`) — a permanent shape mismatch, never
+    /// fixed by retrying (unlike `Network`, which also carries body-read
+    /// timeouts and transport failures and IS retried). `is_retryable`
+    /// returns `false` for this variant.
+    Decode(String),
+    /// Transport / unexpected-status / body-read failure. Retried by
+    /// `is_retryable` — a decode failure of an otherwise-successful response
+    /// is `Decode`, not this.
     Network(String),
 }
 
@@ -135,6 +144,7 @@ impl std::fmt::Display for AccountClientError {
             | AccountClientError::DeviceConflict(m)
             | AccountClientError::PeerValidation(m)
             | AccountClientError::BadRequest(m)
+            | AccountClientError::Decode(m)
             | AccountClientError::Network(m) => f.write_str(m),
         }
     }

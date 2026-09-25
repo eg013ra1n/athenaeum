@@ -271,19 +271,37 @@ fn net(e: reqwest::Error) -> AccountClientError {
     AccountClientError::Network(e.to_string())
 }
 
+/// Map a `.json::<T>()` failure on an otherwise-successful response.
+/// `reqwest::Error::is_decode()` is true exactly when the body was read fine
+/// but didn't parse into `T` — a permanent shape mismatch that retrying can
+/// never fix, so it becomes [`AccountClientError::Decode`] (never retried)
+/// and is logged at `error!` here, once, at the point of failure. A body-read
+/// failure (timeout, connection drop mid-body) is not a decode error and
+/// stays [`AccountClientError::Network`] (retried).
+fn decode_err(what: &str, e: reqwest::Error) -> AccountClientError {
+    if e.is_decode() {
+        tracing::error!(command = what, error = %e, "hub response body did not decode; not retrying");
+        AccountClientError::Decode(format!("decode {what}: {e}"))
+    } else {
+        AccountClientError::Network(format!("decode {what}: {e}"))
+    }
+}
+
 /// One status classifier for every GET/POST/PUT/PATCH call this client makes
 /// against the per-frame api (`get_json` and every new v3 method below):
-/// `401` → `Unauthorized`; `403` → `Forbidden`; a `409`/`410` whose body
-/// `{error}` is a recognised typed refusal (`collab_api_outdated`,
-/// `session_gone`, `version_conflict`) → that typed variant; any other `410`
-/// → [`AccountClientError::Gone`] with the hub's `error` string (the caller
-/// reads it via [`AccountClientError::hub_text`] for the specific 410 cases
-/// it handles itself); everything else → [`AccountClientError::Http`],
-/// carrying the status, the call (`what`), and the hub's best-effort message.
+/// `401` → `Unauthorized`; `403` → `Forbidden`; `429` → `RateLimited` (spec
+/// §4.6: retried); a `409`/`410` whose body `{error}` is a recognised typed
+/// refusal (`collab_api_outdated`, `session_gone`, `version_conflict`) → that
+/// typed variant; any other `410` → [`AccountClientError::Gone`] with the
+/// hub's `error` string (the caller matches `Gone(e)` directly for the
+/// specific 410 cases it handles itself — `hub_text()` does not cover it);
+/// everything else → [`AccountClientError::Http`], carrying the status, the
+/// call (`what`), and the hub's best-effort message.
 async fn classify(status: StatusCode, resp: reqwest::Response, what: &str) -> AccountClientError {
     match status {
         StatusCode::UNAUTHORIZED => AccountClientError::Unauthorized,
         StatusCode::FORBIDDEN => AccountClientError::Forbidden,
+        StatusCode::TOO_MANY_REQUESTS => AccountClientError::RateLimited,
         StatusCode::CONFLICT | StatusCode::GONE => {
             let text = resp.text().await.unwrap_or_default();
             let json: serde_json::Value =
@@ -383,10 +401,7 @@ impl CollabClient {
         let resp = req.send().await.map_err(net)?;
         let status = resp.status();
         if status == StatusCode::OK {
-            return resp
-                .json::<T>()
-                .await
-                .map_err(|e| AccountClientError::Network(format!("decode {what}: {e}")));
+            return resp.json::<T>().await.map_err(|e| decode_err(what, e));
         }
         Err(classify(status, resp, what).await)
     }
@@ -484,7 +499,7 @@ impl CollabClient {
             return resp
                 .json::<ManifestPageWire>()
                 .await
-                .map_err(|e| AccountClientError::Network(format!("decode manifest page: {e}")));
+                .map_err(|e| decode_err("manifest page", e));
         }
         Err(classify(status, resp, "manifest page").await)
     }
@@ -512,7 +527,7 @@ impl CollabClient {
             return resp
                 .json::<AnnounceFramesWire>()
                 .await
-                .map_err(|e| AccountClientError::Network(format!("decode announce frames: {e}")));
+                .map_err(|e| decode_err("announce frames", e));
         }
         Err(classify(status, resp, "announce frames").await)
     }
@@ -550,9 +565,10 @@ impl CollabClient {
             .map_err(net)?;
         let status = resp.status();
         if status == StatusCode::OK {
-            return resp.json::<NewVersionWire>().await.map_err(|e| {
-                AccountClientError::Network(format!("decode new frame version: {e}"))
-            });
+            return resp
+                .json::<NewVersionWire>()
+                .await
+                .map_err(|e| decode_err("new frame version", e));
         }
         Err(classify(status, resp, "new frame version").await)
     }
@@ -592,7 +608,7 @@ impl CollabClient {
                 .json::<ApproveReply>()
                 .await
                 .map(|r| r.published)
-                .map_err(|e| AccountClientError::Network(format!("decode approve frame: {e}")));
+                .map_err(|e| decode_err("approve frame", e));
         }
         Err(classify(status, resp, "approve frame").await)
     }
@@ -739,7 +755,7 @@ impl CollabClient {
             return resp
                 .json::<HolderDeltaPageWire>()
                 .await
-                .map_err(|e| AccountClientError::Network(format!("decode holders delta: {e}")));
+                .map_err(|e| decode_err("holders delta", e));
         }
         Err(classify(status, resp, "holders delta").await)
     }
@@ -765,9 +781,10 @@ impl CollabClient {
             .map_err(net)?;
         let status = resp.status();
         if status == StatusCode::OK {
-            return resp.json::<HoldersReportReplyWire>().await.map_err(|e| {
-                AccountClientError::Network(format!("decode holders report reply: {e}"))
-            });
+            return resp
+                .json::<HoldersReportReplyWire>()
+                .await
+                .map_err(|e| decode_err("holders report reply", e));
         }
         Err(classify(status, resp, "report holders").await)
     }
@@ -796,7 +813,7 @@ impl CollabClient {
             return resp
                 .json::<VersionsReplyWire>()
                 .await
-                .map_err(|e| AccountClientError::Network(format!("decode versions batch: {e}")));
+                .map_err(|e| decode_err("versions batch", e));
         }
         Err(classify(status, resp, "frame versions batch").await)
     }
@@ -857,11 +874,14 @@ pub enum RetryPolicy {
 pub const INTERACTIVE_ATTEMPTS: u32 = 3;
 
 /// Transport errors, 5xx and 429 retry (spec §4.6); 401/403/409/410 never do
-/// — they are refusals no amount of retrying fixes.
+/// — they are refusals no amount of retrying fixes. Nor does
+/// [`AccountClientError::Decode`] — a response body that didn't parse into
+/// the expected type is a permanent shape mismatch, not a transient failure.
 pub fn is_retryable(e: &AccountClientError) -> bool {
     match e {
         AccountClientError::Network(_) | AccountClientError::RateLimited => true,
         AccountClientError::Http { status, .. } => *status >= 500,
+        AccountClientError::Decode(_) => false,
         _ => false,
     }
 }
@@ -1279,6 +1299,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error":"db down"})))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/me/projects"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
         let c = CollabClient::new(server.uri()).unwrap();
         let beat = BeatWire {
             session_id: "0".repeat(32),
@@ -1302,6 +1327,10 @@ mod tests {
         assert!(matches!(err, AccountClientError::Http { status: 503, .. }));
         assert!(is_retryable(&err));
         assert!(err.to_string().contains("db down"), "{err}");
+        // 429 → RateLimited, and it IS retried (spec §4.6).
+        let err = c.my_projects("t").await.unwrap_err();
+        assert!(matches!(err, AccountClientError::RateLimited));
+        assert!(is_retryable(&err));
     }
 
     #[tokio::test]
@@ -1399,6 +1428,37 @@ mod tests {
         .await
         .unwrap();
         assert!(ok.is_ok());
+    }
+
+    /// A 200 whose body doesn't decode into the expected type is a permanent
+    /// shape mismatch, not a transient failure: it classifies as `Decode`
+    /// (never `Network`), `is_retryable` is `false`, and `with_retry` under
+    /// `RetryPolicy::Background` returns on the first attempt instead of
+    /// looping forever. The mock's `.expect(2)` (one direct call, one through
+    /// `with_retry`) fails the test if a retry were attempted.
+    #[tokio::test]
+    async fn a_malformed_200_body_is_a_decode_error_and_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1/holders/snapshot"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let err = c.holders_snapshot("t", "p1").await.unwrap_err();
+        assert!(matches!(err, AccountClientError::Decode(_)), "{err:?}");
+        assert!(!is_retryable(&err));
+        let e = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            with_retry("snapshot", RetryPolicy::Background, || {
+                c.holders_snapshot("t", "p1")
+            }),
+        )
+        .await
+        .expect("with_retry must return immediately, not loop")
+        .unwrap_err();
+        assert!(matches!(e, AccountClientError::Decode(_)), "{e:?}");
     }
 
     #[tokio::test]

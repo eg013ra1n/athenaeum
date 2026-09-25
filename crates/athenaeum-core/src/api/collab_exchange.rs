@@ -51,7 +51,7 @@ fn client_err(e: crate::account::AccountClientError) -> ApiError {
             crate::account::client::warn_collab_api_outdated_once();
             ApiError::Conflict(crate::account::client::COLLAB_API_OUTDATED_MSG.into())
         }
-        E::Http { message, .. } | E::Gone(message) => {
+        E::Http { message, .. } | E::Gone(message) | E::Decode(message) => {
             ApiError::Internal(format!("Hub request failed: {message}"))
         }
         E::SessionGone => ApiError::Internal("hub session expired".into()),
