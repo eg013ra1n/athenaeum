@@ -582,7 +582,7 @@ project WBPP export lands `<title>/<publisher>/<camera>/<filter>/`.
     - §5.3 steps 3–6 and §5.5;
     - amendment A3.
   - **Scope.** It brings "hub push over SSE" (§13) into scope. Its rulings
-    are L1–L13 and its invariants I1–I10.
+    are L1–L13 and its invariants I1–I11.
   - **New wave numbering.**
     - 3 = live exchange;
     - 4 = gate and metadata;
