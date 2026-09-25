@@ -891,10 +891,14 @@ pub struct SharedIrohNode {
     /// Serializes [`set_collab_root`](Self::set_collab_root) calls (open → sweep
     /// → swap → shut old) and fences them against [`shutdown`](Self::shutdown).
     collab_mount: tokio::sync::Mutex<()>,
-    /// The [`home_relay_watch`](Self::home_relay_watch) watcher's sender, lazily
-    /// spawned on first call (live exchange presence beat, spec §4.2). `None`
-    /// until then; every later call subscribes to the same task.
-    home_relay_tx: Mutex<Option<tokio::sync::watch::Sender<Option<String>>>>,
+    /// The [`home_relay_watch`](Self::home_relay_watch) watcher's sender and
+    /// task handle, lazily spawned on first call (live exchange presence
+    /// beat, spec §4.2). `None` until then; every later call subscribes to
+    /// the same task. Like [`NetLayer::relay_watcher`], iroh keeps
+    /// `watch_addr()`'s underlying watcher alive until the last endpoint
+    /// clone drops — the handle is here so [`shutdown`](Self::shutdown) can
+    /// abort it explicitly instead of leaking it.
+    home_relay_tx: Mutex<Option<(tokio::sync::watch::Sender<Option<String>>, JoinHandle<()>)>>,
 }
 
 /// Tag prefix of the collab store's in-flight fetches (plan P22:
@@ -1358,19 +1362,23 @@ impl SharedIrohNode {
     }
 
     /// Changes of [`Self::home_relay_url`], deduplicated. One watcher task per
-    /// node, spawned on first call and ended with the node's endpoint.
+    /// node, spawned lazily on first call. iroh keeps `watch_addr()`'s
+    /// underlying watcher alive until the last `Endpoint` clone drops (same
+    /// as the home-relay-status watcher — see [`shutdown`](Self::shutdown)),
+    /// so closing the endpoint does NOT end this task by itself; `shutdown`
+    /// aborts it explicitly, same as `relay_watcher`/`telemetry_sampler`.
     pub fn home_relay_watch(&self) -> tokio::sync::watch::Receiver<Option<String>> {
         let mut slot = self
             .home_relay_tx
             .lock()
             .expect("home relay watch poisoned");
-        if let Some(tx) = slot.as_ref() {
+        if let Some((tx, _)) = slot.as_ref() {
             return tx.subscribe();
         }
         let (tx, rx) = tokio::sync::watch::channel(self.home_relay_url());
         let endpoint = self.endpoint();
         let tx2 = tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             use iroh::Watcher as _;
             let mut addrs = endpoint.watch_addr().stream();
             while let Some(addr) = n0_future::StreamExt::next(&mut addrs).await {
@@ -1386,7 +1394,7 @@ impl SharedIrohNode {
             }
             tracing::debug!("home relay watch ended");
         });
-        *slot = Some(tx);
+        *slot = Some((tx, handle));
         rx
     }
 
@@ -1760,6 +1768,19 @@ impl SharedIrohNode {
             handle.abort();
         }
         if let Some(handle) = sampler {
+            handle.abort();
+        }
+        // Same for the home-relay-watch task (live exchange presence beat,
+        // T4 fix round 1): it holds its own `Endpoint` clone, so it would
+        // otherwise survive this function returning. Dropping the sender
+        // here also ends every outstanding `home_relay_watch()` receiver's
+        // `changed()` with `Err` — the node is gone, so its watch is too.
+        if let Some((_tx, handle)) = self
+            .home_relay_tx
+            .lock()
+            .expect("home relay watch poisoned")
+            .take()
+        {
             handle.abort();
         }
         // Session total BEFORE the endpoint closes — the one line that answers

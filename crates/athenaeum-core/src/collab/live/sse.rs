@@ -1,11 +1,28 @@
 //! A minimal Server-Sent Events parser for the hub's event channel
 //! (spec §4.1; hub § Wire contract framing). Pure: bytes in, frames out.
 
+/// A single unterminated line may not grow past this many bytes (T4 fix
+/// round 1): a hub bug or a malicious proxy sending an endless line would
+/// otherwise buffer forever. 8 MiB comfortably covers the largest legitimate
+/// frame (an inlined `project` event's ≤ 50 manifest rows).
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// One event's accumulated `data` (across every `data:` line before the
+/// blank-line dispatch) may not grow past this many bytes either — the same
+/// cap, guarding the case of many small lines instead of one huge one.
+pub const MAX_DATA_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SseFrame {
-    Event { name: String, data: String },
+    Event {
+        name: String,
+        data: String,
+    },
     Comment,
     Retry(u64),
+    /// A line or one event's `data` exceeded its size cap. The parser stops
+    /// trusting anything after this — the caller (`stream::pump`) ends the
+    /// connection so the session reconnects fresh.
+    TooLarge,
 }
 
 #[derive(Default)]
@@ -14,6 +31,10 @@ pub struct SseParser {
     name: Option<String>,
     data: Option<String>,
     saw_cr: bool,
+    /// Set once a cap is exceeded; every byte after is ignored (the frame
+    /// reporting it was already emitted, and the caller is about to drop
+    /// this parser along with the connection).
+    overflowed: bool,
 }
 
 impl SseParser {
@@ -23,6 +44,9 @@ impl SseParser {
     pub fn push(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
         let mut out = Vec::new();
         for &b in chunk {
+            if self.overflowed {
+                continue;
+            }
             if self.saw_cr {
                 self.saw_cr = false;
                 if b == b'\n' {
@@ -35,7 +59,19 @@ impl SseParser {
                     let line = std::mem::take(&mut self.buf);
                     self.line(&String::from_utf8_lossy(&line), &mut out);
                 }
-                _ => self.buf.push(b),
+                _ => {
+                    if self.buf.len() >= MAX_LINE_BYTES {
+                        tracing::warn!(
+                            cap = MAX_LINE_BYTES,
+                            "sse line exceeded the size cap; ending the stream"
+                        );
+                        self.overflowed = true;
+                        self.buf.clear();
+                        out.push(SseFrame::TooLarge);
+                        continue;
+                    }
+                    self.buf.push(b);
+                }
             }
         }
         out
@@ -64,13 +100,26 @@ impl SseParser {
         };
         match field {
             "event" => self.name = Some(value.to_string()),
-            "data" => match &mut self.data {
-                Some(d) => {
-                    d.push('\n');
-                    d.push_str(value);
+            "data" => {
+                let prior = self.data.as_ref().map_or(0, |d| d.len() + 1);
+                if prior + value.len() > MAX_DATA_BYTES {
+                    tracing::warn!(
+                        cap = MAX_DATA_BYTES,
+                        "sse event data exceeded the size cap; ending the stream"
+                    );
+                    self.data = None;
+                    self.overflowed = true;
+                    out.push(SseFrame::TooLarge);
+                    return;
                 }
-                None => self.data = Some(value.to_string()),
-            },
+                match &mut self.data {
+                    Some(d) => {
+                        d.push('\n');
+                        d.push_str(value);
+                    }
+                    None => self.data = Some(value.to_string()),
+                }
+            }
             "retry" => {
                 if let Ok(ms) = value.parse() {
                     out.push(SseFrame::Retry(ms));
@@ -117,6 +166,58 @@ mod tests {
             got.extend(p.push(&bytes[cut..]));
             assert_eq!(got, expected(), "split at {cut}");
         }
+    }
+
+    /// The same sample and expectations, but with every line ending
+    /// rewritten to CRLF — the hub never sends this, but a proxy might.
+    #[test]
+    fn every_split_point_gives_the_same_frames_with_crlf() {
+        let text = SAMPLE.replace('\n', "\r\n");
+        let bytes = text.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut p = SseParser::default();
+            let mut got = p.push(&bytes[..cut]);
+            got.extend(p.push(&bytes[cut..]));
+            assert_eq!(got, expected(), "CRLF split at {cut}");
+        }
+    }
+
+    /// Same again with bare CR line endings (the spec's third accepted form).
+    #[test]
+    fn every_split_point_gives_the_same_frames_with_cr_only() {
+        let text = SAMPLE.replace('\n', "\r");
+        let bytes = text.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut p = SseParser::default();
+            let mut got = p.push(&bytes[..cut]);
+            got.extend(p.push(&bytes[cut..]));
+            assert_eq!(got, expected(), "CR-only split at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_line_past_the_cap_ends_the_parse_with_too_large() {
+        let mut p = SseParser::default();
+        let huge = vec![b'a'; MAX_LINE_BYTES + 1];
+        assert_eq!(p.push(&huge), vec![SseFrame::TooLarge]);
+        // Nothing further from this parser — including a well-formed event
+        // right after the overflow — is trusted.
+        assert_eq!(p.push(b"\nevent: hello\ndata: {}\n\n"), Vec::new());
+    }
+
+    #[test]
+    fn event_data_past_the_cap_ends_the_parse_with_too_large() {
+        let mut p = SseParser::default();
+        // Many small `data:` lines whose sum crosses the cap — the per-line
+        // cap alone would not catch this.
+        let line = format!("data: {}\n", "a".repeat(1000));
+        let mut buf = Vec::new();
+        let reps = MAX_DATA_BYTES / 1000 + 2;
+        for _ in 0..reps {
+            buf.extend_from_slice(line.as_bytes());
+        }
+        let frames = p.push(&buf);
+        assert!(frames.contains(&SseFrame::TooLarge), "{frames:?}");
     }
 
     #[test]

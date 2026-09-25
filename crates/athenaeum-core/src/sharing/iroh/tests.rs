@@ -2149,8 +2149,14 @@ async fn home_relay_url_and_watch_start_at_none_with_relay_disabled() {
     let dir = tempdir().unwrap();
     let node = bind_disabled(dir.path()).await;
     assert_eq!(node.home_relay_url(), None);
-    let watch = node.home_relay_watch();
+    let mut watch = node.home_relay_watch();
     assert_eq!(*watch.borrow(), None);
+    // `shutdown` must abort the watcher task and drop its sender (T4 fix
+    // round 1) rather than leaking it alongside the endpoint's own clone —
+    // an outstanding receiver sees its watch end, same as any other watch
+    // whose `Watchable` was dropped.
+    node.shutdown().await;
+    assert!(watch.changed().await.is_err());
 }
 
 async fn tag_present(store: &Store, name: &str) -> bool {

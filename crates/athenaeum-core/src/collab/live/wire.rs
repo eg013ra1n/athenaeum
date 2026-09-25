@@ -243,11 +243,16 @@ pub struct PresenceEvent {
 }
 
 /// An `account` event's kind: this account's own membership on a project.
+/// `Unknown` is forward compatibility (I3, T4 fix round 1) for a kind this
+/// build predates — callers log and no-op rather than failing to decode the
+/// whole event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccountKind {
     Joined,
     Left,
+    #[serde(other)]
+    Unknown,
 }
 
 /// An `account` event: the account's own membership on `project_id` changed.
@@ -259,12 +264,16 @@ pub struct AccountEvent {
 }
 
 /// A `resync` event's side: catch this side of the named project up over
-/// REST rather than trusting the stream.
+/// REST rather than trusting the stream. `Unknown` is forward compatibility
+/// (I3, T4 fix round 1) for a side this build predates — callers log and
+/// no-op rather than failing to decode the whole event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResyncWhat {
     Project,
     Holders,
+    #[serde(other)]
+    Unknown,
 }
 
 /// A `resync` event: catch up `what` for `project_id` over REST.

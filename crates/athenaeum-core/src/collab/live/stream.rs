@@ -34,8 +34,28 @@ pub enum OpenError {
     Unauthorized,
     Forbidden,
     Outdated,
-    Status(u16),
+    /// Any other non-2xx status, with a body sample (truncated to at most
+    /// [`MAX_ERROR_BODY_BYTES`]) for diagnostics.
+    Status(u16, String),
     Transport(String),
+}
+
+/// Cap on the diagnostic body text carried in [`OpenError::Status`] — enough
+/// to read a hub error message, never enough to log an accidental multi-MB
+/// error page.
+const MAX_ERROR_BODY_BYTES: usize = 512;
+
+/// Truncate to at most `MAX_ERROR_BODY_BYTES`, never splitting inside a
+/// UTF-8 character.
+fn truncate_body(body: &str) -> String {
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        return body.to_string();
+    }
+    let mut end = MAX_ERROR_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body[..end].to_string()
 }
 
 /// Open the event stream. `token` is the device's bearer token; a 401 is the
@@ -54,19 +74,29 @@ pub async fn open(
         .send()
         .await
         .map_err(|e| OpenError::Transport(e.to_string()))?;
-    match resp.status().as_u16() {
+    let status = resp.status().as_u16();
+    match status {
         200 => Ok(resp),
         401 => Err(OpenError::Unauthorized),
         403 => Err(OpenError::Forbidden),
         409 => {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "event stream 409 body read failed");
+                String::new()
+            });
             if body.contains("collab_api_outdated") {
                 Err(OpenError::Outdated)
             } else {
-                Err(OpenError::Status(409))
+                Err(OpenError::Status(409, truncate_body(&body)))
             }
         }
-        s => Err(OpenError::Status(s)),
+        s => {
+            let body = resp.text().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, status = s, "event stream error body read failed");
+                String::new()
+            });
+            Err(OpenError::Status(s, truncate_body(&body)))
+        }
     }
 }
 
@@ -109,8 +139,15 @@ pub async fn pump(
             Some(Ok(bytes)) => {
                 got_byte = true;
                 for frame in parser.push(&bytes) {
-                    let SseFrame::Event { name, data } = frame else {
-                        continue;
+                    let (name, data) = match frame {
+                        SseFrame::Event { name, data } => (name, data),
+                        SseFrame::TooLarge => {
+                            tracing::warn!(
+                                "event stream frame exceeded the size cap; ending the stream"
+                            );
+                            return StreamEnd::ReadError("event too large".to_string());
+                        }
+                        SseFrame::Comment | SseFrame::Retry(_) => continue,
                     };
                     match decode_event(&name, &data) {
                         Ok(LiveEvent::Unknown(n)) => {
@@ -120,6 +157,15 @@ pub async fn pump(
                             if tx.send(ev).await.is_err() {
                                 return StreamEnd::ReceiverGone;
                             }
+                        }
+                        // `hello` re-establishes the session id and every
+                        // project's cursor: losing it silently would run the
+                        // rest of the stream against a stale/absent session,
+                        // so a bad `hello` ends the connection outright
+                        // instead of being merely logged.
+                        Err(e) if name == "hello" => {
+                            tracing::error!(error = %e, "hello event failed to decode; ending the stream");
+                            return StreamEnd::ReadError(format!("hello decode failed: {e}"));
                         }
                         Err(e) => {
                             tracing::error!(kind = %name, error = %e, "event failed to decode; dropped")
@@ -131,8 +177,12 @@ pub async fn pump(
     }
 }
 
-// A dropped malformed event is safe: the next event's `prev` mismatches and
-// the applier catches up over REST (I3).
+// A dropped malformed `project` or `holders` event is safe: the next one's
+// `prev` won't match the stored cursor, and the applier resyncs over REST
+// (I3). A malformed event of any other kind (`presence`, `account`,
+// `resync`, `versions`) carries no `prev` cursor to detect the gap by, so it
+// is simply logged and dropped — except `hello` (above), which ends the
+// stream instead of leaving the session without one.
 
 #[cfg(test)]
 mod tests {
@@ -201,5 +251,93 @@ mod tests {
                 .unwrap(),
             StreamEnd::Cancelled
         );
+    }
+
+    /// A tiny axum server answering `/api/v1/me/events` with one fixed,
+    /// finite body — for pinning `pump`'s per-frame decisions against exact
+    /// bytes without driving the fake hub's whole state machine. Returns the
+    /// base url `open` expects.
+    async fn serve_fixed_body(body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/api/v1/me/events",
+            axum::routing::get(move || async move {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(body))
+                    .expect("static response")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixed-body server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn unknown_and_malformed_non_hello_events_do_not_end_the_pump() {
+        let body = concat!(
+            "event: hello\n",
+            "data: {\"sessionId\":\"s\",\"epoch\":\"e\",\"accountId\":\"a\",\"projects\":{}}\n\n",
+            "event: future\n",
+            "data: {}\n\n",
+            "event: project\n",
+            "data: not json\n\n",
+            "event: versions\n",
+            "data: {\"p1\":[1,2]}\n\n",
+        );
+        let base = serve_fixed_body(body).await;
+        let client = stream_http_client();
+        let resp = open(&client, &base, "irrelevant").await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let end = tokio::time::timeout(Duration::from_secs(5), pump(resp, &tx, &mut cancel))
+            .await
+            .unwrap();
+        // The unknown `future` event and the malformed `project` event were
+        // both simply dropped — the stream ran to its natural, finite end
+        // rather than aborting on either one.
+        assert_eq!(end, StreamEnd::Closed);
+        let hello = rx.try_recv().unwrap();
+        assert!(matches!(hello, LiveEvent::Hello(_)));
+        let versions = rx.try_recv().unwrap();
+        assert!(matches!(versions, LiveEvent::Versions(_)));
+        assert!(
+            rx.try_recv().is_err(),
+            "future/project must not be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_hello_ends_the_stream_with_read_error() {
+        let body = "event: hello\ndata: not json\n\n";
+        let base = serve_fixed_body(body).await;
+        let client = stream_http_client();
+        let resp = open(&client, &base, "irrelevant").await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let end = tokio::time::timeout(Duration::from_secs(5), pump(resp, &tx, &mut cancel))
+            .await
+            .unwrap();
+        assert!(matches!(end, StreamEnd::ReadError(_)), "{end:?}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_ends_the_pump_with_read_error() {
+        let huge = "a".repeat(crate::collab::live::sse::MAX_DATA_BYTES + 1);
+        let body: String = format!("event: hello\ndata: {huge}\n\n");
+        let base = serve_fixed_body(Box::leak(body.into_boxed_str())).await;
+        let client = stream_http_client();
+        let resp = open(&client, &base, "irrelevant").await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let (_cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let end = tokio::time::timeout(Duration::from_secs(10), pump(resp, &tx, &mut cancel))
+            .await
+            .unwrap();
+        assert_eq!(end, StreamEnd::ReadError("event too large".to_string()));
     }
 }
