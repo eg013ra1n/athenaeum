@@ -343,7 +343,7 @@ memory and makes no database query.
 | 403 | empty | not a member |
 
 **Implicit claims.** A successful announce (`POST /projects/{id}/frames`) claims `(uuid, 1)` for the calling device, per frame. A successful version (`POST …/{uuid}/version` or an `ok` entry of `POST …/frames/versions`) claims `(uuid, newContentVersion)`.
-- The hub writes these claims in the same transaction and keeps their stored `reportSeq`.
+- The hub writes these claims in the same transaction and stamps them with this device's highest stored `reportSeq` in the project, so a delayed older report can never roll them back (amended during execution, hub Task 2 review).
 - Add them to your claim set and digest without reporting them.
 - Flush any pending outbox entry for such a frame **before** calling version.
 
