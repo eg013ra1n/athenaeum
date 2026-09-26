@@ -198,6 +198,36 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Collab v3 wave 3 — hub live exchange (2026-09-25)
+
+Hub branch `collab-v3-wave3`, merged to local main only; astronet commit on
+`main`, not deployed. The hub now pushes (SSE `/api/v1/me/events`), keeps
+presence live, holds durable device-owned claims with a digest, versions by
+compare-and-set, and propagates revocation (spec
+`docs/superpowers/specs/2026-09-25-collab-v3-live-exchange-design.md`, plan
+`docs/superpowers/plans/2026-09-25-collab-v3-wave3-hub-live-exchange-plan.md`).
+
+- **Owed — test-hub deploy (owner's word).** Run `ansible-playbook
+  deploy_athenaeum_hub.yml -e hub_target=athenaeum_hub_test -e
+  hub_artifact_ref=collab-v3-wave3 -e @~/.config/athenaeum-hub/smtp.yml`. It
+  converges the unit (StateDirectory, LimitNOFILE), the events location in
+  the write-once vhost, nginx worker sizing (HOST-WIDE, the production hub
+  included) and runs the 2 s first-byte probe. astronet commit bd65477
+  (local main, not pushed). Post-deploy:
+  - `SELECT max(version) FROM _sqlx_migrations` → 23;
+  - `ls /var/lib/athenaeum-hub-test/feed-marks.json` (appears within 60 s);
+  - `journalctl -u athenaeum-hub-test | grep 'feed epoch'`.
+- **Owed — the load check on the test hub (P30).** The in-process harness
+  (`tests/load_check.rs`) passed locally with the numbers in its commit. A
+  run against the deployed test hub needs 100 device tokens minted there.
+- **Owed — the one-week soak** (spec §15), with at least three real devices
+  on the test hub once app wave 3 lands: the hourly digest checks all match.
+- **Expected, do not re-flag:**
+  - The desktop app on local main (wave 2) gets `409 collab_api_outdated`
+    from a wave-3 hub on `/me/project-versions`, per-frame holders, holder
+    reports and versions, until app wave 3.
+  - The released app never called these routes.
+
 ### Collab v3 wave 2 — the app on the per-frame model (2026-09-24)
 
 Spec `docs/superpowers/specs/2026-09-23-collab-v3-per-frame-model-design.md` (§5, §15
