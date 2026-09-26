@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -18,10 +19,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::api::collab_exchange::{CollabFramesLanded, COLLAB_FRAMES_LANDED_EVENT};
 use crate::api::collab_live::executor::{Derive, ExecEnv, Executor, Note};
-use crate::api::collab_live::feed::{FeedApplier, FeedEffect};
-use crate::api::collab_live::holdings::{member_devices, Holdings};
+use crate::api::collab_live::feed::FeedEffect;
+use crate::api::collab_live::holdings::{member_devices, HolderMaps};
 use crate::api::collab_live::storage_task::{
     HolderView, StorageEngine, StorageEvent, StorageTimings,
+};
+use crate::api::collab_live::workers::{
+    FeedOut, FeedWork, FeedWorker, SharedHolders, StorageOut, StorageWork,
 };
 use crate::api::collab_live::{
     CollabAttentionChanged, CollabDeletionChoice, CollabFrameChanged, CollabFrameLost,
@@ -42,9 +46,15 @@ use crate::services::ServiceContext;
 use crate::sharing::iroh::node::SharedIrohNode;
 use crate::sync::receiver::InboundControl;
 
+/// How long the runtime waits for its session to leave presence and end,
+/// beyond the leave's own bound.
+const SESSION_MARGIN: Duration = Duration::from_millis(500);
+/// How long the runtime waits for an aborted worker to end.
+const WORKER_STOP: Duration = Duration::from_millis(250);
 /// `shutdown` / `on_sign_out` wait at most this long for the runtime to
-/// leave presence and stop (P28).
-pub const STOP_BOUND: Duration = Duration::from_secs(2);
+/// leave presence and stop (P28): the leave's bound plus a margin (M1).
+pub const STOP_BOUND: Duration =
+    Duration::from_secs(crate::api::collab_live::session::LEAVE_TIMEOUT.as_secs() + 1);
 /// How often an armed runtime re-checks for a bound node, a mounted collab
 /// store and a started receiver before it can run.
 pub const READY_POLL: Duration = Duration::from_secs(5);
@@ -196,7 +206,29 @@ impl Shared {
         *self.credentials.lock().unwrap_or_else(|p| p.into_inner()) = creds;
     }
 
-    fn credentials(&self) -> Option<(String, String)> {
+    pub(crate) fn emitter(&self) -> Option<Arc<dyn ProgressEmitter>> {
+        self.emitter.clone()
+    }
+
+    /// The feed's presence book, copied after every applied event.
+    pub(crate) fn set_presence(&self, presence: &PresenceBook) {
+        match self.presence.write() {
+            Ok(mut p) => *p = presence.clone(),
+            Err(e) => tracing::error!(error = %e, "presence copy lock poisoned; not updated"),
+        }
+    }
+
+    pub(crate) fn presence_copy(&self) -> PresenceBook {
+        match self.presence.read() {
+            Ok(p) => p.clone(),
+            Err(e) => {
+                tracing::error!(error = %e, "presence copy lock poisoned; read as left");
+                e.into_inner().clone()
+            }
+        }
+    }
+
+    pub(crate) fn credentials(&self) -> Option<(String, String)> {
         self.credentials
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -503,8 +535,15 @@ async fn stop(ctx: &ServiceContext, sign_out: bool) {
 #[allow(dead_code)] // read by the Task 16 commands (the last-copy warning)
 pub(crate) fn holder_view(ctx: &ServiceContext) -> Option<Arc<dyn HolderView>> {
     let shared = handle_shared(ctx)?;
-    let me = shared.me.read().ok()?.clone()?;
-    let presence = shared.presence.read().ok()?.clone();
+    // M2 (fix round 1): a poisoned lock is logged, never a silent `None`.
+    let me = match shared.me.read() {
+        Ok(me) => me.clone()?,
+        Err(e) => {
+            tracing::error!(error = %e, "live device id lock poisoned; no holder view");
+            return None;
+        }
+    };
+    let presence = shared.presence_copy();
     Some(Arc::new(PersistedView {
         ctx: Arc::clone(&shared.ctx),
         presence,
@@ -543,7 +582,7 @@ impl HolderView for PersistedView {
     }
 }
 
-fn redundancy_of(
+pub(crate) fn redundancy_of(
     map: &crate::collab::live::holders::ProjectHolders,
     presence: &PresenceBook,
     project: &crate::db::collab::CollabProjectRow,
@@ -568,39 +607,6 @@ fn redundancy_of(
     )
 }
 
-/// The runtime's own holder view: the in-memory holder maps.
-struct LiveView<'a> {
-    ctx: &'a ServiceContext,
-    holdings: Option<&'a Holdings>,
-    presence: &'a PresenceBook,
-    me: &'a str,
-}
-
-impl HolderView for LiveView<'_> {
-    fn other_holders(&self, project_id: &str, frame_uuid: &str) -> Redundancy {
-        let Some(map) = self.holdings.and_then(|h| h.map(project_id)) else {
-            return Redundancy::default();
-        };
-        let read = db(self.ctx).and_then(|d| {
-            let conn = d.conn();
-            Ok((
-                crate::db::collab_frames::get(&conn, project_id, frame_uuid)?,
-                crate::db::collab::get_project(&conn, project_id)?,
-            ))
-        });
-        match read {
-            Ok((Some(row), Some(project))) => {
-                redundancy_of(map, self.presence, &project, self.me, &row)
-            }
-            Ok(_) => Redundancy::default(),
-            Err(e) => {
-                tracing::warn!(project_id, frame_uuid, error = %e, "holders could not be read; counted none");
-                Redundancy::default()
-            }
-        }
-    }
-}
-
 // ── the runtime ─────────────────────────────────────────────────────────
 
 /// What the runtime needs before it can run.
@@ -609,9 +615,18 @@ struct Ready {
     store: iroh_blobs::api::Store,
     root: PathBuf,
     control: Arc<InboundControl>,
+    /// The node's collab mount generation, seen at this store (I1).
+    mount_gen: watch::Receiver<u64>,
 }
 
-async fn ready(ctx: &ServiceContext, gate: &GateSource) -> Result<Ready, &'static str> {
+/// `lazy_mount`: mount the designated folder's store when the node has none
+/// (the first start). After a remount it is never done here — the
+/// designation in progress mounts it itself, and a lazy mount would race it.
+async fn ready(
+    ctx: &ServiceContext,
+    gate: &GateSource,
+    lazy_mount: bool,
+) -> Result<Ready, &'static str> {
     let Some(node) = crate::api::collab_exchange::bound_node(ctx).await else {
         return Err("no bound node");
     };
@@ -623,13 +638,38 @@ async fn ready(ctx: &ServiceContext, gate: &GateSource) -> Result<Ready, &'stati
             return Err("collaboration root unreadable");
         }
     };
-    let store = match node.collab_store() {
-        Some(s) => s,
-        None => match crate::api::collab_exchange::ensure_collab_store(ctx).await {
-            Some(s) => s,
-            None => return Err("collab store not mounted"),
-        },
+    // A designation in progress (its mount done, its marker not recorded
+    // yet): the runtime waits for the marker, or its own adoption would race
+    // the designation's (I1).
+    match db(ctx).and_then(|d| Ok(crate::db::collab_live::store_marker_path(&d.conn())?)) {
+        Ok(Some(at)) if at != root.to_string_lossy() => {
+            return Err("storage marker not recorded for this folder yet")
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "storage marker record could not be read");
+            return Err("storage marker record unreadable");
+        }
+    }
+    if node.collab_store().is_none()
+        && (!lazy_mount
+            || crate::api::collab_exchange::ensure_collab_store(ctx)
+                .await
+                .is_none())
+    {
+        return Err("collab store not mounted");
+    }
+    // Seen BEFORE the store is read (a mount bumps after its swap): any
+    // later mount, unmount or swap restarts the runtime (Task 15 fix
+    // round 1, I1).
+    let mut mount_gen = node.collab_mount_signal();
+    mount_gen.borrow_and_update();
+    let Some((mounted, store)) = node.collab_mounted() else {
+        return Err("collab store not mounted");
     };
+    if !crate::sharing::iroh::node::same_dir(&mounted, &root) {
+        return Err("collab store mounted at another folder");
+    }
     let control = match gate {
         GateSource::Sync(sync) => match sync.inbound_control().await {
             Some(c) => c,
@@ -642,10 +682,12 @@ async fn ready(ctx: &ServiceContext, gate: &GateSource) -> Result<Ready, &'stati
         store,
         root,
         control,
+        mount_gen,
     })
 }
 
-/// The armed task: wait until the runtime can run, then run it.
+/// The armed task: wait until the runtime can run, then run it — again on
+/// its new store after the Collaboration folder moved (I1).
 async fn supervise(
     shared: Arc<Shared>,
     mut commands: mpsc::UnboundedReceiver<LiveCommand>,
@@ -653,13 +695,18 @@ async fn supervise(
     cfg: LiveConfig,
 ) {
     let ctx = Arc::clone(&shared.ctx);
+    let mut lazy_mount = true;
     loop {
-        match ready(&ctx, &gate).await {
+        match ready(&ctx, &gate, lazy_mount).await {
             Ok(r) => match Runtime::start(Arc::clone(&shared), r, cfg).await {
-                Ok(rt) => {
-                    rt.run(commands).await;
-                    return;
-                }
+                Ok(rt) => match rt.run(&mut commands).await {
+                    RunEnd::Stopped => return,
+                    RunEnd::Remount => {
+                        tracing::info!("collaboration store changed; the live exchange restarts");
+                        lazy_mount = false;
+                        continue;
+                    }
+                },
                 Err(e) => {
                     tracing::error!(error = %e, "collab live exchange could not start; retried");
                 }
@@ -695,25 +742,49 @@ struct Burst {
     last: HashMap<String, Instant>,
 }
 
+/// How a runtime's loop ended.
+enum Exit {
+    /// `shutdown` / `on_sign_out` (or the handle dropped: `None`).
+    Stop(Option<(bool, oneshot::Sender<()>)>),
+    /// The collab store was mounted, unmounted or swapped (I1).
+    Remount,
+}
+
+enum RunEnd {
+    Stopped,
+    Remount,
+}
+
 struct Runtime {
     shared: Arc<Shared>,
     ctx: Arc<ServiceContext>,
     node: Arc<SharedIrohNode>,
     me: String,
-    feed: Option<FeedApplier>,
-    holdings: Option<Holdings>,
-    creds: Option<(String, String)>,
-    storage: StorageEngine,
+    /// The holder maps the feed worker keeps current (read here).
+    maps: HolderMaps,
+    feed_tx: mpsc::UnboundedSender<FeedWork>,
+    feed_rx: mpsc::UnboundedReceiver<FeedOut>,
+    feed_open: bool,
+    feed_task: tokio::task::JoinHandle<()>,
+    /// Stream events handed to the feed worker and not applied yet.
+    feed_pending: Arc<AtomicUsize>,
+    storage_tx: mpsc::UnboundedSender<StorageWork>,
+    storage_rx: mpsc::UnboundedReceiver<StorageOut>,
+    storage_open: bool,
+    storage_task: tokio::task::JoinHandle<()>,
     storage_state: StoreState,
+    degraded: bool,
+    network: bool,
     exec: Executor,
     events_rx: mpsc::Receiver<LiveEvent>,
     events_open: bool,
     checks_rx: mpsc::UnboundedReceiver<(String, String)>,
     /// A closed channel answers `None` at once, forever: its arm is
     /// switched off instead of spinning the loop (the serve oracle replaced
-    /// by another, the watcher gone).
+    /// by another).
     checks_open: bool,
-    fs_open: bool,
+    mount_gen: watch::Receiver<u64>,
+    mount_open: bool,
     reset: watch::Receiver<u64>,
     stop_tx: watch::Sender<bool>,
     session: tokio::task::JoinHandle<()>,
@@ -763,12 +834,28 @@ impl Runtime {
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "landing temp sweep task failed"),
         }
-        let storage = StorageEngine::start_with(
+        let engine = StorageEngine::start_with(
             Arc::clone(&ctx),
             Arc::clone(&r.node),
             Arc::clone(&guard),
             cfg.timings,
         );
+        let (degraded, network) = (engine.degraded(), engine.network());
+        let maps = HolderMaps::default();
+        let holders: Arc<dyn HolderView> = Arc::new(SharedHolders {
+            ctx: Arc::clone(&ctx),
+            maps: Arc::clone(&maps),
+            shared: Arc::clone(&shared),
+            me: me.clone(),
+        });
+        let (storage_tx, storage_work) = mpsc::unbounded_channel();
+        let (storage_out, storage_rx) = mpsc::unbounded_channel();
+        let storage_task = tokio::spawn(crate::api::collab_live::workers::run_storage(
+            engine,
+            holders,
+            storage_work,
+            storage_out,
+        ));
         let (checks_tx, checks_rx) = mpsc::unbounded_channel();
         r.node.set_collab_serve_oracle(Some(Arc::new(
             crate::api::collab_live::serve_oracle::DbServeOracle::new(
@@ -803,6 +890,29 @@ impl Runtime {
             receive,
             seed,
         );
+        let (feed_tx, feed_work) = mpsc::unbounded_channel();
+        let (feed_out, feed_rx) = mpsc::unbounded_channel();
+        let feed_pending = Arc::new(AtomicUsize::new(0));
+        let feed_task = tokio::spawn(
+            FeedWorker::new(
+                Arc::clone(&shared),
+                me.clone(),
+                Arc::clone(&maps),
+                feed_out,
+                Arc::clone(&feed_pending),
+            )
+            .run(feed_work),
+        );
+        // M2 (fix round 1): an unreadable account is logged, never swallowed
+        // — the feed waits for the next hello's credentials.
+        let creds = match crate::api::account::hub_credentials(&ctx) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "account could not be read; the feed waits for the next hello");
+                None
+            }
+        };
+        let _ = feed_tx.send(FeedWork::Creds(creds));
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
         let (stop_tx, stop_rx) = watch::channel(false);
         let session = tokio::spawn(crate::api::collab_live::session::run_session(
@@ -816,17 +926,26 @@ impl Runtime {
             ctx,
             node: r.node,
             me,
-            feed: None,
-            holdings: None,
-            creds: None,
-            storage,
+            maps,
+            feed_tx,
+            feed_rx,
+            feed_open: true,
+            feed_task,
+            feed_pending,
+            storage_tx,
+            storage_rx,
+            storage_open: true,
+            storage_task,
             storage_state: state.clone(),
+            degraded,
+            network,
             exec,
             events_rx,
             events_open: true,
             checks_rx,
             checks_open: true,
-            fs_open: true,
+            mount_gen: r.mount_gen,
+            mount_open: true,
             reset: crate::collab::live::backoff::reset_signal(),
             stop_tx,
             session,
@@ -839,7 +958,6 @@ impl Runtime {
             shared,
         };
         rt.publish_storage();
-        rt.ensure_feed(crate::api::account::hub_credentials(&rt.ctx).ok().flatten());
         rt.exec.storage(state.fetching());
         for pid in rt.live_projects() {
             rt.exec.dirty.insert(pid);
@@ -858,49 +976,28 @@ impl Runtime {
         }
     }
 
-    /// Build the feed applier and the holder side for `creds` (again when
-    /// the account's token changed).
-    fn ensure_feed(&mut self, creds: Option<(String, String)>) {
-        let Some(creds) = creds else {
-            return;
-        };
-        if self.creds.as_ref() == Some(&creds) && self.feed.is_some() {
-            return;
-        }
-        let (hub, token) = creds.clone();
-        let clients = CollabClient::new(hub.clone()).and_then(|a| Ok((a, CollabClient::new(hub)?)));
-        let (feed_client, holdings_client) = match clients {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "hub client could not be built; the feed waits");
-                return;
-            }
-        };
-        match Holdings::load(
-            Arc::clone(&self.ctx),
-            holdings_client,
-            token.clone(),
-            self.me.clone(),
-        ) {
-            Ok(h) => self.holdings = Some(h),
-            Err(e) => {
-                tracing::error!(error = %e, "holder maps could not be loaded; the feed waits");
-                return;
-            }
-        }
-        self.feed = Some(FeedApplier::new(
-            Arc::clone(&self.ctx),
-            feed_client,
-            token,
-            self.shared.emitter.clone(),
-        ));
-        self.creds = Some(creds);
-    }
-
     fn emit<T: serde::Serialize>(&self, name: &str, payload: &T) {
         if let Some(em) = &self.shared.emitter {
             emit_event(em.as_ref(), name, payload);
         }
+    }
+
+    /// Hand work to the feed worker (it is gone only after a panic, logged
+    /// where it is reaped).
+    fn to_feed(&self, work: FeedWork) {
+        if self.feed_tx.send(work).is_err() {
+            tracing::error!("the feed worker is gone; feed work dropped");
+        }
+    }
+
+    fn to_storage(&self, work: StorageWork) {
+        if self.storage_tx.send(work).is_err() {
+            tracing::error!("the storage task is gone; storage work dropped");
+        }
+    }
+
+    fn note_append(&self, project_id: &str) {
+        self.to_feed(FeedWork::NoteAppend(project_id.to_string(), Instant::now()));
     }
 
     fn publish_storage(&mut self) {
@@ -922,16 +1019,12 @@ impl Runtime {
             ),
         };
         self.shared.set_storage(view, reason);
-        self.shared
-            .set_watcher(self.storage.degraded(), self.storage.network());
+        self.shared.set_watcher(self.degraded, self.network);
         self.serving_dirty = true;
     }
 
     fn deadline(&self) -> Instant {
-        let mut d = self.storage.next_deadline().min(self.next_gc_probe);
-        if let Some(h) = self.holdings.as_ref().and_then(Holdings::next_deadline) {
-            d = d.min(h);
-        }
+        let mut d = self.next_gc_probe;
         if let Some(w) = self.exec.next_wake() {
             d = d.min(w);
         }
@@ -943,50 +1036,66 @@ impl Runtime {
         d
     }
 
-    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<LiveCommand>) {
-        let mut stop: Option<(bool, oneshot::Sender<()>)> = None;
-        loop {
+    /// The loop. Every arm is short: hub HTTP and sweeps run on the two
+    /// workers (Task 15 fix round 1, C1), so executor results, lane grants,
+    /// pool events, the yield signal, commands and stop are serviced within
+    /// milliseconds.
+    async fn run(mut self, commands: &mut mpsc::UnboundedReceiver<LiveCommand>) -> RunEnd {
+        let exit = loop {
             self.flush_dirty();
-            let deadline = self.deadline();
+            let mut deadline = self.deadline();
+            // M6: a due timer runs first, whatever else is ready (a cheap
+            // starvation guard; the timer work is short).
+            if Instant::now() >= deadline {
+                self.on_timers().await;
+                self.flush_dirty();
+                deadline = self.deadline();
+            }
+            let feed_room = self.feed_pending.load(Ordering::SeqCst) < EVENT_QUEUE;
             tokio::select! {
                 biased;
                 cmd = commands.recv() => match cmd {
-                    None => break,
+                    None => break Exit::Stop(None),
                     Some(LiveCommand::Stop { sign_out, done }) => {
-                        stop = Some((sign_out, done));
-                        break;
+                        break Exit::Stop(Some((sign_out, done)));
                     }
-                    Some(LiveCommand::Reconcile) => self.reconcile().await,
+                    Some(LiveCommand::Reconcile) => self.reconcile(),
                     Some(LiveCommand::LocalChange(p)) => {
                         // The command may have appended claim changes: they
                         // flush after the usual delay, not at the next wake.
-                        if let Some(h) = self.holdings.as_mut() {
-                            h.note_append(&p, Instant::now());
-                        }
+                        self.note_append(&p);
                         self.exec.dirty.insert(p.clone());
                         self.attention.insert(p);
                     }
                     Some(LiveCommand::SetStreams(n)) => self.exec.set_slots(n),
                 },
-                ev = self.events_rx.recv(), if self.events_open => match ev {
-                    Some(ev) => self.on_event(ev).await,
-                    None => self.events_open = false,
-                },
-                changed = self.reset.changed() => {
+                changed = self.mount_gen.changed(), if self.mount_open => {
                     if changed.is_ok() {
-                        self.exec.step(Input::ClearBackoffs);
+                        break Exit::Remount;
                     }
+                    self.mount_open = false;
                 }
-                ev = self.exec.events_rx.recv() => {
-                    if let Some(ev) = ev {
-                        self.exec.on_event(ev).await;
-                        self.apply_notes().await;
+                changed = self.exec.yield_rx.changed() => {
+                    if changed.is_ok() {
+                        self.exec.on_yield_changed();
                     }
                 }
                 done = self.exec.done_rx.recv() => {
                     if let Some((name, outcome)) = done {
                         self.exec.on_done(name, outcome).await;
-                        self.apply_notes().await;
+                        self.apply_notes();
+                    }
+                }
+                ev = self.exec.events_rx.recv() => {
+                    if let Some(ev) = ev {
+                        self.exec.on_event(ev).await;
+                        self.apply_notes();
+                    }
+                }
+                ended = self.exec.tasks.join_next_with_id(), if !self.exec.tasks.is_empty() => {
+                    if let Some(ended) = ended {
+                        self.exec.on_task_ended(ended).await;
+                        self.apply_notes();
                     }
                 }
                 v = self.exec.verdicts_rx.recv() => {
@@ -999,23 +1108,44 @@ impl Runtime {
                         self.exec.on_pool(ev);
                     }
                 }
-                changed = self.exec.yield_rx.changed() => {
+                changed = self.reset.changed() => {
                     if changed.is_ok() {
-                        self.exec.on_yield_changed();
+                        self.exec.step(Input::ClearBackoffs);
                     }
                 }
-                sig = self.storage.recv_signal(), if self.fs_open => match sig {
-                    Some(sig) => self.storage.on_signal(sig, Instant::now()),
+                out = self.feed_rx.recv(), if self.feed_open => match out {
+                    Some(out) => self.on_feed_out(out),
                     None => {
-                        tracing::warn!("collaboration folder signals ended; changes are seen by the periodic check only");
-                        self.fs_open = false;
+                        tracing::error!("the feed worker ended; hub events are no longer applied");
+                        self.feed_open = false;
                     }
                 },
-                check = self.checks_rx.recv(), if self.checks_open => match check {
-                    Some((p, u)) => {
-                        let evs = self.storage.local_check(&p, &u).await;
-                        self.on_storage_events(evs);
+                out = self.storage_rx.recv(), if self.storage_open => match out {
+                    Some(out) => {
+                        let watcher = (out.degraded, out.network);
+                        if watcher != (self.degraded, self.network) {
+                            (self.degraded, self.network) = watcher;
+                            self.publish_storage();
+                        }
+                        self.on_storage_events(out.events);
                     }
+                    None => {
+                        tracing::error!("the storage task ended; the collaboration folder is no longer watched");
+                        self.storage_open = false;
+                    }
+                },
+                ev = self.events_rx.recv(), if self.events_open && feed_room => match ev {
+                    Some(ev) => {
+                        if let LiveEvent::Hello(h) = &ev {
+                            self.shared.set_session_id(Some(h.session_id.clone()));
+                        }
+                        self.feed_pending.fetch_add(1, Ordering::SeqCst);
+                        self.to_feed(FeedWork::Event(ev));
+                    }
+                    None => self.events_open = false,
+                },
+                check = self.checks_rx.recv(), if self.checks_open => match check {
+                    Some((p, u)) => self.to_storage(StorageWork::Check(p, u)),
                     None => {
                         tracing::warn!("the serve oracle's check channel closed; mismatches wait for the sweep");
                         self.checks_open = false;
@@ -1023,16 +1153,39 @@ impl Runtime {
                 },
                 _ = tokio::time::sleep_until(deadline.into()) => self.on_timers().await,
             }
-        }
-        self.finish(stop).await;
+        };
+        self.finish(exit).await
     }
 
-    async fn finish(mut self, stop: Option<(bool, oneshot::Sender<()>)>) {
+    async fn finish(mut self, exit: Exit) -> RunEnd {
+        let (stop, remount) = match exit {
+            Exit::Stop(stop) => (stop, false),
+            Exit::Remount => (None, true),
+        };
         let sign_out = stop.as_ref().is_some_and(|(s, _)| *s);
+        // The session leaves presence (≤ LEAVE_TIMEOUT) while the rest stops.
         let _ = self.stop_tx.send(true);
         self.exec.shutdown();
-        // The session leaves presence (≤ LEAVE_TIMEOUT) and ends.
-        match tokio::time::timeout(STOP_BOUND, &mut self.session).await {
+        self.feed_task.abort();
+        self.storage_task.abort();
+        match tokio::time::timeout(WORKER_STOP, &mut self.feed_task).await {
+            Ok(Err(e)) if e.is_panic() => tracing::error!(error = %e, "feed worker panicked"),
+            Ok(_) => {}
+            Err(_) => tracing::warn!(
+                duration_ms = WORKER_STOP.as_millis() as u64,
+                "feed worker did not end in time"
+            ),
+        }
+        match tokio::time::timeout(WORKER_STOP, &mut self.storage_task).await {
+            Ok(Err(e)) if e.is_panic() => tracing::error!(error = %e, "storage task panicked"),
+            Ok(_) => {}
+            Err(_) => tracing::warn!(
+                duration_ms = WORKER_STOP.as_millis() as u64,
+                "storage task did not end in time"
+            ),
+        }
+        let session_bound = crate::api::collab_live::session::LEAVE_TIMEOUT + SESSION_MARGIN;
+        match tokio::time::timeout(session_bound, &mut self.session).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::error!(error = %e, "event session task panicked"),
             Err(_) => {
@@ -1050,60 +1203,35 @@ impl Runtime {
         if let Some((_, done)) = stop {
             let _ = done.send(());
         }
+        if remount {
+            RunEnd::Remount
+        } else {
+            RunEnd::Stopped
+        }
     }
 
-    // ── feed events ─────────────────────────────────────────────────────
+    // ── feed results ────────────────────────────────────────────────────
 
-    async fn on_event(&mut self, ev: LiveEvent) {
-        let project = match &ev {
-            LiveEvent::Project(p) => Some(p.project_id.clone()),
-            LiveEvent::Holders(h) => Some(h.project_id.clone()),
-            LiveEvent::Resync(r) => Some(r.project_id.clone()),
-            LiveEvent::Account(a) => Some(a.project_id.clone()),
-            _ => None,
-        };
-        let presence_changed = matches!(ev, LiveEvent::Hello(_) | LiveEvent::Presence(_));
-        if let LiveEvent::Hello(h) = &ev {
-            self.shared.set_session_id(Some(h.session_id.clone()));
-            self.ensure_feed(self.shared.credentials());
-            if !self.refused.is_empty() {
-                tracing::info!(
-                    count = self.refused.len(),
-                    "a new session retries the refused projects"
-                );
-                self.refused.clear();
-                self.serving_dirty = true;
-            }
-        }
-        let (Some(feed), Some(holdings)) = (self.feed.as_mut(), self.holdings.as_mut()) else {
-            tracing::debug!(
-                "feed event before the account was loaded; skipped (the next hello catches up)"
-            );
-            return;
-        };
-        let applied = feed.apply(ev, holdings).await;
-        if presence_changed {
-            if let Ok(mut p) = self.shared.presence.write() {
-                *p = feed.presence.clone();
-            }
-        }
-        match applied {
-            Ok(effects) => {
+    fn on_feed_out(&mut self, out: FeedOut) {
+        match out {
+            FeedOut::Effects(effects) => {
                 for e in effects {
                     self.on_effect(e);
                 }
             }
-            Err(ApiError::Conflict(m)) if m == "epoch_changed" => {
-                tracing::warn!("the hub's epoch changed under the session; reconnecting to reload");
-                self.shared.reconnect_now();
+            FeedOut::NewSession => {
+                if !self.refused.is_empty() {
+                    tracing::info!(
+                        count = self.refused.len(),
+                        "a new session retries the refused projects"
+                    );
+                    for p in std::mem::take(&mut self.refused) {
+                        self.exec.dirty.insert(p);
+                    }
+                    self.serving_dirty = true;
+                }
             }
-            Err(ApiError::Forbidden(e)) => match project {
-                Some(p) => self.refuse(p, &e),
-                None => tracing::error!(error = %e, "feed event refused by the hub"),
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "feed event could not be applied; the next event or the versions vector catches up")
-            }
+            FeedOut::Refused { project_id, error } => self.refuse(project_id, &error),
         }
     }
 
@@ -1118,21 +1246,35 @@ impl Runtime {
         }
     }
 
+    /// The provider derivation's inputs: the shared maps (a short read
+    /// lock) and the presence copy.
+    fn with_derive<T>(&mut self, f: impl FnOnce(&mut Executor, &Derive<'_>) -> T) -> T {
+        let presence = self.shared.presence_copy();
+        let maps = self.maps.read().unwrap_or_else(|p| {
+            tracing::error!("holder maps lock poisoned; read as left");
+            p.into_inner()
+        });
+        let derive = Derive {
+            maps: &maps,
+            presence: &presence,
+            me: &self.me,
+        };
+        f(&mut self.exec, &derive)
+    }
+
     fn on_effect(&mut self, e: FeedEffect) {
         match e {
             FeedEffect::NeedSetChanged(p) | FeedEffect::ProjectJoined(p) => {
                 // A manifest apply: new rows start `wanted` whatever the
                 // policy — the scope is re-derived (Task 15 R1, the T9
-                // carry) — and a moved version may have queued claim
-                // changes (flushed after the usual delay).
+                // carry). The feed worker started the claim flush wait.
                 self.policy_dirty.insert(p.clone());
-                if let Some(h) = self.holdings.as_mut() {
-                    h.note_append(&p, Instant::now());
-                }
                 self.exec.dirty.insert(p);
                 self.serving_dirty = true;
             }
-            FeedEffect::ProvidersChanged(p) => self.refresh_providers(&p),
+            FeedEffect::ProvidersChanged(p) => {
+                self.with_derive(|exec, d| exec.refresh_providers(&p, d));
+            }
             FeedEffect::MembersChanged(p) => {
                 // I11: a device that may no longer connect is closed on both
                 // sides; the policy is re-derived (a caps change).
@@ -1143,7 +1285,7 @@ impl Runtime {
                 }
                 self.policy_dirty.insert(p.clone());
                 self.exec.dirty.insert(p.clone());
-                self.refresh_providers(&p);
+                self.with_derive(|exec, d| exec.refresh_providers(&p, d));
                 self.attention.insert(p);
             }
             FeedEffect::ProjectGone(p) => {
@@ -1153,36 +1295,23 @@ impl Runtime {
             FeedEffect::EpochChanged => {
                 // Every need set AND every provider list in one pass (a
                 // reused version number must not keep an old-epoch list).
-                let derive = Derive {
-                    holdings: self.holdings.as_ref(),
-                    presence: self
-                        .feed
-                        .as_ref()
-                        .map(|f| &f.presence)
-                        .unwrap_or(&EMPTY_PRESENCE),
-                    me: &self.me,
-                };
                 let fetching = self.storage_state.fetching();
-                for p in self.live_projects() {
-                    let refused = self.refused.contains(&p);
-                    self.exec.refresh_need(&p, fetching, refused, &derive, true);
-                }
+                let projects: Vec<(String, bool)> = self
+                    .live_projects()
+                    .into_iter()
+                    .map(|p| {
+                        let refused = self.refused.contains(&p);
+                        (p, refused)
+                    })
+                    .collect();
+                self.with_derive(|exec, d| {
+                    for (p, refused) in &projects {
+                        exec.refresh_need(p, fetching, *refused, d, true);
+                    }
+                });
                 self.serving_dirty = true;
             }
         }
-    }
-
-    fn refresh_providers(&mut self, project_id: &str) {
-        let derive = Derive {
-            holdings: self.holdings.as_ref(),
-            presence: self
-                .feed
-                .as_ref()
-                .map(|f| &f.presence)
-                .unwrap_or(&EMPTY_PRESENCE),
-            me: &self.me,
-        };
-        self.exec.refresh_providers(project_id, &derive);
     }
 
     /// Re-read every dirty need set, publish the serving map and the
@@ -1193,9 +1322,7 @@ impl Runtime {
                 Ok(0) => {}
                 Ok(_) => {
                     // Scope moves are claim changes and attention changes.
-                    if let Some(h) = self.holdings.as_mut() {
-                        h.note_append(&p, Instant::now());
-                    }
+                    self.note_append(&p);
                     self.attention.insert(p);
                 }
                 Err(e) => {
@@ -1204,22 +1331,19 @@ impl Runtime {
             }
         }
         if !self.exec.dirty.is_empty() {
-            let dirty = std::mem::take(&mut self.exec.dirty);
-            let derive = Derive {
-                holdings: self.holdings.as_ref(),
-                presence: self
-                    .feed
-                    .as_ref()
-                    .map(|f| &f.presence)
-                    .unwrap_or(&EMPTY_PRESENCE),
-                me: &self.me,
-            };
+            let dirty: Vec<(String, bool)> = std::mem::take(&mut self.exec.dirty)
+                .into_iter()
+                .map(|p| {
+                    let refused = self.refused.contains(&p);
+                    (p, refused)
+                })
+                .collect();
             let fetching = self.storage_state.fetching();
-            for p in dirty {
-                let refused = self.refused.contains(&p);
-                self.exec
-                    .refresh_need(&p, fetching, refused, &derive, false);
-            }
+            self.with_derive(|exec, d| {
+                for (p, refused) in &dirty {
+                    exec.refresh_need(p, fetching, *refused, d, false);
+                }
+            });
         }
         if self.serving_dirty {
             self.serving_dirty = false;
@@ -1245,7 +1369,6 @@ impl Runtime {
     // ── storage ─────────────────────────────────────────────────────────
 
     fn on_storage_events(&mut self, evs: Vec<StorageEvent>) {
-        let now = Instant::now();
         for ev in evs {
             match ev {
                 StorageEvent::StateChanged {
@@ -1254,9 +1377,7 @@ impl Runtime {
                     to,
                     ..
                 } => {
-                    if let Some(h) = self.holdings.as_mut() {
-                        h.note_append(&project_id, now);
-                    }
+                    self.note_append(&project_id);
                     let listed = |s: LocalState| {
                         matches!(
                             s,
@@ -1328,29 +1449,12 @@ impl Runtime {
         }
     }
 
-    async fn storage_tick(&mut self, now: Instant) {
-        let view = LiveView {
-            ctx: &self.ctx,
-            holdings: self.holdings.as_ref(),
-            presence: self
-                .feed
-                .as_ref()
-                .map(|f| &f.presence)
-                .unwrap_or(&EMPTY_PRESENCE),
-            me: &self.me,
-        };
-        let evs = self.storage.tick(now, &view).await;
-        self.on_storage_events(evs);
-    }
-
-    async fn apply_notes(&mut self) {
+    fn apply_notes(&mut self) {
         let now = Instant::now();
         for note in self.exec.take_notes() {
             match note {
                 Note::Landed(p) => {
-                    if let Some(h) = self.holdings.as_mut() {
-                        h.note_append(&p, now);
-                    }
+                    self.note_append(&p);
                     self.burst
                         .counts
                         .entry(p.clone())
@@ -1371,10 +1475,7 @@ impl Runtime {
                         .or_insert_with(|| blank(&p))
                         .awaiting_gc += 1;
                 }
-                Note::StorageCheck(p, u) => {
-                    let evs = self.storage.local_check(&p, &u).await;
-                    self.on_storage_events(evs);
-                }
+                Note::StorageCheck(p, u) => self.to_storage(StorageWork::Check(p, u)),
             }
         }
         self.flush_bursts(now);
@@ -1404,24 +1505,11 @@ impl Runtime {
 
     // ── timers and reconciliation ───────────────────────────────────────
 
+    /// The loop's own due work: the GC probe, the core's `Tick`, the
+    /// landed bursts. (The holder side's and the storage engine's timers
+    /// run on their workers.)
     async fn on_timers(&mut self) {
         let now = Instant::now();
-        if now >= self.storage.next_deadline() {
-            self.storage_tick(now).await;
-        }
-        let mut refused = Vec::new();
-        if let Some(h) = self.holdings.as_mut() {
-            // Every wake (Task 15 R1): the due flushes AND the hourly check.
-            for (pid, res) in h.flush_due(now).await {
-                if let Err(ApiError::Forbidden(e)) = res {
-                    refused.push((pid, e));
-                }
-            }
-            h.hourly_digest_checks(now).await;
-        }
-        for (pid, e) in refused {
-            self.refuse(pid, &e);
-        }
         if now >= self.next_gc_probe {
             self.next_gc_probe = now + GC_PROBE_EVERY;
             self.exec.gc_probe().await;
@@ -1433,38 +1521,21 @@ impl Runtime {
     }
 
     /// Sync now's reconciliation (P26): the refused projects are retried, a
-    /// digest check per project, a stat sweep, every need set re-read (the
-    /// stream itself was reopened by the caller, so `hello` catches every
-    /// project up).
-    async fn reconcile(&mut self) {
+    /// digest check per project and a stat sweep (both on their workers),
+    /// every need set re-read (the stream itself was reopened by the
+    /// caller, so `hello` catches every project up).
+    fn reconcile(&mut self) {
         if !self.refused.is_empty() {
             self.refused.clear();
             self.serving_dirty = true;
         }
         let projects = self.live_projects();
-        if let Some(h) = self.holdings.as_mut() {
-            for p in &projects {
-                if let Err(e) = h.digest_check(p).await {
-                    tracing::warn!(project_id = %p, error = %e, "sync now: claim digest check failed; retried on the next flush");
-                }
-            }
-        }
-        let view = LiveView {
-            ctx: &self.ctx,
-            holdings: self.holdings.as_ref(),
-            presence: self
-                .feed
-                .as_ref()
-                .map(|f| &f.presence)
-                .unwrap_or(&EMPTY_PRESENCE),
-            me: &self.me,
-        };
-        let evs = self.storage.sweep(&view).await;
-        self.on_storage_events(evs);
+        self.to_feed(FeedWork::DigestAll(projects.clone()));
+        self.to_storage(StorageWork::Sweep);
         for p in projects {
             self.exec.dirty.insert(p);
         }
-        tracing::info!("sync now reconciled");
+        tracing::info!("sync now reconciliation queued");
     }
 }
 
@@ -1476,6 +1547,3 @@ fn blank(project_id: &str) -> CollabFramesLanded {
         awaiting_gc: 0,
     }
 }
-
-static EMPTY_PRESENCE: std::sync::LazyLock<PresenceBook> =
-    std::sync::LazyLock::new(PresenceBook::default);

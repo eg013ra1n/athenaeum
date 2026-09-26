@@ -122,7 +122,9 @@ async fn a_personal_transfer_waits_at_most_one_frame() {
     let w = ts::two_instances_throttled(RATE).await;
     w.b.set_receive_limit(1).await; // one lane: collab holds it
     crate::api::collab_live::set_receive_streams(&w.b.ctx, STREAMS);
-    w.a_publishes_big(4, FRAME).await;
+    // M3 (fix round 1): eight frames — without the yield the lane would be
+    // held for all of them (8 × 2 s), far past the bound.
+    w.a_publishes_big(8, FRAME).await;
     w.b.wait_any_fetch_started(Duration::from_secs(10)).await;
     let admitted = w.b.personal_acquire_timed().await; // time until a personal permit is granted
     let in_flight = (STREAMS as u64) * FRAME as u64;
@@ -242,4 +244,237 @@ async fn nothing_runs_without_a_collaboration_folder_or_signed_out() {
     wait_status(&ctx2, LiveState::SignedOut, Duration::from_secs(5)).await;
     assert!(hub2.connected(ts::PID).is_empty(), "no event stream opened");
     shutdown(&ctx2).await;
+}
+
+// ── Task 15 fix round 1 ─────────────────────────────────────────────────
+
+/// Priority setup shared by the C1 tests: A uploads at 8 MB/s, B has one
+/// receive lane (collab holds it) and two collab streams, A publishes eight
+/// 16 MiB frames and B's fetch is under way. Returns the derived bound a
+/// personal transfer may wait (the units in flight at the cap, plus 3 s).
+async fn lane_held_by_collab(w: &ts::World) -> Duration {
+    const RATE: u64 = 8 * 1024 * 1024;
+    const FRAME: usize = 16 * 1024 * 1024;
+    const STREAMS: usize = 2;
+    w.b.set_receive_limit(1).await;
+    crate::api::collab_live::set_receive_streams(&w.b.ctx, STREAMS);
+    w.a_publishes_big(8, FRAME).await;
+    w.b.wait_any_fetch_started(Duration::from_secs(10)).await;
+    let in_flight = (STREAMS as u64) * FRAME as u64;
+    Duration::from_secs_f64(in_flight as f64 / RATE as f64) + Duration::from_secs(3)
+}
+
+/// The fake hub fails every holder catch-up (the feed worker retries
+/// forever, `Background`), and a resync makes B ask for one. Returns once
+/// B's feed worker is in that retry.
+async fn feed_stuck_in_a_retry(w: &ts::World) {
+    w.hub.set_failing("/holders", true);
+    w.hub.set_failing("/holders/snapshot", true);
+    let before = w.hub.requests_matching("/projects/p1/holders", "").await;
+    w.hub.send_resync(ts::PID, "holders");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // both instances' first attempts, then at least one retry
+    while w.hub.requests_matching("/projects/p1/holders", "").await < before + 3 {
+        assert!(Instant::now() < deadline, "no holder catch-up retried");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// C1 (a): hub HTTP never holds the lane — a feed stuck in its retry, a
+/// personal transfer is still admitted within the derived bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_personal_transfer_is_admitted_while_the_feed_is_stuck_in_a_retry() {
+    let w = ts::two_instances_throttled(8 * 1024 * 1024).await;
+    let bound = lane_held_by_collab(&w).await;
+    feed_stuck_in_a_retry(&w).await;
+    let admitted = w.b.personal_acquire_timed().await;
+    assert!(admitted < bound, "waited {admitted:?} (bound {bound:?})");
+}
+
+/// C1 (b): stop completes cleanly within its bound — never by the timeout
+/// abort — while the feed worker is stuck in a retry, and presence is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_completes_while_the_feed_worker_is_stuck_in_a_retry() {
+    let w = ts::two_instances().await;
+    feed_stuck_in_a_retry(&w).await;
+    let t0 = Instant::now();
+    shutdown(&w.b.ctx).await;
+    let took = t0.elapsed();
+    assert!(
+        took < crate::api::collab_live::runtime::STOP_BOUND,
+        "stop took {took:?}: it hit the bound (the loop never read the stop)"
+    );
+    assert_eq!(status(&w.b.ctx).state, LiveState::Off);
+    assert!(
+        !w.hub.connected(ts::PID).contains(&w.b.device()),
+        "DELETE /me/presence was sent"
+    );
+}
+
+/// C1 (c): a slow sweep (Sync now's, delayed 30 s by the test hook) never
+/// delays the lane's release at a yield.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_sweep_never_delays_a_yields_lane_release() {
+    let mut cfg = ts::live_config();
+    cfg.timings.sweep_delay = Duration::from_secs(30);
+    let w = ts::two_instances_with(Some(8 * 1024 * 1024), cfg).await;
+    let bound = lane_held_by_collab(&w).await;
+    sync_now(&w.b.ctx).unwrap(); // queues the (slow) sweep
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let admitted = w.b.personal_acquire_timed().await;
+    assert!(admitted < bound, "waited {admitted:?} (bound {bound:?})");
+}
+
+/// I2: a landing task that panics is reaped as that fetch's failure — the
+/// core frees its slot (one stream: the next frame still lands) and a
+/// yield still gets the lane back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_landing_frees_its_slot_and_the_lane() {
+    let w = ts::two_instances().await;
+    w.b.set_receive_limit(1).await;
+    crate::api::collab_live::set_receive_streams(&w.b.ctx, 1);
+    crate::api::collab_live::executor::test_hooks::panic_next_landing(&w.b.root);
+    let uuids = w.a_publishes(2).await;
+    // Both land in the end: the panicked one after its back-off, the other
+    // through the slot the panic freed.
+    for u in &uuids {
+        w.b.wait_state(u, LocalState::Held, Duration::from_secs(30))
+            .await;
+    }
+    assert!(
+        !crate::api::collab_live::executor::test_hooks::landing_panic_pending(&w.b.root),
+        "a landing did panic"
+    );
+    // The lane is free again: a personal transfer is admitted at once.
+    let admitted = w.b.personal_acquire_timed().await;
+    assert!(admitted < Duration::from_secs(3), "waited {admitted:?}");
+}
+
+async fn wait_rows(
+    ctx: &crate::services::ServiceContext,
+    what: &str,
+    within: Duration,
+    pred: impl Fn(&[crate::db::collab_frames::LocalFrameRow]) -> bool,
+) {
+    let deadline = Instant::now() + within;
+    loop {
+        let rows = crate::db::collab_frames::list_for_project(
+            &crate::api::db(ctx).unwrap().conn(),
+            ts::PID,
+        )
+        .unwrap();
+        if pred(&rows) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: not within {within:?}: {rows:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The Folders page's "change": clear the designation, designate `dir`.
+async fn redesignate(
+    ctx: &crate::services::ServiceContext,
+    dir: &std::path::Path,
+) -> std::path::PathBuf {
+    crate::api::scan_roots::clear_collaboration_dir(ctx)
+        .await
+        .expect("clear the Collaboration folder");
+    std::fs::create_dir_all(dir).unwrap();
+    crate::api::scan_roots::set_collaboration_dir(
+        ctx,
+        dir.to_string_lossy().to_string(),
+        &crate::api::PathPolicy::AllowAll,
+    )
+    .await
+    .expect("re-designate the Collaboration folder");
+    ts::collab_root(ctx)
+}
+
+/// I1 + owner rule A: re-designating the Collaboration folder mid-run
+/// restarts the runtime on the new store; the replicas under the old folder
+/// leave `held` through the L4 deletion path and a batch of ≤ 10 is
+/// re-fetched into the new folder. Clearing the folder stops the exchange:
+/// nothing is fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redesignated_folder_refetches_into_the_new_root_and_clearing_stops_it() {
+    let w = ts::two_instances().await;
+    let uuids = w.a_publishes(3).await;
+    w.b.wait_all_held(Duration::from_secs(20)).await;
+    let old_root = w.b.root.clone();
+    let other = tempfile::tempdir().unwrap();
+    let new_root = redesignate(&w.b.ctx, &other.path().join("Collab2")).await;
+    wait_rows(
+        &w.b.ctx,
+        "re-fetched under the new root",
+        Duration::from_secs(30),
+        |rows| {
+            rows.iter()
+                .filter(|r| uuids.contains(&r.frame_uuid))
+                .all(|r| {
+                    r.local_state == LocalState::Held
+                        && r.landed_path
+                            .as_deref()
+                            .is_some_and(|p| std::path::Path::new(p).starts_with(&new_root))
+                })
+        },
+    )
+    .await;
+    wait_status(&w.b.ctx, LiveState::Live, Duration::from_secs(5)).await;
+    for u in &uuids {
+        assert_eq!(w.b.file_bytes(u), w.a.file_bytes(u));
+    }
+    // the old files are the user's: left where they were
+    assert!(walk_files(&old_root) >= uuids.len());
+
+    // Cleared: the runtime stops at its store's unmount; nothing is fetched.
+    crate::api::scan_roots::clear_collaboration_dir(&w.b.ctx)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while status(&w.b.ctx).storage != crate::api::collab_live::StorageStateView::NotSet {
+        assert!(Instant::now() < deadline, "status {:?}", status(&w.b.ctx));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_ne!(status(&w.b.ctx).state, LiveState::Live);
+    let late = w.a_publishes(1).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        w.b.row(&late[0])
+            .is_none_or(|r| r.local_state != LocalState::Held),
+        "nothing fetched without a Collaboration folder"
+    );
+}
+
+/// Owner rule A, the mass case: more than ten replicas outside the new
+/// root in the window raise the one deletion choice instead of a re-fetch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redesignation_over_ten_frames_raises_the_deletion_choice() {
+    let w = ts::two_instances().await;
+    let uuids = w.a_publishes(11).await;
+    w.b.wait_all_held(Duration::from_secs(30)).await;
+    let other = tempfile::tempdir().unwrap();
+    redesignate(&w.b.ctx, &other.path().join("Collab2")).await;
+    wait_rows(
+        &w.b.ctx,
+        "every replica awaits the choice",
+        Duration::from_secs(30),
+        |rows| {
+            rows.iter()
+                .filter(|r| uuids.contains(&r.frame_uuid))
+                .all(|r| r.local_state == LocalState::AwaitingChoice)
+        },
+    )
+    .await;
+}
+
+fn walk_files(root: &std::path::Path) -> usize {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| !e.path().components().any(|c| c.as_os_str() == ".athenaeum"))
+        .count()
 }

@@ -288,7 +288,14 @@ async fn beat_loop(
             serving: serving.borrow_and_update().clone(),
             relay_url: node.home_relay_url(),
         };
-        match client.presence_beat(&body).await {
+        // M1 (fix round 1): a beat in flight never delays the clean exit's
+        // `DELETE /me/presence` — the end cuts it.
+        let beat = tokio::select! {
+            biased;
+            _ = end.changed() => return,
+            beat = client.presence_beat(&body) => beat,
+        };
+        match beat {
             Ok(()) => {}
             Err(AccountClientError::SessionGone) => {
                 tracing::info!("presence session gone; reopening the event stream");

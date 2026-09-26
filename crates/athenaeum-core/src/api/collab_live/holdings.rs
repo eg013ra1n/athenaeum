@@ -10,7 +10,7 @@
 //! alone.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use rusqlite::Connection;
@@ -87,6 +87,12 @@ impl From<rusqlite::Error> for SendErr {
     }
 }
 
+fn write_maps(
+    maps: &HolderMaps,
+) -> std::sync::RwLockWriteGuard<'_, HashMap<String, ProjectHolders>> {
+    maps.write().unwrap_or_else(|p| p.into_inner())
+}
+
 /// One project's retry state after a failed report.
 #[derive(Default)]
 struct Retry {
@@ -96,13 +102,20 @@ struct Retry {
     outage_logged: bool,
 }
 
+/// Every live project's in-memory holder map, shared between the holder
+/// side (the feed worker writes it) and the runtime loop and the storage
+/// task (they read it) — Task 15 fix round 1, C1. The lock is never held
+/// across an await: writers apply a delta or swap a map in between their
+/// hub calls, readers derive a provider list or a redundancy and let go.
+pub type HolderMaps = Arc<RwLock<HashMap<String, ProjectHolders>>>;
+
 /// Every live project's holder map, flush clock and report retry state.
 pub struct Holdings {
     ctx: Arc<ServiceContext>,
     client: CollabClient,
     token: String,
     me: String,
-    maps: HashMap<String, ProjectHolders>,
+    maps: HolderMaps,
     clocks: HashMap<String, FlushClock>,
     backoffs: HashMap<String, Retry>,
     /// Projects whose `full: true` report is owed (a digest mismatch after
@@ -146,7 +159,7 @@ impl Holdings {
             client,
             token,
             me,
-            maps,
+            maps: Arc::new(RwLock::new(maps)),
             clocks,
             backoffs: HashMap::new(),
             needs_full: HashSet::new(),
@@ -159,25 +172,53 @@ impl Holdings {
         &self.me
     }
 
-    pub fn map(&self, project_id: &str) -> Option<&ProjectHolders> {
-        self.maps.get(project_id)
+    /// A copy of one project's in-memory holder map.
+    pub fn map(&self, project_id: &str) -> Option<ProjectHolders> {
+        self.read_maps().get(project_id).cloned()
     }
 
-    /// The in-memory map, loaded from its persisted rows when this session
-    /// has not seen the project yet.
-    fn map_mut(&mut self, project_id: &str) -> Result<&mut ProjectHolders, ApiError> {
-        if !self.maps.contains_key(project_id) {
+    /// The shared maps: the runtime and the storage task read them while
+    /// this holder side keeps them current.
+    pub fn maps_handle(&self) -> HolderMaps {
+        Arc::clone(&self.maps)
+    }
+
+    /// Move this holder side onto `target` (its contents replaced by this
+    /// side's maps), so readers holding `target` see every later change.
+    pub fn share_into(&mut self, target: &HolderMaps) {
+        let loaded = std::mem::take(&mut *write_maps(&self.maps));
+        *write_maps(target) = loaded;
+        self.maps = Arc::clone(target);
+    }
+
+    fn read_maps(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, ProjectHolders>> {
+        self.maps.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Apply `f` to the in-memory map, loaded from its persisted rows when
+    /// this session has not seen the project yet. The lock is held only for
+    /// `f` (never across an await).
+    fn with_map_mut(
+        &mut self,
+        project_id: &str,
+        f: impl FnOnce(&mut ProjectHolders),
+    ) -> Result<(), ApiError> {
+        let loaded = if self.read_maps().contains_key(project_id) {
+            None
+        } else {
             let (devices, claims) = {
                 let database = db(&self.ctx)?;
                 let conn = database.conn();
                 live_db::load_holders(&conn, project_id)?
             };
-            self.maps.insert(
-                project_id.to_string(),
-                ProjectHolders::from_rows(&devices, &claims),
-            );
+            Some(ProjectHolders::from_rows(&devices, &claims))
+        };
+        let mut maps = write_maps(&self.maps);
+        if let Some(map) = loaded {
+            maps.entry(project_id.to_string()).or_insert(map);
         }
-        Ok(self.maps.get_mut(project_id).expect("inserted above"))
+        f(maps.get_mut(project_id).expect("inserted above"));
+        Ok(())
     }
 
     /// The stored holder cursor, `None` when the project is not a live cache
@@ -214,7 +255,7 @@ impl Holdings {
             let conn = database.conn();
             persist_snapshot(&conn, project_id, &map, &snap)?;
         }
-        self.maps.insert(project_id.to_string(), map);
+        write_maps(&self.maps).insert(project_id.to_string(), map);
         tracing::info!(
             project_id,
             holder_seq = snap.holder_seq,
@@ -286,10 +327,11 @@ impl Holdings {
                     let conn = database.conn();
                     apply_deltas(&conn, project_id, &page.deltas, None)?;
                 }
-                let map = self.map_mut(project_id)?;
-                for d in &page.deltas {
-                    map.apply_delta(d);
-                }
+                self.with_map_mut(project_id, |map| {
+                    for d in &page.deltas {
+                        map.apply_delta(d);
+                    }
+                })?;
                 applied = true;
             }
             if !page.has_more {
@@ -683,10 +725,11 @@ impl HolderSide for Holdings {
                     let conn = database.conn();
                     apply_deltas(&conn, &ev.project_id, &ev.deltas, Some(ev.seq))?;
                 }
-                let map = self.map_mut(&ev.project_id)?;
-                for d in &ev.deltas {
-                    map.apply_delta(d);
-                }
+                self.with_map_mut(&ev.project_id, |map| {
+                    for d in &ev.deltas {
+                        map.apply_delta(d);
+                    }
+                })?;
                 Ok(if ev.deltas.is_empty() {
                     vec![]
                 } else {
@@ -716,7 +759,7 @@ impl HolderSide for Holdings {
     }
 
     fn forget(&mut self, project_id: &str) {
-        self.maps.remove(project_id);
+        write_maps(&self.maps).remove(project_id);
         self.clocks.remove(project_id);
         self.backoffs.remove(project_id);
         self.needs_full.remove(project_id);

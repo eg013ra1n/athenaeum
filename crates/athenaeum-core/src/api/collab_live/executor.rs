@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, watch};
 use crate::api::collab_exchange::{
     drop_tag, read_policy, role_allows_replication, ReplicationPolicy,
 };
-use crate::api::collab_live::holdings::{member_devices, Holdings};
+use crate::api::collab_live::holdings::member_devices;
 use crate::api::collab_live::landing::{
     identical_landed, land_frame, link_identical, project_frame_in_flight_tag, Landed, LandingEnv,
 };
@@ -82,7 +82,8 @@ pub(crate) struct ExecEnv {
 /// What the provider derivation reads (spec §6.1, I4/I5): the holder maps,
 /// the presence book and this device's id.
 pub(crate) struct Derive<'a> {
-    pub holdings: Option<&'a Holdings>,
+    /// The live holder maps (read under the runtime's short read lock).
+    pub maps: &'a HashMap<String, crate::collab::live::holders::ProjectHolders>,
     pub presence: &'a PresenceBook,
     pub me: &'a str,
 }
@@ -158,6 +159,18 @@ struct Run {
     items: mpsc::Sender<LiveItem>,
 }
 
+/// What one of the executor's tasks was doing, so a task that panicked is
+/// reaped as its fetch's failure or its run's end (Task 15 fix round 1,
+/// I2) — never a leaked core slot or a lane held forever.
+enum TaskKind {
+    /// A prepare or landing task of the item named so.
+    Item(String),
+    /// The live run with this id.
+    Run(u64),
+    /// A tag cleanup.
+    Cleanup,
+}
+
 pub(crate) struct Executor {
     env: Arc<ExecEnv>,
     core: Core,
@@ -175,7 +188,10 @@ pub(crate) struct Executor {
     requesting: Option<tokio::task::JoinHandle<()>>,
     run: Option<Run>,
     run_seq: u64,
-    tasks: tokio::task::JoinSet<()>,
+    /// Every task this executor runs; the runtime reaps them
+    /// ([`Executor::on_task_ended`]).
+    pub(crate) tasks: tokio::task::JoinSet<()>,
+    task_kinds: HashMap<tokio::task::Id, TaskKind>,
     events_tx: mpsc::UnboundedSender<ExecEvent>,
     pub(crate) events_rx: mpsc::UnboundedReceiver<ExecEvent>,
     done_tx: mpsc::UnboundedSender<(String, ItemOutcome)>,
@@ -347,6 +363,7 @@ impl Executor {
             run: None,
             run_seq: 0,
             tasks: tokio::task::JoinSet::new(),
+            task_kinds: HashMap::new(),
             events_tx,
             events_rx,
             done_tx,
@@ -439,7 +456,7 @@ impl Executor {
         };
         let old = self.need.remove(project_id).unwrap_or_default();
         let mut next: BTreeMap<String, NeedEntry> = BTreeMap::new();
-        let mut entered: Vec<String> = Vec::new();
+        let mut entered: HashSet<String> = HashSet::new();
         for r in &rows {
             let uuid = r.want.key.1.clone();
             let kept = old.get(&uuid).filter(|e| {
@@ -451,7 +468,7 @@ impl Executor {
                 kept.and_then(|e| e.fed.clone())
             };
             if fed.is_none() {
-                entered.push(uuid.clone());
+                entered.insert(uuid.clone());
             }
             next.insert(
                 uuid,
@@ -510,12 +527,12 @@ impl Executor {
         &mut self,
         project: &CollabProjectRow,
         derive: &Derive<'_>,
-        only: Option<&[String]>,
+        only: Option<&HashSet<String>>,
     ) {
         let pid = project.project_id.clone();
         let members = member_devices(project);
         let none = HashSet::new();
-        let map = derive.holdings.and_then(|h| h.map(&pid));
+        let map = derive.maps.get(&pid);
         let mut lists = Vec::new();
         let Some(entries) = self.need.get_mut(&pid) else {
             return;
@@ -728,10 +745,12 @@ impl Executor {
         );
         let env = Arc::clone(&self.env);
         let tx = self.events_tx.clone();
-        self.tasks.spawn(async move {
+        let kind = TaskKind::Item(name.clone());
+        let task = self.tasks.spawn(async move {
             let outcome = prepare(&env, &key, content_version, &blake3, hash).await;
             let _ = tx.send(ExecEvent::Prepared { name, outcome });
         });
+        self.task_kinds.insert(task.id(), kind);
     }
 
     fn request_lane(&mut self) {
@@ -776,10 +795,11 @@ impl Executor {
             let verdicts = self.verdicts_tx.clone();
             let yield_now = self.env.control.receive_gate.yield_signal();
             let ev = self.events_tx.clone();
-            self.tasks.spawn(async move {
+            let task = self.tasks.spawn(async move {
                 run_live(&store, dialer, rx, opts, done, verdicts, yield_now).await;
                 let _ = ev.send(ExecEvent::RunEnded { run: id });
             });
+            self.task_kinds.insert(task.id(), TaskKind::Run(id));
             tracing::debug!(count = id, "collab live run started");
             self.run = Some(Run { id, items: tx });
         }
@@ -924,10 +944,12 @@ impl Executor {
         let started_at = item.started_at.clone();
         let name = name.to_string();
         let tx = self.events_tx.clone();
-        self.tasks.spawn(async move {
+        let kind = TaskKind::Item(name.clone());
+        let task = self.tasks.spawn(async move {
             let landed = land(&env, &row, hash, &started_at).await;
             let _ = tx.send(ExecEvent::Landed { name, landed });
         });
+        self.task_kinds.insert(task.id(), kind);
     }
 
     fn on_landed(&mut self, name: String, landed: Landed) {
@@ -1096,8 +1118,56 @@ impl Executor {
         };
         let store = self.env.store.clone();
         let tag = project_frame_in_flight_tag(project_id, frame_uuid, cv);
-        self.tasks
+        let task = self
+            .tasks
             .spawn(async move { drop_tag(&store, &tag).await });
+        self.task_kinds.insert(task.id(), TaskKind::Cleanup);
+    }
+
+    /// One of this executor's tasks ended (the runtime reaps the join set).
+    /// A task that panicked is its item's failure (the core frees the slot
+    /// and backs the frame off) or its run's end (items still queued are
+    /// cancelled and re-queued), so a panic never leaks a slot or the lane
+    /// (Task 15 fix round 1, I2). A task aborted by the shutdown is not an
+    /// error.
+    pub(crate) async fn on_task_ended(
+        &mut self,
+        ended: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
+    ) {
+        let (id, failure) = match ended {
+            Ok((id, ())) => (id, None),
+            Err(e) => (e.id(), Some(e)),
+        };
+        let kind = self.task_kinds.remove(&id);
+        let Some(e) = failure else {
+            return;
+        };
+        if e.is_cancelled() {
+            return;
+        }
+        match kind {
+            Some(TaskKind::Item(name)) => {
+                let key = self.items.get(&name).map(|i| i.key.clone());
+                tracing::error!(frame_uuid = %name, error = %e, "a fetch task panicked; the fetch failed");
+                if let Some((pid, uuid)) = key {
+                    crate::api::collab_exchange::record_frame_error(
+                        &self.env.ctx,
+                        &pid,
+                        &uuid,
+                        &format!("internal error: {e}"),
+                    );
+                    self.notes.push(Note::Failed(pid));
+                }
+                self.finish(&name, FetchResult::Failed).await;
+            }
+            Some(TaskKind::Run(run)) => {
+                tracing::error!(error = %e, "the collab live run panicked; its fetches are re-queued");
+                self.on_event(ExecEvent::RunEnded { run }).await;
+            }
+            Some(TaskKind::Cleanup) | None => {
+                tracing::error!(error = %e, "a collab executor task panicked");
+            }
+        }
     }
 
     /// I11: close every pooled connection to a node the connect gate no
@@ -1158,6 +1228,7 @@ impl Executor {
         }
         self.run = None;
         self.tasks.abort_all();
+        self.task_kinds.clear();
         self.permit = None;
         for item in self.items.values() {
             item.cancel.send_replace(true);
@@ -1215,8 +1286,16 @@ async fn prepare(
     }
     // The row's own file already holds this version (its bytes put back):
     // re-adopted, no transfer. A file of the previous version (`prev_stamp`
-    // set) never does — no hash spent on it.
-    if let Some(path) = row.landed_path.as_deref().map(PathBuf::from) {
+    // set) never does — no hash spent on it. A replica file outside the
+    // CURRENT Collaboration root never does either: after a re-designation
+    // it counts as gone and the frame is fetched into the new root (owner
+    // rule, Task 15 fix round 1, I1).
+    if let Some(path) = row
+        .landed_path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|p| crate::api::collab_exchange::inside_root(Some(&env.root), &row, p))
+    {
         if own_file_holds(env, &row, &path).await {
             match crate::api::collab_live::replace::adopt_by_hash(
                 &env.ctx, &env.node, &env.root, &path,
@@ -1306,6 +1385,10 @@ async fn own_file_holds(env: &ExecEnv, row: &LocalFrameRow, path: &std::path::Pa
 
 /// Land one fetched frame through the moved wave-2 landing (Task 11).
 async fn land(env: &ExecEnv, row: &LocalFrameRow, hash: Hash, started_at: &str) -> Landed {
+    #[cfg(test)]
+    if test_hooks::take_landing_panic(&env.root) {
+        panic!("injected landing panic (test hook)");
+    }
     let project = match landing_project(env, row) {
         Ok(p) => p,
         Err(landed) => return landed,
@@ -1322,6 +1405,41 @@ async fn land(env: &ExecEnv, row: &LocalFrameRow, hash: Hash, started_at: &str) 
         hooks: &hooks,
     };
     land_frame(&landing, row, hash).await
+}
+
+/// Test hooks (Task 15 fix round 1, I2): the next landing under a root
+/// panics, once.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static PANIC_NEXT_LANDING: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+    pub(crate) fn panic_next_landing(root: &Path) {
+        PANIC_NEXT_LANDING
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert(root.to_path_buf());
+    }
+
+    pub(crate) fn landing_panic_pending(root: &Path) -> bool {
+        PANIC_NEXT_LANDING
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.contains(root))
+    }
+
+    pub(super) fn take_landing_panic(root: &Path) -> bool {
+        PANIC_NEXT_LANDING
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|s| s.remove(root))
+    }
 }
 
 /// The frame's project row as it is now (a landing names its folder).
@@ -1401,6 +1519,30 @@ mod tests {
         }
         let node = ctx.iroh_node.lock().await.clone().unwrap();
         let root = ts::collab_root(&ctx);
+        // M4 (fix round 1): g2's entry is DEAD — complete per the store, its
+        // referenced file gone — so the GC has not dropped it yet: it stays
+        // parked.
+        let big: Vec<u8> = (0..40 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let g2 = root.join("m31").join("g2.fits");
+        ts::land_frame(&ctx, &hub, &node, "g2", &g2, &big).await;
+        std::fs::remove_file(&g2).unwrap();
+        let g2_hash: Hash = blake3::hash(&big).to_hex().parse().unwrap();
+        assert_eq!(
+            node.collab_blob_health(g2_hash).await.unwrap(),
+            BlobHealth::Dead
+        );
+        {
+            // as a landing parks it (P20): wanted, no stamp, awaiting the GC
+            let conn = db(&ctx).unwrap().conn();
+            conn.execute(
+                "UPDATE project_frames_local SET local_state = 'wanted', size_mtime_seen = NULL
+                 WHERE project_id = ?1 AND frame_uuid = 'g2'",
+                rusqlite::params![ts::PID],
+            )
+            .unwrap();
+            frames_db::set_awaiting_gc(&conn, ts::PID, "g2", true).unwrap();
+            assert_eq!(frames_db::awaiting_gc_released(&conn).unwrap().len(), 2);
+        }
         let me = crate::api::account::own_device_id(&ctx).unwrap();
         let mut exec = Executor::new(
             ExecEnv {
@@ -1420,6 +1562,10 @@ mod tests {
             .unwrap();
         assert!(!row.awaiting_gc, "released: its entry is gone");
         assert!(exec.dirty.contains(ts::PID), "its need set is re-read");
+        let g2 = frames_db::get(&db(&ctx).unwrap().conn(), ts::PID, "g2")
+            .unwrap()
+            .unwrap();
+        assert!(g2.awaiting_gc, "a dead entry keeps its frame parked");
         exec.shutdown();
     }
 

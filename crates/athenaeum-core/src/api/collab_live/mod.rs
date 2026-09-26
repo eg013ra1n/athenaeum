@@ -34,6 +34,10 @@ pub(crate) mod executor;
 mod runtime;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub(crate) mod session;
+// The runtime's off-loop workers (Task 15 fix round 1, C1): the ordered
+// feed worker and the storage task.
+#[cfg(all(feature = "render", feature = "solver"))]
+mod workers;
 #[cfg(all(feature = "render", feature = "solver"))]
 #[allow(unused_imports)] // read by the Task 16 commands
 pub(crate) use runtime::holder_view;

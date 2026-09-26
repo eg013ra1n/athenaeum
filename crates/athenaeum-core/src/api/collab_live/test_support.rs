@@ -1131,6 +1131,16 @@ pub(crate) const LIVE_TIMINGS: crate::collab::fake_hub::FakeTimings =
     };
 pub(crate) const LIVE_BEAT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The live tests' runtime config: a beat inside the fake hub's shortened
+/// silence rule, a fast ready poll.
+pub(crate) fn live_config() -> crate::api::collab_live::LiveConfig {
+    crate::api::collab_live::LiveConfig {
+        beat: LIVE_BEAT,
+        ready_poll: std::time::Duration::from_millis(100),
+        ..Default::default()
+    }
+}
+
 /// One app instance with a live exchange: its own catalog, a bound
 /// relay-disabled node, its Collaboration root, and a receive gate it owns
 /// (the sync receiver is never started here).
@@ -1207,11 +1217,11 @@ impl Instance {
     /// Arm the live exchange (the test config: a beat inside the fake
     /// hub's shortened silence rule).
     pub(crate) fn start_live(&self) {
-        let cfg = crate::api::collab_live::LiveConfig {
-            beat: LIVE_BEAT,
-            ready_poll: std::time::Duration::from_millis(100),
-            ..Default::default()
-        };
+        self.start_live_with(live_config());
+    }
+
+    /// [`start_live`](Self::start_live) with `cfg`.
+    pub(crate) fn start_live_with(&self, cfg: crate::api::collab_live::LiveConfig) {
         crate::api::collab_live::spawn_with(
             Arc::clone(&self.ctx),
             crate::api::collab_live::GateSource::Fixed(Arc::clone(&self.control)),
@@ -1360,15 +1370,20 @@ pub(crate) struct World {
 }
 
 pub(crate) async fn two_instances() -> World {
-    two_instances_with(None).await
+    two_instances_with(None, live_config()).await
 }
 
 /// As [`two_instances`], A's uploads capped at `bps` bytes per second.
 pub(crate) async fn two_instances_throttled(bps: u64) -> World {
-    two_instances_with(Some(bps)).await
+    two_instances_with(Some(bps), live_config()).await
 }
 
-async fn two_instances_with(throttle: Option<u64>) -> World {
+/// As [`two_instances`], A's uploads optionally capped, B's live exchange
+/// run with `b_cfg`.
+pub(crate) async fn two_instances_with(
+    throttle: Option<u64>,
+    b_cfg: crate::api::collab_live::LiveConfig,
+) -> World {
     let hub = FakeHub::start().await;
     hub.set_timings(LIVE_TIMINGS);
     hub.add_project(
@@ -1388,7 +1403,7 @@ async fn two_instances_with(throttle: Option<u64>) -> World {
         a.node.set_upload_limit(bps);
     }
     a.start_live();
-    b.start_live();
+    b.start_live_with(b_cfg);
     let window = std::time::Duration::from_secs(10);
     hub.wait_connected(PID, &a.device(), window).await;
     hub.wait_connected(PID, &b.device(), window).await;
