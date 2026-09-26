@@ -44,6 +44,10 @@ pub enum AccountClientError {
     DuplicateName,
     /// 400 elsewhere — malformed request (e.g. bad pubkey, bad code shape).
     BadRequest(String),
+    /// 404 — the referenced device does not exist (any more). Distinct from
+    /// [`Self::BadRequest`] so a caller can type-check "already retired /
+    /// gone" without string-matching a message (T7 fix round 2, point 2).
+    NotFound(String),
     /// 403 — the account's role may not perform this action.
     Forbidden,
     /// 409 on a collab v3 (per-frame) endpoint whose body is exactly
@@ -144,6 +148,7 @@ impl std::fmt::Display for AccountClientError {
             | AccountClientError::DeviceConflict(m)
             | AccountClientError::PeerValidation(m)
             | AccountClientError::BadRequest(m)
+            | AccountClientError::NotFound(m)
             | AccountClientError::Decode(m)
             | AccountClientError::Network(m) => f.write_str(m),
         }
@@ -296,7 +301,7 @@ impl HubClient {
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
-            StatusCode::NOT_FOUND => Err(AccountClientError::BadRequest("no such device".into())),
+            StatusCode::NOT_FOUND => Err(AccountClientError::NotFound("no such device".into())),
             s => Err(unexpected(s, resp).await),
         }
     }

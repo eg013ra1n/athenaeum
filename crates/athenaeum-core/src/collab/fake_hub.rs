@@ -3798,7 +3798,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, crate::account::AccountClientError::BadRequest(_)),
+            matches!(err, crate::account::AccountClientError::NotFound(_)),
             "retired is terminal: a second retire 404s, {err:?}"
         );
     }

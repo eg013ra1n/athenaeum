@@ -1180,13 +1180,20 @@ async fn mount_configured_collab_root(ctx: &ServiceContext, node: &SharedIrohNod
     let Some(root) = root else { return };
     let root_path = Path::new(&root);
     match crate::api::collab_exchange::check_storage_marker(ctx, root_path).await {
-        Ok(state) if state.serving() => {
-            if let Err(e) = node.set_collab_root(Some(root_path)).await {
+        Ok(check) if check.state.serving() => match node.set_collab_root(Some(root_path)).await {
+            Ok(()) => {
+                if let Err(e) =
+                    crate::api::collab_exchange::commit_marker_check(ctx, root_path, check.pending)
+                {
+                    tracing::error!(path = %root, error = %e, "recording the storage marker after mount at bind failed");
+                }
+            }
+            Err(e) => {
                 tracing::warn!(path = %root, error = %format!("{e:#}"), "collab store not mounted at bind");
             }
-        }
-        Ok(state) => {
-            tracing::warn!(path = %root, state = ?state, "collab store not mounted at bind: storage not available");
+        },
+        Ok(check) => {
+            tracing::warn!(path = %root, state = ?check.state, "collab store not mounted at bind: storage not available");
         }
         Err(e) => {
             tracing::warn!(path = %root, error = %e, "collab store not mounted at bind: storage marker check failed");

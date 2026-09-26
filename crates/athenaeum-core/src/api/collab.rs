@@ -882,6 +882,7 @@ fn client_err(e: crate::account::AccountClientError) -> ApiError {
         }
         E::SecondPrimary(m) | E::DeviceConflict(m) => ApiError::Conflict(m),
         E::PeerValidation(m) | E::BadRequest(m) => ApiError::Invalid(m),
+        E::NotFound(m) => ApiError::NotFound(m),
         E::DuplicateName => ApiError::Invalid("name already in use".into()),
         E::Forbidden => {
             ApiError::Forbidden("The account's role may not perform this action.".into())

@@ -43,6 +43,7 @@ pub(crate) fn client_err(e: crate::account::AccountClientError) -> ApiError {
         }
         E::SecondPrimary(m) | E::DeviceConflict(m) => ApiError::Conflict(m),
         E::PeerValidation(m) | E::BadRequest(m) => ApiError::Invalid(m),
+        E::NotFound(m) => ApiError::NotFound(m),
         E::DuplicateName => ApiError::Invalid("name already in use".into()),
         E::Forbidden => {
             ApiError::Forbidden("The account's role may not perform this action.".into())
@@ -1409,44 +1410,51 @@ fn check_and_adopt_marker(
     }
 }
 
+/// The result of [`check_storage_marker`]: the resolved state, and — when a
+/// marker was freshly written or recognized as already naming this device —
+/// the marker a caller should [`commit_marker_check`] once whatever it
+/// gates (a mount) actually succeeds. Never persisted by the check itself
+/// (fix round 2, ruling 6): a caller that never mounts, or whose mount
+/// fails, must leave any previously recorded marker exactly as it was.
+pub(crate) struct MarkerCheck {
+    pub state: crate::collab::storage::marker::StoreState,
+    pub pending: Option<crate::collab::storage::marker::StoreMarker>,
+}
+
 /// Verify the Collaboration root's storage marker (spec §9.1, plan P22)
 /// against what this device last recorded: refuse another device's disk,
-/// forget a stale record for a path that changed, and persist a fresh or
-/// returning marker. Never mounts or unmounts anything — the caller gates
-/// `set_collab_root`/holds/fetch/publish on the returned state's
-/// `serving()`/`fetching()`. This is the ONE check `scan_roots::set_collaboration_dir`'s
-/// designation, this module's own lazy mount ([`ensure_collab_store`]), and
-/// `api::sync`'s mount-at-bind all run, so a folder that fails to designate
-/// can never later be mounted, and vice versa.
+/// treat a recorded marker for a DIFFERENT path as not recorded for this
+/// check (comparing it against this path's on-disk marker would compare
+/// apples to oranges). Never mounts, unmounts or writes to the catalog —
+/// the caller gates `set_collab_root`/holds/fetch/publish on the returned
+/// state's `serving()`/`fetching()`, and persists `pending` (via
+/// [`commit_marker_check`]) only once its own mount actually succeeds. This
+/// is the ONE check `scan_roots::set_collaboration_dir`'s designation, this
+/// module's own lazy mount ([`ensure_collab_store`]), and `api::sync`'s
+/// mount-at-bind all run, so a folder that fails to designate can never
+/// later be mounted, and vice versa.
 ///
-/// Fix round 1: never holds the pooled connection across the filesystem
-/// check (the read and the eventual record are two separate, short
-/// checkouts; the check itself runs in `spawn_blocking`). It also applies
-/// spec §9.1's "one that is not retired": a marker naming a device of THIS
-/// account that the hub no longer lists as active (i.e. retired — the hub
-/// has no "list retired devices" endpoint, so "not currently active" is the
-/// only signal available) is silently taken over rather than refused —
-/// otherwise a retired device's marker would block the folder forever. A
-/// hub call that fails (signed out, offline) is conservative: it keeps
-/// refusing rather than risk overwriting a still-live device's claim.
+/// Fix round 2, ruling 1: makes NO hub call and offers no automatic
+/// takeover of any kind — absence from this account's active device list is
+/// not proof of same-account ownership (it could be another account's
+/// device, a plain-revoked device, or a swapped disk). A marker naming
+/// another device always refuses; classifying that refusal (a still-active
+/// device of this account vs. one this device cannot vouch for at all) is
+/// the caller's job at the ONE place that surfaces it to the user
+/// (`scan_roots::check_storage_marker_for_designation`), never here — this
+/// function runs on background paths (lazy mount, bind-mount) too, where a
+/// hub call's failure-side-effect (a 401 clearing the local session) has no
+/// business firing.
 pub(crate) async fn check_storage_marker(
     ctx: &ServiceContext,
     root: &Path,
-) -> Result<crate::collab::storage::marker::StoreState, ApiError> {
-    use crate::collab::storage::marker::{
-        writable, write_marker, StoreMarker, StoreState, UnavailableReason,
-    };
-
+) -> Result<MarkerCheck, ApiError> {
     let me = crate::api::account::own_device_id(ctx)?;
     let root_str = root.to_string_lossy().to_string();
 
-    // Fix round 1 (folded minor): a recorded marker for a DIFFERENT path is
-    // simply not `recorded` for THIS check (comparing it against the new
-    // path's on-disk marker would compare apples to oranges) — but its row
-    // is never deleted here. A successful check below overwrites it via
-    // `record_store_marker` anyway; a refused/failed check for the new path
-    // leaves the old path's record exactly as it was, so a failed attempt
-    // elsewhere never costs a still-valid designation its history.
+    // A recorded marker for a DIFFERENT path is simply not `recorded` for
+    // THIS check — never deleted here (ruling 6: only a caller's successful
+    // `commit_marker_check` ever overwrites the persisted record).
     let recorded = {
         let db = db(ctx)?;
         let conn = db.conn();
@@ -1460,63 +1468,31 @@ pub(crate) async fn check_storage_marker(
 
     let root_for_task = root.to_path_buf();
     let me_for_task = me.clone();
-    let (mut state, mut adopted) = tokio::task::spawn_blocking(move || {
+    let (state, pending) = tokio::task::spawn_blocking(move || {
         check_and_adopt_marker(&root_for_task, recorded, &me_for_task)
     })
     .await
     .map_err(|e| ApiError::Internal(format!("storage marker check task join: {e}")))?;
 
-    if let StoreState::Unavailable(UnavailableReason::OtherDevice { device_id }) = &state {
-        let device_id = device_id.clone();
-        let active = match crate::api::account::list_devices(ctx).await {
-            Ok(devices) => devices.iter().any(|d| d.pubkey == device_id),
-            Err(e) => {
-                tracing::warn!(path = %root_str, device_id = %device_id, error = %e, "storage marker: could not confirm the other device is retired; refusing");
-                true
-            }
-        };
-        if !active {
-            let root_for_task = root.to_path_buf();
-            let me_for_task = me.clone();
-            let new_state = tokio::task::spawn_blocking(move || {
-                let store_id = match crate::collab::storage::marker::read_marker(&root_for_task) {
-                    Ok(Some(m)) => m.store_id,
-                    _ => uuid::Uuid::new_v4().to_string(),
-                };
-                let m = StoreMarker {
-                    store_id,
-                    device_id: me_for_task,
-                };
-                let state = match write_marker(&root_for_task, &m) {
-                    Ok(()) => {
-                        if writable(&root_for_task) {
-                            StoreState::Available
-                        } else {
-                            StoreState::ReadOnly
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = %root_for_task.display(), error = %e, "collaboration store marker could not be written");
-                        StoreState::ReadOnly
-                    }
-                };
-                (state, m)
-            })
-            .await
-            .map_err(|e| ApiError::Internal(format!("storage marker rewrite task join: {e}")))?;
-            let (new_state, new_marker) = new_state;
-            tracing::info!(path = %root_str, device_id = %device_id, "collaboration folder's marker named a retired device; taken over");
-            state = new_state;
-            adopted = Some(new_marker);
-        }
-    }
+    Ok(MarkerCheck { state, pending })
+}
 
-    if let Some(m) = adopted {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        crate::db::collab_live::record_store_marker(&conn, &m, &root_str)?;
-    }
-    Ok(state)
+/// Persist a [`MarkerCheck`]'s `pending` marker — called ONLY once whatever
+/// the check gated (a mount) has actually succeeded (fix round 2, ruling
+/// 6). A no-op when `pending` is `None` (nothing new to record — the
+/// existing record, if any, is left exactly as it was).
+pub(crate) fn commit_marker_check(
+    ctx: &ServiceContext,
+    root: &Path,
+    pending: Option<crate::collab::storage::marker::StoreMarker>,
+) -> Result<(), ApiError> {
+    let Some(m) = pending else {
+        return Ok(());
+    };
+    let db = db(ctx)?;
+    let conn = db.conn();
+    crate::db::collab_live::record_store_marker(&conn, &m, &root.to_string_lossy())?;
+    Ok(())
 }
 
 /// How long a failed lazy mount waits before the next attempt (I3).
@@ -1586,8 +1562,8 @@ pub(crate) async fn ensure_collab_store(ctx: &ServiceContext) -> Option<iroh_blo
             }
         }
     };
-    let state = match check_storage_marker(ctx, &root).await {
-        Ok(state) => state,
+    let check = match check_storage_marker(ctx, &root).await {
+        Ok(check) => check,
         Err(e) => {
             if already_warned {
                 tracing::debug!(path = %root.display(), error = %format!("{e:#}"), "lazy collab store mount skipped again: storage marker check failed");
@@ -1598,17 +1574,20 @@ pub(crate) async fn ensure_collab_store(ctx: &ServiceContext) -> Option<iroh_blo
             return None;
         }
     };
-    if !state.serving() {
+    if !check.state.serving() {
         if already_warned {
-            tracing::debug!(path = %root.display(), state = ?state, "lazy collab store mount skipped again: storage not available");
+            tracing::debug!(path = %root.display(), state = ?check.state, "lazy collab store mount skipped again: storage not available");
         } else {
-            tracing::warn!(path = %root.display(), state = ?state, "lazy collab store mount skipped: storage not available");
+            tracing::warn!(path = %root.display(), state = ?check.state, "lazy collab store mount skipped: storage not available");
             latch_mount_warned(&key);
         }
         return None;
     }
     match node.set_collab_root(Some(&root)).await {
         Ok(()) => {
+            if let Err(e) = commit_marker_check(ctx, &root, check.pending) {
+                tracing::error!(path = %root.display(), error = %e, "recording the storage marker after a lazy mount failed");
+            }
             if let Some(attempts) = COLLAB_MOUNT_ATTEMPTS.get() {
                 attempts
                     .lock()
