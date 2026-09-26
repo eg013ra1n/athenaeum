@@ -65,6 +65,14 @@ pub fn reset_all() {
     tracing::info!("collab back-offs cleared");
 }
 
+/// Serialises the tests that fire [`reset_all`] against the tests that
+/// count a retry loop's attempts. The reset channel is process-global, so a
+/// reset fired by one test while another's retry sleeps restarts that
+/// retry's back-off (by design, P26) and breaks its attempt count — a flake
+/// seen in the full core suite on 2026-09-26.
+#[cfg(test)]
+pub(crate) static RESET_ALL_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub fn reset_signal() -> tokio::sync::watch::Receiver<u64> {
     let mut rx = reset_tx().subscribe();
     rx.mark_unchanged();
@@ -118,6 +126,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_all_cuts_a_sleep_short() {
+        let _serial = RESET_ALL_TEST_SERIAL.lock().await;
         let mut rx = reset_signal();
         let sleeper =
             tokio::spawn(async move { sleep_or_reset(Duration::from_secs(30), &mut rx).await });

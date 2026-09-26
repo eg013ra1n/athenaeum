@@ -691,17 +691,6 @@ pub(crate) async fn park_row(
     row: &LocalFrameRow,
     landed_path: &Path,
 ) -> Result<(), ApiError> {
-    if let Err(e) = node
-        .unseed_project_frame(&row.project_id, &row.frame_uuid)
-        .await
-    {
-        tracing::warn!(
-            project_id = %row.project_id,
-            frame_uuid = %row.frame_uuid,
-            error = %e,
-            "moved frame: unseed before parking failed"
-        );
-    }
     let parked = if row.origin == FrameOrigin::Own {
         LocalState::OwnMissing
     } else {
@@ -742,6 +731,20 @@ pub(crate) async fn park_row(
             "moved frame changed meanwhile; not parked"
         );
         return Ok(());
+    }
+    // M4 (Task 11 fix round 1): the seed tags go only once the fence let the
+    // park through, still under the disk lock — a row that moved on keeps
+    // the tags its newer write relies on.
+    if let Err(e) = node
+        .unseed_project_frame(&row.project_id, &row.frame_uuid)
+        .await
+    {
+        tracing::warn!(
+            project_id = %row.project_id,
+            frame_uuid = %row.frame_uuid,
+            error = %e,
+            "moved frame: unseed after parking failed"
+        );
     }
     tracing::warn!(
         project_id = %row.project_id,

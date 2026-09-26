@@ -49,6 +49,7 @@ use crate::api::collab_exchange::{
 use crate::api::{db, ApiError};
 use crate::collab::storage::marker::StoreGuard;
 use crate::collab::storage::states::{transition, StateEvent};
+use crate::collab::storage::sweep::{stat_verdict, Stamp, StatVerdict};
 use crate::db::collab::CollabProjectRow;
 use crate::db::collab_frames::{self as frames_db, LocalFrameRow, LocalState};
 use crate::services::ServiceContext;
@@ -126,7 +127,15 @@ impl LandingMode {
 /// is on the target's device — the one case iroh-blobs 0.103 exports by an
 /// atomic rename. Inline and external entries, and an owned one on another
 /// device (the library's EXDEV fallback copies onto the target in place; on
-/// Windows the rename just fails), take TEMP.
+/// Windows the rename just fails), take TEMP. A DIRECT export that fails
+/// anyway (not a vanished source) is retried once through TEMP — e.g.
+/// Windows' ERROR_NOT_SAME_DEVICE for a volume mounted inside the root,
+/// which the drive-letter device key cannot see (fix round 1, M2).
+///
+/// Known unsupported layout: a Linux bind mount inside the root reports the
+/// SAME `st_dev` on both sides, yet `rename` across it fails with EXDEV, and
+/// iroh-blobs then copies onto the target IN PLACE (the old version is not
+/// kept whole while the copy runs). Nothing here can detect it cheaply.
 pub(crate) fn landing_mode(owned: bool, same_device: bool) -> LandingMode {
     if owned && same_device {
         LandingMode::Direct
@@ -300,24 +309,76 @@ fn new_landing_path(env: &LandingEnv<'_>, row: &LocalFrameRow) -> Result<PathBuf
 async fn landing_target(
     env: &LandingEnv<'_>,
     row: &LocalFrameRow,
-) -> Result<(PathBuf, bool), String> {
+) -> Result<(PathBuf, bool), TargetRefusal> {
     let existing = row
         .landed_path
         .as_deref()
         .map(PathBuf::from)
         .filter(|p| inside_root(Some(env.collab_root), row, p));
     let Some(dest) = existing else {
-        return new_landing_path(env, row).map(|p| (p, false));
+        return new_landing_path(env, row)
+            .map(|p| (p, false))
+            .map_err(TargetRefusal::Failed);
     };
     let holds = dest.exists() && holds_frame_content(&dest, row).await;
-    if row.size_mtime_seen.is_some() && dest.exists() && !holds {
-        return Err(format!(
-            "the file at {} changed since it was verified at this version; not landed over (L5)",
-            dest.display()
-        ));
+    if dest.exists() && !holds {
+        if row.size_mtime_seen.is_some() {
+            return Err(TargetRefusal::Edited(format!(
+                "the file at {} changed since it was verified at this version; not landed over (L5)",
+                dest.display()
+            )));
+        }
+        // L5/C38 (fix round 1): a new version never replaces an old file
+        // that no longer stats as it was last verified — an edit nothing
+        // watched (the app closed, the watcher dead) is the user's.
+        let prev = db(env.ctx)
+            .map_err(anyhow::Error::from)
+            .and_then(|db| frames_db::prev_stamp(&db.conn(), env.pid(), &row.frame_uuid))
+            .map_err(|e| TargetRefusal::Failed(format!("read the previous stamp: {e:#}")))?;
+        if let Some(prev) = prev.as_deref().and_then(Stamp::parse) {
+            match stat_verdict(&dest, Some(prev)) {
+                StatVerdict::Same | StatVerdict::Missing => {}
+                StatVerdict::Drifted(now) => {
+                    return Err(TargetRefusal::Edited(format!(
+                        "the file at {} changed since its last verified version ({} → {}); \
+                         the new version is not landed over it (L5)",
+                        dest.display(),
+                        prev.encode(),
+                        now.encode()
+                    )))
+                }
+                StatVerdict::Unreadable(e) => {
+                    return Err(TargetRefusal::Failed(format!(
+                        "stat {}: {e}",
+                        dest.display()
+                    )))
+                }
+            }
+        }
     }
     unseed(env.node, env.pid(), &row.frame_uuid).await;
     Ok((dest, holds))
+}
+
+/// Why [`landing_target`] refused.
+enum TargetRefusal {
+    /// A local failure (logged and recorded by the caller).
+    Failed(String),
+    /// The file at the target is an edit the storage engine has not ruled
+    /// on yet (L5): never landed over; the file goes to the engine, which
+    /// quarantines it (spec §9.4), and the fetched bytes keep their
+    /// in-flight tag so the frame is not fetched again meanwhile (M3).
+    Edited(String),
+}
+
+/// Hand an edited target to the running storage engine (it quarantines the
+/// frame, spec §9.4). No engine → its next check of the root finds it.
+fn hand_to_engine(env: &LandingEnv<'_>, row: &LocalFrameRow, dest: &Path) {
+    if crate::collab::storage::watch::route_touched(dest) {
+        tracing::info!(project_id = env.pid(), frame_uuid = %row.frame_uuid, path = %dest.display(), "edited landing target handed to the storage engine");
+    } else {
+        tracing::debug!(project_id = env.pid(), frame_uuid = %row.frame_uuid, path = %dest.display(), "no storage engine watches the edited landing target; left for its next check");
+    }
 }
 
 /// Does the file at `path` already hold this frame's content (size first,
@@ -370,8 +431,16 @@ pub async fn land_frame(
     }
     let (dest, holds) = match landing_target(env, &row).await {
         Ok(d) => d,
-        Err(msg) => {
+        Err(TargetRefusal::Failed(msg)) => {
             drop_tag(env.store, &in_flight).await;
+            return fail(msg);
+        }
+        Err(TargetRefusal::Edited(msg)) => {
+            // M3: the in-flight tag stays — the bytes wait for the user's
+            // choice instead of being fetched again every pass.
+            if let Some(p) = row.landed_path.as_deref() {
+                hand_to_engine(env, &row, Path::new(p));
+            }
             return fail(msg);
         }
     };
@@ -395,10 +464,24 @@ pub async fn land_frame(
         ("none", Ok(Ok(())))
     } else {
         match probe_mode(env, &hash, &dest, size) {
-            (LandingMode::Direct, Some(data)) => (
-                LandingMode::Direct.as_str(),
-                blobs::export_child_direct(env.store, hash, &dest, size, &data, env.hooks).await,
-            ),
+            (LandingMode::Direct, Some(data)) => {
+                match blobs::export_child_direct(env.store, hash, &dest, size, &data, env.hooks)
+                    .await
+                {
+                    // M2: a rename the device check could not foresee
+                    // (Windows ERROR_NOT_SAME_DEVICE for a volume mounted
+                    // inside the root): once more through the temp file.
+                    Ok(Err(e)) if !blobs::export_source_vanished(&e) => {
+                        tracing::warn!(project_id = pid, frame_uuid = uuid, path = %dest.display(), error = %e, "direct landing export failed; retrying through a temp file");
+                        (
+                            LandingMode::Temp.as_str(),
+                            blobs::export_child_replacing(env.store, hash, &dest, size, env.hooks)
+                                .await,
+                        )
+                    }
+                    other => (LandingMode::Direct.as_str(), other),
+                }
+            }
             _ => (
                 LandingMode::Temp.as_str(),
                 blobs::export_child_replacing(env.store, hash, &dest, size, env.hooks).await,
@@ -605,7 +688,15 @@ pub async fn link_identical(env: &LandingEnv<'_>, row: &LocalFrameRow, src: &Pat
     tracing::warn!(project_id = pid, frame_uuid = uuid, path = %src.display(), "identical frame content in project");
     let dest = match landing_target(env, &row).await {
         Ok((d, _)) => d,
-        Err(msg) => return fail(msg),
+        Err(TargetRefusal::Failed(msg)) => return fail(msg),
+        Err(TargetRefusal::Edited(msg)) => {
+            hand_to_engine(
+                env,
+                &row,
+                &PathBuf::from(row.landed_path.as_deref().unwrap_or_default()),
+            );
+            return fail(msg);
+        }
     };
     let replaces = row.landed_path.as_deref().map(Path::new) == Some(dest.as_path());
     if dest != src {
@@ -627,6 +718,24 @@ pub async fn link_identical(env: &LandingEnv<'_>, row: &LocalFrameRow, src: &Pat
                 tmp.display()
             ));
         }
+        // I1 (fix round 1): the source may have been edited since it
+        // landed — its bytes are verified BEFORE they can replace the old
+        // version.
+        match blobs::blake3_on_blocking(&tmp).await {
+            Ok(h) if h == hash => {}
+            got => {
+                let got = match got {
+                    Ok(h) => h.to_string(),
+                    Err(e) => format!("unreadable: {e:#}"),
+                };
+                remove_landed(&tmp);
+                tracing::error!(project_id = pid, frame_uuid = uuid, path = %src.display(), expected = %hash, got = %got, "identical frame source does not hold the frame's bytes");
+                return fail(format!(
+                    "{} does not hash to {hash} (got {got}); the old version is kept",
+                    src.display()
+                ));
+            }
+        }
         if let Err(e) = std::fs::rename(&tmp, &dest) {
             remove_landed(&tmp);
             return fail(format!(
@@ -636,15 +745,30 @@ pub async fn link_identical(env: &LandingEnv<'_>, row: &LocalFrameRow, src: &Pat
             ));
         }
     }
-    if let Err(e) = env
+    match env
         .node
         .seed_project_frame(pid, uuid, row.content_version, &dest)
         .await
     {
-        if !replaces {
-            remove_landed(&dest);
+        Ok(seeded) if seeded == hash => {}
+        Ok(seeded) => {
+            // The file changed after its check (or `dest == src` was never
+            // checked): never recorded held (I1).
+            unseed(env.node, pid, uuid).await;
+            if !replaces {
+                remove_landed(&dest);
+            }
+            return fail(format!(
+                "seed {}: hashed {seeded} instead of {hash}",
+                dest.display()
+            ));
         }
-        return fail(format!("seed {}: {e:#}", dest.display()));
+        Err(e) => {
+            if !replaces {
+                remove_landed(&dest);
+            }
+            return fail(format!("seed {}: {e:#}", dest.display()));
+        }
     }
     match record_landing(env, &row, &dest) {
         Ok(true) => {
@@ -805,6 +929,13 @@ mod tests {
             "the old file is intact (I7)"
         );
         assert_eq!(rig.row(0).local_state, LocalState::Wanted);
+        // M1: a stale temp file of an earlier TEMP attempt is cleared by the
+        // DIRECT landing.
+        std::fs::write(
+            crate::sharing::iroh::blobs::athtmp_path(&v1_path),
+            b"a stale temp",
+        )
+        .unwrap();
         let again = rig.land(0).await.unwrap();
         assert_eq!(again, v1_path);
         assert_eq!(std::fs::read(&again).unwrap(), rig.v2_bytes(0));
@@ -813,6 +944,173 @@ mod tests {
             (2, 0)
         );
         assert_eq!(athtmp_files(&rig.root), 0);
+    }
+
+    /// M2: a DIRECT export the store refuses (as a rename across volumes
+    /// the device check could not see) is retried once through TEMP.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_direct_export_is_retried_through_a_temp_file() {
+        let rig = ts::fetch_rig(1).await;
+        let v1_path = rig.land(0).await.unwrap();
+        rig.publish_new_version(0).await;
+        rig.fetch_blob(0).await;
+        rig.hooks.fail_direct_export_once();
+        let v2_path = rig.land(0).await.expect("lands through the temp file");
+        assert_eq!(v2_path, v1_path);
+        assert_eq!(std::fs::read(&v2_path).unwrap(), rig.v2_bytes(0));
+        assert_eq!(
+            (rig.hooks.direct_exports(), rig.hooks.temp_exports()),
+            (2, 1)
+        );
+        assert_eq!(athtmp_files(&rig.root), 0);
+        crate::sharing::iroh::blobs::probe_first_byte(&rig.receiver_store(), rig.v2_hash(0))
+            .await
+            .unwrap();
+        assert_eq!(rig.row(0).local_state, LocalState::Held);
+    }
+
+    /// I1: an EXTERNAL entry whose referenced file was edited (same size)
+    /// is copied from that file — the TEMP landing verifies the temp's
+    /// BLAKE3 before the rename, refuses, and leaves the old version whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_temp_landing_from_an_edited_external_file_is_refused_before_the_rename() {
+        let rig = ts::fetch_rig(2).await;
+        let a = rig.land(0).await.unwrap();
+        let b = rig.land(1).await.unwrap();
+        rig.publish_version_with(1, rig.v1_bytes(0)).await;
+        rig.fetch_blob(1).await;
+        ts::overwrite_same_size(&a); // the entry's only path now holds other bytes
+        assert!(
+            matches!(rig.land(1).await, Err(Landed::Failed(m)) if m.contains("does not hash")),
+            "refused by the BLAKE3 check"
+        );
+        assert_eq!(
+            std::fs::read(&b).unwrap(),
+            rig.v1_bytes(1),
+            "v1 intact (I7)"
+        );
+        assert_eq!(athtmp_files(&rig.root), 0, "the unverified temp is removed");
+        let row = rig.row(1);
+        assert!(row.local_state == LocalState::Wanted && !row.on_disk);
+    }
+
+    /// I1: `link_identical` from a source edited since it landed is refused
+    /// before the rename — the old version whole, the row never held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linking_from_an_edited_source_is_refused() {
+        let rig = ts::fetch_rig(2).await;
+        let a = rig.land(0).await.unwrap();
+        let b = rig.land(1).await.unwrap();
+        rig.publish_version_with(1, rig.v1_bytes(0)).await;
+        ts::overwrite_same_size(&a);
+        assert!(
+            matches!(rig.link(1, &a).await, Err(Landed::Failed(m)) if m.contains("does not hash")),
+            "refused by the BLAKE3 check"
+        );
+        assert_eq!(
+            std::fs::read(&b).unwrap(),
+            rig.v1_bytes(1),
+            "v1 intact (I7)"
+        );
+        assert_eq!(athtmp_files(&rig.root), 0);
+        let row = rig.row(1);
+        assert!(row.local_state == LocalState::Wanted && !row.on_disk);
+        assert!(rig
+            .node
+            .project_frame_tags(&row.project_id, &row.frame_uuid)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    struct TwoHolders;
+    impl crate::api::collab_live::storage_task::HolderView for TwoHolders {
+        fn other_holders(&self, _: &str, _: &str) -> crate::collab::live::holders::Redundancy {
+            crate::collab::live::holders::Redundancy {
+                online: 2,
+                total: 2,
+            }
+        }
+    }
+
+    /// I2 — owner rule L5/C38: the user's edit is never overwritten, not
+    /// even by a new version. v1 held → edited while the app was closed (no
+    /// engine saw it) → the publisher releases v2: the landing refuses (the
+    /// file no longer stats as v1 was verified), keeps the fetched bytes
+    /// (M3), and hands the file to the engine, which quarantines it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_version_never_lands_over_an_edit_nothing_saw() {
+        let rig = ts::fetch_rig(1).await;
+        let (pid, uuid) = rig.frame(0);
+        let path = rig.land(0).await.unwrap();
+        ts::overwrite_same_size(&path); // the app is closed: no engine pass
+        let edited = std::fs::read(&path).unwrap();
+        rig.publish_new_version(0).await;
+        assert_eq!(rig.row(0).local_state, LocalState::Wanted);
+        rig.fetch_blob(0).await;
+        let mut eng = rig.engine();
+        assert!(
+            matches!(rig.land(0).await, Err(Landed::Failed(m)) if m.contains("(L5)")),
+            "refused by the previous-stamp check"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            edited,
+            "the edit is intact (L5)"
+        );
+        let in_flight = project_frame_in_flight_tag(&pid, &uuid, 2);
+        assert!(
+            rig.receiver_store()
+                .tags()
+                .get(&in_flight)
+                .await
+                .unwrap()
+                .is_some(),
+            "the fetched bytes keep their in-flight tag (M3)"
+        );
+        let t0 = std::time::Instant::now();
+        eng.tick(t0, &TwoHolders).await;
+        eng.tick(t0 + crate::collab::storage::watch::AGGREGATE, &TwoHolders)
+            .await;
+        assert_eq!(
+            rig.row(0).local_state,
+            LocalState::Quarantined,
+            "handed to the engine"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), edited);
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        assert_eq!(
+            frames_db::prev_stamp(&conn, &pid, &uuid).unwrap(),
+            None,
+            "cleared when the row left wanted"
+        );
+        assert_eq!(
+            crate::db::collab_live::list_quarantine(&conn, &pid)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The same, untouched: v2 replaces v1 and the previous stamp goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untouched_old_version_is_replaced_and_its_previous_stamp_cleared() {
+        let rig = ts::fetch_rig(1).await;
+        let (pid, uuid) = rig.frame(0);
+        rig.land(0).await.unwrap();
+        rig.publish_new_version(0).await;
+        {
+            let conn = crate::api::db(&rig.ctx).unwrap().conn();
+            assert!(
+                frames_db::prev_stamp(&conn, &pid, &uuid).unwrap().is_some(),
+                "kept by the bump"
+            );
+        }
+        rig.fetch_blob(0).await;
+        let path = rig.land(0).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), rig.v2_bytes(0));
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        assert_eq!(frames_db::prev_stamp(&conn, &pid, &uuid).unwrap(), None);
     }
 
     /// TEMP path: an inline blob (≤ 16 KiB — the library writes it with
@@ -979,5 +1277,14 @@ mod tests {
         assert!(matches!(rig.land(0).await, Err(Landed::Failed(_))));
         assert_eq!(std::fs::read(&path).unwrap(), edited);
         assert_eq!(rig.row(0).local_state, LocalState::Wanted);
+        assert!(
+            rig.receiver_store()
+                .tags()
+                .get(&project_frame_in_flight_tag(&pid, &uuid, 1))
+                .await
+                .unwrap()
+                .is_some(),
+            "the fetched bytes keep their in-flight tag (M3)"
+        );
     }
 }

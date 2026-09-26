@@ -1396,6 +1396,11 @@ mod tests {
 
     #[tokio::test]
     async fn interactive_retry_gives_up_after_three_attempts_and_background_recovers() {
+        // A concurrent `reset_all` (another test) would restart this retry's
+        // back-off and let it run past three attempts.
+        let _serial = crate::collab::live::backoff::RESET_ALL_TEST_SERIAL
+            .lock()
+            .await;
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/projects/p1/holders/snapshot"))
@@ -1418,6 +1423,11 @@ mod tests {
             e,
             Err(AccountClientError::Http { status: 503, .. })
         ));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            INTERACTIVE_ATTEMPTS as usize,
+            "the interactive policy stops after exactly three attempts"
+        );
         // one 503 left, then 200: the background policy retries through it
         let ok = tokio::time::timeout(
             std::time::Duration::from_secs(10),

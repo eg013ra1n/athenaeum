@@ -555,6 +555,27 @@ impl StorageEngine {
                         | LocalState::OwnMissing
                 ) =>
             {
+                let prev = if row.local_state == LocalState::Wanted
+                    && row.origin == FrameOrigin::Replica
+                    && row.size_mtime_seen.is_none()
+                    && !row.awaiting_gc
+                {
+                    match db(&self.ctx).and_then(|d| {
+                        Ok(frames_db::prev_stamp(
+                            &d.conn(),
+                            &row.project_id,
+                            &row.frame_uuid,
+                        )?)
+                    }) {
+                        Ok(p) => p.as_deref().and_then(Stamp::parse),
+                        Err(e) => {
+                            tracing::error!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "previous stamp could not be read");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 if row.local_state == LocalState::Wanted
                     && row.origin == FrameOrigin::Replica
                     && row.size_mtime_seen.is_some()
@@ -563,6 +584,10 @@ impl StorageEngine {
                     // A re-included frame whose file was verified at this
                     // version (fix round 1): re-adopt, or quarantine an edit.
                     self.check_reincluded(&row, path, ev).await;
+                } else if let Some(prev) = prev {
+                    // A new version is wanted over an older verified file
+                    // (Task 11 fix round 1, L5/C38): an edit is quarantined.
+                    self.check_pre_bump(&row, path, prev, ev).await;
                 } else {
                     // The file came back (FileBack / PutBack): stat + hash
                     // decide.
@@ -1332,8 +1357,15 @@ impl StorageEngine {
     async fn release_parked(&self, row: &LocalFrameRow, reason: &str) {
         let res = self
             .with_frame_tx(row, |tx| {
+                // L5/C38 (Task 11 fix round 1): the stamp the parked file was
+                // verified at is kept as `prev_stamp`, so a landing never
+                // replaces a file edited after this release.
                 tx.execute(
-                    "UPDATE project_frames_local SET awaiting_gc = 0, size_mtime_seen = NULL
+                    "UPDATE project_frames_local
+                     SET awaiting_gc = 0,
+                         prev_stamp = CASE WHEN local_state = 'wanted'
+                                      THEN COALESCE(prev_stamp, size_mtime_seen) ELSE prev_stamp END,
+                         size_mtime_seen = NULL
                      WHERE project_id = ?1 AND frame_uuid = ?2",
                     rusqlite::params![row.project_id, row.frame_uuid],
                 )?;
@@ -1397,6 +1429,44 @@ impl StorageEngine {
                 Err(e) => {
                     tracing::error!(project_id = %sib.project_id, frame_uuid = %sib.frame_uuid, error = %e, "sibling of a dead store entry could not be parked")
                 }
+            }
+        }
+    }
+
+    /// A `wanted` replica whose OLDER verified file still sits at its path
+    /// while a new version waits (Task 11 fix round 1, L5/C38 — the owner
+    /// rule: the user's edit is never overwritten, including by a new
+    /// version). The file stats as last verified (`prev_stamp`, 2 s mtime
+    /// tolerance) → untouched, left for the landing to replace. Otherwise it
+    /// was changed while nothing watched; it cannot be hashed against the
+    /// old version (the row carries the new one), so it is quarantined —
+    /// spec §9.4 "Quarantined ──new version current──▶ Quarantined": the
+    /// file untouched, "a new version is waiting", nothing lands until the
+    /// user chooses. A missing file is simply landed fresh.
+    async fn check_pre_bump(
+        &mut self,
+        row: &LocalFrameRow,
+        path: &Path,
+        prev: Stamp,
+        ev: &mut Vec<StorageEvent>,
+    ) {
+        let p = path.to_path_buf();
+        let verdict =
+            match tokio::task::spawn_blocking(move || sweep::stat_verdict(&p, Some(prev))).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(path = %path.display(), error = %e, "stat task failed");
+                    return;
+                }
+            };
+        match verdict {
+            StatVerdict::Same | StatVerdict::Missing => {}
+            StatVerdict::Unreadable(e) => {
+                tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path = %path.display(), error = %e, "file under a waiting new version could not be read; left as is");
+            }
+            StatVerdict::Drifted(current) => {
+                self.content_changed(row, &path.to_string_lossy(), &current, false, ev)
+                    .await;
             }
         }
     }

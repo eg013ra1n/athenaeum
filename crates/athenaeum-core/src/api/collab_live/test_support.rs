@@ -638,6 +638,56 @@ impl FetchRig {
             .unwrap();
     }
 
+    /// A storage engine on this rig's root (it registers as the engine the
+    /// landing hands edited targets to).
+    pub(crate) fn engine(&self) -> crate::api::collab_live::storage_task::StorageEngine {
+        let me = crate::api::account::own_device_id(&self.ctx).unwrap();
+        let recorded = crate::db::collab_live::recorded_store_marker(
+            &crate::api::db(&self.ctx).unwrap().conn(),
+        )
+        .unwrap();
+        let guard = Arc::new(crate::collab::storage::marker::StoreGuard::new(
+            self.root.clone(),
+            me,
+            recorded,
+        ));
+        crate::api::collab_live::storage_task::StorageEngine::start(
+            Arc::clone(&self.ctx),
+            Arc::clone(&self.node),
+            guard,
+        )
+    }
+
+    /// `link_identical` of frame `i` (its current row) from `src`.
+    pub(crate) async fn link(
+        &self,
+        i: usize,
+        src: &Path,
+    ) -> Result<PathBuf, crate::api::collab_live::landing::Landed> {
+        use crate::api::collab_live::landing::{link_identical, Landed, LandingEnv};
+        let row = self.row(i);
+        let project =
+            crate::db::collab::get_project(&crate::api::db(&self.ctx).unwrap().conn(), PID)
+                .unwrap()
+                .expect("the project row");
+        let store = self.receiver_store();
+        let started_at = crate::sync::now_iso();
+        let env = LandingEnv {
+            ctx: &self.ctx,
+            node: &self.node,
+            store: &store,
+            project: &project,
+            collab_root: &self.root,
+            guard: &self.guard,
+            started_at: &started_at,
+            hooks: &self.hooks,
+        };
+        match link_identical(&env, &row, src).await {
+            Landed::Yes(p) => Ok(p),
+            other => Err(other),
+        }
+    }
+
     /// Land frame `i` with the row its last fetch carried: `Ok(path)` for
     /// `Landed::Yes`, `Err(landed)` otherwise.
     pub(crate) async fn land(

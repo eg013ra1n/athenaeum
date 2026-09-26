@@ -418,8 +418,18 @@ pub fn upsert_from_manifest_deferred(
             // of a fetch (fix round 1: a parked frame must not stay parked
             // forever). A quarantined row keeps its stamp — its file is the
             // user's to resolve.
+            //
+            // L5/C38 (Task 11 fix round 1): a `wanted` row keeps the stamp
+            // its old file was verified at as `prev_stamp` (only if it has
+            // none yet — a second bump while still wanted keeps the FIRST,
+            // which describes the file actually on disk), so the landing can
+            // tell the untouched old version from an edit nothing watched.
             conn.execute(
-                "UPDATE project_frames_local SET size_mtime_seen = NULL, awaiting_gc = 0
+                "UPDATE project_frames_local
+                 SET prev_stamp = CASE
+                         WHEN local_state = 'wanted' AND prev_stamp IS NULL THEN size_mtime_seen
+                         ELSE prev_stamp END,
+                     size_mtime_seen = NULL, awaiting_gc = 0
                  WHERE project_id = ?1 AND frame_uuid = ?2 AND local_state <> 'quarantined'",
                 params![project_id, v.frame_uuid],
             )?;
@@ -615,8 +625,11 @@ pub fn set_local_state(
         return Ok(None);
     };
     let from = LocalState::from_db_str(from_raw.as_deref().unwrap_or("wanted"));
+    // `prev_stamp` only means something on a `wanted` row (Task 11 fix
+    // round 1): cleared whenever the row leaves `wanted`.
     conn.execute(
         "UPDATE project_frames_local SET local_state = ?3, on_disk = ?4,
+            prev_stamp = CASE WHEN ?3 = 'wanted' THEN prev_stamp ELSE NULL END,
             state_changed_at = datetime('now'), updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2",
         params![project_id, frame_uuid, to.as_db_str(), to.servable()],
@@ -632,6 +645,21 @@ pub fn set_local_state(
         crate::db::collab_live::record_claim_change(conn, project_id, frame_uuid, op)?;
     }
     Ok(Some(StateWrite { from, to, claim }))
+}
+
+/// The `size:mtime` a `wanted` row's landed file was last verified at,
+/// kept when a new version (or a parked frame's release) cleared
+/// `size_mtime_seen` (Task 11 fix round 1, L5/C38). `None` when not recorded
+/// or the row does not exist.
+pub fn prev_stamp(conn: &Connection, project_id: &str, frame_uuid: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT prev_stamp FROM project_frames_local WHERE project_id = ?1 AND frame_uuid = ?2",
+            params![project_id, frame_uuid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// Set a frame's hub frame ordinal (`frameSeq`, the dense per-project number
@@ -842,7 +870,7 @@ pub fn set_landed_if(
     Ok(conn.execute(
         "UPDATE project_frames_local
          SET landed_path = ?3, size_mtime_seen = ?4, awaiting_gc = 0,
-             last_error = NULL, rejected_size_mtime = NULL,
+             last_error = NULL, rejected_size_mtime = NULL, prev_stamp = NULL,
              updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND content_version = ?5 AND blake3 = ?6
            AND local_state = 'wanted'",
@@ -2140,6 +2168,55 @@ mod tests {
         assert_eq!(landed.size_mtime_seen.as_deref(), Some("1:1"));
         assert_eq!(
             rejected_size_mtime(&c, "p1", "u1").unwrap(),
+            None,
+            "a landing clears it"
+        );
+    }
+
+    /// Task 11 fix round 1 (L5/C38): a new version keeps the held file's
+    /// verified stamp as `prev_stamp` (the FIRST one across further bumps
+    /// while still wanted); leaving `wanted` or recording a landing clears it.
+    #[test]
+    fn a_new_version_keeps_the_previous_stamp_until_the_row_leaves_wanted() {
+        let c = conn();
+        upsert_from_manifest(&c, "p1", &view("u1", 1)).unwrap();
+        let r = get(&c, "p1", "u1").unwrap().unwrap();
+        set_landed_if(&c, "p1", "u1", "/x/a.fits", "100:7", 1, &r.blake3).unwrap();
+        set_local_state(&c, "p1", "u1", LocalState::Held).unwrap();
+        assert_eq!(prev_stamp(&c, "p1", "u1").unwrap(), None);
+
+        let bump = |cv: i32, b: &str| {
+            let mut v = view("u1", cv as i64);
+            v.content_version = cv;
+            v.blake3 = b.repeat(64);
+            upsert_from_manifest(&c, "p1", &v).unwrap();
+        };
+        bump(2, "c");
+        let r = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(r.local_state, LocalState::Wanted);
+        assert_eq!(r.size_mtime_seen, None);
+        assert_eq!(
+            prev_stamp(&c, "p1", "u1").unwrap().as_deref(),
+            Some("100:7")
+        );
+        bump(3, "d");
+        assert_eq!(
+            prev_stamp(&c, "p1", "u1").unwrap().as_deref(),
+            Some("100:7"),
+            "the file on disk is still the one verified first"
+        );
+        set_local_state(&c, "p1", "u1", LocalState::Quarantined).unwrap();
+        assert_eq!(prev_stamp(&c, "p1", "u1").unwrap(), None, "left wanted");
+
+        set_local_state(&c, "p1", "u1", LocalState::Wanted).unwrap();
+        c.execute(
+            "UPDATE project_frames_local SET prev_stamp = '1:1' WHERE frame_uuid = 'u1'",
+            [],
+        )
+        .unwrap();
+        set_landed_if(&c, "p1", "u1", "/x/a.fits", "100:9", 3, &"d".repeat(64)).unwrap();
+        assert_eq!(
+            prev_stamp(&c, "p1", "u1").unwrap(),
             None,
             "a landing clears it"
         );

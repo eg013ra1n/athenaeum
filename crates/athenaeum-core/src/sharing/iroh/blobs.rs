@@ -748,6 +748,7 @@ pub(crate) fn athtmp_path(target: &Path) -> PathBuf {
 pub(crate) struct ExportHooks {
     fail_before_export: std::sync::atomic::AtomicBool,
     fail_after_export: std::sync::atomic::AtomicBool,
+    fail_direct_export: std::sync::atomic::AtomicBool,
     direct_exports: std::sync::atomic::AtomicUsize,
     temp_exports: std::sync::atomic::AtomicUsize,
 }
@@ -764,6 +765,14 @@ impl ExportHooks {
     #[cfg(test)]
     pub(crate) fn fail_after_export_once(&self) {
         self.fail_after_export
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The next DIRECT export fails with an io error from the store (as a
+    /// rename across volumes would), before touching anything.
+    #[cfg(test)]
+    pub(crate) fn fail_direct_export_once(&self) {
+        self.fail_direct_export
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -820,9 +829,31 @@ pub(crate) async fn export_child_direct(
     hooks: &ExportHooks,
 ) -> Result<ExportOutcome> {
     hooks.injected(&hooks.fail_before_export, "before export")?;
+    // A temp file an earlier TEMP landing of this target left behind (M1):
+    // never referenced by the store once a landing got past it.
+    let tmp = athtmp_path(target);
+    match tokio::fs::remove_file(&tmp).await {
+        Ok(()) => tracing::debug!(path = %tmp.display(), "stale landing temp file removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(LocalFault(
+                anyhow::Error::new(e).context(format!("remove stale temp {}", tmp.display())),
+            )
+            .into())
+        }
+    }
     hooks
         .direct_exports
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if ExportHooks::take(&hooks.fail_direct_export) {
+        tracing::error!(path = %target.display(), "collab landing test fault");
+        return Ok(Err(iroh_blobs::api::RequestError::from(
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected direct export failure",
+            ),
+        )));
+    }
     if let Err(e) = store
         .blobs()
         .export_with_opts(ExportOptions {
@@ -863,10 +894,13 @@ pub(crate) async fn export_child_direct(
 /// import merges the path lists, sorted, and `<name>` sorts before
 /// `<name>.athtmp`).
 ///
-/// A temp file left by a landing that stopped after its export and before
-/// its rename is reused when its size AND its BLAKE3 match — verified BEFORE
-/// the rename, so a wrong file never replaces the old version; one that
-/// does not match is removed and exported again.
+/// The temp file's BLAKE3 is checked BEFORE the rename, always (fix round 1,
+/// I1): an external entry is copied from a file that may have been edited
+/// since the store referenced it, and a wrong file must never replace the
+/// old version — a mismatch removes the temp and fails. A temp file left by
+/// a landing that stopped after its export and before its rename is reused
+/// when its size AND its BLAKE3 match; one that does not is removed and
+/// exported again.
 pub(crate) async fn export_child_replacing(
     store: &Store,
     hash: Hash,
@@ -927,6 +961,27 @@ pub(crate) async fn export_child_replacing(
         {
             return Ok(Err(e));
         }
+        // I1 (fix round 1): the bytes are verified BEFORE they can replace
+        // the old version — an external entry is copied from a file the
+        // user may have edited since it was referenced.
+        match blake3_on_blocking(&tmp).await {
+            Ok(h) if h == hash => {}
+            got => {
+                let got = match got {
+                    Ok(h) => h.to_string(),
+                    Err(e) => format!("unreadable: {e:#}"),
+                };
+                if let Err(e) = tokio::fs::remove_file(&tmp).await {
+                    tracing::warn!(path = %tmp.display(), error = %e, "remove unverified landing temp file failed");
+                }
+                let e = anyhow::anyhow!(
+                    "exported {} does not hash to {hash} (got {got}); the old version is kept",
+                    tmp.display()
+                );
+                tracing::error!(path = %tmp.display(), expected = %hash, got = %got, "landing temp file does not hold the frame's bytes");
+                return Err(LocalFault(e).into());
+            }
+        }
     } else {
         tracing::info!(path = %tmp.display(), "landing temp file reused");
     }
@@ -965,7 +1020,7 @@ pub(crate) async fn export_child_replacing(
 }
 
 /// Full-file BLAKE3 of `path`, off the runtime.
-async fn blake3_on_blocking(path: &Path) -> Result<Hash> {
+pub(crate) async fn blake3_on_blocking(path: &Path) -> Result<Hash> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<Hash> {
         let mut hasher = blake3::Hasher::new();

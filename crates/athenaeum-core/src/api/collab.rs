@@ -1772,9 +1772,7 @@ fn new_frame_target(
 /// The sibling temp an `update` regenerates into before its BLAKE3 decides
 /// whether it replaces the landed file (P19).
 fn update_temp_path(target: &Path) -> std::path::PathBuf {
-    let mut name = target.as_os_str().to_os_string();
-    name.push(".athtmp");
-    std::path::PathBuf::from(name)
+    crate::sharing::iroh::blobs::athtmp_path(target)
 }
 
 /// One gate-passing frame a publish run considers.
