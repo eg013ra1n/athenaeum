@@ -416,16 +416,21 @@ pub async fn land_frame(
     let landed = land_frame_locked(env, row, hash, &mut replaced).await;
     // After the landing's locks are released: parking takes each sibling's
     // project disk lock (this frame's own among them).
+    // The live exchange (and its parking) exists only in a full build.
+    #[cfg(all(feature = "render", feature = "solver"))]
     if let Landed::Yes(dest) = &landed {
         for old in replaced {
             park_replaced_siblings(env, row, &old, dest).await;
         }
     }
+    #[cfg(not(all(feature = "render", feature = "solver")))]
+    let _ = replaced;
     landed
 }
 
 /// Park every servable frame (another project's too) that still holds
 /// `old` — the hash whose file at `dest` a new version just replaced.
+#[cfg(all(feature = "render", feature = "solver"))]
 async fn park_replaced_siblings(
     env: &LandingEnv<'_>,
     row: &LocalFrameRow,
