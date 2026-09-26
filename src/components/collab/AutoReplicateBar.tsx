@@ -13,11 +13,11 @@ import { formatBytes } from './format';
  * saved then re-read — the parent's `onToggled` reloads the detail from the
  * catalog, so the rendered state is the stored one (S6), never optimistic.
  *
- * "Sync now" runs one replication pass immediately with the toggle FORCED on,
- * so it is deliberately not gated on `autoReplicate` here: a project with
- * auto-download off still downloads when the user asks explicitly. The pass is
- * spawned, not awaited — the downloads surface themselves on the frame rows,
- * so only a failure to start needs a notification.
+ * "Sync now" is the one global command of the live exchange
+ * (`collab_sync_now`, L10): it reconnects the event channel, clears every
+ * back-off and reconciles every project at once. It is not gated on
+ * `autoReplicate`. It returns once queued — the downloads surface themselves
+ * on the frame rows, so only a failure to start needs a notification.
  *
  * Collab v3 wave 2 Task 10 (R16, P13): a second, independent LOCAL preference
  * sits next to it — `autoPublish` coalesces and auto-publishes this device's
@@ -81,11 +81,11 @@ export default function AutoReplicateBar({
     setSyncing(true);
     setError(null);
     try {
-      await api.invoke('sync_project_now', { projectId });
+      await api.invoke('collab_sync_now');
       onSynced();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error('[projects] sync_project_now failed:', err);
+      console.error('[projects] collab_sync_now failed:', err);
       notify({
         title: 'Sync now failed',
         detail: msg,
@@ -154,7 +154,7 @@ export default function AutoReplicateBar({
             onClick={() => void syncNow()}
             disabled={syncing}
             className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
-            title="Download every published contribution this device is missing"
+            title="Reconnect to the hub and check every project at once"
           >
             {syncing ? (
               <Loader2 size={14} className="animate-spin" />

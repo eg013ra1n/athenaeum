@@ -1,11 +1,12 @@
 import { useEffect, useRef } from 'react';
 import { api } from '../api';
 import { useNotifications, type NotifyLike } from '../contexts/NotificationContext';
-import { formatGb } from '../components/collab/format';
 import type {
+  CollabDeletionChoice,
+  CollabFrameChanged,
+  CollabFrameLost,
   CollabFramesChange,
   CollabFramesLanded,
-  CollabReplicationPaused,
   ProjectCard,
 } from '../types/models';
 
@@ -20,13 +21,16 @@ interface CollabPublishedEvent {
   heldBack: number;
 }
 
-/* No `dedupeKey` on any collab live notification (final review I4): the
- * dedupe set persists in localStorage, so a content-shaped key such as
- * `frames-<kind>-<project>-<count>` or `paused-<project>-<missing>` would
- * swallow a later, genuine outcome that happens to carry the same numbers —
- * days later, forever. Each event is one discrete outcome, and this hook is
- * the ONE place each of these events reaches `notify()` (R29; the manual
- * refresh no longer notifies), so there is no second delivery to collapse. */
+/* No content-shaped `dedupeKey` on any collab live notification (final
+ * review I4): the dedupe set persists in localStorage, so a key such as
+ * `frames-<kind>-<project>-<count>` would swallow a later, genuine outcome
+ * that happens to carry the same numbers — days later, forever. Each event is
+ * one discrete outcome, and this hook is the ONE place each of these events
+ * reaches `notify()` (R29), so there is no second delivery to collapse.
+ *
+ * The one key used is core's own `CollabDeletionChoice.dedupeKey`, which is
+ * per OCCURRENCE (`collab-deletion-choice:<ids>:<batch id>`): a replay of the
+ * same batch (a reconnect) is shown once, every new batch notifies. */
 
 function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title: string) {
   if (change.count === 0) return;
@@ -98,13 +102,14 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
 /**
  * R29: the one app-root owner of every live collab notification. Mounted
  * once in `Layout.tsx` (next to `useProjectMatches`, same precedent) so a
- * data-loss-risk, user-actionable outcome — the loss guard pausing
- * replication — reaches `notify()` regardless of which page or tab is open,
+ * data-loss-risk, user-actionable outcome — a mass deletion waiting for a
+ * choice, a frame lost everywhere, an edited replica set aside (L4, L5) —
+ * reaches `notify()` regardless of which page or tab is open,
  * and a background auto-publish or version-poll tick surfaces a toast even
  * when nobody is on the Projects page. Per-page hooks/components
- * (`useProjects`, `ReceiveTab`) keep their own state/UI concerns only — no
- * `notify()` calls of their own for these four events, so there is exactly
- * one place that can toast for each.
+ * (`useProjects`, `ReceiveTab`, `CollabAttention`) keep their own state/UI
+ * concerns only — no `notify()` calls of their own for these events, so
+ * there is exactly one place that can toast for each.
  */
 export function useCollabNotifications() {
   const { notify } = useNotifications();
@@ -130,22 +135,92 @@ export function useCollabNotifications() {
 
   const titleFor = (projectId: string) => titlesRef.current.get(projectId) ?? projectId;
 
-  // `collab-replication-paused` (P14) — a data-loss-risk, user-actionable
-  // outcome that must reach `notify()` regardless of which tab is open
-  // (ReceiveTab keeps its own inline banner + Restore/Stop keeping buttons,
-  // but raises no notification of its own).
+  // `collab-deletion-choice` (L4) — a mass deletion (or a second deletion
+  // within 24 h) is waiting for "Re-fetch" or "Stop keeping". One
+  // notification per batch: core's key is per occurrence.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     api
-      .listen<CollabReplicationPaused>('collab-replication-paused', (p) => {
+      .listen<CollabDeletionChoice>('collab-deletion-choice', (p) => {
         if (cancelled) return;
+        const n = p.count;
         notify({
-          title: `Replication paused: ${p.missing} frames missing (${formatGb(p.missingBytes)})`,
-          detail: titleFor(p.projectId),
+          title: `${n} ${n === 1 ? 'replica was' : 'replicas were'} deleted — choose what to do`,
+          detail: `${p.projectIds.map(titleFor).join(', ')}: re-fetch or stop keeping on the Receive tab. Nothing else is paused.`,
           kind: 'project',
           tone: 'warning',
           hasErrors: true,
+          link: p.projectIds.length === 1 ? `/projects/${p.projectIds[0]}?tab=receive` : '/projects',
+          dedupeKey: p.dedupeKey,
+        });
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[collab] deletion-choice listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [notify]);
+
+  // `collab-frame-lost` (L4, I7) — no holder of the current version is left
+  // anywhere, so an automatic re-fetch has nowhere to fetch from. When the
+  // file still sits in the PREVIOUS Collaboration folder (a re-designation,
+  // owner rule A) the notice points there — never at the Trash.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<CollabFrameLost>('collab-frame-lost', (p) => {
+        if (cancelled) return;
+        const project = titleFor(p.projectId);
+        notify(
+          p.inPreviousFolder
+            ? {
+                title: `${p.fileName} is lost everywhere — it is still in the previous Collaboration folder`,
+                detail: `${project}: the file is still at ${p.previousPath ?? 'its previous path'}; it is fetched again if another member serves it.`,
+                kind: 'project',
+                tone: 'warning',
+                hasErrors: true,
+                link: `/projects/${p.projectId}?tab=receive`,
+              }
+            : {
+                title: `${p.fileName} is lost everywhere — restore it from the Trash`,
+                detail: `${project}: no member holds the current version any more, so it cannot be fetched again.`,
+                kind: 'project',
+                tone: 'warning',
+                hasErrors: true,
+                link: `/projects/${p.projectId}?tab=receive`,
+              },
+        );
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[collab] frame-lost listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [notify]);
+
+  // `collab-frame-changed` (L5) — a replica edited in place stops serving at
+  // once and waits under "Changed files".
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<CollabFrameChanged>('collab-frame-changed', (p) => {
+        if (cancelled) return;
+        notify({
+          title: `${p.fileName} changed on disk and was set aside`,
+          detail: `${titleFor(p.projectId)}: it is no longer served — re-fetch the original or delete it under Changed files.`,
+          kind: 'project',
+          tone: 'warning',
           link: `/projects/${p.projectId}?tab=receive`,
         });
       })
@@ -153,7 +228,7 @@ export function useCollabNotifications() {
         if (cancelled) fn();
         else unlisten = fn;
       })
-      .catch((err) => console.error('[collab] replication-paused listen failed:', err));
+      .catch((err) => console.error('[collab] frame-changed listen failed:', err));
     return () => {
       cancelled = true;
       unlisten?.();

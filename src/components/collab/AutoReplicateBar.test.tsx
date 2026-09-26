@@ -14,7 +14,7 @@ beforeEach(() => {
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
   vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'sync_project_now') {
+    if (command === 'collab_sync_now') {
       return Promise.reject('the collab store is not mounted');
     }
     return Promise.resolve(null);
@@ -45,6 +45,9 @@ describe('AutoReplicateBar', () => {
     const first = renderBar();
     fireEvent.click(await screen.findByRole('button', { name: 'Sync now' }));
     expect(await screen.findAllByRole('status')).toHaveLength(1);
+    // "Sync now" is the one global command (L10) — no project argument.
+    expect(api.invoke).toHaveBeenCalledWith('collab_sync_now');
+    expect(api.invoke).not.toHaveBeenCalledWith('sync_project_now', expect.anything());
 
     // A second failure in the same session…
     await waitFor(() => expect(screen.getByRole('button', { name: 'Sync now' })).not.toBeDisabled());

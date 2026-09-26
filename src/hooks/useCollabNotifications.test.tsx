@@ -5,13 +5,24 @@ import { NotificationProvider } from '../contexts/NotificationContext';
 import { ToastStack } from '../components/Toast';
 import { useCollabNotifications } from './useCollabNotifications';
 import { api } from '../api';
-import type { CollabReplicationPaused, ProjectCard } from '../types/models';
+import type {
+  CollabDeletionChoice,
+  CollabFrameChanged,
+  CollabFrameLost,
+  ProjectCard,
+} from '../types/models';
 
 vi.mock('../api', () => ({
   api: { invoke: vi.fn(), listen: vi.fn() },
 }));
 
-let pausedListener: ((p: CollabReplicationPaused) => void) | undefined;
+/** Every registered listener, by event name (the last registration wins). */
+let listeners: Record<string, (p: unknown) => void> = {};
+function emit<T>(event: string, payload: T) {
+  const h = listeners[event];
+  if (!h) throw new Error(`no listener for ${event}`);
+  act(() => h(payload));
+}
 
 function projectCard(overrides: Partial<ProjectCard>): ProjectCard {
   return {
@@ -39,7 +50,7 @@ function projectCard(overrides: Partial<ProjectCard>): ProjectCard {
 }
 
 beforeEach(() => {
-  pausedListener = undefined;
+  listeners = {};
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
   vi.mocked(api.invoke).mockImplementation(((command: string) => {
@@ -49,9 +60,7 @@ beforeEach(() => {
     return Promise.resolve([]);
   }) as never);
   vi.mocked(api.listen).mockImplementation((<T,>(event: string, cb: (p: T) => void) => {
-    if (event === 'collab-replication-paused') {
-      pausedListener = cb as unknown as (p: CollabReplicationPaused) => void;
-    }
+    listeners[event] = cb as unknown as (p: unknown) => void;
     return Promise.resolve(() => {});
   }) as never);
 });
@@ -71,88 +80,98 @@ function renderHarness() {
   );
 }
 
+/** Let the mount-time `list_collab_projects` fetch and every `api.listen`
+ * registration settle before firing an event. */
+async function settle() {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
 describe('useCollabNotifications', () => {
-  it('collab-replication-paused produces exactly one toast with the link, and a repeated identical event is a new toast', async () => {
+  it('no longer listens for the removed replication-paused event', async () => {
     renderHarness();
+    await settle();
+    expect(listeners['collab-replication-paused']).toBeUndefined();
+  });
 
-    // Let the mount-time `list_collab_projects` fetch and the `api.listen`
-    // registration settle before firing the event.
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(pausedListener).toBeDefined();
-
-    act(() => {
-      pausedListener?.({ projectId: 'proj-1', missing: 5, missingBytes: 2 * 1024 * 1024 * 1024 });
-    });
-
+  it('collab-deletion-choice is one warning linking the Receive tab, deduplicated per occurrence', async () => {
+    renderHarness();
+    await settle();
+    const choice: CollabDeletionChoice = {
+      count: 15,
+      projectIds: ['proj-1'],
+      dedupeKey: 'collab-deletion-choice:proj-1:1001',
+    };
+    emit('collab-deletion-choice', choice);
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
-    expect(toasts[0]).toHaveTextContent('Replication paused: 5 frames missing (2.00 GB)');
+    expect(toasts[0]).toHaveTextContent('15 replicas were deleted — choose what to do');
+    expect(screen.getByRole('button', { name: '15 replicas were deleted — choose what to do' })).toBeInTheDocument();
 
-    // The toast is a clickable link to that project's Receive tab.
-    const linkButton = screen.getByRole('button', {
-      name: 'Replication paused: 5 frames missing (2.00 GB)',
-    });
-    expect(linkButton).toBeInTheDocument();
+    // A replay of the same batch (same key) is not shown again…
+    emit('collab-deletion-choice', choice);
+    expect(screen.getAllByRole('status')).toHaveLength(1);
 
-    // Final review I4: each event is one discrete outcome (this hook is the
-    // only place it reaches notify()), so a second pause with the same
-    // numbers is a second, genuine outcome — never swallowed.
-    act(() => {
-      pausedListener?.({ projectId: 'proj-1', missing: 5, missingBytes: 2 * 1024 * 1024 * 1024 });
-    });
-
+    // …a new batch for the same project always is.
+    emit('collab-deletion-choice', { ...choice, dedupeKey: 'collab-deletion-choice:proj-1:1002' });
     expect(screen.getAllByRole('status')).toHaveLength(2);
   });
 
-  it('an identical outcome days later — after a reload, with the persisted history — still notifies', async () => {
-    const first = renderHarness();
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    act(() => {
-      pausedListener?.({ projectId: 'proj-1', missing: 5, missingBytes: 2 * 1024 * 1024 * 1024 });
-    });
-    expect(await screen.findAllByRole('status')).toHaveLength(1);
-    first.unmount();
-
-    // The app restarts: the notification history (and any dedupe set) is
-    // read back from localStorage, which this test deliberately keeps.
-    pausedListener = undefined;
+  it('a deletion choice of one replica reads in the singular', async () => {
     renderHarness();
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(pausedListener).toBeDefined();
-    act(() => {
-      pausedListener?.({ projectId: 'proj-1', missing: 5, missingBytes: 2 * 1024 * 1024 * 1024 });
-    });
-
+    await settle();
+    emit('collab-deletion-choice', { count: 1, projectIds: ['proj-1'], dedupeKey: 'k:1' });
     const toasts = await screen.findAllByRole('status');
-    expect(toasts).toHaveLength(1);
-    expect(toasts[0]).toHaveTextContent('Replication paused: 5 frames missing (2.00 GB)');
+    expect(toasts[0]).toHaveTextContent('1 replica was deleted — choose what to do');
   });
 
-  it('a different missing count is a new toast too', async () => {
+  it('collab-frame-lost points to the Trash when the file is gone', async () => {
     renderHarness();
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    await settle();
+    const lost: CollabFrameLost = {
+      projectId: 'proj-1',
+      frameUuid: 'u2',
+      fileName: 'c_b.fits',
+      inPreviousFolder: false,
+      previousPath: null,
+    };
+    emit('collab-frame-lost', lost);
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('c_b.fits is lost everywhere — restore it from the Trash');
+  });
 
-    act(() => {
-      pausedListener?.({ projectId: 'proj-1', missing: 5, missingBytes: 2 * 1024 * 1024 * 1024 });
+  it('collab-frame-lost points to the previous Collaboration folder, never the Trash, when the file is still there', async () => {
+    renderHarness();
+    await settle();
+    emit<CollabFrameLost>('collab-frame-lost', {
+      projectId: 'proj-1',
+      frameUuid: 'u2',
+      fileName: 'c_b.fits',
+      inPreviousFolder: true,
+      previousPath: '/old/collab/m42/c_b.fits',
     });
-    await screen.findAllByRole('status');
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts[0]).toHaveTextContent('c_b.fits is lost everywhere — it is still in the previous Collaboration folder');
+    expect(toasts[0]).not.toHaveTextContent(/Trash/);
+    // The history entry carries the path and the re-fetch promise.
+    const stored = JSON.parse(localStorage.getItem('athenaeum.notifications.v1') ?? '{}') as {
+      notifications: { title: string; detail: string }[];
+    };
+    const entry = stored.notifications.find((n) => n.title.startsWith('c_b.fits is lost everywhere'));
+    expect(entry?.detail).toContain('/old/collab/m42/c_b.fits');
+    expect(entry?.detail).toContain('fetched again if another member serves it');
+    expect(entry?.detail).not.toMatch(/Trash/);
+  });
 
-    act(() => {
-      pausedListener?.({ projectId: 'proj-1', missing: 9, missingBytes: 3 * 1024 * 1024 * 1024 });
-    });
-
-    expect(screen.getAllByRole('status')).toHaveLength(2);
+  it('collab-frame-changed is a warning that the file was set aside', async () => {
+    renderHarness();
+    await settle();
+    emit<CollabFrameChanged>('collab-frame-changed', { projectId: 'proj-1', frameUuid: 'u1', fileName: 'c_a.fits' });
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('c_a.fits changed on disk and was set aside');
   });
 });

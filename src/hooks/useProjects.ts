@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { useNotifications } from '../contexts/NotificationContext';
-import type { CollabFramesChange, ProjectCard } from '../types/models';
+import type { ProjectCard } from '../types/models';
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -15,15 +15,16 @@ function isOutdated(msg: string): boolean {
  * mount and every 5 minutes while the page is open (spec §2 poll cadence).
  *
  * R29 (controller ruling, Task 11b fix round 1): notifications for
- * per-frame/publish outcomes moved to the app-root `useCollabNotifications`
- * hook (mounted in `Layout.tsx`), because a data-loss-risk outcome
- * (`collab-replication-paused`) and background auto-publish/version-poll
- * ticks must reach `notify()` regardless of which page is open — this hook
- * only runs while `Projects.tsx` is mounted. `refresh_collab_frames` is
- * still called here to force an immediate version-poll tick (rather than
- * waiting on the ~15 s background cadence), but its return value is no
- * longer turned into a notification — that would double-toast alongside the
- * live `collab-frames-changed` event the SAME tick already emits. */
+ * per-frame/publish outcomes live in the app-root `useCollabNotifications`
+ * hook (mounted in `Layout.tsx`), because data-loss-risk outcomes and
+ * background ticks must reach `notify()` regardless of which page is open —
+ * this hook only runs while `Projects.tsx` is mounted.
+ *
+ * Frame changes arrive as live events (wave 3, L3), so there is no frames
+ * poll any more. The MANUAL refresh (the returned `refresh`, the page's
+ * Refresh button) also runs "Sync now" (`collab_sync_now`, L10) once the
+ * projects refreshed; the automatic mount/5-minute refresh never does — Sync
+ * now clears every back-off and reconnects, a user's step. */
 export function useProjects() {
   const { notify } = useNotifications();
   const [projects, setProjects] = useState<ProjectCard[]>([]);
@@ -37,7 +38,8 @@ export function useProjects() {
   // refresh) so the very first fetch never mis-fires a "Joined" toast.
   const knownIdsRef = useRef<Set<string> | null>(null);
 
-  const refresh = useCallback(async () => {
+  /** The projects list from the hub; `true` when it refreshed. */
+  const refreshProjects = useCallback(async (): Promise<boolean> => {
     setRefreshing(true);
     let fresh: ProjectCard[] | null = null;
     try {
@@ -87,23 +89,20 @@ export function useProjects() {
       knownIdsRef.current = new Set(fresh.map((p) => p.projectId));
     }
 
-    // Force an immediate version-poll tick only when the projects refresh
-    // succeeded (i.e. signed in). The tick's own `collab-frames-changed`
-    // events reach `notify()` through `useCollabNotifications`, not here.
-    if (!fresh) return;
-    try {
-      await api.invoke<CollabFramesChange[]>('refresh_collab_frames');
-    } catch (err) {
-      // S6 — a failed frames poll is logged, never silently ignored. It is not
-      // a sign-out signal, so it must not flip `signedOut`.
-      const msg = err instanceof Error ? err.message : String(err);
-      if (isOutdated(msg)) {
-        if (mounted.current) setUpdateRequired(true);
-      } else {
-        console.error('[projects] frames refresh failed:', err);
-      }
-    }
+    return fresh !== null;
   }, [notify]);
+
+  /** The Refresh button: projects, then "Sync now" when signed in. */
+  const refresh = useCallback(async () => {
+    if (!(await refreshProjects())) return;
+    try {
+      await api.invoke('collab_sync_now');
+    } catch (err) {
+      // S6 — logged, never silently ignored; the live status line on the page
+      // shows why the exchange is not running. Not a sign-out signal.
+      console.error('[projects] sync now failed:', err);
+    }
+  }, [refreshProjects]);
 
   useEffect(() => {
     mounted.current = true;
@@ -119,14 +118,14 @@ export function useProjects() {
       } finally {
         if (mounted.current) setLoading(false);
       }
-      void refresh();
+      void refreshProjects();
     })();
-    const timer = setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
+    const timer = setInterval(() => void refreshProjects(), REFRESH_INTERVAL_MS);
     return () => {
       mounted.current = false;
       clearInterval(timer);
     };
-  }, [refresh]);
+  }, [refreshProjects]);
 
   return { projects, loading, refreshing, signedOut, updateRequired, refresh };
 }
