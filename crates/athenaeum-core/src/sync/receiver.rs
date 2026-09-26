@@ -471,8 +471,20 @@ impl Drop for ReceivePermit {
     fn drop(&mut self) {
         let (grants, yield_changed, snap) = {
             let mut state = self.shared.lock();
-            // Never underflows: every permit was counted when it was granted.
-            state.in_use = state.in_use.saturating_sub(1);
+            // Every permit was counted when it was granted, so this never
+            // underflows; a release build that somehow gets here twice reports
+            // it instead of wrapping (or panicking inside a `Drop`).
+            debug_assert!(state.in_use > 0, "receive lane released twice");
+            if state.in_use == 0 {
+                tracing::warn!(
+                    class = self.class.as_str(),
+                    in_use = state.in_use,
+                    limit = state.limit,
+                    "receive lane released twice"
+                );
+            } else {
+                state.in_use -= 1;
+            }
             self.shared.settle(&mut state)
         };
         tracing::debug!(
@@ -622,6 +634,10 @@ impl ReceiveGate {
     /// A watch on the yield flag: `true` exactly while a personal transfer
     /// waits and every lane is taken. The collab lane reads it to finish its
     /// frame in flight and give its permit back; the gate never takes one.
+    ///
+    /// Never hold a `borrow()` of this receiver across a permit drop or an
+    /// `acquire`/`acquire_collab` call — the gate publishes under its own lock
+    /// and would deadlock.
     pub fn yield_signal(&self) -> tokio::sync::watch::Receiver<bool> {
         self.shared.yield_tx.subscribe()
     }
@@ -7758,7 +7774,7 @@ mod tests {
     // sleeps: "must block" is a timeout that ELAPSES, "must be admitted" is one
     // that resolves far inside its bound. A blocked acquire is also a DROPPED
     // acquire future, so every such assertion doubles as a cancel-safety check —
-    // an abandoned wait must not strand a permit or a debt unit.
+    // an abandoned wait must not strand a lane or leave a queue entry behind.
 
     /// Bound for "this acquire must NOT be admitted". Small: it is paid in real
     /// wall time on every negative assertion.
@@ -7824,9 +7840,9 @@ mod tests {
             .expect("waiter task panicked");
     }
 
-    /// The debt mechanics, pinned step by step: `forget_permits` can only take
-    /// AVAILABLE permits, so a shrink under load lands as debt that the next
-    /// releases pay off before anyone is admitted again.
+    /// A shrink under load, pinned step by step: it interrupts no holder and
+    /// stops grants until `in_use` falls below the new limit, so the releases
+    /// that bring the count down admit nobody until it is there.
     #[tokio::test]
     async fn receive_gate_shrink_takes_effect_as_permits_release() {
         let gate = ReceiveGate::new(3);
@@ -7834,34 +7850,29 @@ mod tests {
         let p2 = gate_admit(&gate, "second of three").await;
         let p3 = gate_admit(&gate, "third of three").await;
 
-        // Nothing is available, so this shrink is 100% debt (2 units).
+        // All three lanes are held: the shrink interrupts none of them.
         gate.set_limit(1);
         assert_eq!(gate.limit(), 1);
 
         drop(p1);
-        gate_blocks(&gate, "first release pays a debt unit, admits nobody").await;
+        gate_blocks(
+            &gate,
+            "first release leaves two held, over the limit of one",
+        )
+        .await;
 
         drop(p2);
-        gate_blocks(&gate, "second release pays the last debt unit").await;
+        gate_blocks(&gate, "second release leaves one held, at the limit").await;
 
         drop(p3);
-        let _p4 = gate_admit(&gate, "debt cleared: the third release is a real permit").await;
+        let _p4 = gate_admit(&gate, "the third release frees a lane under the new limit").await;
         gate_blocks(&gate, "only one concurrent receive at limit 1").await;
     }
 
-    /// A shrink/grow round trip must leave no surplus: after 3→1→3 the gate still
-    /// admits exactly 3.
-    ///
-    /// NB what this does and does not pin, established by mutation rather than by
-    /// argument. Deleting the debt bookkeeping from the shrink (`state.debt +=
-    /// cut - forgotten`) FAILS this test at the "fourth while all three are still
-    /// held" assertion — real over-provision. Deleting only the pay-first step from
-    /// the grow (minting `add_permits(2)` on top of a 2-unit debt) still PASSES:
-    /// each debt unit destroys exactly one permit whenever it is paid, so total
-    /// capacity converges to the same 3 either way. Pay-first is therefore chosen
-    /// for the interim state — an honest `available_permits` and no needless
-    /// acquire→forget→re-queue trips to the back of the FIFO — and no test here
-    /// can tell the two apart. Do not read a green run as a pay-first guard.
+    /// A shrink/grow round trip must leave no surplus: a 3→1→3 round trip made
+    /// while all three lanes are held leaves exactly 3 lanes — no fourth receive
+    /// is admitted while the three are held, and exactly three are admitted once
+    /// they are released.
     #[tokio::test]
     async fn receive_gate_grow_pays_debt_first() {
         let gate = ReceiveGate::new(3);
@@ -7869,8 +7880,8 @@ mod tests {
         let p2 = gate_admit(&gate, "second of three").await;
         let p3 = gate_admit(&gate, "third of three").await;
 
-        gate.set_limit(1); // debt 2 — nothing available to forget
-        gate.set_limit(3); // pays the debt down instead of adding permits
+        gate.set_limit(1); // three held over a limit of one — nobody interrupted
+        gate.set_limit(3); // back to three: exactly the lanes already held
         assert_eq!(gate.limit(), 3);
 
         // Still three in flight against a limit of three: at capacity.
@@ -7977,7 +7988,7 @@ mod tests {
         let personal = tokio::spawn(async move { g2.acquire().await });
         tokio::task::yield_now().await;
         drop(held);
-        let p = tokio::time::timeout(std::time::Duration::from_secs(1), personal)
+        let p = tokio::time::timeout(GATE_ADMITTED, personal)
             .await
             .unwrap()
             .unwrap();
@@ -7987,7 +7998,7 @@ mod tests {
             "the queued collab unit waits behind the personal transfer"
         );
         drop(p);
-        let c = tokio::time::timeout(std::time::Duration::from_secs(1), collab_next)
+        let c = tokio::time::timeout(GATE_ADMITTED, collab_next)
             .await
             .unwrap()
             .unwrap();
@@ -8002,7 +8013,7 @@ mod tests {
         assert!(!*signal.borrow());
         let g = std::sync::Arc::clone(&gate);
         let personal = tokio::spawn(async move { g.acquire().await });
-        tokio::time::timeout(std::time::Duration::from_secs(1), signal.wait_for(|y| *y))
+        tokio::time::timeout(GATE_ADMITTED, signal.wait_for(|y| *y))
             .await
             .unwrap()
             .unwrap();
@@ -8034,7 +8045,7 @@ mod tests {
         let _ = waiter.await;
         drop(held);
         // the lane is free again for the next caller
-        let _again = tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire())
+        let _again = tokio::time::timeout(GATE_ADMITTED, gate.acquire())
             .await
             .unwrap();
         assert_eq!(gate.in_use(), 1);
@@ -8052,7 +8063,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!next.is_finished(), "one holder left = the new limit");
         drop(b);
-        let _n = tokio::time::timeout(std::time::Duration::from_secs(1), next)
+        let _n = tokio::time::timeout(GATE_ADMITTED, next)
             .await
             .unwrap()
             .unwrap();
@@ -8100,8 +8111,9 @@ mod tests {
     /// R4 no barging: with limit 2 and two collab holders, a collab unit
     /// queues FIRST and a personal transfer queues after it. When one lane
     /// frees, the personal transfer wins it, and a collab caller arriving at
-    /// that very moment cannot slip in either — the lane was reserved for the
-    /// personal waiter before it was even woken.
+    /// that very moment cannot slip in either — nor can a fresh personal
+    /// caller: the lane was reserved for the personal waiter before it was
+    /// even woken.
     #[tokio::test]
     async fn a_freed_lane_goes_to_the_personal_waiter_and_nobody_barges() {
         let gate = Arc::new(ReceiveGate::new(2));
@@ -8128,6 +8140,15 @@ mod tests {
                 .is_err(),
             "a collab caller must not barge into the lane reserved for the personal waiter"
         );
+        // The probe only the reservation stops: a fresh PERSONAL caller finds
+        // the personal queue empty (its waiter was already granted), so class
+        // priority alone would let it in — the lane counted as held keeps it out.
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, gate.acquire())
+                .await
+                .is_err(),
+            "a personal caller must not barge into the lane reserved for the personal waiter"
+        );
         assert_eq!(gate.in_use(), 2, "the freed lane is already reserved");
         assert!(!*signal.borrow(), "the personal waiter holds a lane now");
 
@@ -8148,6 +8169,36 @@ mod tests {
             .expect("the collab waiter is admitted next")
             .expect("collab waiter panicked");
         assert_eq!(c.class(), ReceiveClass::Collab);
+    }
+
+    /// A lane granted into a waiter's channel whose future is then dropped
+    /// before it ever runs: the permit sitting in the dropped channel releases
+    /// the lane, so nothing is stranded.
+    #[tokio::test]
+    async fn a_lane_granted_to_a_waiter_dropped_before_it_runs_is_released() {
+        let gate = Arc::new(ReceiveGate::new(1));
+        let held = gate.acquire().await;
+        let g = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { g.acquire().await });
+        settle().await;
+        assert!(!waiter.is_finished());
+
+        // The release grants the lane into the waiter's channel; the waiter is
+        // woken but, on this current-thread runtime, has not run yet.
+        drop(held);
+        assert_eq!(gate.in_use(), 1, "the lane is reserved for the waiter");
+        waiter.abort();
+        assert!(
+            waiter.await.unwrap_err().is_cancelled(),
+            "the waiter was dropped before it could take its permit"
+        );
+        assert_eq!(gate.in_use(), 0, "the unclaimed permit released the lane");
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, gate.acquire())
+                .await
+                .is_ok(),
+            "a fresh acquire is admitted at once"
+        );
     }
 
     /// R4: raising the limit while a personal transfer waits admits it at
