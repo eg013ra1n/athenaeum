@@ -59,3 +59,20 @@ describe('fieldMeta', () => {
     expect(() => fieldMeta('nonexistent.section', 'x')).toThrow();
   });
 });
+
+describe('transfers.collabStreams (L11)', () => {
+  it('registers both collaboration stream limits on the Transfers tab, after the receiving card', () => {
+    const section = sectionById('transfers.collabStreams');
+    expect(section.tab).toBe('transfers');
+    const transfers = SETTINGS_SECTIONS.filter((s) => s.tab === 'transfers').map((s) => s.id);
+    expect(transfers.indexOf('transfers.collabStreams')).toBe(transfers.indexOf('transfers.receiving') + 1);
+
+    const upload = fieldMeta('transfers.collabStreams', 'uploadStreams');
+    expect(upload.label).toBe('Simultaneous collaboration uploads');
+    expect(upload.keywords).toEqual(expect.arrayContaining(['collab.max_upload_streams', 'set_collab_max_upload_streams']));
+
+    const receive = fieldMeta('transfers.collabStreams', 'receiveStreams');
+    expect(receive.label).toBe('Simultaneous collaboration downloads');
+    expect(receive.keywords).toEqual(expect.arrayContaining(['collab.max_receive_streams', 'set_collab_max_receive_streams']));
+  });
+});

@@ -1,7 +1,8 @@
 // Settings redesign (spec 2026-09-18 §2) — Transfers tab: Account · Sync ·
-// Folders · Upload speed limit · Simultaneous incoming transfers · Transfer
-// storage. `AccountSection`/`SyncSection` each render one `SettingsSection`;
-// `TransfersSection` renders four from one component (shared-element
+// Folders · Upload speed limit · Simultaneous incoming transfers ·
+// Collaboration streams · Transfer storage. `AccountSection`/`SyncSection`
+// each render one `SettingsSection`; `TransfersSection` renders five from one
+// component (shared-element
 // pattern, see `AnalysisTab.tsx`) — the registry supplies every
 // title/description. Account and Sync moved here from General (spec §2).
 import AccountSection from '../AccountSection';
@@ -17,6 +18,7 @@ export const TRANSFERS_SECTIONS: TabSectionEntry[] = [
   { sectionId: 'transfers.folders', element: transfersSection },
   { sectionId: 'transfers.upload', element: transfersSection },
   { sectionId: 'transfers.receiving', element: transfersSection },
+  { sectionId: 'transfers.collabStreams', element: transfersSection },
   { sectionId: 'transfers.storage', element: transfersSection },
 ];
 

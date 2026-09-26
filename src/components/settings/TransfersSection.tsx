@@ -1,7 +1,7 @@
-// Settings → Transfers (task 15; settings redesign Task D3). Four
+// Settings → Transfers (task 15; settings redesign Task D3). Five
 // `SettingsSection`s now — Folders, Upload speed limit, Simultaneous
-// incoming transfers, Transfer storage — the registry supplies each card's
-// title/description.
+// incoming transfers, Collaboration streams, Transfer storage — the registry
+// supplies each card's title/description.
 //
 // The two Folders cards are new (transfer-prepare spec §6.3–6.5: the outgoing
 // staging folder and the incoming working folder). Upload speed limit and
@@ -92,6 +92,14 @@ const uploadMbCodec: Codec<number> = {
 // getter clamps into the same window.
 const MIN_RECEIVES = 1;
 const MAX_RECEIVES = 8;
+
+// Collaboration streams (L11). `collab.max_upload_streams` /
+// `collab.max_receive_streams` are plain integer strings; the setters refuse
+// anything outside these windows (`Invalid`), applied live on success. The
+// defaults come from `get_settings_defaults`, never restated here.
+const MIN_COLLAB_STREAMS = 1;
+const MAX_COLLAB_UPLOAD_STREAMS = 64;
+const MAX_COLLAB_RECEIVE_STREAMS = 32;
 
 export default function TransfersSection() {
   const { notify } = useNotifications();
@@ -362,6 +370,34 @@ export default function TransfersSection() {
           step={1}
           write={(n) => api.invoke('set_sync_max_concurrent_receives', { maxConcurrentReceives: n })}
         />
+      </SettingsSection>
+
+      {/* Collaboration streams (L11): how many frames this device serves to
+          collaborators at once, and how many one collab download fetches at
+          once — beside the byte-rate cap above. */}
+      <SettingsSection id="transfers.collabStreams">
+        <div className="space-y-4">
+          <SettingNumber
+            section="transfers.collabStreams"
+            field="uploadStreams"
+            settingKey="collab.max_upload_streams"
+            codec={intCodec(MIN_COLLAB_STREAMS, MAX_COLLAB_UPLOAD_STREAMS)}
+            min={MIN_COLLAB_STREAMS}
+            max={MAX_COLLAB_UPLOAD_STREAMS}
+            step={1}
+            write={(n) => api.invoke('set_collab_max_upload_streams', { maxUploadStreams: n })}
+          />
+          <SettingNumber
+            section="transfers.collabStreams"
+            field="receiveStreams"
+            settingKey="collab.max_receive_streams"
+            codec={intCodec(MIN_COLLAB_STREAMS, MAX_COLLAB_RECEIVE_STREAMS)}
+            min={MIN_COLLAB_STREAMS}
+            max={MAX_COLLAB_RECEIVE_STREAMS}
+            step={1}
+            write={(n) => api.invoke('set_collab_max_receive_streams', { maxReceiveStreams: n })}
+          />
+        </div>
       </SettingsSection>
 
       {/* Transfer storage (B7): footprint + one-click reclaim of finished-transfer temp data. */}

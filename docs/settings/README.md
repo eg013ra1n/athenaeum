@@ -61,7 +61,7 @@ value, a default or render code. Two consumers read it: the search index
 | Plate Solving | `plateSolving.catalog` `plateSolving.solver` `plateSolving.inputGate` |
 | Calibration | `calibration.matching` `calibration.memory` `calibration.masterFormat` |
 | Stacking | `stacking.pipeline` `stacking.folders` |
-| Transfers | `transfers.account` `transfers.sync` `transfers.folders` `transfers.upload` `transfers.receiving` `transfers.storage` |
+| Transfers | `transfers.account` `transfers.sync` `transfers.folders` `transfers.upload` `transfers.receiving` `transfers.collabStreams` `transfers.storage` |
 
 ## 3. Render it — the field components and the autosave rule
 

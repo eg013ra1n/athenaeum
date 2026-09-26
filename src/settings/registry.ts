@@ -827,6 +827,25 @@ export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     ],
   },
   {
+    id: 'transfers.collabStreams',
+    tab: 'transfers',
+    title: 'Collaboration streams',
+    fields: [
+      {
+        id: 'uploadStreams',
+        label: 'Simultaneous collaboration uploads',
+        help: 'How many frames this device serves to collaborators at once. Further requests are sent to other holders.',
+        keywords: ['collab.max_upload_streams', 'set_collab_max_upload_streams', 'swarm', 'seeding'],
+      },
+      {
+        id: 'receiveStreams',
+        label: 'Simultaneous collaboration downloads',
+        help: 'How many frames one collaboration download fetches at once. Personal transfers always go first.',
+        keywords: ['collab.max_receive_streams', 'set_collab_max_receive_streams', 'swarm'],
+      },
+    ],
+  },
+  {
     id: 'transfers.storage',
     tab: 'transfers',
     title: 'Transfer storage',
