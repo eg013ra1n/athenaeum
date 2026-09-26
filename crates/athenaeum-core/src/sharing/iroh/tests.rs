@@ -5113,7 +5113,10 @@ mod live_run {
     use iroh_blobs::api::proto::BlobStatus;
 
     use crate::api::collab_live::test_support as ts;
-    use crate::sharing::iroh::assign::{ItemOutcome, LiveVerdict, ProviderSet};
+    use crate::db::collab_frames::LocalState;
+    use crate::sharing::iroh::assign::{
+        is_refused_by_every_provider, Dialer, ItemOutcome, LiveVerdict, ProviderSet,
+    };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_live_item_waits_for_its_first_provider_then_completes() {
@@ -5223,8 +5226,7 @@ mod live_run {
         let me = ts::bare_node().await;
         ts::pair(&me, &rig.node).await;
         let store = ts::scratch_store();
-        let out =
-            ts::run_one_live_cancel_after(&me, &store, &rig, 0, Duration::from_millis(1500)).await;
+        let out = ts::run_one_live_cancel_once_moving(&me, &store, &rig, 0).await;
         assert!(matches!(out, ItemOutcome::Cancelled), "{out:?}");
         assert!(matches!(
             store.blobs().status(rig.hash_of(0)).await.unwrap(),
@@ -5249,8 +5251,7 @@ mod live_run {
         ts::pair(&me, &b.node).await;
         let store = ts::scratch_store();
 
-        let out =
-            ts::run_one_live_cancel_after(&me, &store, &a, 0, Duration::from_millis(1500)).await;
+        let out = ts::run_one_live_cancel_once_moving(&me, &store, &a, 0).await;
         assert!(matches!(out, ItemOutcome::Cancelled), "{out:?}");
         assert!(matches!(
             store.blobs().status(hash).await.unwrap(),
@@ -5309,5 +5310,177 @@ mod live_run {
         assert!(stats.max_concurrent <= 2, "{}", stats.max_concurrent);
         assert_eq!(stats.completed, 4);
         assert!(!stats.returned_early);
+    }
+
+    // ─── fix round 1 ─────────────────────────────────────────────────────
+
+    /// I1: an item waiting on an empty live set is not transferring, so a
+    /// yield cuts it at once — it does not hold its slot until a provider
+    /// appears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_waiting_item_is_cut_at_once_by_a_yield() {
+        let me = ts::bare_node().await;
+        let store = ts::scratch_store();
+        let (_prov_tx, prov_rx) =
+            tokio::sync::watch::channel(Arc::new(Vec::<iroh::EndpointId>::new()));
+        let hash = iroh_blobs::Hash::new(b"a frame nobody holds yet");
+        let (item, _cancel) = ts::live_item("f00", hash, 1024, ProviderSet::Live(prov_rx));
+        let (outcomes, after_yield) = ts::run_live_then_yield(
+            &store,
+            ts::live_dialer(&me, &[]),
+            vec![item],
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            after_yield < Duration::from_secs(2),
+            "the run returned {after_yield:?} after the yield"
+        );
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0].1, ItemOutcome::Cancelled),
+            "{outcomes:?}"
+        );
+    }
+
+    /// I2 (a): a provider that refused, left the live set and came back is
+    /// asked again — its exclusion ended when it was seen absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_that_leaves_and_returns_is_asked_again() {
+        let (a, b) = ts::two_landed_providers().await;
+        // A refuses (its row is not held); B is busy, so the item waits.
+        ts::set_frame_state_raw(&a, 0, LocalState::Idle);
+        b.node.set_collab_upload_limit(1);
+        let busy = b.node.collab_stream_gauge_for_test().try_acquire().unwrap();
+        let me = ts::bare_node().await;
+        ts::pair(&me, &a.node).await;
+        ts::pair(&me, &b.node).await;
+        let store = ts::scratch_store();
+        let (a_id, b_id) = (a.node.endpoint_addr().id, b.node.endpoint_addr().id);
+        let (prov_tx, prov_rx) = tokio::sync::watch::channel(Arc::new(vec![a_id, b_id]));
+        let (item, _cancel) =
+            ts::live_item(&a.frames[0].1, a.hash_of(0), 0, ProviderSet::Live(prov_rx));
+        let run = ts::drive_live(
+            &store,
+            ts::live_dialer(&me, &[&a.node, &b.node]),
+            vec![item],
+            ts::live_opts(8, crate::sharing::noop_provider_telemetry()),
+            async {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                prov_tx.send_replace(Arc::new(vec![b_id])); // A leaves
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                ts::set_frame_state_raw(&a, 0, LocalState::Held);
+                prov_tx.send_replace(Arc::new(vec![a_id, b_id])); // A comes back
+            },
+        )
+        .await;
+        drop(busy);
+        assert_eq!(run.outcomes.len(), 1);
+        assert!(
+            matches!(run.outcomes[0].1, ItemOutcome::Done),
+            "{:?}",
+            run.outcomes
+        );
+        assert!(
+            run.verdicts
+                .iter()
+                .any(|v| matches!(v, LiveVerdict::Refused { provider, .. } if *provider == a_id)),
+            "{:?}",
+            run.verdicts
+        );
+        assert!(
+            run.report
+                .per_provider
+                .get(&a_id)
+                .is_some_and(|s| s.bytes > 0),
+            "A served it after coming back: {:?}",
+            run.report
+        );
+    }
+
+    /// I2 (b): a live item whose every provider refused it fails at once,
+    /// with a cause the scheduler recognises.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_item_every_provider_refused_fails_to_the_scheduler() {
+        let rig = ts::landed_rig(1).await;
+        ts::set_frame_state_raw(&rig, 0, LocalState::Idle);
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let store = ts::scratch_store();
+        let (_prov_tx, prov_rx) =
+            tokio::sync::watch::channel(Arc::new(vec![rig.node.endpoint_addr().id]));
+        let started = std::time::Instant::now();
+        let (out, _report) =
+            ts::run_one_live(&me, &store, &rig, 0, ProviderSet::Live(prov_rx), async {}).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let ItemOutcome::Failed(e) = out else {
+            panic!("expected Failed, got {out:?}");
+        };
+        assert!(is_refused_by_every_provider(&e), "{e:#}");
+        assert!(
+            format!("{e:#}").starts_with("refused by every provider"),
+            "{e:#}"
+        );
+    }
+
+    /// I3: set changes that wake an item early from a failure backoff spend
+    /// no round — ten of them, more than the whole ladder, do not fail it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_changes_during_a_backoff_spend_no_round() {
+        let rig = ts::landed_rig(1).await;
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let store = ts::scratch_store();
+        let provider = rig.node.endpoint_addr().id;
+        // No address at first: every dial fails, the provider is struck into
+        // backoff after three.
+        let book: Arc<std::sync::Mutex<Option<iroh::EndpointAddr>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let dialer = {
+            let book = Arc::clone(&book);
+            let (events, _) = tokio::sync::mpsc::unbounded_channel();
+            Dialer::Collab {
+                pool: crate::sharing::iroh::collab_pool::CollabPool::new(me.endpoint(), events),
+                addrs: Arc::new(move |_| book.lock().unwrap().clone()),
+            }
+        };
+        let (prov_tx, prov_rx) = tokio::sync::watch::channel(Arc::new(vec![provider]));
+        let (item, _cancel) = ts::live_item(
+            &rig.frames[0].1,
+            rig.hash_of(0),
+            0,
+            ProviderSet::Live(prov_rx),
+        );
+        let addr = rig.node.endpoint_addr();
+        let run = ts::drive_live(
+            &store,
+            dialer,
+            vec![item],
+            ts::live_opts(8, crate::sharing::noop_provider_telemetry()),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                for _ in 0..10 {
+                    prov_tx.send_replace(Arc::new(vec![provider]));
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                *book.lock().unwrap() = Some(addr);
+            },
+        )
+        .await;
+        assert_eq!(run.outcomes.len(), 1);
+        assert!(
+            matches!(run.outcomes[0].1, ItemOutcome::Done),
+            "{:?}",
+            run.outcomes
+        );
+        assert!(
+            run.verdicts
+                .iter()
+                .filter(|v| matches!(v, LiveVerdict::DialFailed { .. }))
+                .count()
+                >= 3,
+            "the provider was struck into backoff first: {:?}",
+            run.verdicts
+        );
     }
 }

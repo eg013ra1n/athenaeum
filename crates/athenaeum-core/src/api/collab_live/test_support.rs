@@ -487,24 +487,110 @@ pub(crate) async fn run_one_live_fixed(
     (only_outcome(&mut run), run.verdicts)
 }
 
-/// Fetch frame `i` of `rig` and flip its cancel switch after `after`.
-pub(crate) async fn run_one_live_cancel_after(
+/// Fetch frame `i` of `rig` and flip its cancel switch as soon as the store
+/// holds some of its bytes (polled, 30 s at most) — mid-transfer by
+/// construction rather than by a guessed delay.
+pub(crate) async fn run_one_live_cancel_once_moving(
     me: &SharedIrohNode,
     store: &iroh_blobs::api::Store,
     rig: &LandedRig,
     i: usize,
-    after: std::time::Duration,
 ) -> ItemOutcome {
     let providers = ProviderSet::Fixed(Arc::new(vec![rig.node.endpoint_addr().id]));
     let (item, cancel) = rig_item(rig, i, providers);
+    let hash = rig.hash_of(i);
     let dialer = live_dialer(me, &[&rig.node]);
     let opts = live_opts(8, crate::sharing::noop_provider_telemetry());
+    let blobs = store.blobs().clone();
     let mut run = drive_live(store, dialer, vec![item], opts, async move {
-        tokio::time::sleep(after).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let moved = blobs
+                .observe(hash)
+                .await
+                .map(|b| b.total_bytes())
+                .unwrap_or(0);
+            if moved > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no byte of the frame arrived within 30 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         cancel.send_replace(true);
     })
     .await;
     only_outcome(&mut run)
+}
+
+/// Queue `items` on a live run whose item channel stays OPEN, request a
+/// yield after `yield_after`, and return the outcomes plus how long the run
+/// took to return after the yield (fix round 1, I1).
+pub(crate) async fn run_live_then_yield(
+    store: &iroh_blobs::api::Store,
+    dialer: Dialer,
+    items: Vec<LiveItem>,
+    yield_after: std::time::Duration,
+) -> (Vec<(String, ItemOutcome)>, std::time::Duration) {
+    let (item_tx, item_rx) = tokio::sync::mpsc::channel(items.len().max(1));
+    for item in items {
+        item_tx.send(item).await.unwrap();
+    }
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (verdict_tx, _verdict_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (yield_tx, yield_rx) = tokio::sync::watch::channel(false);
+    let opts = live_opts(8, crate::sharing::noop_provider_telemetry());
+    let run = run_live(store, dialer, item_rx, opts, done_tx, verdict_tx, yield_rx);
+    let yielded_at = Arc::new(std::sync::Mutex::new(None));
+    let side = {
+        let yielded_at = Arc::clone(&yielded_at);
+        async move {
+            tokio::time::sleep(yield_after).await;
+            *yielded_at.lock().unwrap() = Some(std::time::Instant::now());
+            yield_tx.send_replace(true);
+            // Keep the sender (and so the yield) alive until the run ends.
+            std::future::pending::<()>().await;
+        }
+    };
+    let report = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::select! {
+            r = run => r,
+            _ = side => unreachable!("the side future never ends"),
+        }
+    })
+    .await
+    .expect("a yield ends the live run");
+    drop(report);
+    let after_yield = yielded_at
+        .lock()
+        .unwrap()
+        .expect("the yield was requested before the run returned")
+        .elapsed();
+    drop(item_tx);
+    let mut outcomes = Vec::new();
+    while let Ok(o) = done_rx.try_recv() {
+        outcomes.push(o);
+    }
+    (outcomes, after_yield)
+}
+
+/// Force frame `i` of `rig` into `state` with a raw UPDATE (no transition
+/// checks, no outbox) — for a test that makes its serve oracle refuse
+/// (`idle`) and serve again (`held`).
+pub(crate) fn set_frame_state_raw(
+    rig: &LandedRig,
+    i: usize,
+    state: crate::db::collab_frames::LocalState,
+) {
+    let (pid, uuid, _) = &rig.frames[i];
+    let conn = crate::api::db(&rig.ctx).unwrap().conn();
+    conn.execute(
+        "UPDATE project_frames_local SET local_state = ?3 WHERE project_id = ?1 AND frame_uuid = ?2",
+        rusqlite::params![pid, uuid, state.as_db_str()],
+    )
+    .unwrap();
 }
 
 /// What [`run_many_live`] saw.

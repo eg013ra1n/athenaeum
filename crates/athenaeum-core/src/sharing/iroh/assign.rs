@@ -103,7 +103,7 @@
 //! connection would make the next attempt pay a fresh handshake.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -557,22 +557,80 @@ impl ProviderSet {
         }
     }
 
-    /// Sleep for `wait`, or less if a live set changes first.
-    async fn sleep_or_change(&mut self, wait: Duration) {
+    /// Sleep for `wait`, or less if a live set changes first. `true` when
+    /// the timer ran out, `false` when a set change woke it early.
+    async fn sleep_or_change(&mut self, wait: Duration) -> bool {
         match self {
-            Self::Fixed(_) => tokio::time::sleep(wait).await,
+            Self::Fixed(_) => {
+                tokio::time::sleep(wait).await;
+                true
+            }
             Self::Live(rx) => {
                 tokio::select! {
-                    _ = tokio::time::sleep(wait) => {}
+                    _ = tokio::time::sleep(wait) => true,
                     changed = rx.changed() => {
                         if changed.is_err() {
                             // The sender is gone: the set is final, so only
                             // the backoff can free a provider now.
                             tokio::time::sleep(wait).await;
+                            true
+                        } else {
+                            false
                         }
                     }
                 }
             }
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
+}
+
+/// A live item whose providers ALL refused it (or served bytes that failed
+/// verification) ends with this error — the scheduler owns when to try it
+/// again (several refusal causes are transient: storage unmounted, a
+/// mismatch cleared by a rehash, a provider still landing its own copy).
+/// Recognise it with [`is_refused_by_every_provider`]; its message starts
+/// with "refused by every provider".
+#[derive(Debug)]
+pub(crate) struct RefusedByEveryProvider {
+    pub item: String,
+}
+
+impl std::fmt::Display for RefusedByEveryProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused by every provider: {}", self.item)
+    }
+}
+
+impl std::error::Error for RefusedByEveryProvider {}
+
+/// Whether a live item failed because every provider refused it.
+#[allow(dead_code)] // read by the live scheduler (Tasks 14-15) and the tests
+pub(crate) fn is_refused_by_every_provider(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RefusedByEveryProvider>().is_some()
+}
+
+/// Marks a live item as transferring for as long as it lives — set the
+/// moment a provider is claimed, cleared when the round ends however it
+/// ends (a `continue 'child` included).
+struct Transferring(Option<Arc<AtomicBool>>);
+
+impl Transferring {
+    fn start(flag: &Option<Arc<AtomicBool>>) -> Self {
+        if let Some(f) = flag {
+            f.store(true, Ordering::Release);
+        }
+        Self(flag.clone())
+    }
+}
+
+impl Drop for Transferring {
+    fn drop(&mut self) {
+        if let Some(f) = &self.0 {
+            f.store(false, Ordering::Release);
         }
     }
 }
@@ -630,7 +688,10 @@ pub(crate) struct LiveItem {
 pub(crate) enum ItemOutcome {
     /// Complete and verified in the store.
     Done,
-    /// Cancelled (its switch, or cut at a yield); partial bytes stay.
+    /// Cancelled — its switch, or cut at a yield (an item that was not
+    /// transferring ends at once; one that was, once it moved the work-unit
+    /// cap). Its verified partial bytes stay in the store, and the scheduler
+    /// re-queues it: a resumed fetch asks only for what is still missing.
     Cancelled,
     /// The item exhausted its ladder or hit an error no provider owns.
     Failed(anyhow::Error),
@@ -1045,6 +1106,7 @@ async fn run_items(
                 item,
                 opts.clone(),
                 None,
+                None,
             ));
             slot_of.insert(handle.id(), slot);
         }
@@ -1121,7 +1183,14 @@ struct ItemLabel {
 /// providers, the per-item counterpart of what [`fail_with_report`] attaches
 /// to a fail-fast error.
 fn isolated_failure(states: &States, label: &ItemLabel, e: anyhow::Error) -> anyhow::Error {
-    let e = match last_failure_cause(states, Some(&label.providers.current())) {
+    // A live item every provider refused keeps that cause outermost, so the
+    // scheduler reads it as such (its message starts with it).
+    let cause = if is_refused_by_every_provider(&e) {
+        None
+    } else {
+        last_failure_cause(states, Some(&label.providers.current()))
+    };
+    let e = match cause {
         Some(c) => e.context(format!("last provider fault: {c}")),
         None => e,
     };
@@ -1189,13 +1258,18 @@ fn last_failure_cause(states: &States, among: Option<&[EndpointId]>) -> Option<S
 ///   `GetProgress` stream is dropped, which resets its QUIC stream (module
 ///   doc), and its verified ranges stay in the store for a resume.
 /// - **Yield** (`yield_now` = `true`, a personal transfer is waiting — §8):
-///   no new item is taken; an in-flight item larger than
-///   `opts.unit_cap_bytes` is cut ([`ItemOutcome::Cancelled`]) once it has
-///   moved that much since the yield; the run returns as soon as nothing is
-///   in flight.
+///   no new item is taken; an in-flight item that is not transferring (it
+///   waits for a provider) is cut at once ([`ItemOutcome::Cancelled`]), and
+///   a transferring one larger than `opts.unit_cap_bytes` once it has moved
+///   that much since the yield; the run returns as soon as nothing is in
+///   flight.
 ///
 /// Returns when `items` is closed and drained, or at a yield once nothing is
 /// in flight. Per-provider state (backoff, busy, goodput) lives for the run.
+///
+/// Items still queued in the channel when a yield returns are dropped with
+/// the receiver and get NO outcome on `done`: the caller re-derives them
+/// from its need set (T15).
 #[allow(dead_code)] // driven by the live scheduler (Tasks 13-15) and the tests
 pub(crate) async fn run_live(
     store: &Store,
@@ -1300,6 +1374,7 @@ pub(crate) async fn run_live(
                         providers: item.providers.clone(),
                     };
                     let (hash, size) = (item.hash, item.size);
+                    let transferring = Arc::new(AtomicBool::new(false));
                     let child = run_child(
                         dialer.clone(),
                         remote.clone(),
@@ -1309,6 +1384,7 @@ pub(crate) async fn run_live(
                         item,
                         child_opts.clone(),
                         Some(verdicts.clone()),
+                        Some(Arc::clone(&transferring)),
                     );
                     let cut = cut_at_yield(
                         yield_now.clone(),
@@ -1316,6 +1392,7 @@ pub(crate) async fn run_live(
                         hash,
                         size,
                         opts.unit_cap_bytes,
+                        transferring,
                     );
                     let handle = set.spawn(async move {
                         tokio::select! {
@@ -1377,20 +1454,24 @@ async fn cancelled(mut cancel: watch::Receiver<bool>) {
     }
 }
 
-/// Resolves when a yield should cut this item: it is larger than the
-/// work-unit cap and has moved `cap` bytes since the yield began (§8 — a
-/// personal transfer waits at most one frame). A withdrawn yield starts the
-/// count again at the next one.
+/// Resolves when a yield should cut this item (§8 — a personal transfer
+/// waits at most one frame):
+///
+/// - an item that is NOT transferring (waiting for a provider to appear, on
+///   parked or busy providers) is cut at once — it would otherwise hold its
+///   stream slot and keep the yield from ever completing;
+/// - a transferring item larger than the work-unit cap is cut once it has
+///   moved `cap` bytes since the yield began; a smaller one finishes.
+///
+/// A withdrawn yield starts the count again at the next one.
 async fn cut_at_yield(
     mut yield_now: watch::Receiver<bool>,
     blobs: Blobs,
     hash: Hash,
     size: u64,
     cap: u64,
+    transferring: Arc<AtomicBool>,
 ) {
-    if size <= cap {
-        return std::future::pending().await;
-    }
     loop {
         // Wait for a yield.
         while !*yield_now.borrow_and_update() {
@@ -1398,16 +1479,29 @@ async fn cut_at_yield(
                 return std::future::pending().await;
             }
         }
-        let base = local_bytes(&blobs, hash).await;
+        let base = if size > cap {
+            Some(local_bytes(&blobs, hash).await)
+        } else {
+            None
+        };
         while *yield_now.borrow() {
-            tokio::time::sleep(YIELD_CUT_POLL).await;
-            if local_bytes(&blobs, hash).await.saturating_sub(base) >= cap {
+            if !transferring.load(Ordering::Acquire) {
                 tracing::debug!(
                     blake3 = %hash,
-                    bytes = cap,
-                    "live fetch cut at a yield: the work-unit cap moved"
+                    "live fetch cut at a yield: not transferring"
                 );
                 return;
+            }
+            tokio::time::sleep(YIELD_CUT_POLL).await;
+            if let Some(base) = base {
+                if local_bytes(&blobs, hash).await.saturating_sub(base) >= cap {
+                    tracing::debug!(
+                        blake3 = %hash,
+                        bytes = cap,
+                        "live fetch cut at a yield: the work-unit cap moved"
+                    );
+                    return;
+                }
             }
         }
     }
@@ -1439,6 +1533,7 @@ async fn run_child(
     item: FetchItem<ProviderSet>,
     opts: AssignmentOptions,
     verdicts: Option<VerdictSink>,
+    transferring: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
     let request = item.request.clone();
     // Log fields keep the collection path's names: `root_hash` is the hash the
@@ -1477,13 +1572,27 @@ async fn run_child(
         let missing = local.missing();
 
         // This round's candidates: the providers now, minus the excluded.
-        let candidates: Vec<EndpointId> = providers
-            .current_seen()
+        let current = providers.current_seen();
+        if providers.is_live() {
+            // A provider that left the live set and came back re-announced
+            // itself as serving (spec §4.2): its exclusion for this item ends
+            // the moment it is seen absent.
+            excluded.retain(|p| current.contains(p));
+        }
+        let candidates: Vec<EndpointId> = current
             .iter()
             .copied()
             .filter(|p| !excluded.contains(p))
             .collect();
         if candidates.is_empty() {
+            if providers.is_live() && !current.is_empty() {
+                // Every provider of a live set refused this item: it fails to
+                // the scheduler, which owns when to try again — waiting here
+                // would hold a stream slot for as long as the refusals last.
+                return Err(anyhow::Error::new(RefusedByEveryProvider {
+                    item: item.describe(),
+                }));
+            }
             // Nobody to ask. A live set waits for a provider to appear, for
             // as long as it takes and without spending a round (spec §7.2: a
             // frame without providers sleeps and costs nothing); a fixed list
@@ -1531,10 +1640,18 @@ async fn run_child(
                     "every provider in backoff — waiting for the earliest"
                 );
             }
-            providers.sleep_or_change(wait).await;
+            let timer = providers.sleep_or_change(wait).await;
+            if !busy && !timer {
+                // A live set changed before the backoff ran out: nothing was
+                // tried and nothing waited out, so the round is given back.
+                rounds -= 1;
+            }
             continue;
         };
 
+        // From the claim to the end of this round the item is transferring;
+        // a yield cuts a live item that is not (see `cut_at_yield`).
+        let _transferring = Transferring::start(&transferring);
         let provider = claim.provider();
         (opts.telemetry)(ProviderEvent::Trying(*provider.as_bytes()));
         let started = Instant::now();
@@ -1820,7 +1937,9 @@ impl FaultScope<'_> {
 ///   ([`record_failure`]) and a `Failed` telemetry event — unchanged.
 /// - `Busy` (`ERR_LIMIT`): the provider is skipped for [`LIMIT_RETRY`] for
 ///   every hash; no strike, no fault telemetry.
-/// - `Refused` (`ERR_PERMISSION`): excluded for this item only; no strike.
+/// - `Refused` (`ERR_PERMISSION`): excluded for this item only; no strike,
+///   no fault telemetry. On a live set the exclusion ends when the provider
+///   leaves the set and comes back.
 /// - `Corrupt` (verification failed): struck like any failure; on the live
 ///   path also excluded for this item. The batch paths keep retrying it on
 ///   the ladder exactly as they always did.
@@ -1849,9 +1968,9 @@ fn note_fault(
             scope.verdict(LiveVerdict::Busy { provider });
         }
         TransferFault::Refused { bytes } => {
+            // Not a provider fault: no strike and no `Failed` telemetry.
             excluded.insert(provider);
             credit_attempt(scope.states, provider, *bytes, elapsed);
-            (scope.opts.telemetry)(ProviderEvent::Failed(*provider.as_bytes()));
             tracing::debug!(
                 provider = %provider.fmt_short(),
                 frame_uuid = scope.key,
