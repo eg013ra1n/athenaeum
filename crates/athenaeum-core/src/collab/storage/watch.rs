@@ -300,6 +300,76 @@ pub fn spawn_watcher(
     Some(watcher)
 }
 
+/// The running storage engines' signal inboxes, by the root(s) they watch —
+/// how a caller that holds no engine handle (the scanner's Collaboration-root
+/// reconcile, a plain `rusqlite` caller on a blocking thread) routes a moved
+/// file through re-adoption (spec §9.1/§9.4, Task 9 ruling) instead of
+/// repairing a path behind the engine's back: the path enters the engine's
+/// aggregator exactly like a watcher event.
+type EngineSinks = Vec<(
+    u64,
+    Vec<PathBuf>,
+    tokio::sync::mpsc::UnboundedSender<FsSignal>,
+)>;
+
+fn engine_sinks() -> &'static std::sync::Mutex<EngineSinks> {
+    static SINKS: std::sync::OnceLock<std::sync::Mutex<EngineSinks>> = std::sync::OnceLock::new();
+    SINKS.get_or_init(Default::default)
+}
+
+/// Unregisters its engine's inbox on drop.
+#[derive(Debug)]
+pub struct SinkRegistration {
+    id: u64,
+}
+
+impl Drop for SinkRegistration {
+    fn drop(&mut self) {
+        engine_sinks()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(id, _, _)| *id != self.id);
+    }
+}
+
+/// Register an engine's inbox for every spelling of its root (`roots`: the
+/// stored root and its canonical form, say).
+pub fn register_engine_sink(
+    roots: Vec<PathBuf>,
+    tx: tokio::sync::mpsc::UnboundedSender<FsSignal>,
+) -> SinkRegistration {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    engine_sinks()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((id, roots, tx));
+    SinkRegistration { id }
+}
+
+/// Hand `path` to the storage engine running on the root it lies under, as
+/// a [`FsSignal::Touched`]. `false` when no engine watches that root (the
+/// caller keeps its own fallback) or its inbox is gone.
+pub fn route_touched(path: &Path) -> bool {
+    let mut sinks = engine_sinks().lock().unwrap_or_else(|p| p.into_inner());
+    let mut dead = Vec::new();
+    let mut routed = false;
+    for (id, roots, tx) in sinks.iter() {
+        if !roots.iter().any(|r| path.starts_with(r)) {
+            continue;
+        }
+        if tx.send(FsSignal::Touched(path.to_path_buf())).is_ok() {
+            routed = true;
+            break;
+        }
+        dead.push(*id);
+    }
+    if !dead.is_empty() {
+        sinks.retain(|(id, _, _)| !dead.contains(id));
+    }
+    routed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +513,23 @@ mod tests {
         assert_eq!(
             signals_for_event(root, &canary, &closed_after_write),
             vec![FsSignal::Touched(touched)]
+        );
+    }
+
+    #[test]
+    fn a_path_is_routed_to_the_engine_watching_its_root_until_it_unregisters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("routed-root");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg = register_engine_sink(vec![root.clone()], tx);
+        let inside = root.join("m31/x.fits");
+        assert!(route_touched(&inside));
+        assert_eq!(rx.try_recv().unwrap(), FsSignal::Touched(inside.clone()));
+        assert!(!route_touched(&tmp.path().join("elsewhere/x.fits")));
+        drop(reg);
+        assert!(
+            !route_touched(&inside),
+            "an unregistered engine gets nothing"
         );
     }
 

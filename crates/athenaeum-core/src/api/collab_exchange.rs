@@ -1169,7 +1169,7 @@ fn manifest_meta_f64(row: &LocalFrameRow, key: &str) -> Option<f64> {
 }
 
 /// Does `row` pass the policy's filter / publisher / quality constraints?
-fn policy_matches(row: &LocalFrameRow, policy: &ReplicationPolicy) -> bool {
+pub(crate) fn policy_matches(row: &LocalFrameRow, policy: &ReplicationPolicy) -> bool {
     if !policy.filters.is_empty() && !policy.filters.contains(&row.filter_canonical) {
         return false;
     }
@@ -3467,7 +3467,7 @@ async fn link_identical(env: &FetchEnv<'_>, row: &LocalFrameRow, src: &Path) -> 
 
 /// The stored policy of a live project. An unreadable document is logged and
 /// read as the default (replicate everything) — the same as never set.
-fn read_policy(project: &crate::db::collab::CollabProjectRow) -> ReplicationPolicy {
+pub(crate) fn read_policy(project: &crate::db::collab::CollabProjectRow) -> ReplicationPolicy {
     serde_json::from_str(&project.policy_json).unwrap_or_else(|e| {
         tracing::warn!(project_id = %project.project_id, error = %e, "replication policy unreadable; replicating everything");
         ReplicationPolicy::default()
@@ -3555,6 +3555,14 @@ pub async fn set_collab_policy(
         let rows = crate::db::collab_frames::list_for_project(&conn, project_id)?;
         policy_preview(&rows, &policy)
     };
+    // Task 9 (P10): the new scope moves the local frame states — a dropped
+    // frame goes idle (file kept, not served), a re-included one held or
+    // wanted by stat + hash. `api::collab_live` is render+solver-gated.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_live::storage_task::apply_policy(ctx, project_id).map_err(|e| {
+        tracing::error!(project_id, error = %e, "replication policy stored but not applied to the local frame states");
+        e
+    })?;
     tracing::info!(
         project_id,
         count = preview.to_fetch,
@@ -3732,7 +3740,7 @@ pub struct AutoSyncPassOutcome {
 /// data_role == "send_receive"` against the CACHED project row. The hub
 /// filters holder rows by the same rule, so a stale cache costs at most one
 /// fetch whose holds the hub drops.
-fn role_allows_replication(data_role: &str, is_coordinator: bool) -> bool {
+pub(crate) fn role_allows_replication(data_role: &str, is_coordinator: bool) -> bool {
     is_coordinator || data_role == "send_receive"
 }
 
@@ -4066,6 +4074,14 @@ pub fn set_project_auto_replicate(
         return Err(ApiError::Invalid(format!("unknown project {project_id}")));
     }
     tracing::info!(project_id, enabled, "collab auto-replication toggled");
+    // Task 9 (P10): the toggle itself changes no frame state; the call
+    // re-derives the scope so a stale state is corrected either way.
+    drop(conn);
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_live::storage_task::apply_policy(ctx, project_id).map_err(|e| {
+        tracing::error!(project_id, error = %e, "auto-replication toggled but the local frame states were not re-derived");
+        e
+    })?;
     if !enabled {
         cancel_project_fetch(ctx, project_id);
     }

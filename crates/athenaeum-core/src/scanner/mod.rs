@@ -736,8 +736,25 @@ fn reconcile_project_file(
         .iter()
         .find(|r| r.landed_path.as_deref().is_some_and(|p| !Path::new(p).exists()))
     {
-        frames_db::update_landed_path(conn, &row.project_id, &row.frame_uuid, current_path)?;
         frames_db::forget_foreign_file(conn, current_path)?;
+        // Task 9 (spec §9.1/§9.4): a move inside a watched Collaboration
+        // root goes through re-adoption by hash in the storage engine
+        // (re-seeded at the new path, verified against the manifest, moved
+        // through the state machine) — never a bare path repair behind its
+        // back. Only with no engine running (or a stamped file outside the
+        // root) does the scanner repair the path itself.
+        if crate::collab::storage::watch::route_touched(path) {
+            tracing::info!(
+                root_id,
+                src = row.landed_path.as_deref().unwrap_or_default(),
+                path = %current_path,
+                project_id = %row.project_id,
+                frame_uuid = %row.frame_uuid,
+                "project frame moved; handed to re-adoption"
+            );
+            return Ok(());
+        }
+        frames_db::update_landed_path(conn, &row.project_id, &row.frame_uuid, current_path)?;
         tracing::info!(
             root_id,
             src = row.landed_path.as_deref().unwrap_or_default(),
@@ -844,6 +861,27 @@ fn is_collaboration_root(conn: &Connection, root_id: i64) -> anyhow::Result<bool
     Ok(kind.as_deref() == Some("collaboration"))
 }
 
+/// Why the Collaboration root at `root_path` must not be scanned now
+/// ([`crate::collab::storage::marker::scan_refusal`]), against the marker
+/// the catalog recorded for THAT path (a record for another path is not
+/// this root's record).
+fn collaboration_store_refusal(
+    conn: &Connection,
+    root_path: &Path,
+) -> anyhow::Result<Option<crate::collab::storage::marker::UnavailableReason>> {
+    let recorded = if crate::db::collab_live::store_marker_path(conn)?.as_deref()
+        == Some(&*root_path.to_string_lossy())
+    {
+        crate::db::collab_live::recorded_store_marker(conn)?
+    } else {
+        None
+    };
+    Ok(crate::collab::storage::marker::scan_refusal(
+        root_path,
+        recorded.as_ref(),
+    ))
+}
+
 /// Reconcile every discovered file of the Collaboration root (P26) — the
 /// whole scan of that root. `progress(index)` is called before each file;
 /// returning `false` cancels the rest. A COMPLETED walk then drops every
@@ -857,6 +895,33 @@ fn reconcile_collaboration_root(
     result: &mut ScanResult,
     mut progress: impl FnMut(usize, &Path) -> bool,
 ) {
+    // Spec §9.1: the marker is checked before any scan of the root. An
+    // unmounted or swapped disk is never reconciled — its missing files
+    // would read as moves, and a completed walk would unlist every foreign
+    // file. Unmounted is not deleted: nothing is changed, the scan reports
+    // why.
+    match collaboration_store_refusal(conn, root_path) {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            tracing::warn!(
+                root_id,
+                path = %root_path.display(),
+                reason = ?reason,
+                "collaboration folder unavailable; not reconciled"
+            );
+            result.errors.push(format!(
+                "Collaboration folder unavailable ({reason:?}); not reconciled"
+            ));
+            return;
+        }
+        Err(e) => {
+            tracing::error!(root_id, error = %e, "collaboration store marker check failed; not reconciled");
+            result
+                .errors
+                .push(format!("Collaboration folder marker check failed: {e}"));
+            return;
+        }
+    }
     tracing::info!(root_id, count = files.len(), "reconciling the collaboration folder");
     for (idx, path) in files.iter().enumerate() {
         if !progress(idx, path) {
@@ -3640,6 +3705,120 @@ mod calibrated_light_scan_tests {
             assert_eq!(landed(&conn, "m"), Some(s(&now)), "parallel={parallel}: path repaired");
             assert_eq!(catalog_rows(&conn), (0, 0), "parallel={parallel}");
             assert!(foreign(&conn).is_empty(), "parallel={parallel}: a moved frame is not foreign");
+        }
+    }
+
+    /// Task 9 (spec §9.1/§9.4): with a storage engine watching the root, a
+    /// moved frame is handed to its re-adoption (the engine re-seeds and
+    /// re-verifies), never repaired behind its back.
+    #[test]
+    fn moved_replica_is_routed_to_the_storage_engine_when_one_runs() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let now = root.path().join("m31").join("Moved").join("L_0013.fits");
+            write_plain_light(&now, 13);
+            let gone = root.path().join("m31").join("Other").join("L_0013.fits");
+
+            let conn = collab_db(root.path(), 1);
+            let xxh3 = crate::package::xxh3_full_file(&now).unwrap();
+            seed_frame(&conn, "p1", "m", FrameOrigin::Replica, &gone, &xxh3);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let _reg = crate::collab::storage::watch::register_engine_sink(
+                vec![root.path().to_path_buf()],
+                tx,
+            );
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(
+                result.errors.is_empty(),
+                "parallel={parallel}: {:?}",
+                result.errors
+            );
+            assert_eq!(
+                landed(&conn, "m"),
+                Some(s(&gone)),
+                "parallel={parallel}: not repaired here"
+            );
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                crate::collab::storage::watch::FsSignal::Touched(now.clone()),
+                "parallel={parallel}"
+            );
+            assert!(
+                foreign(&conn).is_empty(),
+                "parallel={parallel}: a moved frame is not foreign"
+            );
+        }
+    }
+
+    /// Spec §9.1: the marker is checked before any scan of the root. A
+    /// recorded store whose marker is missing (an unmounted or swapped
+    /// disk) is not reconciled at all — no path repaired, nothing listed,
+    /// nothing unlisted.
+    #[test]
+    fn an_unmarked_recorded_store_is_not_reconciled() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let now = root.path().join("m31").join("Moved").join("L_0014.fits");
+            write_plain_light(&now, 14);
+            let stray = root.path().join("m31").join("Other").join("L_0015.fits");
+            write_plain_light(&stray, 15);
+            let gone = root.path().join("m31").join("Other").join("L_0014.fits");
+
+            let conn = collab_db(root.path(), 1);
+            let xxh3 = crate::package::xxh3_full_file(&now).unwrap();
+            seed_frame(&conn, "p1", "m", FrameOrigin::Replica, &gone, &xxh3);
+            crate::db::collab_frames::record_foreign_file(
+                &conn,
+                "/elsewhere/listed.fits",
+                None,
+                None,
+            )
+            .unwrap();
+            crate::db::collab_live::record_store_marker(
+                &conn,
+                &crate::collab::storage::marker::StoreMarker {
+                    store_id: "s".into(),
+                    device_id: "ME".into(),
+                },
+                &s(root.path()),
+            )
+            .unwrap();
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert_eq!(
+                result.errors.len(),
+                1,
+                "parallel={parallel}: {:?}",
+                result.errors
+            );
+            assert!(
+                result.errors[0].contains("unavailable"),
+                "parallel={parallel}"
+            );
+            assert_eq!(landed(&conn, "m"), Some(s(&gone)), "parallel={parallel}");
+            assert_eq!(
+                foreign(&conn),
+                vec![("/elsewhere/listed.fits".to_string(), None)],
+                "parallel={parallel}: nothing listed or unlisted"
+            );
+
+            // the marker back → reconciled as usual
+            crate::collab::storage::marker::write_marker(
+                root.path(),
+                &crate::collab::storage::marker::StoreMarker {
+                    store_id: "s".into(),
+                    device_id: "ME".into(),
+                },
+            )
+            .unwrap();
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(
+                result.errors.is_empty(),
+                "parallel={parallel}: {:?}",
+                result.errors
+            );
+            assert_eq!(landed(&conn, "m"), Some(s(&now)), "parallel={parallel}");
         }
     }
 

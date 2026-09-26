@@ -181,3 +181,136 @@ pub(crate) async fn seed_replica_file(
 
     (PID.to_string(), uuid.to_string(), path)
 }
+
+/// A signed-in rig with `n` held replica frames (Task 9): real small files
+/// (< 16 KiB, so the store inlines them) under `<root>/m31/other/`,
+/// published on the hub by a second account (`acc-o`) with their real
+/// hashes, cached through `upsert_from_manifest`, seeded into the collab
+/// store and moved to `held` through `set_local_state` (so each carries its
+/// outbox `add`). Until Task 11's landing exists the files are placed
+/// directly.
+pub(crate) struct LandedRig {
+    pub _tmp: tempfile::TempDir,
+    pub ctx: Arc<ServiceContext>,
+    pub hub: FakeHub,
+    pub node: Arc<SharedIrohNode>,
+    pub root: PathBuf,
+    /// `(project_id, frame_uuid, landed path)`, in uuid order.
+    pub frames: Vec<(String, String, PathBuf)>,
+}
+
+impl LandedRig {
+    /// A storage engine on this rig's root, with the marker this device
+    /// recorded at designation.
+    pub(crate) fn engine(&self) -> crate::api::collab_live::storage_task::StorageEngine {
+        let me = crate::api::account::own_device_id(&self.ctx).unwrap();
+        let recorded = crate::db::collab_live::recorded_store_marker(
+            &crate::api::db(&self.ctx).unwrap().conn(),
+        )
+        .unwrap();
+        assert!(recorded.is_some(), "designation recorded the store marker");
+        let guard = Arc::new(crate::collab::storage::marker::StoreGuard::new(
+            self.root.clone(),
+            me,
+            recorded,
+        ));
+        crate::api::collab_live::storage_task::StorageEngine::start(
+            Arc::clone(&self.ctx),
+            Arc::clone(&self.node),
+            guard,
+        )
+    }
+}
+
+pub(crate) async fn landed_rig(n: usize) -> LandedRig {
+    let (tmp, ctx, hub) = signed_in_rig().await;
+    let root = collab_root(&ctx);
+    let node = ctx.iroh_node.lock().await.clone().expect("a bound node");
+    assert!(node.collab_store().is_some(), "the collab store is mounted");
+    let dir = root.join("m31").join("other");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let uuids: Vec<String> = (0..n).map(|i| format!("f{i:02}")).collect();
+    let mut frames = Vec::with_capacity(n);
+    for uuid in &uuids {
+        let bytes = format!("replica frame {uuid}: a few hundred bytes of pixels ")
+            .repeat(8)
+            .into_bytes();
+        let path = dir.join(format!("{uuid}.fits"));
+        land_frame(&ctx, &hub, &node, uuid, &path, &bytes).await;
+        frames.push((PID.to_string(), uuid.clone(), path));
+    }
+    LandedRig {
+        _tmp: tmp,
+        ctx: Arc::new(ctx),
+        hub,
+        node,
+        root,
+        frames,
+    }
+}
+
+/// Publish `uuid` on the hub as `acc-o` with `bytes`' real hashes, write
+/// the file at `path`, cache the row, seed it and move it to `held` — the
+/// landing [`landed_rig`] fakes until Task 11's exists.
+pub(crate) async fn land_frame(
+    ctx: &ServiceContext,
+    hub: &FakeHub,
+    node: &SharedIrohNode,
+    uuid: &str,
+    path: &Path,
+    bytes: &[u8],
+) {
+    hub.seed_frames(PID, "acc-o", &[uuid], "published");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+    let blake3 = blake3::hash(bytes).to_hex().to_string();
+    let xxh3 = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(bytes));
+    let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+    hub.update_frame(PID, uuid, |f| {
+        f.blake3 = blake3;
+        f.byte_size = bytes.len() as i64;
+        f.xxh3 = xxh3;
+        f.file_name = file_name;
+    });
+    let view = hub.frame(PID, uuid).expect("frame just seeded");
+    {
+        let conn = crate::api::db(ctx).unwrap().conn();
+        crate::db::collab_frames::upsert_from_manifest(&conn, PID, &view).unwrap();
+    }
+    node.seed_project_frame(PID, uuid, view.content_version, path)
+        .await
+        .expect("seed the landed frame");
+    let conn = crate::api::db(ctx).unwrap().conn();
+    let stamp = crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(path).unwrap());
+    crate::db::collab_frames::update_landed_path(&conn, PID, uuid, &path.to_string_lossy())
+        .unwrap();
+    crate::db::collab_frames::set_size_mtime_seen(&conn, PID, uuid, &stamp.encode()).unwrap();
+    crate::db::collab_frames::set_local_state(
+        &conn,
+        PID,
+        uuid,
+        crate::db::collab_frames::LocalState::Held,
+    )
+    .unwrap();
+}
+
+/// Move `path`'s mtime `secs_forward` seconds past now (beyond the 2 s
+/// tolerance for anything ≥ 3).
+pub(crate) fn set_mtime(path: &Path, secs_forward: u64) {
+    let t = std::time::SystemTime::now() + std::time::Duration::from_secs(secs_forward);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+}
+
+/// Flip one byte, keep the size, bump the mtime — an in-place edit.
+pub(crate) fn overwrite_same_size(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes[0] ^= 0xff;
+    std::fs::write(path, &bytes).unwrap();
+    set_mtime(path, 10);
+}

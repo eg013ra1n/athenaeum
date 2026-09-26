@@ -130,6 +130,39 @@ pub fn check_store(root: &Path, recorded: Option<&StoreMarker>, me: &str) -> Che
     }
 }
 
+/// The marker check a scan of the root runs FIRST (spec §9.1: "the marker
+/// is checked before every … scan of the root") — for a caller that holds
+/// only the catalog connection (the scanner), not this device's id. `None`
+/// = the scan may proceed. `recorded` is what the catalog recorded for THIS
+/// root (`None` when nothing is recorded for it yet — a wave-2 root not yet
+/// adopted — in which case only the path itself is checked). A recorded
+/// marker that is missing on disk, names another store, or names another
+/// device refuses: an unmounted or swapped disk must never be reconciled
+/// (its missing files would be misread as moves or deletions). Never writes
+/// anything, not even the write probe.
+pub fn scan_refusal(root: &Path, recorded: Option<&StoreMarker>) -> Option<UnavailableReason> {
+    use UnavailableReason::*;
+    if !root.exists() {
+        return Some(PathMissing);
+    }
+    if !root.is_dir() {
+        return Some(NotADirectory);
+    }
+    let recorded = recorded?;
+    match read_marker(root) {
+        Ok(None) => Some(MarkerMissing),
+        Ok(Some(m)) if m.store_id != recorded.store_id => Some(MarkerMismatch),
+        Ok(Some(m)) if m.device_id != recorded.device_id => Some(OtherDevice {
+            device_id: m.device_id,
+        }),
+        Ok(Some(_)) => None,
+        Err(e) => {
+            tracing::warn!(path = %root.display(), error = %e, "collaboration store marker unreadable");
+            Some(MarkerMissing)
+        }
+    }
+}
+
 pub fn offer_flags(
     last_seen: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
@@ -310,6 +343,36 @@ mod tests {
         std::fs::set_permissions(&athenaeum, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(got, CheckOutcome::State(StoreState::ReadOnly));
         assert!(StoreState::ReadOnly.serving() && !StoreState::ReadOnly.fetching());
+    }
+
+    #[test]
+    fn a_scan_is_refused_on_an_unmounted_or_swapped_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = m("s", "ME");
+        assert_eq!(
+            scan_refusal(&root.join("gone"), Some(&mk)),
+            Some(UnavailableReason::PathMissing)
+        );
+        // nothing recorded for this root yet: only the path is checked
+        assert_eq!(scan_refusal(root, None), None);
+        assert_eq!(
+            scan_refusal(root, Some(&mk)),
+            Some(UnavailableReason::MarkerMissing)
+        );
+        write_marker(root, &mk).unwrap();
+        assert_eq!(scan_refusal(root, Some(&mk)), None);
+        assert_eq!(
+            scan_refusal(root, Some(&m("other", "ME"))),
+            Some(UnavailableReason::MarkerMismatch)
+        );
+        write_marker(root, &m("s", "OTHER")).unwrap();
+        assert_eq!(
+            scan_refusal(root, Some(&mk)),
+            Some(UnavailableReason::OtherDevice {
+                device_id: "OTHER".into()
+            })
+        );
     }
 
     #[test]

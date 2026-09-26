@@ -527,7 +527,7 @@ async fn land_candidate(
     node: &SharedIrohNode,
     row: &LocalFrameRow,
     landed_path: &Path,
-) -> Result<bool, ApiError> {
+) -> Result<Option<(LocalState, LocalState)>, ApiError> {
     let landed_str = landed_path.to_string_lossy().to_string();
     let hash = match node
         .seed_project_frame(
@@ -547,7 +547,10 @@ async fn land_candidate(
                 error = %format!("{e:#}"),
                 "adopt by hash: seed failed"
             );
-            return Ok(false);
+            if is_moved_class(row) {
+                park_moved(ctx, node, row, landed_path).await?;
+            }
+            return Ok(None);
         }
     };
     if hash.to_string() != row.blake3 {
@@ -570,7 +573,7 @@ async fn land_candidate(
                 "adopt by hash: unseed after a hash mismatch failed"
             );
         }
-        return Ok(false);
+        return Ok(None);
     }
 
     let target_state = if row.origin == FrameOrigin::Own {
@@ -599,9 +602,108 @@ async fn land_candidate(
             &crate::api::collab_exchange::size_mtime_from(&meta),
         )?;
     }
-    crate::db::collab_frames::set_local_state(&tx, &row.project_id, &row.frame_uuid, target_state)?;
+    tx.execute(
+        "UPDATE project_frames_local SET awaiting_gc = 0, rejected_size_mtime = NULL
+         WHERE project_id = ?1 AND frame_uuid = ?2",
+        rusqlite::params![row.project_id, row.frame_uuid],
+    )?;
+    let write = crate::db::collab_frames::set_local_state(
+        &tx,
+        &row.project_id,
+        &row.frame_uuid,
+        target_state,
+    )?;
     tx.commit().map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(true)
+    if is_moved_class(row) {
+        tracing::info!(
+            project_id = %row.project_id,
+            frame_uuid = %row.frame_uuid,
+            src = row.landed_path.as_deref().unwrap_or_default(),
+            path = %landed_str,
+            "moved frame re-adopted by hash"
+        );
+    }
+    Ok(write.map(|w| (w.from, w.to)))
+}
+
+/// Task 9: a `held`/`own_held` row whose recorded file no longer exists — a
+/// move inside the root (spec §9.4 "Held ──moved inside the root──▶ Held,
+/// re-adopted by hash, path updated, no transfer").
+fn is_moved_class(row: &LocalFrameRow) -> bool {
+    matches!(row.local_state, LocalState::Held | LocalState::OwnHeld)
+        && row
+            .landed_path
+            .as_deref()
+            .is_some_and(|p| !Path::new(p).exists())
+}
+
+/// A moved frame whose re-seed at its new path failed. The usual cause is
+/// iroh-blobs 0.103's external-path UNION (`blobs::ensure_child_readable`):
+/// the entry keeps reading the OLD, now-dead path when it sorts first, and
+/// the collab store never copy-repairs (P20). The bytes are verified (size +
+/// xxh3 matched), so the frame is recorded at its new path, its seed tags
+/// dropped so the collab GC can collect the dead entry (P31), and it is
+/// parked `wanted` with `awaiting_gc` — not servable (a dead entry serves
+/// nothing), never fetched while parked. The storage engine's sweep
+/// re-adopts it by hash from the new path once the entry is gone.
+async fn park_moved(
+    ctx: &ServiceContext,
+    node: &SharedIrohNode,
+    row: &LocalFrameRow,
+    landed_path: &Path,
+) -> Result<(), ApiError> {
+    if let Err(e) = node
+        .unseed_project_frame(&row.project_id, &row.frame_uuid)
+        .await
+    {
+        tracing::warn!(
+            project_id = %row.project_id,
+            frame_uuid = %row.frame_uuid,
+            error = %e,
+            "moved frame: unseed before parking failed"
+        );
+    }
+    let parked = if row.origin == FrameOrigin::Own {
+        LocalState::OwnMissing
+    } else {
+        LocalState::Wanted
+    };
+    let landed_str = landed_path.to_string_lossy().to_string();
+    let lock = crate::api::collab_exchange::project_disk_lock(ctx, &row.project_id)?;
+    let _guard = lock.lock().await;
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    crate::db::collab_frames::update_landed_path(
+        &tx,
+        &row.project_id,
+        &row.frame_uuid,
+        &landed_str,
+    )?;
+    if let Ok(meta) = std::fs::metadata(landed_path) {
+        crate::db::collab_frames::set_size_mtime_seen(
+            &tx,
+            &row.project_id,
+            &row.frame_uuid,
+            &crate::api::collab_exchange::size_mtime_from(&meta),
+        )?;
+    }
+    tx.execute(
+        "UPDATE project_frames_local SET awaiting_gc = 1 WHERE project_id = ?1 AND frame_uuid = ?2",
+        rusqlite::params![row.project_id, row.frame_uuid],
+    )?;
+    crate::db::collab_frames::set_local_state(&tx, &row.project_id, &row.frame_uuid, parked)?;
+    tx.commit().map_err(|e| ApiError::Internal(e.to_string()))?;
+    tracing::warn!(
+        project_id = %row.project_id,
+        frame_uuid = %row.frame_uuid,
+        path = %landed_str,
+        to_state = parked.as_db_str(),
+        "moved frame cannot be re-seeded until the collab store drops its dead entry; parked"
+    );
+    Ok(())
 }
 
 /// Match a file already sitting in the Collaboration root, by content hash,
@@ -631,18 +733,58 @@ pub(crate) async fn adopt_by_hash(
     root: &Path,
     path: &Path,
 ) -> Result<Vec<(String, String)>, ApiError> {
+    Ok(adopt_by_hash_detailed(ctx, node, root, path)
+        .await?
+        .adopted
+        .into_iter()
+        .map(|a| (a.project_id, a.frame_uuid))
+        .collect())
+}
+
+/// One adoption [`adopt_by_hash_detailed`] landed: the frame and the state
+/// move it made (`from == to` for a moved `held` row — no outbox row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Adopted {
+    pub project_id: String,
+    pub frame_uuid: String,
+    pub from: LocalState,
+    pub to: LocalState,
+}
+
+/// [`adopt_by_hash_detailed`]'s answer: the adoptions that landed, and
+/// whether the file matched ANY cached frame by `(size, xxh3)` at all (an
+/// idle frame's recorded path, a duplicate of a frame already held — a file
+/// that matched is never listed under "Other files").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AdoptOutcome {
+    pub adopted: Vec<Adopted>,
+    pub matched: bool,
+}
+
+/// [`adopt_by_hash`] with each adoption's state move and the "matched at
+/// all" flag — the storage engine's re-adoption leg (Task 9). Candidate
+/// classes: `wanted`, `missing`, `awaiting_choice`, `not_kept` (put back),
+/// `own_missing` (back), and — Task 9 — a `held`/`own_held` row whose
+/// recorded file no longer exists (moved inside the root: re-seeded at the
+/// new path, path updated, stays held, no outbox row).
+pub(crate) async fn adopt_by_hash_detailed(
+    ctx: &ServiceContext,
+    node: &SharedIrohNode,
+    root: &Path,
+    path: &Path,
+) -> Result<AdoptOutcome, ApiError> {
     let size = match tokio::fs::metadata(path).await {
         Ok(m) => m.len() as i64,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "adopt by hash: stat failed");
-            return Ok(Vec::new());
+            return Ok(AdoptOutcome::default());
         }
     };
     let xxh3 = match crate::api::collab_exchange::xxh3_on_blocking(path).await {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "adopt by hash: hash failed");
-            return Ok(Vec::new());
+            return Ok(AdoptOutcome::default());
         }
     };
     let path_str = path.to_string_lossy().to_string();
@@ -653,7 +795,7 @@ pub(crate) async fn adopt_by_hash(
         .map(|c| c.as_os_str().to_string_lossy().to_string());
 
     let db = db(ctx)?;
-    let (servable_or_own, idle) = {
+    let (servable_or_own, idle, matched) = {
         let conn = db.conn();
         let mut candidates: Vec<LocalFrameRow> = Vec::new();
         for project_id in crate::db::collab_frames::project_ids(&conn)? {
@@ -684,6 +826,7 @@ pub(crate) async fn adopt_by_hash(
                     .unwrap_or(true)
             });
         }
+        let matched = !candidates.is_empty();
         let servable_or_own: Vec<LocalFrameRow> = candidates
             .iter()
             .filter(|r| {
@@ -694,7 +837,7 @@ pub(crate) async fn adopt_by_hash(
                         | LocalState::AwaitingChoice
                         | LocalState::NotKept
                         | LocalState::OwnMissing
-                )
+                ) || is_moved_class(r)
             })
             .cloned()
             .collect();
@@ -705,7 +848,7 @@ pub(crate) async fn adopt_by_hash(
         } else {
             None
         };
-        (servable_or_own, idle)
+        (servable_or_own, idle, matched)
     };
 
     if servable_or_own.is_empty() {
@@ -726,7 +869,10 @@ pub(crate) async fn adopt_by_hash(
                 "adopt by hash: path recorded for an excluded frame"
             );
         }
-        return Ok(Vec::new());
+        return Ok(AdoptOutcome {
+            adopted: Vec::new(),
+            matched,
+        });
     }
 
     let mut adopted = Vec::new();
@@ -756,8 +902,13 @@ pub(crate) async fn adopt_by_hash(
             &owned_path
         };
         match land_candidate(ctx, node, row, landed_path).await {
-            Ok(true) => adopted.push((row.project_id.clone(), row.frame_uuid.clone())),
-            Ok(false) => {
+            Ok(Some((from, to))) => adopted.push(Adopted {
+                project_id: row.project_id.clone(),
+                frame_uuid: row.frame_uuid.clone(),
+                from,
+                to,
+            }),
+            Ok(None) => {
                 if is_follower {
                     cleanup_follower_copy(landed_path);
                 }
@@ -774,7 +925,7 @@ pub(crate) async fn adopt_by_hash(
             }
         }
     }
-    Ok(adopted)
+    Ok(AdoptOutcome { adopted, matched })
 }
 
 /// Fix round 2, ruling 7 (and round 3, point 4 — the `Err` path too): a

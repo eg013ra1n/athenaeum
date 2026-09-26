@@ -197,7 +197,8 @@ pub struct LocalFrameRow {
     pub updated_at: String,
     /// The wave-3 local state machine (P8). Written only by the functions
     /// documented on [`LocalState`]; a manifest fetch ([`upsert_from_manifest`])
-    /// only sets it for a brand-new row (see that function's docs).
+    /// sets it for a brand-new row and otherwise moves it only through the
+    /// state machine's manifest edges (see that function's docs).
     pub local_state: LocalState,
     /// The hub's dense per-project frame ordinal (`frameSeq`: assigned at
     /// announce, never reused) — the key holder claims, `holders` deltas and
@@ -243,21 +244,39 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LocalFrameRow> {
 }
 
 /// Apply one manifest row (mine or a peer's) to the local cache: insert it if
-/// new, or refresh the manifest-derived columns if not. Never touches
-/// `landed_path`/`on_disk`/`locally_declined`/`awaiting_gc`/
-/// `source_frame_id`/`recipe_hash` — those are local disk/publish state that
-/// a manifest fetch knows nothing about — EXCEPT: when `contentVersion`
-/// increases on a `'replica'` row, this also resets `on_disk = 0` and
-/// `size_mtime_seen = NULL`, because a new content version is new bytes that
-/// must be fetched again (the old landed file is still the OLD version's
-/// content until the next fetch lands it).
+/// new, or refresh the manifest-derived columns if not. The UPSERT never
+/// writes `local_state`/`on_disk`/`landed_path`/`locally_declined`/
+/// `awaiting_gc`/`source_frame_id`/`recipe_hash` — local disk/publish state
+/// a manifest fetch knows nothing about. A brand-new row starts `own_missing`
+/// (own), `wanted` (a published, accepted replica) or `idle`.
+///
+/// For an EXISTING row the previous row is read first (on the caller's
+/// connection / transaction) and the manifest's move is fed to the state
+/// machine (`collab::storage::states`, spec §9.4, Task 9), each resulting
+/// move through [`set_local_state`] (claim + outbox in the same transaction,
+/// C24):
+///
+/// 1. a new `contentVersion` → `NewVersion { same_bytes: blake3 unchanged }`
+///    — a `held` replica with new bytes goes back to `wanted` (its old file
+///    stays until the new version replaces it, L7) and its
+///    `size_mtime_seen` is cleared; with the same bytes it stays `held` and
+///    is re-claimed at the new version (P10); `quarantined`/`not_kept`/
+///    `awaiting_choice`/`idle` keep their state (L5, L6);
+/// 2. then a publish-state move — published ∧ accepted lost → `Excluded`
+///    (`wanted`/`held`/`awaiting_choice`/`missing` → `idle`: file kept, not
+///    served, not fetched); regained → `Reincluded` (`idle` → `held` when
+///    stat + hash confirm the landed file, else `wanted`, via
+///    [`reinclude_target`]).
 pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWire) -> Result<()> {
+    use crate::collab::storage::states::{transition, StateEvent};
+
     let manifest_json = serde_json::to_string(v)?;
     let origin = if v.own {
         FrameOrigin::Own
     } else {
         FrameOrigin::Replica
     };
+    let prev = get(conn, project_id, &v.frame_uuid)?;
     conn.execute(
         "INSERT INTO project_frames_local
             (project_id, frame_uuid, content_version, origin, publisher_account_id,
@@ -285,29 +304,6 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
             manifest_version = excluded.manifest_version,
             manifest_json = excluded.manifest_json,
             frame_seq = CASE WHEN ?16 > 0 THEN ?16 ELSE frame_seq END,
-            on_disk = CASE
-                WHEN origin = 'replica' AND excluded.content_version > content_version THEN 0
-                ELSE on_disk
-            END,
-            -- Interim rule (Task 9 replaces this with the full edge set): a
-            -- version bump only ever downgrades a currently-`held` replica
-            -- back to `wanted` (new bytes to fetch); every other state
-            -- (`missing`, `awaiting_choice`, `quarantined`, `not_kept`,
-            -- `idle`, `wanted` itself) is untouched by a manifest refresh.
-            local_state = CASE
-                WHEN origin = 'replica' AND excluded.content_version > content_version
-                     AND local_state = 'held' THEN 'wanted'
-                ELSE local_state
-            END,
-            state_changed_at = CASE
-                WHEN origin = 'replica' AND excluded.content_version > content_version
-                     AND local_state = 'held' THEN datetime('now')
-                ELSE state_changed_at
-            END,
-            size_mtime_seen = CASE
-                WHEN origin = 'replica' AND excluded.content_version > content_version THEN NULL
-                ELSE size_mtime_seen
-            END,
             updated_at = datetime('now')",
         params![
             project_id,
@@ -328,7 +324,131 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
             v.frame_seq,
         ],
     )?;
+    let Some(prev) = prev else {
+        return Ok(());
+    };
+
+    let mut state = prev.local_state;
+    // 1. a new content version
+    if prev.content_version != v.content_version {
+        let same_bytes = prev.blake3 == v.blake3;
+        let ev = StateEvent::NewVersion { same_bytes };
+        if let Some(to) = transition(prev.origin, state, ev) {
+            if to != state {
+                set_local_state(conn, project_id, &v.frame_uuid, to)?;
+                tracing::debug!(
+                    project_id,
+                    frame_uuid = %v.frame_uuid,
+                    content_version = v.content_version,
+                    from_state = state.as_db_str(),
+                    to_state = to.as_db_str(),
+                    "new content version moved the local state"
+                );
+                state = to;
+            } else if same_bytes && to.servable() {
+                // P10: the same bytes under a new version — re-claim at it.
+                crate::db::collab_live::record_claim_change(
+                    conn,
+                    project_id,
+                    &v.frame_uuid,
+                    crate::db::collab_live::ClaimOp::Add {
+                        content_version: v.content_version,
+                    },
+                )?;
+            }
+        }
+        if !same_bytes && prev.origin == FrameOrigin::Replica {
+            // New bytes: the recorded stamp describes the OLD content. A
+            // quarantined row keeps it — its file is the user's to resolve.
+            conn.execute(
+                "UPDATE project_frames_local SET size_mtime_seen = NULL
+                 WHERE project_id = ?1 AND frame_uuid = ?2 AND local_state <> 'quarantined'",
+                params![project_id, v.frame_uuid],
+            )?;
+        }
+    }
+    // 2. a publish-state move (after the version edge: both can arrive in
+    //    one manifest row)
+    if prev.origin == FrameOrigin::Replica {
+        let published = v.state == "published" && v.accepted;
+        let was_published = prev.state == "published" && prev.accepted;
+        let ev = match (was_published, published) {
+            (true, false) => Some(StateEvent::Excluded),
+            (false, true) => Some(StateEvent::Reincluded),
+            _ => None,
+        };
+        if let Some(ev) = ev {
+            if let Some(mut to) = transition(prev.origin, state, ev) {
+                if ev == StateEvent::Reincluded {
+                    let Some(row) = get(conn, project_id, &v.frame_uuid)? else {
+                        return Ok(());
+                    };
+                    to = reinclude_target(conn, &row)?;
+                }
+                if to != state {
+                    set_local_state(conn, project_id, &v.frame_uuid, to)?;
+                    tracing::debug!(
+                        project_id,
+                        frame_uuid = %v.frame_uuid,
+                        from_state = state.as_db_str(),
+                        to_state = to.as_db_str(),
+                        "publish state moved the local state"
+                    );
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// Where a re-included (`idle`) replica goes (spec §9.4 "Idle ──re-included──▶
+/// Held or Wanted (stat + hash decide)"): `held` when its landed file still
+/// is the current version — the stat matches the recorded `size_mtime_seen`
+/// (a stamp is only ever recorded for verified, seeded bytes of the current
+/// content version, and cleared on a new-bytes version), or it drifted and
+/// the full-file xxh3 still equals the manifest's (the stamp is re-recorded)
+/// — else `wanted`. A row without a recorded stamp is `wanted`: its bytes
+/// were never verified at this version (an excluded frame adopted by path
+/// only), so it cannot claim a holding.
+pub fn reinclude_target(conn: &Connection, row: &LocalFrameRow) -> Result<LocalState> {
+    use crate::collab::storage::sweep::{stat_verdict, Stamp, StatVerdict};
+    let (Some(path), Some(seen)) = (row.landed_path.as_deref(), row.size_mtime_seen.as_deref())
+    else {
+        return Ok(LocalState::Wanted);
+    };
+    match stat_verdict(std::path::Path::new(path), Stamp::parse(seen)) {
+        StatVerdict::Same => Ok(LocalState::Held),
+        StatVerdict::Drifted(now) if now.size as i64 == row.byte_size => {
+            match crate::package::xxh3_full_file(std::path::Path::new(path)) {
+                Ok(h) if h == row.xxh3 => {
+                    set_size_mtime_seen(conn, &row.project_id, &row.frame_uuid, &now.encode())?;
+                    Ok(LocalState::Held)
+                }
+                Ok(_) => Ok(LocalState::Wanted),
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %row.project_id,
+                        frame_uuid = %row.frame_uuid,
+                        path,
+                        error = %format!("{e:#}"),
+                        "re-included frame could not be hashed; fetched again"
+                    );
+                    Ok(LocalState::Wanted)
+                }
+            }
+        }
+        StatVerdict::Unreadable(e) => {
+            tracing::warn!(
+                project_id = %row.project_id,
+                frame_uuid = %row.frame_uuid,
+                path,
+                error = %e,
+                "re-included frame could not be read; fetched again"
+            );
+            Ok(LocalState::Wanted)
+        }
+        StatVerdict::Drifted(_) | StatVerdict::Missing => Ok(LocalState::Wanted),
+    }
 }
 
 /// Move a frame to `to`, keeping `on_disk` equal to "servable" and appending
@@ -731,6 +851,64 @@ pub fn find_by_landed_path(conn: &Connection, path: &str) -> Result<Option<Local
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// Every cached frame whose `landed_path` is `dir` itself or lies under it
+/// (separator-strict: `/c/M31` never matches `/c/M31_Ha/x.fits`) — a removed
+/// folder settles as ONE path, and every landing beneath it is gone with it
+/// (Task 9, from the Task 8 review). Ordered by `(project_id, frame_uuid)`.
+pub fn rows_under(conn: &Connection, dir: &str) -> Result<Vec<LocalFrameRow>> {
+    let (pred, mut values) = crate::db::scan_root_prefix_predicate(
+        "landed_path",
+        std::slice::from_ref(&dir.to_string()),
+    );
+    values.insert(0, rusqlite::types::Value::Text(dir.to_string()));
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM project_frames_local \
+         WHERE landed_path = ? OR ({pred}) ORDER BY project_id, frame_uuid"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(values.iter()), row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every cached frame with a recorded `landed_path`, own rows outside the
+/// Collaboration root included (spec §9.2, amendment A1) — the stat sweep's
+/// input. Ordered by `(project_id, frame_uuid)`.
+pub fn rows_with_landed_path(conn: &Connection) -> Result<Vec<LocalFrameRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM project_frames_local \
+         WHERE landed_path IS NOT NULL ORDER BY project_id, frame_uuid"
+    ))?;
+    let rows = stmt
+        .query_map([], row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every cached frame of a project in one of `states` — the "Changed
+/// files", "Not kept" and deletion-choice lists. An empty `states` matches
+/// nothing. Ordered by `frame_uuid`.
+pub fn list_by_state(
+    conn: &Connection,
+    project_id: &str,
+    states: &[LocalState],
+) -> Result<Vec<LocalFrameRow>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; states.len()].join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM project_frames_local \
+         WHERE project_id = ? AND local_state IN ({placeholders}) ORDER BY frame_uuid"
+    ))?;
+    let values = std::iter::once(project_id.to_string())
+        .chain(states.iter().map(|s| s.as_db_str().to_string()));
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(values), row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Every cached frame of a project with the given content hash — the
@@ -1201,9 +1379,184 @@ mod tests {
         v.accepted_reason = Some("clouds".into());
         upsert_from_manifest(&c, "p1", &v).unwrap();
         let r = get(&c, "p1", "u1").unwrap().unwrap();
-        assert!(r.on_disk && !r.accepted);
+        // Task 9 (spec §9.4): an excluded frame goes `idle` — the file and
+        // its recorded path are kept, but it is no longer served.
+        assert!(!r.on_disk && !r.accepted);
+        assert_eq!(r.local_state, LocalState::Idle);
         assert_eq!(r.landed_path.as_deref(), Some("/collab/m31/ann/c_u1.fits"));
+        assert_eq!(r.size_mtime_seen.as_deref(), Some("100:1700000000"));
         assert_eq!(r.manifest_version, 2);
+    }
+
+    fn outbox_ops(c: &Connection) -> Vec<(String, crate::db::collab_live::ClaimOp)> {
+        crate::db::collab_live::outbox(c, "p1")
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.frame_uuid, r.op))
+            .collect()
+    }
+
+    fn held(c: &Connection, uuid: &str, path: &str) {
+        upsert_from_manifest(c, "p1", &view(uuid, 1)).unwrap();
+        update_landed_path(c, "p1", uuid, path).unwrap();
+        set_size_mtime_seen(c, "p1", uuid, "100:1").unwrap();
+        set_local_state(c, "p1", uuid, LocalState::Held).unwrap();
+        crate::db::collab_live::ack_outbox(c, "p1", i64::MAX).unwrap();
+    }
+
+    /// Task 9 step 4: the manifest's full edge set.
+    #[test]
+    fn a_new_version_of_a_held_replica_is_wanted_again_and_its_claim_dropped() {
+        use crate::db::collab_live::ClaimOp;
+        let c = conn();
+        held(&c, "u1", "/c/m31/ann/u1.fits");
+        let mut v2 = view("u1", 2);
+        v2.content_version = 2;
+        v2.blake3 = "c".repeat(64);
+        upsert_from_manifest(&c, "p1", &v2).unwrap();
+        let r = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(r.local_state, LocalState::Wanted);
+        assert!(!r.on_disk && r.size_mtime_seen.is_none());
+        assert_eq!(
+            r.landed_path.as_deref(),
+            Some("/c/m31/ann/u1.fits"),
+            "the v1 file stays until v2 replaces it (L7)"
+        );
+        assert_eq!(outbox_ops(&c), vec![("u1".to_string(), ClaimOp::Remove)]);
+    }
+
+    /// Wave-3 replacement for the retired wave-2
+    /// `a_same_content_version_bump_keeps_the_landed_file` (T11/T12/T18
+    /// ruling): the same bytes under a new version keep the landed file, its
+    /// path and its stamp, stay `held`, and are re-claimed at the new version
+    /// (P10) — nothing to fetch.
+    #[test]
+    fn a_same_content_version_bump_keeps_the_landed_file_and_reclaims() {
+        use crate::db::collab_live::ClaimOp;
+        let c = conn();
+        held(&c, "u1", "/c/m31/ann/u1.fits");
+        let mut v2 = view("u1", 2);
+        v2.content_version = 2;
+        upsert_from_manifest(&c, "p1", &v2).unwrap();
+        let r = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(r.local_state, LocalState::Held);
+        assert!(r.on_disk);
+        assert_eq!(r.content_version, 2);
+        assert_eq!(r.landed_path.as_deref(), Some("/c/m31/ann/u1.fits"));
+        assert_eq!(r.size_mtime_seen.as_deref(), Some("100:1"));
+        assert_eq!(
+            outbox_ops(&c),
+            vec![("u1".to_string(), ClaimOp::Add { content_version: 2 })]
+        );
+    }
+
+    #[test]
+    fn a_new_version_leaves_quarantined_not_kept_and_awaiting_rows_alone() {
+        let c = conn();
+        for (uuid, st) in [
+            ("q", LocalState::Quarantined),
+            ("n", LocalState::NotKept),
+            ("a", LocalState::AwaitingChoice),
+            ("i", LocalState::Idle),
+        ] {
+            held(&c, uuid, &format!("/c/m31/ann/{uuid}.fits"));
+            set_local_state(&c, "p1", uuid, st).unwrap();
+            crate::db::collab_live::ack_outbox(&c, "p1", i64::MAX).unwrap();
+            let mut v2 = view(uuid, 2);
+            v2.content_version = 2;
+            v2.blake3 = "d".repeat(64);
+            upsert_from_manifest(&c, "p1", &v2).unwrap();
+            let r = get(&c, "p1", uuid).unwrap().unwrap();
+            assert_eq!(r.local_state, st, "{uuid}");
+            if st == LocalState::Quarantined {
+                assert_eq!(
+                    r.size_mtime_seen.as_deref(),
+                    Some("100:1"),
+                    "a quarantined file is the user's to resolve"
+                );
+            }
+        }
+        assert!(outbox_ops(&c).is_empty());
+    }
+
+    #[test]
+    fn exclusion_idles_a_held_replica_and_reinclusion_decides_by_stat() {
+        use crate::db::collab_live::ClaimOp;
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("u1.fits");
+        std::fs::write(&f, vec![7u8; 100]).unwrap();
+        let stamp = crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(&f).unwrap());
+        let c = conn();
+        held(&c, "u1", &f.to_string_lossy());
+        set_size_mtime_seen(&c, "p1", "u1", &stamp.encode()).unwrap();
+
+        let mut out = view("u1", 2);
+        out.accepted = false;
+        upsert_from_manifest(&c, "p1", &out).unwrap();
+        assert_eq!(
+            get(&c, "p1", "u1").unwrap().unwrap().local_state,
+            LocalState::Idle
+        );
+        assert_eq!(outbox_ops(&c), vec![("u1".to_string(), ClaimOp::Remove)]);
+        crate::db::collab_live::ack_outbox(&c, "p1", i64::MAX).unwrap();
+
+        // re-included with the file untouched → held again, re-claimed
+        upsert_from_manifest(&c, "p1", &view("u1", 3)).unwrap();
+        let r = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(r.local_state, LocalState::Held);
+        assert_eq!(
+            outbox_ops(&c),
+            vec![("u1".to_string(), ClaimOp::Add { content_version: 1 })]
+        );
+
+        // excluded again, the file removed meanwhile → re-included as wanted
+        upsert_from_manifest(&c, "p1", &out).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        upsert_from_manifest(&c, "p1", &view("u1", 4)).unwrap();
+        assert_eq!(
+            get(&c, "p1", "u1").unwrap().unwrap().local_state,
+            LocalState::Wanted
+        );
+
+        // an idle row whose path was only recorded (no verified stamp) is
+        // wanted, never held
+        let mut idle = view("u2", 1);
+        idle.accepted = false;
+        upsert_from_manifest(&c, "p1", &idle).unwrap();
+        let g = tmp.path().join("u2.fits");
+        std::fs::write(&g, vec![7u8; 100]).unwrap();
+        update_landed_path(&c, "p1", "u2", &g.to_string_lossy()).unwrap();
+        upsert_from_manifest(&c, "p1", &view("u2", 2)).unwrap();
+        assert_eq!(
+            get(&c, "p1", "u2").unwrap().unwrap().local_state,
+            LocalState::Wanted
+        );
+    }
+
+    #[test]
+    fn rows_under_is_separator_strict_and_list_by_state_filters() {
+        let c = conn();
+        held(&c, "a", "/c/m31/ann/a.fits");
+        held(&c, "b", "/c/m31/ann/sub/b.fits");
+        held(&c, "c", "/c/m31/ann_x/c.fits");
+        upsert_from_manifest(&c, "p1", &view("d", 1)).unwrap();
+        let under: Vec<String> = rows_under(&c, "/c/m31/ann")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.frame_uuid)
+            .collect();
+        assert_eq!(under, vec!["a", "b"]);
+        assert_eq!(rows_under(&c, "/c/m31/ann/a.fits").unwrap().len(), 1);
+        assert_eq!(rows_with_landed_path(&c).unwrap().len(), 3);
+        set_local_state(&c, "p1", "c", LocalState::NotKept).unwrap();
+        let listed: Vec<String> =
+            list_by_state(&c, "p1", &[LocalState::NotKept, LocalState::Wanted])
+                .unwrap()
+                .into_iter()
+                .map(|r| r.frame_uuid)
+                .collect();
+        assert_eq!(listed, vec!["c", "d"]);
+        assert!(list_by_state(&c, "p1", &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -1279,6 +1632,8 @@ mod tests {
         assert!(same.on_disk && same.size_mtime_seen.is_some());
         let mut bumped = view("u1", 1);
         bumped.content_version = 2;
+        // new bytes (a same-bytes bump keeps the file — Task 9, P10)
+        bumped.blake3 = "c".repeat(64);
         upsert_from_manifest(&c, "p1", &bumped).unwrap();
         let after = get(&c, "p1", "u1").unwrap().unwrap();
         assert!(!after.on_disk);

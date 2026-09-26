@@ -12,6 +12,10 @@ pub mod holdings;
 // one of this account's OWN devices (offering a replace) and the
 // device-replace core (retire + marker rewrite + re-adoption by hash).
 pub mod replace;
+// The storage engine (Task 9): the per-frame local state driven from the
+// disk — settle, the L4 deletion window and its one reversible choice,
+// "lost everywhere", quarantine of changed replicas, re-adoption by hash.
+pub mod storage_task;
 
 // Fixtures shared by every wave-3 `api::collab_live` test module (Tasks
 // 7-18): a signed-in `ServiceContext` + `FakeHub` + a real relay-disabled
