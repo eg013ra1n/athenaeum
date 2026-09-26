@@ -392,6 +392,54 @@ No holder row is deleted. Older claims simply stop validating.
 - **`POST /auth/verify`** for an `athenaeum` device bumps kind `members` in every project of the account.
 - **Retired routes.** `GET /me/project-versions` and `GET /projects/{id}/frames/{uuid}/holders` answer `409 {"error":"collab_api_outdated"}`. So does every request of the wave-2 shapes above.
 
+### Publishing device — amendment A6 (appended 2026-09-27)
+
+Spec `2026-09-23-collab-v3-per-frame-model-design.md` §16 A6: one device per
+(project, account) may announce NEW frames. Hub migration
+`0024_publishing_device.sql` (`project_publishers`), hub commit `9f2abbb`.
+Everything below adds to
+the shapes above; nothing above changes meaning.
+
+- **`FrameEvent` and manifest `FrameView`** gain `publisherDeviceId`: the
+  announcing device as `device` (base64 pubkey, P3), or `null` when the hub
+  never recorded it. Present in every manifest row and every inline
+  `project`-event frame. A frame is **own on a device** when
+  `publisherDeviceId` equals that device's pubkey; `FrameView.own` stays
+  "published by this account".
+- **`GET /me/projects`** rows gain `publishingDevice`: `{"deviceId":"<b64>","name":"<str>"|null}`
+  — the account's bound device in that project — or `null` when nothing is
+  bound or the bound device is revoked/retired.
+- **`POST /projects/{id}/frames` (announce)**, inside its transaction:
+  - no binding, or the bound device is revoked/retired → the caller is bound;
+  - bound to the caller → unchanged;
+  - bound to another device in service → the whole batch is refused:
+    `409 {"error":"publishing_device","deviceId":"<b64>","deviceName":"<str>"|null}`
+    naming the bound device. Nothing is written.
+  - An announce that creates or moves the binding bumps kind `members` in
+    addition to `frames`, at the same `version` (`kinds: ["frames","members"]`).
+- **`PUT /projects/{id}/publishing-device`** (new) — "Publish from this device".
+  - **Auth.** `deviceToken` of a member (any data role). A portal session
+    gets `400 {"error":"a device token is required to set the publishing device"}`;
+    a non-member or unknown project `403` (empty body); a closed project
+    `409 {"error":"project is closed"}`. No request body is read.
+  - **Response.** `200 {"deviceId":"<b64>","name":"<str>"|null,"projectVersion":43,"changed":true}`
+    — the binding after the call (the caller).
+  - **Idempotent.** When the caller is already bound: `changed: false`,
+    `projectVersion` is the current version, no bump, no event.
+  - **A real move** bumps `projects.version` with kind `members` (every
+    member's devices refetch their small documents, which include
+    `/me/projects`).
+- **Versions** (`POST …/frames/{uuid}/version`, `POST …/frames/versions`).
+  The device allowed to version a frame is: the frame's own announcing
+  device while it is in service; else the account's bound device while that
+  one is in service; else nobody in particular (any device of the publisher
+  account is accepted).
+  - Single route, a different device: `409 {"error":"not_publishing_device","deviceId":"<b64>","deviceName":"<str>"|null}`
+    naming the allowed device. It is checked after `403` (other account) and
+    `409 project is closed`, before `version_conflict`.
+  - Batch: a new per-entry `status` value `not_publishing_device`, with
+    `contentVersion` 0, checked after `forbidden` and before `conflict`.
+
 ---
 
 ## Plan rulings (decided here; cite as P1…)
