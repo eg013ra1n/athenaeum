@@ -1157,7 +1157,7 @@ impl SharedIrohNode {
         let collab: SharedCollabSlot = Arc::new(RwLock::new(None));
         let collab_oracle: SharedServeOracle = Arc::new(RwLock::new(None));
         let collab_gauge = StreamGauge::new(default_collab_upload_streams());
-        let collab_conns = Arc::new(ConnRegistry::default());
+        let collab_conns = Arc::new(ConnRegistry::new("collab"));
         let (collab_events, collab_rx) = provider_event_channel();
         spawn_collab_provider_events(
             collab_rx,

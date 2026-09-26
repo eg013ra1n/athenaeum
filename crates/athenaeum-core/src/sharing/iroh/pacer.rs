@@ -15,11 +15,20 @@
 //! Class-aware (collab v3 wave 3, spec §8, L1): the personal store's uploads
 //! ([`UploadClass::Personal`]) always use the device bucket above, unchanged.
 //! Collab uploads ([`UploadClass::Collab`]) share that bucket while no
-//! personal upload runs; while one does, they are paced on their own
-//! schedule at [`COLLAB_SHARE_WHILE_PERSONAL`] of the link — the cap when one
-//! is set, else the personal rate observed over [`PERSONAL_RATE_WINDOW`] —
-//! never below [`COLLAB_FLOOR_BYTES_PER_SEC`]. Collab never charges the
-//! personal bucket, so a personal upload is never slowed by collab.
+//! personal upload runs; while one does, they are ALSO paced on their own
+//! schedule at [`COLLAB_SHARE_WHILE_PERSONAL`] of the link:
+//!
+//! - with a cap, the share is `cap × 10 %` and every collab chunk still
+//!   reserves on the device bucket (the wait is the longer of the two), so
+//!   collab's share comes OUT of the cap — the device total never exceeds it
+//!   and personal keeps ~90 %;
+//! - without a cap, the share is 10 % of the personal rate observed over
+//!   [`PERSONAL_RATE_WINDOW`], never below [`COLLAB_FLOOR_BYTES_PER_SEC`], and
+//!   nothing charges a bucket (there is none) — personal is never slowed.
+//!
+//! When a personal upload starts while none ran, the device bucket's
+//! schedule is restarted from the present, so collab chunks reserved before
+//! it never delay the personal upload's first chunk.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -67,8 +76,30 @@ pub struct UploadPacer {
     collab_next_free: Mutex<Option<Instant>>,
     /// How many personal uploads are running ([`PersonalUploadGuard`]s alive).
     personal_active: AtomicUsize,
-    /// Personal chunks of the last [`PERSONAL_RATE_WINDOW`], `(at, bytes)`.
-    personal_window: Mutex<VecDeque<(Instant, u64)>>,
+    /// Personal chunks of the last [`PERSONAL_RATE_WINDOW`] (recorded only
+    /// while no cap is set — the observed rate is used only then).
+    personal_window: Mutex<RateWindow>,
+}
+
+/// Personal chunks `(at, bytes)` of the last [`PERSONAL_RATE_WINDOW`] and
+/// their running byte sum, so reading the rate is O(1) amortized.
+#[derive(Default)]
+struct RateWindow {
+    chunks: VecDeque<(Instant, u64)>,
+    bytes: u64,
+}
+
+impl RateWindow {
+    /// Drop the chunks older than [`PERSONAL_RATE_WINDOW`] before `now`.
+    fn evict(&mut self, now: Instant) {
+        while let Some(&(t, b)) = self.chunks.front() {
+            if now.saturating_duration_since(t) <= PERSONAL_RATE_WINDOW {
+                break;
+            }
+            self.chunks.pop_front();
+            self.bytes -= b;
+        }
+    }
 }
 
 impl UploadPacer {
@@ -78,7 +109,7 @@ impl UploadPacer {
             next_free: Mutex::new(None),
             collab_next_free: Mutex::new(None),
             personal_active: AtomicUsize::new(0),
-            personal_window: Mutex::new(VecDeque::new()),
+            personal_window: Mutex::new(RateWindow::default()),
         }
     }
 
@@ -129,7 +160,11 @@ impl UploadPacer {
     pub(crate) fn reserve_class_at(&self, now: Instant, size: u64, class: UploadClass) -> Duration {
         match class {
             UploadClass::Personal => {
-                self.record_personal_at(now, size);
+                // With a cap the personal path is exactly the wave-2 bucket;
+                // the observed rate is recorded only when it is used (no cap).
+                if self.rate() == 0 {
+                    self.record_personal_at(now, size);
+                }
                 self.reserve_at(now, size)
             }
             UploadClass::Collab if self.personal_active.load(Ordering::Relaxed) == 0 => {
@@ -137,17 +172,25 @@ impl UploadPacer {
             }
             UploadClass::Collab => {
                 let cap = self.rate();
-                let base = if cap > 0 {
-                    cap
+                let share = if cap > 0 {
+                    // The floor never lifts collab above its share of a
+                    // small cap: max(cap × share, min(floor, cap × share)).
+                    let capped = (cap as f64 * COLLAB_SHARE_WHILE_PERSONAL) as u64;
+                    capped.max(COLLAB_FLOOR_BYTES_PER_SEC.min(capped)).max(1)
                 } else {
-                    self.personal_rate_at(now)
+                    ((self.personal_rate_at(now) as f64 * COLLAB_SHARE_WHILE_PERSONAL) as u64)
+                        .max(COLLAB_FLOOR_BYTES_PER_SEC)
                 };
-                let share = ((base as f64 * COLLAB_SHARE_WHILE_PERSONAL) as u64)
-                    .max(COLLAB_FLOOR_BYTES_PER_SEC);
-                let mut next = self.collab_next_free.lock().expect("pacer mutex poisoned");
-                let start = next.map_or(now, |t| t.max(now));
-                *next = Some(start + Duration::from_secs_f64(size as f64 / share as f64));
-                start.saturating_duration_since(now)
+                let collab_wait = {
+                    let mut next = self.collab_next_free.lock().expect("pacer mutex poisoned");
+                    let start = next.map_or(now, |t| t.max(now));
+                    *next = Some(start + Duration::from_secs_f64(size as f64 / share as f64));
+                    start.saturating_duration_since(now)
+                };
+                // With a cap, collab bytes are device bytes too: they take
+                // their slot on the shared bucket (a no-op without a cap).
+                let shared_wait = self.reserve_at(now, size);
+                collab_wait.max(shared_wait)
             }
         }
     }
@@ -155,30 +198,31 @@ impl UploadPacer {
     /// Record `size` personal bytes let out at `at` (the observed-rate base).
     pub(crate) fn record_personal_at(&self, at: Instant, size: u64) {
         let mut w = self.personal_window.lock().expect("pacer mutex poisoned");
-        w.push_back((at, size));
-        while w
-            .front()
-            .is_some_and(|(t, _)| at.saturating_duration_since(*t) > PERSONAL_RATE_WINDOW)
-        {
-            w.pop_front();
-        }
+        w.chunks.push_back((at, size));
+        w.bytes += size;
+        w.evict(at);
     }
 
     /// Personal bytes/sec over the last [`PERSONAL_RATE_WINDOW`] before `now`.
     fn personal_rate_at(&self, now: Instant) -> u64 {
-        let w = self.personal_window.lock().expect("pacer mutex poisoned");
-        let bytes: u64 = w
-            .iter()
-            .filter(|(t, _)| now.saturating_duration_since(*t) <= PERSONAL_RATE_WINDOW)
-            .map(|(_, b)| b)
-            .sum();
-        (bytes as f64 / PERSONAL_RATE_WINDOW.as_secs_f64()) as u64
+        let mut w = self.personal_window.lock().expect("pacer mutex poisoned");
+        w.evict(now);
+        (w.bytes as f64 / PERSONAL_RATE_WINDOW.as_secs_f64()) as u64
     }
 
     /// Mark a personal upload active for the guard's lifetime (held by the
-    /// personal provider consumer for every payload-carrying get).
+    /// personal provider consumer for every payload-carrying get). The first
+    /// one (0 → 1) restarts the device bucket's schedule from the present, so
+    /// collab chunks reserved before it never delay its first chunk.
     pub fn personal_upload(self: &Arc<Self>) -> PersonalUploadGuard {
-        self.personal_active.fetch_add(1, Ordering::Relaxed);
+        if self.personal_active.fetch_add(1, Ordering::Relaxed) == 0 {
+            match self.next_free.lock() {
+                Ok(mut next_free) => *next_free = None,
+                Err(e) => {
+                    tracing::error!(error = %e, "upload pacer poisoned; device schedule kept")
+                }
+            }
+        }
         PersonalUploadGuard {
             pacer: Arc::clone(self),
         }
@@ -402,17 +446,110 @@ mod tests {
                 Duration::ZERO
             );
         }
-        // With a cap, a burst of collab chunks never delays the personal bucket.
-        let p = Arc::new(UploadPacer::new(1_000_000));
+    }
+
+    /// With a cap, both classes running flat out: the device total stays
+    /// within the cap and personal keeps ~90 % of it. Simulated in virtual
+    /// time — each flow asks for its next chunk the moment the previous one's
+    /// reservation lets it out, like the provider's writer does.
+    #[test]
+    fn with_a_cap_collab_comes_out_of_it_and_personal_keeps_ninety_percent() {
+        const CAP: u64 = 1_000_000;
+        let p = Arc::new(UploadPacer::new(CAP));
         let _g = p.personal_upload();
-        let now = Instant::now();
-        for _ in 0..10 {
-            p.reserve_class_at(now, 100_000, UploadClass::Collab);
+        let t0 = Instant::now();
+        let horizon = Duration::from_secs(20);
+        let (mut personal_at, mut collab_at) = (t0, t0);
+        let (mut personal_bytes, mut collab_bytes) = (0u64, 0u64);
+        loop {
+            let (class, at) = if personal_at <= collab_at {
+                (UploadClass::Personal, personal_at)
+            } else {
+                (UploadClass::Collab, collab_at)
+            };
+            if at - t0 >= horizon {
+                break;
+            }
+            let sent_at = at + p.reserve_class_at(at, KIB16, class);
+            let counted = if sent_at - t0 < horizon { KIB16 } else { 0 };
+            match class {
+                UploadClass::Personal => {
+                    personal_bytes += counted;
+                    personal_at = sent_at;
+                }
+                UploadClass::Collab => {
+                    collab_bytes += counted;
+                    collab_at = sent_at;
+                }
+            }
         }
+        let budget = CAP * horizon.as_secs();
+        let total = personal_bytes + collab_bytes;
+        assert!(
+            total <= budget + 2 * KIB16,
+            "device total {total} over the cap budget {budget}"
+        );
+        assert!(
+            personal_bytes as f64 >= 0.88 * budget as f64,
+            "personal got {personal_bytes} of {budget} (collab {collab_bytes})"
+        );
+        assert!(collab_bytes > 0, "collab still moves");
+    }
+
+    /// Personal-only traffic under a cap is exactly the wave-2 bucket: the
+    /// class-aware entry point returns what `reserve_at` alone would, and
+    /// records nothing.
+    #[test]
+    fn capped_personal_only_matches_the_plain_bucket() {
+        let classed = Arc::new(UploadPacer::new(1_000_000));
+        let _g = classed.personal_upload();
+        let plain = UploadPacer::new(1_000_000);
+        let now = Instant::now();
+        for i in 0..64u64 {
+            let at = now + Duration::from_millis(i * 3);
+            assert_eq!(
+                classed.reserve_class_at(at, KIB16, UploadClass::Personal),
+                plain.reserve_at(at, KIB16)
+            );
+        }
+        assert!(
+            classed.personal_window.lock().unwrap().chunks.is_empty(),
+            "nothing recorded under a cap"
+        );
+    }
+
+    #[test]
+    fn a_new_personal_upload_is_not_delayed_by_earlier_collab_reservations() {
+        let p = Arc::new(UploadPacer::new(1_000_000));
+        let now = Instant::now();
+        // Collab alone filled the shared bucket for the next second.
+        for _ in 0..61 {
+            p.reserve_class_at(now, KIB16, UploadClass::Collab);
+        }
+        assert!(p.reserve_class_at(now, 1, UploadClass::Collab) > Duration::from_millis(900));
+        let _g = p.personal_upload();
         assert_eq!(
             p.reserve_class_at(now, KIB16, UploadClass::Personal),
-            Duration::ZERO
+            Duration::ZERO,
+            "the first personal chunk goes out now"
         );
+    }
+
+    #[test]
+    fn the_observed_rate_is_a_running_sum_over_the_window() {
+        let p = UploadPacer::new(0);
+        let now = Instant::now();
+        p.record_personal_at(now - Duration::from_millis(3000), 1_000_000); // aged out
+        p.record_personal_at(now - Duration::from_millis(1000), 2_000_000);
+        p.record_personal_at(now, 2_000_000);
+        assert_eq!(p.personal_rate_at(now), 2_000_000);
+        assert_eq!(p.personal_window.lock().unwrap().chunks.len(), 2);
+        // A second and a half later the older in-window chunk has aged out.
+        assert_eq!(
+            p.personal_rate_at(now + Duration::from_millis(1500)),
+            1_000_000
+        );
+        assert_eq!(p.personal_window.lock().unwrap().bytes, 2_000_000);
     }
 
     #[test]

@@ -2517,6 +2517,24 @@ pub fn init_db(conn: &Connection) -> Result<()> {
          WHERE local_state IS NULL",
         [],
     )?;
+    // `own_staged` (wave 3, Task 10 fix round 1, C11): an own row between
+    // `stage_own_file` (the new file is on disk, its stamp recorded) and
+    // `set_own_version` (the hub confirmed the new blake3). Its `blake3` is
+    // still the OLD version's, so the collab serve check refuses it. One-time
+    // backfill when the column is added: before wave 3 the only writer that
+    // left an on-disk own row without a recipe was `stage_own_file`.
+    if !column_exists(conn, "project_frames_local", "own_staged")? {
+        conn.execute(
+            "ALTER TABLE project_frames_local ADD COLUMN own_staged INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE project_frames_local SET own_staged = 1
+             WHERE origin = 'own' AND on_disk = 1 AND recipe_hash IS NULL
+               AND landed_path IS NOT NULL",
+            [],
+        )?;
+    }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_project_frames_local_blake3 ON project_frames_local(blake3);
          CREATE INDEX IF NOT EXISTS idx_project_frames_local_state ON project_frames_local(project_id, local_state);

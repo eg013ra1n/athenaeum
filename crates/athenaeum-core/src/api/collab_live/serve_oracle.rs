@@ -30,6 +30,10 @@ use crate::services::ServiceContext;
 /// row keeps its seed tags (so its blob is still in the store) but is never
 /// served; neither is a wanted, missing, quarantined, declined or
 /// awaiting-choice one.
+///
+/// An own row that is `own_staged` (its new file on disk and stamped, the
+/// hub not yet confirming the new version, so `blake3` is still the old
+/// one) is refused too: the old hash must never be served from new bytes.
 const SERVABLE_STATES: [LocalState; 2] = [LocalState::Held, LocalState::OwnHeld];
 
 pub struct DbServeOracle {
@@ -77,7 +81,7 @@ impl ServeOracle for DbServeOracle {
             .query_row(
                 "SELECT project_id, frame_uuid, landed_path, size_mtime_seen
                  FROM project_frames_local
-                 WHERE blake3 = ?1 AND local_state IN (?2, ?3)
+                 WHERE blake3 = ?1 AND local_state IN (?2, ?3) AND own_staged = 0
                    AND landed_path IS NOT NULL AND size_mtime_seen IS NOT NULL
                  ORDER BY project_id, frame_uuid
                  LIMIT 1",
@@ -124,13 +128,18 @@ impl ServeOracle for DbServeOracle {
             );
             return;
         };
-        if let Err(e) = checks.send((rec.project_id.clone(), rec.frame_uuid.clone())) {
-            tracing::warn!(
+        match checks.send((rec.project_id.clone(), rec.frame_uuid.clone())) {
+            Ok(()) => tracing::debug!(
+                project_id = %rec.project_id,
+                frame_uuid = %rec.frame_uuid,
+                "local check queued for the changed file"
+            ),
+            Err(e) => tracing::warn!(
                 project_id = %rec.project_id,
                 frame_uuid = %rec.frame_uuid,
                 error = %e,
                 "local check not queued: the storage engine stopped"
-            );
+            ),
         }
     }
 }
@@ -338,6 +347,135 @@ mod tests {
         );
     }
 
+    /// Fix round 1: a request past offset 0 would stream a hash-seq's
+    /// children, which the serve check never sees — refused outright, even on
+    /// a held hash.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_get_with_child_ranges_is_refused() {
+        use iroh_blobs::protocol::{ChunkRanges, GetRequest};
+        let rig = ts::landed_rig(1).await;
+        let fetcher = ts::bare_node().await;
+        ts::pair(&fetcher, &rig.node).await;
+        let conn = fetcher
+            .endpoint()
+            .connect(
+                rig.node.endpoint_addr(),
+                crate::sharing::iroh::COLLAB_BLOBS_ALPN,
+            )
+            .await
+            .unwrap();
+        let request = GetRequest::builder()
+            .root(ChunkRanges::all())
+            .child(0, ChunkRanges::all())
+            .build(rig.hash_of(0));
+        let err = ts::scratch_store()
+            .remote()
+            .execute_get(conn, request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.iroh_error_code(),
+            Some(iroh_blobs::protocol::ERR_PERMISSION)
+        );
+    }
+
+    /// Fix round 1 (C11): an own frame staged with new bytes (its stamp
+    /// recorded, the hub not yet confirming the new blake3) never serves the
+    /// OLD hash from the new file; once the version is confirmed the NEW hash
+    /// is served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_own_frame_is_served_only_after_its_version_is_confirmed() {
+        let rig = ts::landed_rig(1).await;
+        let (pid, uuid, path) = rig.frames[0].clone();
+        let old = rig.hash_of(0);
+        {
+            let conn = crate::api::db(&rig.ctx).unwrap().conn();
+            conn.execute(
+                "UPDATE project_frames_local SET origin = 'own', local_state = 'own_held',
+                    recipe_hash = 'r1' WHERE project_id = ?1 AND frame_uuid = ?2",
+                rusqlite::params![pid, uuid],
+            )
+            .unwrap();
+        }
+        // The regenerated file replaces the landed one and is seeded as v2.
+        let bytes = format!("regenerated own frame {uuid}: pixels ")
+            .repeat(1024)
+            .into_bytes();
+        std::fs::write(&path, &bytes).unwrap();
+        let new = rig
+            .node
+            .seed_project_frame(&pid, &uuid, 2, &path)
+            .await
+            .unwrap();
+        let xxh3 = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
+        let stamp = Stamp::of(&std::fs::metadata(&path).unwrap()).encode();
+        {
+            let conn = crate::api::db(&rig.ctx).unwrap().conn();
+            let n = crate::db::collab_frames::stage_own_file(
+                &conn,
+                &pid,
+                &uuid,
+                &path.to_string_lossy(),
+                &xxh3,
+                bytes.len() as i64,
+                Some(&stamp),
+            )
+            .unwrap();
+            assert_eq!(n, 1);
+        }
+        let oracle = catalog_oracle(&rig);
+        assert_eq!(
+            oracle.lookup(&old.to_hex()),
+            None,
+            "staged: old hash refused"
+        );
+        assert_eq!(oracle.lookup(&new.to_hex()), None, "not confirmed yet");
+
+        let fetcher = ts::bare_node().await;
+        ts::pair(&fetcher, &rig.node).await;
+        let conn = fetcher
+            .endpoint()
+            .connect(
+                rig.node.endpoint_addr(),
+                crate::sharing::iroh::COLLAB_BLOBS_ALPN,
+            )
+            .await
+            .unwrap();
+        let err = ts::scratch_store()
+            .remote()
+            .execute_get(conn.clone(), iroh_blobs::protocol::GetRequest::blob(old))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.iroh_error_code(),
+            Some(iroh_blobs::protocol::ERR_PERMISSION)
+        );
+
+        {
+            let conn = crate::api::db(&rig.ctx).unwrap().conn();
+            crate::db::collab_frames::set_own_version(
+                &conn,
+                &pid,
+                &uuid,
+                2,
+                &new.to_hex(),
+                &xxh3,
+                bytes.len() as i64,
+                "r2",
+                Some(&stamp),
+            )
+            .unwrap();
+        }
+        assert!(oracle.lookup(&new.to_hex()).is_some(), "confirmed: served");
+        let store = ts::scratch_store();
+        store
+            .remote()
+            .execute_get(conn, iroh_blobs::protocol::GetRequest::blob(new))
+            .await
+            .expect("the confirmed version is served");
+        assert!(store.blobs().has(new).await.unwrap());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_upload_stream_limit_refuses_with_err_limit() {
         let rig = ts::landed_rig(1).await;
@@ -376,6 +514,43 @@ mod tests {
             .execute_get(conn, iroh_blobs::protocol::GetRequest::blob(rig.hash_of(0)))
             .await
             .expect("served once a stream is free");
+    }
+
+    /// Fix round 1: a membership change landing between the accept-time gate
+    /// checks and the registration is caught by the re-check right after
+    /// registering. The gate admits its first two evaluations (the slot
+    /// handler's and the provider's accept-time checks) and refuses from the
+    /// third on — the post-registration re-check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_whose_member_was_dropped_while_accepting_is_closed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rig = ts::landed_rig(1).await;
+        let fetcher = ts::bare_node().await;
+        ts::pair(&fetcher, &rig.node).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        rig.node
+            .set_connect_gate(Arc::new(move |_| seen.fetch_add(1, Ordering::SeqCst) < 2));
+        let conn = fetcher
+            .endpoint()
+            .connect(
+                rig.node.endpoint_addr(),
+                crate::sharing::iroh::COLLAB_BLOBS_ALPN,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed())
+            .await
+            .expect("closed right after registration");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "the gate was asked again"
+        );
+        assert_eq!(
+            rig.node.close_collab_connections_not_admitted(),
+            0,
+            "nothing left registered"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

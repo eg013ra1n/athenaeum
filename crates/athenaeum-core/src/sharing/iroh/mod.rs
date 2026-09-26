@@ -544,7 +544,7 @@ pub(crate) fn build_router(
     // The personal store's accepted connections, so the consumer can name the
     // peer behind a request's `connection_id` (a refused push is logged with
     // its `from`).
-    let conns = Arc::new(ConnRegistry::default());
+    let conns = Arc::new(ConnRegistry::new("personal"));
     // Wrap the blobs provider so an ungated peer never receives a blob byte:
     // `GatedBlobs` checks the connect gate against the dialing node id before
     // delegating to the inner `iroh_blobs` handler (finding F5 hardening).
@@ -1020,12 +1020,21 @@ pub type SharedServeOracle = Arc<RwLock<Option<Arc<dyn crate::collab::serve::Ser
 /// Registered by [`GatedBlobs::accept`] after the connect gate admitted the
 /// peer; forgotten when the provider reports the connection closed (and
 /// pruned of dead handles on every registration).
-#[derive(Default)]
 pub(crate) struct ConnRegistry {
+    /// Which store's provider this registry belongs to (`"personal"` /
+    /// `"collab"`), for its log lines.
+    store: &'static str,
     conns: Mutex<HashMap<u64, (NodeId, iroh::endpoint::WeakConnectionHandle)>>,
 }
 
 impl ConnRegistry {
+    pub(crate) fn new(store: &'static str) -> Self {
+        Self {
+            store,
+            conns: Mutex::new(HashMap::new()),
+        }
+    }
+
     fn lock(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<u64, (NodeId, iroh::endpoint::WeakConnectionHandle)>>
@@ -1044,6 +1053,33 @@ impl ConnRegistry {
             connection.stable_id() as u64,
             (from, connection.weak_handle()),
         );
+    }
+
+    /// Register a connection the connect gate just admitted, then ask the
+    /// gate AGAIN: a membership change landing between the accept-time check
+    /// and the registration would otherwise miss
+    /// [`close_not_admitted`](Self::close_not_admitted) (its snapshot did not
+    /// hold this connection yet). Returns `false` — the connection closed —
+    /// when the peer is no longer admitted.
+    pub(crate) fn register_admitted(
+        &self,
+        connection: &Connection,
+        gate: &SharedConnectGate,
+    ) -> bool {
+        self.register(connection);
+        let from: NodeId = *connection.remote_id().as_bytes();
+        if connect_gate_admits(gate, &from) {
+            return true;
+        }
+        self.forget(connection.stable_id() as u64);
+        connection.close(0u32.into(), b"membership revoked");
+        tracing::info!(
+            peer = %hex32(&from),
+            store = self.store,
+            count = 1,
+            "connections closed: no longer admitted"
+        );
+        false
     }
 
     pub(crate) fn forget(&self, connection_id: u64) {
@@ -1093,7 +1129,12 @@ impl ConnRegistry {
         let mut closed = 0;
         for (node, count) in closed_per_peer {
             closed += count;
-            tracing::info!(peer = %hex32(&node), count, "collab connections closed: no longer admitted");
+            tracing::info!(
+                peer = %hex32(&node),
+                store = self.store,
+                count,
+                "connections closed: no longer admitted"
+            );
         }
         closed
     }
@@ -1106,7 +1147,9 @@ impl ConnRegistry {
 /// reply oneshot gets exactly one reply, every update stream is drained for
 /// the whole transfer, every throttle is answered `Ok(())` after its delay.
 ///
-/// - **get** — the serve check ([`collab_serve_verdict`]): the catalog row,
+/// - **get** — refused unless it is a plain blob request (a request past
+///   offset 0 would stream hash-seq children the check never sees), then the
+///   serve check ([`collab_serve_verdict`]): the catalog row,
 ///   the file's stamp, storage availability and the upload stream limit
 ///   decide; a refusal is `ERR_PERMISSION`, or `ERR_LIMIT` past the limit.
 ///   An admitted get holds a [`StreamPermit`] until its transfer drains.
@@ -1131,17 +1174,30 @@ pub(crate) fn spawn_collab_provider_events(
                     let from = conns.peer_label(m.inner.connection_id);
                     tokio::spawn(async move {
                         let hash = m.inner.request.hash;
-                        let permit =
-                            match collab_serve_verdict(oracle, hash, &gauge, true, &from).await {
-                                Ok(permit) => {
-                                    m.tx.send(Ok(())).await.ok();
-                                    permit
-                                }
-                                Err(reason) => {
-                                    m.tx.send(Err(reason)).await.ok();
-                                    None
-                                }
-                            };
+                        // Only a plain blob request is checked (and fetched by
+                        // the collab exchange): a request reaching past offset
+                        // 0 would stream a hash-seq's CHILDREN, which the serve
+                        // check never sees — refused outright.
+                        let verdict = if m.inner.request.ranges.is_blob() {
+                            collab_serve_verdict(oracle, hash, &gauge, true, &from).await
+                        } else {
+                            tracing::warn!(
+                                from = %from,
+                                blake3 = %hash,
+                                "collab get refused: not a plain blob request"
+                            );
+                            Err(AbortReason::Permission)
+                        };
+                        let permit = match verdict {
+                            Ok(permit) => {
+                                m.tx.send(Ok(())).await.ok();
+                                permit
+                            }
+                            Err(reason) => {
+                                m.tx.send(Err(reason)).await.ok();
+                                None
+                            }
+                        };
                         // SAFETY RULE: drain the update stream for the whole
                         // transfer; the permit is held until it ends.
                         let mut updates = m.rx;
@@ -1308,7 +1364,7 @@ async fn collab_serve_verdict(
                     project_id = %r.project_id,
                     frame_uuid = %r.frame_uuid,
                     path = %r.path.display(),
-                    "collab get refused: file changed on disk; checking it now"
+                    "collab get refused: file changed on disk"
                 );
                 o.on_mismatch(r);
             }
@@ -2507,7 +2563,9 @@ impl ProtocolHandler for GatedBlobs {
             connection.close(0u32.into(), b"unauthorized");
             return Ok(());
         }
-        self.conns.register(&connection);
+        if !self.conns.register_admitted(&connection, &self.gate) {
+            return Ok(());
+        }
         // A blob download connection lives for the whole transfer — the longest
         // window this transport holds a `Connection` handle, so its path watcher
         // is the most likely to observe a mid-transfer relay→direct upgrade.

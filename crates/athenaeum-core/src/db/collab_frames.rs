@@ -1152,7 +1152,7 @@ pub fn set_own_version(
     let n = conn.execute(
         "UPDATE project_frames_local
          SET content_version = ?3, blake3 = ?4, xxh3 = ?5, byte_size = ?6, recipe_hash = ?7,
-             size_mtime_seen = ?8, awaiting_gc = 0, last_error = NULL,
+             size_mtime_seen = ?8, awaiting_gc = 0, last_error = NULL, own_staged = 0,
              manifest_json = CASE WHEN json_valid(manifest_json)
                  THEN json_set(manifest_json, '$.contentVersion', ?3, '$.blake3', ?4,
                                '$.xxh3', ?5, '$.byteSize', ?6)
@@ -1183,7 +1183,9 @@ pub fn set_own_version(
 /// file on disk move (`xxh3`, `byte_size`, `size_mtime_seen`, `on_disk = 1`,
 /// `awaiting_gc = 0`), so disk truth sees the new file as present instead of
 /// "edited". The hub-confirmed columns (`content_version`, `blake3`) stay
-/// until [`set_own_version`], and `recipe_hash` is cleared: an empty recipe
+/// until [`set_own_version`] (the row is marked `own_staged` meanwhile, so the
+/// collab serve check never serves the old hash from the new file), and
+/// `recipe_hash` is cleared: an empty recipe
 /// matches no current recipe, so ANY later publish run — not only a
 /// republish — regenerates the frame, finds bytes the hub does not have, and
 /// posts the version a dead run never confirmed (a republish or a plate solve
@@ -1205,7 +1207,7 @@ pub fn stage_own_file(
     let n = conn.execute(
         "UPDATE project_frames_local
          SET xxh3 = ?4, byte_size = ?5, size_mtime_seen = ?6, awaiting_gc = 0,
-             recipe_hash = NULL, updated_at = datetime('now')
+             recipe_hash = NULL, own_staged = 1, updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own' AND landed_path = ?3",
         params![
             project_id,
@@ -1243,7 +1245,7 @@ pub fn unstage_own_file(
     let n = conn.execute(
         "UPDATE project_frames_local
          SET xxh3 = ?3, byte_size = ?4, size_mtime_seen = NULL, awaiting_gc = 0,
-             updated_at = datetime('now')
+             own_staged = 0, updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own'",
         params![project_id, frame_uuid, hub_xxh3, hub_byte_size],
     )?;
@@ -1274,7 +1276,7 @@ pub fn adopt_own(
     let n = conn.execute(
         "UPDATE project_frames_local
          SET source_frame_id = ?3, landed_path = ?4, recipe_hash = ?5, size_mtime_seen = ?6,
-             awaiting_gc = 0, last_error = NULL, updated_at = datetime('now')
+             awaiting_gc = 0, last_error = NULL, own_staged = 0, updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own'",
         params![
             project_id,
@@ -1528,6 +1530,92 @@ mod tests {
         set_size_mtime_seen(c, "p1", uuid, "100:1").unwrap();
         set_local_state(c, "p1", uuid, LocalState::Held).unwrap();
         crate::db::collab_live::ack_outbox(c, "p1", i64::MAX).unwrap();
+    }
+
+    fn own_staged(c: &Connection, uuid: &str) -> bool {
+        c.query_row(
+            "SELECT own_staged FROM project_frames_local WHERE project_id = 'p1' AND frame_uuid = ?1",
+            [uuid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Task 10 fix round 1 (C11): `own_staged` is set by `stage_own_file` and
+    /// cleared by `set_own_version`, `unstage_own_file` and `adopt_own`; the
+    /// one-time backfill marks an on-disk own row without a recipe (the only
+    /// shape `stage_own_file` left before wave 3).
+    #[test]
+    fn own_staged_follows_the_own_version_writers_and_is_backfilled() {
+        let c = conn();
+        let mut own = view("u1", 1);
+        own.own = true;
+        upsert_from_manifest(&c, "p1", &own).unwrap();
+        adopt_own(&c, "p1", "u1", 7, "/c/u1.fits", "r1", Some("100:1")).unwrap();
+        assert!(!own_staged(&c, "u1"));
+        stage_own_file(
+            &c,
+            "p1",
+            "u1",
+            "/c/u1.fits",
+            "fedcba9876543210",
+            120,
+            Some("120:2"),
+        )
+        .unwrap();
+        assert!(own_staged(&c, "u1"));
+        set_own_version(
+            &c,
+            "p1",
+            "u1",
+            2,
+            &"c".repeat(64),
+            "fedcba9876543210",
+            120,
+            "r2",
+            Some("120:2"),
+        )
+        .unwrap();
+        assert!(!own_staged(&c, "u1"));
+        stage_own_file(
+            &c,
+            "p1",
+            "u1",
+            "/c/u1.fits",
+            "0000000000000000",
+            130,
+            Some("130:3"),
+        )
+        .unwrap();
+        unstage_own_file(&c, "p1", "u1", "fedcba9876543210", 120).unwrap();
+        assert!(!own_staged(&c, "u1"));
+        stage_own_file(
+            &c,
+            "p1",
+            "u1",
+            "/c/u1.fits",
+            "0000000000000000",
+            130,
+            Some("130:3"),
+        )
+        .unwrap();
+        adopt_own(&c, "p1", "u1", 7, "/c/u1.fits", "r3", Some("130:3")).unwrap();
+        assert!(!own_staged(&c, "u1"));
+
+        // The backfill: drop the column, shape a pre-wave-3 staged row and a
+        // published one, and let init_db add the column again.
+        let mut other = view("u2", 1);
+        other.own = true;
+        upsert_from_manifest(&c, "p1", &other).unwrap();
+        adopt_own(&c, "p1", "u2", 8, "/c/u2.fits", "r1", Some("100:1")).unwrap();
+        c.execute_batch(
+            "UPDATE project_frames_local SET recipe_hash = NULL, on_disk = 1 WHERE frame_uuid = 'u1';
+             ALTER TABLE project_frames_local DROP COLUMN own_staged;",
+        )
+        .unwrap();
+        crate::db::schema::init_db(&c).unwrap();
+        assert!(own_staged(&c, "u1"), "a pre-wave-3 staged row");
+        assert!(!own_staged(&c, "u2"), "a published row");
     }
 
     /// Task 9 step 4: the manifest's full edge set.

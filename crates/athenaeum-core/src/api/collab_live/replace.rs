@@ -615,8 +615,11 @@ pub(crate) async fn land_candidate(
             &crate::api::collab_exchange::size_mtime_from(&meta),
         )?;
     }
+    // The file hashed to the row's confirmed blake3: an own row is no longer
+    // staged (Task 10, C11).
     tx.execute(
-        "UPDATE project_frames_local SET awaiting_gc = 0, rejected_size_mtime = NULL
+        "UPDATE project_frames_local SET awaiting_gc = 0, rejected_size_mtime = NULL,
+            own_staged = 0
          WHERE project_id = ?1 AND frame_uuid = ?2",
         rusqlite::params![row.project_id, row.frame_uuid],
     )?;
