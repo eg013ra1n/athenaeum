@@ -90,7 +90,15 @@ pub struct FakeDeviceRow {
     pub name: String,
     pub created_at: String,
     pub last_seen_at: Option<String>,
+    /// A permanent "will never sign in again" mark (spec §9.1: "one that is
+    /// not retired"). Distinct from [`revoked`](Self::revoked) — fix round
+    /// 1, point 6 — so a test can prove `retire: true` was actually sent,
+    /// not just that SOME revoke happened.
     pub retired: bool,
+    /// A plain (non-retire) revoke: the token dies, but the device could
+    /// still be retired later. Both `revoked` and `retired` hide the row
+    /// from `GET /devices`.
+    pub revoked: bool,
 }
 
 /// One project membership.
@@ -849,6 +857,7 @@ impl FakeHub {
                 created_at: now_rfc3339(),
                 last_seen_at: last_seen.map(|t| t.to_rfc3339()),
                 retired: false,
+                revoked: false,
             },
         );
     }
@@ -1934,7 +1943,7 @@ fn list_devices_route(st: &FakeHubState, acct: &FakeAccount) -> ResponseTemplate
     let mut out: Vec<(String, Value)> = st
         .devices
         .iter()
-        .filter(|(_, d)| d.account_id == acct.account_id && !d.retired)
+        .filter(|(_, d)| d.account_id == acct.account_id && !d.retired && !d.revoked)
         .map(|(id, d)| {
             (
                 id.clone(),
@@ -1977,11 +1986,19 @@ fn revoke_device_route(
     let Some(dev) = st.devices.get(id).cloned() else {
         return error(404, "no such device");
     };
-    if dev.account_id != acct.account_id {
+    // Retired is terminal: a device already retired 404s on a second
+    // revoke, exactly like an unknown id — this is what lets a caller treat
+    // a 404 here as "already done" (fix round 1, point 1). A merely
+    // `revoked` (non-retire) device can still be acted on again.
+    if dev.account_id != acct.account_id || dev.retired {
         return error(404, "no such device");
     }
     if let Some(d) = st.devices.get_mut(id) {
-        d.retired = true;
+        if retire {
+            d.retired = true;
+        } else {
+            d.revoked = true;
+        }
     }
     revoke_device_state(st, &dev.pubkey, retire);
     empty(204)
@@ -3729,5 +3746,60 @@ mod tests {
             .find(|m| m["accountId"] == "acc-me")
             .unwrap();
         assert_eq!(member["displayName"], "Me");
+    }
+
+    /// Fix round 1, point 6: `GET /devices` / `POST /devices/{id}/revoke`
+    /// (T7's account device registry, distinct from `revoke_device`'s
+    /// collab-claims effects above). A plain revoke and a retire both hide
+    /// the row from the list, but only a retire is terminal (a second
+    /// revoke/retire attempt 404s) — `device_retired` proves `retire: true`
+    /// was actually sent, not just that some revoke happened.
+    #[tokio::test]
+    async fn revoke_and_retire_both_hide_the_device_but_only_retire_is_terminal() {
+        let hub = FakeHub::start().await;
+        hub.add_account("tok", "acc-me", "Me", "MY-PUBKEY", None);
+        hub.add_device("acc-me", "PLAIN-DEV", "plain-id", "Plain laptop", None);
+        hub.add_device("acc-me", "RETIRE-DEV", "retire-id", "Retire laptop", None);
+        let client = crate::account::HubClient::new(hub.uri()).unwrap();
+
+        let before = client.list_devices("tok").await.unwrap();
+        assert_eq!(before.len(), 2);
+
+        client
+            .revoke_device("tok", "plain-id", false)
+            .await
+            .unwrap();
+        assert!(
+            !hub.device_retired("plain-id"),
+            "a plain revoke never retires"
+        );
+        let after_plain = client.list_devices("tok").await.unwrap();
+        assert!(
+            after_plain.iter().all(|d| d.id != "plain-id"),
+            "hidden from the list"
+        );
+        client
+            .revoke_device("tok", "plain-id", false)
+            .await
+            .expect("a merely revoked device can be acted on again");
+
+        client
+            .revoke_device("tok", "retire-id", true)
+            .await
+            .unwrap();
+        assert!(hub.device_retired("retire-id"), "retire: true was sent");
+        let after_retire = client.list_devices("tok").await.unwrap();
+        assert!(
+            after_retire.iter().all(|d| d.id != "retire-id"),
+            "hidden from the list"
+        );
+        let err = client
+            .revoke_device("tok", "retire-id", true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::account::AccountClientError::BadRequest(_)),
+            "retired is terminal: a second retire 404s, {err:?}"
+        );
     }
 }

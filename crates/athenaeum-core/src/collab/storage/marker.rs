@@ -82,7 +82,7 @@ pub fn write_marker(root: &Path, m: &StoreMarker) -> std::io::Result<()> {
 /// (expected in normal operation — a read-only remount is not a fault) and a
 /// leftover probe file (the write itself succeeded but the cleanup did not)
 /// is logged at `warn!`.
-fn writable(root: &Path) -> bool {
+pub(crate) fn writable(root: &Path) -> bool {
     let probe = root.join(WRITE_PROBE_REL);
     match std::fs::write(&probe, b"probe") {
         Ok(()) => {
@@ -184,9 +184,17 @@ impl StoreGuard {
             CheckOutcome::State(s) => s,
             CheckOutcome::Adopt(m) => match read_marker(&self.root) {
                 Ok(Some(_)) => {
+                    // Already on disk (a returning device, or another party
+                    // wrote it moments ago) — never overwrite it, but still
+                    // run the write probe: an existing marker does not
+                    // itself prove the folder is writable right now.
                     *self.recorded.lock().expect("store guard poisoned") = Some(m.clone());
                     *self.adoption.lock().expect("store guard poisoned") = Some(m);
-                    StoreState::Available
+                    if writable(&self.root) {
+                        StoreState::Available
+                    } else {
+                        StoreState::ReadOnly
+                    }
                 }
                 _ => match write_marker(&self.root, &m) {
                     Ok(()) => {
@@ -337,6 +345,29 @@ mod tests {
         assert_eq!(
             g.state(),
             StoreState::Unavailable(UnavailableReason::MarkerMissing)
+        );
+    }
+
+    /// Fix round 1 (folded minor): adopting a marker that already exists on
+    /// disk and already names `me` (recorded is `None` — a returning device)
+    /// still runs the write probe. Read-only must not silently read back as
+    /// `Available`.
+    #[cfg(unix)]
+    #[test]
+    fn the_guard_adoption_of_an_existing_marker_runs_the_write_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_marker(root, &m("s", "ME")).unwrap();
+        let athenaeum = root.join(".athenaeum");
+        std::fs::set_permissions(&athenaeum, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let g = StoreGuard::new(root.to_path_buf(), "ME".into(), None);
+        let got = g.check_now();
+        std::fs::set_permissions(&athenaeum, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(got, StoreState::ReadOnly);
+        assert!(
+            g.take_adoption().is_some(),
+            "still adopted the existing marker"
         );
     }
 }

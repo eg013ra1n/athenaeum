@@ -25,6 +25,24 @@ pub(crate) const PID: &str = "p1";
 /// seeded both on the hub and in the local cache. The returned `TempDir`
 /// must be kept alive for as long as `ctx`/`hub` are used.
 pub(crate) async fn signed_in_rig() -> (tempfile::TempDir, ServiceContext, FakeHub) {
+    let (tmp, ctx, hub) = signed_in_rig_no_root().await;
+    let requested = tmp.path().join("Collab");
+    std::fs::create_dir_all(&requested).unwrap();
+    crate::api::scan_roots::set_collaboration_dir(
+        &ctx,
+        requested.to_string_lossy().to_string(),
+        &PathPolicy::AllowAll,
+    )
+    .await
+    .expect("designate the Collaboration root");
+    (tmp, ctx, hub)
+}
+
+/// As [`signed_in_rig`], but WITHOUT designating a Collaboration root — for
+/// a test that needs to set up its own folder (a pre-existing marker naming
+/// another device, say) before anything is designated, e.g. the device
+/// replace / reinstall tests.
+pub(crate) async fn signed_in_rig_no_root() -> (tempfile::TempDir, ServiceContext, FakeHub) {
     let hub = FakeHub::start().await;
     let (tmp, ctx) = crate::api::collab_exchange::test_support::test_ctx();
     crate::api::collab_exchange::test_support::wire_hub(&ctx, &hub.uri(), "tok");
@@ -45,16 +63,6 @@ pub(crate) async fn signed_in_rig() -> (tempfile::TempDir, ServiceContext, FakeH
     let my_pubkey = crate::api::account::own_device_id(&ctx).unwrap();
     hub.add_account("tok", "acc-me", "Me", &my_pubkey, None);
     hub.add_project(PID, "m31", &[("acc-me", "send_receive", true)], false);
-
-    let requested = tmp.path().join("Collab");
-    std::fs::create_dir_all(&requested).unwrap();
-    crate::api::scan_roots::set_collaboration_dir(
-        &ctx,
-        requested.to_string_lossy().to_string(),
-        &PathPolicy::AllowAll,
-    )
-    .await
-    .expect("designate the Collaboration root");
 
     seed_local_project(&ctx, &my_pubkey);
 

@@ -1369,27 +1369,151 @@ fn mounted_collaboration_root(ctx: &ServiceContext) -> Option<PathBuf> {
 /// `scan_roots::set_collaboration_dir`'s designation and this module's own
 /// lazy mount ([`ensure_collab_store`]) run, so a folder that fails to
 /// designate can never later be mounted, and vice versa.
-pub(crate) fn check_storage_marker(
+/// The blocking half of [`check_storage_marker`]: `check_store` plus the
+/// write-on-`Adopt` step, entirely off the async runtime (fix round 1 —
+/// this used to run on the connection-holding async path). Returns the
+/// resolved state and, when a marker was freshly written OR recognized as
+/// already naming `me`, the marker to record.
+fn check_and_adopt_marker(
+    root: &Path,
+    recorded: Option<crate::collab::storage::marker::StoreMarker>,
+    me: &str,
+) -> (
+    crate::collab::storage::marker::StoreState,
+    Option<crate::collab::storage::marker::StoreMarker>,
+) {
+    use crate::collab::storage::marker::{
+        check_store, read_marker, writable, write_marker, CheckOutcome, StoreState,
+    };
+    match check_store(root, recorded.as_ref(), me) {
+        CheckOutcome::State(s) => (s, None),
+        CheckOutcome::Adopt(m) => match read_marker(root) {
+            Ok(Some(_)) => {
+                // Already on disk — never overwrite it, but the write probe
+                // still decides Available vs ReadOnly.
+                let state = if writable(root) {
+                    StoreState::Available
+                } else {
+                    StoreState::ReadOnly
+                };
+                (state, Some(m))
+            }
+            _ => match write_marker(root, &m) {
+                Ok(()) => (StoreState::Available, Some(m)),
+                Err(e) => {
+                    tracing::warn!(path = %root.display(), error = %e, "collaboration store marker could not be written");
+                    (StoreState::ReadOnly, None)
+                }
+            },
+        },
+    }
+}
+
+/// Verify the Collaboration root's storage marker (spec §9.1, plan P22)
+/// against what this device last recorded: refuse another device's disk,
+/// forget a stale record for a path that changed, and persist a fresh or
+/// returning marker. Never mounts or unmounts anything — the caller gates
+/// `set_collab_root`/holds/fetch/publish on the returned state's
+/// `serving()`/`fetching()`. This is the ONE check `scan_roots::set_collaboration_dir`'s
+/// designation, this module's own lazy mount ([`ensure_collab_store`]), and
+/// `api::sync`'s mount-at-bind all run, so a folder that fails to designate
+/// can never later be mounted, and vice versa.
+///
+/// Fix round 1: never holds the pooled connection across the filesystem
+/// check (the read and the eventual record are two separate, short
+/// checkouts; the check itself runs in `spawn_blocking`). It also applies
+/// spec §9.1's "one that is not retired": a marker naming a device of THIS
+/// account that the hub no longer lists as active (i.e. retired — the hub
+/// has no "list retired devices" endpoint, so "not currently active" is the
+/// only signal available) is silently taken over rather than refused —
+/// otherwise a retired device's marker would block the folder forever. A
+/// hub call that fails (signed out, offline) is conservative: it keeps
+/// refusing rather than risk overwriting a still-live device's claim.
+pub(crate) async fn check_storage_marker(
     ctx: &ServiceContext,
     root: &Path,
 ) -> Result<crate::collab::storage::marker::StoreState, ApiError> {
-    use crate::collab::storage::marker::StoreGuard;
-    let me = crate::api::account::own_device_id(ctx)?;
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let root_str = root.to_string_lossy().to_string();
-    let stored_path = crate::db::collab_live::store_marker_path(&conn)?;
-    let recorded = if stored_path.as_deref() == Some(root_str.as_str()) {
-        crate::db::collab_live::recorded_store_marker(&conn)?
-    } else {
-        if stored_path.is_some() {
-            crate::db::collab_live::forget_store_marker(&conn)?;
-        }
-        None
+    use crate::collab::storage::marker::{
+        writable, write_marker, StoreMarker, StoreState, UnavailableReason,
     };
-    let guard = StoreGuard::new(root.to_path_buf(), me, recorded);
-    let state = guard.check_now();
-    if let Some(m) = guard.take_adoption() {
+
+    let me = crate::api::account::own_device_id(ctx)?;
+    let root_str = root.to_string_lossy().to_string();
+
+    // Fix round 1 (folded minor): a recorded marker for a DIFFERENT path is
+    // simply not `recorded` for THIS check (comparing it against the new
+    // path's on-disk marker would compare apples to oranges) — but its row
+    // is never deleted here. A successful check below overwrites it via
+    // `record_store_marker` anyway; a refused/failed check for the new path
+    // leaves the old path's record exactly as it was, so a failed attempt
+    // elsewhere never costs a still-valid designation its history.
+    let recorded = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let stored_path = crate::db::collab_live::store_marker_path(&conn)?;
+        if stored_path.as_deref() == Some(root_str.as_str()) {
+            crate::db::collab_live::recorded_store_marker(&conn)?
+        } else {
+            None
+        }
+    }; // the connection is dropped here, before the filesystem I/O below.
+
+    let root_for_task = root.to_path_buf();
+    let me_for_task = me.clone();
+    let (mut state, mut adopted) = tokio::task::spawn_blocking(move || {
+        check_and_adopt_marker(&root_for_task, recorded, &me_for_task)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("storage marker check task join: {e}")))?;
+
+    if let StoreState::Unavailable(UnavailableReason::OtherDevice { device_id }) = &state {
+        let device_id = device_id.clone();
+        let active = match crate::api::account::list_devices(ctx).await {
+            Ok(devices) => devices.iter().any(|d| d.pubkey == device_id),
+            Err(e) => {
+                tracing::warn!(path = %root_str, device_id = %device_id, error = %e, "storage marker: could not confirm the other device is retired; refusing");
+                true
+            }
+        };
+        if !active {
+            let root_for_task = root.to_path_buf();
+            let me_for_task = me.clone();
+            let new_state = tokio::task::spawn_blocking(move || {
+                let store_id = match crate::collab::storage::marker::read_marker(&root_for_task) {
+                    Ok(Some(m)) => m.store_id,
+                    _ => uuid::Uuid::new_v4().to_string(),
+                };
+                let m = StoreMarker {
+                    store_id,
+                    device_id: me_for_task,
+                };
+                let state = match write_marker(&root_for_task, &m) {
+                    Ok(()) => {
+                        if writable(&root_for_task) {
+                            StoreState::Available
+                        } else {
+                            StoreState::ReadOnly
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %root_for_task.display(), error = %e, "collaboration store marker could not be written");
+                        StoreState::ReadOnly
+                    }
+                };
+                (state, m)
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("storage marker rewrite task join: {e}")))?;
+            let (new_state, new_marker) = new_state;
+            tracing::info!(path = %root_str, device_id = %device_id, "collaboration folder's marker named a retired device; taken over");
+            state = new_state;
+            adopted = Some(new_marker);
+        }
+    }
+
+    if let Some(m) = adopted {
+        let db = db(ctx)?;
+        let conn = db.conn();
         crate::db::collab_live::record_store_marker(&conn, &m, &root_str)?;
     }
     Ok(state)
@@ -1462,7 +1586,7 @@ pub(crate) async fn ensure_collab_store(ctx: &ServiceContext) -> Option<iroh_blo
             }
         }
     };
-    let state = match check_storage_marker(ctx, &root) {
+    let state = match check_storage_marker(ctx, &root).await {
         Ok(state) => state,
         Err(e) => {
             if already_warned {

@@ -851,12 +851,15 @@ pub fn get_collaboration_dir(ctx: &ServiceContext) -> Result<Option<String>, Api
 /// usual scan-root rules (outside every other root, one Collaboration root at
 /// most).
 ///
-/// Contract: `Err` ⇒ nothing changed. A mount failure undoes exactly what the
-/// designation did (R5 fix option a) before the error is returned. The
-/// storage marker check (spec §9.1, plan P22) runs after a successful mount
-/// and is undone the same way: a folder another of this account's devices
-/// already claimed refuses the designation with
-/// [`ApiError::Conflict`]`("collab_other_device: …")`.
+/// Contract: `Err` ⇒ nothing changed. The storage marker check (spec §9.1,
+/// plan P22) runs BEFORE the mount (fix round 1: no need to open another
+/// device's store just to refuse it) and undoes the designation the same
+/// way a mount failure does: a folder another of this account's devices
+/// already claimed refuses with [`ApiError::Conflict`]`("collab_other_device: …")`,
+/// recording the refused path + device
+/// ([`crate::db::collab_live::refused_designation`]) for a later status
+/// read. A mount failure (R5 fix option a) undoes exactly what the
+/// designation did, plus any marker this call adopted.
 pub async fn set_collaboration_dir(
     ctx: &ServiceContext,
     path: String,
@@ -883,17 +886,35 @@ pub async fn set_collaboration_dir(
             }
         }
     };
-    if let Err(e) = mount_collab_store(ctx, Some(Path::new(&stored))).await {
-        tracing::error!(path = %stored, error = %e, "collaboration store mount failed; undoing the designation");
+    // The storage-marker check (fix round 1, point 4) runs BEFORE the mount:
+    // it is pure filesystem + catalog I/O, so a folder that will be refused
+    // never pays for opening another device's store and sweeping its
+    // in-flight tags.
+    if let Err(e) = check_storage_marker_for_designation(ctx, &stored).await {
         undo_collaboration_designation(ctx, &designation);
         remove_created_folder(&candidate, existed);
         return Err(e);
     }
-    if let Err(e) = check_storage_marker_for_designation(ctx, &stored) {
+    if let Err(e) = mount_collab_store(ctx, Some(Path::new(&stored))).await {
+        tracing::error!(path = %stored, error = %e, "collaboration store mount failed; undoing the designation");
+        // The marker check above may have adopted/recorded a fresh marker
+        // for this designation attempt; the designation itself is about to
+        // be fully undone, so that record must not outlive it. `set_collab_root`
+        // itself leaves any PREVIOUS mount in place on error (its own
+        // contract), so there is nothing to (re)mount here.
+        if let Ok(db) = db(ctx) {
+            if let Err(fe) = crate::db::collab_live::forget_store_marker(&db.conn()) {
+                tracing::error!(path = %stored, error = %fe, "forgetting the storage marker after a failed mount failed");
+            }
+        }
         undo_collaboration_designation(ctx, &designation);
-        let _ = mount_collab_store(ctx, None).await;
         remove_created_folder(&candidate, existed);
         return Err(e);
+    }
+    if let Ok(db) = db(ctx) {
+        if let Err(e) = crate::db::collab_live::clear_refused_designation(&db.conn()) {
+            tracing::warn!(path = %stored, error = %e, "clearing the refused-designation record failed");
+        }
     }
     Ok(stored)
 }
@@ -901,22 +922,32 @@ pub async fn set_collaboration_dir(
 /// The storage-marker half of [`set_collaboration_dir`]: refuse another
 /// device's disk, else record a fresh or returning marker. Uses
 /// [`crate::api::collab_exchange::check_storage_marker`] — the same check
-/// `ensure_collab_store`'s lazy mount runs — so a folder that fails to
-/// designate can never later be mounted, and vice versa.
-fn check_storage_marker_for_designation(
+/// `ensure_collab_store`'s lazy mount and `api::sync`'s mount-at-bind run —
+/// so a folder that fails to designate can never later be mounted, and vice
+/// versa.
+async fn check_storage_marker_for_designation(
     ctx: &ServiceContext,
     stored: &str,
 ) -> Result<(), ApiError> {
     use crate::collab::storage::marker::{StoreState, UnavailableReason};
-    let state = crate::api::collab_exchange::check_storage_marker(ctx, Path::new(stored))?;
+    let state = crate::api::collab_exchange::check_storage_marker(ctx, Path::new(stored)).await?;
     match state {
         StoreState::Available | StoreState::ReadOnly => Ok(()),
         StoreState::Unavailable(UnavailableReason::OtherDevice { device_id }) => {
             tracing::warn!(
                 path = stored,
-                other_device = %device_id,
+                device_id = %device_id,
                 "collaboration folder designation refused: belongs to another device"
             );
+            if let Ok(db) = db(ctx) {
+                if let Err(e) = crate::db::collab_live::record_refused_designation(
+                    &db.conn(),
+                    stored,
+                    &device_id,
+                ) {
+                    tracing::warn!(path = stored, error = %e, "recording the refused designation failed");
+                }
+            }
             Err(ApiError::Conflict(
                 "collab_other_device: this Collaboration folder belongs to another device of your account".to_string(),
             ))
@@ -2519,6 +2550,77 @@ mod special_root_tests {
             crate::db::collab_live::recorded_store_marker(&db(&ctx).unwrap().conn()).unwrap(),
             None
         );
+        // Fix round 1, point 2: the refused path + the marker's device id
+        // are recorded so a later status read can offer a replace without
+        // re-touching the filesystem.
+        let canonical = crate::test_support::canonical_path(folder.path());
+        assert_eq!(
+            crate::db::collab_live::refused_designation(&db(&ctx).unwrap().conn()).unwrap(),
+            Some((
+                canonical.to_string_lossy().to_string(),
+                "OTHER-DEVICE".to_string()
+            ))
+        );
+        // A later successful designation elsewhere clears the stale record.
+        let clean = TempDir::new().unwrap();
+        set_collaboration_dir(
+            &ctx,
+            clean.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::db::collab_live::refused_designation(&db(&ctx).unwrap().conn()).unwrap(),
+            None,
+            "cleared on the next successful designation"
+        );
+    }
+
+    /// Controller ruling (fix round 1, point 7; spec §9.1 "one that is not
+    /// retired"): a marker naming a RETIRED device of this same account is
+    /// accepted — designation proceeds and rewrites the marker to this
+    /// device — because a retired device's marker would otherwise block the
+    /// folder forever.
+    #[tokio::test]
+    async fn set_collaboration_dir_accepts_a_retired_devices_marker() {
+        let hub = crate::collab::fake_hub::FakeHub::start().await;
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        crate::api::collab_exchange::test_support::wire_hub(&ctx, &hub.uri(), "tok");
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        hub.add_account("tok", "acc-me", "Me", &me, None);
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        crate::api::account::revoke_device_retire(&ctx, "old-id".to_string())
+            .await
+            .unwrap();
+        assert!(hub.device_retired("old-id"));
+
+        let folder = TempDir::new().unwrap();
+        crate::collab::storage::marker::write_marker(
+            folder.path(),
+            &crate::collab::storage::marker::StoreMarker {
+                store_id: "s1".into(),
+                device_id: "OLD-DEV".into(),
+            },
+        )
+        .unwrap();
+
+        let stored = set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .expect("a retired device's marker is silently taken over");
+        assert_eq!(
+            crate::collab::storage::marker::read_marker(folder.path())
+                .unwrap()
+                .unwrap()
+                .device_id,
+            me
+        );
+        assert_eq!(get_collaboration_dir(&ctx).unwrap(), Some(stored));
     }
 
     /// R5: a folder that was a Collaboration root before (its store dir is
@@ -2613,9 +2715,13 @@ mod special_root_tests {
         .unwrap();
         *ctx.iroh_node.lock().await = Some(std::sync::Arc::clone(&node));
 
-        // Inserted → deleted.
+        // Inserted → deleted. The storage-marker check now runs BEFORE the
+        // mount (fix round 1, point 4), so `.athenaeum` itself must stay a
+        // real directory for that check to pass — the sabotage blocks
+        // `.athenaeum/blobs` specifically, the thing the MOUNT needs.
         let fresh = TempDir::new().unwrap();
-        std::fs::write(fresh.path().join(".athenaeum"), b"not a dir").unwrap();
+        std::fs::create_dir_all(fresh.path().join(".athenaeum")).unwrap();
+        std::fs::write(fresh.path().join(".athenaeum").join("blobs"), b"not a dir").unwrap();
         let err = set_collaboration_dir(
             &ctx,
             fresh.path().to_string_lossy().to_string(),
@@ -2631,12 +2737,22 @@ mod special_root_tests {
             crate::db::get_scan_roots(&conn).unwrap().len()
         };
         assert_eq!(rows, 0, "the inserted row is deleted again");
+        assert_eq!(
+            crate::db::collab_live::recorded_store_marker(&db(&ctx).unwrap().conn()).unwrap(),
+            None,
+            "the marker adopted for this attempt is forgotten with the rest of it"
+        );
 
         // Promoted → restored with its previous switches.
         let monitored = TempDir::new().unwrap();
         let stored = monitored_folder(&ctx, monitored.path(), false);
         let before = row_of(&ctx, &stored);
-        std::fs::write(monitored.path().join(".athenaeum"), b"not a dir").unwrap();
+        std::fs::create_dir_all(monitored.path().join(".athenaeum")).unwrap();
+        std::fs::write(
+            monitored.path().join(".athenaeum").join("blobs"),
+            b"not a dir",
+        )
+        .unwrap();
         assert!(set_collaboration_dir(
             &ctx,
             monitored.path().to_string_lossy().to_string(),

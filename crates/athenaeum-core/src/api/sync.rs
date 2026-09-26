@@ -1160,7 +1160,11 @@ pub(crate) async fn ensure_iroh_node(
 
 /// Mount the configured Collaboration root's collab store on a freshly bound
 /// node (see [`ensure_iroh_node`]). Best-effort by contract: every failure is
-/// logged and folded, never returned.
+/// logged and folded, never returned. Fix round 1 (point 3): runs the
+/// storage marker check first and mounts only when its state `serving()`s —
+/// unconditionally mounting here previously bypassed the marker entirely,
+/// so a swapped disk (`MarkerMismatch`) got used and an empty mountpoint
+/// (`MarkerMissing`) had `.athenaeum/blobs` created on the local disk.
 async fn mount_configured_collab_root(ctx: &ServiceContext, node: &SharedIrohNode) {
     let root = match db(ctx).and_then(|d| {
         let conn = d.conn();
@@ -1174,8 +1178,19 @@ async fn mount_configured_collab_root(ctx: &ServiceContext, node: &SharedIrohNod
         }
     };
     let Some(root) = root else { return };
-    if let Err(e) = node.set_collab_root(Some(Path::new(&root))).await {
-        tracing::warn!(path = %root, error = %format!("{e:#}"), "collab store not mounted at bind");
+    let root_path = Path::new(&root);
+    match crate::api::collab_exchange::check_storage_marker(ctx, root_path).await {
+        Ok(state) if state.serving() => {
+            if let Err(e) = node.set_collab_root(Some(root_path)).await {
+                tracing::warn!(path = %root, error = %format!("{e:#}"), "collab store not mounted at bind");
+            }
+        }
+        Ok(state) => {
+            tracing::warn!(path = %root, state = ?state, "collab store not mounted at bind: storage not available");
+        }
+        Err(e) => {
+            tracing::warn!(path = %root, error = %e, "collab store not mounted at bind: storage marker check failed");
+        }
     }
 }
 
@@ -7821,6 +7836,46 @@ mod tests {
             .join("blobs")
             .join("blobs.db")
             .exists());
+
+        let taken = ctx.iroh_node.lock().await.take().expect("node present");
+        taken.shutdown().await;
+    }
+
+    /// Fix round 1, point 3: mounting the configured Collaboration root at
+    /// bind used to skip the storage marker entirely — a swapped disk
+    /// (`MarkerMismatch`) got used, and an empty mountpoint
+    /// (`MarkerMissing`) had `.athenaeum/blobs` created on the local disk.
+    /// A `collaboration` scan root whose on-disk marker names ANOTHER
+    /// device must not be mounted at bind.
+    #[tokio::test]
+    async fn a_root_whose_marker_names_another_device_is_not_mounted_at_bind() {
+        let (_tmp, ctx) = test_ctx();
+        store_cached_relays(&ctx, &["https://relay.invalid".to_string()]);
+        let root = tempfile::tempdir().unwrap();
+        crate::collab::storage::marker::write_marker(
+            root.path(),
+            &crate::collab::storage::marker::StoreMarker {
+                store_id: "s1".into(),
+                device_id: "OTHER-DEVICE".into(),
+            },
+        )
+        .unwrap();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::upsert_scan_root(&conn, &root.path().to_string_lossy(), "collaboration")
+                .unwrap();
+        }
+
+        let node = ensure_iroh_node(&ctx).await.expect("bind");
+        assert!(
+            node.collab_store().is_none(),
+            "another device's marker must not be mounted at bind"
+        );
+        assert!(
+            !root.path().join(".athenaeum").join("blobs").exists(),
+            "no store directory created on a refused disk"
+        );
 
         let taken = ctx.iroh_node.lock().await.take().expect("node present");
         taken.shutdown().await;

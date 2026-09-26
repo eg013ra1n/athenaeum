@@ -117,9 +117,47 @@ pub fn record_store_marker(
     marker: &crate::collab::storage::marker::StoreMarker,
     path: &str,
 ) -> Result<()> {
-    meta_set(conn, META_STORE_ID, &marker.store_id)?;
-    meta_set(conn, META_STORE_DEVICE, &marker.device_id)?;
-    meta_set(conn, META_STORE_PATH, path)?;
+    let tx = conn.unchecked_transaction()?;
+    meta_set(&tx, META_STORE_ID, &marker.store_id)?;
+    meta_set(&tx, META_STORE_DEVICE, &marker.device_id)?;
+    meta_set(&tx, META_STORE_PATH, path)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// A designation this device refused because the folder's marker named
+/// another device (`api::scan_roots::set_collaboration_dir`'s
+/// `collab_other_device` refusal, T7 fix round 1): the path attempted and
+/// the marker's device id, so a later status read (Task 16) can offer a
+/// replace without re-touching the filesystem. Cleared on the next
+/// successful designation.
+pub const META_REFUSED_PATH: &str = "refused_path";
+pub const META_REFUSED_DEVICE: &str = "refused_device";
+
+pub fn record_refused_designation(conn: &Connection, path: &str, device_id: &str) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    meta_set(&tx, META_REFUSED_PATH, path)?;
+    meta_set(&tx, META_REFUSED_DEVICE, device_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The last refused designation's `(path, device_id)`, if any and if both
+/// halves are present.
+pub fn refused_designation(conn: &Connection) -> Result<Option<(String, String)>> {
+    let path = meta_get(conn, META_REFUSED_PATH)?;
+    let device_id = meta_get(conn, META_REFUSED_DEVICE)?;
+    Ok(match (path, device_id) {
+        (Some(path), Some(device_id)) => Some((path, device_id)),
+        _ => None,
+    })
+}
+
+pub fn clear_refused_designation(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM collab_live_meta WHERE key IN (?1, ?2)",
+        params![META_REFUSED_PATH, META_REFUSED_DEVICE],
+    )?;
     Ok(())
 }
 
@@ -736,5 +774,18 @@ mod tests {
         forget_store_marker(&conn).unwrap();
         assert_eq!(recorded_store_marker(&conn).unwrap(), None);
         assert_eq!(store_marker_path(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn refused_designation_round_trips_and_clears() {
+        let conn = conn_with_project();
+        assert_eq!(refused_designation(&conn).unwrap(), None);
+        record_refused_designation(&conn, "/collab/root", "OTHER-DEVICE").unwrap();
+        assert_eq!(
+            refused_designation(&conn).unwrap(),
+            Some(("/collab/root".to_string(), "OTHER-DEVICE".to_string()))
+        );
+        clear_refused_designation(&conn).unwrap();
+        assert_eq!(refused_designation(&conn).unwrap(), None);
     }
 }
