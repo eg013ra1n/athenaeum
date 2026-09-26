@@ -901,6 +901,9 @@ pub struct SharedIrohNode {
     /// Serializes [`set_collab_root`](Self::set_collab_root) calls (open → sweep
     /// → swap → shut old) and fences them against [`shutdown`](Self::shutdown).
     collab_mount: tokio::sync::Mutex<()>,
+    /// Bumped after every collab store mount, unmount and swap (Task 15 fix
+    /// round 1, I1): the live runtime restarts on its new store and root.
+    collab_mount_gen: tokio::sync::watch::Sender<u64>,
     /// The [`home_relay_watch`](Self::home_relay_watch) watcher's sender and
     /// task handle, lazily spawned on first call (live exchange presence
     /// beat, spec §4.2). `None` until then; every later call subscribes to
@@ -1349,6 +1352,7 @@ impl SharedIrohNode {
             collab_gauge,
             collab_conns,
             collab_mount: tokio::sync::Mutex::new(()),
+            collab_mount_gen: tokio::sync::watch::Sender::new(0),
             home_relay_tx: Mutex::new(None),
         }))
     }
@@ -1883,6 +1887,7 @@ impl SharedIrohNode {
             let old = self.collab.write().expect("collab slot poisoned").take();
             if let Some(old) = old {
                 shut_collab_store(old).await;
+                self.bump_collab_mount_gen();
             }
             tracing::info!("collab store unmounted");
             return Ok(());
@@ -1954,8 +1959,31 @@ impl SharedIrohNode {
         if let Some(old) = old {
             shut_collab_store(old).await;
         }
+        self.bump_collab_mount_gen();
         tracing::info!(path = %root.display(), "collab store mounted");
         Ok(())
+    }
+
+    fn bump_collab_mount_gen(&self) {
+        self.collab_mount_gen
+            .send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// Changes after every collab store mount, unmount and swap (Task 15
+    /// fix round 1, I1).
+    pub fn collab_mount_signal(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.collab_mount_gen.subscribe()
+    }
+
+    /// The mounted collab store and its root, read together.
+    pub fn collab_mounted(&self) -> Option<(PathBuf, Store)> {
+        match self.collab.read() {
+            Ok(slot) => slot.as_ref().map(|m| (m.root.clone(), m.store.clone())),
+            Err(e) => {
+                tracing::error!(error = %e, "collab store slot poisoned; reporting no store");
+                None
+            }
+        }
     }
 
     /// Gracefully tear down the node (I1): abort the relay refresh loop + relay
@@ -2034,6 +2062,7 @@ impl SharedIrohNode {
             let mounted = self.collab.write().expect("collab slot poisoned").take();
             if let Some(mounted) = mounted {
                 shut_collab_store(mounted).await;
+                self.bump_collab_mount_gen();
             }
         }
         if tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, endpoint.close())
@@ -3814,7 +3843,7 @@ async fn shut_collab_store(mount: CollabMount) {
 /// Whether `a` and `b` name the same directory: equal as given, or equal once
 /// both resolve (a symlinked or differently spelled Collaboration root must
 /// not re-open a store that is already open).
-fn same_dir(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }

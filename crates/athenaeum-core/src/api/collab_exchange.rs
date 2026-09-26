@@ -613,9 +613,12 @@ pub(crate) fn publisher_folder(
     fallback: &str,
 ) -> Result<PathBuf> {
     if !account_id.is_empty() {
-        if let Some(dir) =
-            crate::db::collab_frames::publisher_dir(conn, &project.project_id, account_id)?
-        {
+        if let Some(dir) = crate::db::collab_frames::publisher_dir(
+            conn,
+            &project.project_id,
+            account_id,
+            collab_root,
+        )? {
             return Ok(dir);
         }
     }

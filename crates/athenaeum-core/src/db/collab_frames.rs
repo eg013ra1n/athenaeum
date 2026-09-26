@@ -23,7 +23,7 @@
 // SELECT; `anyhow::Result`, `params!`, `OptionalExtension`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -1139,23 +1139,32 @@ pub fn own_by_source_frame(
 }
 
 /// The parent directory of any already-landed row for a publisher in a
-/// project (P10): the folder every later frame from that publisher reuses.
-/// `None` when nothing from that publisher has landed yet.
+/// project (P10) that lies under `root`, the current Collaboration folder:
+/// the folder every later frame from that publisher reuses. A landing under
+/// a previous folder (a re-designation, Task 15 fix round 1) or an own
+/// frame's file outside it never counts. `None` when nothing from that
+/// publisher has landed under `root` yet.
 pub fn publisher_dir(
     conn: &Connection,
     project_id: &str,
     publisher_account_id: &str,
+    root: &Path,
 ) -> Result<Option<PathBuf>> {
-    let landed: Option<String> = conn
-        .query_row(
-            "SELECT landed_path FROM project_frames_local
-             WHERE project_id = ?1 AND publisher_account_id = ?2 AND landed_path IS NOT NULL
-             LIMIT 1",
-            params![project_id, publisher_account_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(landed.and_then(|p| PathBuf::from(p).parent().map(PathBuf::from)))
+    let mut stmt = conn.prepare(
+        "SELECT landed_path FROM project_frames_local
+         WHERE project_id = ?1 AND publisher_account_id = ?2 AND landed_path IS NOT NULL
+         ORDER BY frame_uuid",
+    )?;
+    let landed = stmt
+        .query_map(params![project_id, publisher_account_id], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(landed
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.starts_with(root))
+        .and_then(|p| p.parent().map(PathBuf::from)))
 }
 
 /// Store a new recipe hash on an own frame whose regeneration came out
@@ -1984,10 +1993,18 @@ mod tests {
         upsert_from_manifest(&c, "p1", &view("u1", 1)).unwrap();
         set_landed(&c, "p1", "u1", "/collab/m31/ann/c_u1.fits", "100:1").unwrap();
         assert_eq!(
-            publisher_dir(&c, "p1", "a1").unwrap(),
+            publisher_dir(&c, "p1", "a1", Path::new("/collab")).unwrap(),
             Some(PathBuf::from("/collab/m31/ann"))
         );
-        assert_eq!(publisher_dir(&c, "p1", "zz").unwrap(), None);
+        assert_eq!(
+            publisher_dir(&c, "p1", "zz", Path::new("/collab")).unwrap(),
+            None
+        );
+        // a landing under a previous Collaboration folder never counts
+        assert_eq!(
+            publisher_dir(&c, "p1", "a1", Path::new("/collab2")).unwrap(),
+            None
+        );
     }
 
     #[test]

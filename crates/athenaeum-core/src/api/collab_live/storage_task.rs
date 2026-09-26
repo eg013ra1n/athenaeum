@@ -108,6 +108,10 @@ pub struct StorageTimings {
     pub settle: Duration,
     pub sweep_healthy: Duration,
     pub sweep_degraded: Duration,
+    /// Test hook: every sweep first sleeps this long (a slow sweep must
+    /// never hold the runtime loop, Task 15 fix round 1, C1).
+    #[cfg(test)]
+    pub sweep_delay: Duration,
 }
 
 impl Default for StorageTimings {
@@ -117,6 +121,8 @@ impl Default for StorageTimings {
             settle: watch::SETTLE,
             sweep_healthy: sweep::SWEEP_HEALTHY,
             sweep_degraded: sweep::SWEEP_DEGRADED,
+            #[cfg(test)]
+            sweep_delay: Duration::ZERO,
         }
     }
 }
@@ -414,6 +420,18 @@ impl StorageEngine {
             },
             None => p.to_path_buf(),
         }
+    }
+
+    /// A replica whose landed file lies outside the current root (a
+    /// re-designated Collaboration folder, owner rule A).
+    fn replica_outside_root(&self, row: &LocalFrameRow) -> bool {
+        if row.origin != FrameOrigin::Replica {
+            return false;
+        }
+        let Some(p) = row.landed_path.as_deref().map(Path::new) else {
+            return false;
+        };
+        !(p.starts_with(&self.root) || self.canon_root.as_ref().is_some_and(|c| p.starts_with(c)))
     }
 
     fn wall_ms(&self, now: Instant) -> i64 {
@@ -1037,6 +1055,7 @@ impl StorageEngine {
                 r.landed_path
                     .as_deref()
                     .is_some_and(|p| !Path::new(p).exists())
+                    || self.replica_outside_root(r)
             })
             .filter(|r| matches!(r.local_state, LocalState::Held | LocalState::OwnHeld))
             .collect();
@@ -1219,7 +1238,11 @@ impl StorageEngine {
         }
     }
 
-    async fn sweep_at(&mut self, now: Instant, _holders: &dyn HolderView) -> Vec<StorageEvent> {
+    async fn sweep_at(&mut self, now: Instant, holders: &dyn HolderView) -> Vec<StorageEvent> {
+        #[cfg(test)]
+        if !self.timings.sweep_delay.is_zero() {
+            tokio::time::sleep(self.timings.sweep_delay).await;
+        }
         let mut ev = Vec::new();
         // Re-read the marker on every sweep (Task 8 carry).
         self.refresh_store(now, &mut ev).await;
@@ -1240,12 +1263,28 @@ impl StorageEngine {
                 }
             };
         let mut checked = 0usize;
+        let mut outside = Vec::new();
         for row in rows {
             self.pump(now);
-            if checked_state(row.local_state) {
+            if row.local_state == LocalState::Held && self.replica_outside_root(&row) {
+                outside.push(row);
+            } else if checked_state(row.local_state) {
                 checked += 1;
                 self.recheck(&row, now, &mut ev).await;
             }
+        }
+        // Owner rule A (Task 15 fix round 1, I1): after a re-designation a
+        // replica whose file lies outside the CURRENT root counts as gone —
+        // the L4 deletion path rules it (re-fetched into the new root, or
+        // the one choice for a mass) and "lost everywhere" warns as usual.
+        // Own frames live wherever their owner keeps them: never.
+        if !outside.is_empty() {
+            tracing::info!(
+                path = %self.root.display(),
+                count = outside.len(),
+                "replicas outside the collaboration folder counted as gone"
+            );
+            self.file_gone(outside, now, holders, &mut ev).await;
         }
         // Parked frames are retried by every sweep too (fix round 1).
         self.retry_parked(now, &mut ev).await;
