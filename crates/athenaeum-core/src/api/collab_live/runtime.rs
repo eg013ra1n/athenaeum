@@ -717,6 +717,9 @@ struct Runtime {
     burst: Burst,
     serving_dirty: bool,
     attention: BTreeSet<String>,
+    /// Projects whose replication scope (`apply_policy`) is re-derived at
+    /// the end of this turn.
+    policy_dirty: BTreeSet<String>,
 }
 
 impl Runtime {
@@ -825,6 +828,7 @@ impl Runtime {
             burst: Burst::default(),
             serving_dirty: true,
             attention: BTreeSet::new(),
+            policy_dirty: BTreeSet::new(),
             shared,
         };
         rt.publish_storage();
@@ -947,6 +951,11 @@ impl Runtime {
                     }
                     Some(LiveCommand::Reconcile) => self.reconcile().await,
                     Some(LiveCommand::LocalChange(p)) => {
+                        // The command may have appended claim changes: they
+                        // flush after the usual delay, not at the next wake.
+                        if let Some(h) = self.holdings.as_mut() {
+                            h.note_append(&p, Instant::now());
+                        }
                         self.exec.dirty.insert(p.clone());
                         self.attention.insert(p);
                     }
@@ -1099,6 +1108,14 @@ impl Runtime {
     fn on_effect(&mut self, e: FeedEffect) {
         match e {
             FeedEffect::NeedSetChanged(p) | FeedEffect::ProjectJoined(p) => {
+                // A manifest apply: new rows start `wanted` whatever the
+                // policy — the scope is re-derived (Task 15 R1, the T9
+                // carry) — and a moved version may have queued claim
+                // changes (flushed after the usual delay).
+                self.policy_dirty.insert(p.clone());
+                if let Some(h) = self.holdings.as_mut() {
+                    h.note_append(&p, Instant::now());
+                }
                 self.exec.dirty.insert(p);
                 self.serving_dirty = true;
             }
@@ -1111,9 +1128,7 @@ impl Runtime {
                 if inbound + outbound > 0 {
                     tracing::info!(project_id = %p, count = inbound + outbound, "connections of devices no longer admitted closed");
                 }
-                if let Err(e) = crate::api::collab_live::storage_task::apply_policy(&self.ctx, &p) {
-                    tracing::error!(project_id = %p, error = %e, "the replication scope was not re-derived after a membership change");
-                }
+                self.policy_dirty.insert(p.clone());
                 self.exec.dirty.insert(p.clone());
                 self.refresh_providers(&p);
                 self.attention.insert(p);
@@ -1160,6 +1175,21 @@ impl Runtime {
     /// Re-read every dirty need set, publish the serving map and the
     /// attention changes.
     fn flush_dirty(&mut self) {
+        for p in std::mem::take(&mut self.policy_dirty) {
+            match crate::api::collab_live::storage_task::apply_policy(&self.ctx, &p) {
+                Ok(0) => {}
+                Ok(_) => {
+                    // Scope moves are claim changes and attention changes.
+                    if let Some(h) = self.holdings.as_mut() {
+                        h.note_append(&p, Instant::now());
+                    }
+                    self.attention.insert(p);
+                }
+                Err(e) => {
+                    tracing::error!(project_id = %p, error = %e, "the replication scope was not re-derived after a manifest or membership change");
+                }
+            }
+        }
         if !self.exec.dirty.is_empty() {
             let dirty = std::mem::take(&mut self.exec.dirty);
             let derive = Derive {

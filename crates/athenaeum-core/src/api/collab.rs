@@ -1458,6 +1458,17 @@ pub(crate) async fn refresh_projects_reporting(
     for lost in &report.lost {
         crate::api::collab_exchange::unseed_project_local_data(ctx, lost).await;
     }
+    // I11 (Task 15 R4): every membership refresh rebuilt what the connect
+    // gate admits — close the open collab connections it no longer does.
+    if let Some(node) = crate::api::collab_exchange::bound_node(ctx).await {
+        let closed = node.close_collab_connections_not_admitted();
+        if closed > 0 {
+            tracing::info!(
+                count = closed,
+                "collab connections of devices no longer admitted closed"
+            );
+        }
+    }
 
     Ok(report)
 }

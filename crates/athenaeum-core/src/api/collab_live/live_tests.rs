@@ -132,3 +132,27 @@ async fn a_personal_transfer_waits_at_most_one_frame() {
         "waited {admitted:?}: more than {STREAMS} frames of {FRAME} bytes at {RATE} B/s (+3 s) = {bound:?}"
     );
 }
+
+/// Task 15 R1 (the T9 carry): a manifest apply re-derives the replication
+/// scope — a frame outside B's policy arrives `idle`, never fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_outside_the_policy_arrives_idle_and_is_never_fetched() {
+    let w = ts::two_instances().await;
+    crate::api::collab_exchange::set_collab_policy(
+        &w.b.ctx,
+        ts::PID,
+        crate::api::collab_exchange::ReplicationPolicy {
+            filters: vec!["Ha".into()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let uuids = w.a_publishes(1).await; // filter L
+    w.b.wait_state(&uuids[0], LocalState::Idle, Duration::from_secs(10))
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let row = w.b.row(&uuids[0]).unwrap();
+    assert_eq!(row.local_state, LocalState::Idle);
+    assert!(row.landed_path.is_none(), "never fetched");
+}
