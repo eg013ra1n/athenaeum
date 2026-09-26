@@ -192,6 +192,8 @@ pub(crate) struct Executor {
     /// ([`Executor::on_task_ended`]).
     pub(crate) tasks: tokio::task::JoinSet<()>,
     task_kinds: HashMap<tokio::task::Id, TaskKind>,
+    /// Where the next GC probe continues (round-robin, fix round 2).
+    gc_cursor: Option<(String, String)>,
     events_tx: mpsc::UnboundedSender<ExecEvent>,
     pub(crate) events_rx: mpsc::UnboundedReceiver<ExecEvent>,
     done_tx: mpsc::UnboundedSender<(String, ItemOutcome)>,
@@ -205,6 +207,9 @@ pub(crate) struct Executor {
     /// change).
     pub(crate) dirty: BTreeSet<String>,
 }
+
+/// At most this many parked rows per GC probe (one local store call each).
+pub(crate) const GC_PROBE_BATCH: usize = 200;
 
 /// Wall-clock milliseconds — the core's clock: `Want::since_ms` comes from
 /// the catalog's `state_changed_at`, so the starvation rule and the
@@ -364,6 +369,7 @@ impl Executor {
             run_seq: 0,
             tasks: tokio::task::JoinSet::new(),
             task_kinds: HashMap::new(),
+            gc_cursor: None,
             events_tx,
             events_rx,
             done_tx,
@@ -795,7 +801,13 @@ impl Executor {
             let verdicts = self.verdicts_tx.clone();
             let yield_now = self.env.control.receive_gate.yield_signal();
             let ev = self.events_tx.clone();
+            #[cfg(test)]
+            let root = self.env.root.clone();
             let task = self.tasks.spawn(async move {
+                #[cfg(test)]
+                if test_hooks::take_run_panic(&root) {
+                    panic!("injected run panic (test hook)");
+                }
                 run_live(&store, dialer, rx, opts, done, verdicts, yield_now).await;
                 let _ = ev.send(ExecEvent::RunEnded { run: id });
             });
@@ -818,27 +830,40 @@ impl Executor {
             }
             ExecEvent::Prepared { name, outcome } => self.on_prepared(name, outcome).await,
             ExecEvent::Landed { name, landed } => self.on_landed(name, landed),
-            ExecEvent::RunEnded { run } => {
-                // Every outcome the run sent is already queued (it sends each
-                // before it returns): take them first.
-                while let Ok((n, o)) = self.done_rx.try_recv() {
-                    self.on_done(n, o).await;
-                }
-                if self.run.as_ref().is_some_and(|r| r.id == run) {
-                    self.run = None;
-                }
-                // Items still queued at a yield got no outcome: re-derived
-                // (a cancel the core re-queues at once).
-                let orphans: Vec<String> = self
-                    .items
-                    .iter()
-                    .filter(|(_, i)| i.phase == Phase::Sent { run })
-                    .map(|(n, _)| n.clone())
-                    .collect();
-                for name in orphans {
-                    self.finish(&name, FetchResult::Cancelled).await;
+            // Items still queued at a yield got no outcome: re-derived (a
+            // cancel the core re-queues at once).
+            ExecEvent::RunEnded { run } => self.end_run(run, FetchResult::Cancelled).await,
+        }
+    }
+
+    /// A live run ended: every outcome it sent first (it sends each before
+    /// it returns), then its items that got none finish as `orphans`.
+    async fn end_run(&mut self, run: u64, orphans: FetchResult) {
+        while let Ok((n, o)) = self.done_rx.try_recv() {
+            self.on_done(n, o).await;
+        }
+        if self.run.as_ref().is_some_and(|r| r.id == run) {
+            self.run = None;
+        }
+        let names: Vec<String> = self
+            .items
+            .iter()
+            .filter(|(_, i)| i.phase == Phase::Sent { run })
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in names {
+            if orphans == FetchResult::Failed {
+                if let Some((pid, uuid)) = self.items.get(&name).map(|i| i.key.clone()) {
+                    crate::api::collab_exchange::record_frame_error(
+                        &self.env.ctx,
+                        &pid,
+                        &uuid,
+                        "internal error: the transfer run failed",
+                    );
+                    self.notes.push(Note::Failed(pid));
                 }
             }
+            self.finish(&name, orphans).await;
         }
     }
 
@@ -879,9 +904,22 @@ impl Executor {
                 };
                 item.row = Some(row);
                 item.phase = Phase::Sent { run };
-                if let Err(e) = queue.try_send(live) {
-                    tracing::warn!(frame_uuid = %name, error = %e, "live run queue refused the fetch; re-queued");
-                    self.finish(&name, FetchResult::Cancelled).await;
+                match queue.try_send(live) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // The run is gone (it panicked; its reaping is on
+                        // the way): failed, backed off — never re-queued at
+                        // once into the same dead queue (fix round 2).
+                        tracing::warn!(frame_uuid = %name, "live run ended before the fetch was queued; it failed and backs off");
+                        if self.run.as_ref().is_some_and(|r| r.id == run) {
+                            self.run = None;
+                        }
+                        self.finish(&name, FetchResult::Failed).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(frame_uuid = %name, error = %e, "live run queue refused the fetch; re-queued");
+                        self.finish(&name, FetchResult::Cancelled).await;
+                    }
                 }
             }
         }
@@ -1161,8 +1199,10 @@ impl Executor {
                 self.finish(&name, FetchResult::Failed).await;
             }
             Some(TaskKind::Run(run)) => {
-                tracing::error!(error = %e, "the collab live run panicked; its fetches are re-queued");
-                self.on_event(ExecEvent::RunEnded { run }).await;
+                // Failed, never cancelled (fix round 2): a panic that repeats
+                // backs its fetches off instead of re-queuing them at once.
+                tracing::error!(error = %e, "the collab live run panicked; its fetches failed and back off");
+                self.end_run(run, FetchResult::Failed).await;
             }
             Some(TaskKind::Cleanup) | None => {
                 tracing::error!(error = %e, "a collab executor task panicked");
@@ -1179,8 +1219,17 @@ impl Executor {
 
     /// Rows parked for the GC (a landing whose store data vanished, P20)
     /// whose entry is gone or partial by now: released into the need set.
+    ///
+    /// At most [`GC_PROBE_BATCH`] rows per probe (fix round 2: the probe
+    /// runs in the loop, one local store call per row), round-robin: each
+    /// probe continues after the last row the previous one looked at and
+    /// wraps at the end, so every parked row is eventually probed.
     pub(crate) async fn gc_probe(&mut self) {
-        let rows = match db(&self.env.ctx)
+        self.gc_probe_batch(GC_PROBE_BATCH).await;
+    }
+
+    async fn gc_probe_batch(&mut self, batch: usize) {
+        let all = match db(&self.env.ctx)
             .and_then(|d| Ok(frames_db::awaiting_gc_released(&d.conn())?))
         {
             Ok(rows) => rows,
@@ -1188,6 +1237,18 @@ impl Executor {
                 tracing::warn!(error = %e, "awaiting-GC rows could not be read; retried at the next probe");
                 return;
             }
+        };
+        // Sorted by (project_id, frame_uuid): the rows after the cursor.
+        let start = match &self.gc_cursor {
+            Some(c) => all.partition_point(|(p, u, _)| (p, u) <= (&c.0, &c.1)),
+            None => 0,
+        };
+        let rows: Vec<(String, String, String)> =
+            all[start..].iter().take(batch.max(1)).cloned().collect();
+        self.gc_cursor = if start + rows.len() >= all.len() {
+            None
+        } else {
+            rows.last().map(|(p, u, _)| (p.clone(), u.clone()))
         };
         let mut released = 0usize;
         for (pid, uuid, blake3) in rows {
@@ -1425,6 +1486,43 @@ pub(crate) mod test_hooks {
             .insert(root.to_path_buf());
     }
 
+    static PANIC_RUNS: Mutex<Option<std::collections::HashMap<PathBuf, usize>>> = Mutex::new(None);
+
+    /// Every live run under `root` panics at its start, until
+    /// [`stop_run_panics`]; returns nothing, counts them.
+    pub(crate) fn panic_every_run(root: &Path) {
+        PANIC_RUNS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .insert(root.to_path_buf(), 0);
+    }
+
+    /// Stop the run panics under `root`; how many runs panicked.
+    pub(crate) fn stop_run_panics(root: &Path) -> usize {
+        PANIC_RUNS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|m| m.remove(root))
+            .unwrap_or(0)
+    }
+
+    pub(super) fn take_run_panic(root: &Path) -> bool {
+        match PANIC_RUNS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|m| m.get_mut(root))
+        {
+            Some(n) => {
+                *n += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn landing_panic_pending(root: &Path) -> bool {
         PANIC_NEXT_LANDING
             .lock()
@@ -1566,6 +1664,68 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(g2.awaiting_gc, "a dead entry keeps its frame parked");
+        exec.shutdown();
+    }
+
+    /// Fix round 2 (M-2): the GC probe looks at a capped batch per probe,
+    /// round-robin — two dead entries ahead of a released one never starve
+    /// it: with a batch of one, the third probe reaches it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gc_probe_is_capped_and_round_robin() {
+        let (_tmp, ctx, hub) = ts::signed_in_rig().await;
+        let ctx = Arc::new(ctx);
+        let node = ctx.iroh_node.lock().await.clone().unwrap();
+        let root = ts::collab_root(&ctx);
+        for (u, seed) in [("r1", 7u32), ("r2", 11u32)] {
+            let big: Vec<u8> = (0..40 * 1024u32)
+                .map(|i| ((i * seed) % 251) as u8)
+                .collect();
+            let p = root.join("m31").join(format!("{u}.fits"));
+            ts::land_frame(&ctx, &hub, &node, u, &p, &big).await;
+            std::fs::remove_file(&p).unwrap(); // a dead entry: stays parked
+        }
+        hub.seed_frames(ts::PID, "acc-o", &["r3"], "published");
+        {
+            let conn = db(&ctx).unwrap().conn();
+            let view = hub.frame(ts::PID, "r3").unwrap();
+            frames_db::upsert_from_manifest(&conn, ts::PID, &view).unwrap();
+            conn.execute(
+                "UPDATE project_frames_local SET local_state = 'wanted', size_mtime_seen = NULL
+                 WHERE project_id = ?1",
+                rusqlite::params![ts::PID],
+            )
+            .unwrap();
+            for u in ["r1", "r2", "r3"] {
+                frames_db::set_awaiting_gc(&conn, ts::PID, u, true).unwrap();
+            }
+        }
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        let mut exec = Executor::new(
+            ExecEnv {
+                ctx: Arc::clone(&ctx),
+                store: node.collab_store().unwrap(),
+                node,
+                root: root.clone(),
+                guard: Arc::new(StoreGuard::new(root, me, None)),
+                control: Arc::new(InboundControl::new()),
+            },
+            2,
+            7,
+        );
+        let parked = |u: &str| {
+            frames_db::get(&db(&ctx).unwrap().conn(), ts::PID, u)
+                .unwrap()
+                .unwrap()
+                .awaiting_gc
+        };
+        exec.gc_probe_batch(1).await; // r1: dead
+        exec.gc_probe_batch(1).await; // r2: dead
+        assert!(parked("r3"), "not probed yet");
+        exec.gc_probe_batch(1).await; // r3: its entry is gone
+        assert!(!parked("r3"), "released on its turn");
+        assert!(parked("r1") && parked("r2"));
+        exec.gc_probe_batch(1).await; // wrapped: r1 again
+        assert!(parked("r1"));
         exec.shutdown();
     }
 

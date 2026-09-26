@@ -424,6 +424,18 @@ impl StorageEngine {
 
     /// A replica whose landed file lies outside the current root (a
     /// re-designated Collaboration folder, owner rule A).
+    ///
+    /// Rule A rules `Held` replica rows only, by design (fix round 2, M-3):
+    /// - `Held`: counted as gone — the L4 deletion path, re-fetched into the
+    ///   new root or the one choice for a mass;
+    /// - `Idle` (excluded by the policy): nothing is served or fetched, so
+    ///   nothing is ruled; once re-included it is `wanted` or `held` again
+    ///   and the next sweep rules it like any other;
+    /// - `Quarantined` and `AwaitingChoice`: they keep their old paths until
+    ///   the user decides (refetch / delete, keep / stop keeping) — the user's
+    ///   choice is never made for them by a folder change.
+    ///
+    /// Own frames live wherever their owner keeps them and never count.
     fn replica_outside_root(&self, row: &LocalFrameRow) -> bool {
         if row.origin != FrameOrigin::Replica {
             return false;

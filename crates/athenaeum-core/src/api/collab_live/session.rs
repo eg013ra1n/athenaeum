@@ -78,7 +78,10 @@ pub(crate) async fn run_session(
             continue;
         };
         shared.set_credentials(Some((hub_url.clone(), token.clone())));
-        shared.set_session_id(None);
+        // A new connection: its `hello` (read by the pump below, never
+        // through the runtime's event queue) names the session the beat
+        // uses; an older connection's can no longer set it.
+        let conn = shared.begin_connection();
         shared.set_state(
             if failures == 0 {
                 LiveState::Connecting
@@ -111,7 +114,12 @@ pub(crate) async fn run_session(
                     ))
                 });
                 let (cancel_tx, mut cancel_rx) = watch::channel(false);
-                let pump = stream::pump(resp, &events, &mut cancel_rx);
+                let hello_shared = Arc::clone(&shared);
+                let pump = stream::pump_with(resp, &events, &mut cancel_rx, move |ev| {
+                    if let LiveEvent::Hello(h) = ev {
+                        hello_shared.set_session_for(conn, h.session_id.clone());
+                    }
+                });
                 tokio::pin!(pump);
                 let ended = tokio::select! {
                     end = &mut pump => Ended::Stream(end),

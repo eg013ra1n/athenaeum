@@ -486,3 +486,50 @@ fn walk_files(root: &std::path::Path) -> usize {
         .filter(|e| !e.path().components().any(|c| c.as_os_str() == ".athenaeum"))
         .count()
 }
+
+/// Fix round 2 (I-1): the session id comes from the pump, never through
+/// the runtime's event queue. With the feed worker stuck and more than
+/// `EVENT_QUEUE` events waiting on it (the stream back-pressured), a
+/// reconnect's `hello` still names the new session at once: the beat
+/// resumes and the hub keeps the device online past its silence rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_beats_at_once_while_the_feed_worker_is_stuck() {
+    let w = ts::two_instances().await;
+    feed_stuck_in_a_retry(&w).await;
+    // far more events than the worker's back-pressure lets through
+    for _ in 0..(2 * super::runtime::EVENT_QUEUE + 64) {
+        w.hub.send_versions();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    w.hub.kill_streams(); // a hub restart: every session gone
+    let t0 = Instant::now();
+    w.hub
+        .wait_connected(
+            ts::PID,
+            &w.b.device(),
+            ts::LIVE_BEAT * 4 + Duration::from_secs(2),
+        )
+        .await;
+    let back = t0.elapsed();
+    // Well past the fake hub's silence rule (1 s): only beats keep it.
+    tokio::time::sleep(ts::LIVE_TIMINGS.silence * 3).await;
+    assert!(
+        w.hub.connected(ts::PID).contains(&w.b.device()),
+        "beats keep the device online (reconnected after {back:?})"
+    );
+}
+
+/// Fix round 2 (M-1): a run that panics every time fails its fetches —
+/// they back off — instead of re-queuing them at once into a spin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_that_keeps_panicking_backs_its_fetches_off() {
+    let w = ts::two_instances().await;
+    crate::api::collab_live::executor::test_hooks::panic_every_run(&w.b.root);
+    let uuids = w.a_publishes(1).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let panics = crate::api::collab_live::executor::test_hooks::stop_run_panics(&w.b.root);
+    // full-jitter back-off from 1 s: a handful in 3 s, never a spin
+    assert!((1..=12).contains(&panics), "{panics} runs panicked in 3 s");
+    w.b.wait_state(&uuids[0], LocalState::Held, Duration::from_secs(90))
+        .await;
+}

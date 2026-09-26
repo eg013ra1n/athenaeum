@@ -115,6 +115,19 @@ pub async fn pump(
     tx: &tokio::sync::mpsc::Sender<LiveEvent>,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> StreamEnd {
+    pump_with(resp, tx, cancel, |_| {}).await
+}
+
+/// [`pump`], with `seen` called on every decoded event as it is read —
+/// BEFORE the send, which may wait for a busy consumer (Task 15 fix round 2:
+/// the session takes a connection's `hello` session id here, so the
+/// presence beat never waits behind the event queue).
+pub async fn pump_with(
+    resp: reqwest::Response,
+    tx: &tokio::sync::mpsc::Sender<LiveEvent>,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    mut seen: impl FnMut(&LiveEvent),
+) -> StreamEnd {
     let mut body = resp.bytes_stream();
     let mut parser = SseParser::default();
     let mut got_byte = false;
@@ -154,6 +167,7 @@ pub async fn pump(
                             tracing::debug!(kind = %n, "unknown event ignored")
                         }
                         Ok(ev) => {
+                            seen(&ev);
                             // A full channel (a busy runtime) must not hold
                             // the stream past a cancel (Task 15 R1): the
                             // send races the cancel.

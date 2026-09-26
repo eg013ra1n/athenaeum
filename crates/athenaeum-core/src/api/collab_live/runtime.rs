@@ -65,7 +65,7 @@ pub const GC_PROBE_EVERY: Duration = crate::sharing::iroh::COLLAB_GC_INTERVAL;
 /// never per frame).
 pub const LANDED_BURST: Duration = Duration::from_secs(1);
 /// Events queued from the stream before the pump waits for the runtime.
-const EVENT_QUEUE: usize = 256;
+pub(super) const EVENT_QUEUE: usize = 256;
 
 // ── the shared state (runtime ↔ session ↔ handle) ───────────────────────
 
@@ -76,6 +76,9 @@ pub(crate) struct Shared {
     status: watch::Sender<CollabLiveStatus>,
     reconnect: watch::Sender<u64>,
     session_id: watch::Sender<Option<String>>,
+    /// The event stream connection whose `hello` may set the session id
+    /// (Task 15 fix round 2). Held while the id is written.
+    connection: Mutex<u64>,
     serving: watch::Sender<BTreeMap<String, bool>>,
     credentials: Mutex<Option<(String, String)>>,
     /// A copy of the feed's presence book, for [`holder_view`].
@@ -104,6 +107,7 @@ impl Shared {
             .0,
             reconnect: watch::channel(0).0,
             session_id: watch::channel(None).0,
+            connection: Mutex::new(0),
             serving: watch::channel(BTreeMap::new()).0,
             credentials: Mutex::new(None),
             presence: RwLock::new(PresenceBook::default()),
@@ -178,6 +182,26 @@ impl Shared {
 
     pub(crate) fn set_session_id(&self, id: Option<String>) {
         self.session_id.send_replace(id);
+    }
+
+    /// A new event stream connection: the session id is cleared until its
+    /// own `hello` names one. Returns the connection's generation.
+    pub(crate) fn begin_connection(&self) -> u64 {
+        let mut current = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        *current = current.wrapping_add(1);
+        self.session_id.send_replace(None);
+        *current
+    }
+
+    /// Connection `conn`'s `hello` named session `id` — set unless a newer
+    /// connection began since (a stale `hello` never replaces a newer id).
+    pub(crate) fn set_session_for(&self, conn: u64, id: String) {
+        let current = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        if *current != conn {
+            tracing::debug!("a stale connection's hello ignored");
+            return;
+        }
+        self.session_id.send_replace(Some(id));
     }
 
     pub(crate) fn session_signal(&self) -> watch::Receiver<Option<String>> {
@@ -1142,9 +1166,8 @@ impl Runtime {
                 },
                 ev = self.events_rx.recv(), if self.events_open && feed_room => match ev {
                     Some(ev) => {
-                        if let LiveEvent::Hello(h) = &ev {
-                            self.shared.set_session_id(Some(h.session_id.clone()));
-                        }
+                        // The session set the id when its pump read the
+                        // hello (fix round 2): never gated by this queue.
                         self.feed_pending.fetch_add(1, Ordering::SeqCst);
                         self.to_feed(FeedWork::Event(ev));
                     }
@@ -1551,5 +1574,30 @@ fn blank(project_id: &str) -> CollabFramesLanded {
         landed: 0,
         failed: 0,
         awaiting_gc: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fix round 2 (I-1): a connection's `hello` sets the session id; one
+    /// read by an older connection never replaces a newer connection's.
+    #[test]
+    fn a_stale_hello_never_replaces_a_newer_session_id() {
+        let (_tmp, ctx) = crate::api::collab_exchange::test_support::test_ctx();
+        let shared = Shared::new(Arc::new(ctx), None);
+        let old = shared.begin_connection();
+        shared.set_session_for(old, "s-old".into());
+        assert_eq!(shared.session_signal().borrow().as_deref(), Some("s-old"));
+        let new = shared.begin_connection();
+        assert_eq!(
+            *shared.session_signal().borrow(),
+            None,
+            "cleared per connection"
+        );
+        shared.set_session_for(new, "s-new".into());
+        shared.set_session_for(old, "s-stale".into());
+        assert_eq!(shared.session_signal().borrow().as_deref(), Some("s-new"));
     }
 }
