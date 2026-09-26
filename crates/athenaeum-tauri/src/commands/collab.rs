@@ -10,6 +10,8 @@ use athenaeum_core::api::collab::{
 };
 use athenaeum_core::api::collab_exchange as exchange;
 use athenaeum_core::api::collab_exchange::ProjectFrameView;
+use athenaeum_core::api::collab_live::surface;
+use athenaeum_core::api::PathPolicy;
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::export::models::ExportResult;
 use tauri::{AppHandle, State};
@@ -116,14 +118,15 @@ pub async fn republish_collab_frames(
         .map_err(|e| e.to_string())
 }
 
-/// Every cached frame of a project (cache-only — no hub call).
+/// Every cached frame of a project (cache-only — no hub call), with its local
+/// state and the live holder counts.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn list_collab_frames(
     state: State<'_, AppState>,
     project_id: String,
 ) -> Result<Vec<ProjectFrameView>, String> {
-    exchange::list_project_frames(&state.ctx, &project_id).map_err(|e| e.to_string())
+    surface::list_collab_frames(&state.ctx, &project_id).map_err(|e| e.to_string())
 }
 
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
@@ -259,4 +262,159 @@ pub async fn export_collab_project(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+// ── Live exchange (collab v3 wave 3, Task 16) ────────────────────────────────
+
+/// Sync now (L10): back-offs cleared, the event stream reopened, then a
+/// digest check per project and a stat sweep.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn collab_sync_now(state: State<'_, AppState>) -> Result<(), String> {
+    surface::collab_sync_now(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// The live exchange's status (P27) — polled by the UI.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_collab_live_status(
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::api::collab_live::CollabLiveStatus, String> {
+    Ok(surface::get_collab_live_status(&state.ctx))
+}
+
+/// A project's attention lists: changed files, the deletion choice, not
+/// kept, other files (L4–L6).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_collab_attention(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<surface::CollabAttention, String> {
+    surface::list_collab_attention(&state.ctx, &project_id).map_err(|e| e.to_string())
+}
+
+/// Answer the deletion choice (L4) for all awaiting frames or the named ones.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn resolve_collab_deletions(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame_uuids: Option<Vec<String>>,
+    action: surface::DeletionActionArg,
+) -> Result<usize, String> {
+    surface::resolve_collab_deletions(&state.ctx, &project_id, frame_uuids, action)
+        .map_err(|e| e.to_string())
+}
+
+/// The last-copy warning a "Stop keeping" shows first (L4, I7).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn preview_collab_stop_keeping(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame_uuids: Vec<String>,
+) -> Result<Vec<surface::LastCopyView>, String> {
+    surface::preview_collab_stop_keeping(&state.ctx, &project_id, frame_uuids)
+        .map_err(|e| e.to_string())
+}
+
+/// "Keep again" (L6), for all not-kept frames or the named ones.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn keep_collab_frames_again(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame_uuids: Option<Vec<String>>,
+) -> Result<usize, String> {
+    surface::keep_collab_frames_again(&state.ctx, &project_id, frame_uuids)
+        .map_err(|e| e.to_string())
+}
+
+/// Answer a changed file (L5): re-fetch the original or delete it.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn resolve_collab_changed_file(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame_uuid: String,
+    action: surface::ChangedActionArg,
+    confirmed_delete: bool,
+) -> Result<surface::ChangedFileOutcome, String> {
+    surface::resolve_collab_changed_file(
+        &state.ctx,
+        &project_id,
+        &frame_uuid,
+        action,
+        confirmed_delete,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The Collaboration storage, with the replace offer or the take-over (§9.5).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_collab_storage_status(
+    state: State<'_, AppState>,
+) -> Result<surface::CollabStorageStatus, String> {
+    surface::get_collab_storage_status(&state.ctx)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Replace another device of this account as the owner of the folder (the
+/// offer's folder unless `root` names one).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn collab_replace_device(
+    state: State<'_, AppState>,
+    device_id: String,
+    root: Option<String>,
+) -> Result<surface::ReplaceOutcomeView, String> {
+    surface::collab_replace_device(
+        &state.ctx,
+        &device_id,
+        root.as_deref(),
+        &PathPolicy::AllowAll,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Take over a folder whose marker names a device this account does not
+/// list — only after its recorded refusal, and only once the user confirmed.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn take_over_collab_folder(
+    state: State<'_, AppState>,
+    root: String,
+    confirmed: bool,
+) -> Result<surface::ReplaceOutcomeView, String> {
+    surface::take_over_collab_folder(&state.ctx, &root, confirmed, &PathPolicy::AllowAll)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `collab.max_upload_streams` (L11), applied live.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_collab_max_upload_streams(
+    state: State<'_, AppState>,
+    max_upload_streams: usize,
+) -> Result<(), String> {
+    surface::set_collab_max_upload_streams(&state.ctx, max_upload_streams)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `collab.max_receive_streams` (L11), applied live.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_collab_max_receive_streams(
+    state: State<'_, AppState>,
+    max_receive_streams: usize,
+) -> Result<(), String> {
+    surface::set_collab_max_receive_streams(&state.ctx, max_receive_streams)
+        .map_err(|e| e.to_string())
 }

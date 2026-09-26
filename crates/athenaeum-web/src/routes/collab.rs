@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use athenaeum_core::api::collab as api;
 use athenaeum_core::api::collab_exchange as exchange;
+use athenaeum_core::api::collab_live::surface;
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::export::models::ExportResult;
 use axum::extract::State;
@@ -12,6 +13,7 @@ use serde::Deserialize;
 
 use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
+use crate::routes::scan_roots::allowed_roots_policy;
 use crate::WebAppState; // the web crate's state type — there is no `AppState` in athenaeum-web
 
 #[derive(Deserialize)]
@@ -77,6 +79,66 @@ pub struct ExportProjectArgs {
     project_id: String,
     output_dir: String,
     use_symlinks: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionsArgs {
+    project_id: String,
+    #[serde(default)]
+    frame_uuids: Option<Vec<String>>,
+    action: surface::DeletionActionArg,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopKeepingArgs {
+    project_id: String,
+    frame_uuids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeepAgainArgs {
+    project_id: String,
+    #[serde(default)]
+    frame_uuids: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangedFileArgs {
+    project_id: String,
+    frame_uuid: String,
+    action: surface::ChangedActionArg,
+    confirmed_delete: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceDeviceArgs {
+    device_id: String,
+    #[serde(default)]
+    root: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeOverArgs {
+    root: String,
+    confirmed: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadStreamsArgs {
+    max_upload_streams: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveStreamsArgs {
+    max_receive_streams: usize,
 }
 
 #[tracing::instrument(skip_all, err(Debug))]
@@ -177,13 +239,14 @@ pub async fn republish_collab_frames(
         .map_err(api_err)
 }
 
-/// Every cached frame of a project (cache-only — no hub call).
+/// Every cached frame of a project (cache-only — no hub call), with its local
+/// state and the live holder counts.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_collab_frames(
     State(state): State<WebAppState>,
     Json(args): Json<ProjectIdArgs>,
 ) -> Result<Json<Vec<exchange::ProjectFrameView>>, (axum::http::StatusCode, String)> {
-    exchange::list_project_frames(&state.ctx, &args.project_id)
+    surface::list_collab_frames(&state.ctx, &args.project_id)
         .map(Json)
         .map_err(api_err)
 }
@@ -329,4 +392,246 @@ pub async fn export_collab_project(
     .await
     .map(Json)
     .map_err(api_err)
+}
+
+// ── Live exchange (collab v3 wave 3, Task 16) ────────────────────────────────
+
+/// Sync now (L10): back-offs cleared, the event stream reopened, then a
+/// digest check per project and a stat sweep.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn collab_sync_now(
+    State(state): State<WebAppState>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    surface::collab_sync_now(&state.ctx)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// The live exchange's status (P27) — polled by the UI.
+#[tracing::instrument(skip_all, level = "debug")]
+pub async fn get_collab_live_status(
+    State(state): State<WebAppState>,
+) -> Json<athenaeum_core::api::collab_live::CollabLiveStatus> {
+    Json(surface::get_collab_live_status(&state.ctx))
+}
+
+/// A project's attention lists: changed files, the deletion choice, not
+/// kept, other files (L4–L6).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn list_collab_attention(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<surface::CollabAttention>, (axum::http::StatusCode, String)> {
+    surface::list_collab_attention(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Answer the deletion choice (L4) for all awaiting frames or the named ones.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn resolve_collab_deletions(
+    State(state): State<WebAppState>,
+    Json(args): Json<DeletionsArgs>,
+) -> Result<Json<usize>, (axum::http::StatusCode, String)> {
+    surface::resolve_collab_deletions(&state.ctx, &args.project_id, args.frame_uuids, args.action)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// The last-copy warning a "Stop keeping" shows first (L4, I7).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn preview_collab_stop_keeping(
+    State(state): State<WebAppState>,
+    Json(args): Json<StopKeepingArgs>,
+) -> Result<Json<Vec<surface::LastCopyView>>, (axum::http::StatusCode, String)> {
+    surface::preview_collab_stop_keeping(&state.ctx, &args.project_id, args.frame_uuids)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// "Keep again" (L6), for all not-kept frames or the named ones.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn keep_collab_frames_again(
+    State(state): State<WebAppState>,
+    Json(args): Json<KeepAgainArgs>,
+) -> Result<Json<usize>, (axum::http::StatusCode, String)> {
+    surface::keep_collab_frames_again(&state.ctx, &args.project_id, args.frame_uuids)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Answer a changed file (L5): re-fetch the original or delete it.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn resolve_collab_changed_file(
+    State(state): State<WebAppState>,
+    Json(args): Json<ChangedFileArgs>,
+) -> Result<Json<surface::ChangedFileOutcome>, (axum::http::StatusCode, String)> {
+    surface::resolve_collab_changed_file(
+        &state.ctx,
+        &args.project_id,
+        &args.frame_uuid,
+        args.action,
+        args.confirmed_delete,
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// The Collaboration storage, with the replace offer or the take-over (§9.5).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_collab_storage_status(
+    State(state): State<WebAppState>,
+) -> Result<Json<surface::CollabStorageStatus>, (axum::http::StatusCode, String)> {
+    surface::get_collab_storage_status(&state.ctx)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Replace another device of this account as the owner of the folder (the
+/// offer's folder unless `root` names one — refused when it contains `..`,
+/// then held to the allowed roots).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn collab_replace_device(
+    State(state): State<WebAppState>,
+    Json(args): Json<ReplaceDeviceArgs>,
+) -> Result<Json<surface::ReplaceOutcomeView>, (axum::http::StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    surface::collab_replace_device(&state.ctx, &args.device_id, args.root.as_deref(), &policy)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Take over a folder whose marker names a device this account does not
+/// list — only after its recorded refusal, and only once the user confirmed.
+/// A `root` with `..` is refused before anything else.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn take_over_collab_folder(
+    State(state): State<WebAppState>,
+    Json(args): Json<TakeOverArgs>,
+) -> Result<Json<surface::ReplaceOutcomeView>, (axum::http::StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    surface::take_over_collab_folder(&state.ctx, &args.root, args.confirmed, &policy)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// `collab.max_upload_streams` (L11), applied live.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_collab_max_upload_streams(
+    State(state): State<WebAppState>,
+    Json(args): Json<UploadStreamsArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    surface::set_collab_max_upload_streams(&state.ctx, args.max_upload_streams)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// `collab.max_receive_streams` (L11), applied live.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_collab_max_receive_streams(
+    State(state): State<WebAppState>,
+    Json(args): Json<ReceiveStreamsArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    surface::set_collab_max_receive_streams(&state.ctx, args.max_receive_streams)
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[cfg(test)]
+mod live_surface_tests {
+    use super::*;
+    use athenaeum_core::cache::MemoryImageCache;
+    use athenaeum_core::db::Database;
+    use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
+    use athenaeum_core::settings::SettingsManager;
+    use axum::http::StatusCode;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock, RwLock};
+    use tempfile::TempDir;
+
+    use crate::events::SseEvent;
+
+    fn test_state(db: Database, allowed_paths: Vec<PathBuf>) -> WebAppState {
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(db);
+        let ctx = Arc::new(ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_stacks: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
+            operation_queue: OperationQueue::start(),
+            compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
+            iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
+        });
+        let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
+        WebAppState {
+            ctx,
+            event_tx,
+            allowed_paths,
+            export_dir: None,
+            api_key: None,
+            image_semaphore: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(1)))),
+            max_blink_threads: 1,
+            monitor: athenaeum_core::monitor::MonitorService::new(),
+            sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
+            sync_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
+        }
+    }
+
+    /// Task 16 (R3): a root with `..` is refused with 400 before the policy,
+    /// the filesystem or the hub are touched — on both folder routes.
+    #[tokio::test]
+    async fn a_root_with_a_parent_step_is_refused_on_both_folder_routes() {
+        let tmp = TempDir::new().unwrap();
+        let allowed = tmp.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let state = test_state(
+            Database::new(tmp.path().join("catalog.db")).unwrap(),
+            vec![allowed.clone()],
+        );
+        let sneaky = format!("{}/../../etc", allowed.display());
+
+        let err = take_over_collab_folder(
+            State(state.clone()),
+            Json(TakeOverArgs {
+                root: sneaky.clone(),
+                confirmed: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST, "{}", err.1);
+        assert!(err.1.contains(".."), "{}", err.1);
+
+        let err = collab_replace_device(
+            State(state),
+            Json(ReplaceDeviceArgs {
+                device_id: "old-id".into(),
+                root: Some(sneaky),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST, "{}", err.1);
+        assert!(err.1.contains(".."), "{}", err.1);
+    }
 }

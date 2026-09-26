@@ -512,6 +512,18 @@ pub fn run() {
             commands::approve_collab_frame,
             commands::reject_collab_frame,
             commands::export_collab_project,
+            commands::collab_sync_now,
+            commands::get_collab_live_status,
+            commands::list_collab_attention,
+            commands::resolve_collab_deletions,
+            commands::preview_collab_stop_keeping,
+            commands::keep_collab_frames_again,
+            commands::resolve_collab_changed_file,
+            commands::get_collab_storage_status,
+            commands::collab_replace_device,
+            commands::take_over_collab_folder,
+            commands::set_collab_max_upload_streams,
+            commands::set_collab_max_receive_streams,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
