@@ -182,8 +182,9 @@ pub(crate) async fn seed_replica_file(
     (PID.to_string(), uuid.to_string(), path)
 }
 
-/// A signed-in rig with `n` held replica frames (Task 9): real small files
-/// (< 16 KiB, so the store inlines them) under `<root>/m31/other/`,
+/// A signed-in rig with `n` held replica frames (Task 9): real files ABOVE
+/// the store's 16 KiB inline threshold (fix round 1 — like real FITS frames,
+/// so they are imported by reference) under `<root>/m31/other/`,
 /// published on the hub by a second account (`acc-o`) with their real
 /// hashes, cached through `upsert_from_manifest`, seeded into the collab
 /// store and moved to `held` through `set_local_state` (so each carries its
@@ -233,9 +234,10 @@ pub(crate) async fn landed_rig(n: usize) -> LandedRig {
     let uuids: Vec<String> = (0..n).map(|i| format!("f{i:02}")).collect();
     let mut frames = Vec::with_capacity(n);
     for uuid in &uuids {
-        let bytes = format!("replica frame {uuid}: a few hundred bytes of pixels ")
-            .repeat(8)
+        let bytes = format!("replica frame {uuid}: pixels ")
+            .repeat(1024)
             .into_bytes();
+        debug_assert!(bytes.len() > 16 * 1024);
         let path = dir.join(format!("{uuid}.fits"));
         land_frame(&ctx, &hub, &node, uuid, &path, &bytes).await;
         frames.push((PID.to_string(), uuid.clone(), path));

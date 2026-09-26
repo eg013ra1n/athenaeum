@@ -23,6 +23,18 @@ use walkdir::WalkDir;
 /// Convert a path to UTF-8 string for DB persistence.
 /// Rejects non-UTF-8 paths instead of silently corrupting them via U+FFFD
 /// replacement (which would break any subsequent path-based lookup).
+/// The frame file extensions both walkers take (lower-case) — also the only
+/// unknown files the collab storage engine tries to re-adopt or lists under
+/// "Other files".
+pub(crate) const FRAME_EXTENSIONS: &[&str] = &["fits", "fit", "fts", "xisf"];
+
+/// Whether `path` has one of [`FRAME_EXTENSIONS`] (any case).
+pub(crate) fn is_frame_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| FRAME_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
 pub(crate) fn path_to_utf8(path: &std::path::Path) -> anyhow::Result<String> {
     path.to_str()
         .map(|s| s.to_string())
@@ -170,14 +182,7 @@ pub fn scan_directory(
         .filter_entry(|e| !is_app_metadata_dir(e))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            if let Some(ext) = e.path().extension() {
-                let ext_str = ext.to_string_lossy().to_lowercase();
-                matches!(ext_str.as_str(), "fits" | "fit" | "fts" | "xisf")
-            } else {
-                false
-            }
-        })
+        .filter(|e| is_frame_file(e.path()))
         .map(|e| e.path().to_path_buf())
         .collect();
 
@@ -869,8 +874,17 @@ fn collaboration_store_refusal(
     conn: &Connection,
     root_path: &Path,
 ) -> anyhow::Result<Option<crate::collab::storage::marker::UnavailableReason>> {
-    let recorded = if crate::db::collab_live::store_marker_path(conn)?.as_deref()
-        == Some(&*root_path.to_string_lossy())
+    // Compared in canonical spelling: the record and the scan root may spell
+    // the same folder differently (a symlink, `/var` vs `/private/var`).
+    let canonical = |p: &Path| {
+        p.canonicalize()
+            .map(|c| crate::api::scan_roots::normalize_path(&c))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    let recorded_path = crate::db::collab_live::store_marker_path(conn)?;
+    let recorded = if recorded_path
+        .as_deref()
+        .is_some_and(|r| canonical(Path::new(r)) == canonical(root_path))
     {
         crate::db::collab_live::recorded_store_marker(conn)?
     } else {
@@ -1534,23 +1548,23 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
-        if let Some(ext) = entry.path().extension() {
-            let ext_str = ext.to_string_lossy().to_lowercase();
-            if matches!(ext_str.as_str(), "fits" | "fit" | "fts" | "xisf") {
-                files.push(entry.path().to_path_buf());
-                discovery_count += 1;
+        if is_frame_file(entry.path()) {
+            files.push(entry.path().to_path_buf());
+            discovery_count += 1;
 
-                // Emit progress every 100 files discovered
-                if discovery_count % 100 == 0 {
-                    emit_progress(
-                        emitter,
-                        root_id,
-                        discovery_count,
-                        0, // Total unknown during discovery
-                        entry.path().file_name().map(|n| n.to_string_lossy().to_string()),
-                        "discovery",
-                    );
-                }
+            // Emit progress every 100 files discovered
+            if discovery_count % 100 == 0 {
+                emit_progress(
+                    emitter,
+                    root_id,
+                    discovery_count,
+                    0, // Total unknown during discovery
+                    entry
+                        .path()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string()),
+                    "discovery",
+                );
             }
         }
 
@@ -3820,6 +3834,33 @@ mod calibrated_light_scan_tests {
             );
             assert_eq!(landed(&conn, "m"), Some(s(&now)), "parallel={parallel}");
         }
+    }
+
+    /// Fix round 1: the recorded marker is matched to the scan root in
+    /// canonical spelling — a record written under another spelling of the
+    /// same folder still gates the scan.
+    #[test]
+    fn the_marker_record_is_matched_in_canonical_spelling() {
+        let root = TempDir::new().unwrap();
+        let stray = root.path().join("m31").join("Other").join("L_0016.fits");
+        write_plain_light(&stray, 16);
+        let conn = collab_db(root.path(), 1);
+        let other_spelling = format!("{}/.", s(root.path()));
+        crate::db::collab_live::record_store_marker(
+            &conn,
+            &crate::collab::storage::marker::StoreMarker {
+                store_id: "s".into(),
+                device_id: "ME".into(),
+            },
+            &other_spelling,
+        )
+        .unwrap();
+        let result = run_scan(false, root.path(), &conn, 1);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            foreign(&conn).is_empty(),
+            "the unmarked store is not reconciled"
+        );
     }
 
     /// Duplicate: a row matches `(project, xxh3)` but its recorded path still

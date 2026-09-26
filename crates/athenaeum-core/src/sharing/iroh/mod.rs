@@ -116,7 +116,7 @@ pub(crate) fn package_tag(package_id: &PackageId) -> String {
 /// interval may be collected before a resume — that degrades resume to a
 /// re-download, never loses data (every byte is re-verified). 900 s is a
 /// deliberately slack interval so a normal transfer never races collection.
-const GC_INTERVAL: Duration = Duration::from_secs(900);
+pub(crate) const GC_INTERVAL: Duration = Duration::from_secs(900);
 
 /// Depth of an endpoint's inbound event channel. Control events are low volume;
 /// this comfortably holds bursts of announces/acks.

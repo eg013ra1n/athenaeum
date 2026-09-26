@@ -56,9 +56,15 @@ pub const WATCH_ERRORS_DEGRADE: u32 = 3;
 /// answers when the system trash refuses the changed file.
 pub const TRASH_UNAVAILABLE: &str = "trash_unavailable";
 
-/// The FITS/XISF extensions the scanner reconciles — the only unknown files
-/// the engine tries to re-adopt or lists under "Other files".
-const FRAME_EXTENSIONS: &[&str] = &["fits", "fit", "fts", "xisf"];
+/// Slack past one collab GC interval before a parked frame (a moved file
+/// whose re-seed hit a dead store entry) is retried.
+pub const PARKED_RETRY_MARGIN: Duration = Duration::from_secs(60);
+/// When a parked frame is retried: one collab GC interval (the dead entry
+/// is collected once its seed tags are gone, P31) plus
+/// [`PARKED_RETRY_MARGIN`].
+pub const PARKED_RETRY_AFTER: Duration = Duration::from_secs(
+    crate::sharing::iroh::GC_INTERVAL.as_secs() + PARKED_RETRY_MARGIN.as_secs(),
+);
 
 /// Who else holds a frame's CURRENT version, from the holder map (Task 6).
 pub trait HolderView: Send + Sync {
@@ -138,6 +144,12 @@ pub struct StorageEngine {
     recheck_store: bool,
     next_check: Instant,
     next_sweep: Instant,
+    /// Parked frames are retried at this deadline (fix round 1).
+    next_parked_retry: Option<Instant>,
+    /// Until this instant the watcher may have missed moves (a rescan, a
+    /// touched root, a watcher error): removals are ruled only after a walk
+    /// for the moved files (fix round 1).
+    watch_gap_until: Option<Instant>,
     rng: SplitMix64,
     timings: StorageTimings,
     /// `(instant, wall-clock ms)` at start: the wall clock the L4 history is
@@ -206,6 +218,8 @@ impl StorageEngine {
             // A sweep at start confirms the files before anything new is
             // reported (§9.1).
             next_sweep: now,
+            next_parked_retry: None,
+            watch_gap_until: None,
             rng: SplitMix64(seed),
             timings,
             clock_base: (now, chrono::Utc::now().timestamp_millis()),
@@ -216,6 +230,9 @@ impl StorageEngine {
         let mut d = self.next_check.min(self.next_sweep);
         if let Some(a) = self.agg.next_deadline() {
             d = d.min(a);
+        }
+        if let Some(r) = self.next_parked_retry {
+            d = d.min(r);
         }
         d
     }
@@ -236,11 +253,13 @@ impl StorageEngine {
             FsSignal::Root => {
                 self.recheck_store = true;
                 self.watch_errors = 0;
+                self.mark_watch_gap(now);
                 self.agg.observe(&FsSignal::Root, now);
             }
             FsSignal::Rescan => {
                 self.recheck_store = true;
                 self.watch_errors = 0;
+                self.mark_watch_gap(now);
                 self.agg.observe(&FsSignal::Rescan, now);
             }
             FsSignal::Touched(p) => {
@@ -256,6 +275,7 @@ impl StorageEngine {
             }
             FsSignal::WatchError(e) => {
                 self.watch_errors = self.watch_errors.saturating_add(1);
+                self.mark_watch_gap(now);
                 tracing::debug!(
                     error = %e,
                     count = self.watch_errors,
@@ -281,6 +301,9 @@ impl StorageEngine {
         // 3. aggregated changes: changed FIRST (re-adoption of a moved file
         //    before its old path is ruled a deletion), then removals.
         let drained = self.agg.drain(now, |p| p.exists());
+        if drained.root_touched {
+            self.mark_watch_gap(now);
+        }
         for path in self.expand_changed(&drained.changed) {
             self.pump(now);
             self.on_changed(&path, now, &mut ev).await;
@@ -299,7 +322,17 @@ impl StorageEngine {
                 (&a.project_id, &a.frame_uuid).cmp(&(&b.project_id, &b.frame_uuid))
             });
             rows.dedup_by(|a, b| a.project_id == b.project_id && a.frame_uuid == b.frame_uuid);
+            // Moves the watcher did not see (degraded, or a rescan / touched
+            // root / watcher error) are re-adopted BEFORE the removal is
+            // ruled a deletion (fix round 1).
+            if self.degraded || self.watch_gap_until.is_some_and(|t| now <= t) {
+                self.adopt_unseen_moves(&rows, now, &mut ev).await;
+            }
             self.file_gone(rows, now, holders, &mut ev).await;
+        }
+        // 3b. parked frames, one collab GC interval after they were parked
+        if self.next_parked_retry.is_some_and(|t| now >= t) {
+            self.retry_parked(now, &mut ev).await;
         }
         // 4. the sweep (a touched root or a rescan forces one)
         if drained.root_touched || now >= self.next_sweep {
@@ -352,6 +385,11 @@ impl StorageEngine {
     }
 
     // ── internals ───────────────────────────────────────────────────────
+
+    fn mark_watch_gap(&mut self, now: Instant) {
+        let until = now + self.timings.aggregate + self.timings.settle * 2;
+        self.watch_gap_until = Some(self.watch_gap_until.map_or(until, |t| t.max(until)));
+    }
 
     /// Keep the signal channel drained into the aggregator before (and
     /// between) slow work, so a burst never piles up behind a hash.
@@ -517,18 +555,29 @@ impl StorageEngine {
                         | LocalState::OwnMissing
                 ) =>
             {
-                // The file came back (FileBack / PutBack): stat + hash decide.
-                self.readopt(path, ev).await;
+                if row.local_state == LocalState::Wanted
+                    && row.origin == FrameOrigin::Replica
+                    && row.size_mtime_seen.is_some()
+                    && !row.awaiting_gc
+                {
+                    // A re-included frame whose file was verified at this
+                    // version (fix round 1): re-adopt, or quarantine an edit.
+                    self.check_reincluded(&row, path, ev).await;
+                } else {
+                    // The file came back (FileBack / PutBack): stat + hash
+                    // decide.
+                    self.readopt(path, now, ev).await;
+                }
             }
             // `idle`: an excluded frame is never served; nothing to do.
             Some(_) => {}
             None => {
-                if !is_frame_file(path) || watch::is_ignored(&self.root, path) {
+                if !crate::scanner::is_frame_file(path) || watch::is_ignored(&self.root, path) {
                     return;
                 }
                 // An unknown file: a moved or put-back frame (§9.4 "Unknown
                 // files"), else "Other files" (R18).
-                if !self.readopt(path, ev).await {
+                if !self.readopt(path, now, ev).await {
                     let size_mtime = std::fs::metadata(path).ok().map(|m| Stamp::of(&m).encode());
                     let listed = db(&self.ctx).and_then(|d| {
                         Ok(frames_db::record_foreign_file(
@@ -552,13 +601,16 @@ impl StorageEngine {
     }
 
     /// Re-adoption by hash; `true` when the file matched any cached frame.
-    async fn readopt(&mut self, path: &Path, ev: &mut Vec<StorageEvent>) -> bool {
+    async fn readopt(&mut self, path: &Path, now: Instant, ev: &mut Vec<StorageEvent>) -> bool {
         match crate::api::collab_live::replace::adopt_by_hash_detailed(
             &self.ctx, &self.node, &self.root, path,
         )
         .await
         {
             Ok(out) => {
+                if !out.parked.is_empty() {
+                    self.schedule_parked_retry(now);
+                }
                 for a in out.adopted {
                     if a.from != a.to {
                         ev.push(StorageEvent::StateChanged {
@@ -861,8 +913,21 @@ impl StorageEngine {
         holders: &dyn HolderView,
         ev: &mut Vec<StorageEvent>,
     ) {
+        // Re-read every row: a re-adoption earlier in this tick (a moved
+        // file, the unseen-moves walk) may have moved it on (fix round 1).
         let rows: Vec<LocalFrameRow> = rows
             .into_iter()
+            .filter_map(|r| {
+                match db(&self.ctx)
+                    .and_then(|d| Ok(frames_db::get(&d.conn(), &r.project_id, &r.frame_uuid)?))
+                {
+                    Ok(fresh) => fresh,
+                    Err(e) => {
+                        tracing::error!(project_id = %r.project_id, frame_uuid = %r.frame_uuid, error = %e, "gone frame could not be re-read");
+                        None
+                    }
+                }
+            })
             .filter(|r| {
                 r.landed_path
                     .as_deref()
@@ -892,6 +957,7 @@ impl StorageEngine {
         let ruled = deletions::rule_batch(&history, &batch, now_ms);
         let mut awaiting = 0usize;
         let mut choice_projects: Vec<String> = Vec::new();
+        let mut applied: Vec<&LocalFrameRow> = Vec::new();
 
         for r in &rows {
             let key = (r.project_id.clone(), r.frame_uuid.clone());
@@ -907,6 +973,14 @@ impl StorageEngine {
                         return Ok(None);
                     };
                     frames_db::set_local_state(tx, &r.project_id, &r.frame_uuid, gone)?;
+                    // Unseeded below: the stamp no longer records seeded
+                    // bytes (it is the "known seeded" record re-inclusion
+                    // trusts — fix round 1).
+                    tx.execute(
+                        "UPDATE project_frames_local SET size_mtime_seen = NULL
+                         WHERE project_id = ?1 AND frame_uuid = ?2",
+                        rusqlite::params![r.project_id, r.frame_uuid],
+                    )?;
                     let mut to = gone;
                     if let Some(ruling) = ruling {
                         live_db::record_deletion(tx, &r.project_id, &r.frame_uuid, now_ms)?;
@@ -927,6 +1001,7 @@ impl StorageEngine {
                         to_state = to.as_db_str(),
                         "landed file gone"
                     );
+                    applied.push(r);
                     // The dead entry stops being pinned, so the collab GC can
                     // drop it (P31) — after the state write, so a frame a
                     // concurrent landing revived is never unseeded.
@@ -1018,8 +1093,9 @@ impl StorageEngine {
             });
         }
 
-        // Lost everywhere: nobody else holds the current version (L4).
-        for r in &rows {
+        // Lost everywhere: nobody else holds the current version (L4) — only
+        // for frames whose state write applied (fix round 1).
+        for r in applied {
             if deletions::lost_everywhere(holders.other_holders(&r.project_id, &r.frame_uuid).total)
             {
                 tracing::error!(project_id = %r.project_id, frame_uuid = %r.frame_uuid, path = r.landed_path.as_deref().unwrap_or_default(), "frame lost everywhere");
@@ -1064,21 +1140,338 @@ impl StorageEngine {
             if checked_state(row.local_state) {
                 checked += 1;
                 self.recheck(&row, now, &mut ev).await;
-            } else if row.awaiting_gc
-                && matches!(row.local_state, LocalState::Wanted | LocalState::OwnMissing)
-                && row
-                    .landed_path
-                    .as_deref()
-                    .is_some_and(|p| Path::new(p).is_file())
-            {
-                // A moved frame parked over a dead store entry: re-adopt it
-                // from its new path once the collab GC dropped the entry.
-                let path = PathBuf::from(row.landed_path.as_deref().unwrap_or_default());
-                self.readopt(&path, &mut ev).await;
             }
         }
+        // Parked frames are retried by every sweep too (fix round 1).
+        self.retry_parked(now, &mut ev).await;
         tracing::debug!(count = checked, "stat sweep finished");
         ev
+    }
+
+    fn schedule_parked_retry(&mut self, now: Instant) {
+        let at = now + PARKED_RETRY_AFTER;
+        self.next_parked_retry = Some(self.next_parked_retry.map_or(at, |t| t.min(at)));
+    }
+
+    /// Retry every parked frame (a moved file whose re-seed hit a dead store
+    /// entry). Per frame:
+    /// - its file is gone or no longer the frame's size → released to a
+    ///   plain fetch (`awaiting_gc` cleared);
+    /// - the store entry is gone / partial / readable → re-seeded from the
+    ///   recorded path (`held`); when that does not land, released;
+    /// - the entry is still dead → still the frame's bytes: every sibling
+    ///   frame sharing the hash (C10) is parked too, because its tag keeps
+    ///   the dead entry alive and it cannot serve through it either; not the
+    ///   frame's bytes any more → released.
+    ///
+    /// Frames still parked get the next retry one GC interval later.
+    async fn retry_parked(&mut self, now: Instant, ev: &mut Vec<StorageEvent>) {
+        self.next_parked_retry = None;
+        let rows = match db(&self.ctx).and_then(|d| Ok(frames_db::parked_rows(&d.conn())?)) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "parked frames could not be read");
+                self.schedule_parked_retry(now);
+                return;
+            }
+        };
+        let mut still = 0usize;
+        for row in rows {
+            self.pump(now);
+            if self.retry_one_parked(&row, ev).await {
+                still += 1;
+            }
+        }
+        if still > 0 {
+            tracing::debug!(count = still, "frames still parked over a dead store entry");
+            self.schedule_parked_retry(now);
+        }
+    }
+
+    /// `true` when the frame stays parked.
+    async fn retry_one_parked(&mut self, row: &LocalFrameRow, ev: &mut Vec<StorageEvent>) -> bool {
+        use crate::api::collab_live::replace::{land_candidate, Landing};
+        use crate::sharing::iroh::node::BlobHealth;
+        let path = PathBuf::from(row.landed_path.as_deref().unwrap_or_default());
+        let size_ok = std::fs::metadata(&path)
+            .map(|m| m.is_file() && m.len() as i64 == row.byte_size)
+            .unwrap_or(false);
+        if !size_ok {
+            self.release_parked(row, "file gone or changed").await;
+            return false;
+        }
+        let health = match row.blake3.parse::<iroh_blobs::Hash>() {
+            Ok(h) => self.node.collab_blob_health(h).await.ok(),
+            Err(e) => {
+                tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "parked frame blake3 does not parse");
+                None
+            }
+        };
+        match health {
+            None => true,
+            Some(BlobHealth::Dead) => {
+                if !self.file_matches(row, &path).await {
+                    self.release_parked(row, "file no longer the frame's bytes")
+                        .await;
+                    return false;
+                }
+                self.park_siblings(row, ev).await;
+                true
+            }
+            Some(h) => match land_candidate(&self.ctx, &self.node, row, &path).await {
+                Ok(Landing::Landed { from, to }) => {
+                    tracing::info!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path = %path.display(), "parked frame re-seeded");
+                    if from != to {
+                        ev.push(StorageEvent::StateChanged {
+                            project_id: row.project_id.clone(),
+                            frame_uuid: row.frame_uuid.clone(),
+                            from,
+                            to,
+                        });
+                    }
+                    false
+                }
+                Ok(Landing::Parked) => true,
+                Ok(Landing::Refused) => {
+                    if h == BlobHealth::Readable && self.file_matches(row, &path).await {
+                        return true;
+                    }
+                    self.release_parked(row, "re-seed refused").await;
+                    false
+                }
+                Err(e) => {
+                    tracing::error!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "parked frame re-seed failed");
+                    true
+                }
+            },
+        }
+    }
+
+    /// Full-file xxh3 of `path` (off the runtime) equals the frame's.
+    async fn file_matches(&self, row: &LocalFrameRow, path: &Path) -> bool {
+        match crate::api::collab_exchange::xxh3_on_blocking(path).await {
+            Ok(h) => h == row.xxh3,
+            Err(e) => {
+                tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path = %path.display(), error = %format!("{e:#}"), "parked frame could not be hashed");
+                false
+            }
+        }
+    }
+
+    /// Clear `awaiting_gc` (and the stamp): the frame is fetched normally.
+    async fn release_parked(&self, row: &LocalFrameRow, reason: &str) {
+        let res = self
+            .with_frame_tx(row, |tx| {
+                tx.execute(
+                    "UPDATE project_frames_local SET awaiting_gc = 0, size_mtime_seen = NULL
+                     WHERE project_id = ?1 AND frame_uuid = ?2",
+                    rusqlite::params![row.project_id, row.frame_uuid],
+                )?;
+                Ok(Some(()))
+            })
+            .await;
+        match res {
+            Ok(_) => {
+                tracing::info!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, reason, "parked frame released to a fetch")
+            }
+            Err(e) => {
+                tracing::error!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "parked frame could not be released")
+            }
+        }
+    }
+
+    /// C10: the dead entry is shared — every held sibling with the same
+    /// hash reads through it too, and its tag keeps the entry from being
+    /// collected. Park each at its own path.
+    async fn park_siblings(&mut self, row: &LocalFrameRow, ev: &mut Vec<StorageEvent>) {
+        let siblings = match db(&self.ctx)
+            .and_then(|d| Ok(frames_db::rows_with_blake3(&d.conn(), &row.blake3)?))
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "siblings of a dead store entry could not be read");
+                return;
+            }
+        };
+        for sib in siblings {
+            if (sib.project_id == row.project_id && sib.frame_uuid == row.frame_uuid)
+                || !sib.local_state.servable()
+            {
+                continue;
+            }
+            let Some(path) = sib.landed_path.clone().map(PathBuf::from) else {
+                continue;
+            };
+            tracing::warn!(
+                project_id = %sib.project_id,
+                frame_uuid = %sib.frame_uuid,
+                path = %path.display(),
+                "frame shares a dead store entry; parked until the entry is collected"
+            );
+            match crate::api::collab_live::replace::park_row(&self.ctx, &self.node, &sib, &path)
+                .await
+            {
+                Ok(()) => {
+                    let to = if sib.origin == FrameOrigin::Own {
+                        LocalState::OwnMissing
+                    } else {
+                        LocalState::Wanted
+                    };
+                    ev.push(StorageEvent::StateChanged {
+                        project_id: sib.project_id.clone(),
+                        frame_uuid: sib.frame_uuid.clone(),
+                        from: sib.local_state,
+                        to,
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(project_id = %sib.project_id, frame_uuid = %sib.frame_uuid, error = %e, "sibling of a dead store entry could not be parked")
+                }
+            }
+        }
+    }
+
+    /// A re-included frame (still `wanted`, its stamp recorded at this
+    /// version) whose landed file the manifest applier handed over: the same
+    /// bytes are re-seeded and verified (`held`); an edit made while it was
+    /// idle is quarantined (I9, L5) — never fetched over.
+    async fn check_reincluded(
+        &mut self,
+        row: &LocalFrameRow,
+        path: &Path,
+        ev: &mut Vec<StorageEvent>,
+    ) {
+        use crate::api::collab_live::replace::{land_candidate, Landing};
+        let recorded = row.size_mtime_seen.as_deref().and_then(Stamp::parse);
+        let p = path.to_path_buf();
+        let verdict =
+            match tokio::task::spawn_blocking(move || sweep::stat_verdict(&p, recorded)).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(path = %path.display(), error = %e, "stat task failed");
+                    return;
+                }
+            };
+        let current = match verdict {
+            StatVerdict::Missing | StatVerdict::Unreadable(_) => return,
+            StatVerdict::Same => None,
+            StatVerdict::Drifted(s) => Some(s),
+        };
+        let same_bytes = match current {
+            None => true,
+            Some(s) if s.size as i64 != row.byte_size => false,
+            Some(_) => self.file_matches(row, path).await,
+        };
+        if same_bytes {
+            match land_candidate(&self.ctx, &self.node, row, path).await {
+                Ok(Landing::Landed { from, to }) => {
+                    if from != to {
+                        ev.push(StorageEvent::StateChanged {
+                            project_id: row.project_id.clone(),
+                            frame_uuid: row.frame_uuid.clone(),
+                            from,
+                            to,
+                        });
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path = %path.display(), "re-included frame could not be re-seeded; stays wanted")
+                }
+                Err(e) => {
+                    tracing::error!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "re-included frame could not be re-adopted")
+                }
+            }
+            return;
+        }
+        let Some(current) = current else { return };
+        self.content_changed(row, &path.to_string_lossy(), &current, ev)
+            .await;
+    }
+
+    /// Moves the watcher did not see: before removals are ruled, walk the
+    /// root for frame files no row references whose size matches a removed
+    /// frame, and re-adopt them by hash (fix round 1).
+    async fn adopt_unseen_moves(
+        &mut self,
+        removed: &[LocalFrameRow],
+        now: Instant,
+        ev: &mut Vec<StorageEvent>,
+    ) {
+        let sizes: std::collections::HashSet<i64> = removed
+            .iter()
+            .filter(|r| matches!(r.local_state, LocalState::Held | LocalState::OwnHeld))
+            .filter(|r| {
+                r.landed_path
+                    .as_deref()
+                    .is_some_and(|p| !Path::new(p).exists())
+            })
+            .map(|r| r.byte_size)
+            .collect();
+        if sizes.is_empty() {
+            return;
+        }
+        let root = self.root.clone();
+        let walked = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for entry in walkdir::WalkDir::new(&root)
+                .into_iter()
+                .filter_entry(|e| e.file_name() != ".athenaeum")
+            {
+                match entry {
+                    Ok(e) if e.file_type().is_file() => {
+                        let path = e.path();
+                        if !crate::scanner::is_frame_file(path) || watch::is_ignored(&root, path) {
+                            continue;
+                        }
+                        if e.metadata()
+                            .is_ok_and(|m| sizes.contains(&(m.len() as i64)))
+                        {
+                            out.push(path.to_path_buf());
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(path = %root.display(), error = %e, "walk for unseen moves failed on one entry")
+                    }
+                }
+            }
+            out
+        })
+        .await;
+        let candidates = match walked {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "walk for unseen moves failed");
+                return;
+            }
+        };
+        let mut adopted = 0usize;
+        for path in candidates {
+            self.pump(now);
+            let known = db(&self.ctx).and_then(|d| {
+                Ok(frames_db::find_by_landed_path(
+                    &d.conn(),
+                    &path.to_string_lossy(),
+                )?)
+            });
+            match known {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(path = %path.display(), error = %e, "unseen-move candidate could not be looked up");
+                    continue;
+                }
+            }
+            if self.readopt(&path, now, ev).await {
+                adopted += 1;
+            }
+        }
+        if adopted > 0 {
+            tracing::info!(
+                count = adopted,
+                "moves the watcher did not see re-adopted before ruling deletions"
+            );
+        }
     }
 }
 
@@ -1090,12 +1483,6 @@ fn checked_state(s: LocalState) -> bool {
     )
 }
 
-fn is_frame_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| FRAME_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-}
-
 async fn with_frame_tx<T>(
     ctx: &ServiceContext,
     row: &LocalFrameRow,
@@ -1103,13 +1490,28 @@ async fn with_frame_tx<T>(
 ) -> Result<Option<T>, ApiError> {
     let lock = crate::api::collab_exchange::project_disk_lock(ctx, &row.project_id)?;
     let _guard = lock.lock().await;
+    frame_tx_locked(ctx, row, f)
+}
+
+/// [`with_frame_tx`] for a caller that already holds the project's disk
+/// lock. `BEGIN IMMEDIATE`; the row must still match on state, landed path,
+/// content version and stamp.
+fn frame_tx_locked<T>(
+    ctx: &ServiceContext,
+    row: &LocalFrameRow,
+    f: impl FnOnce(&rusqlite::Transaction<'_>) -> anyhow::Result<Option<T>>,
+) -> Result<Option<T>, ApiError> {
     let db = db(ctx)?;
-    let conn = db.conn();
-    let tx = conn.unchecked_transaction()?;
+    let mut conn = db.conn();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let Some(cur) = frames_db::get(&tx, &row.project_id, &row.frame_uuid)? else {
         return Ok(None);
     };
-    if cur.local_state != row.local_state || cur.landed_path != row.landed_path {
+    if cur.local_state != row.local_state
+        || cur.landed_path != row.landed_path
+        || cur.content_version != row.content_version
+        || cur.size_mtime_seen != row.size_mtime_seen
+    {
         tracing::debug!(
             project_id = %row.project_id,
             frame_uuid = %row.frame_uuid,
@@ -1188,9 +1590,9 @@ fn apply_user_event(
     ev: StateEvent,
 ) -> Result<usize, ApiError> {
     let db = db(ctx)?;
-    let conn = db.conn();
+    let mut conn = db.conn();
     require_project(&conn, project_id)?;
-    let tx = conn.unchecked_transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let rows = frames_db::list_by_state(&tx, project_id, &[from])?;
     let mut n = 0;
     for row in rows {
@@ -1292,6 +1694,11 @@ pub async fn resolve_changed_file_with(
     confirmed_delete: bool,
     trash: Arc<dyn Trash>,
 ) -> Result<ChangedOutcome, ApiError> {
+    // The state is validated under the project's disk lock BEFORE anything
+    // is trashed or deleted, and the lock is held through the state write
+    // (fix round 1).
+    let lock = crate::api::collab_exchange::project_disk_lock(ctx, project_id)?;
+    let _guard = lock.lock().await;
     let (row, path) = {
         let db = db(ctx)?;
         let conn = db.conn();
@@ -1318,7 +1725,16 @@ pub async fn resolve_changed_file_with(
             .or_else(|| row.landed_path.clone());
         (row, path.map(PathBuf::from))
     };
-    let (ev, trashed) = match action {
+    let ev = match action {
+        ChangedAction::Delete => StateEvent::DeleteChanged,
+        ChangedAction::RefetchOriginal => StateEvent::Refetch,
+    };
+    let Some(to) = transition(row.origin, row.local_state, ev) else {
+        return Err(ApiError::Conflict(format!(
+            "frame {frame_uuid} is not a changed file"
+        )));
+    };
+    let trashed = match action {
         ChangedAction::Delete => {
             if !confirmed_delete {
                 tracing::warn!(
@@ -1333,7 +1749,7 @@ pub async fn resolve_changed_file_with(
             if let Some(p) = &path {
                 remove_changed_file(p)?;
             }
-            (StateEvent::DeleteChanged, false)
+            false
         }
         ChangedAction::RefetchOriginal => {
             let trashed = match &path {
@@ -1358,18 +1774,13 @@ pub async fn resolve_changed_file_with(
                 }
                 _ => false,
             };
-            (StateEvent::Refetch, trashed)
+            trashed
         }
-    };
-    let Some(to) = transition(row.origin, row.local_state, ev) else {
-        return Err(ApiError::Conflict(format!(
-            "frame {frame_uuid} is not a changed file"
-        )));
     };
     if let Err(e) = node.unseed_project_frame(project_id, frame_uuid).await {
         tracing::debug!(project_id, frame_uuid, error = %e, "changed file: unseed skipped");
     }
-    let applied = with_frame_tx(ctx, &row, |tx| {
+    let applied = frame_tx_locked(ctx, &row, |tx| {
         live_db::unquarantine(tx, project_id, frame_uuid)?;
         tx.execute(
             "UPDATE project_frames_local SET rejected_size_mtime = NULL, size_mtime_seen = NULL, locally_declined = ?3
@@ -1379,7 +1790,6 @@ pub async fn resolve_changed_file_with(
         frames_db::set_local_state(tx, project_id, frame_uuid, to)?;
         Ok(Some(()))
     })
-    .await
     .map_err(|e| {
         tracing::error!(project_id, frame_uuid, error = %e, "changed file resolution could not be recorded");
         e
@@ -1452,15 +1862,16 @@ pub fn last_copy_report(
 /// the rows moved.
 pub fn apply_policy(ctx: &ServiceContext, project_id: &str) -> Result<usize, ApiError> {
     let db = db(ctx)?;
-    let conn = db.conn();
+    let mut conn = db.conn();
     let project = require_project(&conn, project_id)?;
     let allowed = crate::api::collab_exchange::role_allows_replication(
         &project.data_role,
         project.is_coordinator,
     );
     let policy = crate::api::collab_exchange::read_policy(&project);
-    let tx = conn.unchecked_transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut moved = 0usize;
+    let mut routes: Vec<PathBuf> = Vec::new();
     for row in frames_db::list_for_project(&tx, project_id)? {
         if row.origin != FrameOrigin::Replica {
             continue;
@@ -1474,18 +1885,28 @@ pub fn apply_policy(ctx: &ServiceContext, project_id: &str) -> Result<usize, Api
         } else {
             StateEvent::Excluded
         };
-        let Some(mut to) = transition(row.origin, row.local_state, ev) else {
+        if transition(row.origin, row.local_state, ev).is_none() {
             continue;
-        };
-        if ev == StateEvent::Reincluded {
-            to = frames_db::reinclude_target(&tx, &row)?;
         }
+        // No hashing inside this write transaction (fix round 1): a file
+        // that needs a hash is handed to the storage engine after commit.
+        let to = if ev == StateEvent::Reincluded {
+            let (to, route) = frames_db::reinclude(&tx, &row)?;
+            routes.extend(route);
+            to
+        } else {
+            frames_db::exclude_to_idle(&tx, &row)?
+        };
         if to != row.local_state {
-            frames_db::set_local_state(&tx, project_id, &row.frame_uuid, to)?;
             moved += 1;
         }
     }
     tx.commit()?;
+    for path in routes {
+        if !watch::route_touched(&path) {
+            tracing::debug!(project_id, path = %path.display(), "no storage engine watches this file; the re-included frame stays wanted");
+        }
+    }
     tracing::info!(
         project_id,
         count = moved,
@@ -1802,6 +2223,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_moved_file_is_readopted_by_hash_without_a_deletion() {
+        // > 16 KiB (imported by reference); the NEW path sorts first, so the
+        // store's path union reads the live file at once — held, not parked.
         let rig = ts::landed_rig(1).await;
         let (pid, uuid, path) = rig.frames[0].clone();
         let moved = path
@@ -1809,7 +2232,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap()
-            .join("renamed.fits");
+            .join("a-renamed.fits");
         std::fs::rename(&path, &moved).unwrap();
         let mut eng = rig.engine();
         let t0 = Instant::now();
@@ -1835,13 +2258,48 @@ mod tests {
             1,
             "only the landing's add: a move changes no servability"
         );
+        drop(conn);
+        let hash: iroh_blobs::Hash = r.blake3.parse().unwrap();
+        assert_eq!(
+            rig.node.collab_blob_health(hash).await.unwrap(),
+            crate::sharing::iroh::node::BlobHealth::Readable,
+            "served from the new path"
+        );
     }
 
-    /// Task 8 carry: a changed folder is walked — a renamed folder re-adopts
-    /// every frame inside it.
+    /// Poll until the collab store dropped `blake3`'s entry (a test GC gate
+    /// is open), within 20 s.
+    async fn wait_collected(node: &SharedIrohNode, blake3: &str) {
+        let hash: iroh_blobs::Hash = blake3.parse().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while node.collab_blob_health(hash).await.unwrap()
+            != crate::sharing::iroh::node::BlobHealth::Missing
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "GC never dropped the entry"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn gc_gate() -> Arc<std::sync::atomic::AtomicBool> {
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::sharing::iroh::node::test_gc::arm(Some(Arc::clone(&gate)));
+        gate
+    }
+
+    /// Task 8 carry + fix round 1: a changed folder is walked. Renamed so the
+    /// OLD folder sorts first (`other` → `renamed-folder`), every > 16 KiB
+    /// frame hits the dead entry and is parked; once the collab GC dropped
+    /// the entries, the parked retry — one GC interval later — re-seeds
+    /// every frame from its new path.
     #[tokio::test]
-    async fn a_renamed_folder_is_walked_and_readopted() {
+    async fn a_renamed_folder_is_walked_parked_and_readopted_after_the_gc() {
+        use std::sync::atomic::Ordering;
+        let gate = gc_gate();
         let rig = ts::landed_rig(2).await;
+        crate::sharing::iroh::node::test_gc::arm(None);
         let dir = rig.frames[0].2.parent().unwrap().to_path_buf();
         let renamed = dir.parent().unwrap().join("renamed-folder");
         std::fs::rename(&dir, &renamed).unwrap();
@@ -1851,9 +2309,40 @@ mod tests {
         eng.on_signal(FsSignal::Touched(renamed.clone()), t0);
         eng.tick(t0 + AGG, &Holders(2)).await;
         eng.tick(t0 + AGG + SETTLE, &Holders(2)).await;
+        for (pid, uuid, _) in &rig.frames {
+            let r = row(&rig.ctx, pid, uuid);
+            assert!(
+                r.local_state == LocalState::Wanted && r.awaiting_gc,
+                "parked: {r:?}"
+            );
+        }
+        let retry_at = eng.next_parked_retry.expect("a parked retry is scheduled");
+        assert!(eng.next_deadline() <= retry_at);
+        assert!(retry_at >= t0 + AGG + PARKED_RETRY_AFTER);
+        gate.store(true, Ordering::SeqCst);
+        for (pid, uuid, _) in &rig.frames {
+            wait_collected(&rig.node, &row(&rig.ctx, pid, uuid).blake3).await;
+        }
+        gate.store(false, Ordering::SeqCst);
+        let ev = eng.tick(retry_at, &Holders(2)).await;
+        assert!(
+            ev.iter()
+                .filter(|e| matches!(
+                    e,
+                    StorageEvent::StateChanged {
+                        to: LocalState::Held,
+                        ..
+                    }
+                ))
+                .count()
+                == 2,
+            "{ev:?}"
+        );
+        assert!(eng.next_parked_retry.is_none());
         for (pid, uuid, path) in &rig.frames {
             let r = row(&rig.ctx, pid, uuid);
             assert_eq!(r.local_state, LocalState::Held);
+            assert!(!r.awaiting_gc);
             let want = renamed.join(path.file_name().unwrap());
             assert_eq!(
                 r.landed_path.as_deref(),
@@ -1977,6 +2466,241 @@ mod tests {
                 crate::db::collab_live::ClaimOp::Remove
             ],
             "the landing's add, then one rm: a parked frame is not claimed"
+        );
+        drop(conn);
+
+        // a new version while parked is fetched, never left parked
+        rig.hub.update_frame(ts::PID, "big", |f| {
+            f.content_version = 2;
+            f.blake3 = "f".repeat(64);
+        });
+        let v = rig.hub.frame(ts::PID, "big").unwrap();
+        frames_db::upsert_from_manifest(&crate::api::db(&rig.ctx).unwrap().conn(), ts::PID, &v)
+            .unwrap();
+        let r = row(&rig.ctx, ts::PID, "big");
+        assert!(
+            r.local_state == LocalState::Wanted && !r.awaiting_gc,
+            "{r:?}"
+        );
+        let need =
+            crate::api::collab_exchange::frame_need(&[r], &Default::default(), true, true, false);
+        assert_eq!(need.len(), 1, "the new version is in the need set");
+    }
+
+    /// C10 + fix round 1: a dead entry kept alive by an identical sibling's
+    /// tag. The sibling reads through the same dead entry, so the retry
+    /// parks it too; once the GC dropped the entry, both are re-seeded, each
+    /// from its own path.
+    #[tokio::test]
+    async fn a_dead_entry_shared_with_an_identical_frame_parks_both_until_the_gc() {
+        use std::sync::atomic::Ordering;
+        let gate = gc_gate();
+        let rig = ts::landed_rig(0).await;
+        crate::sharing::iroh::node::test_gc::arm(None);
+        let big: Vec<u8> = (0..40 * 1024u32).map(|i| (i % 241) as u8).collect();
+        let a = rig.root.join("m31").join("a").join("x.fits");
+        let b = rig.root.join("m31").join("b").join("y.fits");
+        ts::land_frame(&rig.ctx, &rig.hub, &rig.node, "fa", &a, &big).await;
+        ts::land_frame(&rig.ctx, &rig.hub, &rig.node, "fb", &b, &big).await;
+        let moved = rig.root.join("m31").join("z.fits");
+        std::fs::rename(&a, &moved).unwrap();
+        let mut eng = rig.engine();
+        let t0 = Instant::now();
+        eng.on_signal(FsSignal::Touched(a.clone()), t0);
+        eng.on_signal(FsSignal::Touched(moved.clone()), t0);
+        // the start sweep's parked retry runs in the same tick as the move:
+        // fa parks, its entry is dead and pinned by fb's tag, so fb parks too
+        let ev = eng.tick(t0 + AGG, &Holders(2)).await;
+        assert!(row(&rig.ctx, ts::PID, "fa").awaiting_gc, "fa parked");
+        let fb = row(&rig.ctx, ts::PID, "fb");
+        assert!(
+            fb.local_state == LocalState::Wanted && fb.awaiting_gc,
+            "the sibling is parked too: {ev:?}"
+        );
+        assert_eq!(
+            fb.landed_path.as_deref(),
+            Some(b.to_string_lossy().as_ref())
+        );
+        gate.store(true, Ordering::SeqCst);
+        wait_collected(&rig.node, &fb.blake3).await;
+        gate.store(false, Ordering::SeqCst);
+        let retry_at = eng.next_parked_retry.expect("still parked, retried again");
+        eng.tick(retry_at, &Holders(2)).await;
+        let fa = row(&rig.ctx, ts::PID, "fa");
+        let fb = row(&rig.ctx, ts::PID, "fb");
+        assert_eq!(
+            (fa.local_state, fb.local_state),
+            (LocalState::Held, LocalState::Held)
+        );
+        assert_eq!(
+            fa.landed_path.as_deref(),
+            Some(moved.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            fb.landed_path.as_deref(),
+            Some(b.to_string_lossy().as_ref())
+        );
+        let hash: iroh_blobs::Hash = fa.blake3.parse().unwrap();
+        assert_eq!(
+            rig.node.collab_blob_health(hash).await.unwrap(),
+            crate::sharing::iroh::node::BlobHealth::Readable
+        );
+    }
+
+    /// Fix round 1: a move the watcher did not see (degraded) is re-adopted
+    /// by the walk that runs before removals are ruled — no deletion choice,
+    /// no "lost everywhere", no re-fetch.
+    #[tokio::test]
+    async fn a_folder_renamed_unseen_in_degraded_mode_is_readopted_not_deleted() {
+        let rig = ts::landed_rig(12).await;
+        let dir = rig.frames[0].2.parent().unwrap().to_path_buf();
+        // the new name sorts first: re-seeded at once (the parked path has
+        // its own tests)
+        let renamed = dir.parent().unwrap().join("0-renamed");
+        std::fs::rename(&dir, &renamed).unwrap();
+        let mut eng = rig.engine();
+        let (_quiet_tx, quiet_rx) = tokio::sync::mpsc::unbounded_channel();
+        eng.fs_rx = quiet_rx; // the watcher sees nothing
+        eng.network = true; // → degraded
+        let t0 = Instant::now();
+        let mut ev = eng.tick(t0 + AGG, &Holders(0)).await; // start sweep: all missing
+        assert!(eng.degraded());
+        ev.extend(eng.tick(t0 + AGG * 2, &Holders(0)).await);
+        ev.extend(eng.tick(t0 + AGG * 2 + SETTLE, &Holders(0)).await);
+        assert!(
+            !ev.iter().any(|e| matches!(
+                e,
+                StorageEvent::DeletionChoice { .. } | StorageEvent::FrameLost { .. }
+            )),
+            "{ev:?}"
+        );
+        for (pid, uuid, path) in &rig.frames {
+            let r = row(&rig.ctx, pid, uuid);
+            assert_eq!(r.local_state, LocalState::Held, "{uuid}");
+            let want = renamed.join(path.file_name().unwrap());
+            assert_eq!(
+                r.landed_path.as_deref(),
+                Some(want.to_string_lossy().as_ref())
+            );
+        }
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        assert!(crate::db::collab_live::deletions_since(&conn, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Fix round 1 (a): a re-included frame that was NOT seeded when it was
+    /// excluded (it went missing, was re-fetch-ruled, then excluded; the
+    /// file came back from the trash) is never held on a stat alone — it
+    /// stays wanted, claims nothing, and the engine re-adopts it by hash.
+    #[tokio::test]
+    async fn a_reincluded_unseeded_frame_is_readopted_not_held_on_a_stat() {
+        let rig = ts::landed_rig(1).await;
+        let (pid, uuid, path) = rig.frames[0].clone();
+        let bytes = std::fs::read(&path).unwrap();
+        let stamp_before = row(&rig.ctx, &pid, &uuid).size_mtime_seen;
+        std::fs::remove_file(&path).unwrap();
+        let mut eng = rig.engine();
+        let t0 = Instant::now();
+        eng.on_signal(FsSignal::Touched(path.clone()), t0);
+        eng.tick(t0 + AGG, &Holders(2)).await;
+        eng.tick(t0 + AGG + SETTLE, &Holders(2)).await;
+        assert_eq!(state(&rig.ctx, &pid, &uuid), LocalState::Wanted);
+        let narrow = r#"{"filters":["Ha"]}"#;
+        crate::db::collab::set_policy(&crate::api::db(&rig.ctx).unwrap().conn(), &pid, narrow)
+            .unwrap();
+        apply_policy(&rig.ctx, &pid).unwrap();
+        assert_eq!(state(&rig.ctx, &pid, &uuid), LocalState::Idle);
+        // restored from the trash, same bytes, same mtime as recorded
+        std::fs::write(&path, &bytes).unwrap();
+        if let Some(st) = stamp_before.as_deref().and_then(Stamp::parse) {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(st.mtime as u64))
+                .unwrap();
+        }
+        let adds_before =
+            crate::db::collab_live::my_claims(&crate::api::db(&rig.ctx).unwrap().conn(), &pid)
+                .unwrap()
+                .len();
+        crate::db::collab::set_policy(&crate::api::db(&rig.ctx).unwrap().conn(), &pid, "{}")
+            .unwrap();
+        apply_policy(&rig.ctx, &pid).unwrap();
+        assert_eq!(
+            state(&rig.ctx, &pid, &uuid),
+            LocalState::Wanted,
+            "never held on a stat alone"
+        );
+        assert_eq!(
+            crate::db::collab_live::my_claims(&crate::api::db(&rig.ctx).unwrap().conn(), &pid)
+                .unwrap()
+                .len(),
+            adds_before,
+            "claims nothing it cannot serve"
+        );
+        // the routed file: re-adopted by hash, seeded, held
+        let t1 = t0 + AGG + SETTLE + Duration::from_secs(1);
+        eng.tick(t1, &Holders(2)).await;
+        eng.tick(t1 + AGG, &Holders(2)).await;
+        assert_eq!(state(&rig.ctx, &pid, &uuid), LocalState::Held);
+        assert_eq!(
+            rig.node
+                .project_frame_tags(&pid, &uuid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Fix round 1 (b), I9/L5: a held frame excluded (seeded, stamp kept),
+    /// edited while idle, then re-included: not held, not re-fetched over —
+    /// quarantined by the engine.
+    #[tokio::test]
+    async fn a_reincluded_frame_edited_while_idle_is_quarantined() {
+        let rig = ts::landed_rig(1).await;
+        let (pid, uuid, path) = rig.frames[0].clone();
+        let mut eng = rig.engine();
+        crate::db::collab::set_policy(
+            &crate::api::db(&rig.ctx).unwrap().conn(),
+            &pid,
+            r#"{"filters":["Ha"]}"#,
+        )
+        .unwrap();
+        apply_policy(&rig.ctx, &pid).unwrap();
+        assert_eq!(state(&rig.ctx, &pid, &uuid), LocalState::Idle);
+        ts::overwrite_same_size(&path);
+        let edited = std::fs::read(&path).unwrap();
+        crate::db::collab::set_policy(&crate::api::db(&rig.ctx).unwrap().conn(), &pid, "{}")
+            .unwrap();
+        apply_policy(&rig.ctx, &pid).unwrap();
+        assert_eq!(state(&rig.ctx, &pid, &uuid), LocalState::Wanted);
+        let t0 = Instant::now();
+        let mut ev = eng.tick(t0, &Holders(2)).await;
+        ev.extend(eng.tick(t0 + AGG, &Holders(2)).await);
+        assert_eq!(
+            state(&rig.ctx, &pid, &uuid),
+            LocalState::Quarantined,
+            "{ev:?}"
+        );
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, StorageEvent::Quarantined { .. })),
+            "{ev:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            edited,
+            "the edit is untouched"
+        );
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        assert_eq!(
+            crate::db::collab_live::list_quarantine(&conn, &pid)
+                .unwrap()
+                .len(),
+            1
         );
     }
 

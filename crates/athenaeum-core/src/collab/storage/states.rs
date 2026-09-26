@@ -6,9 +6,13 @@
 //! Two edges need a caller-side refinement the table cannot make on its own:
 //!
 //! - `(Idle, Reincluded)` answers `Wanted`; the caller moves the row to
-//!   `Held` instead when stat + hash confirm the landed file is still the
-//!   current version (spec §9.4 "Idle ──re-included──▶ Held or Wanted (stat +
-//!   hash decide)") — see `db::collab_frames::reinclude_target`.
+//!   `Held` instead when the row is known to be seeded and its landed file
+//!   stats the same (spec §9.4 "Idle ──re-included──▶ Held or Wanted (stat +
+//!   hash decide)"); otherwise the storage engine hashes the file off the
+//!   write path — see `db::collab_frames::reinclude`.
+//! - `(Wanted, ContentChanged)` answers `Quarantined`: the engine raises it
+//!   only for a re-included frame whose verified file (it still carries the
+//!   stamp recorded at this version) was edited while it was idle (I9, L5).
 //! - `(Quarantined, StampDrift | FileBack)` answers `Held`: the edited bytes
 //!   were put back (the hash matches the current version again). The caller
 //!   only raises those events after a hash check.
@@ -80,6 +84,8 @@ pub fn transition(origin: FrameOrigin, from: LocalState, ev: StateEvent) -> Opti
         (AwaitingChoice, StopKeeping) => Some(NotKept),
         (Held, StampDrift) => Some(Held),
         (Held, ContentChanged) => Some(Quarantined),
+        // fix round 1: a re-included, verified file edited while idle
+        (Wanted, ContentChanged) => Some(Quarantined),
         (Quarantined, Refetch) => Some(Wanted),
         (Quarantined, DeleteChanged) => Some(NotKept),
         (NotKept, KeepAgain) => Some(Wanted),
@@ -134,6 +140,8 @@ mod tests {
             ),
             (Held, StampDrift, Some(Held)),
             (Held, ContentChanged, Some(Quarantined)),
+            (Wanted, ContentChanged, Some(Quarantined)), // re-included, edited while idle (fix round 1)
+            (Missing, ContentChanged, None),
             (Quarantined, Refetch, Some(Wanted)),
             (Quarantined, DeleteChanged, Some(NotKept)),
             (

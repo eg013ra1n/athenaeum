@@ -264,9 +264,11 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LocalFrameRow> {
 ///    `awaiting_choice`/`idle` keep their state (L5, L6);
 /// 2. then a publish-state move — published ∧ accepted lost → `Excluded`
 ///    (`wanted`/`held`/`awaiting_choice`/`missing` → `idle`: file kept, not
-///    served, not fetched); regained → `Reincluded` (`idle` → `held` when
-///    stat + hash confirm the landed file, else `wanted`, via
-///    [`reinclude_target`]).
+///    served, not fetched; [`exclude_to_idle`]); regained → `Reincluded`
+///    (`idle` → `held` only for a known-seeded row whose file stats the
+///    same, else `wanted` with its landed file handed to the storage engine
+///    — [`reinclude`]). Nothing is hashed here: this runs in the caller's
+///    write transaction.
 pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWire) -> Result<()> {
     use crate::collab::storage::states::{transition, StateEvent};
 
@@ -358,10 +360,13 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
             }
         }
         if !same_bytes && prev.origin == FrameOrigin::Replica {
-            // New bytes: the recorded stamp describes the OLD content. A
-            // quarantined row keeps it — its file is the user's to resolve.
+            // New bytes: the recorded stamp describes the OLD content, and a
+            // dead store entry of the old hash no longer stands in the way
+            // of a fetch (fix round 1: a parked frame must not stay parked
+            // forever). A quarantined row keeps its stamp — its file is the
+            // user's to resolve.
             conn.execute(
-                "UPDATE project_frames_local SET size_mtime_seen = NULL
+                "UPDATE project_frames_local SET size_mtime_seen = NULL, awaiting_gc = 0
                  WHERE project_id = ?1 AND frame_uuid = ?2 AND local_state <> 'quarantined'",
                 params![project_id, v.frame_uuid],
             )?;
@@ -378,15 +383,20 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
             _ => None,
         };
         if let Some(ev) = ev {
-            if let Some(mut to) = transition(prev.origin, state, ev) {
-                if ev == StateEvent::Reincluded {
-                    let Some(row) = get(conn, project_id, &v.frame_uuid)? else {
-                        return Ok(());
-                    };
-                    to = reinclude_target(conn, &row)?;
-                }
+            if transition(prev.origin, state, ev).is_some() {
+                let Some(row) = get(conn, project_id, &v.frame_uuid)? else {
+                    return Ok(());
+                };
+                let to = if ev == StateEvent::Reincluded {
+                    let (to, route) = reinclude(conn, &row)?;
+                    if let Some(path) = route {
+                        route_to_engine(project_id, &v.frame_uuid, &path);
+                    }
+                    to
+                } else {
+                    exclude_to_idle(conn, &row)?
+                };
                 if to != state {
-                    set_local_state(conn, project_id, &v.frame_uuid, to)?;
                     tracing::debug!(
                         project_id,
                         frame_uuid = %v.frame_uuid,
@@ -401,54 +411,130 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
     Ok(())
 }
 
-/// Where a re-included (`idle`) replica goes (spec §9.4 "Idle ──re-included──▶
-/// Held or Wanted (stat + hash decide)"): `held` when its landed file still
-/// is the current version — the stat matches the recorded `size_mtime_seen`
-/// (a stamp is only ever recorded for verified, seeded bytes of the current
-/// content version, and cleared on a new-bytes version), or it drifted and
-/// the full-file xxh3 still equals the manifest's (the stamp is re-recorded)
-/// — else `wanted`. A row without a recorded stamp is `wanted`: its bytes
-/// were never verified at this version (an excluded frame adopted by path
-/// only), so it cannot claim a holding.
-pub fn reinclude_target(conn: &Connection, row: &LocalFrameRow) -> Result<LocalState> {
-    use crate::collab::storage::sweep::{stat_verdict, Stamp, StatVerdict};
-    let (Some(path), Some(seen)) = (row.landed_path.as_deref(), row.size_mtime_seen.as_deref())
-    else {
-        return Ok(LocalState::Wanted);
-    };
-    match stat_verdict(std::path::Path::new(path), Stamp::parse(seen)) {
-        StatVerdict::Same => Ok(LocalState::Held),
-        StatVerdict::Drifted(now) if now.size as i64 == row.byte_size => {
-            match crate::package::xxh3_full_file(std::path::Path::new(path)) {
-                Ok(h) if h == row.xxh3 => {
-                    set_size_mtime_seen(conn, &row.project_id, &row.frame_uuid, &now.encode())?;
-                    Ok(LocalState::Held)
-                }
-                Ok(_) => Ok(LocalState::Wanted),
-                Err(e) => {
-                    tracing::warn!(
-                        project_id = %row.project_id,
-                        frame_uuid = %row.frame_uuid,
-                        path,
-                        error = %format!("{e:#}"),
-                        "re-included frame could not be hashed; fetched again"
-                    );
-                    Ok(LocalState::Wanted)
-                }
-            }
-        }
-        StatVerdict::Unreadable(e) => {
-            tracing::warn!(
-                project_id = %row.project_id,
-                frame_uuid = %row.frame_uuid,
-                path,
-                error = %e,
-                "re-included frame could not be read; fetched again"
-            );
-            Ok(LocalState::Wanted)
-        }
-        StatVerdict::Drifted(_) | StatVerdict::Missing => Ok(LocalState::Wanted),
+/// Hand a re-included frame's landed file to the running storage engine,
+/// which re-adopts it (hash off the async runtime, seed, verify) or
+/// quarantines it when its bytes changed. No engine → the frame simply
+/// stays wanted.
+fn route_to_engine(project_id: &str, frame_uuid: &str, path: &std::path::Path) {
+    if !crate::collab::storage::watch::route_touched(path) {
+        tracing::debug!(
+            project_id,
+            frame_uuid,
+            path = %path.display(),
+            "no storage engine watches this file; the re-included frame stays wanted"
+        );
     }
+}
+
+/// Move a replica to `idle` (excluded / lost project / policy drop). A
+/// frame excluded from a SERVABLE state keeps its seed tags and its stamp —
+/// the stamp is this row's "known seeded" record, which [`reinclude`]
+/// trusts. One excluded from any other state was not seeded, so its stamp
+/// is cleared (fix round 1). Returns the new state.
+pub fn exclude_to_idle(conn: &Connection, row: &LocalFrameRow) -> Result<LocalState> {
+    use crate::collab::storage::states::{transition, StateEvent};
+    let Some(to) = transition(row.origin, row.local_state, StateEvent::Excluded) else {
+        return Ok(row.local_state);
+    };
+    if to != row.local_state {
+        set_local_state(conn, &row.project_id, &row.frame_uuid, to)?;
+    }
+    if !row.local_state.servable() {
+        conn.execute(
+            "UPDATE project_frames_local SET size_mtime_seen = NULL
+             WHERE project_id = ?1 AND frame_uuid = ?2",
+            params![row.project_id, row.frame_uuid],
+        )?;
+    }
+    Ok(to)
+}
+
+/// Re-include an `idle` replica (spec §9.4 "Idle ──re-included──▶ Held or
+/// Wanted (stat + hash decide)"), without hashing: this runs inside the
+/// caller's write transaction (fix round 1).
+///
+/// - `held` only for a row KNOWN to be seeded — a recorded stamp (kept only
+///   by an exclusion from a servable state), not parked (`awaiting_gc = 0`)
+///   — whose file still stats the same.
+/// - otherwise `wanted`, the stamp kept, and the landed file (when present)
+///   returned for the caller to hand to the storage engine AFTER its write,
+///   which re-adopts it by hash or quarantines it when the bytes changed.
+///
+/// `awaiting_gc` is cleared either way. Returns the new state and the path
+/// to route.
+pub fn reinclude(
+    conn: &Connection,
+    row: &LocalFrameRow,
+) -> Result<(LocalState, Option<std::path::PathBuf>)> {
+    use crate::collab::storage::states::{transition, StateEvent};
+    use crate::collab::storage::sweep::{stat_verdict, Stamp, StatVerdict};
+    if transition(row.origin, row.local_state, StateEvent::Reincluded).is_none() {
+        return Ok((row.local_state, None));
+    }
+    let path = row.landed_path.as_deref().map(std::path::PathBuf::from);
+    let known_seeded = row.size_mtime_seen.is_some() && !row.awaiting_gc;
+    let same = match (&path, known_seeded) {
+        (Some(p), true) => matches!(
+            stat_verdict(p, row.size_mtime_seen.as_deref().and_then(Stamp::parse)),
+            StatVerdict::Same
+        ),
+        _ => false,
+    };
+    let to = if same {
+        LocalState::Held
+    } else {
+        LocalState::Wanted
+    };
+    conn.execute(
+        "UPDATE project_frames_local SET awaiting_gc = 0 WHERE project_id = ?1 AND frame_uuid = ?2",
+        params![row.project_id, row.frame_uuid],
+    )?;
+    set_local_state(conn, &row.project_id, &row.frame_uuid, to)?;
+    let route = match (&path, same) {
+        (Some(p), false) if p.is_file() => Some(p.clone()),
+        _ => None,
+    };
+    Ok((to, route))
+}
+
+/// Whether any cached frame has exactly `byte_size` bytes — the cheap
+/// pre-filter before an unknown file is fully hashed (fix round 1).
+pub fn any_with_byte_size(conn: &Connection, byte_size: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM project_frames_local WHERE byte_size = ?1 LIMIT 1",
+            params![byte_size],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Frames parked over a dead collab-store entry (`awaiting_gc` on a
+/// `wanted`/`own_missing` row with a recorded path) — the storage engine's
+/// retry set (fix round 1).
+pub fn parked_rows(conn: &Connection) -> Result<Vec<LocalFrameRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM project_frames_local \
+         WHERE awaiting_gc = 1 AND landed_path IS NOT NULL \
+           AND local_state IN ('wanted', 'own_missing') ORDER BY project_id, frame_uuid"
+    ))?;
+    let rows = stmt
+        .query_map([], row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every cached frame (any project) with content hash `blake3` — the
+/// siblings a dead store entry takes down with it (C10, fix round 1).
+pub fn rows_with_blake3(conn: &Connection, blake3: &str) -> Result<Vec<LocalFrameRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM project_frames_local WHERE blake3 = ?1 ORDER BY project_id, frame_uuid"
+    ))?;
+    let rows = stmt
+        .query_map(params![blake3], row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Move a frame to `to`, keeping `on_disk` equal to "servable" and appending
@@ -1531,6 +1617,75 @@ mod tests {
             get(&c, "p1", "u2").unwrap().unwrap().local_state,
             LocalState::Wanted
         );
+    }
+
+    /// Fix round 1: a parked row (`awaiting_gc`) never stays parked across a
+    /// new version or a re-inclusion, and a parked or not-seeded row is
+    /// never held on a stat alone.
+    #[test]
+    fn parked_rows_are_released_by_a_new_version_or_a_reinclusion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("u1.fits");
+        std::fs::write(&f, vec![7u8; 100]).unwrap();
+        let stamp = crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(&f).unwrap());
+        let park = |c: &Connection, uuid: &str| {
+            c.execute(
+                "UPDATE project_frames_local SET awaiting_gc = 1, size_mtime_seen = ?2 WHERE frame_uuid = ?1",
+                params![uuid, stamp.encode()],
+            )
+            .unwrap();
+        };
+        let c = conn();
+        held(&c, "u1", &f.to_string_lossy());
+        set_local_state(&c, "p1", "u1", LocalState::Wanted).unwrap();
+        park(&c, "u1");
+        assert_eq!(parked_rows(&c).unwrap().len(), 1);
+
+        // a new version (new bytes) releases it
+        let mut v2 = view("u1", 2);
+        v2.content_version = 2;
+        v2.blake3 = "c".repeat(64);
+        upsert_from_manifest(&c, "p1", &v2).unwrap();
+        assert!(!get(&c, "p1", "u1").unwrap().unwrap().awaiting_gc);
+
+        // parked, excluded, re-included with a same-stat file: wanted, not
+        // held (it is not known to be seeded), and no longer parked
+        park(&c, "u1");
+        let mut out = v2.clone();
+        out.accepted = false;
+        upsert_from_manifest(&c, "p1", &out).unwrap();
+        assert_eq!(
+            get(&c, "p1", "u1").unwrap().unwrap().local_state,
+            LocalState::Idle
+        );
+        park(&c, "u1");
+        upsert_from_manifest(&c, "p1", &v2).unwrap();
+        let r = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(r.local_state, LocalState::Wanted);
+        assert!(!r.awaiting_gc);
+    }
+
+    #[test]
+    fn an_exclusion_from_a_non_servable_state_drops_the_seeded_record() {
+        let c = conn();
+        held(&c, "u1", "/c/m31/ann/u1.fits");
+        set_local_state(&c, "p1", "u1", LocalState::Wanted).unwrap();
+        let mut out = view("u1", 2);
+        out.accepted = false;
+        upsert_from_manifest(&c, "p1", &out).unwrap();
+        let r = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(r.local_state, LocalState::Idle);
+        assert!(r.size_mtime_seen.is_none(), "a wanted row was never seeded");
+        // from held: seeded, the stamp stays
+        held(&c, "u2", "/c/m31/ann/u2.fits");
+        let mut out = view("u2", 2);
+        out.accepted = false;
+        upsert_from_manifest(&c, "p1", &out).unwrap();
+        assert!(get(&c, "p1", "u2")
+            .unwrap()
+            .unwrap()
+            .size_mtime_seen
+            .is_some());
     }
 
     #[test]

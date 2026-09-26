@@ -922,9 +922,14 @@ pub(crate) async fn open_fs_store(dir: &Path) -> Result<Store> {
         interval: GC_INTERVAL,
         add_protected: None,
     });
+    // Tests: no GC task unless a test armed `test_gc`. The production
+    // interval (900 s) never elapses in a test, and the GC task holds a store
+    // handle, so the store's actor — and its multi-thread runtime, ~10 OS
+    // threads — would never exit: every node a test binds would leak them
+    // for the rest of the test process (collab v3 wave 3, Task 9 fix round 1).
     #[cfg(test)]
-    if let Some(gc) = test_gc::config_for_next_store() {
-        options.gc = Some(gc);
+    {
+        options.gc = test_gc::config_for_next_store();
     }
     let store: Store = FsStore::load_with_opts(db_path, options)
         .await
