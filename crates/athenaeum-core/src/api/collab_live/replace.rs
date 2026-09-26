@@ -534,6 +534,43 @@ pub(crate) enum Landing {
     Refused,
 }
 
+/// A fence-refused adoption's seed tag (Task 15 R4): dropped when it names
+/// a version the row no longer has — the GC then owns those bytes; a tag of
+/// the row's CURRENT version is the live one (a concurrent landing's, same
+/// name) and stays.
+async fn drop_superseded_seed_tag(
+    ctx: &ServiceContext,
+    node: &SharedIrohNode,
+    row: &LocalFrameRow,
+) {
+    let current = match crate::api::db(ctx).and_then(|d| {
+        Ok(crate::db::collab_frames::get(
+            &d.conn(),
+            &row.project_id,
+            &row.frame_uuid,
+        )?)
+    }) {
+        Ok(current) => current.map(|r| r.content_version),
+        Err(e) => {
+            tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "adopt by hash: re-reading the frame failed; its seed tag is kept");
+            return;
+        }
+    };
+    if current == Some(row.content_version) {
+        return;
+    }
+    let Some(store) = node.collab_store() else {
+        return;
+    };
+    let tag = crate::sharing::iroh::node::project_frame_tag(
+        &row.project_id,
+        &row.frame_uuid,
+        row.content_version,
+    );
+    crate::api::collab_exchange::drop_tag(&store, &tag).await;
+    tracing::debug!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, content_version = row.content_version, "adopt by hash: superseded seed tag dropped");
+}
+
 pub(crate) async fn land_candidate(
     ctx: &ServiceContext,
     node: &SharedIrohNode,
@@ -641,6 +678,7 @@ pub(crate) async fn land_candidate(
             path = %landed_str,
             "adopt by hash: the frame moved on meanwhile; not recorded"
         );
+        drop_superseded_seed_tag(ctx, node, row).await;
         return Ok(Landing::Refused);
     }
     if is_moved_class(row) {
@@ -1751,6 +1789,15 @@ mod tests {
         );
         assert_eq!(row.landed_path, None);
         assert_eq!(row.content_version, stale.content_version + 1);
+        assert!(
+            !node
+                .project_frame_tags(&pid, &uuid)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(v, _)| *v == stale.content_version),
+            "the refused adoption's tag of the superseded version is dropped (Task 15 R4)"
+        );
 
         // the current row (same bytes, so it still hashes to its blake3) adopts
         assert!(matches!(

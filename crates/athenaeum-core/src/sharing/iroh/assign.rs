@@ -613,25 +613,15 @@ pub(crate) fn is_refused_by_every_provider(e: &anyhow::Error) -> bool {
     e.downcast_ref::<RefusedByEveryProvider>().is_some()
 }
 
-/// Marks a live item as transferring for as long as it lives — set the
-/// moment a provider is claimed, cleared when the round ends however it
-/// ends (a `continue 'child` included).
-struct Transferring(Option<Arc<AtomicBool>>);
-
-impl Transferring {
-    fn start(flag: &Option<Arc<AtomicBool>>) -> Self {
-        if let Some(f) = flag {
-            f.store(true, Ordering::Release);
-        }
-        Self(flag.clone())
-    }
-}
-
-impl Drop for Transferring {
-    fn drop(&mut self) {
-        if let Some(f) = &self.0 {
-            f.store(false, Ordering::Release);
-        }
+/// A live item's "transferring" flag (`cut_at_yield` reads it): set the
+/// moment a provider is claimed, cleared ONLY where the item starts to wait
+/// — for a provider to appear, or on parked/busy providers (Task 15, T12
+/// minor). A round that ends in a hedge win or a fault and goes straight
+/// into the next round stays "transferring", so a yield never cuts an item
+/// whose blob is about to be complete (the hedge-win window).
+fn set_transferring(flag: &Option<Arc<AtomicBool>>, on: bool) {
+    if let Some(f) = flag {
+        f.store(on, Ordering::Release);
     }
 }
 
@@ -1597,6 +1587,7 @@ async fn run_child(
             // as long as it takes and without spending a round (spec §7.2: a
             // frame without providers sleeps and costs nothing); a fixed list
             // — or a live one whose sender is gone — never grows.
+            set_transferring(&transferring, false);
             if providers.changed().await {
                 continue;
             }
@@ -1640,18 +1631,34 @@ async fn run_child(
                     "every provider in backoff — waiting for the earliest"
                 );
             }
+            set_transferring(&transferring, false);
             let timer = providers.sleep_or_change(wait).await;
             if !busy && !timer {
                 // A live set changed before the backoff ran out: nothing was
                 // tried and nothing waited out, so the round is given back.
                 rounds -= 1;
             }
+            if busy && providers.is_live() && !excluded.is_empty() {
+                // A busy park ended (Task 15, T12 minor): a provider this
+                // item excluded after a refusal may serve again by now (a
+                // rehash cleared its mismatch, its storage came back) —
+                // without being seen absent from the live set in between.
+                // Ask it again rather than waiting on the busy one alone.
+                tracing::debug!(
+                    frame_uuid = index,
+                    blake3 = %hash,
+                    count = excluded.len(),
+                    "busy wait ended; refused providers asked again"
+                );
+                excluded.clear();
+            }
             continue;
         };
 
-        // From the claim to the end of this round the item is transferring;
-        // a yield cuts a live item that is not (see `cut_at_yield`).
-        let _transferring = Transferring::start(&transferring);
+        // From the claim on, the item is transferring until it next waits
+        // (see `set_transferring`); a yield cuts a live item that is not
+        // (see `cut_at_yield`).
+        set_transferring(&transferring, true);
         let provider = claim.provider();
         (opts.telemetry)(ProviderEvent::Trying(*provider.as_bytes()));
         let started = Instant::now();

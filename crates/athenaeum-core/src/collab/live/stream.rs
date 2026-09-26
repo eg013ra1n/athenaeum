@@ -154,8 +154,16 @@ pub async fn pump(
                             tracing::debug!(kind = %n, "unknown event ignored")
                         }
                         Ok(ev) => {
-                            if tx.send(ev).await.is_err() {
-                                return StreamEnd::ReceiverGone;
+                            // A full channel (a busy runtime) must not hold
+                            // the stream past a cancel (Task 15 R1): the
+                            // send races the cancel.
+                            tokio::select! {
+                                sent = tx.send(ev) => {
+                                    if sent.is_err() {
+                                        return StreamEnd::ReceiverGone;
+                                    }
+                                }
+                                _ = cancel.changed() => return StreamEnd::Cancelled,
                             }
                         }
                         // `hello` re-establishes the session id and every
@@ -248,6 +256,34 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), pumping)
                 .await
                 .unwrap()
+                .unwrap(),
+            StreamEnd::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_ends_the_pump_while_a_send_is_blocked() {
+        // Two events, a channel of one, nobody reading: the second send
+        // blocks. A cancel must still end the pump (Task 15 R1).
+        let body = concat!(
+            "event: versions\n",
+            "data: {\"p1\":[1,2]}\n\n",
+            "event: versions\n",
+            "data: {\"p1\":[3,4]}\n\n",
+        );
+        let base = serve_fixed_body(body).await;
+        let client = stream_http_client();
+        let resp = open(&client, &base, "irrelevant").await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let pumping = tokio::spawn(async move { pump(resp, &tx, &mut cancel).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!pumping.is_finished(), "the second send is blocked");
+        cancel_tx.send(true).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), pumping)
+                .await
+                .expect("the pump observes the cancel while a send is blocked")
                 .unwrap(),
             StreamEnd::Cancelled
         );

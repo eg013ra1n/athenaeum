@@ -220,7 +220,9 @@ async fn unseed(node: &SharedIrohNode, project_id: &str, frame_uuid: &str) {
 
 /// The storage may be written for a fetch right now (§9.1); logged when not.
 fn storage_fetching(env: &LandingEnv<'_>, row: &LocalFrameRow) -> bool {
-    let state = env.guard.check_now();
+    // The marker check without the write probe (Task 15 R4): the live
+    // session's storage engine runs the full check every few seconds.
+    let state = env.guard.check_marker();
     if state.fetching() {
         return true;
     }
@@ -505,7 +507,7 @@ pub async fn land_frame(
             unseed(env.node, pid, uuid).await;
             match db(env.ctx) {
                 Ok(db) => {
-                    if let Err(e) = frames_db::set_missing(&db.conn(), pid, uuid, true) {
+                    if let Err(e) = frames_db::set_awaiting_gc(&db.conn(), pid, uuid, true) {
                         tracing::warn!(project_id = pid, frame_uuid = uuid, error = %format!("{e:#}"), "mark frame awaiting GC failed");
                     }
                 }
@@ -801,6 +803,45 @@ pub async fn link_identical(env: &LandingEnv<'_>, row: &LocalFrameRow, src: &Pat
             fail(format!("record landing: {e:#}"))
         }
     }
+}
+
+/// Remove every `<target>.athtmp` a crash or kill left under the
+/// Collaboration root mid-landing (Task 15, the T11 M1 carry). Run by the
+/// live session when it mounts the store, before any landing of the session
+/// starts — so no live temp file is ever touched. `.athenaeum` (the store,
+/// the marker) is never walked. Returns how many files went.
+pub fn sweep_orphaned_athtmp(root: &Path) -> usize {
+    let mut removed = 0usize;
+    let walker = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || e.file_name() != ".athenaeum");
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(path = %root.display(), error = %e, "landing temp sweep: a folder could not be read");
+                continue;
+            }
+        };
+        let is_temp = entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|x| x == blobs::ATHTMP_EXT);
+        if !is_temp {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                tracing::warn!(path = %entry.path().display(), error = %e, "landing temp sweep: an orphaned temp file could not be removed")
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(path = %root.display(), count = removed, "orphaned landing temp files removed");
+    }
+    removed
 }
 
 /// A landed, on-disk frame of the same project with this content (P24).
@@ -1265,6 +1306,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rig.row(1).local_state, LocalState::Held);
+    }
+
+    /// Task 15 (T11 M1 carry): the mount-time sweep removes orphaned
+    /// `.athtmp` files anywhere under the root, never under `.athenaeum`,
+    /// and never a frame file.
+    #[test]
+    fn the_mount_sweep_removes_orphaned_temp_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("m31").join("pub");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(root.join(".athenaeum").join("blobs")).unwrap();
+        std::fs::write(dir.join("a.fits"), b"frame").unwrap();
+        std::fs::write(dir.join("a.fits.athtmp"), b"half").unwrap();
+        std::fs::write(root.join("b.fits.athtmp"), b"half").unwrap();
+        std::fs::write(
+            root.join(".athenaeum").join("blobs").join("x.athtmp"),
+            b"store",
+        )
+        .unwrap();
+        assert_eq!(sweep_orphaned_athtmp(root), 2);
+        assert!(dir.join("a.fits").exists(), "a frame file is never touched");
+        assert!(
+            root.join(".athenaeum")
+                .join("blobs")
+                .join("x.athtmp")
+                .exists(),
+            ".athenaeum is never walked"
+        );
+        assert_eq!(athtmp_files(root), 1);
+        assert_eq!(sweep_orphaned_athtmp(root), 0, "idempotent");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -462,7 +462,22 @@ impl Holdings {
         }) {
             Ok(p) => p,
             Err(error) => {
-                tracing::warn!(%error, "reading the claim outbox failed; flush retried next tick");
+                // Task 15 R1: every due clock and owed report waits at least
+                // the back-off floor — left in the past, `next_deadline`
+                // would wake the session loop again at once, forever.
+                let floor = now + crate::collab::live::backoff::BACKOFF_FLOOR;
+                let waiting: Vec<String> = self
+                    .clocks
+                    .iter()
+                    .filter(|(_, c)| c.deadline().is_some())
+                    .map(|(pid, _)| pid.clone())
+                    .chain(self.needs_full.iter().cloned())
+                    .collect();
+                for pid in waiting {
+                    let r = self.backoffs.entry(pid).or_default();
+                    r.retry_at = Some(r.retry_at.map_or(floor, |t| t.max(floor)));
+                }
+                tracing::warn!(%error, retry_in_ms = crate::collab::live::backoff::BACKOFF_FLOOR.as_millis() as u64, "reading the claim outbox failed; flush retried after the back-off floor");
                 return vec![];
             }
         };
@@ -1372,6 +1387,30 @@ mod tests {
             h.next_deadline(),
             Some(h.last_digest_check + DIGEST_CHECK_EVERY),
             "only the hourly check is left"
+        );
+    }
+
+    /// Task 15 R1: an outbox that cannot be read pushes every due deadline
+    /// past the back-off floor — never a deadline in the past a loop would
+    /// spin on.
+    #[tokio::test]
+    async fn an_unreadable_outbox_pushes_the_deadlines_past_the_floor() {
+        let (_t, ctx, _hub, mut h) = rig().await;
+        let t0 = Instant::now();
+        hold(&ctx, "u1");
+        h.note_append("p1", t0);
+        let late = t0 + outbox::DEFAULT_FLUSH * 5;
+        crate::api::db(&ctx)
+            .unwrap()
+            .conn()
+            .execute("DROP TABLE collab_outbox", [])
+            .unwrap();
+        assert!(h.flush_due(late).await.is_empty());
+        let d = h.next_deadline().unwrap();
+        assert!(
+            d >= late + crate::collab::live::backoff::BACKOFF_FLOOR,
+            "the due flush waits the floor: {:?} after the tick",
+            d.checked_duration_since(late)
         );
     }
 

@@ -63,7 +63,7 @@ pub const PARKED_RETRY_MARGIN: Duration = Duration::from_secs(60);
 /// is collected once its seed tags are gone, P31) plus
 /// [`PARKED_RETRY_MARGIN`].
 pub const PARKED_RETRY_AFTER: Duration = Duration::from_secs(
-    crate::sharing::iroh::GC_INTERVAL.as_secs() + PARKED_RETRY_MARGIN.as_secs(),
+    crate::sharing::iroh::COLLAB_GC_INTERVAL.as_secs() + PARKED_RETRY_MARGIN.as_secs(),
 );
 
 /// Who else holds a frame's CURRENT version, from the holder map (Task 6).

@@ -949,6 +949,24 @@ pub fn set_missing(
     Ok(())
 }
 
+/// Park (`on`) or release a frame waiting for the collab store's GC to drop
+/// a dead entry (P20): nothing else moves — a `wanted` row stays `wanted`,
+/// and the need set skips it while `awaiting_gc = 1` (Task 15, replaces the
+/// wave-2 `set_missing(.., awaiting_gc = true)` in the landing). Returns the
+/// rows touched.
+pub fn set_awaiting_gc(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    on: bool,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local SET awaiting_gc = ?3, updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2",
+        params![project_id, frame_uuid, on],
+    )?)
+}
+
 /// Record a new `size:mtime` for a landed file whose content re-hashed to
 /// the recorded `xxh3` (disk truth, spec §5.5: touched but identical).
 /// Column-targeted; returns the rows touched.

@@ -1418,6 +1418,9 @@ pub(crate) async fn refresh_projects_reporting(
             )
             .map_err(internal)?;
             crate::db::collab::mark_lost(&conn, lost).map_err(internal)?;
+            // Task 15 R1: a lost project is never reported again — its claim
+            // set, outbox and holder map go with it (a re-join reloads them).
+            crate::db::collab_live::clear_project_live_state(&conn, lost).map_err(internal)?;
             crate::api::collab_exchange::cancel_project_fetch(ctx, lost);
             tracing::info!(project_id = %lost, count = removed, "project lost: marked, replica frame rows deleted");
         }
@@ -5093,6 +5096,15 @@ pub(crate) mod tests {
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
             seed_publish_project(&conn, "p-gone", "[]");
+            // Task 15 R1: a claim and an unsent report of the project.
+            crate::db::collab_live::add_implicit_claim(&conn, "p-gone", "f-a", 1).unwrap();
+            crate::db::collab_live::record_claim_change(
+                &conn,
+                "p-gone",
+                "f-b",
+                crate::db::collab_live::ClaimOp::Add { content_version: 1 },
+            )
+            .unwrap();
         }
         let collab_root = _tmp.path().join("Collab");
         let node = seed_tag_on_node(&ctx, &collab_root, "p-gone", "f-a").await;
@@ -5112,6 +5124,13 @@ pub(crate) mod tests {
             assert!(
                 crate::db::collab::list_projects(&conn).unwrap().is_empty(),
                 "and hidden from the project list"
+            );
+            assert!(
+                crate::db::collab_live::my_claims(&conn, "p-gone")
+                    .unwrap()
+                    .is_empty()
+                    && crate::db::collab_live::outbox_len(&conn, "p-gone").unwrap() == 0,
+                "a lost project's claims and unsent reports are dropped, never reported"
             );
         }
         assert!(

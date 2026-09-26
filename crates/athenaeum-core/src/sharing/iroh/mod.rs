@@ -119,6 +119,14 @@ pub(crate) fn package_tag(package_id: &PackageId) -> String {
 /// deliberately slack interval so a normal transfer never races collection.
 pub(crate) const GC_INTERVAL: Duration = Duration::from_secs(900);
 
+/// How often the COLLAB store's GC runs (Task 15, T9 ruling / P31): a
+/// deleted replica's dead entry is dropped at most this long after its seed
+/// tag went at settle, so a single delete re-fetches within settle + one
+/// interval. Every in-flight collab fetch holds its in-flight tag (P22), so
+/// a short interval never races a transfer. Measured cheap (see the Task 15
+/// report: a GC run over 5,000 entries).
+pub(crate) const COLLAB_GC_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Depth of an endpoint's inbound event channel. Control events are low volume;
 /// this comfortably holds bursts of announces/acks.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -493,7 +501,7 @@ fn request_is_payload_carrying(ranges: &ChunkRangesSeq) -> bool {
 /// today's behavior). The gate `Arc` is cloned out from under the lock BEFORE the
 /// predicate runs, so a gate that does blocking catalog I/O never holds the mutex
 /// across that work.
-fn connect_gate_admits(gate: &SharedConnectGate, from: &NodeId) -> bool {
+pub(crate) fn connect_gate_admits(gate: &SharedConnectGate, from: &NodeId) -> bool {
     let predicate = gate.lock().expect("connect_gate mutex poisoned").clone();
     match predicate {
         Some(g) => g(from),
@@ -2613,6 +2621,8 @@ pub(crate) struct CollabMount {
     pub(crate) root: PathBuf,
     pub(crate) store: Store,
     pub(crate) blobs: Arc<GatedBlobs>,
+    /// Ends the store's GC task once the store is shut down (Task 15 R4).
+    pub(crate) gc: node::StoreGc,
 }
 
 /// The node's collab-store slot. `None` ⇒ no Collaboration root mounted, and

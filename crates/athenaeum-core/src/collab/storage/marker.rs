@@ -211,6 +211,34 @@ impl StoreGuard {
         self.adoption.lock().expect("store guard poisoned").take()
     }
 
+    /// The marker check WITHOUT the write probe — a landing's precondition
+    /// (Task 15 R4: the live session owns ONE guard and no landing writes a
+    /// probe file). Path and marker as [`Self::check_now`]; writability as
+    /// the last full check found it (the storage engine runs one every few
+    /// seconds). With nothing recorded yet (an adoption is due) it falls
+    /// back to the full check.
+    pub fn check_marker(&self) -> StoreState {
+        let recorded = self.recorded.lock().expect("store guard poisoned").clone();
+        if recorded.is_none() {
+            return self.check_now();
+        }
+        let last = self.state();
+        let next = match scan_refusal(&self.root, recorded.as_ref()) {
+            Some(reason) => StoreState::Unavailable(reason),
+            None if last == StoreState::ReadOnly => StoreState::ReadOnly,
+            None => StoreState::Available,
+        };
+        if next != last {
+            // Only the unavailable direction is decided here; a store coming
+            // back is confirmed (probe included) by the next full check.
+            if let StoreState::Unavailable(_) = next {
+                tracing::warn!(path = %self.root.display(), state = ?next, "collaboration storage not available");
+                *self.state.write().expect("store guard poisoned") = next.clone();
+            }
+        }
+        next
+    }
+
     pub fn check_now(&self) -> StoreState {
         let recorded = self.recorded.lock().expect("store guard poisoned").clone();
         let next = match check_store(&self.root, recorded.as_ref(), &self.me) {

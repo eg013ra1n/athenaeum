@@ -53,7 +53,7 @@ use iroh_blobs::api::Store;
 use iroh_blobs::provider::events::EventSender;
 use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
-use iroh_blobs::store::GcConfig;
+use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::{Hash, HashAndFormat};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::{mpsc, Notify};
@@ -73,12 +73,12 @@ use super::pacer::UploadPacer;
 use super::proto::{self, Msg, OfferEntry};
 use super::telemetry::{peer_conn_path, TransportCounters};
 use super::{
-    blobs, build_router, collab_gated_blobs, hex32, provider_event_channel,
+    blobs, build_router, collab_gated_blobs, connect_gate_admits, hex32, provider_event_channel,
     spawn_collab_provider_events, spawn_conn_path_diagnostics, CollabMount, CollabSlotBlobs,
     ConnRegistry, ConnectGate, Delivery, EventSink, PresenceHook, ServeFileResolver,
     ServeRootResolver, SharedCollabSlot, SharedConnectGate, SharedPresenceHook, SharedResponder,
-    SharedServeOracle, StreamGauge, CONTROL_SEND_TIMEOUT, EVENT_CHANNEL_CAPACITY, GC_INTERVAL,
-    MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
+    SharedServeOracle, StreamGauge, COLLAB_GC_INTERVAL, CONTROL_SEND_TIMEOUT,
+    EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
 };
 
 /// Upper bound on the graceful `endpoint.close()` at shutdown (I1). A clean
@@ -780,6 +780,8 @@ pub struct SharedIrohNode {
     net: Mutex<NetLayer>,
     /// The single blob store shared by every role handle.
     store: Store,
+    /// Ends the personal store's GC task once the store is shut down.
+    store_gc: StoreGc,
     /// This endpoint's node id (== ed25519 public key bytes). Stable for the node's
     /// lifetime, so peers and history keep addressing this node by the same id.
     node_id: NodeId,
@@ -931,33 +933,106 @@ pub(crate) fn collab_store_dir(root: &Path) -> PathBuf {
 
 /// Open (creating the dir) a persistent blob store at `dir` — the one opener
 /// both of the node's stores use (the personal `<working_dir>/blobs` and the
-/// collab `<Collaboration root>/.athenaeum/blobs`, plan P1).
+/// collab `<Collaboration root>/.athenaeum/blobs`, plan P1) — with GC every
+/// [`GC_INTERVAL`] (the personal cadence). See [`open_fs_store_with_gc`].
+/// Tests only: production keeps the [`StoreGc`] to end the GC at shutdown.
+#[cfg(test)]
+pub(crate) async fn open_fs_store(dir: &Path) -> Result<Store> {
+    Ok(open_fs_store_with_gc(dir, GC_INTERVAL).await?.0)
+}
+
+/// Open a persistent blob store at `dir` with GC every `interval`, and the
+/// handle that ends that GC ([`StoreGc::close`]).
 ///
 /// Mirrors `FsStore::load`'s internals but with GC on (load() hardcodes gc:
-/// None, so released blobs would leak forever). Interval is slack (see
-/// `GC_INTERVAL`) so an in-flight transfer never races collection.
-pub(crate) async fn open_fs_store(dir: &Path) -> Result<Store> {
+/// None, so released blobs would leak forever). iroh-blobs 0.103's GC task
+/// holds a store handle and ends only when a run fails, so the store's actor
+/// — and its multi-thread runtime, ~10 OS threads — outlives every shutdown
+/// while the task waits out its interval (Task 9 fix round 1: a collab
+/// unmount/remount leaked one runtime each). Here the task's own tick is
+/// [`GC_TICK`] and the protect callback waits for the real `interval` OR
+/// [`StoreGc::close`]; after a close the next run meets the shut store,
+/// fails, and the task ends — dropping the last handle (Task 15 R4).
+pub(crate) async fn open_fs_store_with_gc(
+    dir: &Path,
+    interval: std::time::Duration,
+) -> Result<(Store, StoreGc)> {
     std::fs::create_dir_all(dir).with_context(|| format!("create blob dir {}", dir.display()))?;
     let db_path = dir.join("blobs.db");
+    let gc = StoreGc::default();
     let mut options = FsOptions::new(dir);
-    options.gc = Some(GcConfig {
-        interval: GC_INTERVAL,
-        add_protected: None,
-    });
-    // Tests: no GC task unless a test armed `test_gc`. The production
-    // interval (900 s) never elapses in a test, and the GC task holds a store
-    // handle, so the store's actor — and its multi-thread runtime, ~10 OS
-    // threads — would never exit: every node a test binds would leak them
-    // for the rest of the test process (collab v3 wave 3, Task 9 fix round 1).
+    options.gc = Some(gc.config(interval));
+    // Tests: no GC task unless a test armed `test_gc` (a gated 100 ms GC)
+    // or asked for the production GC on this thread — the production
+    // interval never elapses in a test, and every test would otherwise run
+    // a GC task per store it opens.
     #[cfg(test)]
     {
-        options.gc = test_gc::config_for_next_store();
+        options.gc = test_gc::config_for_next_store(options.gc.take());
     }
     let store: Store = FsStore::load_with_opts(db_path, options)
         .await
         .with_context(|| format!("open blob store {}", dir.display()))?
         .into();
-    Ok(store)
+    Ok((store, gc))
+}
+
+/// How often a store's GC task wakes to ask its protect callback (which then
+/// waits out the real interval): an upper bound on how long a closed store's
+/// GC task lives on ([`open_fs_store_with_gc`]).
+pub(crate) const GC_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The handle that ends one store's GC task ([`open_fs_store_with_gc`]).
+/// Closing it is idempotent; the store must be shut down first — the run
+/// the close releases then fails against it and the task ends.
+#[derive(Clone, Default)]
+pub(crate) struct StoreGc(Arc<StoreGcInner>);
+
+#[derive(Default)]
+struct StoreGcInner {
+    closed: AtomicBool,
+    wake: Notify,
+}
+
+impl StoreGc {
+    /// The GC config whose protect callback waits `interval` between runs,
+    /// or returns at once once closed.
+    fn config(&self, interval: std::time::Duration) -> GcConfig {
+        let inner = Arc::clone(&self.0);
+        GcConfig {
+            interval: GC_TICK,
+            add_protected: Some(Arc::new(move |_live| {
+                let inner = Arc::clone(&inner);
+                Box::pin(async move {
+                    let notified = inner.wake.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if !inner.closed.load(Ordering::SeqCst) {
+                        tokio::select! {
+                            _ = tokio::time::sleep(interval) => {}
+                            _ = notified => {}
+                        }
+                    }
+                    ProtectOutcome::Continue
+                })
+            })),
+        }
+    }
+
+    /// End the GC task: the waiting callback returns now, the run it
+    /// releases meets the (already shut) store and fails, and the task
+    /// drops its store handle.
+    pub(crate) fn close(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        self.0.wake.notify_waiters();
+    }
+
+    /// Owners of this GC's callback besides the caller's handle: the GC
+    /// task and the store actor's options each hold one while they live.
+    #[cfg(test)]
+    pub(crate) fn live_owners(&self) -> usize {
+        Arc::strong_count(&self.0) - 1
+    }
 }
 
 /// Test-only control of the stores' GC (iroh-blobs 0.103 has no public "run
@@ -978,6 +1053,7 @@ pub(crate) mod test_gc {
 
     thread_local! {
         static GATE: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+        static PRODUCTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Arm (`Some`) or disarm (`None`) the gate for stores opened later on
@@ -987,8 +1063,23 @@ pub(crate) mod test_gc {
         GATE.with(|g| *g.borrow_mut() = gate);
     }
 
-    pub(super) fn config_for_next_store() -> Option<GcConfig> {
-        let gate = GATE.with(|g| g.borrow().clone())?;
+    /// Stores opened later on this thread run the PRODUCTION GC (its real
+    /// interval and closable callback) instead of none — for a test of the
+    /// GC task's own lifetime (Task 15 R4).
+    pub(crate) fn use_production(on: bool) {
+        PRODUCTION.with(|p| p.set(on));
+    }
+
+    /// The GC a store opened now gets: the armed gate's, else the
+    /// production `default` when [`use_production`] is on, else none.
+    pub(super) fn config_for_next_store(default: Option<GcConfig>) -> Option<GcConfig> {
+        let Some(gate) = GATE.with(|g| g.borrow().clone()) else {
+            return if PRODUCTION.with(|p| p.get()) {
+                default
+            } else {
+                None
+            };
+        };
         Some(GcConfig {
             interval: Duration::from_millis(100),
             add_protected: Some(Arc::new(move |_live| {
@@ -1104,7 +1195,8 @@ impl SharedIrohNode {
 
         // One `FsStore` at `<working_dir>/blobs` for all roles (spec §2), GC on
         // (see `open_fs_store`).
-        let store = open_fs_store(&working_dir.join("blobs")).await?;
+        let (store, store_gc) =
+            open_fs_store_with_gc(&working_dir.join("blobs"), GC_INTERVAL).await?;
 
         // Shared connect gate: unset at construction, installed later by the host
         // (`set_connect_gate`). Cloned into BOTH handlers so a single install
@@ -1225,6 +1317,7 @@ impl SharedIrohNode {
                 uses_relay,
             }),
             store,
+            store_gc,
             node_id,
             peers: Mutex::new(HashMap::new()),
             lookup,
@@ -1309,6 +1402,23 @@ impl SharedIrohNode {
     /// the connect gate no longer admits; returns how many were closed. The
     /// gate reads membership live, so call this right after a membership
     /// snapshot refresh.
+    /// The mounted collab store's GC handle (the GC-lifetime test).
+    #[cfg(test)]
+    pub(crate) fn collab_gc_for_test(&self) -> Option<StoreGc> {
+        self.collab
+            .read()
+            .expect("collab slot poisoned")
+            .as_ref()
+            .map(|m| m.gc.clone())
+    }
+
+    /// The connect-gate predicate for `node` (absent gate ⇒ admit): the
+    /// collab pool's I11 sweep closes outbound connections to every node
+    /// this no longer admits (Task 15).
+    pub fn admits(&self, node: &NodeId) -> bool {
+        connect_gate_admits(&self.connect_gate, node)
+    }
+
     pub fn close_collab_connections_not_admitted(&self) -> usize {
         self.collab_conns.close_not_admitted(&self.connect_gate)
     }
@@ -1460,6 +1570,12 @@ impl SharedIrohNode {
             .home_relay_tx
             .lock()
             .expect("home relay watch poisoned");
+        // Checked under the slot lock `shutdown` takes after setting the
+        // flag (Task 15 R1): a call after shutdown never spawns a task that
+        // outlives the node — it gets a closed watch (its `changed()` errs).
+        if self.shutdown_done.load(Ordering::SeqCst) {
+            return tokio::sync::watch::channel(None).1;
+        }
         if let Some((tx, _)) = slot.as_ref() {
             return tx.subscribe();
         }
@@ -1792,8 +1908,8 @@ impl SharedIrohNode {
             return Err(e);
         }
         let dir = collab_store_dir(root);
-        let store = match open_fs_store(&dir).await {
-            Ok(store) => store,
+        let (store, gc) = match open_fs_store_with_gc(&dir, COLLAB_GC_INTERVAL).await {
+            Ok(opened) => opened,
             Err(e) => {
                 tracing::error!(path = %dir.display(), error = %format!("{e:#}"), "collab store open failed");
                 return Err(e);
@@ -1815,6 +1931,7 @@ impl SharedIrohNode {
                 if let Err(e2) = store.shutdown().await {
                     tracing::warn!(path = %dir.display(), error = %e2, "collab store shutdown after failed sweep");
                 }
+                gc.close();
                 return Err(anyhow!("sweep in-flight tags of {}: {e}", dir.display()));
             }
         }
@@ -1832,6 +1949,7 @@ impl SharedIrohNode {
                 root: root.to_path_buf(),
                 store,
                 blobs,
+                gc,
             });
         if let Some(old) = old {
             shut_collab_store(old).await;
@@ -1906,6 +2024,7 @@ impl SharedIrohNode {
         if let Err(e) = self.store.shutdown().await {
             tracing::warn!(error = %e, "shared iroh node blob store shutdown");
         }
+        self.store_gc.close();
         // Then the collab store (P1: shutdown flushes both stores). Taken under
         // the mount mutex, so a `set_collab_root` racing this teardown either
         // finished before (and its store is shut here) or sees `shutdown_done`
@@ -3687,6 +3806,9 @@ async fn shut_collab_store(mount: CollabMount) {
     if let Err(e) = mount.store.shutdown().await {
         tracing::warn!(path = %mount.root.display(), error = %e, "collab store shutdown failed");
     }
+    // After the shutdown, never before: the run the close releases must
+    // meet the shut store and end the GC task (Task 15 R4).
+    mount.gc.close();
 }
 
 /// Whether `a` and `b` name the same directory: equal as given, or equal once
@@ -6726,5 +6848,133 @@ mod collab_store_tests {
         );
 
         node.shutdown().await;
+    }
+
+    /// Task 15 R4: an unmounted collab store leaves nothing running. Its GC
+    /// task used to hold a store handle until a run failed — one interval
+    /// later at best — so every remount leaked the store's actor and its
+    /// ~10-thread runtime. With the production GC on, each remount's old
+    /// store must drop every owner of its GC (the GC task AND the actor,
+    /// whose options hold the callback) within a few GC ticks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remounting_the_collab_store_leaves_no_store_task_behind() {
+        test_gc::use_production(true);
+        let tmp = tempdir().unwrap();
+        let node = bind_disabled(&tmp.path().join("node")).await;
+        let mut released = Vec::new();
+        for i in 0..4 {
+            let root = tmp.path().join(format!("collab-{i}"));
+            std::fs::create_dir_all(&root).unwrap();
+            node.set_collab_root(Some(&root)).await.unwrap();
+            let gc = node.collab_gc_for_test().expect("a mounted store");
+            assert!(gc.live_owners() >= 1, "the GC runs while mounted");
+            released.push(gc);
+        }
+        node.set_collab_root(None).await.unwrap();
+        test_gc::use_production(false);
+        let deadline = tokio::time::Instant::now() + GC_TICK * 10;
+        loop {
+            let alive: Vec<usize> = released.iter().map(StoreGc::live_owners).collect();
+            if alive.iter().all(|n| *n == 0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "store tasks outlived their unmount: {alive:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        node.shutdown().await;
+    }
+
+    /// Task 15 R1: `home_relay_watch` never spawns after `shutdown` — the
+    /// watch it returns is already closed.
+    #[tokio::test]
+    async fn home_relay_watch_after_shutdown_is_closed() {
+        let tmp = tempdir().unwrap();
+        let node = bind_disabled(tmp.path()).await;
+        node.shutdown().await;
+        let mut rx = node.home_relay_watch();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), rx.changed())
+                .await
+                .expect("a closed watch answers at once")
+                .is_err(),
+            "no watcher task after shutdown"
+        );
+        assert!(node.home_relay_tx.lock().unwrap().is_none());
+    }
+
+    /// Task 15 (T9 ruling / P31): what one collab GC run costs over 5,000
+    /// entries — the measurement behind `COLLAB_GC_INTERVAL`. Run with
+    /// `--ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement: run by hand"]
+    async fn collab_gc_run_cost_over_five_thousand_entries() {
+        use std::sync::Mutex as StdMutex;
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("blobs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stamps: Arc<StdMutex<Vec<Instant>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen = Arc::clone(&stamps);
+        let gate = Arc::new(AtomicBool::new(false));
+        let open = Arc::clone(&gate);
+        let mut options = FsOptions::new(&dir);
+        let tick = Duration::from_millis(200);
+        options.gc = Some(GcConfig {
+            interval: tick,
+            add_protected: Some(Arc::new(move |_live| {
+                let seen = Arc::clone(&seen);
+                let open = open.load(Ordering::SeqCst);
+                Box::pin(async move {
+                    if open {
+                        seen.lock().unwrap().push(Instant::now());
+                        ProtectOutcome::Continue
+                    } else {
+                        ProtectOutcome::Abort
+                    }
+                })
+            })),
+        });
+        let store: Store = FsStore::load_with_opts(dir.join("blobs.db"), options)
+            .await
+            .unwrap()
+            .into();
+        let files = tmp.path().join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        for i in 0..5000u32 {
+            let p = files.join(format!("f{i}.fits"));
+            let mut bytes = vec![0u8; 17 * 1024];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            std::fs::write(&p, &bytes).unwrap();
+            let tt = store
+                .blobs()
+                .add_path_with_opts(AddPathOptions {
+                    path: p,
+                    format: BlobFormat::Raw,
+                    mode: ImportMode::TryReference,
+                })
+                .temp_tag()
+                .await
+                .unwrap();
+            store
+                .tags()
+                .set(format!("f/{i}"), HashAndFormat::raw(tt.hash()))
+                .await
+                .unwrap();
+        }
+        gate.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        gate.store(false, Ordering::SeqCst);
+        let stamps = stamps.lock().unwrap().clone();
+        let runs: Vec<u128> = stamps
+            .windows(2)
+            .map(|w| (w[1] - w[0]).saturating_sub(tick).as_millis())
+            .collect();
+        eprintln!(
+            "collab GC over 5000 entries: {} runs, run_ms = {runs:?}",
+            runs.len()
+        );
+        store.shutdown().await.unwrap();
     }
 }

@@ -17,8 +17,6 @@
 
 use std::sync::Arc;
 
-use rusqlite::OptionalExtension;
-
 use crate::collab::serve::{ServeOracle, ServeRecord};
 use crate::collab::storage::marker::StoreGuard;
 use crate::collab::storage::sweep::Stamp;
@@ -77,27 +75,49 @@ impl ServeOracle for DbServeOracle {
             return None;
         };
         let conn = db.conn();
-        let row: Option<(String, String, String, String)> = conn
-            .query_row(
+        // Every servable row of the hash (two frames may hold identical
+        // bytes, C10): the one whose file still stats as recorded is served
+        // (Task 15, T10 carry — `LIMIT 1` refused a get whenever the first
+        // row's stamp was stale although a sibling could serve), else the
+        // first, whose mismatch queues its local check.
+        let rows: Vec<(String, String, String, String)> = conn
+            .prepare(
                 "SELECT project_id, frame_uuid, landed_path, size_mtime_seen
                  FROM project_frames_local
                  WHERE blake3 = ?1 AND local_state IN (?2, ?3) AND own_staged = 0
                    AND landed_path IS NOT NULL AND size_mtime_seen IS NOT NULL
-                 ORDER BY project_id, frame_uuid
-                 LIMIT 1",
-                rusqlite::params![
-                    blake3_hex,
-                    SERVABLE_STATES[0].as_db_str(),
-                    SERVABLE_STATES[1].as_db_str()
-                ],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                 ORDER BY project_id, frame_uuid",
             )
-            .optional()
+            .and_then(|mut stmt| {
+                stmt.query_map(
+                    rusqlite::params![
+                        blake3_hex,
+                        SERVABLE_STATES[0].as_db_str(),
+                        SERVABLE_STATES[1].as_db_str()
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?
+                .collect()
+            })
             .unwrap_or_else(|e| {
                 tracing::error!(blake3 = blake3_hex, error = %e, "serve lookup failed; refusing");
-                None
+                Vec::new()
             });
-        let (project_id, frame_uuid, path, stamp) = row?;
+        let pick = rows
+            .iter()
+            .position(|(_, _, path, stamp)| {
+                Stamp::parse(stamp).is_some_and(|st| {
+                    matches!(
+                        crate::collab::storage::sweep::stat_verdict(
+                            std::path::Path::new(path),
+                            Some(st)
+                        ),
+                        crate::collab::storage::sweep::StatVerdict::Same
+                    )
+                })
+            })
+            .unwrap_or(0);
+        let (project_id, frame_uuid, path, stamp) = rows.into_iter().nth(pick)?;
         let Some(stamp) = Stamp::parse(&stamp) else {
             tracing::warn!(
                 project_id = %project_id,
@@ -180,6 +200,41 @@ mod tests {
             rusqlite::params![pid, uuid, to.as_db_str()],
         )
         .unwrap();
+    }
+
+    /// Task 15 (T10 carry): two servable rows share a hash (C10); the one
+    /// whose file still stats as recorded is served, not merely the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_duplicate_hash_is_served_from_the_row_whose_stamp_matches() {
+        let rig = ts::landed_rig(2).await;
+        let oracle = catalog_oracle(&rig);
+        let hex = blake3_of(&rig, 0);
+        let (pid, _, first) = rig.frames[0].clone();
+        let (_, twin, _) = rig.frames[1].clone();
+        let copy = rig.root.join("m31").join("other").join("twin-copy.fits");
+        std::fs::copy(&first, &copy).unwrap();
+        let stamp = crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(&copy).unwrap());
+        crate::api::db(&rig.ctx)
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE project_frames_local SET blake3 = ?3, landed_path = ?4, size_mtime_seen = ?5
+                 WHERE project_id = ?1 AND frame_uuid = ?2",
+                rusqlite::params![pid, twin, hex, copy.to_string_lossy(), stamp.encode()],
+            )
+            .unwrap();
+        assert_eq!(
+            oracle.lookup(&hex).unwrap().frame_uuid,
+            "f00",
+            "both match: the first in order"
+        );
+        ts::set_mtime(&first, 10);
+        let rec = oracle.lookup(&hex).expect("the twin can serve");
+        assert_eq!(
+            rec.frame_uuid, twin,
+            "the stale first row does not hide its twin"
+        );
+        assert_eq!(rec.path, copy);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

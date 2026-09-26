@@ -46,14 +46,23 @@ pub const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// What the pool tells its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoolEvent {
+    /// A dial to `node` succeeded and pooled the connection `conn_id` (the
+    /// scheduler's `DialOk`: the device may be sending again, Task 15 R7).
+    /// Sent once per real dial, never for a reuse of a pooled connection.
+    Dialed { node: EndpointId, conn_id: usize },
     /// A pooled connection to `node` closed, for whatever reason (rendered
     /// from the connection's close reason). Sent once per connection.
     /// `conn_id` is that connection's `stable_id`, so an owner can ignore a
-    /// stale close for a node it has already re-dialled.
+    /// stale close for a node it has already re-dialled
+    /// ([`CollabPool::current_conn_id`]). `idle` is `true` when this pool's
+    /// own idle reaper closed it after [`KEEP_OPEN`] unused — nothing went
+    /// wrong, so the scheduler strikes nothing (its `ConnectionIdle`);
+    /// every other close is a `ConnectionClosed`.
     Closed {
         node: EndpointId,
         conn_id: usize,
         reason: String,
+        idle: bool,
     },
 }
 
@@ -123,6 +132,9 @@ pub struct CollabPool {
     /// Dial attempts made (pooled reuse and shared dials keep this flat).
     dials: AtomicU64,
     connect_timeout: Duration,
+    /// How long an unused connection stays open ([`KEEP_OPEN`]; shorter in
+    /// a test of the idle close).
+    keep_open: Duration,
 }
 
 /// A borrowed pooled connection. While any is alive the idle reaper leaves
@@ -183,7 +195,7 @@ impl CollabPool {
         endpoint: Endpoint,
         events: tokio::sync::mpsc::UnboundedSender<PoolEvent>,
     ) -> Arc<Self> {
-        Self::build(endpoint, events, CONNECT_TIMEOUT)
+        Self::build(endpoint, events, CONNECT_TIMEOUT, KEEP_OPEN)
     }
 
     /// A pool with a shorter connect timeout, so a test of an unreachable
@@ -194,13 +206,25 @@ impl CollabPool {
         events: tokio::sync::mpsc::UnboundedSender<PoolEvent>,
         t: Duration,
     ) -> Arc<Self> {
-        Self::build(endpoint, events, t)
+        Self::build(endpoint, events, t, KEEP_OPEN)
+    }
+
+    /// A pool whose idle connections close after `keep_open` — a test of
+    /// the idle close does not wait out the production [`KEEP_OPEN`].
+    #[cfg(test)]
+    pub fn with_keep_open(
+        endpoint: Endpoint,
+        events: tokio::sync::mpsc::UnboundedSender<PoolEvent>,
+        keep_open: Duration,
+    ) -> Arc<Self> {
+        Self::build(endpoint, events, CONNECT_TIMEOUT, keep_open)
     }
 
     fn build(
         endpoint: Endpoint,
         events: tokio::sync::mpsc::UnboundedSender<PoolEvent>,
         connect_timeout: Duration,
+        keep_open: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
             endpoint,
@@ -210,7 +234,19 @@ impl CollabPool {
             events,
             dials: AtomicU64::new(0),
             connect_timeout,
+            keep_open,
         })
+    }
+
+    /// The `stable_id` of the open pooled connection to `node`, if any —
+    /// how an owner tells a stale [`PoolEvent::Closed`] (the node was
+    /// re-dialled since, `Some(other id)`) from a current one.
+    pub fn current_conn_id(&self, node: &EndpointId) -> Option<usize> {
+        let entries = lock(&self.entries, "entries");
+        entries
+            .get(node)
+            .filter(|e| e.conn.close_reason().is_none())
+            .map(|e| e.conn.stable_id())
     }
 
     /// A connection to `addr.id`: the pooled one while it is open, else a
@@ -310,7 +346,19 @@ impl CollabPool {
                 active: Arc::clone(&active),
             },
         );
+        let conn_id = conn.stable_id();
         self.spawn_watcher(node, conn, last_used, active);
+        if self
+            .events
+            .send(PoolEvent::Dialed { node, conn_id })
+            .is_err()
+        {
+            tracing::debug!(
+                node = %node.fmt_short(),
+                connection_id = conn_id,
+                "collab pool event dropped: nobody is listening"
+            );
+        }
         Ok(handed)
     }
 
@@ -379,7 +427,7 @@ impl CollabPool {
         let idle = entries.get(node).is_some_and(|e| {
             e.conn.stable_id() == stable_id
                 && e.active.load(Ordering::Acquire) == 0
-                && lock(&e.last_used, "last_used").elapsed() >= KEEP_OPEN
+                && lock(&e.last_used, "last_used").elapsed() >= self.keep_open
         });
         if idle {
             entries.remove(node);
@@ -398,6 +446,7 @@ impl CollabPool {
     ) {
         let pool: Weak<Self> = Arc::downgrade(self);
         let events = self.events.clone();
+        let keep_open = self.keep_open;
         tokio::spawn(async move {
             let stable_id = conn.stable_id();
             let mut idle_closed = false;
@@ -406,9 +455,9 @@ impl CollabPool {
                 // `last_used`, so look again a full KEEP_OPEN from now rather
                 // than at a deadline that may already be in the past.
                 let deadline = if active.load(Ordering::Acquire) > 0 {
-                    Instant::now() + KEEP_OPEN
+                    Instant::now() + keep_open
                 } else {
-                    *lock(&last_used, "last_used") + KEEP_OPEN
+                    *lock(&last_used, "last_used") + keep_open
                 };
                 tokio::select! {
                     reason = conn.closed() => break reason,
@@ -420,7 +469,7 @@ impl CollabPool {
                             Some(pool) => pool.reap_if_idle(&node, stable_id),
                             None => {
                                 active.load(Ordering::Acquire) == 0
-                                    && lock(&last_used, "last_used").elapsed() >= KEEP_OPEN
+                                    && lock(&last_used, "last_used").elapsed() >= keep_open
                             }
                         };
                         if reaped {
@@ -449,6 +498,7 @@ impl CollabPool {
                 node,
                 conn_id: stable_id,
                 reason,
+                idle: idle_closed,
             };
             if events.send(event).is_err() {
                 tracing::debug!(
@@ -475,6 +525,23 @@ mod tests {
     use super::*;
     use crate::api::collab_live::test_support as ts;
 
+    /// The next close event, skipping the `Dialed` events before it.
+    async fn next_closed(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PoolEvent>,
+        within: Duration,
+    ) -> PoolEvent {
+        tokio::time::timeout(within, async {
+            loop {
+                match rx.recv().await.expect("the pool is alive") {
+                    PoolEvent::Dialed { .. } => continue,
+                    closed => return closed,
+                }
+            }
+        })
+        .await
+        .expect("a close is reported")
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_connection_per_provider_reused_and_a_close_is_reported_at_once() {
         let rig = ts::landed_rig(1).await;
@@ -488,12 +555,10 @@ mod tests {
         assert_eq!(pool.dials(), 1);
         drop((a, b));
         rig.node.shutdown().await;
-        let ev = tokio::time::timeout(Duration::from_secs(40), rx.recv())
-            .await
-            .expect("closed() fires")
-            .unwrap();
+        let ev = next_closed(&mut rx, Duration::from_secs(40)).await;
         assert!(
-            matches!(ev, PoolEvent::Closed { node, .. } if node == rig.node.endpoint_addr().id)
+            matches!(ev, PoolEvent::Closed { node, idle: false, .. } if node == rig.node.endpoint_addr().id),
+            "a remote close is not an idle close: {ev:?}"
         );
     }
 
@@ -548,13 +613,12 @@ mod tests {
         let first = pool.get(rig.node.endpoint_addr()).await.unwrap();
         let first_id = first.conn.stable_id();
         drop(first);
+        assert_eq!(pool.current_conn_id(&provider), Some(first_id));
         pool.close(&provider, b"test");
-        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("the close is reported")
-            .unwrap();
+        assert_eq!(pool.current_conn_id(&provider), None, "evicted at once");
+        let ev = next_closed(&mut rx, Duration::from_secs(10)).await;
         assert!(
-            matches!(ev, PoolEvent::Closed { node, conn_id, .. } if node == provider && conn_id == first_id),
+            matches!(ev, PoolEvent::Closed { node, conn_id, idle: false, .. } if node == provider && conn_id == first_id),
             "{ev:?}"
         );
 
@@ -565,10 +629,7 @@ mod tests {
 
         assert_eq!(pool.close_where(|id| *id != provider), 0);
         assert_eq!(pool.close_where(|id| *id == provider), 1);
-        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("the second close is reported")
-            .unwrap();
+        let ev = next_closed(&mut rx, Duration::from_secs(10)).await;
         assert!(matches!(ev, PoolEvent::Closed { node, .. } if node == provider));
         assert!(
             tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -576,5 +637,43 @@ mod tests {
                 .is_err(),
             "one event per closed connection, never two"
         );
+    }
+
+    /// Task 15 R7: every real dial is reported (`Dialed`, the scheduler's
+    /// `DialOk`) with the pooled connection's id — a reuse is not — and a
+    /// close by the pool's own idle reaper says so (`idle: true`, the
+    /// scheduler's `ConnectionIdle`: no strike).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dial_is_reported_and_an_idle_close_says_it_was_idle() {
+        let rig = ts::landed_rig(1).await;
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = CollabPool::with_keep_open(me.endpoint(), tx, Duration::from_millis(300));
+        let provider = rig.node.endpoint_addr().id;
+        let c = pool.get(rig.node.endpoint_addr()).await.unwrap();
+        let id = c.conn.stable_id();
+        let reused = pool.get(rig.node.endpoint_addr()).await.unwrap();
+        drop((c, reused));
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the dial is reported")
+            .unwrap();
+        assert_eq!(
+            ev,
+            PoolEvent::Dialed {
+                node: provider,
+                conn_id: id
+            }
+        );
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the idle close is reported")
+            .unwrap();
+        assert!(
+            matches!(ev, PoolEvent::Closed { node, conn_id, idle: true, .. } if node == provider && conn_id == id),
+            "one Dialed for two gets, then the idle close: {ev:?}"
+        );
+        assert_eq!(pool.current_conn_id(&provider), None);
     }
 }
