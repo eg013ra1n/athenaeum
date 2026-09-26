@@ -1357,14 +1357,16 @@ impl StorageEngine {
     async fn release_parked(&self, row: &LocalFrameRow, reason: &str) {
         let res = self
             .with_frame_tx(row, |tx| {
-                // L5/C38 (Task 11 fix round 1): the stamp the parked file was
-                // verified at is kept as `prev_stamp`, so a landing never
-                // replaces a file edited after this release.
+                // L5/C38 (Task 11 fix rounds 1+2): the stamp the parked file
+                // was verified at is kept as `prev_stamp` (a stamp verified
+                // at the current version is the better description, so it
+                // wins over an older one), so a landing never replaces a
+                // file edited after this release.
                 tx.execute(
                     "UPDATE project_frames_local
                      SET awaiting_gc = 0,
                          prev_stamp = CASE WHEN local_state = 'wanted'
-                                      THEN COALESCE(prev_stamp, size_mtime_seen) ELSE prev_stamp END,
+                                      THEN COALESCE(size_mtime_seen, prev_stamp) ELSE prev_stamp END,
                          size_mtime_seen = NULL
                      WHERE project_id = ?1 AND frame_uuid = ?2",
                     rusqlite::params![row.project_id, row.frame_uuid],
@@ -1434,9 +1436,13 @@ impl StorageEngine {
     }
 
     /// A `wanted` replica whose OLDER verified file still sits at its path
-    /// while a new version waits (Task 11 fix round 1, L5/C38 — the owner
+    /// while a new version waits (Task 11 fix rounds 1+2, L5/C38 — the owner
     /// rule: the user's edit is never overwritten, including by a new
-    /// version). The file stats as last verified (`prev_stamp`, 2 s mtime
+    /// version). The stamp was kept by a bump on a `wanted` or `idle` row
+    /// and survives `wanted → idle → wanted`, so this also catches an edit
+    /// made while the frame was excluded, after its re-inclusion (only
+    /// entering `held`, `own_held` or `quarantined` clears it). The file
+    /// stats as last verified (`prev_stamp`, 2 s mtime
     /// tolerance) → untouched, left for the landing to replace. Otherwise it
     /// was changed while nothing watched; it cannot be hashed against the
     /// old version (the row carries the new one), so it is quarantined —

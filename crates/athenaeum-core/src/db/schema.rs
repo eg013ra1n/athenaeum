@@ -2539,14 +2539,16 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
         sp.commit()?;
     }
-    // `prev_stamp` (wave 3, Task 11 fix round 1, L5/C38): the `size:mtime`
-    // of the landed file as last verified, kept when a new version (or a
-    // parked frame's release) clears `size_mtime_seen` and the row goes
-    // back to `wanted`. A landing refuses to replace a file that no longer
-    // stats as recorded — an edit made while nothing watched is never
-    // overwritten, not even by a new version. Cleared when the landing
-    // records and whenever the row leaves `wanted`. No backfill: nothing
-    // before this column recorded it.
+    // `prev_stamp` (wave 3, Task 11 fix rounds 1+2, L5/C38): the
+    // `size:mtime` of the landed file as last verified, kept when a new
+    // version (or a parked frame's release) clears `size_mtime_seen` on a
+    // `wanted` or `idle` row. A landing refuses to replace a file that no
+    // longer stats as recorded, and the storage engine quarantines it — an
+    // edit made while nothing watched (the app closed, the frame excluded)
+    // is never overwritten, not even by a new version. Cleared only by a
+    // newer truth: when a landing records, by `set_landed`, and on ENTERING
+    // `held`, `own_held` or `quarantined` (`wanted → idle → wanted` keeps
+    // it). No backfill: nothing before this column recorded it.
     if !column_exists(conn, "project_frames_local", "prev_stamp")? {
         conn.execute(
             "ALTER TABLE project_frames_local ADD COLUMN prev_stamp TEXT",

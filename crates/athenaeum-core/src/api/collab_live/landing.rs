@@ -372,12 +372,14 @@ enum TargetRefusal {
 }
 
 /// Hand an edited target to the running storage engine (it quarantines the
-/// frame, spec §9.4). No engine → its next check of the root finds it.
+/// frame, spec §9.4). Without a running engine nothing re-checks the file:
+/// every landing pass refuses again (the fetched bytes keep their in-flight
+/// tag) until an engine runs and quarantines it.
 fn hand_to_engine(env: &LandingEnv<'_>, row: &LocalFrameRow, dest: &Path) {
     if crate::collab::storage::watch::route_touched(dest) {
         tracing::info!(project_id = env.pid(), frame_uuid = %row.frame_uuid, path = %dest.display(), "edited landing target handed to the storage engine");
     } else {
-        tracing::debug!(project_id = env.pid(), frame_uuid = %row.frame_uuid, path = %dest.display(), "no storage engine watches the edited landing target; left for its next check");
+        tracing::debug!(project_id = env.pid(), frame_uuid = %row.frame_uuid, path = %dest.display(), "no storage engine runs; nothing re-checks the edited landing target and every pass refuses again until one runs (the fetched bytes keep their tag)");
     }
 }
 
@@ -437,11 +439,15 @@ pub async fn land_frame(
         }
         Err(TargetRefusal::Edited(msg)) => {
             // M3: the in-flight tag stays — the bytes wait for the user's
-            // choice instead of being fetched again every pass.
+            // choice instead of being fetched again every pass. A held-back
+            // landing, not a failure: a warning, repeated each pass until
+            // the engine quarantines the file (fix round 2).
+            tracing::warn!(project_id = pid, frame_uuid = uuid, error = %msg, "frame landing held back over an edited file");
             if let Some(p) = row.landed_path.as_deref() {
                 hand_to_engine(env, &row, Path::new(p));
             }
-            return fail(msg);
+            record_frame_error(env.ctx, pid, uuid, &msg);
+            return Landed::Failed(msg);
         }
     };
     // The target replaces the row's previous file: never removed on a later
@@ -1082,13 +1088,75 @@ mod tests {
         assert_eq!(
             frames_db::prev_stamp(&conn, &pid, &uuid).unwrap(),
             None,
-            "cleared when the row left wanted"
+            "cleared on entering quarantined"
         );
         assert_eq!(
             crate::db::collab_live::list_quarantine(&conn, &pid)
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// I-1 (Task 11 fix round 2) — owner rule L5/C38 across an exclusion:
+    /// v1 held → excluded (`idle`, the engine ignores it) → edited in place
+    /// → the publisher releases v2 while the frame is still idle → re-
+    /// included. The bump keeps v1's verified stamp as `prev_stamp` on the
+    /// idle row and re-inclusion keeps it, so the engine's pass quarantines
+    /// the edit and nothing lands over it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edit_made_while_excluded_is_never_landed_over_by_a_new_version() {
+        use crate::api::collab_live::storage_task::apply_policy;
+        let rig = ts::fetch_rig(1).await;
+        let (pid, uuid) = rig.frame(0);
+        let path = rig.land(0).await.unwrap();
+        assert_eq!(rig.row(0).local_state, LocalState::Held);
+        let mut eng = rig.engine();
+        crate::db::collab::set_policy(
+            &crate::api::db(&rig.ctx).unwrap().conn(),
+            &pid,
+            r#"{"filters":["Ha"]}"#,
+        )
+        .unwrap();
+        apply_policy(&rig.ctx, &pid).unwrap();
+        assert_eq!(rig.row(0).local_state, LocalState::Idle);
+        ts::overwrite_same_size(&path); // idle: the engine ignores it
+        let edited = std::fs::read(&path).unwrap();
+        rig.publish_new_version(0).await;
+        assert_eq!(rig.row(0).local_state, LocalState::Idle, "v2 while idle");
+        crate::db::collab::set_policy(&crate::api::db(&rig.ctx).unwrap().conn(), &pid, "{}")
+            .unwrap();
+        apply_policy(&rig.ctx, &pid).unwrap();
+        assert_eq!(rig.row(0).local_state, LocalState::Wanted, "re-included");
+        let t0 = std::time::Instant::now();
+        eng.tick(t0, &TwoHolders).await;
+        eng.tick(t0 + crate::collab::storage::watch::AGGREGATE, &TwoHolders)
+            .await;
+        assert_eq!(
+            rig.row(0).local_state,
+            LocalState::Quarantined,
+            "the engine's pass quarantines the edit made while excluded"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), edited, "the edit is intact");
+        // v2 arrives anyway: nothing lands over the quarantined file.
+        rig.fetch_blob(0).await;
+        assert!(rig.land(0).await.is_err(), "nothing lands (P13)");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            edited,
+            "the edit is byte-identical (L5)"
+        );
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        assert_eq!(
+            crate::db::collab_live::list_quarantine(&conn, &pid)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            frames_db::prev_stamp(&conn, &pid, &uuid).unwrap(),
+            None,
+            "cleared on entering quarantined"
         );
     }
 
