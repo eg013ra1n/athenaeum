@@ -619,9 +619,10 @@ struct Ready {
     mount_gen: watch::Receiver<u64>,
 }
 
-/// `lazy_mount`: mount the designated folder's store when the node has none
-/// (the first start). After a remount it is never done here — the
-/// designation in progress mounts it itself, and a lazy mount would race it.
+/// `lazy_mount` (the first start): mount the designated folder's store when
+/// the node has none, and adopt a folder whose marker was never recorded.
+/// After a remount neither is done here — the designation in progress mounts
+/// the store and records the marker itself, and either would race it.
 async fn ready(
     ctx: &ServiceContext,
     gate: &GateSource,
@@ -641,10 +642,15 @@ async fn ready(
     // A designation in progress (its mount done, its marker not recorded
     // yet): the runtime waits for the marker, or its own adoption would race
     // the designation's (I1).
+    // After a remount the record must name THIS folder: a record cleared by
+    // the folder change (`None`) would let this runtime adopt a marker the
+    // designation is about to write. The first start adopts a root never
+    // recorded (a wave-2 root).
     match db(ctx).and_then(|d| Ok(crate::db::collab_live::store_marker_path(&d.conn())?)) {
         Ok(Some(at)) if at != root.to_string_lossy() => {
             return Err("storage marker not recorded for this folder yet")
         }
+        Ok(None) if !lazy_mount => return Err("storage marker not recorded for this folder yet"),
         Ok(_) => {}
         Err(e) => {
             tracing::warn!(error = %e, "storage marker record could not be read");

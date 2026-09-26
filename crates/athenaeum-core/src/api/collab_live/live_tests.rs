@@ -402,7 +402,10 @@ async fn redesignate(
 async fn a_redesignated_folder_refetches_into_the_new_root_and_clearing_stops_it() {
     let w = ts::two_instances().await;
     let uuids = w.a_publishes(3).await;
-    w.b.wait_all_held(Duration::from_secs(20)).await;
+    for u in &uuids {
+        w.b.wait_state(u, LocalState::Held, Duration::from_secs(20))
+            .await;
+    }
     let old_root = w.b.root.clone();
     let other = tempfile::tempdir().unwrap();
     let new_root = redesignate(&w.b.ctx, &other.path().join("Collab2")).await;
@@ -454,7 +457,12 @@ async fn a_redesignated_folder_refetches_into_the_new_root_and_clearing_stops_it
 async fn a_redesignation_over_ten_frames_raises_the_deletion_choice() {
     let w = ts::two_instances().await;
     let uuids = w.a_publishes(11).await;
-    w.b.wait_all_held(Duration::from_secs(30)).await;
+    // every named frame, not "every row B has seen so far": a batch that
+    // is re-designated before the rest arrive rules ≤ 10
+    for u in &uuids {
+        w.b.wait_state(u, LocalState::Held, Duration::from_secs(30))
+            .await;
+    }
     let other = tempfile::tempdir().unwrap();
     redesignate(&w.b.ctx, &other.path().join("Collab2")).await;
     wait_rows(
