@@ -2600,9 +2600,10 @@ pub(crate) async fn fetch_frames_gated(
         let mut batch = prepare_batch(&env, &mut queue, &mut hinted, &mut outcome).await?;
         let attempted = batch.fetches.len() + batch.local.len();
         let fetched_landed = if attempted > 0 {
-            // R17: one permit per batch, never across batches.
+            // R17: one permit per batch, never across batches — a collab
+            // permit, so a waiting personal transfer goes first (wave 3 §8).
             let _permit = match gate {
-                Some(gate) => Some(gate.acquire().await),
+                Some(gate) => Some(gate.acquire_collab().await),
                 None => None,
             };
             run_batch(&env, &mut batch, &mut outcome).await

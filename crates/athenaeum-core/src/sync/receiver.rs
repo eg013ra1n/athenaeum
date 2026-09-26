@@ -202,64 +202,328 @@ pub const DEFAULT_MAX_CONCURRENT_RECEIVES: usize = 2;
 const MIN_CONCURRENT_RECEIVES: usize = 1;
 const MAX_CONCURRENT_RECEIVES: usize = 8;
 
-/// The resizable half of [`ReceiveGate`], behind one lock so a `set_limit` racing
-/// an `acquire` can never split the pair.
-#[derive(Debug)]
+/// Which class an admission belongs to (collab v3 wave 3, spec §8, L1). A
+/// personal transfer (one permit per package, exactly as before) is always
+/// admitted before a collab unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiveClass {
+    /// A personal-sync package receive ([`ReceiveGate::acquire`]).
+    Personal,
+    /// One collab work unit ([`ReceiveGate::acquire_collab`]).
+    Collab,
+}
+
+impl ReceiveClass {
+    /// Stable log value for the `class` field.
+    fn as_str(self) -> &'static str {
+        match self {
+            ReceiveClass::Personal => "personal",
+            ReceiveClass::Collab => "collab",
+        }
+    }
+}
+
+/// One parked `acquire`: the channel its lane is handed over on, keyed by an id
+/// so an abandoned wait can find and remove exactly its own entry.
+struct GateWaiter {
+    id: u64,
+    tx: tokio::sync::oneshot::Sender<ReceivePermit>,
+}
+
+/// The mutable half of [`ReceiveGate`], behind one lock so admission, release,
+/// resize and the yield flag always see the same numbers.
 struct GateState {
     /// The limit currently in force (already clamped).
     limit: usize,
-    /// Permits a shrink still has to reclaim because they were IN USE at the time
-    /// (see [`ReceiveGate`]'s doc — the debt-counter recipe).
-    debt: usize,
+    /// Lanes held right now, counting lanes reserved for a waiter whose permit
+    /// is on its way to it.
+    in_use: usize,
+    /// Parked personal transfers, FIFO.
+    personal: std::collections::VecDeque<GateWaiter>,
+    /// Parked collab units, FIFO; served only while `personal` is empty.
+    collab: std::collections::VecDeque<GateWaiter>,
+    /// Source of [`GateWaiter::id`].
+    next_id: u64,
 }
 
-/// Live-resizable concurrency gate for the fetch+ingest phase (W2 T2.2): at most
-/// `limit` inbound transfers hold a permit at once, and the limit can be changed
-/// from the settings UI WITHOUT restarting the receiver.
+impl GateState {
+    fn queue(&mut self, class: ReceiveClass) -> &mut std::collections::VecDeque<GateWaiter> {
+        match class {
+            ReceiveClass::Personal => &mut self.personal,
+            ReceiveClass::Collab => &mut self.collab,
+        }
+    }
+
+    fn waiters(&self) -> usize {
+        self.personal.len() + self.collab.len()
+    }
+
+    /// True exactly while a personal transfer waits and every lane is taken.
+    fn wants_yield(&self) -> bool {
+        !self.personal.is_empty() && self.in_use >= self.limit
+    }
+
+    /// Reserve free lanes for the next waiters, personal first, FIFO within a
+    /// class. A reserved lane is counted in `in_use` HERE, under the lock, so
+    /// no caller can barge into it before its waiter is woken. A waiter whose
+    /// future is already gone (its receiver closed) is skipped.
+    fn collect_grants(&mut self) -> Vec<(GateWaiter, ReceiveClass)> {
+        let mut out = Vec::new();
+        while self.in_use < self.limit {
+            let next = match self.personal.pop_front() {
+                Some(w) => (w, ReceiveClass::Personal),
+                None => match self.collab.pop_front() {
+                    Some(w) => (w, ReceiveClass::Collab),
+                    None => break,
+                },
+            };
+            if next.0.tx.is_closed() {
+                continue;
+            }
+            self.in_use += 1;
+            out.push(next);
+        }
+        out
+    }
+}
+
+/// The gate's shared core: the state and the yield flag it drives. Held by the
+/// gate, by every permit and by every parked acquire.
+struct GateShared {
+    state: std::sync::Mutex<GateState>,
+    yield_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// The numbers a debug line reports, read under the lock.
+#[derive(Clone, Copy)]
+struct GateSnapshot {
+    in_use: usize,
+    limit: usize,
+    waiters: usize,
+}
+
+impl GateShared {
+    /// Lock the state. The critical sections below never panic, so a poisoned
+    /// lock can only come from a bug elsewhere; the state is still consistent
+    /// between statements, and recovering it keeps a permit's `Drop` (which may
+    /// run during unwinding) from turning a panic into an abort.
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Re-derive the yield flag from `state`. Called with the lock held so two
+    /// transitions can never publish their flags out of order. Returns the new
+    /// value when it changed.
+    fn refresh_yield(&self, state: &GateState) -> Option<bool> {
+        let want = state.wants_yield();
+        self.yield_tx
+            .send_if_modified(|current| {
+                if *current == want {
+                    false
+                } else {
+                    *current = want;
+                    true
+                }
+            })
+            .then_some(want)
+    }
+
+    /// Everything after a mutation, still under the lock: reserve the lanes
+    /// that can be granted, refresh the yield flag, and snapshot the numbers.
+    fn settle(
+        &self,
+        state: &mut GateState,
+    ) -> (Vec<(GateWaiter, ReceiveClass)>, Option<bool>, GateSnapshot) {
+        let grants = state.collect_grants();
+        let yield_changed = self.refresh_yield(state);
+        (grants, yield_changed, snapshot(state))
+    }
+
+    /// Outside the lock: hand each reserved lane to its waiter and log the
+    /// transitions. A waiter that went away between the reservation and the
+    /// send gets its permit back inside the `Err`, and dropping it releases the
+    /// lane again (which re-runs the grant pass).
+    fn deliver(
+        self: &Arc<Self>,
+        grants: Vec<(GateWaiter, ReceiveClass)>,
+        yield_changed: Option<bool>,
+        snap: GateSnapshot,
+    ) {
+        log_yield(yield_changed, snap);
+        for (waiter, class) in grants {
+            log_admitted(class, snap);
+            let permit = ReceivePermit {
+                shared: Arc::clone(self),
+                class,
+            };
+            if let Err(permit) = waiter.tx.send(permit) {
+                tracing::debug!(
+                    class = class.as_str(),
+                    "receive lane handed back: the waiter went away"
+                );
+                drop(permit);
+            }
+        }
+    }
+}
+
+fn snapshot(state: &GateState) -> GateSnapshot {
+    GateSnapshot {
+        in_use: state.in_use,
+        limit: state.limit,
+        waiters: state.waiters(),
+    }
+}
+
+fn log_admitted(class: ReceiveClass, snap: GateSnapshot) {
+    tracing::debug!(
+        class = class.as_str(),
+        in_use = snap.in_use,
+        limit = snap.limit,
+        count = snap.waiters,
+        "receive lane admitted"
+    );
+}
+
+fn log_yield(changed: Option<bool>, snap: GateSnapshot) {
+    match changed {
+        Some(true) => tracing::debug!(
+            class = ReceiveClass::Personal.as_str(),
+            in_use = snap.in_use,
+            limit = snap.limit,
+            count = snap.waiters,
+            "receive gate yield raised"
+        ),
+        Some(false) => tracing::debug!(
+            class = ReceiveClass::Personal.as_str(),
+            in_use = snap.in_use,
+            limit = snap.limit,
+            count = snap.waiters,
+            "receive gate yield lowered"
+        ),
+        None => {}
+    }
+}
+
+/// Live-resizable two-class admission gate for the fetch+ingest phase (W2 T2.2;
+/// collab v3 wave 3, spec §8, L1): at most `limit` receives hold a lane at once,
+/// and the limit can be changed from the settings UI WITHOUT restarting the
+/// receiver.
 ///
-/// # Why a debt counter
+/// # Two classes
 ///
-/// Growing is trivial ([`Semaphore::add_permits`]). Shrinking is not:
-/// [`Semaphore::forget_permits`] can only take permits that are AVAILABLE right
-/// now, and it reports how many it actually got. Lowering the cap from 3 to 1
-/// while all three lanes are busy therefore removes nothing at the moment of the
-/// call — the permits are out in the world and tokio has no way to claw them back.
+/// A personal transfer ([`acquire`](Self::acquire)) is always admitted before a
+/// collab unit ([`acquire_collab`](Self::acquire_collab)): while any personal
+/// transfer waits, no collab unit is admitted, and each class is FIFO. A freed
+/// lane is reserved for the next waiter under the lock, at the moment it frees,
+/// so a caller arriving in the gap before that waiter is woken cannot barge in.
+/// With no collab traffic the gate behaves exactly as the fair semaphore it
+/// replaced.
 ///
-/// So the un-forgotten remainder is recorded as `debt`, and payment is deferred to
-/// [`acquire`](Self::acquire): every successful acquire re-checks the debt and, if
-/// any is outstanding, decrements it, [`forget`](tokio::sync::OwnedSemaphorePermit::forget)s
-/// its own permit (so the permit is destroyed rather than returned) and loops to
-/// wait again instead of proceeding. The shrink thus takes effect as the busy
-/// lanes finish, one release at a time, and it never interrupts an in-flight
-/// transfer — exactly the semantics a live setting change wants.
+/// # Yield
 ///
-/// # Debt vs. grow
+/// [`yield_signal`](Self::yield_signal) is `true` exactly while a personal
+/// transfer waits AND every lane is taken. It never interrupts a holder: the
+/// collab lane reads it, finishes its frame in flight, releases its permit and
+/// re-queues — a permit is released only by its holder.
 ///
-/// A grow that lands while debt is outstanding pays the debt down FIRST and only
-/// adds real permits with what is left over (`grow -= min(grow, debt)`). Shrinking
-/// 3→1 and then growing 1→3 is a full round trip: it cancels 2 debt units and adds
-/// 0 permits, leaving the gate exactly where it started. Blindly calling
-/// `add_permits(2)` instead would leave a 2-permit surplus AND the 2-unit debt that
-/// eats it; total capacity converges to the same number either way (each debt unit
-/// destroys exactly one permit), so it does not over-ADMIT — but it does inflate
-/// `available_permits` with phantom capacity and forces the next acquirer through
-/// two pointless acquire→forget→re-queue rounds, each landing it at the back of
-/// the semaphore's FIFO queue behind later arrivals. Pay first; keep the books
-/// honest.
+/// # Resizing
+///
+/// A grow grants the new lanes to waiters at once. A shrink never interrupts a
+/// holder: grants simply stop until `in_use` falls below the new limit, so the
+/// cut takes effect as the busy lanes finish, one release at a time.
 ///
 /// # Invariant
 ///
-/// At quiescence (no `acquire` mid-loop, no `set_limit` mid-flight):
-/// `available + in_use - debt == limit`. Every mutation preserves it:
-/// `add_permits(k)` raises `available` and `limit` by `k`; a shrink of `cut` lowers
-/// `limit` by `cut` and lowers `available + in_use` and raises `debt` by exactly
-/// `cut` between them; a debt payment lowers both `available + in_use` and `debt`
-/// by 1.
+/// `in_use` equals the number of live [`ReceivePermit`]s plus the lanes reserved
+/// for a waiter whose permit is in transit; a permit decrements it exactly once,
+/// in `Drop` (unwinding included). At quiescence a waiter is parked only when
+/// no lane is free for its class.
 pub struct ReceiveGate {
-    /// Arc'd because [`acquire`](Self::acquire) hands out owned permits, which
-    /// outlive the borrow of the gate.
-    sem: Arc<tokio::sync::Semaphore>,
-    state: std::sync::Mutex<GateState>,
+    shared: Arc<GateShared>,
+}
+
+/// A held lane. Released when dropped, exactly once — also while a panic
+/// unwinds through its holder.
+pub struct ReceivePermit {
+    shared: Arc<GateShared>,
+    class: ReceiveClass,
+}
+
+impl std::fmt::Debug for ReceivePermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceivePermit")
+            .field("class", &self.class)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReceivePermit {
+    /// The class this lane was admitted as.
+    pub fn class(&self) -> ReceiveClass {
+        self.class
+    }
+}
+
+impl Drop for ReceivePermit {
+    fn drop(&mut self) {
+        let (grants, yield_changed, snap) = {
+            let mut state = self.shared.lock();
+            // Never underflows: every permit was counted when it was granted.
+            state.in_use = state.in_use.saturating_sub(1);
+            self.shared.settle(&mut state)
+        };
+        tracing::debug!(
+            class = self.class.as_str(),
+            in_use = snap.in_use,
+            limit = snap.limit,
+            count = snap.waiters,
+            "receive lane released"
+        );
+        self.shared.deliver(grants, yield_changed, snap);
+    }
+}
+
+/// Removes a parked acquire's queue entry when its future is dropped before it
+/// was granted (cancel-safety): the yield flag is re-derived at once and any
+/// waiter the entry was holding back is served. When the entry was already
+/// granted it is no longer queued, and the permit sitting in the dropped
+/// receiver releases the lane on its own.
+struct ParkedAcquire {
+    shared: Arc<GateShared>,
+    id: u64,
+    class: ReceiveClass,
+    granted: bool,
+}
+
+impl Drop for ParkedAcquire {
+    fn drop(&mut self) {
+        if self.granted {
+            return;
+        }
+        let (removed, grants, yield_changed, snap) = {
+            let mut state = self.shared.lock();
+            let queue = state.queue(self.class);
+            let removed = match queue.iter().position(|w| w.id == self.id) {
+                Some(at) => queue.remove(at).is_some(),
+                None => false,
+            };
+            let (grants, yield_changed, snap) = self.shared.settle(&mut state);
+            (removed, grants, yield_changed, snap)
+        };
+        if removed {
+            tracing::debug!(
+                class = self.class.as_str(),
+                in_use = snap.in_use,
+                limit = snap.limit,
+                count = snap.waiters,
+                "receive lane wait abandoned"
+            );
+        }
+        self.shared.deliver(grants, yield_changed, snap);
+    }
 }
 
 impl ReceiveGate {
@@ -268,79 +532,122 @@ impl ReceiveGate {
     pub fn new(limit: usize) -> Self {
         let limit = limit.clamp(MIN_CONCURRENT_RECEIVES, MAX_CONCURRENT_RECEIVES);
         Self {
-            sem: Arc::new(tokio::sync::Semaphore::new(limit)),
-            state: std::sync::Mutex::new(GateState { limit, debt: 0 }),
+            shared: Arc::new(GateShared {
+                state: std::sync::Mutex::new(GateState {
+                    limit,
+                    in_use: 0,
+                    personal: std::collections::VecDeque::new(),
+                    collab: std::collections::VecDeque::new(),
+                    next_id: 0,
+                }),
+                yield_tx: tokio::sync::watch::channel(false).0,
+            }),
         }
     }
 
-    /// Wait for a lane. The returned permit holds the slot until it is dropped, so
-    /// the caller keeps it alive for the whole fetch+ingest phase.
+    /// Wait for a lane as a personal transfer. The returned permit holds the
+    /// slot until it is dropped, so the caller keeps it alive for the whole
+    /// fetch+ingest phase.
     ///
-    /// Cancel-safe: dropping the future while it waits leaves the gate untouched
-    /// (tokio hands a permit only to a live waiter, and the debt bookkeeping runs
-    /// entirely between await points).
-    pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
-        loop {
-            let permit = Arc::clone(&self.sem)
-                .acquire_owned()
-                .await
-                // `close()` is never called on this semaphore — it is private to
-                // the gate, which lives as long as the `InboundControl` owning it,
-                // and nothing here closes it. `AcquireError` is therefore
-                // unreachable rather than a case to handle.
-                .expect("receive gate semaphore is never closed");
-            {
-                let mut state = self
-                    .state
-                    .lock()
-                    .expect("receive gate state mutex poisoned");
-                if state.debt == 0 {
-                    return permit;
-                }
-                // This permit belongs to a shrink that could not take effect when
-                // it was requested. Pay one unit and go back to waiting.
-                state.debt -= 1;
+    /// Cancel-safe: dropping the future while it waits removes its queue entry
+    /// (lowering the yield flag if it was the one holding it up), and a lane
+    /// granted to it in the same instant is released again.
+    pub async fn acquire(&self) -> ReceivePermit {
+        self.acquire_class(ReceiveClass::Personal).await
+    }
+
+    /// Wait for a lane as one collab unit: admitted only while no personal
+    /// transfer waits, FIFO among collab units. Cancel-safe as
+    /// [`acquire`](Self::acquire).
+    pub async fn acquire_collab(&self) -> ReceivePermit {
+        self.acquire_class(ReceiveClass::Collab).await
+    }
+
+    async fn acquire_class(&self, class: ReceiveClass) -> ReceivePermit {
+        let (rx, mut parked) = {
+            let mut state = self.shared.lock();
+            let free = state.in_use < state.limit;
+            // No barging: an earlier waiter of a class that goes first (or of
+            // the same class) keeps its turn even if a lane looks free.
+            let ahead = match class {
+                ReceiveClass::Personal => !state.personal.is_empty(),
+                ReceiveClass::Collab => state.waiters() > 0,
+            };
+            if free && !ahead {
+                state.in_use += 1;
+                let yield_changed = self.shared.refresh_yield(&state);
+                let snap = snapshot(&state);
+                drop(state);
+                log_yield(yield_changed, snap);
+                log_admitted(class, snap);
+                return ReceivePermit {
+                    shared: Arc::clone(&self.shared),
+                    class,
+                };
             }
-            // Outside the lock: destroy the permit instead of releasing it, so the
-            // semaphore's total shrinks by one for good.
-            permit.forget();
-        }
+            let id = state.next_id;
+            state.next_id += 1;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state.queue(class).push_back(GateWaiter { id, tx });
+            let yield_changed = self.shared.refresh_yield(&state);
+            let snap = snapshot(&state);
+            drop(state);
+            tracing::debug!(
+                class = class.as_str(),
+                in_use = snap.in_use,
+                limit = snap.limit,
+                count = snap.waiters,
+                "receive lane queued"
+            );
+            log_yield(yield_changed, snap);
+            let parked = ParkedAcquire {
+                shared: Arc::clone(&self.shared),
+                id,
+                class,
+                granted: false,
+            };
+            (rx, parked)
+        };
+        // The sender lives in this waiter's queue entry. Only the grant pass
+        // removes it (and it sends first), or `parked`'s `Drop` (and then this
+        // future is gone); `parked` keeps the shared state alive. A closed
+        // channel is therefore unreachable rather than a case to handle.
+        let permit = rx
+            .await
+            .expect("a parked receive waiter is only removed by granting it");
+        parked.granted = true;
+        permit
+    }
+
+    /// A watch on the yield flag: `true` exactly while a personal transfer
+    /// waits and every lane is taken. The collab lane reads it to finish its
+    /// frame in flight and give its permit back; the gate never takes one.
+    pub fn yield_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shared.yield_tx.subscribe()
     }
 
     /// Change the cap live (clamped as in [`new`](Self::new)). Never blocks and
-    /// never interrupts a transfer already holding a permit: a grow wakes parked
-    /// waiters immediately, a shrink lands as debt that the in-flight lanes pay off
-    /// as they finish.
+    /// never interrupts a transfer already holding a permit: a grow admits
+    /// parked waiters immediately (personal first), a shrink stops grants until
+    /// enough holders have finished.
     pub fn set_limit(&self, limit: usize) {
         let limit = limit.clamp(MIN_CONCURRENT_RECEIVES, MAX_CONCURRENT_RECEIVES);
-        let mut state = self
-            .state
-            .lock()
-            .expect("receive gate state mutex poisoned");
-        if limit > state.limit {
-            let mut grow = limit - state.limit;
-            // Debt first — see "Debt vs. grow" on the struct.
-            let paid = grow.min(state.debt);
-            state.debt -= paid;
-            grow -= paid;
-            if grow > 0 {
-                self.sem.add_permits(grow);
-            }
-        } else if limit < state.limit {
-            let cut = state.limit - limit;
-            // Takes only what is available right now; the rest becomes debt.
-            let forgotten = self.sem.forget_permits(cut);
-            state.debt += cut - forgotten;
-        }
-        state.limit = limit;
+        let (grants, yield_changed, snap) = {
+            let mut state = self.shared.lock();
+            state.limit = limit;
+            self.shared.settle(&mut state)
+        };
+        self.shared.deliver(grants, yield_changed, snap);
     }
 
     /// The cap currently in force (post-clamp) — for status reporting and tests.
     pub fn limit(&self) -> usize {
-        self.state
-            .lock()
-            .expect("receive gate state mutex poisoned")
-            .limit
+        self.shared.lock().limit
+    }
+
+    /// Lanes held right now (including one reserved for a waiter being woken).
+    pub fn in_use(&self) -> usize {
+        self.shared.lock().in_use
     }
 }
 
@@ -2099,7 +2406,7 @@ async fn handle_announce(
     // `Notified` is enabled BEFORE the flags are read — the same ordering the fetch
     // select loop uses further down. The acquire future is pinned ACROSS wakes so a
     // spurious wake (a cancel for some other package) does not cost this lane its
-    // place in the semaphore's FIFO queue.
+    // place in the gate's FIFO queue.
     let _receive_permit = {
         // Variant C: while this block runs, the row sits `announced` with nothing in
         // durable state to say it is merely waiting its turn. The marker is the live
@@ -7462,7 +7769,7 @@ mod tests {
 
     /// Admit one receive through `gate`, failing loudly (not hanging) if the gate
     /// wrongly blocks it.
-    async fn gate_admit(gate: &ReceiveGate, what: &str) -> tokio::sync::OwnedSemaphorePermit {
+    async fn gate_admit(gate: &ReceiveGate, what: &str) -> ReceivePermit {
         match tokio::time::timeout(GATE_ADMITTED, gate.acquire()).await {
             Ok(permit) => permit,
             Err(_) => panic!("{what}: acquire must be admitted, but the gate blocked it"),
@@ -7640,6 +7947,293 @@ mod tests {
         let control = InboundControl::new();
         apply_receive_limit(&control, Some(99));
         assert_eq!(control.receive_gate.limit(), 8);
+    }
+
+    // ─── Two-class ReceiveGate (collab v3 wave 3, T13, spec §8, L1) ────────
+    //
+    // Personal transfers are admitted strictly before collab units; the gate
+    // reserves a freed lane for the next waiter under its lock, so nothing can
+    // barge into it. Sequencing is deterministic on the current-thread test
+    // runtime: `settle` lets every spawned task run to its next await point, so
+    // "still waiting" is read from `is_finished` after a settle instead of from
+    // an elapsed timeout. `GATE_ADMITTED` bounds only a deadlock, never a rate.
+
+    /// Let every spawned task on the current-thread runtime run to its next
+    /// await point.
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_waiting_personal_transfer_is_admitted_before_any_collab_unit() {
+        let gate = std::sync::Arc::new(ReceiveGate::new(1));
+        let held = gate.acquire_collab().await;
+        let g1 = std::sync::Arc::clone(&gate);
+        let collab_next = tokio::spawn(async move { g1.acquire_collab().await });
+        tokio::task::yield_now().await;
+        let g2 = std::sync::Arc::clone(&gate);
+        let personal = tokio::spawn(async move { g2.acquire().await });
+        tokio::task::yield_now().await;
+        drop(held);
+        let p = tokio::time::timeout(std::time::Duration::from_secs(1), personal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.class(), ReceiveClass::Personal);
+        assert!(
+            !collab_next.is_finished(),
+            "the queued collab unit waits behind the personal transfer"
+        );
+        drop(p);
+        let c = tokio::time::timeout(std::time::Duration::from_secs(1), collab_next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.class(), ReceiveClass::Collab);
+    }
+
+    #[tokio::test]
+    async fn a_personal_waiter_raises_the_yield_signal_until_it_is_admitted() {
+        let gate = std::sync::Arc::new(ReceiveGate::new(1));
+        let mut signal = gate.yield_signal();
+        let held = gate.acquire_collab().await;
+        assert!(!*signal.borrow());
+        let g = std::sync::Arc::clone(&gate);
+        let personal = tokio::spawn(async move { g.acquire().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), signal.wait_for(|y| *y))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(held); // the collab lane finished its frame and yielded
+        let _p = personal.await.unwrap();
+        assert!(!*gate.yield_signal().borrow());
+    }
+
+    #[tokio::test]
+    async fn no_collab_waiter_personal_only_behaves_as_before() {
+        let gate = ReceiveGate::new(2);
+        let a = gate.acquire().await;
+        let b = gate.acquire().await;
+        assert_eq!(gate.in_use(), 2);
+        drop(a);
+        let _c = gate.acquire().await;
+        drop(b);
+        assert_eq!(gate.in_use(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_acquire_never_leaks_a_lane() {
+        let gate = std::sync::Arc::new(ReceiveGate::new(1));
+        let held = gate.acquire().await;
+        let g = std::sync::Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { g.acquire_collab().await });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+        drop(held);
+        // the lane is free again for the next caller
+        let _again = tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire())
+            .await
+            .unwrap();
+        assert_eq!(gate.in_use(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_shrink_takes_effect_as_holders_finish() {
+        let gate = std::sync::Arc::new(ReceiveGate::new(2));
+        let a = gate.acquire().await;
+        let b = gate.acquire_collab().await;
+        gate.set_limit(1);
+        let g = std::sync::Arc::clone(&gate);
+        let next = tokio::spawn(async move { g.acquire().await });
+        drop(a);
+        tokio::task::yield_now().await;
+        assert!(!next.is_finished(), "one holder left = the new limit");
+        drop(b);
+        let _n = tokio::time::timeout(std::time::Duration::from_secs(1), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gate.limit(), 1);
+    }
+
+    /// R4: a personal `acquire()` future dropped while it waits removes its
+    /// waiter — the yield signal falls at once, and the collab unit queued
+    /// behind it is admitted by the next release instead of waiting forever
+    /// behind a ghost.
+    #[tokio::test]
+    async fn a_dropped_personal_waiter_lowers_the_yield_and_lets_a_queued_collab_unit_in() {
+        let gate = Arc::new(ReceiveGate::new(1));
+        let signal = gate.yield_signal();
+        let held = gate.acquire_collab().await;
+
+        let g = Arc::clone(&gate);
+        let personal = tokio::spawn(async move { g.acquire().await });
+        settle().await;
+        assert!(*signal.borrow(), "a personal transfer waits on full lanes");
+
+        let g = Arc::clone(&gate);
+        let collab_next = tokio::spawn(async move { g.acquire_collab().await });
+        settle().await;
+        assert!(!collab_next.is_finished());
+
+        personal.abort();
+        assert!(personal.await.unwrap_err().is_cancelled());
+        assert!(
+            !*signal.borrow(),
+            "the cancelled personal waiter no longer holds the yield up"
+        );
+        assert_eq!(gate.in_use(), 1, "the abandoned wait reserved nothing");
+
+        drop(held);
+        let c = tokio::time::timeout(GATE_ADMITTED, collab_next)
+            .await
+            .expect("the queued collab unit is admitted once the lane frees")
+            .expect("collab waiter panicked");
+        assert_eq!(c.class(), ReceiveClass::Collab);
+        assert_eq!(gate.in_use(), 1);
+        assert!(!*signal.borrow());
+    }
+
+    /// R4 no barging: with limit 2 and two collab holders, a collab unit
+    /// queues FIRST and a personal transfer queues after it. When one lane
+    /// frees, the personal transfer wins it, and a collab caller arriving at
+    /// that very moment cannot slip in either — the lane was reserved for the
+    /// personal waiter before it was even woken.
+    #[tokio::test]
+    async fn a_freed_lane_goes_to_the_personal_waiter_and_nobody_barges() {
+        let gate = Arc::new(ReceiveGate::new(2));
+        let signal = gate.yield_signal();
+        let a = gate.acquire_collab().await;
+        let _b = gate.acquire_collab().await;
+
+        let g = Arc::clone(&gate);
+        let collab_queued = tokio::spawn(async move { g.acquire_collab().await });
+        settle().await;
+        let g = Arc::clone(&gate);
+        let personal = tokio::spawn(async move { g.acquire().await });
+        settle().await;
+        assert!(*signal.borrow());
+
+        drop(a);
+        // Same instant, before any spawned task has run: a fresh collab caller
+        // finds no free lane.
+        // A zero timeout polls the acquire exactly once (the inner future is
+        // polled before the elapsed deadline) and then drops it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, gate.acquire_collab())
+                .await
+                .is_err(),
+            "a collab caller must not barge into the lane reserved for the personal waiter"
+        );
+        assert_eq!(gate.in_use(), 2, "the freed lane is already reserved");
+        assert!(!*signal.borrow(), "the personal waiter holds a lane now");
+
+        let p = tokio::time::timeout(GATE_ADMITTED, personal)
+            .await
+            .expect("the personal waiter is admitted")
+            .expect("personal waiter panicked");
+        assert_eq!(p.class(), ReceiveClass::Personal);
+        settle().await;
+        assert!(
+            !collab_queued.is_finished(),
+            "the earlier collab waiter still waits — class beats arrival order"
+        );
+
+        drop(p);
+        let c = tokio::time::timeout(GATE_ADMITTED, collab_queued)
+            .await
+            .expect("the collab waiter is admitted next")
+            .expect("collab waiter panicked");
+        assert_eq!(c.class(), ReceiveClass::Collab);
+    }
+
+    /// R4: raising the limit while a personal transfer waits admits it at
+    /// once and lowers the yield signal; the holders are untouched.
+    #[tokio::test]
+    async fn raising_the_limit_admits_a_waiting_personal_transfer_and_lowers_the_yield() {
+        let gate = Arc::new(ReceiveGate::new(1));
+        let signal = gate.yield_signal();
+        let _held = gate.acquire_collab().await;
+
+        let g = Arc::clone(&gate);
+        let personal = tokio::spawn(async move { g.acquire().await });
+        settle().await;
+        assert!(*signal.borrow());
+
+        gate.set_limit(2);
+        assert!(!*signal.borrow(), "the grow admitted the personal waiter");
+        assert_eq!(gate.in_use(), 2, "the collab holder was not interrupted");
+        let p = tokio::time::timeout(GATE_ADMITTED, personal)
+            .await
+            .expect("the personal waiter is admitted by the grow")
+            .expect("personal waiter panicked");
+        assert_eq!(p.class(), ReceiveClass::Personal);
+    }
+
+    /// Within one class admission is FIFO, for collab units as for personal
+    /// transfers.
+    #[tokio::test]
+    async fn collab_units_are_admitted_in_arrival_order() {
+        let gate = Arc::new(ReceiveGate::new(1));
+        let held = gate.acquire_collab().await;
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for i in 0..3 {
+            let (g, order) = (Arc::clone(&gate), Arc::clone(&order));
+            tasks.push(tokio::spawn(async move {
+                let _p = g.acquire_collab().await;
+                order.lock().unwrap().push(i);
+            }));
+            settle().await;
+        }
+        drop(held);
+        for t in tasks {
+            tokio::time::timeout(GATE_ADMITTED, t)
+                .await
+                .expect("every collab waiter is admitted in turn")
+                .expect("collab waiter panicked");
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(gate.in_use(), 0);
+    }
+
+    /// A holder that panics releases its lane exactly once while unwinding.
+    #[tokio::test]
+    async fn a_holder_that_panics_releases_its_lane_exactly_once() {
+        let gate = Arc::new(ReceiveGate::new(2));
+        let g = Arc::clone(&gate);
+        let holder = tokio::spawn(async move {
+            let _p = g.acquire_collab().await;
+            panic!("holder failed mid-unit");
+        });
+        assert!(holder.await.unwrap_err().is_panic());
+        assert_eq!(gate.in_use(), 0, "the unwinding holder released its lane");
+        let _a = gate_admit(&gate, "first lane after the panic").await;
+        let _b = gate_admit(&gate, "second lane after the panic").await;
+        assert_eq!(gate.in_use(), 2);
+        gate_blocks(&gate, "no lane was minted by the unwind").await;
+    }
+
+    /// A collab unit alone never raises the yield: the signal is about a
+    /// personal transfer waiting, not about full lanes.
+    #[tokio::test]
+    async fn full_lanes_without_a_personal_waiter_raise_no_yield() {
+        let gate = Arc::new(ReceiveGate::new(1));
+        let signal = gate.yield_signal();
+        let held = gate.acquire_collab().await;
+        let g = Arc::clone(&gate);
+        let collab_next = tokio::spawn(async move { g.acquire_collab().await });
+        settle().await;
+        assert!(!*signal.borrow());
+        drop(held);
+        let _c = tokio::time::timeout(GATE_ADMITTED, collab_next)
+            .await
+            .expect("admitted")
+            .expect("collab waiter panicked");
+        assert!(!*signal.borrow());
     }
 
     // ─── Per-peer receive lanes (W2 T2.3) ───────────────────────────────────

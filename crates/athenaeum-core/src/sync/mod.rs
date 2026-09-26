@@ -95,7 +95,7 @@ pub use retention::{
     disk_usage_pct, evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy,
 };
 pub use receiver::{
-    allow_all_peers, InboundControl, IncomingResolver, PeerAuthorizer, QueuedAnnounce, QueuedAnnounceEntry, ReceiveGate, ReceiverHooks, SyncFinishedEvent,
+    allow_all_peers, InboundControl, IncomingResolver, PeerAuthorizer, QueuedAnnounce, QueuedAnnounceEntry, ReceiveClass, ReceiveGate, ReceivePermit, ReceiverHooks, SyncFinishedEvent,
     SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime,
     DEFAULT_MAX_CONCURRENT_RECEIVES,
 };
