@@ -2,8 +2,13 @@
 // commit-on-blur/Enter/Escape pin as `AnalysisSettingsPanel.test.tsx`, plus
 // the "Refuse trailed frames" checkbox committing immediately (a discrete
 // control), for the other panel this task migrated.
-import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+//
+// Fake timers throughout, for the same reason as the Analysis file: a
+// real-timer `waitFor` raced the hook's 500 ms debounce against its own
+// 1000 ms budget and could lose under CPU load.
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { advance, PAST_THE_DEBOUNCE_MS } from '../../test/fakeClock';
 import { SettingsDefaultsProvider } from '../../settings/SettingsDefaultsContext';
 import { PlateSolveSettingsPanel } from './PlateSolveSettingsPanel';
 import { api } from '../../api';
@@ -57,59 +62,69 @@ beforeEach(() => {
   vi.mocked(api.invoke).mockImplementation(mockInvoke as never);
   vi.mocked(api.listen).mockResolvedValue(() => {});
   notifyMock.mockClear();
+  vi.useFakeTimers();
 });
 
-function renderPanel() {
-  return render(
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+/** Renders the panel and settles its mount loads — no real-time wait. */
+async function renderPanel() {
+  render(
     <SettingsDefaultsProvider>
       <PlateSolveSettingsPanel />
     </SettingsDefaultsProvider>,
   );
+  await advance(0);
+  await advance(0);
+}
+
+function setPlateSolveConfigCalls() {
+  return vi.mocked(api.invoke).mock.calls.filter(([cmd]) => cmd === 'set_plate_solve_config');
 }
 
 describe('PlateSolveSettingsPanel', () => {
   it('commits SIP Distortion Order on blur, once, with the whole config', async () => {
-    renderPanel();
+    await renderPanel();
 
     // `3` (the fixture's `sip_order`) is unique across the panel's numeric
     // fields at mount (autofind is 0.5, tolerance 8, batch concurrency 0).
-    const input = await screen.findByDisplayValue('3');
+    const input = screen.getByDisplayValue('3');
 
     fireEvent.change(input, { target: { value: '4' } });
     fireEvent.blur(input);
+    await advance(PAST_THE_DEBOUNCE_MS);
 
-    await waitFor(() => {
-      const calls = vi.mocked(api.invoke).mock.calls.filter(([cmd]) => cmd === 'set_plate_solve_config');
-      expect(calls).toHaveLength(1);
-      expect(calls[0][1]).toEqual({ config: { ...PLATE_SOLVE_CONFIG_FIXTURE, sip_order: 4 } });
-    });
+    const calls = setPlateSolveConfigCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toEqual({ config: { ...PLATE_SOLVE_CONFIG_FIXTURE, sip_order: 4 } });
   });
 
   it('rejects an out-of-range SIP order inline and never commits it', async () => {
-    renderPanel();
-    const input = await screen.findByDisplayValue('3');
+    await renderPanel();
+    const input = screen.getByDisplayValue('3');
 
     fireEvent.change(input, { target: { value: '9' } });
     fireEvent.blur(input);
 
-    expect(await screen.findByText(/Must be a whole number between 2 and 5/)).toBeInTheDocument();
-    await new Promise((r) => setTimeout(r, 600));
-    expect(vi.mocked(api.invoke)).not.toHaveBeenCalledWith('set_plate_solve_config', expect.anything());
+    expect(screen.getByText(/Must be a whole number between 2 and 5/)).toBeInTheDocument();
+    await advance(PAST_THE_DEBOUNCE_MS);
+    expect(setPlateSolveConfigCalls()).toHaveLength(0);
   });
 
   it('toggles "Refuse trailed frames before solving" immediately, no blur needed', async () => {
-    renderPanel();
-    await screen.findByDisplayValue('3');
+    await renderPanel();
+    screen.getByDisplayValue('3');
 
     const checkbox = screen.getByRole('checkbox', { name: 'Refuse trailed frames before solving' });
     expect(checkbox).toBeChecked();
 
     fireEvent.click(checkbox);
+    await advance(PAST_THE_DEBOUNCE_MS);
 
-    await waitFor(() => {
-      const calls = vi.mocked(api.invoke).mock.calls.filter(([cmd]) => cmd === 'set_plate_solve_config');
-      expect(calls).toHaveLength(1);
-      expect(calls[0][1]).toEqual({ config: { ...PLATE_SOLVE_CONFIG_FIXTURE, input_gate_enabled: false } });
-    });
+    const calls = setPlateSolveConfigCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toEqual({ config: { ...PLATE_SOLVE_CONFIG_FIXTURE, input_gate_enabled: false } });
   });
 });
