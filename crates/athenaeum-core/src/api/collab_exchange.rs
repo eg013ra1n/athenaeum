@@ -313,7 +313,13 @@ pub(crate) async fn sync_manifest_inner(
             {
                 let database = db(ctx)?;
                 let conn = database.conn();
-                let tx = conn.unchecked_transaction()?;
+                // IMMEDIATE: read-then-write — see `FeedApplier::apply_inline`
+                // (a deferred upgrade under another writer fails at once and
+                // the live event that asked for this page is dropped).
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
                 let mut routes = frames_db::EngineRoutes::default();
                 for v in &page.rows {
                     let prev = frames_db::get(&tx, project_id, &v.frame_uuid)?;

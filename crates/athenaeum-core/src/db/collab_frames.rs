@@ -720,7 +720,10 @@ pub fn delete_not_in(conn: &Connection, project_id: &str, keep: &HashSet<String>
     // observe the rows gone without their claims already dropped, or the
     // claims dropped while the rows still exist to be re-scanned as "doomed"
     // a second time.
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE: it reads before it writes; a deferred read-to-write upgrade
+    // under another writer fails at once with SQLITE_BUSY, never waiting the
+    // busy timeout (the collab live feed's full reload runs this).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     // A servable ('held') replica row about to be deleted must drop its
     // local claim too, through the outbox (T5/T9 ruling): otherwise the
     // device keeps reporting a claim on a frame it no longer has any local

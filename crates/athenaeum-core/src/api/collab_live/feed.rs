@@ -592,7 +592,14 @@ impl FeedApplier {
         let database = db(&self.ctx)?;
         let conn = database.conn();
         let project = crate::api::collab_exchange::live_project(&conn, pid)?;
-        let tx = conn.unchecked_transaction()?;
+        // IMMEDIATE: this transaction reads before it writes, and a
+        // read-to-write upgrade under another writer fails at once with
+        // SQLITE_BUSY (or BUSY_SNAPSHOT) — the busy timeout never applies —
+        // and the event would be dropped (the last event of a burst then
+        // waits for the 60 s versions vector). Taking the write lock up front
+        // waits the busy timeout instead.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         let mut routes = frames_db::EngineRoutes::default();
         let mut max_mv = project.manifest_cursor;
         let mut counts: std::collections::BTreeMap<
@@ -1542,6 +1549,75 @@ mod tests {
         // replaying it is a no-op
         f.apply(LiveEvent::Project(last), &mut h).await.unwrap();
         assert_eq!(manifest_requests(&hub).await, before + 1);
+    }
+
+    /// Another connection takes the catalog's write lock and holds it for
+    /// `hold` — as the storage task's scope pass or a landing does
+    /// (`BEGIN IMMEDIATE`, milliseconds in the app). Returns once it is held.
+    fn hold_write_lock(
+        ctx: &ServiceContext,
+        hold: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let path = crate::api::db(ctx).unwrap().path().to_path_buf();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(hold);
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        held_rx.recv().unwrap();
+        writer
+    }
+
+    /// The load flake of `a_publish_is_fetched_without_any_poll` (2026-09-27):
+    /// a manifest write that began as a read transaction could not take the
+    /// write lock another writer held — SQLite answers `SQLITE_BUSY` at once
+    /// (no busy wait for a read-to-write upgrade) — so the event was dropped,
+    /// and the LAST event of a burst waited for the 60 s versions vector.
+    /// The write lock is taken up front: the apply waits the busy timeout.
+    #[tokio::test]
+    async fn an_inline_apply_waits_for_another_writer_instead_of_dropping_the_event() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        hub.seed_frames(PID, "acc-o", &["u1"], "published");
+        let ev = project_event_from_hub(&hub, PID);
+        let writer = hold_write_lock(&ctx, std::time::Duration::from_millis(300));
+        let effects = f
+            .apply(LiveEvent::Project(ev.clone()), &mut h)
+            .await
+            .expect("the apply waits for the other writer");
+        writer.join().unwrap();
+        assert!(effects.contains(&FeedEffect::NeedSetChanged(PID.into())));
+        assert_eq!(cursor(&ctx).1, ev.version);
+    }
+
+    /// As above for the REST catch-up's manifest page write.
+    #[tokio::test]
+    async fn a_rest_catch_up_waits_for_another_writer_instead_of_dropping_the_event() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        hub.seed_frames(PID, "acc-o", &["u1"], "published");
+        hub.seed_frames(PID, "acc-o", &["u2"], "published");
+        let last = project_event_from_hub(&hub, PID); // a gap: caught up over REST
+        let writer = hold_write_lock(&ctx, std::time::Duration::from_millis(300));
+        f.apply(LiveEvent::Project(last.clone()), &mut h)
+            .await
+            .expect("the catch-up waits for the other writer");
+        writer.join().unwrap();
+        assert_eq!(cursor(&ctx).1, last.version);
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        assert!(crate::db::collab_frames::get(&conn, PID, "u2")
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
