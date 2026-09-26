@@ -1156,10 +1156,10 @@ impl SharedIrohNode {
         //
         // Collab v3 wave 3 (spec §8, §9.3): the collab consumer is its own —
         // the serve check on every get (the oracle slot starts empty: no
-        // check, no stream limit, until the host installs one), the upload
-        // stream limit (starts at the default of `collab.max_upload_streams`),
-        // push refused, and collab-class pacing that yields to personal
-        // uploads.
+        // record/stamp check until the host installs one), the upload stream
+        // limit on every counted get, oracle or not (starts at the default of
+        // `collab.max_upload_streams`), push refused, and collab-class pacing
+        // that yields to personal uploads.
         let collab: SharedCollabSlot = Arc::new(RwLock::new(None));
         let collab_oracle: SharedServeOracle = Arc::new(RwLock::new(None));
         let collab_gauge = StreamGauge::new(default_collab_upload_streams());
@@ -6240,6 +6240,51 @@ mod collab_store_tests {
             "B holds the blob after the collab GET"
         );
 
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// Task 12 ruling R2: a node with NO serve oracle still counts every get
+    /// against its collab upload stream limit — past it the get is refused
+    /// with `ERR_LIMIT` (which the fetcher retries), and served once a
+    /// stream frees up.
+    #[tokio::test]
+    async fn a_node_without_an_oracle_still_enforces_the_collab_stream_limit() {
+        let (da, db, root) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let (a, b, a_info, _) = two_nodes(da.path(), db.path()).await;
+        a.set_collab_root(Some(root.path())).await.expect("mount");
+        let frame = root.path().join("frame.fits");
+        write_file(&frame, 64 * 1024);
+        let hash = add_by_reference(&a.collab_store().unwrap(), &frame, "project/p/u/1").await;
+
+        a.set_collab_upload_limit(1);
+        let held = a.collab_stream_gauge_for_test().try_acquire().unwrap();
+        let pool = ConnectionPool::new(b.endpoint(), COLLAB_BLOBS_ALPN, PoolOptions::default());
+        let conn = pool
+            .get_or_connect(EndpointId::from_bytes(&a_info.node_id).unwrap())
+            .await
+            .expect("dial");
+        let err = tokio::time::timeout(
+            MUST_FAIL_WITHIN,
+            b.store()
+                .remote()
+                .execute_get((*conn).clone(), GetRequest::blob(hash)),
+        )
+        .await
+        .expect("a refusal comes back at once")
+        .expect_err("the only stream is busy");
+        assert_eq!(err.iroh_error_code(), Some(iroh_blobs::protocol::ERR_LIMIT));
+        assert!(!b.store().blobs().has(hash).await.unwrap());
+
+        drop(held);
+        b.store()
+            .remote()
+            .execute_get((*conn).clone(), GetRequest::blob(hash))
+            .await
+            .expect("served once the stream is free");
+        assert!(b.store().blobs().has(hash).await.unwrap());
+
+        drop(conn);
         a.shutdown().await;
         b.shutdown().await;
     }

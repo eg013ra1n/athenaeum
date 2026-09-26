@@ -70,6 +70,7 @@ use crate::sync::DedupResponder;
 
 pub(crate) mod assign;
 pub mod blobs;
+pub mod collab_pool;
 pub mod node;
 pub mod pacer;
 pub mod proto;
@@ -1006,12 +1007,14 @@ impl Drop for StreamPermit {
     }
 }
 
-/// The node's late-bindable serve oracle slot (spec §9.3). `None` ⇒ no serve
-/// check — neither the record/stamp conditions nor the upload stream limit:
-/// a bare node with no catalog behind it (the transport's own tests) serves
-/// whatever its collab store holds, like the connect gate admits everyone
-/// when none is installed. The app installs the catalog-backed oracle as
-/// soon as it binds the node (`api::sync::ensure_iroh_node`).
+/// The node's late-bindable serve oracle slot (spec §9.3). `None` ⇒ no
+/// record/stamp check: a bare node with no catalog behind it (the transport's
+/// own tests) serves whatever its collab store holds, like the connect gate
+/// admits everyone when none is installed. The upload stream limit (L11)
+/// applies either way — past it a get is refused with `ERR_LIMIT`, which the
+/// fetcher reads as "busy, retry later" (Task 12). The app installs the
+/// catalog-backed oracle as soon as it binds the node
+/// (`api::sync::ensure_iroh_node`).
 pub type SharedServeOracle = Arc<RwLock<Option<Arc<dyn crate::collab::serve::ServeOracle>>>>;
 
 /// The accepted connections of one blobs provider, keyed by the provider's
@@ -1152,7 +1155,8 @@ impl ConnRegistry {
 ///   serve check ([`collab_serve_verdict`]): the catalog row,
 ///   the file's stamp, storage availability and the upload stream limit
 ///   decide; a refusal is `ERR_PERMISSION`, or `ERR_LIMIT` past the limit.
-///   An admitted get holds a [`StreamPermit`] until its transfer drains.
+///   Without an oracle only the stream limit applies. An admitted get holds
+///   a [`StreamPermit`] until its transfer drains.
 /// - **observe** — the same check without counting a stream.
 /// - **push** — refused (`ERR_PERMISSION`), logged with the peer.
 /// - **get-many** — refused: the collab exchange never sends one.
@@ -1285,9 +1289,9 @@ fn current_oracle(slot: &SharedServeOracle) -> Option<Arc<dyn crate::collab::ser
 
 /// The serve check of one collab get/observe (spec §9.3). The oracle's
 /// catalog read and the file stat run on a blocking thread. Without an
-/// oracle there is no serve check (see [`SharedServeOracle`]).
-/// `Ok(Some(permit))` admits a counted get; `Ok(None)` an observe, a get with
-/// `count_stream == false`, or any request on a node without an oracle.
+/// oracle only the upload stream limit is checked (see
+/// [`SharedServeOracle`]). `Ok(Some(permit))` admits a counted get;
+/// `Ok(None)` an observe or a get with `count_stream == false`.
 async fn collab_serve_verdict(
     oracle: Option<Arc<dyn crate::collab::serve::ServeOracle>>,
     hash: Hash,
@@ -1305,10 +1309,23 @@ async fn collab_serve_verdict(
         usize::MAX
     };
     let (decision, rec, oracle) = match oracle {
-        // No serve check at all (see `SharedServeOracle`): the stream limit
-        // is one of its four conditions, so it is not counted either — a
-        // bare node serves exactly as before wave 3.
-        None => return Ok(None),
+        // No record/stamp check (see `SharedServeOracle`), but a counted get
+        // still takes a stream under the limit — or is refused with
+        // `ERR_LIMIT`, which the fetcher retries (Task 12, ruling R2).
+        None if !count_stream => return Ok(None),
+        None => {
+            return match gauge.try_acquire() {
+                Some(permit) => Ok(Some(permit)),
+                None => {
+                    tracing::debug!(
+                        from,
+                        streams = gauge.in_use(),
+                        "collab get refused: upload stream limit"
+                    );
+                    Err(AbortReason::RateLimited)
+                }
+            };
+        }
         Some(oracle) => {
             let o = Arc::clone(&oracle);
             let hex = blake3_hex.clone();

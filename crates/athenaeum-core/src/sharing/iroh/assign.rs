@@ -60,6 +60,17 @@
 //! least-loaded pick, kept as ONE function so A4's `RankedProviders` is one
 //! edit.
 //!
+//! ## The live run
+//!
+//! Collab v3 wave 3 (spec §7.2, §7.3, §8) adds [`run_live`]: the same child
+//! loop fed from a channel of [`LiveItem`]s, each result sent the moment it
+//! lands, over a [`ProviderSet`] that may be live (providers appear while an
+//! item waits) and through the dedicated collab pool ([`Dialer::Collab`]).
+//! Every path now reads the provider's refusal: `ERR_LIMIT` is a busy
+//! provider retried after [`LIMIT_RETRY`] with no strike, `ERR_PERMISSION`
+//! excludes the provider for that item only. The batch entry points build
+//! [`ProviderSet::Fixed`] and [`Dialer::Stock`] and behave as before.
+//!
 //! ## Progress truth
 //!
 //! Nothing here emits UI progress. D4 T7 fixed `store.observe()` as the single
@@ -91,21 +102,25 @@
 //! want: a stalled peer is not necessarily a dead one, and closing its
 //! connection would make the next attempt pay a fresh handshake.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId};
 use iroh_blobs::api::blobs::Blobs;
 use iroh_blobs::api::remote::{GetProgressItem, Remote};
 use iroh_blobs::api::Store;
 use iroh_blobs::get::Stats;
 use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
-use iroh_blobs::util::connection_pool::{ConnectionPool, Options as PoolOptions};
+use iroh_blobs::util::connection_pool::{ConnectionPool, ConnectionRef, Options as PoolOptions};
 use iroh_blobs::Hash;
 use n0_future::StreamExt as _;
+use tokio::sync::{mpsc, watch};
+
+use super::collab_pool::{CollabPool, PooledConn};
 
 use crate::sharing::{ProviderEvent, ProviderTelemetrySink};
 
@@ -137,6 +152,14 @@ const BACKOFF_MAX_RUNGS: u32 = 6;
 /// `0.5 + 1 + 2 + 4 + 8 + 16 = 31.5 s` of waiting plus the dial attempts
 /// between the rungs — a bounded ladder, never a spin.
 const MAX_BACKOFF_ROUNDS: u32 = 6;
+
+/// Spec §7.2 / T12 ruling R2: a provider that refused a get with `ERR_LIMIT`
+/// (at its upload stream limit) is not asked again for this long — for any
+/// hash — and gets no failure strike: it is alive and serving others.
+pub(crate) const LIMIT_RETRY: Duration = Duration::from_secs(2);
+
+/// How often an item that must stop at a yield checks how far it got.
+const YIELD_CUT_POLL: Duration = Duration::from_millis(250);
 
 /// Floor on the sleep a child takes when every provider is in backoff, so a
 /// clock that has already crossed `next_try` by a hair cannot spin.
@@ -336,6 +359,23 @@ impl HedgeBudget {
         Self { tokens: cap, cap }
     }
 
+    /// A live run's item joins the run: the cap grows by its share, and so do
+    /// the tokens, as if it had been part of the batch from the start.
+    fn extend(&mut self, bytes: u64) {
+        let share = HEDGE_BUDGET_RATIO * bytes as f64;
+        self.cap += share;
+        self.tokens += share;
+    }
+
+    /// A live run's item has ended: its share leaves the cap, so the budget
+    /// stays [`HEDGE_BUDGET_RATIO`] of the items IN FLIGHT — what a batch of
+    /// them would have had — instead of growing with everything ever taken.
+    fn retire(&mut self, bytes: u64) {
+        let share = HEDGE_BUDGET_RATIO * bytes as f64;
+        self.cap = (self.cap - share).max(0.0);
+        self.tokens = self.tokens.min(self.cap);
+    }
+
     /// A completed child refills the bucket, never past the cap.
     fn earn(&mut self, bytes: u64) {
         self.tokens = (self.tokens + HEDGE_BUDGET_RATIO * bytes as f64).min(self.cap);
@@ -428,7 +468,12 @@ pub(crate) enum FailMode {
 /// request), which the hedge observes. `size` is the caller's announced size,
 /// informational only (`0` when unknown): the hedge budget's base is
 /// [`AssignmentOptions::total_bytes`].
-pub(crate) struct FetchItem {
+///
+/// `P` is how the item names its providers. The batch entry points take the
+/// default, a fixed list (`Arc<Vec<EndpointId>>`), and wrap it as
+/// [`ProviderSet::Fixed`]; the engine itself and the live run
+/// ([`run_live`]) work over a [`ProviderSet`], which may be live.
+pub(crate) struct FetchItem<P = Arc<Vec<EndpointId>>> {
     /// The caller's id for the item (a frame uuid; a child index for the
     /// collection wrapper), echoed in the results.
     pub key: String,
@@ -437,10 +482,23 @@ pub(crate) struct FetchItem {
     pub size: u64,
     /// The providers this item may be assigned to. Per-provider state
     /// (backoff, load, goodput) is shared across every item of the call.
-    pub providers: Arc<Vec<EndpointId>>,
+    pub providers: P,
 }
 
 impl FetchItem {
+    /// The batch item as the engine runs it: its list, fixed.
+    fn into_set(self) -> FetchItem<ProviderSet> {
+        FetchItem {
+            key: self.key,
+            request: self.request,
+            hash: self.hash,
+            size: self.size,
+            providers: ProviderSet::Fixed(self.providers),
+        }
+    }
+}
+
+impl<P> FetchItem<P> {
     /// How error messages name the item. A child keeps the exact wording the
     /// collection path always used (`child {index} of {root}`).
     fn describe(&self) -> String {
@@ -454,6 +512,164 @@ impl FetchItem {
 
 /// Per-item results of one call, in input order.
 pub(crate) type ItemResults = Vec<(String, Result<()>)>;
+
+/// An item's providers (spec §7.2 "live providers").
+///
+/// `Fixed` is the list a batch caller hands over, frozen for the call — the
+/// personal path and the wave-2 collab batch. `Live` is a watch channel the
+/// collab scheduler feeds from holder and presence events: a provider that
+/// appears is picked up at the item's next round, and an item whose set is
+/// empty sleeps until one appears (it never fails for waiting). A provider
+/// that leaves the set is not assigned new work for the item; a transfer
+/// already running on it goes on (I5 — only a closed connection or a failed
+/// dial takes a provider out of an in-flight fetch).
+#[derive(Clone)]
+pub(crate) enum ProviderSet {
+    Fixed(Arc<Vec<EndpointId>>),
+    #[allow(dead_code)] // fed by the live scheduler (Tasks 13-15) and the tests
+    Live(watch::Receiver<Arc<Vec<EndpointId>>>),
+}
+
+impl ProviderSet {
+    /// The providers right now.
+    pub(crate) fn current(&self) -> Arc<Vec<EndpointId>> {
+        match self {
+            Self::Fixed(list) => Arc::clone(list),
+            Self::Live(rx) => Arc::clone(&rx.borrow()),
+        }
+    }
+
+    /// As [`current`](Self::current), marking a live value seen so
+    /// [`changed`](Self::changed) waits for the NEXT one.
+    fn current_seen(&mut self) -> Arc<Vec<EndpointId>> {
+        match self {
+            Self::Fixed(list) => Arc::clone(list),
+            Self::Live(rx) => Arc::clone(&rx.borrow_and_update()),
+        }
+    }
+
+    /// Wait until the set changes. `false` when it never can: a fixed list,
+    /// or a live set whose sender is gone.
+    async fn changed(&mut self) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Live(rx) => rx.changed().await.is_ok(),
+        }
+    }
+
+    /// Sleep for `wait`, or less if a live set changes first.
+    async fn sleep_or_change(&mut self, wait: Duration) {
+        match self {
+            Self::Fixed(_) => tokio::time::sleep(wait).await,
+            Self::Live(rx) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            // The sender is gone: the set is final, so only
+                            // the backoff can free a provider now.
+                            tokio::time::sleep(wait).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How the live run finds a provider's dial address (the scheduler's holder
+/// map and presence); `None` means no address is known.
+#[allow(dead_code)] // built by the live scheduler (Tasks 13-15) and the tests
+pub(crate) type ProviderAddrs =
+    Arc<dyn Fn(&EndpointId) -> Option<iroh::EndpointAddr> + Send + Sync>;
+
+/// How transfers get their connection.
+///
+/// `Stock` is the stock `iroh_blobs` pool on one ALPN — the personal path and
+/// the wave-2 collab batch, exactly as before. `Collab` is the dedicated
+/// collab pool (spec §7.3): one kept-open connection per provider, dialled
+/// with its own transport config at the address `addrs` gives.
+#[derive(Clone)]
+pub(crate) enum Dialer {
+    Stock(ConnectionPool),
+    #[allow(dead_code)] // built by the live scheduler (Tasks 13-15) and the tests
+    Collab {
+        pool: Arc<CollabPool>,
+        addrs: ProviderAddrs,
+    },
+}
+
+/// A connection held for one transfer: the stock pool's permit, or a
+/// collab-pool borrow that keeps the connection from idling out.
+enum DialedConn {
+    Stock(ConnectionRef),
+    Collab(PooledConn),
+}
+
+impl DialedConn {
+    fn connection(&self) -> Connection {
+        match self {
+            Self::Stock(c) => (**c).clone(),
+            Self::Collab(c) => c.conn.clone(),
+        }
+    }
+}
+
+/// One frame handed to [`run_live`], with its own cancel switch: `true`
+/// stops that item alone (a new version, an exclusion, a lost project —
+/// spec §7.4), keeping its verified bytes in the store.
+#[allow(dead_code)] // built by the live scheduler (Tasks 13-15) and the tests
+pub(crate) struct LiveItem {
+    pub item: FetchItem<ProviderSet>,
+    pub cancel: watch::Receiver<bool>,
+}
+
+/// How one live item ended, sent on [`run_live`]'s `done` channel the
+/// moment it ends.
+#[derive(Debug)]
+pub(crate) enum ItemOutcome {
+    /// Complete and verified in the store.
+    Done,
+    /// Cancelled (its switch, or cut at a yield); partial bytes stay.
+    Cancelled,
+    /// The item exhausted its ladder or hit an error no provider owns.
+    Failed(anyhow::Error),
+}
+
+/// What the live run learned about a provider, for the scheduler's
+/// per-provider health (spec §7.2, §7.3). None of these is a failed fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LiveVerdict {
+    /// `ERR_PERMISSION`: the provider does not serve this hash now. Excluded
+    /// for the hash, no strike.
+    Refused { provider: EndpointId, hash: Hash },
+    /// `ERR_LIMIT`: the provider is at its upload stream limit. Skipped for
+    /// [`LIMIT_RETRY`], no strike.
+    Busy { provider: EndpointId },
+    /// The provider's bytes failed BLAKE3 verification. Excluded for the
+    /// hash (and struck, like any failure).
+    Corrupt { provider: EndpointId, hash: Hash },
+    /// The provider could not be dialled.
+    DialFailed { provider: EndpointId, error: String },
+}
+
+type VerdictSink = mpsc::UnboundedSender<LiveVerdict>;
+
+/// Knobs for one [`run_live`].
+#[allow(dead_code)] // built by the live scheduler (Tasks 13-15) and the tests
+pub(crate) struct LiveRunOptions {
+    /// The progress deadline ([`STALL_HARD_LIMIT`] in production).
+    pub stall_hard_limit: Duration,
+    /// Race a hedge for the back half of a slow item.
+    pub hedging: bool,
+    pub telemetry: ProviderTelemetrySink,
+    /// Items in flight at once (the collab receive stream limit, L11);
+    /// read before each new item is taken, so a change applies live.
+    pub max_in_flight: Arc<AtomicUsize>,
+    /// The work-unit cap: at a yield, an item larger than this is cut once it
+    /// has moved this many bytes since the yield.
+    pub unit_cap_bytes: u64,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -482,27 +698,56 @@ fn open_pool(endpoint: &Endpoint, alpn: &'static [u8]) -> ConnectionPool {
 
 /// Why one assignment ended without the child's bytes.
 ///
-/// Both variants carry the bytes the attempt did move, because that is what
+/// Every variant carries the bytes the attempt did move, because that is what
 /// the provider is credited with and — Task 8 — what tells a hedge whether the
 /// loser was worth anything.
+///
+/// `Refused`, `Busy` and `Corrupt` read the provider's answer (spec §7.2,
+/// T12 ruling R2). The personal provider never refuses a get with a code, so
+/// on the personal path only `Corrupt` can occur, and it is struck exactly
+/// like the `Failed` it used to be.
 #[derive(Debug)]
 enum TransferFault {
     /// No growth in `bytes_read` for `stall_hard_limit`. No error was raised;
     /// this is the judgement the stock loop cannot make.
     Stalled { bytes: u64 },
-    /// The dial or the transfer errored — the stock loop's own trigger.
+    /// The transfer errored — the stock loop's own trigger.
     Failed { bytes: u64, error: anyhow::Error },
+    /// The dial failed. Struck exactly like `Failed`; told apart only so the
+    /// live run can report it ([`LiveVerdict::DialFailed`]).
+    DialFailed { error: anyhow::Error },
+    /// `ERR_PERMISSION`: this provider does not serve this hash now.
+    Refused { bytes: u64 },
+    /// `ERR_LIMIT`: this provider is at its upload stream limit.
+    Busy { bytes: u64 },
+    /// The bytes failed BLAKE3 verification.
+    Corrupt { bytes: u64, error: anyhow::Error },
 }
 
 impl TransferFault {
     fn bytes(&self) -> u64 {
         match self {
-            Self::Stalled { bytes } | Self::Failed { bytes, .. } => *bytes,
+            Self::Stalled { bytes }
+            | Self::Failed { bytes, .. }
+            | Self::Refused { bytes }
+            | Self::Busy { bytes }
+            | Self::Corrupt { bytes, .. } => *bytes,
+            Self::DialFailed { .. } => 0,
         }
     }
 
     fn is_stall(&self) -> bool {
         matches!(self, Self::Stalled { .. })
+    }
+
+    /// The error a failure carries, for `last_error`.
+    fn error(&self) -> Option<&anyhow::Error> {
+        match self {
+            Self::Failed { error, .. }
+            | Self::DialFailed { error }
+            | Self::Corrupt { error, .. } => Some(error),
+            Self::Stalled { .. } | Self::Refused { .. } | Self::Busy { .. } => None,
+        }
     }
 
     /// One line for a log's `error` field.
@@ -514,8 +759,48 @@ impl TransferFault {
     fn cause(&self) -> String {
         match self {
             Self::Stalled { .. } => "stalled: no progress within the ceiling".to_string(),
-            Self::Failed { error, .. } => format!("{error:#}"),
+            Self::Failed { error, .. }
+            | Self::DialFailed { error }
+            | Self::Corrupt { error, .. } => {
+                format!("{error:#}")
+            }
+            Self::Refused { .. } => "refused: the provider does not serve this hash".to_string(),
+            Self::Busy { .. } => "busy: the provider is at its upload stream limit".to_string(),
         }
+    }
+}
+
+/// Read a failed get's refusal code (spec §7.2): `ERR_PERMISSION` is
+/// [`TransferFault::Refused`], `ERR_LIMIT` is [`TransferFault::Busy`], a
+/// BLAKE3 mismatch is [`TransferFault::Corrupt`], anything else `Failed`.
+fn classify_get_error(
+    e: &iroh_blobs::get::GetError,
+    bytes: u64,
+    provider: EndpointId,
+) -> TransferFault {
+    use iroh_blobs::get::fsm::DecodeError;
+    use iroh_blobs::get::GetError;
+    match e.iroh_error_code() {
+        Some(c) if c == iroh_blobs::protocol::ERR_PERMISSION => {
+            return TransferFault::Refused { bytes };
+        }
+        Some(c) if c == iroh_blobs::protocol::ERR_LIMIT => return TransferFault::Busy { bytes },
+        _ => {}
+    }
+    if let GetError::Decode { source, .. } = e {
+        if matches!(
+            source,
+            DecodeError::ParentHashMismatch { .. } | DecodeError::LeafHashMismatch { .. }
+        ) {
+            return TransferFault::Corrupt {
+                bytes,
+                error: anyhow::anyhow!("verification failed from {}: {e}", provider.fmt_short()),
+            };
+        }
+    }
+    TransferFault::Failed {
+        bytes,
+        error: anyhow::anyhow!("get from {}: {e}", provider.fmt_short()),
     }
 }
 
@@ -528,6 +813,9 @@ impl TransferFault {
 struct ProviderState {
     failures: u32,
     next_try: Option<Instant>,
+    /// Set by an `ERR_LIMIT` refusal ([`LIMIT_RETRY`]): not a failure, so it
+    /// is kept apart from `next_try` and never escalates the ladder.
+    busy_until: Option<Instant>,
     inflight: u32,
     /// The most recent `TransferFault::Failed` cause, and when it was recorded
     /// — so a run that exhausts its ladder can say WHY rather than only that it
@@ -545,6 +833,22 @@ struct ProviderState {
     goodput: Option<f64>,
     goodput_samples: u32,
     stats: ProviderStats,
+}
+
+impl ProviderState {
+    /// Neither in backoff nor busy at `now`.
+    fn available(&self, now: Instant) -> bool {
+        !self.next_try.is_some_and(|t| t > now) && !self.busy_until.is_some_and(|t| t > now)
+    }
+
+    /// When it becomes [`available`](Self::available) again, if it is parked
+    /// at all.
+    fn available_at(&self) -> Option<Instant> {
+        match (self.next_try, self.busy_until) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 type States = Arc<Mutex<HashMap<EndpointId, ProviderState>>>;
@@ -670,7 +974,8 @@ async fn run_items(
     // a connection stays warm across the items assigned to one provider, which
     // is the whole reason to pool at all. ONE pool per call, whatever the item
     // count.
-    let pool = open_pool(endpoint, opts.alpn);
+    let dialer = Dialer::Stock(open_pool(endpoint, opts.alpn));
+    let items: Vec<FetchItem<ProviderSet>> = items.into_iter().map(FetchItem::into_set).collect();
     let remote: Remote = store.remote().clone();
     let blobs: Blobs = store.blobs().clone();
 
@@ -690,7 +995,7 @@ async fn run_items(
     let states: States = Arc::new(Mutex::new(
         items
             .iter()
-            .flat_map(|item| item.providers.iter().copied())
+            .flat_map(|item| item.providers.current().iter().copied().collect::<Vec<_>>())
             .map(|p| (p, ProviderState::default()))
             .collect(),
     ));
@@ -701,7 +1006,7 @@ async fn run_items(
         .map(|i| ItemLabel {
             key: i.key.clone(),
             bytes: i.size,
-            providers: Arc::clone(&i.providers),
+            providers: i.providers.clone(),
         })
         .collect();
     let mut results: Vec<Option<Result<()>>> = (0..item_count).map(|_| None).collect();
@@ -721,7 +1026,7 @@ async fn run_items(
             let Some((slot, item)) = pending.next() else {
                 break;
             };
-            if item.providers.is_empty() {
+            if item.providers.current().is_empty() {
                 let e = anyhow::anyhow!("{}: no provider to assign it to", item.describe());
                 match opts.fail_mode {
                     FailMode::FailFast => return Err(fail_with_report(&states, batch_root, e)),
@@ -732,13 +1037,14 @@ async fn run_items(
                 }
             }
             let handle = set.spawn(run_child(
-                pool.clone(),
+                dialer.clone(),
                 remote.clone(),
                 blobs.clone(),
                 Arc::clone(&states),
                 Arc::clone(&ledger),
                 item,
                 opts.clone(),
+                None,
             ));
             slot_of.insert(handle.id(), slot);
         }
@@ -807,7 +1113,7 @@ async fn run_items(
 struct ItemLabel {
     key: String,
     bytes: u64,
-    providers: Arc<Vec<EndpointId>>,
+    providers: ProviderSet,
 }
 
 /// Log one item's failure under [`FailMode::Isolate`] and hand the error back
@@ -815,7 +1121,7 @@ struct ItemLabel {
 /// providers, the per-item counterpart of what [`fail_with_report`] attaches
 /// to a fail-fast error.
 fn isolated_failure(states: &States, label: &ItemLabel, e: anyhow::Error) -> anyhow::Error {
-    let e = match last_failure_cause(states, Some(&label.providers)) {
+    let e = match last_failure_cause(states, Some(&label.providers.current())) {
         Some(c) => e.context(format!("last provider fault: {c}")),
         None => e,
     };
@@ -868,17 +1174,271 @@ fn last_failure_cause(states: &States, among: Option<&[EndpointId]>) -> Option<S
         .map(|(_, cause)| cause)
 }
 
+/// The live assignment run (spec §7.2, §8 receive side): the item engine fed
+/// from a channel instead of a batch.
+///
+/// - **Items** arrive on `items`, each with a [`ProviderSet`] (usually live)
+///   and its own cancel switch. One is taken only while fewer than
+///   `opts.max_in_flight` are in flight and no yield is requested.
+/// - **Results** go out on `done` the moment each item ends, so the caller
+///   lands a frame at once rather than at the end of a batch. Items are
+///   always isolated: one item's failure is its own ([`FailMode::Isolate`]).
+/// - **Verdicts** — refusals, busy providers, corrupt bytes, failed dials —
+///   go out on `verdicts` for the scheduler's per-provider health.
+/// - **Cancel.** An item's switch set to `true` stops that item alone; its
+///   `GetProgress` stream is dropped, which resets its QUIC stream (module
+///   doc), and its verified ranges stay in the store for a resume.
+/// - **Yield** (`yield_now` = `true`, a personal transfer is waiting — §8):
+///   no new item is taken; an in-flight item larger than
+///   `opts.unit_cap_bytes` is cut ([`ItemOutcome::Cancelled`]) once it has
+///   moved that much since the yield; the run returns as soon as nothing is
+///   in flight.
+///
+/// Returns when `items` is closed and drained, or at a yield once nothing is
+/// in flight. Per-provider state (backoff, busy, goodput) lives for the run.
+#[allow(dead_code)] // driven by the live scheduler (Tasks 13-15) and the tests
+pub(crate) async fn run_live(
+    store: &Store,
+    dialer: Dialer,
+    mut items: mpsc::Receiver<LiveItem>,
+    opts: LiveRunOptions,
+    done: mpsc::UnboundedSender<(String, ItemOutcome)>,
+    verdicts: mpsc::UnboundedSender<LiveVerdict>,
+    mut yield_now: watch::Receiver<bool>,
+) -> AssignmentReport {
+    let remote: Remote = store.remote().clone();
+    let blobs: Blobs = store.blobs().clone();
+    // The hedge budget grows with every item taken (`HedgeBudget::extend`):
+    // a live run has no batch size to take 5 % of.
+    let ledger: Ledger = Arc::new(Mutex::new(HedgeLedger {
+        budget: HedgeBudget::new(0),
+        completions: CompletionWindow::default(),
+        hedges: 0,
+        hedge_bytes: 0,
+    }));
+    let states: States = Arc::new(Mutex::new(HashMap::new()));
+    let child_opts = AssignmentOptions {
+        stall_hard_limit: opts.stall_hard_limit,
+        hedging: opts.hedging,
+        total_bytes: 0,
+        telemetry: Arc::clone(&opts.telemetry),
+        alpn: super::COLLAB_BLOBS_ALPN,
+        fail_mode: FailMode::Isolate,
+    };
+    let mut set: tokio::task::JoinSet<ItemOutcome> = tokio::task::JoinSet::new();
+    let mut labels: HashMap<tokio::task::Id, ItemLabel> = HashMap::new();
+    let mut items_open = true;
+    let mut yield_open = true;
+    let mut taken = 0usize;
+
+    loop {
+        let yielding = *yield_now.borrow_and_update();
+        if set.is_empty() && (yielding || !items_open) {
+            break;
+        }
+        let cap = opts.max_in_flight.load(Ordering::Relaxed).max(1);
+        let can_take = items_open && !yielding && set.len() < cap;
+        tokio::select! {
+            joined = set.join_next_with_id(), if !set.is_empty() => {
+                let (id, outcome) = match joined {
+                    Some(Ok((id, outcome))) => (id, outcome),
+                    Some(Err(join)) => {
+                        let id = join.id();
+                        let e = anyhow::Error::new(join).context("assignment task panicked");
+                        tracing::error!(error = %format!("{e:#}"), "live assignment task panicked");
+                        (id, ItemOutcome::Failed(e))
+                    }
+                    // Guarded by `!set.is_empty()`.
+                    None => continue,
+                };
+                let Some(label) = labels.remove(&id) else {
+                    debug_assert!(false, "every live task is registered under its id");
+                    tracing::error!("live assignment task finished unregistered");
+                    continue;
+                };
+                ledger
+                    .lock()
+                    .expect("hedge ledger mutex poisoned")
+                    .budget
+                    .retire(label.bytes);
+                let outcome = match outcome {
+                    ItemOutcome::Failed(e) => ItemOutcome::Failed(isolated_failure(&states, &label, e)),
+                    other => {
+                        tracing::debug!(
+                            frame_uuid = %label.key,
+                            bytes = label.bytes,
+                            outcome = if matches!(other, ItemOutcome::Done) { "ok" } else { "cancelled" },
+                            "blob fetch finished"
+                        );
+                        other
+                    }
+                };
+                send_done(&done, label.key, outcome);
+            }
+            next = items.recv(), if can_take => match next {
+                Some(live) => {
+                    taken += 1;
+                    let LiveItem { item, cancel } = live;
+                    if *cancel.borrow() {
+                        tracing::debug!(
+                            frame_uuid = %item.key,
+                            bytes = item.size,
+                            outcome = "cancelled",
+                            "blob fetch finished"
+                        );
+                        send_done(&done, item.key, ItemOutcome::Cancelled);
+                        continue;
+                    }
+                    ledger
+                        .lock()
+                        .expect("hedge ledger mutex poisoned")
+                        .budget
+                        .extend(item.size);
+                    let label = ItemLabel {
+                        key: item.key.clone(),
+                        bytes: item.size,
+                        providers: item.providers.clone(),
+                    };
+                    let (hash, size) = (item.hash, item.size);
+                    let child = run_child(
+                        dialer.clone(),
+                        remote.clone(),
+                        blobs.clone(),
+                        Arc::clone(&states),
+                        Arc::clone(&ledger),
+                        item,
+                        child_opts.clone(),
+                        Some(verdicts.clone()),
+                    );
+                    let cut = cut_at_yield(
+                        yield_now.clone(),
+                        blobs.clone(),
+                        hash,
+                        size,
+                        opts.unit_cap_bytes,
+                    );
+                    let handle = set.spawn(async move {
+                        tokio::select! {
+                            r = child => match r {
+                                Ok(()) => ItemOutcome::Done,
+                                Err(e) => ItemOutcome::Failed(e),
+                            },
+                            _ = cancelled(cancel) => ItemOutcome::Cancelled,
+                            _ = cut => ItemOutcome::Cancelled,
+                        }
+                    });
+                    labels.insert(handle.id(), label);
+                }
+                None => items_open = false,
+            },
+            changed = yield_now.changed(), if yield_open => {
+                if changed.is_err() {
+                    // The sender is gone: its last value stands.
+                    yield_open = false;
+                }
+            }
+        }
+    }
+
+    let report = report_from_with_ledger(&states, &ledger);
+    tracing::debug!(
+        count = taken,
+        bytes = report.total_bytes(),
+        "live assignment run finished"
+    );
+    report
+}
+
+/// Hand one live item's outcome to the caller.
+fn send_done(
+    done: &mpsc::UnboundedSender<(String, ItemOutcome)>,
+    key: String,
+    outcome: ItemOutcome,
+) {
+    if let Err(mpsc::error::SendError((key, outcome))) = done.send((key, outcome)) {
+        tracing::warn!(
+            frame_uuid = %key,
+            outcome = ?outcome,
+            "live fetch result dropped: nobody is listening"
+        );
+    }
+}
+
+/// Resolves once the item's cancel switch reads `true`. A switch whose
+/// sender is gone without having been set never fires.
+async fn cancelled(mut cancel: watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow_and_update() {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Resolves when a yield should cut this item: it is larger than the
+/// work-unit cap and has moved `cap` bytes since the yield began (§8 — a
+/// personal transfer waits at most one frame). A withdrawn yield starts the
+/// count again at the next one.
+async fn cut_at_yield(
+    mut yield_now: watch::Receiver<bool>,
+    blobs: Blobs,
+    hash: Hash,
+    size: u64,
+    cap: u64,
+) {
+    if size <= cap {
+        return std::future::pending().await;
+    }
+    loop {
+        // Wait for a yield.
+        while !*yield_now.borrow_and_update() {
+            if yield_now.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+        }
+        let base = local_bytes(&blobs, hash).await;
+        while *yield_now.borrow() {
+            tokio::time::sleep(YIELD_CUT_POLL).await;
+            if local_bytes(&blobs, hash).await.saturating_sub(base) >= cap {
+                tracing::debug!(
+                    blake3 = %hash,
+                    bytes = cap,
+                    "live fetch cut at a yield: the work-unit cap moved"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// The verified bytes of `hash` in the store now (0 when it cannot say).
+async fn local_bytes(blobs: &Blobs, hash: Hash) -> u64 {
+    match blobs.observe(hash).await {
+        Ok(bitfield) => bitfield.total_bytes(),
+        Err(e) => {
+            tracing::debug!(blake3 = %hash, error = %e, "observe for the yield cut failed");
+            0
+        }
+    }
+}
+
 /// One child: pick a provider, transfer what is still missing, repeat until the
 /// child is complete locally or the ladder runs out.
+///
+/// `verdicts` is the live run's channel ([`run_live`]); `None` on the batch
+/// paths, which then behave exactly as before the live run existed.
 #[allow(clippy::too_many_arguments)]
 async fn run_child(
-    pool: ConnectionPool,
+    dialer: Dialer,
     remote: Remote,
     blobs: Blobs,
     states: States,
     ledger: Ledger,
-    item: FetchItem,
+    item: FetchItem<ProviderSet>,
     opts: AssignmentOptions,
+    verdicts: Option<VerdictSink>,
 ) -> Result<()> {
     let request = item.request.clone();
     // Log fields keep the collection path's names: `root_hash` is the hash the
@@ -887,7 +1447,18 @@ async fn run_child(
     let root = item.request.hash;
     let index = item.key.as_str();
     let hash = item.hash;
-    let providers = Arc::clone(&item.providers);
+    let mut providers = item.providers.clone();
+    // Providers this item will not ask again: a refusal (`ERR_PERMISSION`)
+    // on the live and batch paths alike, and on the live path also a
+    // provider whose bytes failed verification (spec §7.2, §7.3).
+    let mut excluded: HashSet<EndpointId> = HashSet::new();
+    let faults = FaultScope {
+        states: &states,
+        opts: &opts,
+        verdicts: verdicts.as_ref(),
+        key: index,
+        hash,
+    };
     let mut rounds = 0u32;
     // Set when a hedge wins: the rest of this child goes to the provider that
     // just proved it can move bytes, not back to the one we gave up on.
@@ -905,25 +1476,62 @@ async fn run_child(
         }
         let missing = local.missing();
 
-        let Some(claim) = claim_provider(&states, &providers, forced.take()) else {
-            // Every provider is in backoff. Wait for the earliest of them and
-            // try again — bounded, never a spin.
-            rounds += 1;
-            if rounds > MAX_BACKOFF_ROUNDS {
-                anyhow::bail!(
-                    "{}: every provider exhausted after {rounds} rounds",
-                    item.describe()
+        // This round's candidates: the providers now, minus the excluded.
+        let candidates: Vec<EndpointId> = providers
+            .current_seen()
+            .iter()
+            .copied()
+            .filter(|p| !excluded.contains(p))
+            .collect();
+        if candidates.is_empty() {
+            // Nobody to ask. A live set waits for a provider to appear, for
+            // as long as it takes and without spending a round (spec §7.2: a
+            // frame without providers sleeps and costs nothing); a fixed list
+            // — or a live one whose sender is gone — never grows.
+            if providers.changed().await {
+                continue;
+            }
+            if excluded.is_empty() {
+                anyhow::bail!("{}: no provider to assign it to", item.describe());
+            }
+            anyhow::bail!(
+                "{}: every provider refused it or served bytes that failed verification",
+                item.describe()
+            );
+        }
+
+        let Some(claim) = claim_provider(&states, &candidates, forced.take()) else {
+            // Every candidate is parked. Wait for the earliest of them and
+            // try again — bounded, never a spin. Waiting on a provider that is
+            // merely BUSY (`ERR_LIMIT`) spends no round: it is alive and will
+            // free a stream.
+            let busy = waiting_on_busy(&states, &candidates);
+            if !busy {
+                rounds += 1;
+                if rounds > MAX_BACKOFF_ROUNDS {
+                    anyhow::bail!(
+                        "{}: every provider exhausted after {rounds} rounds",
+                        item.describe()
+                    );
+                }
+            }
+            let wait = earliest_wait(&states, &candidates);
+            if busy {
+                tracing::debug!(
+                    frame_uuid = index,
+                    blake3 = %hash,
+                    "every provider busy — waiting for a free stream"
+                );
+            } else {
+                tracing::debug!(
+                    root_hash = %root,
+                    child = index,
+                    attempt = rounds,
+                    delay_ms = wait.as_millis() as u64,
+                    "every provider in backoff — waiting for the earliest"
                 );
             }
-            let wait = earliest_wait(&states, &providers);
-            tracing::debug!(
-                root_hash = %root,
-                child = index,
-                attempt = rounds,
-                delay_ms = wait.as_millis() as u64,
-                "every provider in backoff — waiting for the earliest"
-            );
-            tokio::time::sleep(wait).await;
+            providers.sleep_or_change(wait).await;
             continue;
         };
 
@@ -938,7 +1546,7 @@ async fn run_child(
         // is dropped, which resets its QUIC stream (see the module doc).
         let primary_progress = Arc::new(AtomicU64::new(0));
         let mut primary: BoxedTransfer = Box::pin(transfer_once(
-            pool.clone(),
+            dialer.clone(),
             remote.clone(),
             provider,
             missing,
@@ -986,8 +1594,7 @@ async fn run_child(
                     // the primary's failure, then let the hedge finish and
                     // become this round's result; the remainder is picked up by
                     // the next round, on the hedge's provider.
-                    record_failure(&states, provider, &fault, started.elapsed());
-                    (opts.telemetry)(ProviderEvent::Failed(*provider.as_bytes()));
+                    note_fault(&faults, &mut excluded, provider, &fault, started.elapsed());
                     tracing::debug!(
                         root_hash = %root,
                         child = index,
@@ -1080,8 +1687,13 @@ async fn run_child(
                             // never the child's — unless it was carrying the
                             // round alone, in which case it IS the round's
                             // outcome and the loop below reassigns.
-                            record_failure(&states, h.provider, &fault, h.started.elapsed());
-                            (opts.telemetry)(ProviderEvent::Failed(*h.provider.as_bytes()));
+                            note_fault(
+                                &faults,
+                                &mut excluded,
+                                h.provider,
+                                &fault,
+                                h.started.elapsed(),
+                            );
                             settle_hedge_loser(&ledger, &h, fault.bytes().min(h.charge));
                             if primary_gone {
                                 // Nothing is left running. Both failures are
@@ -1097,13 +1709,14 @@ async fn run_child(
                 }
                 Step::Reevaluate => {
                     hedge = try_arm_hedge(
-                        &pool,
+                        &dialer,
                         &remote,
                         &blobs,
                         &states,
                         &ledger,
                         &opts,
                         &item,
+                        &candidates,
                         provider,
                         started,
                         &primary_progress,
@@ -1137,8 +1750,7 @@ async fn run_child(
                 return Ok(());
             }
             Err(fault) => {
-                record_failure(&states, provider, &fault, elapsed);
-                (opts.telemetry)(ProviderEvent::Failed(*provider.as_bytes()));
+                note_fault(&faults, &mut excluded, provider, &fault, elapsed);
                 match &fault {
                     TransferFault::Stalled { bytes } => tracing::warn!(
                         root_hash = %root,
@@ -1158,10 +1770,128 @@ async fn run_child(
                         error = %format!("{error:#}"),
                         "provider failed on this child — reassigning"
                     ),
+                    TransferFault::DialFailed { error } => tracing::debug!(
+                        root_hash = %root,
+                        child = index,
+                        child_hash = %hash,
+                        provider = %provider.fmt_short(),
+                        bytes = 0u64,
+                        error = %format!("{error:#}"),
+                        "provider failed on this child — reassigning"
+                    ),
+                    // Logged by `note_fault`, which read the provider's answer.
+                    TransferFault::Refused { .. }
+                    | TransferFault::Busy { .. }
+                    | TransferFault::Corrupt { .. } => {}
                 }
                 // Round again: `local_for_request` above recomputes the missing
                 // range, so the next provider resumes at the byte.
             }
+        }
+    }
+}
+
+/// What [`note_fault`] needs from its child.
+struct FaultScope<'a> {
+    states: &'a States,
+    opts: &'a AssignmentOptions,
+    verdicts: Option<&'a VerdictSink>,
+    /// The item's key (a frame uuid on the collab paths).
+    key: &'a str,
+    hash: Hash,
+}
+
+impl FaultScope<'_> {
+    fn verdict(&self, v: LiveVerdict) {
+        if let Some(tx) = self.verdicts {
+            if tx.send(v).is_err() {
+                tracing::debug!(
+                    frame_uuid = self.key,
+                    "live verdict dropped: nobody is listening"
+                );
+            }
+        }
+    }
+}
+
+/// Book one provider's fault against it (spec §7.2, §7.3, T12 ruling R2).
+///
+/// - `Stalled`, `Failed`, `DialFailed`: the backoff ladder
+///   ([`record_failure`]) and a `Failed` telemetry event — unchanged.
+/// - `Busy` (`ERR_LIMIT`): the provider is skipped for [`LIMIT_RETRY`] for
+///   every hash; no strike, no fault telemetry.
+/// - `Refused` (`ERR_PERMISSION`): excluded for this item only; no strike.
+/// - `Corrupt` (verification failed): struck like any failure; on the live
+///   path also excluded for this item. The batch paths keep retrying it on
+///   the ladder exactly as they always did.
+fn note_fault(
+    scope: &FaultScope<'_>,
+    excluded: &mut HashSet<EndpointId>,
+    provider: EndpointId,
+    fault: &TransferFault,
+    elapsed: Duration,
+) {
+    match fault {
+        TransferFault::Busy { bytes } => {
+            mark_busy(
+                scope.states,
+                provider,
+                *bytes,
+                elapsed,
+                Instant::now() + LIMIT_RETRY,
+            );
+            tracing::debug!(
+                provider = %provider.fmt_short(),
+                frame_uuid = scope.key,
+                blake3 = %scope.hash,
+                "provider at its upload stream limit — trying another"
+            );
+            scope.verdict(LiveVerdict::Busy { provider });
+        }
+        TransferFault::Refused { bytes } => {
+            excluded.insert(provider);
+            credit_attempt(scope.states, provider, *bytes, elapsed);
+            (scope.opts.telemetry)(ProviderEvent::Failed(*provider.as_bytes()));
+            tracing::debug!(
+                provider = %provider.fmt_short(),
+                frame_uuid = scope.key,
+                blake3 = %scope.hash,
+                "provider refused this frame — excluded for it"
+            );
+            scope.verdict(LiveVerdict::Refused {
+                provider,
+                hash: scope.hash,
+            });
+        }
+        TransferFault::Corrupt { error, .. } => {
+            record_failure(scope.states, provider, fault, elapsed);
+            (scope.opts.telemetry)(ProviderEvent::Failed(*provider.as_bytes()));
+            tracing::warn!(
+                provider = %provider.fmt_short(),
+                frame_uuid = scope.key,
+                blake3 = %scope.hash,
+                error = %format!("{error:#}"),
+                "provider served bytes that failed verification"
+            );
+            if scope.verdicts.is_some() {
+                excluded.insert(provider);
+            }
+            scope.verdict(LiveVerdict::Corrupt {
+                provider,
+                hash: scope.hash,
+            });
+        }
+        TransferFault::DialFailed { error } => {
+            record_failure(scope.states, provider, fault, elapsed);
+            (scope.opts.telemetry)(ProviderEvent::Failed(*provider.as_bytes()));
+            scope.verdict(LiveVerdict::DialFailed {
+                provider,
+                error: format!("{error:#}"),
+            });
+        }
+        TransferFault::Stalled { .. } | TransferFault::Failed { .. } => {
+            record_failure(scope.states, provider, fault, elapsed);
+            (scope.opts.telemetry)(ProviderEvent::Failed(*provider.as_bytes()));
         }
     }
 }
@@ -1363,18 +2093,20 @@ fn settle_hedge_loser(ledger: &Ledger, hedge: &HedgeRun, duplicated: u64) {
 /// budget refusing. The caller simply asks again.
 #[allow(clippy::too_many_arguments)]
 async fn try_arm_hedge(
-    pool: &ConnectionPool,
+    dialer: &Dialer,
     remote: &Remote,
     blobs: &Blobs,
     states: &States,
     ledger: &Ledger,
     opts: &AssignmentOptions,
-    item: &FetchItem,
+    item: &FetchItem<ProviderSet>,
+    candidates: &[EndpointId],
     primary: EndpointId,
     started: Instant,
     primary_progress: &Arc<AtomicU64>,
 ) -> Option<HedgeRun> {
-    let providers: &[EndpointId] = &item.providers;
+    // The round's candidates: the item's providers minus the ones it excluded.
+    let providers: &[EndpointId] = candidates;
     let index = item.key.as_str();
     let hash = item.hash;
     // What is still missing, from the progress truth (`store.observe`) rather
@@ -1460,7 +2192,7 @@ async fn try_arm_hedge(
     let hedge_provider = claim.provider();
     let progress = Arc::new(AtomicU64::new(0));
     let fut: BoxedTransfer = Box::pin(transfer_once(
-        pool.clone(),
+        dialer.clone(),
         remote.clone(),
         hedge_provider,
         request,
@@ -1500,30 +2232,24 @@ async fn try_arm_hedge(
 /// Returns as soon as the request completes, errors, or goes
 /// `stall_hard_limit` without its `bytes_read` growing. `progress` mirrors the
 /// running payload-byte count so a caller that drops this future can still see
-/// how far it got. Takes its pool and remote by value so the future is
+/// how far it got. Takes its dialer and remote by value so the future is
 /// `'static` and can be boxed beside a sibling in a `select!`. In the stall case the
 /// `GetProgress` stream is dropped on the way out, which resets the QUIC stream
 /// — see the module doc's cancellation note for why that is enough.
 async fn transfer_once(
-    pool: ConnectionPool,
+    dialer: Dialer,
     remote: Remote,
     provider: EndpointId,
     request: GetRequest,
     stall_hard_limit: Duration,
     progress: Arc<AtomicU64>,
 ) -> std::result::Result<Stats, TransferFault> {
-    let conn = pool
-        .get_or_connect(provider)
-        .await
-        .map_err(|e| TransferFault::Failed {
-            bytes: 0,
-            error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
-        })?;
+    let conn = dial(&dialer, provider).await?;
 
-    // `ConnectionRef` derefs to the pooled `Connection` and holds the pool's
-    // permit; it stays alive for the whole transfer and is dropped with this
-    // function, releasing the permit while leaving the connection warm.
-    let get = remote.execute_get((*conn).clone(), request);
+    // The stock `ConnectionRef` holds the pool's permit, a `PooledConn` keeps
+    // the collab connection from idling out; either stays alive for the whole
+    // transfer and is dropped with this function, leaving the connection warm.
+    let get = remote.execute_get(conn.connection(), request);
     let mut stream = std::pin::pin!(get.stream());
 
     let mut last_bytes = 0u64;
@@ -1546,10 +2272,7 @@ async fn transfer_once(
             }
             Ok(Some(GetProgressItem::Done(stats))) => return Ok(stats),
             Ok(Some(GetProgressItem::Error(e))) => {
-                return Err(TransferFault::Failed {
-                    bytes: last_bytes,
-                    error: anyhow::anyhow!("get from {}: {e}", provider.fmt_short()),
-                })
+                return Err(classify_get_error(&e, last_bytes, provider));
             }
             Ok(None) => {
                 return Err(TransferFault::Failed {
@@ -1565,6 +2288,36 @@ async fn transfer_once(
                     return Err(TransferFault::Stalled { bytes: last_bytes });
                 }
             }
+        }
+    }
+}
+
+/// A connection to `provider` for one transfer.
+async fn dial(
+    dialer: &Dialer,
+    provider: EndpointId,
+) -> std::result::Result<DialedConn, TransferFault> {
+    match dialer {
+        Dialer::Stock(pool) => pool
+            .get_or_connect(provider)
+            .await
+            .map(DialedConn::Stock)
+            .map_err(|e| TransferFault::DialFailed {
+                error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
+            }),
+        Dialer::Collab { pool, addrs } => {
+            let Some(addr) = addrs(&provider) else {
+                return Err(TransferFault::DialFailed {
+                    error: anyhow::anyhow!("no dial address for {}", provider.fmt_short()),
+                });
+            };
+            // The pool logs the failure itself (`collab dial failed`).
+            pool.get(addr)
+                .await
+                .map(DialedConn::Collab)
+                .map_err(|e| TransferFault::DialFailed {
+                    error: anyhow::anyhow!("dial {}: {e}", provider.fmt_short()),
+                })
         }
     }
 }
@@ -1585,18 +2338,14 @@ fn claim_provider(
         // backoff gate: a provider that has since been evicted is not a
         // sensible place to send the rest of the child.
         let now = Instant::now();
-        let forced = forced.filter(|p| {
-            guard
-                .get(p)
-                .is_some_and(|st| !st.next_try.is_some_and(|t| t > now))
-        });
+        let forced = forced.filter(|p| guard.get(p).is_some_and(|st| st.available(now)));
         let chosen = match forced {
             Some(p) => p,
             None => pick_provider(&guard, providers, now)?,
         };
-        if let Some(st) = guard.get_mut(&chosen) {
-            st.inflight += 1;
-        }
+        // A live provider that appeared after the run began has no state
+        // yet: it starts from the default.
+        guard.entry(chosen).or_default().inflight += 1;
         chosen
     };
     Some(InflightGuard {
@@ -1605,8 +2354,9 @@ fn claim_provider(
     })
 }
 
-/// A2's provider choice: among the providers not in backoff, the least loaded;
-/// ties go to the fewest failures, then to list order.
+/// A2's provider choice: among the providers not in backoff (nor busy), the
+/// least loaded; ties go to the fewest failures, then to list order. A
+/// provider with no state yet (a live one that just appeared) is idle.
 ///
 /// Deliberately dumb and deliberately alone in a function — A4's
 /// `RankedProviders` (goodput EWMA, SRTT, exploration share) replaces this body
@@ -1621,11 +2371,12 @@ fn pick_provider(
         .iter()
         .enumerate()
         .filter_map(|(order, id)| {
-            let st = states.get(id)?;
-            if st.next_try.is_some_and(|t| t > now) {
-                return None;
-            }
-            Some((st.inflight, st.failures, order, *id))
+            let (inflight, failures) = match states.get(id) {
+                Some(st) if !st.available(now) => return None,
+                Some(st) => (st.inflight, st.failures),
+                None => (0, 0),
+            };
+            Some((inflight, failures, order, *id))
         })
         .min()
         .map(|(_, _, _, id)| id)
@@ -1644,11 +2395,42 @@ fn earliest_wait(states: &States, providers: &[EndpointId]) -> Duration {
     let guard = states.lock().expect("assignment states mutex poisoned");
     providers
         .iter()
-        .filter_map(|p| guard.get(p)?.next_try)
+        .filter_map(|p| guard.get(p)?.available_at())
         .map(|t| t.saturating_duration_since(now))
         .min()
         .unwrap_or(BACKOFF_BASE)
         .max(MIN_BACKOFF_SLEEP)
+}
+
+/// Whether some of `providers` is parked only because it is BUSY
+/// (`ERR_LIMIT`), not in failure backoff — a wait that spends no round.
+fn waiting_on_busy(states: &States, providers: &[EndpointId]) -> bool {
+    let now = Instant::now();
+    let guard = states.lock().expect("assignment states mutex poisoned");
+    providers.iter().any(|p| {
+        guard.get(p).is_some_and(|st| {
+            st.busy_until.is_some_and(|t| t > now) && !st.next_try.is_some_and(|t| t > now)
+        })
+    })
+}
+
+/// Park `provider` until `until` after an `ERR_LIMIT` refusal: no strike,
+/// the consecutive-failure count and the backoff ladder are untouched.
+fn mark_busy(states: &States, provider: EndpointId, bytes: u64, elapsed: Duration, until: Instant) {
+    let mut guard = states.lock().expect("assignment states mutex poisoned");
+    let st = guard.entry(provider).or_default();
+    st.stats.bytes += bytes;
+    st.stats.elapsed += elapsed;
+    st.busy_until = Some(st.busy_until.map_or(until, |t| t.max(until)));
+}
+
+/// Credit an attempt that ended without a strike (a refusal) with the bytes
+/// and time it took.
+fn credit_attempt(states: &States, provider: EndpointId, bytes: u64, elapsed: Duration) {
+    let mut guard = states.lock().expect("assignment states mutex poisoned");
+    let st = guard.entry(provider).or_default();
+    st.stats.bytes += bytes;
+    st.stats.elapsed += elapsed;
 }
 
 /// Record a completed transfer against its provider.
@@ -1758,7 +2540,7 @@ fn record_failure_at(
     st.stats.elapsed += elapsed;
     if fault.is_stall() {
         st.stalls += 1;
-    } else if let TransferFault::Failed { error, .. } = fault {
+    } else if let Some(error) = fault.error() {
         st.last_error = Some(format!("{error:#}"));
         st.last_error_at = Some(now);
     }
@@ -2235,5 +3017,85 @@ mod tests {
             rungs[6..].iter().all(|ms| *ms == 16000),
             "and stops at {BACKOFF_MAX_RUNGS} rungs instead of growing forever: {rungs:?}"
         );
+    }
+
+    /// A provider that appeared in a live set after the run began has no
+    /// state yet: it is picked as idle. A busy provider is skipped like a
+    /// parked one.
+    #[test]
+    fn pick_provider_treats_an_unseen_provider_as_idle_and_skips_a_busy_one() {
+        let (seen, unseen, busy) = (distinct_id(), distinct_id(), distinct_id());
+        let now = Instant::now();
+        let st = states_of(vec![
+            (
+                seen,
+                ProviderState {
+                    inflight: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                busy,
+                ProviderState {
+                    busy_until: Some(now + LIMIT_RETRY),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert_eq!(pick_provider(&st, &[seen, unseen], now), Some(unseen));
+        assert_eq!(pick_provider(&st, &[busy, seen], now), Some(seen));
+        assert_eq!(pick_provider(&st, &[busy], now), None);
+    }
+
+    /// `ERR_LIMIT` parks a provider for [`LIMIT_RETRY`] without a strike:
+    /// the consecutive count and the ladder are untouched, and a wait on it
+    /// is a busy wait (no round spent).
+    #[test]
+    fn a_busy_provider_is_parked_without_a_strike() {
+        let a = distinct_id();
+        let states: States = Arc::new(Mutex::new(states_of(vec![(a, ProviderState::default())])));
+        mark_busy(&states, a, 0, Duration::ZERO, Instant::now() + LIMIT_RETRY);
+        {
+            let g = states.lock().unwrap();
+            assert_eq!(g[&a].failures, 0, "no strike");
+            assert_eq!(g[&a].stats.failures, 0, "not a failure in the report");
+            assert!(g[&a].next_try.is_none(), "the ladder is untouched");
+            assert!(g[&a].busy_until.is_some());
+        }
+        assert!(waiting_on_busy(&states, &[a]));
+        let wait = earliest_wait(&states, &[a]);
+        assert!(
+            wait > LIMIT_RETRY - Duration::from_millis(500) && wait <= LIMIT_RETRY,
+            "{wait:?}"
+        );
+        // A provider parked by the LADDER is not a busy wait, busy or not.
+        states.lock().unwrap().get_mut(&a).unwrap().next_try =
+            Some(Instant::now() + Duration::from_secs(5));
+        assert!(!waiting_on_busy(&states, &[a]));
+    }
+
+    /// A live run's budget is 5 % of the items in flight: it grows with each
+    /// item taken and shrinks as each ends, and the tokens never exceed it.
+    #[test]
+    fn a_live_budget_follows_the_items_in_flight() {
+        let mut b = HedgeBudget::new(0);
+        b.extend(1_000_000);
+        b.extend(3_000_000);
+        assert!((b.cap - 200_000.0).abs() < 1e-6);
+        assert!(
+            (b.tokens - 200_000.0).abs() < 1e-6,
+            "an item brings its share"
+        );
+        assert!(b.try_charge(60_000));
+        b.retire(3_000_000);
+        assert!((b.cap - 50_000.0).abs() < 1e-6);
+        assert!(b.tokens <= b.cap, "the tokens follow the cap down");
+        b.retire(1_000_000);
+        assert!(
+            b.cap.abs() < 1e-6,
+            "nothing in flight, no budget: {}",
+            b.cap
+        );
+        assert!(b.tokens <= b.cap);
     }
 }

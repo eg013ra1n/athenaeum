@@ -247,6 +247,31 @@ impl LandedRig {
 }
 
 pub(crate) async fn landed_rig(n: usize) -> LandedRig {
+    landed_rig_with(n, |uuid| {
+        format!("replica frame {uuid}: pixels ")
+            .repeat(1024)
+            .into_bytes()
+    })
+    .await
+}
+
+/// As [`landed_rig`], with frames of exactly `size` bytes (Task 12: a
+/// frame big enough to cancel mid-transfer). The bytes depend only on the
+/// frame's uuid, so two rigs hold the same frames under the same hashes.
+pub(crate) async fn landed_rig_big(n: usize, size: usize) -> LandedRig {
+    landed_rig_with(n, |uuid| {
+        let pattern = format!("replica frame {uuid}: pixels ").into_bytes();
+        let mut bytes = Vec::with_capacity(size + pattern.len());
+        while bytes.len() < size {
+            bytes.extend_from_slice(&pattern);
+        }
+        bytes.truncate(size);
+        bytes
+    })
+    .await
+}
+
+async fn landed_rig_with(n: usize, bytes_of: impl Fn(&str) -> Vec<u8>) -> LandedRig {
     let (tmp, ctx, hub) = signed_in_rig().await;
     let root = collab_root(&ctx);
     let node = ctx.iroh_node.lock().await.clone().expect("a bound node");
@@ -257,9 +282,7 @@ pub(crate) async fn landed_rig(n: usize) -> LandedRig {
     let uuids: Vec<String> = (0..n).map(|i| format!("f{i:02}")).collect();
     let mut frames = Vec::with_capacity(n);
     for uuid in &uuids {
-        let bytes = format!("replica frame {uuid}: pixels ")
-            .repeat(1024)
-            .into_bytes();
+        let bytes = bytes_of(uuid);
         debug_assert!(bytes.len() > 16 * 1024);
         let path = dir.join(format!("{uuid}.fits"));
         land_frame(&ctx, &hub, &node, uuid, &path, &bytes).await;
@@ -293,6 +316,290 @@ pub(crate) async fn landed_rig(n: usize) -> LandedRig {
         root,
         frames,
         checks: tokio::sync::Mutex::new(rx),
+    }
+}
+
+/// Two signed-in providers holding the same single frame (`f00`, same
+/// bytes, same hash), each with its own serve oracle (Task 12).
+pub(crate) async fn two_landed_providers() -> (LandedRig, LandedRig) {
+    let a = landed_rig(1).await;
+    let b = landed_rig(1).await;
+    assert_eq!(a.hash_of(0), b.hash_of(0), "the same frame on both");
+    (a, b)
+}
+
+// ----- the live assignment run (Task 12) -----------------------------------
+
+use crate::sharing::iroh::assign::{
+    run_live, AssignmentReport, Dialer, FetchItem, ItemOutcome, LiveItem, LiveRunOptions,
+    LiveVerdict, ProviderSet,
+};
+
+/// The work-unit cap the live-run helpers pass (spec §7.2: 256 MiB).
+const TEST_UNIT_CAP: u64 = 256 * 1024 * 1024;
+
+/// A collab-pool dialer from `me` whose address book is `providers`.
+pub(crate) fn live_dialer(me: &SharedIrohNode, providers: &[&SharedIrohNode]) -> Dialer {
+    let book: std::collections::HashMap<iroh::EndpointId, iroh::EndpointAddr> = providers
+        .iter()
+        .map(|p| {
+            let addr = p.endpoint_addr();
+            (addr.id, addr)
+        })
+        .collect();
+    // Pool events are the scheduler's business; the run itself does not
+    // need them, so the receiver is simply dropped.
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    Dialer::Collab {
+        pool: crate::sharing::iroh::collab_pool::CollabPool::new(me.endpoint(), events),
+        addrs: Arc::new(move |id| book.get(id).cloned()),
+    }
+}
+
+/// Live-run knobs for the tests: a 5 s stall ceiling, no hedging.
+pub(crate) fn live_opts(
+    max_in_flight: usize,
+    telemetry: crate::sharing::ProviderTelemetrySink,
+) -> LiveRunOptions {
+    LiveRunOptions {
+        stall_hard_limit: std::time::Duration::from_secs(5),
+        hedging: false,
+        telemetry,
+        max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(max_in_flight)),
+        unit_cap_bytes: TEST_UNIT_CAP,
+    }
+}
+
+/// One raw-blob live item and its cancel switch.
+pub(crate) fn live_item(
+    key: &str,
+    hash: iroh_blobs::Hash,
+    size: u64,
+    providers: ProviderSet,
+) -> (LiveItem, tokio::sync::watch::Sender<bool>) {
+    let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+    let item = FetchItem {
+        key: key.to_string(),
+        request: iroh_blobs::protocol::GetRequest::blob(hash),
+        hash,
+        size,
+        providers,
+    };
+    (LiveItem { item, cancel }, cancel_tx)
+}
+
+/// Frame `i` of `rig` as a live item.
+fn rig_item(
+    rig: &LandedRig,
+    i: usize,
+    providers: ProviderSet,
+) -> (LiveItem, tokio::sync::watch::Sender<bool>) {
+    let (_, uuid, path) = &rig.frames[i];
+    let size = std::fs::metadata(path).unwrap().len();
+    live_item(uuid, rig.hash_of(i), size, providers)
+}
+
+/// What one live run produced.
+pub(crate) struct LiveRun {
+    pub outcomes: Vec<(String, ItemOutcome)>,
+    pub verdicts: Vec<LiveVerdict>,
+    pub report: AssignmentReport,
+}
+
+/// Run `items` through [`run_live`] (the item channel closed behind them)
+/// beside `side`, and collect everything it reported. 120 s at most.
+pub(crate) async fn drive_live(
+    store: &iroh_blobs::api::Store,
+    dialer: Dialer,
+    items: Vec<LiveItem>,
+    opts: LiveRunOptions,
+    side: impl std::future::Future<Output = ()>,
+) -> LiveRun {
+    let (item_tx, item_rx) = tokio::sync::mpsc::channel(items.len().max(1));
+    for item in items {
+        item_tx.send(item).await.unwrap();
+    }
+    drop(item_tx);
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (verdict_tx, mut verdict_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_yield_tx, yield_rx) = tokio::sync::watch::channel(false);
+    let run = run_live(store, dialer, item_rx, opts, done_tx, verdict_tx, yield_rx);
+    let (report, ()) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        tokio::join!(run, side)
+    })
+    .await
+    .expect("the live run returns once its items are done");
+    let mut outcomes = Vec::new();
+    while let Ok(o) = done_rx.try_recv() {
+        outcomes.push(o);
+    }
+    let mut verdicts = Vec::new();
+    while let Ok(v) = verdict_rx.try_recv() {
+        verdicts.push(v);
+    }
+    LiveRun {
+        outcomes,
+        verdicts,
+        report,
+    }
+}
+
+/// The one outcome of a one-item run.
+fn only_outcome(run: &mut LiveRun) -> ItemOutcome {
+    assert_eq!(run.outcomes.len(), 1, "one item, one outcome");
+    run.outcomes.pop().unwrap().1
+}
+
+/// Fetch frame `i` of `rig` into `store` over a live run with `providers`,
+/// while `side` runs (e.g. a provider appearing later).
+pub(crate) async fn run_one_live(
+    me: &SharedIrohNode,
+    store: &iroh_blobs::api::Store,
+    rig: &LandedRig,
+    i: usize,
+    providers: ProviderSet,
+    side: impl std::future::Future<Output = ()>,
+) -> (ItemOutcome, AssignmentReport) {
+    let (item, _cancel) = rig_item(rig, i, providers);
+    let dialer = live_dialer(me, &[&rig.node]);
+    let opts = live_opts(8, crate::sharing::noop_provider_telemetry());
+    let mut run = drive_live(store, dialer, vec![item], opts, side).await;
+    (only_outcome(&mut run), run.report)
+}
+
+/// Fetch `hash` (keyed `key`) from the fixed provider list `rigs`, in that
+/// order; returns the outcome and every verdict the run sent.
+pub(crate) async fn run_one_live_fixed(
+    me: &SharedIrohNode,
+    store: &iroh_blobs::api::Store,
+    hash: iroh_blobs::Hash,
+    key: String,
+    rigs: &[&LandedRig],
+) -> (ItemOutcome, Vec<LiveVerdict>) {
+    let nodes: Vec<&SharedIrohNode> = rigs.iter().map(|r| &*r.node).collect();
+    let providers = ProviderSet::Fixed(Arc::new(
+        nodes.iter().map(|n| n.endpoint_addr().id).collect(),
+    ));
+    let (item, _cancel) = live_item(&key, hash, 0, providers);
+    let dialer = live_dialer(me, &nodes);
+    let opts = live_opts(8, crate::sharing::noop_provider_telemetry());
+    let mut run = drive_live(store, dialer, vec![item], opts, async {}).await;
+    (only_outcome(&mut run), run.verdicts)
+}
+
+/// Fetch frame `i` of `rig` and flip its cancel switch after `after`.
+pub(crate) async fn run_one_live_cancel_after(
+    me: &SharedIrohNode,
+    store: &iroh_blobs::api::Store,
+    rig: &LandedRig,
+    i: usize,
+    after: std::time::Duration,
+) -> ItemOutcome {
+    let providers = ProviderSet::Fixed(Arc::new(vec![rig.node.endpoint_addr().id]));
+    let (item, cancel) = rig_item(rig, i, providers);
+    let dialer = live_dialer(me, &[&rig.node]);
+    let opts = live_opts(8, crate::sharing::noop_provider_telemetry());
+    let mut run = drive_live(store, dialer, vec![item], opts, async move {
+        tokio::time::sleep(after).await;
+        cancel.send_replace(true);
+    })
+    .await;
+    only_outcome(&mut run)
+}
+
+/// What [`run_many_live`] saw.
+pub(crate) struct LiveStats {
+    /// The most items that were in flight at once.
+    pub max_concurrent: usize,
+    /// Items that ended `Done`.
+    pub completed: usize,
+    /// `run_live` returned while its item channel was still open.
+    pub returned_early: bool,
+}
+
+/// Queue every frame of `rig` on a live run capped at `max_in_flight`.
+/// With `yield_after_first`, a yield is requested the moment the first item
+/// starts and the item channel is kept OPEN (so only the yield can end the
+/// run); without it the channel is closed behind the items. Concurrency is counted from
+/// the telemetry: `+1` on each `Trying` (one per item — a healthy provider,
+/// no hedging), `-1` per outcome, the outcomes drained inside the callback
+/// so an item's end is always counted before the next item's start.
+pub(crate) async fn run_many_live(
+    me: &SharedIrohNode,
+    store: &iroh_blobs::api::Store,
+    rig: &LandedRig,
+    max_in_flight: usize,
+    yield_after_first: bool,
+) -> LiveStats {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let provider = rig.node.endpoint_addr().id;
+    let (item_tx, item_rx) = tokio::sync::mpsc::channel(rig.frames.len().max(1));
+    let mut cancels = Vec::new();
+    for i in 0..rig.frames.len() {
+        let (item, cancel) = rig_item(rig, i, ProviderSet::Fixed(Arc::new(vec![provider])));
+        cancels.push(cancel);
+        item_tx.send(item).await.unwrap();
+    }
+    let item_tx = yield_after_first.then_some(item_tx);
+    let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel::<(String, ItemOutcome)>();
+    let done_rx = Arc::new(std::sync::Mutex::new(done_rx));
+    let (verdict_tx, _verdict_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (yield_tx, yield_rx) = tokio::sync::watch::channel(false);
+    let yield_tx = Arc::new(yield_tx);
+
+    let current = Arc::new(AtomicUsize::new(0));
+    let max = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let drain = {
+        let (done_rx, current, completed) = (
+            Arc::clone(&done_rx),
+            Arc::clone(&current),
+            Arc::clone(&completed),
+        );
+        move || {
+            let mut rx = done_rx.lock().unwrap();
+            while let Ok((_, outcome)) = rx.try_recv() {
+                current.fetch_sub(1, Ordering::SeqCst);
+                if matches!(outcome, ItemOutcome::Done) {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    };
+    let telemetry: crate::sharing::ProviderTelemetrySink = {
+        let (drain, current, max, yield_tx) = (
+            drain.clone(),
+            Arc::clone(&current),
+            Arc::clone(&max),
+            Arc::clone(&yield_tx),
+        );
+        Arc::new(move |ev| {
+            if let crate::sharing::ProviderEvent::Trying(_) = ev {
+                drain();
+                let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(now, Ordering::SeqCst);
+                if yield_after_first {
+                    yield_tx.send_replace(true);
+                }
+            }
+        })
+    };
+    let dialer = live_dialer(me, &[&rig.node]);
+    let opts = live_opts(max_in_flight, telemetry);
+    let returned = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        run_live(store, dialer, item_rx, opts, done_tx, verdict_tx, yield_rx),
+    )
+    .await;
+    drain();
+    // `item_tx` is still held here: a return is "early" when it came while
+    // the channel was open, i.e. while items were still queued behind it.
+    let returned_early = returned.is_ok() && item_tx.is_some();
+    drop(item_tx);
+    LiveStats {
+        max_concurrent: max.load(Ordering::SeqCst),
+        completed: completed.load(Ordering::SeqCst),
+        returned_early,
     }
 }
 

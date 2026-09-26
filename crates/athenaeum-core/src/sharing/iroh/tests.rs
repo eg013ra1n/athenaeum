@@ -5098,3 +5098,216 @@ async fn one_pool_per_call() {
     p.shutdown().await;
     r.shutdown().await;
 }
+
+// ─── collab v3 wave 3, Task 12: the live assignment run ───────────────────
+//
+// `run_live` over the collab pool against signed-in providers with serve
+// oracles (the landed rigs). Gated like the fixtures they use (P1 headless
+// rule): `api::collab_live::test_support` needs `render` + `solver`.
+
+#[cfg(all(feature = "render", feature = "solver"))]
+mod live_run {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use iroh_blobs::api::proto::BlobStatus;
+
+    use crate::api::collab_live::test_support as ts;
+    use crate::sharing::iroh::assign::{ItemOutcome, LiveVerdict, ProviderSet};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_item_waits_for_its_first_provider_then_completes() {
+        let rig = ts::landed_rig(1).await;
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let store = ts::scratch_store();
+        let provider = rig.node.endpoint_addr().id;
+        let (prov_tx, prov_rx) =
+            tokio::sync::watch::channel(Arc::new(Vec::<iroh::EndpointId>::new()));
+        let (out, report) = ts::run_one_live(
+            &me,
+            &store,
+            &rig,
+            0,
+            ProviderSet::Live(prov_rx),
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                prov_tx.send(Arc::new(vec![provider])).unwrap(); // a provider appears
+            },
+        )
+        .await;
+        assert!(matches!(out, ItemOutcome::Done), "{out:?}");
+        assert!(report.total_bytes() > 0);
+        assert!(store.blobs().has(rig.hash_of(0)).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusing_provider_is_excluded_for_the_hash_without_a_strike() {
+        // provider A edited its file (serve check refuses: ERR_PERMISSION), B serves
+        let (a, b) = ts::two_landed_providers().await;
+        ts::overwrite_same_size(&a.frames[0].2);
+        let me = ts::bare_node().await;
+        ts::pair(&me, &a.node).await;
+        ts::pair(&me, &b.node).await;
+        let store = ts::scratch_store();
+        let (out, verdicts) =
+            ts::run_one_live_fixed(&me, &store, a.hash_of(0), a.frames[0].1.clone(), &[&a, &b])
+                .await;
+        assert!(matches!(out, ItemOutcome::Done), "{out:?}");
+        let a_id = a.node.endpoint_addr().id;
+        assert!(
+            verdicts
+                .iter()
+                .any(|v| matches!(v, LiveVerdict::Refused { provider, .. } if *provider == a_id)),
+            "{verdicts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_busy_provider_is_retried_later_and_another_one_serves_now() {
+        let (a, b) = ts::two_landed_providers().await;
+        a.node.set_collab_upload_limit(1);
+        let _busy = a.node.collab_stream_gauge_for_test().try_acquire().unwrap();
+        let me = ts::bare_node().await;
+        ts::pair(&me, &a.node).await;
+        ts::pair(&me, &b.node).await;
+        let store = ts::scratch_store();
+        let (out, verdicts) =
+            ts::run_one_live_fixed(&me, &store, a.hash_of(0), a.frames[0].1.clone(), &[&a, &b])
+                .await;
+        assert!(matches!(out, ItemOutcome::Done), "{out:?}");
+        let a_id = a.node.endpoint_addr().id;
+        assert!(
+            verdicts
+                .iter()
+                .any(|v| matches!(v, LiveVerdict::Busy { provider } if *provider == a_id)),
+            "{verdicts:?}"
+        );
+    }
+
+    /// With only a busy provider, the item waits for a free stream — no
+    /// strike, no exhausted ladder — and is served once one frees up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lone_busy_provider_serves_once_a_stream_frees_up() {
+        let rig = ts::landed_rig(1).await;
+        rig.node.set_collab_upload_limit(1);
+        let busy = rig
+            .node
+            .collab_stream_gauge_for_test()
+            .try_acquire()
+            .unwrap();
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let store = ts::scratch_store();
+        let (out, _report) = ts::run_one_live(
+            &me,
+            &store,
+            &rig,
+            0,
+            ProviderSet::Fixed(Arc::new(vec![rig.node.endpoint_addr().id])),
+            async move {
+                // Longer than the whole failure ladder would allow for
+                // six busy refusals if each spent a round.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(busy);
+            },
+        )
+        .await;
+        assert!(matches!(out, ItemOutcome::Done), "{out:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_stops_one_item_and_keeps_its_partial_bytes() {
+        let rig = ts::landed_rig_big(1, 64 * 1024 * 1024).await; // one 64 MiB frame
+        rig.node.set_upload_limit(8 * 1024 * 1024); // slow it down: 8 MB/s
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let store = ts::scratch_store();
+        let out =
+            ts::run_one_live_cancel_after(&me, &store, &rig, 0, Duration::from_millis(1500)).await;
+        assert!(matches!(out, ItemOutcome::Cancelled), "{out:?}");
+        assert!(matches!(
+            store.blobs().status(rig.hash_of(0)).await.unwrap(),
+            BlobStatus::Partial { .. }
+        ));
+    }
+
+    /// T12 ruling R4 (replaces the retired wave-2 resume test): a fetch cut
+    /// off mid-transfer — cancelled, then its provider gone — resumes from
+    /// its verified ranges on a second run against another provider holding
+    /// the same bytes, moving fewer bytes than the whole frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_fetch_resumes_from_partial_bytes_after_the_provider_drops() {
+        const SIZE: usize = 64 * 1024 * 1024;
+        let a = ts::landed_rig_big(1, SIZE).await;
+        let b = ts::landed_rig_big(1, SIZE).await;
+        let hash = a.hash_of(0);
+        assert_eq!(hash, b.hash_of(0), "the same frame on both providers");
+        a.node.set_upload_limit(8 * 1024 * 1024);
+        let me = ts::bare_node().await;
+        ts::pair(&me, &a.node).await;
+        ts::pair(&me, &b.node).await;
+        let store = ts::scratch_store();
+
+        let out =
+            ts::run_one_live_cancel_after(&me, &store, &a, 0, Duration::from_millis(1500)).await;
+        assert!(matches!(out, ItemOutcome::Cancelled), "{out:?}");
+        assert!(matches!(
+            store.blobs().status(hash).await.unwrap(),
+            BlobStatus::Partial { .. }
+        ));
+        a.node.shutdown().await; // the provider drops
+
+        let (out, report) = ts::run_one_live(
+            &me,
+            &store,
+            &b,
+            0,
+            ProviderSet::Fixed(Arc::new(vec![b.node.endpoint_addr().id])),
+            async {},
+        )
+        .await;
+        assert!(matches!(out, ItemOutcome::Done), "{out:?}");
+        assert!(matches!(
+            store.blobs().status(hash).await.unwrap(),
+            BlobStatus::Complete { .. }
+        ));
+        let moved = report.total_bytes();
+        assert!(
+            moved > 0 && moved < SIZE as u64,
+            "the second run moved only the missing ranges: {moved} of {SIZE} ({report:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stream_cap_bounds_concurrent_items_and_yield_stops_taking_new_ones() {
+        let rig = ts::landed_rig(4).await;
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let store = ts::scratch_store();
+        let stats = ts::run_many_live(
+            &me, &store, &rig, /*max_in_flight*/ 1, /*yield after first*/ true,
+        )
+        .await;
+        assert_eq!(stats.max_concurrent, 1);
+        assert_eq!(
+            stats.completed, 1,
+            "yield: the in-flight item finished, the queued ones were not taken"
+        );
+        assert!(stats.returned_early);
+    }
+
+    /// Without a yield the cap still holds and every queued item completes;
+    /// the run returns once the closed channel is drained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stream_cap_holds_across_a_whole_queue() {
+        let rig = ts::landed_rig(4).await;
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let store = ts::scratch_store();
+        let stats = ts::run_many_live(&me, &store, &rig, 2, false).await;
+        assert!(stats.max_concurrent <= 2, "{}", stats.max_concurrent);
+        assert_eq!(stats.completed, 4);
+        assert!(!stats.returned_early);
+    }
+}
