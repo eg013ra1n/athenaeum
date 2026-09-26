@@ -533,3 +533,55 @@ async fn a_run_that_keeps_panicking_backs_its_fetches_off() {
     w.b.wait_state(&uuids[0], LocalState::Held, Duration::from_secs(90))
         .await;
 }
+
+/// Task 16: the command surface reads the live holder map and presence —
+/// B's frames list counts A (the publisher) as an online holder of each
+/// frame, and as an offline one once A leaves; the last-copy warning is
+/// raised (one other holder is fewer than two).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_frames_list_counts_live_holders_and_a_departure() {
+    use crate::api::collab_live::surface;
+    let w = ts::two_instances().await;
+    let uuids = w.a_publishes(2).await;
+    w.b.wait_all_held(Duration::from_secs(20)).await;
+    let counts = |ctx: &crate::services::ServiceContext| {
+        surface::list_collab_frames(ctx, ts::PID)
+            .unwrap()
+            .into_iter()
+            .filter(|f| uuids.contains(&f.frame_uuid))
+            .map(|f| (f.local_state, f.holders_online, f.holders_total))
+            .collect::<Vec<_>>()
+    };
+    let wait_for = |want: (usize, usize), what: &'static str| {
+        let ctx = std::sync::Arc::clone(&w.b.ctx);
+        let counts = &counts;
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let got = counts(&ctx);
+                if got.len() == 2
+                    && got
+                        .iter()
+                        .all(|c| c.0 == surface::LocalStateView::Held && (c.1, c.2) == want)
+                {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "{what}: {got:?}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    wait_for((1, 1), "A online and holding").await;
+    let preview =
+        surface::preview_collab_stop_keeping(&w.b.ctx, ts::PID, vec![uuids[0].clone()]).unwrap();
+    assert_eq!(
+        (
+            preview[0].holders_online,
+            preview[0].holders_total,
+            preview[0].at_risk
+        ),
+        (1, 1, true)
+    );
+    shutdown(&w.a.ctx).await;
+    wait_for((0, 1), "A left, still a holder").await;
+}
