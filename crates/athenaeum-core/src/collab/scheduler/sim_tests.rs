@@ -48,12 +48,15 @@ enum Local {
 /// A fetch as the executor sees it.
 #[derive(Clone, Debug)]
 struct Fetch {
+    id: u64,
     cv: i32,
     providers: BTreeSet<String>,
     /// Devices given to it that may still be sending (minus those whose
     /// dial failed or whose connection closed since) — recomputed here from
     /// the commands and the inputs, independently of the core.
     maybe_active: BTreeSet<String>,
+    /// The last device to leave `maybe_active` left by an idle close.
+    idle_cleared: bool,
 }
 
 /// How often each path ran, summed over the seeds: the simulation must
@@ -73,6 +76,13 @@ struct Coverage {
     cancel_no_provider: usize,
     yields: usize,
     lane_releases: usize,
+    /// a Start on a list fed BEFORE the need set that introduced the want
+    starts_providers_first: usize,
+    slots_below_in_flight: usize,
+    /// a late result of a cancelled fetch while the frame was in flight again
+    late_ignored: usize,
+    idle_freed_slot: usize,
+    version_down: usize,
 }
 
 impl Coverage {
@@ -90,16 +100,22 @@ impl Coverage {
         self.cancel_no_provider += o.cancel_no_provider;
         self.yields += o.yields;
         self.lane_releases += o.lane_releases;
+        self.starts_providers_first += o.starts_providers_first;
+        self.slots_below_in_flight += o.slots_below_in_flight;
+        self.late_ignored += o.late_ignored;
+        self.idle_freed_slot += o.idle_freed_slot;
+        self.version_down += o.version_down;
     }
 }
 
 /// Work the executor does after the core's commands were checked.
 enum FollowUp {
     GrantLane,
-    /// The local shortcut at Start (adopt by hash, identical landed file).
-    LocalLanded(String, i32),
+    /// The local shortcut at Start (adopt by hash, identical landed file):
+    /// `(frame, fetch_id, version)`.
+    LocalLanded(String, u64, i32),
     /// A waiting item cut at a yield.
-    YieldCut(String, i32),
+    YieldCut(String, u64, i32),
 }
 
 struct World {
@@ -118,11 +134,20 @@ struct World {
     // ---- the executor's side ----
     flying: BTreeMap<String, Fetch>,
     lane_admitted: bool,
+    /// The lane was yielded and its fetches have not drained yet.
+    lane_yielded: bool,
     lane_pending: bool,
     personal: bool,
+    /// Results of cancelled fetches still on their way `(frame, fetch_id,
+    /// version, result)` — the executor forwards them late.
+    late: Vec<(String, u64, i32, FetchResult)>,
     // ---- a mirror of what the core was fed (core-relative checks) ----
     fed_need: BTreeMap<String, Want>,
-    fed_providers: BTreeMap<String, (i32, Vec<ProviderRef>)>,
+    /// frame → version → (feed sequence number, list)
+    fed_providers: BTreeMap<String, BTreeMap<i32, (u64, Vec<ProviderRef>)>>,
+    /// frame → (version, feed sequence number when that want first came)
+    need_seq: BTreeMap<String, (i32, u64)>,
+    feed_seq: u64,
     fed_storage: bool,
     followups: Vec<FollowUp>,
     /// `COLLAB_SIM_TRACE=1`: print every input and its commands.
@@ -175,10 +200,14 @@ impl World {
             core: Core::new(seed, 3),
             flying: BTreeMap::new(),
             lane_admitted: false,
+            lane_yielded: false,
             lane_pending: false,
             personal: false,
+            late: Vec::new(),
             fed_need: BTreeMap::new(),
             fed_providers: BTreeMap::new(),
+            need_seq: BTreeMap::new(),
+            feed_seq: 0,
             fed_storage: true,
             followups: Vec::new(),
             trace: std::env::var_os("COLLAB_SIM_TRACE").is_some(),
@@ -292,12 +321,27 @@ impl World {
     /// Mirror an input into the "what the core was told" record, by the
     /// rules the core documents (R1), then step the core and check.
     fn feed(&mut self, input: Input) {
+        self.feed_seq += 1;
+        let seq = self.feed_seq;
         match &input {
             Input::NeedSet { wants, .. } => {
                 let incoming: BTreeMap<String, Want> =
                     wants.iter().map(|w| (w.key.1.clone(), w.clone())).collect();
                 self.fed_providers
+                    .retain(|u, by_version| match incoming.get(u) {
+                        Some(w) => {
+                            by_version.retain(|v, _| *v == w.content_version);
+                            !by_version.is_empty()
+                        }
+                        None => false,
+                    });
+                self.need_seq
                     .retain(|u, (cv, _)| incoming.get(u).is_some_and(|w| w.content_version == *cv));
+                for (u, w) in &incoming {
+                    self.need_seq
+                        .entry(u.clone())
+                        .or_insert((w.content_version, seq));
+                }
                 self.fed_need = incoming;
             }
             Input::Providers {
@@ -305,45 +349,56 @@ impl World {
                 content_version,
                 providers,
             } => {
-                let u = &key.1;
-                let older = self
-                    .fed_need
-                    .get(u)
-                    .is_some_and(|w| *content_version < w.content_version)
-                    || self
-                        .fed_providers
-                        .get(u)
-                        .is_some_and(|(cv, _)| content_version < cv);
-                if !older {
-                    let mut ps = providers.clone();
-                    ps.sort();
-                    ps.dedup_by(|a, b| a.device == b.device);
-                    self.fed_providers.insert(u.clone(), (*content_version, ps));
-                }
+                let mut ps = providers.clone();
+                ps.sort();
+                ps.dedup_by(|a, b| a.device == b.device);
+                self.fed_providers
+                    .entry(key.1.clone())
+                    .or_default()
+                    .insert(*content_version, (seq, ps));
             }
             Input::ProjectGone { .. } => {
                 self.fed_need.clear();
                 self.fed_providers.clear();
+                self.need_seq.clear();
             }
             Input::Storage { fetching } => self.fed_storage = *fetching,
-            Input::Lane { admitted } => self.lane_admitted = *admitted,
+            Input::Lane { admitted } => {
+                self.lane_yielded = !*admitted && (self.lane_admitted || self.lane_yielded);
+                self.lane_admitted = *admitted;
+            }
             Input::Finished {
                 key,
-                content_version,
+                fetch_id,
                 result,
             } => {
-                if matches!(result, FetchResult::Landed | FetchResult::AwaitingGc)
-                    && self
-                        .fed_need
-                        .get(&key.1)
-                        .is_some_and(|w| w.content_version == *content_version)
-                {
-                    self.fed_need.remove(&key.1);
+                let u = &key.1;
+                match self.flying.get(u) {
+                    Some(f) if f.id == *fetch_id => {
+                        self.flying.remove(u);
+                        if matches!(result, FetchResult::Landed | FetchResult::AwaitingGc) {
+                            self.fed_need.remove(u);
+                            self.need_seq.remove(u);
+                        }
+                    }
+                    // a late result while the frame runs again: the
+                    // dangerous case the fetch id exists for
+                    Some(_) => self.cov.late_ignored += 1,
+                    None => {}
                 }
             }
             Input::DialFailed { device } | Input::ConnectionClosed { device } => {
                 for f in self.flying.values_mut() {
-                    f.maybe_active.remove(device);
+                    if f.maybe_active.remove(device) {
+                        f.idle_cleared = false;
+                    }
+                }
+            }
+            Input::ConnectionIdle { device } => {
+                for f in self.flying.values_mut() {
+                    if f.maybe_active.remove(device) {
+                        f.idle_cleared = true;
+                    }
                 }
             }
             _ => {}
@@ -364,16 +419,14 @@ impl World {
         for f in followups {
             match f {
                 FollowUp::GrantLane => self.feed(Input::Lane { admitted: true }),
-                FollowUp::LocalLanded(u, cv) => {
-                    if self.flying.get(&u).is_some_and(|f| f.cv == cv) {
-                        self.flying.remove(&u);
-                        self.finish(u, cv, FetchResult::Landed);
+                FollowUp::LocalLanded(u, id, cv) => {
+                    if self.flying.get(&u).is_some_and(|f| f.id == id) {
+                        self.finish(u, id, cv, FetchResult::Landed);
                     }
                 }
-                FollowUp::YieldCut(u, cv) => {
-                    if self.flying.get(&u).is_some_and(|f| f.cv == cv) {
-                        self.flying.remove(&u);
-                        self.finish(u, cv, FetchResult::Cancelled);
+                FollowUp::YieldCut(u, id, cv) => {
+                    if self.flying.get(&u).is_some_and(|f| f.id == id) {
+                        self.finish(u, id, cv, FetchResult::Cancelled);
                     }
                 }
             }
@@ -386,6 +439,7 @@ impl World {
         match c {
             Command::Start {
                 key,
+                fetch_id,
                 content_version,
                 blake3,
                 providers,
@@ -428,14 +482,16 @@ impl World {
                     !self.core.frame_backing_off(&key, self.now),
                     "{u} started while its own back-off runs"
                 );
-                let (fcv, fed) = self
+                let (fed_at, fed) = self
                     .fed_providers
                     .get(&u)
-                    .unwrap_or_else(|| panic!("I5: Start of {u} with no provider list fed"));
-                assert_eq!(
-                    *fcv, content_version,
-                    "I4: {u} v{content_version} started on v{fcv}'s providers"
-                );
+                    .and_then(|by_version| by_version.get(&content_version))
+                    .unwrap_or_else(|| {
+                        panic!("I4/I5: Start of {u} v{content_version} with no list fed for it")
+                    });
+                if self.need_seq.get(&u).is_some_and(|(_, at)| fed_at < at) {
+                    self.cov.starts_providers_first += 1;
+                }
                 let claimants = self.holders.claimants(seq_of(&u), content_version);
                 for p in &providers {
                     assert!(fed.contains(p), "I5: {} was never fed for {u}", p.device);
@@ -451,12 +507,18 @@ impl World {
                     );
                 }
                 let devices: BTreeSet<String> = providers.into_iter().map(|p| p.device).collect();
+                assert!(
+                    self.flying.values().all(|f| f.id != fetch_id),
+                    "fetch id {fetch_id} reused"
+                );
                 self.flying.insert(
                     u.clone(),
                     Fetch {
+                        id: fetch_id,
                         cv: content_version,
                         providers: devices.clone(),
                         maybe_active: devices,
+                        idle_cleared: false,
                     },
                 );
                 starts.push(u.clone());
@@ -467,22 +529,27 @@ impl World {
                 // the executor's local shortcut (T15: adopt/link) — sometimes
                 if self.rng.below(12) == 0 {
                     self.followups
-                        .push(FollowUp::LocalLanded(u, content_version));
+                        .push(FollowUp::LocalLanded(u, fetch_id, content_version));
                 }
             }
-            Command::UpdateProviders { key, providers } => {
+            Command::UpdateProviders {
+                key,
+                fetch_id,
+                providers,
+            } => {
                 let u = key.1;
                 let f = self
                     .flying
                     .get_mut(&u)
                     .unwrap_or_else(|| panic!("UpdateProviders for {u}, which is not in flight"));
-                match self.fed_providers.get(&u) {
-                    Some((cv, fed)) if *cv == f.cv => {
+                assert_eq!(f.id, fetch_id, "UpdateProviders names another fetch of {u}");
+                match self.fed_providers.get(&u).and_then(|bv| bv.get(&f.cv)) {
+                    Some((_, fed)) => {
                         for p in &providers {
                             assert!(fed.contains(p), "I5: {} was never fed for {u}", p.device);
                         }
                     }
-                    _ => assert!(
+                    None => assert!(
                         providers.is_empty(),
                         "I4: {u} v{} got providers of another version",
                         f.cv
@@ -493,12 +560,30 @@ impl World {
                 f.maybe_active
                     .extend(providers.into_iter().map(|p| p.device));
             }
-            Command::Cancel { key, reason } => {
+            Command::Cancel {
+                key,
+                fetch_id,
+                reason,
+            } => {
                 let u = key.1;
                 let f = self
                     .flying
                     .remove(&u)
                     .unwrap_or_else(|| panic!("Cancel of {u}, which is not in flight"));
+                assert_eq!(f.id, fetch_id, "Cancel names another fetch of {u}");
+                if reason == CancelReason::NoProvider && f.idle_cleared {
+                    self.cov.idle_freed_slot += 1;
+                }
+                // the cancelled fetch may still report, late (I1: harmless)
+                if self.rng.below(3) == 0 {
+                    let r = match self.rng.below(4) {
+                        0 => FetchResult::Landed,
+                        1 => FetchResult::Failed,
+                        2 => FetchResult::AwaitingGc,
+                        _ => FetchResult::Cancelled,
+                    };
+                    self.late.push((u.clone(), f.id, f.cv, r));
+                }
                 match reason {
                     CancelReason::NewVersion => self.cov.cancel_new_version += 1,
                     CancelReason::NotWanted => self.cov.cancel_not_wanted += 1,
@@ -536,6 +621,10 @@ impl World {
             Command::RequestLane => {
                 assert!(!self.lane_admitted, "RequestLane while holding the lane");
                 assert!(
+                    !self.lane_yielded,
+                    "RequestLane before the yielded permit went back"
+                );
+                assert!(
                     !self.lane_pending,
                     "a second RequestLane while one is pending"
                 );
@@ -547,9 +636,13 @@ impl World {
                 }
             }
             Command::ReleaseLane => {
-                assert!(self.lane_admitted, "ReleaseLane without the lane");
+                assert!(
+                    self.lane_admitted || self.lane_yielded,
+                    "ReleaseLane without the lane"
+                );
                 assert!(self.flying.is_empty(), "ReleaseLane with fetches in flight");
                 self.lane_admitted = false;
+                self.lane_yielded = false;
                 self.cov.lane_releases += 1;
             }
         }
@@ -573,6 +666,17 @@ impl World {
             self.lane_admitted,
             "core and executor disagree on the lane"
         );
+        assert_eq!(
+            self.core.lane_yielded(),
+            self.lane_yielded,
+            "core and executor disagree on the yielded permit"
+        );
+        if self.lane_yielded {
+            assert!(
+                !self.flying.is_empty(),
+                "a drained yielded lane was not released"
+            );
+        }
         if !starts.is_empty() {
             assert!(self.flying.len() <= self.slots, "slot cap exceeded");
         }
@@ -609,12 +713,16 @@ impl World {
             if self.flying.contains_key(u) || self.core.frame_backing_off(&key(u), self.now) {
                 continue;
             }
-            let n = match self.fed_providers.get(u) {
-                Some((cv, ps)) if *cv == w.content_version => ps
+            let n = match self
+                .fed_providers
+                .get(u)
+                .and_then(|bv| bv.get(&w.content_version))
+            {
+                Some((_, ps)) => ps
                     .iter()
                     .filter(|p| !self.core.device_backing_off(&p.device, self.now))
                     .count(),
-                _ => 0,
+                None => 0,
             };
             if n > 0 {
                 idle.push((u.clone(), n, w.since_ms));
@@ -648,7 +756,8 @@ impl World {
         let old = |since: i64| self.now.saturating_sub(since) >= starving;
         for s in starts {
             let w = &self.fed_need[s];
-            let n_s = self.fed_providers[s].1.len();
+            let fed_s = &self.fed_providers[s][&w.content_version].1;
+            let n_s = fed_s.len();
             for (u, n, since) in &idle {
                 if old(*since) {
                     assert!(
@@ -659,8 +768,7 @@ impl World {
                     // rarest first: the started frame had no more providers
                     // than a younger idle one (counts are at start time; a
                     // back-off cannot differ within the step)
-                    let started_avail = self.fed_providers[s]
-                        .1
+                    let started_avail = fed_s
                         .iter()
                         .filter(|p| !self.core.device_backing_off(&p.device, self.now))
                         .count();
@@ -708,12 +816,50 @@ impl World {
                 "fetching continues on an unavailable store"
             );
         }
+        // LIVENESS: storage up, a free slot and a lane that is held or can
+        // be had ⇒ every wanted frame with a usable production-derived
+        // candidate is in flight (or its lane request is pending)
+        let lane_ok = self.lane_admitted || (!self.personal && !self.lane_yielded);
+        if self.storage_ok
+            && self.project_live
+            && self.flying.len() < self.slots
+            && lane_ok
+            && !self.lane_pending
+        {
+            for w in self.need_set() {
+                let u = &w.key.1;
+                if self.flying.contains_key(u) || self.core.frame_backing_off(&w.key, self.now) {
+                    continue;
+                }
+                let usable: Vec<String> = self
+                    .providers_of(u)
+                    .into_iter()
+                    .map(|p| p.device)
+                    .filter(|d| !self.core.device_backing_off(d, self.now))
+                    .collect();
+                assert!(
+                    usable.is_empty(),
+                    "liveness: {u} v{} is wanted, {usable:?} could serve it, a slot is free \
+                     ({} of {} in flight) and the lane is {}, yet it is not in flight",
+                    w.content_version,
+                    self.flying.len(),
+                    self.slots,
+                    if self.lane_admitted {
+                        "held"
+                    } else {
+                        "free to request"
+                    }
+                );
+            }
+        }
     }
 
     // --------------------------------------------------------------- events
 
-    /// A fetch ends; the landing fence records only the current version (I1).
-    fn finish(&mut self, u: String, cv: i32, result: FetchResult) {
+    /// Fetch `id` of `u` (version `cv`) ends — the fetch in flight, or a
+    /// cancelled one reporting late. The landing fence records only the
+    /// current version of a wanted frame (I1), whichever fetch landed it.
+    fn finish(&mut self, u: String, id: u64, cv: i32, result: FetchResult) {
         let mut result = result;
         if result == FetchResult::Landed {
             if cv == self.frames[&u].cv && self.local[&u] == Local::Wanted {
@@ -738,20 +884,36 @@ impl World {
         }
         self.feed(Input::Finished {
             key: key(&u),
-            content_version: cv,
+            fetch_id: id,
             result,
         });
         self.feed_need();
+    }
+
+    /// A frame (re-)entered the need set: the executor feeds its need set
+    /// and its provider list, in a seeded order (R1).
+    fn feed_entry(&mut self, u: &str) {
+        let providers_first = self.rng.below(2) == 0;
+        if providers_first && self.project_live {
+            self.feed_providers(u);
+        }
+        self.feed_need();
+        if !providers_first && self.project_live {
+            self.feed_providers(u);
+        }
     }
 
     fn crash(&mut self) {
         self.core = Core::new(self.rng.next_u64(), self.slots);
         self.flying.clear();
         self.lane_admitted = false;
+        self.lane_yielded = false;
         self.lane_pending = false;
         self.personal = false;
+        self.late.clear();
         self.fed_need.clear();
         self.fed_providers.clear();
+        self.need_seq.clear();
         self.fed_storage = true;
         self.feed(Input::Storage {
             fetching: self.storage_ok,
@@ -797,10 +959,15 @@ impl World {
                 self.feed(Input::Lane { admitted: true });
             }
         }
+        if !self.late.is_empty() && self.rng.below(2) == 0 {
+            let i = self.rng.below(self.late.len());
+            let (lu, id, cv, r) = self.late.remove(i);
+            self.finish(lu, id, cv, r);
+        }
         let us: Vec<String> = self.frames.keys().cloned().collect();
         let u = us[self.rng.below(us.len())].clone();
         let dev = PEERS[self.rng.below(PEERS.len())].to_string();
-        match self.rng.below(28) {
+        match self.rng.below(32) {
             0..=2 => {
                 // a holder claims a version (current, or an older one)
                 let cur = self.frames[&u].cv;
@@ -887,13 +1054,12 @@ impl World {
                 if !self.flying.is_empty() {
                     let fs: Vec<String> = self.flying.keys().cloned().collect();
                     let fu = fs[self.rng.below(fs.len())].clone();
-                    let f = self.flying.remove(&fu).expect("listed");
+                    let f = self.flying[&fu].clone();
                     let result = if f.providers.is_empty() && f.maybe_active.is_empty() {
                         // nobody to fetch from: the run gives up or waits
                         if self.rng.below(2) == 0 {
                             FetchResult::Failed
                         } else {
-                            self.flying.insert(fu.clone(), f);
                             return "fetch waits";
                         }
                     } else {
@@ -904,7 +1070,7 @@ impl World {
                             _ => FetchResult::AwaitingGc,
                         }
                     };
-                    self.finish(fu, f.cv, result);
+                    self.finish(fu, f.id, f.cv, result);
                 }
                 "fetch finished"
             }
@@ -927,7 +1093,11 @@ impl World {
                     Local::Quarantined => self.set_wanted(&u),
                     _ => return "edit (nothing held)",
                 }
-                self.feed_need();
+                if self.local[&u] == Local::Wanted {
+                    self.feed_entry(&u);
+                } else {
+                    self.feed_need();
+                }
                 "edited / refetched"
             }
             15 => {
@@ -964,7 +1134,8 @@ impl World {
                         // the live run cuts every item not transferring at once
                         for (fu, f) in &self.flying {
                             if f.providers.is_empty() && f.maybe_active.is_empty() {
-                                self.followups.push(FollowUp::YieldCut(fu.clone(), f.cv));
+                                self.followups
+                                    .push(FollowUp::YieldCut(fu.clone(), f.id, f.cv));
                             }
                         }
                         self.cov.yields += 1;
@@ -975,6 +1146,9 @@ impl World {
             }
             21 => {
                 self.slots = 1 + self.rng.below(4);
+                if self.slots < self.flying.len() {
+                    self.cov.slots_below_in_flight += 1;
+                }
                 self.feed(Input::Slots(self.slots));
                 "slots changed"
             }
@@ -983,7 +1157,8 @@ impl World {
                 "sync now"
             }
             23 => {
-                // a late provider list of an older version (R1): ignored
+                // a late provider list of an older version (R1): kept under
+                // its own version, never used for the current want
                 let cv = self.frames[&u].cv - 1;
                 if cv >= 1 && self.project_live {
                     let providers = self.providers_at(&u, cv);
@@ -1004,20 +1179,59 @@ impl World {
                 }
                 "project gone"
             }
-            _ => {
+            25 => {
                 // the GC ran over a parked frame, or a user flips "keep"
                 match self.local[&u] {
-                    Local::Parked | Local::NotKept => self.set_wanted(&u),
+                    Local::Parked | Local::NotKept => {
+                        self.set_wanted(&u);
+                        self.feed_entry(&u);
+                    }
                     Local::Wanted => {
                         self.local.insert(u.clone(), Local::NotKept);
+                        self.feed_need();
                     }
                     _ => {
                         self.feed(Input::Tick);
                         return "tick";
                     }
                 }
-                self.feed_need();
                 "keep / gc"
+            }
+            28..=30 => {
+                // our own pool closes an idle connection: no strike
+                self.feed(Input::ConnectionIdle { device: dev });
+                "idle close"
+            }
+            _ => {
+                // an epoch restore (spec §4.4) lowers a frame's version; the
+                // restored hub holds that version's claims again
+                let cur = self.frames[&u].cv;
+                if cur <= 1 {
+                    self.feed(Input::Tick);
+                    return "tick";
+                }
+                if self
+                    .fed_need
+                    .get(&u)
+                    .is_some_and(|w| w.content_version == cur)
+                {
+                    self.cov.version_down += 1;
+                }
+                self.frames.get_mut(&u).expect("known frame").cv = cur - 1;
+                self.holders.apply_delta(&HolderDeltaWire {
+                    device: dev,
+                    add: vec![(seq_of(&u), cur - 1)],
+                    rm: vec![],
+                });
+                match self.local[&u] {
+                    Local::Held(v) if v != cur - 1 => self.set_wanted(&u),
+                    Local::Wanted => {
+                        self.wanted_since.insert(u.clone(), self.now);
+                    }
+                    _ => {}
+                }
+                self.resync_all();
+                "version restored down"
             }
         }
     }
@@ -1057,7 +1271,7 @@ fn run_seed(seed: u64) -> Coverage {
         match r {
             Ok(label) => last = label,
             Err(e) => panic!(
-                "collab scheduler simulation failed: seed {seed}, step {i} (after \"{last}\"): {}",
+                "collab scheduler simulation failed: seed {seed}, step {i} (previous event \"{last}\"): {}",
                 panic_text(&*e)
             ),
         }
@@ -1100,6 +1314,14 @@ fn seeded_interleavings_keep_every_invariant() {
         ("NoProvider cancels", cov.cancel_no_provider),
         ("yields", cov.yields),
         ("lane releases", cov.lane_releases),
+        (
+            "starts on lists fed before the need set",
+            cov.starts_providers_first,
+        ),
+        ("slots lowered below in-flight", cov.slots_below_in_flight),
+        ("late results ignored", cov.late_ignored),
+        ("idle closes freeing a slot", cov.idle_freed_slot),
+        ("versions going down", cov.version_down),
     ] {
         assert!(n >= 10, "the simulation barely exercised {what}: {cov:?}");
     }
