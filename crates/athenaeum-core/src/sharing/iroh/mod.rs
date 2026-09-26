@@ -78,7 +78,7 @@ pub(crate) mod telemetry;
 #[cfg(test)]
 mod tests;
 
-use pacer::UploadPacer;
+use pacer::{UploadClass, UploadPacer};
 use proto::{announce_received_from_msg, Msg, OfferEntry};
 
 /// Custom ALPN for the announce/ack control channel. Distinct from
@@ -535,11 +535,16 @@ pub(crate) fn build_router(
     pacer: Arc<UploadPacer>,
     collab: Option<CollabSlotBlobs>,
 ) -> Router {
-    // Provider upload events (Task 13): the masked channel and its consumer are
-    // factored into `provider_event_channel` / `spawn_provider_events` so the
-    // collab store's provider (collab v3 wave 2, P1) gets the SAME mask and the
-    // SAME consumer — sharing this one `pacer` — without a second copy of either.
+    // Provider upload events (Task 13): the masked channel is factored into
+    // `provider_event_channel` so the collab store's provider (collab v3 wave 2,
+    // P1) gets the SAME mask; its consumer is its own
+    // (`spawn_collab_provider_events`, wave 3 — the serve check) but shares
+    // this one `pacer`.
     let (events, rx) = provider_event_channel();
+    // The personal store's accepted connections, so the consumer can name the
+    // peer behind a request's `connection_id` (a refused push is logged with
+    // its `from`).
+    let conns = Arc::new(ConnRegistry::default());
     // Wrap the blobs provider so an ungated peer never receives a blob byte:
     // `GatedBlobs` checks the connect gate against the dialing node id before
     // delegating to the inner `iroh_blobs` handler (finding F5 hardening).
@@ -547,11 +552,19 @@ pub(crate) fn build_router(
         inner: BlobsProtocol::new(store, Some(events)),
         gate: Arc::clone(gate),
         flush_store_on_shutdown,
+        conns: Arc::clone(&conns),
     };
 
     // The provider-events consumer (see `spawn_provider_events` for the
     // load-bearing drain + throttle-reply rules).
-    spawn_provider_events(rx, pacer, sink.clone(), serve_resolver, serve_file_resolver);
+    spawn_provider_events(
+        rx,
+        pacer,
+        sink.clone(),
+        serve_resolver,
+        serve_file_resolver,
+        conns,
+    );
 
     let control = SyncControlProtocol {
         sink,
@@ -577,7 +590,9 @@ pub(crate) fn build_router(
 
 /// The masked provider-event channel every blobs provider on this node uses
 /// (the personal store's in [`build_router`], the collab store's in
-/// [`node::SharedIrohNode::bind_with`]). One mask, one definition.
+/// [`node::SharedIrohNode::bind_with`]). One mask, one definition: the
+/// collab store's consumer is [`spawn_collab_provider_events`], which puts
+/// the serve check behind the same `get: InterceptLog`.
 pub(crate) fn provider_event_channel() -> (EventSender, mpsc::Receiver<ProviderMessage>) {
     // Provider upload events (Task 13): a masked `EventSender` feeds a per-process
     // consumer that turns a peer's collection pull into outgoing byte progress.
@@ -627,15 +642,26 @@ pub(crate) fn provider_event_channel() -> (EventSender, mpsc::Receiver<ProviderM
     )
 }
 
-/// Spawn the consumer that drains one provider's event stream: per-GET upload
-/// progress (resolved through `serve_resolver` / `serve_file_resolver` and
-/// routed into `consumer_sink`) and the upload throttle, paced by `pacer`.
-///
-/// Shared by both stores on the shared node (collab v3 wave 2, P1): the
-/// personal store's consumer is spawned in [`build_router`]; the collab
-/// store's in [`node::SharedIrohNode::bind_with`], with the SAME `pacer` (so
-/// the device-wide upload cap covers both stores) and resolvers that resolve
-/// nothing (collab uploads route no package progress).
+/// A detached pure-drain task for a request's update stream (LOAD-BEARING
+/// SAFETY RULE of [`spawn_provider_events`]): keep reading until the sender
+/// drops, never abort, never drop the receiver early. A macro, not a
+/// function: the receiver's type lives in a crate we do not depend on.
+macro_rules! drain_detached {
+    ($rx:expr) => {{
+        let mut updates = $rx;
+        tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+    }};
+}
+
+/// Spawn the consumer that drains the PERSONAL store's provider event
+/// stream: per-GET upload progress (resolved through `serve_resolver` /
+/// `serve_file_resolver` and routed into `consumer_sink`) and the upload
+/// throttle, paced by `pacer` as [`UploadClass::Personal`]. Every
+/// payload-carrying GET holds a
+/// [`PersonalUploadGuard`](pacer::PersonalUploadGuard) for its whole
+/// transfer, so collab uploads yield to it (spec §8). The collab store has
+/// its own consumer, [`spawn_collab_provider_events`], sharing the SAME
+/// `pacer` (one device-wide cap).
 ///
 /// The provider-events consumer lives beside the router (never woven into the
 /// node internals): one task drains the masked event stream and, per GET
@@ -677,14 +703,14 @@ pub(crate) fn spawn_provider_events(
     consumer_sink: EventSink,
     serve_resolver: ServeRootResolver,
     serve_file_resolver: ServeFileResolver,
+    conns: Arc<ConnRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // A detached pure-drain task for any rx-carrying message we don't emit for
         // (mask-quirk defense): keep reading until the sender drops, never abort.
         macro_rules! drain_only {
             ($m:expr) => {{
-                let mut updates = $m.rx;
-                tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+                drain_detached!($m.rx);
             }};
         }
         while let Some(msg) = rx.recv().await {
@@ -713,7 +739,13 @@ pub(crate) fn spawn_provider_events(
                     let resolver = Arc::clone(&serve_resolver);
                     let file_resolver = Arc::clone(&serve_file_resolver);
                     let sink = consumer_sink.clone();
+                    // A personal upload is running for as long as this
+                    // payload-carrying transfer drains (spec §8): collab
+                    // uploads yield to it. Taken before the spawn so a
+                    // throttle of this transfer's first chunk already sees it.
+                    let active = payload_carrying.then(|| pacer.personal_upload());
                     tokio::spawn(async move {
+                        let _active = active;
                         // The single emit gate: `Some(pkg)` only when the request
                         // both carries payload AND resolves to one of our packages.
                         // ALL per-file emits are additionally gated on this, so a
@@ -858,6 +890,8 @@ pub(crate) fn spawn_provider_events(
                 // store write), so a refused push writes nothing.
                 ProviderMessage::PushRequestReceived(m) => {
                     tracing::warn!(
+                        from = %conns.peer_label(m.inner.connection_id),
+                        store = "personal",
                         connection_id = m.inner.connection_id,
                         request_id = m.inner.request_id,
                         hash = %m.inner.request.hash,
@@ -883,7 +917,7 @@ pub(crate) fn spawn_provider_events(
                 // dropping `tx` or replying `Err` aborts the peer's download, so
                 // waiting is the only rate-limiting move available to us.
                 ProviderMessage::Throttle(m) => {
-                    let wait = pacer.reserve(m.inner.size);
+                    let wait = pacer.reserve_class(m.inner.size, UploadClass::Personal);
                     if wait.is_zero() {
                         // Unlimited (rate 0) or simply within budget: reply inline.
                         // A local irpc oneshot never yields, so this costs no
@@ -902,13 +936,396 @@ pub(crate) fn spawn_provider_events(
                         });
                     }
                 }
-                // No update channel to drain.
-                ProviderMessage::ClientConnected(_)
-                | ProviderMessage::ClientConnectedNotify(_)
-                | ProviderMessage::ConnectionClosed(_) => {}
+                // No update channel to drain. A closed connection leaves the
+                // registry (its peer no longer needs naming).
+                ProviderMessage::ConnectionClosed(m) => conns.forget(m.inner.connection_id),
+                ProviderMessage::ClientConnected(_) | ProviderMessage::ClientConnectedNotify(_) => {
+                }
             }
         }
     })
+}
+
+/// The collab store's upload stream gauge (L11): how many collab gets are
+/// being served right now, against the device's limit
+/// (`collab.max_upload_streams`). A [`StreamPermit`] is held for the whole
+/// transfer; the limit is live-updatable.
+pub struct StreamGauge {
+    in_use: std::sync::atomic::AtomicUsize,
+    limit: std::sync::atomic::AtomicUsize,
+}
+
+impl StreamGauge {
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            in_use: std::sync::atomic::AtomicUsize::new(0),
+            limit: std::sync::atomic::AtomicUsize::new(limit),
+        })
+    }
+
+    /// Take one stream if `in_use < limit` — atomically, so two requests
+    /// admitted at once never exceed the limit (the loser is refused).
+    pub fn try_acquire(self: &Arc<Self>) -> Option<StreamPermit> {
+        use std::sync::atomic::Ordering;
+        let limit = self.limit.load(Ordering::Relaxed);
+        self.in_use
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < limit).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| StreamPermit {
+                gauge: Arc::clone(self),
+            })
+    }
+
+    pub fn in_use(&self) -> usize {
+        self.in_use.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Apply a new limit to the next request; streams already running keep
+    /// going (a lower limit only refuses new ones).
+    pub fn set_limit(&self, n: usize) {
+        self.limit.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One served collab stream ([`StreamGauge::try_acquire`]); released on drop.
+pub struct StreamPermit {
+    gauge: Arc<StreamGauge>,
+}
+
+impl Drop for StreamPermit {
+    fn drop(&mut self) {
+        self.gauge
+            .in_use
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The node's late-bindable serve oracle slot (spec §9.3). `None` ⇒ no serve
+/// check — neither the record/stamp conditions nor the upload stream limit:
+/// a bare node with no catalog behind it (the transport's own tests) serves
+/// whatever its collab store holds, like the connect gate admits everyone
+/// when none is installed. The app installs the catalog-backed oracle as
+/// soon as it binds the node (`api::sync::ensure_iroh_node`).
+pub type SharedServeOracle = Arc<RwLock<Option<Arc<dyn crate::collab::serve::ServeOracle>>>>;
+
+/// The accepted connections of one blobs provider, keyed by the provider's
+/// `connection_id` (`Connection::stable_id`, the id iroh-blobs puts on every
+/// provider event): the peer behind each, and a weak handle to close it.
+/// Registered by [`GatedBlobs::accept`] after the connect gate admitted the
+/// peer; forgotten when the provider reports the connection closed (and
+/// pruned of dead handles on every registration).
+#[derive(Default)]
+pub(crate) struct ConnRegistry {
+    conns: Mutex<HashMap<u64, (NodeId, iroh::endpoint::WeakConnectionHandle)>>,
+}
+
+impl ConnRegistry {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<u64, (NodeId, iroh::endpoint::WeakConnectionHandle)>>
+    {
+        self.conns.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("connection registry poisoned; recovering it");
+            poisoned.into_inner()
+        })
+    }
+
+    pub(crate) fn register(&self, connection: &Connection) {
+        let from: NodeId = *connection.remote_id().as_bytes();
+        let mut conns = self.lock();
+        conns.retain(|_, (_, h)| h.upgrade().is_some_and(|c| c.close_reason().is_none()));
+        conns.insert(
+            connection.stable_id() as u64,
+            (from, connection.weak_handle()),
+        );
+    }
+
+    pub(crate) fn forget(&self, connection_id: u64) {
+        self.lock().remove(&connection_id);
+    }
+
+    /// The peer behind `connection_id`, if the connection is registered.
+    pub(crate) fn peer_of(&self, connection_id: u64) -> Option<NodeId> {
+        self.lock().get(&connection_id).map(|(node, _)| *node)
+    }
+
+    /// [`peer_of`](Self::peer_of) rendered for a `from` log field.
+    pub(crate) fn peer_label(&self, connection_id: u64) -> String {
+        self.peer_of(connection_id)
+            .map(|n| hex32(&n))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Close every registered connection whose peer `gate` no longer admits;
+    /// returns how many were closed. The gate runs outside the registry lock
+    /// (it may read the catalog).
+    pub(crate) fn close_not_admitted(&self, gate: &SharedConnectGate) -> usize {
+        let peers: HashSet<NodeId> = self.lock().values().map(|(node, _)| *node).collect();
+        let dropped: HashSet<NodeId> = peers
+            .into_iter()
+            .filter(|node| !connect_gate_admits(gate, node))
+            .collect();
+        if dropped.is_empty() {
+            return 0;
+        }
+        let mut closed_per_peer: HashMap<NodeId, usize> = HashMap::new();
+        {
+            let mut conns = self.lock();
+            conns.retain(|_, (node, handle)| {
+                if !dropped.contains(node) {
+                    return true;
+                }
+                if let Some(c) = handle.upgrade() {
+                    if c.close_reason().is_none() {
+                        c.close(0u32.into(), b"membership revoked");
+                        *closed_per_peer.entry(*node).or_default() += 1;
+                    }
+                }
+                false
+            });
+        }
+        let mut closed = 0;
+        for (node, count) in closed_per_peer {
+            closed += count;
+            tracing::info!(peer = %hex32(&node), count, "collab connections closed: no longer admitted");
+        }
+        closed
+    }
+}
+
+/// Spawn the consumer of the COLLAB store's provider events (spec §8, §9.3,
+/// plan P14/P15). The channel is [`provider_event_channel`] (its
+/// `get: InterceptLog` routes every request kind here for a reply), and the
+/// SAFETY RULES of [`spawn_provider_events`] hold unchanged: every request
+/// reply oneshot gets exactly one reply, every update stream is drained for
+/// the whole transfer, every throttle is answered `Ok(())` after its delay.
+///
+/// - **get** — the serve check ([`collab_serve_verdict`]): the catalog row,
+///   the file's stamp, storage availability and the upload stream limit
+///   decide; a refusal is `ERR_PERMISSION`, or `ERR_LIMIT` past the limit.
+///   An admitted get holds a [`StreamPermit`] until its transfer drains.
+/// - **observe** — the same check without counting a stream.
+/// - **push** — refused (`ERR_PERMISSION`), logged with the peer.
+/// - **get-many** — refused: the collab exchange never sends one.
+/// - **throttle** — paced by `pacer` as [`UploadClass::Collab`], so collab
+///   uploads yield to an active personal upload.
+pub(crate) fn spawn_collab_provider_events(
+    mut rx: mpsc::Receiver<ProviderMessage>,
+    pacer: Arc<UploadPacer>,
+    oracle: SharedServeOracle,
+    gauge: Arc<StreamGauge>,
+    conns: Arc<ConnRegistry>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ProviderMessage::GetRequestReceived(m) => {
+                    let oracle = current_oracle(&oracle);
+                    let gauge = Arc::clone(&gauge);
+                    let from = conns.peer_label(m.inner.connection_id);
+                    tokio::spawn(async move {
+                        let hash = m.inner.request.hash;
+                        let permit =
+                            match collab_serve_verdict(oracle, hash, &gauge, true, &from).await {
+                                Ok(permit) => {
+                                    m.tx.send(Ok(())).await.ok();
+                                    permit
+                                }
+                                Err(reason) => {
+                                    m.tx.send(Err(reason)).await.ok();
+                                    None
+                                }
+                            };
+                        // SAFETY RULE: drain the update stream for the whole
+                        // transfer; the permit is held until it ends.
+                        let mut updates = m.rx;
+                        while let Ok(Some(_)) = updates.recv().await {}
+                        drop(permit);
+                    });
+                }
+                ProviderMessage::ObserveRequestReceived(m) => {
+                    let oracle = current_oracle(&oracle);
+                    let gauge = Arc::clone(&gauge);
+                    let from = conns.peer_label(m.inner.connection_id);
+                    tokio::spawn(async move {
+                        let hash = m.inner.request.hash;
+                        let verdict =
+                            collab_serve_verdict(oracle, hash, &gauge, false, &from).await;
+                        m.tx.send(verdict.map(|_| ())).await.ok();
+                        let mut updates = m.rx;
+                        while let Ok(Some(_)) = updates.recv().await {}
+                    });
+                }
+                ProviderMessage::PushRequestReceived(m) => {
+                    tracing::warn!(
+                        from = %conns.peer_label(m.inner.connection_id),
+                        store = "collab",
+                        connection_id = m.inner.connection_id,
+                        request_id = m.inner.request_id,
+                        hash = %m.inner.request.hash,
+                        "inbound push refused"
+                    );
+                    m.tx.send(Err(AbortReason::Permission)).await.ok();
+                    drain_detached!(m.rx);
+                }
+                ProviderMessage::GetManyRequestReceived(m) => {
+                    tracing::debug!(
+                        from = %conns.peer_label(m.inner.connection_id),
+                        connection_id = m.inner.connection_id,
+                        "collab get-many refused"
+                    );
+                    m.tx.send(Err(AbortReason::Permission)).await.ok();
+                    drain_detached!(m.rx);
+                }
+                ProviderMessage::Throttle(m) => {
+                    let wait = pacer.reserve_class(m.inner.size, UploadClass::Collab);
+                    if wait.is_zero() {
+                        m.tx.send(Ok(())).await.ok();
+                    } else {
+                        // Never sleep on this consumer (see
+                        // `spawn_provider_events`'s SAFETY RULE).
+                        let tx = m.tx;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(wait).await;
+                            tx.send(Ok(())).await.ok();
+                        });
+                    }
+                }
+                // Dead-code-safe defensive arms, as in `spawn_provider_events`.
+                ProviderMessage::GetRequestReceivedNotify(m) => drain_detached!(m.rx),
+                ProviderMessage::GetManyRequestReceivedNotify(m) => drain_detached!(m.rx),
+                ProviderMessage::PushRequestReceivedNotify(m) => drain_detached!(m.rx),
+                ProviderMessage::ObserveRequestReceivedNotify(m) => drain_detached!(m.rx),
+                // `connected: Notify` never produces the intercepted variant;
+                // answer it anyway so a future mask change cannot wedge a
+                // connection on an unanswered oneshot.
+                ProviderMessage::ClientConnected(m) => {
+                    m.tx.send(Ok(())).await.ok();
+                }
+                ProviderMessage::ConnectionClosed(m) => conns.forget(m.inner.connection_id),
+                ProviderMessage::ClientConnectedNotify(_) => {}
+            }
+        }
+    })
+}
+
+/// The installed oracle, cloned out from under the lock (never held across
+/// an await). A poisoned slot is logged and read through.
+fn current_oracle(slot: &SharedServeOracle) -> Option<Arc<dyn crate::collab::serve::ServeOracle>> {
+    match slot.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            tracing::error!("collab serve oracle slot poisoned; reading through it");
+            poisoned.into_inner().clone()
+        }
+    }
+}
+
+/// The serve check of one collab get/observe (spec §9.3). The oracle's
+/// catalog read and the file stat run on a blocking thread. Without an
+/// oracle there is no serve check (see [`SharedServeOracle`]).
+/// `Ok(Some(permit))` admits a counted get; `Ok(None)` an observe, a get with
+/// `count_stream == false`, or any request on a node without an oracle.
+async fn collab_serve_verdict(
+    oracle: Option<Arc<dyn crate::collab::serve::ServeOracle>>,
+    hash: Hash,
+    gauge: &Arc<StreamGauge>,
+    count_stream: bool,
+    from: &str,
+) -> Result<Option<StreamPermit>, AbortReason> {
+    use crate::collab::serve::{decide, ServeDecision};
+    use crate::collab::storage::sweep::Stamp;
+
+    let blake3_hex = hash.to_hex().to_string();
+    let limit = if count_stream {
+        gauge.limit()
+    } else {
+        usize::MAX
+    };
+    let (decision, rec, oracle) = match oracle {
+        // No serve check at all (see `SharedServeOracle`): the stream limit
+        // is one of its four conditions, so it is not counted either — a
+        // bare node serves exactly as before wave 3.
+        None => return Ok(None),
+        Some(oracle) => {
+            let o = Arc::clone(&oracle);
+            let hex = blake3_hex.clone();
+            let checked = tokio::task::spawn_blocking(move || {
+                let rec = o.lookup(&hex);
+                let observed = rec.as_ref().and_then(|r| match std::fs::metadata(&r.path) {
+                    Ok(meta) => Some(Stamp::of(&meta)),
+                    Err(e) => {
+                        tracing::debug!(path = %r.path.display(), error = %e, "serve check: stat failed");
+                        None
+                    }
+                });
+                (rec, observed, o.serving())
+            })
+            .await;
+            let (rec, observed, serving) = match checked {
+                Ok(checked) => checked,
+                Err(e) => {
+                    tracing::error!(from, blake3 = %blake3_hex, error = %e, "collab get refused: serve check failed");
+                    return Err(AbortReason::Permission);
+                }
+            };
+            let decision = decide(rec.as_ref(), observed, serving, gauge.in_use(), limit);
+            (decision, rec, Some(oracle))
+        }
+    };
+    match decision {
+        ServeDecision::Serve if !count_stream => Ok(None),
+        ServeDecision::Serve => match gauge.try_acquire() {
+            Some(permit) => Ok(Some(permit)),
+            // Lost the race for the last stream after the check said Serve.
+            None => {
+                tracing::debug!(
+                    from,
+                    streams = gauge.in_use(),
+                    "collab get refused: upload stream limit"
+                );
+                Err(AbortReason::RateLimited)
+            }
+        },
+        ServeDecision::RefuseLimit => {
+            tracing::debug!(
+                from,
+                streams = gauge.in_use(),
+                "collab get refused: upload stream limit"
+            );
+            Err(AbortReason::RateLimited)
+        }
+        ServeDecision::RefuseMismatch => {
+            if let (Some(r), Some(o)) = (rec.as_ref(), oracle.as_ref()) {
+                tracing::warn!(
+                    from,
+                    project_id = %r.project_id,
+                    frame_uuid = %r.frame_uuid,
+                    path = %r.path.display(),
+                    "collab get refused: file changed on disk; checking it now"
+                );
+                o.on_mismatch(r);
+            }
+            Err(AbortReason::Permission)
+        }
+        ServeDecision::RefuseNotHeld => {
+            tracing::debug!(from, blake3 = %blake3_hex, "collab get refused: not a held current version");
+            Err(AbortReason::Permission)
+        }
+        ServeDecision::RefuseUnavailable => {
+            tracing::debug!(
+                from,
+                "collab get refused: collaboration storage unavailable"
+            );
+            Err(AbortReason::Permission)
+        }
+    }
 }
 
 /// Where an [`IrohTransport`] keeps downloaded/served blob content.
@@ -2066,6 +2483,9 @@ pub(crate) struct GatedBlobs {
     /// its endpoint closes), so the node flushes the store explicitly in its own
     /// [`shutdown`](crate::sharing::iroh::node::SharedIrohNode::shutdown) instead.
     flush_store_on_shutdown: bool,
+    /// This provider's accepted connections (peer naming in the provider
+    /// consumer; for the collab store also the I11 close, P16).
+    conns: Arc<ConnRegistry>,
 }
 
 // `SharedConnectGate` wraps a boxed closure (not `Debug`), so the `ProtocolHandler`
@@ -2087,6 +2507,7 @@ impl ProtocolHandler for GatedBlobs {
             connection.close(0u32.into(), b"unauthorized");
             return Ok(());
         }
+        self.conns.register(&connection);
         // A blob download connection lives for the whole transfer — the longest
         // window this transport holds a `Connection` handle, so its path watcher
         // is the most likely to observe a mid-transfer relay→direct upgrade.
@@ -2133,11 +2554,13 @@ pub(crate) fn collab_gated_blobs(
     store: &Store,
     events: EventSender,
     gate: &SharedConnectGate,
+    conns: &Arc<ConnRegistry>,
 ) -> GatedBlobs {
     GatedBlobs {
         inner: BlobsProtocol::new(store, Some(events)),
         gate: Arc::clone(gate),
         flush_store_on_shutdown: false,
+        conns: Arc::clone(conns),
     }
 }
 

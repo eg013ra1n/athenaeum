@@ -129,6 +129,15 @@ pub mod defaults {
     pub const COLLAB_LOSS_GUARD_FRACTION: &str = "0.10";
     pub const COLLAB_LOSS_GUARD_BYTES: &str = "10737418240";
 
+    /// PROVISIONAL — collab v3 wave 3 plan P21; re-set from the relay
+    /// measurement. Simultaneous collab upload streams this device serves
+    /// (L11), clamped to [`COLLAB_UPLOAD_STREAMS_RANGE`](super::COLLAB_UPLOAD_STREAMS_RANGE).
+    pub const COLLAB_MAX_UPLOAD_STREAMS: &str = "8";
+    /// PROVISIONAL — collab v3 wave 3 plan P21; re-set from the relay
+    /// measurement. Simultaneous collab receive streams per fetch (L11),
+    /// clamped to [`COLLAB_RECEIVE_STREAMS_RANGE`](super::COLLAB_RECEIVE_STREAMS_RANGE).
+    pub const COLLAB_MAX_RECEIVE_STREAMS: &str = "8";
+
     // Account layer (task B4). Base URL of the athenaeum-hub. The device token
     // lives in the OS keychain (never here), keyed per hub host — so the prod
     // and test sign-ins coexist and switching is safe.
@@ -221,6 +230,14 @@ pub mod defaults {
             (
                 super::keys::COLLAB_LOSS_GUARD_BYTES,
                 COLLAB_LOSS_GUARD_BYTES,
+            ),
+            (
+                super::keys::COLLAB_MAX_UPLOAD_STREAMS,
+                COLLAB_MAX_UPLOAD_STREAMS,
+            ),
+            (
+                super::keys::COLLAB_MAX_RECEIVE_STREAMS,
+                COLLAB_MAX_RECEIVE_STREAMS,
             ),
             (super::keys::BLINK_RESOLUTION, BLINK_RESOLUTION),
             (
@@ -372,6 +389,12 @@ pub mod keys {
     /// Collab replication loss guard (P14): the bytes of held replicas whose
     /// loss in one disk-truth pass pauses the project's replication.
     pub const COLLAB_LOSS_GUARD_BYTES: &str = "collab.loss_guard_bytes";
+    /// Simultaneous collab upload streams this device serves (L11); a get
+    /// past the limit is refused with `ERR_LIMIT` and the fetcher moves on.
+    pub const COLLAB_MAX_UPLOAD_STREAMS: &str = "collab.max_upload_streams";
+    /// Simultaneous collab receive streams per fetch (L11): the assignment
+    /// engine's in-flight cap for collab.
+    pub const COLLAB_MAX_RECEIVE_STREAMS: &str = "collab.max_receive_streams";
 
     /// Absolute path of the folder that holds prepared outgoing packages
     /// (`<dir>/<uuid>/…`). Empty/unset = `<identity_dir>/packages`
@@ -463,6 +486,11 @@ pub mod keys {
 /// or an unbounded one.
 pub const BLINK_MEMORY_CACHE_MAX_MB_MIN: usize = 64;
 pub const BLINK_MEMORY_CACHE_MAX_MB_MAX: usize = 16384;
+
+/// Bounds of `collab.max_upload_streams` (L11).
+pub const COLLAB_UPLOAD_STREAMS_RANGE: std::ops::RangeInclusive<usize> = 1..=64;
+/// Bounds of `collab.max_receive_streams` (L11).
+pub const COLLAB_RECEIVE_STREAMS_RANGE: std::ops::RangeInclusive<usize> = 1..=32;
 
 /// Resolve `blink.memory_cache_max_mb` from its raw stored text: absent or
 /// unparseable falls back to the default (logged when a value was present),
@@ -788,6 +816,48 @@ impl SettingsManager {
         let n: i64 = value.trim().parse()?;
         Ok(n.max(0))
     }
+
+    /// `collab.max_upload_streams` (L11), clamped to
+    /// [`COLLAB_UPLOAD_STREAMS_RANGE`]; a non-numeric value falls back to
+    /// the default with a warning.
+    pub fn get_collab_max_upload_streams(&self, conn: &Connection) -> Result<usize> {
+        self.get_clamped_count(
+            conn,
+            keys::COLLAB_MAX_UPLOAD_STREAMS,
+            defaults::COLLAB_MAX_UPLOAD_STREAMS,
+            COLLAB_UPLOAD_STREAMS_RANGE,
+        )
+    }
+
+    /// `collab.max_receive_streams` (L11), clamped to
+    /// [`COLLAB_RECEIVE_STREAMS_RANGE`]; a non-numeric value falls back to
+    /// the default with a warning.
+    pub fn get_collab_max_receive_streams(&self, conn: &Connection) -> Result<usize> {
+        self.get_clamped_count(
+            conn,
+            keys::COLLAB_MAX_RECEIVE_STREAMS,
+            defaults::COLLAB_MAX_RECEIVE_STREAMS,
+            COLLAB_RECEIVE_STREAMS_RANGE,
+        )
+    }
+
+    fn get_clamped_count(
+        &self,
+        conn: &Connection,
+        key: &str,
+        default: &str,
+        range: std::ops::RangeInclusive<usize>,
+    ) -> Result<usize> {
+        let value = self.get_with_precedence(conn, key, default)?;
+        let n = match value.trim().parse::<usize>() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(key, value = %value, error = %e, "unparseable setting value — using the default");
+                default.parse()?
+            }
+        };
+        Ok(n.clamp(*range.start(), *range.end()))
+    }
 }
 
 #[cfg(test)]
@@ -814,6 +884,8 @@ mod tests {
             keys::BLINK_RESOLUTION,
             keys::COLLAB_LOSS_GUARD_FRACTION,
             keys::COLLAB_LOSS_GUARD_BYTES,
+            keys::COLLAB_MAX_UPLOAD_STREAMS,
+            keys::COLLAB_MAX_RECEIVE_STREAMS,
         ] {
             assert!(
                 listed.contains(key),
@@ -855,6 +927,42 @@ mod tests {
             .persist_setting(&conn, keys::COLLAB_LOSS_GUARD_FRACTION, "lots")
             .unwrap();
         assert!(manager.get_collab_loss_guard_fraction(&conn).is_err());
+    }
+
+    /// L11 (P21): the two collab stream limits read their provisional
+    /// defaults, honour a stored value, clamp out-of-range ones and fall
+    /// back to the default on a non-numeric one.
+    #[test]
+    fn collab_stream_limit_getters_default_and_clamp() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+        assert_eq!(manager.get_collab_max_upload_streams(&conn).unwrap(), 8);
+        assert_eq!(manager.get_collab_max_receive_streams(&conn).unwrap(), 8);
+        manager
+            .persist_setting(&conn, keys::COLLAB_MAX_UPLOAD_STREAMS, "16")
+            .unwrap();
+        manager
+            .persist_setting(&conn, keys::COLLAB_MAX_RECEIVE_STREAMS, "4")
+            .unwrap();
+        assert_eq!(manager.get_collab_max_upload_streams(&conn).unwrap(), 16);
+        assert_eq!(manager.get_collab_max_receive_streams(&conn).unwrap(), 4);
+        manager
+            .persist_setting(&conn, keys::COLLAB_MAX_UPLOAD_STREAMS, "1000")
+            .unwrap();
+        manager
+            .persist_setting(&conn, keys::COLLAB_MAX_RECEIVE_STREAMS, "0")
+            .unwrap();
+        assert_eq!(manager.get_collab_max_upload_streams(&conn).unwrap(), 64);
+        assert_eq!(manager.get_collab_max_receive_streams(&conn).unwrap(), 1);
+        manager
+            .persist_setting(&conn, keys::COLLAB_MAX_RECEIVE_STREAMS, "1000")
+            .unwrap();
+        assert_eq!(manager.get_collab_max_receive_streams(&conn).unwrap(), 32);
+        manager
+            .persist_setting(&conn, keys::COLLAB_MAX_UPLOAD_STREAMS, "lots")
+            .unwrap();
+        assert_eq!(manager.get_collab_max_upload_streams(&conn).unwrap(), 8);
     }
 
     #[test]

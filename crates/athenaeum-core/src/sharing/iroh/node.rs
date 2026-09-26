@@ -74,10 +74,11 @@ use super::proto::{self, Msg, OfferEntry};
 use super::telemetry::{peer_conn_path, TransportCounters};
 use super::{
     blobs, build_router, collab_gated_blobs, hex32, provider_event_channel,
-    spawn_conn_path_diagnostics, spawn_provider_events, CollabMount, CollabSlotBlobs, ConnectGate,
-    Delivery, EventSink, PresenceHook, ServeFileResolver, ServeRootResolver, SharedCollabSlot,
-    SharedConnectGate, SharedPresenceHook, SharedResponder, CONTROL_SEND_TIMEOUT,
-    EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
+    spawn_collab_provider_events, spawn_conn_path_diagnostics, CollabMount, CollabSlotBlobs,
+    ConnRegistry, ConnectGate, Delivery, EventSink, PresenceHook, ServeFileResolver,
+    ServeRootResolver, SharedCollabSlot, SharedConnectGate, SharedPresenceHook, SharedResponder,
+    SharedServeOracle, StreamGauge, CONTROL_SEND_TIMEOUT, EVENT_CHANNEL_CAPACITY, GC_INTERVAL,
+    MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
 };
 
 /// Upper bound on the graceful `endpoint.close()` at shutdown (I1). A clean
@@ -888,6 +889,13 @@ pub struct SharedIrohNode {
     /// Provider-event sender every collab mount's `BlobsProtocol` clones; its one
     /// consumer (spawned at bind) shares [`upload_pacer`](Self::upload_pacer).
     collab_events: EventSender,
+    /// The serve oracle the collab consumer asks per get (spec §9.3); `None`
+    /// until the host installs one ([`set_collab_serve_oracle`](Self::set_collab_serve_oracle)).
+    collab_oracle: SharedServeOracle,
+    /// The collab upload stream gauge (L11), shared with the collab consumer.
+    collab_gauge: Arc<StreamGauge>,
+    /// Every accepted collab connection (plan P16), for the I11 close.
+    collab_conns: Arc<ConnRegistry>,
     /// Serializes [`set_collab_root`](Self::set_collab_root) calls (open → sweep
     /// → swap → shut old) and fences them against [`shutdown`](Self::shutdown).
     collab_mount: tokio::sync::Mutex<()>,
@@ -899,6 +907,14 @@ pub struct SharedIrohNode {
     /// clone drops — the handle is here so [`shutdown`](Self::shutdown) can
     /// abort it explicitly instead of leaking it.
     home_relay_tx: Mutex<Option<(tokio::sync::watch::Sender<Option<String>>, JoinHandle<()>)>>,
+}
+
+/// The provisional default of `collab.max_upload_streams` (P21), the limit a
+/// freshly bound node starts with until the host applies the setting.
+fn default_collab_upload_streams() -> usize {
+    crate::settings::defaults::COLLAB_MAX_UPLOAD_STREAMS
+        .parse()
+        .expect("the collab.max_upload_streams default is a number")
 }
 
 /// Tag prefix of the collab store's in-flight fetches (plan P22:
@@ -1130,15 +1146,25 @@ impl SharedIrohNode {
         // `BlobsProtocol` from a clone of `collab_events`, and the ONE consumer
         // drains them all with the SAME pacer (so the device-wide upload cap
         // covers both stores and every throttle is answered). Collab uploads
-        // route no package progress, so its resolvers resolve nothing.
+        // route no package progress.
+        //
+        // Collab v3 wave 3 (spec §8, §9.3): the collab consumer is its own —
+        // the serve check on every get (the oracle slot starts empty: no
+        // check, no stream limit, until the host installs one), the upload
+        // stream limit (starts at the default of `collab.max_upload_streams`),
+        // push refused, and collab-class pacing that yields to personal
+        // uploads.
         let collab: SharedCollabSlot = Arc::new(RwLock::new(None));
+        let collab_oracle: SharedServeOracle = Arc::new(RwLock::new(None));
+        let collab_gauge = StreamGauge::new(default_collab_upload_streams());
+        let collab_conns = Arc::new(ConnRegistry::default());
         let (collab_events, collab_rx) = provider_event_channel();
-        spawn_provider_events(
+        spawn_collab_provider_events(
             collab_rx,
             Arc::clone(&upload_pacer),
-            EventSink::Demux(Arc::clone(&demux)),
-            Arc::new(|_: Hash| -> Option<PackageId> { None }),
-            Arc::new(|_: Hash, _: u64| -> Option<(String, u64)> { None }),
+            Arc::clone(&collab_oracle),
+            Arc::clone(&collab_gauge),
+            Arc::clone(&collab_conns),
         );
         // Shared node: `EventSink::Demux` (inbound events fan out through the demux,
         // Task 2/Д4, not a single shared stream), and `flush_store_on_shutdown:
@@ -1220,6 +1246,9 @@ impl SharedIrohNode {
             serve_import_mode: opts.serve_import_mode,
             collab,
             collab_events,
+            collab_oracle,
+            collab_gauge,
+            collab_conns,
             collab_mount: tokio::sync::Mutex::new(()),
             home_relay_tx: Mutex::new(None),
         }))
@@ -1234,6 +1263,54 @@ impl SharedIrohNode {
     pub fn set_upload_limit(&self, bytes_per_sec: u64) {
         self.upload_pacer.set_rate(bytes_per_sec);
         tracing::info!(bytes_per_sec, "sync upload limit applied");
+    }
+
+    // ----- the collab provider's serve check and limits (wave 3, §8/§9.3) -----
+
+    /// Install (`Some`) or remove (`None`) the collab store's serve oracle.
+    /// Picked up by the next get; a get already admitted keeps going.
+    pub fn set_collab_serve_oracle(
+        &self,
+        oracle: Option<Arc<dyn crate::collab::serve::ServeOracle>>,
+    ) {
+        let installed = oracle.is_some();
+        match self.collab_oracle.write() {
+            Ok(mut slot) => *slot = oracle,
+            Err(poisoned) => {
+                tracing::error!("collab serve oracle slot poisoned; replacing it anyway");
+                *poisoned.into_inner() = oracle;
+            }
+        }
+        tracing::info!(installed, "collab serve oracle set");
+    }
+
+    /// Set the limit on simultaneous collab upload streams (L11), clamped to
+    /// [`COLLAB_UPLOAD_STREAMS_RANGE`](crate::settings::COLLAB_UPLOAD_STREAMS_RANGE).
+    /// Applies to the next get; streams already running keep going.
+    pub fn set_collab_upload_limit(&self, streams: usize) {
+        let range = crate::settings::COLLAB_UPLOAD_STREAMS_RANGE;
+        let streams = streams.clamp(*range.start(), *range.end());
+        self.collab_gauge.set_limit(streams);
+        tracing::info!(streams, "collab upload stream limit applied");
+    }
+
+    /// How many collab gets are being served right now.
+    pub fn collab_streams_in_use(&self) -> usize {
+        self.collab_gauge.in_use()
+    }
+
+    /// I11 (plan P16): close every accepted collab connection whose remote
+    /// the connect gate no longer admits; returns how many were closed. The
+    /// gate reads membership live, so call this right after a membership
+    /// snapshot refresh.
+    pub fn close_collab_connections_not_admitted(&self) -> usize {
+        self.collab_conns.close_not_admitted(&self.connect_gate)
+    }
+
+    /// The collab stream gauge itself, for tests that hold a stream busy.
+    #[cfg(test)]
+    pub fn collab_stream_gauge_for_test(&self) -> Arc<StreamGauge> {
+        Arc::clone(&self.collab_gauge)
     }
 
     // ----- network-layer accessors (Task 8) -----------------------------------
@@ -1718,6 +1795,7 @@ impl SharedIrohNode {
             &store,
             self.collab_events.clone(),
             &self.connect_gate,
+            &self.collab_conns,
         ));
         let old = self
             .collab
@@ -5975,10 +6053,10 @@ mod collab_store_tests {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
-        let refusals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refusals = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
         let _guard = tracing_subscriber::registry()
             .with(PushRefusalCaptureLayer {
-                count: Arc::clone(&refusals),
+                seen: Arc::clone(&refusals),
             })
             .set_default();
 
@@ -6028,9 +6106,17 @@ mod collab_store_tests {
             "the pushed blob must NOT land in the collab store"
         );
 
+        // Both refusals name the pusher (`from`, via the provider's connection
+        // registry) and the store that refused it (Task 10).
+        let b_hex = super::hex32(&b.node_id());
+        let mut seen = refusals.lock().unwrap().clone();
+        seen.sort();
         assert_eq!(
-            refusals.load(std::sync::atomic::Ordering::SeqCst),
-            2,
+            seen,
+            vec![
+                (b_hex.clone(), "collab".to_string()),
+                (b_hex, "personal".to_string())
+            ],
             "both pushes must be refused with the `inbound push refused` warn"
         );
 
@@ -6045,24 +6131,32 @@ mod collab_store_tests {
     #[derive(Default)]
     struct PushRefusalWarnCollector {
         message: String,
+        from: String,
+        store: String,
     }
 
     impl tracing::field::Visit for PushRefusalWarnCollector {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.message = format!("{value:?}");
+            match field.name() {
+                "message" => self.message = format!("{value:?}"),
+                "from" => self.from = format!("{value:?}"),
+                "store" => self.store = format!("{value:?}").trim_matches('"').to_string(),
+                _ => {}
             }
         }
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                self.message = value.to_string();
+            match field.name() {
+                "message" => self.message = value.to_string(),
+                "from" => self.from = value.to_string(),
+                "store" => self.store = value.to_string(),
+                _ => {}
             }
         }
     }
 
     #[derive(Clone)]
     struct PushRefusalCaptureLayer {
-        count: Arc<std::sync::atomic::AtomicUsize>,
+        seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     }
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PushRefusalCaptureLayer {
@@ -6078,7 +6172,10 @@ mod collab_store_tests {
             let mut collector = PushRefusalWarnCollector::default();
             event.record(&mut collector);
             if collector.message == "inbound push refused" {
-                self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((collector.from, collector.store));
             }
         }
     }

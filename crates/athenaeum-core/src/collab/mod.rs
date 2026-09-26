@@ -18,6 +18,9 @@ pub mod hub_client;
 // The live exchange (wave 3): retry back-off, the claim digest, and the REST
 // wire shapes for holders/versions/presence. Pure and ungated.
 pub mod live;
+// The per-request serve check of the collab provider (wave 3, spec §9.3):
+// a pure decision plus the oracle trait the provider consumer asks.
+pub mod serve;
 pub mod snapshot;
 // On-disk state of the Collaboration root itself (wave 3, spec §9): the
 // storage marker (available/read-only/unavailable, another device's disk

@@ -198,9 +198,32 @@ pub(crate) struct LandedRig {
     pub root: PathBuf,
     /// `(project_id, frame_uuid, landed path)`, in uuid order.
     pub frames: Vec<(String, String, PathBuf)>,
+    /// The local checks the node's serve oracle queued (Task 10): the
+    /// receiving half of the [`DbServeOracle`](crate::api::collab_live::serve_oracle::DbServeOracle)
+    /// channel [`landed_rig`] installs.
+    pub checks: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
 }
 
 impl LandedRig {
+    /// The blake3 of frame `i` as the catalog records it (its current version).
+    pub(crate) fn hash_of(&self, i: usize) -> iroh_blobs::Hash {
+        let (pid, uuid, _) = &self.frames[i];
+        let row =
+            crate::db::collab_frames::get(&crate::api::db(&self.ctx).unwrap().conn(), pid, uuid)
+                .unwrap()
+                .expect("a landed row");
+        row.blake3.parse().expect("a blake3 hex")
+    }
+
+    /// The next local check the serve oracle queued, or `None` after 5 s.
+    pub(crate) async fn next_local_check(&self) -> Option<(String, String)> {
+        let mut rx = self.checks.lock().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// A storage engine on this rig's root, with the marker this device
     /// recorded at designation.
     pub(crate) fn engine(&self) -> crate::api::collab_live::storage_task::StorageEngine {
@@ -242,14 +265,79 @@ pub(crate) async fn landed_rig(n: usize) -> LandedRig {
         land_frame(&ctx, &hub, &node, uuid, &path, &bytes).await;
         frames.push((PID.to_string(), uuid.clone(), path));
     }
+    let ctx = Arc::new(ctx);
+    // The live session's serve oracle (Task 10), on a guard that checked the
+    // marker designation wrote.
+    let me = crate::api::account::own_device_id(&ctx).unwrap();
+    let recorded =
+        crate::db::collab_live::recorded_store_marker(&crate::api::db(&ctx).unwrap().conn())
+            .unwrap();
+    let guard = Arc::new(crate::collab::storage::marker::StoreGuard::new(
+        root.clone(),
+        me,
+        recorded,
+    ));
+    assert!(
+        guard.check_now().serving(),
+        "the designated root is available"
+    );
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    node.set_collab_serve_oracle(Some(Arc::new(
+        crate::api::collab_live::serve_oracle::DbServeOracle::new(Arc::clone(&ctx), guard, tx),
+    )));
     LandedRig {
         _tmp: tmp,
-        ctx: Arc::new(ctx),
+        ctx,
         hub,
         node,
         root,
         frames,
+        checks: tokio::sync::Mutex::new(rx),
     }
+}
+
+/// A relay-disabled node with no catalog behind it (a fetcher in the
+/// two-node tests), in its own temp dir.
+pub(crate) struct BareNode {
+    pub node: Arc<SharedIrohNode>,
+    _tmp: tempfile::TempDir,
+}
+
+impl std::ops::Deref for BareNode {
+    type Target = Arc<SharedIrohNode>;
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+
+pub(crate) async fn bare_node() -> BareNode {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = SharedIrohNode::bind_with(
+        tmp.path(),
+        tmp.path(),
+        iroh::RelayMode::Disabled,
+        crate::sharing::iroh::node::NodeOptions::default(),
+    )
+    .await
+    .expect("bind relay-disabled node");
+    BareNode { node, _tmp: tmp }
+}
+
+/// Relay-disabled nodes have no discovery: exchange addresses.
+pub(crate) async fn pair(a: &Arc<SharedIrohNode>, b: &Arc<SharedIrohNode>) {
+    for n in [a, b] {
+        n.handle(crate::sharing::iroh::node::Role::Out)
+            .start()
+            .await
+            .unwrap();
+    }
+    a.add_peer(b.endpoint_addr());
+    b.add_peer(a.endpoint_addr());
+}
+
+/// An empty in-memory blob store to fetch into.
+pub(crate) fn scratch_store() -> iroh_blobs::api::Store {
+    iroh_blobs::store::mem::MemStore::new().into()
 }
 
 /// Publish `uuid` on the hub as `acc-o` with `bytes`' real hashes, write

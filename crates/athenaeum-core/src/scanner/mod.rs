@@ -20,9 +20,6 @@ use std::sync::{Arc, Mutex};
 use crate::events::{ProgressEmitter, emit_event};
 use walkdir::WalkDir;
 
-/// Convert a path to UTF-8 string for DB persistence.
-/// Rejects non-UTF-8 paths instead of silently corrupting them via U+FFFD
-/// replacement (which would break any subsequent path-based lookup).
 /// The frame file extensions both walkers take (lower-case) — also the only
 /// unknown files the collab storage engine tries to re-adopt or lists under
 /// "Other files".
@@ -35,6 +32,9 @@ pub(crate) fn is_frame_file(path: &Path) -> bool {
         .is_some_and(|e| FRAME_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
+/// Convert a path to UTF-8 string for DB persistence.
+/// Rejects non-UTF-8 paths instead of silently corrupting them via U+FFFD
+/// replacement (which would break any subsequent path-based lookup).
 pub(crate) fn path_to_utf8(path: &std::path::Path) -> anyhow::Result<String> {
     path.to_str()
         .map(|s| s.to_string())

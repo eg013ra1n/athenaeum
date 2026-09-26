@@ -593,6 +593,7 @@ impl FeedApplier {
         let conn = database.conn();
         let project = crate::api::collab_exchange::live_project(&conn, pid)?;
         let tx = conn.unchecked_transaction()?;
+        let mut routes = frames_db::EngineRoutes::default();
         let mut max_mv = project.manifest_cursor;
         let mut counts: std::collections::BTreeMap<
             crate::api::collab_exchange::FramesChangeKind,
@@ -604,12 +605,13 @@ impl FeedApplier {
             for kind in crate::api::collab_exchange::classify_frame_change(prev.as_ref(), v) {
                 *counts.entry(kind).or_default() += 1;
             }
-            frames_db::upsert_from_manifest(&tx, pid, v)?;
+            frames_db::upsert_from_manifest_deferred(&tx, pid, v, &mut routes)?;
             max_mv = max_mv.max(v.manifest_version);
         }
         crate::db::collab::set_sync_state(&tx, pid, Some(version), max_mv, &project.gov_caps_json)?;
         crate::db::collab::set_feed_version(&tx, pid, epoch, version)?;
         tx.commit()?;
+        routes.route();
         for (kind, count) in counts {
             let change = crate::api::collab_exchange::CollabFramesChange {
                 project_id: pid.to_string(),

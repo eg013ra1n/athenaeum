@@ -269,7 +269,45 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LocalFrameRow> {
 ///    same, else `wanted` with its landed file handed to the storage engine
 ///    — [`reinclude`]). Nothing is hashed here: this runs in the caller's
 ///    write transaction.
+///
+/// For a caller OUTSIDE a transaction (autocommit): the landed file of a
+/// re-included frame is handed to the storage engine right away. A caller
+/// inside a transaction uses [`upsert_from_manifest_deferred`] and routes the
+/// collected [`EngineRoutes`] only after its commit, so the engine never
+/// reads a row the transaction might still roll back.
 pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWire) -> Result<()> {
+    let mut routes = EngineRoutes::default();
+    upsert_from_manifest_deferred(conn, project_id, v, &mut routes)?;
+    routes.route();
+    Ok(())
+}
+
+/// The landed files of re-included frames that [`upsert_from_manifest_deferred`]
+/// hands to the storage engine once the caller has committed.
+#[derive(Debug, Default)]
+#[must_use = "route the collected files after the transaction commits"]
+pub struct EngineRoutes(Vec<(String, String, std::path::PathBuf)>);
+
+impl EngineRoutes {
+    /// Hand every collected file to the running storage engine (see
+    /// [`route_to_engine`]). Call after the transaction that collected them
+    /// committed.
+    pub fn route(self) {
+        for (project_id, frame_uuid, path) in self.0 {
+            route_to_engine(&project_id, &frame_uuid, &path);
+        }
+    }
+}
+
+/// [`upsert_from_manifest`] for a caller inside a write transaction: the
+/// files to hand to the storage engine are collected into `routes`, to be
+/// routed with [`EngineRoutes::route`] after the commit.
+pub fn upsert_from_manifest_deferred(
+    conn: &Connection,
+    project_id: &str,
+    v: &FrameViewWire,
+    routes: &mut EngineRoutes,
+) -> Result<()> {
     use crate::collab::storage::states::{transition, StateEvent};
 
     let manifest_json = serde_json::to_string(v)?;
@@ -390,7 +428,9 @@ pub fn upsert_from_manifest(conn: &Connection, project_id: &str, v: &FrameViewWi
                 let to = if ev == StateEvent::Reincluded {
                     let (to, route) = reinclude(conn, &row)?;
                     if let Some(path) = route {
-                        route_to_engine(project_id, &v.frame_uuid, &path);
+                        routes
+                            .0
+                            .push((project_id.to_string(), v.frame_uuid.clone(), path));
                     }
                     to
                 } else {
@@ -1616,6 +1656,36 @@ mod tests {
         assert_eq!(
             get(&c, "p1", "u2").unwrap().unwrap().local_state,
             LocalState::Wanted
+        );
+    }
+
+    /// T9 review fold (Task 10): inside a transaction the re-included
+    /// frame's file is collected, not routed — the caller routes it after
+    /// its commit, so a rolled-back upsert hands nothing to the engine.
+    #[test]
+    fn a_deferred_upsert_collects_the_engine_route_for_after_the_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("u2.fits");
+        let c = conn();
+        let mut idle = view("u2", 1);
+        idle.accepted = false;
+        upsert_from_manifest(&c, "p1", &idle).unwrap();
+        std::fs::write(&f, vec![7u8; 100]).unwrap();
+        update_landed_path(&c, "p1", "u2", &f.to_string_lossy()).unwrap();
+
+        let tx = c.unchecked_transaction().unwrap();
+        let mut routes = EngineRoutes::default();
+        upsert_from_manifest_deferred(&tx, "p1", &view("u2", 2), &mut routes).unwrap();
+        assert_eq!(
+            routes.0,
+            vec![("p1".to_string(), "u2".to_string(), f.clone())],
+            "the landed file is collected for the engine"
+        );
+        drop(tx); // rolled back
+        assert_eq!(
+            get(&c, "p1", "u2").unwrap().unwrap().local_state,
+            LocalState::Idle,
+            "the rollback undid the re-inclusion; the route was never sent"
         );
     }
 

@@ -339,16 +339,18 @@ pub(crate) async fn sync_manifest_inner(
                 let database = db(ctx)?;
                 let conn = database.conn();
                 let tx = conn.unchecked_transaction()?;
+                let mut routes = frames_db::EngineRoutes::default();
                 for v in &page.rows {
                     let prev = frames_db::get(&tx, project_id, &v.frame_uuid)?;
                     for kind in classify_frame_change(prev.as_ref(), v) {
                         *counts.entry(kind).or_default() += 1;
                     }
-                    frames_db::upsert_from_manifest(&tx, project_id, v)?;
+                    frames_db::upsert_from_manifest_deferred(&tx, project_id, v, &mut routes)?;
                     seen.insert(v.frame_uuid.clone());
                     max_mv = max_mv.max(v.manifest_version);
                 }
                 tx.commit()?;
+                routes.route();
             }
             applied += page.rows.len();
             if !page.has_more {

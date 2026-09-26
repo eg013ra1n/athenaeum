@@ -47,7 +47,7 @@ use crate::collab::fake_hub::FakeHub;
 use crate::db::collab_frames::{self as frames_db, LocalFrameRow};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
-use crate::sharing::iroh::node::{project_frame_tag, test_gc, BlobHealth, Role, SharedIrohNode};
+use crate::sharing::iroh::node::{project_frame_tag, test_gc, BlobHealth, SharedIrohNode};
 
 const PID: &str = "p-m31";
 /// Frames A publishes.
@@ -153,6 +153,9 @@ async fn bind_node(ctx: &ServiceContext) -> Arc<SharedIrohNode> {
     )
     .await
     .expect("bind relay-disabled node");
+    // As `ensure_iroh_node` does (Task 10): every collab get this instance
+    // serves passes the catalog-backed serve check.
+    crate::api::collab_live::serve_oracle::install_catalog_oracle(ctx, &node);
     *ctx.iroh_node.lock().await = Some(Arc::clone(&node));
     node
 }
@@ -200,14 +203,9 @@ async fn member(
     }
 }
 
-/// Relay-disabled nodes have no discovery: exchange addresses.
-async fn pair(a: &Arc<SharedIrohNode>, b: &Arc<SharedIrohNode>) {
-    for n in [a, b] {
-        n.handle(Role::Out).start().await.unwrap();
-    }
-    a.add_peer(b.endpoint_addr());
-    b.add_peer(a.endpoint_addr());
-}
+// Relay-disabled nodes have no discovery: `pair` exchanges addresses (moved
+// to the shared wave-3 fixtures, Task 10).
+use crate::api::collab_live::test_support::pair;
 
 /// Records every emitted event.
 #[derive(Default)]

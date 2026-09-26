@@ -1132,6 +1132,25 @@ pub(crate) async fn ensure_iroh_node(
             "read upload limit at bind failed; running unlimited"
         ),
     }
+    // Collab v3 wave 3 (spec §8, §9.3): the collab store's upload stream
+    // limit (L11) and its serve check. The node binds at the default limit
+    // and with no serve oracle; the catalog-backed oracle is installed here,
+    // before the collab store mounts, so no collab get is ever served
+    // without the check (the live session later swaps in its own).
+    match db(ctx).and_then(|d| {
+        let conn = d.conn();
+        ctx.settings
+            .get_collab_max_upload_streams(&conn)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }) {
+        Ok(streams) => node.set_collab_upload_limit(streams),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "read collab upload stream limit at bind failed; using the default"
+        ),
+    }
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_live::serve_oracle::install_catalog_oracle(ctx, &node);
     // Unified store: the node binds at `<working>/blobs`. After the first
     // successful bind, the old per-role stores are dead weight — remove them so a
     // migrated install doesn't carry three parallel blob DBs (tolerate absence).
