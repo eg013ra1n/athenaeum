@@ -138,6 +138,10 @@ pub fn record_store_marker(
 pub const META_REFUSED_PATH: &str = "refused_path";
 pub const META_REFUSED_DEVICE: &str = "refused_device";
 pub const META_REFUSED_KIND: &str = "refused_kind";
+/// `"1"` when the refusal was classified without the hub's answer (signed
+/// out, offline, or the device list failed) — `Unknown` by design, and the
+/// UI says so (Task 16).
+pub const META_REFUSED_OFFLINE: &str = "refused_offline";
 
 /// Whether a refused designation's marker names a device still active in
 /// this account (offer a replace) or not (offer a take-over instead — spec
@@ -170,18 +174,47 @@ impl RefusedDeviceKind {
     }
 }
 
+/// Record a refused designation. `offline`: the kind was decided without the
+/// hub's device list (see [`META_REFUSED_OFFLINE`]).
 pub fn record_refused_designation(
     conn: &Connection,
     path: &str,
     device_id: &str,
     kind: RefusedDeviceKind,
+    offline: bool,
 ) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     meta_set(&tx, META_REFUSED_PATH, path)?;
     meta_set(&tx, META_REFUSED_DEVICE, device_id)?;
     meta_set(&tx, META_REFUSED_KIND, kind.as_db_str())?;
+    meta_set(&tx, META_REFUSED_OFFLINE, if offline { "1" } else { "0" })?;
     tx.commit()?;
     Ok(())
+}
+
+/// A recorded refused designation, with how its kind was decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedDesignation {
+    pub path: String,
+    pub device_id: String,
+    pub kind: RefusedDeviceKind,
+    /// Classified without the hub's device list (always `Unknown`).
+    pub offline: bool,
+}
+
+/// [`refused_designation`] with the offline flag (a record written before
+/// the flag existed reads as not offline).
+pub fn refused_designation_detail(conn: &Connection) -> Result<Option<RefusedDesignation>> {
+    let Some((path, device_id, kind)) = refused_designation(conn)? else {
+        return Ok(None);
+    };
+    let offline = meta_get(conn, META_REFUSED_OFFLINE)?.as_deref() == Some("1");
+    Ok(Some(RefusedDesignation {
+        path,
+        device_id,
+        kind,
+        offline,
+    }))
 }
 
 /// The last refused designation's `(path, device_id, kind)`, if any and if
@@ -202,8 +235,13 @@ pub fn refused_designation(
 
 pub fn clear_refused_designation(conn: &Connection) -> Result<()> {
     conn.execute(
-        "DELETE FROM collab_live_meta WHERE key IN (?1, ?2, ?3)",
-        params![META_REFUSED_PATH, META_REFUSED_DEVICE, META_REFUSED_KIND],
+        "DELETE FROM collab_live_meta WHERE key IN (?1, ?2, ?3, ?4)",
+        params![
+            META_REFUSED_PATH,
+            META_REFUSED_DEVICE,
+            META_REFUSED_KIND,
+            META_REFUSED_OFFLINE
+        ],
     )?;
     Ok(())
 }
@@ -832,6 +870,7 @@ mod tests {
             "/collab/root",
             "OTHER-DEVICE",
             RefusedDeviceKind::Other,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -842,8 +881,15 @@ mod tests {
                 RefusedDeviceKind::Other
             ))
         );
-        record_refused_designation(&conn, "/collab/root2", "GHOST", RefusedDeviceKind::Unknown)
-            .unwrap();
+        assert!(!refused_designation_detail(&conn).unwrap().unwrap().offline);
+        record_refused_designation(
+            &conn,
+            "/collab/root2",
+            "GHOST",
+            RefusedDeviceKind::Unknown,
+            true,
+        )
+        .unwrap();
         assert_eq!(
             refused_designation(&conn).unwrap(),
             Some((
@@ -852,7 +898,18 @@ mod tests {
                 RefusedDeviceKind::Unknown
             ))
         );
+        assert_eq!(
+            refused_designation_detail(&conn).unwrap(),
+            Some(RefusedDesignation {
+                path: "/collab/root2".to_string(),
+                device_id: "GHOST".to_string(),
+                kind: RefusedDeviceKind::Unknown,
+                offline: true,
+            })
+        );
         clear_refused_designation(&conn).unwrap();
         assert_eq!(refused_designation(&conn).unwrap(), None);
+        assert_eq!(refused_designation_detail(&conn).unwrap(), None);
+        assert_eq!(meta_get(&conn, META_REFUSED_OFFLINE).unwrap(), None);
     }
 }

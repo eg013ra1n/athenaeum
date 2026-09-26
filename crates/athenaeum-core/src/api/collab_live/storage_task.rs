@@ -85,11 +85,14 @@ pub enum StorageEvent {
         project_ids: Vec<String>,
     },
     /// No other holder of the current version anywhere (L4) — "restore it
-    /// from the Trash".
+    /// from the Trash", or, after a re-designation, "it is still in the
+    /// previous Collaboration folder" (`previous_path`, owner rule A).
     FrameLost {
         project_id: String,
         frame_uuid: String,
         file_name: String,
+        /// The replica's file, still on disk outside the current root.
+        previous_path: Option<String>,
     },
     /// A replica's bytes changed; it stopped serving (L5).
     Quarantined {
@@ -1234,11 +1237,19 @@ impl StorageEngine {
         for r in applied {
             if deletions::lost_everywhere(holders.other_holders(&r.project_id, &r.frame_uuid).total)
             {
-                tracing::error!(project_id = %r.project_id, frame_uuid = %r.frame_uuid, path = r.landed_path.as_deref().unwrap_or_default(), "frame lost everywhere");
+                // Owner rule A follow-up (Task 16): a replica ruled gone
+                // because it lies outside a re-designated root is still on
+                // disk in the previous folder — say where, not "the Trash".
+                let previous_path = r
+                    .landed_path
+                    .clone()
+                    .filter(|p| self.replica_outside_root(r) && Path::new(p).exists());
+                tracing::error!(project_id = %r.project_id, frame_uuid = %r.frame_uuid, path = r.landed_path.as_deref().unwrap_or_default(), outcome = if previous_path.is_some() { "in_previous_folder" } else { "gone" }, "frame lost everywhere");
                 ev.push(StorageEvent::FrameLost {
                     project_id: r.project_id.clone(),
                     frame_uuid: r.frame_uuid.clone(),
                     file_name: r.file_name.clone(),
+                    previous_path,
                 });
             }
         }
@@ -2406,6 +2417,43 @@ mod tests {
         );
     }
 
+    /// Owner rule A follow-up (Task 16): a last copy ruled gone because it
+    /// lies outside a re-designated root is still on disk — the lost
+    /// notice names the previous folder's file instead of the Trash.
+    #[tokio::test]
+    async fn a_last_copy_outside_the_root_is_lost_with_its_previous_path() {
+        let rig = ts::landed_rig(1).await;
+        let (pid, uuid, path) = rig.frames[0].clone();
+        let old_dir = rig._tmp.path().join("previous-collab");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let old = old_dir.join(path.file_name().unwrap());
+        std::fs::copy(&path, &old).unwrap();
+        {
+            let conn = crate::api::db(&rig.ctx).unwrap().conn();
+            conn.execute(
+                "UPDATE project_frames_local SET landed_path = ?3
+                 WHERE project_id = ?1 AND frame_uuid = ?2",
+                rusqlite::params![pid, uuid, old.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        let mut eng = rig.engine();
+        let ev = eng.sweep(&Holders(0)).await;
+        let lost: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                StorageEvent::FrameLost { previous_path, .. } => Some(previous_path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lost,
+            vec![Some(old.to_string_lossy().to_string())],
+            "{ev:?}"
+        );
+        assert!(old.exists(), "the previous folder's file is never touched");
+    }
+
     #[tokio::test]
     async fn fifteen_deletions_raise_one_choice_and_a_last_copy_raises_lost_everywhere() {
         let rig = ts::landed_rig(15).await;
@@ -2428,9 +2476,16 @@ mod tests {
         );
         assert_eq!(
             ev.iter()
-                .filter(|e| matches!(e, StorageEvent::FrameLost { .. }))
+                .filter(|e| matches!(
+                    e,
+                    StorageEvent::FrameLost {
+                        previous_path: None,
+                        ..
+                    }
+                ))
                 .count(),
-            15
+            15,
+            "deleted files are not in a previous folder"
         );
         for (pid, uuid, _) in &rig.frames {
             assert_eq!(state(&rig.ctx, pid, uuid), LocalState::AwaitingChoice);

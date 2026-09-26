@@ -1606,18 +1606,28 @@ own: boolean, filter: string, exptimeSec: number, dateObs: string | null,
  */
 state: string, accepted: boolean, acceptedReason: string | null, 
 /**
- * Holders the hub last reported.
+ * This device's state for the frame (spec §9).
  */
-holderCount: number, onDisk: boolean, 
+localState: LocalStateView, onDisk: boolean, 
 /**
- * A newer content version superseded this landed copy — kept until GC.
+ * Other member devices holding the current version that are online and
+ * serving now (0 while the live exchange is off).
  */
-awaitingGc: boolean, 
+holdersOnline: number, 
 /**
- * This device chose not to keep the frame (policy narrowed, or the loss
- * guard's "stop holding" answer).
+ * Other member devices holding the current version, offline included.
  */
-locallyDeclined: boolean, byteSize: number, contentVersion: number, lastError: string | null, 
+holdersTotal: number, 
+/**
+ * L7: the current version is held only by the publisher's devices, and
+ * none of them is online.
+ */
+waitingForPublisher: boolean, 
+/**
+ * A changed (quarantined) replica whose frame has a newer version than
+ * the one it was quarantined at.
+ */
+newVersionWaiting: boolean, byteSize: number, contentVersion: number, lastError: string | null, 
 /**
  * Parsed from the manifest row's `meta.fwhmArcsec` (`build_frame_meta`).
  */
@@ -1674,11 +1684,7 @@ alreadyHeld: number,
  */
 toFetch: number, toFetchBytes: number, };
 
-export type CollabReplicationPaused = { projectId: string, missing: number, missingBytes: number, };
-
 export type CollabFramesLanded = { projectId: string, landed: number, failed: number, awaitingGc: number, };
-
-export type LossAction = "restore" | "stopHolding";
 
 export type LiveState = "off" | "connecting" | "live" | "reconnecting" | "unreachable" | "signedOut" | "outdated";
 
@@ -1698,13 +1704,134 @@ since: string, storage: StorageStateView, storageReason: string | null,
  */
 watcherDegraded: boolean, networkVolume: boolean, };
 
-export type CollabDeletionChoice = { count: number, projectIds: Array<string>, };
+export type CollabDeletionChoice = { count: number, 
+/**
+ * Sorted, no duplicates.
+ */
+projectIds: Array<string>, 
+/**
+ * `collab-deletion-choice:<projectId>[,<projectId>…]` — stable for the
+ * same projects, so the notification replaces an earlier one instead
+ * of stacking (`notify({ dedupeKey })`).
+ */
+dedupeKey: string, };
 
-export type CollabFrameLost = { projectId: string, frameUuid: string, fileName: string, };
+export type CollabFrameLost = { projectId: string, frameUuid: string, fileName: string, 
+/**
+ * The frame's file still sits in the PREVIOUS Collaboration folder (a
+ * re-designation, owner rule A): the notice points there instead of
+ * the Trash, and the frame is fetched again if another holder serves it.
+ */
+inPreviousFolder: boolean, 
+/**
+ * That file, when `in_previous_folder`.
+ */
+previousPath: string | null, };
 
 export type CollabFrameChanged = { projectId: string, frameUuid: string, fileName: string, };
 
 export type CollabAttentionChanged = { projectId: string, };
+
+export type LocalStateView = "wanted" | "held" | "missing" | "awaiting_choice" | "quarantined" | "not_kept" | "idle" | "own_held" | "own_missing" | "own_changed";
+
+export type ChangedFileView = { frameUuid: string, fileName: string, 
+/**
+ * The changed file, left where it is.
+ */
+path: string, detectedAt: string, 
+/**
+ * The frame has a newer version than the one the file was changed from.
+ */
+newVersionWaiting: boolean, };
+
+export type ChoiceFrameView = { frameUuid: string, fileName: string, holdersOnline: number, holdersTotal: number, 
+/**
+ * The last-copy warning: fewer than 2 other holders, offline included.
+ */
+atRisk: boolean, };
+
+export type NotKeptView = { frameUuid: string, fileName: string, contentVersion: number, };
+
+export type ForeignFileView = { path: string, seenAt: string, };
+
+export type CollabAttention = { changed: Array<ChangedFileView>, awaitingChoice: Array<ChoiceFrameView>, notKept: Array<NotKeptView>, otherFiles: Array<ForeignFileView>, };
+
+export type DeletionActionArg = "refetch" | "stopKeeping";
+
+export type ChangedActionArg = "refetchOriginal" | "delete";
+
+export type LastCopyView = { frameUuid: string, fileName: string, holdersOnline: number, holdersTotal: number, atRisk: boolean, };
+
+export type ChangedFileOutcome = { 
+/**
+ * `true`: the changed file went to the system trash; `false`: it was
+ * deleted after the user confirmed.
+ */
+trashed: boolean, };
+
+export type DeviceReplaceOfferView = { 
+/**
+ * The hub's device id — what `collab_replace_device` takes.
+ */
+deviceId: string, deviceName: string, lastSeenAt: string | null, offlineDays: number | null, 
+/**
+ * Offline for more than 7 days: prompt for the replace.
+ */
+prompt: boolean, 
+/**
+ * Offline for more than 30 days: propose retiring it (never automatic).
+ */
+proposeRetire: boolean, 
+/**
+ * The folder the replace applies to.
+ */
+path: string, 
+/**
+ * The folder's marker names another store than the one this catalog
+ * recorded for it (a swapped disk): a replace would be refused.
+ */
+markerMismatch: boolean, };
+
+export type UnknownDeviceView = { 
+/**
+ * The device the marker names (its public key), as the marker spells it.
+ */
+deviceId: string, 
+/**
+ * The folder — what `take_over_collab_folder` takes.
+ */
+path: string, 
+/**
+ * Classified without the hub's answer (offline or signed out): the
+ * device may well be one of this account's; ask again when online.
+ */
+recordedOffline: boolean, 
+/**
+ * The folder's marker names another store than the one this catalog
+ * recorded for it (a swapped disk): a take-over would be refused.
+ */
+markerMismatch: boolean, };
+
+export type CollabStorageStatus = { state: StorageStateView, 
+/**
+ * `path_missing` | `not_a_directory` | `marker_missing` |
+ * `marker_mismatch` | `other_device` | `unknown_device`.
+ */
+reason: string | null, 
+/**
+ * The designated Collaboration folder.
+ */
+root: string | null, watcherDegraded: boolean, networkVolume: boolean, 
+/**
+ * `reason = other_device` (or a refused designation of such a folder).
+ */
+replace: DeviceReplaceOfferView | null, 
+/**
+ * `reason = unknown_device` (or a refused designation of such a folder).
+ */
+unknownDevice: UnknownDeviceView | null, };
+
+export type ReplaceOutcomeView = { scanned: number, adopted: number, };
 
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**

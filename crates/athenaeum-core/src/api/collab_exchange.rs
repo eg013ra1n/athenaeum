@@ -10,7 +10,7 @@
 //! on `db`, `sync`, `sharing`, `collab`, `package`, so it compiles in the
 //! headless (`--no-default-features`) build.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -428,7 +428,9 @@ pub(crate) fn parse_manifest_wire(
 }
 
 /// One cached per-frame manifest row of a project (mine or a peer's),
-/// projected for the frames list (wave 2 Task 11).
+/// projected for the frames list (wave 2 Task 11; wave 3 Task 16: the local
+/// state and the live holder counts replace the retired on-disk / GC /
+/// declined flags and the hub's holder count).
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectFrameView {
@@ -444,14 +446,20 @@ pub struct ProjectFrameView {
     pub state: String,
     pub accepted: bool,
     pub accepted_reason: Option<String>,
-    /// Holders the hub last reported.
-    pub holder_count: i64,
+    /// This device's state for the frame (spec §9).
+    pub local_state: crate::api::collab_live::LocalStateView,
     pub on_disk: bool,
-    /// A newer content version superseded this landed copy — kept until GC.
-    pub awaiting_gc: bool,
-    /// This device chose not to keep the frame (policy narrowed, or the loss
-    /// guard's "stop holding" answer).
-    pub locally_declined: bool,
+    /// Other member devices holding the current version that are online and
+    /// serving now (0 while the live exchange is off).
+    pub holders_online: usize,
+    /// Other member devices holding the current version, offline included.
+    pub holders_total: usize,
+    /// L7: the current version is held only by the publisher's devices, and
+    /// none of them is online.
+    pub waiting_for_publisher: bool,
+    /// A changed (quarantined) replica whose frame has a newer version than
+    /// the one it was quarantined at.
+    pub new_version_waiting: bool,
     pub byte_size: i64,
     pub content_version: i32,
     pub last_error: Option<String>,
@@ -463,16 +471,26 @@ pub struct ProjectFrameView {
     pub stars_detected: Option<i64>,
 }
 
+/// What the live exchange knows about a frame beyond its catalog row: other
+/// holders of its current version and whether it waits for its publisher
+/// (Task 16; all zero / `false` while no live exchange runs).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameLiveInfo {
+    pub holders_online: usize,
+    pub holders_total: usize,
+    pub waiting_for_publisher: bool,
+}
+
 impl ProjectFrameView {
-    /// Combines the reliable local columns (state/accepted/on_disk/… — kept
-    /// current by the manifest sync and the live exchange) with the fields
-    /// only the retained manifest row carries
-    /// (exptime/dateObs/acceptedReason/meta metrics). A row whose
-    /// `manifest_json` fails to parse (it never should — this cache only
-    /// ever writes it via `serde_json::to_string` of a decoded
-    /// [`FrameViewWire`]) still returns a view, with those fields empty and
-    /// a `warn!` — never a lost frame from the list.
-    fn from_local_row(row: LocalFrameRow) -> Self {
+    /// Combines the reliable local columns (state/accepted/local state/… —
+    /// kept current by the manifest sync and the live exchange) with the
+    /// fields only the retained manifest row carries
+    /// (exptime/dateObs/acceptedReason/meta metrics) and the live holder
+    /// counts. A row whose `manifest_json` fails to parse (it never should —
+    /// this cache only ever writes it via `serde_json::to_string` of a
+    /// decoded [`FrameViewWire`]) still returns a view, with those fields
+    /// empty and a `warn!` — never a lost frame from the list.
+    fn from_local_row(row: LocalFrameRow, live: FrameLiveInfo, new_version_waiting: bool) -> Self {
         let wire = parse_manifest_wire(
             &row.project_id,
             &row.frame_uuid,
@@ -506,13 +524,12 @@ impl ProjectFrameView {
             state: row.state,
             accepted: row.accepted,
             accepted_reason,
-            // Interim until Task 16 reshapes the DTO: the holder count is
-            // no longer a column (the live holder map answers it), and
-            // "declined" is the `not_kept` state (L6).
-            holder_count: 0,
+            local_state: row.local_state.into(),
             on_disk: row.on_disk,
-            awaiting_gc: row.awaiting_gc,
-            locally_declined: row.local_state == crate::db::collab_frames::LocalState::NotKept,
+            holders_online: live.holders_online,
+            holders_total: live.holders_total,
+            waiting_for_publisher: live.waiting_for_publisher,
+            new_version_waiting,
             byte_size: row.byte_size,
             content_version: row.content_version,
             last_error: row.last_error,
@@ -524,18 +541,46 @@ impl ProjectFrameView {
 }
 
 /// Every cached frame of a project (cache-only — no hub call), ordered by
-/// frame uuid (the `list_for_project` order). The manifest sync and the live
-/// exchange keep the cache current; this never fetches.
+/// frame uuid (the `list_for_project` order), without live holder counts.
+/// The manifest sync and the live exchange keep the cache current; this
+/// never fetches. The command surface adds the holder counts
+/// (`collab_live::surface::list_collab_frames`).
 pub fn list_project_frames(
     ctx: &ServiceContext,
     project_id: &str,
 ) -> Result<Vec<ProjectFrameView>, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let rows = crate::db::collab_frames::list_for_project(&conn, project_id)?;
+    list_project_frames_with(ctx, project_id, |_| FrameLiveInfo::default())
+}
+
+/// [`list_project_frames`] with each row's live holder information from
+/// `live` (called once per row, with the catalog connection released).
+pub fn list_project_frames_with(
+    ctx: &ServiceContext,
+    project_id: &str,
+    live: impl Fn(&LocalFrameRow) -> FrameLiveInfo,
+) -> Result<Vec<ProjectFrameView>, ApiError> {
+    let (rows, quarantined) = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let rows = crate::db::collab_frames::list_for_project(&conn, project_id)?;
+        let quarantined: HashMap<String, i32> =
+            crate::db::collab_live::list_quarantine(&conn, project_id)?
+                .into_iter()
+                .map(|q| (q.frame_uuid, q.quarantined_version))
+                .collect();
+        (rows, quarantined)
+    };
     Ok(rows
         .into_iter()
-        .map(ProjectFrameView::from_local_row)
+        .map(|row| {
+            let info = live(&row);
+            let new_version_waiting = row.local_state
+                == crate::db::collab_frames::LocalState::Quarantined
+                && quarantined
+                    .get(&row.frame_uuid)
+                    .is_some_and(|v| row.content_version > *v);
+            ProjectFrameView::from_local_row(row, info, new_version_waiting)
+        })
         .collect())
 }
 
@@ -660,11 +705,6 @@ pub(crate) fn publisher_folder(
     )
 }
 
-/// The retired loss guard's pause event ([`CollabReplicationPaused`]) — the
-/// name and payload stay until the command surface drops them (Task 16);
-/// nothing emits it any more.
-pub const COLLAB_REPLICATION_PAUSED_EVENT: &str = "collab-replication-paused";
-
 /// Emitted at most once per second per project while the live exchange
 /// lands frames ([`CollabFramesLanded`]) — a burst outcome, never progress.
 pub const COLLAB_FRAMES_LANDED_EVENT: &str = "collab-frames-landed";
@@ -714,16 +754,6 @@ pub struct PolicyPreview {
     pub to_fetch_bytes: i64,
 }
 
-/// Payload of [`COLLAB_REPLICATION_PAUSED_EVENT`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
-#[serde(rename_all = "camelCase")]
-pub struct CollabReplicationPaused {
-    pub project_id: String,
-    pub missing: usize,
-    #[ts(type = "number")]
-    pub missing_bytes: i64,
-}
-
 /// Payload of [`COLLAB_FRAMES_LANDED_EVENT`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -732,17 +762,6 @@ pub struct CollabFramesLanded {
     pub landed: usize,
     pub failed: usize,
     pub awaiting_gc: usize,
-}
-
-/// The user's answer to a paused project (P14).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, ts_rs::TS)]
-#[serde(rename_all = "camelCase")]
-pub enum LossAction {
-    /// Rescan the Collaboration root (the scanner repairs moved files), run
-    /// disk truth again, unpause.
-    Restore,
-    /// Stop holding the missing frames (`locally_declined`), unpause.
-    StopHolding,
 }
 
 /// `"size:mtime_secs"` — the same spelling publish records.
@@ -1830,10 +1849,14 @@ mod tests {
         assert_eq!(f.date_obs.as_deref(), Some("2026-07-01T21:00:00Z"));
         assert_eq!(f.state, "published");
         assert!(f.accepted);
-        // v3 wave 3: a manifest sync no longer writes `holder_count` (the
-        // hub client's `FrameViewWire` dropped the field, P4) — the column
-        // keeps whatever it was, 0 for a brand-new row.
-        assert_eq!(f.holder_count, 0);
+        // v3 wave 3 (Task 16): the hub's holder count is gone; the live
+        // holder counts are 0 without a live exchange.
+        assert_eq!((f.holders_online, f.holders_total), (0, 0));
+        assert!(!f.waiting_for_publisher && !f.new_version_waiting);
+        assert_eq!(
+            f.local_state,
+            crate::api::collab_live::LocalStateView::Wanted
+        );
         assert_eq!(f.byte_size, 4096);
         assert_eq!(f.content_version, 1);
         assert_eq!(f.fwhm_arcsec, Some(2.4), "parsed from meta.fwhmArcsec");

@@ -81,7 +81,7 @@ pub(crate) struct Shared {
     connection: Mutex<u64>,
     serving: watch::Sender<BTreeMap<String, bool>>,
     credentials: Mutex<Option<(String, String)>>,
-    /// A copy of the feed's presence book, for [`holder_view`].
+    /// A copy of the feed's presence book, for [`live_presence`].
     presence: RwLock<PresenceBook>,
     me: RwLock<Option<String>>,
 }
@@ -553,11 +553,11 @@ async fn stop(ctx: &ServiceContext, sign_out: bool) {
     handle.shared.set_state(LiveState::Off, None);
 }
 
-/// Who else holds a frame's current version, for the user-facing commands
-/// (Task 16: the last-copy warning): the persisted holder map and the live
-/// presence. `None` when no live exchange runs.
-#[allow(dead_code)] // read by the Task 16 commands (the last-copy warning)
-pub(crate) fn holder_view(ctx: &ServiceContext) -> Option<Arc<dyn HolderView>> {
+/// The live presence and this device's id, for the command surface's holder
+/// counts (Task 16: the frames list, the attention lists, the last-copy
+/// warning) — read against the persisted holder map, one project at a time.
+/// `None` when no live exchange runs.
+pub(crate) fn live_presence(ctx: &ServiceContext) -> Option<(PresenceBook, String)> {
     let shared = handle_shared(ctx)?;
     // M2 (fix round 1): a poisoned lock is logged, never a silent `None`.
     let me = match shared.me.read() {
@@ -567,43 +567,7 @@ pub(crate) fn holder_view(ctx: &ServiceContext) -> Option<Arc<dyn HolderView>> {
             return None;
         }
     };
-    let presence = shared.presence_copy();
-    Some(Arc::new(PersistedView {
-        ctx: Arc::clone(&shared.ctx),
-        presence,
-        me,
-    }))
-}
-
-/// The holder view over the persisted holder map (see [`holder_view`]).
-struct PersistedView {
-    ctx: Arc<ServiceContext>,
-    presence: PresenceBook,
-    me: String,
-}
-
-impl HolderView for PersistedView {
-    fn other_holders(&self, project_id: &str, frame_uuid: &str) -> Redundancy {
-        let read = db(&self.ctx).and_then(|d| {
-            let conn = d.conn();
-            let (devices, claims) = crate::db::collab_live::load_holders(&conn, project_id)?;
-            let row = crate::db::collab_frames::get(&conn, project_id, frame_uuid)?;
-            let project = crate::db::collab::get_project(&conn, project_id)?;
-            Ok((devices, claims, row, project))
-        });
-        match read {
-            Ok((devices, claims, Some(row), Some(project))) => {
-                let map =
-                    crate::collab::live::holders::ProjectHolders::from_rows(&devices, &claims);
-                redundancy_of(&map, &self.presence, &project, &self.me, &row)
-            }
-            Ok(_) => Redundancy::default(),
-            Err(e) => {
-                tracing::warn!(project_id, frame_uuid, error = %e, "holders could not be read; counted none");
-                Redundancy::default()
-            }
-        }
-    }
+    Some((shared.presence_copy(), me))
 }
 
 pub(crate) fn redundancy_of(
@@ -1427,13 +1391,14 @@ impl Runtime {
                     }
                     self.emit(
                         COLLAB_DELETION_CHOICE_EVENT,
-                        &CollabDeletionChoice { count, project_ids },
+                        &CollabDeletionChoice::new(count, project_ids),
                     );
                 }
                 StorageEvent::FrameLost {
                     project_id,
                     frame_uuid,
                     file_name,
+                    previous_path,
                 } => {
                     self.attention.insert(project_id.clone());
                     self.emit(
@@ -1442,6 +1407,8 @@ impl Runtime {
                             project_id,
                             frame_uuid,
                             file_name,
+                            in_previous_folder: previous_path.is_some(),
+                            previous_path,
                         },
                     );
                 }

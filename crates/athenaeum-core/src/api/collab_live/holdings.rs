@@ -559,6 +559,12 @@ impl Holdings {
         out
     }
 
+    /// Sync now (L10): every project's report back-off is forgotten, so the
+    /// next flush is due at once instead of after the back-off.
+    pub fn clear_backoffs(&mut self) {
+        self.backoffs.clear();
+    }
+
     /// The executor calls this after every state transition that wrote an
     /// outbox row: the project's flush wait starts at its first unsent entry.
     pub fn note_append(&mut self, project_id: &str, now: Instant) {

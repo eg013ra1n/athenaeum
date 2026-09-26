@@ -131,6 +131,7 @@ impl FeedWorker {
             }
             FeedWork::DigestAll(projects) => {
                 if let Some(h) = self.holdings.as_mut() {
+                    h.clear_backoffs();
                     for p in &projects {
                         if let Err(e) = h.digest_check(p).await {
                             tracing::warn!(project_id = %p, error = %e, "sync now: claim digest check failed; retried on the next flush");

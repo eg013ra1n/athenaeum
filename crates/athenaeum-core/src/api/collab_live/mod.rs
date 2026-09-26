@@ -24,6 +24,9 @@ pub mod serve_oracle;
 // "lost everywhere", quarantine of changed replicas, re-adoption by hash.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod storage_task;
+// The command surface both hosts wrap (Task 16).
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod surface;
 
 // The live orchestrator (Task 15): the event session (stream, beat,
 // reconnect), the scheduler's executor, and the runtime loop that owns the
@@ -39,8 +42,7 @@ pub(crate) mod session;
 #[cfg(all(feature = "render", feature = "solver"))]
 mod workers;
 #[cfg(all(feature = "render", feature = "solver"))]
-#[allow(unused_imports)] // read by the Task 16 commands
-pub(crate) use runtime::holder_view;
+pub(crate) use runtime::live_presence;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub use runtime::{
     notify_local_change, on_sign_out, set_receive_streams, shutdown, spawn_collab_live, status,
@@ -111,7 +113,25 @@ pub const COLLAB_ATTENTION_EVENT: &str = "collab-attention-changed";
 #[serde(rename_all = "camelCase")]
 pub struct CollabDeletionChoice {
     pub count: usize,
+    /// Sorted, no duplicates.
     pub project_ids: Vec<String>,
+    /// `collab-deletion-choice:<projectId>[,<projectId>…]` — stable for the
+    /// same projects, so the notification replaces an earlier one instead
+    /// of stacking (`notify({ dedupeKey })`).
+    pub dedupe_key: String,
+}
+
+impl CollabDeletionChoice {
+    pub fn new(count: usize, mut project_ids: Vec<String>) -> Self {
+        project_ids.sort();
+        project_ids.dedup();
+        let dedupe_key = format!("{COLLAB_DELETION_CHOICE_EVENT}:{}", project_ids.join(","));
+        Self {
+            count,
+            project_ids,
+            dedupe_key,
+        }
+    }
 }
 
 /// Payload of [`COLLAB_FRAME_LOST_EVENT`].
@@ -121,6 +141,47 @@ pub struct CollabFrameLost {
     pub project_id: String,
     pub frame_uuid: String,
     pub file_name: String,
+    /// The frame's file still sits in the PREVIOUS Collaboration folder (a
+    /// re-designation, owner rule A): the notice points there instead of
+    /// the Trash, and the frame is fetched again if another holder serves it.
+    pub in_previous_folder: bool,
+    /// That file, when `in_previous_folder`.
+    pub previous_path: Option<String>,
+}
+
+/// A frame's local state as the frames list shows it (spec §9, L4–L6) — the
+/// catalog's `local_state`, spelled as stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalStateView {
+    Wanted,
+    Held,
+    Missing,
+    AwaitingChoice,
+    Quarantined,
+    NotKept,
+    Idle,
+    OwnHeld,
+    OwnMissing,
+    OwnChanged,
+}
+
+impl From<crate::db::collab_frames::LocalState> for LocalStateView {
+    fn from(s: crate::db::collab_frames::LocalState) -> Self {
+        use crate::db::collab_frames::LocalState as S;
+        match s {
+            S::Wanted => Self::Wanted,
+            S::Held => Self::Held,
+            S::Missing => Self::Missing,
+            S::AwaitingChoice => Self::AwaitingChoice,
+            S::Quarantined => Self::Quarantined,
+            S::NotKept => Self::NotKept,
+            S::Idle => Self::Idle,
+            S::OwnHeld => Self::OwnHeld,
+            S::OwnMissing => Self::OwnMissing,
+            S::OwnChanged => Self::OwnChanged,
+        }
+    }
 }
 
 /// Payload of [`COLLAB_FRAME_CHANGED_EVENT`].

@@ -1483,6 +1483,20 @@ pub fn record_foreign_file(
     Ok(())
 }
 
+/// The foreign files listed for a project — those whose `ATH_PRJ` stamp
+/// names it, plus the unstamped ones (they belong to no project, so every
+/// project's "Other files" list shows them). `(path, seen_at)` by path.
+pub fn list_foreign_files(conn: &Connection, project_id: &str) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, seen_at FROM collab_foreign_files
+         WHERE project_id = ?1 OR project_id IS NULL ORDER BY path",
+    )?;
+    let rows = stmt
+        .query_map(params![project_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+    Ok(rows)
+}
+
 /// The `size:mtime` a listed foreign file was hashed at: `None` when `path`
 /// is not listed, `Some(None)` for a row without one.
 pub fn foreign_file_size_mtime(conn: &Connection, path: &str) -> Result<Option<Option<String>>> {
@@ -1568,6 +1582,23 @@ mod tests {
             "meta":{},"gateVersion":0,"accepted":true,"state":"published","manifestVersion":mv,
             "createdAt":"2026-09-24T00:00:00Z","holderCount":1}))
         .unwrap()
+    }
+
+    #[test]
+    fn foreign_files_list_the_projects_own_and_the_unstamped() {
+        let c = conn();
+        record_foreign_file(&c, "/collab/b.fits", Some("p1"), None).unwrap();
+        record_foreign_file(&c, "/collab/a.fits", None, None).unwrap();
+        record_foreign_file(&c, "/collab/c.fits", Some("p2"), None).unwrap();
+        let paths: Vec<String> = list_foreign_files(&c, "p1")
+            .unwrap()
+            .into_iter()
+            .map(|(p, seen)| {
+                assert!(!seen.is_empty());
+                p
+            })
+            .collect();
+        assert_eq!(paths, vec!["/collab/a.fits", "/collab/b.fits"]);
     }
 
     #[test]

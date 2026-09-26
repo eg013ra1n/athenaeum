@@ -957,17 +957,17 @@ async fn check_storage_marker_for_designation(
             // be another account's device, a plain-revoked device, or a
             // swapped disk) — it only decides which message/record this
             // refusal carries, never whether to refuse.
-            let kind = match crate::api::account::list_devices(ctx).await {
+            let (kind, offline) = match crate::api::account::list_devices(ctx).await {
                 Ok(devices) => {
                     if devices.iter().any(|d| d.pubkey == device_id) {
-                        RefusedDeviceKind::Other
+                        (RefusedDeviceKind::Other, false)
                     } else {
-                        RefusedDeviceKind::Unknown
+                        (RefusedDeviceKind::Unknown, false)
                     }
                 }
                 Err(e) => {
                     tracing::warn!(path = stored, device_id = %device_id, error = %e, "could not confirm whether the marker's device is still active");
-                    RefusedDeviceKind::Unknown
+                    (RefusedDeviceKind::Unknown, true)
                 }
             };
             tracing::warn!(
@@ -982,6 +982,7 @@ async fn check_storage_marker_for_designation(
                     stored,
                     &device_id,
                     kind,
+                    offline,
                 ) {
                     tracing::warn!(path = stored, error = %e, "recording the refused designation failed");
                 }

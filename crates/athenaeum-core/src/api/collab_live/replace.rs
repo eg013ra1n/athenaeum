@@ -23,6 +23,11 @@ use crate::db::collab_frames::{FrameOrigin, LocalFrameRow, LocalState};
 use crate::services::ServiceContext;
 use crate::sharing::iroh::node::SharedIrohNode;
 
+/// The stable prefix of the error a replace or take-over answers when the
+/// folder's on-disk marker names a different store than the one this catalog
+/// recorded for the path — a swapped disk (Task 16: the UI explains it).
+pub const MARKER_MISMATCH: &str = "collab_marker_mismatch";
+
 /// What replacing the marker's device would look like, resolved against
 /// this account's own device list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +165,7 @@ async fn check_designation_preconditions(
 /// would report, surfaced early so nothing irreversible happens first. A
 /// missing record, or one for a different path, is not this function's
 /// concern — it returns `Ok`.
-fn check_no_recorded_marker_mismatch(
+pub(crate) fn check_no_recorded_marker_mismatch(
     ctx: &ServiceContext,
     root: &Path,
     root_canon: &Path,
@@ -194,9 +199,10 @@ fn check_no_recorded_marker_mismatch(
             recorded_store_id = %recorded.store_id,
             "collaboration folder precondition failed: the on-disk marker's store id disagrees with the one this catalog recorded for this path"
         );
-        return Err(ApiError::Conflict(
-            "collaboration folder is not usable: MarkerMismatch".to_string(),
-        ));
+        return Err(ApiError::Conflict(format!(
+            "{MARKER_MISMATCH}: the disk in this folder is not the one this catalog recorded \
+             for it (MarkerMismatch)"
+        )));
     }
     Ok(())
 }
