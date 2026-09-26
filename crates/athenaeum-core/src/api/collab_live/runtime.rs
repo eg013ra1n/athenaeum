@@ -1385,13 +1385,17 @@ impl Runtime {
                     }
                     self.exec.dirty.insert(project_id);
                 }
-                StorageEvent::DeletionChoice { count, project_ids } => {
+                StorageEvent::DeletionChoice {
+                    count,
+                    project_ids,
+                    batch_id,
+                } => {
                     for p in &project_ids {
                         self.attention.insert(p.clone());
                     }
                     self.emit(
                         COLLAB_DELETION_CHOICE_EVENT,
-                        &CollabDeletionChoice::new(count, project_ids),
+                        &CollabDeletionChoice::new(count, project_ids, batch_id),
                     );
                 }
                 StorageEvent::FrameLost {

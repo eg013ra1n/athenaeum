@@ -520,6 +520,7 @@ pub fn run() {
             commands::keep_collab_frames_again,
             commands::resolve_collab_changed_file,
             commands::get_collab_storage_status,
+            commands::check_collab_folder_owner,
             commands::collab_replace_device,
             commands::take_over_collab_folder,
             commands::set_collab_max_upload_streams,

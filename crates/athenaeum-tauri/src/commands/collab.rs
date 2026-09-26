@@ -363,6 +363,19 @@ pub async fn get_collab_storage_status(
         .map_err(|e| e.to_string())
 }
 
+/// "Check again": ask the hub who owns a folder whose marker names another
+/// device (`root`, else the contested folder), record it, return the status.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn check_collab_folder_owner(
+    state: State<'_, AppState>,
+    root: Option<String>,
+) -> Result<surface::CollabStorageStatus, String> {
+    surface::check_collab_folder_owner(&state.ctx, root.as_deref(), &PathPolicy::AllowAll)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Replace another device of this account as the owner of the folder (the
 /// offer's folder unless `root` names one).
 #[tauri::command]

@@ -142,6 +142,22 @@ pub const META_REFUSED_KIND: &str = "refused_kind";
 /// out, offline, or the device list failed) — `Unknown` by design, and the
 /// UI says so (Task 16).
 pub const META_REFUSED_OFFLINE: &str = "refused_offline";
+/// The replace offer an `Other` classification saw (Task 16 fix round 1):
+/// the hub device id, its name and last-seen time, so the passive status
+/// read can show the offer without asking the hub.
+pub const META_REFUSED_OFFER_ID: &str = "refused_offer_id";
+pub const META_REFUSED_OFFER_NAME: &str = "refused_offer_name";
+pub const META_REFUSED_OFFER_LAST_SEEN: &str = "refused_offer_last_seen";
+
+const REFUSAL_KEYS: [&str; 7] = [
+    META_REFUSED_PATH,
+    META_REFUSED_DEVICE,
+    META_REFUSED_KIND,
+    META_REFUSED_OFFLINE,
+    META_REFUSED_OFFER_ID,
+    META_REFUSED_OFFER_NAME,
+    META_REFUSED_OFFER_LAST_SEEN,
+];
 
 /// Whether a refused designation's marker names a device still active in
 /// this account (offer a replace) or not (offer a take-over instead — spec
@@ -174,46 +190,73 @@ impl RefusedDeviceKind {
     }
 }
 
-/// Record a refused designation. `offline`: the kind was decided without the
-/// hub's device list (see [`META_REFUSED_OFFLINE`]).
-pub fn record_refused_designation(
-    conn: &Connection,
-    path: &str,
-    device_id: &str,
-    kind: RefusedDeviceKind,
-    offline: bool,
-) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    meta_set(&tx, META_REFUSED_PATH, path)?;
-    meta_set(&tx, META_REFUSED_DEVICE, device_id)?;
-    meta_set(&tx, META_REFUSED_KIND, kind.as_db_str())?;
-    meta_set(&tx, META_REFUSED_OFFLINE, if offline { "1" } else { "0" })?;
-    tx.commit()?;
-    Ok(())
+/// The replace offer an `Other` classification saw, as recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedOffer {
+    /// The hub's device id (what the replace takes).
+    pub device_id: String,
+    pub device_name: String,
+    pub last_seen_at: Option<String>,
 }
 
 /// A recorded refused designation, with how its kind was decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusedDesignation {
     pub path: String,
+    /// The marker's device (its public key).
     pub device_id: String,
     pub kind: RefusedDeviceKind,
     /// Classified without the hub's device list (always `Unknown`).
     pub offline: bool,
+    /// For `Other`: the offer the hub's device list gave.
+    pub offer: Option<RecordedOffer>,
 }
 
-/// [`refused_designation`] with the offline flag (a record written before
-/// the flag existed reads as not offline).
+/// Record a refused designation (replacing any earlier one, every part).
+pub fn record_refused_designation(conn: &Connection, r: &RefusedDesignation) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for key in REFUSAL_KEYS {
+        tx.execute("DELETE FROM collab_live_meta WHERE key = ?1", params![key])?;
+    }
+    meta_set(&tx, META_REFUSED_PATH, &r.path)?;
+    meta_set(&tx, META_REFUSED_DEVICE, &r.device_id)?;
+    meta_set(&tx, META_REFUSED_KIND, r.kind.as_db_str())?;
+    meta_set(&tx, META_REFUSED_OFFLINE, if r.offline { "1" } else { "0" })?;
+    if let Some(o) = &r.offer {
+        meta_set(&tx, META_REFUSED_OFFER_ID, &o.device_id)?;
+        meta_set(&tx, META_REFUSED_OFFER_NAME, &o.device_name)?;
+        if let Some(t) = &o.last_seen_at {
+            meta_set(&tx, META_REFUSED_OFFER_LAST_SEEN, t)?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The whole recorded refusal (a record written before the offline flag or
+/// the offer existed reads as not offline, without an offer).
 pub fn refused_designation_detail(conn: &Connection) -> Result<Option<RefusedDesignation>> {
     let Some((path, device_id, kind)) = refused_designation(conn)? else {
         return Ok(None);
     };
     let offline = meta_get(conn, META_REFUSED_OFFLINE)?.as_deref() == Some("1");
+    let offer = match (
+        meta_get(conn, META_REFUSED_OFFER_ID)?,
+        meta_get(conn, META_REFUSED_OFFER_NAME)?,
+    ) {
+        (Some(device_id), Some(device_name)) => Some(RecordedOffer {
+            device_id,
+            device_name,
+            last_seen_at: meta_get(conn, META_REFUSED_OFFER_LAST_SEEN)?,
+        }),
+        _ => None,
+    };
     Ok(Some(RefusedDesignation {
         path,
         device_id,
         kind,
         offline,
+        offer,
     }))
 }
 
@@ -234,15 +277,9 @@ pub fn refused_designation(
 }
 
 pub fn clear_refused_designation(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "DELETE FROM collab_live_meta WHERE key IN (?1, ?2, ?3, ?4)",
-        params![
-            META_REFUSED_PATH,
-            META_REFUSED_DEVICE,
-            META_REFUSED_KIND,
-            META_REFUSED_OFFLINE
-        ],
-    )?;
+    for key in REFUSAL_KEYS {
+        conn.execute("DELETE FROM collab_live_meta WHERE key = ?1", params![key])?;
+    }
     Ok(())
 }
 
@@ -865,14 +902,18 @@ mod tests {
     fn refused_designation_round_trips_and_clears() {
         let conn = conn_with_project();
         assert_eq!(refused_designation(&conn).unwrap(), None);
-        record_refused_designation(
-            &conn,
-            "/collab/root",
-            "OTHER-DEVICE",
-            RefusedDeviceKind::Other,
-            false,
-        )
-        .unwrap();
+        let other = RefusedDesignation {
+            path: "/collab/root".into(),
+            device_id: "OTHER-DEVICE".into(),
+            kind: RefusedDeviceKind::Other,
+            offline: false,
+            offer: Some(RecordedOffer {
+                device_id: "hub-id".into(),
+                device_name: "Old laptop".into(),
+                last_seen_at: Some("2026-09-01T00:00:00Z".into()),
+            }),
+        };
+        record_refused_designation(&conn, &other).unwrap();
         assert_eq!(
             refused_designation(&conn).unwrap(),
             Some((
@@ -881,35 +922,22 @@ mod tests {
                 RefusedDeviceKind::Other
             ))
         );
-        assert!(!refused_designation_detail(&conn).unwrap().unwrap().offline);
-        record_refused_designation(
-            &conn,
-            "/collab/root2",
-            "GHOST",
-            RefusedDeviceKind::Unknown,
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            refused_designation(&conn).unwrap(),
-            Some((
-                "/collab/root2".to_string(),
-                "GHOST".to_string(),
-                RefusedDeviceKind::Unknown
-            ))
-        );
-        assert_eq!(
-            refused_designation_detail(&conn).unwrap(),
-            Some(RefusedDesignation {
-                path: "/collab/root2".to_string(),
-                device_id: "GHOST".to_string(),
-                kind: RefusedDeviceKind::Unknown,
-                offline: true,
-            })
-        );
+        assert_eq!(refused_designation_detail(&conn).unwrap(), Some(other));
+        // A later record replaces every part — no stale offer survives.
+        let unknown = RefusedDesignation {
+            path: "/collab/root2".into(),
+            device_id: "GHOST".into(),
+            kind: RefusedDeviceKind::Unknown,
+            offline: true,
+            offer: None,
+        };
+        record_refused_designation(&conn, &unknown).unwrap();
+        assert_eq!(refused_designation_detail(&conn).unwrap(), Some(unknown));
         clear_refused_designation(&conn).unwrap();
         assert_eq!(refused_designation(&conn).unwrap(), None);
         assert_eq!(refused_designation_detail(&conn).unwrap(), None);
-        assert_eq!(meta_get(&conn, META_REFUSED_OFFLINE).unwrap(), None);
+        for key in REFUSAL_KEYS {
+            assert_eq!(meta_get(&conn, key).unwrap(), None, "{key}");
+        }
     }
 }

@@ -1710,9 +1710,10 @@ export type CollabDeletionChoice = { count: number,
  */
 projectIds: Array<string>, 
 /**
- * `collab-deletion-choice:<projectId>[,<projectId>…]` — stable for the
- * same projects, so the notification replaces an earlier one instead
- * of stacking (`notify({ dedupeKey })`).
+ * `collab-deletion-choice:<projectId>[,<projectId>…]:<batch id>` — one
+ * key per OCCURRENCE (`notify({ dedupeKey })` suppresses a seen key for
+ * good): a re-emit of the same batch (a replay) is shown once, every new
+ * batch notifies (Task 16 fix round 1).
  */
 dedupeKey: string, };
 
@@ -1815,7 +1816,9 @@ markerMismatch: boolean, };
 export type CollabStorageStatus = { state: StorageStateView, 
 /**
  * `path_missing` | `not_a_directory` | `marker_missing` |
- * `marker_mismatch` | `other_device` | `unknown_device`.
+ * `marker_mismatch` | `other_device` (the marker names another device;
+ * with no `replace` and no `unknownDevice` it is not classified yet —
+ * "Check again" calls `check_collab_folder_owner`).
  */
 reason: string | null, 
 /**
@@ -1823,11 +1826,13 @@ reason: string | null,
  */
 root: string | null, watcherDegraded: boolean, networkVolume: boolean, 
 /**
- * `reason = other_device` (or a refused designation of such a folder).
+ * Recorded as one of this account's devices (or a refused designation
+ * of such a folder).
  */
 replace: DeviceReplaceOfferView | null, 
 /**
- * `reason = unknown_device` (or a refused designation of such a folder).
+ * Recorded as a device this account does not list (or a refused
+ * designation of such a folder).
  */
 unknownDevice: UnknownDeviceView | null, };
 

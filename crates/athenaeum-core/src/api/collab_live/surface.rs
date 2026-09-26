@@ -20,11 +20,13 @@ use crate::collab::live::presence::PresenceBook;
 use crate::collab::snapshot::SnapshotMember;
 use crate::collab::storage::deletions;
 use crate::collab::storage::marker::{
-    check_store, read_marker, CheckOutcome, StoreMarker, StoreState, UnavailableReason,
+    check_store, offer_flags, read_marker, CheckOutcome, StoreMarker, StoreState, UnavailableReason,
 };
 use crate::db::collab::CollabProjectRow;
 use crate::db::collab_frames::{self as frames_db, LocalFrameRow, LocalState};
-use crate::db::collab_live::{self as live_db, RefusedDesignation, RefusedDeviceKind};
+use crate::db::collab_live::{
+    self as live_db, RecordedOffer, RefusedDesignation, RefusedDeviceKind,
+};
 use crate::services::ServiceContext;
 
 pub use super::{CollabLiveStatus, LocalStateView, StorageStateView};
@@ -185,15 +187,19 @@ pub struct UnknownDeviceView {
 pub struct CollabStorageStatus {
     pub state: StorageStateView,
     /// `path_missing` | `not_a_directory` | `marker_missing` |
-    /// `marker_mismatch` | `other_device` | `unknown_device`.
+    /// `marker_mismatch` | `other_device` (the marker names another device;
+    /// with no `replace` and no `unknownDevice` it is not classified yet —
+    /// "Check again" calls `check_collab_folder_owner`).
     pub reason: Option<String>,
     /// The designated Collaboration folder.
     pub root: Option<String>,
     pub watcher_degraded: bool,
     pub network_volume: bool,
-    /// `reason = other_device` (or a refused designation of such a folder).
+    /// Recorded as one of this account's devices (or a refused designation
+    /// of such a folder).
     pub replace: Option<DeviceReplaceOfferView>,
-    /// `reason = unknown_device` (or a refused designation of such a folder).
+    /// Recorded as a device this account does not list (or a refused
+    /// designation of such a folder).
     pub unknown_device: Option<UnknownDeviceView>,
 }
 
@@ -275,7 +281,12 @@ impl ProjectHolderCounts {
         FrameLiveInfo {
             holders_online: r.online,
             holders_total: r.total,
-            waiting_for_publisher: waiting_for_publisher(
+            // Only a frame this device still needs can wait for its
+            // publisher (fix round 1, M1).
+            waiting_for_publisher: matches!(
+                row.local_state,
+                LocalState::Wanted | LocalState::Missing
+            ) && waiting_for_publisher(
                 &self.map,
                 &self.presence,
                 &self.members,
@@ -637,100 +648,146 @@ fn reason_str(r: &UnavailableReason) -> &'static str {
     }
 }
 
-/// Which kind of device `device` (a marker's device) is, asking the hub the
-/// way a designation does (spec §9.5, T7): one of this account's → the
-/// replace offer; not listed → unknown; the hub cannot be asked → unknown,
-/// labelled offline. The answer is recorded as the folder's refusal (so a
-/// take-over of an unknown device's folder is possible, and only then).
-/// `sets_reason`: the refusal explains the status (`reason`).
-async fn classify_marker_device(
-    ctx: &ServiceContext,
-    path: &Path,
-    device: &str,
-    sets_reason: bool,
-    out: &mut CollabStorageStatus,
-) -> Result<(), ApiError> {
-    let canon = canonical(path);
-    let path_str = canon.to_string_lossy().to_string();
-    let marker_mismatch = match replace::check_no_recorded_marker_mismatch(ctx, path, &canon) {
+fn mismatch_of(ctx: &ServiceContext, path: &Path, canon: &Path) -> bool {
+    match replace::check_no_recorded_marker_mismatch(ctx, path, canon) {
         Ok(()) => false,
         Err(ApiError::Conflict(_)) => true,
         Err(e) => {
-            tracing::warn!(path = %path_str, error = %e, "recorded storage marker could not be compared; no mismatch assumed");
+            tracing::warn!(path = %canon.display(), error = %e, "recorded storage marker could not be compared; no mismatch assumed");
             false
         }
-    };
-    let (kind, offline) = match replace::replace_offer(ctx, device).await {
-        Ok(Some(o)) => {
+    }
+}
+
+/// The Other / Unknown view a RECORDED classification gives for `path`,
+/// whose marker names `device` — hub-free and write-free (fix round 1,
+/// the T7 rule). Only a record for this very folder and device counts; an
+/// `Other` record without its offer is left unclassified ("Check again").
+/// Returns whether a view was set.
+fn view_from_record(
+    ctx: &ServiceContext,
+    rec: &RefusedDesignation,
+    path: &Path,
+    device: &str,
+    out: &mut CollabStorageStatus,
+) -> bool {
+    let canon = canonical(path);
+    let path_str = canon.to_string_lossy().to_string();
+    if rec.path != path_str || rec.device_id != device {
+        return false;
+    }
+    let marker_mismatch = mismatch_of(ctx, path, &canon);
+    match (rec.kind, &rec.offer) {
+        (RefusedDeviceKind::Other, Some(o)) => {
+            let last_seen = o
+                .last_seen_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            let (offline_days, prompt, propose_retire) = offer_flags(last_seen, chrono::Utc::now());
             out.replace = Some(DeviceReplaceOfferView {
+                device_id: o.device_id.clone(),
+                device_name: o.device_name.clone(),
+                last_seen_at: o.last_seen_at.clone(),
+                offline_days,
+                prompt,
+                propose_retire,
+                path: path_str,
+                marker_mismatch,
+            });
+            true
+        }
+        (RefusedDeviceKind::Other, None) => {
+            tracing::debug!(path = %path_str, "recorded replace offer incomplete; the folder needs a check");
+            false
+        }
+        (RefusedDeviceKind::Unknown, _) => {
+            out.unknown_device = Some(UnknownDeviceView {
+                device_id: device.to_string(),
+                path: path_str,
+                recorded_offline: rec.offline,
+                marker_mismatch,
+            });
+            true
+        }
+    }
+}
+
+/// Ask the hub which kind of device `device` (the marker's device of
+/// `path`) is — exactly as a designation does (spec §9.5, T7): one of this
+/// account's → `Other` with its offer; not listed → `Unknown`; the device
+/// list failed → `Unknown`, labelled offline. The answer is recorded as the
+/// folder's refusal (a take-over needs a recorded `Unknown`). An
+/// online-verified record for the same folder and device is never replaced
+/// by an offline answer: the hub's error is returned instead.
+async fn classify_and_record(
+    ctx: &ServiceContext,
+    path: &Path,
+    device: &str,
+) -> Result<(), ApiError> {
+    let path_str = canonical(path).to_string_lossy().to_string();
+    let (kind, offline, offer) = match replace::replace_offer(ctx, device).await {
+        Ok(Some(o)) => (
+            RefusedDeviceKind::Other,
+            false,
+            Some(RecordedOffer {
                 device_id: o.device_id,
                 device_name: o.device_name,
                 last_seen_at: o.last_seen_at,
-                offline_days: o.offline_days,
-                prompt: o.prompt,
-                propose_retire: o.propose_retire,
-                path: path_str.clone(),
-                marker_mismatch,
-            });
-            (RefusedDeviceKind::Other, false)
-        }
-        Ok(None) => (RefusedDeviceKind::Unknown, false),
+            }),
+        ),
+        Ok(None) => (RefusedDeviceKind::Unknown, false, None),
         Err(e) => {
-            tracing::warn!(path = %path_str, device, error = %e, "could not confirm whether the marker's device is still active");
-            (RefusedDeviceKind::Unknown, true)
+            let existing = {
+                let db = db(ctx)?;
+                let conn = db.conn();
+                live_db::refused_designation_detail(&conn)?
+            };
+            if existing
+                .as_ref()
+                .is_some_and(|r| r.path == path_str && r.device_id == device && !r.offline)
+            {
+                tracing::warn!(path = %path_str, device, error = %e, "the hub could not be asked; the verified classification is kept");
+                return Err(e);
+            }
+            tracing::warn!(path = %path_str, device, error = %e, "could not confirm whether the marker's device is still active; recorded as unknown");
+            (RefusedDeviceKind::Unknown, true, None)
         }
     };
-    if kind == RefusedDeviceKind::Unknown {
-        out.unknown_device = Some(UnknownDeviceView {
-            device_id: device.to_string(),
-            path: path_str.clone(),
-            recorded_offline: offline,
-            marker_mismatch,
-        });
-    }
-    if sets_reason {
-        out.reason = Some(
-            match kind {
-                RefusedDeviceKind::Other => "other_device",
-                RefusedDeviceKind::Unknown => "unknown_device",
-            }
-            .to_string(),
-        );
-    }
     let record = RefusedDesignation {
         path: path_str,
         device_id: device.to_string(),
         kind,
         offline,
+        offer,
     };
     let db = db(ctx)?;
     let conn = db.conn();
     if live_db::refused_designation_detail(&conn)?.as_ref() != Some(&record) {
-        if let Err(e) = live_db::record_refused_designation(
-            &conn,
-            &record.path,
-            &record.device_id,
-            record.kind,
-            record.offline,
-        ) {
-            tracing::warn!(path = %record.path, error = %e, "recording the storage refusal failed");
-        } else {
-            tracing::info!(
-                path = %record.path,
-                device = %record.device_id,
-                kind = ?record.kind,
-                refused = true,
-                "collaboration folder refusal classified"
-            );
-        }
+        live_db::record_refused_designation(&conn, &record).map_err(|e| {
+            tracing::error!(path = %record.path, error = %e, "recording the folder classification failed");
+            ApiError::from(e)
+        })?;
     }
+    tracing::info!(
+        path = %record.path,
+        device = %record.device_id,
+        kind = ?record.kind,
+        refused = true,
+        "collaboration folder owner classified"
+    );
     Ok(())
 }
 
-/// The Collaboration storage (§9.1, §9.5): the designated folder's marker
-/// check, the watcher state, and — when the folder's marker names another
-/// device (or a designation was refused for that reason) — the replace offer
-/// for one of this account's devices, or the take-over of an unknown one's.
+/// The Collaboration storage (§9.1, §9.5) — a PASSIVE read (fix round 1):
+/// no hub call, no record written. The designated folder's marker check and
+/// the watcher state; when a folder's marker names another device
+/// (`reason = other_device`), the replace offer or the take-over as the
+/// last classification of THAT folder and device recorded it (a designation
+/// refusal or [`check_collab_folder_owner`]), else no classification — the
+/// UI offers "Check again". A refused designation of another folder (the
+/// reinstall flow) is surfaced the same way while its marker still names
+/// another device.
 pub async fn get_collab_storage_status(
     ctx: &ServiceContext,
 ) -> Result<CollabStorageStatus, ApiError> {
@@ -747,22 +804,25 @@ pub async fn get_collab_storage_status(
     };
     let me = crate::api::account::own_device_id(ctx)?;
     let root_canon = root.as_deref().map(|r| canonical(Path::new(r)));
+    let (record, recorded_marker) = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let marker = match &root {
+            Some(r) if live_db::store_marker_path(&conn)?.as_deref() == Some(r.as_str()) => {
+                live_db::recorded_store_marker(&conn)?
+            }
+            _ => None,
+        };
+        (live_db::refused_designation_detail(&conn)?, marker)
+    };
 
     if let Some(root) = &root {
         let root_path = PathBuf::from(root);
-        let recorded = {
-            let db = db(ctx)?;
-            let conn = db.conn();
-            if live_db::store_marker_path(&conn)?.as_deref() == Some(root.as_str()) {
-                live_db::recorded_store_marker(&conn)?
-            } else {
-                None
-            }
-        };
         let (p, m) = (root_path.clone(), me.clone());
-        let outcome = tokio::task::spawn_blocking(move || check_store(&p, recorded.as_ref(), &m))
-            .await
-            .map_err(|e| ApiError::Internal(format!("storage check task join: {e}")))?;
+        let outcome =
+            tokio::task::spawn_blocking(move || check_store(&p, recorded_marker.as_ref(), &m))
+                .await
+                .map_err(|e| ApiError::Internal(format!("storage check task join: {e}")))?;
         match outcome {
             // A folder with no marker yet (or one naming this device, not
             // yet recorded): the live exchange adopts it on its next check.
@@ -773,35 +833,34 @@ pub async fn get_collab_storage_status(
             CheckOutcome::State(StoreState::Unavailable(r)) => {
                 out.state = StorageStateView::Unavailable;
                 out.reason = Some(reason_str(&r).to_string());
-                if let UnavailableReason::OtherDevice { device_id } = r {
-                    classify_marker_device(ctx, &root_path, &device_id, true, &mut out).await?;
+                if let (UnavailableReason::OtherDevice { device_id }, Some(rec)) = (&r, &record) {
+                    view_from_record(ctx, rec, &root_path, device_id, &mut out);
                 }
             }
         }
     }
 
-    // A refused designation of another folder (the reinstall flow: the old
-    // folder was picked and refused) is surfaced too — while its marker
-    // still names another device.
     if out.replace.is_none() && out.unknown_device.is_none() {
-        let refusal = {
-            let db = db(ctx)?;
-            let conn = db.conn();
-            live_db::refused_designation_detail(&conn)?
-        };
-        if let Some(r) = refusal.filter(|r| root_canon.as_deref() != Some(Path::new(&r.path))) {
-            let path = PathBuf::from(&r.path);
+        if let Some(rec) = record.filter(|r| root_canon.as_deref() != Some(Path::new(&r.path))) {
+            let path = PathBuf::from(&rec.path);
             match marker_at(&path).await {
                 Ok(Some(m)) if m.device_id != me => {
-                    classify_marker_device(ctx, &path, &m.device_id, root.is_none(), &mut out)
-                        .await?;
+                    if root.is_none() {
+                        out.reason = Some(
+                            reason_str(&UnavailableReason::OtherDevice {
+                                device_id: m.device_id.clone(),
+                            })
+                            .to_string(),
+                        );
+                    }
+                    view_from_record(ctx, &rec, &path, &m.device_id, &mut out);
                 }
                 Ok(_) => tracing::debug!(
-                    path = %r.path,
+                    path = %rec.path,
                     "the refused folder's marker no longer names another device"
                 ),
                 Err(e) => {
-                    tracing::warn!(path = %r.path, error = %e, "the refused folder could not be checked")
+                    tracing::warn!(path = %rec.path, error = %e, "the refused folder could not be checked")
                 }
             }
         }
@@ -809,31 +868,60 @@ pub async fn get_collab_storage_status(
     Ok(out)
 }
 
-/// The folder a replace applies to when the UI names none: the designated
-/// Collaboration folder when its marker names another device, else the
-/// folder whose designation was refused.
-async fn replace_target(ctx: &ServiceContext) -> Result<PathBuf, ApiError> {
+/// "Check again" (fix round 1): the explicit, user-initiated classification
+/// of a folder whose marker names another device — `root`, else the
+/// designated folder when its marker names another device, else the folder
+/// whose designation was refused. Asks the hub (as a designation does),
+/// records the answer, and returns the (passive) storage status. A `root`
+/// with `..` or outside the allowed roots is refused first; an unreachable
+/// hub never replaces an online-verified classification (its error is
+/// returned).
+pub async fn check_collab_folder_owner(
+    ctx: &ServiceContext,
+    root: Option<&str>,
+    policy: &PathPolicy,
+) -> Result<CollabStorageStatus, ApiError> {
+    let target = match root {
+        Some(r) => Some(folder_arg(r)?),
+        None => contested_folder(ctx).await?,
+    };
+    if let Some(path) = target {
+        policy.check(&path)?;
+        let me = crate::api::account::own_device_id(ctx)?;
+        match marker_at(&path).await? {
+            Some(m) if m.device_id != me => classify_and_record(ctx, &path, &m.device_id).await?,
+            _ => tracing::debug!(
+                path = %path.display(),
+                "the folder's marker names no other device; nothing to classify"
+            ),
+        }
+    } else {
+        tracing::debug!("no folder names another device; nothing to classify");
+    }
+    get_collab_storage_status(ctx).await
+}
+
+/// The folder a replace or a check applies to when the UI names none: the
+/// designated Collaboration folder when its marker names another device,
+/// else the folder whose designation was refused. Hub-free.
+async fn contested_folder(ctx: &ServiceContext) -> Result<Option<PathBuf>, ApiError> {
     let me = crate::api::account::own_device_id(ctx)?;
     if let Some(root) = crate::api::scan_roots::get_collaboration_dir(ctx)? {
         let root = PathBuf::from(root);
         if marker_at(&root).await?.is_some_and(|m| m.device_id != me) {
-            return Ok(root);
+            return Ok(Some(root));
         }
     }
-    let refusal = {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        live_db::refused_designation_detail(&conn)?
-    };
-    match refusal {
-        Some(r) => Ok(PathBuf::from(r.path)),
-        None => {
-            tracing::warn!("device replace refused: no folder names another device");
-            Err(ApiError::Invalid(
-                "no Collaboration folder names another device".to_string(),
-            ))
-        }
-    }
+    let db = db(ctx)?;
+    let conn = db.conn();
+    Ok(live_db::refused_designation_detail(&conn)?.map(|r| PathBuf::from(r.path)))
+}
+
+async fn replace_target(ctx: &ServiceContext) -> Result<PathBuf, ApiError> {
+    contested_folder(ctx).await?.ok_or_else(|| {
+        tracing::warn!("device replace refused: no folder names another device");
+        ApiError::Invalid("no Collaboration folder names another device".to_string())
+    })
 }
 
 fn notify_every_project(ctx: &ServiceContext) {
@@ -948,8 +1036,27 @@ mod tests {
         assert!(a.awaiting_choice.is_empty() && a.not_kept.is_empty());
     }
 
+    fn write_marker_naming(root: &std::path::Path, store_id: &str, device: &str) {
+        crate::collab::storage::marker::write_marker(
+            root,
+            &crate::collab::storage::marker::StoreMarker {
+                store_id: store_id.into(),
+                device_id: device.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn recorded(ctx: &ServiceContext) -> Option<RefusedDesignation> {
+        live_db::refused_designation_detail(&crate::api::db(ctx).unwrap().conn()).unwrap()
+    }
+
+    /// Fix round 1: the status read is passive — no hub call, no record —
+    /// and reports the unclassified `other_device`; the explicit check asks
+    /// the hub once, records the offer, and later reads show it from the
+    /// record.
     #[tokio::test]
-    async fn storage_status_reports_an_other_device_root_with_a_replace_offer() {
+    async fn the_status_read_is_passive_and_the_check_records_the_replace_offer() {
         let (_t, ctx, hub) = ts::signed_in_rig().await;
         let root = ts::collab_root(&ctx);
         hub.add_device(
@@ -959,31 +1066,34 @@ mod tests {
             "Old laptop",
             Some(chrono::Utc::now() - chrono::Duration::days(10)),
         );
-        crate::collab::storage::marker::write_marker(
-            &root,
-            &crate::collab::storage::marker::StoreMarker {
-                store_id: "s".into(),
-                device_id: "OLD-DEV".into(),
-            },
-        )
-        .unwrap();
+        write_marker_naming(&root, "s", "OLD-DEV");
+
         let s = get_collab_storage_status(&ctx).await.unwrap();
         assert_eq!(s.state, StorageStateView::Unavailable);
         assert_eq!(s.reason.as_deref(), Some("other_device"));
-        assert!(s.unknown_device.is_none());
-        let offer = s.replace.expect("an offer for an account device");
+        assert!(
+            s.replace.is_none() && s.unknown_device.is_none(),
+            "not classified yet"
+        );
+        assert_eq!(hub.requests_to("/devices").await, 0, "no hub call");
+        assert!(recorded(&ctx).is_none(), "nothing recorded");
+
+        let s = check_collab_folder_owner(&ctx, None, &PathPolicy::AllowAll)
+            .await
+            .unwrap();
+        let offer = s.replace.clone().expect("an offer for an account device");
         assert!(offer.prompt && !offer.propose_retire);
         assert_eq!(offer.device_id, "old-id");
         assert_eq!(offer.device_name, "Old laptop");
         assert_eq!(offer.offline_days, Some(10));
         assert_eq!(offer.path, s.root.clone().unwrap());
-        // The status read records the classification: an OtherDevice
-        // refusal never unlocks a take-over.
-        let refusal =
-            crate::db::collab_live::refused_designation(&crate::api::db(&ctx).unwrap().conn())
-                .unwrap()
-                .expect("the classification is recorded");
-        assert_eq!(refusal.2, crate::db::collab_live::RefusedDeviceKind::Other);
+        assert_eq!(hub.requests_to("/devices").await, 1);
+
+        let again = get_collab_storage_status(&ctx).await.unwrap();
+        assert_eq!(again.replace, Some(offer.clone()), "from the record");
+        assert_eq!(hub.requests_to("/devices").await, 1, "still one hub call");
+        assert_eq!(recorded(&ctx).unwrap().kind, RefusedDeviceKind::Other);
+        // An Other classification never unlocks a take-over.
         let err = take_over_collab_folder(&ctx, &offer.path, true, &PathPolicy::AllowAll)
             .await
             .unwrap_err();
@@ -991,22 +1101,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_status_classifies_an_unlisted_marker_device_as_unknown() {
+    async fn the_check_classifies_an_unlisted_marker_device_as_unknown() {
         let (_t, ctx, _hub) = ts::signed_in_rig().await;
         let root = ts::collab_root(&ctx);
-        crate::collab::storage::marker::write_marker(
-            &root,
-            &crate::collab::storage::marker::StoreMarker {
-                store_id: "swapped".into(),
-                device_id: "GHOST".into(),
-            },
-        )
-        .unwrap();
-        let s = get_collab_storage_status(&ctx).await.unwrap();
+        write_marker_naming(&root, "swapped", "GHOST");
+        let s = check_collab_folder_owner(&ctx, None, &PathPolicy::AllowAll)
+            .await
+            .unwrap();
         assert_eq!(s.state, StorageStateView::Unavailable);
-        assert_eq!(s.reason.as_deref(), Some("unknown_device"));
+        assert_eq!(s.reason.as_deref(), Some("other_device"));
         assert!(s.replace.is_none());
-        let u = s.unknown_device.expect("an unknown-device refusal");
+        let u = s.unknown_device.expect("an unknown-device classification");
         assert_eq!(u.device_id, "GHOST");
         assert_eq!(u.path, s.root.clone().unwrap());
         assert!(!u.recorded_offline);
@@ -1014,16 +1119,8 @@ mod tests {
         // folder: a swapped disk — the take-over would be refused, and the
         // status says so up front.
         assert!(u.marker_mismatch);
-        let refusal = crate::db::collab_live::refused_designation_detail(
-            &crate::api::db(&ctx).unwrap().conn(),
-        )
-        .unwrap()
-        .expect("recorded");
-        assert_eq!(
-            refusal.kind,
-            crate::db::collab_live::RefusedDeviceKind::Unknown
-        );
-        assert!(!refusal.offline);
+        let r = recorded(&ctx).expect("recorded");
+        assert_eq!((r.kind, r.offline), (RefusedDeviceKind::Unknown, false));
         let err = take_over_collab_folder(&ctx, &u.path, true, &PathPolicy::AllowAll)
             .await
             .unwrap_err();
@@ -1038,26 +1135,137 @@ mod tests {
         let (_t, ctx, hub) = ts::signed_in_rig().await;
         let root = ts::collab_root(&ctx);
         hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
-        crate::collab::storage::marker::write_marker(
-            &root,
-            &crate::collab::storage::marker::StoreMarker {
-                store_id: "s".into(),
-                device_id: "OLD-DEV".into(),
-            },
-        )
-        .unwrap();
+        write_marker_naming(&root, "s", "OLD-DEV");
         hub.set_failing("/devices", true);
-        let s = get_collab_storage_status(&ctx).await.unwrap();
+        let s = check_collab_folder_owner(&ctx, None, &PathPolicy::AllowAll)
+            .await
+            .unwrap();
         assert!(s.replace.is_none());
         let u = s
             .unknown_device
             .expect("unknown while the hub cannot be asked");
         assert!(u.recorded_offline);
-        // Asked again once the hub answers: the device is an account device.
+        // Checked again once the hub answers: an account device.
         hub.set_failing("/devices", false);
-        let s = get_collab_storage_status(&ctx).await.unwrap();
+        let s = check_collab_folder_owner(&ctx, None, &PathPolicy::AllowAll)
+            .await
+            .unwrap();
         assert!(s.unknown_device.is_none());
         assert_eq!(s.replace.expect("an offer now").device_id, "old-id");
+    }
+
+    /// Fix round 1: an unreachable hub never downgrades an online-verified
+    /// `Other` to an offline `Unknown` — the check answers the hub's error,
+    /// the record and the offer stay, the take-over stays refused.
+    #[tokio::test]
+    async fn a_failing_device_list_keeps_a_verified_other_classification() {
+        let (_t, ctx, hub) = ts::signed_in_rig().await;
+        let root = ts::collab_root(&ctx);
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        write_marker_naming(&root, "s", "OLD-DEV");
+        check_collab_folder_owner(&ctx, None, &PathPolicy::AllowAll)
+            .await
+            .unwrap();
+        let verified = recorded(&ctx).unwrap();
+        assert_eq!(
+            (verified.kind, verified.offline),
+            (RefusedDeviceKind::Other, false)
+        );
+
+        hub.set_failing("/devices", true);
+        assert!(check_collab_folder_owner(&ctx, None, &PathPolicy::AllowAll)
+            .await
+            .is_err());
+        assert_eq!(
+            recorded(&ctx),
+            Some(verified),
+            "the verified record is kept"
+        );
+        let s = get_collab_storage_status(&ctx).await.unwrap();
+        assert_eq!(s.replace.expect("the offer stays").device_id, "old-id");
+        assert!(s.unknown_device.is_none());
+        let err =
+            take_over_collab_folder(&ctx, &root.to_string_lossy(), true, &PathPolicy::AllowAll)
+                .await
+                .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+    }
+
+    /// The reinstall flow: a refused designation records the offer it saw,
+    /// and the passive status shows it with no further hub call.
+    #[tokio::test]
+    async fn a_refused_designation_is_shown_with_its_offer_without_a_hub_call() {
+        let (t, ctx, hub) = ts::signed_in_rig_no_root().await;
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        let old = t.path().join("OldCollab");
+        std::fs::create_dir_all(&old).unwrap();
+        write_marker_naming(&old, "old-store", "OLD-DEV");
+        let err = crate::api::scan_roots::set_collaboration_dir(
+            &ctx,
+            old.to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Conflict(ref m) if m.starts_with("collab_other_device")),
+            "{err:?}"
+        );
+        let asked = hub.requests_to("/devices").await;
+        let s = get_collab_storage_status(&ctx).await.unwrap();
+        assert_eq!(s.state, StorageStateView::NotSet);
+        assert_eq!(s.reason.as_deref(), Some("other_device"));
+        let offer = s.replace.expect("the designation's offer");
+        assert_eq!(
+            (offer.device_id.as_str(), offer.device_name.as_str()),
+            ("old-id", "Old laptop")
+        );
+        assert_eq!(
+            hub.requests_to("/devices").await,
+            asked,
+            "the read asked nothing"
+        );
+    }
+
+    /// Fix round 1 (M2, M3): a refused designation of ANOTHER folder (the
+    /// reinstall flow) is shown from its record; a status read neither asks
+    /// the hub about it nor rewrites it.
+    #[tokio::test]
+    async fn a_status_read_leaves_a_refused_designation_of_another_folder_intact() {
+        let (t, ctx, hub) = ts::signed_in_rig().await;
+        let b = t.path().join("OldCollab");
+        std::fs::create_dir_all(&b).unwrap();
+        write_marker_naming(&b, "old-store", "OLD-DEV");
+        let refusal = RefusedDesignation {
+            path: canonical(&b).to_string_lossy().to_string(),
+            device_id: "OLD-DEV".into(),
+            kind: RefusedDeviceKind::Other,
+            offline: false,
+            offer: Some(RecordedOffer {
+                device_id: "old-id".into(),
+                device_name: "Old laptop".into(),
+                last_seen_at: None,
+            }),
+        };
+        live_db::record_refused_designation(&crate::api::db(&ctx).unwrap().conn(), &refusal)
+            .unwrap();
+        for _ in 0..2 {
+            let s = get_collab_storage_status(&ctx).await.unwrap();
+            assert_eq!(
+                s.state,
+                StorageStateView::Available,
+                "the designated root is fine"
+            );
+            assert_eq!(s.reason, None);
+            let offer = s.replace.expect("the refused folder's offer");
+            assert_eq!(
+                (offer.path.as_str(), offer.device_id.as_str()),
+                (refusal.path.as_str(), "old-id")
+            );
+            assert!(offer.prompt, "never seen: prompt");
+        }
+        assert_eq!(recorded(&ctx), Some(refusal), "untouched");
+        assert_eq!(hub.requests_to("/devices").await, 0, "no hub call");
     }
 
     #[tokio::test]
@@ -1158,11 +1366,58 @@ mod tests {
         );
     }
 
+    /// Fix round 1 (M1): "waiting for the publisher" is shown only for a
+    /// frame this device still needs — a held one never waits.
+    #[tokio::test]
+    async fn only_a_needed_frame_waits_for_its_publisher() {
+        let rig = ts::landed_rig(1).await;
+        let (pid, uuid, _) = rig.frames[0].clone();
+        let mut row = frames_db::get(&crate::api::db(&rig.ctx).unwrap().conn(), &pid, &uuid)
+            .unwrap()
+            .unwrap();
+        row.frame_seq = Some(1);
+        let counts = ProjectHolderCounts {
+            project_id: pid.clone(),
+            // Only the (offline) publisher's device holds the current version.
+            map: ProjectHolders::from_rows(&[], &[("PUB".into(), 1, row.content_version)]),
+            presence: PresenceBook::default(),
+            members: ["PUB".to_string()].into_iter().collect(),
+            publishers: [(
+                row.publisher_account_id.clone(),
+                ["PUB".to_string()].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+            me: "ME".into(),
+        };
+        for (state, waits) in [
+            (LocalState::Wanted, true),
+            (LocalState::Missing, true),
+            (LocalState::Held, false),
+            (LocalState::Quarantined, false),
+            (LocalState::NotKept, false),
+        ] {
+            row.local_state = state;
+            let i = counts.frame(&row);
+            assert_eq!(i.waiting_for_publisher, waits, "{state:?}");
+            assert_eq!((i.holders_online, i.holders_total), (0, 1));
+        }
+    }
+
+    /// Fix round 1: the key is per occurrence — the same batch re-emitted
+    /// keeps it, a new batch for the same projects gets another.
     #[test]
-    fn deletion_choice_carries_a_stable_dedupe_key() {
-        let p =
-            crate::api::collab_live::CollabDeletionChoice::new(3, vec!["p2".into(), "p1".into()]);
-        assert_eq!(p.dedupe_key, "collab-deletion-choice:p1,p2");
+    fn deletion_choice_dedupe_key_is_per_batch() {
+        use crate::api::collab_live::CollabDeletionChoice;
+        let p = CollabDeletionChoice::new(3, vec!["p2".into(), "p1".into()], 17);
+        assert_eq!(p.dedupe_key, "collab-deletion-choice:p1,p2:17");
         assert_eq!(p.project_ids, vec!["p1".to_string(), "p2".to_string()]);
+        let replay = CollabDeletionChoice::new(3, vec!["p1".into(), "p2".into()], 17);
+        assert_eq!(
+            replay.dedupe_key, p.dedupe_key,
+            "a replay of the same batch"
+        );
+        let next = CollabDeletionChoice::new(1, vec!["p1".into(), "p2".into()], 18);
+        assert_ne!(next.dedupe_key, p.dedupe_key, "a new batch notifies again");
     }
 }

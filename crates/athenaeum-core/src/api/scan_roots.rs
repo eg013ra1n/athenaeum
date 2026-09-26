@@ -957,17 +957,22 @@ async fn check_storage_marker_for_designation(
             // be another account's device, a plain-revoked device, or a
             // swapped disk) — it only decides which message/record this
             // refusal carries, never whether to refuse.
-            let (kind, offline) = match crate::api::account::list_devices(ctx).await {
-                Ok(devices) => {
-                    if devices.iter().any(|d| d.pubkey == device_id) {
-                        (RefusedDeviceKind::Other, false)
-                    } else {
-                        (RefusedDeviceKind::Unknown, false)
-                    }
-                }
+            let (kind, offline, offer) = match crate::api::account::list_devices(ctx).await {
+                Ok(devices) => match devices.into_iter().find(|d| d.pubkey == device_id) {
+                    Some(d) => (
+                        RefusedDeviceKind::Other,
+                        false,
+                        Some(crate::db::collab_live::RecordedOffer {
+                            device_id: d.id,
+                            device_name: d.name,
+                            last_seen_at: d.last_seen_at,
+                        }),
+                    ),
+                    None => (RefusedDeviceKind::Unknown, false, None),
+                },
                 Err(e) => {
                     tracing::warn!(path = stored, device_id = %device_id, error = %e, "could not confirm whether the marker's device is still active");
-                    (RefusedDeviceKind::Unknown, true)
+                    (RefusedDeviceKind::Unknown, true, None)
                 }
             };
             tracing::warn!(
@@ -979,10 +984,13 @@ async fn check_storage_marker_for_designation(
             if let Ok(db) = db(ctx) {
                 if let Err(e) = crate::db::collab_live::record_refused_designation(
                     &db.conn(),
-                    stored,
-                    &device_id,
-                    kind,
-                    offline,
+                    &crate::db::collab_live::RefusedDesignation {
+                        path: stored.to_string(),
+                        device_id: device_id.clone(),
+                        kind,
+                        offline,
+                        offer,
+                    },
                 ) {
                     tracing::warn!(path = stored, error = %e, "recording the refused designation failed");
                 }

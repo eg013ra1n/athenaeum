@@ -124,6 +124,13 @@ pub struct ReplaceDeviceArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FolderOwnerArgs {
+    #[serde(default)]
+    root: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TakeOverArgs {
     root: String,
     confirmed: bool,
@@ -489,6 +496,21 @@ pub async fn get_collab_storage_status(
         .map_err(api_err)
 }
 
+/// "Check again": ask the hub who owns a folder whose marker names another
+/// device (`root`, else the contested folder), record it, return the status.
+/// A `root` with `..` is refused, then held to the allowed roots.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn check_collab_folder_owner(
+    State(state): State<WebAppState>,
+    Json(args): Json<FolderOwnerArgs>,
+) -> Result<Json<surface::CollabStorageStatus>, (axum::http::StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    surface::check_collab_folder_owner(&state.ctx, args.root.as_deref(), &policy)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// Replace another device of this account as the owner of the folder (the
 /// offer's folder unless `root` names one — refused when it contains `..`,
 /// then held to the allowed roots).
@@ -598,9 +620,9 @@ mod live_surface_tests {
     }
 
     /// Task 16 (R3): a root with `..` is refused with 400 before the policy,
-    /// the filesystem or the hub are touched — on both folder routes.
+    /// the filesystem or the hub are touched — on every folder route.
     #[tokio::test]
-    async fn a_root_with_a_parent_step_is_refused_on_both_folder_routes() {
+    async fn a_root_with_a_parent_step_is_refused_on_every_folder_route() {
         let tmp = TempDir::new().unwrap();
         let allowed = tmp.path().join("allowed");
         std::fs::create_dir_all(&allowed).unwrap();
@@ -615,6 +637,17 @@ mod live_surface_tests {
             Json(TakeOverArgs {
                 root: sneaky.clone(),
                 confirmed: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST, "{}", err.1);
+        assert!(err.1.contains(".."), "{}", err.1);
+
+        let err = check_collab_folder_owner(
+            State(state.clone()),
+            Json(FolderOwnerArgs {
+                root: Some(sneaky.clone()),
             }),
         )
         .await

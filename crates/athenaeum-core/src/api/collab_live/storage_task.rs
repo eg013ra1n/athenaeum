@@ -83,6 +83,10 @@ pub enum StorageEvent {
     DeletionChoice {
         count: usize,
         project_ids: Vec<String>,
+        /// This choice's occurrence ([`next_choice_batch`]): a re-emit of the
+        /// same batch keeps it, a later batch never reuses it (Task 16 fix
+        /// round 1 — the notification's dedupe key).
+        batch_id: u64,
     },
     /// No other holder of the current version anywhere (L4) — "restore it
     /// from the Trash", or, after a re-designation, "it is still in the
@@ -164,6 +168,15 @@ pub struct StorageEngine {
     /// `(instant, wall-clock ms)` at start: the wall clock the L4 history is
     /// kept in follows the (injectable) `Instant` the ticks run on.
     clock_base: (Instant, i64),
+    /// The last deletion-choice batch id minted ([`next_choice_batch`]).
+    last_choice_batch: u64,
+}
+
+/// The id of a new deletion-choice batch: its wall-clock ms, strictly above
+/// the previous one (two batches in one millisecond still differ). Unique
+/// across restarts through the wall clock.
+pub(crate) fn next_choice_batch(last: u64, now_ms: i64) -> u64 {
+    (now_ms.max(0) as u64).max(last + 1)
 }
 
 impl StorageEngine {
@@ -232,6 +245,7 @@ impl StorageEngine {
             rng: SplitMix64(seed),
             timings,
             clock_base: (now, chrono::Utc::now().timestamp_millis()),
+            last_choice_batch: 0,
         }
     }
 
@@ -1226,9 +1240,11 @@ impl StorageEngine {
                 window_count = ruled.window_count,
                 "replica deletions await one choice"
             );
+            self.last_choice_batch = next_choice_batch(self.last_choice_batch, now_ms);
             ev.push(StorageEvent::DeletionChoice {
                 count,
                 project_ids: choice_projects,
+                batch_id: self.last_choice_batch,
             });
         }
 
@@ -2417,6 +2433,23 @@ mod tests {
         );
     }
 
+    /// Task 16 fix round 1: every deletion-choice batch gets its own id,
+    /// strictly increasing even within one millisecond.
+    #[test]
+    fn deletion_choice_batches_get_distinct_increasing_ids() {
+        let a = next_choice_batch(0, 1_700_000_000_000);
+        assert_eq!(a, 1_700_000_000_000);
+        let b = next_choice_batch(a, 1_700_000_000_000);
+        assert!(b > a, "same millisecond, still a new batch");
+        let c = next_choice_batch(b, 1_700_000_000_500);
+        assert_eq!(c, 1_700_000_000_500);
+        assert_eq!(
+            next_choice_batch(c, 5),
+            c + 1,
+            "a clock step back never reuses an id"
+        );
+    }
+
     /// Owner rule A follow-up (Task 16): a last copy ruled gone because it
     /// lies outside a re-designated root is still on disk — the lost
     /// notice names the previous folder's file instead of the Trash.
@@ -2526,10 +2559,11 @@ mod tests {
         assert_eq!(state(&rig.ctx, &pid, &uuid), LocalState::AwaitingChoice);
         assert_eq!(state(&rig.ctx, &pid, &uuid2), LocalState::Wanted);
         assert!(
-            ev.contains(&StorageEvent::DeletionChoice {
-                count: 1,
-                project_ids: vec![pid.clone()]
-            }),
+            ev.iter().any(|e| matches!(
+                e,
+                StorageEvent::DeletionChoice { count: 1, project_ids, batch_id }
+                    if *project_ids == vec![pid.clone()] && *batch_id > 0
+            )),
             "{ev:?}"
         );
         assert_eq!(

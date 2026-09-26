@@ -353,6 +353,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/keep_collab_frames_again", post(collab::keep_collab_frames_again))
         .route("/api/resolve_collab_changed_file", post(collab::resolve_collab_changed_file))
         .route("/api/get_collab_storage_status", post(collab::get_collab_storage_status))
+        .route("/api/check_collab_folder_owner", post(collab::check_collab_folder_owner))
         .route("/api/collab_replace_device", post(collab::collab_replace_device))
         .route("/api/take_over_collab_folder", post(collab::take_over_collab_folder))
         .route("/api/set_collab_max_upload_streams", post(collab::set_collab_max_upload_streams))

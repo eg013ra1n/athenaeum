@@ -115,17 +115,22 @@ pub struct CollabDeletionChoice {
     pub count: usize,
     /// Sorted, no duplicates.
     pub project_ids: Vec<String>,
-    /// `collab-deletion-choice:<projectId>[,<projectId>…]` — stable for the
-    /// same projects, so the notification replaces an earlier one instead
-    /// of stacking (`notify({ dedupeKey })`).
+    /// `collab-deletion-choice:<projectId>[,<projectId>…]:<batch id>` — one
+    /// key per OCCURRENCE (`notify({ dedupeKey })` suppresses a seen key for
+    /// good): a re-emit of the same batch (a replay) is shown once, every new
+    /// batch notifies (Task 16 fix round 1).
     pub dedupe_key: String,
 }
 
 impl CollabDeletionChoice {
-    pub fn new(count: usize, mut project_ids: Vec<String>) -> Self {
+    /// `batch_id`: the storage engine's id of this choice's batch.
+    pub fn new(count: usize, mut project_ids: Vec<String>, batch_id: u64) -> Self {
         project_ids.sort();
         project_ids.dedup();
-        let dedupe_key = format!("{COLLAB_DELETION_CHOICE_EVENT}:{}", project_ids.join(","));
+        let dedupe_key = format!(
+            "{COLLAB_DELETION_CHOICE_EVENT}:{}:{batch_id}",
+            project_ids.join(",")
+        );
         Self {
             count,
             project_ids,
