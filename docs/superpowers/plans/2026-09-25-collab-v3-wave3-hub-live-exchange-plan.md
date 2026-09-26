@@ -418,7 +418,7 @@ the shapes above; nothing above changes meaning.
   - An announce that creates or moves the binding bumps kind `members` in
     addition to `frames`, at the same `version` (`kinds: ["frames","members"]`).
 - **`PUT /projects/{id}/publishing-device`** (new) — "Publish from this device".
-  - **Auth.** `deviceToken` of a member (any data role). A portal session
+  - **Auth.** `deviceToken` of a member (either data role: `send` or `send_receive`). A portal session
     gets `400 {"error":"a device token is required to set the publishing device"}`;
     a non-member or unknown project `403` (empty body); a closed project
     `409 {"error":"project is closed"}`. No request body is read.
@@ -439,6 +439,22 @@ the shapes above; nothing above changes meaning.
     `409 project is closed`, before `version_conflict`.
   - Batch: a new per-entry `status` value `not_publishing_device`, with
     `contentVersion` 0, checked after `forbidden` and before `conflict`.
+  - **Adoption (fix round 1, hub `a5fc699`).** An ACCEPTED version (single `200`, batch
+    `ok`) sets the frame's device to the caller: from then on the frame's
+    `publisherDeviceId` is the versioning device's key (the manifest row and
+    the inline event of that `project` bump already show it). It is a no-op
+    when the frame's own device versions it. After a fallback version, the
+    adopting device is the frame's device: it classifies the frame as own
+    (it holds the only copy of the new bytes), and the old device, back in
+    service, gets `not_publishing_device` on that frame.
+- **Revoke/retire of a bound device (fix round 1).** When the device is the
+  bound publishing device of a project, that project gets a `project` event
+  with kind `members` whatever the device's capability (a `perseus` device
+  included), so the account's other devices refetch `/me/projects` and see
+  `publishingDevice: null`.
+- **Announce and a leaving member (fix round 1).** Announce re-reads the
+  caller's membership under the project lock: a member that left while the
+  request waited gets `403` (empty body).
 
 ---
 
