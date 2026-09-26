@@ -923,6 +923,12 @@ fn default_collab_upload_streams() -> usize {
 /// mount — so [`SharedIrohNode::set_collab_root`] sweeps the prefix on open.
 const COLLAB_IN_FLIGHT_PREFIX: &str = "in-flight/project/";
 
+/// The collab store's directory under a Collaboration root:
+/// `<root>/.athenaeum/blobs` (plan P1).
+pub(crate) fn collab_store_dir(root: &Path) -> PathBuf {
+    root.join(".athenaeum").join("blobs")
+}
+
 /// Open (creating the dir) a persistent blob store at `dir` — the one opener
 /// both of the node's stores use (the personal `<working_dir>/blobs` and the
 /// collab `<Collaboration root>/.athenaeum/blobs`, plan P1).
@@ -1718,6 +1724,27 @@ impl SharedIrohNode {
         }
     }
 
+    /// Where the mounted collab store keeps a blob it OWNS — iroh-blobs'
+    /// fs layout `<store>/data/<hash>.data` — or `None` when no collab store
+    /// is mounted. The file exists only while the store owns the blob
+    /// (a complete entry above the 16 KiB inline limit, not yet exported by
+    /// reference): the collab landing checks it to pick the DIRECT export,
+    /// one atomic rename onto the target (Task 11 ruling R1).
+    pub(crate) fn collab_owned_data_path(&self, hash: &Hash) -> Option<PathBuf> {
+        let slot = match self.collab.read() {
+            Ok(slot) => slot,
+            Err(e) => {
+                tracing::error!(error = %e, "collab store slot poisoned; reporting no store");
+                return None;
+            }
+        };
+        slot.as_ref().map(|m| {
+            FsOptions::new(&collab_store_dir(&m.root))
+                .path
+                .data_path(hash)
+        })
+    }
+
     /// Mount the collab store of the Collaboration root `root` — the store at
     /// `<root>/.athenaeum/blobs`, served on
     /// [`COLLAB_BLOBS_ALPN`](super::COLLAB_BLOBS_ALPN) — or unmount it (`None`).
@@ -1764,7 +1791,7 @@ impl SharedIrohNode {
             tracing::error!(path = %root.display(), error = %e, "collab store mount failed");
             return Err(e);
         }
-        let dir = root.join(".athenaeum").join("blobs");
+        let dir = collab_store_dir(root);
         let store = match open_fs_store(&dir).await {
             Ok(store) => store,
             Err(e) => {

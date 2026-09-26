@@ -712,7 +712,7 @@ impl StorageEngine {
         };
         match (changed_state, same_bytes) {
             (false, true) => self.stamp_drift(row, &current).await,
-            (false, false) => self.content_changed(row, &path, &current, ev).await,
+            (false, false) => self.content_changed(row, &path, &current, false, ev).await,
             (true, true) => self.bytes_back(row, &path, &current, ev).await,
             (true, false) => {
                 // still changed, at a new stamp: remember it (R21)
@@ -754,11 +754,15 @@ impl StorageEngine {
         }
     }
 
+    /// `unpark`: the row was parked over a dead store entry — `awaiting_gc`
+    /// is cleared in the same transaction, so a later "Re-fetch original"
+    /// fetches it (Task 11).
     async fn content_changed(
         &mut self,
         row: &LocalFrameRow,
         path: &str,
         current: &Stamp,
+        unpark: bool,
         ev: &mut Vec<StorageEvent>,
     ) {
         let Some(to) = transition(row.origin, row.local_state, StateEvent::ContentChanged) else {
@@ -775,6 +779,12 @@ impl StorageEngine {
         let replica = row.origin == FrameOrigin::Replica;
         let res = self
             .with_frame_tx(row, |tx| {
+                if unpark {
+                    tx.execute(
+                        "UPDATE project_frames_local SET awaiting_gc = 0 WHERE project_id = ?1 AND frame_uuid = ?2",
+                        rusqlite::params![row.project_id, row.frame_uuid],
+                    )?;
+                }
                 let w = frames_db::set_local_state(tx, &row.project_id, &row.frame_uuid, to)?;
                 if replica {
                     live_db::quarantine(
@@ -1197,7 +1207,8 @@ impl StorageEngine {
             .map(|m| m.is_file() && m.len() as i64 == row.byte_size)
             .unwrap_or(false);
         if !size_ok {
-            self.release_parked(row, "file gone or changed").await;
+            self.release_or_quarantine_parked(row, &path, "file gone or changed", None, ev)
+                .await;
             return false;
         }
         let health = match row.blake3.parse::<iroh_blobs::Hash>() {
@@ -1211,8 +1222,14 @@ impl StorageEngine {
             None => true,
             Some(BlobHealth::Dead) => {
                 if !self.file_matches(row, &path).await {
-                    self.release_parked(row, "file no longer the frame's bytes")
-                        .await;
+                    self.release_or_quarantine_parked(
+                        row,
+                        &path,
+                        "file no longer the frame's bytes",
+                        Some(false),
+                        ev,
+                    )
+                    .await;
                     return false;
                 }
                 self.park_siblings(row, ev).await;
@@ -1236,7 +1253,8 @@ impl StorageEngine {
                     if h == BlobHealth::Readable && self.file_matches(row, &path).await {
                         return true;
                     }
-                    self.release_parked(row, "re-seed refused").await;
+                    self.release_or_quarantine_parked(row, &path, "re-seed refused", None, ev)
+                        .await;
                     false
                 }
                 Err(e) => {
@@ -1256,6 +1274,58 @@ impl StorageEngine {
                 false
             }
         }
+    }
+
+    /// End a replica's parking whose re-seed did not happen. Task 11 (ledger
+    /// ruling): a released frame must never be landed over a file that no
+    /// longer holds its bytes. The parked row is a verified copy of THIS
+    /// version (its stamp was recorded when it was parked), so a file still
+    /// at its path with other bytes is an edit — spec §9.4 "Held ──content
+    /// changed──▶ Quarantined (stops serving at once; file untouched)", I9
+    /// "different bytes quarantine", L5: it is quarantined (Changed files),
+    /// never released to a fetch that would replace it. A file that is gone,
+    /// or still holds the frame's bytes (the landing then just records it,
+    /// C1), is released. An own frame is never fetched: released as before.
+    /// `holds`: whether the file holds the frame's bytes, when the caller
+    /// already knows.
+    async fn release_or_quarantine_parked(
+        &mut self,
+        row: &LocalFrameRow,
+        path: &Path,
+        reason: &str,
+        holds: Option<bool>,
+        ev: &mut Vec<StorageEvent>,
+    ) {
+        if row.origin == FrameOrigin::Replica {
+            match std::fs::metadata(path) {
+                Ok(m) if m.is_file() => {
+                    let holds = match holds {
+                        Some(h) => h,
+                        None => {
+                            m.len() as i64 == row.byte_size && self.file_matches(row, path).await
+                        }
+                    };
+                    if !holds {
+                        self.content_changed(
+                            row,
+                            &path.to_string_lossy(),
+                            &Stamp::of(&m),
+                            true,
+                            ev,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path = %path.display(), error = %e, "parked frame's file could not be read; left parked");
+                    return;
+                }
+            }
+        }
+        self.release_parked(row, reason).await;
     }
 
     /// Clear `awaiting_gc` (and the stamp): the frame is fetched normally.
@@ -1384,7 +1454,7 @@ impl StorageEngine {
             return;
         }
         let Some(current) = current else { return };
-        self.content_changed(row, &path.to_string_lossy(), &current, ev)
+        self.content_changed(row, &path.to_string_lossy(), &current, false, ev)
             .await;
     }
 
@@ -1495,8 +1565,9 @@ async fn with_frame_tx<T>(
 
 /// [`with_frame_tx`] for a caller that already holds the project's disk
 /// lock. `BEGIN IMMEDIATE`; the row must still match on state, landed path,
-/// content version and stamp.
-fn frame_tx_locked<T>(
+/// content version and stamp. Also the write path of the device-replace
+/// adoption (`replace::land_candidate`, `replace::park_row`, Task 11).
+pub(crate) fn frame_tx_locked<T>(
     ctx: &ServiceContext,
     row: &LocalFrameRow,
     f: impl FnOnce(&rusqlite::Transaction<'_>) -> anyhow::Result<Option<T>>,
@@ -2485,6 +2556,53 @@ mod tests {
         let need =
             crate::api::collab_exchange::frame_need(&[r], &Default::default(), true, true, false);
         assert_eq!(need.len(), 1, "the new version is in the need set");
+    }
+
+    /// Task 11 (ledger ruling): a parked frame whose file was then edited is
+    /// never released to a fetch that would land over the edit — spec §9.4
+    /// "Held ──content changed──▶ Quarantined", I9, L5: it is quarantined,
+    /// the file untouched, `awaiting_gc` cleared (so a later "Re-fetch
+    /// original" fetches it).
+    #[tokio::test]
+    async fn a_parked_frame_whose_file_was_edited_is_quarantined_not_released() {
+        let rig = ts::landed_rig(0).await;
+        let big: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let old = rig.root.join("m31").join("a").join("big.fits");
+        ts::land_frame(&rig.ctx, &rig.hub, &rig.node, "big", &old, &big).await;
+        let moved = rig.root.join("m31").join("z-big.fits");
+        std::fs::rename(&old, &moved).unwrap();
+        let mut eng = rig.engine();
+        let t0 = Instant::now();
+        eng.on_signal(FsSignal::Touched(old.clone()), t0);
+        eng.on_signal(FsSignal::Touched(moved.clone()), t0);
+        eng.tick(t0 + AGG, &Holders(2)).await;
+        let r = row(&rig.ctx, ts::PID, "big");
+        assert!(
+            r.local_state == LocalState::Wanted && r.awaiting_gc,
+            "parked: {r:?}"
+        );
+
+        ts::overwrite_same_size(&moved);
+        let edited = std::fs::read(&moved).unwrap();
+        eng.sweep(&Holders(2)).await;
+        let r = row(&rig.ctx, ts::PID, "big");
+        assert_eq!(r.local_state, LocalState::Quarantined, "{r:?}");
+        assert!(!r.awaiting_gc, "no longer parked");
+        assert_eq!(
+            std::fs::read(&moved).unwrap(),
+            edited,
+            "the edit is untouched"
+        );
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        assert_eq!(
+            crate::db::collab_live::list_quarantine(&conn, ts::PID)
+                .unwrap()
+                .len(),
+            1,
+            "listed under Changed files"
+        );
+        // Not `wanted`: the landing fence (`set_landed_if` + `fresh_row`,
+        // P13) refuses any landing over it — see the landing tests.
     }
 
     /// C10 + fix round 1: a dead entry kept alive by an identical sibling's

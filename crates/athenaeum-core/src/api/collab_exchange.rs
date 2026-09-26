@@ -17,6 +17,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 
 use crate::account::keys::{device_key_path, DeviceKey};
+use crate::api::collab_live::landing::{self, Landed};
 use crate::api::{db, ApiError};
 use crate::collab::hub_client::CollabClient;
 use crate::collab::snapshot::{own_display_name, SnapshotMember};
@@ -1622,7 +1623,7 @@ pub(crate) async fn ensure_collab_store(ctx: &ServiceContext) -> Option<iroh_blo
 /// A replica's landed path must lie under the current Collaboration root;
 /// one outside it (a root that moved) counts as missing (m5). Own frames may
 /// live anywhere (P26).
-fn inside_root(root: Option<&Path>, row: &LocalFrameRow, path: &Path) -> bool {
+pub(crate) fn inside_root(root: Option<&Path>, row: &LocalFrameRow, path: &Path) -> bool {
     row.origin == FrameOrigin::Own || root.is_none_or(|r| path.starts_with(r))
 }
 
@@ -2400,7 +2401,12 @@ pub(crate) fn cancel_project_fetch(ctx: &ServiceContext, project_id: &str) -> bo
 }
 
 /// Record a frame-level failure on its row (logged by the caller).
-fn record_frame_error(ctx: &ServiceContext, project_id: &str, frame_uuid: &str, error: &str) {
+pub(crate) fn record_frame_error(
+    ctx: &ServiceContext,
+    project_id: &str,
+    frame_uuid: &str,
+    error: &str,
+) {
     match db(ctx) {
         Ok(db) => {
             if let Err(e) =
@@ -2432,6 +2438,12 @@ struct FetchEnv<'a> {
     cancel: Arc<std::sync::atomic::AtomicBool>,
     /// The project's disk lock (R18), held per frame while it lands.
     lock: Arc<tokio::sync::Mutex<()>>,
+    /// The storage guard every landing checks before a disk write (§9.1,
+    /// Task 11). This wave-2 path builds its own per fetch until the live
+    /// session (Task 15) owns one.
+    guard: Arc<crate::collab::storage::marker::StoreGuard>,
+    /// The landing exports' test seams (nothing armed in production).
+    hooks: crate::sharing::iroh::blobs::ExportHooks,
 }
 
 impl FetchEnv<'_> {
@@ -2440,11 +2452,25 @@ impl FetchEnv<'_> {
     }
 
     fn in_flight_tag(&self, row: &LocalFrameRow) -> String {
-        crate::sharing::iroh::blobs::in_flight_tag(&crate::sharing::iroh::node::project_frame_tag(
+        crate::api::collab_live::landing::project_frame_in_flight_tag(
             self.pid(),
             &row.frame_uuid,
             row.content_version,
-        ))
+        )
+    }
+
+    /// The landing environment of this fetch (Task 11).
+    fn landing(&self) -> crate::api::collab_live::landing::LandingEnv<'_> {
+        crate::api::collab_live::landing::LandingEnv {
+            ctx: self.ctx,
+            node: &self.node,
+            store: &self.store,
+            project: &self.project,
+            collab_root: &self.collab_root,
+            guard: &self.guard,
+            started_at: &self.started_at,
+            hooks: &self.hooks,
+        }
     }
 }
 
@@ -2540,6 +2566,7 @@ pub(crate) async fn fetch_frames_gated(
         return Ok(outcome);
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    let guard = Arc::new(fetch_store_guard(ctx, &collab_root)?);
     // The node's own relay set (already resolved and applied at bind / on
     // refresh) completes each holder's hint; no hub round trip here.
     let relay_urls = node.relay_urls();
@@ -2558,6 +2585,8 @@ pub(crate) async fn fetch_frames_gated(
         forced,
         cancel: Arc::clone(&cancel.1),
         lock: project_disk_lock(ctx, project_id)?,
+        guard,
+        hooks: Default::default(),
     };
 
     let total = need.len();
@@ -2628,6 +2657,31 @@ pub(crate) async fn fetch_frames_gated(
         }
     }
     Ok(outcome)
+}
+
+/// The storage guard of one wave-2 fetch (Task 11): this device's id and
+/// the marker the catalog recorded for THIS root (a record for another path
+/// is not this root's, exactly as [`check_storage_marker`] reads it).
+fn fetch_store_guard(
+    ctx: &ServiceContext,
+    collab_root: &Path,
+) -> Result<crate::collab::storage::marker::StoreGuard, ApiError> {
+    let me = crate::api::account::own_device_id(ctx)?;
+    let recorded = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let stored_path = crate::db::collab_live::store_marker_path(&conn)?;
+        if stored_path.as_deref() == Some(collab_root.to_string_lossy().as_ref()) {
+            crate::db::collab_live::recorded_store_marker(&conn)?
+        } else {
+            None
+        }
+    };
+    Ok(crate::collab::storage::marker::StoreGuard::new(
+        collab_root.to_path_buf(),
+        me,
+        recorded,
+    ))
 }
 
 /// The re-check before every batch (R19). `false` = stop: cancelled, the
@@ -2721,22 +2775,6 @@ pub(crate) fn live_project(
         .ok_or_else(|| ApiError::NotFound("project no longer joined".into()))
 }
 
-/// A landed, on-disk frame of the same project with this content (P24).
-fn identical_landed(
-    ctx: &ServiceContext,
-    row: &LocalFrameRow,
-) -> Result<Option<PathBuf>, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    Ok(
-        crate::db::collab_frames::find_by_project_and_xxh3(&conn, &row.project_id, &row.xxh3)?
-            .into_iter()
-            .filter(|r| r.frame_uuid != row.frame_uuid && r.on_disk && r.blake3 == row.blake3)
-            .filter_map(|r| r.landed_path.map(PathBuf::from))
-            .find(|p| p.is_file()),
-    )
-}
-
 /// One batch, prepared: what to fetch, what to land straight from the store,
 /// and who follows whom (identical content, fetched once).
 #[derive(Default)]
@@ -2809,7 +2847,7 @@ async fn prepare_batch(
                 // P20: never fetch over a dead entry. Park until GC.
                 tracing::warn!(project_id = pid, frame_uuid = %uuid, "frame content is a dead store entry; waiting for GC");
                 let _guard = env.lock.lock().await;
-                if fresh_row(env, &row)?.is_none() {
+                if crate::api::collab_live::landing::fresh_row(&env.landing(), &row)?.is_none() {
                     continue;
                 }
                 unseed_frame(Some(&env.node), pid, &uuid).await;
@@ -2819,14 +2857,14 @@ async fn prepare_batch(
                 continue;
             }
             BlobHealth::Readable => {
-                if let Some(src) = identical_landed(env.ctx, &row)? {
-                    match link_identical(env, &row, &src).await {
+                if let Some(src) = landing::identical_landed(env.ctx, &row)? {
+                    match landing::link_identical(&env.landing(), &row, &src).await {
                         Landed::Yes(_) => {
                             batch.landed.push(holder_ref(&row));
                             outcome.landed += 1;
                         }
-                        Landed::Failed => outcome.failed += 1,
-                        Landed::AwaitingGc | Landed::Stale => {}
+                        Landed::Failed(_) => outcome.failed += 1,
+                        Landed::AwaitingGc | Landed::Stale | Landed::Unavailable => {}
                     }
                     continue;
                 }
@@ -3003,31 +3041,34 @@ async fn run_batch(env: &FetchEnv<'_>, batch: &mut Batch, outcome: &mut FetchOut
         }
     }
 
+    let lenv = env.landing();
     for (row, hash) in to_land {
         let uuid = row.frame_uuid.clone();
         let followers = batch.followers.remove(&uuid).unwrap_or_default();
-        match land_frame(env, &row, hash).await {
+        match landing::land_frame(&lenv, &row, hash).await {
             Landed::Yes(dest) => {
                 batch.landed.push(holder_ref(&row));
                 outcome.landed += 1;
                 landed += 1;
                 for f in followers {
-                    match link_identical(env, &f, &dest).await {
+                    match landing::link_identical(&lenv, &f, &dest).await {
                         Landed::Yes(_) => {
                             batch.landed.push(holder_ref(&f));
                             outcome.landed += 1;
                             landed += 1;
                         }
-                        Landed::Failed => outcome.failed += 1,
-                        Landed::AwaitingGc | Landed::Stale => {}
+                        Landed::Failed(_) => outcome.failed += 1,
+                        Landed::AwaitingGc | Landed::Stale | Landed::Unavailable => {}
                     }
                 }
             }
             Landed::AwaitingGc => {
                 outcome.awaiting_gc += 1;
             }
-            Landed::Stale => {}
-            Landed::Failed => {
+            // The storage went unavailable (§9.1): the bytes stay under
+            // their in-flight tag for a later landing; nothing changes.
+            Landed::Stale | Landed::Unavailable => {}
+            Landed::Failed(_) => {
                 outcome.failed += 1 + followers.len();
                 for f in followers {
                     record_frame_error(
@@ -3063,405 +3104,9 @@ fn fail_with_followers(
 
 /// Delete one tag, logging a failure (the store's open sweep and the
 /// maintenance sweep reclaim a stale in-flight tag).
-async fn drop_tag(store: &iroh_blobs::api::Store, tag: &str) {
+pub(crate) async fn drop_tag(store: &iroh_blobs::api::Store, tag: &str) {
     if let Err(e) = store.tags().delete(tag).await {
         tracing::warn!(tag, error = %e, "delete tag failed");
-    }
-}
-
-/// What landing (or linking) one frame did.
-enum Landed {
-    Yes(PathBuf),
-    /// The store's data went away under us (export found no source): the
-    /// tags are dropped and the frame waits for GC (P20). Not a failure.
-    AwaitingGc,
-    /// The row moved on (a new version, other content) while the bytes were
-    /// in flight (R20): nothing recorded, left for the next pass.
-    Stale,
-    /// Logged and recorded on the row.
-    Failed,
-}
-
-/// The row as it is NOW, or `None` (logged) when it no longer describes the
-/// bytes in hand — a manifest sync moved its version or content, it went
-/// away (R20), or it is already on disk (re-admitted meanwhile, N3).
-fn fresh_row(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<Option<LocalFrameRow>, ApiError> {
-    let db = db(env.ctx)?;
-    let fresh = crate::db::collab_frames::get(&db.conn(), env.pid(), &row.frame_uuid)?;
-    match fresh {
-        Some(f)
-            if f.content_version == row.content_version && f.blake3 == row.blake3 && !f.on_disk =>
-        {
-            Ok(Some(f))
-        }
-        _ => {
-            tracing::info!(
-                project_id = env.pid(),
-                frame_uuid = %row.frame_uuid,
-                content_version = row.content_version,
-                "frame changed while in flight; left for the next pass"
-            );
-            Ok(None)
-        }
-    }
-}
-
-/// Where a NEW landing goes (P10, P21): `unique_path(<Collab>/<project>/
-/// <publisher>/<fileName>)`, the file name checked first.
-fn new_landing_path(env: &FetchEnv<'_>, row: &LocalFrameRow) -> Result<PathBuf, String> {
-    crate::package::validate_rel_path(&row.file_name)
-        .map_err(|e| format!("unsafe file name {:?}: {e:#}", row.file_name))?;
-    let dir = db(env.ctx)
-        .map_err(anyhow::Error::from)
-        .and_then(|db| {
-            publisher_folder(
-                &db.conn(),
-                &env.collab_root,
-                &env.project,
-                &row.publisher_account_id,
-                &row.publisher_display,
-                "publisher",
-            )
-        })
-        .map_err(|e| format!("publisher folder: {e:#}"))?;
-    Ok(crate::sync::ingest::unique_path(&dir.join(
-        crate::sync::ingest::native_rel_path(&row.file_name),
-    )))
-}
-
-/// The target of a landing (fetched or linked). A row that already has a
-/// path inside the Collaboration root lands there, its old tags dropped
-/// first:
-///
-/// - a NEW VERSION (a version bump clears `size_mtime_seen`) lands OVER the
-///   old file under the same name (plan step 7.5, owner-approved);
-/// - a SAME-VERSION re-land (the file went missing or was edited) never
-///   destroys what is there: a file at the path is renamed aside to
-///   `unique_path` first — it becomes an inert foreign file (R24, R18).
-///
-/// Anything else goes to [`new_landing_path`].
-///
-/// Returns the target and whether the file already there holds this frame's
-/// content (size + xxh3) — then the caller must NOT export over it (final
-/// review C1: `export_child` clears its target first, and when that file is
-/// the store entry's only data the export destroys the frame).
-async fn landing_target(
-    env: &FetchEnv<'_>,
-    row: &LocalFrameRow,
-) -> Result<(PathBuf, bool), String> {
-    let existing = row
-        .landed_path
-        .as_deref()
-        .map(PathBuf::from)
-        .filter(|p| inside_root(Some(&env.collab_root), row, p));
-    let Some(dest) = existing else {
-        return new_landing_path(env, row).map(|p| (p, false));
-    };
-    unseed_frame(Some(&env.node), env.pid(), &row.frame_uuid).await;
-    let holds = dest.exists() && holds_frame_content(&dest, row).await;
-    if row.size_mtime_seen.is_some() && dest.exists() && !holds {
-        let aside = crate::sync::ingest::unique_path(&dest);
-        std::fs::rename(&dest, &aside).map_err(|e| {
-            format!(
-                "keep the edited file {} aside as {}: {e}",
-                dest.display(),
-                aside.display()
-            )
-        })?;
-        tracing::info!(
-            project_id = env.pid(),
-            frame_uuid = %row.frame_uuid,
-            path = %dest.display(),
-            dest = %aside.display(),
-            "edited replica kept beside the re-fetched frame"
-        );
-    }
-    Ok((dest, holds))
-}
-
-/// Does the file at `path` already hold this frame's content (size first,
-/// then xxh3)? Then a re-land simply goes over it — a byte-identical copy is
-/// no edit worth keeping aside (N3).
-async fn holds_frame_content(path: &Path, row: &LocalFrameRow) -> bool {
-    match tokio::fs::metadata(path).await {
-        Ok(m) if m.is_file() && m.len() as i64 == row.byte_size => {}
-        _ => return false,
-    }
-    matches!(xxh3_on_blocking(path).await, Ok(h) if h == row.xxh3)
-}
-
-/// Land one fetched frame (P21), under the project's disk lock: re-read the
-/// row (R20), pick the target, `export_child` straight to it — a rename of
-/// the store's data file, so the landed file IS the seed — then the
-/// permanent seed tag, then the in-flight tag goes, then one DB transaction
-/// (row + `sync_history`) that only lands on the same version and content.
-/// A stale landing drops its tags and removes nothing the row references.
-async fn land_frame(env: &FetchEnv<'_>, row: &LocalFrameRow, hash: iroh_blobs::Hash) -> Landed {
-    use crate::sharing::iroh::blobs;
-    use crate::sharing::iroh::node::project_frame_tag;
-
-    let pid = env.pid();
-    let uuid = row.frame_uuid.as_str();
-    let in_flight = env.in_flight_tag(row);
-    let fail = |msg: String| {
-        tracing::error!(project_id = pid, frame_uuid = uuid, error = %msg, "frame landing failed");
-        record_frame_error(env.ctx, pid, uuid, &msg);
-    };
-    let _guard = env.lock.lock().await;
-    let row = match fresh_row(env, row) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            drop_tag(&env.store, &in_flight).await;
-            return Landed::Stale;
-        }
-        Err(e) => {
-            fail(format!("re-read the frame: {e}"));
-            return Landed::Failed;
-        }
-    };
-    let (dest, holds) = match landing_target(env, &row).await {
-        Ok(d) => d,
-        Err(msg) => {
-            fail(msg);
-            drop_tag(&env.store, &in_flight).await;
-            return Landed::Failed;
-        }
-    };
-    if let Some(parent) = dest.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            fail(format!("create {}: {e}", parent.display()));
-            drop_tag(&env.store, &in_flight).await;
-            return Landed::Failed;
-        }
-    }
-    // C1: the file at the target already IS this content (a version bump
-    // with identical bytes, or a same-version re-land over an intact copy).
-    // Exporting would clear the target first and — when that file is the
-    // store entry's only data — destroy the frame. Tag and record it as is.
-    let exported = if holds {
-        tracing::info!(project_id = pid, frame_uuid = uuid, path = %dest.display(), "landed file already holds the frame; no export");
-        Ok(Ok(()))
-    } else {
-        blobs::export_child(&env.store, hash, &dest).await
-    };
-    match exported {
-        Err(e) => {
-            fail(format!("export to {}: {e:#}", dest.display()));
-            drop_tag(&env.store, &in_flight).await;
-            return Landed::Failed;
-        }
-        Ok(Err(e)) if blobs::export_source_vanished(&e) => {
-            tracing::warn!(project_id = pid, frame_uuid = uuid, path = %dest.display(), error = %e, "frame data vanished before landing; waiting for GC");
-            drop_tag(&env.store, &in_flight).await;
-            unseed_frame(Some(&env.node), pid, uuid).await;
-            if let Ok(db) = db(env.ctx) {
-                if let Err(e) = crate::db::collab_frames::set_missing(&db.conn(), pid, uuid, true) {
-                    tracing::warn!(project_id = pid, frame_uuid = uuid, error = %format!("{e:#}"), "mark frame awaiting GC failed");
-                }
-            }
-            return Landed::AwaitingGc;
-        }
-        Ok(Err(e)) => {
-            fail(format!("export to {}: {e}", dest.display()));
-            drop_tag(&env.store, &in_flight).await;
-            return Landed::Failed;
-        }
-        Ok(Ok(())) => {}
-    }
-    let tag = project_frame_tag(pid, uuid, row.content_version);
-    if let Err(e) = env
-        .store
-        .tags()
-        .set(&tag, iroh_blobs::HashAndFormat::raw(hash))
-        .await
-    {
-        fail(format!("seed tag {tag}: {e}"));
-        if !holds {
-            remove_landed(&dest);
-        }
-        drop_tag(&env.store, &in_flight).await;
-        return Landed::Failed;
-    }
-    drop_tag(&env.store, &in_flight).await;
-    match record_landing(env, &row, &dest) {
-        Ok(true) => {
-            tracing::info!(project_id = pid, frame_uuid = uuid, path = %dest.display(), "frame landed");
-            Landed::Yes(dest)
-        }
-        Ok(false) => {
-            forget_stale_landing(env, &row, &tag, &dest).await;
-            Landed::Stale
-        }
-        Err(e) => {
-            fail(format!("record landing: {e:#}"));
-            if !holds {
-                remove_landed(&dest);
-            }
-            unseed_frame(Some(&env.node), pid, uuid).await;
-            Landed::Failed
-        }
-    }
-}
-
-/// A landing the row moved away from while it was written (R20): drop the
-/// seed tag it set, and remove the file only when the row does not reference
-/// that path.
-async fn forget_stale_landing(env: &FetchEnv<'_>, row: &LocalFrameRow, tag: &str, dest: &Path) {
-    tracing::info!(
-        project_id = env.pid(),
-        frame_uuid = %row.frame_uuid,
-        path = %dest.display(),
-        "frame changed while landing; left for the next pass"
-    );
-    drop_tag(&env.store, tag).await;
-    // M3: a failed read must never pick the destructive default — keep the
-    // file (at worst an inert leftover) and log.
-    let current = match db(env.ctx) {
-        Ok(db) => crate::db::collab_frames::get(&db.conn(), env.pid(), &row.frame_uuid)
-            .map_err(|e| format!("{e:#}")),
-        Err(e) => Err(e.to_string()),
-    };
-    let referenced = match current {
-        Ok(current) => current
-            .and_then(|r| r.landed_path)
-            .is_some_and(|p| Path::new(&p) == dest),
-        Err(e) => {
-            tracing::warn!(project_id = env.pid(), frame_uuid = %row.frame_uuid, path = %dest.display(), error = %e, "stale landing: re-reading the frame failed; the file is kept");
-            true
-        }
-    };
-    if !referenced {
-        remove_landed(dest);
-    }
-}
-
-/// Remove a landed file after a failed step, logging a failure.
-fn remove_landed(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        tracing::warn!(path = %path.display(), error = %e, "remove orphaned landed frame failed");
-    }
-}
-
-/// One transaction: the row is landed — only while it still describes these
-/// bytes (R20) — and a `sync_history` row records the receive, the way the
-/// package ingest wrote it. `Ok(false)` = stale, nothing written.
-fn record_landing(env: &FetchEnv<'_>, row: &LocalFrameRow, dest: &Path) -> Result<bool> {
-    let meta = std::fs::metadata(dest).with_context(|| format!("stat {}", dest.display()))?;
-    let sm = size_mtime_from(&meta);
-    let db = db(env.ctx).map_err(|e| anyhow!("{e}"))?;
-    let conn = db.conn();
-    let tx = conn.unchecked_transaction().context("begin landing tx")?;
-    let n = crate::db::collab_frames::set_landed_if(
-        &tx,
-        &row.project_id,
-        &row.frame_uuid,
-        &dest.to_string_lossy(),
-        &sm,
-        row.content_version,
-        &row.blake3,
-    )
-    .context("mark frame landed")?;
-    if n == 0 {
-        return Ok(false);
-    }
-    crate::sync::store::insert_history_row(
-        &tx,
-        &crate::sync::HistoryRow {
-            frame_uuid: row.frame_uuid.clone(),
-            filename: row.file_name.clone(),
-            object: None,
-            // A swarm fetch has no single serving device.
-            peer_device: "swarm".to_string(),
-            direction: crate::sync::Direction::Received,
-            bytes: row.byte_size.max(0) as u64,
-            started_at: env.started_at.clone(),
-            finished_at: Some(crate::sync::now_iso()),
-            outcome: "ingested".to_string(),
-            project: Some(row.project_id.clone()),
-            package_id: None,
-            batch_name: None,
-        },
-    )
-    .context("insert sync_history row")?;
-    tx.commit().context("commit landing tx")?;
-    Ok(true)
-}
-
-/// P24: land a frame whose content another frame of the project already has
-/// on disk — link (or copy) that file, seed it by reference, record it. No
-/// fetch. Under the project's disk lock, on the row as it is now (R20).
-async fn link_identical(env: &FetchEnv<'_>, row: &LocalFrameRow, src: &Path) -> Landed {
-    let pid = env.pid();
-    let uuid = row.frame_uuid.as_str();
-    let fail = |msg: String| {
-        tracing::warn!(project_id = pid, frame_uuid = uuid, error = %msg, "identical frame landing failed");
-        record_frame_error(env.ctx, pid, uuid, &msg);
-    };
-    let _guard = env.lock.lock().await;
-    let row = match fresh_row(env, row) {
-        Ok(Some(r)) => r,
-        Ok(None) => return Landed::Stale,
-        Err(e) => {
-            fail(format!("re-read the frame: {e}"));
-            return Landed::Failed;
-        }
-    };
-    tracing::warn!(project_id = pid, frame_uuid = uuid, path = %src.display(), "identical frame content in project");
-    let dest = match landing_target(env, &row).await {
-        Ok((d, _)) => d,
-        Err(msg) => {
-            fail(msg);
-            return Landed::Failed;
-        }
-    };
-    // A new version lands over the old file: clear it for the link.
-    if dest != src {
-        if let Err(e) = std::fs::remove_file(&dest) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                fail(format!("remove stale {}: {e}", dest.display()));
-                return Landed::Failed;
-            }
-        }
-    }
-    if let Some(parent) = dest.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            fail(format!("create {}: {e}", parent.display()));
-            return Landed::Failed;
-        }
-    }
-    if let Err(e) = crate::sync::ingest::link_or_copy(src, &dest, false) {
-        fail(format!(
-            "link {} -> {}: {e:#}",
-            src.display(),
-            dest.display()
-        ));
-        return Landed::Failed;
-    }
-    if let Err(e) = env
-        .node
-        .seed_project_frame(pid, uuid, row.content_version, &dest)
-        .await
-    {
-        fail(format!("seed {}: {e:#}", dest.display()));
-        remove_landed(&dest);
-        return Landed::Failed;
-    }
-    match record_landing(env, &row, &dest) {
-        Ok(true) => {
-            tracing::info!(project_id = pid, frame_uuid = uuid, path = %dest.display(), "frame landed");
-            Landed::Yes(dest)
-        }
-        Ok(false) => {
-            let tag = crate::sharing::iroh::node::project_frame_tag(pid, uuid, row.content_version);
-            forget_stale_landing(env, &row, &tag, &dest).await;
-            Landed::Stale
-        }
-        Err(e) => {
-            fail(format!("record landing: {e:#}"));
-            remove_landed(&dest);
-            unseed_frame(Some(&env.node), pid, uuid).await;
-            Landed::Failed
-        }
     }
 }
 
@@ -6245,20 +5890,23 @@ mod tests {
                 let conn = db(&r.ctx).unwrap().conn();
                 crate::db::collab::get_project(&conn, PID).unwrap().unwrap()
             };
-            let env = FetchEnv {
+            let store = node.collab_store().unwrap();
+            let guard = crate::collab::storage::marker::StoreGuard::new(
+                r.collab.clone(),
+                crate::api::account::own_device_id(&r.ctx).unwrap(),
+                None,
+            );
+            let hooks = crate::sharing::iroh::blobs::ExportHooks::default();
+            let started_at = crate::sync::now_iso();
+            let env = crate::api::collab_live::landing::LandingEnv {
                 ctx: &r.ctx,
-                store: node.collab_store().unwrap(),
-                client: CollabClient::new(&r.hub.uri()).unwrap(),
-                token: "tok".into(),
-                relay_urls: Vec::new(),
-                own: node.node_id(),
-                project,
-                collab_root: r.collab.clone(),
-                started_at: crate::sync::now_iso(),
-                forced: false,
-                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                lock: project_disk_lock(&r.ctx, PID).unwrap(),
-                node: Arc::clone(&node),
+                node: &node,
+                store: &store,
+                project: &project,
+                collab_root: &r.collab,
+                guard: &guard,
+                started_at: &started_at,
+                hooks: &hooks,
             };
             let tag = crate::sharing::iroh::node::project_frame_tag(PID, "f1", 1);
             let rename = |from: &str, to: &str| {
@@ -6270,11 +5918,11 @@ mod tests {
             };
 
             rename("project_frames_local", "pfl_aside");
-            forget_stale_landing(&env, &row, &tag, &stale).await;
+            crate::api::collab_live::landing::forget_stale_landing(&env, &row, &tag, &stale).await;
             assert!(stale.exists(), "an unreadable row keeps the file");
 
             rename("pfl_aside", "project_frames_local");
-            forget_stale_landing(&env, &row, &tag, &stale).await;
+            crate::api::collab_live::landing::forget_stale_landing(&env, &row, &tag, &stale).await;
             assert!(!stale.exists(), "an unreferenced stale file goes");
             node.shutdown().await;
         }

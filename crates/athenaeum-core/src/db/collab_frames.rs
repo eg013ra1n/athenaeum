@@ -819,10 +819,16 @@ pub fn set_landed(
     Ok(())
 }
 
-/// [`set_landed`] only while the row still describes the bytes that landed —
-/// the same `content_version` AND `blake3` (a manifest sync can move either
-/// while a fetch runs, ruling R20). Returns the rows touched: 0 means the
-/// landing is stale and nothing was written.
+/// Record a landing's path and stamp only while the row still describes the
+/// bytes that landed — the same `content_version` AND `blake3` (a manifest
+/// sync can move either while a fetch runs, ruling R20; the landing fence,
+/// I1) — AND is still `wanted` (P13: nothing lands over a quarantined, not
+/// kept or awaiting-choice frame, spec §7.5). Clears `awaiting_gc`,
+/// `last_error` and `rejected_size_mtime`. It no longer moves `on_disk` or
+/// `local_state`: the caller runs [`set_local_state`] (`held`, with its
+/// outbox `add`) in the same transaction (collab v3 wave 3, Task 11).
+/// Returns the rows touched: 0 means the landing is stale and nothing was
+/// written.
 #[allow(clippy::too_many_arguments)]
 pub fn set_landed_if(
     conn: &Connection,
@@ -835,14 +841,11 @@ pub fn set_landed_if(
 ) -> Result<usize> {
     Ok(conn.execute(
         "UPDATE project_frames_local
-         SET landed_path = ?3, size_mtime_seen = ?4, on_disk = 1, awaiting_gc = 0,
+         SET landed_path = ?3, size_mtime_seen = ?4, awaiting_gc = 0,
              last_error = NULL, rejected_size_mtime = NULL,
-             local_state = CASE WHEN origin = 'own' THEN 'own_held' ELSE 'held' END,
-             state_changed_at = CASE
-                 WHEN local_state IS (CASE WHEN origin = 'own' THEN 'own_held' ELSE 'held' END)
-                 THEN state_changed_at ELSE datetime('now') END,
              updated_at = datetime('now')
-         WHERE project_id = ?1 AND frame_uuid = ?2 AND content_version = ?5 AND blake3 = ?6",
+         WHERE project_id = ?1 AND frame_uuid = ?2 AND content_version = ?5 AND blake3 = ?6
+           AND local_state = 'wanted'",
         params![
             project_id,
             frame_uuid,
@@ -2071,48 +2074,41 @@ mod tests {
         assert_eq!(adopt_own(&c, "p1", "u2", 8, "/x", "r", None).unwrap(), 0);
     }
 
-    /// R20: `set_landed_if` lands only on the version and content it was
-    /// asked for; a moved row stays untouched.
+    /// R20 + Task 11 (P13): `set_landed_if` lands only on the version and
+    /// content it was asked for, and only on a `wanted` row; a moved or
+    /// quarantined row stays untouched. It records the path and stamp only
+    /// — the caller's `set_local_state(Held)` in the same transaction moves
+    /// `on_disk`/`local_state` and appends the outbox `add`.
     #[test]
     fn set_landed_if_refuses_a_moved_version() {
         let c = conn();
         upsert_from_manifest(&c, "p1", &view("u1", 1)).unwrap();
         let r = get(&c, "p1", "u1").unwrap().unwrap();
-        assert_eq!(
-            set_landed_if(
-                &c,
-                "p1",
-                "u1",
-                "/x/a.fits",
-                "1:1",
-                r.content_version + 1,
-                &r.blake3
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            set_landed_if(
-                &c,
-                "p1",
-                "u1",
-                "/x/a.fits",
-                "1:1",
-                r.content_version,
-                "f00d"
-            )
-            .unwrap(),
-            0
-        );
+        assert_eq!(r.local_state, LocalState::Wanted);
+        let land =
+            |cv: i32, b3: &str| set_landed_if(&c, "p1", "u1", "/x/a.fits", "1:1", cv, b3).unwrap();
+        assert_eq!(land(r.content_version + 1, &r.blake3), 0);
+        assert_eq!(land(r.content_version, "f00d"), 0);
         assert!(!get(&c, "p1", "u1").unwrap().unwrap().on_disk);
+
+        // P13: not `wanted` (a quarantined file) — refused on the same
+        // version and content.
+        set_local_state(&c, "p1", "u1", LocalState::Quarantined).unwrap();
+        assert_eq!(land(r.content_version, &r.blake3), 0);
+        let q = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(q.local_state, LocalState::Quarantined);
+        assert!(q.landed_path.is_none());
+        set_local_state(&c, "p1", "u1", LocalState::Wanted).unwrap();
+
         set_rejected_size_mtime(&c, "p1", "u1", "9:9").unwrap();
         assert_eq!(
             rejected_size_mtime(&c, "p1", "u1").unwrap().as_deref(),
             Some("9:9")
         );
+        let tx = c.unchecked_transaction().unwrap();
         assert_eq!(
             set_landed_if(
-                &c,
+                &tx,
                 "p1",
                 "u1",
                 "/x/a.fits",
@@ -2123,9 +2119,25 @@ mod tests {
             .unwrap(),
             1
         );
+        let recorded = get(&tx, "p1", "u1").unwrap().unwrap();
+        assert_eq!(recorded.landed_path.as_deref(), Some("/x/a.fits"));
+        assert_eq!(
+            (recorded.local_state, recorded.on_disk),
+            (LocalState::Wanted, false),
+            "the state is the caller's set_local_state"
+        );
+        let w = set_local_state(&tx, "p1", "u1", LocalState::Held)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            w.claim,
+            Some(crate::db::collab_live::ClaimOp::Add { content_version: 1 })
+        );
+        tx.commit().unwrap();
         let landed = get(&c, "p1", "u1").unwrap().unwrap();
         assert!(landed.on_disk);
-        assert_eq!(landed.landed_path.as_deref(), Some("/x/a.fits"));
+        assert_eq!(landed.local_state, LocalState::Held);
+        assert_eq!(landed.size_mtime_seen.as_deref(), Some("1:1"));
         assert_eq!(
             rejected_size_mtime(&c, "p1", "u1").unwrap(),
             None,

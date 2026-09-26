@@ -404,3 +404,270 @@ pub(crate) fn overwrite_same_size(path: &Path) {
     std::fs::write(path, &bytes).unwrap();
     set_mtime(path, 10);
 }
+
+/// Frames of [`fetch_rig`]: above the collab store's 16 KiB inline limit, so
+/// a fetched blob is OWNED by the store and lands by the DIRECT export
+/// (Task 11 ruling R1: the landing tests must run on that path).
+pub(crate) const FETCH_FRAME_BYTES: usize = 64 * 1024;
+
+/// Task 11's two-node landing rig: a signed-in receiver (`ctx`, `node`, the
+/// Collaboration root `root`) whose manifest is synced from the fake hub
+/// (rows `wanted`), and a relay-disabled provider with its own collab store
+/// holding every published version's bytes. [`fetch_blob`](Self::fetch_blob)
+/// is one `execute_get` from the provider over the collab ALPN into the
+/// receiver's collab store, under the frame's in-flight tag; it remembers
+/// the row as it stood then — the row a landing carries.
+pub(crate) struct FetchRig {
+    pub _tmp: tempfile::TempDir,
+    pub ctx: Arc<ServiceContext>,
+    pub hub: FakeHub,
+    pub node: Arc<SharedIrohNode>,
+    pub root: PathBuf,
+    pub provider: BareNode,
+    _provider_root: tempfile::TempDir,
+    pub guard: crate::collab::storage::marker::StoreGuard,
+    pub hooks: crate::sharing::iroh::blobs::ExportHooks,
+    uuids: Vec<String>,
+    /// Per frame, the bytes of every published version (index 0 = v1).
+    versions: std::sync::Mutex<Vec<Vec<Vec<u8>>>>,
+    /// Per frame, the row as it stood at its last [`fetch_blob`](Self::fetch_blob).
+    in_flight: std::sync::Mutex<Vec<Option<crate::db::collab_frames::LocalFrameRow>>>,
+}
+
+/// `n` frames of [`FETCH_FRAME_BYTES`], published and fetched (v1).
+pub(crate) async fn fetch_rig(n: usize) -> FetchRig {
+    fetch_rig_sized(n, FETCH_FRAME_BYTES).await
+}
+
+/// [`fetch_rig`] with frames of `size` bytes (≤ 16 KiB: inline blobs).
+pub(crate) async fn fetch_rig_sized(n: usize, size: usize) -> FetchRig {
+    let (tmp, ctx, hub) = signed_in_rig().await;
+    let root = collab_root(&ctx);
+    let node = ctx.iroh_node.lock().await.clone().expect("a bound node");
+    let provider = bare_node().await;
+    let provider_root = tempfile::tempdir().unwrap();
+    provider
+        .set_collab_root(Some(provider_root.path()))
+        .await
+        .expect("mount the provider's collab store");
+    pair(&node, &provider).await;
+    let me = crate::api::account::own_device_id(&ctx).unwrap();
+    let recorded =
+        crate::db::collab_live::recorded_store_marker(&crate::api::db(&ctx).unwrap().conn())
+            .unwrap();
+    let guard = crate::collab::storage::marker::StoreGuard::new(root.clone(), me, recorded);
+    assert!(
+        guard.check_now().fetching(),
+        "the designated root is available"
+    );
+    let uuids: Vec<String> = (0..n).map(|i| format!("f{i:02}")).collect();
+    let rig = FetchRig {
+        _tmp: tmp,
+        ctx: Arc::new(ctx),
+        hub,
+        node,
+        root,
+        provider,
+        _provider_root: provider_root,
+        guard,
+        hooks: Default::default(),
+        versions: std::sync::Mutex::new(vec![Vec::new(); n]),
+        in_flight: std::sync::Mutex::new(vec![None; n]),
+        uuids,
+    };
+    for i in 0..n {
+        let uuid = rig.uuids[i].clone();
+        let bytes = FetchRig::pattern(&uuid, 1, size);
+        rig.provide(&bytes).await;
+        rig.hub.seed_frames(PID, "acc-o", &[&uuid], "published");
+        rig.publish(i, bytes, false);
+    }
+    for i in 0..n {
+        rig.fetch_blob(i).await;
+    }
+    rig
+}
+
+impl FetchRig {
+    /// `size` bytes of frame `uuid`, version `version` — distinct per both.
+    pub(crate) fn pattern(uuid: &str, version: i32, size: usize) -> Vec<u8> {
+        format!("frame {uuid} v{version}: pixels ")
+            .into_bytes()
+            .into_iter()
+            .cycle()
+            .take(size)
+            .collect()
+    }
+
+    pub(crate) fn frame(&self, i: usize) -> (String, String) {
+        (PID.to_string(), self.uuids[i].clone())
+    }
+
+    pub(crate) fn receiver_store(&self) -> iroh_blobs::api::Store {
+        self.node
+            .collab_store()
+            .expect("the receiver's collab store")
+    }
+
+    pub(crate) fn row(&self, i: usize) -> crate::db::collab_frames::LocalFrameRow {
+        crate::db::collab_frames::get(
+            &crate::api::db(&self.ctx).unwrap().conn(),
+            PID,
+            &self.uuids[i],
+        )
+        .unwrap()
+        .expect("a cached row")
+    }
+
+    pub(crate) fn bytes(&self, i: usize, version: usize) -> Vec<u8> {
+        self.versions.lock().unwrap()[i][version - 1].clone()
+    }
+
+    pub(crate) fn v1_bytes(&self, i: usize) -> Vec<u8> {
+        self.bytes(i, 1)
+    }
+
+    pub(crate) fn v2_bytes(&self, i: usize) -> Vec<u8> {
+        self.bytes(i, 2)
+    }
+
+    pub(crate) fn v2_hash(&self, i: usize) -> iroh_blobs::Hash {
+        iroh_blobs::Hash::new(self.v2_bytes(i))
+    }
+
+    /// Put `bytes` into the provider's collab store (tagged, so they stay).
+    async fn provide(&self, bytes: &[u8]) {
+        let store = self.provider.collab_store().expect("provider store");
+        let tt = store
+            .blobs()
+            .add_bytes(bytes.to_vec())
+            .temp_tag()
+            .await
+            .unwrap();
+        let hash = tt.hash();
+        store
+            .tags()
+            .set(format!("test/{hash}"), iroh_blobs::HashAndFormat::raw(hash))
+            .await
+            .unwrap();
+    }
+
+    /// Publish `bytes` as frame `i`'s next version on the hub (or its first,
+    /// `bump = false`) and sync the receiver's manifest row.
+    fn publish(&self, i: usize, bytes: Vec<u8>, bump: bool) {
+        let uuid = self.uuids[i].clone();
+        let blake3 = blake3::hash(&bytes).to_hex().to_string();
+        let xxh3 = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
+        let len = bytes.len() as i64;
+        self.hub.update_frame(PID, &uuid, |f| {
+            if bump {
+                f.content_version += 1;
+            }
+            f.blake3 = blake3;
+            f.byte_size = len;
+            f.xxh3 = xxh3;
+        });
+        self.versions.lock().unwrap()[i].push(bytes);
+        let view = self.hub.frame(PID, &uuid).expect("frame published");
+        let conn = crate::api::db(&self.ctx).unwrap().conn();
+        crate::db::collab_frames::upsert_from_manifest(&conn, PID, &view).unwrap();
+    }
+
+    /// The provider re-versions frame `i` with new bytes of the same size;
+    /// the receiver's manifest follows (a held row goes back to `wanted`,
+    /// its old file untouched).
+    pub(crate) async fn publish_new_version(&self, i: usize) {
+        let next = self.versions.lock().unwrap()[i].len() as i32 + 1;
+        let size = self.v1_bytes(i).len();
+        let bytes = Self::pattern(&self.uuids[i], next, size);
+        self.publish_version_with(i, bytes).await;
+    }
+
+    /// [`publish_new_version`](Self::publish_new_version) with given bytes.
+    pub(crate) async fn publish_version_with(&self, i: usize, bytes: Vec<u8>) {
+        self.provide(&bytes).await;
+        self.publish(i, bytes, true);
+    }
+
+    /// Fetch frame `i`'s current bytes from the provider into the receiver's
+    /// collab store under the frame's in-flight tag, and remember the row.
+    pub(crate) async fn fetch_blob(&self, i: usize) {
+        let row = self.row(i);
+        let hash: iroh_blobs::Hash = row.blake3.parse().unwrap();
+        let conn = self
+            .node
+            .endpoint()
+            .connect(
+                self.provider.endpoint_addr(),
+                crate::sharing::iroh::COLLAB_BLOBS_ALPN,
+            )
+            .await
+            .expect("dial the provider on the collab ALPN");
+        let store = self.receiver_store();
+        store
+            .remote()
+            .execute_get(conn, iroh_blobs::protocol::GetRequest::blob(hash))
+            .await
+            .expect("fetched");
+        store
+            .tags()
+            .set(
+                crate::api::collab_live::landing::project_frame_in_flight_tag(
+                    PID,
+                    &row.frame_uuid,
+                    row.content_version,
+                ),
+                iroh_blobs::HashAndFormat::raw(hash),
+            )
+            .await
+            .unwrap();
+        self.in_flight.lock().unwrap()[i] = Some(row);
+    }
+
+    /// The manifest moved while the bytes were in flight (a version bump
+    /// written straight into the receiver's row).
+    pub(crate) fn bump_manifest_version_locally(&self, i: usize) {
+        crate::api::db(&self.ctx)
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE project_frames_local SET content_version = content_version + 1
+                 WHERE project_id = ?1 AND frame_uuid = ?2",
+                rusqlite::params![PID, self.uuids[i]],
+            )
+            .unwrap();
+    }
+
+    /// Land frame `i` with the row its last fetch carried: `Ok(path)` for
+    /// `Landed::Yes`, `Err(landed)` otherwise.
+    pub(crate) async fn land(
+        &self,
+        i: usize,
+    ) -> Result<PathBuf, crate::api::collab_live::landing::Landed> {
+        use crate::api::collab_live::landing::{land_frame, Landed, LandingEnv};
+        let row = self.in_flight.lock().unwrap()[i]
+            .clone()
+            .expect("fetch_blob first");
+        let hash: iroh_blobs::Hash = row.blake3.parse().unwrap();
+        let project =
+            crate::db::collab::get_project(&crate::api::db(&self.ctx).unwrap().conn(), PID)
+                .unwrap()
+                .expect("the project row");
+        let store = self.receiver_store();
+        let started_at = crate::sync::now_iso();
+        let env = LandingEnv {
+            ctx: &self.ctx,
+            node: &self.node,
+            store: &store,
+            project: &project,
+            collab_root: &self.root,
+            guard: &self.guard,
+            started_at: &started_at,
+            hooks: &self.hooks,
+        };
+        match land_frame(&env, &row, hash).await {
+            Landed::Yes(p) => Ok(p),
+            other => Err(other),
+        }
+    }
+}

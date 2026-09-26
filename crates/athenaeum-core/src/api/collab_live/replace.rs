@@ -594,42 +594,55 @@ pub(crate) async fn land_candidate(
     } else {
         LocalState::Held
     };
+    // Task 11 (ledger ruling): written through the storage engine's fenced
+    // transaction — the row must still be what the caller read (state,
+    // landed path, content version, stamp); a row that moved on meanwhile
+    // (a manifest bump, a landing, a user action) is never turned `held`
+    // from a stale view. The seed tag this set stays (same name for a
+    // concurrent landing of this version; a new version's landing unseeds
+    // every tag of the frame first).
     let lock = crate::api::collab_exchange::project_disk_lock(ctx, &row.project_id)?;
     let _guard = lock.lock().await;
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    crate::db::collab_frames::update_landed_path(
-        &tx,
-        &row.project_id,
-        &row.frame_uuid,
-        &landed_str,
-    )?;
-    if let Ok(meta) = std::fs::metadata(landed_path) {
-        crate::db::collab_frames::set_size_mtime_seen(
-            &tx,
+    let hash_str = hash.to_string();
+    let write = crate::api::collab_live::storage_task::frame_tx_locked(ctx, row, |tx| {
+        crate::db::collab_frames::update_landed_path(
+            tx,
             &row.project_id,
             &row.frame_uuid,
-            &crate::api::collab_exchange::size_mtime_from(&meta),
+            &landed_str,
         )?;
+        if let Ok(meta) = std::fs::metadata(landed_path) {
+            crate::db::collab_frames::set_size_mtime_seen(
+                tx,
+                &row.project_id,
+                &row.frame_uuid,
+                &crate::api::collab_exchange::size_mtime_from(&meta),
+            )?;
+        }
+        // The file hashed to the row's confirmed blake3: an own row is no
+        // longer staged (Task 10, C11).
+        tx.execute(
+            "UPDATE project_frames_local SET awaiting_gc = 0, rejected_size_mtime = NULL,
+                own_staged = CASE WHEN blake3 = ?3 THEN 0 ELSE own_staged END
+             WHERE project_id = ?1 AND frame_uuid = ?2",
+            rusqlite::params![row.project_id, row.frame_uuid, hash_str],
+        )?;
+        Ok(crate::db::collab_frames::set_local_state(
+            tx,
+            &row.project_id,
+            &row.frame_uuid,
+            target_state,
+        )?)
+    })?;
+    if write.is_none() {
+        tracing::info!(
+            project_id = %row.project_id,
+            frame_uuid = %row.frame_uuid,
+            path = %landed_str,
+            "adopt by hash: the frame moved on meanwhile; not recorded"
+        );
+        return Ok(Landing::Refused);
     }
-    // The file hashed to the row's confirmed blake3: an own row is no longer
-    // staged (Task 10, C11).
-    tx.execute(
-        "UPDATE project_frames_local SET awaiting_gc = 0, rejected_size_mtime = NULL,
-            own_staged = CASE WHEN blake3 = ?3 THEN 0 ELSE own_staged END
-         WHERE project_id = ?1 AND frame_uuid = ?2",
-        rusqlite::params![row.project_id, row.frame_uuid, hash.to_string()],
-    )?;
-    let write = crate::db::collab_frames::set_local_state(
-        &tx,
-        &row.project_id,
-        &row.frame_uuid,
-        target_state,
-    )?;
-    tx.commit().map_err(|e| ApiError::Internal(e.to_string()))?;
     if is_moved_class(row) {
         tracing::info!(
             project_id = %row.project_id,
@@ -695,33 +708,41 @@ pub(crate) async fn park_row(
         LocalState::Wanted
     };
     let landed_str = landed_path.to_string_lossy().to_string();
+    // Task 11 (ledger ruling): the storage engine's fenced transaction — a
+    // row that moved on since the caller read it is left to the newer write.
     let lock = crate::api::collab_exchange::project_disk_lock(ctx, &row.project_id)?;
     let _guard = lock.lock().await;
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    crate::db::collab_frames::update_landed_path(
-        &tx,
-        &row.project_id,
-        &row.frame_uuid,
-        &landed_str,
-    )?;
-    if let Ok(meta) = std::fs::metadata(landed_path) {
-        crate::db::collab_frames::set_size_mtime_seen(
-            &tx,
+    let written = crate::api::collab_live::storage_task::frame_tx_locked(ctx, row, |tx| {
+        crate::db::collab_frames::update_landed_path(
+            tx,
             &row.project_id,
             &row.frame_uuid,
-            &crate::api::collab_exchange::size_mtime_from(&meta),
+            &landed_str,
         )?;
+        if let Ok(meta) = std::fs::metadata(landed_path) {
+            crate::db::collab_frames::set_size_mtime_seen(
+                tx,
+                &row.project_id,
+                &row.frame_uuid,
+                &crate::api::collab_exchange::size_mtime_from(&meta),
+            )?;
+        }
+        tx.execute(
+            "UPDATE project_frames_local SET awaiting_gc = 1 WHERE project_id = ?1 AND frame_uuid = ?2",
+            rusqlite::params![row.project_id, row.frame_uuid],
+        )?;
+        crate::db::collab_frames::set_local_state(tx, &row.project_id, &row.frame_uuid, parked)?;
+        Ok(Some(()))
+    })?;
+    if written.is_none() {
+        tracing::info!(
+            project_id = %row.project_id,
+            frame_uuid = %row.frame_uuid,
+            path = %landed_str,
+            "moved frame changed meanwhile; not parked"
+        );
+        return Ok(());
     }
-    tx.execute(
-        "UPDATE project_frames_local SET awaiting_gc = 1 WHERE project_id = ?1 AND frame_uuid = ?2",
-        rusqlite::params![row.project_id, row.frame_uuid],
-    )?;
-    crate::db::collab_frames::set_local_state(&tx, &row.project_id, &row.frame_uuid, parked)?;
-    tx.commit().map_err(|e| ApiError::Internal(e.to_string()))?;
     tracing::warn!(
         project_id = %row.project_id,
         frame_uuid = %row.frame_uuid,
@@ -1688,5 +1709,53 @@ mod tests {
             .unwrap();
         assert_eq!(b.local_state, LocalState::Wanted, "never landed");
         assert_eq!(b.landed_path, None);
+    }
+
+    /// Task 11 (ledger ruling): `land_candidate` writes through the storage
+    /// engine's fenced transaction — a row that moved on after the caller
+    /// read it (here: a manifest version bump) is never turned `held` from
+    /// the stale view; the current row adopts normally.
+    #[tokio::test]
+    async fn land_candidate_never_records_a_row_that_moved_on() {
+        let (_t, ctx, hub) = signed_in_rig().await;
+        let root = collab_root(&ctx);
+        let (pid, uuid, path) = seed_replica_file(&ctx, &hub, &root).await;
+        let node = crate::api::collab_exchange::bound_node(&ctx).await.unwrap();
+        let stale = crate::db::collab_frames::get(&db(&ctx).unwrap().conn(), &pid, &uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.local_state, LocalState::Wanted);
+        db(&ctx)
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE project_frames_local SET content_version = content_version + 1
+                 WHERE project_id = ?1 AND frame_uuid = ?2",
+                rusqlite::params![pid, uuid],
+            )
+            .unwrap();
+        assert_eq!(
+            land_candidate(&ctx, &node, &stale, &path).await.unwrap(),
+            Landing::Refused
+        );
+        let row = crate::db::collab_frames::get(&db(&ctx).unwrap().conn(), &pid, &uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.local_state,
+            LocalState::Wanted,
+            "not held from a stale view"
+        );
+        assert_eq!(row.landed_path, None);
+        assert_eq!(row.content_version, stale.content_version + 1);
+
+        // the current row (same bytes, so it still hashes to its blake3) adopts
+        assert!(matches!(
+            land_candidate(&ctx, &node, &row, &path).await.unwrap(),
+            Landing::Landed {
+                to: LocalState::Held,
+                ..
+            }
+        ));
     }
 }

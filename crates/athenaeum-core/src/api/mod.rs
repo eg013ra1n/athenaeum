@@ -72,8 +72,10 @@ pub mod collab;
 // the hub's `/me/events` stream — cursors, catch-up, resync, the versions
 // vector and epoch change. Gated the same as `api::collab`, which it calls
 // (`refresh_projects_reporting`, `on_thresholds_or_dictionary_moved`) and
-// alongside (the render-gated publish path a re-announce feeds).
-#[cfg(all(feature = "render", feature = "solver"))]
+// alongside (the render-gated publish path a re-announce feeds). The gate
+// sits on each child in `collab_live/mod.rs`: the landing (Task 11) is the
+// one ungated child, because the wave-2 fetch path in the headless
+// `collab_exchange` calls it until Task 15.
 pub mod collab_live;
 
 // Coalesced auto-publish per project (collab v3 wave 2, Task 10; R16, §5.2

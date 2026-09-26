@@ -260,8 +260,11 @@ fn is_inside_any(p: &Path, roots: &[PathBuf]) -> bool {
     })
 }
 
+/// The device a path (or its nearest existing ancestor) lives on — what
+/// picks `AtomicRename` vs `CopyVerifyDelete` here, and the collab landing's
+/// DIRECT vs TEMP export (collab v3 wave 3, Task 11).
 #[cfg(unix)]
-fn device_id_for(p: &Path) -> Result<u64> {
+pub(crate) fn device_id_for(p: &Path) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     // Walk up to the nearest existing ancestor (planner may be asked about a
     // dest that doesn't yet exist as a sub-tree). For our planner we already
@@ -279,7 +282,7 @@ fn device_id_for(p: &Path) -> Result<u64> {
 }
 
 #[cfg(windows)]
-fn device_id_for(p: &Path) -> Result<u64> {
+pub(crate) fn device_id_for(p: &Path) -> Result<u64> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     // Windows doesn't expose st_dev on stable. Use the volume root (drive

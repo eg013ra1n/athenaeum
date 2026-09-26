@@ -670,7 +670,7 @@ pub(crate) fn export_source_vanished(err: &iroh_blobs::api::RequestError) -> boo
 
 /// What one child export did: `Ok(())` landed, `Err` is iroh's own failure for
 /// the caller to classify (§5.3) with the collection tag in hand.
-type ExportOutcome = std::result::Result<(), iroh_blobs::api::RequestError>;
+pub(crate) type ExportOutcome = std::result::Result<(), iroh_blobs::api::RequestError>;
 
 /// One child of [`fetch_collection_to_dir`]'s export loop: clear a stale target
 /// left by an earlier attempt, then export the blob BY REFERENCE.
@@ -724,6 +724,260 @@ pub(crate) async fn export_child(
         .finish()
         .await
         .map(|_| ()))
+}
+
+// ── collab landing (collab v3 wave 3, Task 11; spec §7.5, I7, L7, P12) ──────
+
+/// The extension of a collab landing's temporary file (the watcher ignores
+/// it, spec §9.2).
+pub(crate) const ATHTMP_EXT: &str = "athtmp";
+
+/// `<target>.athtmp` in the target's directory.
+pub(crate) fn athtmp_path(target: &Path) -> PathBuf {
+    let mut s = target.as_os_str().to_owned();
+    s.push(".");
+    s.push(ATHTMP_EXT);
+    PathBuf::from(s)
+}
+
+/// Test seams of the two collab landing exports, carried by the caller
+/// (never a global: landings run on multi-thread runtimes). Production
+/// passes a default value — nothing armed — and only reads the flags; the
+/// counters let a test COUNT exports instead of assuming them.
+#[derive(Debug, Default)]
+pub(crate) struct ExportHooks {
+    fail_before_export: std::sync::atomic::AtomicBool,
+    fail_after_export: std::sync::atomic::AtomicBool,
+    direct_exports: std::sync::atomic::AtomicUsize,
+    temp_exports: std::sync::atomic::AtomicUsize,
+}
+
+impl ExportHooks {
+    /// The next landing fails before its export (the old file untouched).
+    #[cfg(test)]
+    pub(crate) fn fail_before_export_once(&self) {
+        self.fail_before_export
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The next TEMP landing fails between its export and its rename.
+    #[cfg(test)]
+    pub(crate) fn fail_after_export_once(&self) {
+        self.fail_after_export
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many store exports went straight onto a target (DIRECT).
+    #[cfg(test)]
+    pub(crate) fn direct_exports(&self) -> usize {
+        self.direct_exports
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many store exports went to a `.athtmp` file (TEMP).
+    #[cfg(test)]
+    pub(crate) fn temp_exports(&self) -> usize {
+        self.temp_exports.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn take(flag: &std::sync::atomic::AtomicBool) -> bool {
+        flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn injected(&self, flag: &std::sync::atomic::AtomicBool, at: &str) -> Result<()> {
+        if Self::take(flag) {
+            let e = anyhow::anyhow!("injected fault {at}");
+            tracing::error!(error = %e, "collab landing test fault");
+            return Err(LocalFault(e).into());
+        }
+        Ok(())
+    }
+}
+
+/// DIRECT collab landing (Task 11 ruling R1, "variant C"): the blob is
+/// OWNED by the collab store (`owned_data` = its `<store>/data/<hash>.data`
+/// file exists) and that file sits on the target's device. iroh-blobs 0.103
+/// then exports by ONE `std::fs::rename(<data file>, target)`
+/// (`store/fs.rs::export_path_impl`) — an atomic replace of an existing
+/// target on every platform we ship, so the old version stays whole until
+/// the new one is complete (I7, L7) — and records the entry as
+/// `External([target])`: the store serves from the target, no re-import, no
+/// re-hash. Pinned by
+/// `owned_try_reference_export_is_an_atomic_rename_over_the_target`.
+///
+/// No `remove_file(target)` pre-step (spec §7.5). The caller serializes
+/// landings per hash so nothing re-exports the entry between its Owned check
+/// and this export. Afterwards the data file must be gone and the target
+/// must have `size` bytes; anything else (an export that took the in-place
+/// copy arm after all) is a [`LocalFault`], logged — never an unreported
+/// rewrite of the old file.
+pub(crate) async fn export_child_direct(
+    store: &Store,
+    hash: Hash,
+    target: &Path,
+    size: u64,
+    owned_data: &Path,
+    hooks: &ExportHooks,
+) -> Result<ExportOutcome> {
+    hooks.injected(&hooks.fail_before_export, "before export")?;
+    hooks
+        .direct_exports
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Err(e) = store
+        .blobs()
+        .export_with_opts(ExportOptions {
+            hash,
+            mode: ExportMode::TryReference,
+            target: target.to_path_buf(),
+        })
+        .finish()
+        .await
+    {
+        return Ok(Err(e));
+    }
+    let data_gone = matches!(
+        tokio::fs::metadata(owned_data).await,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    let landed = tokio::fs::metadata(target).await.map(|m| m.len());
+    if !data_gone || !matches!(landed, Ok(n) if n == size) {
+        let e = anyhow::anyhow!(
+            "direct export of {hash} onto {} did not move the store's data file \
+             (data file gone: {data_gone}, target size: {landed:?}, expected {size})",
+            target.display()
+        );
+        tracing::error!(path = %target.display(), hash = %hash, error = %e, "direct landing left an unexpected state");
+        return Err(LocalFault(e).into());
+    }
+    Ok(Ok(()))
+}
+
+/// TEMP collab landing (spec §7.5, plan P12) — every blob the DIRECT path
+/// cannot take: inline (≤ 16 KiB, written by `File::create`), already
+/// external (reflink-or-copy onto the target) or owned on another device
+/// (EXDEV copy): export to `<target>.athtmp`, rename it over `<target>` (the
+/// old version stays whole until the new one is complete, I7/L7), then
+/// re-import `<target>` by reference so the store's first external path is
+/// the target and not the dead temp name (iroh-blobs 0.103 records the
+/// EXPORT path as the entry's location, `store/fs.rs::export_path_impl`; an
+/// import merges the path lists, sorted, and `<name>` sorts before
+/// `<name>.athtmp`).
+///
+/// A temp file left by a landing that stopped after its export and before
+/// its rename is reused when its size AND its BLAKE3 match — verified BEFORE
+/// the rename, so a wrong file never replaces the old version; one that
+/// does not match is removed and exported again.
+pub(crate) async fn export_child_replacing(
+    store: &Store,
+    hash: Hash,
+    target: &Path,
+    size: u64,
+    hooks: &ExportHooks,
+) -> Result<ExportOutcome> {
+    hooks.injected(&hooks.fail_before_export, "before export")?;
+    let tmp = athtmp_path(target);
+    let reuse = match tokio::fs::metadata(&tmp).await {
+        Ok(m) if m.is_file() && m.len() == size => match blake3_on_blocking(&tmp).await {
+            Ok(h) if h == hash => true,
+            Ok(h) => {
+                tracing::warn!(path = %tmp.display(), hash = %h, expected = %hash, "landing temp file holds other bytes; exported again");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(path = %tmp.display(), error = %format!("{e:#}"), "landing temp file unreadable; exported again");
+                false
+            }
+        },
+        Ok(_) => false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(LocalFault(
+                anyhow::Error::new(e).context(format!("stat temp {}", tmp.display())),
+            )
+            .into())
+        }
+    };
+    if !reuse {
+        // A partial or foreign temp file of ours: the store never referenced
+        // it (an export records its path only after the copy completed).
+        match tokio::fs::remove_file(&tmp).await {
+            Ok(()) => {
+                tracing::debug!(path = %tmp.display(), "stale landing temp file removed")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(LocalFault(
+                    anyhow::Error::new(e).context(format!("remove stale temp {}", tmp.display())),
+                )
+                .into())
+            }
+        }
+        hooks
+            .temp_exports
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Err(e) = store
+            .blobs()
+            .export_with_opts(ExportOptions {
+                hash,
+                mode: ExportMode::TryReference,
+                target: tmp.clone(),
+            })
+            .finish()
+            .await
+        {
+            return Ok(Err(e));
+        }
+    } else {
+        tracing::info!(path = %tmp.display(), "landing temp file reused");
+    }
+    hooks.injected(&hooks.fail_after_export, "between export and rename")?;
+    if let Err(e) = tokio::fs::rename(&tmp, target).await {
+        return Err(LocalFault(anyhow::Error::new(e).context(format!(
+            "rename {} over {}",
+            tmp.display(),
+            target.display()
+        )))
+        .into());
+    }
+    let mut meter = ImportProgressMeter::new(None, size);
+    let tt = add_path_child(store, target, size, ImportMode::TryReference, &mut meter).await?;
+    if tt.hash() != hash {
+        let e = anyhow::anyhow!(
+            "re-import of {} hashed {} instead of {}",
+            target.display(),
+            tt.hash(),
+            hash
+        );
+        tracing::error!(path = %target.display(), error = %e, "landing re-import mismatch");
+        return Err(LocalFault(e).into());
+    }
+    let _tt = ensure_child_readable(
+        store,
+        target,
+        hash,
+        size,
+        ImportMode::TryReference,
+        tt,
+        CopyRepair::Refuse,
+    )
+    .await?;
+    Ok(Ok(()))
+}
+
+/// Full-file BLAKE3 of `path`, off the runtime.
+async fn blake3_on_blocking(path: &Path) -> Result<Hash> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Hash> {
+        let mut hasher = blake3::Hasher::new();
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        hasher
+            .update_reader(file)
+            .with_context(|| format!("hash {}", path.display()))?;
+        Ok(Hash::from_bytes(*hasher.finalize().as_bytes()))
+    })
+    .await
+    .context("blake3 task join")?
 }
 
 /// Handle the ONE export failure that is transfer-class (§5.3): the file the
@@ -1643,4 +1897,88 @@ pub async fn fetch_manifest_to_dir(
         "manifest fetched from collection"
     );
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn athtmp_path_is_the_target_plus_the_extension() {
+        assert_eq!(
+            athtmp_path(Path::new("/c/a/x.fits")),
+            PathBuf::from("/c/a/x.fits.athtmp")
+        );
+    }
+
+    /// Task 11 ruling R1 — the library behaviour the DIRECT collab landing
+    /// ([`export_child_direct`]) relies on, read from iroh-blobs 0.103
+    /// `store/fs.rs::export_path_impl`: a `TryReference` export of an OWNED
+    /// blob is one `rename(<store>/data/<hash>.data, target)` — an atomic
+    /// replace of an existing target, never an in-place write — after which
+    /// the store serves the blob from the target.
+    ///
+    /// If this breaks on an iroh upgrade, switch every landing to the TEMP
+    /// path ([`export_child_replacing`], plan P12).
+    #[tokio::test]
+    async fn owned_try_reference_export_is_an_atomic_rename_over_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("blobs");
+        let store = super::super::node::open_fs_store(&dir).await.unwrap();
+        let bytes: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let tt = store
+            .blobs()
+            .add_bytes(bytes.clone())
+            .temp_tag()
+            .await
+            .unwrap();
+        let hash = tt.hash();
+        let data = iroh_blobs::store::fs::options::Options::new(&dir)
+            .path
+            .data_path(&hash);
+        assert!(data.is_file(), "a blob above 16 KiB is owned by the store");
+        #[cfg(unix)]
+        let data_ino = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&data).unwrap().ino()
+        };
+
+        let target = tmp.path().join("landed").join("x.fits");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"the old version: other bytes, other size").unwrap();
+        store
+            .blobs()
+            .export_with_opts(ExportOptions {
+                hash,
+                mode: ExportMode::TryReference,
+                target: target.clone(),
+            })
+            .finish()
+            .await
+            .expect("the export lands");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().ino(),
+                data_ino,
+                "the target IS the former data file: one rename, no in-place write"
+            );
+        }
+        assert!(
+            !data.exists(),
+            "the store's data file moved onto the target"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        probe_first_byte(&store, hash)
+            .await
+            .expect("the store serves the blob from the target");
+        assert_eq!(
+            store.blobs().get_bytes(hash).await.unwrap().as_ref(),
+            bytes.as_slice()
+        );
+        drop(tt);
+        store.shutdown().await.unwrap();
+    }
 }
