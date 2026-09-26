@@ -1302,6 +1302,7 @@ impl Runtime {
                 } => {
                     self.attention.insert(project_id.clone());
                     self.exec.dirty.insert(project_id.clone());
+                    self.exec.forget_partial(&project_id, &frame_uuid);
                     self.emit(
                         COLLAB_FRAME_CHANGED_EVENT,
                         &CollabFrameChanged {

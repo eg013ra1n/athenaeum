@@ -1072,6 +1072,34 @@ impl Executor {
         }
     }
 
+    /// A frame was quarantined (Task 15 R2): the partial bytes of its
+    /// current version's fetch go with their in-flight tag — nothing lands
+    /// over the quarantined file, so nothing resumes them. A fetch still
+    /// running for it drops its own tag when the core's cancel ends it.
+    pub(crate) fn forget_partial(&mut self, project_id: &str, frame_uuid: &str) {
+        if self
+            .items
+            .values()
+            .any(|i| i.key.0 == project_id && i.key.1 == frame_uuid)
+        {
+            return;
+        }
+        let cv = match db(&self.env.ctx)
+            .and_then(|d| Ok(frames_db::get(&d.conn(), project_id, frame_uuid)?))
+        {
+            Ok(Some(r)) => r.content_version,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(project_id, frame_uuid, error = %e, "quarantined frame could not be read; its partial bytes are kept");
+                return;
+            }
+        };
+        let store = self.env.store.clone();
+        let tag = project_frame_in_flight_tag(project_id, frame_uuid, cv);
+        self.tasks
+            .spawn(async move { drop_tag(&store, &tag).await });
+    }
+
     /// I11: close every pooled connection to a node the connect gate no
     /// longer admits.
     pub(crate) fn close_not_admitted(&self) -> usize {
@@ -1348,6 +1376,41 @@ mod tests {
             need_wants(&conn, &off, true).unwrap().is_empty(),
             "toggle gate"
         );
+    }
+
+    /// Task 15 R2: a quarantined frame's partial bytes lose their
+    /// in-flight tag (nothing will resume them).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quarantined_frame_loses_its_in_flight_tag() {
+        let rig = ts::landed_rig(1).await;
+        let (pid, uuid, _) = rig.frames[0].clone();
+        let store = rig.node.collab_store().unwrap();
+        let tag = project_frame_in_flight_tag(&pid, &uuid, 1);
+        store
+            .tags()
+            .set(&tag, iroh_blobs::HashAndFormat::raw(rig.hash_of(0)))
+            .await
+            .unwrap();
+        let me = crate::api::account::own_device_id(&rig.ctx).unwrap();
+        let mut exec = Executor::new(
+            ExecEnv {
+                ctx: Arc::clone(&rig.ctx),
+                node: Arc::clone(&rig.node),
+                store: store.clone(),
+                root: rig.root.clone(),
+                guard: Arc::new(StoreGuard::new(rig.root.clone(), me, None)),
+                control: Arc::new(InboundControl::new()),
+            },
+            2,
+            7,
+        );
+        exec.forget_partial(&pid, &uuid);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.tags().get(tag.as_bytes()).await.unwrap().is_some() {
+            assert!(Instant::now() < deadline, "the in-flight tag is dropped");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        exec.shutdown();
     }
 
     // ── the pure need set (moved from the wave-2 `collab_exchange`) ─────
