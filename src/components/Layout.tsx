@@ -30,6 +30,7 @@ import { UpdateDialog } from './updates/UpdateDialog';
 import { AutoUpdateCheck } from './AutoUpdateCheck';
 import { useProjectMatches } from '../hooks/useProjectMatches';
 import { useCollabNotifications } from '../hooks/useCollabNotifications';
+import DeviceReplaceDialog, { DeviceReplaceProvider } from './collab/DeviceReplaceDialog';
 import { useContentIndexNotifications } from '../hooks/useContentIndex';
 import Logo from '../assets/athenaeum.png';
 
@@ -41,8 +42,9 @@ function ProjectMatchesListener() {
   return null;
 }
 
-/** Mounts every live collab notification listener (R29): replication-paused,
- * frames-changed, published, frames-landed. App-root, same reason as
+/** Mounts every live collab notification listener (R29): deletion-choice,
+ * frame-lost, frame-changed, frames-changed, published, frames-landed.
+ * App-root, same reason as
  * `ProjectMatchesListener` — a data-loss-risk or background outcome must
  * reach `notify()` regardless of which page is open. */
 function CollabNotificationsListener() {
@@ -104,6 +106,7 @@ export default function Layout() {
         <PlateSolveProgressProvider>
         <MasterBuildProvider>
         <StackingProvider>
+        <DeviceReplaceProvider>
         <div className="flex h-screen bg-surface text-content">
           {/* Sidebar Navigation */}
           <aside
@@ -182,9 +185,13 @@ export default function Layout() {
           <AutoUpdateCheck />
           <ProjectMatchesListener />
           <CollabNotificationsListener />
+          {/* The Collaboration folder's owner (L9): the replace prompt / take-over,
+              opened on its own or from the status line's "Replace a device…". */}
+          <DeviceReplaceDialog />
           <ContentIndexListener />
           <GlobalNavKeys />
         </div>
+        </DeviceReplaceProvider>
         </StackingProvider>
         </MasterBuildProvider>
         </PlateSolveProgressProvider>

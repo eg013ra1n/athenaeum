@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { useProjects } from '../hooks/useProjects';
 import { HistoryNav } from '../components/HistoryNav';
 import UpdateRequired from '../components/collab/UpdateRequired';
+import CollabLiveStatus from '../components/collab/CollabLiveStatus';
 
 export default function Projects() {
   const { projects, loading, refreshing, signedOut, updateRequired, refresh } = useProjects();
@@ -15,10 +16,13 @@ export default function Projects() {
         <HistoryNav />
         <Users size={20} className="text-content-secondary" />
         <h1 className="text-lg font-semibold text-content">Projects</h1>
+        <div className="ml-auto">
+          <CollabLiveStatus compact />
+        </div>
         <button
           onClick={() => void refresh()}
           disabled={refreshing}
-          className="ml-auto inline-flex items-center gap-2 rounded-lg border border-border px-3 py-1.5 text-sm text-content-secondary hover:bg-surface-hover disabled:opacity-50"
+          className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-1.5 text-sm text-content-secondary hover:bg-surface-hover disabled:opacity-50"
         >
           <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
           Refresh

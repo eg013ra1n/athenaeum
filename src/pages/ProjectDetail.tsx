@@ -12,6 +12,7 @@ import LinkObjectDialog from '../components/collab/LinkObjectDialog';
 import ReceiveTab from '../components/collab/ReceiveTab';
 import ModerationQueue from '../components/collab/ModerationQueue';
 import UpdateRequired from '../components/collab/UpdateRequired';
+import CollabLiveStatus from '../components/collab/CollabLiveStatus';
 import { formatBytes } from '../components/collab/format';
 import type {
   FrameGateRow,
@@ -307,9 +308,12 @@ export default function ProjectDetail() {
         {c.coordinator && (
           <span className="rounded bg-accent/20 px-1.5 py-0.5 text-xs text-accent">coordinator</span>
         )}
+        <div className="ml-auto">
+          <CollabLiveStatus />
+        </div>
         <button
           onClick={() => void openPortal(portalPath)}
-          className="ml-auto inline-flex items-center gap-1 text-sm text-content-secondary transition-colors hover:text-content"
+          className="inline-flex items-center gap-1 text-sm text-content-secondary transition-colors hover:text-content"
         >
           Manage on portal <ExternalLink size={13} />
         </button>
@@ -628,7 +632,9 @@ function PublicationHistory({
                 <StateChip state={f.state} rejectReason={f.acceptedReason} />
               </div>
               <p className="mt-0.5 text-[11px] text-content-muted">
-                held by {f.holderCount}
+                held by {f.holdersOnline} online / {f.holdersTotal}
+                {f.localState === 'own_missing' ? ' · not on disk' : ''}
+                {f.localState === 'own_changed' ? ' · file changed' : ''}
                 {f.lastError ? ` · ${f.lastError}` : ''}
               </p>
             </li>
