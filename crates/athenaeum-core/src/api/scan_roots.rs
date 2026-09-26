@@ -2877,6 +2877,105 @@ mod special_root_tests {
         node.shutdown().await;
     }
 
+    /// Fix round 3, point 5 (finding 6 coverage): re-designating the SAME
+    /// path is a no-op for the recorded marker — it comes back byte-for-byte
+    /// identical, never a fresh mint.
+    #[tokio::test]
+    async fn redesignating_the_same_path_keeps_its_record() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let folder = TempDir::new().unwrap();
+
+        let stored = set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+        let before = crate::db::collab_live::recorded_store_marker(&db(&ctx).unwrap().conn())
+            .unwrap()
+            .unwrap();
+
+        let stored2 = set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored, stored2);
+        let after = crate::db::collab_live::recorded_store_marker(&db(&ctx).unwrap().conn())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "re-designating the same path keeps its record"
+        );
+    }
+
+    /// Fix round 3, point 5 (finding 6 coverage): a mount failure on a
+    /// re-designation of the SAME, already-recorded path leaves that record
+    /// exactly as it was — `set_collaboration_dir` only ever commits a
+    /// marker once its OWN mount call actually succeeds.
+    #[tokio::test]
+    async fn a_mount_failure_on_a_redesignation_keeps_the_previous_record() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let node_dir = TempDir::new().unwrap();
+        let node = crate::sharing::iroh::node::SharedIrohNode::bind(
+            node_dir.path(),
+            iroh::RelayMode::Disabled,
+        )
+        .await
+        .unwrap();
+        *ctx.iroh_node.lock().await = Some(std::sync::Arc::clone(&node));
+
+        let folder = TempDir::new().unwrap();
+        let stored = set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap();
+        let before = crate::db::collab_live::recorded_store_marker(&db(&ctx).unwrap().conn())
+            .unwrap()
+            .unwrap();
+
+        // Unmount, then sabotage the store's own directory so the NEXT mount
+        // attempt (triggered by re-designating the same path) fails.
+        node.set_collab_root(None).await.unwrap();
+        let blobs_dir = Path::new(&stored).join(".athenaeum").join("blobs");
+        std::fs::remove_dir_all(&blobs_dir).unwrap();
+        std::fs::write(&blobs_dir, b"not a dir").unwrap();
+
+        let err = set_collaboration_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Internal(_)), "{err:?}");
+
+        let after = crate::db::collab_live::recorded_store_marker(&db(&ctx).unwrap().conn())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a failed mount leaves the previous record untouched"
+        );
+        assert_eq!(
+            crate::db::collab_live::store_marker_path(&db(&ctx).unwrap().conn())
+                .unwrap()
+                .as_deref(),
+            Some(stored.as_str())
+        );
+
+        node.shutdown().await;
+    }
+
     /// The write probe still guards the Collaboration root.
     #[cfg(unix)]
     #[tokio::test]

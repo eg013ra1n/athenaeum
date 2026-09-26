@@ -109,6 +109,16 @@ async fn check_designation_preconditions(
         .canonicalize()
         .map(|p| crate::api::scan_roots::normalize_path(&p))
         .unwrap_or_else(|_| root.to_path_buf());
+
+    // Fix round 3, point 1: a record for THIS canonical path whose store id
+    // disagrees with the on-disk marker means a different disk now sits
+    // here (or the marker was swapped underneath us) — refuse now, before
+    // any hub call or rewrite. `set_collaboration_dir`'s own marker check
+    // would eventually catch this too (`check_store`'s `MarkerMismatch`
+    // arm), but by then a `replace_device` retire call is already
+    // irreversible.
+    check_no_recorded_marker_mismatch(ctx, root, &root_canon)?;
+
     let already_the_collab_root = crate::api::scan_roots::get_collaboration_dir(ctx)?
         .map(std::path::PathBuf::from)
         .is_some_and(|current| current == root_canon);
@@ -137,6 +147,47 @@ async fn check_designation_preconditions(
     if crate::api::collab_exchange::bound_node(ctx).await.is_none() {
         tracing::warn!(path = %root.display(), "collaboration folder precondition failed: no iroh node bound");
         return Err(ApiError::Internal("no iroh node bound".to_string()));
+    }
+    Ok(())
+}
+
+/// Fix round 3, point 1: refuse when this catalog already has a recorded
+/// storage marker for `root_canon` (i.e. `root` IS — or was — the
+/// designated Collaboration root) whose `store_id` does not match the
+/// marker actually sitting on disk right now. A mismatch here means the
+/// physical disk changed underneath the path (or the marker was swapped by
+/// something else) — the SAME `MarkerMismatch` [`crate::collab::storage::marker::check_store`]
+/// would report, surfaced early so nothing irreversible happens first. A
+/// missing record, or one for a different path, is not this function's
+/// concern — it returns `Ok`.
+fn check_no_recorded_marker_mismatch(
+    ctx: &ServiceContext,
+    root: &Path,
+    root_canon: &Path,
+) -> Result<(), ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    if crate::db::collab_live::store_marker_path(&conn)?.as_deref()
+        != Some(root_canon.to_string_lossy().as_ref())
+    {
+        return Ok(());
+    }
+    let Some(recorded) = crate::db::collab_live::recorded_store_marker(&conn)? else {
+        return Ok(());
+    };
+    let Ok(Some(on_disk)) = read_marker(root) else {
+        return Ok(());
+    };
+    if on_disk.store_id != recorded.store_id {
+        tracing::warn!(
+            path = %root.display(),
+            store_id = %on_disk.store_id,
+            recorded_store_id = %recorded.store_id,
+            "collaboration folder precondition failed: the on-disk marker's store id disagrees with the one this catalog recorded for this path"
+        );
+        return Err(ApiError::Conflict(
+            "collaboration folder is not usable: MarkerMismatch".to_string(),
+        ));
     }
     Ok(())
 }
@@ -243,6 +294,15 @@ pub async fn replace_device(
     root: &Path,
     policy: &PathPolicy,
 ) -> Result<ReplaceOutcome, ApiError> {
+    // Fix round 3, point 2: the policy gate runs BEFORE any filesystem probe
+    // (`root.is_dir()`, `read_marker`) or hub call (`list_devices`) — on the
+    // raw, uncanonicalized `root`, since canonicalizing is itself a probe.
+    // This is a coarse, information-hiding pre-filter (the web backend must
+    // not let a caller learn whether a marker exists at a path outside its
+    // allowed roots); the authoritative, canonicalized policy check still
+    // happens inside `set_collaboration_dir`'s own `validate_transfer_dir`.
+    policy.check(root)?;
+
     let me = crate::api::account::own_device_id(ctx)?;
 
     let marker = match read_marker(root) {
@@ -344,33 +404,83 @@ pub async fn replace_device(
 /// [`replace_device`] for exactly the case it now refuses outright (fix
 /// round 2, ruling 2 and 3). NO hub call at all: `confirmed` must be `true`
 /// (the caller's explicit confirmation — Task 16/17 own the actual prompt
-/// and the UnknownDevice-only gating on when to offer this action), every
-/// local precondition runs first exactly like a fresh designation
-/// ([`check_designation_preconditions`]), then the marker is rewritten to
-/// name this device (keeping the existing marker's store id when readable —
-/// this is still the same physical store, just under new, unverified
-/// stewardship), the folder is designated and mounted, and its contents are
-/// adopted by hash.
+/// and the UnknownDevice-only gating on when to offer this action), the
+/// folder must carry a RECORDED `UnknownDevice` refusal naming exactly this
+/// marker (fix round 3, point 3 — a fresh, hub-free "not in the active
+/// list" re-classification is NOT sufficient: that list can be stale, or
+/// simply not asked, and offering a take-over on that basis alone could
+/// steal a folder out from under a device this account just hasn't been
+/// able to reach), every local precondition runs first exactly like a
+/// fresh designation ([`check_designation_preconditions`]), then the marker
+/// is rewritten to name this device (keeping the existing marker's store id
+/// when readable — this is still the same physical store, just under new,
+/// unverified stewardship), the folder is designated and mounted, and its
+/// contents are adopted by hash.
 pub async fn take_over_collab_folder(
     ctx: &ServiceContext,
     root: &Path,
     policy: &PathPolicy,
     confirmed: bool,
 ) -> Result<ReplaceOutcome, ApiError> {
+    // Fix round 3, point 2: the policy gate runs BEFORE any filesystem probe
+    // or hub call — see the identical comment in `replace_device`.
+    policy.check(root)?;
+
     if !confirmed {
         return Err(ApiError::Invalid(
             "user confirmation is required to take over this folder".to_string(),
         ));
     }
+
+    let marker = match read_marker(root) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Err(ApiError::Invalid(
+                "this folder has no collaboration storage marker to take over".to_string(),
+            ))
+        }
+        Err(e) => {
+            tracing::error!(path = %root.display(), error = %e, "take over: reading the storage marker failed");
+            return Err(ApiError::Internal(format!("read storage marker: {e}")));
+        }
+    };
+
+    // Fix round 3, point 3: require a RECORDED `Unknown` refusal for this
+    // exact (path, device) — never re-derive "unknown" fresh from the
+    // active-device list here.
+    let root_canon = root
+        .canonicalize()
+        .map(|p| crate::api::scan_roots::normalize_path(&p))
+        .unwrap_or_else(|_| root.to_path_buf());
+    let root_canon_str = root_canon.to_string_lossy().to_string();
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let refusal = crate::db::collab_live::refused_designation(&conn)?;
+        let matches = refusal.as_ref().is_some_and(|(path, device_id, kind)| {
+            *path == root_canon_str
+                && *device_id == marker.device_id
+                && *kind == crate::db::collab_live::RefusedDeviceKind::Unknown
+        });
+        if !matches {
+            tracing::warn!(
+                path = %root.display(),
+                device_id = %marker.device_id,
+                "take over refused: no recorded unknown-device refusal for this folder's marker"
+            );
+            return Err(ApiError::Invalid(
+                "this folder was not refused as an unrecognized device's storage — designate it \
+                 normally, or use replace if the device is still active"
+                    .to_string(),
+            ));
+        }
+    }
+
     check_designation_preconditions(ctx, root, policy).await?;
 
     let me = crate::api::account::own_device_id(ctx)?;
-    let store_id = match read_marker(root) {
-        Ok(Some(m)) => m.store_id,
-        _ => uuid::Uuid::new_v4().to_string(),
-    };
     let new_marker = StoreMarker {
-        store_id,
+        store_id: marker.store_id.clone(),
         device_id: me,
     };
     write_marker(root, &new_marker).map_err(|e| {
@@ -636,20 +746,38 @@ pub(crate) async fn adopt_by_hash(
             owned_path = dest;
             &owned_path
         };
-        if land_candidate(ctx, node, row, landed_path).await? {
-            adopted.push((row.project_id.clone(), row.frame_uuid.clone()));
-        } else if is_follower {
-            // Fix round 2, ruling 7: a follower copy that failed to seed or
-            // whose content mismatched is an orphan nothing tracks — clean
-            // it up rather than leaving it under `.athenaeum/adopted/`.
-            if let Err(e) = std::fs::remove_file(landed_path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %landed_path.display(), error = %e, "adopt by hash: cleaning up a failed follower copy failed");
+        match land_candidate(ctx, node, row, landed_path).await {
+            Ok(true) => adopted.push((row.project_id.clone(), row.frame_uuid.clone())),
+            Ok(false) => {
+                if is_follower {
+                    cleanup_follower_copy(landed_path);
                 }
+            }
+            Err(e) => {
+                // Fix round 3, point 4: `?` must not skip the cleanup below —
+                // an `Err` from `land_candidate` (e.g. a DB failure mid
+                // transaction) leaves the SAME orphaned follower copy a
+                // simple `Ok(false)` does.
+                if is_follower {
+                    cleanup_follower_copy(landed_path);
+                }
+                return Err(e);
             }
         }
     }
     Ok(adopted)
+}
+
+/// Fix round 2, ruling 7 (and round 3, point 4 — the `Err` path too): a
+/// follower copy under `.athenaeum/adopted/` that failed to seed, whose
+/// content mismatched, or whose landing errored outright is an orphan
+/// nothing tracks — removed rather than left behind.
+fn cleanup_follower_copy(landed_path: &Path) {
+    if let Err(e) = std::fs::remove_file(landed_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %landed_path.display(), error = %e, "adopt by hash: cleaning up a failed follower copy failed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -866,6 +994,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+
+        // Fix round 3, point 3: `take_over_collab_folder` requires a
+        // RECORDED `Unknown` refusal naming this exact marker — a plain
+        // `set_collaboration_dir` attempt (as the real recovery UI would
+        // run first) records exactly that, since OLD-DEV is no longer listed.
+        let refusal_err = crate::api::scan_roots::set_collaboration_dir(
+            &ctx,
+            root.to_string_lossy().to_string(),
+            &crate::api::PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(refusal_err, ApiError::Conflict(ref m) if m.starts_with("collab_unknown_device")),
+            "{refusal_err:?}"
+        );
 
         // The user-confirmed take-over completes it, no hub call needed.
         let out = take_over_collab_folder(&ctx, &root, &crate::api::PathPolicy::AllowAll, true)
@@ -1121,5 +1265,223 @@ mod tests {
             bytes,
             "same bytes, hardlinked or copied"
         );
+    }
+
+    /// Fix round 3, point 1 (critical — a round-2 test change hid this): a
+    /// first-time replace on a root that is ALREADY the designated
+    /// Collaboration root, whose on-disk marker's store id disagrees with
+    /// what THIS CATALOG recorded for that path, must refuse before the
+    /// (irreversible) hub retire call — not let `set_collaboration_dir`'s
+    /// own `MarkerMismatch` catch it only afterwards.
+    #[tokio::test]
+    async fn replace_device_refuses_a_mismatched_recorded_store_id_before_retiring() {
+        let (_t, ctx, hub) = signed_in_rig().await;
+        let root = collab_root(&ctx);
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        // A genuinely DIFFERENT store id than the one `signed_in_rig`
+        // recorded for this path — a different disk, not just a different
+        // owning device of the SAME store.
+        write_marker(
+            &root,
+            &StoreMarker {
+                store_id: "a-different-store".into(),
+                device_id: "OLD-DEV".into(),
+            },
+        )
+        .unwrap();
+
+        let err = replace_device(&ctx, "old-id", &root, &crate::api::PathPolicy::AllowAll)
+            .await
+            .unwrap_err();
+        match err {
+            ApiError::Conflict(m) => assert!(m.contains("MarkerMismatch"), "{m}"),
+            other => panic!("expected a MarkerMismatch Conflict, got {other:?}"),
+        }
+        assert!(!hub.device_retired("old-id"), "no hub call was ever made");
+        assert_eq!(
+            read_marker(&root).unwrap().unwrap(),
+            StoreMarker {
+                store_id: "a-different-store".into(),
+                device_id: "OLD-DEV".into(),
+            },
+            "the marker is never touched"
+        );
+    }
+
+    /// Fix round 3, point 1: the same protection for `take_over_collab_folder`
+    /// — it must not rewrite a marker whose store id disagrees with what
+    /// this catalog already recorded for the path.
+    #[tokio::test]
+    async fn take_over_refuses_a_mismatched_recorded_store_id() {
+        let (_t, ctx, _hub) = signed_in_rig().await;
+        let root = collab_root(&ctx);
+        write_marker(
+            &root,
+            &StoreMarker {
+                store_id: "a-different-store".into(),
+                device_id: "GHOST".into(),
+            },
+        )
+        .unwrap();
+        // Record the `Unknown` refusal take-over's own gate (point 3) requires.
+        let refusal_err = crate::api::scan_roots::set_collaboration_dir(
+            &ctx,
+            root.to_string_lossy().to_string(),
+            &crate::api::PathPolicy::AllowAll,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(refusal_err, ApiError::Conflict(ref m) if m.starts_with("collab_unknown_device")),
+            "{refusal_err:?}"
+        );
+
+        let err = take_over_collab_folder(&ctx, &root, &crate::api::PathPolicy::AllowAll, true)
+            .await
+            .unwrap_err();
+        match err {
+            ApiError::Conflict(m) => assert!(m.contains("MarkerMismatch"), "{m}"),
+            other => panic!("expected a MarkerMismatch Conflict, got {other:?}"),
+        }
+        assert_eq!(
+            read_marker(&root).unwrap().unwrap(),
+            StoreMarker {
+                store_id: "a-different-store".into(),
+                device_id: "GHOST".into(),
+            },
+            "the marker is never touched"
+        );
+    }
+
+    /// Fix round 3, point 2: the policy gate runs BEFORE any filesystem
+    /// probe or hub call. `root` here never exists on disk, so if
+    /// `root.is_dir()`/`read_marker` ran first the error would be
+    /// `Invalid("... is not an existing folder")`, not `Forbidden` — and no
+    /// request would reach the fake hub either way.
+    #[tokio::test]
+    async fn replace_device_refuses_a_root_outside_policy_before_any_probe_or_hub_call() {
+        let (tmp, ctx, hub) = test_support::signed_in_rig_no_root().await;
+        let outside = tmp.path().join("Outside");
+        let policy = crate::api::PathPolicy::AllowedRoots(vec![tmp.path().join("Allowed")]);
+        let before = hub.server.received_requests().await.unwrap().len();
+
+        let err = replace_device(&ctx, "old-id", &outside, &policy)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
+
+        let after = hub.server.received_requests().await.unwrap().len();
+        assert_eq!(before, after, "no hub call was ever made");
+    }
+
+    /// Fix round 3, point 2: the same ordering for `take_over_collab_folder`.
+    #[tokio::test]
+    async fn take_over_refuses_a_root_outside_policy_before_any_probe() {
+        let (tmp, ctx, _hub) = test_support::signed_in_rig_no_root().await;
+        let outside = tmp.path().join("Outside");
+        let policy = crate::api::PathPolicy::AllowedRoots(vec![tmp.path().join("Allowed")]);
+
+        let err = take_over_collab_folder(&ctx, &outside, &policy, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
+    }
+
+    /// Fix round 3, point 3 (controller ruling): a device the account still
+    /// lists as active can never be taken over, even with `confirmed: true`
+    /// — no `Unknown` refusal was ever recorded for this marker, so
+    /// `take_over_collab_folder` refuses regardless of the account's
+    /// CURRENT (fresh, hub-free) device list.
+    #[tokio::test]
+    async fn take_over_refuses_an_active_devices_folder_even_when_confirmed() {
+        let (tmp, ctx, hub) = test_support::signed_in_rig_no_root().await;
+        let root = tmp.path().join("Collab");
+        std::fs::create_dir_all(&root).unwrap();
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        write_marker(
+            &root,
+            &StoreMarker {
+                store_id: "s1".into(),
+                device_id: "OLD-DEV".into(),
+            },
+        )
+        .unwrap();
+
+        // No `set_collaboration_dir` attempt was ever made — no refusal of
+        // any kind is recorded for this folder.
+        let err = take_over_collab_folder(&ctx, &root, &crate::api::PathPolicy::AllowAll, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+        assert_eq!(
+            read_marker(&root).unwrap().unwrap().device_id,
+            "OLD-DEV",
+            "never touched"
+        );
+        assert_eq!(
+            crate::api::scan_roots::get_collaboration_dir(&ctx).unwrap(),
+            None
+        );
+    }
+
+    /// Fix round 3, point 4: `land_candidate(...).await?` must not skip the
+    /// follower cleanup on an `Err` OR an `Ok(false)` (mismatch) outcome.
+    /// Forcing a genuine `Err` from `land_candidate` needs deeper store
+    /// mocking than this suite has, so this exercises the `Ok(false)`
+    /// (hash-mismatch) branch — it shares the exact same
+    /// `cleanup_follower_copy` call the `Err` branch now also makes.
+    #[tokio::test]
+    async fn adopt_by_hash_cleans_up_a_failed_followers_copy() {
+        let (_t, ctx, hub) = signed_in_rig().await;
+        let root = collab_root(&ctx);
+        let bytes = b"identical bytes, but one manifest lies about its hash".to_vec();
+        let real_blake3 = blake3::hash(&bytes).to_hex().to_string();
+        let xxh3 = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
+        // f-dup-a: correct blake3 (the primary, path-local — lands fine).
+        // f-dup-b: WRONG blake3 (the follower — its copy must be cleaned up).
+        for (uuid, blake3_val) in [
+            ("f-dup-a", real_blake3.clone()),
+            ("f-dup-b", "b".repeat(64)),
+        ] {
+            hub.seed_frames(test_support::PID, "acc-me", &[uuid], "published");
+            hub.update_frame(test_support::PID, uuid, |f| {
+                f.blake3 = blake3_val;
+                f.byte_size = bytes.len() as i64;
+                f.xxh3 = xxh3.clone();
+                f.file_name = format!("{uuid}.fits");
+            });
+            let view = hub
+                .frame(test_support::PID, uuid)
+                .expect("frame just seeded");
+            let conn = db(&ctx).unwrap().conn();
+            crate::db::collab_frames::upsert_from_manifest(&conn, test_support::PID, &view)
+                .unwrap();
+        }
+        let dest_dir = root.join("m31").join("other");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let path = dest_dir.join("f-dup-a.fits");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let node = crate::api::collab_exchange::bound_node(&ctx).await.unwrap();
+        let landed = adopt_by_hash(&ctx, &node, &root, &path).await.unwrap();
+        assert_eq!(landed.len(), 1, "{landed:?}"); // only f-dup-a lands
+
+        let follower_copy = root
+            .join(".athenaeum")
+            .join("adopted")
+            .join(test_support::PID)
+            .join("f-dup-b")
+            .join("f-dup-b.fits");
+        assert!(
+            !follower_copy.exists(),
+            "the failed follower copy is cleaned up, not left behind"
+        );
+
+        let conn = db(&ctx).unwrap().conn();
+        let b = crate::db::collab_frames::get(&conn, test_support::PID, "f-dup-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.local_state, LocalState::Wanted, "never landed");
+        assert_eq!(b.landed_path, None);
     }
 }
