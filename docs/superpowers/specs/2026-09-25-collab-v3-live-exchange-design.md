@@ -875,7 +875,7 @@ answers it.
 | C5 | A new version while moderation is on | L8: no re-moderation; exclusion is the tool |
 | C6 | Reject after some peers fetched | Cannot happen: the need set holds published frames only (I8) |
 | C7 | Exclusion of an accepted frame | Stops serving and fetching; file kept (I8) |
-| C8 | Two devices of one account publish the same frame | Duplicate uuid → adopt the hub row (§5.2) |
+| C8 | Two devices of one account publish the same frame | Duplicate uuid → adopt the hub row (§5.2); since amendment A6 of the v3 spec only the bound publishing device announces new frames |
 | C9 | Two devices re-version the same frame | Compare-and-set with 409 (§5.2) |
 | C10 | Identical bytes in two frames or projects | Blob ≠ reference; removal only by user action (I10) |
 | C11 | A provider serving while its file is replaced | Temp file + rename (§7.5); the serve check refuses the old hash (§9.3) |

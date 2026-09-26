@@ -589,3 +589,56 @@ project WBPP export lands `<title>/<publisher>/<camera>/<filter>/`.
     - 5 = project UI;
     - 6 = stacking a project;
     - 7 = portal project page.
+- **A5 (2026-09-26, owner) — replicas outside the current Collaboration
+  root count as gone.**
+  - **Rule.** After the Collaboration folder is re-designated, a replica
+    whose landed path lies outside the CURRENT root is no longer held. The
+    storage engine feeds it into the deletion path of the live-exchange
+    spec (L4): above 10 frames in the rolling 5-minute window it raises the
+    one non-blocking, reversible choice; otherwise the frames are fetched
+    again into the new root.
+  - **Scope.** It rules held replicas. Idle rows are ruled at the next
+    sweep once re-included; quarantined rows and rows awaiting the user's
+    choice keep their old paths until the user decides. Own frames never
+    count: they may live anywhere (A1).
+  - **Wording.** A frame that no other member holds gets a "lost
+    everywhere" notice that says the file is still in the previous
+    Collaboration folder (with its path), never "restore it from the
+    Trash".
+  - **Runtime.** A mount change of the collab store restarts the live
+    runtime on the new root; it waits until the new folder's marker is
+    recorded.
+- **A6 (2026-09-27, owner) — one publishing device per account per
+  project.**
+  - **Why.** The publisher is the account (§3), and a publisher's frames
+    share one folder `<Collab>/<project>/<publisher>/`. File names were made
+    unique only within the publishing device's own folder, so two devices of
+    one account publishing into one project could announce the same
+    `fileName` (e.g. `c_Light_0001.fits` from two rigs). Receivers would then
+    rename locally and the names would differ between members, which defeats
+    R4 (names are there to find files by eye, the same everywhere).
+  - **Binding.** The hub keeps, per (project, account), the one device that
+    may announce NEW frames. The first device that publishes into the
+    project becomes it. An announce from any other device of that account
+    is refused (409, naming the bound device). Membership stays per account.
+  - **Other devices of the account** are ordinary exchange participants: they
+    receive the project's frames under their own replication policy and hold
+    and serve them as replicas, which adds redundancy. A frame is "own" on a
+    device only when that device published it: the manifest row carries
+    `publisherDeviceId` (already stored by the hub as `publisher_device_id`),
+    and the app derives `own` from it instead of from the account. This
+    corrects the earlier derivation by account, under which a second device
+    of the account never fetched its account's frames (contrary to §10
+    "Two devices of one account → one publisher, two holder rows").
+  - **Switching.** "Publish from this device" is an explicit, confirmed user
+    action that moves the binding. After a switch, the previously bound
+    device can still post new VERSIONS of the frames it published (only it
+    has their raw sources), but no new frames.
+  - **Names after a switch.** The publishing device makes a new `fileName`
+    unique against every name of its publisher in the project manifest, not
+    only against its local folder, so an earlier device's names are never
+    reused. No hub-side uniqueness constraint is needed while the binding
+    rules out two concurrent publishers.
+  - **Trade-off, accepted by the owner.** An owner with two rigs on two
+    computers cannot publish into one project from both at once: they
+    switch the publishing device, or bring the frames to one machine.
