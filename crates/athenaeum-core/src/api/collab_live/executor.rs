@@ -1376,6 +1376,51 @@ mod tests {
             need_wants(&conn, &off, true).unwrap().is_empty(),
             "toggle gate"
         );
+        let mut send_only = project.clone();
+        send_only.data_role = "send".into();
+        send_only.is_coordinator = false;
+        assert!(
+            need_wants(&conn, &send_only, true).unwrap().is_empty(),
+            "role gate: a send-only member never replicates"
+        );
+    }
+
+    /// Task 15 (replaces the wave-2 `second_pass_after_delete_waits_for_gc_then_refetches`):
+    /// a frame a landing parked for the GC (`awaiting_gc`, no stamp) is
+    /// released into the need set once its store entry is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gc_probe_releases_a_frame_whose_dead_entry_went() {
+        let (_tmp, ctx, hub) = ts::signed_in_rig().await;
+        let ctx = Arc::new(ctx);
+        hub.seed_frames(ts::PID, "acc-o", &["g1"], "published");
+        {
+            let conn = db(&ctx).unwrap().conn();
+            let view = hub.frame(ts::PID, "g1").unwrap();
+            frames_db::upsert_from_manifest(&conn, ts::PID, &view).unwrap();
+            frames_db::set_awaiting_gc(&conn, ts::PID, "g1", true).unwrap();
+        }
+        let node = ctx.iroh_node.lock().await.clone().unwrap();
+        let root = ts::collab_root(&ctx);
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        let mut exec = Executor::new(
+            ExecEnv {
+                ctx: Arc::clone(&ctx),
+                store: node.collab_store().unwrap(),
+                node,
+                root: root.clone(),
+                guard: Arc::new(StoreGuard::new(root, me, None)),
+                control: Arc::new(InboundControl::new()),
+            },
+            2,
+            7,
+        );
+        exec.gc_probe().await;
+        let row = frames_db::get(&db(&ctx).unwrap().conn(), ts::PID, "g1")
+            .unwrap()
+            .unwrap();
+        assert!(!row.awaiting_gc, "released: its entry is gone");
+        assert!(exec.dirty.contains(ts::PID), "its need set is re-read");
+        exec.shutdown();
     }
 
     /// Task 15 R2: a quarantined frame's partial bytes lose their

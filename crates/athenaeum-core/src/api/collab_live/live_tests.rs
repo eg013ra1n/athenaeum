@@ -209,7 +209,7 @@ fn arm(ctx: &std::sync::Arc<crate::services::ServiceContext>) {
 /// stream, no session); signed out, the session waits in `signedOut`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nothing_runs_without_a_collaboration_folder_or_signed_out() {
-    let (_t, ctx, hub) = ts::signed_in_rig_no_root().await;
+    let (t, ctx, hub) = ts::signed_in_rig_no_root().await;
     let ctx = std::sync::Arc::new(ctx);
     arm(&ctx);
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -217,6 +217,22 @@ async fn nothing_runs_without_a_collaboration_folder_or_signed_out() {
     assert_eq!(s.storage, crate::api::collab_live::StorageStateView::NotSet);
     assert_ne!(s.state, LiveState::Live);
     assert!(hub.connected(ts::PID).is_empty(), "no event stream opened");
+    // A folder designated later is picked up (the wave-2
+    // `a_root_that_appears_after_startup_is_mounted_by_maintenance`).
+    let requested = t.path().join("Collab");
+    std::fs::create_dir_all(&requested).unwrap();
+    crate::api::scan_roots::set_collaboration_dir(
+        &ctx,
+        requested.to_string_lossy().to_string(),
+        &crate::api::PathPolicy::AllowAll,
+    )
+    .await
+    .unwrap();
+    wait_status(&ctx, LiveState::Live, Duration::from_secs(5)).await;
+    assert_eq!(
+        status(&ctx).storage,
+        crate::api::collab_live::StorageStateView::Available
+    );
     shutdown(&ctx).await;
 
     let (_t2, ctx2, hub2) = ts::signed_in_rig().await;
