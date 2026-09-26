@@ -102,15 +102,18 @@ pub enum Input {
         project_id: String,
         wants: Vec<Want>,
     },
-    /// A frame's candidates (I4, I5), derived for `content_version` — the
-    /// manifest's current version when the executor derived them. Lists are
-    /// kept per version: a Start uses only the list of the want's exact
-    /// version, so a late list of another version is never used for it, and
-    /// a version that goes DOWN (an epoch restore, spec §4.4) finds its list
-    /// when the need set follows.
+    /// A frame's candidates (I4, I5), derived for `content_version` /
+    /// `blake3` — the manifest's current version and hash when the executor
+    /// derived them. Lists are kept per version: a Start uses only the list
+    /// of the want's exact version AND hash, so a late list of another
+    /// version is never used for it, a version that goes DOWN (an epoch
+    /// restore, spec §4.4) finds its list when the need set follows, and a
+    /// version NUMBER reused after a restore with another hash never
+    /// inherits the old list.
     Providers {
         key: FrameKey,
         content_version: i32,
+        blake3: String,
         providers: Vec<ProviderRef>,
     },
     ProjectGone {
@@ -124,7 +127,10 @@ pub enum Input {
     /// The collab ReceiveGate permit is held (`true`) / was yielded
     /// (`false`, a personal transfer waits). After a yield the core starts
     /// nothing, emits `ReleaseLane` once nothing is in flight (the permit
-    /// goes back, spec §8) and only then `RequestLane` if work waits.
+    /// goes back, spec §8) and only then `RequestLane` if work waits. Only
+    /// `admitted: true` answers a `RequestLane`; a `false` while the core
+    /// holds no permit (e.g. a late yield signal while a request is
+    /// pending) changes nothing — so one request is never answered twice.
     Lane {
         admitted: bool,
     },
@@ -151,7 +157,9 @@ pub enum Input {
     ConnectionIdle {
         device: String,
     },
-    /// A dial succeeded: the device's back-off ends.
+    /// A dial succeeded: the device's back-off ends, and it may be sending
+    /// again to every fetch whose live set holds it (after an idle close
+    /// the engine dials it anew).
     DialOk {
         device: String,
     },
@@ -241,8 +249,10 @@ pub struct Core {
     wants: BTreeMap<FrameKey, Want>,
     /// The per-want random draw behind "rarest first, then random" (§7.2).
     tiebreak: BTreeMap<FrameKey, u64>,
-    /// Per frame, per content version: the list last fed (R1).
-    providers: BTreeMap<FrameKey, BTreeMap<i32, Vec<ProviderRef>>>,
+    /// Per frame, per `(content_version, blake3)` it was derived for: the
+    /// list last fed (R1). Keyed by the hash too, so a late list of the old
+    /// content of a reused version number never overwrites the new one.
+    providers: BTreeMap<FrameKey, BTreeMap<(i32, String), Vec<ProviderRef>>>,
     in_flight: BTreeMap<FrameKey, InFlight>,
     /// Per provider device: a failed dial or a closed connection (§7.3).
     dial_backoff: BTreeMap<String, Retry>,
@@ -252,15 +262,18 @@ pub struct Core {
 
 impl Core {
     pub fn new(seed: u64, slots: usize) -> Self {
+        let mut rng = SplitMix64(seed);
+        // ids of a replaced core never collide with this one's (never 0)
+        let first_fetch_id = rng.next_u64().max(1);
         Self {
-            rng: SplitMix64(seed),
+            rng,
             slots: slots.max(1),
             lane: false,
             yielded: false,
             lane_requested: false,
             storage_ok: true,
             now_ms: i64::MIN,
-            next_fetch_id: 1,
+            next_fetch_id: first_fetch_id,
             wants: BTreeMap::new(),
             tiebreak: BTreeMap::new(),
             providers: BTreeMap::new(),
@@ -270,12 +283,19 @@ impl Core {
         }
     }
 
-    /// The providers of `key` usable for `content_version` right now: the
-    /// fed list of exactly that version, minus devices backing off.
-    fn available(&self, key: &FrameKey, content_version: i32, now_ms: i64) -> Vec<ProviderRef> {
+    /// The providers of `key` usable for `content_version`/`blake3` right
+    /// now: the fed list of exactly that version and hash, minus devices
+    /// backing off.
+    fn available(
+        &self,
+        key: &FrameKey,
+        content_version: i32,
+        blake3: &str,
+        now_ms: i64,
+    ) -> Vec<ProviderRef> {
         self.providers
             .get(key)
-            .and_then(|by_version| by_version.get(&content_version))
+            .and_then(|by_version| by_version.get(&(content_version, blake3.to_string())))
             .map(|ps| {
                 ps.iter()
                     .filter(|p| !backing_off(&self.dial_backoff, p.device.as_str(), now_ms))
@@ -364,7 +384,11 @@ impl Core {
                     }
                     match incoming.get(k) {
                         Some(w) => {
-                            by_version.retain(|v, _| *v == w.content_version);
+                            // a version number reused after a restore with
+                            // another hash does not inherit the old list
+                            by_version.retain(|(v, hash), _| {
+                                *v == w.content_version && *hash == w.blake3
+                            });
                             !by_version.is_empty()
                         }
                         None => false,
@@ -388,6 +412,7 @@ impl Core {
             Input::Providers {
                 key,
                 content_version,
+                blake3,
                 providers,
             } => {
                 let mut ps = providers;
@@ -396,7 +421,7 @@ impl Core {
                 self.providers
                     .entry(key)
                     .or_default()
-                    .insert(content_version, ps);
+                    .insert((content_version, blake3), ps);
             }
             Input::ProjectGone { project_id } => {
                 let flying: Vec<FrameKey> = self
@@ -423,12 +448,19 @@ impl Core {
                 }
             }
             Input::Slots(n) => self.slots = n.max(1),
-            Input::Lane { admitted } => {
-                // a yield while the lane is held keeps the permit until the
-                // fetches in flight drain
-                self.yielded = !admitted && (self.lane || self.yielded);
-                self.lane = admitted;
+            Input::Lane { admitted: true } => {
+                self.lane = true;
+                self.yielded = false;
                 self.lane_requested = false;
+            }
+            Input::Lane { admitted: false } => {
+                // a yield while the lane is held keeps the permit until the
+                // fetches in flight drain; without a permit (a request still
+                // pending, or nothing at all) a yield changes nothing
+                if self.lane || self.yielded {
+                    self.lane = false;
+                    self.yielded = true;
+                }
             }
             Input::Finished {
                 key,
@@ -471,6 +503,11 @@ impl Core {
             }
             Input::DialOk { device } => {
                 self.dial_backoff.remove(&device);
+                for f in self.in_flight.values_mut() {
+                    if f.providers.iter().any(|p| p.device == device) {
+                        f.maybe_active.insert(device.clone());
+                    }
+                }
             }
             Input::ClearBackoffs => {
                 self.dial_backoff.clear();
@@ -490,7 +527,7 @@ impl Core {
             .in_flight
             .iter()
             .filter_map(|(k, f)| {
-                let now = self.available(k, f.content_version, now_ms);
+                let now = self.available(k, f.content_version, &f.blake3, now_ms);
                 (now != f.providers).then(|| (k.clone(), now))
             })
             .collect();
@@ -518,7 +555,9 @@ impl Core {
             .filter(|(k, _)| !self.in_flight.contains_key(*k))
             .filter(|(k, _)| !backing_off(&self.frame_backoff, *k, now_ms))
             .filter_map(|(k, w)| {
-                let n = self.available(k, w.content_version, now_ms).len();
+                let n = self
+                    .available(k, w.content_version, &w.blake3, now_ms)
+                    .len();
                 let old = now_ms.saturating_sub(w.since_ms) >= starving;
                 (n > 0).then(|| {
                     (
@@ -580,9 +619,12 @@ impl Core {
                 }
             }
             let w = self.wants[&key].clone();
-            let providers = self.available(&key, w.content_version, now_ms);
+            let providers = self.available(&key, w.content_version, &w.blake3, now_ms);
             let fetch_id = self.next_fetch_id;
-            self.next_fetch_id += 1;
+            self.next_fetch_id = match self.next_fetch_id.wrapping_add(1) {
+                0 => 1,
+                n => n,
+            };
             self.in_flight.insert(
                 key.clone(),
                 InFlight {
@@ -681,6 +723,7 @@ mod tests {
         Input::Providers {
             key: key(u),
             content_version: cv,
+            blake3: format!("b-{u}-{cv}"),
             providers: ds.iter().map(|d| prov(d)).collect(),
         }
     }
@@ -804,11 +847,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[1], ids[0] + 1, "consecutive within one core");
+        assert_ne!(ids[0], 0);
+        assert_ne!(
+            Core::new(2, 4).next_fetch_id,
+            c.next_fetch_id - 2,
+            "another core's ids start elsewhere"
+        );
         let cmds = c.step(1, Input::DialFailed { device: "X".into() });
         assert!(cmds.contains(&Command::UpdateProviders {
             key: key("a"),
-            fetch_id: 1,
+            fetch_id: ids[0],
             providers: vec![]
         }));
         let cmds = c.step(2, need(vec![want("a", 1, 0)]));
@@ -816,7 +866,7 @@ mod tests {
             cmds,
             vec![Command::Cancel {
                 key: key("b"),
-                fetch_id: 2,
+                fetch_id: ids[1],
                 reason: CancelReason::NotWanted
             }]
         );
@@ -1243,6 +1293,118 @@ mod tests {
         let f = fin(&c, "a", FetchResult::Landed);
         assert_eq!(c.step(7, f), vec![Command::ReleaseLane]);
         assert!(c.in_flight().is_empty());
+    }
+
+    #[test]
+    fn a_re_dialled_device_counts_as_sending_again() {
+        // fix round 2, A: an idle close then a new dial — X is sending again.
+        // No live-set change sits between the dial and the presence drop, so
+        // nothing but DialOk can restore X (in the review's variant a close
+        // of a second provider Y re-added X through the live-set update).
+        let mut c = Core::new(1, 1);
+        c.step(0, need(vec![want("a", 1, 0), want("b", 1, 0)]));
+        c.step(0, provs("a", 1, &["X"]));
+        c.step(0, Input::Lane { admitted: true });
+        c.step(1, Input::ConnectionIdle { device: "X".into() });
+        assert!(c.step(2, Input::DialOk { device: "X".into() }).is_empty());
+        // presence drops X from a's list: X's transfer may still be running
+        let cmds = c.step(3, provs("a", 1, &[]));
+        assert_eq!(updated(&cmds, "a"), Some(vec![]));
+        let cmds = c.step(4, provs("b", 1, &["Z"]));
+        assert_eq!(
+            cancelled(&cmds, "a"),
+            None,
+            "a running transfer is never cut: {cmds:?}"
+        );
+        assert!(starts(&cmds).is_empty());
+        assert_eq!(c.in_flight(), vec![(key("a"), 1)]);
+    }
+
+    #[test]
+    fn the_reviewed_re_dial_scenario_keeps_the_running_transfer() {
+        // the review's exact sequence: live [X, Y], idle close X, DialOk X,
+        // close Y, presence drops X, another frame startable, slots full
+        let mut c = Core::new(1, 1);
+        c.step(0, need(vec![want("a", 1, 0), want("b", 1, 0)]));
+        c.step(0, provs("a", 1, &["X", "Y"]));
+        c.step(0, Input::Lane { admitted: true });
+        c.step(1, Input::ConnectionIdle { device: "X".into() });
+        c.step(2, Input::DialOk { device: "X".into() });
+        c.step(3, Input::ConnectionClosed { device: "Y".into() });
+        c.step(4, provs("a", 1, &[]));
+        let cmds = c.step(5, provs("b", 1, &["Z"]));
+        assert_eq!(cancelled(&cmds, "a"), None, "{cmds:?}");
+        assert_eq!(c.in_flight(), vec![(key("a"), 1)]);
+    }
+
+    #[test]
+    fn a_late_yield_while_a_request_is_pending_never_requests_twice() {
+        // fix round 2, B: two requests, one release would leak a permit
+        let mut c = primed(4);
+        c.step(0, provs("a", 1, &["X"]));
+        c.step(0, Input::Lane { admitted: true });
+        let f = fin(&c, "a", FetchResult::Landed);
+        assert_eq!(c.step(1, f), vec![Command::ReleaseLane]);
+        assert_eq!(c.step(2, provs("b", 1, &["X"])), vec![Command::RequestLane]);
+        // the yield signal of the permit handed back arrives late
+        assert!(c.step(3, Input::Lane { admitted: false }).is_empty());
+        assert!(c.step(4, Input::Tick).is_empty(), "still one request");
+        assert!(!c.lane_yielded() && !c.lane());
+        assert_eq!(
+            starts(&c.step(5, Input::Lane { admitted: true })),
+            vec!["b".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_reused_version_number_with_a_new_hash_drops_the_old_list() {
+        // fix round 2, minor 3: an epoch restore reuses v2 for other content
+        let mut c = Core::new(1, 4);
+        c.step(0, need(vec![want("a", 2, 0)]));
+        c.step(0, provs("a", 2, &["X"])); // derived for b-a-2
+        assert_eq!(
+            starts(&c.step(0, Input::Lane { admitted: true })),
+            vec!["a".to_string()]
+        );
+        let mut w2 = want("a", 2, 0);
+        w2.blake3 = "b-a-2-restored".into();
+        let cmds = c.step(1, need(vec![w2.clone()]));
+        assert_eq!(cancelled(&cmds, "a"), Some(CancelReason::NewVersion));
+        assert!(
+            starts(&cmds).is_empty(),
+            "the old v2 list never serves the new v2: {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&Command::ReleaseLane),
+            "nothing left to fetch"
+        );
+        assert!(c.providers.get(&key("a")).is_none(), "the old list is gone");
+        // the new content's list starts it; a late list of the old content
+        // arriving after it never overwrites it
+        let cmds = c.step(
+            2,
+            Input::Providers {
+                key: key("a"),
+                content_version: 2,
+                blake3: w2.blake3.clone(),
+                providers: vec![prov("Y")],
+            },
+        );
+        assert_eq!(cmds, vec![Command::RequestLane]);
+        assert_eq!(
+            started(&c.step(2, Input::Lane { admitted: true })),
+            vec![("a".to_string(), 2, vec!["Y".to_string()])]
+        );
+        assert!(c.step(3, provs("a", 2, &["X"])).is_empty());
+        let (id, _) = c.fetch_of(&key("a")).unwrap();
+        c.step(4, Input::ConnectionClosed { device: "Y".into() });
+        let cmds = c.step(4, Input::ClearBackoffs);
+        assert_eq!(
+            updated(&cmds, "a"),
+            Some(vec!["Y".to_string()]),
+            "the live set is still the new content's list"
+        );
+        assert_eq!(c.fetch_of(&key("a")).map(|f| f.0), Some(id));
     }
 
     #[test]

@@ -29,6 +29,8 @@ const SEEDS: u64 = 300;
 #[derive(Clone, Debug)]
 struct HubFrame {
     cv: i32,
+    /// the content hash of the current version
+    hash: String,
     published: bool,
     accepted: bool,
 }
@@ -50,6 +52,7 @@ enum Local {
 struct Fetch {
     id: u64,
     cv: i32,
+    hash: String,
     providers: BTreeSet<String>,
     /// Devices given to it that may still be sending (minus those whose
     /// dial failed or whose connection closed since) — recomputed here from
@@ -83,6 +86,12 @@ struct Coverage {
     late_ignored: usize,
     idle_freed_slot: usize,
     version_down: usize,
+    /// a restore that reused a version number for other content
+    hash_reused: usize,
+    /// a re-dialled device counted as sending again for a fetch in flight
+    redial_restored: usize,
+    /// a late yield signal while a lane request was pending
+    late_yield_pending: usize,
 }
 
 impl Coverage {
@@ -105,6 +114,9 @@ impl Coverage {
         self.late_ignored += o.late_ignored;
         self.idle_freed_slot += o.idle_freed_slot;
         self.version_down += o.version_down;
+        self.hash_reused += o.hash_reused;
+        self.redial_restored += o.redial_restored;
+        self.late_yield_pending += o.late_yield_pending;
     }
 }
 
@@ -116,6 +128,8 @@ enum FollowUp {
     LocalLanded(String, u64, i32),
     /// A waiting item cut at a yield.
     YieldCut(String, u64, i32),
+    /// The gate's yield signal arriving late (a request is pending).
+    LateYield,
 }
 
 struct World {
@@ -144,9 +158,18 @@ struct World {
     // ---- a mirror of what the core was fed (core-relative checks) ----
     fed_need: BTreeMap<String, Want>,
     /// frame → version → (feed sequence number, list)
-    fed_providers: BTreeMap<String, BTreeMap<i32, (u64, Vec<ProviderRef>)>>,
-    /// frame → (version, feed sequence number when that want first came)
-    need_seq: BTreeMap<String, (i32, u64)>,
+    fed_providers: BTreeMap<String, BTreeMap<(i32, String), (u64, Vec<ProviderRef>)>>,
+    /// frame → (version, hash, feed sequence number when that want came)
+    need_seq: BTreeMap<String, (i32, String, u64)>,
+    /// every (frame, version) → hash the hub ever published
+    hash_of: BTreeMap<(String, i32), String>,
+    /// content generations (a fresh hash per publish)
+    generation: u64,
+    /// lane accounting since the core started: RequestLane commands, grants
+    /// (`Lane { admitted: true }`) and ReleaseLane commands
+    lane_requests: usize,
+    lane_grants: usize,
+    lane_releases: usize,
     feed_seq: u64,
     fed_storage: bool,
     followups: Vec<FollowUp>,
@@ -178,6 +201,7 @@ impl World {
                         format!("f{i:02}"),
                         HubFrame {
                             cv: 1,
+                            hash: blake(&format!("f{i:02}"), 1),
                             published: true,
                             accepted: true,
                         },
@@ -207,6 +231,16 @@ impl World {
             fed_need: BTreeMap::new(),
             fed_providers: BTreeMap::new(),
             need_seq: BTreeMap::new(),
+            hash_of: (0..FRAMES)
+                .map(|i| {
+                    let u = format!("f{i:02}");
+                    ((u.clone(), 1), blake(&u, 1))
+                })
+                .collect(),
+            generation: 0,
+            lane_requests: 0,
+            lane_grants: 0,
+            lane_releases: 0,
             feed_seq: 0,
             fed_storage: true,
             followups: Vec::new(),
@@ -245,7 +279,7 @@ impl World {
             .map(|(u, f)| Want {
                 key: key(u),
                 content_version: f.cv,
-                blake3: blake(u, f.cv),
+                blake3: f.hash.clone(),
                 byte_size: 10,
                 since_ms: self.wanted_since[u],
             })
@@ -292,11 +326,21 @@ impl World {
     fn feed_providers(&mut self, u: &str) {
         let providers = self.providers_of(u);
         let cv = self.frames[u].cv;
+        let blake3 = self.frames[u].hash.clone();
         self.feed(Input::Providers {
             key: key(u),
             content_version: cv,
+            blake3,
             providers,
         });
+    }
+
+    /// A fresh content hash for a new publish of `u` at `cv`.
+    fn publish_hash(&mut self, u: &str, cv: i32) -> String {
+        self.generation += 1;
+        let h = format!("b-{u}-{cv}-g{}", self.generation);
+        self.hash_of.insert((u.to_string(), cv), h.clone());
+        h
     }
 
     /// The executor's full refresh after an event that may move the need set
@@ -330,23 +374,30 @@ impl World {
                 self.fed_providers
                     .retain(|u, by_version| match incoming.get(u) {
                         Some(w) => {
-                            by_version.retain(|v, _| *v == w.content_version);
+                            by_version
+                                .retain(|(v, h), _| *v == w.content_version && *h == w.blake3);
                             !by_version.is_empty()
                         }
                         None => false,
                     });
-                self.need_seq
-                    .retain(|u, (cv, _)| incoming.get(u).is_some_and(|w| w.content_version == *cv));
+                self.need_seq.retain(|u, (cv, h, _)| {
+                    incoming
+                        .get(u)
+                        .is_some_and(|w| w.content_version == *cv && w.blake3 == *h)
+                });
                 for (u, w) in &incoming {
-                    self.need_seq
-                        .entry(u.clone())
-                        .or_insert((w.content_version, seq));
+                    self.need_seq.entry(u.clone()).or_insert((
+                        w.content_version,
+                        w.blake3.clone(),
+                        seq,
+                    ));
                 }
                 self.fed_need = incoming;
             }
             Input::Providers {
                 key,
                 content_version,
+                blake3,
                 providers,
             } => {
                 let mut ps = providers.clone();
@@ -355,7 +406,7 @@ impl World {
                 self.fed_providers
                     .entry(key.1.clone())
                     .or_default()
-                    .insert(*content_version, (seq, ps));
+                    .insert((*content_version, blake3.clone()), (seq, ps));
             }
             Input::ProjectGone { .. } => {
                 self.fed_need.clear();
@@ -363,9 +414,17 @@ impl World {
                 self.need_seq.clear();
             }
             Input::Storage { fetching } => self.fed_storage = *fetching,
-            Input::Lane { admitted } => {
-                self.lane_yielded = !*admitted && (self.lane_admitted || self.lane_yielded);
-                self.lane_admitted = *admitted;
+            Input::Lane { admitted: true } => {
+                self.lane_admitted = true;
+                self.lane_yielded = false;
+                self.lane_grants += 1;
+            }
+            Input::Lane { admitted: false } => {
+                // only a held permit can be yielded
+                if self.lane_admitted || self.lane_yielded {
+                    self.lane_admitted = false;
+                    self.lane_yielded = true;
+                }
             }
             Input::Finished {
                 key,
@@ -401,6 +460,14 @@ impl World {
                     }
                 }
             }
+            Input::DialOk { device } => {
+                // dialled again: it may be sending to every fetch it serves
+                for f in self.flying.values_mut() {
+                    if f.providers.contains(device) && f.maybe_active.insert(device.clone()) {
+                        self.cov.redial_restored += 1;
+                    }
+                }
+            }
             _ => {}
         }
         let trace_input = self.trace.then(|| format!("{input:?}"));
@@ -423,6 +490,10 @@ impl World {
                     if self.flying.get(&u).is_some_and(|f| f.id == id) {
                         self.finish(u, id, cv, FetchResult::Landed);
                     }
+                }
+                FollowUp::LateYield => {
+                    self.cov.late_yield_pending += 1;
+                    self.feed(Input::Lane { admitted: false });
                 }
                 FollowUp::YieldCut(u, id, cv) => {
                     if self.flying.get(&u).is_some_and(|f| f.id == id) {
@@ -485,11 +556,11 @@ impl World {
                 let (fed_at, fed) = self
                     .fed_providers
                     .get(&u)
-                    .and_then(|by_version| by_version.get(&content_version))
+                    .and_then(|by_version| by_version.get(&(content_version, blake3.clone())))
                     .unwrap_or_else(|| {
                         panic!("I4/I5: Start of {u} v{content_version} with no list fed for it")
                     });
-                if self.need_seq.get(&u).is_some_and(|(_, at)| fed_at < at) {
+                if self.need_seq.get(&u).is_some_and(|(_, _, at)| fed_at < at) {
                     self.cov.starts_providers_first += 1;
                 }
                 let claimants = self.holders.claimants(seq_of(&u), content_version);
@@ -516,6 +587,7 @@ impl World {
                     Fetch {
                         id: fetch_id,
                         cv: content_version,
+                        hash: blake3.clone(),
                         providers: devices.clone(),
                         maybe_active: devices,
                         idle_cleared: false,
@@ -543,7 +615,11 @@ impl World {
                     .get_mut(&u)
                     .unwrap_or_else(|| panic!("UpdateProviders for {u}, which is not in flight"));
                 assert_eq!(f.id, fetch_id, "UpdateProviders names another fetch of {u}");
-                match self.fed_providers.get(&u).and_then(|bv| bv.get(&f.cv)) {
+                match self
+                    .fed_providers
+                    .get(&u)
+                    .and_then(|bv| bv.get(&(f.cv, f.hash.clone())))
+                {
                     Some((_, fed)) => {
                         for p in &providers {
                             assert!(fed.contains(p), "I5: {} was never fed for {u}", p.device);
@@ -629,8 +705,14 @@ impl World {
                     "a second RequestLane while one is pending"
                 );
                 assert!(self.flying.is_empty(), "RequestLane with fetches in flight");
+                self.lane_requests += 1;
                 if self.personal {
                     self.lane_pending = true;
+                    // the gate's yield signal may still be raised: it
+                    // reaches the executor late, while the request waits
+                    if self.rng.below(2) == 0 {
+                        self.followups.push(FollowUp::LateYield);
+                    }
                 } else {
                     self.followups.push(FollowUp::GrantLane);
                 }
@@ -643,6 +725,7 @@ impl World {
                 assert!(self.flying.is_empty(), "ReleaseLane with fetches in flight");
                 self.lane_admitted = false;
                 self.lane_yielded = false;
+                self.lane_releases += 1;
                 self.cov.lane_releases += 1;
             }
         }
@@ -677,6 +760,20 @@ impl World {
                 "a drained yielded lane was not released"
             );
         }
+        // one permit at a time: never two requests outstanding, never a
+        // grant without a request, never more releases than grants
+        assert!(
+            self.lane_grants <= self.lane_requests && self.lane_requests <= self.lane_grants + 1,
+            "lane requests {} vs grants {}",
+            self.lane_requests,
+            self.lane_grants
+        );
+        assert!(
+            self.lane_releases <= self.lane_grants,
+            "lane releases {} exceed grants {}",
+            self.lane_releases,
+            self.lane_grants
+        );
         if !starts.is_empty() {
             assert!(self.flying.len() <= self.slots, "slot cap exceeded");
         }
@@ -716,7 +813,7 @@ impl World {
             let n = match self
                 .fed_providers
                 .get(u)
-                .and_then(|bv| bv.get(&w.content_version))
+                .and_then(|bv| bv.get(&(w.content_version, w.blake3.clone())))
             {
                 Some((_, ps)) => ps
                     .iter()
@@ -756,7 +853,7 @@ impl World {
         let old = |since: i64| self.now.saturating_sub(since) >= starving;
         for s in starts {
             let w = &self.fed_need[s];
-            let fed_s = &self.fed_providers[s][&w.content_version].1;
+            let fed_s = &self.fed_providers[s][&(w.content_version, w.blake3.clone())].1;
             let n_s = fed_s.len();
             for (u, n, since) in &idle {
                 if old(*since) {
@@ -914,6 +1011,9 @@ impl World {
         self.fed_need.clear();
         self.fed_providers.clear();
         self.need_seq.clear();
+        self.lane_requests = 0;
+        self.lane_grants = 0;
+        self.lane_releases = 0;
         self.fed_storage = true;
         self.feed(Input::Storage {
             fetching: self.storage_ok,
@@ -967,7 +1067,7 @@ impl World {
         let us: Vec<String> = self.frames.keys().cloned().collect();
         let u = us[self.rng.below(us.len())].clone();
         let dev = PEERS[self.rng.below(PEERS.len())].to_string();
-        match self.rng.below(32) {
+        match self.rng.below(33) {
             0..=2 => {
                 // a holder claims a version (current, or an older one)
                 let cur = self.frames[&u].cv;
@@ -1016,11 +1116,13 @@ impl World {
             7 | 26 | 27 => {
                 // I10: a CAS version bump; the hub writes the publisher's
                 // first holding in the same transaction (I4)
-                let cv = {
+                let cv = self.frames[&u].cv + 1;
+                let hash = self.publish_hash(&u, cv);
+                {
                     let f = self.frames.get_mut(&u).expect("known frame");
-                    f.cv += 1;
-                    f.cv
-                };
+                    f.cv = cv;
+                    f.hash = hash;
+                }
                 self.holders.apply_delta(&HolderDeltaWire {
                     device: dev,
                     add: vec![(seq_of(&u), cv)],
@@ -1162,9 +1264,11 @@ impl World {
                 let cv = self.frames[&u].cv - 1;
                 if cv >= 1 && self.project_live {
                     let providers = self.providers_at(&u, cv);
+                    let blake3 = self.hash_of[&(u.clone(), cv)].clone();
                     self.feed(Input::Providers {
                         key: key(&u),
                         content_version: cv,
+                        blake3,
                         providers,
                     });
                 }
@@ -1197,6 +1301,17 @@ impl World {
                 }
                 "keep / gc"
             }
+            31 => {
+                // a stale yield signal reaches the executor while it holds
+                // no permit: it must change nothing
+                if !self.lane_admitted {
+                    if self.lane_pending {
+                        self.cov.late_yield_pending += 1;
+                    }
+                    self.feed(Input::Lane { admitted: false });
+                }
+                "late yield signal"
+            }
             28..=30 => {
                 // our own pool closes an idle connection: no strike
                 self.feed(Input::ConnectionIdle { device: dev });
@@ -1217,7 +1332,19 @@ impl World {
                 {
                     self.cov.version_down += 1;
                 }
-                self.frames.get_mut(&u).expect("known frame").cv = cur - 1;
+                // the restored state carries that version's old content, or
+                // — the version number reused — other content
+                let hash = if self.rng.below(3) == 0 {
+                    self.cov.hash_reused += 1;
+                    self.publish_hash(&u, cur - 1)
+                } else {
+                    self.hash_of[&(u.clone(), cur - 1)].clone()
+                };
+                {
+                    let f = self.frames.get_mut(&u).expect("known frame");
+                    f.cv = cur - 1;
+                    f.hash = hash;
+                }
                 self.holders.apply_delta(&HolderDeltaWire {
                     device: dev,
                     add: vec![(seq_of(&u), cur - 1)],
@@ -1322,6 +1449,12 @@ fn seeded_interleavings_keep_every_invariant() {
         ("late results ignored", cov.late_ignored),
         ("idle closes freeing a slot", cov.idle_freed_slot),
         ("versions going down", cov.version_down),
+        ("version numbers reused with a new hash", cov.hash_reused),
+        ("re-dialled devices counted as sending", cov.redial_restored),
+        (
+            "late yields while a request is pending",
+            cov.late_yield_pending,
+        ),
     ] {
         assert!(n >= 10, "the simulation barely exercised {what}: {cov:?}");
     }
