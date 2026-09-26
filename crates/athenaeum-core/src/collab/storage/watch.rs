@@ -16,15 +16,27 @@ pub const CANARY_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsSignal {
+    /// A path under the root changed. May be a directory, not only a file —
+    /// notify reports directory creates/renames/removes too.
     Touched(PathBuf),
+    /// The root itself was touched (renamed, recreated, permissions changed).
     Root,
     Canary,
+    /// The watcher reports it may have missed events (inotify's
+    /// `IN_Q_OVERFLOW`, FSEvents' `kFSEventStreamEventFlagMustScanSubDirs`,
+    /// surfaced by `notify` as `Event::need_rescan()`). Nothing here can be
+    /// trusted incremental; the caller must fall back to a full stat sweep
+    /// (fix round 1, Important ruling).
+    Rescan,
     WatchError(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Drained {
+    /// Paths concluded changed this drain. May be directories, not only
+    /// files.
     pub changed: Vec<PathBuf>,
+    /// Paths concluded removed (settled) this drain. May be directories.
     pub removed: Vec<PathBuf>,
     pub root_touched: bool,
 }
@@ -63,7 +75,11 @@ impl Aggregator {
                 self.touched.insert(p.clone());
                 self.window_started.get_or_insert(now);
             }
-            FsSignal::Root => {
+            // A rescan is folded into `root_touched` the same as the root
+            // itself changing: neither can be resolved incrementally, and
+            // Task 9's storage task reads `root_touched` as its cue to run
+            // an out-of-band stat sweep rather than trust the aggregator.
+            FsSignal::Root | FsSignal::Rescan => {
                 self.root_touched = true;
                 self.window_started.get_or_insert(now);
             }
@@ -126,12 +142,22 @@ impl Aggregator {
     }
 }
 
+/// Everything under `.athenaeum` is ours, and most of it is ignored: the
+/// blob store and the write probe are internal bookkeeping, not content a
+/// device holds. Two exceptions produce a signal like any other path: the
+/// canary (its whole job is to be observed) and the storage marker
+/// (`store-id`) — a marker change (a device replace, a take-over) must not
+/// be swallowed silently (fix round 1, folded ruling).
 pub fn is_ignored(root: &Path, path: &Path) -> bool {
     if path.extension().is_some_and(|e| e == "athtmp") {
         return true;
     }
     match path.strip_prefix(root) {
-        Ok(rel) => rel.starts_with(".athenaeum") && rel != Path::new(CANARY_REL),
+        Ok(rel) => {
+            rel.starts_with(".athenaeum")
+                && rel != Path::new(CANARY_REL)
+                && rel != Path::new(super::marker::MARKER_REL)
+        }
         Err(_) => false,
     }
 }
@@ -168,28 +194,88 @@ pub fn write_canary(root: &Path) -> std::io::Result<()> {
     std::fs::write(root.join(CANARY_REL), stamp)
 }
 
+/// True for `EventKind::Access` events other than a completed write. Opens
+/// and reads are noise for change detection (every provider serve would
+/// otherwise generate a signal); a `Close(Write)` is the one access event
+/// that means a save actually finished, so it is treated like any other
+/// touch (fix round 1, folded ruling).
+fn is_uninteresting_access(kind: &notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Access(a)
+            if !matches!(a, notify::event::AccessKind::Close(notify::event::AccessMode::Write))
+    )
+}
+
+/// Turn one native event into zero or more [`FsSignal`]s. `root` and
+/// `canary` must already be in the SAME (canonicalized/normalized) spelling
+/// [`spawn_watcher`] passed to the underlying watcher — see its doc comment.
+/// A free function (not inlined in the sink) so a synthetic `notify::Event`
+/// can exercise the rescan and access-filtering rules without a real
+/// watcher (fix round 1).
+fn signals_for_event(root: &Path, canary: &Path, event: &notify::Event) -> Vec<FsSignal> {
+    if event.need_rescan() {
+        // inotify's `IN_Q_OVERFLOW` and FSEvents' "must scan subdirs" both
+        // surface here as `EventKind::Other` + `Flag::Rescan` with EMPTY
+        // paths — silently doing nothing with them would be exactly the
+        // never-swallow violation the rest of this module exists to avoid
+        // (fix round 1, Important ruling).
+        tracing::warn!(
+            kind = ?event.kind,
+            "collaboration folder watcher may have missed events; forcing a rescan"
+        );
+        return vec![FsSignal::Rescan];
+    }
+    if is_uninteresting_access(&event.kind) {
+        return Vec::new();
+    }
+    event
+        .paths
+        .iter()
+        .filter_map(|path| {
+            if path == root {
+                Some(FsSignal::Root)
+            } else if path == canary {
+                Some(FsSignal::Canary)
+            } else if is_ignored(root, path) {
+                None
+            } else {
+                Some(FsSignal::Touched(path.clone()))
+            }
+        })
+        .collect()
+}
+
 /// A recursive watcher on the root. Events cross an UNBOUNDED channel: a
 /// bounded one can block the platform's fs-event thread (P23). `None` when
 /// no watcher can be established — the caller then runs the degraded sweep.
+///
+/// The root is canonicalized (and, on Windows, de-verbatim'd via
+/// `normalize_path`) before it is ever compared against an event path or
+/// passed to the underlying watcher. FSEvents (macOS) — and, in general, any
+/// backend — reports paths in their canonical spelling regardless of what
+/// was passed to `watch()`; a symlinked root, or the ordinary macOS `/var`
+/// vs `/private/var` split, would otherwise make `path == root` and
+/// `path == canary` never match: the canary is wrongly declared dead and
+/// `.athenaeum/blobs` writes go through unfiltered (fix round 1, Important
+/// ruling).
 pub fn spawn_watcher(
     root: &Path,
     tx: tokio::sync::mpsc::UnboundedSender<FsSignal>,
 ) -> Option<notify::RecommendedWatcher> {
     use notify::Watcher as _;
-    let root_owned = root.to_path_buf();
-    let canary = root.join(CANARY_REL);
+    let root_owned = match root.canonicalize() {
+        Ok(c) => crate::api::scan_roots::normalize_path(&c),
+        Err(e) => {
+            tracing::warn!(path = %root.display(), error = %e, "collaboration folder watcher: root could not be canonicalized; periodic check only");
+            return None;
+        }
+    };
+    let canary = root_owned.join(CANARY_REL);
+    let watch_root = root_owned.clone();
     let sink = move |res: notify::Result<notify::Event>| match res {
         Ok(event) => {
-            for path in event.paths {
-                let sig = if path == root_owned {
-                    FsSignal::Root
-                } else if path == canary {
-                    FsSignal::Canary
-                } else if is_ignored(&root_owned, &path) {
-                    continue;
-                } else {
-                    FsSignal::Touched(path)
-                };
+            for sig in signals_for_event(&root_owned, &canary, &event) {
                 if tx.send(sig).is_err() {
                     return;
                 }
@@ -203,12 +289,12 @@ pub fn spawn_watcher(
     let mut watcher = match notify::recommended_watcher(sink) {
         Ok(w) => w,
         Err(e) => {
-            tracing::warn!(path = %root.display(), error = %e, "collaboration folder watcher unavailable; periodic check only");
+            tracing::warn!(path = %watch_root.display(), error = %e, "collaboration folder watcher unavailable; periodic check only");
             return None;
         }
     };
-    if let Err(e) = watcher.watch(root, notify::RecursiveMode::Recursive) {
-        tracing::warn!(path = %root.display(), error = %e, "collaboration folder watch failed; periodic check only");
+    if let Err(e) = watcher.watch(&watch_root, notify::RecursiveMode::Recursive) {
+        tracing::warn!(path = %watch_root.display(), error = %e, "collaboration folder watch failed; periodic check only");
         return None;
     }
     Some(watcher)
@@ -292,8 +378,72 @@ mod tests {
             root,
             Path::new("/c/.athenaeum/blobs/data/ab.data")
         ));
+        assert!(
+            is_ignored(root, Path::new("/c/.athenaeum/.write-probe")),
+            "the write probe stays ignored"
+        );
         assert!(!is_ignored(root, Path::new("/c/.athenaeum/canary")));
+        assert!(
+            !is_ignored(root, Path::new("/c/.athenaeum/store-id")),
+            "a marker change (device replace, take-over) must produce a signal"
+        );
         assert!(!is_ignored(root, Path::new("/c/m31/a/x.fits")));
+    }
+
+    #[test]
+    fn a_rescan_flag_forces_a_rescan_signal_despite_empty_paths() {
+        // Fix round 1 (Important ruling): inotify's `IN_Q_OVERFLOW` and
+        // FSEvents' "must scan subdirs" both surface as `EventKind::Other` +
+        // `Flag::Rescan` with NO paths at all — nothing to iterate, so the
+        // old per-path loop silently produced no signal whatsoever.
+        let mut attrs = notify::event::EventAttributes::new();
+        attrs.set_flag(notify::event::Flag::Rescan);
+        let event = notify::Event {
+            kind: notify::EventKind::Other,
+            paths: vec![],
+            attrs,
+        };
+        let root = Path::new("/c");
+        let canary = root.join(CANARY_REL);
+        assert_eq!(
+            signals_for_event(root, &canary, &event),
+            vec![FsSignal::Rescan]
+        );
+    }
+
+    #[test]
+    fn a_plain_access_event_is_skipped_but_a_completed_write_close_is_not() {
+        let root = Path::new("/c");
+        let canary = root.join(CANARY_REL);
+        let touched = root.join("m31/a/x.fits");
+
+        let opened = notify::Event {
+            kind: notify::EventKind::Access(notify::event::AccessKind::Open(
+                notify::event::AccessMode::Any,
+            )),
+            paths: vec![touched.clone()],
+            attrs: notify::event::EventAttributes::new(),
+        };
+        assert!(signals_for_event(root, &canary, &opened).is_empty());
+
+        let read = notify::Event {
+            kind: notify::EventKind::Access(notify::event::AccessKind::Read),
+            paths: vec![touched.clone()],
+            attrs: notify::event::EventAttributes::new(),
+        };
+        assert!(signals_for_event(root, &canary, &read).is_empty());
+
+        let closed_after_write = notify::Event {
+            kind: notify::EventKind::Access(notify::event::AccessKind::Close(
+                notify::event::AccessMode::Write,
+            )),
+            paths: vec![touched.clone()],
+            attrs: notify::event::EventAttributes::new(),
+        };
+        assert_eq!(
+            signals_for_event(root, &canary, &closed_after_write),
+            vec![FsSignal::Touched(touched)]
+        );
     }
 
     #[test]
@@ -329,5 +479,75 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_non_canonical_root_still_detects_the_canary() {
+        // Fix round 1 (Important ruling): FSEvents (macOS) reports paths in
+        // their CANONICAL spelling regardless of what was passed to
+        // `watch()`. A macOS temp dir is exactly the `/var` vs
+        // `/private/var` split this guards against — `tmp.path()` here is
+        // deliberately the raw, non-canonical spelling, not
+        // `canonical_tempdir()`: before the fix, the canary write's
+        // canonical event path never equalled the non-canonical `canary`
+        // this function built, and the live watcher was wrongly declared
+        // dead.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".athenaeum")).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let Some(_w) = spawn_watcher(root, tx) else {
+            eprintln!("no filesystem watcher on this platform; skipping");
+            return;
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        write_canary(root).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let sig = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("an event within 10 s")
+                .unwrap();
+            if sig == FsSignal::Canary {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_watcher_filters_the_blob_store_and_reports_the_canary() {
+        let (_tmp, root) = crate::test_support::canonical_tempdir();
+        std::fs::create_dir_all(root.join(".athenaeum/blobs")).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let Some(_w) = spawn_watcher(&root, tx) else {
+            eprintln!("no filesystem watcher on this platform; skipping");
+            return;
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        write_canary(&root).unwrap();
+        std::fs::write(root.join(".athenaeum/blobs/x.data"), b"blob").unwrap();
+        std::fs::write(root.join("marker.fits"), b"marker").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_canary = false;
+        loop {
+            let sig = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("an event within 10 s")
+                .unwrap();
+            match &sig {
+                FsSignal::Canary => saw_canary = true,
+                FsSignal::Touched(p) => {
+                    assert!(
+                        !p.starts_with(root.join(".athenaeum")),
+                        "the blob store must be filtered: {p:?}"
+                    );
+                    if *p == root.join("marker.fits") {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_canary, "the canary write must be observed");
     }
 }

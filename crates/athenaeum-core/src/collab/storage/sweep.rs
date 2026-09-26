@@ -46,7 +46,10 @@ impl Stamp {
     }
 
     pub fn matches(&self, other: &Stamp) -> bool {
-        self.size == other.size && (self.mtime - other.mtime).abs() <= MTIME_TOLERANCE_SECS
+        // `abs_diff`, not `(a - b).abs()`: the plain subtraction can overflow
+        // `i64` (and panic in a debug build) for the pathological mtimes a
+        // corrupt filesystem or a bad clock can produce.
+        self.size == other.size && self.mtime.abs_diff(other.mtime) <= MTIME_TOLERANCE_SECS as u64
     }
 }
 
@@ -80,52 +83,27 @@ pub fn next_sweep_delay(degraded: bool, rng: &mut SplitMix64) -> Duration {
     SWEEP_HEALTHY.mul_f64(factor)
 }
 
+/// Whether `path` sits on a network mount — the input to the sweep cadence
+/// above (spec §9.2): every 5 minutes on a network volume or when this can't
+/// be told, hourly otherwise. Fix round 1 (Important ruling): this used to
+/// be a second, weaker copy of the platform detection — Windows mapped
+/// drive letters read as local, verbatim local paths as network; the Linux
+/// `f_type` sign-extended on 32-bit targets; macOS matched on a name list
+/// instead of `MNT_LOCAL`; and 9P/CephFS/AFS/Lustre were missing. It now
+/// delegates the actual probe to the shared, tested `storage_class::classify`.
+///
+/// One difference from that function's own contract on purpose: `classify`
+/// treats a probe failure as `Local` (the safe direction for read
+/// concurrency, which must never exceed the core count on a misread). Here
+/// the safe direction is the opposite — falling back to the frequent sweep
+/// is cheap, so an unprobeable path (most commonly: the collaboration root
+/// itself is momentarily gone, e.g. an unmounted network share) counts as
+/// degraded rather than as local.
 pub fn is_network_volume(path: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-            return false;
-        };
-        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `c` is a valid NUL-terminated path; `st` is a valid out-pointer.
-        if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
-            return false;
-        }
-        let name: Vec<u8> = st
-            .f_fstypename
-            .iter()
-            .take_while(|b| **b != 0)
-            .map(|b| *b as u8)
-            .collect();
-        return matches!(
-            name.as_slice(),
-            b"smbfs" | b"nfs" | b"afpfs" | b"webdav" | b"cifs"
-        );
+    if !path.exists() {
+        return true;
     }
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-            return false;
-        };
-        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-        // SAFETY: as above.
-        if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
-            return false;
-        }
-        const NFS: i64 = 0x6969;
-        const SMB: i64 = 0x517B;
-        const SMB2: i64 = 0xFE53_4D42u32 as i64;
-        const CIFS: i64 = 0xFF53_4D42u32 as i64;
-        return matches!(st.f_type as i64, NFS | SMB | SMB2 | CIFS);
-    }
-    #[cfg(windows)]
-    {
-        return path.as_os_str().to_string_lossy().starts_with(r"\\");
-    }
-    #[allow(unreachable_code)]
-    false
+    crate::storage_class::classify(path) == crate::storage_class::StorageClass::Network
 }
 
 #[cfg(test)]
@@ -186,5 +164,27 @@ mod tests {
         assert!(!is_network_volume(&std::env::temp_dir()));
         #[cfg(windows)]
         assert!(is_network_volume(Path::new(r"\\nas\share\collab")));
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_probed_is_degraded() {
+        // Fix round 1: an unprobeable path (the common real case is the
+        // collaboration root itself momentarily unmounted) must fall back to
+        // the frequent sweep, the opposite of `storage_class::classify`'s
+        // own "probe failure is Local" contract.
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("does-not-exist");
+        assert!(is_network_volume(&gone));
+    }
+
+    #[test]
+    fn is_network_volume_agrees_with_storage_class() {
+        // The whole point of the fold-in: no second, weaker detector.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            is_network_volume(dir.path()),
+            crate::storage_class::classify(dir.path())
+                == crate::storage_class::StorageClass::Network
+        );
     }
 }

@@ -20,6 +20,10 @@ pub mod logging;
 pub mod events;
 pub mod resample;
 pub mod geometry;
+// Local-vs-network filesystem detection. Ungated (std/libc/windows-sys only):
+// `integration::read_concurrency` and `collab::storage::sweep`'s network-
+// volume sweep cadence both consume it.
+pub mod storage_class;
 pub mod scanner;
 pub mod monitor;
 pub mod auto_merge;
