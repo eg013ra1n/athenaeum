@@ -175,8 +175,17 @@ fn check_no_recorded_marker_mismatch(
     let Some(recorded) = crate::db::collab_live::recorded_store_marker(&conn)? else {
         return Ok(());
     };
-    let Ok(Some(on_disk)) = read_marker(root) else {
-        return Ok(());
+    let on_disk = match read_marker(root) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                path = %root.display(),
+                error = %e,
+                "collaboration folder marker unreadable while checking for a recorded mismatch"
+            );
+            return Ok(());
+        }
     };
     if on_disk.store_id != recorded.store_id {
         tracing::warn!(
