@@ -227,6 +227,13 @@ impl StorageEngine {
     }
 
     pub fn next_deadline(&self) -> Instant {
+        // Not serving: a tick only re-reads the marker (it drains, sweeps and
+        // retries nothing), so only that check is due — a past sweep,
+        // aggregation or retry deadline would wake the session loop again
+        // at once, forever (Task 15).
+        if !self.state.serving() {
+            return self.next_check;
+        }
         let mut d = self.next_check.min(self.next_sweep);
         if let Some(a) = self.agg.next_deadline() {
             d = d.min(a);
@@ -3025,6 +3032,14 @@ mod tests {
                 "unmounted is not deleted"
             );
         }
+        // Task 15: an unavailable store asks only for its next marker check
+        // — never a deadline already past (the live loop would spin).
+        let now = Instant::now();
+        eng.tick(now, &Holders(2)).await;
+        assert!(
+            eng.next_deadline() > now,
+            "the next deadline is the marker re-check, not a past sweep"
+        );
     }
 
     struct MoveToTrash(PathBuf);

@@ -709,6 +709,11 @@ struct Runtime {
     events_rx: mpsc::Receiver<LiveEvent>,
     events_open: bool,
     checks_rx: mpsc::UnboundedReceiver<(String, String)>,
+    /// A closed channel answers `None` at once, forever: its arm is
+    /// switched off instead of spinning the loop (the serve oracle replaced
+    /// by another, the watcher gone).
+    checks_open: bool,
+    fs_open: bool,
     reset: watch::Receiver<u64>,
     stop_tx: watch::Sender<bool>,
     session: tokio::task::JoinHandle<()>,
@@ -820,6 +825,8 @@ impl Runtime {
             events_rx,
             events_open: true,
             checks_rx,
+            checks_open: true,
+            fs_open: true,
             reset: crate::collab::live::backoff::reset_signal(),
             stop_tx,
             session,
@@ -997,17 +1004,23 @@ impl Runtime {
                         self.exec.on_yield_changed();
                     }
                 }
-                sig = self.storage.recv_signal() => {
-                    if let Some(sig) = sig {
-                        self.storage.on_signal(sig, Instant::now());
+                sig = self.storage.recv_signal(), if self.fs_open => match sig {
+                    Some(sig) => self.storage.on_signal(sig, Instant::now()),
+                    None => {
+                        tracing::warn!("collaboration folder signals ended; changes are seen by the periodic check only");
+                        self.fs_open = false;
                     }
-                }
-                check = self.checks_rx.recv() => {
-                    if let Some((p, u)) = check {
+                },
+                check = self.checks_rx.recv(), if self.checks_open => match check {
+                    Some((p, u)) => {
                         let evs = self.storage.local_check(&p, &u).await;
                         self.on_storage_events(evs);
                     }
-                }
+                    None => {
+                        tracing::warn!("the serve oracle's check channel closed; mismatches wait for the sweep");
+                        self.checks_open = false;
+                    }
+                },
                 _ = tokio::time::sleep_until(deadline.into()) => self.on_timers().await,
             }
         }
