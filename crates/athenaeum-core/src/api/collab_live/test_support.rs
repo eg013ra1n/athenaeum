@@ -366,6 +366,7 @@ pub(crate) fn live_opts(
         hedging: false,
         telemetry,
         max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(max_in_flight)),
+        limit_changed: None,
         unit_cap_bytes: TEST_UNIT_CAP,
     }
 }
@@ -389,7 +390,7 @@ pub(crate) fn live_item(
 }
 
 /// Frame `i` of `rig` as a live item.
-fn rig_item(
+pub(crate) fn rig_item(
     rig: &LandedRig,
     i: usize,
     providers: ProviderSet,
@@ -1112,5 +1113,447 @@ impl FetchRig {
             Landed::Yes(p) => Ok(p),
             other => Err(other),
         }
+    }
+}
+
+// ----- two live instances (Task 15) ---------------------------------------
+
+use crate::db::collab_frames::LocalState;
+use crate::sync::receiver::InboundControl;
+
+/// The fake hub's shortened presence timings for the live tests, and the
+/// beat that keeps a session inside them.
+pub(crate) const LIVE_TIMINGS: crate::collab::fake_hub::FakeTimings =
+    crate::collab::fake_hub::FakeTimings {
+        keepalive: std::time::Duration::from_millis(200),
+        grace: std::time::Duration::from_millis(300),
+        silence: std::time::Duration::from_secs(1),
+    };
+pub(crate) const LIVE_BEAT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One app instance with a live exchange: its own catalog, a bound
+/// relay-disabled node, its Collaboration root, and a receive gate it owns
+/// (the sync receiver is never started here).
+pub(crate) struct Instance {
+    _tmp: tempfile::TempDir,
+    pub ctx: Arc<ServiceContext>,
+    pub node: Arc<SharedIrohNode>,
+    pub root: PathBuf,
+    pub control: Arc<InboundControl>,
+}
+
+async fn live_instance(
+    hub: &FakeHub,
+    token: &'static str,
+    account: &'static str,
+    display: &'static str,
+) -> Instance {
+    let (tmp, ctx) = crate::api::collab_exchange::test_support::test_ctx();
+    crate::api::collab_exchange::test_support::wire_hub(&ctx, &hub.uri(), token);
+    let dirs = crate::api::sync::sync_dirs(&ctx).unwrap();
+    std::fs::create_dir_all(&dirs.identity_dir).unwrap();
+    std::fs::create_dir_all(&dirs.working_dir).unwrap();
+    let node = SharedIrohNode::bind_with(
+        &dirs.identity_dir,
+        &dirs.working_dir,
+        iroh::RelayMode::Disabled,
+        crate::sharing::iroh::node::NodeOptions::default(),
+    )
+    .await
+    .expect("bind relay-disabled node");
+    crate::api::collab_live::serve_oracle::install_catalog_oracle(&ctx, &node);
+    *ctx.iroh_node.lock().await = Some(Arc::clone(&node));
+    let device = crate::api::account::own_device_id(&ctx).unwrap();
+    hub.add_account(token, account, display, &device, None);
+    let requested = tmp.path().join("Collab");
+    std::fs::create_dir_all(&requested).unwrap();
+    crate::api::scan_roots::set_collaboration_dir(
+        &ctx,
+        requested.to_string_lossy().to_string(),
+        &PathPolicy::AllowAll,
+    )
+    .await
+    .expect("designate the Collaboration root");
+    let root = collab_root(&ctx);
+    Instance {
+        _tmp: tmp,
+        ctx: Arc::new(ctx),
+        node,
+        root,
+        control: Arc::new(InboundControl::new()),
+    }
+}
+
+async fn wait_until(what: &str, within: std::time::Duration, mut pred: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if pred() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: not within {within:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+impl Instance {
+    /// This device's id as the hub names it.
+    pub(crate) fn device(&self) -> String {
+        crate::api::account::own_device_id(&self.ctx).unwrap()
+    }
+
+    /// Arm the live exchange (the test config: a beat inside the fake
+    /// hub's shortened silence rule).
+    pub(crate) fn start_live(&self) {
+        let cfg = crate::api::collab_live::LiveConfig {
+            beat: LIVE_BEAT,
+            ready_poll: std::time::Duration::from_millis(100),
+            ..Default::default()
+        };
+        crate::api::collab_live::spawn_with(
+            Arc::clone(&self.ctx),
+            crate::api::collab_live::GateSource::Fixed(Arc::clone(&self.control)),
+            None,
+            cfg,
+        )
+        .expect("armed");
+    }
+
+    /// Stop (clean exit) and arm it again.
+    pub(crate) async fn restart_live(&self) {
+        crate::api::collab_live::shutdown(&self.ctx).await;
+        self.start_live();
+    }
+
+    pub(crate) fn row(&self, uuid: &str) -> Option<crate::db::collab_frames::LocalFrameRow> {
+        crate::db::collab_frames::get(&crate::api::db(&self.ctx).unwrap().conn(), PID, uuid)
+            .unwrap()
+    }
+
+    pub(crate) async fn wait_state(
+        &self,
+        uuid: &str,
+        state: LocalState,
+        within: std::time::Duration,
+    ) {
+        wait_until(&format!("{uuid} {state:?}"), within, || {
+            self.row(uuid).is_some_and(|r| r.local_state == state)
+        })
+        .await;
+    }
+
+    pub(crate) async fn wait_state_version(
+        &self,
+        uuid: &str,
+        state: LocalState,
+        version: i32,
+        within: std::time::Duration,
+    ) {
+        wait_until(&format!("{uuid} {state:?} v{version}"), within, || {
+            self.row(uuid)
+                .is_some_and(|r| r.local_state == state && r.content_version == version)
+        })
+        .await;
+    }
+
+    /// Every cached replica of the project held.
+    pub(crate) async fn wait_all_held(&self, within: std::time::Duration) {
+        wait_until("every replica held", within, || {
+            let rows = crate::db::collab_frames::list_for_project(
+                &crate::api::db(&self.ctx).unwrap().conn(),
+                PID,
+            )
+            .unwrap();
+            !rows.is_empty()
+                && rows
+                    .iter()
+                    .filter(|r| r.origin == crate::db::collab_frames::FrameOrigin::Replica)
+                    .all(|r| r.local_state == LocalState::Held)
+        })
+        .await;
+    }
+
+    /// Bytes of the frame's current version are arriving in the store.
+    async fn fetching(&self, uuid: &str) -> bool {
+        let Some(row) = self.row(uuid) else {
+            return false;
+        };
+        let Some(store) = self.node.collab_store() else {
+            return false;
+        };
+        let Ok(hash) = row.blake3.parse::<iroh_blobs::Hash>() else {
+            return false;
+        };
+        match store.blobs().observe(hash).await {
+            Ok(bitfield) => bitfield.total_bytes() > 0 && !bitfield.is_complete(),
+            Err(_) => false,
+        }
+    }
+
+    pub(crate) async fn wait_fetch_started(&self, uuid: &str, within: std::time::Duration) {
+        let deadline = std::time::Instant::now() + within;
+        while !self.fetching(uuid).await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{uuid}: no fetch started within {within:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    pub(crate) async fn wait_any_fetch_started(&self, within: std::time::Duration) {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let rows = crate::db::collab_frames::list_for_project(
+                &crate::api::db(&self.ctx).unwrap().conn(),
+                PID,
+            )
+            .unwrap();
+            for r in rows {
+                if self.fetching(&r.frame_uuid).await {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no fetch started within {within:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The frame's file bytes as this instance holds them.
+    pub(crate) fn file_bytes(&self, uuid: &str) -> Vec<u8> {
+        let row = self.row(uuid).expect("a cached row");
+        std::fs::read(row.landed_path.expect("a landed file")).unwrap()
+    }
+
+    /// One receive lane in all (the personal-priority test).
+    pub(crate) async fn set_receive_limit(&self, n: usize) {
+        self.control.receive_gate.set_limit(n);
+    }
+
+    /// How long a personal transfer waits for its receive permit.
+    pub(crate) async fn personal_acquire_timed(&self) -> std::time::Duration {
+        let t0 = std::time::Instant::now();
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.control.receive_gate.acquire(),
+        )
+        .await
+        .expect("a personal permit within a minute");
+        let waited = t0.elapsed();
+        drop(permit);
+        waited
+    }
+}
+
+/// A (`send`, publishing) and B (`send_receive`, replicating), both live on
+/// one fake hub, paired, project [`PID`] refreshed on both.
+pub(crate) struct World {
+    pub hub: FakeHub,
+    pub a: Instance,
+    pub b: Instance,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) async fn two_instances() -> World {
+    two_instances_with(None).await
+}
+
+/// As [`two_instances`], A's uploads capped at `bps` bytes per second.
+pub(crate) async fn two_instances_throttled(bps: u64) -> World {
+    two_instances_with(Some(bps)).await
+}
+
+async fn two_instances_with(throttle: Option<u64>) -> World {
+    let hub = FakeHub::start().await;
+    hub.set_timings(LIVE_TIMINGS);
+    hub.add_project(
+        PID,
+        "m31",
+        &[("acc-a", "send", false), ("acc-b", "send_receive", false)],
+        false,
+    );
+    let a = live_instance(&hub, "tok-a", "acc-a", "Alice").await;
+    let b = live_instance(&hub, "tok-b", "acc-b", "Bob").await;
+    pair(&a.node, &b.node).await;
+    for i in [&a, &b] {
+        let cards = crate::api::collab::refresh_projects(&i.ctx).await.unwrap();
+        assert!(cards.iter().any(|p| p.project_id == PID));
+    }
+    if let Some(bps) = throttle {
+        a.node.set_upload_limit(bps);
+    }
+    a.start_live();
+    b.start_live();
+    let window = std::time::Duration::from_secs(10);
+    hub.wait_connected(PID, &a.device(), window).await;
+    hub.wait_connected(PID, &b.device(), window).await;
+    World {
+        hub,
+        a,
+        b,
+        next: std::sync::atomic::AtomicUsize::new(0),
+    }
+}
+
+impl World {
+    fn fresh_uuids(&self, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|_| {
+                let i = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("f{i:03}")
+            })
+            .collect()
+    }
+
+    /// A publishes `n` frames of 64 KiB.
+    pub(crate) async fn a_publishes(&self, n: usize) -> Vec<String> {
+        self.a_publishes_big(n, FETCH_FRAME_BYTES).await
+    }
+
+    /// A publishes `n` frames of `size` bytes, in the order its publish run
+    /// does it: its own file under its root, its own row `own_held`, seeded
+    /// and claimed — THEN the hub's row with the real hashes and A's
+    /// implicit claim (so no peer ever asks before A can serve).
+    pub(crate) async fn a_publishes_big(&self, n: usize, size: usize) -> Vec<String> {
+        let uuids = self.fresh_uuids(n);
+        let dir = self.a.root.join("m31").join("Alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        for uuid in &uuids {
+            let bytes = FetchRig::pattern(uuid, 1, size);
+            let path = dir.join(format!("{uuid}.fits"));
+            std::fs::write(&path, &bytes).unwrap();
+            let blake3 = blake3::hash(&bytes).to_hex().to_string();
+            let xxh3 = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
+            let len = bytes.len() as i64;
+            let file_name = format!("{uuid}.fits");
+            let view = crate::collab::hub_client::FrameViewWire {
+                frame_uuid: uuid.clone(),
+                frame_seq: 0,
+                publisher_account_id: "acc-a".into(),
+                publisher_display_name: "Alice".into(),
+                own: true,
+                file_name: file_name.clone(),
+                content_version: 1,
+                blake3: blake3.clone(),
+                byte_size: len,
+                xxh3: xxh3.clone(),
+                filter_raw: "L".into(),
+                filter_canonical: "L".into(),
+                channel: "mono".into(),
+                exptime_sec: 300.0,
+                date_obs: None,
+                meta: serde_json::json!({}),
+                gate_version: 0,
+                accepted: true,
+                accepted_reason: None,
+                state: "published".into(),
+                reject_reason: None,
+                manifest_version: 0,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            {
+                let conn = crate::api::db(&self.a.ctx).unwrap().conn();
+                crate::db::collab_frames::upsert_from_manifest(&conn, PID, &view).unwrap();
+            }
+            self.a
+                .node
+                .seed_project_frame(PID, uuid, 1, &path)
+                .await
+                .expect("seed A's own frame");
+            let stamp =
+                crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(&path).unwrap());
+            {
+                let conn = crate::api::db(&self.a.ctx).unwrap().conn();
+                crate::db::collab_frames::update_landed_path(
+                    &conn,
+                    PID,
+                    uuid,
+                    &path.to_string_lossy(),
+                )
+                .unwrap();
+                crate::db::collab_frames::set_size_mtime_seen(&conn, PID, uuid, &stamp.encode())
+                    .unwrap();
+                crate::db::collab_live::add_implicit_claim(&conn, PID, uuid, 1).unwrap();
+                conn.execute(
+                    "UPDATE project_frames_local SET local_state = 'own_held', on_disk = 1
+                     WHERE project_id = ?1 AND frame_uuid = ?2",
+                    rusqlite::params![PID, uuid],
+                )
+                .unwrap();
+            }
+            self.hub
+                .seed_frames_with(PID, "acc-a", &[uuid.as_str()], "published", |f| {
+                    f.blake3 = blake3.clone();
+                    f.xxh3 = xxh3.clone();
+                    f.byte_size = len;
+                    f.file_name = file_name.clone();
+                });
+        }
+        uuids
+    }
+
+    /// A publishes a new version of `uuid` with different bytes of the same
+    /// size, as its publish run does: the new file, its own row at the new
+    /// version (own_held, seeded, its implicit claim), then the hub's
+    /// versions call as A (the hub writes A's implicit claim and bumps).
+    pub(crate) async fn a_republishes_changed(&self, uuid: &str) {
+        let row = self.a.row(uuid).expect("A's own row");
+        let next = row.content_version + 1;
+        let bytes = FetchRig::pattern(uuid, next, row.byte_size as usize);
+        let path = self
+            .a
+            .root
+            .join("m31")
+            .join("Alice")
+            .join(format!("{uuid}.v{next}.fits"));
+        std::fs::write(&path, &bytes).unwrap();
+        let blake3 = blake3::hash(&bytes).to_hex().to_string();
+        let xxh3 = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
+        self.a
+            .node
+            .seed_project_frame(PID, uuid, next, &path)
+            .await
+            .expect("seed A's new version");
+        let stamp = crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(&path).unwrap());
+        {
+            let conn = crate::api::db(&self.a.ctx).unwrap().conn();
+            conn.execute(
+                "UPDATE project_frames_local SET content_version = ?3, blake3 = ?4, xxh3 = ?5,
+                     landed_path = ?6, size_mtime_seen = ?7, local_state = 'own_held', on_disk = 1
+                 WHERE project_id = ?1 AND frame_uuid = ?2",
+                rusqlite::params![
+                    PID,
+                    uuid,
+                    next,
+                    blake3,
+                    xxh3,
+                    path.to_string_lossy(),
+                    stamp.encode()
+                ],
+            )
+            .unwrap();
+            crate::db::collab_live::add_implicit_claim(&conn, PID, uuid, next).unwrap();
+        }
+        let client = crate::collab::hub_client::CollabClient::new(self.hub.uri()).unwrap();
+        let reply = client
+            .frame_versions(
+                "tok-a",
+                PID,
+                &[crate::collab::live::wire::VersionInWire {
+                    uuid: uuid.to_string(),
+                    expected_version: row.content_version,
+                    blake3,
+                    byte_size: row.byte_size,
+                    xxh3,
+                }],
+            )
+            .await
+            .expect("the hub takes the new version");
+        assert_eq!(reply.results[0].content_version, next);
     }
 }

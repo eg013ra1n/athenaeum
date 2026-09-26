@@ -967,6 +967,47 @@ pub fn set_awaiting_gc(
     )?)
 }
 
+/// When each `wanted` row of a project became wanted (`state_changed_at`,
+/// UTC), as epoch milliseconds — the scheduler's starvation clock (spec
+/// §7.2). A value that does not parse is left out (the caller reads "now").
+pub fn wanted_since(conn: &Connection, project_id: &str) -> Result<HashMap<String, i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT frame_uuid, state_changed_at FROM project_frames_local
+         WHERE project_id = ?1 AND local_state = 'wanted'",
+    )?;
+    let rows = stmt.query_map(params![project_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (uuid, at) = row?;
+        if let Some(ms) = at.as_deref().and_then(|s| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|t| t.and_utc().timestamp_millis())
+        }) {
+            out.insert(uuid, ms);
+        }
+    }
+    Ok(out)
+}
+
+/// Rows parked by a landing for the collab store's GC (`awaiting_gc = 1`,
+/// no recorded stamp — a row the storage engine PARKED at a moved file
+/// keeps its stamp and is retried by the engine instead): `(project,
+/// frame, blake3)`.
+pub fn awaiting_gc_released(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT project_id, frame_uuid, blake3 FROM project_frames_local
+         WHERE awaiting_gc = 1 AND size_mtime_seen IS NULL
+         ORDER BY project_id, frame_uuid",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Record a new `size:mtime` for a landed file whose content re-hashed to
 /// the recorded `xxh3` (disk truth, spec §5.5: touched but identical).
 /// Column-targeted; returns the rows touched.

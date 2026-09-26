@@ -1154,7 +1154,7 @@ pub(crate) fn size_mtime_from(meta: &std::fs::Metadata) -> String {
 }
 
 /// A string field of a row's verbatim manifest JSON.
-fn manifest_str(row: &LocalFrameRow, key: &str) -> Option<String> {
+pub(crate) fn manifest_str(row: &LocalFrameRow, key: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(&row.manifest_json)
         .ok()?
         .get(key)?
@@ -2379,27 +2379,6 @@ impl Drop for CancelRegistration {
     }
 }
 
-/// Ask a running fetch of `project_id` to stop after its current batch
-/// (R19). Returns whether one was running. Called when auto-replication is
-/// turned off and when the project is lost; the between-batch re-check
-/// covers both too, this only makes the stop explicit.
-pub(crate) fn cancel_project_fetch(ctx: &ServiceContext, project_id: &str) -> bool {
-    let Ok(key) = fetch_key(ctx, project_id) else {
-        return false;
-    };
-    let flag = FETCH_CANCELS
-        .get()
-        .and_then(|m| m.lock().ok().and_then(|m| m.get(&key).cloned()));
-    match flag {
-        Some(flag) => {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            tracing::info!(project_id, "replication fetch cancel requested");
-            true
-        }
-        None => false,
-    }
-}
-
 /// Record a frame-level failure on its row (logged by the caller).
 pub(crate) fn record_frame_error(
     ctx: &ServiceContext,
@@ -3216,7 +3195,8 @@ pub async fn set_collab_policy(
         count = preview.to_fetch,
         "replication policy set"
     );
-    auto_sync_kick().notify_one();
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_live::notify_local_change(ctx, project_id);
     Ok(preview)
 }
 
@@ -3730,9 +3710,8 @@ pub fn set_project_auto_replicate(
         tracing::error!(project_id, error = %e, "auto-replication toggled but the local frame states were not re-derived");
         e
     })?;
-    if !enabled {
-        cancel_project_fetch(ctx, project_id);
-    }
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_live::notify_local_change(ctx, project_id);
     Ok(())
 }
 
@@ -7318,36 +7297,6 @@ mod tests {
             assert_eq!(puts.len(), 1);
             assert_eq!(puts[0]["full"], true);
             node.shutdown().await;
-        }
-
-        /// R19: a cancel lands between batches — the running batch finishes,
-        /// the next one never starts.
-        #[tokio::test]
-        #[ignore = "collab v3 wave 3: retired in Task 15"]
-        async fn a_cancel_stops_the_fetch_between_batches() {
-            let (r, recv, publisher, _pub_dir) = many_rig(FETCH_BATCH + 1).await;
-            let was_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            {
-                let (ctx, was_running) = (Arc::clone(&r.ctx), Arc::clone(&was_running));
-                r.hub.before_next("/frames/f000/holders", move |_| {
-                    was_running.store(
-                        cancel_project_fetch(&ctx, PID),
-                        std::sync::atomic::Ordering::SeqCst,
-                    );
-                });
-            }
-            let out = fetch_all(&r, None).await;
-            assert!(was_running.load(std::sync::atomic::Ordering::SeqCst));
-            assert_eq!(out.landed, FETCH_BATCH, "the first batch finishes");
-            assert!(!row(&r.ctx, "z-last").unwrap().on_disk);
-            assert_eq!(
-                holder_lookups(&r, "z-last").await,
-                0,
-                "the second never starts"
-            );
-            assert!(!cancel_project_fetch(&r.ctx, PID), "unregistered once done");
-            publisher.shutdown().await;
-            recv.shutdown().await;
         }
 
         /// R19: between batches the queue is re-read — a frame declined while

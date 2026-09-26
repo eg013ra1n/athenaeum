@@ -1411,17 +1411,19 @@ pub async fn autostart_if_enabled(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync),
     ));
-    // D3 §3.3: arm the collab auto-replication worker — published frames of
-    // every auto-enabled project replicate themselves. Armed here (and at the
-    // other `ensure_started` site) rather than in each host's startup: the pass
-    // needs exactly the started `SyncRuntime` this function just produced.
-    // Idempotent — the FIRST call spawns the one loop and every later one
-    // no-ops.
-    crate::api::collab_exchange::spawn_collab_auto_sync(
+    // Collab v3 wave 3 (Task 15): arm the live exchange — the event session,
+    // the holder side, the storage engine and the scheduler — once per
+    // catalog. Armed here (and at the other `ensure_started` site) rather than
+    // in each host's startup: its receive lane is the started `SyncRuntime`'s
+    // gate. Idempotent — the FIRST call spawns it and every later one no-ops.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_live::spawn_collab_live(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync),
         Some(emitter_for_auto_sync),
     );
+    #[cfg(not(all(feature = "render", feature = "solver")))]
+    drop(emitter_for_auto_sync);
     Ok(true)
 }
 
@@ -1752,14 +1754,17 @@ pub async fn get_pairing_ticket(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync),
     ));
-    // D3 §3.3: arm the collab auto-replication worker here too — the OTHER
-    // `ensure_started` site. Idempotent (once per process), so it no-ops if
+    // Collab v3 wave 3 (Task 15): arm the live exchange here too — the OTHER
+    // `ensure_started` site. Idempotent (once per catalog), so it no-ops if
     // autostart already armed it.
-    crate::api::collab_exchange::spawn_collab_auto_sync(
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_live::spawn_collab_live(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync),
         Some(emitter_for_auto_sync),
     );
+    #[cfg(not(all(feature = "render", feature = "solver")))]
+    drop(emitter_for_auto_sync);
     Ok(ticket)
 }
 

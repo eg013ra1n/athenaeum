@@ -343,6 +343,11 @@ fn build_status(ctx: &ServiceContext, cfg: &AccountConfig) -> Result<AccountStat
 
 /// Local-only sign-out (see module docs). Idempotent.
 pub async fn sign_out(ctx: &ServiceContext) -> Result<(), ApiError> {
+    // The live exchange leaves presence and stops first (P28), while the
+    // token still authenticates nothing it needs; the node then serves
+    // nothing more.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_live::on_sign_out(ctx).await;
     let cfg = resolve_config(ctx)?;
     clear_local_session(ctx, &cfg)?;
     tracing::info!(hub = %cfg.hub_host, "signed out (local)");

@@ -5144,6 +5144,57 @@ mod live_run {
         assert!(store.blobs().has(rig.hash_of(0)).await.unwrap());
     }
 
+    /// Task 15 (T12 carry): raising the stream limit takes a queued item at
+    /// once — the run wakes on the limit's watch instead of waiting for its
+    /// next join, item or yield.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raising_the_stream_limit_takes_a_queued_item_at_once() {
+        let rig = ts::landed_rig(2).await;
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let store = ts::scratch_store();
+        let provider = rig.node.endpoint_addr().id;
+        // item 0 waits forever on an empty live set; item 1 could run
+        let (_empty_tx, empty_rx) =
+            tokio::sync::watch::channel(Arc::new(Vec::<iroh::EndpointId>::new()));
+        let (waiting, _c0) = ts::rig_item(&rig, 0, ProviderSet::Live(empty_rx));
+        let (ready, _c1) = ts::rig_item(&rig, 1, ProviderSet::Fixed(Arc::new(vec![provider])));
+        let (item_tx, item_rx) = tokio::sync::mpsc::channel(4);
+        item_tx.send(waiting).await.unwrap();
+        item_tx.send(ready).await.unwrap();
+        let mut opts = ts::live_opts(1, crate::sharing::noop_provider_telemetry());
+        let limit = Arc::clone(&opts.max_in_flight);
+        let (limit_tx, limit_rx) = tokio::sync::watch::channel(1usize);
+        opts.limit_changed = Some(limit_rx);
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (verdict_tx, _verdicts) = tokio::sync::mpsc::unbounded_channel();
+        let (_yield_tx, yield_rx) = tokio::sync::watch::channel(false);
+        let dialer = ts::live_dialer(&me, &[&rig.node]);
+        let run = tokio::spawn({
+            let store = store.clone();
+            async move {
+                crate::sharing::iroh::assign::run_live(
+                    &store, dialer, item_rx, opts, done_tx, verdict_tx, yield_rx,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            done_rx.try_recv().is_err(),
+            "one slot, held by the waiting item"
+        );
+        limit.store(2, std::sync::atomic::Ordering::Relaxed);
+        limit_tx.send(2).unwrap();
+        let (key, out) = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+            .await
+            .expect("the raised limit took the queued item at once")
+            .unwrap();
+        assert_eq!(key, "f01");
+        assert!(matches!(out, ItemOutcome::Done), "{out:?}");
+        run.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refusing_provider_is_excluded_for_the_hash_without_a_strike() {
         // provider A edited its file (serve check refuses: ERR_PERMISSION), B serves

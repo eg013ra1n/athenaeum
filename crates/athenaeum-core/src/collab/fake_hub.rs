@@ -1079,6 +1079,20 @@ impl FakeHub {
         uuids: &[&str],
         state: &str,
     ) {
+        self.seed_frames_with(project_id, publisher_account, uuids, state, |_| {});
+    }
+
+    /// As [`seed_frames`](Self::seed_frames), with `f` applied to each row
+    /// before it is stored and published — a publisher's real hashes land in
+    /// ONE commit, as an announce does (Task 15).
+    pub fn seed_frames_with(
+        &self,
+        project_id: &str,
+        publisher_account: &str,
+        uuids: &[&str],
+        state: &str,
+        f: impl Fn(&mut FrameViewWire),
+    ) {
         let mut st = self.lock();
         let display = st.display_of(publisher_account);
         let devices = st.devices_of(publisher_account);
@@ -1119,6 +1133,8 @@ impl FakeHub {
                     manifest_version: version,
                     created_at: now_rfc3339(),
                 };
+                let mut view = view;
+                f(&mut view);
                 p.frames.insert(uuid.to_string(), view);
                 touched.push(uuid.to_string());
                 for device in &devices {
@@ -1218,6 +1234,66 @@ impl FakeHub {
             .claims
             .get(&(device.to_string(), uuid.to_string()))
             .copied()
+    }
+
+    /// REST requests (everything but the event stream and the presence
+    /// beat, which the front answers itself) whose path is exactly
+    /// `/api/v1{path}` (Task 15: "no poll").
+    pub async fn requests_to(&self, path: &str) -> usize {
+        let full = format!("/api/v1{path}");
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == full)
+            .count()
+    }
+
+    /// REST requests whose path contains both `a` and `b` (Task 15: "no
+    /// per-frame holder lookups").
+    pub async fn requests_matching(&self, a: &str, b: &str) -> usize {
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().contains(a) && r.url.path().contains(b))
+            .count()
+    }
+
+    /// Wait until `device` has an open event stream in the project.
+    pub async fn wait_connected(&self, project_id: &str, device: &str, within: Duration) {
+        let deadline = Instant::now() + within;
+        loop {
+            if self.connected(project_id).iter().any(|d| d == device) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{device} did not connect within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Wait until `device` holds `uuid`'s current version at the hub.
+    pub async fn wait_holder(&self, project_id: &str, uuid: &str, device: &str, within: Duration) {
+        let deadline = Instant::now() + within;
+        loop {
+            if self
+                .holders_of(project_id, uuid)
+                .iter()
+                .any(|d| d == device)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{device} is not a holder of {uuid} after {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     /// Claim rows whose visible `(content_version, removed)` changed, summed

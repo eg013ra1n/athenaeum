@@ -1421,7 +1421,8 @@ pub(crate) async fn refresh_projects_reporting(
             // Task 15 R1: a lost project is never reported again — its claim
             // set, outbox and holder map go with it (a re-join reloads them).
             crate::db::collab_live::clear_project_live_state(&conn, lost).map_err(internal)?;
-            crate::api::collab_exchange::cancel_project_fetch(ctx, lost);
+            // Its fetches stop at once (the runtime finds it lost).
+            crate::api::collab_live::notify_local_change(ctx, lost);
             tracing::info!(project_id = %lost, count = removed, "project lost: marked, replica frame rows deleted");
         }
         // Expire stale intents first: a "publish as project" intent that never

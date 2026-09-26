@@ -376,6 +376,9 @@ async fn main() {
     // if the sync autostart bound one. Bounded (5s) + best-effort so a stuck
     // relay/close never hangs process exit; `SharedIrohNode::shutdown` is itself
     // idempotent and logs its own completion.
+    // Collab v3 wave 3 (P28): leave presence and stop the live exchange
+    // (bounded 2 s) before the node goes away.
+    athenaeum_core::api::collab_live::shutdown(&ctx_for_shutdown).await;
     tracing::info!("web server stopped; shutting down shared iroh node");
     // Take the node out (dropping the guard) BEFORE awaiting shutdown, so the
     // MutexGuard temporary never lives across the await.

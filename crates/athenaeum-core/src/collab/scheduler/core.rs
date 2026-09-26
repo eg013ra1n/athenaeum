@@ -116,6 +116,14 @@ pub enum Input {
         blake3: String,
         providers: Vec<ProviderRef>,
     },
+    /// Several frames' lists in one step: each entry exactly as
+    /// [`Input::Providers`], in order, then ONE reconcile and ONE schedule
+    /// (Task 15). A presence change of a device that holds thousands of
+    /// frames, or an epoch change's re-feed, is one step instead of
+    /// thousands — each of which would re-rank the whole need set.
+    ProvidersBatch {
+        lists: Vec<ProviderList>,
+    },
     ProjectGone {
         project_id: String,
     },
@@ -167,6 +175,16 @@ pub enum Input {
     /// `collab::live::backoff::reset_all` fires.
     ClearBackoffs,
     Tick,
+}
+
+/// One entry of [`Input::ProvidersBatch`]: the fields of
+/// [`Input::Providers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderList {
+    pub key: FrameKey,
+    pub content_version: i32,
+    pub blake3: String,
+    pub providers: Vec<ProviderRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +323,23 @@ impl Core {
             .unwrap_or_default()
     }
 
+    /// Keep a frame's list under the version and hash it was derived for.
+    fn store_list(
+        &mut self,
+        key: FrameKey,
+        content_version: i32,
+        blake3: String,
+        providers: Vec<ProviderRef>,
+    ) {
+        let mut ps = providers;
+        ps.sort();
+        ps.dedup_by(|a, b| a.device == b.device);
+        self.providers
+            .entry(key)
+            .or_default()
+            .insert((content_version, blake3), ps);
+    }
+
     fn cancel(&mut self, key: &FrameKey, reason: CancelReason, out: &mut Vec<Command>) {
         if let Some(f) = self.in_flight.remove(key) {
             out.push(Command::Cancel {
@@ -414,14 +449,11 @@ impl Core {
                 content_version,
                 blake3,
                 providers,
-            } => {
-                let mut ps = providers;
-                ps.sort();
-                ps.dedup_by(|a, b| a.device == b.device);
-                self.providers
-                    .entry(key)
-                    .or_default()
-                    .insert((content_version, blake3), ps);
+            } => self.store_list(key, content_version, blake3, providers),
+            Input::ProvidersBatch { lists } => {
+                for l in lists {
+                    self.store_list(l.key, l.content_version, l.blake3, l.providers);
+                }
             }
             Input::ProjectGone { project_id } => {
                 let flying: Vec<FrameKey> = self
@@ -795,6 +827,52 @@ mod tests {
             vec![]
         );
         c
+    }
+
+    /// Task 15: a batch of lists is the same lists fed one by one — the
+    /// same frames start, on the same providers — ranked once over all.
+    #[test]
+    fn a_batch_of_lists_starts_what_the_same_lists_one_by_one_start() {
+        let lists = [("a", vec!["X", "Y"]), ("b", vec!["X"])];
+        let lane_on_c = || {
+            let mut c = primed(3);
+            assert_eq!(c.step(0, provs("c", 1, &["Z"])), vec![Command::RequestLane]);
+            assert_eq!(
+                starts(&c.step(0, Input::Lane { admitted: true })),
+                vec!["c"]
+            );
+            c
+        };
+        let mut one = lane_on_c();
+        let mut seq = Vec::new();
+        for (u, ds) in &lists {
+            seq.extend(started(&one.step(1, provs(u, 1, ds))));
+        }
+        let mut all = lane_on_c();
+        let batch = started(
+            &all.step(
+                1,
+                Input::ProvidersBatch {
+                    lists: lists
+                        .iter()
+                        .map(|(u, ds)| ProviderList {
+                            key: key(u),
+                            content_version: 1,
+                            blake3: format!("b-{u}-1"),
+                            providers: ds.iter().map(|d| prov(d)).collect(),
+                        })
+                        .collect(),
+                },
+            ),
+        );
+        let mut seq_sorted = seq.clone();
+        seq_sorted.sort();
+        let mut batch_sorted = batch.clone();
+        batch_sorted.sort();
+        assert_eq!(batch_sorted, seq_sorted);
+        assert_eq!(all.in_flight(), one.in_flight());
+        let order: Vec<&str> = batch.iter().map(|s| s.0.as_str()).collect();
+        assert_eq!(order, vec!["b", "a"], "one ranking over both: rarest first");
     }
 
     #[test]

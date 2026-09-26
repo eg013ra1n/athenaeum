@@ -528,11 +528,14 @@ pub fn run() {
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
-                let iroh_node = {
+                let (ctx, iroh_node) = {
                     let state: State<AppState> = app_handle.state();
-                    Arc::clone(&state.ctx.iroh_node)
+                    (Arc::clone(&state.ctx), Arc::clone(&state.ctx.iroh_node))
                 };
                 tauri::async_runtime::block_on(async move {
+                    // Collab v3 wave 3 (P28): leave presence and stop the live
+                    // exchange (bounded 2 s) before the node goes away.
+                    athenaeum_core::api::collab_live::shutdown(&ctx).await;
                     if let Some(node) = iroh_node.lock().await.take() {
                         tracing::info!("app exiting; shutting down shared iroh node");
                         if tokio::time::timeout(Duration::from_secs(5), node.shutdown())

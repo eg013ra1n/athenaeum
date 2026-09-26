@@ -717,6 +717,10 @@ pub(crate) struct LiveRunOptions {
     /// Items in flight at once (the collab receive stream limit, L11);
     /// read before each new item is taken, so a change applies live.
     pub max_in_flight: Arc<AtomicUsize>,
+    /// Fires when `max_in_flight` changed (Task 15, T12 carry): a raised
+    /// limit takes queued items at once instead of at the run's next wake.
+    /// `None`: the limit is read at each wake only.
+    pub limit_changed: Option<watch::Receiver<usize>>,
     /// The work-unit cap: at a yield, an item larger than this is cut once it
     /// has moved this many bytes since the yield.
     pub unit_cap_bytes: u64,
@@ -1294,6 +1298,7 @@ pub(crate) async fn run_live(
     let mut items_open = true;
     let mut yield_open = true;
     let mut taken = 0usize;
+    let mut limit_changed = opts.limit_changed.clone();
 
     loop {
         let yielding = *yield_now.borrow_and_update();
@@ -1402,6 +1407,17 @@ pub(crate) async fn run_live(
                 if changed.is_err() {
                     // The sender is gone: its last value stands.
                     yield_open = false;
+                }
+            }
+            changed = async {
+                match limit_changed.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    // The sender is gone: the limit is read at each wake.
+                    limit_changed = None;
                 }
             }
         }
