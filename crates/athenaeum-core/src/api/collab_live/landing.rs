@@ -401,10 +401,88 @@ async fn holds_frame_content(path: &Path, row: &LocalFrameRow) -> bool {
 /// goes, then ONE DB transaction (fence + `held` + `sync_history`) that only
 /// lands on the same version and content of a `wanted` row. A stale landing
 /// drops its tags and removes nothing the row references.
+///
+/// A new version that REPLACED the frame's file in place leaves the old
+/// hash's store entry reading that path; every other frame still holding
+/// the old hash is parked (Task 15 R4 ruling (d)): unseeded and
+/// `awaiting_gc`, re-adopted by hash from its own file once the collab GC
+/// dropped the entry — no second copy on disk.
 pub async fn land_frame(
     env: &LandingEnv<'_>,
     row: &LocalFrameRow,
     hash: iroh_blobs::Hash,
+) -> Landed {
+    let mut replaced = Vec::new();
+    let landed = land_frame_locked(env, row, hash, &mut replaced).await;
+    // After the landing's locks are released: parking takes each sibling's
+    // project disk lock (this frame's own among them).
+    if let Landed::Yes(dest) = &landed {
+        for old in replaced {
+            park_replaced_siblings(env, row, &old, dest).await;
+        }
+    }
+    landed
+}
+
+/// Park every servable frame (another project's too) that still holds
+/// `old` — the hash whose file at `dest` a new version just replaced.
+async fn park_replaced_siblings(
+    env: &LandingEnv<'_>,
+    row: &LocalFrameRow,
+    old: &iroh_blobs::Hash,
+    dest: &Path,
+) {
+    let siblings = match db(env.ctx).and_then(|d| {
+        Ok(frames_db::rows_with_blake3(
+            &d.conn(),
+            &old.to_hex().to_string(),
+        )?)
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(project_id = env.pid(), frame_uuid = %row.frame_uuid, blake3 = %old, error = %e, "frames sharing a replaced file's old content could not be read; they are left to the stat sweep");
+            return;
+        }
+    };
+    for sib in siblings {
+        if (sib.project_id == row.project_id && sib.frame_uuid == row.frame_uuid)
+            || !sib.local_state.servable()
+        {
+            continue;
+        }
+        let Some(path) = sib.landed_path.clone().map(PathBuf::from) else {
+            continue;
+        };
+        if path == dest {
+            continue;
+        }
+        tracing::warn!(
+            project_id = %sib.project_id,
+            frame_uuid = %sib.frame_uuid,
+            path = %path.display(),
+            blake3 = %old,
+            "a new version replaced a file this frame's content was read from; parked until the entry is collected"
+        );
+        if let Err(e) =
+            crate::api::collab_live::replace::park_row(env.ctx, env.node, &sib, &path).await
+        {
+            tracing::error!(project_id = %sib.project_id, frame_uuid = %sib.frame_uuid, error = %e, "frame sharing a replaced file could not be parked");
+            continue;
+        }
+        // The storage engine re-adopts it by hash from its own file: at once
+        // when the GC was quicker, else at its parked retry (one GC interval
+        // later) — which the touch schedules.
+        if !crate::collab::storage::watch::route_touched(&path) {
+            tracing::debug!(project_id = %sib.project_id, frame_uuid = %sib.frame_uuid, path = %path.display(), "no storage engine watches the parked frame; its next sweep retries it");
+        }
+    }
+}
+
+async fn land_frame_locked(
+    env: &LandingEnv<'_>,
+    row: &LocalFrameRow,
+    hash: iroh_blobs::Hash,
+    replaced: &mut Vec<iroh_blobs::Hash>,
 ) -> Landed {
     let pid = env.pid();
     let uuid = row.frame_uuid.as_str();
@@ -432,6 +510,24 @@ pub async fn land_frame(
     if !storage_fetching(env, &row) {
         return Landed::Unavailable;
     }
+    // The hashes this frame seeded before (the target unseeds them): when
+    // the new version replaces the file in place, their entries read a file
+    // that no longer holds them (R4 ruling (d)).
+    let old_seeds: Vec<iroh_blobs::Hash> = if row.landed_path.is_some() {
+        match env.node.project_frame_tags(pid, uuid).await {
+            Ok(tags) => tags
+                .into_iter()
+                .map(|(_, h)| h)
+                .filter(|h| *h != hash)
+                .collect(),
+            Err(e) => {
+                tracing::warn!(project_id = pid, frame_uuid = uuid, error = %format!("{e:#}"), "the frame's previous seeds could not be listed; frames sharing them are left to the stat sweep");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let (dest, holds) = match landing_target(env, &row).await {
         Ok(d) => d,
         Err(TargetRefusal::Failed(msg)) => {
@@ -546,6 +642,11 @@ pub async fn land_frame(
                 mode,
                 "frame landed"
             );
+            if replaces && !holds {
+                *replaced = old_seeds;
+                replaced.sort_unstable();
+                replaced.dedup();
+            }
             Landed::Yes(dest)
         }
         Ok(false) => {
@@ -1201,6 +1302,91 @@ mod tests {
     }
 
     /// The same, untouched: v2 replaces v1 and the previous stamp goes.
+    /// Task 15 R4 ruling (d): a new version replaced frame 0's file in
+    /// place; frame 1 holds the OLD content at its own path, and the old
+    /// hash's store entry reads the replaced file. Frame 1 is parked
+    /// (unseeded, `awaiting_gc`) and — once the GC dropped the entry —
+    /// re-adopted by hash from its own file: servable again, no second copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_file_parks_an_identical_sibling_until_the_gc() {
+        use std::sync::atomic::Ordering;
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::sharing::iroh::node::test_gc::arm(Some(std::sync::Arc::clone(&gate)));
+        let rig = ts::fetch_rig(2).await;
+        crate::sharing::iroh::node::test_gc::arm(None);
+        let (pid, sib) = rig.frame(1);
+        let path0 = rig.land(0).await.unwrap();
+        let old = rig.v1_bytes(0);
+        rig.publish_version_with(1, old.clone()).await;
+        let path1 = rig.link(1, &path0).await.unwrap();
+        assert_ne!(path0, path1);
+        let old_hash = iroh_blobs::Hash::new(&old);
+        // frame 0's new version replaces its file in place
+        rig.publish_new_version(0).await;
+        rig.fetch_blob(0).await;
+        assert_eq!(rig.land(0).await.unwrap(), path0);
+        let parked = rig.row(1);
+        assert_eq!(
+            (parked.local_state, parked.awaiting_gc),
+            (LocalState::Wanted, true),
+            "the sibling is parked"
+        );
+        assert_eq!(
+            parked.landed_path.as_deref(),
+            Some(path1.to_string_lossy().as_ref())
+        );
+        assert!(
+            rig.node
+                .project_frame_tags(&pid, &sib)
+                .await
+                .unwrap()
+                .is_empty(),
+            "unseeded: the entry can be collected"
+        );
+        gate.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while rig.node.collab_blob_health(old_hash).await.unwrap()
+            != crate::sharing::iroh::node::BlobHealth::Missing
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "GC never dropped the entry"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        gate.store(false, Ordering::SeqCst);
+        struct Nobody;
+        impl crate::api::collab_live::storage_task::HolderView for Nobody {
+            fn other_holders(&self, _: &str, _: &str) -> crate::collab::live::holders::Redundancy {
+                Default::default()
+            }
+        }
+        rig.engine().sweep(&Nobody).await;
+        let back = rig.row(1);
+        assert_eq!(
+            back.local_state,
+            LocalState::Held,
+            "re-adopted after the GC"
+        );
+        assert_eq!(
+            back.landed_path.as_deref(),
+            Some(path1.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            rig.node.collab_blob_health(old_hash).await.unwrap(),
+            crate::sharing::iroh::node::BlobHealth::Readable,
+            "served from the sibling's own file"
+        );
+        assert_eq!(std::fs::read(&path1).unwrap(), old);
+        let frames = walkdir::WalkDir::new(&rig.root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| !e.path().components().any(|c| c.as_os_str() == ".athenaeum"))
+            .count();
+        assert_eq!(frames, 2, "no second copy on disk");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_untouched_old_version_is_replaced_and_its_previous_stamp_cleared() {
         let rig = ts::fetch_rig(1).await;
