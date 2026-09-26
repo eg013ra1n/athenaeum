@@ -144,6 +144,21 @@ impl IngestConn<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam for the W2 T2.1 pin (`ingest_releases_conn_between_frames`):
+    /// when set, [`ingest_package`] calls it on the ingesting thread at every
+    /// frame boundary — right after that frame's [`IngestConn::with`] returned,
+    /// i.e. after its guard was dropped and before the next frame's is taken.
+    /// The pin blocks here while ANOTHER thread tries the store connection, so
+    /// "the connection is free between frames" is observed directly instead of
+    /// being inferred from a competitor winning a race. Thread-local, so it only
+    /// ever sees the ingest of the test that installed it. Absent from non-test
+    /// builds.
+    pub(crate) static FRAME_BOUNDARY_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Aggregate result of ingesting one package: the per-frame receipts to ack back
 /// to the sender, plus a breakdown by outcome for the `sync-finished` event.
 #[derive(Debug, Clone, Default)]
@@ -318,6 +333,15 @@ pub fn ingest_package(
                     );
                     FrameVerdict { receipt, history_outcome: "rejected", inserted: None }
                 }
+            }
+        });
+
+        // Frame boundary: this frame's guard is released (test seam, see
+        // `FRAME_BOUNDARY_HOOK`; compiled out of non-test builds).
+        #[cfg(test)]
+        FRAME_BOUNDARY_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
             }
         });
 

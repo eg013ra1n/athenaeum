@@ -2461,9 +2461,8 @@ async fn receiver_ingests_from_authorized_peer() {
 
 // ── W2 T2.1: per-frame connection locking (IngestConn) ──────────────────────
 
-/// Frames per package for the two `IngestConn` tests: enough gaps between frames
-/// for a competing thread to win the mutex at least twice, few enough to keep the
-/// whole test well under a second of real work.
+/// Frames per package for the connection-release pin: sixteen frame boundaries
+/// to observe, few enough to keep the test well under a second of real work.
 const CONN_TEST_FRAMES: usize = 16;
 
 /// Build an `n`-frame fixture package whose payloads are real FITS files of
@@ -2507,61 +2506,70 @@ fn build_multi_frame_package(root: &Path, n: usize, dim: usize) -> (PathBuf, Pac
     (pkg_dir, announce)
 }
 
-/// Run `run_ingest` while a competing thread hammers `store.lock_conn()`, and
-/// return how many of the competitor's acquisitions observed a **partially
-/// ingested** catalog (`0 < files < total_frames`).
+/// Ingest via `run_ingest` with [`FRAME_BOUNDARY_HOOK`] installed on this
+/// thread, and at every frame boundary have a SECOND thread try the store
+/// connection while the ingesting thread waits for it. Returns one entry per
+/// boundary: `Some(files)` — the competitor acquired the connection and saw
+/// `files` rows in the catalog — or `None` — the connection was held.
 ///
-/// That predicate is the whole point: an ingest that holds the guard for the
-/// entire package commits every frame's transaction before any other thread can
-/// read, so a competitor can only ever observe 0 (before) or `total_frames`
-/// (after) — never a partial count. A non-zero result therefore *proves* the
-/// guard was released between frames.
-fn midpackage_observations(
+/// No race is involved: the ingesting thread is parked inside the hook until
+/// the competitor has finished, so the only thing that can make the competitor's
+/// non-blocking `try_lock_conn` fail is a guard still held across the boundary.
+/// The answer is therefore the same on every machine, under any load.
+///
+/// [`FRAME_BOUNDARY_HOOK`]: super::ingest::FRAME_BOUNDARY_HOOK
+fn frame_boundary_acquisitions(
     store: &CatalogSyncStore,
-    total_frames: i64,
-    run_ingest: impl FnOnce() + Send,
-) -> usize {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    run_ingest: impl FnOnce(),
+) -> Vec<Option<i64>> {
+    use super::ingest::FRAME_BOUNDARY_HOOK;
+    use std::sync::mpsc;
 
-    let done = AtomicBool::new(false);
-    // Warm-up handshake: ingest must not start until the probe thread has
-    // completed one full acquire-read-write cycle. Without it, a heavily loaded
-    // machine (the full --workspace run keeps every core busy with sibling
-    // tests) can finish the whole package before the probe thread is ever
-    // scheduled — observed once as a 0-observation flake.
-    let probe_warm = AtomicBool::new(false);
-    let observations = AtomicUsize::new(0);
+    /// Uninstalls the hook even when `run_ingest` panics, and in doing so drops
+    /// the hook's request sender — which is what ends the competitor's loop.
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            FRAME_BOUNDARY_HOOK.with(|h| h.borrow_mut().take());
+        }
+    }
+
+    let (req_tx, req_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
 
     std::thread::scope(|scope| {
-        let probe = scope.spawn(|| {
-            let mut i = 0u64;
-            while !done.load(Ordering::Relaxed) {
-                {
-                    // One competing unit of work: lock, read, trivial write, drop.
-                    let conn = store.lock_conn();
+        let competitor = scope.spawn(move || {
+            let mut seen = Vec::new();
+            // One request per frame boundary; the loop ends when the hook (and
+            // with it `req_tx`) is uninstalled.
+            for (i, ()) in req_rx.iter().enumerate() {
+                let observed = store.try_lock_conn().map(|conn| {
+                    // A concurrent lane's unit of work: read the catalog, then a
+                    // trivial state write, then release.
                     let files: i64 = conn
                         .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
                         .unwrap();
                     crate::db::set_setting(&conn, "test.conn_probe", &i.to_string()).unwrap();
-                    if files > 0 && files < total_frames {
-                        observations.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                probe_warm.store(true, Ordering::Relaxed);
-                i += 1;
-                std::thread::yield_now();
+                    files
+                });
+                seen.push(observed);
+                done_tx.send(()).unwrap();
             }
+            seen
         });
 
-        while !probe_warm.load(Ordering::Relaxed) {
-            std::thread::yield_now();
-        }
+        let _uninstall = HookGuard;
+        FRAME_BOUNDARY_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                req_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            }));
+        });
         run_ingest();
-        done.store(true, Ordering::Relaxed);
-        probe.join().unwrap();
-    });
+        drop(_uninstall);
 
-    observations.load(Ordering::Relaxed)
+        competitor.join().unwrap()
+    })
 }
 
 /// W2 T2.1 — the bounded-wait pin. Ingesting a multi-frame package must release
@@ -2569,42 +2577,33 @@ fn midpackage_observations(
 /// fetch-sink state writes, or its own ingest) waits at most ONE frame, not the
 /// whole multi-GB package.
 ///
-/// This test is **load-sensitive by construction**: it uses a timing probe that
-/// needs a competing thread to win a race against an unfair mutex. Measurement:
-/// 4 of 5 isolated runs failed on Windows; on macOS it surfaced three times
-/// during full-suite load over the course of the 2026-09-07 Windows
-/// test-failure cycle, despite passing in isolation. CI
-/// skips it by name, so a green CI run is not evidence it passed. The invariant
-/// it guards is real and documented in CLAUDE.md; making it deterministic is
-/// recorded as a separate item rather than weakening the test.
+/// Observed deterministically at each frame boundary (see
+/// [`frame_boundary_acquisitions`]): the test-only `FRAME_BOUNDARY_HOOK` in
+/// `ingest_package` parks the ingesting thread right after a frame's guard was
+/// dropped, and another thread must then acquire the connection with a
+/// non-blocking `try_lock` AND see exactly the frames committed so far. A guard
+/// held across the boundary makes that `try_lock` fail every time — the control
+/// below proves it with the pre-W2-T2.1 shape. No timing or scheduling is
+/// involved, so it runs on CI too.
+///
+/// What this does not pin: the `yield_now` after each release in
+/// `IngestConn::with`, which makes a thread already BLOCKED on the mutex likely
+/// to win the hand-off. That is a fairness measure against an unfair mutex and
+/// has no deterministic observation; the release it depends on is what is
+/// pinned here.
 #[test]
 fn ingest_releases_conn_between_frames() {
-    // This is a timing probe: it can only observe the released window if the
-    // competing thread actually gets scheduled inside it. On a shared 2-core CI
-    // runner that window never opens and the test reports 0 observations — a
-    // scheduling artefact, not a regression, and the control assertion below
-    // still holds when it happens. Skip there; it runs for real on a developer
-    // machine, which is where this behavior is verified.
-    if std::env::var_os("CI").is_some() {
-        eprintln!(
-            "skipping ingest_releases_conn_between_frames: timing probe, \
-             unreliable on shared CI runners"
-        );
-        return;
-    }
-
     let tmp = TempDir::new().unwrap();
-    let (pkg_dir, announce) = build_multi_frame_package(tmp.path(), CONN_TEST_FRAMES, 384);
-    let frames = CONN_TEST_FRAMES as i64;
+    let (pkg_dir, announce) = build_multi_frame_package(tmp.path(), CONN_TEST_FRAMES, 64);
 
-    // The pin: `IngestConn::Shared` locks per frame, so the competitor gets in
-    // between frames and sees a partially-ingested catalog.
+    // The pin: `IngestConn::Shared` locks per frame, so at boundary k the
+    // competitor gets the connection and sees the k frames committed so far.
     let shared_catalog = tmp.path().join("catalog_shared.db");
     let _shared_db = crate::db::Database::new(shared_catalog.clone()).unwrap();
     let shared_store = CatalogSyncStore::open(&shared_catalog).unwrap();
     let shared_incoming = tmp.path().join("incoming_shared");
 
-    let shared_observed = midpackage_observations(&shared_store, frames, || {
+    let shared = frame_boundary_acquisitions(&shared_store, || {
         let out = ingest_package(
             IngestConn::Shared(&shared_store),
             &shared_incoming,
@@ -2621,15 +2620,14 @@ fn ingest_releases_conn_between_frames() {
 
     // The control (and the RED this test was written against): the pre-W2-T2.1
     // shape, where the CALLER holds `lock_conn()` for the whole package and hands
-    // ingest a `Borrowed` connection. The competitor is then blocked from the
-    // first frame to the last, so it can never observe a partial catalog — 0 by
-    // construction, whatever the machine's timing.
+    // ingest a `Borrowed` connection. The hook still fires at every boundary,
+    // and the competitor finds the connection held every time.
     let control_catalog = tmp.path().join("catalog_control.db");
     let _control_db = crate::db::Database::new(control_catalog.clone()).unwrap();
     let control_store = CatalogSyncStore::open(&control_catalog).unwrap();
     let control_incoming = tmp.path().join("incoming_control");
 
-    let control_observed = midpackage_observations(&control_store, frames, || {
+    let control = frame_boundary_acquisitions(&control_store, || {
         let conn = control_store.lock_conn();
         let out = ingest_package(
             IngestConn::Borrowed(&conn),
@@ -2646,19 +2644,16 @@ fn ingest_releases_conn_between_frames() {
     });
 
     assert_eq!(
-        control_observed, 0,
-        "control premise: a whole-package guard makes a partial catalog unobservable"
+        control,
+        vec![None; CONN_TEST_FRAMES],
+        "control premise: a whole-package guard is held at every frame boundary"
     );
-    // >= 1, deliberately: ONE observation of a partial catalog already proves
-    // the guard is released between frames — the control above proves a
-    // whole-package guard makes even one observation impossible. Requiring more
-    // only re-introduces scheduler-load sensitivity (the full --workspace run
-    // saturates every core), which is what flaked here once.
-    assert!(
-        shared_observed >= 1,
-        "a competing thread must acquire the store connection mid-package \
-         (partial-catalog acquisitions: {shared_observed} with Shared, \
-         {control_observed} with a whole-package guard)"
+    let expected: Vec<Option<i64>> = (1..=CONN_TEST_FRAMES as i64).map(Some).collect();
+    assert_eq!(
+        shared, expected,
+        "at every frame boundary another thread must acquire the store connection \
+         and see exactly the frames committed so far (None = the guard was still \
+         held across that boundary)"
     );
 }
 

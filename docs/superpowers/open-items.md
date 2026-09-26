@@ -79,19 +79,20 @@ fails closed at the sender. `native_rel_path` now drops a literal `.` segment.
 It also collapses an empty segment, so `a//b` and a trailing `a/b/` both
 normalize instead of round-tripping the extra separator into the stored path.
 
-**Open question, not a finding.** The Windows failures of
-`sync::ingest_tests::ingest_releases_conn_between_frames` are consistent with
-the starvation mitigation being weaker there than CLAUDE.md's comment assumes:
-`std::thread::yield_now()` on Windows is `SwitchToThread`, which yields only to
-a thread ready on the *same* processor. Nobody has measured whether the W2
-bounded-wait guarantee ("a concurrent lane waits at most one frame") actually
-holds on Windows.
-
-**`ingest_releases_conn_between_frames` still fails roughly 4 of 5 isolated
-runs on a developer Windows machine**, measured during this cycle, unless the
-CI skip flag (`--skip ingest_releases_conn_between_frames`) is passed — the
-test also self-skips when `CI` is set, but a bare local run on Windows will see
-it fail most of the time.
+**Open question, not a finding.** The starvation mitigation in
+`IngestConn::with` (one `std::thread::yield_now()` after each per-frame
+release, so a thread already blocked on the unfair store mutex can take the
+hand-off) may be weaker on Windows than its comment assumes: `yield_now()` there
+is `SwitchToThread`, which yields only to a thread ready on the *same*
+processor. Nobody has measured whether the W2 bounded-wait guarantee ("a
+concurrent lane waits at most one frame") holds in practice on Windows. The
+Windows failures of `sync::ingest_tests::ingest_releases_conn_between_frames`
+are no longer evidence either way: that test's timing probe was the cause
+(2026-09-26 — it needed a competitor to win the race inside that one yield, a
+scheduling lottery on any OS). The test now pins the release itself
+deterministically, at each frame boundary through a test-only hook, and runs on
+CI again; the yield's fairness effect has no deterministic test and is what
+this question is about.
 
 **The collab-contribution path fix (`sync/project_ingest.rs`) has no
 regression test of its own**, unlike its sibling fix in `sync/ingest.rs`
@@ -143,13 +144,13 @@ re-count on the next Windows run. Removing the e2e's unix gate is untried; the
 old reason ("loopback engines on background tasks") no longer applies — it
 runs real iroh nodes on a multi-thread runtime, which Tokio supports on Windows.
 
-**The two `--skip`s in the Windows CI job are load-bearing, not cosmetic.**
-`ingest_releases_conn_between_frames` is not fixed, it is skipped — measured
-failing 4 of 5 isolated runs on the Windows box. `unclean_shutdown_mid_transfer_resumes_on_restart`
-is skipped alongside it. Whoever removes either skip should expect the job to
-start failing intermittently, and now that the job is a candidate to become
-blocking, that is a trap rather than a nuisance. Both skips are also on the
-Linux job, so the commands stay identical.
+**The `unclean_shutdown_mid_transfer_resumes_on_restart` `--skip` in the
+Windows CI job is load-bearing, not cosmetic.** Whoever removes it should
+expect the job to start failing intermittently, and now that the job is
+blocking, that is a trap rather than a nuisance. The skip is also on the Linux
+job, so the commands stay identical. (Its former companion,
+`ingest_releases_conn_between_frames`, was made deterministic on 2026-09-26 and
+its skip removed from both jobs.)
 
 **The `format!("{x}/y.fits")` construction is a third member of this class**,
 invisible to a `join("…/…")` grep. 18 such sites existed in
@@ -265,9 +266,10 @@ and a one-copy disk ledger).
   frames, "Update required", Receive tab policy + loss banner, moderation queue,
   app-root collab notifications R29).
 - **Owed before push — the full core suite on an idle machine.**
-  `sync::ingest_tests::ingest_releases_conn_between_frames` fails under full-suite
-  load on the dev Mac and passes alone (adjudicated as load in tasks 2 and 12; the
-  diff touches no ingest locking). Two stacking tests did the same once in task 2
+  `sync::ingest_tests::ingest_releases_conn_between_frames` failed under full-suite
+  load on the dev Mac and passed alone (adjudicated as load in tasks 2 and 12); it
+  was root-caused as a timing probe and made deterministic on 2026-09-26 (see the
+  Windows section), so it no longer needs an idle machine. Two stacking tests did the same once in task 2
   (`writer_output_matches_…` with an integer-overflow panic in
   `geometry/pixel_map.rs`, and `a_tps_run_never_holds_…`) — a load-dependent
   overflow panic is suspicious and worth one look of its own.
@@ -1043,7 +1045,7 @@ M4a (plan `docs/superpowers/plans/2026-09-10-stacking-m4a-plan-quality.md`, ruli
   drizzle `rej/run-<id>` cleanup-on-cancel tests (a race that Task 4's
   RAII de-registration change narrows but does not fully close) and
   `sync::ingest_tests::ingest_releases_conn_between_frames` (a
-  self-documented timing probe).
+  self-documented timing probe; made deterministic 2026-09-26).
 
 - **Residual (OSC drizzle):** the G/B drizzled/undrizzled FWHM ratio is 0.836 / 0.819 against
   the external tool's 0.744 / 0.737 under the same (new) estimator — +12 / +11 %, the M3 residual

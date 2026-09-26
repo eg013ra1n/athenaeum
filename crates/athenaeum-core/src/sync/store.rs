@@ -3033,6 +3033,21 @@ impl CatalogSyncStore {
         self.conn.lock().expect("catalog sync store mutex poisoned")
     }
 
+    /// Test seam: take the connection only if nobody holds it right now —
+    /// `None` when it is held (by any thread), never blocks. Lets the W2 T2.1
+    /// pin observe from another thread whether ingest left the guard released
+    /// at a frame boundary, without a race or a deadlock when it did not.
+    #[cfg(test)]
+    pub(crate) fn try_lock_conn(&self) -> Option<std::sync::MutexGuard<'_, Connection>> {
+        match self.conn.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("catalog sync store mutex poisoned")
+            }
+        }
+    }
+
     /// Total receipts recorded for `package_id`, any outcome. See
     /// [`count_satisfied_receipts`](Self::count_satisfied_receipts) for the
     /// actual ack-replay guard.

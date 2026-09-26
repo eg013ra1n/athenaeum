@@ -15133,7 +15133,8 @@ mod tests {
         // fully-cached stage (v0.6.3's release commit, Linux job), which is
         // the runner, not a cache miss — the `cached_ln` flags and the
         // artifact counts below are what pin the caching itself, on every
-        // machine. Same convention as `ingest_releases_conn_between_frames`.
+        // machine. Same convention as the announce→fetching ceiling in
+        // `tests/sync_e2e.rs`'s `bidirectional_simultaneous_transfers_both_complete`.
         if std::env::var_os("CI").is_some() {
             eprintln!(
                 "skipping the wall-clock ceiling on CI: second run's stage_output (LN fully \

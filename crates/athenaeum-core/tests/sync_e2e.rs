@@ -2165,8 +2165,9 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     // a 346 ms gap (v0.6.3's release commit, Windows job) with both fetches
     // still demonstrably concurrent — the two relative assertions above are
     // the pin that matters (a serialized fetch costs ~N×DELAY ≈ 500 ms+, not
-    // jitter). Logged, not asserted, under `CI`; same convention as
-    // `ingest_releases_conn_between_frames`.
+    // jitter). Logged, not asserted, under `CI`; same convention as the
+    // wall-clock ceiling in `stacking::run`'s
+    // `local_normalization_sidecars_are_cached_on_the_second_run`.
     if std::env::var_os("CI").is_some() {
         eprintln!(
             "skipping the announce→fetching ceiling on CI: A→B {a2b_gap:?}, B→A {b2a_gap:?} \
