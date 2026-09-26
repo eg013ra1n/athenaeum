@@ -2522,8 +2522,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // `set_own_version` (the hub confirmed the new blake3). Its `blake3` is
     // still the OLD version's, so the collab serve check refuses it. One-time
     // backfill when the column is added: before wave 3 the only writer that
-    // left an on-disk own row without a recipe was `stage_own_file`.
+    // left an on-disk own row without a recipe was `stage_own_file`. The
+    // ALTER and the backfill share one savepoint, so a failed backfill rolls
+    // the column back too and the next `init_db` runs both again.
     if !column_exists(conn, "project_frames_local", "own_staged")? {
+        let sp = crate::db::operations::SavepointGuard::new(conn, "own_staged_column")?;
         conn.execute(
             "ALTER TABLE project_frames_local ADD COLUMN own_staged INTEGER NOT NULL DEFAULT 0",
             [],
@@ -2534,6 +2537,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
                AND landed_path IS NOT NULL",
             [],
         )?;
+        sp.commit()?;
     }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_project_frames_local_blake3 ON project_frames_local(blake3);

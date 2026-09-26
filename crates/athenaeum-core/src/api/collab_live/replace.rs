@@ -619,9 +619,9 @@ pub(crate) async fn land_candidate(
     // staged (Task 10, C11).
     tx.execute(
         "UPDATE project_frames_local SET awaiting_gc = 0, rejected_size_mtime = NULL,
-            own_staged = 0
+            own_staged = CASE WHEN blake3 = ?3 THEN 0 ELSE own_staged END
          WHERE project_id = ?1 AND frame_uuid = ?2",
-        rusqlite::params![row.project_id, row.frame_uuid],
+        rusqlite::params![row.project_id, row.frame_uuid, hash.to_string()],
     )?;
     let write = crate::db::collab_frames::set_local_state(
         &tx,

@@ -31,7 +31,7 @@
 //! it never delay the personal upload's first chunk.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,10 @@ pub struct UploadPacer {
     collab_next_free: Mutex<Option<Instant>>,
     /// How many personal uploads are running ([`PersonalUploadGuard`]s alive).
     personal_active: AtomicUsize,
+    /// Whether collab booked slots on the device bucket since personal last
+    /// did (or since the last restart). Only then does a new personal upload
+    /// restart the schedule — personal-only traffic stays the wave-2 bucket.
+    collab_booked: AtomicBool,
     /// Personal chunks of the last [`PERSONAL_RATE_WINDOW`] (recorded only
     /// while no cap is set — the observed rate is used only then).
     personal_window: Mutex<RateWindow>,
@@ -109,6 +113,7 @@ impl UploadPacer {
             next_free: Mutex::new(None),
             collab_next_free: Mutex::new(None),
             personal_active: AtomicUsize::new(0),
+            collab_booked: AtomicBool::new(false),
             personal_window: Mutex::new(RateWindow::default()),
         }
     }
@@ -164,19 +169,22 @@ impl UploadPacer {
                 // the observed rate is recorded only when it is used (no cap).
                 if self.rate() == 0 {
                     self.record_personal_at(now, size);
+                } else {
+                    self.collab_booked.store(false, Ordering::Relaxed);
                 }
                 self.reserve_at(now, size)
             }
             UploadClass::Collab if self.personal_active.load(Ordering::Relaxed) == 0 => {
+                self.note_collab_booking();
                 self.reserve_at(now, size)
             }
             UploadClass::Collab => {
                 let cap = self.rate();
                 let share = if cap > 0 {
-                    // The floor never lifts collab above its share of a
-                    // small cap: max(cap × share, min(floor, cap × share)).
-                    let capped = (cap as f64 * COLLAB_SHARE_WHILE_PERSONAL) as u64;
-                    capped.max(COLLAB_FLOOR_BYTES_PER_SEC.min(capped)).max(1)
+                    // With a cap the share is exactly cap × share: the floor
+                    // is not applied, so it never lifts collab above its share
+                    // of a small cap (`max(1)` only keeps the divisor nonzero).
+                    ((cap as f64 * COLLAB_SHARE_WHILE_PERSONAL) as u64).max(1)
                 } else {
                     ((self.personal_rate_at(now) as f64 * COLLAB_SHARE_WHILE_PERSONAL) as u64)
                         .max(COLLAB_FLOOR_BYTES_PER_SEC)
@@ -189,9 +197,18 @@ impl UploadPacer {
                 };
                 // With a cap, collab bytes are device bytes too: they take
                 // their slot on the shared bucket (a no-op without a cap).
+                self.note_collab_booking();
                 let shared_wait = self.reserve_at(now, size);
                 collab_wait.max(shared_wait)
             }
+        }
+    }
+
+    /// Collab is about to book a slot on the device bucket (only a cap makes
+    /// that a real booking).
+    fn note_collab_booking(&self) {
+        if self.rate() > 0 {
+            self.collab_booked.store(true, Ordering::Relaxed);
         }
     }
 
@@ -212,10 +229,14 @@ impl UploadPacer {
 
     /// Mark a personal upload active for the guard's lifetime (held by the
     /// personal provider consumer for every payload-carrying get). The first
-    /// one (0 → 1) restarts the device bucket's schedule from the present, so
-    /// collab chunks reserved before it never delay its first chunk.
+    /// one (0 → 1) restarts the device bucket's schedule from the present
+    /// when collab booked slots on it since personal last did, so those collab
+    /// chunks never delay its first chunk. Without collab bookings the bucket
+    /// is left alone: personal-only traffic is exactly the wave-2 bucket.
     pub fn personal_upload(self: &Arc<Self>) -> PersonalUploadGuard {
-        if self.personal_active.fetch_add(1, Ordering::Relaxed) == 0 {
+        if self.personal_active.fetch_add(1, Ordering::Relaxed) == 0
+            && self.collab_booked.swap(false, Ordering::Relaxed)
+        {
             match self.next_free.lock() {
                 Ok(mut next_free) => *next_free = None,
                 Err(e) => {
@@ -533,6 +554,27 @@ mod tests {
             Duration::ZERO,
             "the first personal chunk goes out now"
         );
+    }
+
+    /// Fix round 2: personal-only traffic — two transfers, the second
+    /// starting while the first's schedule is still booked, then a third
+    /// after an idle gap — waits exactly what the plain wave-2 bucket does.
+    #[test]
+    fn personal_only_transfers_are_the_wave_two_bucket_exactly() {
+        let classed = Arc::new(UploadPacer::new(1_000_000));
+        let plain = UploadPacer::new(1_000_000);
+        let t0 = Instant::now();
+        for (start_ms, chunks) in [(0u64, 64u64), (100, 32), (10_000, 16)] {
+            let _g = classed.personal_upload();
+            for i in 0..chunks {
+                let at = t0 + Duration::from_millis(start_ms + i);
+                assert_eq!(
+                    classed.reserve_class_at(at, KIB16, UploadClass::Personal),
+                    plain.reserve_at(at, KIB16),
+                    "transfer at {start_ms} ms, chunk {i}"
+                );
+            }
+        }
     }
 
     #[test]

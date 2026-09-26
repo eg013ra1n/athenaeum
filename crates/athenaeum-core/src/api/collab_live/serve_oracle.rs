@@ -476,6 +476,85 @@ mod tests {
         assert!(store.blobs().has(new).await.unwrap());
     }
 
+    /// Fix round 2 (C11): the hub confirms the staged file through the
+    /// manifest (same xxh3 and size as the staged bytes, the new blake3) —
+    /// the row is no longer staged and the new hash is served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_own_frame_confirmed_by_the_manifest_is_served() {
+        let rig = ts::landed_rig(1).await;
+        let (pid, uuid, path) = rig.frames[0].clone();
+        {
+            let conn = crate::api::db(&rig.ctx).unwrap().conn();
+            conn.execute(
+                "UPDATE project_frames_local SET origin = 'own', local_state = 'own_held',
+                    recipe_hash = 'r1' WHERE project_id = ?1 AND frame_uuid = ?2",
+                rusqlite::params![pid, uuid],
+            )
+            .unwrap();
+        }
+        let bytes = format!("regenerated own frame {uuid}: pixels ")
+            .repeat(1024)
+            .into_bytes();
+        std::fs::write(&path, &bytes).unwrap();
+        let new = rig
+            .node
+            .seed_project_frame(&pid, &uuid, 2, &path)
+            .await
+            .unwrap();
+        let xxh3 = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
+        let stamp = Stamp::of(&std::fs::metadata(&path).unwrap()).encode();
+        {
+            let conn = crate::api::db(&rig.ctx).unwrap().conn();
+            crate::db::collab_frames::stage_own_file(
+                &conn,
+                &pid,
+                &uuid,
+                &path.to_string_lossy(),
+                &xxh3,
+                bytes.len() as i64,
+                Some(&stamp),
+            )
+            .unwrap();
+        }
+        let oracle = catalog_oracle(&rig);
+        assert_eq!(oracle.lookup(&new.to_hex()), None, "not confirmed yet");
+
+        // The manifest delivers the confirmed version of exactly these bytes.
+        rig.hub.update_frame(&pid, &uuid, |f| {
+            f.content_version = 2;
+            f.blake3 = new.to_hex().to_string();
+            f.xxh3 = xxh3.clone();
+            f.byte_size = bytes.len() as i64;
+        });
+        let mut view = rig.hub.frame(&pid, &uuid).unwrap();
+        view.own = true;
+        {
+            let conn = crate::api::db(&rig.ctx).unwrap().conn();
+            crate::db::collab_frames::upsert_from_manifest(&conn, &pid, &view).unwrap();
+        }
+        let rec = oracle
+            .lookup(&new.to_hex())
+            .expect("confirmed by the manifest: served");
+        assert_eq!(rec.path, path);
+
+        let fetcher = ts::bare_node().await;
+        ts::pair(&fetcher, &rig.node).await;
+        let conn = fetcher
+            .endpoint()
+            .connect(
+                rig.node.endpoint_addr(),
+                crate::sharing::iroh::COLLAB_BLOBS_ALPN,
+            )
+            .await
+            .unwrap();
+        let store = ts::scratch_store();
+        store
+            .remote()
+            .execute_get(conn, iroh_blobs::protocol::GetRequest::blob(new))
+            .await
+            .expect("the confirmed version is served");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_upload_stream_limit_refuses_with_err_limit() {
         let rig = ts::landed_rig(1).await;

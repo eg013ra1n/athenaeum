@@ -368,6 +368,21 @@ pub fn upsert_from_manifest_deferred(
         return Ok(());
     };
 
+    // An own row staged with new bytes (`stage_own_file`) whose version the
+    // hub now confirms with exactly those bytes: same xxh3 and size as the
+    // staged file, a new blake3 — no longer staged (Task 10, C11).
+    if prev.origin == FrameOrigin::Own
+        && prev.xxh3 == v.xxh3
+        && prev.byte_size == v.byte_size
+        && prev.blake3 != v.blake3
+    {
+        conn.execute(
+            "UPDATE project_frames_local SET own_staged = 0
+             WHERE project_id = ?1 AND frame_uuid = ?2 AND own_staged = 1",
+            params![project_id, v.frame_uuid],
+        )?;
+    }
+
     let mut state = prev.local_state;
     // 1. a new content version
     if prev.content_version != v.content_version {
@@ -1222,6 +1237,30 @@ pub fn stage_own_file(
         set_local_state(conn, project_id, frame_uuid, LocalState::OwnHeld)?;
     }
     sp.commit()?;
+    Ok(n)
+}
+
+/// Clear the `own_staged` mark of an own row whose CONFIRMED version is
+/// exactly the staged file: its `blake3` is `blake3` (the hash just verified
+/// against the hub) and its `xxh3` is `xxh3` (the bytes on disk). Used by the
+/// publish run's identical-pixels shortcut (P19), which never goes through
+/// [`set_own_version`]. Returns the rows touched.
+pub fn clear_own_staged(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    blake3: &str,
+    xxh3: &str,
+) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE project_frames_local SET own_staged = 0, updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2 AND origin = 'own' AND own_staged = 1
+           AND blake3 = ?3 AND xxh3 = ?4",
+        params![project_id, frame_uuid, blake3, xxh3],
+    )?;
+    if n > 0 {
+        tracing::debug!(project_id, frame_uuid, "staged own frame confirmed");
+    }
     Ok(n)
 }
 

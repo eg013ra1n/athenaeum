@@ -1977,7 +1977,8 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     // Pixel phase: no catalog connection held.
     let mut hot_maps = HashMap::new();
     let mut written: Vec<WrittenFrame> = Vec::new();
-    let mut identical: Vec<(String, String)> = Vec::new();
+    // (frame_uuid, recipe, verified blake3, regenerated xxh3)
+    let mut identical: Vec<(String, String, String, String)> = Vec::new();
     for (plan, spec, recipe) in prepared {
         let PlannedFrame {
             cand,
@@ -2057,7 +2058,12 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
                 // P19: identical pixels — only the recipe moves. No version,
                 // no re-seed, no holder change.
                 remove_temp(pid, &staged);
-                identical.push((row.frame_uuid.clone(), recipe));
+                identical.push((
+                    row.frame_uuid.clone(),
+                    recipe,
+                    row.blake3.clone(),
+                    xxh3.clone(),
+                ));
                 continue;
             }
         }
@@ -2092,11 +2098,18 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
 
     if !identical.is_empty() {
         let conn = job.db.conn();
-        for (frame_uuid, recipe) in identical {
+        for (frame_uuid, recipe, blake3, xxh3) in identical {
             if let Err(e) =
                 crate::db::collab_frames::set_recipe_hash(&conn, pid, &frame_uuid, &recipe)
             {
                 tracing::error!(project_id = pid, frame_uuid = %frame_uuid, error = %format!("{e:#}"), "publish: storing the new recipe failed");
+            }
+            // The regeneration matched the hub's version: a row staged with
+            // exactly these bytes is confirmed (Task 10, C11).
+            if let Err(e) =
+                crate::db::collab_frames::clear_own_staged(&conn, pid, &frame_uuid, &blake3, &xxh3)
+            {
+                tracing::error!(project_id = pid, frame_uuid = %frame_uuid, error = %format!("{e:#}"), "publish: clearing the staged mark failed");
             }
             unchanged += 1;
         }
@@ -2946,7 +2959,20 @@ async fn run_publish(
                 let written = {
                     let db = db(ctx)?;
                     let conn = db.conn();
-                    frames_db::set_recipe_hash(&conn, project_id, &w.uuid, &w.recipe)
+                    frames_db::set_recipe_hash(&conn, project_id, &w.uuid, &w.recipe).and_then(
+                        |n| {
+                            // The hub already versioned exactly these bytes: a
+                            // row staged with them is confirmed (Task 10, C11).
+                            frames_db::clear_own_staged(
+                                &conn,
+                                project_id,
+                                &w.uuid,
+                                &current.blake3,
+                                &w.xxh3,
+                            )?;
+                            Ok(n)
+                        },
+                    )
                 };
                 if let Err(e) = written {
                     tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: storing the new recipe failed");
@@ -6141,6 +6167,48 @@ pub(crate) mod tests {
                 !update_temp_path(Path::new(after.landed_path.as_deref().unwrap())).exists(),
                 "the identical regeneration is cleaned up"
             );
+        }
+
+        /// Task 10 fix round 2 (C11): an own row still marked staged whose
+        /// regeneration matches the hub's version byte for byte (the P19
+        /// identical-pixels shortcut — no `set_own_version`) is confirmed:
+        /// the mark is cleared and the collab serve check serves it again.
+        #[tokio::test]
+        async fn identical_output_confirms_a_staged_own_row() {
+            use crate::collab::serve::ServeOracle as _;
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let staged = |fx: &PubFx| -> bool {
+                crate::api::db(&fx.ctx)
+                    .unwrap()
+                    .conn()
+                    .query_row(
+                        "SELECT own_staged FROM project_frames_local WHERE frame_uuid = ?1",
+                        [&fx.uuids[0]],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            crate::api::db(&fx.ctx)
+                .unwrap()
+                .conn()
+                .execute(
+                    "UPDATE project_frames_local SET own_staged = 1 WHERE frame_uuid = ?1",
+                    [&fx.uuids[0]],
+                )
+                .unwrap();
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            let oracle = crate::api::collab_live::serve_oracle::DbServeOracle::catalog_only(
+                crate::api::db(&fx.ctx).unwrap().clone(),
+            );
+            assert!(oracle.lookup(&row.blake3).is_none(), "staged: refused");
+
+            set_mtime(&fx.lights[0], 120);
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.unchanged, 1, "{res:?}");
+            assert!(!staged(&fx), "the identical regeneration confirmed it");
+            assert!(oracle.lookup(&row.blake3).is_some(), "served again");
         }
 
         /// P19: the engine version is not an input of the recipe.
