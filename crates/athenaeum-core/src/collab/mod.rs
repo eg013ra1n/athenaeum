@@ -21,6 +21,9 @@ pub mod live;
 // The per-request serve check of the collab provider (wave 3, spec §9.3):
 // a pure decision plus the oracle trait the provider consumer asks.
 pub mod serve;
+// The receive-side scheduler (wave 3, spec §7): a pure deterministic core
+// plus its seeded simulation. Pure and ungated — the headless build carries it.
+pub mod scheduler;
 pub mod snapshot;
 // On-disk state of the Collaboration root itself (wave 3, spec §9): the
 // storage marker (available/read-only/unavailable, another device's disk
