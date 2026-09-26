@@ -975,26 +975,38 @@ async fn check_storage_marker_for_designation(
                     (RefusedDeviceKind::Unknown, true, None)
                 }
             };
+            let new = crate::db::collab_live::RefusedDesignation {
+                path: stored.to_string(),
+                device_id: device_id.clone(),
+                kind,
+                offline,
+                offer,
+            };
+            // The one guarded writer (fix round 2): an offline answer never
+            // replaces an online-verified classification of this folder and
+            // device — and the refusal then speaks from the KEPT record.
+            let kind = match db(ctx).and_then(|db| {
+                let conn = db.conn();
+                if crate::db::collab_live::record_classification(&conn, &new)? {
+                    Ok(new.kind)
+                } else {
+                    let kept = crate::db::collab_live::refused_designation_detail(&conn)?;
+                    tracing::warn!(path = stored, device_id = %device_id, "the hub could not be asked; the verified classification is kept");
+                    Ok(kept.map_or(new.kind, |k| k.kind))
+                }
+            }) {
+                Ok(kind) => kind,
+                Err(e) => {
+                    tracing::warn!(path = stored, error = %e, "recording the refused designation failed");
+                    new.kind
+                }
+            };
             tracing::warn!(
                 path = stored,
                 device_id = %device_id,
                 kind = ?kind,
                 "collaboration folder designation refused: belongs to another device"
             );
-            if let Ok(db) = db(ctx) {
-                if let Err(e) = crate::db::collab_live::record_refused_designation(
-                    &db.conn(),
-                    &crate::db::collab_live::RefusedDesignation {
-                        path: stored.to_string(),
-                        device_id: device_id.clone(),
-                        kind,
-                        offline,
-                        offer,
-                    },
-                ) {
-                    tracing::warn!(path = stored, error = %e, "recording the refused designation failed");
-                }
-            }
             let msg = match kind {
                 RefusedDeviceKind::Other => {
                     "collab_other_device: this Collaboration folder belongs to another device of your account"

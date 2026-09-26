@@ -212,24 +212,47 @@ pub struct RefusedDesignation {
     pub offer: Option<RecordedOffer>,
 }
 
-/// Record a refused designation (replacing any earlier one, every part).
-pub fn record_refused_designation(conn: &Connection, r: &RefusedDesignation) -> Result<()> {
+/// Record a folder's owner classification — THE writer of the refusal
+/// record (Task 16 fix round 2): the designation refusal and the explicit
+/// "Check again" both go through here. Returns `false` when the write was
+/// SKIPPED because `new` is an offline answer (the hub could not be asked)
+/// and the record already holds an online-verified classification of the
+/// same folder and device — an unreachable hub never turns a verified
+/// `Other` into an `Unknown` a take-over would accept. An identical record
+/// is not rewritten (`true`). Otherwise every part is replaced.
+pub fn record_classification(conn: &Connection, new: &RefusedDesignation) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
+    let existing = refused_designation_detail(&tx)?;
+    if let Some(e) = &existing {
+        if new.offline && !e.offline && e.path == new.path && e.device_id == new.device_id {
+            return Ok(false);
+        }
+        if e == new {
+            return Ok(true);
+        }
+    }
+    write_refusal(&tx, new)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Replace every part of the refusal record. Private: every writer goes
+/// through the guarded [`record_classification`].
+fn write_refusal(tx: &Connection, r: &RefusedDesignation) -> Result<()> {
     for key in REFUSAL_KEYS {
         tx.execute("DELETE FROM collab_live_meta WHERE key = ?1", params![key])?;
     }
-    meta_set(&tx, META_REFUSED_PATH, &r.path)?;
-    meta_set(&tx, META_REFUSED_DEVICE, &r.device_id)?;
-    meta_set(&tx, META_REFUSED_KIND, r.kind.as_db_str())?;
-    meta_set(&tx, META_REFUSED_OFFLINE, if r.offline { "1" } else { "0" })?;
+    meta_set(tx, META_REFUSED_PATH, &r.path)?;
+    meta_set(tx, META_REFUSED_DEVICE, &r.device_id)?;
+    meta_set(tx, META_REFUSED_KIND, r.kind.as_db_str())?;
+    meta_set(tx, META_REFUSED_OFFLINE, if r.offline { "1" } else { "0" })?;
     if let Some(o) = &r.offer {
-        meta_set(&tx, META_REFUSED_OFFER_ID, &o.device_id)?;
-        meta_set(&tx, META_REFUSED_OFFER_NAME, &o.device_name)?;
+        meta_set(tx, META_REFUSED_OFFER_ID, &o.device_id)?;
+        meta_set(tx, META_REFUSED_OFFER_NAME, &o.device_name)?;
         if let Some(t) = &o.last_seen_at {
-            meta_set(&tx, META_REFUSED_OFFER_LAST_SEEN, t)?;
+            meta_set(tx, META_REFUSED_OFFER_LAST_SEEN, t)?;
         }
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -899,6 +922,51 @@ mod tests {
     }
 
     #[test]
+    fn an_offline_answer_never_replaces_a_verified_classification() {
+        let conn = conn_with_project();
+        let verified = RefusedDesignation {
+            path: "/collab/b".into(),
+            device_id: "OLD-DEV".into(),
+            kind: RefusedDeviceKind::Other,
+            offline: false,
+            offer: None,
+        };
+        assert!(record_classification(&conn, &verified).unwrap());
+        let offline = RefusedDesignation {
+            kind: RefusedDeviceKind::Unknown,
+            offline: true,
+            ..verified.clone()
+        };
+        assert!(!record_classification(&conn, &offline).unwrap(), "skipped");
+        assert_eq!(
+            refused_designation_detail(&conn).unwrap(),
+            Some(verified.clone())
+        );
+        // An online answer replaces it; so does an offline one for another
+        // folder or device (the record has one slot).
+        let online_unknown = RefusedDesignation {
+            offline: false,
+            ..offline.clone()
+        };
+        assert!(record_classification(&conn, &online_unknown).unwrap());
+        assert_eq!(
+            refused_designation_detail(&conn).unwrap(),
+            Some(online_unknown)
+        );
+        let elsewhere = RefusedDesignation {
+            path: "/collab/c".into(),
+            ..offline.clone()
+        };
+        assert!(record_classification(&conn, &elsewhere).unwrap());
+        assert_eq!(
+            refused_designation_detail(&conn).unwrap(),
+            Some(elsewhere.clone())
+        );
+        // An offline answer over an offline record for the same folder: written.
+        assert!(record_classification(&conn, &elsewhere).unwrap());
+    }
+
+    #[test]
     fn refused_designation_round_trips_and_clears() {
         let conn = conn_with_project();
         assert_eq!(refused_designation(&conn).unwrap(), None);
@@ -913,7 +981,7 @@ mod tests {
                 last_seen_at: Some("2026-09-01T00:00:00Z".into()),
             }),
         };
-        record_refused_designation(&conn, &other).unwrap();
+        assert!(record_classification(&conn, &other).unwrap());
         assert_eq!(
             refused_designation(&conn).unwrap(),
             Some((
@@ -931,7 +999,7 @@ mod tests {
             offline: true,
             offer: None,
         };
-        record_refused_designation(&conn, &unknown).unwrap();
+        assert!(record_classification(&conn, &unknown).unwrap());
         assert_eq!(refused_designation_detail(&conn).unwrap(), Some(unknown));
         clear_refused_designation(&conn).unwrap();
         assert_eq!(refused_designation(&conn).unwrap(), None);

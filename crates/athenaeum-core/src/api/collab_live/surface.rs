@@ -726,7 +726,7 @@ async fn classify_and_record(
     device: &str,
 ) -> Result<(), ApiError> {
     let path_str = canonical(path).to_string_lossy().to_string();
-    let (kind, offline, offer) = match replace::replace_offer(ctx, device).await {
+    let (kind, offline, offer, hub_err) = match replace::replace_offer(ctx, device).await {
         Ok(Some(o)) => (
             RefusedDeviceKind::Other,
             false,
@@ -735,23 +735,12 @@ async fn classify_and_record(
                 device_name: o.device_name,
                 last_seen_at: o.last_seen_at,
             }),
+            None,
         ),
-        Ok(None) => (RefusedDeviceKind::Unknown, false, None),
+        Ok(None) => (RefusedDeviceKind::Unknown, false, None, None),
         Err(e) => {
-            let existing = {
-                let db = db(ctx)?;
-                let conn = db.conn();
-                live_db::refused_designation_detail(&conn)?
-            };
-            if existing
-                .as_ref()
-                .is_some_and(|r| r.path == path_str && r.device_id == device && !r.offline)
-            {
-                tracing::warn!(path = %path_str, device, error = %e, "the hub could not be asked; the verified classification is kept");
-                return Err(e);
-            }
-            tracing::warn!(path = %path_str, device, error = %e, "could not confirm whether the marker's device is still active; recorded as unknown");
-            (RefusedDeviceKind::Unknown, true, None)
+            tracing::warn!(path = %path_str, device, error = %e, "could not confirm whether the marker's device is still active");
+            (RefusedDeviceKind::Unknown, true, None, Some(e))
         }
     };
     let record = RefusedDesignation {
@@ -761,13 +750,17 @@ async fn classify_and_record(
         offline,
         offer,
     };
-    let db = db(ctx)?;
-    let conn = db.conn();
-    if live_db::refused_designation_detail(&conn)?.as_ref() != Some(&record) {
-        live_db::record_refused_designation(&conn, &record).map_err(|e| {
+    let written = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        live_db::record_classification(&conn, &record).map_err(|e| {
             tracing::error!(path = %record.path, error = %e, "recording the folder classification failed");
             ApiError::from(e)
-        })?;
+        })?
+    };
+    if let (false, Some(e)) = (written, hub_err) {
+        tracing::warn!(path = %record.path, device, "the hub could not be asked; the verified classification is kept");
+        return Err(e);
     }
     tracing::info!(
         path = %record.path,
@@ -1227,6 +1220,48 @@ mod tests {
         );
     }
 
+    /// Fix round 2: a designation retried while the hub is unreachable keeps
+    /// the online-verified `Other` record, refuses as `collab_other_device`,
+    /// and the take-over stays refused.
+    #[tokio::test]
+    async fn an_offline_designation_retry_keeps_the_verified_other_record() {
+        let (t, ctx, hub) = ts::signed_in_rig_no_root().await;
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        let b = t.path().join("OldCollab");
+        std::fs::create_dir_all(&b).unwrap();
+        write_marker_naming(&b, "old-store", "OLD-DEV");
+        let designate = || {
+            crate::api::scan_roots::set_collaboration_dir(
+                &ctx,
+                b.to_string_lossy().to_string(),
+                &PathPolicy::AllowAll,
+            )
+        };
+        let err = designate().await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::Conflict(ref m) if m.starts_with("collab_other_device")),
+            "{err:?}"
+        );
+        let verified = recorded(&ctx).expect("recorded");
+        assert_eq!(
+            (verified.kind, verified.offline),
+            (RefusedDeviceKind::Other, false)
+        );
+        assert!(verified.offer.is_some());
+
+        hub.set_failing("/devices", true);
+        let err = designate().await.unwrap_err();
+        assert!(
+            matches!(err, ApiError::Conflict(ref m) if m.starts_with("collab_other_device")),
+            "the message comes from the kept record: {err:?}"
+        );
+        assert_eq!(recorded(&ctx), Some(verified.clone()), "record unchanged");
+        let err = take_over_collab_folder(&ctx, &verified.path, true, &PathPolicy::AllowAll)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+    }
+
     /// Fix round 1 (M2, M3): a refused designation of ANOTHER folder (the
     /// reinstall flow) is shown from its record; a status read neither asks
     /// the hub about it nor rewrites it.
@@ -1247,8 +1282,10 @@ mod tests {
                 last_seen_at: None,
             }),
         };
-        live_db::record_refused_designation(&crate::api::db(&ctx).unwrap().conn(), &refusal)
-            .unwrap();
+        assert!(
+            live_db::record_classification(&crate::api::db(&ctx).unwrap().conn(), &refusal)
+                .unwrap()
+        );
         for _ in 0..2 {
             let s = get_collab_storage_status(&ctx).await.unwrap();
             assert_eq!(
