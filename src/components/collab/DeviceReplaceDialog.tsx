@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -195,9 +196,12 @@ export default function DeviceReplaceDialog() {
   // that opened on its own before anything in it had focus). While the
   // take-over confirm or an action is running it does nothing — the confirm
   // has its own Cancel. Closing the replace prompt this way counts as
-  // "Not now".
+  // "Not now". A layout effect, so the listener is attached in the same
+  // commit that puts the dialog on screen: a passive effect runs a task
+  // later, and an Escape pressed in between (a visible dialog, no listener
+  // yet) was lost — seen as a flaky test under CPU load.
   const escapeClosesAsNotNow = status?.replace != null && !status.replace.markerMismatch;
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open || confirmTakeOver || busy !== null) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') close(escapeClosesAsNotNow);

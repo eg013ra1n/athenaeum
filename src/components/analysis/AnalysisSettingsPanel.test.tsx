@@ -49,7 +49,9 @@ function mockInvoke(command: string, _args?: Record<string, unknown>): Promise<u
     case 'get_analysis_config':
       return Promise.resolve(ANALYSIS_CONFIG_FIXTURE);
     case 'get_setting':
-      return Promise.resolve('');
+      // A valid stored value per key: nothing saved for the rejection
+      // thresholds (the empty JSON blob), `px` for the FWHM unit.
+      return Promise.resolve(_args?.key === 'analysis.fwhm_default_unit' ? 'px' : '');
     case 'set_analysis_config':
     case 'delete_setting':
       return Promise.resolve(undefined);

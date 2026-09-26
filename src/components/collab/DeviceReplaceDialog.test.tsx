@@ -148,8 +148,10 @@ describe('DeviceReplaceDialog — replace (another device of this account)', () 
     mockCommands(storage({ replace: offer }));
     renderWithProvider();
     await screen.findByText('This device replaces Old laptop');
+    // The listener is attached in the commit that shows the dialog, so the
+    // Escape is handled at once — no waiting that could hide a late listener.
     fireEvent.keyDown(window, { key: 'Escape' });
-    await waitFor(() => expect(screen.queryByText('This device replaces Old laptop')).not.toBeInTheDocument());
+    expect(screen.queryByText('This device replaces Old laptop')).not.toBeInTheDocument();
   });
 
   it('proposes retiring a device offline for more than 30 days', async () => {

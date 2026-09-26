@@ -7,6 +7,7 @@ import CollabLiveStatus, { liveStatusLabel } from './CollabLiveStatus';
 import DeviceReplaceDialog, { DeviceReplaceProvider } from './DeviceReplaceDialog';
 import { api } from '../../api';
 import type { CollabLiveStatus as Status, CollabStorageStatus } from '../../types/models';
+import { advance } from '../../test/fakeClock';
 
 vi.mock('../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
 
@@ -99,15 +100,16 @@ describe('CollabLiveStatus', () => {
   });
 
   it('counts the reconnect down once a second', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // A fully fake clock: with `shouldAdvanceTime` real elapsed time also
+    // moved it, so a stall could add a tick the test never asked for.
+    vi.useFakeTimers();
     try {
       renderIt();
-      await screen.findByText('Live');
+      await advance(0);
+      expect(screen.getByText('Live')).toBeInTheDocument();
       act(() => emit?.({ ...base, state: 'reconnecting', retryInSecs: 5 }));
       expect(screen.getByText('Reconnecting in 5 s')).toBeInTheDocument();
-      act(() => {
-        vi.advanceTimersByTime(2000);
-      });
+      await advance(2000);
       expect(screen.getByText('Reconnecting in 3 s')).toBeInTheDocument();
       // A fresh event restarts the count from its own retryInSecs.
       act(() => emit?.({ ...base, state: 'reconnecting', retryInSecs: 10, since: '2026-09-25T10:01:00Z' }));
