@@ -121,7 +121,10 @@ describe('DeviceReplaceDialog — replace (another device of this account)', () 
     expect(screen.queryByText(/can be retired/)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Replace Old laptop' }));
-    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('collab_replace_device', { deviceId: 'old-id' }));
+    // The replace names the folder the dialog shows — never left to core's pick.
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('collab_replace_device', { deviceId: 'old-id', root: '/c' }),
+    );
     const toasts = await screen.findAllByRole('status');
     expect(toasts[0]).toHaveTextContent('Adopted 12 of 12 files');
     await waitFor(() => expect(screen.queryByText('This device replaces Old laptop')).not.toBeInTheDocument());
@@ -139,6 +142,14 @@ describe('DeviceReplaceDialog — replace (another device of this account)', () 
     );
     await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('get_collab_storage_status'));
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it('Escape closes the prompt that opened on its own', async () => {
+    mockCommands(storage({ replace: offer }));
+    renderWithProvider();
+    await screen.findByText('This device replaces Old laptop');
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByText('This device replaces Old laptop')).not.toBeInTheDocument());
   });
 
   it('proposes retiring a device offline for more than 30 days', async () => {
@@ -201,7 +212,7 @@ describe('DeviceReplaceDialog — take-over (a device this account does not list
     expect(toasts[0]).toHaveTextContent('Adopted 3 of 4 files');
   });
 
-  it('labels a classification recorded while offline', async () => {
+  it('labels a classification recorded while offline, in the dialog and in the take-over confirm', async () => {
     mockCommands(storage({ unknownDevice: { ...unknown, recordedOffline: true } }));
     renderWithProvider();
     fireEvent.click(await screen.findByRole('button', { name: 'open folder owner' }));
@@ -209,6 +220,21 @@ describe('DeviceReplaceDialog — take-over (a device this account does not list
       await screen.findByText('Recorded while offline — the device may belong to this account. Check again once online.'),
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Check again' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Take over this folder…' }));
+    expect(
+      await screen.findByText(
+        /\(recorded while offline — it may be one of this account's devices; Check again while online first\)/,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('a confirm for a folder classified online carries no offline caveat', async () => {
+    mockCommands(storage({ unknownDevice: unknown }));
+    renderWithProvider();
+    fireEvent.click(await screen.findByRole('button', { name: 'open folder owner' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Take over this folder…' }));
+    const message = await screen.findByText(/This folder was written by a device this account does not list/);
+    expect(message).not.toHaveTextContent(/recorded while offline/);
   });
 
   it('explains a swapped disk instead of offering a take-over that would be refused', async () => {
@@ -246,13 +272,40 @@ describe('DeviceReplaceDialog — Check again', () => {
     expect(screen.getByText('This device replaces Old laptop')).toBeInTheDocument();
   });
 
-  it('says that checking the designated folder replaces a pending offer for another folder', async () => {
-    mockCommands(storage({ root: '/a', replace: { ...offer, path: '/b', prompt: false } }));
+  it('says that checking the designated folder replaces a pending offer for another folder, and Replace acts on the folder shown', async () => {
+    mockCommands(storage({ root: '/a', replace: { ...offer, path: '/b', prompt: false } }), {
+      collab_replace_device: () => Promise.resolve({ scanned: 2, adopted: 2 }),
+    });
     renderWithProvider();
     fireEvent.click(await screen.findByRole('button', { name: 'open folder owner' }));
     expect(
       await screen.findByText(/Checking \/a replaces the pending offer for \/b/),
     ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Replace Old laptop' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('collab_replace_device', { deviceId: 'old-id', root: '/b' }),
+    );
+  });
+
+  it('re-reads the status only when the (storage, reason) pair changes', async () => {
+    mockCommands(storage({ state: 'available', reason: null }));
+    renderWithProvider();
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('get_collab_storage_status'));
+    const reads = () => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_collab_storage_status').length;
+    expect(reads()).toBe(1);
+
+    act(() => emitLive?.(live));
+    await waitFor(() => expect(reads()).toBe(2));
+    // The same pair again (a reconnect, a countdown change): no read.
+    act(() => emitLive?.({ ...live, state: 'reconnecting', retryInSecs: 5 }));
+    act(() => emitLive?.(live));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(reads()).toBe(2);
+    // Another reason: read again.
+    act(() => emitLive?.({ ...live, storageReason: 'marker_mismatch' }));
+    await waitFor(() => expect(reads()).toBe(3));
   });
 
   it('reads the status on mount and on storage events only — never on a timer, never asks the hub by itself', async () => {

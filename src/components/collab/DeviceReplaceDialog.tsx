@@ -18,7 +18,6 @@ import type {
   CollabLiveStatus,
   CollabStorageStatus,
   ReplaceOutcomeView,
-  StorageStateView,
 } from '../../types/models';
 
 /**
@@ -28,8 +27,9 @@ import type {
  * `Layout.tsx`.
  *
  * Reads: `get_collab_storage_status` is PASSIVE (no hub call, no write) and is
- * read on mount and on `collab-live-status` events that concern the storage —
- * never on a timer. `check_collab_folder_owner` asks the hub (a 401 there
+ * read on mount and whenever a `collab-live-status` event changes the
+ * `(storage, storageReason)` pair — never on a timer, never for an event that
+ * repeats the pair (a reconnect, a countdown). `check_collab_folder_owner` asks the hub (a 401 there
  * clears the session) and runs ONLY from a user's "Check again" click.
  *
  * `DeviceReplaceContext` lets `CollabLiveStatus` show a "Replace a device…"
@@ -141,17 +141,20 @@ export default function DeviceReplaceDialog() {
     void load();
   }, [load]);
 
-  // Re-read on the storage-related live events only (StrictMode-safe pattern).
+  // Re-read when the (storage, storageReason) pair changes — StrictMode-safe
+  // pattern. The first event after mount always reads (the mount read may
+  // predate it).
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    let lastStorage: StorageStateView | null = null;
+    let lastPair: string | null = null;
     api
       .listen<CollabLiveStatus>('collab-live-status', (p) => {
         if (cancelled) return;
-        const changed = p.storage !== lastStorage;
-        lastStorage = p.storage;
-        if (p.storage === 'unavailable' || changed) void load();
+        const pair = `${p.storage}|${p.storageReason ?? ''}`;
+        if (pair === lastPair) return;
+        lastPair = pair;
+        void load();
       })
       .then((fn) => {
         if (cancelled) fn();
@@ -183,10 +186,25 @@ export default function DeviceReplaceDialog() {
     void load();
   }, [openSeq, load]);
 
-  const close = (notNow: boolean) => {
+  const close = useCallback((notNow: boolean) => {
     if (notNow) dismissed.current = true;
     setOpen(false);
-  };
+  }, []);
+
+  // Escape closes the dialog (a window listener, so it works for the prompt
+  // that opened on its own before anything in it had focus). While the
+  // take-over confirm or an action is running it does nothing — the confirm
+  // has its own Cancel. Closing the replace prompt this way counts as
+  // "Not now".
+  const escapeClosesAsNotNow = status?.replace != null && !status.replace.markerMismatch;
+  useEffect(() => {
+    if (!open || confirmTakeOver || busy !== null) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close(escapeClosesAsNotNow);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [open, confirmTakeOver, busy, close, escapeClosesAsNotNow]);
 
   const checkAgain = async (root: string | null) => {
     setBusy('check');
@@ -231,10 +249,13 @@ export default function DeviceReplaceDialog() {
     });
   };
 
-  const replaceDevice = async (deviceId: string, deviceName: string) => {
+  /** `root` is the folder the dialog shows: in the one-slot case the offer
+   *  can be for a refused folder other than the designated one, and core must
+   *  not pick. */
+  const replaceDevice = async (deviceId: string, deviceName: string, root: string) => {
     setBusy('replace');
     try {
-      const out = await api.invoke<ReplaceOutcomeView>('collab_replace_device', { deviceId });
+      const out = await api.invoke<ReplaceOutcomeView>('collab_replace_device', { deviceId, root });
       notify({
         title: `Adopted ${out.adopted} of ${out.scanned} files`,
         detail: `This device replaces ${deviceName}; the files already in the Collaboration folder were adopted without downloading.`,
@@ -339,7 +360,7 @@ export default function DeviceReplaceDialog() {
           type="button"
           className={BTN_PRIMARY}
           disabled={busy !== null}
-          onClick={() => void replaceDevice(replace.deviceId, name)}
+          onClick={() => void replaceDevice(replace.deviceId, name, replace.path)}
         >
           {busy === 'replace' && <Loader2 size={14} className="animate-spin" />}
           {`Replace ${name}`}
@@ -407,9 +428,6 @@ export default function DeviceReplaceDialog() {
           aria-labelledby={titleId}
           className="w-[32rem] max-w-[90vw] space-y-3 rounded-lg border border-border bg-surface-elevated p-4"
           onClick={(e) => e.stopPropagation()}
-          onKeyDown={(e) => {
-            if (e.key === 'Escape' && busy === null) close(kind === 'replace');
-          }}
         >
           <div className="flex items-center gap-2">
             {mismatch ? (
@@ -437,7 +455,11 @@ export default function DeviceReplaceDialog() {
         <ConfirmDialog
           isOpen={confirmTakeOver}
           title="Take over this folder?"
-          message={`This folder was written by a device this account does not list. Taking it over makes this device its owner and adopts the files it holds. If that device still uses this folder, the two will damage each other's data.\n\n${unknown.path}`}
+          message={`This folder was written by a device this account does not list${
+            unknown.recordedOffline
+              ? " (recorded while offline — it may be one of this account's devices; Check again while online first)"
+              : ''
+          }. Taking it over makes this device its owner and adopts the files it holds. If that device still uses this folder, the two will damage each other's data.\n\n${unknown.path}`}
           confirmText="Take over"
           confirmDanger
           onConfirm={() => void takeOver(unknown.path)}

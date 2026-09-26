@@ -154,13 +154,14 @@ describe('useCollabNotifications', () => {
       previousPath: '/old/collab/m42/c_b.fits',
     });
     const toasts = await screen.findAllByRole('status');
-    expect(toasts[0]).toHaveTextContent('c_b.fits is lost everywhere — it is still in the previous Collaboration folder');
+    expect(toasts[0]).toHaveTextContent('c_b.fits: no member holds it — it is still in the previous Collaboration folder');
+    expect(toasts[0]).not.toHaveTextContent(/lost everywhere/);
     expect(toasts[0]).not.toHaveTextContent(/Trash/);
     // The history entry carries the path and the re-fetch promise.
     const stored = JSON.parse(localStorage.getItem('athenaeum.notifications.v1') ?? '{}') as {
       notifications: { title: string; detail: string }[];
     };
-    const entry = stored.notifications.find((n) => n.title.startsWith('c_b.fits is lost everywhere'));
+    const entry = stored.notifications.find((n) => n.title.startsWith('c_b.fits: no member holds it'));
     expect(entry?.detail).toContain('/old/collab/m42/c_b.fits');
     expect(entry?.detail).toContain('fetched again if another member serves it');
     expect(entry?.detail).not.toMatch(/Trash/);

@@ -331,7 +331,6 @@ export default function ProjectDetail() {
           autoPublish={c.autoPublish}
           publishedBytes={publishedBytes}
           onToggled={() => void load()}
-          onSynced={() => void loadFrames()}
         />
       )}
 

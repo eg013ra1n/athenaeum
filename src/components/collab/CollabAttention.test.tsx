@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { NotificationProvider } from '../../contexts/NotificationContext';
 import { ToastStack } from '../Toast';
@@ -94,10 +94,40 @@ describe('CollabAttention', () => {
     await waitFor(() => expect(attentionReads()).toBe(2));
   });
 
-  it('per-row and bulk buttons have distinct accessible names', async () => {
+  it('every button has its own accessible name — per-row names carry the file name', async () => {
+    const two: Attention = {
+      changed: [
+        ...attention.changed,
+        { frameUuid: 'u4', fileName: 'c_d.fits', path: '/c/m31/o/c_d.fits', detectedAt: '2026-09-25T10:05:00Z', newVersionWaiting: false },
+      ],
+      awaitingChoice: [
+        ...attention.awaitingChoice,
+        { frameUuid: 'u5', fileName: 'c_e.fits', holdersOnline: 2, holdersTotal: 3, atRisk: false },
+      ],
+      notKept: [...attention.notKept, { frameUuid: 'u6', fileName: 'c_f.fits', contentVersion: 2 }],
+      otherFiles: attention.otherFiles,
+    };
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
+      Promise.resolve(cmd === 'list_collab_attention' ? two : 1)) as never);
     renderIt();
     await screen.findByText('Changed files');
-    for (const name of ['Re-fetch all', 'Stop keeping all', 'Re-fetch', 'Stop keeping', 'Keep again', 'Keep all again', 'Re-fetch original', 'Delete']) {
+    const names = screen.getAllByRole('button').map((b) => b.getAttribute('aria-label') ?? b.textContent ?? '');
+    expect(new Set(names).size).toBe(names.length);
+    for (const name of [
+      'Re-fetch all',
+      'Stop keeping all',
+      'Keep all again',
+      'Re-fetch c_b.fits',
+      'Re-fetch c_e.fits',
+      'Stop keeping c_b.fits',
+      'Stop keeping c_e.fits',
+      'Keep again c_c.fits',
+      'Keep again c_f.fits',
+      'Re-fetch original c_a.fits',
+      'Re-fetch original c_d.fits',
+      'Delete c_a.fits',
+      'Delete c_d.fits',
+    ]) {
       expect(screen.getAllByRole('button', { name })).toHaveLength(1);
     }
   });
@@ -122,10 +152,39 @@ describe('CollabAttention', () => {
     );
   });
 
+  it('the last-copy warning names 10 frames and counts the rest; the confirm drops the whole previewed list', async () => {
+    const many = Array.from({ length: 100 }, (_, i) => {
+      const n = String(i).padStart(3, '0');
+      return { frameUuid: `m${n}`, fileName: `c_${n}.fits`, holdersOnline: 0, holdersTotal: 1, atRisk: true };
+    });
+    preview = many;
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
+      if (cmd === 'list_collab_attention') return Promise.resolve({ ...empty, awaitingChoice: many });
+      if (cmd === 'preview_collab_stop_keeping') return Promise.resolve(preview);
+      return Promise.resolve(1);
+    }) as never);
+    renderIt();
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop keeping all' }));
+    const message = await screen.findByText(/fewer than 2 other copies/);
+    for (let i = 0; i < 10; i++) {
+      expect(message).toHaveTextContent(`c_${String(i).padStart(3, '0')}.fits — fewer than 2 other copies`);
+    }
+    expect(message).not.toHaveTextContent('c_010.fits');
+    expect(message).toHaveTextContent('…and 90 more (100 at risk in total)');
+    fireEvent.click(screen.getByRole('button', { name: 'Stop keeping' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('resolve_collab_deletions', {
+        projectId: 'p1',
+        frameUuids: many.map((r) => r.frameUuid),
+        action: 'stopKeeping',
+      }),
+    );
+  });
+
   it('stop keeping acts directly when every frame has enough other copies', async () => {
     preview = [{ frameUuid: 'u2', fileName: 'c_b.fits', holdersOnline: 2, holdersTotal: 3, atRisk: false }];
     renderIt();
-    fireEvent.click(await screen.findByRole('button', { name: 'Stop keeping' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop keeping c_b.fits' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('resolve_collab_deletions', {
         projectId: 'p1',
@@ -138,7 +197,7 @@ describe('CollabAttention', () => {
 
   it('re-fetch works per frame and for all', async () => {
     renderIt();
-    fireEvent.click(await screen.findByRole('button', { name: 'Re-fetch' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Re-fetch c_b.fits' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('resolve_collab_deletions', { projectId: 'p1', frameUuids: ['u2'], action: 'refetch' }),
     );
@@ -150,7 +209,7 @@ describe('CollabAttention', () => {
 
   it('re-fetch original falls back to a confirmed delete when there is no trash', async () => {
     renderIt();
-    fireEvent.click(await screen.findByRole('button', { name: 'Re-fetch original' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Re-fetch original c_a.fits' }));
     expect(await screen.findByText(/system trash is not available/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Delete and re-fetch' }));
     await waitFor(() =>
@@ -168,7 +227,7 @@ describe('CollabAttention', () => {
   it('a re-fetch that trashed the changed file says so', async () => {
     changedFile = () => Promise.resolve({ trashed: true });
     renderIt();
-    fireEvent.click(await screen.findByRole('button', { name: 'Re-fetch original' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Re-fetch original c_a.fits' }));
     const toasts = await screen.findAllByRole('status');
     expect(toasts[0]).toHaveTextContent('c_a.fits moved to the Trash; the original is being re-fetched');
     expect(api.invoke).toHaveBeenCalledWith('resolve_collab_changed_file', {
@@ -181,11 +240,10 @@ describe('CollabAttention', () => {
 
   it('delete asks first, then deletes without a re-fetch', async () => {
     renderIt();
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
-    const confirm = await screen.findByText('Delete the changed file? It will not be re-fetched.');
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete c_a.fits' }));
+    await screen.findByText('Delete the changed file? It will not be re-fetched.');
     expect(api.invoke).not.toHaveBeenCalledWith('resolve_collab_changed_file', expect.anything());
-    const dialog = confirm.closest('div') as HTMLElement;
-    fireEvent.click(within(dialog.parentElement as HTMLElement).getByRole('button', { name: 'Delete' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('resolve_collab_changed_file', {
         projectId: 'p1',
@@ -198,7 +256,7 @@ describe('CollabAttention', () => {
 
   it('keep again works per frame and for all', async () => {
     renderIt();
-    fireEvent.click(await screen.findByRole('button', { name: 'Keep again' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Keep again c_c.fits' }));
     await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('keep_collab_frames_again', { projectId: 'p1', frameUuids: ['u3'] }));
     fireEvent.click(screen.getByRole('button', { name: 'Keep all again' }));
     await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('keep_collab_frames_again', { projectId: 'p1', frameUuids: null }));

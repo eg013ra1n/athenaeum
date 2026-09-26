@@ -1,23 +1,19 @@
 import { useState } from 'react';
-import { Loader2, RefreshCw } from 'lucide-react';
 import { api } from '../../api';
-import { useNotifications } from '../../contexts/NotificationContext';
 import { formatBytes } from './format';
 
 /**
- * D3 §3.3 project bar: the per-project auto-replication toggle, the project's
- * published byte total, and "Sync now".
+ * D3 §3.3 project bar: the per-project auto-replication toggle and the
+ * project's published byte total.
  *
  * The toggle is a LOCAL preference (`set_project_auto_replicate` writes the
  * `collab_projects.auto_replicate` column; the hub never learns of it). It is
  * saved then re-read — the parent's `onToggled` reloads the detail from the
  * catalog, so the rendered state is the stored one (S6), never optimistic.
  *
- * "Sync now" is the one global command of the live exchange
- * (`collab_sync_now`, L10): it reconnects the event channel, clears every
- * back-off and reconciles every project at once. It is not gated on
- * `autoReplicate`. It returns once queued — the downloads surface themselves
- * on the frame rows, so only a failure to start needs a notification.
+ * "Sync now" is not here: it is one global command of the live exchange
+ * (`collab_sync_now`, L10), and its one button is the page header's
+ * (`CollabLiveStatus`).
  *
  * Collab v3 wave 2 Task 10 (R16, P13): a second, independent LOCAL preference
  * sits next to it — `autoPublish` coalesces and auto-publishes this device's
@@ -30,7 +26,6 @@ export default function AutoReplicateBar({
   autoPublish,
   publishedBytes,
   onToggled,
-  onSynced,
 }: {
   projectId: string;
   autoReplicate: boolean;
@@ -38,12 +33,9 @@ export default function AutoReplicateBar({
   /** Sum of the published, non-superseded frames; `null` while unknown. */
   publishedBytes: number | null;
   onToggled: () => void;
-  onSynced: () => void;
 }) {
-  const { notify } = useNotifications();
   const [saving, setSaving] = useState(false);
   const [savingPublish, setSavingPublish] = useState(false);
-  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const setEnabled = async (enabled: boolean) => {
@@ -74,29 +66,6 @@ export default function AutoReplicateBar({
       setError(msg);
     } finally {
       setSavingPublish(false);
-    }
-  };
-
-  const syncNow = async () => {
-    setSyncing(true);
-    setError(null);
-    try {
-      await api.invoke('collab_sync_now');
-      onSynced();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('[projects] collab_sync_now failed:', err);
-      notify({
-        title: 'Sync now failed',
-        detail: msg,
-        kind: 'project',
-        tone: 'warning',
-        hasErrors: true,
-        link: `/projects/${projectId}`,
-      });
-      setError(msg);
-    } finally {
-      setSyncing(false);
     }
   };
 
@@ -149,20 +118,6 @@ export default function AutoReplicateBar({
               {formatBytes(publishedBytes)} published
             </span>
           )}
-          <button
-            type="button"
-            onClick={() => void syncNow()}
-            disabled={syncing}
-            className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
-            title="Reconnect to the hub and check every project at once"
-          >
-            {syncing ? (
-              <Loader2 size={14} className="animate-spin" />
-            ) : (
-              <RefreshCw size={14} />
-            )}
-            Sync now
-          </button>
         </div>
       </div>
       {error && <p className="text-sm text-error">{error}</p>}

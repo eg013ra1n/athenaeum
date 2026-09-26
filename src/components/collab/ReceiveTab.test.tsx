@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
+import { render, screen, act, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { NotificationProvider } from '../../contexts/NotificationContext';
 import ReceiveTab from './ReceiveTab';
@@ -119,13 +119,11 @@ describe('ReceiveTab', () => {
     expect(within(rowOf('light_001.fits')).getByText('1 online / 4')).toBeInTheDocument();
   });
 
-  it('"Sync now" calls the global command and reloads', async () => {
-    const { reload } = renderTab([frame({})]);
+  it('has no Sync now of its own — the one Sync now is the page header\'s', async () => {
+    renderTab([frame({})]);
     await screen.findByTitle('light_001.fits');
-    fireEvent.click(screen.getByRole('button', { name: 'Sync now' }));
-    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('collab_sync_now'));
-    await waitFor(() => expect(reload).toHaveBeenCalled());
-    expect(api.invoke).not.toHaveBeenCalledWith('sync_project_now', expect.anything());
+    expect(screen.queryByRole('button', { name: /Sync now/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Export for WBPP/ })).toBeInTheDocument();
   });
 
   it('shows the attention lists above the frames', async () => {

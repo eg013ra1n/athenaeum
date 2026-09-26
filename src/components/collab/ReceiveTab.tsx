@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { FolderOpen, FolderOutput, Loader2, RefreshCw } from 'lucide-react';
+import { FolderOpen, FolderOutput } from 'lucide-react';
 import { api } from '../../api';
 import ProjectExportDialog from './ProjectExportDialog';
 import CollabAttention from './CollabAttention';
@@ -17,7 +17,7 @@ import type {
  * straight off the stored row (`localState`, spec §9.4 — S6, never
  * optimistic) and the holders column counts the live holders
  * (`holdersOnline` / `holdersTotal`). The live exchange fetches on events;
- * "Sync now" is the one global command (`collab_sync_now`, L10). The files
+ * the one "Sync now" is the page header's (`CollabLiveStatus`, L10). The files
  * that need the user — changed, waiting for a choice, not kept, other files —
  * sit above the list (`CollabAttention`). The list re-reads when this
  * project's attention changes or frames land.
@@ -35,8 +35,6 @@ export default function ReceiveTab({
 }) {
   // `undefined` = still loading the folder setting; `null` = unset (banner).
   const [collabDir, setCollabDir] = useState<string | null | undefined>(undefined);
-  const [syncing, setSyncing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
 
   useEffect(() => {
@@ -82,22 +80,6 @@ export default function ReceiveTab({
     };
   }, [projectId]);
 
-  const syncNow = async () => {
-    setSyncing(true);
-    setError(null);
-    try {
-      await api.invoke('collab_sync_now');
-      reload();
-    } catch (err) {
-      // S6 — a failed sync surfaces inline, never silently swallowed.
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('[receive] collab_sync_now failed:', err);
-      setError(msg);
-    } finally {
-      setSyncing(false);
-    }
-  };
-
   const dirUnset = collabDir === null;
   const others = (frames ?? []).filter((f) => !f.own);
   const groups = groupByPublisher(others);
@@ -107,20 +89,6 @@ export default function ReceiveTab({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-sm font-medium text-content">Received frames</span>
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => void syncNow()}
-            disabled={syncing}
-            className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
-            title="Reconnect to the hub and check every project at once"
-          >
-            {syncing ? (
-              <Loader2 size={14} className="animate-spin" />
-            ) : (
-              <RefreshCw size={14} />
-            )}
-            Sync now
-          </button>
           <button
             type="button"
             onClick={() => setExportOpen(true)}
@@ -144,8 +112,6 @@ export default function ReceiveTab({
           </Link>
         </div>
       )}
-
-      {error && <p className="text-sm text-error">{error}</p>}
 
       <CollabAttention projectId={projectId} />
 

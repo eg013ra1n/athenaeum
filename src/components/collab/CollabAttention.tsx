@@ -26,14 +26,18 @@ import type {
  * - **Other files** — files in the folder that no frame references; listed,
  *   never deleted.
  *
- * Reloads on mount and on `collab-attention-changed` for this project. The
- * list under an open confirmation is `aria-hidden`, so a per-row button and
- * the dialog's confirm button never share a reachable name.
+ * Reloads on mount and on `collab-attention-changed` for this project.
+ * Per-row buttons are named with their file ("Re-fetch c_b.fits"), bulk
+ * buttons say "all"; the list under an open confirmation is `aria-hidden`.
  */
 
 /** Core's refusal when the system trash cannot take the changed file
  *  (`storage_task::TRASH_UNAVAILABLE`). */
 const TRASH_UNAVAILABLE = 'trash_unavailable';
+
+/** At-risk frames named in the last-copy warning; the rest are counted, so
+ *  the confirm's buttons stay on screen however many frames are dropped. */
+const LAST_COPY_NAMED = 10;
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -53,7 +57,6 @@ const SMALL_BTN_DANGER =
 
 export default function CollabAttention({ projectId }: { projectId: string }) {
   const { notify } = useNotifications();
-  const idBase = useId();
   const [data, setData] = useState<Attention | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -165,13 +168,17 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
       void dropFrames(frameUuids);
       return;
     }
-    const lines = atRisk.map(
-      (r) => `${r.fileName} — fewer than 2 other copies: ${r.holdersOnline} online, ${r.holdersTotal} in total`,
-    );
+    const lines = atRisk
+      .slice(0, LAST_COPY_NAMED)
+      .map((r) => `${r.fileName} — fewer than 2 other copies: ${r.holdersOnline} online, ${r.holdersTotal} in total`);
+    if (atRisk.length > LAST_COPY_NAMED) {
+      lines.push(`…and ${atRisk.length - LAST_COPY_NAMED} more (${atRisk.length} at risk in total)`);
+    }
     ask({
       title: frameUuids.length === 1 ? 'Stop keeping this frame?' : `Stop keeping ${frameUuids.length} frames?`,
       message: `Fewer than 2 other members keep ${atRisk.length === 1 ? 'this frame' : 'these frames'}, offline members included. If those copies go too, the frame is lost.\n\n${lines.join('\n')}`,
       confirmText: 'Stop keeping',
+      // The FULL previewed list — the names above are only the first ten.
       onConfirm: confirmed(() => void dropFrames(frameUuids)),
     });
   };
@@ -251,8 +258,6 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
   const { changed, awaitingChoice, notKept, otherFiles } = data;
   if (changed.length + awaitingChoice.length + notKept.length + otherFiles.length === 0) return null;
 
-  const nameId = (kind: string, uuid: string) => `${idBase}-${kind}-${uuid}`;
-
   return (
     <div className="space-y-3">
       <div className="space-y-3" aria-hidden={confirm ? true : undefined}>
@@ -266,7 +271,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
             <ul className="space-y-1.5">
               {changed.map((row) => (
                 <li key={row.frameUuid} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                  <span id={nameId('changed', row.frameUuid)} className="max-w-[16rem] truncate text-content" title={row.fileName}>
+                  <span className="max-w-[16rem] truncate text-content" title={row.fileName}>
                     {row.fileName}
                   </span>
                   <span className="min-w-0 flex-1 truncate text-content-muted" title={row.path}>
@@ -281,7 +286,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
                       type="button"
                       className={SMALL_BTN}
                       disabled={busy}
-                      aria-describedby={nameId('changed', row.frameUuid)}
+                      aria-label={`Re-fetch original ${row.fileName}`}
                       onClick={() => void refetchOriginal(row, false)}
                     >
                       Re-fetch original
@@ -290,7 +295,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
                       type="button"
                       className={SMALL_BTN_DANGER}
                       disabled={busy}
-                      aria-describedby={nameId('changed', row.frameUuid)}
+                      aria-label={`Delete ${row.fileName}`}
                       onClick={() => deleteChanged(row)}
                     >
                       Delete
@@ -327,7 +332,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
             <ul className="space-y-1.5">
               {awaitingChoice.map((row) => (
                 <li key={row.frameUuid} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                  <span id={nameId('choice', row.frameUuid)} className="max-w-[16rem] truncate text-content" title={row.fileName}>
+                  <span className="max-w-[16rem] truncate text-content" title={row.fileName}>
                     {row.fileName}
                   </span>
                   <span className="text-content-muted">
@@ -343,7 +348,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
                       type="button"
                       className={SMALL_BTN}
                       disabled={busy}
-                      aria-describedby={nameId('choice', row.frameUuid)}
+                      aria-label={`Re-fetch ${row.fileName}`}
                       onClick={() => void refetch([row.frameUuid])}
                     >
                       Re-fetch
@@ -352,7 +357,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
                       type="button"
                       className={SMALL_BTN_DANGER}
                       disabled={busy}
-                      aria-describedby={nameId('choice', row.frameUuid)}
+                      aria-label={`Stop keeping ${row.fileName}`}
                       onClick={() => void stopKeeping([row.frameUuid])}
                     >
                       Stop keeping
@@ -378,7 +383,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
             <ul className="space-y-1.5">
               {notKept.map((row) => (
                 <li key={row.frameUuid} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                  <span id={nameId('notKept', row.frameUuid)} className="max-w-[16rem] truncate text-content" title={row.fileName}>
+                  <span className="max-w-[16rem] truncate text-content" title={row.fileName}>
                     {row.fileName}
                   </span>
                   <span className="text-content-muted">v{row.contentVersion}</span>
@@ -387,7 +392,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
                       type="button"
                       className={SMALL_BTN}
                       disabled={busy}
-                      aria-describedby={nameId('notKept', row.frameUuid)}
+                      aria-label={`Keep again ${row.fileName}`}
                       onClick={() => void keepAgain([row.frameUuid])}
                     >
                       Keep again

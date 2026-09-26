@@ -180,7 +180,7 @@ export function useCollabNotifications() {
         notify(
           p.inPreviousFolder
             ? {
-                title: `${p.fileName} is lost everywhere — it is still in the previous Collaboration folder`,
+                title: `${p.fileName}: no member holds it — it is still in the previous Collaboration folder`,
                 detail: `${project}: the file is still at ${p.previousPath ?? 'its previous path'}; it is fetched again if another member serves it.`,
                 kind: 'project',
                 tone: 'warning',
