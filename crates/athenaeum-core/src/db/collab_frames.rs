@@ -32,10 +32,14 @@ use crate::collab::hub_client::FrameViewWire;
 
 /// Column list shared by every read query, so `row_from_sql`'s index-based
 /// `row.get(N)` calls can't silently drift out of sync with the SELECT.
+///
+/// `holder_count` and `locally_declined` stay in the table, never read (wave
+/// 3 Task 15: the live holder map answers the count, `not_kept` replaced the
+/// decline).
 const SELECT_COLS: &str = "project_id, frame_uuid, content_version, origin, publisher_account_id, \
     publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3, blake3, \
-    holder_count, manifest_version, manifest_json, landed_path, size_mtime_seen, on_disk, \
-    locally_declined, awaiting_gc, source_frame_id, recipe_hash, last_error, updated_at, \
+    manifest_version, manifest_json, landed_path, size_mtime_seen, on_disk, \
+    awaiting_gc, source_frame_id, recipe_hash, last_error, updated_at, \
     local_state, frame_seq";
 
 /// Whether a `project_frames_local` row is a frame I published, or a peer's
@@ -69,10 +73,8 @@ impl FrameOrigin {
 /// stands relative to my disk, independent of the hub's own `state`
 /// (moderation) column. `on_disk` is kept in lockstep with [`servable`] —
 /// [`set_local_state`] is the ONE writer that moves both together (plus the
-/// claim/outbox change a servability flip causes, C24); the wave-2 writers
-/// (`set_landed`, `set_missing`, `set_declined`, `record_own`) still move
-/// `on_disk` directly, in step with `local_state`, until Tasks 9/11/15
-/// replace them.
+/// claim/outbox change a servability flip causes, C24); `set_landed` and
+/// `record_own` still move `on_disk` directly, in step with `local_state`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LocalState {
     /// A replica frame I don't have and haven't declined — the need set.
@@ -172,7 +174,6 @@ pub struct LocalFrameRow {
     pub byte_size: i64,
     pub xxh3: String,
     pub blake3: String,
-    pub holder_count: i64,
     pub manifest_version: i64,
     /// The full manifest row, verbatim (`serde_json::to_string` of the
     /// [`FrameViewWire`] this cache entry came from) — the fields above are
@@ -184,7 +185,6 @@ pub struct LocalFrameRow {
     /// `"size:mtime_secs"` at the last verified hash.
     pub size_mtime_seen: Option<String>,
     pub on_disk: bool,
-    pub locally_declined: bool,
     pub awaiting_gc: bool,
     /// Own only — the local `frames.id` this publication was generated from.
     /// Deliberately NOT a foreign key (see module docs / P19): a deleted
@@ -224,28 +224,26 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LocalFrameRow> {
         byte_size: row.get(10)?,
         xxh3: row.get(11)?,
         blake3: row.get(12)?,
-        holder_count: row.get(13)?,
-        manifest_version: row.get(14)?,
-        manifest_json: row.get(15)?,
-        landed_path: row.get(16)?,
-        size_mtime_seen: row.get(17)?,
-        on_disk: row.get::<_, i64>(18)? != 0,
-        locally_declined: row.get::<_, i64>(19)? != 0,
-        awaiting_gc: row.get::<_, i64>(20)? != 0,
-        source_frame_id: row.get(21)?,
-        recipe_hash: row.get(22)?,
-        last_error: row.get(23)?,
-        updated_at: row.get(24)?,
+        manifest_version: row.get(13)?,
+        manifest_json: row.get(14)?,
+        landed_path: row.get(15)?,
+        size_mtime_seen: row.get(16)?,
+        on_disk: row.get::<_, i64>(17)? != 0,
+        awaiting_gc: row.get::<_, i64>(18)? != 0,
+        source_frame_id: row.get(19)?,
+        recipe_hash: row.get(20)?,
+        last_error: row.get(21)?,
+        updated_at: row.get(22)?,
         local_state: LocalState::from_db_str(
-            &row.get::<_, Option<String>>(25)?.unwrap_or_default(),
+            &row.get::<_, Option<String>>(23)?.unwrap_or_default(),
         ),
-        frame_seq: row.get(26)?,
+        frame_seq: row.get(24)?,
     })
 }
 
 /// Apply one manifest row (mine or a peer's) to the local cache: insert it if
 /// new, or refresh the manifest-derived columns if not. The UPSERT never
-/// writes `local_state`/`on_disk`/`landed_path`/`locally_declined`/
+/// writes `local_state`/`on_disk`/`landed_path`/
 /// `awaiting_gc`/`source_frame_id`/`recipe_hash` — local disk/publish state
 /// a manifest fetch knows nothing about. A brand-new row starts `own_missing`
 /// (own), `wanted` (a published, accepted replica) or `idle`.
@@ -778,7 +776,7 @@ pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
     // rare test fixture that seeds a 'replica' row through this path), not
     // copied from `row.local_state`: this is the interim rule until Task 9's
     // full edge set (an own row is exactly `own_held`/`own_missing` by its
-    // `on_disk`, mirroring `set_landed`/`set_missing`'s own/replica split).
+    // `on_disk`, mirroring `set_landed`'s own/replica split).
     let local_state = match (row.origin, row.on_disk) {
         (FrameOrigin::Own, true) => LocalState::OwnHeld,
         (FrameOrigin::Own, false) => LocalState::OwnMissing,
@@ -789,12 +787,12 @@ pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
         "INSERT OR REPLACE INTO project_frames_local
             (project_id, frame_uuid, content_version, origin, publisher_account_id,
              publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3,
-             blake3, holder_count, manifest_version, manifest_json, landed_path, size_mtime_seen,
-             on_disk, locally_declined, awaiting_gc, source_frame_id, recipe_hash, last_error,
+             blake3, manifest_version, manifest_json, landed_path, size_mtime_seen,
+             on_disk, awaiting_gc, source_frame_id, recipe_hash, last_error,
              local_state, frame_seq, state_changed_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                 ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                 COALESCE(?26, (SELECT frame_seq FROM project_frames_local
+                 ?19, ?20, ?21, ?22, ?23,
+                 COALESCE(?24, (SELECT frame_seq FROM project_frames_local
                                 WHERE project_id = ?1 AND frame_uuid = ?2)),
                  datetime('now'), datetime('now'))",
         params![
@@ -811,13 +809,11 @@ pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
             row.byte_size,
             row.xxh3,
             row.blake3,
-            row.holder_count,
             row.manifest_version,
             row.manifest_json,
             row.landed_path,
             row.size_mtime_seen,
             row.on_disk,
-            row.locally_declined,
             row.awaiting_gc,
             row.source_frame_id,
             row.recipe_hash,
@@ -926,34 +922,11 @@ pub fn set_rejected_size_mtime(
     Ok(())
 }
 
-/// Mark a frame's content missing from disk (`on_disk = 0`); `awaiting_gc`
-/// records whether it's missing because the store's own GC dropped it (P20 —
-/// never `Copy`-repaired, re-fetched once the entry is `NotFound`) or for
-/// some other reason (e.g. disk truth found the landed file gone).
-pub fn set_missing(
-    conn: &Connection,
-    project_id: &str,
-    frame_uuid: &str,
-    awaiting_gc: bool,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE project_frames_local SET on_disk = 0, awaiting_gc = ?3,
-             local_state = CASE WHEN origin = 'own' THEN 'own_missing' ELSE 'missing' END,
-             state_changed_at = CASE
-                 WHEN local_state IS (CASE WHEN origin = 'own' THEN 'own_missing' ELSE 'missing' END)
-                 THEN state_changed_at ELSE datetime('now') END,
-             updated_at = datetime('now')
-         WHERE project_id = ?1 AND frame_uuid = ?2",
-        params![project_id, frame_uuid, awaiting_gc],
-    )?;
-    Ok(())
-}
-
 /// Park (`on`) or release a frame waiting for the collab store's GC to drop
 /// a dead entry (P20): nothing else moves — a `wanted` row stays `wanted`,
-/// and the need set skips it while `awaiting_gc = 1` (Task 15, replaces the
-/// wave-2 `set_missing(.., awaiting_gc = true)` in the landing). Returns the
-/// rows touched.
+/// and the need set skips it while `awaiting_gc = 1` (Task 15: the landing
+/// and the executor's dead-entry check park; the executor's GC probe
+/// releases). Returns the rows touched.
 pub fn set_awaiting_gc(
     conn: &Connection,
     project_id: &str,
@@ -1022,47 +995,6 @@ pub fn set_size_mtime_seen(
          WHERE project_id = ?1 AND frame_uuid = ?2",
         params![project_id, frame_uuid, size_mtime],
     )?)
-}
-
-/// Set (or clear) `locally_declined` on a batch of frames of one project — the
-/// loss guard's "stop holding" step (P14) and any future manual decline.
-pub fn set_declined(
-    conn: &Connection,
-    project_id: &str,
-    frame_uuids: &[String],
-    declined: bool,
-) -> Result<()> {
-    if frame_uuids.is_empty() {
-        return Ok(());
-    }
-    // Interim rule (Task 15 replaces this with the full state machine):
-    // declining moves straight to `not_kept`; undoing a decline moves back to
-    // `wanted` — this is the loss guard's own "stop holding"/"resume" toggle,
-    // never called on an own row.
-    let local_state = if declined {
-        LocalState::NotKept
-    } else {
-        LocalState::Wanted
-    };
-    let local_state_str = local_state.as_db_str();
-    let placeholders = vec!["?"; frame_uuids.len()].join(", ");
-    // `prev_stamp` is kept on purpose (Task 11 fix round 2): the old file is
-    // unchanged when the row resumes, and neither state here supersedes it.
-    let sql = format!(
-        "UPDATE project_frames_local SET locally_declined = ?, \
-         state_changed_at = CASE WHEN local_state IS ?2 THEN state_changed_at ELSE datetime('now') END, \
-         local_state = ?2, updated_at = datetime('now') \
-         WHERE project_id = ?3 AND frame_uuid IN ({placeholders})"
-    );
-    let mut vals: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(frame_uuids.len() + 3);
-    vals.push(&declined);
-    vals.push(&local_state_str);
-    vals.push(&project_id);
-    for u in frame_uuids {
-        vals.push(u);
-    }
-    conn.execute(&sql, vals.as_slice())?;
-    Ok(())
 }
 
 /// Record (or clear, `None`) a frame's last error — landing/fetch failure,
@@ -2640,21 +2572,10 @@ mod tests {
         reset(&c);
         set_landed(&c, "p1", "u1", "/l/u1.fits", "1:2").unwrap();
         assert_eq!(stamp(&c).as_deref(), Some("old"), "held → held is no move");
-        set_missing(&c, "p1", "u1", false).unwrap();
+        set_local_state(&c, "p1", "u1", LocalState::Missing).unwrap();
         assert_ne!(stamp(&c).as_deref(), Some("old"), "held → missing");
         reset(&c);
-        set_declined(&c, "p1", &["u1".to_string()], true).unwrap();
+        set_local_state(&c, "p1", "u1", LocalState::NotKept).unwrap();
         assert_ne!(stamp(&c).as_deref(), Some("old"), "missing → not_kept");
-        assert_eq!(
-            get(&c, "p1", "u1").unwrap().unwrap().local_state,
-            LocalState::NotKept
-        );
-        reset(&c);
-        set_declined(&c, "p1", &["u1".to_string()], true).unwrap();
-        assert_eq!(
-            stamp(&c).as_deref(),
-            Some("old"),
-            "not_kept → not_kept is no move"
-        );
     }
 }

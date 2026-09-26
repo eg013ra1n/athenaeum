@@ -2306,6 +2306,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Collab v3 wave 3 (P33): the loss guard is retired (L4 replaces it) —
+    // its two settings rows go, idempotently.
+    conn.execute(
+        "DELETE FROM settings WHERE key IN ('collab.loss_guard_fraction','collab.loss_guard_bytes')",
+        [],
+    )?;
+
     // v3 (wave-2 Task 2): the hub-side counter is now `pendingFrames`, not
     // `pendingAnnouncements`. Renamed in place so existing moderation counts
     // survive; guarded both ways so a catalog already on the new name (or one

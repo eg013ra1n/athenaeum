@@ -669,6 +669,66 @@ impl StorageEngine {
     /// `stat_verdict` against the recorded stamp; the same bytes re-record
     /// it, different bytes quarantine (replica) / mark changed (own), a
     /// missing file enters the settle.
+    /// Defence in depth (Task 15, the wave-2 disk-truth re-seed carried
+    /// over): a servable frame whose file stats as recorded but whose seed
+    /// tag is gone (a publish run that died between unseed and seed) is
+    /// seeded again at its version — only when the file hashes to the row's
+    /// BLAKE3, and never while a tag of another version exists (a publish
+    /// moving the frame right now). Without its tag the GC would drop the
+    /// entry under a row that still serves.
+    async fn ensure_seeded(&mut self, row: &LocalFrameRow, path: &str) {
+        if !row.local_state.servable() || row.size_mtime_seen.is_none() {
+            return;
+        }
+        let tags = match self
+            .node
+            .project_frame_tags(&row.project_id, &row.frame_uuid)
+            .await
+        {
+            Ok(t) => t,
+            Err(_) => return, // logged inside
+        };
+        if !tags.is_empty() {
+            return;
+        }
+        let lock = match crate::api::collab_exchange::project_disk_lock(&self.ctx, &row.project_id)
+        {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "seed tag check: project lock unavailable");
+                return;
+            }
+        };
+        let _guard = lock.lock().await;
+        match self
+            .node
+            .seed_project_frame(
+                &row.project_id,
+                &row.frame_uuid,
+                row.content_version,
+                Path::new(path),
+            )
+            .await
+        {
+            Ok(hash) if hash.to_string() == row.blake3 => {
+                tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, content_version = row.content_version, path, "a served frame had lost its seed tag; seeded again");
+            }
+            Ok(hash) => {
+                tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, blake3 = %hash, expected = %row.blake3, path, "an untagged frame's file no longer holds its bytes; left for its recheck");
+                if let Err(e) = self
+                    .node
+                    .unseed_project_frame(&row.project_id, &row.frame_uuid)
+                    .await
+                {
+                    tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "unseed after a hash mismatch failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path, error = %format!("{e:#}"), "re-seeding an untagged frame failed")
+            }
+        }
+    }
+
     async fn recheck(&mut self, row: &LocalFrameRow, now: Instant, ev: &mut Vec<StorageEvent>) {
         let Some(path) = row.landed_path.clone() else {
             return;
@@ -700,7 +760,10 @@ impl StorageEngine {
                 }
                 return;
             }
-            StatVerdict::Same if !changed_state => return,
+            StatVerdict::Same if !changed_state => {
+                self.ensure_seeded(row, &path).await;
+                return;
+            }
             StatVerdict::Same => match recorded {
                 Some(s) => s,
                 None => return,
@@ -1750,11 +1813,6 @@ fn apply_user_event(
             continue;
         };
         frames_db::set_local_state(&tx, project_id, &row.frame_uuid, to)?;
-        // the wave-2 need set still reads `locally_declined`
-        tx.execute(
-            "UPDATE project_frames_local SET locally_declined = ?3 WHERE project_id = ?1 AND frame_uuid = ?2",
-            rusqlite::params![project_id, row.frame_uuid, to == LocalState::NotKept],
-        )?;
         n += 1;
     }
     tx.commit()?;
@@ -1930,9 +1988,9 @@ pub async fn resolve_changed_file_with(
     let applied = frame_tx_locked(ctx, &row, |tx| {
         live_db::unquarantine(tx, project_id, frame_uuid)?;
         tx.execute(
-            "UPDATE project_frames_local SET rejected_size_mtime = NULL, size_mtime_seen = NULL, locally_declined = ?3
+            "UPDATE project_frames_local SET rejected_size_mtime = NULL, size_mtime_seen = NULL
              WHERE project_id = ?1 AND frame_uuid = ?2",
-            rusqlite::params![project_id, frame_uuid, to == LocalState::NotKept],
+            rusqlite::params![project_id, frame_uuid],
         )?;
         frames_db::set_local_state(tx, project_id, frame_uuid, to)?;
         Ok(Some(()))
@@ -2114,6 +2172,30 @@ mod tests {
             recorded.matches(&Stamp::of(&std::fs::metadata(&path).unwrap())),
             "the stamp is re-recorded"
         );
+    }
+
+    /// Task 15 (replaces the wave-2 `a_present_untagged_frame_is_seeded_again`):
+    /// the sweep re-seeds a held frame whose seed tag is gone — its file
+    /// still stats as recorded and hashes to its BLAKE3.
+    #[tokio::test]
+    async fn a_held_frame_that_lost_its_seed_tag_is_seeded_again() {
+        let rig = ts::landed_rig(1).await;
+        let (pid, uuid, _) = rig.frames[0].clone();
+        rig.node.unseed_project_frame(&pid, &uuid).await.unwrap();
+        assert!(rig
+            .node
+            .project_frame_tags(&pid, &uuid)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut eng = rig.engine();
+        assert!(eng.sweep(&Holders(2)).await.is_empty());
+        assert_eq!(
+            rig.node.project_frame_tags(&pid, &uuid).await.unwrap(),
+            vec![(1, rig.hash_of(0))],
+            "seeded again at its version"
+        );
+        assert_eq!(state(&rig.ctx, &pid, &uuid), LocalState::Held);
     }
 
     #[tokio::test]
@@ -2306,7 +2388,6 @@ mod tests {
         );
         assert_eq!(keep_again(&rig.ctx, pid, None).unwrap(), 15);
         assert_eq!(state(&rig.ctx, pid, &rig.frames[3].1), LocalState::Wanted);
-        assert!(!row(&rig.ctx, pid, &rig.frames[3].1).locally_declined);
     }
 
     /// L4: a frame deleted a second time within 24 h joins the choice even
@@ -2629,8 +2710,7 @@ mod tests {
             r.local_state == LocalState::Wanted && !r.awaiting_gc,
             "{r:?}"
         );
-        let need =
-            crate::api::collab_exchange::frame_need(&[r], &Default::default(), true, true, false);
+        let need = crate::api::collab_live::executor::frame_need(&[r], &Default::default());
         assert_eq!(need.len(), 1, "the new version is in the need set");
     }
 

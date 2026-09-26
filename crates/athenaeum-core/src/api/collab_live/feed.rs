@@ -1558,6 +1558,45 @@ mod tests {
         assert!(effects.contains(&FeedEffect::MembersChanged(PID.into())));
     }
 
+    /// Task 15 (replaces the wave-2 poll's `threshold_move_calls_the_hook`
+    /// and `dictionary_move_is_refetched_and_calls_the_hook`): a thresholds
+    /// or dictionary move reaching the feed fires the gate hook (the
+    /// auto-publish trigger) once per move.
+    #[tokio::test]
+    async fn a_thresholds_or_dictionary_move_fires_the_gate_hook() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        let _ = crate::api::collab::take_gate_moves_seen();
+        hub.set_thresholds_version(PID, 3);
+        let ev = project_event_from_hub(&hub, PID);
+        assert!(ev.kinds.contains(&ChangeKind::Thresholds));
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        assert_eq!(
+            crate::api::collab::take_gate_moves_seen(),
+            vec![PID.to_string()]
+        );
+        hub.set_dictionary(PID, 2, crate::collab::fake_hub::default_dictionary());
+        let ev = project_event_from_hub(&hub, PID);
+        assert!(ev.kinds.contains(&ChangeKind::Dictionary));
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        assert_eq!(
+            crate::api::collab::take_gate_moves_seen(),
+            vec![PID.to_string()]
+        );
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        assert_eq!(
+            crate::db::collab::get_project(&conn, PID)
+                .unwrap()
+                .unwrap()
+                .dictionary_version,
+            Some(2),
+            "the dictionary is refetched"
+        );
+    }
+
     #[tokio::test]
     async fn account_left_marks_the_project_lost_and_forgets_its_live_state() {
         let (_t, ctx, hub, mut f) = rig().await;

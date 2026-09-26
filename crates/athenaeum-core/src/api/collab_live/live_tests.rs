@@ -156,3 +156,74 @@ async fn a_frame_outside_the_policy_arrives_idle_and_is_never_fetched() {
     assert_eq!(row.local_state, LocalState::Idle);
     assert!(row.landed_path.is_none(), "never fetched");
 }
+
+/// P24, C10 (the wave-2 `identical_content_second_frame_is_linked_not_fetched`
+/// on the live executor): a second frame whose content B already holds is
+/// linked from the landed file — its bytes never cross the wire again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_content_is_linked_not_fetched() {
+    const SIZE: usize = 256 * 1024;
+    let w = ts::two_instances().await;
+    let bytes = ts::FetchRig::pattern("twin", 1, SIZE);
+    let first = w.a_publishes_bytes(&bytes).await;
+    w.b.wait_state(&first, LocalState::Held, Duration::from_secs(20))
+        .await;
+    let sent = |n: &crate::sharing::iroh::node::SharedIrohNode| {
+        let c = n.counters_snapshot_for_test();
+        c.send_direct_bytes.saturating_add(c.send_relay_bytes)
+    };
+    let before = sent(&w.a.node);
+    let second = w.a_publishes_bytes(&bytes).await;
+    w.b.wait_state(&second, LocalState::Held, Duration::from_secs(20))
+        .await;
+    let moved = sent(&w.a.node).saturating_sub(before);
+    assert!(
+        moved < (SIZE / 2) as u64,
+        "A sent {moved} bytes: the second frame was fetched, not linked"
+    );
+    assert_eq!(w.b.file_bytes(&second), bytes);
+    assert_ne!(
+        w.b.row(&first).unwrap().landed_path,
+        w.b.row(&second).unwrap().landed_path
+    );
+}
+
+fn arm(ctx: &std::sync::Arc<crate::services::ServiceContext>) {
+    crate::api::collab_live::spawn_with(
+        std::sync::Arc::clone(ctx),
+        crate::api::collab_live::GateSource::Fixed(std::sync::Arc::new(
+            crate::sync::receiver::InboundControl::new(),
+        )),
+        None,
+        crate::api::collab_live::LiveConfig {
+            beat: ts::LIVE_BEAT,
+            ready_poll: Duration::from_millis(100),
+            ..Default::default()
+        },
+    )
+    .expect("armed");
+}
+
+/// The wave-2 `the_pass_is_a_no_op_signed_out_or_without_a_collaboration_root`
+/// on the live exchange: without a Collaboration folder nothing starts (no
+/// stream, no session); signed out, the session waits in `signedOut`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_runs_without_a_collaboration_folder_or_signed_out() {
+    let (_t, ctx, hub) = ts::signed_in_rig_no_root().await;
+    let ctx = std::sync::Arc::new(ctx);
+    arm(&ctx);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let s = status(&ctx);
+    assert_eq!(s.storage, crate::api::collab_live::StorageStateView::NotSet);
+    assert_ne!(s.state, LiveState::Live);
+    assert!(hub.connected(ts::PID).is_empty(), "no event stream opened");
+    shutdown(&ctx).await;
+
+    let (_t2, ctx2, hub2) = ts::signed_in_rig().await;
+    let ctx2 = std::sync::Arc::new(ctx2);
+    crate::api::account::sign_out(&ctx2).await.unwrap();
+    arm(&ctx2);
+    wait_status(&ctx2, LiveState::SignedOut, Duration::from_secs(5)).await;
+    assert!(hub2.connected(ts::PID).is_empty(), "no event stream opened");
+    shutdown(&ctx2).await;
+}

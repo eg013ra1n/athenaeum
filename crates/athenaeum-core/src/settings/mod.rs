@@ -121,14 +121,6 @@ pub mod defaults {
     // `SettingsManager::get_sync_max_concurrent_receives`).
     pub const SYNC_MAX_CONCURRENT_RECEIVES: &str = "2";
 
-    // Collab replication loss guard (collab v3 wave 2, P14). Disk truth that
-    // finds more than this fraction of the held replicas missing, OR more
-    // than this many bytes of them, pauses the project's replication instead
-    // of re-downloading what looks like a folder moved away. The Settings UI
-    // for both lands in wave 4.
-    pub const COLLAB_LOSS_GUARD_FRACTION: &str = "0.10";
-    pub const COLLAB_LOSS_GUARD_BYTES: &str = "10737418240";
-
     /// PROVISIONAL — collab v3 wave 3 plan P21; re-set from the relay
     /// measurement. Simultaneous collab upload streams this device serves
     /// (L11), clamped to [`COLLAB_UPLOAD_STREAMS_RANGE`](super::COLLAB_UPLOAD_STREAMS_RANGE).
@@ -222,14 +214,6 @@ pub mod defaults {
             (
                 super::keys::SYNC_MAX_CONCURRENT_RECEIVES,
                 SYNC_MAX_CONCURRENT_RECEIVES,
-            ),
-            (
-                super::keys::COLLAB_LOSS_GUARD_FRACTION,
-                COLLAB_LOSS_GUARD_FRACTION,
-            ),
-            (
-                super::keys::COLLAB_LOSS_GUARD_BYTES,
-                COLLAB_LOSS_GUARD_BYTES,
             ),
             (
                 super::keys::COLLAB_MAX_UPLOAD_STREAMS,
@@ -383,12 +367,6 @@ pub mod keys {
     /// interrupts a transfer already in flight.
     pub const SYNC_MAX_CONCURRENT_RECEIVES: &str = "sync.max_concurrent_receives";
 
-    /// Collab replication loss guard (P14): the fraction of held replicas
-    /// whose loss in one disk-truth pass pauses the project's replication.
-    pub const COLLAB_LOSS_GUARD_FRACTION: &str = "collab.loss_guard_fraction";
-    /// Collab replication loss guard (P14): the bytes of held replicas whose
-    /// loss in one disk-truth pass pauses the project's replication.
-    pub const COLLAB_LOSS_GUARD_BYTES: &str = "collab.loss_guard_bytes";
     /// Simultaneous collab upload streams this device serves (L11); a get
     /// past the limit is refused with `ERR_LIMIT` and the fetcher moves on.
     pub const COLLAB_MAX_UPLOAD_STREAMS: &str = "collab.max_upload_streams";
@@ -790,33 +768,6 @@ impl SettingsManager {
         Ok(n.clamp(1, 8))
     }
 
-    /// The collab loss guard's fraction (P14), clamped to `0.0..=1.0`. A
-    /// value that does not parse is an error for the caller to log; the
-    /// guard then falls back to the default.
-    pub fn get_collab_loss_guard_fraction(&self, conn: &Connection) -> Result<f64> {
-        let value = self.get_with_precedence(
-            conn,
-            keys::COLLAB_LOSS_GUARD_FRACTION,
-            defaults::COLLAB_LOSS_GUARD_FRACTION,
-        )?;
-        let f: f64 = value.trim().parse()?;
-        if !f.is_finite() {
-            anyhow::bail!("collab.loss_guard_fraction is not finite: {value}");
-        }
-        Ok(f.clamp(0.0, 1.0))
-    }
-
-    /// The collab loss guard's byte threshold (P14); negative clamps to 0.
-    pub fn get_collab_loss_guard_bytes(&self, conn: &Connection) -> Result<i64> {
-        let value = self.get_with_precedence(
-            conn,
-            keys::COLLAB_LOSS_GUARD_BYTES,
-            defaults::COLLAB_LOSS_GUARD_BYTES,
-        )?;
-        let n: i64 = value.trim().parse()?;
-        Ok(n.max(0))
-    }
-
     /// `collab.max_upload_streams` (L11), clamped to
     /// [`COLLAB_UPLOAD_STREAMS_RANGE`]; a non-numeric value falls back to
     /// the default with a warning.
@@ -882,8 +833,6 @@ mod tests {
             keys::UPDATES_AUTO_CHECK,
             keys::FLAT_CONTOUR_CONTOURS,
             keys::BLINK_RESOLUTION,
-            keys::COLLAB_LOSS_GUARD_FRACTION,
-            keys::COLLAB_LOSS_GUARD_BYTES,
             keys::COLLAB_MAX_UPLOAD_STREAMS,
             keys::COLLAB_MAX_RECEIVE_STREAMS,
         ] {
@@ -899,34 +848,29 @@ mod tests {
         );
     }
 
-    /// P14: the loss guard reads its two keys with the documented defaults,
-    /// honours a stored value, and clamps out-of-range ones.
+    /// P33: the retired loss guard's settings rows are deleted at init,
+    /// idempotently.
     #[test]
-    fn collab_loss_guard_getters_default_and_clamp() {
+    fn the_retired_loss_guard_rows_are_deleted_at_init() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        let manager = SettingsManager::new();
-        assert_eq!(manager.get_collab_loss_guard_fraction(&conn).unwrap(), 0.10);
-        assert_eq!(
-            manager.get_collab_loss_guard_bytes(&conn).unwrap(),
-            10_737_418_240
-        );
-        manager
-            .persist_setting(&conn, keys::COLLAB_LOSS_GUARD_FRACTION, "0.25")
+        for key in ["collab.loss_guard_fraction", "collab.loss_guard_bytes"] {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, '1')",
+                rusqlite::params![key],
+            )
             .unwrap();
-        manager
-            .persist_setting(&conn, keys::COLLAB_LOSS_GUARD_BYTES, "-5")
+        }
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key LIKE 'collab.loss_guard_%'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(manager.get_collab_loss_guard_fraction(&conn).unwrap(), 0.25);
-        assert_eq!(manager.get_collab_loss_guard_bytes(&conn).unwrap(), 0);
-        manager
-            .persist_setting(&conn, keys::COLLAB_LOSS_GUARD_FRACTION, "7")
-            .unwrap();
-        assert_eq!(manager.get_collab_loss_guard_fraction(&conn).unwrap(), 1.0);
-        manager
-            .persist_setting(&conn, keys::COLLAB_LOSS_GUARD_FRACTION, "lots")
-            .unwrap();
-        assert!(manager.get_collab_loss_guard_fraction(&conn).is_err());
+        assert_eq!(left, 0);
     }
 
     /// L11 (P21): the two collab stream limits read their provisional

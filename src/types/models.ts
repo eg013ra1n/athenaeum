@@ -1680,6 +1680,32 @@ export type CollabFramesLanded = { projectId: string, landed: number, failed: nu
 
 export type LossAction = "restore" | "stopHolding";
 
+export type LiveState = "off" | "connecting" | "live" | "reconnecting" | "unreachable" | "signedOut" | "outdated";
+
+export type StorageStateView = "available" | "readOnly" | "unavailable" | "notSet";
+
+export type CollabLiveStatus = { state: LiveState, 
+/**
+ * Seconds until the next reconnect attempt, while reconnecting.
+ */
+retryInSecs: number | null, 
+/**
+ * When `state` last changed (RFC 3339).
+ */
+since: string, storage: StorageStateView, storageReason: string | null, 
+/**
+ * Changes are seen by the periodic check only (§9.2).
+ */
+watcherDegraded: boolean, networkVolume: boolean, };
+
+export type CollabDeletionChoice = { count: number, projectIds: Array<string>, };
+
+export type CollabFrameLost = { projectId: string, frameUuid: string, fileName: string, };
+
+export type CollabFrameChanged = { projectId: string, frameUuid: string, fileName: string, };
+
+export type CollabAttentionChanged = { projectId: string, };
+
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**
  * Human-readable failure reasons, empty when publishable (e.g.

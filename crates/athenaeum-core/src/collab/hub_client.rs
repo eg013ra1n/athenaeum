@@ -105,32 +105,7 @@ struct PubkeyWire {
     pubkey: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HolderWire {
-    /// base64-encoded 32-byte peer pubkey.
-    pub pubkey: String,
-    pub display_name: String,
-    pub last_seen_at: Option<String>,
-    /// The holder's self-reported home relay url (finding H1, T7). CROSS-ACCOUNT
-    /// by nature (a holder may be in a different account), so the hub serves the
-    /// relay ONLY — never direct addrs (S1). Absent on an older hub → `None`, in
-    /// which case the download falls back to our own resolved relay set.
-    #[serde(default)]
-    pub relay_url: Option<String>,
-}
-
 // ── Per-frame api (collab v3, wave 2) ────────────────────────────────────────
-
-/// One entry of `GET /me/project-versions` — the cheap per-project version this
-/// device already has cached, used to skip a manifest fetch when nothing
-/// changed.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectVersionWire {
-    pub project_id: String,
-    pub version: i64,
-}
 
 /// One row of `GET /projects/{id}/manifest` — a published (or moderation-
 /// pending) frame from ANY member, never the local file itself.
@@ -226,15 +201,6 @@ pub struct AnnounceFramesWire {
 pub struct NewVersionWire {
     pub content_version: i32,
     pub project_version: i64,
-}
-
-/// One `(frame_uuid, content_version)` this device holds, for
-/// `PUT /projects/{id}/holders/self`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HolderRefWire {
-    pub frame_uuid: String,
-    pub content_version: i32,
 }
 
 /// One entry of the project's filter/channel dictionary.
@@ -456,18 +422,6 @@ impl CollabClient {
 
     // ── Per-frame api (collab v3, wave 2) ────────────────────────────────────
 
-    /// `GET /me/project-versions` — every project I'm a member of, with the
-    /// hub's current `version` for each, so the caller can skip a manifest
-    /// fetch for a project whose cached version already matches.
-    #[deprecated(note = "collab v3 wave 3: removed in Task 15")]
-    pub async fn project_versions(
-        &self,
-        token: &str,
-    ) -> Result<Vec<ProjectVersionWire>, AccountClientError> {
-        self.get_json("/me/project-versions", Some(token), "project versions")
-            .await
-    }
-
     /// `GET /projects/{id}/manifest` — one page of frame rows with
     /// `manifestVersion > since` (`since = 0` = full manifest), resumed via
     /// `after` when the previous page's `hasMore` was true. `limit` is passed
@@ -638,52 +592,6 @@ impl CollabClient {
             return Ok(());
         }
         Err(classify(status, resp, "reject frame").await)
-    }
-
-    /// `PUT /projects/{id}/holders/self` — this device's holder report for the
-    /// project: `full = true` replaces the whole set, `false` applies `add`/
-    /// `remove` as a delta. Always sends all three keys, even when `add`/
-    /// `remove` are empty (an empty `add` under `full = true` is a real
-    /// statement: "I hold nothing here any more").
-    #[deprecated(note = "collab v3 wave 3: removed in Task 15")]
-    pub async fn put_holders(
-        &self,
-        token: &str,
-        project_id: &str,
-        full: bool,
-        add: &[HolderRefWire],
-        remove: &[String],
-    ) -> Result<(), AccountClientError> {
-        let resp = self
-            .http
-            .put(self.url(&format!("/projects/{project_id}/holders/self")))
-            .bearer_auth(token)
-            .json(&serde_json::json!({ "full": full, "add": add, "remove": remove }))
-            .send()
-            .await
-            .map_err(net)?;
-        let status = resp.status();
-        if status == StatusCode::NO_CONTENT || status == StatusCode::OK {
-            return Ok(());
-        }
-        Err(classify(status, resp, "put holders").await)
-    }
-
-    /// `GET /projects/{id}/frames/{uuid}/holders` — every device currently
-    /// reporting it holds this frame's content.
-    #[deprecated(note = "collab v3 wave 3: removed in Task 15")]
-    pub async fn frame_holders(
-        &self,
-        token: &str,
-        project_id: &str,
-        frame_uuid: &str,
-    ) -> Result<Vec<HolderWire>, AccountClientError> {
-        self.get_json(
-            &format!("/projects/{project_id}/frames/{frame_uuid}/holders"),
-            Some(token),
-            "frame holders",
-        )
-        .await
     }
 
     /// `GET /projects/{id}/dictionary` — the project's current filter/channel
@@ -1019,7 +927,7 @@ mod tests {
     async fn outdated_api_409_is_typed_on_get_and_post() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/v1/me/project-versions"))
+            .and(path("/api/v1/me/projects"))
             .respond_with(
                 ResponseTemplate::new(409).set_body_json(json!({"error":"collab_api_outdated"})),
             )
@@ -1034,7 +942,7 @@ mod tests {
             .await;
         let c = CollabClient::new(server.uri()).unwrap();
         assert!(matches!(
-            c.project_versions("t").await,
+            c.my_projects("t").await,
             Err(AccountClientError::CollabApiOutdated)
         ));
         assert!(matches!(
@@ -1113,37 +1021,6 @@ mod tests {
         assert_eq!(p.gov_caps, vec!["data.moderate".to_string()]);
     }
 
-    /// `put_holders` always sends all three keys (`full`/`add`/`remove`), never
-    /// omitting an empty `remove`.
-    #[tokio::test]
-    async fn put_holders_sends_full_add_remove() {
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/api/v1/projects/p1/holders/self"))
-            .and(body_json(json!({
-                "full": true,
-                "add": [{"frameUuid":"u1","contentVersion":2}],
-                "remove": []
-            })))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let c = CollabClient::new(server.uri()).unwrap();
-        c.put_holders(
-            "t",
-            "p1",
-            true,
-            &[HolderRefWire {
-                frame_uuid: "u1".into(),
-                content_version: 2,
-            }],
-            &[],
-        )
-        .await
-        .unwrap();
-    }
-
     // ---- per-frame api, wire shapes pinned against the hub (fix round 1) ----
 
     /// `approve_frame` always sends `{"trust": trust}` and decodes the hub's
@@ -1202,30 +1079,6 @@ mod tests {
             .unwrap();
         assert_eq!(v.content_version, 2);
         assert_eq!(v.project_version, 11);
-    }
-
-    /// `frame_holders` decodes the hub's holder list — same shape as an
-    /// announcement's `holders` (pubkey/displayName/lastSeenAt/relayUrl).
-    #[tokio::test]
-    async fn frame_holders_decodes() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/projects/p1/frames/u1/holders"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                { "pubkey": "cHVia2V5", "displayName": "Vilen",
-                  "lastSeenAt": "2026-09-24T00:00:00Z",
-                  "relayUrl": "https://relay.example.org/" }
-            ])))
-            .mount(&server)
-            .await;
-        let c = CollabClient::new(server.uri()).unwrap();
-        let holders = c.frame_holders("t", "p1", "u1").await.unwrap();
-        assert_eq!(holders.len(), 1);
-        assert_eq!(holders[0].display_name, "Vilen");
-        assert_eq!(
-            holders[0].relay_url.as_deref(),
-            Some("https://relay.example.org/")
-        );
     }
 
     /// `dictionary` decodes a present current set — ignoring the hub's extra

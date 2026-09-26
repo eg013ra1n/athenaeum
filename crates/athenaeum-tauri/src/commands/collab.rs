@@ -9,7 +9,7 @@ use athenaeum_core::api::collab::{
     ProjectDetail, PublishResult,
 };
 use athenaeum_core::api::collab_exchange as exchange;
-use athenaeum_core::api::collab_exchange::{CollabFramesChange, ProjectFrameView};
+use athenaeum_core::api::collab_exchange::ProjectFrameView;
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::export::models::ExportResult;
 use tauri::{AppHandle, State};
@@ -116,22 +116,6 @@ pub async fn republish_collab_frames(
         .map_err(|e| e.to_string())
 }
 
-/// Poll every cached project's version (wave 2 Task 11): one version-poll
-/// tick, returning every `collab-frames-changed` it applied — the events
-/// themselves still reach the frontend live via the usual event; this is the
-/// "refresh" button's plain return value.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn refresh_collab_frames(
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> Result<Vec<CollabFramesChange>, String> {
-    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
-    exchange::refresh_collab_frames(&state.ctx, Some(emitter.as_ref()))
-        .await
-        .map_err(|e| e.to_string())
-}
-
 /// Every cached frame of a project (cache-only — no hub call).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
@@ -143,8 +127,8 @@ pub async fn list_collab_frames(
 }
 
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
-/// the hub never learns of it). The worker reads the column at the start of each
-/// pass, so there is nothing to live-apply.
+/// the hub never learns of it). The live exchange re-reads the project's need
+/// set at once.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn set_project_auto_replicate(
@@ -168,27 +152,6 @@ pub async fn set_project_auto_publish(
     api::set_project_auto_publish(&state.ctx, &project_id, enabled)
         .await
         .map_err(|e| e.to_string())
-}
-
-/// D3 §3.3 "Sync now": run one auto-replication pass for this project
-/// immediately, with the toggle forced on (an explicit user act). Returns as soon
-/// as the pass is spawned — its outcomes ride the `collab-frames-landed` and
-/// `collab-replication-paused` events.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn sync_project_now(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    project_id: String,
-) -> Result<(), String> {
-    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
-    exchange::sync_project_now(
-        Arc::clone(&state.ctx),
-        Arc::clone(&state.sync),
-        &project_id,
-        Some(emitter),
-    )
-    .map_err(|e| e.to_string())
 }
 
 /// The project's local replication policy (collab v3, spec §5.3).
@@ -227,28 +190,6 @@ pub async fn preview_collab_policy(
     exchange::preview_collab_policy(&state.ctx, &project_id, policy)
         .await
         .map_err(|e| e.to_string())
-}
-
-/// Answer a project the loss guard paused (P14): restore (rescan the
-/// Collaboration folder) or stop holding the missing frames.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn resolve_collab_loss(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    project_id: String,
-    action: exchange::LossAction,
-) -> Result<(), String> {
-    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
-    exchange::resolve_collab_loss(
-        Arc::clone(&state.ctx),
-        Arc::clone(&state.sync),
-        &project_id,
-        action,
-        Some(emitter),
-    )
-    .await
-    .map_err(|e| e.to_string())
 }
 
 /// The coordinator's review queue: every PENDING frame (cache-only).

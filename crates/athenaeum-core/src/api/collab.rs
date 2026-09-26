@@ -3477,13 +3477,11 @@ async fn run_publish(
                 byte_size: w.byte_size as i64,
                 xxh3: w.xxh3.clone(),
                 blake3: f.blake3.clone(),
-                holder_count: 1,
                 manifest_version: 0,
                 manifest_json: manifest.to_string(),
                 landed_path: Some(w.target.to_string_lossy().to_string()),
                 size_mtime_seen: size_mtime_seen(&w.target),
                 on_disk: true,
-                locally_declined: false,
                 awaiting_gc: false,
                 source_frame_id: Some(w.frame_id),
                 recipe_hash: Some(w.recipe.clone()),
@@ -5465,7 +5463,7 @@ pub(crate) mod tests {
 
         pub(super) struct PubFx {
             pub tmp: tempfile::TempDir,
-            pub ctx: ServiceContext,
+            pub ctx: Arc<ServiceContext>,
             pub server: MockServer,
             pub node: Arc<crate::sharing::iroh::node::SharedIrohNode>,
             pub collab: PathBuf,
@@ -5735,6 +5733,40 @@ pub(crate) mod tests {
             crate::db::collab_frames::get(&conn, PID, uuid).unwrap()
         }
 
+        struct NoHolders;
+        impl crate::api::collab_live::storage_task::HolderView for NoHolders {
+            fn other_holders(
+                &self,
+                _project_id: &str,
+                _frame_uuid: &str,
+            ) -> crate::collab::live::holders::Redundancy {
+                Default::default()
+            }
+        }
+
+        /// One stat sweep of the storage engine over the fixture's root —
+        /// the wave-3 check that replaced disk truth (Task 15).
+        async fn storage_sweep(
+            fx: &PubFx,
+        ) -> Vec<crate::api::collab_live::storage_task::StorageEvent> {
+            let me = crate::api::account::own_device_id(&fx.ctx).unwrap();
+            let recorded = crate::db::collab_live::recorded_store_marker(
+                &crate::api::db(&fx.ctx).unwrap().conn(),
+            )
+            .unwrap();
+            let guard = Arc::new(crate::collab::storage::marker::StoreGuard::new(
+                fx.collab.clone(),
+                me,
+                recorded,
+            ));
+            let mut eng = crate::api::collab_live::storage_task::StorageEngine::start(
+                Arc::clone(&fx.ctx),
+                Arc::clone(&fx.node),
+                guard,
+            );
+            eng.sweep(&NoHolders).await
+        }
+
         fn dir_bytes(dir: &Path) -> u64 {
             let mut total = 0;
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -5984,7 +6016,7 @@ pub(crate) mod tests {
             link_frame_set(&ctx, PID, set.set_id).unwrap();
             PubFx {
                 tmp,
-                ctx,
+                ctx: Arc::new(ctx),
                 server,
                 node,
                 collab,
@@ -6912,12 +6944,13 @@ pub(crate) mod tests {
             assert!(hub_frame_rule_problem(&m).is_some());
         }
 
-        /// I2: disk truth running while an update waits for its
+        /// I2 (the wave-2 disk-truth test, on the wave-3 storage engine —
+        /// Task 15): a stat sweep running while an update waits for its
         /// `…/version` reply sees the regenerated file as the frame's own —
-        /// it does not count it missing and does not drop the new seed tag,
-        /// so the frame ends seeded at v2 AND on disk.
+        /// no state change, and the new seed tag survives — so the frame
+        /// ends seeded at v2 AND on disk.
         #[tokio::test]
-        async fn disk_truth_mid_update_leaves_the_frame_seeded_and_on_disk() {
+        async fn a_storage_sweep_mid_update_leaves_the_frame_seeded_and_on_disk() {
             let fx = fixture(1).await;
             Mock::given(wm_method("POST"))
                 .and(wm_path(versions_path()))
@@ -6931,20 +6964,10 @@ pub(crate) mod tests {
                 .await;
             mount_hub(&fx.server, "published").await;
             publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
-            // `size:mtime` has one-second granularity and both runs finish
-            // within a second: record an older stamp, as a later run sees.
-            {
-                let conn = crate::api::db(&fx.ctx).unwrap().conn();
-                conn.execute(
-                    "UPDATE project_frames_local SET size_mtime_seen = '1:1'",
-                    [],
-                )
-                .unwrap();
-            }
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
 
-            let mid_truth = async {
+            let mid_sweep = async {
                 // The update has replaced the file and seeded v2; its
                 // `…/version` reply is held back 1.5 s by the mock.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -6955,28 +6978,33 @@ pub(crate) mod tests {
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
-                let truth = crate::api::collab_exchange::disk_truth(&fx.ctx, PID)
-                    .await
-                    .unwrap();
+                let events = storage_sweep(&fx).await;
                 let row = own_row(&fx, &fx.uuids[0]).unwrap();
-                (truth, row, tag_present(&fx, &fx.uuids[0], 2).await)
+                (events, row, tag_present(&fx, &fx.uuids[0], 2).await)
             };
-            let (res, (truth, mid_row, mid_tag)) =
-                tokio::join!(publish_collab_frames(&fx.ctx, PID, None), mid_truth);
+            let (res, (events, mid_row, mid_tag)) =
+                tokio::join!(publish_collab_frames(&fx.ctx, PID, None), mid_sweep);
             let res = res.unwrap();
             assert_eq!(res.updated, 1, "{res:?}");
-            assert!(truth.missing_own.is_empty(), "{truth:?}");
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    crate::api::collab_live::storage_task::StorageEvent::StateChanged { .. }
+                )),
+                "{events:?}"
+            );
             assert!(mid_row.on_disk, "mid-update the file is the frame's own");
-            assert!(mid_tag, "the v2 tag survives the walk");
+            assert!(mid_tag, "the v2 tag survives the sweep");
 
             let row = own_row(&fx, &fx.uuids[0]).unwrap();
             assert_eq!(row.content_version, 2);
             assert!(row.on_disk);
             assert!(tag_present(&fx, &fx.uuids[0], 2).await, "seeded at v2");
-            let truth = crate::api::collab_exchange::disk_truth(&fx.ctx, PID)
-                .await
-                .unwrap();
-            assert_eq!(truth.present, vec![(fx.uuids[0].clone(), 2)]);
+            assert!(storage_sweep(&fx).await.is_empty());
+            assert_eq!(
+                own_row(&fx, &fx.uuids[0]).unwrap().local_state,
+                crate::db::collab_frames::LocalState::OwnHeld
+            );
         }
 
         /// I2: a `…/version` the hub refuses puts the row back to the hub's
@@ -7012,10 +7040,17 @@ pub(crate) mod tests {
             assert!(!row.on_disk, "the regenerated file is not v1");
             assert_eq!(row.recipe_hash, None, "the version is unconfirmed");
             assert_eq!(project_tag_count(&fx).await, 0, "nothing advertised");
-            let truth = crate::api::collab_exchange::disk_truth(&fx.ctx, PID)
-                .await
-                .unwrap();
-            assert!(truth.present.is_empty(), "{truth:?}");
+            storage_sweep(&fx).await;
+            let conn = crate::api::db(&fx.ctx).unwrap().conn();
+            assert!(
+                crate::db::collab_live::my_claims(&conn, PID)
+                    .unwrap()
+                    .iter()
+                    .all(|(u, _)| u != &fx.uuids[0]),
+                "the unconfirmed file is not claimed"
+            );
+            assert!(!own_row(&fx, &fx.uuids[0]).unwrap().on_disk);
+            drop(conn);
 
             let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
             assert_eq!(res.updated, 1, "{res:?}");

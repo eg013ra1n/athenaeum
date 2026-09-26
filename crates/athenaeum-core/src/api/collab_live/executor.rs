@@ -1349,4 +1349,186 @@ mod tests {
             "toggle gate"
         );
     }
+
+    // ── the pure need set (moved from the wave-2 `collab_exchange`) ─────
+
+    fn replica(uuid: &str, created: &str, size: i64) -> LocalFrameRow {
+        LocalFrameRow {
+            project_id: "p1".into(),
+            frame_uuid: uuid.into(),
+            content_version: 1,
+            origin: crate::db::collab_frames::FrameOrigin::Replica,
+            publisher_account_id: "acc-o".into(),
+            publisher_display: "Other".into(),
+            file_name: format!("{uuid}.fits"),
+            filter_canonical: "L".into(),
+            state: "published".into(),
+            accepted: true,
+            byte_size: size,
+            xxh3: "0".repeat(16),
+            blake3: "0".repeat(64),
+            manifest_version: 1,
+            manifest_json: serde_json::json!({ "createdAt": created, "meta": {} }).to_string(),
+            landed_path: None,
+            size_mtime_seen: None,
+            on_disk: false,
+            awaiting_gc: false,
+            source_frame_id: None,
+            recipe_hash: None,
+            last_error: None,
+            updated_at: String::new(),
+            local_state: LocalState::Wanted,
+            frame_seq: None,
+        }
+    }
+
+    fn uuids(v: &[LocalFrameRow]) -> Vec<&str> {
+        v.iter().map(|r| r.frame_uuid.as_str()).collect()
+    }
+
+    fn all() -> ReplicationPolicy {
+        ReplicationPolicy::default()
+    }
+
+    /// Spec §7.1 / Task 15 R2: only a published, accepted peer frame that is
+    /// `wanted` and not waiting for the GC is needed — never an own, not
+    /// kept, quarantined, idle, missing, awaiting-choice or held one.
+    #[test]
+    fn need_is_wanted_published_accepted_replicas_only() {
+        let ok = replica("ok", "t", 10);
+        let mut own = replica("own", "t", 10);
+        own.origin = crate::db::collab_frames::FrameOrigin::Own;
+        let mut unaccepted = replica("unaccepted", "t", 10);
+        unaccepted.accepted = false;
+        let mut pending = replica("pending", "t", 10);
+        pending.state = "pending".into();
+        let mut rejected = replica("rejected", "t", 10);
+        rejected.state = "rejected".into();
+        let mut awaiting = replica("awaiting", "t", 10);
+        awaiting.awaiting_gc = true;
+        let mut rows = vec![ok, own, unaccepted, pending, rejected, awaiting];
+        for (u, st) in [
+            ("not_kept", LocalState::NotKept),
+            ("quarantined", LocalState::Quarantined),
+            ("idle", LocalState::Idle),
+            ("missing", LocalState::Missing),
+            ("choice", LocalState::AwaitingChoice),
+            ("held", LocalState::Held),
+        ] {
+            let mut r = replica(u, "t", 10);
+            r.local_state = st;
+            rows.push(r);
+        }
+        assert_eq!(uuids(&frame_need(&rows, &all())), vec!["ok"]);
+    }
+
+    /// Oldest first (`createdAt`), then by uuid — the order the byte budget
+    /// is spent in (the scheduler ranks rarest first itself).
+    #[test]
+    fn need_is_oldest_first() {
+        let rows = vec![
+            replica("a", "2026-09-01T00:00:01Z", 10),
+            replica("b", "2026-09-01T00:00:03Z", 10),
+            replica("c", "2026-09-01T00:00:02Z", 10),
+            replica("d", "2026-09-01T00:00:00Z", 10),
+        ];
+        assert_eq!(uuids(&frame_need(&rows, &all())), vec!["d", "a", "c", "b"]);
+    }
+
+    /// The budget counts the replicas already on disk (own frames are not
+    /// replicas) and stops at the first frame that would cross it.
+    #[test]
+    fn byte_budget_counts_already_held_bytes() {
+        let mut held = replica("held", "t0", 600);
+        held.on_disk = true;
+        held.local_state = LocalState::Held;
+        let mut own = replica("own", "t0", 5000);
+        own.origin = crate::db::collab_frames::FrameOrigin::Own;
+        own.on_disk = true;
+        let rows = vec![
+            held,
+            own,
+            replica("a", "t1", 300),
+            replica("b", "t2", 200),
+            replica("c", "t3", 10),
+        ];
+        let policy = ReplicationPolicy {
+            byte_budget: Some(1000),
+            ..all()
+        };
+        assert_eq!(
+            uuids(&frame_need(&rows, &policy)),
+            vec!["a"],
+            "600 held + 300 fits, + 200 would not — and the walk stops there"
+        );
+        let roomy = ReplicationPolicy {
+            byte_budget: Some(1100),
+            ..all()
+        };
+        assert_eq!(uuids(&frame_need(&rows, &roomy)), vec!["a", "b"]);
+    }
+
+    /// Filters, publishers, FWHM and star bounds each narrow the set; a
+    /// frame without the measurement never matches a set bound.
+    #[test]
+    fn policy_filters_by_canonical_filter_publisher_fwhm_stars() {
+        let with_meta = |uuid: &str, filter: &str, publisher: &str, meta: serde_json::Value| {
+            let mut r = replica(uuid, uuid, 10);
+            r.filter_canonical = filter.into();
+            r.publisher_account_id = publisher.into();
+            r.manifest_json = serde_json::json!({ "createdAt": uuid, "meta": meta }).to_string();
+            r
+        };
+        let rows = vec![
+            with_meta(
+                "1",
+                "L",
+                "acc-o",
+                serde_json::json!({ "fwhmArcsec": 2.0, "starsDetected": 100 }),
+            ),
+            with_meta(
+                "2",
+                "Ha",
+                "acc-o",
+                serde_json::json!({ "fwhmArcsec": 4.0, "starsDetected": 10 }),
+            ),
+            with_meta("3", "L", "acc-x", serde_json::json!({})),
+        ];
+        let need = |p: ReplicationPolicy| {
+            uuids(&frame_need(&rows, &p))
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(need(all()), vec!["1", "2", "3"]);
+        assert_eq!(
+            need(ReplicationPolicy {
+                filters: vec!["Ha".into()],
+                ..all()
+            }),
+            vec!["2"]
+        );
+        assert_eq!(
+            need(ReplicationPolicy {
+                publishers: vec!["acc-x".into()],
+                ..all()
+            }),
+            vec!["3"]
+        );
+        assert_eq!(
+            need(ReplicationPolicy {
+                max_fwhm_arcsec: Some(3.0),
+                ..all()
+            }),
+            vec!["1"],
+            "4.0 is over the bound and a missing FWHM never matches"
+        );
+        assert_eq!(
+            need(ReplicationPolicy {
+                min_stars: Some(50),
+                ..all()
+            }),
+            vec!["1"]
+        );
+    }
 }

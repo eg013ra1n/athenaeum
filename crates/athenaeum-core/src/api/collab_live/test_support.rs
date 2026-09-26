@@ -1421,10 +1421,25 @@ impl World {
     /// implicit claim (so no peer ever asks before A can serve).
     pub(crate) async fn a_publishes_big(&self, n: usize, size: usize) -> Vec<String> {
         let uuids = self.fresh_uuids(n);
+        for uuid in &uuids {
+            self.a_publishes_as(uuid, FetchRig::pattern(uuid, 1, size))
+                .await;
+        }
+        uuids
+    }
+
+    /// A publishes one frame of exactly `bytes` (identical content in two
+    /// frames: C10).
+    pub(crate) async fn a_publishes_bytes(&self, bytes: &[u8]) -> String {
+        let uuid = self.fresh_uuids(1).remove(0);
+        self.a_publishes_as(&uuid, bytes.to_vec()).await;
+        uuid
+    }
+
+    async fn a_publishes_as(&self, uuid: &String, bytes: Vec<u8>) {
         let dir = self.a.root.join("m31").join("Alice");
         std::fs::create_dir_all(&dir).unwrap();
-        for uuid in &uuids {
-            let bytes = FetchRig::pattern(uuid, 1, size);
+        {
             let path = dir.join(format!("{uuid}.fits"));
             std::fs::write(&path, &bytes).unwrap();
             let blake3 = blake3::hash(&bytes).to_hex().to_string();
@@ -1494,7 +1509,6 @@ impl World {
                     f.file_name = file_name.clone();
                 });
         }
-        uuids
     }
 
     /// A publishes a new version of `uuid` with different bytes of the same

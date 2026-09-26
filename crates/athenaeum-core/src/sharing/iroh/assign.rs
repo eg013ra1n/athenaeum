@@ -1005,7 +1005,7 @@ pub(crate) async fn fetch_children_assigned(
 /// what a failed item does to the others; under [`FailMode::Isolate`] the call
 /// itself only fails for a reason no item owns, and every item's outcome is in
 /// the returned results, in input order.
-#[allow(dead_code)] // consumed by the collab replication pass (wave 2, Task 9)
+#[cfg_attr(not(test), allow(dead_code))] // its production caller (the wave-2 collab batch) is retired (wave 3 Task 15); the raw-item engine tests drive it
 pub(crate) async fn fetch_items_assigned(
     store: &Store,
     endpoint: &Endpoint,

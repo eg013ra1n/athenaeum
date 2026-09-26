@@ -32,9 +32,8 @@
 //! The row write is ONE transaction: `set_landed_if` (the landing fence, I1),
 //! `set_local_state(held)` (its outbox `add`, C24) and the `sync_history` row.
 //!
-//! Ungated, unlike the rest of `api::collab_live`: the wave-2 fetch path in
-//! the headless `api::collab_exchange` (`run_batch`) calls it until Task 15
-//! retires that path. It needs nothing render- or solver-gated.
+//! Ungated, unlike the rest of `api::collab_live` (it needs nothing render-
+//! or solver-gated); the live executor (Task 15) is its caller.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

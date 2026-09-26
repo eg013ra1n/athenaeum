@@ -17,8 +17,7 @@
 //! (final review C1, owner decision 2026-09-24). A request that arrives
 //! DURING a run marks its project dirty again and is picked up by the next
 //! run — the loop re-arms itself via [`tokio::sync::Notify`]'s single stored
-//! permit, the same mechanism [`super::collab_exchange::auto_sync_kick`]
-//! uses (see that module's `auto_sync_loop_inner` for the identical pattern).
+//! permit (a `notify_one` while nobody waits is kept for the next wait).
 //!
 //! Gated the same as `api::collab` (render+solver, `api/mod.rs`): it drives
 //! the render-gated calibrated-light generator via `publish_collab_frames`.
@@ -39,11 +38,11 @@ use crate::services::ServiceContext;
 /// Debounce between a kick and the drained run (worker step 2): long enough
 /// that a scan's completion and its immediately-following analysis coalesce
 /// into one publish run.
+#[cfg_attr(test, allow(dead_code))]
 const AUTO_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(30);
 
-// ── Dirty state (module statics — same pattern as
-// `collab_exchange::auto_sync_kick`: the producers, reached from every
-// trigger site across the crate, and the worker have no shared owner) ──────
+// ── Dirty state (module statics: the producers, reached from every trigger
+// site across the crate, and the worker have no shared owner) ─────────────
 
 /// Project ids marked dirty directly (a project-scoped trigger: a link, a
 /// thresholds/dictionary move, a manual "sync now"-style act).
@@ -205,9 +204,8 @@ fn drain_due_projects(ctx: &ServiceContext) -> Vec<String> {
 /// inject a recorder.
 ///
 /// `publish` takes an owned `project_id: String` and closes over `ctx`
-/// itself rather than receiving `&ServiceContext` as a parameter: the same
-/// shape `collab_exchange::run_auto_sync_pass`'s `fetch` closure uses,
-/// because a generic `Fn` bound over TWO independent borrowed parameters
+/// itself rather than receiving `&ServiceContext` as a parameter, because a
+/// generic `Fn` bound over TWO independent borrowed parameters
 /// (`&ServiceContext` and `&str`) does not unify against a plain async fn
 /// item — the async fn's opaque return type is tied to one concrete
 /// lifetime, not the higher-ranked `for<'a, 'b>` bound the generic needs.
@@ -334,9 +332,9 @@ where
 }
 
 /// Arm the auto-publish worker for this process. NOT independently
-/// guarded — the one caller, `collab_exchange::spawn_collab_auto_sync`, spawns
-/// this from inside its own `AUTO_SYNC_ARMED` swap-guard, so the two loops
-/// share a single arming site and the app runs exactly one of each.
+/// guarded — the one caller, `api::collab_live::spawn_collab_live`, spawns
+/// it once per process behind its own swap-guard.
+#[cfg_attr(test, allow(dead_code))] // armed by the live exchange's production spawner only
 pub(crate) fn spawn_auto_publish_worker(
     ctx: Arc<ServiceContext>,
     emitter: Option<Arc<dyn ProgressEmitter>>,

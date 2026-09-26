@@ -4626,7 +4626,6 @@ async fn re_export_into_the_same_staging_target_does_not_truncate_it() {
 // nodes with mounted collab stores, served on `COLLAB_BLOBS_ALPN`.
 
 use super::assign::{FailMode, FetchItem};
-use super::blobs::FrameFetch;
 use super::COLLAB_BLOBS_ALPN;
 
 /// Engine knobs for a raw-item test run: collab ALPN, no hedging, a short
@@ -4683,9 +4682,8 @@ async fn seed_raw(store: &Store, bytes: Vec<u8>, tag: &str) -> Hash {
 }
 
 /// Two providers each hold a DIFFERENT blob; one call fetches both, each from
-/// its own provider list, and both succeed. Driven through the collab caller
-/// (`fetch_blobs_assigned`), which also sets every in-flight tag up front and
-/// leaves them for the landing step.
+/// its own provider list, and both succeed. (Driven through the engine's
+/// raw-item entry point since its wave-2 collab caller retired, Task 15.)
 #[tokio::test]
 async fn raw_items_fetch_from_per_item_providers() {
     let (dr, dp1, dp2) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
@@ -4712,26 +4710,31 @@ async fn raw_items_fetch_from_per_item_providers() {
     .await;
 
     let r_store = r.collab_store().unwrap();
-    let frames = vec![
-        FrameFetch {
+    let items = vec![
+        FetchItem {
             key: "f1".to_string(),
+            request: iroh_blobs::protocol::GetRequest::blob(h1),
             hash: h1,
             size: SIZE as u64,
-            providers: vec![endpoint_id(p1_id)],
-            in_flight_tag: "in-flight/project/p/f1/1".to_string(),
+            providers: Arc::new(vec![endpoint_id(p1_id)]),
         },
-        FrameFetch {
+        FetchItem {
             key: "f2".to_string(),
+            request: iroh_blobs::protocol::GetRequest::blob(h2),
             hash: h2,
             size: SIZE as u64,
-            providers: vec![endpoint_id(p2_id)],
-            in_flight_tag: "in-flight/project/p/f2/1".to_string(),
+            providers: Arc::new(vec![endpoint_id(p2_id)]),
         },
     ];
     let (telemetry, _seen) = recording_telemetry();
-    let results = tokio::time::timeout(
+    let (_report, results) = tokio::time::timeout(
         Duration::from_secs(60),
-        super::blobs::fetch_blobs_assigned(&r_store, &r.endpoint(), frames, telemetry),
+        super::assign::fetch_items_assigned(
+            &r_store,
+            &r.endpoint(),
+            items,
+            raw_item_opts(FailMode::Isolate, 2 * SIZE as u64, telemetry),
+        ),
     )
     .await
     .expect("two small blobs must not take a minute")
@@ -4750,12 +4753,6 @@ async fn raw_items_fetch_from_per_item_providers() {
         assert!(
             r_store.blobs().has(h).await.unwrap(),
             "the receiver's collab store holds {h} complete"
-        );
-    }
-    for tag in ["in-flight/project/p/f1/1", "in-flight/project/p/f2/1"] {
-        assert!(
-            tag_present(&r_store, tag).await,
-            "the in-flight tag {tag} stays in place for the landing step"
         );
     }
 

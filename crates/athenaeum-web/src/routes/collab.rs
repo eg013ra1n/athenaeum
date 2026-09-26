@@ -57,13 +57,6 @@ pub struct PolicyArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LossArgs {
-    project_id: String,
-    action: exchange::LossAction,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ApproveFrameArgs {
     project_id: String,
     frame_uuid: String,
@@ -184,22 +177,6 @@ pub async fn republish_collab_frames(
         .map_err(api_err)
 }
 
-/// Poll every cached project's version (wave 2 Task 11): one version-poll
-/// tick, returning every `collab-frames-changed` it applied — the events
-/// themselves still reach the frontend live via SSE; this is the "refresh"
-/// button's plain return value.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn refresh_collab_frames(
-    State(state): State<WebAppState>,
-) -> Result<Json<Vec<exchange::CollabFramesChange>>, (axum::http::StatusCode, String)> {
-    let emitter: Arc<dyn ProgressEmitter> =
-        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    exchange::refresh_collab_frames(&state.ctx, Some(emitter.as_ref()))
-        .await
-        .map(Json)
-        .map_err(api_err)
-}
-
 /// Every cached frame of a project (cache-only — no hub call).
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_collab_frames(
@@ -212,8 +189,8 @@ pub async fn list_collab_frames(
 }
 
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
-/// the hub never learns of it). The worker reads the column at the start of each
-/// pass, so there is nothing to live-apply.
+/// the hub never learns of it). The live exchange re-reads the project's need
+/// set at once.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_project_auto_replicate(
     State(state): State<WebAppState>,
@@ -235,27 +212,6 @@ pub async fn set_project_auto_publish(
         .await
         .map(Json)
         .map_err(api_err)
-}
-
-/// D3 §3.3 "Sync now": run one auto-replication pass for this project
-/// immediately, with the toggle forced on (an explicit user act). Returns as soon
-/// as the pass is spawned — its outcomes ride the `collab-frames-landed` and
-/// `collab-replication-paused` SSE events.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn sync_project_now(
-    State(state): State<WebAppState>,
-    Json(args): Json<ProjectIdArgs>,
-) -> Result<Json<()>, (axum::http::StatusCode, String)> {
-    let emitter: Arc<dyn ProgressEmitter> =
-        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    exchange::sync_project_now(
-        Arc::clone(&state.ctx),
-        Arc::clone(&state.sync),
-        &args.project_id,
-        Some(emitter),
-    )
-    .map(Json)
-    .map_err(api_err)
 }
 
 /// The project's local replication policy (collab v3, spec §5.3).
@@ -292,27 +248,6 @@ pub async fn preview_collab_policy(
         .await
         .map(Json)
         .map_err(api_err)
-}
-
-/// Answer a project the loss guard paused (P14): restore (rescan the
-/// Collaboration folder) or stop holding the missing frames.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn resolve_collab_loss(
-    State(state): State<WebAppState>,
-    Json(args): Json<LossArgs>,
-) -> Result<Json<()>, (axum::http::StatusCode, String)> {
-    let emitter: Arc<dyn ProgressEmitter> =
-        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    exchange::resolve_collab_loss(
-        Arc::clone(&state.ctx),
-        Arc::clone(&state.sync),
-        &args.project_id,
-        args.action,
-        Some(emitter),
-    )
-    .await
-    .map(Json)
-    .map_err(api_err)
 }
 
 /// The coordinator's review queue: every PENDING frame (cache-only).
