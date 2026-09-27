@@ -214,7 +214,7 @@ pub struct FakeProject {
     report_hwm: HashMap<String, i64>,
     /// Amendment A6 (`project_publishers`): account id → the device pubkey
     /// (base64) bound as the account's publishing device. A bound device
-    /// that is out of service (no live token: revoked/retired) reads as
+    /// that is out of service (revoked/retired — [`FakeHubState::revoked`]) reads as
     /// unbound everywhere.
     pub publishers: HashMap<String, String>,
 }
@@ -375,6 +375,9 @@ pub struct FakeHubState {
     /// When set, every v3 route (including the event stream) answers 409
     /// `collab_api_outdated`, except the two public routes.
     pub api_outdated: bool,
+    /// Revoked or retired device pubkeys (A6 fix round 2, M5): a device is
+    /// in service while NOT in this set, like the hub's `revoked_at IS NULL`.
+    pub revoked: HashSet<String>,
     session_seq: u64,
     /// Every event published, oldest first, capped at 256 — test-only,
     /// `FakeHub::last_event` reads from here so a test can inspect the exact
@@ -394,13 +397,11 @@ impl FakeHubState {
             .collect()
     }
 
-    /// Every device pubkey with a live token — "in service" (a revoke or a
-    /// retire removes the token).
-    fn in_service(&self) -> HashSet<String> {
-        self.tokens
-            .values()
-            .map(|a| a.device_pubkey_b64.clone())
-            .collect()
+    /// Every revoked or retired device pubkey. "In service" is NOT in this
+    /// set — the hub's `revoked_at IS NULL` (fix round 2, M5), whatever the
+    /// device's tokens.
+    fn out_of_service(&self) -> HashSet<String> {
+        self.revoked.clone()
     }
 
     /// The registry name of a device pubkey (`GET /devices`' `name`), if the
@@ -415,12 +416,11 @@ impl FakeHubState {
     /// The account's effective publishing device in a project (A6): the
     /// bound device while it is in service, else none.
     fn publishing_device_of(&self, pid: &str, account_id: &str) -> Option<String> {
-        let live = self.in_service();
         self.projects
             .get(pid)?
             .publishers
             .get(account_id)
-            .filter(|d| live.contains(*d))
+            .filter(|d| !self.revoked.contains(*d))
             .cloned()
     }
 
@@ -737,6 +737,7 @@ impl FakeHub {
             holder_writes: 0,
             dropped_events: HashMap::new(),
             api_outdated: false,
+            revoked: HashSet::new(),
             session_seq: 0,
             event_log: VecDeque::new(),
         }));
@@ -1498,6 +1499,7 @@ impl FakeHub {
 /// `&mut FakeHubState` from [`route`], can call it without re-locking.
 fn revoke_device_state(st: &mut FakeHubState, device_pubkey_b64: &str, retire: bool) {
     let _ = retire; // the fake treats revoke and retire identically.
+    st.revoked.insert(device_pubkey_b64.to_string());
     let account = st.device_accounts().get(device_pubkey_b64).cloned();
     // The device's token(s) die at once: the next authenticated call
     // gets 401, and it drops out of every `devices_of` (membership
@@ -2418,7 +2420,7 @@ fn announce(
     req: &Request,
 ) -> ResponseTemplate {
     let display = st.display_of(&acct.account_id);
-    let live = st.in_service();
+    let revoked = st.out_of_service();
     let names: HashMap<String, String> = st
         .devices
         .values()
@@ -2459,7 +2461,7 @@ fn announce(
     let rebind = match p.publishers.get(&acct.account_id) {
         None => true,
         Some(bound) if *bound == device => false,
-        Some(bound) if live.contains(bound) => {
+        Some(bound) if !revoked.contains(bound) => {
             return ResponseTemplate::new(409).set_body_json(json!({
                 "error": "publishing_device",
                 "deviceId": bound,
@@ -2584,13 +2586,21 @@ fn announce(
 /// to version frame `f` of the caller's account — the frame's own device
 /// while in service, else the account's bound device while in service —
 /// or `None` when any device of the publisher account may.
-fn version_arbiter(p: &FakeProject, f: &FrameViewWire, live: &HashSet<String>) -> Option<String> {
-    if let Some(d) = f.publisher_device_id.as_ref().filter(|d| live.contains(*d)) {
+fn version_arbiter(
+    p: &FakeProject,
+    f: &FrameViewWire,
+    revoked: &HashSet<String>,
+) -> Option<String> {
+    if let Some(d) = f
+        .publisher_device_id
+        .as_ref()
+        .filter(|d| !revoked.contains(*d))
+    {
         return Some(d.clone());
     }
     p.publishers
         .get(&f.publisher_account_id)
-        .filter(|d| live.contains(*d))
+        .filter(|d| !revoked.contains(*d))
         .cloned()
 }
 
@@ -2639,7 +2649,7 @@ fn new_version(
     uuid: &str,
     req: &Request,
 ) -> ResponseTemplate {
-    let live = st.in_service();
+    let revoked = st.out_of_service();
     let names: HashMap<String, String> = st
         .devices
         .values()
@@ -2677,7 +2687,7 @@ fn new_version(
         return error(409, "project is closed");
     }
     let frame = p.frames.get(uuid).expect("checked above");
-    if let Some(allowed) = version_arbiter(p, frame, &live) {
+    if let Some(allowed) = version_arbiter(p, frame, &revoked) {
         if allowed != acct.device_pubkey_b64 {
             return ResponseTemplate::new(409).set_body_json(json!({
                 "error": "not_publishing_device",
@@ -2741,7 +2751,7 @@ fn frame_versions_batch(
     pid: &str,
     req: &Request,
 ) -> ResponseTemplate {
-    let live = st.in_service();
+    let revoked = st.out_of_service();
     let body: VersionsBatchBody = match req.body_json() {
         Ok(b) => b,
         Err(e) => return error(422, format!("bad versions body: {e}")),
@@ -2777,7 +2787,7 @@ fn frame_versions_batch(
             );
             continue;
         }
-        if version_arbiter(p, f, &live).is_some_and(|allowed| allowed != device) {
+        if version_arbiter(p, f, &revoked).is_some_and(|allowed| allowed != device) {
             results.push(
                 json!({"uuid": v.uuid, "status": "not_publishing_device", "contentVersion": 0}),
             );
@@ -3660,6 +3670,27 @@ mod tests {
             hub.last_event("project", "p1").unwrap()["kinds"],
             json!(["frames", "members"]),
             "the rebind rides a members bump"
+        );
+    }
+
+    /// Fix round 2 (M5): "in service" means not revoked or retired — like
+    /// the hub's `revoked_at IS NULL` — whatever the device's tokens: a bound
+    /// device without a live token still refuses the other device's announce.
+    #[tokio::test]
+    async fn a_bound_device_without_a_token_is_still_in_service() {
+        let hub = two_device_hub().await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        c.announce_frames("tok", "p1", &[frame_in("u1")])
+            .await
+            .unwrap();
+        hub.lock().tokens.remove("tok");
+        assert!(matches!(
+            c.announce_frames("tok-2", "p1", &[frame_in("u2")]).await,
+            Err(crate::account::AccountClientError::PublishingDevice { device_id, .. }) if device_id == "AAA="
+        ));
+        assert_eq!(
+            publishing_device_seen_by(&my_projects_json(&hub, "tok-2").await)["deviceId"],
+            "AAA="
         );
     }
 

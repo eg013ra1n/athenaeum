@@ -73,6 +73,25 @@ pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+/// A6 fix round 2: a project whose epoch-change re-announce was refused
+/// because another device of this account was bound — the one case where a
+/// later move of the binding to this device must run the re-announce check
+/// again (besides a move from another device). Set, or cleared.
+pub fn set_reannounce_refused(conn: &Connection, project_id: &str, refused: bool) -> Result<()> {
+    let key = format!("reannounce_refused.{project_id}");
+    if refused {
+        meta_set(conn, &key, "1")
+    } else {
+        conn.execute("DELETE FROM collab_live_meta WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+}
+
+/// Whether [`set_reannounce_refused`] marked the project.
+pub fn reannounce_refused(conn: &Connection, project_id: &str) -> Result<bool> {
+    Ok(meta_get(conn, &format!("reannounce_refused.{project_id}"))?.is_some())
+}
+
 /// Record that this device replaced `device_id` (a base64 public key) in
 /// `account_id` (amendment A6 fix round 1). One upsert statement — a known
 /// account is never overwritten by an unknown one.

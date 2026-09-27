@@ -364,6 +364,11 @@ pub async fn replace_device(
 
         check_designation_preconditions(ctx, root, policy).await?;
 
+        // A6 fix round 2: the account the replaced device's frames belong
+        // to, resolved BEFORE the retire (a verified snapshot still lists
+        // the old device then).
+        let account = verified_account_for_replace(ctx, &me, &marker.device_id).await?;
+
         match crate::api::account::revoke_device_retire(ctx, device_id.to_string()).await {
             Ok(()) => {}
             Err(ApiError::NotFound(_)) => {
@@ -375,11 +380,20 @@ pub async fn replace_device(
             Err(e) => return Err(e),
         }
 
-        // A6 fix round 1: this device now stands in for the retired one —
-        // the frames it published are own here (and versionable: the hub's
-        // fallback accepts, then adopts them). Recorded before the walk so
-        // the files re-adopt as own.
-        crate::api::collab_exchange::record_device_replaced(ctx, &marker.device_id)?;
+        // A6 fix rounds 1+2: this device now stands in for the retired one
+        // — the frames it published are own here (and versionable: the
+        // hub's fallback accepts, then adopts them). The one-statement
+        // record is fatal; the re-derive below is best-effort and re-runs
+        // on a retry.
+        match &account {
+            Some(a) => {
+                crate::api::collab_exchange::record_device_replaced(ctx, &marker.device_id, a)?
+            }
+            None => tracing::warn!(
+                device_id = %marker.device_id,
+                "device replace: this account is in no known project; no authorship to inherit"
+            ),
+        }
 
         let new_marker = StoreMarker {
             store_id: marker.store_id.clone(),
@@ -390,6 +404,12 @@ pub async fn replace_device(
             ApiError::Internal(format!("write storage marker: {e}"))
         })?;
     }
+
+    // A6 fix round 2: best-effort and idempotent, on BOTH branches — a
+    // failed pass never fails the replace (the old device is already
+    // retired), and a retry (the `already_replaced` branch) repairs it.
+    // Before the walk, so the files re-adopt as own.
+    crate::api::collab_exchange::rederive_own_frames(ctx);
 
     // Designate (or confirm) `root` as the Collaboration root and mount it
     // DIRECTLY (`set_collaboration_dir` mounts through `mount_collab_store`,
@@ -416,6 +436,32 @@ pub async fn replace_device(
         "collaboration folder re-adopted after a device replace"
     );
     Ok(ReplaceOutcome { scanned, adopted })
+}
+
+/// The verified account a replace records (A6 fix round 2): the signed-in
+/// session's account, else a verified snapshot's member listing this device
+/// or the one being replaced — refreshing the project list once from the
+/// hub when the catalog knows neither yet (a fresh reinstall). `None` only
+/// when the account is in no project at all (there is nothing to inherit).
+async fn verified_account_for_replace(
+    ctx: &ServiceContext,
+    me: &str,
+    old: &str,
+) -> Result<Option<String>, ApiError> {
+    let known = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::api::collab_exchange::verified_account_id(&conn, &[me, old])?
+    };
+    if known.is_some() {
+        return Ok(known);
+    }
+    if let Err(e) = crate::api::collab::refresh_projects_reporting(ctx, None).await {
+        tracing::warn!(error = %e, "device replace: refreshing the projects to learn the account failed");
+    }
+    let db = db(ctx)?;
+    let conn = db.conn();
+    crate::api::collab_exchange::verified_account_id(&conn, &[me, old])
 }
 
 /// Take over a Collaboration folder whose marker names a device this
@@ -1187,6 +1233,59 @@ mod tests {
             .unwrap();
         assert_eq!(origin("o1"), FrameOrigin::Own);
         assert_eq!(origin("x1"), FrameOrigin::Replica);
+    }
+
+    /// A6 fix round 2 (I1): the re-derive after the retire is best-effort —
+    /// a failed pass never fails the replace (the old device is retired
+    /// already, so a failure would make it un-retryable); the record is
+    /// written, and a retry (the `already_replaced` branch) re-derives.
+    #[tokio::test]
+    async fn a_failed_rederive_never_fails_the_replace_and_a_retry_repairs_it() {
+        let (_t, ctx, hub) = signed_in_rig().await;
+        let root = collab_root(&ctx);
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        hub.seed_frames_with(test_support::PID, "acc-me", &["o1"], "published", |f| {
+            f.publisher_device_id = Some("OLD-DEV".into());
+        });
+        crate::api::collab_exchange::sync_manifest(&ctx, test_support::PID, None, None)
+            .await
+            .unwrap();
+        let origin = || {
+            crate::db::collab_frames::get(&db(&ctx).unwrap().conn(), test_support::PID, "o1")
+                .unwrap()
+                .unwrap()
+                .origin
+        };
+        let store_id = read_marker(&root).unwrap().unwrap().store_id;
+        write_marker(
+            &root,
+            &StoreMarker {
+                store_id,
+                device_id: "OLD-DEV".into(),
+            },
+        )
+        .unwrap();
+        crate::api::collab_exchange::FAIL_REDERIVE_ONCE
+            .with(|f| *f.borrow_mut() = Some(test_support::PID.to_string()));
+        replace_device(&ctx, "old-id", &root, &crate::api::PathPolicy::AllowAll)
+            .await
+            .expect("the replace completes although the re-derive failed");
+        assert!(hub.device_retired("old-id"));
+        assert_eq!(
+            origin(),
+            FrameOrigin::Replica,
+            "the injected failure skipped it"
+        );
+        assert!(
+            crate::db::collab_live::replaced_devices(&db(&ctx).unwrap().conn())
+                .unwrap()
+                .contains_key("OLD-DEV")
+        );
+        // The retry: the marker already names this device.
+        replace_device(&ctx, "old-id", &root, &crate::api::PathPolicy::AllowAll)
+            .await
+            .expect("the retry");
+        assert_eq!(origin(), FrameOrigin::Own, "the retry re-derived it");
     }
 
     /// Critical fix round 1, point 1: the reinstall flow. A plain

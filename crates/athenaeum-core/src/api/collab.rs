@@ -1459,11 +1459,12 @@ pub(crate) async fn refresh_projects_reporting(
     // create is skipped by the write itself). A moved binding re-arms
     // auto-publish: a device that stopped on a refusal resumes, a device
     // that lost the binding stops on the next run's check.
-    let mut moved_here: Vec<String> = Vec::new();
+    // (project, the device bound before) for every binding that moved HERE.
+    let mut moved_here: Vec<(String, Option<String>)> = Vec::new();
+    let mut me: Option<String> = None;
     {
         let db = db(ctx)?;
         let conn = db.conn();
-        let mut me: Option<String> = None;
         for p in &mine {
             let device =
                 p.publishing_device
@@ -1472,8 +1473,9 @@ pub(crate) async fn refresh_projects_reporting(
                         device_id: d.device_id.clone(),
                         name: d.name.clone(),
                     });
-            if crate::db::collab::set_publishing_device(&conn, &p.id, device.as_ref())
-                .map_err(internal)?
+            if let Some(previous) =
+                crate::db::collab::replace_publishing_device(&conn, &p.id, device.as_ref())
+                    .map_err(internal)?
             {
                 tracing::info!(
                     project_id = %p.id,
@@ -1486,19 +1488,24 @@ pub(crate) async fn refresh_projects_reporting(
                         me = device_for_cards(ctx);
                     }
                     if me.as_deref() == Some(d.device_id.as_str()) {
-                        moved_here.push(p.id.clone());
+                        moved_here.push((p.id.clone(), previous));
                     }
                 }
             }
         }
     }
-    // Fix round 1: own frames the hub lost while another device was bound
-    // are listed again now that this device is.
-    for project_id in &moved_here {
-        if let Err(e) =
-            crate::api::collab_live::feed::reannounce_after_rebind(ctx, project_id).await
-        {
-            tracing::warn!(project_id = %project_id, error = %e, "re-announce check after the binding moved here failed");
+    // Fix rounds 1+2: own frames the hub lost while another device was
+    // bound are listed again now that this device is — only when another
+    // device was bound before, or a re-announce was refused meanwhile.
+    if let Some(me) = &me {
+        for (project_id, previous) in &moved_here {
+            crate::api::collab_live::feed::after_binding_moved_here(
+                ctx,
+                project_id,
+                previous.as_deref(),
+                me,
+            )
+            .await;
         }
     }
 
@@ -1610,10 +1617,10 @@ pub async fn set_collab_publishing_device(
             tracing::error!(project_id, error = %e, "publishing device switch failed");
             client_err(e)
         })?;
-    let cached_moved = {
+    let moved = {
         let db = db(ctx)?;
         let conn = db.conn();
-        crate::db::collab::set_publishing_device(
+        crate::db::collab::replace_publishing_device(
             &conn,
             project_id,
             Some(&crate::db::collab::PublishingDevice {
@@ -1626,15 +1633,21 @@ pub async fn set_collab_publishing_device(
             internal(e)
         })?
     };
-    if reply.changed || cached_moved {
-        // Fix round 1: own frames the hub lost while another device was
-        // bound (an epoch-change re-announce refused then) are listed again.
-        if let Err(e) =
-            crate::api::collab_live::feed::reannounce_after_rebind(ctx, project_id).await
-        {
-            tracing::warn!(project_id, error = %e, "re-announce check after the switch failed");
-        }
-    }
+    // Fix rounds 1+2: own frames the hub lost while another device was
+    // bound (an epoch-change re-announce refused then) are listed again —
+    // when another device was bound before, or the refusal mark is set. An
+    // unchanged cache (already this device) needs the mark.
+    let previous = match moved {
+        Some(previous) => previous,
+        None => Some(reply.device_id.clone()),
+    };
+    crate::api::collab_live::feed::after_binding_moved_here(
+        ctx,
+        project_id,
+        previous.as_deref(),
+        &reply.device_id,
+    )
+    .await;
     tracing::info!(
         project_id,
         device_id = %reply.device_id,
@@ -2955,8 +2968,19 @@ async fn run_publish(
         tracing::error!(project_id, error = %e, "publish: this device's key is unavailable");
         e
     })?;
-    let bound_elsewhere: Option<Option<String>> =
-        binding.filter(|b| b.device_id != me).map(|b| b.name);
+    // Fix round 2 (M3): a binding naming a device THIS device replaced is
+    // not "elsewhere" (that device is retired; the hub reads it unbound).
+    let replaced = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::collab_live::replaced_devices(&conn).map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the replaced devices failed");
+            internal(e)
+        })?
+    };
+    let bound_elsewhere: Option<Option<String>> = binding
+        .filter(|b| b.device_id != me && !replaced.contains_key(&b.device_id))
+        .map(|b| b.name);
     let mut refused_new = 0usize;
 
     // ── 3. The split (ruling R9: before any compute permit) ─────────────────
@@ -7956,7 +7980,9 @@ pub(crate) mod tests {
             );
             // The replace: the old device is retired, and recorded here.
             hub.revoke_device(OLD, true);
-            crate::api::collab_exchange::record_device_replaced(&fx.ctx, OLD).unwrap();
+            crate::api::collab_exchange::record_device_replaced(&fx.ctx, OLD, "acc-Me Myself")
+                .unwrap();
+            crate::api::collab_exchange::rederive_own_frames(&fx.ctx);
             assert_eq!(
                 own_row(&fx, &uuid).unwrap().origin,
                 crate::db::collab_frames::FrameOrigin::Own
@@ -7980,6 +8006,35 @@ pub(crate) mod tests {
             assert_eq!(row.origin, crate::db::collab_frames::FrameOrigin::Own);
             assert_eq!(row.content_version, 2);
             assert_eq!(row.source_frame_id, Some(fx.frame_ids[0]), "bound again");
+        }
+
+        /// A6 fix round 2 (M3): a cached binding naming a device THIS
+        /// device replaced is not "bound elsewhere" — the publish announces.
+        #[tokio::test]
+        async fn a_binding_naming_a_replaced_device_does_not_refuse_the_publish() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                crate::db::collab::set_publishing_device(
+                    &conn,
+                    PID,
+                    Some(&crate::db::collab::PublishingDevice {
+                        device_id: "T0xELURFVg==".into(),
+                        name: Some("Old PC".into()),
+                    }),
+                )
+                .unwrap();
+                crate::db::collab_live::record_replaced_device(
+                    &conn,
+                    "T0xELURFVg==",
+                    Some("acc-Me Myself"),
+                )
+                .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{res:?}");
+            assert!(res.held_back.iter().all(|h| h.publishing_device.is_none()));
         }
 
         /// A6 (UI follow-up): a held-back frame carries `publishingDevice`

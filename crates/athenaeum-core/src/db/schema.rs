@@ -2480,19 +2480,30 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // — HUB state with dedicated writers (`db::collab::set_publishing_device`),
     // outside `upsert_project`'s wholesale list. NULL = nothing bound (or the
     // bound device is out of service): "no device is publishing yet".
-    for (col, ddl) in [
-        (
-            "publishing_device_id",
+    // Fix round 2 (M2): rows cached BEFORE A6 derived `own` per account.
+    // When the column first appears, the manifest cursor and the feed's
+    // version cursor go back to 0, so the next hello catches every project
+    // up with a manifest fetch from 0 — every cached row is re-derived per
+    // device (a second device of the account turns its account's rows into
+    // replicas it then fetches). The ALTER and the reset share a savepoint:
+    // a failed reset rolls the column back and the next `init_db` retries.
+    if !column_exists(conn, "collab_projects", "publishing_device_id")? {
+        let sp = crate::db::operations::SavepointGuard::new(conn, "publishing_device_column")?;
+        conn.execute(
             "ALTER TABLE collab_projects ADD COLUMN publishing_device_id TEXT",
-        ),
-        (
-            "publishing_device_name",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE collab_projects SET manifest_cursor = 0, hub_version = 0",
+            [],
+        )?;
+        sp.commit()?;
+    }
+    if !column_exists(conn, "collab_projects", "publishing_device_name")? {
+        conn.execute(
             "ALTER TABLE collab_projects ADD COLUMN publishing_device_name TEXT",
-        ),
-    ] {
-        if !column_exists(conn, "collab_projects", col)? {
-            conn.execute(ddl, [])?;
-        }
+            [],
+        )?;
     }
     // `local_state`/`frame_seq`/`state_changed_at`: the per-frame local state
     // machine (P8) — `db::collab_frames::set_local_state` is the ONLY writer

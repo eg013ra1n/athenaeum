@@ -193,7 +193,10 @@ impl OwnDevices {
 /// any other is a replica. Frames another device of this account published
 /// are therefore replicas here: fetched under this device's policy, held,
 /// served and claimed (spec §10 "two devices of one account → one publisher,
-/// two holder rows").
+/// two holder rows"). The data role still rules receiving: a `send`-role
+/// member's devices never receive anything, including their own account's
+/// frames from another device — the role means "contributes, stores
+/// nothing" ([`role_allows_replication`]; fix round 2, M7).
 pub(crate) fn derive_device_own(
     v: &mut crate::collab::hub_client::FrameViewWire,
     own: &OwnDevices,
@@ -263,56 +266,141 @@ pub(crate) fn own_devices(
     })
 }
 
-/// Fix round 1 (A6): the verified device replace — this device now stands
-/// in for `old_device` (its files, its authorship). Records it, then
-/// re-derives every cached frame of every live project from its stored
-/// manifest row, so the frames `old_device` published become own here
-/// right away (the storage walk that follows re-adopts their files as own).
-// Called by the render+solver-gated replace flow (and its tests) only.
+/// The account a device replace records (A6 fix rounds 1+2): the signed-in
+/// session's account as the hub's authenticated `hello` gave it, else the
+/// member of a signature-verified membership snapshot whose nodes list one
+/// of `devices` (this device, or the device being replaced — both are this
+/// account's). `None` when the catalog knows neither.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub(crate) fn verified_account_id(
+    conn: &rusqlite::Connection,
+    devices: &[&str],
+) -> Result<Option<String>, ApiError> {
+    if let Some(a) =
+        crate::db::collab_live::meta_get(conn, crate::db::collab_live::META_ACCOUNT_ID)?
+    {
+        return Ok(Some(a));
+    }
+    for p in crate::db::collab::list_projects(conn)? {
+        let members: Vec<SnapshotMember> = match serde_json::from_str(&p.members_json) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(project_id = %p.project_id, error = %e, "cached members_json does not parse; skipped");
+                continue;
+            }
+        };
+        if let Some(m) = members
+            .into_iter()
+            .find(|m| m.nodes.iter().any(|n| devices.contains(&n.as_str())))
+        {
+            return Ok(Some(m.account_id));
+        }
+    }
+    Ok(None)
+}
+
+/// Fix rounds 1+2 (A6): the verified device replace — this device now
+/// stands in for `old_device` (its files, its authorship) in `account_id`,
+/// the account the replace flow verified. One upsert; its failure is the
+/// caller's error. [`rederive_own_frames`] then applies it to the cache.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub(crate) fn record_device_replaced(
     ctx: &ServiceContext,
     old_device: &str,
+    account_id: &str,
 ) -> Result<(), ApiError> {
-    use crate::db::collab_frames as frames_db;
-    let me = crate::api::account::own_device_id(ctx)?;
     let database = db(ctx)?;
     let conn = database.conn();
-    let account = my_account_id(&conn, &me, None)?;
-    crate::db::collab_live::record_replaced_device(&conn, old_device, account.as_deref())?;
-    tracing::info!(device_id = %old_device, account_id = ?account, "replaced device recorded: its frames are own here");
-    let mut flipped = 0usize;
-    let mut routes = frames_db::EngineRoutes::default();
-    for project in crate::db::collab::list_projects(&conn)? {
-        let own = own_devices(ctx, &conn, &project)?;
-        // IMMEDIATE: reads every row, then writes the ones that flip.
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        for row in frames_db::list_for_project(&tx, &project.project_id)? {
-            let Some(mut v) = parse_manifest_wire(
-                &project.project_id,
-                &row.frame_uuid,
-                &row.manifest_json,
-                "replace",
-            ) else {
-                continue;
-            };
-            derive_device_own(&mut v, &own, Some(&row));
-            if v.own != (row.origin == FrameOrigin::Own) {
-                frames_db::upsert_from_manifest_deferred(
-                    &tx,
-                    &project.project_id,
-                    &v,
-                    &mut routes,
+    crate::db::collab_live::record_replaced_device(&conn, old_device, Some(account_id))
+        .map_err(|e| {
+            tracing::error!(device_id = %old_device, error = %format!("{e:#}"), "recording the replaced device failed");
+            ApiError::from(e)
+        })?;
+    tracing::info!(device_id = %old_device, account_id, "replaced device recorded: its frames are own here");
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (A6 fix round 2): the next [`rederive_own_frames`] fails
+    /// this project's pass once.
+    pub(crate) static FAIL_REDERIVE_ONCE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Re-derive `own` for every cached frame of every live project from its
+/// stored manifest row (A6: after a device replace, the frames the replaced
+/// device published become own here at once; the storage walk that follows
+/// re-adopts their files as own). Idempotent and BEST-EFFORT (fix round 2):
+/// a project whose pass fails is logged and skipped — the replace it
+/// follows has already retired the old device, so it must not fail on it;
+/// a retry of the replace (or any later manifest apply) re-derives it.
+/// Returns the rows that flipped.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub(crate) fn rederive_own_frames(ctx: &ServiceContext) -> usize {
+    use crate::db::collab_frames as frames_db;
+    let pass = || -> Result<usize, ApiError> {
+        let database = db(ctx)?;
+        let conn = database.conn();
+        let mut flipped = 0usize;
+        for project in crate::db::collab::list_projects(&conn)? {
+            let pid = project.project_id.clone();
+            let one = || -> Result<usize, ApiError> {
+                #[cfg(test)]
+                if FAIL_REDERIVE_ONCE.with(|f| {
+                    let mut f = f.borrow_mut();
+                    if f.as_deref() == Some(pid.as_str()) {
+                        *f = None;
+                        true
+                    } else {
+                        false
+                    }
+                }) {
+                    return Err(ApiError::Internal("injected re-derive failure".into()));
+                }
+                let own = own_devices(ctx, &conn, &project)?;
+                let mut routes = frames_db::EngineRoutes::default();
+                // IMMEDIATE: reads every row, then writes the ones that flip.
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
                 )?;
-                flipped += 1;
+                let mut n = 0usize;
+                for row in frames_db::list_for_project(&tx, &pid)? {
+                    let Some(mut v) =
+                        parse_manifest_wire(&pid, &row.frame_uuid, &row.manifest_json, "replace")
+                    else {
+                        continue;
+                    };
+                    derive_device_own(&mut v, &own, Some(&row));
+                    if v.own != (row.origin == FrameOrigin::Own) {
+                        frames_db::upsert_from_manifest_deferred(&tx, &pid, &v, &mut routes)?;
+                        n += 1;
+                    }
+                }
+                tx.commit()?;
+                routes.route();
+                Ok(n)
+            };
+            match one() {
+                Ok(n) => flipped += n,
+                Err(e) => {
+                    tracing::error!(project_id = %pid, error = %e, "re-deriving own frames failed for this project; a retry or the next manifest apply repairs it");
+                }
             }
         }
-        tx.commit()?;
+        Ok(flipped)
+    };
+    match pass() {
+        Ok(n) => {
+            tracing::info!(count = n, "own frames re-derived");
+            n
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "re-deriving own frames failed; a retry or the next manifest apply repairs it");
+            0
+        }
     }
-    routes.route();
-    tracing::info!(device_id = %old_device, count = flipped, "frames re-derived after a device replace");
-    Ok(())
 }
 
 /// Classify one manifest row against the local row it replaces (`None` =
@@ -1526,6 +1614,11 @@ pub async fn set_collab_policy(
 /// data_role == "send_receive"` against the CACHED project row. The hub
 /// filters holder rows by the same rule, so a stale cache costs at most one
 /// fetch whose holds the hub drops.
+///
+/// Amendment A6 (fix round 2, M7): this holds for every device of the
+/// account — a `send` member's second device receives nothing either, not
+/// even the frames its own account's other device published: the role
+/// means "contributes, stores nothing".
 #[cfg(all(feature = "render", feature = "solver"))]
 pub(crate) fn role_allows_replication(data_role: &str, is_coordinator: bool) -> bool {
     is_coordinator || data_role == "send_receive"

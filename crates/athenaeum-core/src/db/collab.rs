@@ -240,6 +240,17 @@ pub fn set_publishing_device(
     project_id: &str,
     device: Option<&PublishingDevice>,
 ) -> Result<bool> {
+    Ok(replace_publishing_device(conn, project_id, device)?.is_some())
+}
+
+/// [`set_publishing_device`], reporting the move: `Some(previous device)`
+/// when the bound DEVICE changed (`Some(None)` = it was unbound), `None`
+/// when it did not (or the project is not cached).
+pub fn replace_publishing_device(
+    conn: &Connection,
+    project_id: &str,
+    device: Option<&PublishingDevice>,
+) -> Result<Option<Option<String>>> {
     // IMMEDIATE: it reads the stored binding before it writes (the project
     // rule for every read-then-write transaction).
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -251,7 +262,7 @@ pub fn set_publishing_device(
         )
         .optional()?;
     let Some(before) = before else {
-        return Ok(false);
+        return Ok(None);
     };
     tx.execute(
         "UPDATE collab_projects SET publishing_device_id = ?2, publishing_device_name = ?3
@@ -263,7 +274,7 @@ pub fn set_publishing_device(
         ],
     )?;
     tx.commit()?;
-    Ok(before.as_deref() != device.map(|d| d.device_id.as_str()))
+    Ok((before.as_deref() != device.map(|d| d.device_id.as_str())).then_some(before))
 }
 
 /// Record the manifest-sync cursor after a successful fetch (P9): the highest
@@ -740,6 +751,34 @@ mod tests {
     /// Wave 3 (Task 1): the same holds for the live-feed cursor
     /// (`feed_epoch`/`holder_seq`), set by [`set_feed_version`]/
     /// [`set_holder_seq`].
+    /// A6 fix round 2 (M2): a catalog cached before A6 gets its manifest and
+    /// feed cursors reset ONCE when the binding column first appears, so the
+    /// next hello re-fetches (and re-derives `own` per device for) every
+    /// row; a later `init_db` leaves the cursors alone.
+    #[test]
+    fn a_pre_a6_catalog_is_resynced_from_zero_once() {
+        let conn = test_conn();
+        upsert_project(&conn, &sample_row("p-1")).unwrap();
+        set_sync_state(&conn, "p-1", Some(7), 5, "[]").unwrap();
+        // The old shape: no binding columns yet.
+        conn.execute_batch(
+            "ALTER TABLE collab_projects DROP COLUMN publishing_device_id;
+             ALTER TABLE collab_projects DROP COLUMN publishing_device_name;",
+        )
+        .unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let row = get_project(&conn, "p-1").unwrap().unwrap();
+        assert_eq!(
+            (row.hub_version, row.manifest_cursor),
+            (0, 0),
+            "full resync forced"
+        );
+        set_sync_state(&conn, "p-1", Some(9), 6, "[]").unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let row = get_project(&conn, "p-1").unwrap().unwrap();
+        assert_eq!((row.hub_version, row.manifest_cursor), (9, 6), "only once");
+    }
+
     /// A6: the binding store reports a DEVICE move (not a rename), survives
     /// a wholesale poll refresh, and ignores an uncached project.
     #[test]

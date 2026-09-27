@@ -1281,6 +1281,9 @@ pub(crate) async fn reannounce_lost_own_frames(
                             name: device_name,
                         }),
                     )?;
+                    // Fix round 2: a move of the binding to this device
+                    // runs this check again (`after_binding_moved_here`).
+                    crate::db::collab_live::set_reannounce_refused(&conn, project_id, true)?;
                     return Ok(announced);
                 }
                 Err(e) => {
@@ -1323,6 +1326,62 @@ pub(crate) async fn reannounce_after_rebind(
         "own frames checked after the binding moved here"
     );
     Ok(n)
+}
+
+/// Fix round 2: whether a move of the binding TO this device must run
+/// [`reannounce_after_rebind`] — only when the previous binding named
+/// ANOTHER device (`None → me`, the first refresh after the upgrade, never
+/// does) or an epoch re-announce was refused meanwhile (the mark).
+pub(crate) fn rebind_needs_reannounce(
+    ctx: &ServiceContext,
+    project_id: &str,
+    previous: Option<&str>,
+    me: &str,
+) -> bool {
+    if previous.is_some_and(|p| p != me) {
+        return true;
+    }
+    match db(ctx).and_then(|d| {
+        crate::db::collab_live::reannounce_refused(&d.conn(), project_id).map_err(ApiError::from)
+    }) {
+        Ok(refused) => refused,
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "reading the refused re-announce mark failed; checking anyway");
+            true
+        }
+    }
+}
+
+/// [`reannounce_after_rebind`] when [`rebind_needs_reannounce`] says so;
+/// the refused mark is cleared once the check succeeded. Never fails the
+/// caller (a switch or a refresh): a failure is logged.
+pub(crate) async fn after_binding_moved_here(
+    ctx: &ServiceContext,
+    project_id: &str,
+    previous: Option<&str>,
+    me: &str,
+) {
+    if !rebind_needs_reannounce(ctx, project_id, previous, me) {
+        tracing::debug!(
+            project_id,
+            "the binding moved here from no device; no re-announce check"
+        );
+        return;
+    }
+    match reannounce_after_rebind(ctx, project_id).await {
+        Ok(_) => {
+            let cleared = db(ctx).and_then(|d| {
+                crate::db::collab_live::set_reannounce_refused(&d.conn(), project_id, false)
+                    .map_err(ApiError::from)
+            });
+            if let Err(e) = cleared {
+                tracing::warn!(project_id, error = %e, "clearing the refused re-announce mark failed");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "re-announce check after the binding moved here failed");
+        }
+    }
 }
 
 /// Indices of `batch` a 409 "already announced" refusal names — R8a's
@@ -1814,6 +1873,76 @@ mod tests {
             .frame(PID, "own1")
             .expect("re-announced after the switch");
         assert_eq!(back.publisher_device_id.as_deref(), Some(me.as_str()));
+    }
+
+    /// A6 fix round 2 (M1): the first refresh after the upgrade that shows
+    /// the binding here (nothing cached → this device) runs NO full
+    /// manifest sync — nothing was refused, nothing can be lost.
+    #[tokio::test]
+    async fn a_binding_moving_here_from_no_device_runs_no_full_sync() {
+        let (_t, ctx, hub, _f) = rig().await;
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        hub.set_publishing_device(PID, "acc-me", &me);
+        let before = manifest_requests(&hub).await;
+        let card = crate::api::collab::refresh_projects(&ctx)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.project_id == PID)
+            .unwrap();
+        assert!(card.publishing_here);
+        assert_eq!(
+            manifest_requests(&hub).await,
+            before,
+            "no re-announce check"
+        );
+    }
+
+    /// A6 fix round 2 (M1): a re-announce refused while another device was
+    /// bound is marked; the other device is revoked (the binding reads
+    /// unbound), then this device is bound — a move from NO device, which
+    /// still runs the check because of the mark, and clears it.
+    #[tokio::test]
+    async fn a_refused_reannounce_is_checked_again_when_the_binding_comes_here_from_none() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        hub.seed_frames(PID, "acc-me", &["own1"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.catch_up_project(PID, None, &[ChangeKind::Frames])
+            .await
+            .unwrap();
+        set_own_held(&ctx, PID, "own1");
+        hub.add_account("tok-2", "acc-me", "Me", "T1RIRVI=", None);
+        hub.set_publishing_device(PID, "acc-me", "T1RIRVI=");
+        hub.forget_frames(PID, &["own1"]);
+        let e2 = hub.rotate_epoch();
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert!(hub.frame(PID, "own1").is_none(), "refused while not bound");
+        let marked = || {
+            crate::db::collab_live::reannounce_refused(&crate::api::db(&ctx).unwrap().conn(), PID)
+                .unwrap()
+        };
+        assert!(marked(), "the refusal is marked");
+        // The other device is revoked: unbound (another device → none).
+        hub.revoke_device("T1RIRVI=", true);
+        crate::api::collab::refresh_projects(&ctx).await.unwrap();
+        assert!(hub.frame(PID, "own1").is_none(), "not a move here");
+        // This device is bound (none → this device): the mark runs the check.
+        hub.set_publishing_device(PID, "acc-me", &me);
+        crate::api::collab::refresh_projects(&ctx).await.unwrap();
+        assert_eq!(
+            hub.frame(PID, "own1")
+                .expect("re-announced")
+                .publisher_device_id
+                .as_deref(),
+            Some(me.as_str())
+        );
+        assert!(!marked(), "cleared after the check");
     }
 
     #[tokio::test]
