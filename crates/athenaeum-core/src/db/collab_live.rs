@@ -557,6 +557,11 @@ pub fn drop_claims(conn: &Connection, project_id: &str, frame_uuids: &[String]) 
     Ok(n)
 }
 
+/// The `last_error` a claim the hub refused leaves on its frame row (P9);
+/// a manifest upsert of that frame reports the claim again
+/// (`db::collab_frames::upsert_from_manifest`).
+pub const REFUSED_CLAIM_ERROR: &str = "claim refused by the hub";
+
 /// Drop ONE claim the hub refused (P9) — only while the claim set still
 /// holds it at the refused `content_version` AND no outbox row above
 /// `above_seq` (the refused report's sequence) names the frame. A frame

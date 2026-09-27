@@ -476,6 +476,23 @@ pub fn upsert_from_manifest_deferred(
             }
         }
     }
+    // 3. a claim the hub refused (P9) is reported again once the hub lists
+    //    the frame anew — the only input that can change its verdict. A hub
+    //    restore that lost the frame refuses every claim that reaches it
+    //    before the publisher re-announces it under the same uuid; the row
+    //    never left `held`, so without this the holding stayed off the hub
+    //    for good (both digests agree on the missing claim).
+    if prev.last_error.as_deref() == Some(crate::db::collab_live::REFUSED_CLAIM_ERROR)
+        && ensure_claimed(conn, project_id, &v.frame_uuid)?.is_some()
+    {
+        set_error(conn, project_id, &v.frame_uuid, None)?;
+        tracing::info!(
+            project_id,
+            frame_uuid = %v.frame_uuid,
+            content_version = v.content_version,
+            "a refused claim is reported again: the hub lists the frame"
+        );
+    }
     Ok(())
 }
 
@@ -2775,6 +2792,49 @@ mod tests {
         assert_eq!(my_claims(&c, "p1").unwrap(), vec![("u1".to_string(), 1)]);
         assert_eq!(outbox_len(&c, "p1").unwrap(), 2);
         assert_eq!(ensure_claimed(&c, "p1", "nope").unwrap(), None);
+    }
+
+    /// Task 18 (spec §12 "epoch rotation", no lost holdings): a claim the
+    /// hub refused because a restore lost the frame is reported again when
+    /// the publisher's re-announce lists the frame anew under its uuid — the
+    /// row stayed `held` throughout, so nothing else would re-add it.
+    #[test]
+    fn a_refused_claim_is_reported_again_once_the_hub_lists_the_frame() {
+        use crate::db::collab_live::{drop_refused_claim, my_claims, outbox, REFUSED_CLAIM_ERROR};
+        let c = conn();
+        upsert_from_manifest(&c, "p1", &view("u1", 1)).unwrap();
+        set_local_state(&c, "p1", "u1", LocalState::Held).unwrap();
+        let reported = outbox(&c, "p1").unwrap().last().unwrap().seq;
+        // the report reached the hub after the restore: refused, dropped
+        assert!(drop_refused_claim(&c, "p1", "u1", 1, reported).unwrap());
+        set_error(&c, "p1", "u1", Some(REFUSED_CLAIM_ERROR)).unwrap();
+        assert!(my_claims(&c, "p1").unwrap().is_empty());
+        let before = outbox(&c, "p1").unwrap().len();
+        // the publisher re-announced it: the manifest lists it again
+        upsert_from_manifest(&c, "p1", &view("u1", 5)).unwrap();
+        assert_eq!(my_claims(&c, "p1").unwrap(), vec![("u1".to_string(), 1)]);
+        assert_eq!(outbox(&c, "p1").unwrap().len(), before + 1);
+        let row = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(row.local_state, LocalState::Held);
+        assert_eq!(row.last_error, None);
+        // idempotent: a later upsert adds nothing
+        upsert_from_manifest(&c, "p1", &view("u1", 6)).unwrap();
+        assert_eq!(outbox(&c, "p1").unwrap().len(), before + 1);
+    }
+
+    /// A row whose claim was never refused is never re-claimed by an
+    /// upsert (a staged own row must not claim its old version early).
+    #[test]
+    fn an_upsert_leaves_an_unrefused_unclaimed_row_alone() {
+        use crate::db::collab_live::{my_claims, outbox};
+        let c = conn();
+        upsert_from_manifest(&c, "p1", &view("u1", 1)).unwrap();
+        set_local_state(&c, "p1", "u1", LocalState::Held).unwrap();
+        c.execute("DELETE FROM collab_my_claims", []).unwrap();
+        let before = outbox(&c, "p1").unwrap().len();
+        upsert_from_manifest(&c, "p1", &view("u1", 2)).unwrap();
+        assert!(my_claims(&c, "p1").unwrap().is_empty());
+        assert_eq!(outbox(&c, "p1").unwrap().len(), before);
     }
 
     /// T1 minor carried by Task 6: `record_own` is for new rows, and a

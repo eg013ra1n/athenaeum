@@ -37,7 +37,7 @@ use crate::db::collab_live as live_db;
 use crate::services::ServiceContext;
 
 /// The `last_error` a claim the hub refused leaves on its frame row (P9).
-const REFUSED_ERROR: &str = "claim refused by the hub";
+const REFUSED_ERROR: &str = live_db::REFUSED_CLAIM_ERROR;
 
 /// The standard base64 node ids of every member device in the project's
 /// signed membership snapshot — the "is a member" leg of I5. A snapshot that
