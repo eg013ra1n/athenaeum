@@ -96,6 +96,12 @@ function pendingOf(s: CollabStorageStatus | null): FolderOwnerPending {
   return null;
 }
 
+/** "as of the last check" — with its time when the record carries one
+ *  (`checkedAt` is null for a record written before the stamp existed). */
+function asOfCheck(checkedAt: string | null): string {
+  return checkedAt ? `last checked ${formatTimestamp(checkedAt)}` : 'as of the last check';
+}
+
 function shortId(id: string): string {
   return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-6)}` : id;
 }
@@ -348,8 +354,8 @@ export default function DeviceReplaceDialog() {
         )}
         <p className="text-xs text-content-muted">
           {replace.lastSeenAt
-            ? `Last seen ${formatTimestamp(replace.lastSeenAt)}, as of the last check — check again if ${name} may have been used since.`
-            : `Never seen online, as of the last check.`}
+            ? `Last seen ${formatTimestamp(replace.lastSeenAt)}, ${asOfCheck(replace.checkedAt)} — check again if ${name} may have been used since.`
+            : `Never seen online, ${asOfCheck(replace.checkedAt)}.`}
         </p>
         <p className="break-all text-xs text-content-muted">Folder: {replace.path}</p>
       </>
@@ -382,6 +388,9 @@ export default function DeviceReplaceDialog() {
           <p className="text-sm text-warning">
             Recorded while offline — the device may belong to this account. Check again once online.
           </p>
+        )}
+        {unknown.checkedAt && (
+          <p className="text-xs text-content-muted">{`Last checked ${formatTimestamp(unknown.checkedAt)}.`}</p>
         )}
       </>
     );

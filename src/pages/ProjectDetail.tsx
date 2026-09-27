@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
-import { ExternalLink, Loader2, Plus, RefreshCw, Send, Target } from 'lucide-react';
+import { ExternalLink, Loader2, Monitor, Plus, RefreshCw, Send, Target } from 'lucide-react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
 import { useSessionState } from '../contexts/SessionStateContext';
@@ -14,9 +14,11 @@ import ModerationQueue from '../components/collab/ModerationQueue';
 import UpdateRequired from '../components/collab/UpdateRequired';
 import CollabLiveStatus from '../components/collab/CollabLiveStatus';
 import { formatBytes } from '../components/collab/format';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import type {
   FrameGateRow,
   GateReport,
+  ProjectCard,
   ProjectDetail as Detail,
   ProjectFrameView,
   PublishResult,
@@ -55,6 +57,47 @@ function isPublishBusy(msg: string): boolean {
 const PUBLISH_BUSY_INLINE =
   'Publication of this project is already running — wait for it to finish, then try again.';
 
+/** Amendment A6: another device of this account is the project's publishing
+ *  device. A publish/republish rejects with
+ *  `collab_publishing_device:<name>` (`account::client::publishing_device_msg`)
+ *  when nothing else went out; the prefix is stable, the rest is the device
+ *  name or `OTHER_DEVICE`. */
+const PUBLISHING_DEVICE_PREFIX = 'collab_publishing_device:';
+
+/** The name core uses for a bound device the hub reports without one
+ *  (`account::client::publishing_device_label`). */
+const OTHER_DEVICE = 'another device of this account';
+
+/** A run that ALSO posted versions resolves Ok, with the refused new frames
+ *  held back as `"<name> publishes new frames to this project — use …"`
+ *  (`api::collab::publishing_device_reason`). */
+const HELD_FOR_PUBLISHING_DEVICE = ' publishes new frames to this project — ';
+
+function publishingDeviceRefusal(msg: string): string | null {
+  if (!msg.startsWith(PUBLISHING_DEVICE_PREFIX)) return null;
+  return msg.slice(PUBLISHING_DEVICE_PREFIX.length).trim() || OTHER_DEVICE;
+}
+
+function heldForPublishingDevice(res: PublishResult | null | undefined): string | null {
+  for (const frame of res?.heldBack ?? []) {
+    for (const reason of frame.reasons) {
+      const at = reason.indexOf(HELD_FOR_PUBLISHING_DEVICE);
+      if (at > 0) return reason.slice(0, at);
+    }
+  }
+  return null;
+}
+
+/** The bound device's name for display; never "this device". */
+function deviceLabel(name: string | null | undefined): string {
+  return name?.trim() || OTHER_DEVICE;
+}
+
+/** A device name at the start of a sentence. */
+function leading(name: string): string {
+  return name === OTHER_DEVICE ? 'Another device of this account' : name;
+}
+
 export default function ProjectDetail() {
   const { id } = useParams();
   const { notify } = useNotifications();
@@ -88,6 +131,10 @@ export default function ProjectDetail() {
   const [republishConfirm, setRepublishConfirm] = useState(false);
   const [republishBusy, setRepublishBusy] = useState(false);
   const [republishError, setRepublishError] = useState<string | null>(null);
+  /** The publishing device a publish/republish was refused for (A6). */
+  const [refusedBy, setRefusedBy] = useState<string | null>(null);
+  const [switchConfirm, setSwitchConfirm] = useState(false);
+  const [switchBusy, setSwitchBusy] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -166,13 +213,60 @@ export default function ProjectDetail() {
   // refusal (another run of this project in progress) is an info toast, not
   // a failure.
 
+  /** A6 refusal: the other device publishes new frames here. Inline with
+   *  the switch action, plus one warning toast (the backend raises no event
+   *  for a rejected run); the reload picks up the binding core recorded. */
+  const showPublishingDeviceRefusal = (name: string) => {
+    setRefusedBy(name);
+    notify({
+      title: `${leading(name)} publishes new frames to this project`,
+      detail: 'Use "Publish from this device" on the project page to publish new frames from here.',
+      kind: 'project',
+      tone: 'warning',
+      link: `/projects/${id}`,
+      dedupeKey: `publishing-device-${id}-${Date.now()}`,
+    });
+    void load();
+  };
+
+  /** "Publish from this device": moves the binding here (confirmed first). */
+  const doSwitch = async () => {
+    if (!id) return;
+    setSwitchConfirm(false);
+    setSwitchBusy(true);
+    try {
+      const card = await api.invoke<ProjectCard>('set_collab_publishing_device', { projectId: id });
+      setDetail((d) => (d ? { ...d, card } : d));
+      setRefusedBy(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[projects] set publishing device failed:', err);
+      if (isOutdated(msg)) {
+        setUpdateRequired(true);
+      } else {
+        notify({
+          title: 'Could not publish from this device',
+          detail: msg,
+          kind: 'project',
+          tone: 'warning',
+          hasErrors: true,
+          link: `/projects/${id}`,
+          dedupeKey: `publishing-device-switch-failed-${id}-${Date.now()}`,
+        });
+      }
+    } finally {
+      setSwitchBusy(false);
+    }
+  };
+
   const doPublish = async () => {
     if (!id) return;
     setPublishBusy(true);
     setPublishError(null);
     try {
-      await api.invoke<PublishResult>('publish_collab_frames', { projectId: id });
+      const res = await api.invoke<PublishResult>('publish_collab_frames', { projectId: id });
       setPublishConfirm(false);
+      setRefusedBy(heldForPublishingDevice(res));
       await loadFrames();
       await load();
     } catch (err) {
@@ -180,9 +274,13 @@ export default function ProjectDetail() {
       // swallowed (the backend raises no event to notify from otherwise).
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[projects] publish failed:', err);
+      const refused = publishingDeviceRefusal(msg);
       if (isOutdated(msg)) {
         setPublishConfirm(false);
         setUpdateRequired(true);
+      } else if (refused) {
+        setPublishConfirm(false);
+        showPublishingDeviceRefusal(refused);
       } else if (isPublishBusy(msg)) {
         setPublishError(PUBLISH_BUSY_INLINE);
         notify({
@@ -215,16 +313,21 @@ export default function ProjectDetail() {
     setRepublishBusy(true);
     setRepublishError(null);
     try {
-      await api.invoke<PublishResult>('republish_collab_frames', { projectId: id });
+      const res = await api.invoke<PublishResult>('republish_collab_frames', { projectId: id });
       setRepublishConfirm(false);
+      setRefusedBy(heldForPublishingDevice(res));
       await loadFrames();
       await load();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[projects] republish failed:', err);
+      const refused = publishingDeviceRefusal(msg);
       if (isOutdated(msg)) {
         setRepublishConfirm(false);
         setUpdateRequired(true);
+      } else if (refused) {
+        setRepublishConfirm(false);
+        showPublishingDeviceRefusal(refused);
       } else if (isPublishBusy(msg)) {
         setRepublishError(PUBLISH_BUSY_INLINE);
         notify({
@@ -296,6 +399,20 @@ export default function ProjectDetail() {
     'overview',
   ];
   const activeTab = tabs.includes(tab) ? tab : 'contribute';
+  // The device the switch takes the binding from: the card's (freshest), else
+  // the one a refusal named.
+  const switchFrom = c.publishingDevice ? deviceLabel(c.publishingDevice.name) : (refusedBy ?? OTHER_DEVICE);
+  const switchButton = (
+    <button
+      type="button"
+      onClick={() => setSwitchConfirm(true)}
+      disabled={switchBusy}
+      className="inline-flex items-center gap-1 rounded border border-border px-2 py-0.5 text-xs text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {switchBusy && <Loader2 size={11} className="animate-spin" />}
+      Publish from this device
+    </button>
+  );
 
   return (
     <div className="space-y-4 p-6">
@@ -317,6 +434,21 @@ export default function ProjectDetail() {
         >
           Manage on portal <ExternalLink size={13} />
         </button>
+      </div>
+
+      {/* A6: one device of this account announces new frames here. `null`
+          = nobody yet (the next device that publishes becomes it) — never
+          "this device". */}
+      <div className="flex flex-wrap items-center gap-2 text-xs text-content-muted">
+        <Monitor size={12} className="shrink-0" />
+        <span className="break-words">
+          {c.publishingHere
+            ? 'Publishing from this device'
+            : c.publishingDevice
+              ? `Publishing from ${deviceLabel(c.publishingDevice.name)}`
+              : 'Nobody is publishing to this project yet'}
+        </span>
+        {!c.publishingHere && c.publishingDevice && switchButton}
       </div>
 
       {updateRequired && <UpdateRequired />}
@@ -429,6 +561,15 @@ export default function ProjectDetail() {
           {republishError && !republishConfirm && (
             <p className="text-sm text-error">{republishError}</p>
           )}
+          {refusedBy && !c.publishingHere && (
+            <div
+              data-testid="publishing-refusal"
+              className="flex flex-wrap items-center gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-content"
+            >
+              <span className="break-words">{`${leading(refusedBy)} publishes new frames to this project.`}</span>
+              {switchButton}
+            </div>
+          )}
 
           <PublicationHistory frames={own} error={framesError} loaded={frames !== null} />
         </div>
@@ -494,6 +635,15 @@ export default function ProjectDetail() {
           onChanged={() => void load()}
         />
       )}
+
+      <ConfirmDialog
+        isOpen={switchConfirm}
+        title="Publish from this device?"
+        message={`${leading(switchFrom)} will stop publishing new frames to this project; it can still update the frames it already published.`}
+        confirmText="Switch"
+        onConfirm={() => void doSwitch()}
+        onCancel={() => setSwitchConfirm(false)}
+      />
 
       {publishConfirm && (
         <div

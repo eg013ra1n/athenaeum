@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { NotificationProvider } from '../contexts/NotificationContext';
 import { SessionStateProvider } from '../contexts/SessionStateContext';
@@ -41,13 +41,15 @@ function projectCard(overrides: Partial<ProjectCard> = {}): ProjectCard {
     autoReplicate: true,
     autoPublish: true,
     fetchedAt: '2026-09-24T00:00:00Z',
+    publishingDevice: null,
+    publishingHere: false,
     ...overrides,
   };
 }
 
-function detailFixture(): Detail {
+function detailFixture(card: ProjectCard = projectCard()): Detail {
   return {
-    card: projectCard(),
+    card,
     members: [],
     thresholdsVersion: null,
     thresholds: [],
@@ -223,3 +225,244 @@ describe('ProjectDetail manual publish', () => {
     expect(toasts[0]).not.toHaveTextContent('Publish failed');
   });
 });
+
+/** The default command answers, with `extra` taking precedence per command. */
+function mockCommands(
+  card: ProjectCard,
+  extra: Record<string, (args?: unknown) => Promise<unknown>> = {},
+) {
+  vi.mocked(api.invoke).mockImplementation(((command: string, args?: unknown) => {
+    if (extra[command]) return extra[command](args);
+    switch (command) {
+      case 'get_collab_project_detail':
+        return Promise.resolve(detailFixture(card));
+      case 'evaluate_collab_gate':
+        return Promise.resolve(gateFixture());
+      case 'list_collab_frames':
+        return Promise.resolve([] as ProjectFrameView[]);
+      case 'list_collab_projects':
+        return Promise.resolve([card]);
+      default:
+        return Promise.resolve(null);
+    }
+  }) as never);
+}
+
+const obsPc = { deviceId: 'dev-obs', name: 'Obs PC' };
+const boundElsewhere = projectCard({ publishingDevice: obsPc, publishingHere: false });
+const boundHere = projectCard({ publishingDevice: { deviceId: 'dev-me', name: 'Laptop' }, publishingHere: true });
+
+async function publishViaConfirm() {
+  fireEvent.click(await screen.findByRole('button', { name: /Publish 2 passing frames/ }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
+}
+
+describe('ProjectDetail publishing device (A6)', () => {
+  it('names this device when it is the publishing device, with no switch offered', async () => {
+    mockCommands(boundHere);
+    renderProjectDetail();
+    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
+  });
+
+  it('names the other device and offers "Publish from this device"', async () => {
+    mockCommands(boundElsewhere);
+    renderProjectDetail();
+    expect(await screen.findByText('Publishing from Obs PC')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Publish from this device' })).toBeInTheDocument();
+  });
+
+  it('an unnamed bound device reads as another device of this account', async () => {
+    mockCommands(projectCard({ publishingDevice: { deviceId: 'dev-x', name: null }, publishingHere: false }));
+    renderProjectDetail();
+    expect(await screen.findByText('Publishing from another device of this account')).toBeInTheDocument();
+  });
+
+  it('an unbound project says nobody is publishing yet — never "this device", no switch', async () => {
+    mockCommands(projectCard({ publishingDevice: null, publishingHere: false }));
+    renderProjectDetail();
+    expect(await screen.findByText('Nobody is publishing to this project yet')).toBeInTheDocument();
+    expect(screen.queryByText('Publishing from this device')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
+  });
+
+  it('the switch is confirmed, sends the project id and updates the card from the answer', async () => {
+    const switched = projectCard({ publishingDevice: { deviceId: 'dev-me', name: 'Laptop' }, publishingHere: true });
+    const setDevice = vi.fn(() => Promise.resolve(switched));
+    mockCommands(boundElsewhere, { set_collab_publishing_device: setDevice });
+    renderProjectDetail();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish from this device' }));
+    expect(
+      await screen.findByText(
+        'Obs PC will stop publishing new frames to this project; it can still update the frames it already published.',
+      ),
+    ).toBeInTheDocument();
+    expect(setDevice).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('set_collab_publishing_device', { projectId: 'proj-1' }),
+    );
+    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
+    // No reload was needed: the card came from the command's answer.
+    expect(vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_collab_project_detail')).toHaveLength(1);
+    expect(screen.queryAllByRole('status')).toHaveLength(0);
+  });
+
+  it('cancelling the confirm switches nothing', async () => {
+    const setDevice = vi.fn(() => Promise.resolve(boundHere));
+    mockCommands(boundElsewhere, { set_collab_publishing_device: setDevice });
+    renderProjectDetail();
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish from this device' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByText(/will stop publishing new frames/)).not.toBeInTheDocument();
+    expect(setDevice).not.toHaveBeenCalled();
+    expect(screen.getByText('Publishing from Obs PC')).toBeInTheDocument();
+  });
+
+  it('a failed switch is one warning with the reason, and the card is unchanged', async () => {
+    mockCommands(boundElsewhere, {
+      set_collab_publishing_device: () => Promise.reject("The account's role may not perform this action."),
+    });
+    renderProjectDetail();
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish from this device' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Switch' }));
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Could not publish from this device');
+    // The toast shows the title; the reason is the entry's detail.
+    await waitFor(() =>
+      expect(localStorage.getItem('athenaeum.notifications.v1') ?? '').toContain(
+        "The account's role may not perform this action.",
+      ),
+    );
+    expect(screen.getByText('Publishing from Obs PC')).toBeInTheDocument();
+  });
+
+  it('a publish refused by the publishing device names it and offers the switch — not a generic failure', async () => {
+    mockCommands(boundElsewhere, {
+      publish_collab_frames: () => Promise.reject('collab_publishing_device:Obs PC'),
+    });
+    renderProjectDetail();
+    await publishViaConfirm();
+
+    const refusal = await screen.findByTestId('publishing-refusal');
+    expect(refusal).toHaveTextContent('Obs PC publishes new frames to this project');
+    expect(within(refusal).getByRole('button', { name: 'Publish from this device' })).toBeInTheDocument();
+    expect(screen.queryByText('collab_publishing_device:Obs PC')).not.toBeInTheDocument();
+    // The publish confirm closed; the one toast names the device, not "Publish failed".
+    expect(screen.queryByRole('button', { name: 'Publish' })).not.toBeInTheDocument();
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Obs PC publishes new frames to this project');
+    expect(toasts[0]).not.toHaveTextContent('Publish failed');
+
+    // The refusal's action opens the same confirm.
+    fireEvent.click(within(refusal).getByRole('button', { name: 'Publish from this device' }));
+    expect(await screen.findByText(/Obs PC will stop publishing new frames to this project/)).toBeInTheDocument();
+  });
+
+  it('an unnamed device in the refusal reads as another device of this account', async () => {
+    mockCommands(boundElsewhere, {
+      publish_collab_frames: () => Promise.reject('collab_publishing_device:another device of this account'),
+    });
+    renderProjectDetail();
+    await publishViaConfirm();
+    expect(await screen.findByTestId('publishing-refusal')).toHaveTextContent(
+      'Another device of this account publishes new frames to this project',
+    );
+  });
+
+  it('a republish refused the same way shows the same message', async () => {
+    mockCommands(boundElsewhere, {
+      list_collab_frames: () => Promise.resolve([ownFrame()]),
+      republish_collab_frames: () => Promise.reject('collab_publishing_device:Obs PC'),
+    });
+    renderProjectDetail();
+    fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Republish' }));
+    expect(await screen.findByTestId('publishing-refusal')).toHaveTextContent(
+      'Obs PC publishes new frames to this project',
+    );
+    expect(screen.queryByText('Republish failed')).not.toBeInTheDocument();
+  });
+
+  it('a run that succeeds with new frames held back for the other device shows the same message', async () => {
+    mockCommands(boundElsewhere, {
+      publish_collab_frames: () =>
+        Promise.resolve({
+          announced: 0,
+          updated: 1,
+          state: null,
+          heldBack: [
+            {
+              frameId: 7,
+              filename: 'L_0007.fits',
+              reasons: ['Obs PC publishes new frames to this project — use "Publish from this device" to switch'],
+            },
+          ],
+          unchanged: 0,
+        } as PublishResult),
+    });
+    renderProjectDetail();
+    await publishViaConfirm();
+
+    const refusal = await screen.findByTestId('publishing-refusal');
+    expect(refusal).toHaveTextContent('Obs PC publishes new frames to this project');
+    expect(within(refusal).getByRole('button', { name: 'Publish from this device' })).toBeInTheDocument();
+    // A successful run raises no toast of its own (the live event does).
+    expect(screen.queryAllByRole('status')).toHaveLength(0);
+  });
+
+  it('a successful run with unrelated held-back reasons shows no refusal', async () => {
+    mockCommands(boundHere, {
+      publish_collab_frames: () =>
+        Promise.resolve({
+          announced: 1,
+          updated: 0,
+          state: 'published',
+          heldBack: [{ frameId: 8, filename: 'L_0008.fits', reasons: ['calibration failed: no master dark'] }],
+          unchanged: 0,
+        } as PublishResult),
+    });
+    renderProjectDetail();
+    await publishViaConfirm();
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Publish' })).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId('publishing-refusal')).not.toBeInTheDocument();
+  });
+
+  it('switching after a refusal clears it', async () => {
+    const switched = projectCard({ publishingDevice: { deviceId: 'dev-me', name: 'Laptop' }, publishingHere: true });
+    mockCommands(boundElsewhere, {
+      publish_collab_frames: () => Promise.reject('collab_publishing_device:Obs PC'),
+      set_collab_publishing_device: () => Promise.resolve(switched),
+    });
+    renderProjectDetail();
+    await publishViaConfirm();
+    const refusal = await screen.findByTestId('publishing-refusal');
+    fireEvent.click(within(refusal).getByRole('button', { name: 'Publish from this device' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Switch' }));
+    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
+    expect(screen.queryByTestId('publishing-refusal')).not.toBeInTheDocument();
+  });
+});
+
+function ownFrame(): ProjectFrameView {
+  return {
+    frameUuid: 'f-1',
+    fileName: 'c_L_0001.fits',
+    own: true,
+    state: 'published',
+    contentVersion: 1,
+    byteSize: 1024,
+    holdersOnline: 1,
+    holdersTotal: 1,
+    localState: 'own_held',
+    lastError: null,
+    acceptedReason: null,
+  } as ProjectFrameView;
+}

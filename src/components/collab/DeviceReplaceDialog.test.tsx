@@ -5,6 +5,7 @@ import { NotificationProvider } from '../../contexts/NotificationContext';
 import { ToastStack } from '../Toast';
 import DeviceReplaceDialog, { DeviceReplaceProvider, useDeviceReplace } from './DeviceReplaceDialog';
 import { api } from '../../api';
+import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   CollabLiveStatus,
   CollabStorageStatus,
@@ -23,6 +24,7 @@ const offer: DeviceReplaceOfferView = {
   proposeRetire: false,
   path: '/c',
   markerMismatch: false,
+  checkedAt: null,
 };
 
 const unknown: UnknownDeviceView = {
@@ -30,6 +32,7 @@ const unknown: UnknownDeviceView = {
   path: '/c',
   recordedOffline: false,
   markerMismatch: false,
+  checkedAt: null,
 };
 
 const storage = (over: Partial<CollabStorageStatus>): CollabStorageStatus => ({
@@ -331,5 +334,51 @@ describe('DeviceReplaceDialog — Check again', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('DeviceReplaceDialog — when the answer was last checked', () => {
+  const checkedAt = '2026-09-26T08:30:00Z';
+
+  it('prints "last checked" next to the recorded last-seen, and keeps "Check again"', async () => {
+    mockCommands(storage({ replace: { ...offer, checkedAt } }));
+    renderWithProvider();
+    await screen.findByText('This device replaces Old laptop');
+    const line = screen.getByText(/^Last seen /);
+    expect(line).toHaveTextContent(`Last seen ${formatTimestamp(offer.lastSeenAt!)}`);
+    expect(line).toHaveTextContent(`last checked ${formatTimestamp(checkedAt)}`);
+    expect(screen.getByRole('button', { name: 'Check again' })).toBeInTheDocument();
+  });
+
+  it('a device never seen online still says when it was last checked', async () => {
+    mockCommands(storage({ replace: { ...offer, lastSeenAt: null, offlineDays: null, checkedAt } }));
+    renderWithProvider();
+    await screen.findByText('This device replaces Old laptop');
+    expect(screen.getByText(/^Never seen online/)).toHaveTextContent(`last checked ${formatTimestamp(checkedAt)}`);
+  });
+
+  it('a record without a check time prints no timestamp', async () => {
+    mockCommands(storage({ replace: offer }));
+    renderWithProvider();
+    await screen.findByText('This device replaces Old laptop');
+    expect(screen.queryByText(/last checked/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Check again' })).toBeInTheDocument();
+  });
+
+  it('a folder of an unlisted device says when that was last checked', async () => {
+    mockCommands(storage({ unknownDevice: { ...unknown, checkedAt } }));
+    renderWithProvider();
+    fireEvent.click(await screen.findByRole('button', { name: 'open folder owner' }));
+    await screen.findByText('This folder belongs to another device');
+    expect(screen.getByText(`Last checked ${formatTimestamp(checkedAt)}.`)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Check again' })).toBeInTheDocument();
+  });
+
+  it('a folder of an unlisted device without a check time prints no timestamp', async () => {
+    mockCommands(storage({ unknownDevice: unknown }));
+    renderWithProvider();
+    fireEvent.click(await screen.findByRole('button', { name: 'open folder owner' }));
+    await screen.findByText('This folder belongs to another device');
+    expect(screen.queryByText(/last checked/i)).not.toBeInTheDocument();
   });
 });

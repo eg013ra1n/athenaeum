@@ -45,6 +45,8 @@ function projectCard(overrides: Partial<ProjectCard>): ProjectCard {
     autoReplicate: true,
     autoPublish: true,
     fetchedAt: '2026-09-24T00:00:00Z',
+    publishingDevice: null,
+    publishingHere: false,
     ...overrides,
   };
 }
