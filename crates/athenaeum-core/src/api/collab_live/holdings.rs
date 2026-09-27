@@ -885,7 +885,11 @@ async fn report_full(
     let (report_seq, claims) = {
         let database = db(ctx)?;
         let conn = database.conn();
-        let tx = conn.unchecked_transaction()?;
+        // IMMEDIATE: `next_report_seq` reads before it writes; a deferred
+        // read-to-write upgrade under another writer fails at once with
+        // SQLITE_BUSY, never waiting the busy timeout.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         let r = live_db::next_report_seq(&tx)?;
         let claims = live_db::my_claims(&tx, project_id)?;
         tx.commit()?;

@@ -221,7 +221,10 @@ pub struct RefusedDesignation {
 /// `Other` into an `Unknown` a take-over would accept. An identical record
 /// is not rewritten (`true`). Otherwise every part is replaced.
 pub fn record_classification(conn: &Connection, new: &RefusedDesignation) -> Result<bool> {
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE: it reads the kept record before it writes; a deferred
+    // read-to-write upgrade under another writer fails at once with
+    // SQLITE_BUSY, never waiting the busy timeout.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let existing = refused_designation_detail(&tx)?;
     if let Some(e) = &existing {
         if new.offline && !e.offline && e.path == new.path && e.device_id == new.device_id {
@@ -964,6 +967,45 @@ mod tests {
         );
         // An offline answer over an offline record for the same folder: written.
         assert!(record_classification(&conn, &elsewhere).unwrap());
+    }
+
+    /// A read-then-write transaction must wait for another writer, not fail:
+    /// a deferred transaction's read-to-write upgrade under another writer's
+    /// lock answers `SQLITE_BUSY` at once (the busy timeout never applies),
+    /// so the classification was lost. Another connection holds the write
+    /// lock for 300 ms (as a landing or the storage task's scope pass does);
+    /// the record waits for it and is written.
+    #[test]
+    fn a_classification_waits_for_another_writer_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("catalog.db");
+        let conn = Connection::open(&path).unwrap();
+        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
+        init_db(&conn).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let other = Connection::open(&path).unwrap();
+            crate::db::SqliteConnectionManager::setup_connection(&other).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        held_rx.recv().unwrap();
+        let refusal = RefusedDesignation {
+            path: "/collab/b".into(),
+            device_id: "OLD-DEV".into(),
+            kind: RefusedDeviceKind::Other,
+            offline: false,
+            offer: None,
+        };
+        let recorded = record_classification(&conn, &refusal);
+        writer.join().unwrap();
+        assert!(
+            recorded.expect("the record waits for the other writer"),
+            "written"
+        );
+        assert_eq!(refused_designation_detail(&conn).unwrap(), Some(refusal));
     }
 
     #[test]

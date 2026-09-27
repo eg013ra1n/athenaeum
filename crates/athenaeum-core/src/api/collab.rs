@@ -3508,8 +3508,15 @@ async fn run_publish(
             Ok(())
         };
         // One transaction per frame: the own-row write(s) and the claim.
+        // IMMEDIATE: a body may read before it writes (the "already
+        // announced" bind reads the row first); a deferred read-to-write
+        // upgrade under another writer fails at once with SQLITE_BUSY, never
+        // waiting the busy timeout.
         let in_tx = |body: &dyn Fn(&Connection) -> anyhow::Result<()>| -> anyhow::Result<()> {
-            let tx = conn.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             body(&tx)?;
             tx.commit()?;
             Ok(())
