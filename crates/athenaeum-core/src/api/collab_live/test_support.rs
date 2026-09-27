@@ -165,6 +165,9 @@ pub(crate) async fn seed_replica_file(
         f.blake3 = blake3;
         f.byte_size = bytes.len() as i64;
         f.xxh3 = xxh3;
+        // A6: announced by a device that is neither this one nor one it
+        // replaces — a replica here whatever the replace flow records.
+        f.publisher_device_id = Some("PEER-DEV".into());
     });
     let view = hub.frame(PID, uuid).expect("frame just seeded");
 

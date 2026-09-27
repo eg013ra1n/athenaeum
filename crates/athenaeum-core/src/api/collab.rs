@@ -1459,9 +1459,11 @@ pub(crate) async fn refresh_projects_reporting(
     // create is skipped by the write itself). A moved binding re-arms
     // auto-publish: a device that stopped on a refusal resumes, a device
     // that lost the binding stops on the next run's check.
+    let mut moved_here: Vec<String> = Vec::new();
     {
         let db = db(ctx)?;
         let conn = db.conn();
+        let mut me: Option<String> = None;
         for p in &mine {
             let device =
                 p.publishing_device
@@ -1479,7 +1481,24 @@ pub(crate) async fn refresh_projects_reporting(
                     "the account's publishing device moved"
                 );
                 crate::api::collab_autopublish::request_auto_publish(Some(&p.id));
+                if let Some(d) = &device {
+                    if me.is_none() {
+                        me = device_for_cards(ctx);
+                    }
+                    if me.as_deref() == Some(d.device_id.as_str()) {
+                        moved_here.push(p.id.clone());
+                    }
+                }
             }
+        }
+    }
+    // Fix round 1: own frames the hub lost while another device was bound
+    // are listed again now that this device is.
+    for project_id in &moved_here {
+        if let Err(e) =
+            crate::api::collab_live::feed::reannounce_after_rebind(ctx, project_id).await
+        {
+            tracing::warn!(project_id = %project_id, error = %e, "re-announce check after the binding moved here failed");
         }
     }
 
@@ -1591,7 +1610,7 @@ pub async fn set_collab_publishing_device(
             tracing::error!(project_id, error = %e, "publishing device switch failed");
             client_err(e)
         })?;
-    {
+    let cached_moved = {
         let db = db(ctx)?;
         let conn = db.conn();
         crate::db::collab::set_publishing_device(
@@ -1605,7 +1624,16 @@ pub async fn set_collab_publishing_device(
         .map_err(|e| {
             tracing::error!(project_id, error = %format!("{e:#}"), "publishing device switch: storing the binding failed");
             internal(e)
-        })?;
+        })?
+    };
+    if reply.changed || cached_moved {
+        // Fix round 1: own frames the hub lost while another device was
+        // bound (an epoch-change re-announce refused then) are listed again.
+        if let Err(e) =
+            crate::api::collab_live::feed::reannounce_after_rebind(ctx, project_id).await
+        {
+            tracing::warn!(project_id, error = %e, "re-announce check after the switch failed");
+        }
     }
     tracing::info!(
         project_id,
@@ -1659,6 +1687,11 @@ pub struct HeldBackFrame {
     pub frame_id: i64,
     pub filename: String,
     pub reasons: Vec<String>,
+    /// Amendment A6: set ONLY for a new frame held back because another
+    /// device of this account is the project's publishing device — that
+    /// device's name, or "another device of this account". `None` for every
+    /// other reason. The UI keys on this field, never on the reason text.
+    pub publishing_device: Option<String>,
 }
 
 /// The hub caps one `POST /projects/{id}/frames` batch at 500 frames.
@@ -2044,6 +2077,17 @@ fn held(frame_id: i64, filename: &str, reason: String) -> HeldBackFrame {
         frame_id,
         filename: filename.to_string(),
         reasons: vec![reason],
+        publishing_device: None,
+    }
+}
+
+/// A new frame held back because another device of this account is the
+/// project's publishing device (amendment A6): the reason text plus the
+/// structured `publishing_device` the UI keys on.
+fn held_bound_elsewhere(frame_id: i64, filename: &str, device_name: Option<&str>) -> HeldBackFrame {
+    HeldBackFrame {
+        publishing_device: Some(crate::account::client::publishing_device_label(device_name)),
+        ..held(frame_id, filename, publishing_device_reason(device_name))
     }
 }
 
@@ -2483,12 +2527,13 @@ fn not_publishing_mark(manifest_version: i64) -> String {
 }
 
 /// Whether an own row's recorded publishing device (its manifest row's
-/// `publisherDeviceId`) is another device than `me` — its versions are that
-/// device's to post (amendment A6). `None`/unparseable → not another.
+/// `publisherDeviceId`) is another device than this one (or one it
+/// replaced) — its versions are that device's to post (amendment A6).
+/// `None`/unparseable → not another.
 fn published_by_another_device(
     project_id: &str,
     row: &crate::db::collab_frames::LocalFrameRow,
-    me: &str,
+    own: &crate::api::collab_exchange::OwnDevices,
 ) -> bool {
     crate::api::collab_exchange::parse_manifest_wire(
         project_id,
@@ -2496,8 +2541,11 @@ fn published_by_another_device(
         &row.manifest_json,
         "publish",
     )
-    .and_then(|v| v.publisher_device_id)
-    .is_some_and(|d| d != me)
+    .and_then(|v| {
+        v.publisher_device_id
+            .map(|d| !own.is_mine(&d, &v.publisher_account_id))
+    })
+    .unwrap_or(false)
 }
 
 /// Unseed and hold back every frame of a failed batch (F5).
@@ -2821,6 +2869,7 @@ async fn run_publish(
                 frame_id: row.frame_id,
                 filename: row.filename,
                 reasons: row.failures,
+                publishing_device: None,
             });
         }
     }
@@ -2922,6 +2971,7 @@ async fn run_publish(
                 tracing::error!(project_id, error = %format!("{e:#}"), "publish: own folder failed");
                 internal(e)
             })?;
+        let own_devices = crate::api::collab_exchange::own_devices(ctx, &conn, &project)?;
         let own = frames_db::own_by_source_frame(&conn, project_id).map_err(|e| {
             tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
             internal(e)
@@ -2987,17 +3037,13 @@ async fn run_publish(
             match &kind {
                 PublishKind::New => {
                     if let Some(name) = &bound_elsewhere {
-                        held_back.push(held(
-                            fid,
-                            &cand.filename,
-                            publishing_device_reason(name.as_deref()),
-                        ));
+                        held_back.push(held_bound_elsewhere(fid, &cand.filename, name.as_deref()));
                         refused_new += 1;
                         continue;
                     }
                 }
                 PublishKind::Update(row) | PublishKind::Adopt(row) => {
-                    if published_by_another_device(project_id, row, &me) {
+                    if published_by_another_device(project_id, row, &own_devices) {
                         tracing::debug!(project_id, frame_uuid = %row.frame_uuid, "publish: frame published by another device of this account; its versions are that device's");
                         continue;
                     }
@@ -3417,10 +3463,18 @@ async fn run_publish(
                             tracing::error!(project_id, error = %format!("{e:#}"), "publish: recording the publishing device failed");
                         }
                     }
-                    let reason = publishing_device_reason(device_name.as_deref());
-                    fail_batch(&node, project_id, &batch, &reason, &mut held_back).await;
                     let rest: Vec<SeededFrame> = batches.drain(..).flatten().collect();
-                    fail_batch(&node, project_id, &rest, &reason, &mut held_back).await;
+                    for group in [&batch, &rest] {
+                        let refs: Vec<&SeededFrame> = group.iter().collect();
+                        unseed_all(&node, project_id, &refs).await;
+                        held_back.extend(group.iter().map(|f| {
+                            held_bound_elsewhere(
+                                f.written.frame_id,
+                                &f.written.filename,
+                                device_name.as_deref(),
+                            )
+                        }));
+                    }
                     first_err = Some(ApiError::Conflict(
                         crate::account::client::publishing_device_msg(device_name.as_deref()),
                     ));
@@ -3504,6 +3558,7 @@ async fn run_publish(
                             frame_id: f.written.frame_id,
                             filename: f.written.filename.clone(),
                             reasons,
+                            publishing_device: None,
                         });
                     }
                 }
@@ -7853,6 +7908,139 @@ pub(crate) mod tests {
                 matches!(&refused, Err(crate::account::AccountClientError::PublishingDevice { device_id, .. }) if *device_id == me),
                 "{refused:?}"
             );
+        }
+
+        /// A6 fix round 1: a device replace keeps authorship. Frames the
+        /// retired device published (a reinstall that kept the catalog under
+        /// a new key) are replicas here until the replace is recorded, then
+        /// own again; a recalibration posts their new version from THIS
+        /// device, the hub accepts it through its fallback (the old device
+        /// is retired) and adopts the frame — the manifest then names this
+        /// device.
+        #[tokio::test]
+        async fn a_replaced_devices_frames_are_versioned_here_and_adopted() {
+            const OLD: &str = "T0xELURFVg=="; // "OLD-DEV"
+            let fx = fixture(1).await;
+            let hub = crate::collab::fake_hub::FakeHub::start().await;
+            let me = crate::api::account::own_device_id(&fx.ctx).unwrap();
+            hub.add_account("tok", "acc-Me Myself", "Me Myself", &me, None);
+            hub.add_account("tok-old", "acc-Me Myself", "Me Myself", OLD, None);
+            hub.add_device("acc-Me Myself", OLD, "dev-old", "Old PC", None);
+            hub.add_project(
+                PID,
+                "m31",
+                &[("acc-Me Myself", "send_receive", false)],
+                false,
+            );
+            wire_hub(&fx.ctx, &hub.uri());
+            // The old install (the old key) published the frame.
+            crate::api::account::store_token_for_test(&fx.ctx, "tok-old").unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1);
+            let uuid = fx.uuids[0].clone();
+            assert_eq!(
+                hub.frame(PID, &uuid)
+                    .unwrap()
+                    .publisher_device_id
+                    .as_deref(),
+                Some(OLD)
+            );
+            // This install (the new key) reads the manifest: another device's frame.
+            crate::api::account::store_token_for_test(&fx.ctx, "tok").unwrap();
+            crate::api::collab_exchange::sync_manifest(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                own_row(&fx, &uuid).unwrap().origin,
+                crate::db::collab_frames::FrameOrigin::Replica
+            );
+            // The replace: the old device is retired, and recorded here.
+            hub.revoke_device(OLD, true);
+            crate::api::collab_exchange::record_device_replaced(&fx.ctx, OLD).unwrap();
+            assert_eq!(
+                own_row(&fx, &uuid).unwrap().origin,
+                crate::db::collab_frames::FrameOrigin::Own
+            );
+            // A recalibration: a new version from this device, accepted and adopted.
+            write_dark(&fx.master, 310.0);
+            set_mtime(&fx.master, 120);
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.updated, 1, "{res:?}");
+            let hub_row = hub.frame(PID, &uuid).unwrap();
+            assert_eq!(hub_row.content_version, 2);
+            assert_eq!(
+                hub_row.publisher_device_id.as_deref(),
+                Some(me.as_str()),
+                "the hub adopted the frame"
+            );
+            crate::api::collab_exchange::sync_manifest(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let row = own_row(&fx, &uuid).unwrap();
+            assert_eq!(row.origin, crate::db::collab_frames::FrameOrigin::Own);
+            assert_eq!(row.content_version, 2);
+            assert_eq!(row.source_frame_id, Some(fx.frame_ids[0]), "bound again");
+        }
+
+        /// A6 (UI follow-up): a held-back frame carries `publishingDevice`
+        /// ONLY when another device of this account is bound — a run that
+        /// also posts a version resolves Ok, and the refused new frame is
+        /// told apart by the field, not the reason text. Every other
+        /// held-back frame has `None`.
+        #[tokio::test]
+        async fn a_frame_held_back_for_the_binding_names_the_device() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            // Publish frame 0 only (frame 1 not linked yet → gate-held).
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute(
+                    "UPDATE frames SET uuid = NULL WHERE id = ?1",
+                    [fx.frame_ids[1]],
+                )
+                .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{res:?}");
+            assert!(
+                res.held_back.iter().all(|h| h.publishing_device.is_none()),
+                "a gate hold-back names no device: {:?}",
+                res.held_back
+            );
+            // Another device of the account is bound now; frame 1 becomes
+            // publishable and frame 0's recipe moves (a version).
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute(
+                    "UPDATE frames SET uuid = ?2 WHERE id = ?1",
+                    rusqlite::params![fx.frame_ids[1], fx.uuids[1]],
+                )
+                .unwrap();
+                crate::db::collab::set_publishing_device(
+                    &conn,
+                    PID,
+                    Some(&crate::db::collab::PublishingDevice {
+                        device_id: "T0JTLVBD".into(),
+                        name: Some("Obs PC".into()),
+                    }),
+                )
+                .unwrap();
+            }
+            write_dark(&fx.master, 310.0);
+            set_mtime(&fx.master, 120);
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.updated, 1, "the version still goes out: {res:?}");
+            let refused: Vec<&HeldBackFrame> = res
+                .held_back
+                .iter()
+                .filter(|h| h.publishing_device.is_some())
+                .collect();
+            assert_eq!(refused.len(), 1, "{:?}", res.held_back);
+            assert_eq!(refused[0].frame_id, fx.frame_ids[1]);
+            assert_eq!(refused[0].publishing_device.as_deref(), Some("Obs PC"));
+            assert!(refused[0].reasons[0].contains(" publishes new frames to this project"));
+            let json = serde_json::to_value(refused[0]).unwrap();
+            assert_eq!(json["publishingDevice"], "Obs PC");
         }
 
         /// A6: a frame this device holds as own but whose manifest row names

@@ -1610,7 +1610,14 @@ heldBack: Array<HeldBackFrame>,
  */
 unchanged: number, };
 
-export type HeldBackFrame = { frameId: number, filename: string, reasons: Array<string>, };
+export type HeldBackFrame = { frameId: number, filename: string, reasons: Array<string>, 
+/**
+ * Amendment A6: set ONLY for a new frame held back because another
+ * device of this account is the project's publishing device — that
+ * device's name, or "another device of this account". `None` for every
+ * other reason. The UI keys on this field, never on the reason text.
+ */
+publishingDevice: string | null, };
 
 export type ModerationFrameView = { frameUuid: string, fileName: string, publisher: string, publisherAccountId: string, filter: string, exptimeSec: number, 
 /**

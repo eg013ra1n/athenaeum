@@ -2588,6 +2588,16 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
          );
+         -- Amendment A6 fix round 1: every device this device REPLACED (the
+         -- verified device-replace flow). A frame such a device published is
+         -- own here: this device inherited its files and its authorship.
+         -- `account_id` = the account it was replaced in (NULL when unknown
+         -- at the time); a replaced id never counts for another account.
+         CREATE TABLE IF NOT EXISTS collab_replaced_devices (
+            device_id TEXT PRIMARY KEY,
+            account_id TEXT,
+            replaced_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );
          CREATE TABLE IF NOT EXISTS collab_my_claims (
             project_id TEXT NOT NULL,
             frame_uuid TEXT NOT NULL,

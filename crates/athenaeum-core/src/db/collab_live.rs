@@ -73,6 +73,37 @@ pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+/// Record that this device replaced `device_id` (a base64 public key) in
+/// `account_id` (amendment A6 fix round 1). One upsert statement — a known
+/// account is never overwritten by an unknown one.
+pub fn record_replaced_device(
+    conn: &Connection,
+    device_id: &str,
+    account_id: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO collab_replaced_devices (device_id, account_id) VALUES (?1, ?2)
+         ON CONFLICT(device_id) DO UPDATE SET
+            account_id = COALESCE(excluded.account_id, collab_replaced_devices.account_id)",
+        params![device_id, account_id],
+    )?;
+    Ok(())
+}
+
+/// Every device this device replaced: device id → the account it was
+/// replaced in (`None` when unknown).
+pub fn replaced_devices(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, Option<String>>> {
+    let mut stmt = conn.prepare("SELECT device_id, account_id FROM collab_replaced_devices")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+    Ok(rows)
+}
+
 pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO collab_live_meta (key, value) VALUES (?1, ?2)

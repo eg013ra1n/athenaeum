@@ -588,10 +588,10 @@ impl FeedApplier {
         mut rows: Vec<crate::collab::hub_client::FrameViewWire>,
     ) -> Result<(), ApiError> {
         use crate::db::collab_frames as frames_db;
-        let me = crate::api::collab_exchange::device_for_own(&self.ctx, pid)?;
         let database = db(&self.ctx)?;
         let conn = database.conn();
         let project = crate::api::collab_exchange::live_project(&conn, pid)?;
+        let own = crate::api::collab_exchange::own_devices(&self.ctx, &conn, &project)?;
         // IMMEDIATE: this transaction reads before it writes, and a
         // read-to-write upgrade under another writer fails at once with
         // SQLITE_BUSY (or BUSY_SNAPSHOT) — the busy timeout never applies —
@@ -609,7 +609,7 @@ impl FeedApplier {
         for v in rows.iter_mut() {
             let prev = frames_db::get(&tx, pid, &v.frame_uuid)?;
             // A6: own per DEVICE, never per account.
-            crate::api::collab_exchange::derive_device_own(v, &me, prev.as_ref());
+            crate::api::collab_exchange::derive_device_own(v, &own, prev.as_ref());
             for kind in crate::api::collab_exchange::classify_frame_change(prev.as_ref(), v) {
                 *counts.entry(kind).or_default() += 1;
             }
@@ -1163,11 +1163,11 @@ pub(crate) async fn reannounce_lost_own_frames(
     seen: &HashSet<String>,
 ) -> Result<usize, ApiError> {
     use crate::db::collab_frames::{self as frames_db, LocalState};
-    let me = crate::api::collab_exchange::device_for_own(ctx, project_id)?;
     let (lost, gate): (Vec<FrameInWire>, i32) = {
         let database = db(ctx)?;
         let conn = database.conn();
         let project = crate::api::collab_exchange::live_project(&conn, project_id)?;
+        let own = crate::api::collab_exchange::own_devices(ctx, &conn, &project)?;
         let lost: Vec<FrameInWire> = frames_db::list_for_project(&conn, project_id)?
             .into_iter()
             .filter(|r| r.local_state == LocalState::OwnHeld && !seen.contains(&r.frame_uuid))
@@ -1179,10 +1179,14 @@ pub(crate) async fn reannounce_lost_own_frames(
                     "reannounce",
                 )
             })
-            // A6: only frames THIS device published (a recorded device that
-            // is another one never re-announces here — that device does).
+            // A6: only frames THIS device published (or a device it
+            // replaced); another device's frames are that device's to
+            // re-announce.
             .filter(|v| {
-                let mine = v.publisher_device_id.as_deref().is_none_or(|d| d == me);
+                let mine = v
+                    .publisher_device_id
+                    .as_deref()
+                    .is_none_or(|d| own.is_mine(d, &v.publisher_account_id));
                 if !mine {
                     tracing::debug!(project_id, frame_uuid = %v.frame_uuid, "re-announce: frame published by another device; skipped");
                 }
@@ -1294,6 +1298,31 @@ pub(crate) async fn reannounce_lost_own_frames(
         );
     }
     Ok(announced)
+}
+
+/// A6 fix round 1: the binding moved TO this device (a switch, or a
+/// `/me/projects` refresh that shows it here). While another device was
+/// bound, an epoch-change re-announce of this device's frames was refused
+/// (recorded, not retried); run the same check now — one full manifest
+/// fetch, then every own frame the hub no longer lists is re-announced.
+/// Signed out → nothing to do.
+pub(crate) async fn reannounce_after_rebind(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<usize, ApiError> {
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        return Ok(0);
+    };
+    let client = CollabClient::new(&hub_url).map_err(crate::api::collab_exchange::client_err)?;
+    let (seen, _) =
+        crate::api::collab_exchange::sync_manifest_full(ctx, project_id, None, None).await?;
+    let n = reannounce_lost_own_frames(ctx, &client, &token, project_id, &seen).await?;
+    tracing::info!(
+        project_id,
+        count = n,
+        "own frames checked after the binding moved here"
+    );
+    Ok(n)
 }
 
 /// Indices of `batch` a 409 "already announced" refusal names — R8a's
@@ -1736,6 +1765,55 @@ mod tests {
         assert!(h.0.contains(&"forget p1".to_string()));
         let conn = crate::api::db(&ctx).unwrap().conn();
         assert!(crate::db::collab::lost_at(&conn, PID).unwrap().is_some());
+    }
+
+    /// A6 fix round 1: an epoch change while ANOTHER device of this account
+    /// is bound — the re-announce is refused (recorded, the epoch still
+    /// moves, nothing retried); when the binding moves back to this device
+    /// ("Publish from this device"), the lost own frame is re-announced.
+    #[tokio::test]
+    async fn a_lost_own_frame_is_reannounced_once_the_binding_moves_here() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        hub.seed_frames(PID, "acc-me", &["own1"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.catch_up_project(PID, None, &[ChangeKind::Frames])
+            .await
+            .unwrap();
+        set_own_held(&ctx, PID, "own1");
+        // Another device of the account is bound (in service).
+        hub.add_account("tok-2", "acc-me", "Me", "T1RIRVI=", None);
+        hub.add_device("acc-me", "T1RIRVI=", "dev-2", "Laptop", None);
+        hub.set_publishing_device(PID, "acc-me", "T1RIRVI=");
+        hub.forget_frames(PID, &["own1"]);
+        let e2 = hub.rotate_epoch();
+        let effects = f
+            .apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert!(effects.contains(&FeedEffect::EpochChanged));
+        assert!(hub.frame(PID, "own1").is_none(), "refused while not bound");
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            assert_eq!(
+                crate::db::collab::publishing_device(&conn, PID)
+                    .unwrap()
+                    .map(|d| d.device_id),
+                Some("T1RIRVI=".to_string()),
+                "the refusal is recorded"
+            );
+        }
+        let card = crate::api::collab::set_collab_publishing_device(&ctx, PID)
+            .await
+            .unwrap();
+        assert!(card.publishing_here);
+        let back = hub
+            .frame(PID, "own1")
+            .expect("re-announced after the switch");
+        assert_eq!(back.publisher_device_id.as_deref(), Some(me.as_str()));
     }
 
     #[tokio::test]

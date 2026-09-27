@@ -135,10 +135,58 @@ pub struct CollabFramesChange {
     pub count: usize,
 }
 
+/// The devices whose frames are "own" on THIS device (amendment A6): this
+/// device's key, plus every device it REPLACED (fix round 1 — the verified
+/// device replace inherits the old device's files and its authorship),
+/// the latter only for this device's account.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OwnDevices {
+    /// This device's base64 public key (`api::account::own_device_id`).
+    pub me: String,
+    /// Replaced device id → the account it was replaced in (`None` when
+    /// unknown then).
+    pub replaced: std::collections::HashMap<String, Option<String>>,
+    /// This device's account (in the project at hand, from its membership
+    /// snapshot, else the live session's), when known.
+    pub account: Option<String>,
+}
+
+impl OwnDevices {
+    /// Only this device — no replaced devices (tests, callers without a
+    /// catalog).
+    #[cfg(test)]
+    pub(crate) fn only(me: &str) -> Self {
+        OwnDevices {
+            me: me.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Whether a frame announced by `device` under `publisher_account` is
+    /// this device's own. A replaced device counts only for the account it
+    /// was replaced in and only when that is this device's account — a
+    /// replaced id never makes another account's frame own.
+    pub(crate) fn is_mine(&self, device: &str, publisher_account: &str) -> bool {
+        if device == self.me {
+            return true;
+        }
+        let Some(recorded) = self.replaced.get(device) else {
+            return false;
+        };
+        let recorded_ok = recorded.as_deref().is_none_or(|a| a == publisher_account);
+        match (&self.account, recorded) {
+            (Some(mine), _) => mine == publisher_account && recorded_ok,
+            (None, Some(a)) => a == publisher_account,
+            (None, None) => false,
+        }
+    }
+}
+
 /// Amendment A6: a frame is `own` on THIS device only when this device
-/// published it — `publisherDeviceId` names this device's key (`me`, base64,
-/// as `api::account::own_device_id` spells it). The hub's account-level
-/// `own` is overwritten here, before anything classifies or stores the row.
+/// published it — `publisherDeviceId` is one of [`OwnDevices`] (this
+/// device's key, or a device it replaced, for its own account). The hub's
+/// account-level `own` is overwritten here, before anything classifies or
+/// stores the row.
 ///
 /// A row with no recorded device (`publisherDeviceId: null`): a frame this
 /// device already holds as own — an `own` row with a local path — stays own;
@@ -148,23 +196,123 @@ pub struct CollabFramesChange {
 /// two holder rows").
 pub(crate) fn derive_device_own(
     v: &mut crate::collab::hub_client::FrameViewWire,
-    me: &str,
+    own: &OwnDevices,
     prev: Option<&LocalFrameRow>,
 ) {
     v.own = match v.publisher_device_id.as_deref() {
-        Some(device) => device == me,
+        Some(device) => own.is_mine(device, &v.publisher_account_id),
         None => prev.is_some_and(|p| p.origin == FrameOrigin::Own && p.landed_path.is_some()),
     };
 }
 
-/// This device's key for [`derive_device_own`], or the error that stops a
-/// manifest apply: never guess — an apply without the key would turn every
+/// This device's account as the catalog knows it: the member of a cached
+/// project snapshot whose nodes list this device, else the live session's
+/// `hello.accountId`.
+fn my_account_id(
+    conn: &rusqlite::Connection,
+    me: &str,
+    project: Option<&crate::db::collab::CollabProjectRow>,
+) -> Result<Option<String>, ApiError> {
+    let in_snapshot = |members_json: &str| -> Option<String> {
+        serde_json::from_str::<Vec<SnapshotMember>>(members_json)
+            .ok()?
+            .into_iter()
+            .find(|m| m.nodes.iter().any(|n| n == me))
+            .map(|m| m.account_id)
+    };
+    if let Some(a) = project.and_then(|p| in_snapshot(&p.members_json)) {
+        return Ok(Some(a));
+    }
+    if let Some(a) =
+        crate::db::collab_live::meta_get(conn, crate::db::collab_live::META_ACCOUNT_ID)?
+    {
+        return Ok(Some(a));
+    }
+    if project.is_none() {
+        for p in crate::db::collab::list_projects(conn)? {
+            if let Some(a) = in_snapshot(&p.members_json) {
+                return Ok(Some(a));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// [`OwnDevices`] for a manifest apply of `project`, or the error that stops
+/// it: never guess — an apply without this device's key would turn every
 /// own frame into a replica.
-pub(crate) fn device_for_own(ctx: &ServiceContext, project_id: &str) -> Result<String, ApiError> {
-    crate::api::account::own_device_id(ctx).map_err(|e| {
-        tracing::error!(project_id, error = %e, "manifest apply: this device's key is unavailable");
+pub(crate) fn own_devices(
+    ctx: &ServiceContext,
+    conn: &rusqlite::Connection,
+    project: &crate::db::collab::CollabProjectRow,
+) -> Result<OwnDevices, ApiError> {
+    let me = crate::api::account::own_device_id(ctx).map_err(|e| {
+        tracing::error!(project_id = %project.project_id, error = %e, "manifest apply: this device's key is unavailable");
         e
+    })?;
+    let replaced = crate::db::collab_live::replaced_devices(conn)?;
+    let account = if replaced.is_empty() {
+        None
+    } else {
+        my_account_id(conn, &me, Some(project))?
+    };
+    Ok(OwnDevices {
+        me,
+        replaced,
+        account,
     })
+}
+
+/// Fix round 1 (A6): the verified device replace — this device now stands
+/// in for `old_device` (its files, its authorship). Records it, then
+/// re-derives every cached frame of every live project from its stored
+/// manifest row, so the frames `old_device` published become own here
+/// right away (the storage walk that follows re-adopts their files as own).
+// Called by the render+solver-gated replace flow (and its tests) only.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub(crate) fn record_device_replaced(
+    ctx: &ServiceContext,
+    old_device: &str,
+) -> Result<(), ApiError> {
+    use crate::db::collab_frames as frames_db;
+    let me = crate::api::account::own_device_id(ctx)?;
+    let database = db(ctx)?;
+    let conn = database.conn();
+    let account = my_account_id(&conn, &me, None)?;
+    crate::db::collab_live::record_replaced_device(&conn, old_device, account.as_deref())?;
+    tracing::info!(device_id = %old_device, account_id = ?account, "replaced device recorded: its frames are own here");
+    let mut flipped = 0usize;
+    let mut routes = frames_db::EngineRoutes::default();
+    for project in crate::db::collab::list_projects(&conn)? {
+        let own = own_devices(ctx, &conn, &project)?;
+        // IMMEDIATE: reads every row, then writes the ones that flip.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        for row in frames_db::list_for_project(&tx, &project.project_id)? {
+            let Some(mut v) = parse_manifest_wire(
+                &project.project_id,
+                &row.frame_uuid,
+                &row.manifest_json,
+                "replace",
+            ) else {
+                continue;
+            };
+            derive_device_own(&mut v, &own, Some(&row));
+            if v.own != (row.origin == FrameOrigin::Own) {
+                frames_db::upsert_from_manifest_deferred(
+                    &tx,
+                    &project.project_id,
+                    &v,
+                    &mut routes,
+                )?;
+                flipped += 1;
+            }
+        }
+        tx.commit()?;
+    }
+    routes.route();
+    tracing::info!(device_id = %old_device, count = flipped, "frames re-derived after a device replace");
+    Ok(())
 }
 
 /// Classify one manifest row against the local row it replaces (`None` =
@@ -315,7 +463,11 @@ pub(crate) async fn sync_manifest_inner(
         live_project(&conn, project_id)?
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
-    let me = device_for_own(ctx, project_id)?;
+    let own = {
+        let database = db(ctx)?;
+        let conn = database.conn();
+        own_devices(ctx, &conn, &project)?
+    };
 
     let caps_changed = project.gov_caps_json != project.synced_caps_json;
     let full = caps_changed || force_full;
@@ -362,7 +514,7 @@ pub(crate) async fn sync_manifest_inner(
                 let mut routes = frames_db::EngineRoutes::default();
                 for v in page.rows.iter_mut() {
                     let prev = frames_db::get(&tx, project_id, &v.frame_uuid)?;
-                    derive_device_own(v, &me, prev.as_ref());
+                    derive_device_own(v, &own, prev.as_ref());
                     for kind in classify_frame_change(prev.as_ref(), v) {
                         *counts.entry(kind).or_default() += 1;
                     }
@@ -2313,7 +2465,34 @@ mod tests {
             assert!(r.on_disk, "an own row keeps on_disk across a version move");
         }
 
-        /// The pure classifier, one row at a time.
+        /// Fix round 1: a replaced device's frames are own — for this
+        /// device's account only, and a replaced id recorded for one account
+        /// never counts for another.
+        #[test]
+        fn a_replaced_device_counts_as_own_for_its_account_only() {
+            let mut own = OwnDevices::only("ME");
+            own.replaced.insert("OLD".into(), Some("acc-me".into()));
+            own.replaced.insert("UNK".into(), None);
+            own.account = Some("acc-me".into());
+            assert!(own.is_mine("ME", "acc-me"));
+            assert!(own.is_mine("OLD", "acc-me"));
+            assert!(!own.is_mine("OLD", "acc-x"), "another account's frame");
+            assert!(
+                own.is_mine("UNK", "acc-me"),
+                "unknown then, this account now"
+            );
+            assert!(!own.is_mine("UNK", "acc-x"));
+            assert!(!own.is_mine("PEER", "acc-me"));
+            // This device's account unknown: only a recorded account counts.
+            own.account = None;
+            assert!(own.is_mine("OLD", "acc-me"));
+            assert!(!own.is_mine("OLD", "acc-x"));
+            assert!(!own.is_mine("UNK", "acc-me"));
+            // Recorded for one account, this device now in another: never.
+            own.account = Some("acc-x".into());
+            assert!(!own.is_mine("OLD", "acc-x"));
+        }
+
         /// A6: `own` follows the recorded device, never the account; with no
         /// recorded device only a row already held here as own (with a path)
         /// stays own.
@@ -2328,14 +2507,14 @@ mod tests {
             "createdAt":"2026-09-27T00:00:00Z"}))
             .unwrap();
             v.publisher_device_id = Some("ME".into());
-            derive_device_own(&mut v, "ME", None);
+            derive_device_own(&mut v, &OwnDevices::only("ME"), None);
             assert!(v.own, "this device published it");
             v.publisher_device_id = Some("OTHER".into());
-            derive_device_own(&mut v, "ME", None);
+            derive_device_own(&mut v, &OwnDevices::only("ME"), None);
             assert!(!v.own, "another device of the SAME account: a replica here");
 
             v.publisher_device_id = None;
-            derive_device_own(&mut v, "ME", None);
+            derive_device_own(&mut v, &OwnDevices::only("ME"), None);
             assert!(!v.own, "unknown device, no own row here: a replica");
             let conn = Connection::open_in_memory().unwrap();
             crate::db::schema::init_db(&conn).unwrap();
@@ -2354,16 +2533,17 @@ mod tests {
             let without_path = crate::db::collab_frames::get(&conn, "p1", "u")
                 .unwrap()
                 .unwrap();
-            derive_device_own(&mut v, "ME", Some(&without_path));
+            derive_device_own(&mut v, &OwnDevices::only("ME"), Some(&without_path));
             assert!(!v.own, "an own row with no file here is not held as own");
             crate::db::collab_frames::update_landed_path(&conn, "p1", "u", "/x/u.fits").unwrap();
             let with_path = crate::db::collab_frames::get(&conn, "p1", "u")
                 .unwrap()
                 .unwrap();
-            derive_device_own(&mut v, "ME", Some(&with_path));
+            derive_device_own(&mut v, &OwnDevices::only("ME"), Some(&with_path));
             assert!(v.own, "unknown device, held here as own: stays own");
         }
 
+        /// The pure classifier, one row at a time.
         #[test]
         fn classify_frame_change_rules() {
             use FramesChangeKind as K;

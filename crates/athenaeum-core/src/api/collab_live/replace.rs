@@ -375,6 +375,12 @@ pub async fn replace_device(
             Err(e) => return Err(e),
         }
 
+        // A6 fix round 1: this device now stands in for the retired one —
+        // the frames it published are own here (and versionable: the hub's
+        // fallback accepts, then adopts them). Recorded before the walk so
+        // the files re-adopt as own.
+        crate::api::collab_exchange::record_device_replaced(ctx, &marker.device_id)?;
+
         let new_marker = StoreMarker {
             store_id: marker.store_id.clone(),
             device_id: me.clone(),
@@ -1120,6 +1126,67 @@ mod tests {
         );
         assert_eq!(crate::db::collab_live::outbox_len(&conn, &pid).unwrap(), 1);
         // one add, zero transfer
+    }
+
+    /// A6 fix round 1: the replace records the retired device, and the
+    /// frames IT published (this account) become own here at once — a
+    /// replica of them turns own and its file re-adopts as `own_held`. A
+    /// frame another account announced from the same device id never does.
+    #[tokio::test]
+    async fn a_replace_makes_the_replaced_devices_frames_own_here() {
+        let (_t, ctx, hub) = signed_in_rig().await;
+        let root = collab_root(&ctx);
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        hub.seed_frames_with(test_support::PID, "acc-me", &["o1"], "published", |f| {
+            f.publisher_device_id = Some("OLD-DEV".into());
+        });
+        hub.seed_frames_with(test_support::PID, "acc-x", &["x1"], "published", |f| {
+            f.publisher_device_id = Some("OLD-DEV".into());
+        });
+        crate::api::collab_exchange::sync_manifest(&ctx, test_support::PID, None, None)
+            .await
+            .unwrap();
+        let origin = |uuid: &str| {
+            crate::db::collab_frames::get(&db(&ctx).unwrap().conn(), test_support::PID, uuid)
+                .unwrap()
+                .unwrap()
+                .origin
+        };
+        assert_eq!(
+            origin("o1"),
+            FrameOrigin::Replica,
+            "another device's, before"
+        );
+        let store_id = read_marker(&root).unwrap().unwrap().store_id;
+        write_marker(
+            &root,
+            &StoreMarker {
+                store_id,
+                device_id: "OLD-DEV".into(),
+            },
+        )
+        .unwrap();
+        replace_device(&ctx, "old-id", &root, &crate::api::PathPolicy::AllowAll)
+            .await
+            .unwrap();
+        assert_eq!(
+            origin("o1"),
+            FrameOrigin::Own,
+            "the replaced device's frame is own now"
+        );
+        assert_eq!(
+            origin("x1"),
+            FrameOrigin::Replica,
+            "never for another account"
+        );
+        let replaced = crate::db::collab_live::replaced_devices(&db(&ctx).unwrap().conn()).unwrap();
+        assert_eq!(replaced.get("OLD-DEV"), Some(&Some("acc-me".to_string())));
+        // A later manifest apply keeps deriving it own.
+        crate::api::collab_exchange::sync_manifest_full(&ctx, test_support::PID, None, None)
+            .await
+            .unwrap();
+        assert_eq!(origin("o1"), FrameOrigin::Own);
+        assert_eq!(origin("x1"), FrameOrigin::Replica);
     }
 
     /// Critical fix round 1, point 1: the reinstall flow. A plain
