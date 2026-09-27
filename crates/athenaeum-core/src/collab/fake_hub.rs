@@ -212,6 +212,11 @@ pub struct FakeProject {
     /// be stamped correctly even after a report that touched no claim of its
     /// own (an empty digest-check report still advances this).
     report_hwm: HashMap<String, i64>,
+    /// Amendment A6 (`project_publishers`): account id → the device pubkey
+    /// (base64) bound as the account's publishing device. A bound device
+    /// that is out of service (no live token: revoked/retired) reads as
+    /// unbound everywhere.
+    pub publishers: HashMap<String, String>,
 }
 
 impl FakeProject {
@@ -387,6 +392,36 @@ impl FakeHubState {
             .values()
             .map(|a| (a.device_pubkey_b64.clone(), a.account_id.clone()))
             .collect()
+    }
+
+    /// Every device pubkey with a live token — "in service" (a revoke or a
+    /// retire removes the token).
+    fn in_service(&self) -> HashSet<String> {
+        self.tokens
+            .values()
+            .map(|a| a.device_pubkey_b64.clone())
+            .collect()
+    }
+
+    /// The registry name of a device pubkey (`GET /devices`' `name`), if the
+    /// device is registered.
+    fn device_name(&self, pubkey: &str) -> Option<String> {
+        self.devices
+            .values()
+            .find(|d| d.pubkey == pubkey)
+            .map(|d| d.name.clone())
+    }
+
+    /// The account's effective publishing device in a project (A6): the
+    /// bound device while it is in service, else none.
+    fn publishing_device_of(&self, pid: &str, account_id: &str) -> Option<String> {
+        let live = self.in_service();
+        self.projects
+            .get(pid)?
+            .publishers
+            .get(account_id)
+            .filter(|d| live.contains(*d))
+            .cloned()
     }
 
     fn display_of(&self, account_id: &str) -> String {
@@ -911,6 +946,7 @@ impl FakeHub {
                 require_approval,
                 next_frame_seq: 1,
                 report_hwm: HashMap::new(),
+                publishers: HashMap::new(),
             },
         );
     }
@@ -1096,6 +1132,9 @@ impl FakeHub {
         let mut st = self.lock();
         let display = st.display_of(publisher_account);
         let devices = st.devices_of(publisher_account);
+        // A6: the announcing device — the account's one device when it has
+        // exactly one (`f` may set another, or `None` = unknown).
+        let publisher_device = (devices.len() == 1).then(|| devices[0].clone());
         let (prev_version, prev_holder_seq, touched, holder_adds) = {
             let p = st
                 .projects
@@ -1114,6 +1153,7 @@ impl FakeHub {
                     publisher_account_id: publisher_account.to_string(),
                     publisher_display_name: display.clone(),
                     own: false,
+                    publisher_device_id: publisher_device.clone(),
                     file_name: format!("{uuid}.fits"),
                     content_version: 1,
                     blake3: hex_of(uuid, 64),
@@ -1135,9 +1175,16 @@ impl FakeHub {
                 };
                 let mut view = view;
                 f(&mut view);
+                // The announce's implicit claim is the announcing device's
+                // alone; an unknown device stands for every device of the
+                // account (the pre-A6 helper behaviour).
+                let claimers: Vec<String> = match &view.publisher_device_id {
+                    Some(d) => vec![d.clone()],
+                    None => devices.clone(),
+                };
                 p.frames.insert(uuid.to_string(), view);
                 touched.push(uuid.to_string());
-                for device in &devices {
+                for device in &claimers {
                     if p.write_hub_claim(device, uuid, 1) {
                         holder_adds.push((device.clone(), seq, 1));
                     }
@@ -1411,6 +1458,30 @@ impl FakeHub {
     /// `members` on every affected project, and close its stream(s).
     pub fn revoke_device(&self, device_pubkey_b64: &str, retire: bool) {
         revoke_device_state(&mut self.lock(), device_pubkey_b64, retire);
+    }
+
+    /// Bind `device` (a pubkey) as `account`'s publishing device in the
+    /// project (A6) — the state an earlier announce or switch left, with no
+    /// event (tests that need the event use the real routes).
+    pub fn set_publishing_device(&self, project_id: &str, account_id: &str, device: &str) {
+        let mut st = self.lock();
+        let p = st
+            .projects
+            .get_mut(project_id)
+            .unwrap_or_else(|| panic!("fake hub: no project {project_id}"));
+        p.publishers
+            .insert(account_id.to_string(), device.to_string());
+    }
+
+    /// The account's stored publishing device in the project (A6), in
+    /// service or not.
+    pub fn publishing_device(&self, project_id: &str, account_id: &str) -> Option<String> {
+        self.lock()
+            .projects
+            .get(project_id)?
+            .publishers
+            .get(account_id)
+            .cloned()
     }
 
     /// Every v3 route (except `collab/pubkey` and the public project page)
@@ -1968,6 +2039,7 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
         ("GET", ["projects", pid, "dictionary"]) => dictionary(st, &acct, pid),
         ("GET", ["projects", pid, "manifest"]) => manifest(st, &acct, pid, req),
         ("POST", ["projects", pid, "frames"]) => announce(st, &acct, pid, req),
+        ("PUT", ["projects", pid, "publishing-device"]) => put_publishing_device(st, &acct, pid),
         ("POST", ["projects", pid, "frames", uuid, "version"]) => {
             new_version(st, &acct, pid, uuid, req)
         }
@@ -2104,6 +2176,10 @@ fn my_projects(st: &FakeHubState, acct: &FakeAccount) -> ResponseTemplate {
             "pendingFrames": pending,
             "pendingAnnouncements": pending,
             "govCaps": m.gov_caps,
+            // A6: null when unbound or the bound device is out of service.
+            "publishingDevice": st
+                .publishing_device_of(id, &acct.account_id)
+                .map(|d| json!({ "deviceId": d, "name": st.device_name(&d) })),
         }));
     }
     ok(Value::Array(out))
@@ -2342,6 +2418,12 @@ fn announce(
     req: &Request,
 ) -> ResponseTemplate {
     let display = st.display_of(&acct.account_id);
+    let live = st.in_service();
+    let names: HashMap<String, String> = st
+        .devices
+        .values()
+        .map(|d| (d.pubkey.clone(), d.name.clone()))
+        .collect();
     let Some(p) = st.projects.get_mut(pid) else {
         return not_found_project();
     };
@@ -2370,6 +2452,22 @@ fn announce(
     if p.status != "active" {
         return error(409, "project is closed");
     }
+    // A6: one publishing device per (project, account) — decided here,
+    // before the gate/dictionary checks; written only once every check
+    // passed (the hub's transaction rolls a refused batch's binding back).
+    let device = acct.device_pubkey_b64.clone();
+    let rebind = match p.publishers.get(&acct.account_id) {
+        None => true,
+        Some(bound) if *bound == device => false,
+        Some(bound) if live.contains(bound) => {
+            return ResponseTemplate::new(409).set_body_json(json!({
+                "error": "publishing_device",
+                "deviceId": bound,
+                "deviceName": names.get(bound),
+            }));
+        }
+        Some(_) => true,
+    };
     let gate = p.thresholds_version;
     if p.dictionary_version == 0 || p.dictionary.is_empty() {
         return error(409, "project has no filter dictionary");
@@ -2417,7 +2515,9 @@ fn announce(
     } else {
         "pending"
     };
-    let device = acct.device_pubkey_b64.clone();
+    if rebind {
+        p.publishers.insert(acct.account_id.clone(), device.clone());
+    }
     let prev_version = p.version;
     let prev_holder_seq = p.holder_seq;
     let version = p.bump();
@@ -2435,6 +2535,7 @@ fn announce(
                 publisher_account_id: acct.account_id.clone(),
                 publisher_display_name: display.clone(),
                 own: false,
+                publisher_device_id: Some(device.clone()),
                 file_name: f.file_name,
                 content_version: 1,
                 blake3: f.blake3,
@@ -2462,7 +2563,13 @@ fn announce(
     if !holder_adds.is_empty() {
         p.holder_seq = prev_holder_seq + 1;
     }
-    st.publish_bump(pid, prev_version, &["frames"], &touched);
+    // A6: a created or moved binding rides the same version as `members`.
+    let kinds: &[&str] = if rebind {
+        &["frames", "members"]
+    } else {
+        &["frames"]
+    };
+    st.publish_bump(pid, prev_version, kinds, &touched);
     if !holder_adds.is_empty() {
         st.publish_holders(
             pid,
@@ -2471,6 +2578,48 @@ fn announce(
         );
     }
     ok(json!({ "state": state, "projectVersion": version, "announced": n }))
+}
+
+/// A6 (`routes/publishing.rs::version_arbiter`): the one device allowed
+/// to version frame `f` of the caller's account — the frame's own device
+/// while in service, else the account's bound device while in service —
+/// or `None` when any device of the publisher account may.
+fn version_arbiter(p: &FakeProject, f: &FrameViewWire, live: &HashSet<String>) -> Option<String> {
+    if let Some(d) = f.publisher_device_id.as_ref().filter(|d| live.contains(*d)) {
+        return Some(d.clone());
+    }
+    p.publishers
+        .get(&f.publisher_account_id)
+        .filter(|d| live.contains(*d))
+        .cloned()
+}
+
+/// `PUT /projects/{id}/publishing-device` (A6): bind the caller as its
+/// account's publishing device. Non-member or unknown project → 403
+/// (empty); closed → 409. Idempotent (`changed: false`, no bump); a real
+/// move bumps the project with kind `members`.
+fn put_publishing_device(st: &mut FakeHubState, acct: &FakeAccount, pid: &str) -> ResponseTemplate {
+    let device = acct.device_pubkey_b64.clone();
+    let name = st.device_name(&device);
+    let Some(p) = st.projects.get_mut(pid) else {
+        return empty(403);
+    };
+    if p.member(&acct.account_id).is_none() {
+        return empty(403);
+    }
+    if p.status != "active" {
+        return error(409, "project is closed");
+    }
+    if p.publishers.get(&acct.account_id) == Some(&device) {
+        return ok(json!({
+            "deviceId": device, "name": name, "projectVersion": p.version, "changed": false,
+        }));
+    }
+    p.publishers.insert(acct.account_id.clone(), device.clone());
+    let prev = p.version;
+    let version = p.bump();
+    st.publish_bump(pid, prev, &["members"], &[]);
+    ok(json!({ "deviceId": device, "name": name, "projectVersion": version, "changed": true }))
 }
 
 #[derive(serde::Deserialize)]
@@ -2490,6 +2639,12 @@ fn new_version(
     uuid: &str,
     req: &Request,
 ) -> ResponseTemplate {
+    let live = st.in_service();
+    let names: HashMap<String, String> = st
+        .devices
+        .values()
+        .map(|d| (d.pubkey.clone(), d.name.clone()))
+        .collect();
     let Some(p) = st.projects.get_mut(pid) else {
         return not_found_project();
     };
@@ -2521,7 +2676,17 @@ fn new_version(
     if p.status != "active" {
         return error(409, "project is closed");
     }
-    let current = p.frames.get(uuid).expect("checked above").content_version;
+    let frame = p.frames.get(uuid).expect("checked above");
+    if let Some(allowed) = version_arbiter(p, frame, &live) {
+        if allowed != acct.device_pubkey_b64 {
+            return ResponseTemplate::new(409).set_body_json(json!({
+                "error": "not_publishing_device",
+                "deviceId": allowed,
+                "deviceName": names.get(&allowed),
+            }));
+        }
+    }
+    let current = frame.content_version;
     if expected != current {
         return ResponseTemplate::new(409)
             .set_body_json(json!({ "error": "version_conflict", "contentVersion": current }));
@@ -2535,6 +2700,8 @@ fn new_version(
     f.byte_size = body.byte_size;
     f.xxh3 = body.xxh3;
     f.manifest_version = version;
+    // A6 fix round 1: an accepted version adopts the frame.
+    f.publisher_device_id = Some(acct.device_pubkey_b64.clone());
     let next = f.content_version;
     let frame_seq = f.frame_seq;
     let device = acct.device_pubkey_b64.clone();
@@ -2574,6 +2741,7 @@ fn frame_versions_batch(
     pid: &str,
     req: &Request,
 ) -> ResponseTemplate {
+    let live = st.in_service();
     let body: VersionsBatchBody = match req.body_json() {
         Ok(b) => b,
         Err(e) => return error(422, format!("bad versions body: {e}")),
@@ -2609,6 +2777,12 @@ fn frame_versions_batch(
             );
             continue;
         }
+        if version_arbiter(p, f, &live).is_some_and(|allowed| allowed != device) {
+            results.push(
+                json!({"uuid": v.uuid, "status": "not_publishing_device", "contentVersion": 0}),
+            );
+            continue;
+        }
         if f.content_version != v.expected_version {
             results.push(
                 json!({"uuid": v.uuid, "status": "conflict", "contentVersion": f.content_version}),
@@ -2620,6 +2794,8 @@ fn frame_versions_batch(
         frame.blake3 = v.blake3.clone();
         frame.byte_size = v.byte_size;
         frame.xxh3 = v.xxh3.clone();
+        // A6 fix round 1: an accepted version adopts the frame.
+        frame.publisher_device_id = Some(device.clone());
         let next = frame.content_version;
         let frame_seq = frame.frame_seq;
         any_ok = true;
@@ -3280,6 +3456,231 @@ mod tests {
                 return ev;
             }
         }
+    }
+
+    // ── Amendment A6: one publishing device per (project, account) ─────────
+
+    /// Account "acc-me" with two devices (`tok` = AAA=, `tok-2` = CCC=, both
+    /// registered by name), no frames.
+    async fn two_device_hub() -> FakeHub {
+        let hub = FakeHub::start().await;
+        hub.add_account("tok", "acc-me", "Me", "AAA=", None);
+        hub.add_account("tok-2", "acc-me", "Me", "CCC=", None);
+        hub.add_device("acc-me", "AAA=", "dev-a", "Obs PC", None);
+        hub.add_device("acc-me", "CCC=", "dev-c", "Laptop", None);
+        hub.add_project("p1", "m31", &[("acc-me", "send_receive", false)], false);
+        hub
+    }
+
+    fn frame_in(uuid: &str) -> crate::collab::hub_client::FrameInWire {
+        crate::collab::hub_client::FrameInWire {
+            frame_uuid: uuid.into(),
+            file_name: format!("{uuid}.fits"),
+            blake3: "a".repeat(64),
+            byte_size: 10,
+            xxh3: "0".repeat(16),
+            filter_raw: "L".into(),
+            filter_canonical: "L".into(),
+            channel: "mono".into(),
+            exptime_sec: 300.0,
+            date_obs: None,
+            gate_version: 0,
+            meta: json!({}),
+        }
+    }
+
+    fn publishing_device_seen_by(v: &Value) -> Value {
+        v[0]["publishingDevice"].clone()
+    }
+
+    async fn my_projects_json(hub: &FakeHub, token: &str) -> Value {
+        reqwest::Client::new()
+            .get(format!("{}/api/v1/me/projects", hub.uri()))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    /// The first announce binds its device (`kinds: frames+members`), a
+    /// second device of the account is refused naming it (nothing written),
+    /// both devices read the same `publishingDevice`, and every manifest row
+    /// names its announcing device.
+    #[tokio::test]
+    async fn the_first_announce_binds_and_another_device_is_refused() {
+        let hub = two_device_hub().await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        c.announce_frames("tok", "p1", &[frame_in("u1")])
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.publishing_device("p1", "acc-me").as_deref(),
+            Some("AAA=")
+        );
+        let ev = hub.last_event("project", "p1").unwrap();
+        assert_eq!(ev["kinds"], json!(["frames", "members"]));
+        assert_eq!(ev["frames"][0]["publisherDeviceId"], "AAA=");
+        c.announce_frames("tok", "p1", &[frame_in("u2")])
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.last_event("project", "p1").unwrap()["kinds"],
+            json!(["frames"])
+        );
+
+        let err = c
+            .announce_frames("tok-2", "p1", &[frame_in("u3")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, crate::account::AccountClientError::PublishingDevice { device_id, device_name }
+                if device_id == "AAA=" && device_name.as_deref() == Some("Obs PC")),
+            "{err:?}"
+        );
+        assert!(hub.frame("p1", "u3").is_none(), "nothing written");
+        for token in ["tok", "tok-2"] {
+            assert_eq!(
+                publishing_device_seen_by(&my_projects_json(&hub, token).await),
+                json!({"deviceId": "AAA=", "name": "Obs PC"})
+            );
+        }
+        let page = c.manifest_page("tok-2", "p1", 0, None, 100).await.unwrap();
+        assert!(page
+            .rows
+            .iter()
+            .all(|r| r.publisher_device_id.as_deref() == Some("AAA=")));
+    }
+
+    /// The switch moves the binding (a `members` bump), is idempotent, and
+    /// then the other device is the one refused. The previously bound device
+    /// still versions the frames it published; the new one may not.
+    #[tokio::test]
+    async fn the_switch_moves_the_binding_and_versions_stay_with_the_frames_device() {
+        let hub = two_device_hub().await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        c.announce_frames("tok", "p1", &[frame_in("u1")])
+            .await
+            .unwrap();
+        let v0 = hub.version("p1");
+        let sw = c.set_publishing_device("tok-2", "p1").await.unwrap();
+        assert_eq!((sw.device_id.as_str(), sw.changed), ("CCC=", true));
+        assert_eq!(sw.name.as_deref(), Some("Laptop"));
+        assert_eq!(sw.project_version, v0 + 1);
+        assert_eq!(
+            hub.last_event("project", "p1").unwrap()["kinds"],
+            json!(["members"])
+        );
+        let again = c.set_publishing_device("tok-2", "p1").await.unwrap();
+        assert!(!again.changed);
+        assert_eq!(again.project_version, v0 + 1, "no bump");
+
+        c.announce_frames("tok-2", "p1", &[frame_in("u2")])
+            .await
+            .unwrap();
+        assert!(matches!(
+            c.announce_frames("tok", "p1", &[frame_in("u3")]).await,
+            Err(crate::account::AccountClientError::PublishingDevice { device_id, .. }) if device_id == "CCC="
+        ));
+
+        // u1 is AAA='s: only AAA= versions it; the bound CCC= is refused.
+        assert!(matches!(
+            c.new_frame_version("tok-2", "p1", "u1", 1, &"c".repeat(64), 10, &"0".repeat(16)).await,
+            Err(crate::account::AccountClientError::NotPublishingDevice { device_id, .. }) if device_id == "AAA="
+        ));
+        let batch = c
+            .frame_versions(
+                "tok-2",
+                "p1",
+                &[crate::collab::live::wire::VersionInWire {
+                    uuid: "u1".into(),
+                    expected_version: 1,
+                    blake3: "c".repeat(64),
+                    byte_size: 10,
+                    xxh3: "0".repeat(16),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.results[0].status,
+            crate::collab::live::wire::VersionStatus::NotPublishingDevice
+        );
+        let ok = c
+            .new_frame_version("tok", "p1", "u1", 1, &"c".repeat(64), 10, &"0".repeat(16))
+            .await
+            .unwrap();
+        assert_eq!(ok.content_version, 2);
+        assert_eq!(
+            hub.frame("p1", "u1")
+                .unwrap()
+                .publisher_device_id
+                .as_deref(),
+            Some("AAA=")
+        );
+    }
+
+    /// A revoked bound device reads as unbound (`publishingDevice: null`)
+    /// and the next announce rebinds. Its frames fall to the bound device,
+    /// whose accepted version ADOPTS the frame (fix round 1).
+    #[tokio::test]
+    async fn a_revoked_bound_device_unbinds_and_a_fallback_version_adopts() {
+        let hub = two_device_hub().await;
+        let c = CollabClient::new(hub.uri()).unwrap();
+        c.announce_frames("tok", "p1", &[frame_in("u1")])
+            .await
+            .unwrap();
+        hub.revoke_device("AAA=", false);
+        assert_eq!(
+            publishing_device_seen_by(&my_projects_json(&hub, "tok-2").await),
+            Value::Null
+        );
+        // Nobody in service is bound: any device of the account may version;
+        // the accepted version adopts the frame.
+        c.new_frame_version("tok-2", "p1", "u1", 1, &"c".repeat(64), 10, &"0".repeat(16))
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.frame("p1", "u1")
+                .unwrap()
+                .publisher_device_id
+                .as_deref(),
+            Some("CCC=")
+        );
+        c.announce_frames("tok-2", "p1", &[frame_in("u2")])
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.publishing_device("p1", "acc-me").as_deref(),
+            Some("CCC=")
+        );
+        assert_eq!(
+            hub.last_event("project", "p1").unwrap()["kinds"],
+            json!(["frames", "members"]),
+            "the rebind rides a members bump"
+        );
+    }
+
+    /// The switch refusals: a non-member and an unknown project get an empty
+    /// 403, a closed project 409.
+    #[tokio::test]
+    async fn the_switch_refuses_non_members_unknown_and_closed_projects() {
+        let hub = two_device_hub().await;
+        hub.add_account("tok-x", "acc-x", "X", "XXX=", None);
+        let c = CollabClient::new(hub.uri()).unwrap();
+        assert!(matches!(
+            c.set_publishing_device("tok-x", "p1").await,
+            Err(crate::account::AccountClientError::Forbidden)
+        ));
+        assert!(matches!(
+            c.set_publishing_device("tok", "nope").await,
+            Err(crate::account::AccountClientError::Forbidden)
+        ));
+        hub.lock().projects.get_mut("p1").unwrap().status = "closed".into();
+        let err = c.set_publishing_device("tok", "p1").await.unwrap_err();
+        assert!(err.to_string().contains("project is closed"), "{err}");
     }
 
     #[tokio::test]

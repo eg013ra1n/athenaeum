@@ -1452,7 +1452,103 @@ impl World {
     }
 
     async fn a_publishes_as(&self, uuid: &String, bytes: Vec<u8>) {
-        let dir = self.a.root.join("m31").join("Alice");
+        publish_as(&self.hub, &self.a, uuid, bytes).await;
+    }
+}
+
+/// Amendment A6: TWO devices of ONE account ("acc-a", `send_receive`) —
+/// `a` publishes, `b` is its second device — plus `c`, a member of another
+/// account paired with `b` only (so a frame `c` gets came from `b`). All
+/// three live on one fake hub.
+pub(crate) struct AccountWorld {
+    pub hub: FakeHub,
+    pub a: Instance,
+    pub b: Instance,
+    pub c: Instance,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) async fn two_devices_of_one_account() -> AccountWorld {
+    let hub = FakeHub::start().await;
+    hub.set_timings(LIVE_TIMINGS);
+    hub.add_project(
+        PID,
+        "m31",
+        &[
+            ("acc-a", "send_receive", false),
+            ("acc-c", "send_receive", false),
+        ],
+        false,
+    );
+    let a = live_instance(&hub, "tok-a", "acc-a", "Alice").await;
+    let b = live_instance(&hub, "tok-a2", "acc-a", "Alice").await;
+    let c = live_instance(&hub, "tok-c", "acc-c", "Carol").await;
+    hub.add_device("acc-a", &a.device(), "dev-a", "Obs PC", None);
+    hub.add_device("acc-a", &b.device(), "dev-b", "Laptop", None);
+    pair(&a.node, &b.node).await;
+    pair(&b.node, &c.node).await;
+    for i in [&a, &b] {
+        let cards = crate::api::collab::refresh_projects(&i.ctx).await.unwrap();
+        assert!(cards.iter().any(|p| p.project_id == PID));
+    }
+    a.start_live();
+    b.start_live();
+    let window = std::time::Duration::from_secs(10);
+    hub.wait_connected(PID, &a.device(), window).await;
+    hub.wait_connected(PID, &b.device(), window).await;
+    AccountWorld {
+        hub,
+        a,
+        b,
+        c,
+        next: std::sync::atomic::AtomicUsize::new(0),
+    }
+}
+
+impl AccountWorld {
+    /// `a` publishes `n` frames of 64 KiB and is the account's publishing
+    /// device (as its first announce would have made it).
+    pub(crate) async fn a_publishes(&self, n: usize) -> Vec<String> {
+        self.hub
+            .set_publishing_device(PID, "acc-a", &self.a.device());
+        let mut uuids = Vec::new();
+        for _ in 0..n {
+            let i = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let uuid = format!("f{i:03}");
+            publish_as(
+                &self.hub,
+                &self.a,
+                &uuid,
+                FetchRig::pattern(&uuid, 1, FETCH_FRAME_BYTES),
+            )
+            .await;
+            uuids.push(uuid);
+        }
+        uuids
+    }
+
+    /// Bring `c` (the other account) in: refreshed and live.
+    pub(crate) async fn start_c(&self) {
+        let cards = crate::api::collab::refresh_projects(&self.c.ctx)
+            .await
+            .unwrap();
+        assert!(cards.iter().any(|p| p.project_id == PID));
+        self.c.start_live();
+        self.hub
+            .wait_connected(PID, &self.c.device(), std::time::Duration::from_secs(10))
+            .await;
+    }
+}
+
+/// `a` (an "acc-a"/"Alice" device) publishes one frame of exactly `bytes`,
+/// in the order its publish run does it: its own file under its root, its
+/// own row `own_held`, seeded and claimed — THEN the hub's row with the real
+/// hashes, `a`'s device as the announcing device (A6) and `a`'s implicit
+/// claim (so no peer ever asks before `a` can serve).
+async fn publish_as(hub: &FakeHub, a: &Instance, uuid: &String, bytes: Vec<u8>) {
+    let device = a.device();
+    {
+        let dir = a.root.join("m31").join("Alice");
         std::fs::create_dir_all(&dir).unwrap();
         {
             let path = dir.join(format!("{uuid}.fits"));
@@ -1467,6 +1563,7 @@ impl World {
                 publisher_account_id: "acc-a".into(),
                 publisher_display_name: "Alice".into(),
                 own: true,
+                publisher_device_id: Some(device.clone()),
                 file_name: file_name.clone(),
                 content_version: 1,
                 blake3: blake3.clone(),
@@ -1487,18 +1584,17 @@ impl World {
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
             {
-                let conn = crate::api::db(&self.a.ctx).unwrap().conn();
+                let conn = crate::api::db(&a.ctx).unwrap().conn();
                 crate::db::collab_frames::upsert_from_manifest(&conn, PID, &view).unwrap();
             }
-            self.a
-                .node
+            a.node
                 .seed_project_frame(PID, uuid, 1, &path)
                 .await
                 .expect("seed A's own frame");
             let stamp =
                 crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(&path).unwrap());
             {
-                let conn = crate::api::db(&self.a.ctx).unwrap().conn();
+                let conn = crate::api::db(&a.ctx).unwrap().conn();
                 crate::db::collab_frames::update_landed_path(
                     &conn,
                     PID,
@@ -1516,16 +1612,18 @@ impl World {
                 )
                 .unwrap();
             }
-            self.hub
-                .seed_frames_with(PID, "acc-a", &[uuid.as_str()], "published", |f| {
-                    f.blake3 = blake3.clone();
-                    f.xxh3 = xxh3.clone();
-                    f.byte_size = len;
-                    f.file_name = file_name.clone();
-                });
+            hub.seed_frames_with(PID, "acc-a", &[uuid.as_str()], "published", |f| {
+                f.blake3 = blake3.clone();
+                f.xxh3 = xxh3.clone();
+                f.byte_size = len;
+                f.file_name = file_name.clone();
+                f.publisher_device_id = Some(device.clone());
+            });
         }
     }
+}
 
+impl World {
     /// A publishes a new version of `uuid` with different bytes of the same
     /// size, as its publish run does: the new file, its own row at the new
     /// version (own_held, seeded, its implicit claim), then the hub's

@@ -160,6 +160,9 @@ pub struct DeviceReplaceOfferView {
     /// The folder's marker names another store than the one this catalog
     /// recorded for it (a swapped disk): a replace would be refused.
     pub marker_mismatch: bool,
+    /// When this classification was checked with the hub (RFC 3339, UTC) —
+    /// "last checked …"; `None` for a record older than the stamp.
+    pub checked_at: Option<String>,
 }
 
 /// A Collaboration folder whose marker names a device this account does not
@@ -178,6 +181,9 @@ pub struct UnknownDeviceView {
     /// The folder's marker names another store than the one this catalog
     /// recorded for it (a swapped disk): a take-over would be refused.
     pub marker_mismatch: bool,
+    /// When this classification was made (RFC 3339, UTC) — "last checked
+    /// …"; `None` for a record older than the stamp.
+    pub checked_at: Option<String>,
 }
 
 /// The Collaboration storage as the Folders / Receive pages show it (§9.1,
@@ -694,6 +700,7 @@ fn view_from_record(
                 propose_retire,
                 path: path_str,
                 marker_mismatch,
+                checked_at: rec.checked_at.clone(),
             });
             true
         }
@@ -707,6 +714,7 @@ fn view_from_record(
                 path: path_str,
                 recorded_offline: rec.offline,
                 marker_mismatch,
+                checked_at: rec.checked_at.clone(),
             });
             true
         }
@@ -749,6 +757,7 @@ async fn classify_and_record(
         kind,
         offline,
         offer,
+        checked_at: Some(chrono::Utc::now().to_rfc3339()),
     };
     let written = {
         let db = db(ctx)?;
@@ -1281,6 +1290,7 @@ mod tests {
                 device_name: "Old laptop".into(),
                 last_seen_at: None,
             }),
+            checked_at: Some("2026-09-27T10:00:00+00:00".into()),
         };
         assert!(
             live_db::record_classification(&crate::api::db(&ctx).unwrap().conn(), &refusal)
@@ -1300,6 +1310,11 @@ mod tests {
                 (refusal.path.as_str(), "old-id")
             );
             assert!(offer.prompt, "never seen: prompt");
+            assert_eq!(
+                offer.checked_at.as_deref(),
+                Some("2026-09-27T10:00:00+00:00"),
+                "the record's check time reaches the offer"
+            );
         }
         assert_eq!(recorded(&ctx), Some(refusal), "untouched");
         assert_eq!(hub.requests_to("/devices").await, 0, "no hub call");

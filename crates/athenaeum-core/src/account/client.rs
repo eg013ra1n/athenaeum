@@ -74,6 +74,21 @@ pub enum AccountClientError {
     /// 409 `{"error":"version_conflict","contentVersion":N}` on a version
     /// call — the hub's current content version, for the caller to reconcile.
     VersionConflict { content_version: i32 },
+    /// 409 `{"error":"publishing_device","deviceId","deviceName"}` on an
+    /// announce (amendment A6): another in-service device of this account is
+    /// the project's publishing device. The whole batch was refused; nothing
+    /// was written. `device_id` is that device's base64 public key.
+    PublishingDevice {
+        device_id: String,
+        device_name: Option<String>,
+    },
+    /// 409 `{"error":"not_publishing_device","deviceId","deviceName"}` on the
+    /// single-frame version route (amendment A6): the frame may be versioned
+    /// only by `device_id` (its own device, else the bound device).
+    NotPublishingDevice {
+        device_id: String,
+        device_name: Option<String>,
+    },
     /// A 2xx response whose body did not decode into the expected type
     /// (`reqwest::Error::is_decode()`) — a permanent shape mismatch, never
     /// fixed by retrying (unlike `Network`, which also carries body-read
@@ -106,6 +121,42 @@ impl AccountClientError {
 /// as `COLLAB_API_OUTDATED_MSG`.
 pub const COLLAB_API_OUTDATED_MSG: &str =
     "collab_api_outdated: this hub needs a newer Athenaeum — update to keep collaborating";
+
+/// The stable prefix of the error a publish answers when another device of
+/// this account is the project's publishing device (amendment A6):
+/// `collab_publishing_device:<device name>`. The UI matches the prefix and
+/// shows the name after it.
+pub const COLLAB_PUBLISHING_DEVICE: &str = "collab_publishing_device";
+
+/// The stable prefix of a single-frame version refused because another
+/// device versions the frame (amendment A6):
+/// `collab_not_publishing_device:<device name>`.
+pub const COLLAB_NOT_PUBLISHING_DEVICE: &str = "collab_not_publishing_device";
+
+/// The name a refusal shows for the bound device: its name, else a neutral
+/// phrase (the hub reports `deviceName: null` for an unnamed device).
+pub fn publishing_device_label(device_name: Option<&str>) -> String {
+    match device_name.map(str::trim) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => "another device of this account".to_string(),
+    }
+}
+
+/// `collab_publishing_device:<name>` — the typed publish refusal (A6).
+pub fn publishing_device_msg(device_name: Option<&str>) -> String {
+    format!(
+        "{COLLAB_PUBLISHING_DEVICE}:{}",
+        publishing_device_label(device_name)
+    )
+}
+
+/// `collab_not_publishing_device:<name>` — the typed version refusal (A6).
+pub fn not_publishing_device_msg(device_name: Option<&str>) -> String {
+    format!(
+        "{COLLAB_NOT_PUBLISHING_DEVICE}:{}",
+        publishing_device_label(device_name)
+    )
+}
 
 /// Log the `collab_api_outdated` refusal once per process: the version poll
 /// runs every 15 s and would otherwise flood the log with the same fact.
@@ -144,6 +195,12 @@ impl std::fmt::Display for AccountClientError {
                 f,
                 "version_conflict (hub has content version {content_version})"
             ),
+            AccountClientError::PublishingDevice { device_name, .. } => {
+                f.write_str(&publishing_device_msg(device_name.as_deref()))
+            }
+            AccountClientError::NotPublishingDevice { device_name, .. } => {
+                f.write_str(&not_publishing_device_msg(device_name.as_deref()))
+            }
             AccountClientError::SecondPrimary(m)
             | AccountClientError::DeviceConflict(m)
             | AccountClientError::PeerValidation(m)

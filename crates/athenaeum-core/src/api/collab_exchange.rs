@@ -58,6 +58,12 @@ pub(crate) fn client_err(e: crate::account::AccountClientError) -> ApiError {
         E::VersionConflict { content_version } => ApiError::Conflict(format!(
             "version_conflict: the hub has content version {content_version}"
         )),
+        E::PublishingDevice { device_name, .. } => ApiError::Conflict(
+            crate::account::client::publishing_device_msg(device_name.as_deref()),
+        ),
+        E::NotPublishingDevice { device_name, .. } => ApiError::Conflict(
+            crate::account::client::not_publishing_device_msg(device_name.as_deref()),
+        ),
         E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
 }
@@ -127,6 +133,38 @@ pub struct CollabFramesChange {
     pub project_id: String,
     pub kind: FramesChangeKind,
     pub count: usize,
+}
+
+/// Amendment A6: a frame is `own` on THIS device only when this device
+/// published it — `publisherDeviceId` names this device's key (`me`, base64,
+/// as `api::account::own_device_id` spells it). The hub's account-level
+/// `own` is overwritten here, before anything classifies or stores the row.
+///
+/// A row with no recorded device (`publisherDeviceId: null`): a frame this
+/// device already holds as own — an `own` row with a local path — stays own;
+/// any other is a replica. Frames another device of this account published
+/// are therefore replicas here: fetched under this device's policy, held,
+/// served and claimed (spec §10 "two devices of one account → one publisher,
+/// two holder rows").
+pub(crate) fn derive_device_own(
+    v: &mut crate::collab::hub_client::FrameViewWire,
+    me: &str,
+    prev: Option<&LocalFrameRow>,
+) {
+    v.own = match v.publisher_device_id.as_deref() {
+        Some(device) => device == me,
+        None => prev.is_some_and(|p| p.origin == FrameOrigin::Own && p.landed_path.is_some()),
+    };
+}
+
+/// This device's key for [`derive_device_own`], or the error that stops a
+/// manifest apply: never guess — an apply without the key would turn every
+/// own frame into a replica.
+pub(crate) fn device_for_own(ctx: &ServiceContext, project_id: &str) -> Result<String, ApiError> {
+    crate::api::account::own_device_id(ctx).map_err(|e| {
+        tracing::error!(project_id, error = %e, "manifest apply: this device's key is unavailable");
+        e
+    })
 }
 
 /// Classify one manifest row against the local row it replaces (`None` =
@@ -277,6 +315,7 @@ pub(crate) async fn sync_manifest_inner(
         live_project(&conn, project_id)?
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    let me = device_for_own(ctx, project_id)?;
 
     let caps_changed = project.gov_caps_json != project.synced_caps_json;
     let full = caps_changed || force_full;
@@ -299,7 +338,7 @@ pub(crate) async fn sync_manifest_inner(
         let mut since = start;
         let mut after: Option<String> = None;
         loop {
-            let page = client
+            let mut page = client
                 .manifest_page(
                     &token,
                     project_id,
@@ -321,8 +360,9 @@ pub(crate) async fn sync_manifest_inner(
                     rusqlite::TransactionBehavior::Immediate,
                 )?;
                 let mut routes = frames_db::EngineRoutes::default();
-                for v in &page.rows {
+                for v in page.rows.iter_mut() {
                     let prev = frames_db::get(&tx, project_id, &v.frame_uuid)?;
+                    derive_device_own(v, &me, prev.as_ref());
                     for kind in classify_frame_change(prev.as_ref(), v) {
                         *counts.entry(kind).or_default() += 1;
                     }
@@ -2274,6 +2314,56 @@ mod tests {
         }
 
         /// The pure classifier, one row at a time.
+        /// A6: `own` follows the recorded device, never the account; with no
+        /// recorded device only a row already held here as own (with a path)
+        /// stays own.
+        #[test]
+        fn own_is_derived_per_device() {
+            use crate::collab::hub_client::FrameViewWire;
+            let mut v: FrameViewWire = serde_json::from_value(serde_json::json!({
+            "frameUuid":"u","publisherAccountId":"acc-me","publisherDisplayName":"Me","own":true,
+            "fileName":"u.fits","contentVersion":1,"blake3":"b","byteSize":1,"xxh3":"x",
+            "filterRaw":"L","filterCanonical":"L","channel":"mono","exptimeSec":1.0,"meta":{},
+            "gateVersion":0,"accepted":true,"state":"published","manifestVersion":1,
+            "createdAt":"2026-09-27T00:00:00Z"}))
+            .unwrap();
+            v.publisher_device_id = Some("ME".into());
+            derive_device_own(&mut v, "ME", None);
+            assert!(v.own, "this device published it");
+            v.publisher_device_id = Some("OTHER".into());
+            derive_device_own(&mut v, "ME", None);
+            assert!(!v.own, "another device of the SAME account: a replica here");
+
+            v.publisher_device_id = None;
+            derive_device_own(&mut v, "ME", None);
+            assert!(!v.own, "unknown device, no own row here: a replica");
+            let conn = Connection::open_in_memory().unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO collab_projects
+                (project_id, slug, title, data_role, target_name, target_ra_deg, target_dec_deg,
+                 target_radius_deg, membership_version, snapshot_payload_b64,
+                 snapshot_signature_b64, members_json)
+             VALUES ('p1','m31','M31','send_receive','M31',10.7,41.3,1.5,1,'x','x','[]')",
+                [],
+            )
+            .unwrap();
+            let mut own = v.clone();
+            own.own = true;
+            crate::db::collab_frames::upsert_from_manifest(&conn, "p1", &own).unwrap();
+            let without_path = crate::db::collab_frames::get(&conn, "p1", "u")
+                .unwrap()
+                .unwrap();
+            derive_device_own(&mut v, "ME", Some(&without_path));
+            assert!(!v.own, "an own row with no file here is not held as own");
+            crate::db::collab_frames::update_landed_path(&conn, "p1", "u", "/x/u.fits").unwrap();
+            let with_path = crate::db::collab_frames::get(&conn, "p1", "u")
+                .unwrap()
+                .unwrap();
+            derive_device_own(&mut v, "ME", Some(&with_path));
+            assert!(v.own, "unknown device, held here as own: stays own");
+        }
+
         #[test]
         fn classify_frame_change_rules() {
             use FramesChangeKind as K;
@@ -2283,6 +2373,7 @@ mod tests {
                 publisher_account_id: "a".into(),
                 publisher_display_name: "A".into(),
                 own,
+                publisher_device_id: None,
                 file_name: "u.fits".into(),
                 content_version: cv,
                 blake3: "0".repeat(64),

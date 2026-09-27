@@ -1528,6 +1528,16 @@ capability: DeviceCapability,
  */
 hubUrl: string, };
 
+export type PublishingDeviceView = { 
+/**
+ * Base64 of the device's public key.
+ */
+deviceId: string, 
+/**
+ * The device's name on the hub, when it has one.
+ */
+name: string | null, };
+
 export type ProjectCard = { projectId: string, slug: string, title: string, dataRole: string, coordinator: boolean, requireApproval: boolean, pendingFrames: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
 /**
  * D3 §3.3: this device auto-downloads the project's published contributions
@@ -1540,7 +1550,19 @@ autoReplicate: boolean,
  * threshold changes (default ON). Local preference —
  * `set_project_auto_publish` writes it.
  */
-autoPublish: boolean, fetchedAt: string, };
+autoPublish: boolean, fetchedAt: string, 
+/**
+ * Amendment A6: the one device of this account that may announce new
+ * frames into the project, as the hub last reported it. `None` = no
+ * device is publishing yet (nothing bound, or the bound device was
+ * revoked/retired) — the next device that publishes becomes it.
+ */
+publishingDevice: PublishingDeviceView | null, 
+/**
+ * `true` only when `publishing_device` names THIS device. Never `true`
+ * for an unbound project.
+ */
+publishingHere: boolean, };
 
 export type ProjectDetail = { card: ProjectCard, members: Array<ProjectMemberView>, thresholdsVersion: number | null, thresholds: Array<ThresholdRuleView>, links: Array<LinkedSetView>, portalBase: string, };
 
@@ -1791,7 +1813,12 @@ path: string,
  * The folder's marker names another store than the one this catalog
  * recorded for it (a swapped disk): a replace would be refused.
  */
-markerMismatch: boolean, };
+markerMismatch: boolean, 
+/**
+ * When this classification was checked with the hub (RFC 3339, UTC) —
+ * "last checked …"; `None` for a record older than the stamp.
+ */
+checkedAt: string | null, };
 
 export type UnknownDeviceView = { 
 /**
@@ -1811,7 +1838,12 @@ recordedOffline: boolean,
  * The folder's marker names another store than the one this catalog
  * recorded for it (a swapped disk): a take-over would be refused.
  */
-markerMismatch: boolean, };
+markerMismatch: boolean, 
+/**
+ * When this classification was made (RFC 3339, UTC) — "last checked
+ * …"; `None` for a record older than the stamp.
+ */
+checkedAt: string | null, };
 
 export type CollabStorageStatus = { state: StorageStateView, 
 /**

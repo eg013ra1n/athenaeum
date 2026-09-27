@@ -148,8 +148,12 @@ pub const META_REFUSED_OFFLINE: &str = "refused_offline";
 pub const META_REFUSED_OFFER_ID: &str = "refused_offer_id";
 pub const META_REFUSED_OFFER_NAME: &str = "refused_offer_name";
 pub const META_REFUSED_OFFER_LAST_SEEN: &str = "refused_offer_last_seen";
+/// When the classification was last checked (RFC 3339, UTC) — what the UI
+/// prints as "last checked …" (Task 17 concern 1). A re-check that finds the
+/// same classification moves only this stamp.
+pub const META_REFUSED_CHECKED_AT: &str = "refused_checked_at";
 
-const REFUSAL_KEYS: [&str; 7] = [
+const REFUSAL_KEYS: [&str; 8] = [
     META_REFUSED_PATH,
     META_REFUSED_DEVICE,
     META_REFUSED_KIND,
@@ -157,6 +161,7 @@ const REFUSAL_KEYS: [&str; 7] = [
     META_REFUSED_OFFER_ID,
     META_REFUSED_OFFER_NAME,
     META_REFUSED_OFFER_LAST_SEEN,
+    META_REFUSED_CHECKED_AT,
 ];
 
 /// Whether a refused designation's marker names a device still active in
@@ -210,6 +215,21 @@ pub struct RefusedDesignation {
     pub offline: bool,
     /// For `Other`: the offer the hub's device list gave.
     pub offer: Option<RecordedOffer>,
+    /// When this classification was checked (RFC 3339, UTC); `None` for a
+    /// record written before the stamp existed.
+    pub checked_at: Option<String>,
+}
+
+impl RefusedDesignation {
+    /// Everything but the check time — what "the same classification"
+    /// compares.
+    fn same_classification(&self, other: &RefusedDesignation) -> bool {
+        self.path == other.path
+            && self.device_id == other.device_id
+            && self.kind == other.kind
+            && self.offline == other.offline
+            && self.offer == other.offer
+    }
 }
 
 /// Record a folder's owner classification — THE writer of the refusal
@@ -218,8 +238,9 @@ pub struct RefusedDesignation {
 /// SKIPPED because `new` is an offline answer (the hub could not be asked)
 /// and the record already holds an online-verified classification of the
 /// same folder and device — an unreachable hub never turns a verified
-/// `Other` into an `Unknown` a take-over would accept. An identical record
-/// is not rewritten (`true`). Otherwise every part is replaced.
+/// `Other` into an `Unknown` a take-over would accept (its check time stays
+/// the verified one's). The same classification moves only the check time
+/// (`true`). Otherwise every part is replaced.
 pub fn record_classification(conn: &Connection, new: &RefusedDesignation) -> Result<bool> {
     // IMMEDIATE: it reads the kept record before it writes; a deferred
     // read-to-write upgrade under another writer fails at once with
@@ -230,7 +251,15 @@ pub fn record_classification(conn: &Connection, new: &RefusedDesignation) -> Res
         if new.offline && !e.offline && e.path == new.path && e.device_id == new.device_id {
             return Ok(false);
         }
-        if e == new {
+        if e.same_classification(new) {
+            if let Some(t) = new
+                .checked_at
+                .as_ref()
+                .filter(|t| e.checked_at.as_ref() != Some(*t))
+            {
+                meta_set(&tx, META_REFUSED_CHECKED_AT, t)?;
+                tx.commit()?;
+            }
             return Ok(true);
         }
     }
@@ -255,6 +284,9 @@ fn write_refusal(tx: &Connection, r: &RefusedDesignation) -> Result<()> {
         if let Some(t) = &o.last_seen_at {
             meta_set(tx, META_REFUSED_OFFER_LAST_SEEN, t)?;
         }
+    }
+    if let Some(t) = &r.checked_at {
+        meta_set(tx, META_REFUSED_CHECKED_AT, t)?;
     }
     Ok(())
 }
@@ -283,6 +315,7 @@ pub fn refused_designation_detail(conn: &Connection) -> Result<Option<RefusedDes
         kind,
         offline,
         offer,
+        checked_at: meta_get(conn, META_REFUSED_CHECKED_AT)?,
     }))
 }
 
@@ -933,6 +966,7 @@ mod tests {
             kind: RefusedDeviceKind::Other,
             offline: false,
             offer: None,
+            checked_at: None,
         };
         assert!(record_classification(&conn, &verified).unwrap());
         let offline = RefusedDesignation {
@@ -998,6 +1032,7 @@ mod tests {
             kind: RefusedDeviceKind::Other,
             offline: false,
             offer: None,
+            checked_at: None,
         };
         let recorded = record_classification(&conn, &refusal);
         writer.join().unwrap();
@@ -1006,6 +1041,53 @@ mod tests {
             "written"
         );
         assert_eq!(refused_designation_detail(&conn).unwrap(), Some(refusal));
+    }
+
+    /// Task 17 concern 1: the record keeps when it was checked; a re-check
+    /// with the same classification moves only that stamp, and an offline
+    /// answer over a verified record keeps the verified stamp.
+    #[test]
+    fn a_recheck_moves_only_the_check_time() {
+        let conn = conn_with_project();
+        let first = RefusedDesignation {
+            path: "/collab/b".into(),
+            device_id: "OLD-DEV".into(),
+            kind: RefusedDeviceKind::Other,
+            offline: false,
+            offer: Some(RecordedOffer {
+                device_id: "hub-id".into(),
+                device_name: "Old laptop".into(),
+                last_seen_at: None,
+            }),
+            checked_at: Some("2026-09-27T10:00:00+00:00".into()),
+        };
+        assert!(record_classification(&conn, &first).unwrap());
+        assert_eq!(
+            refused_designation_detail(&conn).unwrap(),
+            Some(first.clone())
+        );
+        let again = RefusedDesignation {
+            checked_at: Some("2026-09-27T11:00:00+00:00".into()),
+            ..first.clone()
+        };
+        assert!(record_classification(&conn, &again).unwrap());
+        assert_eq!(
+            refused_designation_detail(&conn).unwrap(),
+            Some(again.clone())
+        );
+        let offline = RefusedDesignation {
+            kind: RefusedDeviceKind::Unknown,
+            offline: true,
+            offer: None,
+            checked_at: Some("2026-09-27T12:00:00+00:00".into()),
+            ..first
+        };
+        assert!(!record_classification(&conn, &offline).unwrap());
+        assert_eq!(
+            refused_designation_detail(&conn).unwrap(),
+            Some(again),
+            "the verified record and its check time stay"
+        );
     }
 
     #[test]
@@ -1022,6 +1104,7 @@ mod tests {
                 device_name: "Old laptop".into(),
                 last_seen_at: Some("2026-09-01T00:00:00Z".into()),
             }),
+            checked_at: None,
         };
         assert!(record_classification(&conn, &other).unwrap());
         assert_eq!(
@@ -1040,6 +1123,7 @@ mod tests {
             kind: RefusedDeviceKind::Unknown,
             offline: true,
             offer: None,
+            checked_at: None,
         };
         assert!(record_classification(&conn, &unknown).unwrap());
         assert_eq!(refused_designation_detail(&conn).unwrap(), Some(unknown));

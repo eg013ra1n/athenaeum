@@ -284,6 +284,20 @@ pub async fn set_project_auto_publish(
         .map_err(api_err)
 }
 
+/// Amendment A6: "Publish from this device" — make this device the one that
+/// announces new frames of this account into the project. Returns the
+/// refreshed card (`publishingDevice`, `publishingHere`).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_collab_publishing_device(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<api::ProjectCard>, (axum::http::StatusCode, String)> {
+    api::set_collab_publishing_device(&state.ctx, &args.project_id)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// The project's local replication policy (collab v3, spec §5.3).
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_collab_policy(

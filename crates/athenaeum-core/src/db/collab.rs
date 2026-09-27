@@ -204,6 +204,68 @@ pub fn upsert_project(conn: &Connection, row: &CollabProjectRow) -> Result<()> {
     Ok(())
 }
 
+/// The account's publishing device for a project (amendment A6): the one
+/// device of this account that may announce NEW frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishingDevice {
+    /// Base64 of the device's public key (P3), as `own_device_id` spells it.
+    pub device_id: String,
+    pub name: Option<String>,
+}
+
+/// The cached publishing device of a project; `None` when nothing is bound
+/// (or the project is not cached).
+pub fn publishing_device(conn: &Connection, project_id: &str) -> Result<Option<PublishingDevice>> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT publishing_device_id, publishing_device_name FROM collab_projects
+             WHERE project_id = ?1",
+            params![project_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((Some(device_id), name)) => Some(PublishingDevice { device_id, name }),
+        _ => None,
+    })
+}
+
+/// Store the project's publishing device as the hub last reported it
+/// (`/me/projects`, a `409 publishing_device`, or the switch reply) — the
+/// ONLY writer of the two columns. Returns whether the bound DEVICE changed
+/// (a rename alone is written but is not a change). A project that is not
+/// cached is left alone (`false`).
+pub fn set_publishing_device(
+    conn: &Connection,
+    project_id: &str,
+    device: Option<&PublishingDevice>,
+) -> Result<bool> {
+    // IMMEDIATE: it reads the stored binding before it writes (the project
+    // rule for every read-then-write transaction).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let before: Option<Option<String>> = tx
+        .query_row(
+            "SELECT publishing_device_id FROM collab_projects WHERE project_id = ?1",
+            params![project_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(before) = before else {
+        return Ok(false);
+    };
+    tx.execute(
+        "UPDATE collab_projects SET publishing_device_id = ?2, publishing_device_name = ?3
+         WHERE project_id = ?1",
+        params![
+            project_id,
+            device.map(|d| d.device_id.as_str()),
+            device.and_then(|d| d.name.as_deref()),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(before.as_deref() != device.map(|d| d.device_id.as_str()))
+}
+
 /// Record the manifest-sync cursor after a successful fetch (P9): the highest
 /// `manifestVersion` applied (`manifest_cursor`) and the caps as of that sync
 /// (`synced_caps_json`); plus the `projects.version` the version poll vouched
@@ -678,6 +740,50 @@ mod tests {
     /// Wave 3 (Task 1): the same holds for the live-feed cursor
     /// (`feed_epoch`/`holder_seq`), set by [`set_feed_version`]/
     /// [`set_holder_seq`].
+    /// A6: the binding store reports a DEVICE move (not a rename), survives
+    /// a wholesale poll refresh, and ignores an uncached project.
+    #[test]
+    fn publishing_device_is_stored_and_reports_a_move() {
+        let conn = test_conn();
+        upsert_project(&conn, &sample_row("p-1")).unwrap();
+        assert_eq!(publishing_device(&conn, "p-1").unwrap(), None);
+        let a = PublishingDevice {
+            device_id: "QUFB".into(),
+            name: Some("Obs PC".into()),
+        };
+        assert!(
+            set_publishing_device(&conn, "p-1", Some(&a)).unwrap(),
+            "first bind"
+        );
+        let renamed = PublishingDevice {
+            name: Some("Observatory".into()),
+            ..a.clone()
+        };
+        assert!(
+            !set_publishing_device(&conn, "p-1", Some(&renamed)).unwrap(),
+            "a rename is not a move"
+        );
+        assert_eq!(
+            publishing_device(&conn, "p-1").unwrap(),
+            Some(renamed.clone())
+        );
+        upsert_project(&conn, &sample_row("p-1")).unwrap();
+        assert_eq!(
+            publishing_device(&conn, "p-1").unwrap(),
+            Some(renamed),
+            "a poll refresh leaves the binding to its own writer"
+        );
+        assert!(
+            set_publishing_device(&conn, "p-1", None).unwrap(),
+            "unbound"
+        );
+        assert_eq!(publishing_device(&conn, "p-1").unwrap(), None);
+        assert!(
+            !set_publishing_device(&conn, "p-x", Some(&a)).unwrap(),
+            "not cached"
+        );
+    }
+
     #[test]
     fn upsert_project_preserves_local_columns() {
         let conn = test_conn();

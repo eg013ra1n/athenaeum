@@ -281,6 +281,18 @@ async fn run_publish_pass<F, Fut>(
                 );
                 request_auto_publish(Some(&project_id));
             }
+            Err(ApiError::Conflict(msg)) if is_publishing_device_refusal(&msg) => {
+                // A6: another device of this account publishes into this
+                // project. Quiet by design: the refusal is recorded with the
+                // project (the next run stops before any work), and a moved
+                // binding re-arms this project (`refresh_projects_reporting`,
+                // `set_collab_publishing_device`) — never a retry loop.
+                tracing::debug!(
+                    project_id = %project_id,
+                    outcome = "publishing_device",
+                    "auto-publish: another device of this account publishes into this project; waiting for the binding to move"
+                );
+            }
             Err(ApiError::Conflict(msg)) if msg == COLLAB_API_OUTDATED_MSG => {
                 tracing::warn!(
                     project_id = %project_id,
@@ -298,6 +310,15 @@ async fn run_publish_pass<F, Fut>(
             }
         }
     }
+}
+
+/// Whether a publish error is the A6 publishing-device refusal
+/// (`collab_publishing_device:<name>`).
+fn is_publishing_device_refusal(msg: &str) -> bool {
+    msg.starts_with(&format!(
+        "{}:",
+        crate::account::client::COLLAB_PUBLISHING_DEVICE
+    ))
 }
 
 /// Re-marks a project dirty without waking the worker — the `DIRTY`-only

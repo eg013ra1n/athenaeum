@@ -338,6 +338,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/list_collab_frames", post(collab::list_collab_frames))
         .route("/api/set_project_auto_replicate", post(collab::set_project_auto_replicate))
         .route("/api/set_project_auto_publish", post(collab::set_project_auto_publish))
+        .route("/api/set_collab_publishing_device", post(collab::set_collab_publishing_device))
         .route("/api/get_collab_policy", post(collab::get_collab_policy))
         .route("/api/set_collab_policy", post(collab::set_collab_policy))
         .route("/api/preview_collab_policy", post(collab::preview_collab_policy))

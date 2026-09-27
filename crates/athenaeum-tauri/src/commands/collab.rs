@@ -157,6 +157,20 @@ pub async fn set_project_auto_publish(
         .map_err(|e| e.to_string())
 }
 
+/// Amendment A6: "Publish from this device" — make this device the one that
+/// announces new frames of this account into the project. Returns the
+/// refreshed card (`publishingDevice`, `publishingHere`).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_collab_publishing_device(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectCard, String> {
+    api::set_collab_publishing_device(&state.ctx, &project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// The project's local replication policy (collab v3, spec §5.3).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]

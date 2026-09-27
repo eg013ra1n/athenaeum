@@ -981,6 +981,7 @@ async fn check_storage_marker_for_designation(
                 kind,
                 offline,
                 offer,
+                checked_at: Some(chrono::Utc::now().to_rfc3339()),
             };
             // The one guarded writer (fix round 2): an offline answer never
             // replaces an online-verified classification of this folder and

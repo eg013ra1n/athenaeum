@@ -588,7 +588,7 @@ impl FeedApplier {
         mut rows: Vec<crate::collab::hub_client::FrameViewWire>,
     ) -> Result<(), ApiError> {
         use crate::db::collab_frames as frames_db;
-        let account = self.account_id.clone().unwrap_or_default();
+        let me = crate::api::collab_exchange::device_for_own(&self.ctx, pid)?;
         let database = db(&self.ctx)?;
         let conn = database.conn();
         let project = crate::api::collab_exchange::live_project(&conn, pid)?;
@@ -607,8 +607,9 @@ impl FeedApplier {
             usize,
         > = Default::default();
         for v in rows.iter_mut() {
-            v.own = v.publisher_account_id == account;
             let prev = frames_db::get(&tx, pid, &v.frame_uuid)?;
+            // A6: own per DEVICE, never per account.
+            crate::api::collab_exchange::derive_device_own(v, &me, prev.as_ref());
             for kind in crate::api::collab_exchange::classify_frame_change(prev.as_ref(), v) {
                 *counts.entry(kind).or_default() += 1;
             }
@@ -1162,6 +1163,7 @@ pub(crate) async fn reannounce_lost_own_frames(
     seen: &HashSet<String>,
 ) -> Result<usize, ApiError> {
     use crate::db::collab_frames::{self as frames_db, LocalState};
+    let me = crate::api::collab_exchange::device_for_own(ctx, project_id)?;
     let (lost, gate): (Vec<FrameInWire>, i32) = {
         let database = db(ctx)?;
         let conn = database.conn();
@@ -1176,6 +1178,15 @@ pub(crate) async fn reannounce_lost_own_frames(
                     &r.manifest_json,
                     "reannounce",
                 )
+            })
+            // A6: only frames THIS device published (a recorded device that
+            // is another one never re-announces here — that device does).
+            .filter(|v| {
+                let mine = v.publisher_device_id.as_deref().is_none_or(|d| d == me);
+                if !mine {
+                    tracing::debug!(project_id, frame_uuid = %v.frame_uuid, "re-announce: frame published by another device; skipped");
+                }
+                mine
             })
             .map(|v| FrameInWire {
                 frame_uuid: v.frame_uuid,
@@ -1240,6 +1251,33 @@ pub(crate) async fn reannounce_lost_own_frames(
                     for &i in already.iter().rev() {
                         batch.remove(i);
                     }
+                }
+                Err(crate::account::AccountClientError::PublishingDevice {
+                    device_id,
+                    device_name,
+                }) => {
+                    // A6: another device of this account publishes into the
+                    // project now; only it may announce. Recorded (the
+                    // publish path stops on it too) and NOT an error — an
+                    // error would keep the epoch reload failing and retrying.
+                    tracing::warn!(
+                        project_id,
+                        count = batch.len(),
+                        bound_device_id = %device_id,
+                        outcome = "publishing_device",
+                        "re-announce refused: another device of the account publishes into this project"
+                    );
+                    let database = db(ctx)?;
+                    let conn = database.conn();
+                    crate::db::collab::set_publishing_device(
+                        &conn,
+                        project_id,
+                        Some(&crate::db::collab::PublishingDevice {
+                            device_id,
+                            name: device_name,
+                        }),
+                    )?;
+                    return Ok(announced);
                 }
                 Err(e) => {
                     tracing::error!(project_id, count = batch.len(), error = %e, "re-announce of own frames failed");
@@ -1376,7 +1414,10 @@ mod tests {
         let (tmp, ctx) = crate::api::collab_exchange::test_support::test_ctx();
         let ctx = Arc::new(ctx);
         let hub = FakeHub::start().await;
-        hub.add_account("tok", "acc-me", "Me", "AAA=", None);
+        // A6: `own` is derived per device, so the hub must know this
+        // device's real key for "acc-me"'s frames to be own here.
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        hub.add_account("tok", "acc-me", "Me", &me, None);
         hub.add_account("tok-o", "acc-o", "Other", "BBB=", None);
         hub.add_project(
             PID,

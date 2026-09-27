@@ -190,6 +190,13 @@ fn map_client_err(e: AccountClientError) -> ApiError {
         AccountClientError::VersionConflict { content_version } => ApiError::Conflict(format!(
             "version_conflict: the hub has content version {content_version}"
         )),
+        // A6 collab refusals — `HubClient` never produces them either.
+        AccountClientError::PublishingDevice { device_name, .. } => ApiError::Conflict(
+            crate::account::client::publishing_device_msg(device_name.as_deref()),
+        ),
+        AccountClientError::NotPublishingDevice { device_name, .. } => ApiError::Conflict(
+            crate::account::client::not_publishing_device_msg(device_name.as_deref()),
+        ),
         AccountClientError::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
 }

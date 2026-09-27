@@ -2475,6 +2475,25 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             conn.execute(ddl, [])?;
         }
     }
+    // Amendment A6: the account's publishing device for the project, as
+    // `/me/projects` (or a `409 publishing_device` refusal) last reported it
+    // — HUB state with dedicated writers (`db::collab::set_publishing_device`),
+    // outside `upsert_project`'s wholesale list. NULL = nothing bound (or the
+    // bound device is out of service): "no device is publishing yet".
+    for (col, ddl) in [
+        (
+            "publishing_device_id",
+            "ALTER TABLE collab_projects ADD COLUMN publishing_device_id TEXT",
+        ),
+        (
+            "publishing_device_name",
+            "ALTER TABLE collab_projects ADD COLUMN publishing_device_name TEXT",
+        ),
+    ] {
+        if !column_exists(conn, "collab_projects", col)? {
+            conn.execute(ddl, [])?;
+        }
+    }
     // `local_state`/`frame_seq`/`state_changed_at`: the per-frame local state
     // machine (P8) — `db::collab_frames::set_local_state` is the ONLY writer
     // of `on_disk` going forward (the wave-2 writers keep writing it

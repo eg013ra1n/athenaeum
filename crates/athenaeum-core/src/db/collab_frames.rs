@@ -365,6 +365,9 @@ pub fn upsert_from_manifest_deferred(
     let Some(prev) = prev else {
         return Ok(());
     };
+    if prev.origin != origin {
+        return change_origin(conn, project_id, v, &prev, origin, routes);
+    }
 
     // An own row staged with new bytes (`stage_own_file`) whose version the
     // hub now confirms with exactly those bytes: same xxh3 and size as the
@@ -473,6 +476,71 @@ pub fn upsert_from_manifest_deferred(
             }
         }
     }
+    Ok(())
+}
+
+/// An existing row whose origin the manifest changed (amendment A6: `own`
+/// is derived per DEVICE from `publisherDeviceId`, no longer per account).
+/// The UPSERT above already wrote the new origin; this moves the local
+/// state to what a row of that origin starts as, never leaving an own
+/// state on a replica (or the reverse):
+///
+/// - own → replica (a frame another device of this account published —
+///   the pre-A6 derivation had cached it as own): the own-only columns go
+///   (`source_frame_id`, `recipe_hash`, `own_staged`); the state is what a
+///   new replica gets (`wanted` when published and accepted, else `idle`).
+///   A file at the recorded path is handed to the storage engine after the
+///   commit, which re-adopts it by hash (no transfer) or quarantines it.
+/// - replica → own (this device's key is the frame's publisher): `held`
+///   becomes `own_held`, anything else `own_missing`.
+fn change_origin(
+    conn: &Connection,
+    project_id: &str,
+    v: &FrameViewWire,
+    prev: &LocalFrameRow,
+    origin: FrameOrigin,
+    routes: &mut EngineRoutes,
+) -> Result<()> {
+    let to = match origin {
+        FrameOrigin::Replica => {
+            conn.execute(
+                "UPDATE project_frames_local
+                 SET source_frame_id = NULL, recipe_hash = NULL, own_staged = 0
+                 WHERE project_id = ?1 AND frame_uuid = ?2",
+                params![project_id, v.frame_uuid],
+            )?;
+            if v.state == "published" && v.accepted {
+                LocalState::Wanted
+            } else {
+                LocalState::Idle
+            }
+        }
+        FrameOrigin::Own => {
+            if prev.local_state == LocalState::Held {
+                LocalState::OwnHeld
+            } else {
+                LocalState::OwnMissing
+            }
+        }
+    };
+    set_local_state(conn, project_id, &v.frame_uuid, to)?;
+    if to == LocalState::Wanted {
+        if let Some(path) = prev.landed_path.as_deref().map(std::path::PathBuf::from) {
+            if path.is_file() {
+                routes
+                    .0
+                    .push((project_id.to_string(), v.frame_uuid.clone(), path));
+            }
+        }
+    }
+    tracing::info!(
+        project_id,
+        frame_uuid = %v.frame_uuid,
+        from_state = prev.local_state.as_db_str(),
+        to_state = to.as_db_str(),
+        outcome = if origin == FrameOrigin::Own { "own" } else { "replica" },
+        "frame origin changed with its publishing device"
+    );
     Ok(())
 }
 
@@ -1121,6 +1189,26 @@ pub fn update_landed_path(
     Ok(())
 }
 
+/// Every `fileName` a publisher (account) has in a project's cached
+/// manifest — what a new own frame's name must not reuse (amendment A6: a
+/// second device of the account may have published under the same name).
+pub fn file_names_of_publisher(
+    conn: &Connection,
+    project_id: &str,
+    publisher_account_id: &str,
+) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT file_name FROM project_frames_local
+         WHERE project_id = ?1 AND publisher_account_id = ?2",
+    )?;
+    let names = stmt
+        .query_map(params![project_id, publisher_account_id], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(names)
+}
+
 /// Every own-frame row of a project, keyed by its `source_frame_id` — the
 /// publish run's "what have I already published for this local frame" index
 /// (P19's recipe-hash comparison).
@@ -1602,6 +1690,121 @@ mod tests {
             })
             .collect();
         assert_eq!(paths, vec!["/collab/a.fits", "/collab/b.fits"]);
+    }
+
+    // ── Amendment A6: own per device ─────────────────────────────────────
+
+    /// A row the pre-A6 derivation cached as own (another device of this
+    /// account published it — `own_missing`, no file here) becomes a
+    /// `wanted` replica once the manifest names the other device: the own
+    /// state never survives on a replica, and it is fetched like any other.
+    #[test]
+    fn an_own_row_of_another_device_becomes_a_wanted_replica() {
+        let c = conn();
+        let mut v = view("u1", 1);
+        v.own = true;
+        upsert_from_manifest(&c, "p1", &v).unwrap();
+        c.execute(
+            "UPDATE project_frames_local SET source_frame_id = 7, recipe_hash = 'r'
+             WHERE frame_uuid = 'u1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            get(&c, "p1", "u1").unwrap().unwrap().local_state,
+            LocalState::OwnMissing
+        );
+        v.own = false;
+        v.manifest_version = 2;
+        upsert_from_manifest(&c, "p1", &v).unwrap();
+        let row = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(row.origin, FrameOrigin::Replica);
+        assert_eq!(row.local_state, LocalState::Wanted);
+        assert_eq!((row.source_frame_id, row.recipe_hash), (None, None));
+
+        // Unpublished (or excluded) → idle, not wanted.
+        let mut p = view("u2", 1);
+        p.own = true;
+        upsert_from_manifest(&c, "p1", &p).unwrap();
+        p.own = false;
+        p.accepted = false;
+        upsert_from_manifest(&c, "p1", &p).unwrap();
+        assert_eq!(
+            get(&c, "p1", "u2").unwrap().unwrap().local_state,
+            LocalState::Idle
+        );
+    }
+
+    /// An `own_held` row turned replica stops being claimed (its servable
+    /// state is gone until the storage engine re-adopts the file by hash).
+    #[test]
+    fn an_own_held_row_turned_replica_drops_its_claim() {
+        let c = conn();
+        let mut v = view("u1", 1);
+        v.own = true;
+        upsert_from_manifest(&c, "p1", &v).unwrap();
+        set_local_state(&c, "p1", "u1", LocalState::OwnHeld).unwrap();
+        assert!(crate::db::collab_live::my_claims(&c, "p1")
+            .unwrap()
+            .iter()
+            .any(|(u, _)| u == "u1"));
+        v.own = false;
+        upsert_from_manifest(&c, "p1", &v).unwrap();
+        let row = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(
+            (row.origin, row.local_state),
+            (FrameOrigin::Replica, LocalState::Wanted)
+        );
+        assert!(!row.on_disk);
+        assert!(!crate::db::collab_live::my_claims(&c, "p1")
+            .unwrap()
+            .iter()
+            .any(|(u, _)| u == "u1"));
+    }
+
+    /// The reverse (this device's key is the publisher): a held replica
+    /// becomes `own_held`, anything else `own_missing`.
+    #[test]
+    fn a_replica_this_device_published_becomes_own() {
+        let c = conn();
+        let v = view("u1", 1);
+        upsert_from_manifest(&c, "p1", &v).unwrap();
+        set_local_state(&c, "p1", "u1", LocalState::Held).unwrap();
+        let mut mine = v.clone();
+        mine.own = true;
+        upsert_from_manifest(&c, "p1", &mine).unwrap();
+        let row = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(
+            (row.origin, row.local_state),
+            (FrameOrigin::Own, LocalState::OwnHeld)
+        );
+
+        upsert_from_manifest(&c, "p1", &view("u2", 1)).unwrap();
+        let mut mine2 = view("u2", 2);
+        mine2.own = true;
+        upsert_from_manifest(&c, "p1", &mine2).unwrap();
+        assert_eq!(
+            get(&c, "p1", "u2").unwrap().unwrap().local_state,
+            LocalState::OwnMissing
+        );
+    }
+
+    /// Every name a publisher has in the project's manifest, whatever the
+    /// device or origin — and only that publisher's.
+    #[test]
+    fn file_names_of_publisher_cover_the_whole_manifest() {
+        let c = conn();
+        let mut own = view("u1", 1);
+        own.own = true;
+        upsert_from_manifest(&c, "p1", &own).unwrap();
+        upsert_from_manifest(&c, "p1", &view("u2", 1)).unwrap();
+        let mut other = view("u3", 1);
+        other.publisher_account_id = "a2".into();
+        upsert_from_manifest(&c, "p1", &other).unwrap();
+        let names = file_names_of_publisher(&c, "p1", "a1").unwrap();
+        let mut names: Vec<String> = names.into_iter().collect();
+        names.sort();
+        assert_eq!(names, vec!["c_u1.fits", "c_u2.fits"]);
     }
 
     #[test]

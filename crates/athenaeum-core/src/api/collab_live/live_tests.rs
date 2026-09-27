@@ -672,3 +672,95 @@ async fn the_frames_list_counts_live_holders_and_a_departure() {
     shutdown(&w.a.ctx).await;
     wait_for((0, 1), "A left, still a holder").await;
 }
+
+/// Amendment A6, the bug it fixes: a SECOND device of the account that
+/// published the frames receives them as replicas under its own policy —
+/// fetched, held, claimed on the hub, and served (a member of another
+/// account paired with it alone gets them from it after the publishing
+/// device went offline). It is not the publishing device ("Obs PC" is): an
+/// announce from it is refused naming that device, until it switches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_device_of_the_account_replicates_serves_and_publishes_only_after_a_switch() {
+    let w = ts::two_devices_of_one_account().await;
+    let uuids = w.a_publishes(2).await;
+    for u in &uuids {
+        w.b.wait_state(u, LocalState::Held, Duration::from_secs(20))
+            .await;
+        let row = w.b.row(u).unwrap();
+        assert_eq!(
+            row.origin,
+            crate::db::collab_frames::FrameOrigin::Replica,
+            "another device's frame is a replica here, never own"
+        );
+        assert_eq!(w.b.file_bytes(u), w.a.file_bytes(u));
+        w.hub
+            .wait_holder(ts::PID, u, &w.b.device(), Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            w.a.row(u).unwrap().origin,
+            crate::db::collab_frames::FrameOrigin::Own,
+            "still own on the device that published it"
+        );
+    }
+
+    // Served: the publishing device goes offline; `c` (paired with `b`
+    // only) gets every frame from `b`.
+    shutdown(&w.a.ctx).await;
+    w.start_c().await;
+    for u in &uuids {
+        w.c.wait_state(u, LocalState::Held, Duration::from_secs(20))
+            .await;
+        assert_eq!(w.c.file_bytes(u), w.b.file_bytes(u));
+    }
+
+    // Publishing: `b` is not the bound device — shown so, refused so.
+    let card = crate::api::collab::refresh_projects(&w.b.ctx)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.project_id == ts::PID)
+        .unwrap();
+    assert!(!card.publishing_here);
+    assert_eq!(
+        card.publishing_device.map(|d| (d.device_id, d.name)),
+        Some((w.a.device(), Some("Obs PC".to_string())))
+    );
+    let frame = |uuid: &str| crate::collab::hub_client::FrameInWire {
+        frame_uuid: uuid.into(),
+        file_name: format!("{uuid}.fits"),
+        blake3: "a".repeat(64),
+        byte_size: 10,
+        xxh3: "0".repeat(16),
+        filter_raw: "L".into(),
+        filter_canonical: "L".into(),
+        channel: "mono".into(),
+        exptime_sec: 300.0,
+        date_obs: None,
+        gate_version: 0,
+        meta: serde_json::json!({}),
+    };
+    let client = crate::collab::hub_client::CollabClient::new(w.hub.uri()).unwrap();
+    let refused = client
+        .announce_frames("tok-a2", ts::PID, &[frame("b1")])
+        .await;
+    assert!(
+        matches!(&refused, Err(crate::account::AccountClientError::PublishingDevice { device_id, .. }) if *device_id == w.a.device()),
+        "{refused:?}"
+    );
+
+    // "Publish from this device" on `b`: it publishes, `a` is refused.
+    let card = crate::api::collab::set_collab_publishing_device(&w.b.ctx, ts::PID)
+        .await
+        .unwrap();
+    assert!(card.publishing_here);
+    client
+        .announce_frames("tok-a2", ts::PID, &[frame("b1")])
+        .await
+        .expect("the bound device announces");
+    assert!(matches!(
+        client
+            .announce_frames("tok-a", ts::PID, &[frame("a9")])
+            .await,
+        Err(crate::account::AccountClientError::PublishingDevice { .. })
+    ));
+}

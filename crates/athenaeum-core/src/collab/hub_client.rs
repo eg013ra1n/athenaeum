@@ -34,6 +34,36 @@ pub struct MyProjectWire {
     /// `"data.moderate"`); empty for an ordinary member.
     #[serde(default)]
     pub gov_caps: Vec<String>,
+    /// The one device of this account that may announce NEW frames into the
+    /// project (amendment A6), or `None` when nothing is bound or the bound
+    /// device is revoked/retired — "no device is publishing yet", never
+    /// "publishing here". Absent on a hub that predates A6 → `None`.
+    #[serde(default)]
+    pub publishing_device: Option<PublishingDeviceWire>,
+}
+
+/// `/me/projects` → `publishingDevice` (amendment A6).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishingDeviceWire {
+    /// Base64 of the bound device's public key (P3) — the same string as
+    /// `GET /devices` → `pubkey` and `own_device_id`.
+    pub device_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Reply to `PUT /projects/{id}/publishing-device` (amendment A6).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishingDeviceSwitchWire {
+    /// The caller's base64 public key — the device now bound.
+    pub device_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub project_version: i64,
+    /// `false` when the caller was already bound (no bump, no event).
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,8 +154,17 @@ pub struct FrameViewWire {
     pub frame_seq: i32,
     pub publisher_account_id: String,
     pub publisher_display_name: String,
+    /// The account-level `own` the hub computes (`publisherAccountId ==
+    /// caller`). Since amendment A6 the app never trusts it: the manifest
+    /// appliers overwrite it with the DEVICE-own derivation
+    /// (`api::collab_exchange::derive_device_own`) before anything reads it.
     #[serde(default)]
     pub own: bool,
+    /// Base64 public key of the device that announced (or, after an accepted
+    /// fallback version, adopted) the frame — amendment A6. `None` when the
+    /// hub has no recorded device (and on a hub that predates A6).
+    #[serde(default)]
+    pub publisher_device_id: Option<String>,
     pub file_name: String,
     pub content_version: i32,
     pub blake3: String,
@@ -286,6 +325,20 @@ async fn classify(status: StatusCode, resp: reqwest::Response, what: &str) -> Ac
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0) as i32,
                 },
+                (StatusCode::CONFLICT, "publishing_device") => {
+                    let (device_id, device_name) = device_of(&json);
+                    AccountClientError::PublishingDevice {
+                        device_id,
+                        device_name,
+                    }
+                }
+                (StatusCode::CONFLICT, "not_publishing_device") => {
+                    let (device_id, device_name) = device_of(&json);
+                    AccountClientError::NotPublishingDevice {
+                        device_id,
+                        device_name,
+                    }
+                }
                 (StatusCode::GONE, _) => AccountClientError::Gone(error),
                 _ => http_status(
                     status,
@@ -303,6 +356,21 @@ async fn classify(status: StatusCode, resp: reqwest::Response, what: &str) -> Ac
             http_status(s, what, &msg)
         }
     }
+}
+
+/// `(deviceId, deviceName)` of an A6 refusal body (`publishing_device` /
+/// `not_publishing_device`): an absent id reads as empty, a null or absent
+/// name as `None`.
+fn device_of(json: &serde_json::Value) -> (String, Option<String>) {
+    (
+        json.get("deviceId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        json.get("deviceName")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    )
 }
 
 /// [`AccountClientError::Http`] with the wave-2 message text (was
@@ -724,6 +792,33 @@ impl CollabClient {
                 .map_err(|e| decode_err("versions batch", e));
         }
         Err(classify(status, resp, "frame versions batch").await)
+    }
+
+    /// `PUT /projects/{id}/publishing-device` — make THIS device (the
+    /// token's) the project's publishing device for its account (amendment
+    /// A6). Idempotent (`changed: false` when already bound). No body is
+    /// read by the hub; `{}` is sent.
+    pub async fn set_publishing_device(
+        &self,
+        token: &str,
+        project_id: &str,
+    ) -> Result<PublishingDeviceSwitchWire, AccountClientError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/projects/{project_id}/publishing-device")))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(net)?;
+        let status = resp.status();
+        if status == StatusCode::OK {
+            return resp
+                .json::<PublishingDeviceSwitchWire>()
+                .await
+                .map_err(|e| decode_err("publishing device", e));
+        }
+        Err(classify(status, resp, "publishing device").await)
     }
 
     /// `POST /me/presence` — the presence beat. Session-authenticated, no
@@ -1334,5 +1429,165 @@ mod tests {
             "state":"published","rejectReason":null,"manifestVersion":9,"createdAt":"2026-09-25T00:00:00Z"}))
         .unwrap();
         assert_eq!((v.frame_seq, v.own), (12, false));
+        assert_eq!(v.publisher_device_id, None, "absent → unknown device");
+    }
+
+    // ---- amendment A6: one publishing device per (project, account) ----
+
+    /// The manifest row names its device (`null` → unknown) and serializes
+    /// it back as `publisherDeviceId: null`, never dropped (the local cache
+    /// round-trips the whole row).
+    #[test]
+    fn frame_view_carries_the_publisher_device() {
+        let row = |device: serde_json::Value| -> FrameViewWire {
+            serde_json::from_value(json!({
+                "frameUuid":"u1","frameSeq":1,"publisherAccountId":"a","publisherDisplayName":"Ann",
+                "own":true,"publisherDeviceId":device,
+                "fileName":"c_x.fits","contentVersion":1,"blake3":"b","byteSize":10,"xxh3":"x",
+                "filterRaw":"Red","filterCanonical":"R","channel":"mono","exptimeSec":300.0,
+                "meta":{},"gateVersion":0,"accepted":true,"state":"published",
+                "manifestVersion":9,"createdAt":"2026-09-25T00:00:00Z"}))
+            .unwrap()
+        };
+        assert_eq!(
+            row(json!("QUJD")).publisher_device_id.as_deref(),
+            Some("QUJD")
+        );
+        let unknown = row(serde_json::Value::Null);
+        assert_eq!(unknown.publisher_device_id, None);
+        let back = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(back["publisherDeviceId"], serde_json::Value::Null);
+        assert!(back.as_object().unwrap().contains_key("publisherDeviceId"));
+    }
+
+    /// `/me/projects` → `publishingDevice {deviceId, name}` or `null`, and
+    /// absent on an older hub.
+    #[tokio::test]
+    async fn my_projects_reads_the_publishing_device() {
+        let server = MockServer::start().await;
+        let base = json!({"id":"p1","slug":"s","title":"T","dataRole":"send","coordinator":false,
+            "requireApproval":false});
+        let mut bound = base.clone();
+        bound["id"] = json!("p1");
+        bound["publishingDevice"] = json!({"deviceId":"QUJD","name":"Obs PC"});
+        let mut unbound = base.clone();
+        unbound["id"] = json!("p2");
+        unbound["publishingDevice"] = serde_json::Value::Null;
+        let mut older = base;
+        older["id"] = json!("p3");
+        Mock::given(method("GET"))
+            .and(path("/api/v1/me/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([bound, unbound, older])))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let mine = c.my_projects("t").await.unwrap();
+        assert_eq!(
+            mine[0].publishing_device,
+            Some(PublishingDeviceWire {
+                device_id: "QUJD".into(),
+                name: Some("Obs PC".into())
+            })
+        );
+        assert_eq!(mine[1].publishing_device, None);
+        assert_eq!(mine[2].publishing_device, None);
+    }
+
+    /// The two A6 409s are typed, carry the device, are never retried, and
+    /// map to the stable `collab_publishing_device:` /
+    /// `collab_not_publishing_device:` prefixes.
+    #[tokio::test]
+    async fn publishing_device_refusals_are_typed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/projects/p1/frames"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error":"publishing_device","deviceId":"QUJD","deviceName":"Obs PC"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/projects/p1/frames/u1/version"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error":"not_publishing_device","deviceId":"QUJD","deviceName":null})))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let err = c.announce_frames("t", "p1", &[]).await.unwrap_err();
+        assert!(
+            matches!(&err, AccountClientError::PublishingDevice { device_id, device_name }
+                if device_id == "QUJD" && device_name.as_deref() == Some("Obs PC")),
+            "{err:?}"
+        );
+        assert!(!is_retryable(&err));
+        assert_eq!(err.to_string(), "collab_publishing_device:Obs PC");
+        let err = c
+            .new_frame_version("t", "p1", "u1", 1, &"b".repeat(64), 10, &"0".repeat(16))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AccountClientError::NotPublishingDevice { device_id, device_name: None }
+                if device_id == "QUJD"),
+            "{err:?}"
+        );
+        assert!(!is_retryable(&err));
+        assert_eq!(
+            err.to_string(),
+            "collab_not_publishing_device:another device of this account"
+        );
+    }
+
+    /// `PUT /projects/{id}/publishing-device` sends `{}` and decodes the
+    /// binding.
+    #[tokio::test]
+    async fn set_publishing_device_puts_and_decodes_the_binding() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/projects/p1/publishing-device"))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "deviceId":"QUJD","name":null,"projectVersion":43,"changed":true})))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let reply = c.set_publishing_device("t", "p1").await.unwrap();
+        assert_eq!(
+            reply,
+            PublishingDeviceSwitchWire {
+                device_id: "QUJD".into(),
+                name: None,
+                project_version: 43,
+                changed: true
+            }
+        );
+    }
+
+    /// A batch reply with `not_publishing_device` — and with a status this
+    /// build has never heard of — still decodes as a whole.
+    #[tokio::test]
+    async fn a_versions_reply_with_new_statuses_still_decodes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/projects/p1/frames/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "projectVersion": 7,
+                "results": [
+                    {"uuid":"u1","status":"ok","contentVersion":2},
+                    {"uuid":"u2","status":"not_publishing_device","contentVersion":0},
+                    {"uuid":"u3","status":"some_future_status","contentVersion":0}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let c = CollabClient::new(server.uri()).unwrap();
+        let reply = c.frame_versions("t", "p1", &[]).await.unwrap();
+        let statuses: Vec<VersionStatus> = reply.results.iter().map(|r| r.status).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                VersionStatus::Ok,
+                VersionStatus::NotPublishingDevice,
+                VersionStatus::Unknown
+            ]
+        );
     }
 }

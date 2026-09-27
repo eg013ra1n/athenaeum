@@ -211,6 +211,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::account::EndpointAddrReport,
             crate::account::AccountDevice,
             crate::account::AccountStatus,
+            crate::api::collab::PublishingDeviceView,
             crate::api::collab::ProjectCard,
             crate::api::collab::ProjectDetail,
             crate::api::collab::ProjectMemberView,

@@ -106,6 +106,13 @@ pub enum VersionStatus {
     Conflict,
     NotFound,
     Forbidden,
+    /// Amendment A6: the frame may be versioned only by its own device (or,
+    /// when that one is out of service, the account's bound device).
+    NotPublishingDevice,
+    /// Any status this build does not know — a closed enum would fail to
+    /// decode the WHOLE batch reply over one new per-entry status.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
