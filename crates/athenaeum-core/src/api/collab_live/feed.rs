@@ -1352,9 +1352,10 @@ pub(crate) fn rebind_needs_reannounce(
     }
 }
 
-/// [`reannounce_after_rebind`] when [`rebind_needs_reannounce`] says so;
-/// the refused mark is cleared once the check succeeded. Never fails the
-/// caller (a switch or a refresh): a failure is logged.
+/// [`reannounce_after_rebind`] when [`rebind_needs_reannounce`] says so.
+/// The refused mark is cleared before the check and set again by a refusal
+/// inside it or by a failure. Never fails the caller (a switch or a
+/// refresh): a failure is logged.
 pub(crate) async fn after_binding_moved_here(
     ctx: &ServiceContext,
     project_id: &str,
@@ -1368,19 +1369,23 @@ pub(crate) async fn after_binding_moved_here(
         );
         return;
     }
-    match reannounce_after_rebind(ctx, project_id).await {
-        Ok(_) => {
-            let cleared = db(ctx).and_then(|d| {
-                crate::db::collab_live::set_reannounce_refused(&d.conn(), project_id, false)
-                    .map_err(ApiError::from)
-            });
-            if let Err(e) = cleared {
-                tracing::warn!(project_id, error = %e, "clearing the refused re-announce mark failed");
-            }
+    // Fix round 3 (m1): the mark is cleared BEFORE the check. A refusal
+    // inside it (the binding moved away again meanwhile) sets it again
+    // itself; a failure sets it again here — it never outlives or loses a
+    // refusal.
+    let mark = |refused: bool| {
+        let written = db(ctx).and_then(|d| {
+            crate::db::collab_live::set_reannounce_refused(&d.conn(), project_id, refused)
+                .map_err(ApiError::from)
+        });
+        if let Err(e) = written {
+            tracing::warn!(project_id, refused, error = %e, "writing the refused re-announce mark failed");
         }
-        Err(e) => {
-            tracing::warn!(project_id, error = %e, "re-announce check after the binding moved here failed");
-        }
+    };
+    mark(false);
+    if let Err(e) = reannounce_after_rebind(ctx, project_id).await {
+        tracing::warn!(project_id, error = %e, "re-announce check after the binding moved here failed");
+        mark(true);
     }
 }
 
@@ -1943,6 +1948,47 @@ mod tests {
             Some(me.as_str())
         );
         assert!(!marked(), "cleared after the check");
+    }
+
+    /// A6 fix round 3 (m1): the mark survives a refused check — the check
+    /// runs (the mark) while another device is bound again, is refused, and
+    /// the mark stays; a later none → this device still runs it.
+    #[tokio::test]
+    async fn the_refused_mark_survives_a_refused_check() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        hub.seed_frames(PID, "acc-me", &["own1"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.catch_up_project(PID, None, &[ChangeKind::Frames])
+            .await
+            .unwrap();
+        set_own_held(&ctx, PID, "own1");
+        hub.add_account("tok-2", "acc-me", "Me", "T1RIRVI=", None);
+        hub.set_publishing_device(PID, "acc-me", "T1RIRVI=");
+        hub.forget_frames(PID, &["own1"]);
+        let e2 = hub.rotate_epoch();
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        let marked = || {
+            crate::db::collab_live::reannounce_refused(&crate::api::db(&ctx).unwrap().conn(), PID)
+                .unwrap()
+        };
+        assert!(marked());
+        // The binding "came here" but moved away again before the check ran.
+        after_binding_moved_here(&ctx, PID, None, &me).await;
+        assert!(hub.frame(PID, "own1").is_none(), "refused again");
+        assert!(marked(), "the mark survives a refused check");
+        // Later: the other device is revoked, then this device is bound.
+        hub.revoke_device("T1RIRVI=", true);
+        crate::api::collab::refresh_projects(&ctx).await.unwrap();
+        hub.set_publishing_device(PID, "acc-me", &me);
+        crate::api::collab::refresh_projects(&ctx).await.unwrap();
+        assert!(hub.frame(PID, "own1").is_some(), "the check ran");
+        assert!(!marked());
     }
 
     #[tokio::test]

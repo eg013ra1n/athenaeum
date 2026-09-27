@@ -333,72 +333,108 @@ pub async fn replace_device(
         }
     };
     let already_replaced = marker.device_id == me;
+    // A6 fix round 3 (m3): every step after the hub retire is retryable.
+    // The replaced device is recorded BEFORE the retire, so a retry whose
+    // marker still names a RECORDED replaced device the hub no longer lists
+    // (retired) resumes after the retire: no list check, no second retire.
+    let recorded_replaced = !already_replaced && {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::collab_live::replaced_devices(&conn)?.contains_key(&marker.device_id)
+    };
 
     if !already_replaced {
-        let Some(dev) = crate::api::account::list_devices(ctx)
+        let listed = crate::api::account::list_devices(ctx)
             .await?
             .into_iter()
-            .find(|d| d.id == device_id)
-        else {
-            tracing::warn!(
-                path = %root.display(),
+            .find(|d| d.id == device_id);
+        let resume = recorded_replaced && listed.is_none();
+        if resume {
+            tracing::info!(
                 device_id,
-                "device replace refused: not an active device of this account"
+                replaced = %marker.device_id,
+                "device replace: resuming after the retire"
             );
-            return Err(ApiError::Invalid(
-                "this device is not an active device of your account".to_string(),
-            ));
-        };
-        if dev.pubkey != marker.device_id {
-            tracing::warn!(
-                path = %root.display(),
-                requested = device_id,
-                device_id = %marker.device_id,
-                "device replace refused: the marker names a different device"
-            );
-            return Err(ApiError::Invalid(
-                "the storage marker names a different device than the one being replaced"
-                    .to_string(),
-            ));
+        } else {
+            let Some(dev) = listed else {
+                tracing::warn!(
+                    path = %root.display(),
+                    device_id,
+                    "device replace refused: not an active device of this account"
+                );
+                return Err(ApiError::Invalid(
+                    "this device is not an active device of your account".to_string(),
+                ));
+            };
+            if dev.pubkey != marker.device_id {
+                tracing::warn!(
+                    path = %root.display(),
+                    requested = device_id,
+                    device_id = %marker.device_id,
+                    "device replace refused: the marker names a different device"
+                );
+                return Err(ApiError::Invalid(
+                    "the storage marker names a different device than the one being replaced"
+                        .to_string(),
+                ));
+            }
         }
 
         check_designation_preconditions(ctx, root, policy).await?;
 
-        // A6 fix round 2: the account the replaced device's frames belong
-        // to, resolved BEFORE the retire (a verified snapshot still lists
-        // the old device then).
-        let account = verified_account_for_replace(ctx, &me, &marker.device_id).await?;
-
-        match crate::api::account::revoke_device_retire(ctx, device_id.to_string()).await {
-            Ok(()) => {}
-            Err(ApiError::NotFound(_)) => {
-                tracing::info!(
-                    device_id,
-                    "device replace: the device was already retired; continuing"
+        if !resume {
+            // A6 fix rounds 2+3: the account the replaced device's frames
+            // belong to, resolved and RECORDED before the retire (a
+            // verified snapshot still lists the old device then; a failure
+            // after the retire stays retryable). An account in no project
+            // records "" — it inherits nothing, and the retry still resumes.
+            let account = verified_account_for_replace(ctx, &me, &marker.device_id).await?;
+            if account.is_none() {
+                tracing::warn!(
+                    device_id = %marker.device_id,
+                    "device replace: this account is in no known project; no authorship to inherit"
                 );
             }
-            Err(e) => return Err(e),
-        }
+            crate::api::collab_exchange::record_device_replaced(
+                ctx,
+                &marker.device_id,
+                account.as_deref().unwrap_or(""),
+            )?;
 
-        // A6 fix rounds 1+2: this device now stands in for the retired one
-        // — the frames it published are own here (and versionable: the
-        // hub's fallback accepts, then adopts them). The one-statement
-        // record is fatal; the re-derive below is best-effort and re-runs
-        // on a retry.
-        match &account {
-            Some(a) => {
-                crate::api::collab_exchange::record_device_replaced(ctx, &marker.device_id, a)?
+            match crate::api::account::revoke_device_retire(ctx, device_id.to_string()).await {
+                Ok(()) => {}
+                Err(ApiError::NotFound(_)) => {
+                    tracing::info!(
+                        device_id,
+                        "device replace: the device was already retired; continuing"
+                    );
+                }
+                Err(e) => {
+                    // The old device is still in service: its frames are not
+                    // this device's — take the record back.
+                    let undone = db(ctx).and_then(|db| {
+                        crate::db::collab_live::forget_replaced_device(
+                            &db.conn(),
+                            &marker.device_id,
+                        )
+                        .map_err(ApiError::from)
+                    });
+                    if let Err(u) = undone {
+                        tracing::error!(device_id = %marker.device_id, error = %u, "device replace: taking the replaced-device record back failed");
+                    }
+                    return Err(e);
+                }
             }
-            None => tracing::warn!(
-                device_id = %marker.device_id,
-                "device replace: this account is in no known project; no authorship to inherit"
-            ),
         }
 
         let new_marker = StoreMarker {
             store_id: marker.store_id.clone(),
             device_id: me.clone(),
         };
+        #[cfg(test)]
+        if FAIL_WRITE_MARKER_ONCE.with(|f| f.replace(false)) {
+            return Err(ApiError::Internal("injected write_marker failure".into()));
+        }
         write_marker(root, &new_marker).map_err(|e| {
             tracing::error!(path = %root.display(), error = %e, "device replace: writing the storage marker failed");
             ApiError::Internal(format!("write storage marker: {e}"))
@@ -438,30 +474,63 @@ pub async fn replace_device(
     Ok(ReplaceOutcome { scanned, adopted })
 }
 
-/// The verified account a replace records (A6 fix round 2): the signed-in
-/// session's account, else a verified snapshot's member listing this device
-/// or the one being replaced — refreshing the project list once from the
-/// hub when the catalog knows neither yet (a fresh reinstall). `None` only
-/// when the account is in no project at all (there is nothing to inherit).
+/// The verified account a replace records (A6 fix rounds 2+3), in order:
+/// a cached verified snapshot's member listing the OLD device; after one
+/// project refresh from the hub, the member listing the old device, then
+/// this device; last, the signed-in session's `hello.accountId`. A
+/// catalog last used by ANOTHER account never answers with that account
+/// (its snapshots do not list the old device, the refresh marks them lost,
+/// and the hello account is cleared at sign-out). `None` only when the
+/// account is in no project at all (there is nothing to inherit).
 async fn verified_account_for_replace(
     ctx: &ServiceContext,
     me: &str,
     old: &str,
 ) -> Result<Option<String>, ApiError> {
-    let known = {
+    use crate::api::collab_exchange::snapshot_account_listing;
+    // 1. A cached verified snapshot listing the OLD device — `list_devices`
+    //    just proved it this account's; a snapshot cached under another
+    //    sign-in never lists it.
+    {
         let db = db(ctx)?;
         let conn = db.conn();
-        crate::api::collab_exchange::verified_account_id(&conn, &[me, old])?
-    };
-    if known.is_some() {
-        return Ok(known);
+        if let Some(a) = snapshot_account_listing(&conn, old)? {
+            return Ok(Some(a));
+        }
     }
-    if let Err(e) = crate::api::collab::refresh_projects_reporting(ctx, None).await {
-        tracing::warn!(error = %e, "device replace: refreshing the projects to learn the account failed");
+    // 2. The signed-in account's projects, fresh from the hub (a project
+    //    cached under another sign-in is marked lost by it) — only then is
+    //    a snapshot listing THIS device trusted.
+    match crate::api::collab::refresh_projects_reporting(ctx, None).await {
+        Ok(_) => {
+            let db = db(ctx)?;
+            let conn = db.conn();
+            if let Some(a) = snapshot_account_listing(&conn, old)? {
+                return Ok(Some(a));
+            }
+            if let Some(a) = snapshot_account_listing(&conn, me)? {
+                return Ok(Some(a));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "device replace: refreshing the projects to learn the account failed");
+        }
     }
+    // 3. Last: the signed-in session's `hello.accountId` (cleared at sign-out).
     let db = db(ctx)?;
     let conn = db.conn();
-    crate::api::collab_exchange::verified_account_id(&conn, &[me, old])
+    Ok(crate::db::collab_live::meta_get(
+        &conn,
+        crate::db::collab_live::META_ACCOUNT_ID,
+    )?)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (A6 fix round 3): the next replace's marker write fails
+    /// once, AFTER the retire.
+    pub(crate) static FAIL_WRITE_MARKER_ONCE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Take over a Collaboration folder whose marker names a device this
@@ -1286,6 +1355,119 @@ mod tests {
             .await
             .expect("the retry");
         assert_eq!(origin(), FrameOrigin::Own, "the retry re-derived it");
+    }
+
+    /// A6 fix round 3 (m3): every step after the hub retire is retryable —
+    /// the marker write fails after the retire; the retry (the marker still
+    /// names the recorded, now retired device) skips the list check and the
+    /// retire and completes the replace.
+    #[tokio::test]
+    async fn a_marker_write_failing_after_the_retire_is_completed_by_a_retry() {
+        let (_t, ctx, hub) = signed_in_rig().await;
+        let root = collab_root(&ctx);
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        hub.seed_frames_with(test_support::PID, "acc-me", &["o1"], "published", |f| {
+            f.publisher_device_id = Some("OLD-DEV".into());
+        });
+        crate::api::collab_exchange::sync_manifest(&ctx, test_support::PID, None, None)
+            .await
+            .unwrap();
+        let store_id = read_marker(&root).unwrap().unwrap().store_id;
+        write_marker(
+            &root,
+            &StoreMarker {
+                store_id,
+                device_id: "OLD-DEV".into(),
+            },
+        )
+        .unwrap();
+        FAIL_WRITE_MARKER_ONCE.with(|f| f.set(true));
+        let err = replace_device(&ctx, "old-id", &root, &crate::api::PathPolicy::AllowAll)
+            .await
+            .expect_err("the injected marker failure");
+        assert!(matches!(err, ApiError::Internal(_)), "{err:?}");
+        assert!(hub.device_retired("old-id"), "retired before the failure");
+        assert_eq!(read_marker(&root).unwrap().unwrap().device_id, "OLD-DEV");
+        assert!(
+            crate::db::collab_live::replaced_devices(&db(&ctx).unwrap().conn())
+                .unwrap()
+                .contains_key("OLD-DEV")
+        );
+
+        replace_device(&ctx, "old-id", &root, &crate::api::PathPolicy::AllowAll)
+            .await
+            .expect("the retry resumes after the retire");
+        assert_eq!(
+            read_marker(&root).unwrap().unwrap().device_id,
+            my_device(&ctx).await
+        );
+        assert_eq!(
+            crate::db::collab_frames::get(&db(&ctx).unwrap().conn(), test_support::PID, "o1")
+                .unwrap()
+                .unwrap()
+                .origin,
+            FrameOrigin::Own
+        );
+    }
+
+    /// A6 fix round 3 (m2): a catalog last used by ANOTHER account X (its
+    /// cached snapshot lists this device under X; X's hello account was
+    /// kept), signed out and into Y, replacing before any hello under Y —
+    /// Y is recorded, never X. Sign-out clears the hello account.
+    #[tokio::test]
+    async fn a_replace_after_switching_accounts_never_records_the_previous_account() {
+        let (_t, ctx, hub) = signed_in_rig().await;
+        let root = collab_root(&ctx);
+        let me = my_device(&ctx).await;
+        {
+            let conn = db(&ctx).unwrap().conn();
+            let stale = serde_json::json!([{
+                "accountId": "acc-X", "displayName": "X", "dataRole": "send_receive",
+                "coordinator": false, "nodes": [me.clone()],
+            }])
+            .to_string();
+            conn.execute(
+                "UPDATE collab_projects SET members_json = ?1",
+                rusqlite::params![stale],
+            )
+            .unwrap();
+            crate::db::collab_live::meta_set(
+                &conn,
+                crate::db::collab_live::META_ACCOUNT_ID,
+                "acc-X",
+            )
+            .unwrap();
+        }
+        crate::api::account::sign_out(&ctx).await.unwrap();
+        assert_eq!(
+            crate::db::collab_live::meta_get(
+                &db(&ctx).unwrap().conn(),
+                crate::db::collab_live::META_ACCOUNT_ID
+            )
+            .unwrap(),
+            None,
+            "sign-out forgets the hello account"
+        );
+        // Signed into Y ("acc-me" on the hub), no hello yet.
+        crate::api::account::store_token_for_test(&ctx, "tok").unwrap();
+        hub.add_device("acc-me", "OLD-DEV", "old-id", "Old laptop", None);
+        let store_id = read_marker(&root).unwrap().unwrap().store_id;
+        write_marker(
+            &root,
+            &StoreMarker {
+                store_id,
+                device_id: "OLD-DEV".into(),
+            },
+        )
+        .unwrap();
+        replace_device(&ctx, "old-id", &root, &crate::api::PathPolicy::AllowAll)
+            .await
+            .unwrap();
+        let recorded = crate::db::collab_live::replaced_devices(&db(&ctx).unwrap().conn())
+            .unwrap()
+            .remove("OLD-DEV")
+            .expect("recorded");
+        assert_eq!(recorded.as_deref(), Some("acc-me"), "Y, never X");
     }
 
     /// Critical fix round 1, point 1: the reinstall flow. A plain

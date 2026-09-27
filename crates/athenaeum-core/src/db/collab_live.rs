@@ -109,6 +109,27 @@ pub fn record_replaced_device(
     Ok(())
 }
 
+/// Take back a replaced-device record (A6 fix round 3: the hub refused the
+/// retire it was written ahead of).
+pub fn forget_replaced_device(conn: &Connection, device_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM collab_replaced_devices WHERE device_id = ?1",
+        params![device_id],
+    )?;
+    Ok(())
+}
+
+/// Forget the live session's account id (`hello.accountId`) — at sign-out,
+/// so a catalog signed into another account never answers with the
+/// previous one (A6 fix round 3).
+pub fn clear_account_id(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM collab_live_meta WHERE key = ?1",
+        params![META_ACCOUNT_ID],
+    )?;
+    Ok(())
+}
+
 /// Every device this device replaced: device id → the account it was
 /// replaced in (`None` when unknown).
 pub fn replaced_devices(

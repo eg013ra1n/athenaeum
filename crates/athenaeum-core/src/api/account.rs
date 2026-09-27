@@ -141,6 +141,13 @@ fn clear_local_session(ctx: &ServiceContext, cfg: &AccountConfig) -> Result<(), 
     clear_state(ctx, keys::ACCOUNT_EMAIL)?;
     clear_state(ctx, keys::ACCOUNT_DEVICE_ID)?;
     clear_sync_caches(ctx)?;
+    // A6 fix round 3: the live session's account id belongs to this
+    // sign-in; the next one learns its own from its first hello.
+    {
+        let database = crate::api::db(ctx)?;
+        crate::db::collab_live::clear_account_id(&database.conn())
+            .map_err(|e| ApiError::Internal(format!("clear account id: {e:#}")))?;
+    }
     Ok(())
 }
 

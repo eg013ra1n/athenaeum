@@ -266,21 +266,14 @@ pub(crate) fn own_devices(
     })
 }
 
-/// The account a device replace records (A6 fix rounds 1+2): the signed-in
-/// session's account as the hub's authenticated `hello` gave it, else the
-/// member of a signature-verified membership snapshot whose nodes list one
-/// of `devices` (this device, or the device being replaced — both are this
-/// account's). `None` when the catalog knows neither.
+/// The member of a signature-verified cached membership snapshot whose
+/// nodes list `device` (A6: the account a device replace records), from the
+/// live projects only (a project lost to this sign-in is not consulted).
 #[cfg(all(feature = "render", feature = "solver"))]
-pub(crate) fn verified_account_id(
+pub(crate) fn snapshot_account_listing(
     conn: &rusqlite::Connection,
-    devices: &[&str],
+    device: &str,
 ) -> Result<Option<String>, ApiError> {
-    if let Some(a) =
-        crate::db::collab_live::meta_get(conn, crate::db::collab_live::META_ACCOUNT_ID)?
-    {
-        return Ok(Some(a));
-    }
     for p in crate::db::collab::list_projects(conn)? {
         let members: Vec<SnapshotMember> = match serde_json::from_str(&p.members_json) {
             Ok(m) => m,
@@ -291,7 +284,7 @@ pub(crate) fn verified_account_id(
         };
         if let Some(m) = members
             .into_iter()
-            .find(|m| m.nodes.iter().any(|n| devices.contains(&n.as_str())))
+            .find(|m| m.nodes.iter().any(|n| n == device))
         {
             return Ok(Some(m.account_id));
         }
