@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::collab_live::executor::test_hooks;
 use crate::api::collab_live::test_support::{self as ts, sent_bytes};
-use crate::api::collab_live::{set_receive_streams, shutdown, sync_now};
+use crate::api::collab_live::{set_receive_streams, shutdown};
 use crate::db::collab_frames::LocalState;
 use crate::sharing::iroh::assign::{ItemOutcome, LiveVerdict};
 
@@ -501,7 +501,7 @@ async fn storage_unmount_and_hub_restart() {
     }
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let writes = w.hub.holder_writes();
-    sync_now(&w.b.ctx).unwrap();
+    ts::sync_now_serial(&w.b.ctx).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
         w.hub.holder_writes(),

@@ -1788,6 +1788,19 @@ pub(crate) fn e2e_config() -> crate::api::collab_live::LiveConfig {
     cfg
 }
 
+/// Sync now, serialised against the tests that count a retry loop's
+/// attempts ([`RESET_ALL_TEST_SERIAL`](crate::collab::live::backoff::RESET_ALL_TEST_SERIAL)):
+/// its `reset_all` is process-global and restarts every sleeping back-off in
+/// the test process, so an unserialised Sync now gave
+/// `interactive_retry_gives_up_after_three_attempts_and_background_recovers`
+/// a fourth attempt (Task 18 gate).
+pub(crate) async fn sync_now_serial(ctx: &ServiceContext) {
+    let _serial = crate::collab::live::backoff::RESET_ALL_TEST_SERIAL
+        .lock()
+        .await;
+    crate::api::collab_live::sync_now(ctx).expect("sync now");
+}
+
 /// The plan's ceiling for any file under a working dir (wave-2 R32): the
 /// personal store never holds a frame's bytes.
 pub(crate) const WORKING_DIR_FILE_CAP: u64 = 64 * 1024;

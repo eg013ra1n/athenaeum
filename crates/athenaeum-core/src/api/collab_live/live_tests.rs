@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crate::api::collab_live::test_support as ts;
-use crate::api::collab_live::{shutdown, status, sync_now, LiveState};
+use crate::api::collab_live::{shutdown, status, LiveState};
 use crate::db::collab_frames::LocalState;
 
 async fn wait_status(ctx: &crate::services::ServiceContext, state: LiveState, within: Duration) {
@@ -103,7 +103,7 @@ async fn sync_now_reconnects_and_clears_back_offs() {
     w.hub.kill_streams();
     wait_status(&w.b.ctx, LiveState::Outdated, Duration::from_secs(5)).await;
     w.hub.set_api_outdated(false);
-    sync_now(&w.b.ctx).unwrap();
+    ts::sync_now_serial(&w.b.ctx).await;
     w.hub
         .wait_connected(ts::PID, &w.b.device(), Duration::from_secs(3))
         .await;
@@ -410,7 +410,7 @@ async fn a_slow_sweep_never_delays_a_yields_lane_release() {
     cfg.timings.sweep_delay = Duration::from_secs(30);
     let w = ts::two_instances_with(Some(8 * 1024 * 1024), cfg).await;
     let bound = lane_held_by_collab(&w).await;
-    sync_now(&w.b.ctx).unwrap(); // queues the (slow) sweep
+    ts::sync_now_serial(&w.b.ctx).await; // queues the (slow) sweep
     tokio::time::sleep(Duration::from_millis(200)).await;
     let admitted = w.b.personal_acquire_timed().await;
     assert!(admitted < bound, "waited {admitted:?} (bound {bound:?})");
