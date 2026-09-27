@@ -104,12 +104,12 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
  * once in `Layout.tsx` (next to `useProjectMatches`, same precedent) so a
  * data-loss-risk, user-actionable outcome — a mass deletion waiting for a
  * choice, a frame lost everywhere, an edited replica set aside (L4, L5) —
- * reaches `notify()` regardless of which page or tab is open,
- * and a background auto-publish or a manifest change arriving on the hub's
- * event feed surfaces a toast even when nobody is on the Projects page. Per-page hooks/components
- * (`useProjects`, `ReceiveTab`, `CollabAttention`) keep their own state/UI
- * concerns only — no `notify()` calls of their own for these events, so
- * there is exactly one place that can toast for each.
+ * reaches `notify()` regardless of which page or tab is open, and a
+ * background auto-publish or a manifest change arriving on the hub's event
+ * feed surfaces a toast even when nobody is on the Projects page. Per-page
+ * hooks/components (`useProjects`, `ReceiveTab`, `CollabAttention`) keep
+ * their own state/UI concerns only — no `notify()` calls of their own for
+ * these events, so there is exactly one place that can toast for each.
  */
 export function useCollabNotifications() {
   const { notify } = useNotifications();
