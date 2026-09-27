@@ -3414,6 +3414,31 @@ impl SharedIrohNode {
     /// frame whose permanent tag went missing (re-seed it) from one a publish
     /// is moving to a new version right now (leave it). A tag name that does
     /// not end in a version number is skipped with a `warn!`.
+    /// Every hash a named tag of the COLLAB store pins right now (one
+    /// listing): what the GC keeps (final fix B-I1 follow-up — a parked frame
+    /// waits while its complete entry is pinned by no tag).
+    pub async fn collab_tagged_hashes(&self) -> Result<std::collections::HashSet<Hash>> {
+        use n0_future::StreamExt as _;
+        let Some(store) = self.collab_store() else {
+            let e = anyhow!("no Collaboration root mounted");
+            tracing::warn!(error = %e, "list collab tags skipped");
+            return Err(e);
+        };
+        let mut stream = store.tags().list().await.map_err(|e| {
+            tracing::warn!(error = %e, "list collab tags failed");
+            anyhow!("list collab tags: {e}")
+        })?;
+        let mut out = std::collections::HashSet::new();
+        while let Some(entry) = stream.next().await {
+            let info = entry.map_err(|e| {
+                tracing::warn!(error = %e, "list collab tags failed");
+                anyhow!("list collab tag: {e}")
+            })?;
+            out.insert(info.hash);
+        }
+        Ok(out)
+    }
+
     pub async fn project_frame_tags(
         &self,
         project_id: &str,

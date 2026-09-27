@@ -1460,11 +1460,24 @@ impl StorageEngine {
                 return;
             }
         };
+        let mut tagged = self.node.collab_tagged_hashes().await.ok();
         let mut still = 0usize;
         for row in rows {
             self.pump(now);
-            if self.retry_one_parked(&row, ev).await {
+            if self.retry_one_parked(&row, tagged.as_ref(), ev).await {
                 still += 1;
+            } else if let (Some(t), Ok(h)) = (tagged.as_mut(), row.blake3.parse()) {
+                // Re-seeded: its entry is pinned on purpose now — an identical
+                // sibling later in this pass may re-seed too (a released row
+                // pins nothing).
+                let reseeded = db(&self.ctx)
+                    .and_then(|d| Ok(frames_db::get(&d.conn(), &row.project_id, &row.frame_uuid)?))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| r.local_state.servable());
+                if reseeded {
+                    t.insert(h);
+                }
             }
         }
         if still > 0 {
@@ -1474,7 +1487,15 @@ impl StorageEngine {
     }
 
     /// `true` when the frame stays parked.
-    async fn retry_one_parked(&mut self, row: &LocalFrameRow, ev: &mut Vec<StorageEvent>) -> bool {
+    ///
+    /// `tagged`: every hash a named tag pins now (`None`: unknown — a
+    /// complete entry is then waited on).
+    async fn retry_one_parked(
+        &mut self,
+        row: &LocalFrameRow,
+        tagged: Option<&std::collections::HashSet<iroh_blobs::Hash>>,
+        ev: &mut Vec<StorageEvent>,
+    ) -> bool {
         use crate::api::collab_live::replace::{land_candidate, Landing};
         use crate::sharing::iroh::node::BlobHealth;
         let path = PathBuf::from(row.landed_path.as_deref().unwrap_or_default());
@@ -1495,6 +1516,21 @@ impl StorageEngine {
         };
         match health {
             None => true,
+            // Final fix B-I1 follow-up: a complete entry NO tag pins is on
+            // its way out (a copied folder's store still naming the previous
+            // file, or a previous file that came back) — re-seeding would
+            // re-tag it with that previous path in its union. Wait for the
+            // GC. One a tag pins was made or kept on purpose (an identical
+            // sibling's fresh re-seed, C10): re-seed from this row's path.
+            Some(BlobHealth::Readable)
+                if !row
+                    .blake3
+                    .parse::<iroh_blobs::Hash>()
+                    .is_ok_and(|h| tagged.is_some_and(|t| t.contains(&h))) =>
+            {
+                tracing::debug!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, "parked frame's entry is complete and unpinned; waiting for the GC");
+                true
+            }
             Some(BlobHealth::Dead) => {
                 if !self.file_matches(row, &path).await {
                     self.release_or_quarantine_parked(
@@ -2637,21 +2673,66 @@ mod tests {
         }
     }
 
-    /// Final fix B-I1: a COPIED Collaboration folder (the previous one still
-    /// holds its files) is re-adopted by hash in place — not a mass
-    /// deletion, not a re-download — and the previous files are untouched.
+    /// Final fix B-I1 (+ follow-up): a COPIED Collaboration folder (the
+    /// previous one still holds its files) is re-adopted by hash in place —
+    /// not a mass deletion, not a re-download. The store entry may still name
+    /// the previous file, so each frame is parked first (no deletion choice,
+    /// nothing lost), and re-seeded from its new path once the GC dropped the
+    /// entry; the previous files are untouched.
     #[tokio::test]
     async fn a_copied_folder_is_readopted_by_hash_not_ruled_gone() {
+        use std::sync::atomic::Ordering;
+        let gate = gc_gate();
         let rig = ts::landed_rig(12).await;
+        crate::sharing::iroh::node::test_gc::arm(None);
         let prev = rig._tmp.path().join("previous-collab");
         recorded_in_a_previous_folder(&rig, &prev, true);
         let mut eng = rig.engine();
         let ev = eng.sweep(&Holders(0)).await;
-        assert_readopted_in_place(&rig, &ev);
-        for (_, _, path) in &rig.frames {
+        assert!(
+            !ev.iter().any(|e| matches!(
+                e,
+                StorageEvent::DeletionChoice { .. } | StorageEvent::FrameLost { .. }
+            )),
+            "{ev:?}"
+        );
+        for (pid, uuid, path) in &rig.frames {
+            let r = row(&rig.ctx, pid, uuid);
             assert!(
-                prev.join(path.file_name().unwrap()).exists(),
-                "the previous folder's file stays"
+                r.local_state == LocalState::Wanted && r.awaiting_gc,
+                "parked: {r:?}"
+            );
+            assert_eq!(
+                r.landed_path.as_deref(),
+                Some(path.to_string_lossy().as_ref())
+            );
+        }
+        let retry_at = eng.next_parked_retry.expect("a parked retry is scheduled");
+        // Before the GC the entry is still complete: the retry waits.
+        eng.tick(retry_at, &Holders(0)).await;
+        let (pid, uuid, _) = &rig.frames[0];
+        assert!(row(&rig.ctx, pid, uuid).awaiting_gc, "waits for the GC");
+        gate.store(true, Ordering::SeqCst);
+        for (pid, uuid, _) in &rig.frames {
+            wait_collected(&rig.node, &row(&rig.ctx, pid, uuid).blake3).await;
+        }
+        gate.store(false, Ordering::SeqCst);
+        let retry_at = eng.next_parked_retry.expect("still parked, retried again");
+        eng.tick(retry_at, &Holders(0)).await;
+        assert_readopted_in_place(&rig, &[]);
+        for (_, _, path) in &rig.frames {
+            let old = prev.join(path.file_name().unwrap());
+            assert!(old.exists(), "the previous folder's file stays");
+            std::fs::remove_file(&old).unwrap();
+        }
+        for (pid, uuid, _) in &rig.frames {
+            assert_eq!(
+                rig.node
+                    .collab_blob_health(row(&rig.ctx, pid, uuid).blake3.parse().unwrap())
+                    .await
+                    .unwrap(),
+                crate::sharing::iroh::node::BlobHealth::Readable,
+                "{uuid}: served from its new path, the previous folder deleted"
             );
         }
     }

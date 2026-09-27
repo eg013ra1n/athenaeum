@@ -1163,3 +1163,98 @@ async fn a_copied_collaboration_folder_is_readopted_not_refetched() {
 async fn a_moved_collaboration_folder_is_readopted_not_refetched() {
     readopted_after_relocation(false).await;
 }
+
+/// Final fix B-I1 follow-up — a move to another disk in Finder is a copy,
+/// then a delete: B's whole folder (store included) is copied, the copy
+/// designated, then the OLD folder deleted. Every frame is parked while the
+/// copied store still names the old file, re-seeded from its new path once
+/// the GC dropped that entry, and then reads through the store with the old
+/// folder gone — and `c`, paired with `b` only, gets every frame from it.
+/// Nothing is fetched again on `b`. The copy is named so the OLD path sorts
+/// FIRST in the store's path union (the case that goes dead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_copied_then_deleted_keeps_serving_from_its_new_place() {
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let w = ts::two_devices_of_one_account().await;
+    let uuids = w.a_publishes(12).await;
+    for u in &uuids {
+        w.b.wait_state(u, LocalState::Held, Duration::from_secs(30))
+            .await;
+    }
+    let landed = landed_total(&w.b);
+    let old_root = w.b.root.clone();
+    crate::api::scan_roots::clear_collaboration_dir(&w.b.ctx)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while status(&w.b.ctx).storage != crate::api::collab_live::StorageStateView::NotSet {
+        assert!(Instant::now() < deadline, "status {:?}", status(&w.b.ctx));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut name = old_root.file_name().unwrap().to_os_string();
+    name.push("z"); // "Collab/" sorts before "Collabz/"
+    let new_dir = old_root.with_file_name(name);
+    copy_tree(&old_root, &new_dir);
+    crate::sharing::iroh::node::test_gc::arm(Some(std::sync::Arc::clone(&gate)));
+    crate::api::scan_roots::set_collaboration_dir(
+        &w.b.ctx,
+        new_dir.to_string_lossy().to_string(),
+        &crate::api::PathPolicy::AllowAll,
+    )
+    .await
+    .unwrap();
+    crate::sharing::iroh::node::test_gc::arm(None);
+    let new_root = ts::collab_root(&w.b.ctx);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut next_sync = Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = crate::db::collab_frames::list_for_project(
+            &crate::api::db(&w.b.ctx).unwrap().conn(),
+            ts::PID,
+        )
+        .unwrap();
+        if rows
+            .iter()
+            .filter(|r| uuids.contains(&r.frame_uuid))
+            .all(|r| {
+                r.local_state == LocalState::Held
+                    && r.landed_path
+                        .as_deref()
+                        .is_some_and(|p| std::path::Path::new(p).starts_with(&new_root))
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "re-seeded in the new folder: {rows:#?}"
+        );
+        if Instant::now() >= next_sync {
+            // the parked retry also runs at every sweep
+            ts::sync_now_serial(&w.b.ctx).await;
+            next_sync = Instant::now() + Duration::from_secs(2);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::fs::remove_dir_all(&old_root).unwrap();
+    for u in &uuids {
+        let hash = w.b.row(u).unwrap().blake3.parse().unwrap();
+        assert_eq!(
+            w.b.node.collab_blob_health(hash).await.unwrap(),
+            crate::sharing::iroh::node::BlobHealth::Readable,
+            "{u}: reads through the store with the old folder deleted"
+        );
+    }
+    w.start_c().await;
+    for u in &uuids {
+        w.c.wait_state(u, LocalState::Held, Duration::from_secs(60))
+            .await;
+        assert_eq!(w.c.file_bytes(u), w.b.file_bytes(u));
+    }
+    assert_eq!(landed_total(&w.b), landed, "nothing fetched again on b");
+    assert_eq!(
+        frame_files(&new_root).len(),
+        uuids.len(),
+        "one file per frame"
+    );
+}

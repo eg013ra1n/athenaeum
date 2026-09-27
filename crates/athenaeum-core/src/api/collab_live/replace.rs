@@ -844,6 +844,20 @@ fn is_outside_replica(row: &LocalFrameRow, root: &Path, canon_root: Option<&Path
             .is_some_and(|p| !(p.starts_with(root) || canon_root.is_some_and(|c| p.starts_with(c))))
 }
 
+/// Whether the collab store holds `row`'s current version as an entry at
+/// all (readable or dead). Unknown (logged inside) reads as present: a park
+/// is the safe side.
+async fn entry_exists(node: &SharedIrohNode, row: &LocalFrameRow) -> bool {
+    let Ok(hash) = row.blake3.parse::<iroh_blobs::Hash>() else {
+        tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, "frame blake3 does not parse; its entry is taken as present");
+        return true;
+    };
+    !matches!(
+        node.collab_blob_health(hash).await,
+        Ok(crate::sharing::iroh::node::BlobHealth::Missing)
+    )
+}
+
 fn is_moved_class(row: &LocalFrameRow) -> bool {
     matches!(row.local_state, LocalState::Held | LocalState::OwnHeld)
         && row
@@ -1151,6 +1165,33 @@ pub(crate) async fn adopt_by_hash_detailed(
             owned_path = dest;
             &owned_path
         };
+        // Final fix B-I1 follow-up: a replica re-adopted from a COPIED folder
+        // (its previous file still exists outside the root) whose store entry
+        // exists — a store copied along still names the previous file, maybe
+        // FIRST (the path union, see `blobs::ensure_child_readable`). A seed
+        // at the new path would union it, not replace it, and the frame would
+        // go dead once the previous folder is deleted (a move to another disk
+        // is a copy, then a delete). Parked instead (R4(d)): its tags go, the
+        // GC drops the entry, and the parked retry re-seeds it from the new
+        // path only — nothing reads the previous file meanwhile.
+        if is_outside_replica(row, root, canon_root.as_deref())
+            && !is_moved_class(row)
+            && entry_exists(node, row).await
+        {
+            match park_row(ctx, node, row, landed_path).await {
+                Ok(()) => {
+                    tracing::info!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path = %landed_path.display(), "copied frame's store entry names the previous folder; parked until the GC drops it");
+                    parked.push((row.project_id.clone(), row.frame_uuid.clone()));
+                }
+                Err(e) => {
+                    if is_follower {
+                        cleanup_follower_copy(landed_path);
+                    }
+                    return Err(e);
+                }
+            }
+            continue;
+        }
         match land_candidate(ctx, node, row, landed_path).await {
             Ok(Landing::Landed { from, to }) => adopted.push(Adopted {
                 project_id: row.project_id.clone(),

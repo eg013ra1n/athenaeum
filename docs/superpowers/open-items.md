@@ -260,6 +260,21 @@ the transfers reference).
 - **Owed — hub deploy + one-week soak** (spec §15, with the hub section
   below): at least three real devices on the test hub; the hourly digest
   checks all match.
+- **Follow-ups from the final fix (owner-visible, not fixed)**:
+  - The catalog pool is 8 connections. Catalog writes now run off the live
+    runtime's loop (final fix A-I2), but several blocking writers can each
+    hold a pooled connection for the 5 s busy timeout under a long external
+    write lock; the loop's own reads still take a pooled connection, so pool
+    exhaustion (not a lock) could still stall it. Never seen in the tests.
+  - A publish regeneration temp (`<target>.athpub`, final fix B-M2) left by a
+    crash is no longer swept when the live session starts; the frame's next
+    regeneration overwrites it, and the watcher and the scanner ignore it
+    meanwhile. A stray `.athpub` in a project folder is that leftover.
+  - A stop that arrives while the runtime is still starting drops `ready()`
+    at its await (final fix A-M2), possibly between a lazy mount of the
+    store and its marker commit; the next start adopts the marker the way it
+    adopts a wave-2 root. Worth one look in a desktop click-through (sign
+    out right after launch).
 - **Owner decisions** (from the plan; each accepted provisionally):
   - P18 — one collab lane: the whole collab exchange holds ONE receive
     permit and yields it to a personal transfer at frame boundaries.
