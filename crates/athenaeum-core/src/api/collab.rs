@@ -1998,9 +1998,17 @@ fn new_frame_target(
 }
 
 /// The sibling temp an `update` regenerates into before its BLAKE3 decides
-/// whether it replaces the landed file (P19).
+/// whether it replaces the landed file (P19): `<target>.athpub`. Never the
+/// landing temp's `.athtmp` (final fix B-M2): the live session removes
+/// every `.athtmp` under the root when it starts (a crashed landing's), and
+/// a publish runs regardless of the session — it must never lose its temp
+/// to that sweep. The watcher ignores both; a crash's leftover `.athpub` is
+/// overwritten by the frame's next regeneration.
 fn update_temp_path(target: &Path) -> std::path::PathBuf {
-    crate::sharing::iroh::blobs::athtmp_path(target)
+    let mut s = target.as_os_str().to_owned();
+    s.push(".");
+    s.push(crate::collab::storage::watch::PUBLISH_TEMP_EXT);
+    std::path::PathBuf::from(s)
 }
 
 /// One gate-passing frame a publish run considers.
@@ -6642,6 +6650,27 @@ pub(crate) mod tests {
             let conn = crate::api::db(&fx.ctx).unwrap().conn();
             let row = crate::db::collab::get_project(&conn, PID).unwrap().unwrap();
             assert_eq!(row.thresholds_version, Some(1), "the refresh is cached");
+        }
+
+        /// Final fix B-M2: a publish's regeneration temp never shares the
+        /// landing temp's suffix — the live session's orphaned-temp sweep at
+        /// its start leaves an in-flight publish temp alone.
+        #[test]
+        fn a_publish_temp_survives_the_landing_temp_sweep() {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join("m31").join("Me").join("c_L_0001.fits");
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let temp = update_temp_path(&target);
+            std::fs::write(&temp, b"regenerating").unwrap();
+            let landing = crate::sharing::iroh::blobs::athtmp_path(&target);
+            std::fs::write(&landing, b"a crashed landing").unwrap();
+            crate::api::collab_live::landing::sweep_orphaned_athtmp(root.path());
+            assert!(temp.exists(), "the publish temp stays");
+            assert!(!landing.exists(), "a landing's orphan goes");
+            assert!(crate::collab::storage::watch::is_ignored(
+                root.path(),
+                &temp
+            ));
         }
 
         /// P19: an mtime-only touch of the source moves the recipe, the frame

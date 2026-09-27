@@ -1009,3 +1009,157 @@ async fn sync_now_before_the_runtime_runs_is_applied_when_it_starts() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+// ── final fix, group B: a moved or copied Collaboration folder ──────────
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    for e in walkdir::WalkDir::new(from)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let rel = e.path().strip_prefix(from).unwrap();
+        let dest = to.join(rel);
+        if e.file_type().is_dir() {
+            std::fs::create_dir_all(&dest).unwrap();
+        } else if e.file_type().is_file() {
+            std::fs::copy(e.path(), &dest).unwrap();
+        }
+    }
+}
+
+/// Every frame file under `root` outside `.athenaeum`.
+fn frame_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| !e.path().components().any(|c| c.as_os_str() == ".athenaeum"))
+        .map(|e| e.path().to_path_buf())
+        .collect()
+}
+
+fn landed_total(i: &ts::Instance) -> u64 {
+    i.events
+        .payloads(crate::api::collab_exchange::COLLAB_FRAMES_LANDED_EVENT)
+        .iter()
+        .map(|p| p["landed"].as_u64().unwrap_or(0))
+        .sum()
+}
+
+/// B's folder moved or copied elsewhere (`copy`: the old one stays), with
+/// its store, and the new place designated — every replica must be
+/// re-adopted where the new folder holds it (final fix B-I1).
+async fn readopted_after_relocation(copy: bool) {
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let w = ts::two_instances().await;
+    let uuids = w.a_publishes(12).await;
+    for u in &uuids {
+        w.b.wait_state(u, LocalState::Held, Duration::from_secs(30))
+            .await;
+    }
+    let old_root = w.b.root.clone();
+    let landed = landed_total(&w.b);
+    let choices =
+        w.b.events
+            .payloads(crate::api::collab_live::COLLAB_DELETION_CHOICE_EVENT)
+            .len();
+    crate::api::scan_roots::clear_collaboration_dir(&w.b.ctx)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while status(&w.b.ctx).storage != crate::api::collab_live::StorageStateView::NotSet {
+        assert!(Instant::now() < deadline, "status {:?}", status(&w.b.ctx));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let other = tempfile::tempdir().unwrap();
+    let new_dir = other.path().join("Collab-elsewhere");
+    if copy {
+        copy_tree(&old_root, &new_dir);
+    } else {
+        std::fs::rename(&old_root, &new_dir).unwrap();
+    }
+    // A moved store's entries still name the old paths: the GC (on for the
+    // store opened now) drops them once the frames re-seeded at the new ones.
+    crate::sharing::iroh::node::test_gc::arm(Some(std::sync::Arc::clone(&gate)));
+    crate::api::scan_roots::set_collaboration_dir(
+        &w.b.ctx,
+        new_dir.to_string_lossy().to_string(),
+        &crate::api::PathPolicy::AllowAll,
+    )
+    .await
+    .unwrap();
+    crate::sharing::iroh::node::test_gc::arm(None);
+    let new_root = ts::collab_root(&w.b.ctx);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut next_sync = Instant::now() + Duration::from_secs(3);
+    loop {
+        let rows = crate::db::collab_frames::list_for_project(
+            &crate::api::db(&w.b.ctx).unwrap().conn(),
+            ts::PID,
+        )
+        .unwrap();
+        let held_here = rows
+            .iter()
+            .filter(|r| uuids.contains(&r.frame_uuid))
+            .all(|r| {
+                r.local_state == LocalState::Held
+                    && r.landed_path
+                        .as_deref()
+                        .is_some_and(|p| std::path::Path::new(p).starts_with(&new_root))
+            });
+        if held_here {
+            break;
+        }
+        assert!(
+            rows.iter()
+                .all(|r| r.local_state != LocalState::AwaitingChoice),
+            "no deletion choice: {rows:#?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "re-adopted in the new folder: {rows:#?}"
+        );
+        if Instant::now() >= next_sync {
+            // A parked frame (a moved store's dead entry) is retried by the
+            // next sweep once the GC dropped its entry.
+            ts::sync_now_serial(&w.b.ctx).await;
+            next_sync = Instant::now() + Duration::from_secs(3);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(landed_total(&w.b), landed, "no frame was fetched again");
+    assert_eq!(
+        w.b.events
+            .payloads(crate::api::collab_live::COLLAB_DELETION_CHOICE_EVENT)
+            .len(),
+        choices,
+        "no deletion choice"
+    );
+    let files = frame_files(&new_root);
+    assert_eq!(
+        files.len(),
+        uuids.len(),
+        "one file per frame, no `_1` beside it: {files:?}"
+    );
+    for u in &uuids {
+        assert_eq!(w.b.file_bytes(u), w.a.file_bytes(u));
+    }
+    if copy {
+        assert_eq!(
+            frame_files(&old_root).len(),
+            uuids.len(),
+            "the old folder is the user's"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copied_collaboration_folder_is_readopted_not_refetched() {
+    readopted_after_relocation(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_moved_collaboration_folder_is_readopted_not_refetched() {
+    readopted_after_relocation(false).await;
+}

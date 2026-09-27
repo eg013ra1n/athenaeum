@@ -747,7 +747,10 @@ fn reconcile_project_file(
         // (re-seeded at the new path, verified against the manifest, moved
         // through the state machine) — never a bare path repair behind its
         // back. Only with no engine running (or a stamped file outside the
-        // root) does the scanner repair the path itself.
+        // root) does the scanner repair the path itself — clearing the stamp
+        // (final fix B-M4): the collab store's entry still names the old
+        // path, and the engine's next check re-seeds the frame there or
+        // parks it over the dead entry, never leaving it held on it.
         if crate::collab::storage::watch::route_touched(path) {
             tracing::info!(
                 root_id,
@@ -759,14 +762,14 @@ fn reconcile_project_file(
             );
             return Ok(());
         }
-        frames_db::update_landed_path(conn, &row.project_id, &row.frame_uuid, current_path)?;
+        frames_db::repair_moved_landed_path(conn, &row.project_id, &row.frame_uuid, current_path)?;
         tracing::info!(
             root_id,
             src = row.landed_path.as_deref().unwrap_or_default(),
             path = %current_path,
             project_id = %row.project_id,
             frame_uuid = %row.frame_uuid,
-            "project frame moved; path repaired"
+            "project frame moved; path repaired, its seed re-checked by the storage engine"
         );
         return Ok(());
     }
@@ -3715,6 +3718,11 @@ mod calibrated_light_scan_tests {
             let result = run_scan(parallel, root.path(), &conn, 1);
             assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
             assert_eq!(landed(&conn, "m"), Some(s(&now)), "parallel={parallel}: path repaired");
+            assert_eq!(
+                frames_db::get(&conn, "p1", "m").unwrap().unwrap().size_mtime_seen,
+                None,
+                "parallel={parallel}: the stamp is cleared — the engine re-checks the seed (B-M4)"
+            );
             assert_eq!(catalog_rows(&conn), (0, 0), "parallel={parallel}");
             assert!(foreign(&conn).is_empty(), "parallel={parallel}: a moved frame is not foreign");
         }

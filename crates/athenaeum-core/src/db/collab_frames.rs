@@ -509,7 +509,16 @@ pub fn upsert_from_manifest_deferred(
 ///   A file at the recorded path is handed to the storage engine after the
 ///   commit, which re-adopts it by hash (no transfer) or quarantines it.
 /// - replica → own (this device's key is the frame's publisher): `held`
-///   becomes `own_held`, anything else `own_missing`.
+///   becomes `own_held`, `quarantined` becomes `own_changed` (its file
+///   changed: not served, the owner's to republish or put back — final fix
+///   B-M1), anything else `own_missing`. The quarantine record of a
+///   quarantined replica goes in the same write: an own frame's change is
+///   its owner's, never a "Changed files" entry, so no record is orphaned.
+/// - Accepted edge (final review B-M3): an own frame's file may lie OUTSIDE
+///   the Collaboration root (own frames live wherever their owner keeps
+///   them). Turned replica, that path is routed to the storage engine, but
+///   no engine watches it — the row stays `wanted` and is fetched into the
+///   root like any replica, a second copy beside the file outside.
 fn change_origin(
     conn: &Connection,
     project_id: &str,
@@ -532,15 +541,16 @@ fn change_origin(
                 LocalState::Idle
             }
         }
-        FrameOrigin::Own => {
-            if prev.local_state == LocalState::Held {
-                LocalState::OwnHeld
-            } else {
-                LocalState::OwnMissing
-            }
-        }
+        FrameOrigin::Own => match prev.local_state {
+            LocalState::Held => LocalState::OwnHeld,
+            LocalState::Quarantined => LocalState::OwnChanged,
+            _ => LocalState::OwnMissing,
+        },
     };
     set_local_state(conn, project_id, &v.frame_uuid, to)?;
+    if prev.local_state == LocalState::Quarantined && origin == FrameOrigin::Own {
+        crate::db::collab_live::unquarantine(conn, project_id, &v.frame_uuid)?;
+    }
     if to == LocalState::Wanted {
         if let Some(path) = prev.landed_path.as_deref().map(std::path::PathBuf::from) {
             if path.is_file() {
@@ -1223,6 +1233,26 @@ pub fn update_landed_path(
     Ok(())
 }
 
+/// The scanner's repair of a moved frame's path with no storage engine
+/// running (final fix B-M4): the path, and the stamp CLEARED — the collab
+/// store's entry still names the old path, so the row is not "verified at
+/// this path" until the engine's next check re-seeds it there (or parks it
+/// over the dead entry); it never stays held on a dead entry.
+pub fn repair_moved_landed_path(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    path: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE project_frames_local SET landed_path = ?3, size_mtime_seen = NULL,
+            updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2",
+        params![project_id, frame_uuid, path],
+    )?;
+    Ok(())
+}
+
 /// Every `fileName` a publisher (account) has in a project's cached
 /// manifest — what a new own frame's name must not reuse (amendment A6: a
 /// second device of the account may have published under the same name).
@@ -1821,6 +1851,41 @@ mod tests {
             get(&c, "p1", "u2").unwrap().unwrap().local_state,
             LocalState::OwnMissing
         );
+    }
+
+    /// Final fix B-M1: a QUARANTINED replica this device published turns
+    /// own as `own_changed` (its changed file is not served), and its
+    /// quarantine record goes in the same write — never an orphaned
+    /// "Changed files" record nothing can resolve.
+    #[test]
+    fn a_quarantined_replica_this_device_published_becomes_own_changed() {
+        let c = conn();
+        let v = view("u1", 1);
+        upsert_from_manifest(&c, "p1", &v).unwrap();
+        set_local_state(&c, "p1", "u1", LocalState::Quarantined).unwrap();
+        crate::db::collab_live::quarantine(
+            &c,
+            &crate::db::collab_live::QuarantineRow {
+                project_id: "p1".into(),
+                frame_uuid: "u1".into(),
+                path: "/collab/m31/ann/c_u1.fits".into(),
+                detected_at: String::new(),
+                quarantined_version: 1,
+                observed_size_mtime: Some("100:1700000000".into()),
+            },
+        )
+        .unwrap();
+        let mut mine = v.clone();
+        mine.own = true;
+        upsert_from_manifest(&c, "p1", &mine).unwrap();
+        let row = get(&c, "p1", "u1").unwrap().unwrap();
+        assert_eq!(
+            (row.origin, row.local_state),
+            (FrameOrigin::Own, LocalState::OwnChanged)
+        );
+        assert!(crate::db::collab_live::list_quarantine(&c, "p1")
+            .unwrap()
+            .is_empty());
     }
 
     /// Every name a publisher has in the project's manifest, whatever the

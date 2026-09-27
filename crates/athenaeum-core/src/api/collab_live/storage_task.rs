@@ -853,6 +853,9 @@ impl StorageEngine {
             }
         };
         match (changed_state, same_bytes) {
+            (false, true) if recorded.is_none() && row.local_state.servable() => {
+                self.verify_repaired(row, &path, &current, now, ev).await
+            }
             (false, true) => self.stamp_drift(row, &current).await,
             (false, false) => self.content_changed(row, &path, &current, false, ev).await,
             (true, true) => self.bytes_back(row, &path, &current, ev).await,
@@ -869,6 +872,97 @@ impl StorageEngine {
                 .await
                 {
                     tracing::error!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "changed-file stamp could not be recorded");
+                }
+            }
+        }
+    }
+
+    /// A servable row with no stamp: its path was repaired behind the
+    /// engine's back — the scanner's move repair while no engine ran (final
+    /// fix B-M4) — and its store entry may still name the old, gone path.
+    /// The bytes already hashed to the row's xxh3; the entry decides:
+    /// readable → the stamp is recorded and the seed tag checked; dead → the
+    /// frame is parked (its tags go, the GC collects the entry, the parked
+    /// retry re-seeds it from the new path) — never held on a dead entry;
+    /// missing or partial → seeded at the new path.
+    async fn verify_repaired(
+        &mut self,
+        row: &LocalFrameRow,
+        path: &str,
+        current: &Stamp,
+        now: Instant,
+        ev: &mut Vec<StorageEvent>,
+    ) {
+        let hash: iroh_blobs::Hash = match row.blake3.parse() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "a repaired frame's hash does not parse; left as is");
+                return;
+            }
+        };
+        let health = match self.node.collab_blob_health(hash).await {
+            Ok(h) => h,
+            Err(_) => return, // logged inside; the next sweep checks again
+        };
+        use crate::sharing::iroh::node::BlobHealth;
+        match health {
+            BlobHealth::Readable => {
+                self.stamp_drift(row, current).await;
+                let mut fresh = row.clone();
+                fresh.size_mtime_seen = Some(current.encode());
+                self.ensure_seeded(&fresh, path).await;
+            }
+            BlobHealth::Dead => {
+                let parked = if row.origin == FrameOrigin::Own {
+                    LocalState::OwnMissing
+                } else {
+                    LocalState::Wanted
+                };
+                match crate::api::collab_live::replace::park_row(
+                    &self.ctx,
+                    &self.node,
+                    row,
+                    Path::new(path),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        self.schedule_parked_retry(now);
+                        ev.push(StorageEvent::StateChanged {
+                            project_id: row.project_id.clone(),
+                            frame_uuid: row.frame_uuid.clone(),
+                            from: row.local_state,
+                            to: parked,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path, error = %e, "a repaired frame over a dead entry could not be parked")
+                    }
+                }
+            }
+            BlobHealth::Missing | BlobHealth::Partial => {
+                match crate::api::collab_live::replace::land_candidate(
+                    &self.ctx,
+                    &self.node,
+                    row,
+                    Path::new(path),
+                )
+                .await
+                {
+                    Ok(crate::api::collab_live::replace::Landing::Landed { from, to })
+                        if from != to =>
+                    {
+                        ev.push(StorageEvent::StateChanged {
+                            project_id: row.project_id.clone(),
+                            frame_uuid: row.frame_uuid.clone(),
+                            from,
+                            to,
+                        })
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, path, error = %e, "a repaired frame could not be seeded at its path")
+                    }
                 }
             }
         }
@@ -1317,11 +1411,19 @@ impl StorageEngine {
         // the L4 deletion path rules it (re-fetched into the new root, or
         // the one choice for a mass) and "lost everywhere" warns as usual.
         // Own frames live wherever their owner keeps them: never.
+        //
+        // Final fix B-I1: a MOVED or COPIED Collaboration folder brings its
+        // frame files along — each is re-adopted by hash at its place in the
+        // new root first (no re-download, no deletion choice, no `_1`
+        // duplicate beside it); only a replica with no matching file in the
+        // new root is ruled by rule A (`file_gone` re-reads every row and
+        // skips the re-adopted ones).
         if !outside.is_empty() {
+            self.adopt_unseen_moves(&outside, now, &mut ev).await;
             tracing::info!(
                 path = %self.root.display(),
                 count = outside.len(),
-                "replicas outside the collaboration folder counted as gone"
+                "replicas outside the collaboration folder checked against the new folder"
             );
             self.file_gone(outside, now, holders, &mut ev).await;
         }
@@ -1684,7 +1786,9 @@ impl StorageEngine {
 
     /// Moves the watcher did not see: before removals are ruled, walk the
     /// root for frame files no row references whose size matches a removed
-    /// frame, and re-adopt them by hash (fix round 1).
+    /// frame, and re-adopt them by hash (fix round 1) — also a replica whose
+    /// file lies outside the current root (a moved or copied Collaboration
+    /// folder, final fix B-I1).
     async fn adopt_unseen_moves(
         &mut self,
         removed: &[LocalFrameRow],
@@ -1698,6 +1802,7 @@ impl StorageEngine {
                 r.landed_path
                     .as_deref()
                     .is_some_and(|p| !Path::new(p).exists())
+                    || self.replica_outside_root(r)
             })
             .map(|r| r.byte_size)
             .collect();
@@ -2452,7 +2557,9 @@ mod tests {
 
     /// Owner rule A follow-up (Task 16): a last copy ruled gone because it
     /// lies outside a re-designated root is still on disk — the lost
-    /// notice names the previous folder's file instead of the Trash.
+    /// notice names the previous folder's file instead of the Trash. (The
+    /// new root holds no copy of it — one it held is re-adopted instead,
+    /// final fix B-I1.)
     #[tokio::test]
     async fn a_last_copy_outside_the_root_is_lost_with_its_previous_path() {
         let rig = ts::landed_rig(1).await;
@@ -2461,6 +2568,7 @@ mod tests {
         std::fs::create_dir_all(&old_dir).unwrap();
         let old = old_dir.join(path.file_name().unwrap());
         std::fs::copy(&path, &old).unwrap();
+        std::fs::remove_file(&path).unwrap(); // the new root is empty
         {
             let conn = crate::api::db(&rig.ctx).unwrap().conn();
             conn.execute(
@@ -2485,6 +2593,79 @@ mod tests {
             "{ev:?}"
         );
         assert!(old.exists(), "the previous folder's file is never touched");
+    }
+
+    /// Every frame of `rig` recorded under `prev` (a previous Collaboration
+    /// folder) instead of the rig's root, which still holds the files — as
+    /// after the folder was copied (`keep_prev`: the previous files stay) or
+    /// moved (they are gone) and the copy designated.
+    fn recorded_in_a_previous_folder(rig: &ts::LandedRig, prev: &Path, keep_prev: bool) {
+        std::fs::create_dir_all(prev).unwrap();
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        for (pid, uuid, path) in &rig.frames {
+            let old = prev.join(path.file_name().unwrap());
+            if keep_prev {
+                std::fs::copy(path, &old).unwrap();
+            }
+            conn.execute(
+                "UPDATE project_frames_local SET landed_path = ?3
+                 WHERE project_id = ?1 AND frame_uuid = ?2",
+                rusqlite::params![pid, uuid, old.to_string_lossy()],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Final fix B-I1: every frame re-adopted at its file in the new root —
+    /// still held, no deletion choice (a mass of 12), nothing lost.
+    fn assert_readopted_in_place(rig: &ts::LandedRig, ev: &[StorageEvent]) {
+        assert!(
+            !ev.iter().any(|e| matches!(
+                e,
+                StorageEvent::DeletionChoice { .. } | StorageEvent::FrameLost { .. }
+            )),
+            "{ev:?}"
+        );
+        for (pid, uuid, path) in &rig.frames {
+            let r = row(&rig.ctx, pid, uuid);
+            assert_eq!(r.local_state, LocalState::Held, "{uuid}");
+            assert_eq!(
+                r.landed_path.as_deref(),
+                Some(path.to_string_lossy().as_ref()),
+                "{uuid}: at its file in the new root"
+            );
+        }
+    }
+
+    /// Final fix B-I1: a COPIED Collaboration folder (the previous one still
+    /// holds its files) is re-adopted by hash in place — not a mass
+    /// deletion, not a re-download — and the previous files are untouched.
+    #[tokio::test]
+    async fn a_copied_folder_is_readopted_by_hash_not_ruled_gone() {
+        let rig = ts::landed_rig(12).await;
+        let prev = rig._tmp.path().join("previous-collab");
+        recorded_in_a_previous_folder(&rig, &prev, true);
+        let mut eng = rig.engine();
+        let ev = eng.sweep(&Holders(0)).await;
+        assert_readopted_in_place(&rig, &ev);
+        for (_, _, path) in &rig.frames {
+            assert!(
+                prev.join(path.file_name().unwrap()).exists(),
+                "the previous folder's file stays"
+            );
+        }
+    }
+
+    /// Final fix B-I1: a MOVED Collaboration folder (the previous files are
+    /// gone) is re-adopted by hash in place — not a mass deletion.
+    #[tokio::test]
+    async fn a_moved_folder_is_readopted_by_hash_not_ruled_gone() {
+        let rig = ts::landed_rig(12).await;
+        let prev = rig._tmp.path().join("previous-collab");
+        recorded_in_a_previous_folder(&rig, &prev, false);
+        let mut eng = rig.engine();
+        let ev = eng.sweep(&Holders(0)).await;
+        assert_readopted_in_place(&rig, &ev);
     }
 
     #[tokio::test]
@@ -2724,6 +2905,60 @@ mod tests {
                 Some(want.to_string_lossy().as_ref())
             );
         }
+    }
+
+    /// Final fix B-M4: a frame moved while no engine ran is repaired by the
+    /// scanner (its path, its stamp cleared). The engine's next sweep finds
+    /// its store entry dead at the old path and parks it — never held on a
+    /// dead entry — and the parked retry re-seeds it from the new path once
+    /// the GC dropped the entry.
+    #[tokio::test]
+    async fn a_path_the_scanner_repaired_is_reseeded_not_held_on_a_dead_entry() {
+        use std::sync::atomic::Ordering;
+        let gate = gc_gate();
+        let rig = ts::landed_rig(1).await;
+        crate::sharing::iroh::node::test_gc::arm(None);
+        let (pid, uuid, path) = rig.frames[0].clone();
+        let moved = path
+            .parent()
+            .unwrap()
+            .join("moved")
+            .join(path.file_name().unwrap());
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::rename(&path, &moved).unwrap();
+        frames_db::repair_moved_landed_path(
+            &crate::api::db(&rig.ctx).unwrap().conn(),
+            &pid,
+            &uuid,
+            &moved.to_string_lossy(),
+        )
+        .unwrap();
+        let mut eng = rig.engine();
+        eng.sweep(&Holders(2)).await;
+        let r = row(&rig.ctx, &pid, &uuid);
+        assert!(
+            r.local_state == LocalState::Wanted && r.awaiting_gc,
+            "parked, not held on a dead entry: {r:?}"
+        );
+        gate.store(true, Ordering::SeqCst);
+        wait_collected(&rig.node, &r.blake3).await;
+        gate.store(false, Ordering::SeqCst);
+        let retry_at = eng.next_parked_retry.expect("a parked retry is scheduled");
+        eng.tick(retry_at, &Holders(2)).await;
+        let r = row(&rig.ctx, &pid, &uuid);
+        assert_eq!(r.local_state, LocalState::Held);
+        assert_eq!(
+            r.landed_path.as_deref(),
+            Some(moved.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            rig.node
+                .collab_blob_health(r.blake3.parse().unwrap())
+                .await
+                .unwrap(),
+            crate::sharing::iroh::node::BlobHealth::Readable,
+            "served from the new path"
+        );
     }
 
     /// Wave-3 replacement for the retired wave-2

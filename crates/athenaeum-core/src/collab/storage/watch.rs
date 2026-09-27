@@ -142,6 +142,12 @@ impl Aggregator {
     }
 }
 
+/// The extension of a publish run's regeneration temp (`<target>.athpub`,
+/// P19) — distinct from a landing's `.athtmp` (final fix B-M2), so the live
+/// session's orphaned-landing-temp sweep at start never removes a publish
+/// temp in flight. Ignored by the watcher like the landing temp.
+pub const PUBLISH_TEMP_EXT: &str = "athpub";
+
 /// Everything under `.athenaeum` is ours, and most of it is ignored: the
 /// blob store and the write probe are internal bookkeeping, not content a
 /// device holds. Two exceptions produce a signal like any other path: the
@@ -149,7 +155,10 @@ impl Aggregator {
 /// (`store-id`) — a marker change (a device replace, a take-over) must not
 /// be swallowed silently (fix round 1, folded ruling).
 pub fn is_ignored(root: &Path, path: &Path) -> bool {
-    if path.extension().is_some_and(|e| e == "athtmp") {
+    if path
+        .extension()
+        .is_some_and(|e| e == "athtmp" || e == PUBLISH_TEMP_EXT)
+    {
         return true;
     }
     match path.strip_prefix(root) {
@@ -444,6 +453,7 @@ mod tests {
     fn our_own_temp_files_and_the_store_are_ignored_but_the_canary_is_not() {
         let root = Path::new("/c");
         assert!(is_ignored(root, Path::new("/c/m31/a/x.fits.athtmp")));
+        assert!(is_ignored(root, Path::new("/c/m31/a/x.fits.athpub")));
         assert!(is_ignored(
             root,
             Path::new("/c/.athenaeum/blobs/data/ab.data")

@@ -829,6 +829,21 @@ pub(crate) async fn land_candidate(
 /// Task 9: a `held`/`own_held` row whose recorded file no longer exists — a
 /// move inside the root (spec §9.4 "Held ──moved inside the root──▶ Held,
 /// re-adopted by hash, path updated, no transfer").
+/// A `held` replica whose recorded file lies outside the Collaboration
+/// root `root` (plain or canonical spelling): a moved or copied folder left
+/// it behind — re-adoptable from a file in the new root like a moved frame
+/// (final fix B-I1, spec I9). Its old file, if it still exists, is never
+/// touched.
+fn is_outside_replica(row: &LocalFrameRow, root: &Path, canon_root: Option<&Path>) -> bool {
+    row.origin == FrameOrigin::Replica
+        && row.local_state == LocalState::Held
+        && row
+            .landed_path
+            .as_deref()
+            .map(Path::new)
+            .is_some_and(|p| !(p.starts_with(root) || canon_root.is_some_and(|c| p.starts_with(c))))
+}
+
 fn is_moved_class(row: &LocalFrameRow) -> bool {
     matches!(row.local_state, LocalState::Held | LocalState::OwnHeld)
         && row
@@ -984,7 +999,9 @@ pub(crate) struct AdoptOutcome {
 /// classes: `wanted`, `missing`, `awaiting_choice`, `not_kept` (put back),
 /// `own_missing` (back), and — Task 9 — a `held`/`own_held` row whose
 /// recorded file no longer exists (moved inside the root: re-seeded at the
-/// new path, path updated, stays held, no outbox row).
+/// new path, path updated, stays held, no outbox row), and — final fix
+/// B-I1 — a `held` replica whose file lies outside `root` (a moved or
+/// copied Collaboration folder: adopted at its file in the new root).
 pub(crate) async fn adopt_by_hash_detailed(
     ctx: &ServiceContext,
     node: &SharedIrohNode,
@@ -1020,6 +1037,10 @@ pub(crate) async fn adopt_by_hash_detailed(
         .and_then(|rel| rel.components().next())
         .map(|c| c.as_os_str().to_string_lossy().to_string());
 
+    let canon_root = root
+        .canonicalize()
+        .ok()
+        .map(|c| crate::api::scan_roots::normalize_path(&c));
     let db = db(ctx)?;
     let (servable_or_own, idle, matched) = {
         let conn = db.conn();
@@ -1064,6 +1085,7 @@ pub(crate) async fn adopt_by_hash_detailed(
                         | LocalState::NotKept
                         | LocalState::OwnMissing
                 ) || is_moved_class(r)
+                    || is_outside_replica(r, root, canon_root.as_deref())
             })
             .cloned()
             .collect();
