@@ -397,10 +397,28 @@ impl Holdings {
     /// Send the device's whole claim set as `full: true` under a NEW journal
     /// sequence (a reused one would be ignored for every frame already
     /// stamped with it, T6 ruling), and ack every outbox row it subsumes.
+    ///
+    /// A claim that entered the local set while the report was in flight
+    /// WITHOUT an outbox row — an announce's or a version's implicit claim
+    /// (P9, hub contract "Implicit claims") — may have been written by the
+    /// hub before this report reached it, stamped below its `reportSeq`: the
+    /// hub then removed it as absent from the "whole set as of R", and the
+    /// digests still matched (both sides describe the set the report read).
+    /// Such a claim owes another full report, sent at once by
+    /// [`Self::flush_due`] — never left for the hourly digest check.
     pub async fn full_report(&mut self, project_id: &str) -> Result<(), ApiError> {
         match report_full(&self.ctx, &self.client, &self.token, project_id).await {
-            Ok(next_flush_ms) => {
-                self.needs_full.remove(project_id);
+            Ok((next_flush_ms, unreported)) => {
+                if unreported.is_empty() {
+                    self.needs_full.remove(project_id);
+                } else {
+                    tracing::info!(
+                        project_id,
+                        count = unreported.len(),
+                        "claims added while the full report was in flight; sending the full claim set again"
+                    );
+                    self.needs_full.insert(project_id.to_string());
+                }
                 self.report_ok(project_id, Some(next_flush_ms));
                 Ok(())
             }
@@ -875,13 +893,14 @@ async fn flush_once(
 /// Send the whole claim set as `full: true` under a NEW journal sequence R
 /// (taken in the same transaction that reads the set, so no outbox row below
 /// R is missing from it), and ack every outbox row up to R. Returns the hub's
-/// next flush delay.
+/// next flush delay and the claims the report may have cost
+/// ([`unreported_claims`]).
 async fn report_full(
     ctx: &ServiceContext,
     client: &CollabClient,
     token: &str,
     project_id: &str,
-) -> Result<u64, SendErr> {
+) -> Result<(u64, Vec<String>), SendErr> {
     let (report_seq, claims) = {
         let database = db(ctx)?;
         let conn = database.conn();
@@ -919,7 +938,36 @@ async fn report_full(
             "claim digest still differs after a full report; the next check retries"
         );
     }
-    Ok(reply.next_flush_ms)
+    let unreported = unreported_claims(ctx, project_id, &claims)?;
+    Ok((reply.next_flush_ms, unreported))
+}
+
+/// The frames whose local claim a `full: true` report that sent `reported`
+/// did not carry, and that no outbox row still names (after the report's
+/// ack, every row left is newer than it and its own flush reports it): a
+/// claim added without an outbox row while the report was in flight — an
+/// implicit claim. The hub may have written that claim before the report
+/// arrived and removed it again as absent from the full set.
+fn unreported_claims(
+    ctx: &ServiceContext,
+    project_id: &str,
+    reported: &[(String, i32)],
+) -> Result<Vec<String>, SendErr> {
+    let sent: HashMap<&str, i32> = reported.iter().map(|(u, v)| (u.as_str(), *v)).collect();
+    let database = db(ctx)?;
+    let conn = database.conn();
+    let tx = conn.unchecked_transaction()?;
+    let now = live_db::my_claims(&tx, project_id)?;
+    let pending: HashSet<String> = live_db::outbox(&tx, project_id)?
+        .into_iter()
+        .map(|r| r.frame_uuid)
+        .collect();
+    tx.commit()?;
+    Ok(now
+        .into_iter()
+        .filter(|(u, v)| sent.get(u.as_str()) != Some(v) && !pending.contains(u))
+        .map(|(u, _)| u)
+        .collect())
 }
 
 /// Apply a report's answer in one transaction: ack the outbox up to
@@ -1398,6 +1446,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hub.holder_seq("p1"), before);
+    }
+
+    /// An implicit claim (an announce's, a version's) that lands while a
+    /// full report is in flight: the hub wrote it before the report arrived,
+    /// stamped below the report's sequence, so the "whole set as of R"
+    /// removed it — and both digests still matched, since both describe the
+    /// set the report read. The claim is owed at once (another full report),
+    /// never left for the hourly digest check: until then no other member
+    /// can fetch the frame from its only holder.
+    #[tokio::test]
+    async fn an_implicit_claim_added_during_a_full_report_is_reported_again_at_once() {
+        let (_t, ctx, hub, mut h) = rig().await;
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            live_db::add_implicit_claim(&conn, "p1", "u1", 1).unwrap();
+        }
+        let ctx2 = Arc::clone(&ctx);
+        hub.before_next("/holders/self", move |st| {
+            // The announce of u2 completes between the report's read and the
+            // hub's handling of it: the hub's implicit claim, then the app's.
+            let p = st.projects.get_mut("p1").unwrap();
+            assert!(p.write_hub_claim("AAA=", "u2", 1));
+            p.holder_seq += 1;
+            let conn = crate::api::db(&ctx2).unwrap().conn();
+            live_db::add_implicit_claim(&conn, "p1", "u2", 1).unwrap();
+        });
+        h.full_report("p1").await.unwrap();
+        let me = "AAA=".to_string();
+        assert!(hub.holders_of("p1", "u1").contains(&me));
+        assert!(
+            !hub.holders_of("p1", "u2").contains(&me),
+            "the full report removed the implicit claim it did not carry"
+        );
+        assert!(
+            h.next_deadline().unwrap() <= Instant::now(),
+            "another full report is due at once"
+        );
+        let done = h.flush_due(Instant::now()).await;
+        assert_eq!(done.len(), 1, "the owed full report ran");
+        assert!(done[0].1.is_ok());
+        assert!(hub.holders_of("p1", "u1").contains(&me));
+        assert!(
+            hub.holders_of("p1", "u2").contains(&me),
+            "the implicit claim is back on the hub"
+        );
+        assert!(
+            h.flush_due(Instant::now()).await.is_empty(),
+            "in sync: nothing more is owed"
+        );
     }
 
     #[tokio::test]

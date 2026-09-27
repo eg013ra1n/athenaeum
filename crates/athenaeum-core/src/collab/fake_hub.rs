@@ -293,7 +293,7 @@ impl FakeProject {
     /// `claims/plan.rs`). Stamped with the device's own highest stored
     /// report_seq (read-only: this never advances the high-water mark
     /// itself). Returns true iff the claim's visible state changed.
-    fn write_hub_claim(&mut self, device: &str, uuid: &str, cv: i32) -> bool {
+    pub(crate) fn write_hub_claim(&mut self, device: &str, uuid: &str, cv: i32) -> bool {
         let report_seq = self.highest_report_seq(device);
         let key = (device.to_string(), uuid.to_string());
         let changed = self
