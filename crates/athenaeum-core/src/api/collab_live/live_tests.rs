@@ -380,6 +380,9 @@ async fn a_personal_transfer_is_admitted_while_the_feed_is_stuck_in_a_retry() {
 
 /// C1 (b): stop completes cleanly within its bound — never by the timeout
 /// abort — while the feed worker is stuck in a retry, and presence is left.
+/// The runtime's own stop takes at most `LEAVE_TIMEOUT + SESSION_MARGIN`
+/// (its waits run at once); `STOP_BOUND` adds `STOP_DISPATCH_MARGIN` for
+/// the command to reach the loop (Task 18, flake-5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stop_completes_while_the_feed_worker_is_stuck_in_a_retry() {
     let w = ts::two_instances().await;
@@ -387,6 +390,7 @@ async fn stop_completes_while_the_feed_worker_is_stuck_in_a_retry() {
     let t0 = Instant::now();
     shutdown(&w.b.ctx).await;
     let took = t0.elapsed();
+    eprintln!("stop took {took:?}");
     assert!(
         took < crate::api::collab_live::runtime::STOP_BOUND,
         "stop took {took:?}: it hit the bound (the loop never read the stop)"

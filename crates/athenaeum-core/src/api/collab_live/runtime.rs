@@ -53,8 +53,26 @@ const SESSION_MARGIN: Duration = Duration::from_millis(500);
 const WORKER_STOP: Duration = Duration::from_millis(250);
 /// `shutdown` / `on_sign_out` wait at most this long for the runtime to
 /// leave presence and stop (P28): the leave's bound plus a margin (M1).
+///
+/// The runtime's own stop ([`Runtime::finish`]) waits for its workers and
+/// its session AT ONCE, never one after another, so it takes at most
+/// `LEAVE_TIMEOUT + SESSION_MARGIN` (2.5 s); the remaining
+/// [`STOP_DISPATCH_MARGIN`] is for the stop command to reach the runtime's
+/// loop. (Task 18, flake-5: the waits used to run in sequence — 250 ms per
+/// worker, then up to 2.5 s for the session — which added up to this whole
+/// bound and left the dispatch no room: under double CPU load a stop hit
+/// the bound at 3.0016 s.)
 pub const STOP_BOUND: Duration =
     Duration::from_secs(crate::api::collab_live::session::LEAVE_TIMEOUT.as_secs() + 1);
+/// What [`STOP_BOUND`] leaves for the stop command to reach the loop (the
+/// loop finishes the arm it is in first — all short, Task 15 C1).
+pub const STOP_DISPATCH_MARGIN: Duration = Duration::from_millis(500);
+const _: () = assert!(
+    crate::api::collab_live::session::LEAVE_TIMEOUT.as_millis()
+        + SESSION_MARGIN.as_millis()
+        + STOP_DISPATCH_MARGIN.as_millis()
+        <= STOP_BOUND.as_millis()
+);
 /// How often an armed runtime re-checks for a bound node, a mounted collab
 /// store and a started receiver before it can run.
 pub const READY_POLL: Duration = Duration::from_secs(5);
@@ -259,26 +277,26 @@ impl Shared {
             .clone()
     }
 
-    /// `DELETE /me/presence` for the current session, bounded (P28).
+    /// `DELETE /me/presence` for the current session, bounded (P28) — the
+    /// bound covers building the request's client too (Task 18, flake-5).
     pub(crate) async fn leave(&self, hub_url: &str) {
         let Some(id) = self.session_id.borrow().clone() else {
             return;
         };
-        let client = match CollabClient::new(hub_url.to_string()) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "presence leave client could not be built");
-                return;
-            }
+        let leave = async {
+            let client = match CollabClient::new(hub_url.to_string()) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "presence leave client could not be built");
+                    return None;
+                }
+            };
+            Some(client.presence_leave(&id).await)
         };
-        match tokio::time::timeout(
-            crate::api::collab_live::session::LEAVE_TIMEOUT,
-            client.presence_leave(&id),
-        )
-        .await
-        {
-            Ok(Ok(())) => tracing::info!("left presence"),
-            Ok(Err(e)) => {
+        match tokio::time::timeout(crate::api::collab_live::session::LEAVE_TIMEOUT, leave).await {
+            Ok(None) => return,
+            Ok(Some(Ok(()))) => tracing::info!("left presence"),
+            Ok(Some(Err(e))) => {
                 tracing::warn!(error = %e, "presence leave failed; the hub's timeouts take the device offline")
             }
             Err(_) => tracing::warn!(
@@ -1214,31 +1232,49 @@ impl Runtime {
         self.exec.shutdown();
         self.feed_task.abort();
         self.storage_task.abort();
-        match tokio::time::timeout(WORKER_STOP, &mut self.feed_task).await {
-            Ok(Err(e)) if e.is_panic() => tracing::error!(error = %e, "feed worker panicked"),
-            Ok(_) => {}
-            Err(_) => tracing::warn!(
-                duration_ms = WORKER_STOP.as_millis() as u64,
-                "feed worker did not end in time"
-            ),
-        }
-        match tokio::time::timeout(WORKER_STOP, &mut self.storage_task).await {
-            Ok(Err(e)) if e.is_panic() => tracing::error!(error = %e, "storage task panicked"),
-            Ok(_) => {}
-            Err(_) => tracing::warn!(
-                duration_ms = WORKER_STOP.as_millis() as u64,
-                "storage task did not end in time"
-            ),
-        }
-        let session_bound = crate::api::collab_live::session::LEAVE_TIMEOUT + SESSION_MARGIN;
-        match tokio::time::timeout(session_bound, &mut self.session).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!(error = %e, "event session task panicked"),
-            Err(_) => {
-                tracing::warn!("event session did not end in time; aborted");
-                self.session.abort();
+        // The workers and the session are waited for AT ONCE: the whole stop
+        // takes at most `LEAVE_TIMEOUT + SESSION_MARGIN`, inside STOP_BOUND
+        // with the dispatch margin to spare (see STOP_BOUND).
+        let (feed, storage, session) = (
+            &mut self.feed_task,
+            &mut self.storage_task,
+            &mut self.session,
+        );
+        let feed = async {
+            match tokio::time::timeout(WORKER_STOP, feed).await {
+                Ok(Err(e)) if e.is_panic() => tracing::error!(error = %e, "feed worker panicked"),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    duration_ms = WORKER_STOP.as_millis() as u64,
+                    "feed worker did not end in time"
+                ),
             }
-        }
+        };
+        let storage = async {
+            match tokio::time::timeout(WORKER_STOP, storage).await {
+                Ok(Err(e)) if e.is_panic() => tracing::error!(error = %e, "storage task panicked"),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    duration_ms = WORKER_STOP.as_millis() as u64,
+                    "storage task did not end in time"
+                ),
+            }
+        };
+        let session_bound = crate::api::collab_live::session::LEAVE_TIMEOUT + SESSION_MARGIN;
+        let session = async {
+            match tokio::time::timeout(session_bound, &mut *session).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!(error = %e, "event session task panicked"),
+                Err(_) => {
+                    tracing::warn!(
+                        duration_ms = session_bound.as_millis() as u64,
+                        "event session did not end in time; aborted"
+                    );
+                    session.abort();
+                }
+            }
+        };
+        tokio::join!(feed, storage, session);
         if sign_out {
             self.node.set_collab_serve_oracle(None);
         } else {
