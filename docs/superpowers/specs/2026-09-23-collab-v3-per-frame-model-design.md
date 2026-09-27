@@ -630,6 +630,14 @@ project WBPP export lands `<title>/<publisher>/<camera>/<filter>/`.
     corrects the earlier derivation by account, under which a second device
     of the account never fetched its account's frames (contrary to §10
     "Two devices of one account → one publisher, two holder rows").
+  - **Data role still rules receiving.** A member whose data role is `send`
+    stores nothing on any of its devices, so a second device of a `send`
+    account does not receive the account's own frames either; only a
+    `send_receive` account's other devices replicate them.
+  - **Device replace keeps authorship.** A device that replaced another one
+    of the same account (§9.5 of the live-exchange spec) treats the replaced
+    device's frames as its own: it can post their new versions, and the hub
+    then records it as their publishing device.
   - **Switching.** "Publish from this device" is an explicit, confirmed user
     action that moves the binding. After a switch, the previously bound
     device can still post new VERSIONS of the frames it published (only it
