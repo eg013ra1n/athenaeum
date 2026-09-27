@@ -310,9 +310,10 @@ memory and makes no database query.
   - An entry applies only if `reportSeq` is greater than the value stored for that `(device, frame)`.
   - So duplicated or reordered deliveries are harmless (C19, C20). Coalesce your outbox per frame (last op wins) before sending.
 - **`full: true`.** `add` is the complete claim set as of `reportSeq` R.
-  - The hub tombstones every live claim of this device in the project that is unlisted and has a stored reportSeq below R.
+  - The hub tombstones every live claim of this device in the project that is unlisted and has a stored reportSeq below R, **except an implicit claim** (see "Implicit claims" below).
   - Entries with a stored reportSeq ≥ R are untouched. They are newer deltas.
-  - `remove` must be empty.
+  - **An implicit claim is never removed by omission, nor rolled back to an older version** (final hub fix, hub `06198cc`, migration 0025). Your read of your own claim set may predate the announce or version whose claim the hub wrote first. So a full report that leaves the frame out of `add`, or lists it at a `contentVersion` below the hub's claim, leaves the claim as it is.
+  - `remove` may accompany `full: true` (earlier it had to be empty). It is the one way a full report ends an implicit claim: list the frame there. It applies like a delta `remove`. A frame in both `add` and `remove` is still a 400.
 - **Claims are durable.** They never expire, and they are stored whatever version is current (I4).
 - **A claim is refused** (listed in `refused`, not stored, and any live hub claim for that frame tombstoned) when any of these holds:
   - the frame is not in this project;
@@ -336,7 +337,6 @@ memory and makes no database query.
 | 400 | `{"error":"add/remove must each contain at most 100000 items"}` | list too long |
 | 400 | `{"error":"duplicate uuid in add: <uuid>"}` or `{"error":"duplicate uuid in remove: <uuid>"}` | duplicate entry |
 | 400 | `{"error":"uuid <uuid> present in both add and remove"}` | contradictory entry |
-| 400 | `{"error":"remove must be empty when full is true"}` | `full` with `remove` |
 | 400 | `{"error":"digest must be 32 lowercase hex chars"}` | bad digest |
 | 400 | `{"error":"count must be >= 0"}` | bad count |
 | 409 | `{"error":"collab_api_outdated"}` | a body without `reportSeq` (a wave-2 app) |
@@ -346,6 +346,10 @@ memory and makes no database query.
 - The hub writes these claims in the same transaction and stamps them with this device's highest stored `reportSeq` in the project, so a delayed older report can never roll them back (amended during execution, hub Task 2 review).
 - Add them to your claim set and digest without reporting them.
 - Flush any pending outbox entry for such a frame **before** calling version.
+- **The implicit mark (final hub fix).** The hub marks such a claim implicit until you name the frame yourself.
+  - The mark is cleared by your next report (full or delta) that lists the frame in `add`, by a `remove` of it, and by any tombstone (refusal, revoke/retire, leaving).
+  - While the mark is set, a `full: true` report keeps the claim unless the frame is under `remove` (see `full: true` above). A delta report applies as before.
+  - The digest is unchanged: the hub's set counts a kept implicit claim like any live claim. A full report that kept one answers `digestMatch: true` when your set holds it too, and `false` while your set still lacks it (for example, the announce's reply has not been applied yet). If you really no longer hold the frame, send it under `remove`.
 
 ### Frames — versions
 
