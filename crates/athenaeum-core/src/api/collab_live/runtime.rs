@@ -102,6 +102,12 @@ pub(crate) struct Shared {
     /// A copy of the feed's presence book, for [`live_presence`].
     presence: RwLock<PresenceBook>,
     me: RwLock<Option<String>>,
+    /// A runtime (its loop and both workers) runs right now — false while
+    /// `supervise` waits to start one, restarts it, or after it stopped.
+    running: std::sync::atomic::AtomicBool,
+    /// Test only (final fix A-I3): how many runtimes this handle started.
+    #[cfg(test)]
+    starts: AtomicUsize,
 }
 
 fn now_rfc3339() -> String {
@@ -130,6 +136,9 @@ impl Shared {
             credentials: Mutex::new(None),
             presence: RwLock::new(PresenceBook::default()),
             me: RwLock::new(None),
+            running: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            starts: AtomicUsize::new(0),
         }
     }
 
@@ -316,6 +325,15 @@ pub(crate) enum LiveCommand {
     /// A command changed a project's local state.
     LocalChange(String),
     SetStreams(usize),
+    /// The publishing binding moved here: the re-announce check, on the
+    /// feed worker (final fix A-I1).
+    Rebind(String),
+    /// Test only (final fix A-I2): re-derive this project's scope.
+    #[cfg(test)]
+    PolicyDirty(String),
+    /// Test only (final fix A-I3): make one of the workers panic.
+    #[cfg(test)]
+    PanicWorker(TestWorker),
     Stop {
         sign_out: bool,
         done: oneshot::Sender<()>,
@@ -326,6 +344,14 @@ pub(crate) enum LiveCommand {
     Crash {
         done: oneshot::Sender<()>,
     },
+}
+
+/// Which worker a test makes panic.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TestWorker {
+    Feed,
+    Storage,
 }
 
 struct LiveHandle {
@@ -495,7 +521,9 @@ pub fn status(ctx: &ServiceContext) -> CollabLiveStatus {
 
 /// Sync now (L10, P26): every back-off cleared, the stream dropped and
 /// reopened at once, then reconciliation (a digest check per project, a
-/// stat sweep).
+/// stat sweep). Armed but not running yet (waiting for its folder, its
+/// node, or restarting): queued, applied when the runtime starts (final
+/// fix A-M4) — never a silent no-op.
 pub fn sync_now(ctx: &ServiceContext) -> Result<(), ApiError> {
     let Some(shared) = handle_shared(ctx) else {
         let e = ApiError::Invalid(
@@ -504,7 +532,11 @@ pub fn sync_now(ctx: &ServiceContext) -> Result<(), ApiError> {
         tracing::warn!(error = %e, "sync now refused");
         return Err(e);
     };
-    tracing::info!("collab sync now requested");
+    if shared.running.load(Ordering::SeqCst) {
+        tracing::info!("collab sync now requested");
+    } else {
+        tracing::info!("collab sync now requested; queued until the live exchange runs");
+    }
     crate::collab::live::backoff::reset_all();
     shared.reconnect_now();
     if !send(ctx, LiveCommand::Reconcile) {
@@ -515,7 +547,8 @@ pub fn sync_now(ctx: &ServiceContext) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// A command changed a project's local state: its need set is re-read.
+/// A command changed a project's local state: its need set is re-read
+/// (queued while the runtime is not running yet, final fix A-M4).
 pub fn notify_local_change(ctx: &ServiceContext, project_id: &str) {
     if !send(ctx, LiveCommand::LocalChange(project_id.to_string())) {
         tracing::debug!(
@@ -523,6 +556,18 @@ pub fn notify_local_change(ctx: &ServiceContext, project_id: &str) {
             "no live exchange runs; the change applies when it starts"
         );
     }
+}
+
+/// Whether a live runtime runs for this catalog right now (its feed worker
+/// takes work).
+pub(crate) fn live_running(ctx: &ServiceContext) -> bool {
+    handle_shared(ctx).is_some_and(|s| s.running.load(Ordering::SeqCst))
+}
+
+/// Hand the re-announce check after a binding move to the feed worker
+/// (final fix A-I1). `false`: no live exchange took it — the caller runs it.
+pub(crate) fn request_rebind(ctx: &ServiceContext, project_id: &str) -> bool {
+    send(ctx, LiveCommand::Rebind(project_id.to_string()))
 }
 
 /// `collab.max_receive_streams` changed (L11): applied live.
@@ -545,6 +590,14 @@ pub async fn shutdown(ctx: &ServiceContext) {
 /// oracle is removed).
 pub async fn on_sign_out(ctx: &ServiceContext) {
     stop(ctx, true).await;
+    // A runtime armed again meanwhile (a sign-in during the stop window)
+    // owns the oracle now (final fix A-M1).
+    if handle_shared(ctx).is_some() {
+        tracing::debug!(
+            "a new live exchange was armed during the sign-out; its serve oracle stays"
+        );
+        return;
+    }
     if let Some(node) = crate::api::collab_exchange::bound_node(ctx).await {
         node.set_collab_serve_oracle(None);
     }
@@ -597,6 +650,31 @@ pub(crate) async fn crash_for_test(ctx: &ServiceContext) {
         let _ = tokio::time::timeout(STOP_BOUND, rx).await;
     }
     handle.abort.abort();
+}
+
+/// Test only (final fix A-I3): how many runtimes this catalog's handle has
+/// started.
+#[cfg(test)]
+pub(crate) fn runtime_starts(ctx: &ServiceContext) -> usize {
+    handle_shared(ctx).map_or(0, |s| s.starts.load(Ordering::SeqCst))
+}
+
+/// Test only (final fix A-I3): make one of the runtime's workers panic.
+#[cfg(test)]
+pub(crate) fn panic_worker_for_test(ctx: &ServiceContext, worker: TestWorker) {
+    assert!(
+        send(ctx, LiveCommand::PanicWorker(worker)),
+        "no live exchange armed"
+    );
+}
+
+/// Test only (final fix A-I2): re-derive `project_id`'s replication scope.
+#[cfg(test)]
+pub(crate) fn mark_policy_dirty_for_test(ctx: &ServiceContext, project_id: &str) {
+    assert!(
+        send(ctx, LiveCommand::PolicyDirty(project_id.to_string())),
+        "no live exchange armed"
+    );
 }
 
 /// The live presence and this device's id, for the command surface's holder
@@ -730,8 +808,68 @@ async fn ready(
     })
 }
 
+/// Commands that arrived while no runtime ran (final fix A-M4): applied
+/// when the next one starts, deduplicated.
+#[derive(Default)]
+struct Pending(Vec<LiveCommand>);
+
+impl Pending {
+    fn push(&mut self, cmd: LiveCommand) {
+        let dup = self.0.iter().any(|c| match (c, &cmd) {
+            (LiveCommand::Reconcile, LiveCommand::Reconcile) => true,
+            (LiveCommand::LocalChange(a), LiveCommand::LocalChange(b)) => a == b,
+            (LiveCommand::Rebind(a), LiveCommand::Rebind(b)) => a == b,
+            _ => false,
+        });
+        if dup {
+            return;
+        }
+        if matches!(cmd, LiveCommand::SetStreams(_)) {
+            self.0.retain(|c| !matches!(c, LiveCommand::SetStreams(_)));
+        }
+        tracing::debug!(
+            count = self.0.len() + 1,
+            "live command queued until the runtime starts"
+        );
+        self.0.push(cmd);
+    }
+}
+
+/// Await `fut` while serving the command channel (final fix A-M2): a stop
+/// is answered at once and ends the wait (`None`, the future dropped at its
+/// await point); every other command is queued for the next runtime.
+async fn or_stop<F: std::future::Future>(
+    fut: F,
+    commands: &mut mpsc::UnboundedReceiver<LiveCommand>,
+    pending: &mut Pending,
+) -> Option<F::Output> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return Some(out),
+            cmd = commands.recv() => match cmd {
+                None => return None,
+                Some(LiveCommand::Stop { done, .. }) => {
+                    let _ = done.send(());
+                    return None;
+                }
+                #[cfg(test)]
+                Some(LiveCommand::Crash { done }) => {
+                    let _ = done.send(());
+                    return None;
+                }
+                Some(other) => pending.push(other),
+            },
+        }
+    }
+}
+
 /// The armed task: wait until the runtime can run, then run it — again on
-/// its new store after the Collaboration folder moved (I1).
+/// its new store after the Collaboration folder moved (I1), or after one of
+/// its workers died (final fix A-I3). A stop is observed at every wait
+/// (final fix A-M2); every other command that arrives while no runtime runs
+/// is queued for the next one (final fix A-M4).
 async fn supervise(
     shared: Arc<Shared>,
     mut commands: mpsc::UnboundedReceiver<LiveCommand>,
@@ -740,21 +878,46 @@ async fn supervise(
 ) {
     let ctx = Arc::clone(&shared.ctx);
     let mut lazy_mount = true;
+    let mut pending = Pending::default();
     loop {
-        match ready(&ctx, &gate, lazy_mount).await {
-            Ok(r) => match Runtime::start(Arc::clone(&shared), r, cfg).await {
-                Ok(rt) => match rt.run(&mut commands).await {
-                    RunEnd::Stopped => return,
-                    RunEnd::Remount => {
-                        tracing::info!("collaboration store changed; the live exchange restarts");
-                        lazy_mount = false;
-                        continue;
+        let Some(ready) =
+            or_stop(ready(&ctx, &gate, lazy_mount), &mut commands, &mut pending).await
+        else {
+            return;
+        };
+        match ready {
+            Ok(r) => {
+                let Some(started) = or_stop(
+                    Runtime::start(Arc::clone(&shared), r, cfg),
+                    &mut commands,
+                    &mut pending,
+                )
+                .await
+                else {
+                    return;
+                };
+                match started {
+                    Ok(rt) => match rt.run(&mut commands, std::mem::take(&mut pending)).await {
+                        RunEnd::Stopped => return,
+                        RunEnd::Remount => {
+                            tracing::info!(
+                                "collaboration store changed; the live exchange restarts"
+                            );
+                            lazy_mount = false;
+                            continue;
+                        }
+                        RunEnd::Restart => {
+                            tracing::warn!(
+                                retry_in_ms = cfg.ready_poll.as_millis() as u64,
+                                "the live exchange restarts after a worker ended"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!(error = %e, "collab live exchange could not start; retried");
                     }
-                },
-                Err(e) => {
-                    tracing::error!(error = %e, "collab live exchange could not start; retried");
                 }
-            },
+            }
             Err(why) => {
                 let view = if why == "no Collaboration folder" {
                     StorageStateView::NotSet
@@ -765,16 +928,15 @@ async fn supervise(
                 tracing::debug!(reason = why, "collab live exchange waits to start");
             }
         }
-        tokio::select! {
-            _ = tokio::time::sleep(cfg.ready_poll) => {}
-            cmd = commands.recv() => match cmd {
-                None => return,
-                Some(LiveCommand::Stop { done, .. }) => {
-                    let _ = done.send(());
-                    return;
-                }
-                Some(_) => {}
-            },
+        if or_stop(
+            tokio::time::sleep(cfg.ready_poll),
+            &mut commands,
+            &mut pending,
+        )
+        .await
+        .is_none()
+        {
+            return;
         }
     }
 }
@@ -792,11 +954,16 @@ enum Exit {
     Stop(Option<(bool, oneshot::Sender<()>)>),
     /// The collab store was mounted, unmounted or swapped (I1).
     Remount,
+    /// A worker ended (a panic): the whole runtime is rebuilt — a loop
+    /// whose feed or storage worker is gone applies nothing more (final fix
+    /// A-I3).
+    Restart,
 }
 
 enum RunEnd {
     Stopped,
     Remount,
+    Restart,
 }
 
 struct Runtime {
@@ -841,6 +1008,18 @@ struct Runtime {
     /// Projects whose replication scope (`apply_policy`) is re-derived at
     /// the end of this turn.
     policy_dirty: BTreeSet<String>,
+    /// Re-derives running on a blocking thread (final fix A-I2: never a
+    /// catalog write on the loop); their need sets wait for the result.
+    policy_pending: BTreeSet<String>,
+    /// Marked dirty again while a re-derive was running: once more after it.
+    policy_again: BTreeSet<String>,
+    /// Failed re-derives, retried after their back-off (never dropped).
+    policy_retry: BTreeMap<String, (Instant, crate::collab::live::backoff::Backoff)>,
+    policy_tx: mpsc::UnboundedSender<(String, Result<usize, ApiError>)>,
+    policy_rx: mpsc::UnboundedReceiver<(String, Result<usize, ApiError>)>,
+    /// The serve oracle this runtime installed: `finish` replaces only it
+    /// (final fix A-M1).
+    oracle: Arc<dyn crate::collab::serve::ServeOracle>,
 }
 
 impl Runtime {
@@ -902,13 +1081,13 @@ impl Runtime {
             storage_out,
         ));
         let (checks_tx, checks_rx) = mpsc::unbounded_channel();
-        r.node.set_collab_serve_oracle(Some(Arc::new(
-            crate::api::collab_live::serve_oracle::DbServeOracle::new(
+        let oracle: Arc<dyn crate::collab::serve::ServeOracle> =
+            Arc::new(crate::api::collab_live::serve_oracle::DbServeOracle::new(
                 Arc::clone(&ctx),
                 Arc::clone(&guard),
                 checks_tx,
-            ),
-        )));
+            ));
+        r.node.set_collab_serve_oracle(Some(Arc::clone(&oracle)));
         let (upload, receive) = {
             let d = db(&ctx)?;
             let conn = d.conn();
@@ -967,6 +1146,7 @@ impl Runtime {
             stop_rx,
             cfg.beat,
         ));
+        let (policy_tx, policy_rx) = mpsc::unbounded_channel();
         let mut rt = Self {
             ctx,
             node: r.node,
@@ -1001,6 +1181,12 @@ impl Runtime {
             serving_dirty: true,
             attention: BTreeSet::new(),
             policy_dirty: BTreeSet::new(),
+            policy_pending: BTreeSet::new(),
+            policy_again: BTreeSet::new(),
+            policy_retry: BTreeMap::new(),
+            policy_tx,
+            policy_rx,
+            oracle,
             shared,
         };
         rt.publish_storage();
@@ -1008,6 +1194,9 @@ impl Runtime {
         for pid in rt.live_projects() {
             rt.exec.dirty.insert(pid);
         }
+        rt.shared.running.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        rt.shared.starts.fetch_add(1, Ordering::SeqCst);
         tracing::info!(state = ?state, "collab live exchange running");
         Ok(rt)
     }
@@ -1074,6 +1263,9 @@ impl Runtime {
         if let Some(w) = self.exec.next_wake() {
             d = d.min(w);
         }
+        for (at, _) in self.policy_retry.values() {
+            d = d.min(*at);
+        }
         for pid in self.burst.counts.keys() {
             if let Some(last) = self.burst.last.get(pid) {
                 d = d.min(*last + LANDED_BURST);
@@ -1083,10 +1275,27 @@ impl Runtime {
     }
 
     /// The loop. Every arm is short: hub HTTP and sweeps run on the two
-    /// workers (Task 15 fix round 1, C1), so executor results, lane grants,
-    /// pool events, the yield signal, commands and stop are serviced within
-    /// milliseconds.
-    async fn run(mut self, commands: &mut mpsc::UnboundedReceiver<LiveCommand>) -> RunEnd {
+    /// workers (Task 15 fix round 1, C1), and catalog writes on blocking
+    /// threads (final fix A-I2), so executor results, lane grants, pool
+    /// events, the yield signal, commands and stop are serviced within
+    /// milliseconds. `pending`: commands queued while no runtime ran (final
+    /// fix A-M4), applied first.
+    async fn run(
+        mut self,
+        commands: &mut mpsc::UnboundedReceiver<LiveCommand>,
+        pending: Pending,
+    ) -> RunEnd {
+        if !pending.0.is_empty() {
+            tracing::info!(
+                count = pending.0.len(),
+                "commands queued before the live exchange ran applied"
+            );
+        }
+        for cmd in pending.0 {
+            if let Some(exit) = self.on_command(cmd) {
+                return self.finish(exit).await;
+            }
+        }
         let exit = loop {
             self.flush_dirty();
             let mut deadline = self.deadline();
@@ -1102,23 +1311,16 @@ impl Runtime {
                 biased;
                 cmd = commands.recv() => match cmd {
                     None => break Exit::Stop(None),
-                    Some(LiveCommand::Stop { sign_out, done }) => {
-                        break Exit::Stop(Some((sign_out, done)));
-                    }
-                    Some(LiveCommand::Reconcile) => self.reconcile(),
-                    Some(LiveCommand::LocalChange(p)) => {
-                        // The command may have appended claim changes: they
-                        // flush after the usual delay, not at the next wake.
-                        self.note_append(&p);
-                        self.exec.dirty.insert(p.clone());
-                        self.attention.insert(p);
-                    }
-                    Some(LiveCommand::SetStreams(n)) => self.exec.set_slots(n),
-                    #[cfg(test)]
-                    Some(LiveCommand::Crash { done }) => {
-                        self.crash();
-                        let _ = done.send(());
-                        return RunEnd::Stopped;
+                    Some(cmd) => {
+                        #[cfg(test)]
+                        if let LiveCommand::Crash { done } = cmd {
+                            self.crash();
+                            let _ = done.send(());
+                            return RunEnd::Stopped;
+                        }
+                        if let Some(exit) = self.on_command(cmd) {
+                            break exit;
+                        }
                     }
                 },
                 changed = self.mount_gen.changed(), if self.mount_open => {
@@ -1165,11 +1367,20 @@ impl Runtime {
                         self.exec.step(Input::ClearBackoffs);
                     }
                 }
+                applied = self.policy_rx.recv() => {
+                    if let Some((p, res)) = applied {
+                        self.on_policy_applied(p, res);
+                    }
+                }
                 out = self.feed_rx.recv(), if self.feed_open => match out {
                     Some(out) => self.on_feed_out(out),
                     None => {
-                        tracing::error!("the feed worker ended; hub events are no longer applied");
+                        // Final fix A-I3: a loop without its feed worker
+                        // applies no hub event more — rebuild the runtime
+                        // (the session leaves presence on the way out).
+                        tracing::error!("the feed worker ended; the live exchange restarts");
                         self.feed_open = false;
+                        break Exit::Restart;
                     }
                 },
                 out = self.storage_rx.recv(), if self.storage_open => match out {
@@ -1182,8 +1393,9 @@ impl Runtime {
                         self.on_storage_events(out.events);
                     }
                     None => {
-                        tracing::error!("the storage task ended; the collaboration folder is no longer watched");
+                        tracing::error!("the storage task ended; the live exchange restarts");
                         self.storage_open = false;
+                        break Exit::Restart;
                     }
                 },
                 ev = self.events_rx.recv(), if self.events_open && feed_room => match ev {
@@ -1208,6 +1420,41 @@ impl Runtime {
         self.finish(exit).await
     }
 
+    /// One command (from the channel, or queued before the runtime ran).
+    /// `Some`: the loop ends.
+    fn on_command(&mut self, cmd: LiveCommand) -> Option<Exit> {
+        match cmd {
+            LiveCommand::Stop { sign_out, done } => {
+                return Some(Exit::Stop(Some((sign_out, done))))
+            }
+            LiveCommand::Reconcile => self.reconcile(),
+            LiveCommand::LocalChange(p) => {
+                // The command may have appended claim changes: they flush
+                // after the usual delay, not at the next wake.
+                self.note_append(&p);
+                self.exec.dirty.insert(p.clone());
+                self.attention.insert(p);
+            }
+            LiveCommand::SetStreams(n) => self.exec.set_slots(n),
+            LiveCommand::Rebind(p) => self.to_feed(FeedWork::Rebind(p)),
+            #[cfg(test)]
+            LiveCommand::PolicyDirty(p) => {
+                self.policy_dirty.insert(p);
+            }
+            #[cfg(test)]
+            LiveCommand::PanicWorker(TestWorker::Feed) => self.to_feed(FeedWork::Panic),
+            #[cfg(test)]
+            LiveCommand::PanicWorker(TestWorker::Storage) => self.to_storage(StorageWork::Panic),
+            #[cfg(test)]
+            LiveCommand::Crash { done } => {
+                // Queued before the runtime ran: nothing to kill yet.
+                let _ = done.send(());
+                return Some(Exit::Stop(None));
+            }
+        }
+        None
+    }
+
     /// Test only: end as a killed process — every task aborted where it
     /// stands. The event stream's connection drops with the session task
     /// (the hub sees a closed stream, never a `DELETE /me/presence`), and
@@ -1222,11 +1469,19 @@ impl Runtime {
     }
 
     async fn finish(mut self, exit: Exit) -> RunEnd {
-        let (stop, remount) = match exit {
-            Exit::Stop(stop) => (stop, false),
-            Exit::Remount => (None, true),
+        let (stop, remount, restart) = match exit {
+            Exit::Stop(stop) => (stop, false, false),
+            Exit::Remount => (None, true, false),
+            Exit::Restart => (None, false, true),
         };
+        let (stop, remount, restart) = (stop, remount, restart);
         let sign_out = stop.as_ref().is_some_and(|(s, _)| *s);
+        self.shared.running.store(false, Ordering::SeqCst);
+        if remount || restart {
+            // Final fix A-I3: nothing is advertised as served while no
+            // runtime runs — the next one publishes its own map.
+            self.shared.set_serving(BTreeMap::new());
+        }
         // The session leaves presence (≤ LEAVE_TIMEOUT) while the rest stops.
         let _ = self.stop_tx.send(true);
         self.exec.shutdown();
@@ -1275,18 +1530,23 @@ impl Runtime {
             }
         };
         tokio::join!(feed, storage, session);
-        if sign_out {
-            self.node.set_collab_serve_oracle(None);
+        // Only while the oracle is still this runtime's (final fix A-M1): a
+        // runtime armed again during this stop installed its own already.
+        let next = if sign_out {
+            None
         } else {
             // Without a runtime the catalog-backed oracle serves (Task 15 R4).
-            crate::api::collab_live::serve_oracle::install_catalog_oracle(&self.ctx, &self.node);
-        }
+            crate::api::collab_live::serve_oracle::catalog_oracle(&self.ctx)
+        };
+        self.node.replace_collab_serve_oracle_if(&self.oracle, next);
         self.shared.set_state(LiveState::Off, None);
         if let Some((_, done)) = stop {
             let _ = done.send(());
         }
         if remount {
             RunEnd::Remount
+        } else if restart {
+            RunEnd::Restart
         } else {
             RunEnd::Stopped
         }
@@ -1399,22 +1659,30 @@ impl Runtime {
     /// Re-read every dirty need set, publish the serving map and the
     /// attention changes.
     fn flush_dirty(&mut self) {
+        // Final fix A-I2: the re-derive is a catalog write (IMMEDIATE, up to
+        // the busy timeout under another writer) — it runs on a blocking
+        // thread and its result comes back to the loop; the project's need
+        // set is re-read once it did.
         for p in std::mem::take(&mut self.policy_dirty) {
-            match crate::api::collab_live::storage_task::apply_policy(&self.ctx, &p) {
-                Ok(0) => {}
-                Ok(_) => {
-                    // Scope moves are claim changes and attention changes.
-                    self.note_append(&p);
-                    self.attention.insert(p);
-                }
-                Err(e) => {
-                    tracing::error!(project_id = %p, error = %e, "the replication scope was not re-derived after a manifest or membership change");
-                }
+            if self.policy_pending.contains(&p) {
+                self.policy_again.insert(p);
+                continue;
             }
+            self.policy_pending.insert(p.clone());
+            let (ctx, tx) = (Arc::clone(&self.ctx), self.policy_tx.clone());
+            tokio::task::spawn_blocking(move || {
+                let res = crate::api::collab_live::storage_task::apply_policy(&ctx, &p);
+                if tx.send((p, res)).is_err() {
+                    tracing::debug!("the live runtime is gone; a replication scope result dropped");
+                }
+            });
         }
         if !self.exec.dirty.is_empty() {
             let dirty: Vec<(String, bool)> = std::mem::take(&mut self.exec.dirty)
                 .into_iter()
+                // Re-read once its re-derive is back (a scope move may take
+                // rows out of the need set): the result re-dirties it.
+                .filter(|p| !self.policy_pending.contains(p))
                 .map(|p| {
                     let refused = self.refused.contains(&p);
                     (p, refused)
@@ -1446,6 +1714,41 @@ impl Runtime {
                 &CollabAttentionChanged { project_id: p },
             );
         }
+    }
+
+    /// A re-derive came back (final fix A-I2). A failure is retried after
+    /// its back-off — never dropped; the need set is re-read either way (a
+    /// failed re-derive keeps the old scope meanwhile).
+    fn on_policy_applied(&mut self, p: String, res: Result<usize, ApiError>) {
+        self.policy_pending.remove(&p);
+        match res {
+            Ok(moved) => {
+                if self.policy_retry.remove(&p).is_some() {
+                    tracing::info!(project_id = %p, count = moved, "replication scope re-derived after a retry");
+                }
+                if moved > 0 {
+                    // Scope moves are claim changes and attention changes.
+                    self.note_append(&p);
+                    self.attention.insert(p.clone());
+                }
+            }
+            Err(ApiError::NotFound(e)) => {
+                self.policy_retry.remove(&p);
+                tracing::warn!(project_id = %p, error = %e, "replication scope not re-derived: the project is gone");
+            }
+            Err(e) => {
+                let entry = self.policy_retry.entry(p.clone()).or_insert_with(|| {
+                    (Instant::now(), crate::collab::live::backoff::Backoff::new())
+                });
+                let delay = entry.1.next_delay();
+                entry.0 = Instant::now() + delay;
+                tracing::error!(project_id = %p, error = %e, retry_in_ms = delay.as_millis() as u64, "the replication scope was not re-derived after a manifest or membership change; retried");
+            }
+        }
+        if self.policy_again.remove(&p) {
+            self.policy_dirty.insert(p.clone());
+        }
+        self.exec.dirty.insert(p);
     }
 
     // ── storage ─────────────────────────────────────────────────────────
@@ -1599,6 +1902,19 @@ impl Runtime {
     /// run on their workers.)
     async fn on_timers(&mut self) {
         let now = Instant::now();
+        let due: Vec<String> = self
+            .policy_retry
+            .iter()
+            .filter(|(p, (at, _))| now >= *at && !self.policy_pending.contains(*p))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in due {
+            if let Some((at, _)) = self.policy_retry.get_mut(&p) {
+                // Not due again until its result is back (and backs off).
+                *at = now + crate::collab::live::backoff::BACKOFF_CAP;
+            }
+            self.policy_dirty.insert(p);
+        }
         if now >= self.next_gc_probe {
             self.next_gc_probe = now + self.gc_probe;
             self.exec.gc_probe().await;

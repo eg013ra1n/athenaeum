@@ -1011,13 +1011,14 @@ pub(crate) async fn report_full_reconciled(
     let mut done = if stale.is_empty() {
         first
     } else {
+        let second = report_full(ctx, client, token, project_id, &stale).await?;
         tracing::info!(
             project_id,
-            count = stale.len(),
-            report_seq = first.report_seq,
-            "the hub keeps claims this device no longer holds; ending them with a full report"
+            count = second.removed,
+            report_seq = second.report_seq,
+            "claims the hub kept that this device no longer holds ended under remove"
         );
-        report_full(ctx, client, token, project_id, &stale).await?
+        second
     };
     if done.digest_match {
         log_full_report(project_id, &done);

@@ -1387,6 +1387,44 @@ impl SharedIrohNode {
         tracing::info!(installed, "collab serve oracle set");
     }
 
+    /// Replace the collab serve oracle only while `current` is still the one
+    /// installed (compared by pointer): a live runtime that stops never
+    /// replaces the oracle its successor already installed (final fix A-M1).
+    /// Returns whether it replaced.
+    pub fn replace_collab_serve_oracle_if(
+        &self,
+        current: &Arc<dyn crate::collab::serve::ServeOracle>,
+        oracle: Option<Arc<dyn crate::collab::serve::ServeOracle>>,
+    ) -> bool {
+        let installed = oracle.is_some();
+        let mut slot = match self.collab_oracle.write() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                tracing::error!("collab serve oracle slot poisoned; compared anyway");
+                poisoned.into_inner()
+            }
+        };
+        let still_ours = slot
+            .as_ref()
+            .is_some_and(|o| std::ptr::addr_eq(Arc::as_ptr(o), Arc::as_ptr(current)));
+        if !still_ours {
+            tracing::debug!("collab serve oracle replaced by another since; left as is");
+            return false;
+        }
+        *slot = oracle;
+        tracing::info!(installed, "collab serve oracle set");
+        true
+    }
+
+    /// The installed collab serve oracle (tests: whose is it).
+    #[cfg(test)]
+    pub fn collab_serve_oracle(&self) -> Option<Arc<dyn crate::collab::serve::ServeOracle>> {
+        self.collab_oracle
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     /// Set the limit on simultaneous collab upload streams (L11), clamped to
     /// [`COLLAB_UPLOAD_STREAMS_RANGE`](crate::settings::COLLAB_UPLOAD_STREAMS_RANGE).
     /// Applies to the next get; streams already running keep going.

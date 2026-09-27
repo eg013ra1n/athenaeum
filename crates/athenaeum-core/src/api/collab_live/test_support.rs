@@ -1598,6 +1598,22 @@ impl AccountWorld {
         out
     }
 
+    /// `b` publishes one frame of its own (64 KiB), as `a_publishes` does
+    /// for `a` — its file, its own row `own_held` and implicit claim, then
+    /// the hub's row naming `b` as the announcing device (final fix A-I1).
+    pub(crate) async fn b_publishes_own(&self) -> String {
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let uuid = format!("b{i:03}");
+        publish_as(
+            &self.hub,
+            &self.b,
+            &uuid,
+            FetchRig::pattern(&uuid, 1, FETCH_FRAME_BYTES),
+        )
+        .await;
+        uuid
+    }
+
     /// Bring `c` (the other account) in: refreshed and live.
     pub(crate) async fn start_c(&self) {
         let cards = crate::api::collab::refresh_projects(&self.c.ctx)

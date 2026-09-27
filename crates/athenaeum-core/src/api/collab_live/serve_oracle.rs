@@ -170,11 +170,22 @@ pub(crate) fn install_catalog_oracle(
     ctx: &ServiceContext,
     node: &crate::sharing::iroh::node::SharedIrohNode,
 ) {
+    if let Some(oracle) = catalog_oracle(ctx) {
+        node.set_collab_serve_oracle(Some(oracle));
+    }
+}
+
+/// The catalog-backed oracle [`install_catalog_oracle`] installs (`None`,
+/// logged, when the catalog is not open).
+pub(crate) fn catalog_oracle(
+    ctx: &ServiceContext,
+) -> Option<Arc<dyn crate::collab::serve::ServeOracle>> {
     match ctx.db.get() {
-        Some(db) => {
-            node.set_collab_serve_oracle(Some(Arc::new(DbServeOracle::catalog_only(db.clone()))))
+        Some(db) => Some(Arc::new(DbServeOracle::catalog_only(db.clone()))),
+        None => {
+            tracing::error!("collab serve oracle not installed: catalog not open");
+            None
         }
-        None => tracing::error!("collab serve oracle not installed: catalog not open"),
     }
 }
 

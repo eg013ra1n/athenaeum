@@ -42,6 +42,13 @@ pub(crate) enum FeedWork {
     NoteAppend(String, Instant),
     /// Sync now: a digest check per project.
     DigestAll(Vec<String>),
+    /// The publishing binding moved to this device: the re-announce check
+    /// (final fix A-I1 — a command hands it here and returns at once; only
+    /// this worker waits on its `Background` retries).
+    Rebind(String),
+    /// Test only (final fix A-I3): the worker panics.
+    #[cfg(test)]
+    Panic,
 }
 
 /// What the feed worker hands back to the loop, in order.
@@ -129,6 +136,16 @@ impl FeedWorker {
                     h.note_append(&p, at);
                 }
             }
+            FeedWork::Rebind(project_id) => {
+                crate::api::collab_live::feed::run_rebind_check(
+                    &self.ctx,
+                    &project_id,
+                    crate::collab::hub_client::RetryPolicy::Background,
+                )
+                .await;
+            }
+            #[cfg(test)]
+            FeedWork::Panic => panic!("injected feed worker panic (test hook)"),
             FeedWork::DigestAll(projects) => {
                 if let Some(h) = self.holdings.as_mut() {
                     h.clear_backoffs();
@@ -274,6 +291,9 @@ pub(crate) enum StorageWork {
     Check(String, String),
     /// Sync now's stat sweep.
     Sweep,
+    /// Test only (final fix A-I3): the task panics.
+    #[cfg(test)]
+    Panic,
 }
 
 /// A batch of storage events, with the watcher's state after it.
@@ -304,6 +324,8 @@ pub(crate) async fn run_storage(
                         None => return,
                         Some(StorageWork::Check(p, u)) => engine.local_check(&p, &u).await,
                         Some(StorageWork::Sweep) => engine.sweep(holders.as_ref()).await,
+                        #[cfg(test)]
+                        Some(StorageWork::Panic) => panic!("injected storage task panic (test hook)"),
                     },
                     sig = engine.recv_signal(), if fs_open => {
                         match sig {

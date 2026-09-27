@@ -1101,6 +1101,23 @@ pub fn set_error(
     Ok(())
 }
 
+/// A fetch's failure on its row, only while the row is still `wanted` —
+/// the live executor's error write runs off its loop (final fix A-I2), and a
+/// write that waited out another writer must never mark a row that landed
+/// or moved on meanwhile. Returns the rows written (0 or 1).
+pub fn set_fetch_error(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+    error: &str,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE project_frames_local SET last_error = ?3, updated_at = datetime('now')
+         WHERE project_id = ?1 AND frame_uuid = ?2 AND COALESCE(local_state, 'wanted') = 'wanted'",
+        params![project_id, frame_uuid, error],
+    )?)
+}
+
 /// The cached frame currently landed at a given path, if any (`landed_path`
 /// is globally UNIQUE across every project). Used by the scanner's
 /// reconciliation pass (P26).

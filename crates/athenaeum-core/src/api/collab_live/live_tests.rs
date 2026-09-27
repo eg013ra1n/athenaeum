@@ -749,3 +749,263 @@ async fn a_second_device_of_the_account_replicates_serves_and_publishes_only_aft
         Err(crate::account::AccountClientError::PublishingDevice { .. })
     ));
 }
+
+// ── final fix, group A: liveness ─────────────────────────────────────────
+
+/// Final fix A-I1: "Publish from this device" never waits on a hub retry.
+/// The switch owes a re-announce of `b`'s own frame the hub lost while `a`
+/// was bound; every announce answers 500 — the command still returns at
+/// once, the feed worker keeps retrying (`Background`), and the frame is
+/// back on the hub once the hub is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publishing_switch_returns_at_once_while_the_reannounce_retries() {
+    let w = ts::two_devices_of_one_account().await;
+    let uuid = w.b_publishes_own().await;
+    w.hub.set_publishing_device(ts::PID, "acc-a", &w.a.device());
+    crate::api::collab::refresh_projects(&w.b.ctx)
+        .await
+        .unwrap();
+    w.hub.forget_frames(ts::PID, &[uuid.as_str()]);
+    w.hub.set_failing("/projects/p1/frames", true);
+    let announces = || w.hub.requests_to("/projects/p1/frames");
+    let before = announces().await;
+    let t0 = Instant::now();
+    let card = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::api::collab::set_collab_publishing_device(&w.b.ctx, ts::PID),
+    )
+    .await
+    .expect("the switch never waits on the re-announce's retries")
+    .unwrap();
+    assert!(card.publishing_here);
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        t0.elapsed()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while announces().await < before + 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the feed worker retries the re-announce"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    w.hub.set_failing("/projects/p1/frames", false);
+    ts::sync_now_serial(&w.b.ctx).await; // the retry's back-off restarts
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while w
+        .hub
+        .frame(ts::PID, &uuid)
+        .and_then(|f| f.publisher_device_id)
+        .as_deref()
+        != Some(w.b.device().as_str())
+    {
+        assert!(Instant::now() < deadline, "the frame is re-announced by b");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Final fix A-I2: a catalog write never runs on the runtime's loop. With
+/// another connection holding the write lock (past the 5 s busy timeout)
+/// while a replication-scope re-derive is due, the loop still serves a
+/// command at once — a new fetch starts within a second — and the
+/// re-derive that failed under the lock is retried, never dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_write_lock_never_stalls_the_loop_and_a_failed_rederive_is_retried() {
+    use crate::api::collab_live::executor::test_hooks::sightings;
+    let w = ts::two_instances_throttled(1024 * 1024).await;
+    crate::api::collab_live::set_receive_streams(&w.b.ctx, 1);
+    let uuids = w.a_publishes_big(4, 4 * 1024 * 1024).await;
+    w.b.wait_any_fetch_started(Duration::from_secs(10)).await;
+    // Every manifest row applied (a later apply would rewrite `state`).
+    wait_rows(
+        &w.b.ctx,
+        "every frame cached",
+        Duration::from_secs(10),
+        |rows| {
+            uuids
+                .iter()
+                .all(|u| rows.iter().any(|r| &r.frame_uuid == u))
+        },
+    )
+    .await;
+    let starts = || {
+        sightings(&w.b.node_key())
+            .iter()
+            .filter(|s| s.start)
+            .count()
+    };
+    // The last frame leaves the scope at the next re-derive.
+    let dropped = uuids.last().unwrap().clone();
+    let path = {
+        let d = crate::api::db(&w.b.ctx).unwrap();
+        d.conn()
+            .execute(
+                "UPDATE project_frames_local SET state = 'rejected'
+                 WHERE project_id = ?1 AND frame_uuid = ?2",
+                rusqlite::params![ts::PID, dropped],
+            )
+            .unwrap();
+        d.path().to_path_buf()
+    };
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let locked_at = Instant::now();
+    crate::api::collab_live::runtime::mark_policy_dirty_for_test(&w.b.ctx, ts::PID);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = starts();
+    let t0 = Instant::now();
+    crate::api::collab_live::set_receive_streams(&w.b.ctx, 2);
+    while starts() == before {
+        assert!(
+            t0.elapsed() < Duration::from_secs(4),
+            "the loop served no command while the write lock was held"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let served = t0.elapsed();
+    assert!(
+        served < Duration::from_secs(1),
+        "a new fetch started after {served:?}"
+    );
+    // Past the busy timeout: the re-derive under the lock failed.
+    tokio::time::sleep(Duration::from_secs(6).saturating_sub(locked_at.elapsed())).await;
+    lock.execute_batch("ROLLBACK").unwrap();
+    drop(lock);
+    w.b.wait_state(&dropped, LocalState::Idle, Duration::from_secs(10))
+        .await;
+}
+
+/// Final fix A-I3: a worker that dies takes the runtime down with it and
+/// `supervise` builds a new one — hub events apply again and frames land,
+/// for the feed worker and for the storage task alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_worker_restarts_the_runtime() {
+    use crate::api::collab_live::runtime::{panic_worker_for_test, runtime_starts, TestWorker};
+    let w = ts::two_instances().await;
+    assert_eq!(runtime_starts(&w.b.ctx), 1);
+    for (i, worker) in [TestWorker::Feed, TestWorker::Storage]
+        .into_iter()
+        .enumerate()
+    {
+        panic_worker_for_test(&w.b.ctx, worker);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while runtime_starts(&w.b.ctx) < i + 2 {
+            assert!(
+                Instant::now() < deadline,
+                "{worker:?}: the runtime never restarted"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        w.hub
+            .wait_connected(ts::PID, &w.b.device(), Duration::from_secs(10))
+            .await;
+        let uuid = w.a_publishes(1).await.remove(0);
+        w.b.wait_state(&uuid, LocalState::Held, Duration::from_secs(20))
+            .await;
+    }
+}
+
+/// Final fix A-M1: a runtime that stops replaces the serve oracle only
+/// while it is still its own — one installed meanwhile (a runtime armed
+/// again during the stop window) survives the stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopping_runtime_never_replaces_its_successors_oracle() {
+    let w = ts::two_instances().await;
+    let successor = crate::api::collab_live::serve_oracle::catalog_oracle(&w.b.ctx).unwrap();
+    w.b.node
+        .set_collab_serve_oracle(Some(std::sync::Arc::clone(&successor)));
+    shutdown(&w.b.ctx).await;
+    let now =
+        w.b.node
+            .collab_serve_oracle()
+            .expect("an oracle is installed");
+    assert!(
+        std::ptr::addr_eq(
+            std::sync::Arc::as_ptr(&now),
+            std::sync::Arc::as_ptr(&successor)
+        ),
+        "the successor's oracle survived the stop"
+    );
+}
+
+/// Final fix A-M2: a stop is observed while the armed task waits for its
+/// node (the node lock held elsewhere) and while the session opens a
+/// stream the hub never answers — both stop at once, never by the bound's
+/// abort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_is_observed_while_starting_and_while_the_stream_opens() {
+    let w = ts::two_instances().await;
+    shutdown(&w.b.ctx).await;
+    {
+        let _node = w.b.ctx.iroh_node.lock().await; // `ready` waits for it
+        w.b.start_live();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let t0 = Instant::now();
+        shutdown(&w.b.ctx).await;
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "stop took {:?}",
+            t0.elapsed()
+        );
+    }
+    // A hub that accepts the connection and never answers.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", silent.local_addr().unwrap());
+    let held = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((s, _)) = silent.accept().await {
+            open.push(s);
+        }
+    });
+    crate::api::collab_exchange::test_support::wire_hub(&w.b.ctx, &url, "tok-b");
+    w.b.start_live();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let t0 = Instant::now();
+    shutdown(&w.b.ctx).await;
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "stop took {:?}",
+        t0.elapsed()
+    );
+    held.abort();
+}
+
+/// Final fix A-M4: Sync now while the armed runtime waits to start (no
+/// Collaboration folder) is queued and applied when it starts — its digest
+/// check reaches the hub — never a silent no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_now_before_the_runtime_runs_is_applied_when_it_starts() {
+    let w = ts::two_instances().await;
+    crate::api::scan_roots::clear_collaboration_dir(&w.b.ctx)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while status(&w.b.ctx).storage != crate::api::collab_live::StorageStateView::NotSet {
+        assert!(Instant::now() < deadline, "status {:?}", status(&w.b.ctx));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let reports = || w.hub.requests_to("/projects/p1/holders/self");
+    let before = reports().await;
+    ts::sync_now_serial(&w.b.ctx).await;
+    let other = tempfile::tempdir().unwrap();
+    let dir = other.path().join("Collab2");
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::api::scan_roots::set_collaboration_dir(
+        &w.b.ctx,
+        dir.to_string_lossy().to_string(),
+        &crate::api::PathPolicy::AllowAll,
+    )
+    .await
+    .unwrap();
+    wait_status(&w.b.ctx, LiveState::Live, Duration::from_secs(10)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while reports().await == before {
+        assert!(
+            Instant::now() < deadline,
+            "the queued Sync now's digest check never reached the hub"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

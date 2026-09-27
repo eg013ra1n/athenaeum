@@ -90,7 +90,17 @@ pub(crate) async fn run_session(
             },
             None,
         );
-        match stream::open(&http, &hub_url, &token).await {
+        // Final fix A-M2: a stop is observed while the stream opens (a hub
+        // that accepts and never answers holds `open` up to its read
+        // timeout). No `hello` was read, so there is no presence to leave.
+        let opened = tokio::select! {
+            opened = stream::open(&http, &hub_url, &token) => opened,
+            _ = stop.changed() => {
+                tracing::info!(outcome = "stopped", "event stream open abandoned at the stop");
+                return;
+            }
+        };
+        match opened {
             Ok(resp) => {
                 failures = 0;
                 backoff.reset();

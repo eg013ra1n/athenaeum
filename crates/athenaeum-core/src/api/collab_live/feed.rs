@@ -1129,7 +1129,16 @@ impl FeedApplier {
             crate::db::collab::reset_holder_seq(&conn, pid)?;
         }
         effects.extend(holders.reload(pid, new_epoch).await?);
-        reannounce_lost_own_frames(&self.ctx, &self.client, &self.token, pid, &seen).await?;
+        // The feed worker's own path: its retries may wait (only it waits).
+        reannounce_lost_own_frames(
+            &self.ctx,
+            &self.client,
+            &self.token,
+            pid,
+            &seen,
+            crate::collab::hub_client::RetryPolicy::Background,
+        )
+        .await?;
         let cursor_version = target_version.unwrap_or(project_version);
         {
             let database = db(&self.ctx)?;
@@ -1155,12 +1164,16 @@ impl FeedApplier {
 /// serve. A 409 "already announced" names specific uuids (R8a's pattern);
 /// this drops just those and retries the rest, rather than abandoning the
 /// whole batch over one frame that turned out not to be lost after all.
+///
+/// `policy`: `Background` on the feed worker only (its retries may wait for
+/// minutes); `Interactive` anywhere a command waits (final fix A-I1).
 pub(crate) async fn reannounce_lost_own_frames(
     ctx: &ServiceContext,
     client: &CollabClient,
     token: &str,
     project_id: &str,
     seen: &HashSet<String>,
+    policy: crate::collab::hub_client::RetryPolicy,
 ) -> Result<usize, ApiError> {
     use crate::db::collab_frames::{self as frames_db, LocalState};
     let (lost, gate): (Vec<FrameInWire>, i32) = {
@@ -1223,11 +1236,9 @@ pub(crate) async fn reannounce_lost_own_frames(
             batch.iter().map(|f| f.frame_uuid.clone()),
         );
         while !batch.is_empty() {
-            match crate::collab::hub_client::with_retry(
-                "reannounce",
-                crate::collab::hub_client::RetryPolicy::Background,
-                || client.announce_frames(token, project_id, &batch),
-            )
+            match crate::collab::hub_client::with_retry("reannounce", policy, || {
+                client.announce_frames(token, project_id, &batch)
+            })
             .await
             {
                 Ok(resp) => {
@@ -1313,11 +1324,12 @@ pub(crate) async fn reannounce_lost_own_frames(
 /// `/me/projects` refresh that shows it here). While another device was
 /// bound, an epoch-change re-announce of this device's frames was refused
 /// (recorded, not retried); run the same check now — one full manifest
-/// fetch, then every own frame the hub no longer lists is re-announced.
-/// Signed out → nothing to do.
+/// fetch, then every own frame the hub no longer lists is re-announced
+/// under `policy`. Signed out → nothing to do.
 pub(crate) async fn reannounce_after_rebind(
     ctx: &ServiceContext,
     project_id: &str,
+    policy: crate::collab::hub_client::RetryPolicy,
 ) -> Result<usize, ApiError> {
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
         return Ok(0);
@@ -1325,7 +1337,7 @@ pub(crate) async fn reannounce_after_rebind(
     let client = CollabClient::new(&hub_url).map_err(crate::api::collab_exchange::client_err)?;
     let (seen, _) =
         crate::api::collab_exchange::sync_manifest_full(ctx, project_id, None, None).await?;
-    let n = reannounce_lost_own_frames(ctx, &client, &token, project_id, &seen).await?;
+    let n = reannounce_lost_own_frames(ctx, &client, &token, project_id, &seen, policy).await?;
     tracing::info!(
         project_id,
         count = n,
@@ -1359,9 +1371,13 @@ pub(crate) fn rebind_needs_reannounce(
 }
 
 /// [`reannounce_after_rebind`] when [`rebind_needs_reannounce`] says so.
-/// The refused mark is cleared before the check and set again by a refusal
-/// inside it or by a failure. Never fails the caller (a switch or a
-/// refresh): a failure is logged.
+/// Never fails the caller (a switch or a refresh) and never makes it wait
+/// on a hub retry (final fix A-I1): while a live exchange runs, the check
+/// is handed to its feed worker (serialised with the applier, `Background`
+/// retries) and this returns at once — the refused mark is set first, so a
+/// check the worker never reached (the app stopped) still runs at the next
+/// binding move here. With no live exchange running it runs here under
+/// `Interactive` (at most [`crate::collab::hub_client::INTERACTIVE_ATTEMPTS`]).
 pub(crate) async fn after_binding_moved_here(
     ctx: &ServiceContext,
     project_id: &str,
@@ -1375,23 +1391,48 @@ pub(crate) async fn after_binding_moved_here(
         );
         return;
     }
-    // Fix round 3 (m1): the mark is cleared BEFORE the check. A refusal
-    // inside it (the binding moved away again meanwhile) sets it again
-    // itself; a failure sets it again here — it never outlives or loses a
-    // refusal.
-    let mark = |refused: bool| {
-        let written = db(ctx).and_then(|d| {
-            crate::db::collab_live::set_reannounce_refused(&d.conn(), project_id, refused)
-                .map_err(ApiError::from)
-        });
-        if let Err(e) = written {
-            tracing::warn!(project_id, refused, error = %e, "writing the refused re-announce mark failed");
+    if crate::api::collab_live::runtime::live_running(ctx) {
+        set_refused_mark(ctx, project_id, true);
+        if crate::api::collab_live::runtime::request_rebind(ctx, project_id) {
+            tracing::info!(
+                project_id,
+                "re-announce check after the binding moved here queued on the feed worker"
+            );
+            return;
         }
-    };
-    mark(false);
-    if let Err(e) = reannounce_after_rebind(ctx, project_id).await {
+    }
+    run_rebind_check(
+        ctx,
+        project_id,
+        crate::collab::hub_client::RetryPolicy::Interactive,
+    )
+    .await;
+}
+
+/// The re-announce check itself (the feed worker's `FeedWork::Rebind`, or a
+/// command with no live exchange running). The refused mark is cleared
+/// BEFORE the check (fix round 3, m1): a refusal inside it (the binding
+/// moved away again meanwhile) sets it again itself; a failure sets it
+/// again here — it never outlives or loses a refusal.
+pub(crate) async fn run_rebind_check(
+    ctx: &ServiceContext,
+    project_id: &str,
+    policy: crate::collab::hub_client::RetryPolicy,
+) {
+    set_refused_mark(ctx, project_id, false);
+    if let Err(e) = reannounce_after_rebind(ctx, project_id, policy).await {
         tracing::warn!(project_id, error = %e, "re-announce check after the binding moved here failed");
-        mark(true);
+        set_refused_mark(ctx, project_id, true);
+    }
+}
+
+fn set_refused_mark(ctx: &ServiceContext, project_id: &str, refused: bool) {
+    let written = db(ctx).and_then(|d| {
+        crate::db::collab_live::set_reannounce_refused(&d.conn(), project_id, refused)
+            .map_err(ApiError::from)
+    });
+    if let Err(e) = written {
+        tracing::warn!(project_id, refused, error = %e, "writing the refused re-announce mark failed");
     }
 }
 
@@ -2461,9 +2502,16 @@ mod tests {
         hub.forget_frames(PID, &["own_missing_one", "own_held_one"]);
 
         let client = CollabClient::new(hub.uri()).unwrap();
-        let announced = reannounce_lost_own_frames(&ctx, &client, "tok", PID, &HashSet::new())
-            .await
-            .unwrap();
+        let announced = reannounce_lost_own_frames(
+            &ctx,
+            &client,
+            "tok",
+            PID,
+            &HashSet::new(),
+            crate::collab::hub_client::RetryPolicy::Interactive,
+        )
+        .await
+        .unwrap();
         assert_eq!(announced, 1);
         assert!(
             hub.frame(PID, "own_held_one").is_some(),
@@ -2492,9 +2540,16 @@ mod tests {
         hub.forget_frames(PID, &["truly_lost"]);
 
         let client = CollabClient::new(hub.uri()).unwrap();
-        let announced = reannounce_lost_own_frames(&ctx, &client, "tok", PID, &HashSet::new())
-            .await
-            .unwrap();
+        let announced = reannounce_lost_own_frames(
+            &ctx,
+            &client,
+            "tok",
+            PID,
+            &HashSet::new(),
+            crate::collab::hub_client::RetryPolicy::Interactive,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             announced, 1,
             "the truly-lost frame is re-announced despite sharing a batch with an already-announced one"

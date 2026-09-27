@@ -148,10 +148,35 @@ pub(crate) enum Prepared {
 
 /// Results of the executor's own tasks, one channel.
 pub(crate) enum ExecEvent {
-    Prepared { name: String, outcome: Prepared },
-    Landed { name: String, landed: Landed },
+    Prepared {
+        name: String,
+        outcome: Prepared,
+    },
+    Landed {
+        name: String,
+        landed: Landed,
+    },
     Lane(ReceivePermit),
-    RunEnded { run: u64 },
+    RunEnded {
+        run: u64,
+    },
+    /// Parked rows the GC probe released (their catalog write done off the
+    /// loop, final fix A-I2): these projects' need sets are re-read.
+    GcReleased(Vec<String>),
+}
+
+/// One catalog write the executor hands off the loop (final fix A-I2).
+type WriteJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// The executor's catalog writer: its jobs run one after another on a
+/// blocking thread, in the order the loop queued them — a write that waits
+/// out another writer's lock (up to the busy timeout) never holds the loop.
+async fn run_writer(mut jobs: mpsc::UnboundedReceiver<WriteJob>) {
+    while let Some(job) = jobs.recv().await {
+        if let Err(e) = tokio::task::spawn_blocking(job).await {
+            tracing::error!(error = %e, "a collab catalog write task failed");
+        }
+    }
 }
 
 struct Run {
@@ -206,6 +231,12 @@ pub(crate) struct Executor {
     /// Projects whose need set must be re-read (a stale landing, a local
     /// change).
     pub(crate) dirty: BTreeSet<String>,
+    /// The catalog writer's queue (`None` once shut down: the writer drains
+    /// what it has and ends).
+    writer: Option<mpsc::UnboundedSender<WriteJob>>,
+    /// Test only: every result a fetch finished with, in order.
+    #[cfg(test)]
+    finished: Vec<(FrameKey, FetchResult)>,
 }
 
 /// At most this many parked rows per GC probe (one local store call each).
@@ -353,6 +384,8 @@ impl Executor {
         let pool = CollabPool::new(env.node.endpoint(), pool_tx);
         let yield_rx = env.control.receive_gate.yield_signal();
         let (slots_tx, _) = watch::channel(slots);
+        let (writer, jobs) = mpsc::unbounded_channel();
+        tokio::spawn(run_writer(jobs));
         Self {
             env: Arc::new(env),
             core: Core::new(seed, slots),
@@ -380,6 +413,54 @@ impl Executor {
             yield_rx,
             notes: Vec::new(),
             dirty: BTreeSet::new(),
+            writer: Some(writer),
+            #[cfg(test)]
+            finished: Vec::new(),
+        }
+    }
+
+    /// Queue a catalog write on the executor's writer (final fix A-I2).
+    fn write(&self, job: WriteJob) {
+        let sent = match &self.writer {
+            Some(w) => w.send(job).is_ok(),
+            None => false,
+        };
+        if !sent {
+            tracing::error!("the collab catalog writer is gone; a write was dropped");
+        }
+    }
+
+    /// A fetch's failure on its row, off the loop — only while the row is
+    /// still `wanted` (a write that waited out another writer never marks a
+    /// row that landed meanwhile).
+    fn write_frame_error(&self, project_id: &str, frame_uuid: &str, error: &str) {
+        let (ctx, pid, uuid, error) = (
+            Arc::clone(&self.env.ctx),
+            project_id.to_string(),
+            frame_uuid.to_string(),
+            error.to_string(),
+        );
+        self.write(Box::new(move || {
+            let written = db(&ctx).and_then(|d| {
+                Ok(frames_db::set_fetch_error(&d.conn(), &pid, &uuid, &error)?)
+            });
+            if let Err(e) = written {
+                tracing::warn!(project_id = %pid, frame_uuid = %uuid, error = %e, "record frame error failed");
+            }
+        }));
+    }
+
+    /// Test only: wait until every queued catalog write ran, then apply the
+    /// events they sent.
+    #[cfg(test)]
+    pub(crate) async fn settle_writes(&mut self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.write(Box::new(move || {
+            let _ = tx.send(());
+        }));
+        let _ = rx.await;
+        while let Ok(ev) = self.events_rx.try_recv() {
+            self.on_event(ev).await;
         }
     }
 
@@ -837,6 +918,7 @@ impl Executor {
             // Items still queued at a yield got no outcome: re-derived (a
             // cancel the core re-queues at once).
             ExecEvent::RunEnded { run } => self.end_run(run, FetchResult::Cancelled).await,
+            ExecEvent::GcReleased(projects) => self.dirty.extend(projects),
         }
     }
 
@@ -858,12 +940,7 @@ impl Executor {
         for name in names {
             if orphans == FetchResult::Failed {
                 if let Some((pid, uuid)) = self.items.get(&name).map(|i| i.key.clone()) {
-                    crate::api::collab_exchange::record_frame_error(
-                        &self.env.ctx,
-                        &pid,
-                        &uuid,
-                        "internal error: the transfer run failed",
-                    );
+                    self.write_frame_error(&pid, &uuid, "internal error: the transfer run failed");
                     self.notes.push(Note::Failed(pid));
                 }
             }
@@ -911,14 +988,18 @@ impl Executor {
                 match queue.try_send(live) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        // The run is gone (it panicked; its reaping is on
-                        // the way): failed, backed off — never re-queued at
-                        // once into the same dead queue (fix round 2).
-                        tracing::warn!(frame_uuid = %name, "live run ended before the fetch was queued; it failed and backs off");
+                        // The run is gone and its end is not reaped yet: it
+                        // ended at a yield (`RunEnded` on its way) or it
+                        // panicked (its task's reaping on its way). The item
+                        // stays `Sent` to that run and the run's end rules on
+                        // it with every other item it left — cancelled (no
+                        // strike, no back-off) at a yield, failed and backed
+                        // off after a panic, never re-queued at once into the
+                        // same dead queue (fix round 2; final fix A-M3).
+                        tracing::debug!(frame_uuid = %name, "live run ended before the fetch was queued; its end rules on it");
                         if self.run.as_ref().is_some_and(|r| r.id == run) {
                             self.run = None;
                         }
-                        self.finish(&name, FetchResult::Failed).await;
                     }
                     Err(e) => {
                         tracing::warn!(frame_uuid = %name, error = %e, "live run queue refused the fetch; re-queued");
@@ -964,7 +1045,7 @@ impl Executor {
                 } else {
                     tracing::warn!(project_id = %pid, frame_uuid = %uuid, error = %msg, "frame fetch failed; retried after its back-off");
                 }
-                crate::api::collab_exchange::record_frame_error(&self.env.ctx, &pid, &uuid, &msg);
+                self.write_frame_error(&pid, &uuid, &msg);
                 self.notes.push(Note::Failed(pid));
                 self.finish(&name, FetchResult::Failed).await;
             }
@@ -1045,6 +1126,8 @@ impl Executor {
             let tag = project_frame_in_flight_tag(&item.key.0, &item.key.1, item.content_version);
             drop_tag(&self.env.store, &tag).await;
         }
+        #[cfg(test)]
+        self.finished.push((item.key.clone(), result));
         self.step(Input::Finished {
             key: item.key,
             fetch_id: item.fetch_id,
@@ -1192,12 +1275,7 @@ impl Executor {
                 let key = self.items.get(&name).map(|i| i.key.clone());
                 tracing::error!(frame_uuid = %name, error = %e, "a fetch task panicked; the fetch failed");
                 if let Some((pid, uuid)) = key {
-                    crate::api::collab_exchange::record_frame_error(
-                        &self.env.ctx,
-                        &pid,
-                        &uuid,
-                        &format!("internal error: {e}"),
-                    );
+                    self.write_frame_error(&pid, &uuid, &format!("internal error: {e}"));
                     self.notes.push(Note::Failed(pid));
                 }
                 self.finish(&name, FetchResult::Failed).await;
@@ -1254,35 +1332,48 @@ impl Executor {
         } else {
             rows.last().map(|(p, u, _)| (p.clone(), u.clone()))
         };
-        let mut released = 0usize;
+        let mut released: Vec<(String, String)> = Vec::new();
         for (pid, uuid, blake3) in rows {
             let Ok(hash) = blake3.parse::<Hash>() else {
                 continue;
             };
             match self.env.node.collab_blob_health(hash).await {
-                Ok(BlobHealth::Missing | BlobHealth::Partial) => {
-                    let done = db(&self.env.ctx).and_then(|d| {
-                        Ok(frames_db::set_awaiting_gc(&d.conn(), &pid, &uuid, false)?)
-                    });
-                    match done {
-                        Ok(_) => {
-                            released += 1;
-                            self.dirty.insert(pid);
-                        }
-                        Err(e) => {
-                            tracing::warn!(project_id = %pid, frame_uuid = %uuid, error = %e, "release from awaiting GC failed")
-                        }
-                    }
-                }
+                Ok(BlobHealth::Missing | BlobHealth::Partial) => released.push((pid, uuid)),
                 Ok(_) => {}
                 Err(e) => {
                     tracing::debug!(project_id = %pid, frame_uuid = %uuid, error = %format!("{e:#}"), "blob health unknown; kept awaiting GC")
                 }
             }
         }
-        if released > 0 {
-            tracing::info!(count = released, "frames released from awaiting GC");
+        if released.is_empty() {
+            return;
         }
+        // Final fix A-I2: the release is a catalog write — off the loop; the
+        // need sets are re-read when it is done (`ExecEvent::GcReleased`).
+        let (ctx, events) = (Arc::clone(&self.env.ctx), self.events_tx.clone());
+        self.write(Box::new(move || {
+            let mut projects = Vec::new();
+            for (pid, uuid) in released {
+                let done = db(&ctx).and_then(|d| {
+                    Ok(frames_db::set_awaiting_gc(&d.conn(), &pid, &uuid, false)?)
+                });
+                match done {
+                    Ok(_) => projects.push(pid),
+                    Err(e) => {
+                        tracing::warn!(project_id = %pid, frame_uuid = %uuid, error = %e, "release from awaiting GC failed")
+                    }
+                }
+            }
+            if projects.is_empty() {
+                return;
+            }
+            tracing::info!(count = projects.len(), "frames released from awaiting GC");
+            projects.sort();
+            projects.dedup();
+            if events.send(ExecEvent::GcReleased(projects)).is_err() {
+                tracing::debug!("the executor is gone; released frames wait for its next start");
+            }
+        }));
     }
 
     /// Stop everything: the lane request, the live run, every task; the
@@ -1291,6 +1382,8 @@ impl Executor {
         if let Some(r) = self.requesting.take() {
             r.abort();
         }
+        // The writer finishes what is queued, then ends.
+        self.writer = None;
         self.run = None;
         self.tasks.abort_all();
         self.task_kinds.clear();
@@ -1741,6 +1834,7 @@ mod tests {
             7,
         );
         exec.gc_probe().await;
+        exec.settle_writes().await; // the release is written off the loop
         let row = frames_db::get(&db(&ctx).unwrap().conn(), ts::PID, "g1")
             .unwrap()
             .unwrap();
@@ -1806,11 +1900,14 @@ mod tests {
         };
         exec.gc_probe_batch(1).await; // r1: dead
         exec.gc_probe_batch(1).await; // r2: dead
+        exec.settle_writes().await;
         assert!(parked("r3"), "not probed yet");
         exec.gc_probe_batch(1).await; // r3: its entry is gone
+        exec.settle_writes().await; // the release is written off the loop
         assert!(!parked("r3"), "released on its turn");
         assert!(parked("r1") && parked("r2"));
         exec.gc_probe_batch(1).await; // wrapped: r1 again
+        exec.settle_writes().await;
         assert!(parked("r1"));
         exec.shutdown();
     }
@@ -1847,6 +1944,95 @@ mod tests {
             assert!(Instant::now() < deadline, "the in-flight tag is dropped");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        exec.shutdown();
+    }
+
+    /// An executor on a signed-in rig holding the collab lane, whose live
+    /// run 7 has already ended (its queue closed) with no end reaped yet,
+    /// and one item `y1` being prepared.
+    async fn a_run_that_ended_unreaped() -> (tempfile::TempDir, Executor, String, FrameKey) {
+        let (tmp, ctx, _hub) = ts::signed_in_rig().await;
+        let ctx = Arc::new(ctx);
+        let node = ctx.iroh_node.lock().await.clone().unwrap();
+        let root = ts::collab_root(&ctx);
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        let control = Arc::new(InboundControl::new());
+        let permit = control.receive_gate.acquire_collab().await;
+        let mut exec = Executor::new(
+            ExecEnv {
+                ctx: Arc::clone(&ctx),
+                store: node.collab_store().unwrap(),
+                node,
+                root: root.clone(),
+                guard: Arc::new(StoreGuard::new(root, me, None)),
+                control,
+            },
+            2,
+            7,
+        );
+        exec.permit = Some(permit);
+        let (items, dead) = mpsc::channel(1);
+        drop(dead);
+        exec.run_seq = 7;
+        exec.run = Some(Run { id: 7, items });
+        let key: FrameKey = (ts::PID.to_string(), "y1".to_string());
+        let name = item_name(&key, 1);
+        let hash = Hash::new(b"y1");
+        exec.items.insert(
+            name.clone(),
+            Item {
+                key: key.clone(),
+                fetch_id: 1,
+                content_version: 1,
+                blake3: hash.to_hex().to_string(),
+                hash,
+                phase: Phase::Preparing,
+                providers: watch::channel(Arc::new(Vec::new())).0,
+                cancel: watch::channel(false).0,
+                cancelled: None,
+                row: None,
+                started_at: crate::sync::now_iso(),
+            },
+        );
+        (tmp, exec, name, key)
+    }
+
+    /// Final fix A-M3: a fetch prepared just after its run ended at a YIELD
+    /// (the queue closed, `RunEnded` not reaped yet) is never struck: it
+    /// waits for the run's end, which cancels it (re-queued at once, no
+    /// back-off) with every other item the run left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_prepared_after_a_yield_ended_its_run_is_cancelled_not_struck() {
+        let (_tmp, mut exec, name, key) = a_run_that_ended_unreaped().await;
+        exec.on_prepared(
+            name.clone(),
+            Prepared::Fetch(replica("y1", "2026-01-01 00:00:00", 10)),
+        )
+        .await;
+        assert!(
+            exec.finished.is_empty(),
+            "no verdict before the run's end: {:?}",
+            exec.finished
+        );
+        assert_eq!(exec.items[&name].phase, Phase::Sent { run: 7 });
+        assert!(exec.run.is_none(), "the next fetch starts a new run");
+        exec.on_event(ExecEvent::RunEnded { run: 7 }).await;
+        assert_eq!(exec.finished, vec![(key, FetchResult::Cancelled)]);
+        exec.shutdown();
+    }
+
+    /// Fix round 2 kept: the same window after a run PANICKED fails the
+    /// fetch (it backs off) — the panic's reaping rules on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_prepared_after_a_run_panicked_fails() {
+        let (_tmp, mut exec, name, key) = a_run_that_ended_unreaped().await;
+        exec.on_prepared(
+            name.clone(),
+            Prepared::Fetch(replica("y1", "2026-01-01 00:00:00", 10)),
+        )
+        .await;
+        exec.end_run(7, FetchResult::Failed).await; // what the panic's reaping does
+        assert_eq!(exec.finished, vec![(key, FetchResult::Failed)]);
         exec.shutdown();
     }
 
