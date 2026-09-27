@@ -759,8 +759,8 @@ fn project_gate(
     };
     // P3: a NULL or unparsed dictionary maps to an empty list, so every frame
     // fails the filter precondition with its own raw name in the reason —
-    // never a silent pass. The dictionary is filled by the version poll
-    // (Task 8); until a project has one, nothing here can pass this
+    // never a silent pass. The dictionary is filled by the project refresh
+    // the live feed runs; until a project has one, nothing here can pass this
     // precondition, which is the correct fail-closed default for a hub field
     // this build hasn't fetched yet.
     let dictionary: Vec<DictionaryEntry> = match &project.dictionary_json {
@@ -1325,11 +1325,11 @@ pub(crate) struct RefreshReport {
 
 /// THE one entry point for "a project's thresholds or dictionary moved"
 /// (ruling R11), called by every refresh path — the project list refresh and
-/// the version poll — so a change is acted on once, whichever path absorbed
+/// the live feed's — so a change is acted on once, whichever path absorbed
 /// it. Dirties the project for auto-publish (Task 10, R16): a tightened
 /// threshold or a dictionary change can turn a previously-refused frame
-/// publishable. May fire twice for one change (a UI refresh and the version
-/// poll overlapping) — the auto-publish worker's dirty-set + kick + debounce
+/// publishable. May fire twice for one change (a UI refresh and the live
+/// feed overlapping) — the auto-publish worker's dirty-set + kick + debounce
 /// design collapses that into one run (see
 /// `collab_autopublish::two_gate_moves_for_the_same_project_drain_to_one_entry`).
 pub(crate) fn on_thresholds_or_dictionary_moved(_ctx: &ServiceContext, project_id: &str) {
@@ -1356,7 +1356,7 @@ pub(crate) fn take_gate_moves_seen() -> Vec<String> {
 
 /// [`refresh_projects`] without the hook, reporting what it did.
 ///
-/// `only` limits the per-project fetch to those ids (the version poll passes
+/// `only` limits the per-project fetch to those ids (the live feed passes
 /// the projects that moved or appeared); every project `/me/projects` lists
 /// still counts as mine, so a loss is detected from the list either way.
 ///
@@ -4201,7 +4201,7 @@ fn decide_err(e: crate::account::AccountClientError) -> ApiError {
 /// `/me/project-versions` value to vouch for (R12 is about that endpoint, not
 /// this reply). That sync is best-effort: once the hub took the decision the
 /// command succeeds, and a failed sync is logged at `warn!` for the next
-/// version poll to repair (M9).
+/// project event to repair (M9).
 ///
 /// A hub 409 (no longer pending) is [`ApiError::Conflict`] and leaves the
 /// local row untouched (a sync will pick up the true state later).
@@ -4226,9 +4226,9 @@ pub async fn approve_collab_frame(
         .map_err(decide_err)?;
     tracing::info!(project_id, frame_uuid, trust, published, "approved frame");
     // M9: the decision is made; a failed follow-up sync is not the
-    // command's failure — the next version poll syncs the manifest.
+    // command's failure — the hub's project event syncs the manifest.
     if let Err(e) = crate::api::collab_exchange::sync_manifest(ctx, project_id, None, None).await {
-        tracing::warn!(project_id, frame_uuid, error = %e, "manifest sync after approval failed; the next poll syncs it");
+        tracing::warn!(project_id, frame_uuid, error = %e, "manifest sync after approval failed; the next project event syncs it");
     }
     Ok(())
 }
@@ -4266,9 +4266,9 @@ pub async fn reject_collab_frame(
         .await
         .map_err(decide_err)?;
     tracing::info!(project_id, frame_uuid, "rejected frame");
-    // M9: as for approval — the next version poll syncs the manifest.
+    // M9: as for approval — the hub's project event syncs the manifest.
     if let Err(e) = crate::api::collab_exchange::sync_manifest(ctx, project_id, None, None).await {
-        tracing::warn!(project_id, frame_uuid, error = %e, "manifest sync after rejection failed; the next poll syncs it");
+        tracing::warn!(project_id, frame_uuid, error = %e, "manifest sync after rejection failed; the next project event syncs it");
     }
     Ok(())
 }
@@ -6247,8 +6247,7 @@ pub(crate) mod tests {
         /// on the M31 target, analyzed, uuid `uuid-pub-<i>`), each a real
         /// `W`×`H` FITS under `<root>/src/`, all linked to ONE real master
         /// dark at `<root>/masters/master_dark.fits` (calibration set 700).
-        /// The caller links the set to its project. Shared with the
-        /// three-instance e2e (`api::collab_v3_e2e_tests`).
+        /// The caller links the set to its project.
         pub(crate) fn seed_real_light_set(
             conn: &rusqlite::Connection,
             root: &Path,

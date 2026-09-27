@@ -136,9 +136,10 @@ package-era `#[cfg(unix)]` collab tests and the 9 `#[ignore]`d publish tests wen
 with the package layer (plan P15: deleted, replaced by the per-frame tests of
 tasks 7–12). The per-frame tests in `api/collab.rs` and `api/collab_exchange.rs`
 carry no platform gate, so Windows now runs them. The ONE remaining unix-gated
-collab test is the three-instance e2e (`api/collab_v3_e2e_tests.rs`, a whole
-`#[cfg(all(test, unix, …))]` module, gated like the package-era e2e it replaces);
-its helpers live inside the gated module, so it adds no never-used warning. The
+collab test module is the three-instance e2e — since wave 3
+`api/collab_v3_live_e2e_tests.rs` (the wave-2 `collab_v3_e2e_tests.rs` is gone),
+a whole `#[cfg(all(test, unix, …))]` module; its helpers live in the gated
+`api::collab_live::test_support`, so it adds no never-used warning. The
 "17 of the 28 Windows warnings" figure above predates this and is stale —
 re-count on the next Windows run. Removing the e2e's unix gate is untried; the
 old reason ("loopback engines on background tasks") no longer applies — it
@@ -199,6 +200,94 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Collab v3 wave 3 — the app on the live exchange (2026-09-25 → 27)
+
+App branch `collab-v3-wave3` (not merged, not pushed). The app follows the hub
+live: one event stream per device, presence beats, claims through an outbox
+with a digest, a deterministic scheduler, a serve check per request, a
+per-frame local storage state machine, the two-class receive gate, the collab
+pool, device replace / take-over, amendments A5 (re-designated folder) and A6
+(one publishing device per account). Spec
+`docs/superpowers/specs/2026-09-25-collab-v3-live-exchange-design.md`, plan
+`docs/superpowers/plans/2026-09-25-collab-v3-wave3-app-live-exchange-plan.md`,
+reference `docs/transfers/README.md` "Collab v3 — live exchange". In-process
+proof: `api::collab_v3_live_e2e_tests` (three instances, relay disabled, the
+§12 latency table, A5, A6, the one-copy disk ledger — measured numbers in
+the transfers reference).
+
+- **Owed — three-machine acceptance on the test hub + test relay** (after the
+  hub wave-3 test-hub deploy owed below, and this branch on all three):
+  1. Three machines: A a `send` contributor, B a `send_receive` processor, C
+     the `send_receive` coordinator; one project; all three on the test hub
+     and the test relay.
+  2. Run the spec §12 table with real timings, each against its bound: A
+     publishes → B starts fetching ≤ 2 s; B lands → C fetches from B ≤ 3 s
+     (≤ 5 s on a cold relay dial); B quits → C stops dialling B ≤ 2 s; B
+     killed → C drops B ≤ 50 s after its last beat; B restarts → a provider
+     again ≤ 3 s, zero re-reports; v2 mid-download; a replica edited in
+     place (refused, quarantined, v2 not landed over it); `touch` (served
+     again); one delete (back after the settle + GC); 15 deletes (ONE
+     choice, nothing blocked); storage unmounted (serving false, no state
+     change, back without a re-fetch); hub restart; epoch rotation; device
+     revoked mid-transfer; a personal transfer during a collab fetch
+     (admitted after at most the frames in flight).
+  3. The §15 acceptance with its two edits: "B deletes 15 at once" expects
+     one non-blocking choice, not a pause; auto-publish is judged as "B
+     starts fetching within 2 s of the announce".
+  4. `du -sh` of each Collaboration root and each working dir's `blobs/`
+     before (after the stores exist — each `blobs.db` is a preallocated
+     1 MiB redb) and after: roots grow by the payload + < 1 %, personal
+     `blobs/` unchanged.
+  5. Record the relay-byte fraction (spec §12).
+- **Owed — the relay stream measurement (plan P21).** Run
+  `api::relay_live_tests::collab_stream_limits_throughput_on_real_relay`
+  (command in its doc comment; `ATHENAEUM_TEST_RELAY=…`); set
+  `collab.max_receive_streams` = the smallest `n` within 90 % of the best
+  MB/s and `collab.max_upload_streams` the same, in `settings/mod.rs`
+  (dropping "PROVISIONAL"). Until then both stay 8. Run the two ends on
+  different networks, or read the printed `relay_share`: well below 1.0
+  means hole punching bypassed the relay.
+- **Owed — desktop click-through**: the live status line ("live",
+  "reconnecting in N s", "hub unreachable") and Sync now; the Receive tab's
+  Changed files, Not kept, Other files and awaiting-choice lists; the
+  15-delete choice and its last-copy dialog; the "lost everywhere"
+  notification (and its previous-folder wording after a re-designation); the
+  device-replace prompt, "Check again", the take-over dialog and the
+  swapped-disk explanation; the project header's publishing device and
+  "Publish from this device"; Settings → Transfers → Collaboration streams.
+- **Owed — Windows**: a rename over an open served file; `trash::delete` on
+  the shell API; UNC network-volume detection (sweeps every 5 min).
+- **Owed — hub deploy + one-week soak** (spec §15, with the hub section
+  below): at least three real devices on the test hub; the hourly digest
+  checks all match.
+- **Owner decisions** (from the plan; each accepted provisionally):
+  - P18 — one collab lane: the whole collab exchange holds ONE receive
+    permit and yields it to a personal transfer at frame boundaries.
+  - P21 — the stream-limit defaults come from the owed measurement.
+  - P28 — no sleep hook on desktop (Tauri has none): the hub's 40 s silence
+    rule and wake detection (a wall-clock jump) cover a sleeping laptop.
+  - P30 — no per-project "serving" or "pause" switches.
+  - P31 — a single deleted replica comes back after the settle plus the
+    collab GC (now 60 s), not at once: iroh-blobs 0.103 has no public blob
+    delete.
+  - The deletion choice's `count` is the WINDOW's count: 15 deletions a few
+    seconds after a single re-fetched one report 16 (the re-fetched frame
+    stays held). Cost if the owner wants "frames awaiting the choice"
+    instead: the event's count changes to the rows moved.
+- **Do NOT re-flag**:
+  - P12's extra BLAKE3 read per TEMP landing is the price of a store that
+    references the landed path.
+  - `holder_count`, `locally_declined` and `replication_paused` stay in the
+    schema unread (SQLite column drops avoided).
+  - The `ReceiveGate` debt counter is replaced by grant-on-release — the
+    same semantics.
+  - The personal store refuses inbound pushes since the push fix (07944ac9,
+    before this wave) — P15's "personal store keeps accepting pushes" is
+    resolved, nothing owed.
+  - A claim the hub refuses (a frame it lost in a restore) is reported again
+    when the frame is listed anew — found and fixed by the Task 18 e2e;
+    `claim refused by the hub` warnings right after a restore are expected.
+
 ### Collab v3 wave 3 — hub live exchange (2026-09-25)
 
 Hub branch `collab-v3-wave3`, merged to local main only; astronet commit on
@@ -226,7 +315,8 @@ compare-and-set, and propagates revocation (spec
 - **Expected, do not re-flag:**
   - The desktop app on local main (wave 2) gets `409 collab_api_outdated`
     from a wave-3 hub on `/me/project-versions`, per-frame holders, holder
-    reports and versions, until app wave 3.
+    reports and versions, until app wave 3 (branch `collab-v3-wave3`,
+    above) is merged.
   - The released app never called these routes.
 
 ### Collab v3 wave 2 — the app on the per-frame model (2026-09-24)
@@ -243,7 +333,13 @@ local policy, and the package layer retired. Reference: `docs/transfers/README.m
 (three contexts, three relay-disabled iroh nodes, one fake hub; the plan's nine steps
 and a one-copy disk ledger).
 
-- **Owed — three-machine acceptance** (after the wave-1 test-hub deploy owed below):
+- **Superseded by wave 3** (above): the version poll, the replication pass, the
+  maintenance loop and the loss guard this section describes are gone, and the
+  three-machine acceptance, the click-through and the relevant decisions are
+  re-listed under "Collab v3 wave 3 — the app on the live exchange". What
+  follows is kept for the record.
+- **Owed — three-machine acceptance** (after the wave-1 test-hub deploy owed below;
+  run the wave-3 one instead once that branch lands):
   1. Deploy nothing new to the hub; the test hub runs wave 1 after its owed deploy.
   2. Three machines: this Mac, a second account's device, and the Linux runner or a
      VM. Test relay. One project with `requireApproval`.
@@ -263,8 +359,8 @@ and a one-copy disk ledger).
      6 MiB of test frames cannot absorb 2 MiB of fixed databases at 1 %).
   5. Also record the relay-byte fraction (spec §12).
 - **Owed — desktop click-through** of the adapted collab UI (Projects page on
-  frames, "Update required", Receive tab policy + loss banner, moderation queue,
-  app-root collab notifications R29).
+  frames, "Update required", Receive tab policy, moderation queue, app-root
+  collab notifications R29; the loss banner is gone with wave 3).
 - **Owed before push — the full core suite on an idle machine.**
   `sync::ingest_tests::ingest_releases_conn_between_frames` failed under full-suite
   load on the dev Mac and passed alone (adjudicated as load in tasks 2 and 12); it
@@ -274,19 +370,11 @@ and a one-copy disk ledger).
   `geometry/pixel_map.rs`, and `a_tps_run_never_holds_…`) — a load-dependent
   overflow panic is suspicious and worth one look of its own.
 - **Owner decisions to confirm**:
-  - **R24** — a user-edited replica is renamed aside (kept as an inert foreign file)
-    before a same-version re-land, instead of spec §5.5's silent re-fetch over it.
-    Version bumps still land over the old path. Cost if wrong: an extra file the
-    user must remove.
   - **R31** — the project WBPP export takes published ∧ accepted ∧ on disk ∧ not
     awaiting GC, so a contributor's own pending/rejected frames are NOT in it (their
     own frame-set export still is). Cost if wrong: no project export of own pending
     frames.
 - **Follow-ups (not smokes)**:
-  - Hub batch holders endpoint: replication asks `GET …/frames/{uuid}/holders` once
-    per frame today (serial, m8).
-  - `holderCount == 0` pre-filter: an unservable frame still costs one holders GET
-    per pass — needed for the 78-member target.
   - Leftover collab `sync_outbound` rows on dev installs from the package era (M10).
   - Old `files`/`frames` rows under a Collaboration root that was promoted from a
     normal scan root are never cleaned.
@@ -298,14 +386,10 @@ and a one-copy disk ledger).
     split's per-candidate work on the async worker; the outdated path emits
     `collab-published` before returning `Conflict`; the update path unseeds and
     renames before `…/version` (a failed version call leaves this device listed on
-    vanished old bytes); a land-over can make a byte-identical sibling's store entry
-    dead (m3); a cross-project same-hash landing race (m6); `Restore` holds the
-    request for the whole rescan (m7); the in-flight sweep keeps partial bytes when
-    auto-replicate is off for good (N5); a concurrent forced pass and maintenance can
-    each stay under the loss guard (N7); a non-404 holders error stops the pass
-    (revisit if the hub adds per-frame 400/409); `request_auto_publish(None)` on scan
+    vanished old bytes); a cross-project same-hash landing race (m6); the in-flight sweep keeps partial bytes when
+    auto-replicate is off for good (N5); `request_auto_publish(None)` on scan
     dirties every auto-publish project; the backoff entry survives a project loss;
-    a whole-refresh failure flaps the "poll down" warn every 20 min; the scanner's
+    the scanner's
     walk drops unreadable entries silently, so the foreign-file prune can drop a row
     for an unreadable-but-present file; the ATH_PRJ divert outside the root can
     repoint a replica outside it; the `db/collab.rs::upsert_project` doc says "Six
@@ -318,10 +402,12 @@ and a one-copy disk ledger).
     version needs changed pixels — or `republish_collab_frames` after an engine
     change (the recipe excludes the engine version, R3).
   - A deleted replica is re-fetched only after the collab store's GC drops its dead
-    entry (P20, 900 s, no shorter interval this wave) — up to two maintenance ticks.
+    entry (P20; since wave 3 the collab GC runs every 60 s and the live runtime
+    probes parked rows as often — P31).
   - A lost project keeps its own rows and files (R14); only replicas' rows go.
-  - `StopHolding` survives a new content version: a declined frame stays declined
-    (the manifest upsert never touches `locally_declined`).
+  - Stop keeping survives a new content version: a `not_kept` frame stays not kept
+    (since wave 3 the state is `project_frames_local.local_state`; "Keep again"
+    undoes it).
 
 ### Collab v3 wave 1 (2026-09-24)
 

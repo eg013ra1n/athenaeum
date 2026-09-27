@@ -158,8 +158,9 @@ pub fn not_publishing_device_msg(device_name: Option<&str>) -> String {
     )
 }
 
-/// Log the `collab_api_outdated` refusal once per process: the version poll
-/// runs every 15 s and would otherwise flood the log with the same fact.
+/// Log the `collab_api_outdated` refusal once per process: every hub call —
+/// the event stream's reconnects, the project refresh, publish — would
+/// otherwise log the same fact again and again.
 /// Shared by every `AccountClientError → ApiError` mapper so the one warning
 /// is process-wide, whichever call hit it first.
 pub fn warn_collab_api_outdated_once() {

@@ -31,8 +31,10 @@ notify({
   calls `openPanel()`. `ToastStack` renders transient toasts.
 - **`NotificationKind`** (icon map lives in `NotificationPanel.tsx`): `files`,
   `update`, `merge`, `scan`, `export`, `analysis`, `platesolve`, `autofind`,
-  `archive`, `fileop`, `generic`. Add a kind → add it to the union *and* the
-  icon map.
+  `archive`, `fileop`, `registration`, `masterbuild`, `calibration`,
+  `stacking`, `sync`, `project`, `generic` (the union in
+  `src/contexts/NotificationContext.tsx`). Add a kind → add it to the union
+  *and* the icon map.
 - **Backend events → notifications**: don't add a listener in
   `NotificationContext`. Call `notify()` from the existing completion handler in
   the relevant hook/component (pattern: `useScanProgress`, `useExportProgress`,
