@@ -3,16 +3,16 @@ import { api } from '../api';
 import { useNotifications } from '../contexts/NotificationContext';
 import type { ProjectCard } from '../types/models';
 
-const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
-
 /** A hub call refused this build with the stable `collab_api_outdated`
  *  prefix (P17) — core emits this exact string for the conflict. */
 function isOutdated(msg: string): boolean {
   return msg.startsWith('collab_api_outdated');
 }
 
-/** Cached-first project list: instant cache render, then a hub refresh on
- * mount and every 5 minutes while the page is open (spec §2 poll cadence).
+/** Cached-first project list: instant cache render, then ONE hub refresh on
+ * mount. No periodic refresh (final fix C-17): the live exchange keeps the
+ * cached projects current from the hub's event feed (a `members` change
+ * refreshes `/me/projects` in core), so the page never polls the hub.
  *
  * R29 (controller ruling, Task 11b fix round 1): notifications for
  * per-frame/publish outcomes live in the app-root `useCollabNotifications`
@@ -23,8 +23,8 @@ function isOutdated(msg: string): boolean {
  * Frame changes arrive as live events (wave 3, L3), so there is no frames
  * poll any more. The MANUAL refresh (the returned `refresh`, the page's
  * Refresh button) also runs "Sync now" (`collab_sync_now`, L10) once the
- * projects refreshed; the automatic mount/5-minute refresh never does — Sync
- * now clears every back-off and reconnects, a user's step. */
+ * projects refreshed; the automatic mount refresh never does — Sync now
+ * clears every back-off and reconnects, a user's step. */
 export function useProjects() {
   const { notify } = useNotifications();
   const [projects, setProjects] = useState<ProjectCard[]>([]);
@@ -120,10 +120,8 @@ export function useProjects() {
       }
       void refreshProjects();
     })();
-    const timer = setInterval(() => void refreshProjects(), REFRESH_INTERVAL_MS);
     return () => {
       mounted.current = false;
-      clearInterval(timer);
     };
   }, [refreshProjects]);
 

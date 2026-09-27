@@ -781,8 +781,11 @@ async fn classify_and_record(
     Ok(())
 }
 
-/// The Collaboration storage (§9.1, §9.5) — a PASSIVE read (fix round 1):
-/// no hub call, no record written. The designated folder's marker check and
+/// The Collaboration storage (§9.1, §9.5) — a passive read (fix round 1):
+/// no hub call and no catalog record written; the ONE write it makes is the
+/// store's own write probe (`.athenaeum/.write-probe`, written and removed
+/// again by the marker check to tell a writable folder from a read-only
+/// one). The designated folder's marker check and
 /// the watcher state; when a folder's marker names another device
 /// (`reason = other_device`), the replace offer or the take-over as the
 /// last classification of THAT folder and device recorded it (a designation

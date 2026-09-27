@@ -105,8 +105,8 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
  * data-loss-risk, user-actionable outcome — a mass deletion waiting for a
  * choice, a frame lost everywhere, an edited replica set aside (L4, L5) —
  * reaches `notify()` regardless of which page or tab is open,
- * and a background auto-publish or version-poll tick surfaces a toast even
- * when nobody is on the Projects page. Per-page hooks/components
+ * and a background auto-publish or a manifest change arriving on the hub's
+ * event feed surfaces a toast even when nobody is on the Projects page. Per-page hooks/components
  * (`useProjects`, `ReceiveTab`, `CollabAttention`) keep their own state/UI
  * concerns only — no `notify()` calls of their own for these events, so
  * there is exactly one place that can toast for each.
@@ -235,8 +235,9 @@ export function useCollabNotifications() {
     };
   }, [notify]);
 
-  // `collab-frames-changed` (Task 8) — background version-poll ticks (every
-  // 15 s in core) reach the frontend here.
+  // `collab-frames-changed` (Task 8) — manifest changes the live exchange
+  // applies from the hub's event feed (wave 3: no poll) reach the frontend
+  // here.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;

@@ -72,6 +72,34 @@ describe('useProjects', () => {
     expect(api.invoke).not.toHaveBeenCalledWith('collab_sync_now');
   });
 
+  it('never polls the hub: one refresh on mount, no periodic timer', async () => {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      switch (command) {
+        case 'list_collab_projects':
+        case 'refresh_collab_projects':
+          return Promise.resolve([]);
+        default:
+          return Promise.resolve(null);
+      }
+    }) as never);
+
+    const { result, unmount } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('refresh_collab_projects'));
+
+    // The live exchange keeps the projects current (final fix C-17): the
+    // hook arms no refresh timer of its own (testing-library's own polling
+    // may use short intervals; a refresh cadence would be minutes).
+    const long = intervalSpy.mock.calls.filter(([, ms]) => typeof ms === 'number' && ms >= 60_000);
+    expect(long).toHaveLength(0);
+    expect(
+      vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'refresh_collab_projects'),
+    ).toHaveLength(1);
+    unmount();
+    intervalSpy.mockRestore();
+  });
+
   it('the manual refresh runs "Sync now" once the projects refreshed', async () => {
     vi.mocked(api.invoke).mockImplementation(((command: string) => {
       switch (command) {
