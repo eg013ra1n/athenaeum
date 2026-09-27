@@ -401,6 +401,7 @@ describe('ProjectDetail publishing device (A6)', () => {
               frameId: 7,
               filename: 'L_0007.fits',
               reasons: ['Obs PC publishes new frames to this project — use "Publish from this device" to switch'],
+              publishingDevice: 'Obs PC',
             },
           ],
           unchanged: 0,
@@ -423,7 +424,60 @@ describe('ProjectDetail publishing device (A6)', () => {
           announced: 1,
           updated: 0,
           state: 'published',
-          heldBack: [{ frameId: 8, filename: 'L_0008.fits', reasons: ['calibration failed: no master dark'] }],
+          heldBack: [
+            {
+              frameId: 8,
+              filename: 'L_0008.fits',
+              reasons: ['calibration failed: no master dark'],
+              publishingDevice: null,
+            },
+          ],
+          unchanged: 0,
+        } as PublishResult),
+    });
+    renderProjectDetail();
+    await publishViaConfirm();
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Publish' })).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId('publishing-refusal')).not.toBeInTheDocument();
+  });
+
+  it('the refusal box names the device from the held-back field, not from the reason text', async () => {
+    mockCommands(boundElsewhere, {
+      publish_collab_frames: () =>
+        Promise.resolve({
+          announced: 0,
+          updated: 1,
+          state: null,
+          heldBack: [
+            { frameId: 7, filename: 'L_0007.fits', reasons: ['held back'], publishingDevice: 'Rig 2' },
+          ],
+          unchanged: 0,
+        } as PublishResult),
+    });
+    renderProjectDetail();
+    await publishViaConfirm();
+    expect(await screen.findByTestId('publishing-refusal')).toHaveTextContent(
+      'Rig 2 publishes new frames to this project',
+    );
+  });
+
+  it('a held-back reason that merely contains the phrase, with no publishingDevice, shows no refusal', async () => {
+    mockCommands(boundElsewhere, {
+      publish_collab_frames: () =>
+        Promise.resolve({
+          announced: 1,
+          updated: 0,
+          state: 'published',
+          heldBack: [
+            {
+              frameId: 9,
+              filename: 'L_0009.fits',
+              reasons: ['Obs PC publishes new frames to this project — use "Publish from this device" to switch'],
+              publishingDevice: null,
+            },
+          ],
           unchanged: 0,
         } as PublishResult),
     });

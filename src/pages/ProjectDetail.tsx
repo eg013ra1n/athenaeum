@@ -68,22 +68,17 @@ const PUBLISHING_DEVICE_PREFIX = 'collab_publishing_device:';
  *  (`account::client::publishing_device_label`). */
 const OTHER_DEVICE = 'another device of this account';
 
-/** A run that ALSO posted versions resolves Ok, with the refused new frames
- *  held back as `"<name> publishes new frames to this project — use …"`
- *  (`api::collab::publishing_device_reason`). */
-const HELD_FOR_PUBLISHING_DEVICE = ' publishes new frames to this project — ';
-
 function publishingDeviceRefusal(msg: string): string | null {
   if (!msg.startsWith(PUBLISHING_DEVICE_PREFIX)) return null;
   return msg.slice(PUBLISHING_DEVICE_PREFIX.length).trim() || OTHER_DEVICE;
 }
 
+/** A run that ALSO posted versions resolves Ok, with the refused new frames
+ *  in `heldBack` carrying `publishingDevice` — the bound device's name (or
+ *  `OTHER_DEVICE`). Keyed on that field only, never on the reason text. */
 function heldForPublishingDevice(res: PublishResult | null | undefined): string | null {
   for (const frame of res?.heldBack ?? []) {
-    for (const reason of frame.reasons) {
-      const at = reason.indexOf(HELD_FOR_PUBLISHING_DEVICE);
-      if (at > 0) return reason.slice(0, at);
-    }
+    if (frame.publishingDevice != null) return deviceLabel(frame.publishingDevice);
   }
   return null;
 }
