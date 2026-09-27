@@ -902,7 +902,10 @@ fn collaboration_root_quiet(ctx: &ServiceContext) -> Option<PathBuf> {
 /// write-on-`Adopt` step, entirely off the async runtime (fix round 1 —
 /// this used to run on the connection-holding async path). Returns the
 /// resolved state and, when a marker was freshly written OR recognized as
-/// already naming `me`, the marker to record.
+/// already naming `me`, the marker to record. The adoption itself is
+/// [`crate::collab::storage::marker::check_and_adopt`], serialized across
+/// every adopter of the root (the designation, the lazy mount, the mount at
+/// bind and a live session's guard) so they all adopt ONE store id.
 fn check_and_adopt_marker(
     root: &Path,
     recorded: Option<crate::collab::storage::marker::StoreMarker>,
@@ -911,31 +914,7 @@ fn check_and_adopt_marker(
     crate::collab::storage::marker::StoreState,
     Option<crate::collab::storage::marker::StoreMarker>,
 ) {
-    use crate::collab::storage::marker::{
-        check_store, read_marker, writable, write_marker, CheckOutcome, StoreState,
-    };
-    match check_store(root, recorded.as_ref(), me) {
-        CheckOutcome::State(s) => (s, None),
-        CheckOutcome::Adopt(m) => match read_marker(root) {
-            Ok(Some(_)) => {
-                // Already on disk — never overwrite it, but the write probe
-                // still decides Available vs ReadOnly.
-                let state = if writable(root) {
-                    StoreState::Available
-                } else {
-                    StoreState::ReadOnly
-                };
-                (state, Some(m))
-            }
-            _ => match write_marker(root, &m) {
-                Ok(()) => (StoreState::Available, Some(m)),
-                Err(e) => {
-                    tracing::warn!(path = %root.display(), error = %e, "collaboration store marker could not be written");
-                    (StoreState::ReadOnly, None)
-                }
-            },
-        },
-    }
+    crate::collab::storage::marker::check_and_adopt(root, recorded.as_ref(), me)
 }
 
 /// The result of [`check_storage_marker`]: the resolved state, and — when a

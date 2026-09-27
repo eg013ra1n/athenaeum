@@ -130,6 +130,186 @@ pub fn check_store(root: &Path, recorded: Option<&StoreMarker>, me: &str) -> Che
     }
 }
 
+/// Serializes the adoption of a Collaboration root's storage marker across
+/// this process: the "no marker on disk yet, mint one and write it" step.
+/// Every adopter goes through [`check_and_adopt`] — the designation
+/// (`scan_roots::set_collaboration_dir`), the lazy mount the live runtime's
+/// first start runs (`collab_exchange::ensure_collab_store`), the mount at
+/// bind, and a live session's [`StoreGuard`]. Without it two of them could
+/// both find no marker, each mint its own store id and each record its own,
+/// leaving the catalog naming a store id the disk does not carry: a
+/// permanent `MarkerMismatch` that also refuses a re-designation of the same
+/// folder. Held only around the filesystem decision and write — never
+/// across an await, a mount or a catalog write — and taken only on the
+/// adoption path, so a plain check of a recorded marker never waits on it.
+static ADOPTION: Mutex<()> = Mutex::new(());
+
+fn adoption_lock(root: &Path) -> std::sync::MutexGuard<'static, ()> {
+    match ADOPTION.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            #[cfg(test)]
+            test_hooks::on_adoption_wait(root);
+            ADOPTION.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(path = %root.display(), "storage marker adoption lock poisoned; continuing");
+                poisoned.into_inner()
+            })
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            tracing::warn!(path = %root.display(), "storage marker adoption lock poisoned; continuing");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// [`check_store`], with an adoption resolved to a state: a marker already
+/// on disk is adopted as it is (never overwritten; the write probe still
+/// decides `Available` vs `ReadOnly`), a missing one is minted and written.
+/// Returns the state and the adopted marker (`None` when nothing was
+/// adopted, or the write failed). An adoption is decided under the
+/// process-wide adoption lock, re-checking the disk once it is held, so
+/// concurrent adopters of one root all adopt the ONE marker the first of
+/// them wrote.
+pub(crate) fn check_and_adopt(
+    root: &Path,
+    recorded: Option<&StoreMarker>,
+    me: &str,
+) -> (StoreState, Option<StoreMarker>) {
+    if let CheckOutcome::State(s) = check_store(root, recorded, me) {
+        return (s, None);
+    }
+    let _adopting = adoption_lock(root);
+    match check_store(root, recorded, me) {
+        CheckOutcome::State(s) => (s, None),
+        CheckOutcome::Adopt(m) => match read_marker(root) {
+            Ok(Some(_)) => {
+                // Already on disk (a returning device, or another adopter
+                // wrote it moments ago) — never overwrite it, but still run
+                // the write probe: an existing marker does not itself prove
+                // the folder is writable right now.
+                let state = if writable(root) {
+                    StoreState::Available
+                } else {
+                    StoreState::ReadOnly
+                };
+                (state, Some(m))
+            }
+            _ => {
+                #[cfg(test)]
+                test_hooks::before_mint(root);
+                match write_marker(root, &m) {
+                    Ok(()) => {
+                        tracing::info!(store_id = %m.store_id, path = %root.display(), "collaboration store marker written");
+                        (StoreState::Available, Some(m))
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %root.display(), error = %e, "collaboration store marker could not be written");
+                        (StoreState::ReadOnly, None)
+                    }
+                }
+            }
+        },
+    }
+}
+
+/// Test hooks for the adoption race (`check_and_adopt`): pause the first
+/// adopter of a root just before it writes a freshly minted marker, and
+/// report another adopter of that root waiting for the adoption lock.
+/// Keyed by root, so parallel tests never see each other's hooks.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{Mutex, OnceLock};
+
+    struct Hook {
+        /// Taken by the first adopter to reach the mint: it reports itself
+        /// paused, then blocks until released.
+        pause: Option<(Sender<()>, Receiver<()>)>,
+        waiting: Sender<()>,
+    }
+
+    /// One spelling per folder (a temp dir may be reached through a
+    /// symlinked prefix).
+    fn key(root: &Path) -> PathBuf {
+        std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+    }
+
+    fn hooks() -> &'static Mutex<HashMap<PathBuf, Hook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
+        HOOKS.get_or_init(Default::default)
+    }
+
+    /// The test's side of an armed root.
+    pub(crate) struct Armed {
+        root: PathBuf,
+        /// One message once the first adopter paused before its mint.
+        pub paused: Receiver<()>,
+        /// One message per adopter found waiting for the adoption lock.
+        pub waiting: Receiver<()>,
+        release: Sender<()>,
+    }
+
+    impl Armed {
+        /// Let the paused adopter write its marker.
+        pub(crate) fn release(&self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+            hooks()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.root);
+        }
+    }
+
+    pub(crate) fn arm(root: &Path) -> Armed {
+        let (paused_tx, paused) = channel();
+        let (release, release_rx) = channel();
+        let (waiting_tx, waiting) = channel();
+        hooks().lock().unwrap_or_else(|p| p.into_inner()).insert(
+            key(root),
+            Hook {
+                pause: Some((paused_tx, release_rx)),
+                waiting: waiting_tx,
+            },
+        );
+        Armed {
+            root: key(root),
+            paused,
+            waiting,
+            release,
+        }
+    }
+
+    pub(super) fn before_mint(root: &Path) {
+        let pause = hooks()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(&key(root))
+            .and_then(|h| h.pause.take());
+        if let Some((paused, release)) = pause {
+            let _ = paused.send(());
+            let _ = release.recv();
+        }
+    }
+
+    pub(super) fn on_adoption_wait(root: &Path) {
+        if let Some(h) = hooks()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key(root))
+        {
+            let _ = h.waiting.send(());
+        }
+    }
+}
+
 /// The marker check a scan of the root runs FIRST (spec §9.1: "the marker
 /// is checked before every … scan of the root") — for a caller that holds
 /// only the catalog connection (the scanner), not this device's id. `None`
@@ -241,36 +421,11 @@ impl StoreGuard {
 
     pub fn check_now(&self) -> StoreState {
         let recorded = self.recorded.lock().expect("store guard poisoned").clone();
-        let next = match check_store(&self.root, recorded.as_ref(), &self.me) {
-            CheckOutcome::State(s) => s,
-            CheckOutcome::Adopt(m) => match read_marker(&self.root) {
-                Ok(Some(_)) => {
-                    // Already on disk (a returning device, or another party
-                    // wrote it moments ago) — never overwrite it, but still
-                    // run the write probe: an existing marker does not
-                    // itself prove the folder is writable right now.
-                    *self.recorded.lock().expect("store guard poisoned") = Some(m.clone());
-                    *self.adoption.lock().expect("store guard poisoned") = Some(m);
-                    if writable(&self.root) {
-                        StoreState::Available
-                    } else {
-                        StoreState::ReadOnly
-                    }
-                }
-                _ => match write_marker(&self.root, &m) {
-                    Ok(()) => {
-                        tracing::info!(store_id = %m.store_id, path = %self.root.display(), "collaboration store marker written");
-                        *self.recorded.lock().expect("store guard poisoned") = Some(m.clone());
-                        *self.adoption.lock().expect("store guard poisoned") = Some(m);
-                        StoreState::Available
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = %self.root.display(), error = %e, "collaboration store marker could not be written");
-                        StoreState::ReadOnly
-                    }
-                },
-            },
-        };
+        let (next, adopted) = check_and_adopt(&self.root, recorded.as_ref(), &self.me);
+        if let Some(m) = adopted {
+            *self.recorded.lock().expect("store guard poisoned") = Some(m.clone());
+            *self.adoption.lock().expect("store guard poisoned") = Some(m);
+        }
         let mut cur = self.state.write().expect("store guard poisoned");
         if *cur != next {
             match &next {

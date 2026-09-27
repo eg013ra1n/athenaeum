@@ -633,7 +633,11 @@ async fn ready(
     // After a remount the record must name THIS folder: a record cleared by
     // the folder change (`None`) would let this runtime adopt a marker the
     // designation is about to write. The first start adopts a root never
-    // recorded (a wave-2 root).
+    // recorded (a wave-2 root) — even while a first designation of it is
+    // in flight: every adoption of a marker (the designation's, this lazy
+    // mount's, the session guard's) is decided under one lock
+    // (`marker::check_and_adopt`), so they all adopt the ONE store id the
+    // first of them wrote.
     match db(ctx).and_then(|d| Ok(crate::db::collab_live::store_marker_path(&d.conn())?)) {
         Ok(Some(at)) if at != root.to_string_lossy() => {
             return Err("storage marker not recorded for this folder yet")

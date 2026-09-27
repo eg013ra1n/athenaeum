@@ -246,6 +246,93 @@ async fn nothing_runs_without_a_collaboration_folder_or_signed_out() {
     shutdown(&ctx2).await;
 }
 
+/// The race behind `nothing_runs_without_a_collaboration_folder_or_signed_out`
+/// (2 of 60 under load): the first designation of a folder and the live
+/// runtime's first start — its lazy mount runs the same storage-marker check
+/// — both found no marker and each minted its own store id, and the catalog
+/// ended up recording one the disk does not carry: a `MarkerMismatch` that
+/// outlives a restart and refuses a re-designation of the folder. The
+/// designation is paused just before it writes its freshly minted marker
+/// and the lazy mount's check then runs: it must wait for the designation
+/// and adopt ITS marker, never mint a second one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_designation_and_a_concurrent_lazy_mount_adopt_one_store_id() {
+    use crate::collab::storage::marker::{read_marker, test_hooks};
+    let (t, ctx, _hub) = ts::signed_in_rig_no_root().await;
+    let ctx = std::sync::Arc::new(ctx);
+    let requested = t.path().join("Collab");
+    std::fs::create_dir_all(&requested).unwrap();
+    let armed = test_hooks::arm(&requested);
+
+    let designation = tokio::spawn({
+        let ctx = std::sync::Arc::clone(&ctx);
+        let path = requested.to_string_lossy().to_string();
+        async move {
+            crate::api::scan_roots::set_collaboration_dir(
+                &ctx,
+                path,
+                &crate::api::PathPolicy::AllowAll,
+            )
+            .await
+        }
+    });
+    tokio::task::block_in_place(|| armed.paused.recv_timeout(Duration::from_secs(10)))
+        .expect("the designation reaches its marker write");
+
+    // The folder is designated (the row is written), its marker not yet:
+    // what the runtime's first start finds.
+    let root = crate::api::scan_roots::get_collaboration_dir(&ctx)
+        .unwrap()
+        .expect("designated");
+    let lazy = tokio::spawn({
+        let ctx = std::sync::Arc::clone(&ctx);
+        let root = std::path::PathBuf::from(&root);
+        async move { crate::api::collab_exchange::check_storage_marker(&ctx, &root).await }
+    });
+    // Either the lazy check waits for the designation's adoption (the
+    // protocol), or it runs to completion while the designation is paused
+    // (the race).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ran_during_the_designation = loop {
+        if armed.waiting.try_recv().is_ok() {
+            break false;
+        }
+        if lazy.is_finished() {
+            break true;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lazy check neither waited nor finished"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    armed.release();
+    designation.await.unwrap().expect("designate");
+    let lazy = lazy.await.unwrap().expect("lazy check");
+
+    let on_disk = read_marker(std::path::Path::new(&root))
+        .unwrap()
+        .expect("a marker on disk");
+    let recorded = {
+        let db = crate::api::db(&ctx).unwrap();
+        crate::db::collab_live::recorded_store_marker(&db.conn()).unwrap()
+    };
+    assert_eq!(
+        lazy.pending.as_ref(),
+        Some(&on_disk),
+        "the lazy mount adopted a store id the disk does not carry"
+    );
+    assert_eq!(
+        recorded.as_ref(),
+        Some(&on_disk),
+        "the designation recorded the disk's marker"
+    );
+    assert!(
+        !ran_during_the_designation,
+        "the lazy check ran while the designation was minting"
+    );
+}
+
 // ── Task 15 fix round 1 ─────────────────────────────────────────────────
 
 /// Priority setup shared by the C1 tests: A uploads at 8 MB/s, B has one
