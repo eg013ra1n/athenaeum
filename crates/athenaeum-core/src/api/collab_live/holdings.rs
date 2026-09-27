@@ -64,7 +64,7 @@ pub struct FlushOutcome {
 
 /// A failed report: the hub refused or was unreachable (the outbox keeps
 /// its rows), or the local store failed.
-enum SendErr {
+pub(crate) enum SendErr {
     Hub(AccountClientError),
     Local(ApiError),
 }
@@ -396,30 +396,31 @@ impl Holdings {
 
     /// Send the device's whole claim set as `full: true` under a NEW journal
     /// sequence (a reused one would be ignored for every frame already
-    /// stamped with it, T6 ruling), and ack every outbox row it subsumes.
+    /// stamped with it, T6 ruling), and ack every outbox row it subsumes —
+    /// [`report_full_reconciled`]: when the digests still differ, the claims
+    /// the hub keeps that this device no longer holds are ended with a
+    /// second report that lists them under `remove`.
     ///
     /// A claim that entered the local set while the report was in flight
     /// WITHOUT an outbox row — an announce's or a version's implicit claim
-    /// (P9, hub contract "Implicit claims") — may have been written by the
-    /// hub before this report reached it, stamped below its `reportSeq`: the
-    /// hub then removed it as absent from the "whole set as of R", and the
-    /// digests still matched (both sides describe the set the report read).
-    /// Such a claim owes another full report, sent at once by
-    /// [`Self::flush_due`] — never left for the hourly digest check.
+    /// (P9, hub contract "Implicit claims") — is never lost to the report:
+    /// the hub keeps an implicit claim a `full: true` report does not name
+    /// (hub 06198cc). Nothing more is owed for it (final fix D-18: the
+    /// re-report `efc9740e` added is dropped — the residual digest
+    /// difference settles by itself once the reply is applied).
     pub async fn full_report(&mut self, project_id: &str) -> Result<(), ApiError> {
-        match report_full(&self.ctx, &self.client, &self.token, project_id).await {
-            Ok((next_flush_ms, unreported)) => {
-                if unreported.is_empty() {
-                    self.needs_full.remove(project_id);
-                } else {
-                    tracing::info!(
-                        project_id,
-                        count = unreported.len(),
-                        "claims added while the full report was in flight; sending the full claim set again"
-                    );
-                    self.needs_full.insert(project_id.to_string());
-                }
-                self.report_ok(project_id, Some(next_flush_ms));
+        match report_full_reconciled(
+            &self.ctx,
+            &self.client,
+            &self.token,
+            project_id,
+            Some(&self.me),
+        )
+        .await
+        {
+            Ok(done) => {
+                self.needs_full.remove(project_id);
+                self.report_ok(project_id, Some(done.next_flush_ms));
                 Ok(())
             }
             Err(e) => {
@@ -890,17 +891,50 @@ async fn flush_once(
     })
 }
 
+/// What one `full: true` report did.
+#[derive(Debug, Clone)]
+pub(crate) struct FullReport {
+    pub next_flush_ms: u64,
+    pub digest_match: bool,
+    pub report_seq: i64,
+    pub holder_seq: i64,
+    pub count: i64,
+    pub refused: usize,
+    /// Frames the report listed under `remove`.
+    pub removed: usize,
+    /// Claims the local set gained while the report was in flight without
+    /// an outbox row ([`unreported_claims`]) — they explain a digest
+    /// difference, and are never owed again.
+    pub unreported: Vec<String>,
+    /// How a digest difference left after [`report_full_reconciled`] was
+    /// ruled (`None`: the digests match).
+    pub residual: Option<Residual>,
+}
+
+/// A digest difference a reconciled full report leaves (final fix D-19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Residual {
+    /// An announce/version call in flight, or a claim the report raced,
+    /// explains it: the harmless residual race — `info!`, nothing owed.
+    Explained,
+    /// Nothing explains it — `warn!`; the next digest check retries.
+    Unexplained,
+}
+
 /// Send the whole claim set as `full: true` under a NEW journal sequence R
 /// (taken in the same transaction that reads the set, so no outbox row below
-/// R is missing from it), and ack every outbox row up to R. Returns the hub's
-/// next flush delay and the claims the report may have cost
-/// ([`unreported_claims`]).
+/// R is missing from it), with `remove` — the claims to end explicitly (a
+/// `full: true` report keeps an unlisted implicit claim, hub 06198cc) minus
+/// any the set read holds again (a frame in both lists is a 400) — and ack
+/// every outbox row up to R. Logs nothing about the digest: the caller
+/// ([`report_full_reconciled`]) rules on it.
 async fn report_full(
     ctx: &ServiceContext,
     client: &CollabClient,
     token: &str,
     project_id: &str,
-) -> Result<(u64, Vec<String>), SendErr> {
+    remove: &[String],
+) -> Result<FullReport, SendErr> {
     let (report_seq, claims) = {
         let database = db(ctx)?;
         let conn = database.conn();
@@ -914,40 +948,121 @@ async fn report_full(
         tx.commit()?;
         (r, claims)
     };
-    let report = outbox::full_report(&claims, report_seq)?;
+    let mut report = outbox::full_report(&claims, report_seq)?;
+    let held: HashSet<&str> = claims.iter().map(|(u, _)| u.as_str()).collect();
+    report.remove = remove
+        .iter()
+        .filter(|u| !held.contains(u.as_str()))
+        .cloned()
+        .collect();
     let reply = client
         .report_holders(token, project_id, &report)
         .await
         .map_err(SendErr::Hub)?;
     apply_reply(ctx, project_id, &report, &reply, report_seq)?;
-    if reply.digest_match {
+    let unreported = unreported_claims(ctx, project_id, &claims)?;
+    Ok(FullReport {
+        next_flush_ms: reply.next_flush_ms,
+        digest_match: reply.digest_match,
+        report_seq,
+        holder_seq: reply.holder_seq,
+        count: report.count,
+        refused: reply.refused.len(),
+        removed: report.remove.len(),
+        unreported,
+        residual: None,
+    })
+}
+
+/// A full report, reconciled (final fix D-18/D-19). When the hub's digest
+/// still differs, this device's own row in the persisted holder map is
+/// compared with its claim set: every frame the hub still lists for it that
+/// it does not hold — and that no announce or version call names right now
+/// ([`claim_calls_in_flight`]: the hub may have written that implicit claim
+/// before its reply reached the local set) — is ended by a second full
+/// report listing it under `remove`. A difference left after that is `info!`
+/// when an in-flight announce/version or a claim the report raced explains
+/// it (the harmless residual race), `warn!` otherwise. `me`: this device's
+/// id as holder maps name it (`None`: the explicit remove is skipped).
+pub(crate) async fn report_full_reconciled(
+    ctx: &ServiceContext,
+    client: &CollabClient,
+    token: &str,
+    project_id: &str,
+    me: Option<&str>,
+) -> Result<FullReport, SendErr> {
+    let first = report_full(ctx, client, token, project_id, &[]).await?;
+    if first.digest_match {
+        log_full_report(project_id, &first);
+        return Ok(first);
+    }
+    let in_flight = claim_calls_in_flight(ctx, project_id);
+    let stale: Vec<String> = match me {
+        Some(me) => {
+            let database = db(ctx)?;
+            let conn = database.conn();
+            live_db::hub_claims_not_held(&conn, project_id, me)?
+                .into_iter()
+                .filter(|u| !in_flight.contains(u))
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let mut done = if stale.is_empty() {
+        first
+    } else {
         tracing::info!(
             project_id,
-            count = report.count,
-            report_seq,
-            holder_seq = reply.holder_seq,
-            refused = reply.refused.len(),
-            "full claim set reported"
+            count = stale.len(),
+            report_seq = first.report_seq,
+            "the hub keeps claims this device no longer holds; ending them with a full report"
+        );
+        report_full(ctx, client, token, project_id, &stale).await?
+    };
+    if done.digest_match {
+        log_full_report(project_id, &done);
+    } else if !done.unreported.is_empty() || !in_flight.is_empty() {
+        done.residual = Some(Residual::Explained);
+        tracing::info!(
+            project_id,
+            count = done.count,
+            report_seq = done.report_seq,
+            holder_seq = done.holder_seq,
+            digest_match = false,
+            "claim digest differs after a full report while an announce or version is in flight; nothing owed"
         );
     } else {
+        done.residual = Some(Residual::Unexplained);
         tracing::warn!(
             project_id,
-            count = report.count,
-            report_seq,
-            holder_seq = reply.holder_seq,
+            count = done.count,
+            report_seq = done.report_seq,
+            holder_seq = done.holder_seq,
+            digest_match = false,
             "claim digest still differs after a full report; the next check retries"
         );
     }
-    let unreported = unreported_claims(ctx, project_id, &claims)?;
-    Ok((reply.next_flush_ms, unreported))
+    Ok(done)
+}
+
+fn log_full_report(project_id: &str, r: &FullReport) {
+    tracing::info!(
+        project_id,
+        count = r.count,
+        report_seq = r.report_seq,
+        holder_seq = r.holder_seq,
+        refused = r.refused,
+        digest_match = true,
+        "full claim set reported"
+    );
 }
 
 /// The frames whose local claim a `full: true` report that sent `reported`
 /// did not carry, and that no outbox row still names (after the report's
 /// ack, every row left is newer than it and its own flush reports it): a
 /// claim added without an outbox row while the report was in flight — an
-/// implicit claim. The hub may have written that claim before the report
-/// arrived and removed it again as absent from the full set.
+/// implicit claim. The hub keeps such a claim (hub 06198cc); it only
+/// explains a digest difference the report answered.
 fn unreported_claims(
     ctx: &ServiceContext,
     project_id: &str,
@@ -968,6 +1083,87 @@ fn unreported_claims(
         .filter(|(u, v)| sent.get(u.as_str()) != Some(v) && !pending.contains(u))
         .map(|(u, _)| u)
         .collect())
+}
+
+// ── announce/version calls in flight (final fix D-18/D-19) ──────────────
+
+/// `(catalog, project)` → frame uuid → how many calls name it now.
+type InFlightCalls = HashMap<(String, String), HashMap<String, usize>>;
+
+static CLAIM_CALLS: std::sync::OnceLock<std::sync::Mutex<InFlightCalls>> =
+    std::sync::OnceLock::new();
+
+fn claim_calls() -> std::sync::MutexGuard<'static, InFlightCalls> {
+    CLAIM_CALLS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// The registry key: one catalog (the in-process tests run several), one
+/// project. An unopened catalog keys as "".
+fn claim_calls_key(ctx: &ServiceContext, project_id: &str) -> (String, String) {
+    let catalog = match db(ctx) {
+        Ok(d) => d.path().display().to_string(),
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "catalog unavailable; in-flight claim calls keyed without it");
+            String::new()
+        }
+    };
+    (catalog, project_id.to_string())
+}
+
+/// Frames an announce or version call names, from before the call until
+/// its reply's implicit claim is recorded locally (the guard's drop): the
+/// hub may already hold the claim the local set does not show yet, so a
+/// full report never ends it explicitly meanwhile (final fix D-18).
+pub(crate) struct ClaimCalls {
+    key: (String, String),
+    uuids: Vec<String>,
+}
+
+impl ClaimCalls {
+    pub(crate) fn begin(
+        ctx: &ServiceContext,
+        project_id: &str,
+        uuids: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let key = claim_calls_key(ctx, project_id);
+        let uuids: Vec<String> = uuids.into_iter().collect();
+        let mut calls = claim_calls();
+        let named = calls.entry(key.clone()).or_default();
+        for u in &uuids {
+            *named.entry(u.clone()).or_default() += 1;
+        }
+        Self { key, uuids }
+    }
+}
+
+impl Drop for ClaimCalls {
+    fn drop(&mut self) {
+        let mut calls = claim_calls();
+        if let Some(named) = calls.get_mut(&self.key) {
+            for u in &self.uuids {
+                if let Some(n) = named.get_mut(u) {
+                    *n -= 1;
+                    if *n == 0 {
+                        named.remove(u);
+                    }
+                }
+            }
+            if named.is_empty() {
+                calls.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// The frames of `project_id` an announce or version call names right now.
+pub(crate) fn claim_calls_in_flight(ctx: &ServiceContext, project_id: &str) -> HashSet<String> {
+    claim_calls()
+        .get(&claim_calls_key(ctx, project_id))
+        .map(|named| named.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Apply a report's answer in one transaction: ack the outbox up to
@@ -1048,12 +1244,19 @@ pub(crate) async fn flush_project_now(
                         project_id,
                         "claim digest mismatch after a flush; sending the full claim set"
                     );
-                    let (c, t) = (&client, token.as_str());
+                    let me = match crate::api::account::own_device_id(ctx) {
+                        Ok(me) => Some(me),
+                        Err(e) => {
+                            tracing::warn!(project_id, error = %e, "this device's id could not be read; no claim is ended explicitly");
+                            None
+                        }
+                    };
+                    let (c, t, me) = (&client, token.as_str(), me.as_deref());
                     let full = with_retry(
                         "full holder report",
                         RetryPolicy::Interactive,
                         || async move {
-                            match report_full(ctx, c, t, project_id).await {
+                            match report_full_reconciled(ctx, c, t, project_id, me).await {
                                 Ok(v) => Ok(Ok(v)),
                                 Err(SendErr::Hub(e)) => Err(e),
                                 Err(SendErr::Local(e)) => Ok(Err(e)),
@@ -1450,13 +1653,13 @@ mod tests {
 
     /// An implicit claim (an announce's, a version's) that lands while a
     /// full report is in flight: the hub wrote it before the report arrived,
-    /// stamped below the report's sequence, so the "whole set as of R"
-    /// removed it — and both digests still matched, since both describe the
-    /// set the report read. The claim is owed at once (another full report),
-    /// never left for the hourly digest check: until then no other member
-    /// can fetch the frame from its only holder.
+    /// stamped below the report's sequence. The hub keeps it (a `full: true`
+    /// report never removes an implicit claim it does not list under
+    /// `remove`, hub 06198cc), so nothing is owed: no second full report
+    /// (final fix D-18 drops `efc9740e`'s re-report), and the next digest
+    /// check matches once the reply is in the local set.
     #[tokio::test]
-    async fn an_implicit_claim_added_during_a_full_report_is_reported_again_at_once() {
+    async fn an_implicit_claim_added_during_a_full_report_survives_without_a_second_report() {
         let (_t, ctx, hub, mut h) = rig().await;
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
@@ -1476,25 +1679,100 @@ mod tests {
         let me = "AAA=".to_string();
         assert!(hub.holders_of("p1", "u1").contains(&me));
         assert!(
-            !hub.holders_of("p1", "u2").contains(&me),
-            "the full report removed the implicit claim it did not carry"
-        );
-        assert!(
-            h.next_deadline().unwrap() <= Instant::now(),
-            "another full report is due at once"
-        );
-        let done = h.flush_due(Instant::now()).await;
-        assert_eq!(done.len(), 1, "the owed full report ran");
-        assert!(done[0].1.is_ok());
-        assert!(hub.holders_of("p1", "u1").contains(&me));
-        assert!(
             hub.holders_of("p1", "u2").contains(&me),
-            "the implicit claim is back on the hub"
+            "the hub kept the implicit claim the report did not carry"
         );
         assert!(
             h.flush_due(Instant::now()).await.is_empty(),
-            "in sync: nothing more is owed"
+            "nothing is owed"
         );
+        assert!(h.digest_check("p1").await.unwrap(), "in sync");
+    }
+
+    /// Seed `m1` as this account's frame on the hub (its implicit claim for
+    /// `AAA=`), cache its row and load the holder map that lists `AAA=` on
+    /// it — while this device's claim set does not hold it.
+    async fn hub_keeps_a_claim_this_device_lacks(
+        ctx: &ServiceContext,
+        hub: &FakeHub,
+        h: &mut Holdings,
+    ) {
+        hub.seed_frames("p1", "acc-me", &["m1"], "published");
+        crate::api::collab_exchange::sync_manifest(ctx, "p1", None, None)
+            .await
+            .unwrap();
+        let epoch = hub.hello_for("tok")["epoch"].as_str().unwrap().to_string();
+        h.snapshot("p1", &epoch).await.unwrap();
+        let conn = crate::api::db(ctx).unwrap().conn();
+        assert_eq!(
+            live_db::hub_claims_not_held(&conn, "p1", "AAA=").unwrap(),
+            vec!["m1".to_string()]
+        );
+    }
+
+    /// Final fix D-18: a claim the hub keeps (implicit, so a full report
+    /// cannot end it by omission) that this device no longer holds is ended
+    /// explicitly — the digest check's full report answers `digestMatch:
+    /// false`, and a second full report lists it under `remove`.
+    #[tokio::test]
+    async fn a_kept_claim_this_device_no_longer_holds_is_ended_under_remove() {
+        let (_t, ctx, hub, mut h) = rig().await;
+        hub_keeps_a_claim_this_device_lacks(&ctx, &hub, &mut h).await;
+        assert!(!h.digest_check("p1").await.unwrap());
+        assert!(
+            !hub.holders_of("p1", "m1").contains(&"AAA=".to_string()),
+            "ended explicitly"
+        );
+        assert!(
+            h.digest_check("p1").await.unwrap(),
+            "in sync after one check"
+        );
+    }
+
+    /// Final fix D-18/D-19: a frame with an announce/version call in flight
+    /// is never ended explicitly (the hub may hold its claim before the
+    /// reply reaches the local set), and the digest difference it leaves is
+    /// ruled explained (`info!`, the harmless residual race), never
+    /// unexplained (`warn!`). Once the call is done the same claim is ended;
+    /// one nothing explains stays unexplained.
+    #[tokio::test]
+    async fn an_in_flight_claim_is_never_removed_and_its_residual_is_explained() {
+        let (_t, ctx, hub, mut h) = rig().await;
+        hub_keeps_a_claim_this_device_lacks(&ctx, &hub, &mut h).await;
+        let client = CollabClient::new(hub.uri()).unwrap();
+        let full = || report_full_reconciled(&ctx, &client, "tok", "p1", Some("AAA="));
+        let done = {
+            let _call = ClaimCalls::begin(&ctx, "p1", ["m1".to_string()]);
+            assert_eq!(
+                claim_calls_in_flight(&ctx, "p1"),
+                HashSet::from(["m1".to_string()])
+            );
+            full().await.ok().unwrap()
+        };
+        assert!(!done.digest_match);
+        assert_eq!(
+            (done.removed, done.residual),
+            (0, Some(Residual::Explained))
+        );
+        assert!(
+            hub.holders_of("p1", "m1").contains(&"AAA=".to_string()),
+            "an in-flight announce's claim is never ended"
+        );
+        assert!(
+            claim_calls_in_flight(&ctx, "p1").is_empty(),
+            "the guard's drop"
+        );
+
+        // m2: a claim the hub keeps on a frame this device has no row for
+        // (it cannot be named) — unexplained; m1 is ended meanwhile.
+        hub.seed_frames("p1", "acc-me", &["m2"], "published");
+        let done = full().await.ok().unwrap();
+        assert!(!done.digest_match);
+        assert_eq!(
+            (done.removed, done.residual),
+            (1, Some(Residual::Unexplained))
+        );
+        assert!(!hub.holders_of("p1", "m1").contains(&"AAA=".to_string()));
     }
 
     #[tokio::test]

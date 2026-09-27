@@ -591,6 +591,29 @@ pub fn my_claims(conn: &Connection, project_id: &str) -> Result<Vec<(String, i32
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// The frames `device`'s own row in the persisted holder map claims and
+/// this device's claim set does not hold (final fix D-18): what the hub
+/// still advertises for it that it no longer holds — an implicit claim a
+/// `full: true` report keeps unless it lists the frame under `remove`
+/// (hub 06198cc). Only frames with a known ordinal (a cached row) can be
+/// named.
+pub fn hub_claims_not_held(
+    conn: &Connection,
+    project_id: &str,
+    device: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.frame_uuid FROM collab_holder_claims c
+         JOIN project_frames_local f ON f.project_id = c.project_id AND f.frame_seq = c.frame_seq
+         WHERE c.project_id = ?1 AND c.device = ?2
+           AND NOT EXISTS (SELECT 1 FROM collab_my_claims m
+                           WHERE m.project_id = c.project_id AND m.frame_uuid = f.frame_uuid)
+         ORDER BY f.frame_uuid",
+    )?;
+    let rows = stmt.query_map(params![project_id, device], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn outbox(conn: &Connection, project_id: &str) -> Result<Vec<OutboxRow>> {
     let mut stmt = conn.prepare(
         "SELECT seq, frame_uuid, op, content_version FROM collab_outbox WHERE project_id = ?1 ORDER BY seq",

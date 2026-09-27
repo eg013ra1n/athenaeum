@@ -3406,6 +3406,19 @@ async fn run_publish(
     }
 
     // ── 5. Announce new frames, ≤ 500 per batch ──────────────────────────────
+    // Final fix D-18: every frame this run announces or versions is "in
+    // flight" until step 7 recorded its implicit claim (the guard lives to
+    // the end of the run) — a full holder report never ends its claim
+    // explicitly meanwhile, although the hub may hold it before the local
+    // set does.
+    let _claim_calls = crate::api::collab_live::holdings::ClaimCalls::begin(
+        ctx,
+        project_id,
+        new_frames
+            .iter()
+            .chain(updates.iter())
+            .map(|f| f.written.uuid.clone()),
+    );
     let mut gate_version: i32 = project.thresholds_version.unwrap_or(0);
     let mut state: Option<String> = None;
     let mut announced: Vec<(SeededFrame, String, i32)> = Vec::new();

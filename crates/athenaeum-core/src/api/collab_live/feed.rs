@@ -1216,6 +1216,12 @@ pub(crate) async fn reannounce_lost_own_frames(
             // current gate version, same as a first-time announce.
             f.gate_version = gate;
         }
+        // Final fix D-18: in flight until the implicit claims are recorded.
+        let _claim_calls = crate::api::collab_live::holdings::ClaimCalls::begin(
+            ctx,
+            project_id,
+            batch.iter().map(|f| f.frame_uuid.clone()),
+        );
         while !batch.is_empty() {
             match crate::collab::hub_client::with_retry(
                 "reannounce",

@@ -29,6 +29,11 @@
 //! - a claim report is filtered per row: `send` members may hold only their
 //!   own frames, `send_receive` members and moderators any published frame,
 //!   moderators also pending ones;
+//! - a claim the hub writes itself (announce, accepted version) is
+//!   implicit: a `full: true` report keeps it unless it lists the frame under
+//!   `remove` (allowed beside `full`), and any report write clears the mark
+//!   (hub 06198cc, migration 0025); a report is validated with the hub's
+//!   rules and words (`validate_report`, the 100 000-item cap);
 //! - every manifest-visible change bumps the project version and stamps the
 //!   touched rows' `manifestVersion` with it, and every visible claim change
 //!   bumps the project's `holderSeq` once per commit;
@@ -130,6 +135,11 @@ pub struct FakeClaim {
     /// `holderSeq` at which this claim's visible state (`content_version`,
     /// `removed`) last changed — what `holders?since=` filters on.
     pub changed_seq: i64,
+    /// Written by the hub itself (announce, accepted version) and not yet
+    /// named by the device in a report (hub migration 0025,
+    /// `frame_holders.implicit`): a `full: true` report keeps it unless it
+    /// lists the frame under `remove`. Any report write clears it.
+    pub implicit: bool,
 }
 
 /// Timings the presence ticker uses. Defaults match the hub's; tests shorten
@@ -286,6 +296,7 @@ impl FakeProject {
                 report_seq,
                 removed,
                 changed_seq,
+                implicit: false,
             },
         );
         Some(changed)
@@ -297,7 +308,8 @@ impl FakeProject {
     /// only for client-submitted reports (real hub `plan_hub_claims`,
     /// `claims/plan.rs`). Stamped with the device's own highest stored
     /// report_seq (read-only: this never advances the high-water mark
-    /// itself). Returns true iff the claim's visible state changed.
+    /// itself). Marked implicit (hub `plan_hub_claims`). Returns true iff the
+    /// claim's visible state changed.
     pub(crate) fn write_hub_claim(&mut self, device: &str, uuid: &str, cv: i32) -> bool {
         let report_seq = self.highest_report_seq(device);
         let key = (device.to_string(), uuid.to_string());
@@ -317,6 +329,7 @@ impl FakeProject {
                 report_seq,
                 removed: false,
                 changed_seq,
+                implicit: true,
             },
         );
         changed
@@ -1553,6 +1566,9 @@ fn revoke_device_state(st: &mut FakeHubState, device_pubkey_b64: &str, retire: b
                         if !c.removed {
                             c.removed = true;
                             c.changed_seq = seq;
+                            // Hub `plan_tombstone_all`: a tombstone is never
+                            // implicit (`frame_holders_tombstone_not_implicit`).
+                            c.implicit = false;
                         }
                     }
                 }
@@ -2794,9 +2810,8 @@ fn frame_versions_batch(
             continue;
         };
         if f.publisher_account_id != acct.account_id {
-            results.push(
-                json!({"uuid": v.uuid, "status": "forbidden", "contentVersion": f.content_version}),
-            );
+            // Hub `frames.rs`: a foreign frame's version is not disclosed.
+            results.push(json!({"uuid": v.uuid, "status": "forbidden", "contentVersion": 0}));
             continue;
         }
         if version_arbiter(p, f, &revoked).is_some_and(|allowed| allowed != device) {
@@ -3077,6 +3092,21 @@ fn holders_since(
     pid: &str,
     req: &Request,
 ) -> ResponseTemplate {
+    // The hub's `Query<SinceQuery>`: `since` is required and an integer —
+    // axum rejects anything else with a 400 before the handler runs (T18).
+    let since: i64 = match query(req, "since") {
+        None => {
+            return ResponseTemplate::new(400)
+                .set_body_string("Failed to deserialize query string: missing field `since`")
+        }
+        Some(raw) => match raw.parse() {
+            Ok(v) => v,
+            Err(e) => {
+                return ResponseTemplate::new(400)
+                    .set_body_string(format!("Failed to deserialize query string: since: {e}"))
+            }
+        },
+    };
     let (p, _) = match member_of(st, acct, pid) {
         Ok(x) => x,
         Err(r) => return r,
@@ -3086,9 +3116,6 @@ fn holders_since(
             return gone("epoch_changed", json!({ "epoch": st.epoch }));
         }
     }
-    let since: i64 = query(req, "since")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
     if since < p.holder_floor {
         return gone(
             "holders_below_floor",
@@ -3182,69 +3209,113 @@ struct ReportAddIn {
     content_version: i32,
 }
 
+/// The hub's `HoldersReport` (`routes/holders.rs`): `digest` and `count` are
+/// required, `full`/`add`/`remove` default.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReportIn {
-    #[serde(default)]
-    report_seq: Option<i64>,
+    report_seq: i64,
     #[serde(default)]
     full: bool,
     #[serde(default)]
     add: Vec<ReportAddIn>,
     #[serde(default)]
     remove: Vec<String>,
-    #[serde(default)]
     digest: String,
-    #[serde(default)]
     count: i64,
 }
 
-fn parse_hex16(hex: &str) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    if hex.len() == 32 {
-        for (i, o) in out.iter_mut().enumerate() {
-            if let Ok(b) = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
-                *o = b;
-            }
+/// The hub's report cap (`holders.rs::MAX_REPORT_ITEMS`, P28: one full report
+/// of a large project fits in one PUT).
+const MAX_REPORT_ITEMS: usize = 100_000;
+
+/// The hub's `validate_report`, message for message.
+fn validate_report(body: &ReportIn) -> Result<(), String> {
+    if body.report_seq < 1 {
+        return Err("reportSeq must be >= 1".into());
+    }
+    if body.add.len() > MAX_REPORT_ITEMS || body.remove.len() > MAX_REPORT_ITEMS {
+        return Err(format!(
+            "add/remove must each contain at most {MAX_REPORT_ITEMS} items"
+        ));
+    }
+    if body.count < 0 {
+        return Err("count must be >= 0".into());
+    }
+    let mut add_set = HashSet::with_capacity(body.add.len());
+    for a in &body.add {
+        if !add_set.insert(a.uuid.as_str()) {
+            return Err(format!("duplicate uuid in add: {}", a.uuid));
         }
     }
-    out
+    let mut remove_set = HashSet::with_capacity(body.remove.len());
+    for u in &body.remove {
+        if !remove_set.insert(u.as_str()) {
+            return Err(format!("duplicate uuid in remove: {u}"));
+        }
+        if add_set.contains(u.as_str()) {
+            return Err(format!("uuid {u} present in both add and remove"));
+        }
+    }
+    Ok(())
 }
 
+/// The hub's `Digest::parse`: exactly 32 lowercase hex characters.
+fn parse_digest(count: i64, hex: &str) -> Option<ClaimDigest> {
+    if hex.len() != 32 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut xor = [0u8; 16];
+    for (i, o) in xor.iter_mut().enumerate() {
+        *o = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(ClaimDigest { count, xor })
+}
+
+/// `PUT /projects/{id}/holders/self` — the hub's `put_holders_self` and its
+/// pure planner (`claims/plan.rs::plan_report`), rule for rule:
+///
+/// - an entry applies only above the stored `report_seq` (P9);
+/// - a refused `add` is listed, and a live claim of that frame the report is
+///   newer than is tombstoned (P6), implicit or not;
+/// - `remove` applies like a delta remove, beside `full: true` too (a
+///   remove of an unknown claim pins an invisible tombstone, P8);
+/// - `full: true` tombstones every unlisted live claim below `reportSeq`
+///   EXCEPT an implicit one (hub-written at announce/version, not yet named
+///   by the device) — kept untouched, as is an implicit claim listed in
+///   `add` at an older version than the hub's (final hub fix, migration
+///   0025);
+/// - every report write clears the implicit mark;
+/// - an empty delta report is the lock-free digest check.
 fn report_holders(
     st: &mut FakeHubState,
     acct: &FakeAccount,
     pid: &str,
     req: &Request,
 ) -> ResponseTemplate {
-    let body: ReportIn = match req.body_json() {
-        Ok(b) => b,
-        Err(e) => return error(422, format!("bad holders report body: {e}")),
-    };
-    let Some(report_seq) = body.report_seq else {
-        return error(409, "collab_api_outdated");
-    };
-    if report_seq < 1 {
-        return error(400, "reportSeq must be >= 1");
-    }
-    if body.full && !body.remove.is_empty() {
-        return error(400, "remove must be empty when full is true");
-    }
-    if body.add.len() > 10_000 || body.remove.len() > 10_000 {
-        return error(400, "add/remove must each contain at most 10000 items");
-    }
-    let mut seen = HashSet::new();
-    for a in &body.add {
-        if !seen.insert(a.uuid.clone()) {
-            return error(400, format!("duplicate frameUuid in batch: {}", a.uuid));
+    let raw: Value = match req.body_json() {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                400,
+                format!("Failed to parse the request body as JSON: {e}"),
+            )
         }
+    };
+    if raw.get("reportSeq").is_none() {
+        return error(409, "collab_api_outdated"); // a wave-2 body (P25)
     }
-    if let Some(both) = body.add.iter().find(|a| body.remove.contains(&a.uuid)) {
-        return error(
-            400,
-            format!("frameUuid {} present in both add and remove", both.uuid),
-        );
+    let body: ReportIn = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => return error(400, format!("invalid holder report: {e}")),
+    };
+    if let Err(m) = validate_report(&body) {
+        return error(400, m);
     }
+    let Some(declared) = parse_digest(body.count, &body.digest) else {
+        return error(400, "digest must be 32 lowercase hex chars");
+    };
+    let report_seq = body.report_seq;
     let Some(p) = st.projects.get_mut(pid) else {
         return not_found_project();
     };
@@ -3255,152 +3326,136 @@ fn report_holders(
     let moderator = member.has_cap("data.moderate");
     let any_frame = member.data_role == "send_receive" || moderator;
     let device = acct.device_pubkey_b64.clone();
-    let mut refused = Vec::new();
-    let mut accepted: Vec<(String, i32)> = Vec::new();
+
+    if !body.full && body.add.is_empty() && body.remove.is_empty() {
+        // The idle path: no write, one digest read.
+        return ok(json!({
+            "holderSeq": p.holder_seq,
+            "digestMatch": p.digest_of(&device) == declared,
+            "nextFlushMs": 1000,
+            "refused": Vec::<String>::new(),
+        }));
+    }
+
+    // The plan: (uuid, content_version, removed) per row write.
+    let stored = |p: &FakeProject, u: &str| p.claims.get(&(device.clone(), u.to_string())).copied();
+    let mut writes: Vec<(String, i32, bool)> = Vec::new();
+    let mut refused: Vec<(String, i32)> = Vec::new();
+    let mut listed: HashSet<String> = HashSet::new();
+    let mut kept_implicit = 0usize;
     for a in &body.add {
-        let Some(f) = p.frames.get(&a.uuid) else {
-            refused.push(a.uuid.clone());
-            continue;
-        };
-        let mine = f.publisher_account_id == acct.account_id;
-        let holdable =
-            mine || (f.state == "published" && any_frame) || (f.state == "pending" && moderator);
-        if a.content_version < 1 || a.content_version > f.content_version || !holdable {
-            refused.push(a.uuid.clone());
-            continue;
-        }
-        accepted.push((a.uuid.clone(), a.content_version));
-    }
-
-    let prev_holder_seq = p.holder_seq;
-    let mut changed_any = false;
-    let mut changed_rows: u64 = 0;
-    // The report-seq high-water mark rises only from rows this report
-    // ACTUALLY WRITES (real hub `store.rs`: `max_report_seq = max over
-    // written rows`); an empty, all-stale or all-refused report writes
-    // nothing and must not advance it.
-    let mut any_written = false;
-    let mut add_deltas: Vec<[i32; 2]> = Vec::new();
-    let mut rm_deltas: Vec<i32> = Vec::new();
-
-    for (uuid, cv) in &accepted {
-        if let Some(changed) = p.write_claim(&device, uuid, *cv, false, report_seq) {
-            any_written = true;
-            if changed {
-                changed_any = true;
-                changed_rows += 1;
-                if let Some(f) = p.frames.get(uuid) {
-                    add_deltas.push([f.frame_seq, *cv]);
-                }
+        listed.insert(a.uuid.clone());
+        let old = stored(p, &a.uuid);
+        let holdable = match p.frames.get(&a.uuid) {
+            None => false,
+            Some(f) if a.content_version < 1 || a.content_version > f.content_version => false,
+            Some(f) => {
+                f.publisher_account_id == acct.account_id
+                    || (any_frame
+                        && (f.state == "published" || (f.state == "pending" && moderator)))
             }
+        };
+        if !holdable {
+            refused.push((a.uuid.clone(), a.content_version));
+            if let Some(s) = old.filter(|s| !s.removed && s.report_seq < report_seq) {
+                writes.push((a.uuid.clone(), s.content_version, true));
+            }
+            continue;
+        }
+        match old {
+            Some(s) if s.report_seq >= report_seq => {}
+            Some(s)
+                if body.full
+                    && s.implicit
+                    && !s.removed
+                    && a.content_version < s.content_version =>
+            {
+                kept_implicit += 1;
+            }
+            _ => writes.push((a.uuid.clone(), a.content_version, false)),
         }
     }
-    // Refused frames: any LIVE claim we already hold is tombstoned.
-    for uuid in &refused {
-        let cv = match p.claims.get(&(device.clone(), uuid.clone())) {
-            Some(c) if !c.removed => c.content_version,
-            _ => continue,
-        };
-        if let Some(changed) = p.write_claim(&device, uuid, cv, true, report_seq) {
-            any_written = true;
-            if changed {
-                changed_any = true;
-                changed_rows += 1;
-                if let Some(f) = p.frames.get(uuid) {
-                    rm_deltas.push(f.frame_seq);
+    for u in &body.remove {
+        listed.insert(u.clone());
+        match stored(p, u) {
+            Some(s) if s.report_seq >= report_seq => {}
+            Some(s) => writes.push((u.clone(), s.content_version, true)),
+            None => {
+                if let Some(f) = p.frames.get(u) {
+                    writes.push((u.clone(), f.content_version, true));
                 }
             }
         }
     }
     if body.full {
-        let keep: HashSet<&str> = accepted.iter().map(|(u, _)| u.as_str()).collect();
-        let to_remove: Vec<(String, i32)> = p
+        let mut unlisted: Vec<(String, FakeClaim)> = p
             .claims
             .iter()
             .filter(|((d, u), c)| {
-                d == &device
-                    && !c.removed
-                    && !keep.contains(u.as_str())
-                    && c.report_seq < report_seq
+                d == &device && !listed.contains(u) && !c.removed && c.report_seq < report_seq
             })
-            .map(|((_, u), c)| (u.clone(), c.content_version))
+            .map(|((_, u), c)| (u.clone(), *c))
             .collect();
-        for (uuid, cv) in to_remove {
-            if let Some(changed) = p.write_claim(&device, &uuid, cv, true, report_seq) {
-                any_written = true;
-                if changed {
-                    changed_any = true;
-                    changed_rows += 1;
-                    if let Some(f) = p.frames.get(&uuid) {
-                        rm_deltas.push(f.frame_seq);
-                    }
-                }
-            }
-        }
-    } else {
-        for uuid in &body.remove {
-            // A remove of a frame the hub has never heard of pins nothing —
-            // no phantom cv-0 tombstone row (hub behaviour: a row only
-            // exists once the frame does).
-            let Some((frame_seq, frame_cv)) =
-                p.frames.get(uuid).map(|f| (f.frame_seq, f.content_version))
-            else {
+        unlisted.sort_by(|a, b| a.0.cmp(&b.0));
+        for (u, c) in unlisted {
+            if c.implicit {
+                kept_implicit += 1;
                 continue;
-            };
-            let cv = p
-                .claims
-                .get(&(device.clone(), uuid.clone()))
-                .map(|c| c.content_version)
-                .unwrap_or(frame_cv);
-            if let Some(changed) = p.write_claim(&device, uuid, cv, true, report_seq) {
-                any_written = true;
-                if changed {
-                    changed_any = true;
-                    changed_rows += 1;
-                    rm_deltas.push(frame_seq);
+            }
+            writes.push((u, c.content_version, true));
+        }
+    }
+
+    let prev_holder_seq = p.holder_seq;
+    let mut changed_rows: u64 = 0;
+    let mut add_deltas: Vec<[i32; 2]> = Vec::new();
+    let mut rm_deltas: Vec<i32> = Vec::new();
+    let any_written = !writes.is_empty();
+    for (uuid, cv, removed) in &writes {
+        if let Some(true) = p.write_claim(&device, uuid, *cv, *removed, report_seq) {
+            changed_rows += 1;
+            if let Some(f) = p.frames.get(uuid) {
+                if *removed {
+                    rm_deltas.push(f.frame_seq);
+                } else {
+                    add_deltas.push([f.frame_seq, *cv]);
                 }
             }
         }
     }
-
     if any_written {
         p.raise_report_hwm(&device, report_seq);
     }
-    if changed_any {
+    if changed_rows > 0 {
         p.holder_seq = prev_holder_seq + 1;
     }
-    st.holder_writes += changed_rows;
-
-    // The wire contract has the client fold every attempted add (including
-    // ones the hub goes on to refuse) into the digest/count it sends
-    // (hub `holders.rs`): `expected` starts as that declared digest, then
-    // each refused `(uuid, the SENT content_version)` is folded back OUT of
-    // it, and the result must equal the hub's own post-report digest for
-    // this device.
-    let mut expected_digest = ClaimDigest {
-        count: body.count,
-        xor: parse_hex16(&body.digest),
-    };
-    for uuid in &refused {
-        if let Some(a) = body.add.iter().find(|a| &a.uuid == uuid) {
-            expected_digest.remove(&uuid_for_digest(uuid), a.content_version as u32);
-        }
-    }
-    let p = st.projects.get(pid).expect("checked above");
-    let server_digest = p.digest_of(&device);
-    let digest_match = expected_digest == server_digest;
     let holder_seq = p.holder_seq;
+    let server_digest = p.digest_of(&device);
+    st.holder_writes += changed_rows;
+    if kept_implicit > 0 {
+        tracing::debug!(
+            project_id = pid,
+            count = kept_implicit,
+            "fake hub: full holder report kept implicit claims it did not remove"
+        );
+    }
 
-    if changed_any {
+    // The declared digest covers every attempted add, refused ones included:
+    // each refused `(uuid, sent version)` is folded back out, and the result
+    // must equal the hub's post-report digest of this device.
+    let mut expected = declared;
+    for (u, v) in &refused {
+        expected.remove(&uuid_for_digest(u), *v as u32);
+    }
+    if changed_rows > 0 {
         let deltas = json!([{ "device": device, "add": add_deltas, "rm": rm_deltas }]);
         st.publish_holders(pid, prev_holder_seq, deltas);
     }
-
     ok(json!({
         "holderSeq": holder_seq,
-        "digestMatch": digest_match,
+        "digestMatch": expected == server_digest,
         "nextFlushMs": 1000,
-        "refused": refused,
+        "refused": refused.into_iter().map(|(u, _)| u).collect::<Vec<_>>(),
     }))
 }
 
@@ -4320,6 +4375,210 @@ mod tests {
         assert!(
             matches!(err, crate::account::AccountClientError::NotFound(_)),
             "retired is terminal: a second retire 404s, {err:?}"
+        );
+    }
+
+    // ── final fix (hub 06198cc): implicit claims and the hub's validation ──
+
+    /// A full or delta report as `tok`, straight over HTTP: the status and
+    /// the body.
+    async fn put_report(hub: &FakeHub, body: serde_json::Value) -> (u16, serde_json::Value) {
+        let r = reqwest::Client::new()
+            .put(format!("{}/api/v1/projects/p1/holders/self", hub.uri()))
+            .bearer_auth("tok")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    fn report_body(
+        seq: i64,
+        full: bool,
+        add: &[(&str, i32)],
+        remove: &[&str],
+    ) -> serde_json::Value {
+        // The device declares exactly what it adds (the claim set it read).
+        let digest = ClaimDigest::of_claims(add.iter().copied()).unwrap();
+        json!({
+            "reportSeq": seq,
+            "full": full,
+            "add": add.iter().map(|(u, v)| json!({"uuid": u, "contentVersion": v})).collect::<Vec<_>>(),
+            "remove": remove,
+            "digest": digest.hex(),
+            "count": digest.count,
+        })
+    }
+
+    /// Hub 06198cc `a_full_report_read_before_an_announce_keeps_the_announce_claim`:
+    /// a full report that never names an announce's implicit claim keeps it
+    /// (the digests differ); one that lists it clears the mark; after that,
+    /// omission removes it as before.
+    #[tokio::test]
+    async fn a_full_report_keeps_an_unlisted_implicit_claim_until_the_device_names_it() {
+        let hub = hub_with_member().await;
+        hub.seed_frames("p1", "acc-me", &["m1"], "published");
+        let claim = || hub.claim_of("p1", "AAA=", "m1").unwrap();
+        assert!(
+            claim().implicit && !claim().removed,
+            "the announce's claim is implicit"
+        );
+        let seq = hub.holder_seq("p1");
+
+        let (status, reply) = put_report(&hub, report_body(1, true, &[], &[])).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            reply["digestMatch"], false,
+            "the hub kept the claim the report did not name"
+        );
+        assert!(!claim().removed && claim().implicit);
+        assert_eq!(hub.holder_seq("p1"), seq, "a kept claim is no write");
+
+        let (_, reply) = put_report(&hub, report_body(2, true, &[("m1", 1)], &[])).await;
+        assert_eq!(reply["digestMatch"], true);
+        assert!(!claim().implicit, "a report that names it clears the mark");
+
+        let (_, reply) = put_report(&hub, report_body(3, true, &[], &[])).await;
+        assert_eq!(reply["digestMatch"], true);
+        assert!(claim().removed, "an ordinary claim ends by omission");
+    }
+
+    /// Hub 06198cc `a_full_report_read_before_a_version_keeps_the_version_claim`:
+    /// a full report that read the frame before its version was accepted
+    /// never rolls the hub's version claim back.
+    #[tokio::test]
+    async fn a_full_report_older_than_a_version_claim_keeps_it() {
+        let hub = hub_with_member().await;
+        hub.seed_frames("p1", "acc-me", &["m1"], "published");
+        put_report(&hub, report_body(1, true, &[("m1", 1)], &[])).await;
+        hub.update_frame("p1", "m1", |f| f.content_version = 2);
+        {
+            let mut st = hub.lock();
+            let p = st.projects.get_mut("p1").unwrap();
+            p.write_hub_claim("AAA=", "m1", 2);
+        }
+        let (_, reply) = put_report(&hub, report_body(2, true, &[("m1", 1)], &[])).await;
+        assert_eq!(reply["digestMatch"], false);
+        let c = hub.claim_of("p1", "AAA=", "m1").unwrap();
+        assert_eq!((c.content_version, c.implicit, c.removed), (2, true, false));
+        let (_, reply) = put_report(&hub, report_body(3, true, &[("m1", 2)], &[])).await;
+        assert_eq!(reply["digestMatch"], true);
+        assert!(!hub.claim_of("p1", "AAA=", "m1").unwrap().implicit);
+    }
+
+    /// Hub 06198cc: `remove` is accepted beside `full: true` and is the one
+    /// way a full report ends an implicit claim; a frame in both lists is
+    /// still a 400; a remove of an unknown claim is an invisible pin.
+    #[tokio::test]
+    async fn a_full_report_ends_an_implicit_claim_only_under_remove() {
+        let hub = hub_with_member().await;
+        hub.seed_frames("p1", "acc-me", &["m1"], "published");
+        let (status, reply) = put_report(&hub, report_body(1, true, &[], &["m1"])).await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["digestMatch"], true);
+        let c = hub.claim_of("p1", "AAA=", "m1").unwrap();
+        assert!(c.removed && !c.implicit);
+
+        let (status, reply) = put_report(&hub, report_body(2, true, &[("u1", 1)], &["u1"])).await;
+        assert_eq!(status, 400);
+        assert_eq!(reply["error"], "uuid u1 present in both add and remove");
+
+        let seq = hub.holder_seq("p1");
+        let (status, reply) = put_report(&hub, report_body(3, true, &[], &["u2"])).await;
+        assert_eq!((status, &reply["digestMatch"]), (200, &json!(true)));
+        assert_eq!(
+            hub.holder_seq("p1"),
+            seq,
+            "an unknown claim's remove is invisible"
+        );
+    }
+
+    /// Hub 06198cc `a_delta_add_clears_the_implicit_mark`.
+    #[tokio::test]
+    async fn a_delta_add_clears_the_implicit_mark() {
+        let hub = hub_with_member().await;
+        hub.seed_frames("p1", "acc-me", &["m1"], "published");
+        put_report(&hub, report_body(1, false, &[("m1", 1)], &[])).await;
+        assert!(!hub.claim_of("p1", "AAA=", "m1").unwrap().implicit);
+        put_report(&hub, report_body(2, true, &[], &[])).await;
+        assert!(hub.claim_of("p1", "AAA=", "m1").unwrap().removed);
+    }
+
+    /// Final review C: the fake refuses what the hub refuses, with the hub's
+    /// words — its `validate_report`, its digest parse, its 100 000 cap, a
+    /// body that is not JSON (400, never 422), and a delta read without
+    /// `since` (axum's query rejection); a foreign frame's version in a batch
+    /// answer is 0.
+    #[tokio::test]
+    async fn the_fake_refuses_what_the_hub_refuses_in_its_words() {
+        let hub = hub_with_member().await;
+        let mut body = report_body(1, false, &[], &[]);
+        body["count"] = json!(-1);
+        assert_eq!(
+            put_report(&hub, body).await.1["error"],
+            "count must be >= 0"
+        );
+        let mut body = report_body(1, false, &[], &["u1", "u1"]);
+        body["digest"] = json!(crate::collab::live::digest::ZERO_HEX);
+        assert_eq!(
+            put_report(&hub, body).await.1["error"],
+            "duplicate uuid in remove: u1"
+        );
+        let mut body = report_body(1, false, &[("u1", 1)], &[]);
+        body["digest"] = json!("ABCDEF00000000000000000000000000");
+        let (status, reply) = put_report(&hub, body).await;
+        assert_eq!(
+            (status, reply["error"].as_str()),
+            (400, Some("digest must be 32 lowercase hex chars"))
+        );
+        let many: Vec<String> = (0..=MAX_REPORT_ITEMS).map(|i| format!("x{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let (status, reply) = put_report(&hub, report_body(1, false, &[], &many)).await;
+        assert_eq!(
+            (status, reply["error"].as_str()),
+            (
+                400,
+                Some("add/remove must each contain at most 100000 items")
+            )
+        );
+        let (status, _) =
+            put_report(&hub, report_body(1, false, &[], &many[..MAX_REPORT_ITEMS])).await;
+        assert_eq!(status, 200, "the hub's own cap is accepted");
+        let r = reqwest::Client::new()
+            .put(format!("{}/api/v1/projects/p1/holders/self", hub.uri()))
+            .bearer_auth("tok")
+            .header("content-type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400);
+
+        let r = reqwest::Client::new()
+            .get(format!("{}/api/v1/projects/p1/holders", hub.uri()))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400, "`since` is required");
+
+        let r = reqwest::Client::new()
+            .post(format!("{}/api/v1/projects/p1/frames/versions", hub.uri()))
+            .bearer_auth("tok")
+            .json(&json!({"versions": [{
+                "uuid": "u1", "expectedVersion": 1, "blake3": "b".repeat(64),
+                "byteSize": 10, "xxh3": "0".repeat(16)
+            }]}))
+            .send()
+            .await
+            .unwrap();
+        let reply: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(reply["results"][0]["status"], "forbidden", "{reply}");
+        assert_eq!(
+            reply["results"][0]["contentVersion"], 0,
+            "a foreign frame's version is not disclosed"
         );
     }
 }
