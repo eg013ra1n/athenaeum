@@ -1378,6 +1378,18 @@ impl FakeHub {
             .unwrap_or(false)
     }
 
+    /// When `device`'s session last beat (`None` once no session of it is
+    /// left) — the start of the hub's silence rule (Task 18, spec §12 "B is
+    /// killed": C drops B ≤ 50 s after its last beat).
+    pub fn last_beat(&self, device: &str) -> Option<Instant> {
+        self.lock()
+            .sessions
+            .values()
+            .filter(|s| s.device == device)
+            .map(|s| s.last_beat)
+            .max()
+    }
+
     /// The next `n` events of that project are swallowed instead of
     /// delivered — a gap the client must detect via `prev`.
     pub fn drop_next_events(&self, project_id: &str, n: usize) {

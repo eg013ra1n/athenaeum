@@ -113,6 +113,12 @@ pub mod settings;
 #[cfg(test)]
 mod relay_live_tests;
 
+// Collab v3 wave 3 (Task 18): three instances on the live exchange — the
+// spec §12 latency table, amendments A5/A6, the derived personal-priority
+// bound and the one-copy disk ledger.
+#[cfg(all(test, unix, feature = "render", feature = "solver"))]
+mod collab_v3_live_e2e_tests;
+
 #[derive(Debug)]
 pub enum ApiError {
     NotFound(String),

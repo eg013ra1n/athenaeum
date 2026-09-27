@@ -461,25 +461,6 @@ async fn wait_rows(
     }
 }
 
-/// The Folders page's "change": clear the designation, designate `dir`.
-async fn redesignate(
-    ctx: &crate::services::ServiceContext,
-    dir: &std::path::Path,
-) -> std::path::PathBuf {
-    crate::api::scan_roots::clear_collaboration_dir(ctx)
-        .await
-        .expect("clear the Collaboration folder");
-    std::fs::create_dir_all(dir).unwrap();
-    crate::api::scan_roots::set_collaboration_dir(
-        ctx,
-        dir.to_string_lossy().to_string(),
-        &crate::api::PathPolicy::AllowAll,
-    )
-    .await
-    .expect("re-designate the Collaboration folder");
-    ts::collab_root(ctx)
-}
-
 /// I1 + owner rule A: re-designating the Collaboration folder mid-run
 /// restarts the runtime on the new store; the replicas under the old folder
 /// leave `held` through the L4 deletion path and a batch of ≤ 10 is
@@ -495,7 +476,7 @@ async fn a_redesignated_folder_refetches_into_the_new_root_and_clearing_stops_it
     }
     let old_root = w.b.root.clone();
     let other = tempfile::tempdir().unwrap();
-    let new_root = redesignate(&w.b.ctx, &other.path().join("Collab2")).await;
+    let new_root = ts::redesignate(&w.b.ctx, &other.path().join("Collab2")).await;
     wait_rows(
         &w.b.ctx,
         "re-fetched under the new root",
@@ -551,7 +532,7 @@ async fn a_redesignation_over_ten_frames_raises_the_deletion_choice() {
             .await;
     }
     let other = tempfile::tempdir().unwrap();
-    redesignate(&w.b.ctx, &other.path().join("Collab2")).await;
+    ts::redesignate(&w.b.ctx, &other.path().join("Collab2")).await;
     wait_rows(
         &w.b.ctx,
         "every replica awaits the choice",

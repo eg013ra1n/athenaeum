@@ -105,3 +105,42 @@ async fn same_key_second_endpoint_evicts_first_on_real_relay() {
          connected→disconnected) within {EVICTION_WINDOW:?} of endpoint 2 binding the same key"
     );
 }
+
+/// Owner-run (plan P21): pick the collab stream-limit defaults from a
+/// measurement on the real relay. The provider holds 16 frames of 32 MiB in
+/// its collab store; the fetcher dials it by its relay url alone and fetches
+/// every frame over one live assignment run with `max_in_flight` ∈ {1, 2, 4,
+/// 8, 16}, a fresh store per run, and prints MB/s for each, with the share
+/// of the provider's sent bytes that crossed the relay (run the two ends on
+/// one machine and hole punching may find a direct path — a share well below
+/// 1.0 means the run did not measure the relay).
+///
+/// Rule for the defaults: `collab.max_receive_streams` = the smallest `n`
+/// reaching ≥ 90 % of the best MB/s; `collab.max_upload_streams` = the same
+/// value (one fetcher can saturate one provider). Until it has run, both
+/// stay 8 (`settings/mod.rs`).
+///
+/// ```text
+/// ATHENAEUM_TEST_RELAY=https://test-relay.artfrom.space:8443 \
+///   cargo test -p athenaeum-core --lib -- --ignored --exact \
+///   api::relay_live_tests::collab_stream_limits_throughput_on_real_relay --nocapture
+/// ```
+#[cfg(all(unix, feature = "render", feature = "solver"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ATHENAEUM_TEST_RELAY=<relay-url>; owner-run against test-relay.artfrom.space"]
+async fn collab_stream_limits_throughput_on_real_relay() {
+    let Ok(relay_url) = std::env::var("ATHENAEUM_TEST_RELAY") else {
+        eprintln!("skip collab_stream_limits_throughput_on_real_relay: set ATHENAEUM_TEST_RELAY");
+        return;
+    };
+    let pair =
+        crate::api::collab_live::test_support::relay_pair(&relay_url, 16, 32 * 1024 * 1024).await;
+    for n in [1usize, 2, 4, 8, 16] {
+        let (bytes, elapsed, relay_share) = pair.fetch_all_fresh(n).await;
+        eprintln!(
+            "streams={n} bytes={bytes} secs={:.1} MB/s={:.1} relay_share={relay_share:.2}",
+            elapsed.as_secs_f64(),
+            bytes as f64 / 1e6 / elapsed.as_secs_f64()
+        );
+    }
+}

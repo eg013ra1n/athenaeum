@@ -660,6 +660,8 @@ impl Executor {
                     fetch_id,
                     providers,
                 } => {
+                    #[cfg(test)]
+                    test_hooks::record_sighting(self.env.node.node_id(), &key.1, &providers, false);
                     let list = self.endpoints(&providers);
                     match self.items.get(&item_name(&key, fetch_id)) {
                         Some(item) => {
@@ -722,6 +724,8 @@ impl Executor {
                 return;
             }
         };
+        #[cfg(test)]
+        test_hooks::record_sighting(self.env.node.node_id(), &key.1, &providers, true);
         let list = self.endpoints(&providers);
         let (providers_tx, _) = watch::channel(list);
         let (cancel_tx, _) = watch::channel(false);
@@ -1455,6 +1459,12 @@ async fn land(env: &ExecEnv, row: &LocalFrameRow, hash: Hash, started_at: &str) 
         Err(landed) => return landed,
     };
     let hooks = crate::sharing::iroh::blobs::ExportHooks::default();
+    #[cfg(test)]
+    if test_hooks::take_landing_fault(&env.root) {
+        // Whichever export this landing takes (DIRECT or TEMP) fails once.
+        hooks.fail_direct_export_once();
+        hooks.fail_after_export_once();
+    }
     let landing = LandingEnv {
         ctx: &env.ctx,
         node: &env.node,
@@ -1537,6 +1547,82 @@ pub(crate) mod test_hooks {
             .unwrap()
             .as_mut()
             .is_some_and(|s| s.remove(root))
+    }
+
+    static FAULT_NEXT_LANDING: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+    /// Task 18 (spec §12 "v2 landing interrupted"): the next landing under
+    /// `root` fails inside its export, once — the DIRECT export before it
+    /// touches the target, the TEMP one between its export and its rename.
+    pub(crate) fn fail_next_landing(root: &Path) {
+        FAULT_NEXT_LANDING
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert(root.to_path_buf());
+    }
+
+    /// Whether the fault armed by [`fail_next_landing`] is still unspent.
+    pub(crate) fn landing_fault_pending(root: &Path) -> bool {
+        FAULT_NEXT_LANDING
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.contains(root))
+    }
+
+    pub(super) fn take_landing_fault(root: &Path) -> bool {
+        FAULT_NEXT_LANDING
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|s| s.remove(root))
+    }
+
+    /// One `Start` or provider update the executor carried out (Task 18):
+    /// spec §12 defines "starts fetching" as the first request, which the
+    /// executor issues right after the core's `Start`.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Sighting {
+        pub at: std::time::Instant,
+        pub frame_uuid: String,
+        /// The provider devices the command named (hub device ids).
+        pub providers: Vec<String>,
+        /// `true` for a `Start`, `false` for an `UpdateProviders`.
+        pub start: bool,
+    }
+
+    type Sightings = std::collections::HashMap<crate::sharing::types::NodeId, Vec<Sighting>>;
+    static SIGHTINGS: Mutex<Option<Sightings>> = Mutex::new(None);
+
+    pub(super) fn record_sighting(
+        node: crate::sharing::types::NodeId,
+        frame_uuid: &str,
+        providers: &[crate::collab::scheduler::core::ProviderRef],
+        start: bool,
+    ) {
+        SIGHTINGS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .entry(node)
+            .or_default()
+            .push(Sighting {
+                at: std::time::Instant::now(),
+                frame_uuid: frame_uuid.to_string(),
+                providers: providers.iter().map(|p| p.device.clone()).collect(),
+                start,
+            });
+    }
+
+    /// Every sighting of `node`'s executor so far, in order.
+    pub(crate) fn sightings(node: &crate::sharing::types::NodeId) -> Vec<Sighting> {
+        SIGHTINGS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(node).cloned())
+            .unwrap_or_default()
     }
 }
 

@@ -25,7 +25,13 @@ pub(crate) const PID: &str = "p1";
 /// seeded both on the hub and in the local cache. The returned `TempDir`
 /// must be kept alive for as long as `ctx`/`hub` are used.
 pub(crate) async fn signed_in_rig() -> (tempfile::TempDir, ServiceContext, FakeHub) {
-    let (tmp, ctx, hub) = signed_in_rig_no_root().await;
+    signed_in_rig_on(iroh::RelayMode::Disabled).await
+}
+
+/// As [`signed_in_rig`], the node bound with `relay` (Task 18: the relay
+/// stream measurement).
+async fn signed_in_rig_on(relay: iroh::RelayMode) -> (tempfile::TempDir, ServiceContext, FakeHub) {
+    let (tmp, ctx, hub) = signed_in_rig_no_root_on(relay).await;
     let requested = tmp.path().join("Collab");
     std::fs::create_dir_all(&requested).unwrap();
     crate::api::scan_roots::set_collaboration_dir(
@@ -43,6 +49,12 @@ pub(crate) async fn signed_in_rig() -> (tempfile::TempDir, ServiceContext, FakeH
 /// another device, say) before anything is designated, e.g. the device
 /// replace / reinstall tests.
 pub(crate) async fn signed_in_rig_no_root() -> (tempfile::TempDir, ServiceContext, FakeHub) {
+    signed_in_rig_no_root_on(iroh::RelayMode::Disabled).await
+}
+
+async fn signed_in_rig_no_root_on(
+    relay: iroh::RelayMode,
+) -> (tempfile::TempDir, ServiceContext, FakeHub) {
     let hub = FakeHub::start().await;
     let (tmp, ctx) = crate::api::collab_exchange::test_support::test_ctx();
     crate::api::collab_exchange::test_support::wire_hub(&ctx, &hub.uri(), "tok");
@@ -53,11 +65,11 @@ pub(crate) async fn signed_in_rig_no_root() -> (tempfile::TempDir, ServiceContex
     let node = SharedIrohNode::bind_with(
         &dirs.identity_dir,
         &dirs.working_dir,
-        iroh::RelayMode::Disabled,
+        relay,
         crate::sharing::iroh::node::NodeOptions::default(),
     )
     .await
-    .expect("bind relay-disabled node");
+    .expect("bind the node");
     *ctx.iroh_node.lock().await = Some(Arc::clone(&node));
 
     let my_pubkey = crate::api::account::own_device_id(&ctx).unwrap();
@@ -275,7 +287,16 @@ pub(crate) async fn landed_rig_big(n: usize, size: usize) -> LandedRig {
 }
 
 async fn landed_rig_with(n: usize, bytes_of: impl Fn(&str) -> Vec<u8>) -> LandedRig {
-    let (tmp, ctx, hub) = signed_in_rig().await;
+    landed_rig_on(iroh::RelayMode::Disabled, n, bytes_of).await
+}
+
+/// As [`landed_rig`], the node bound with `relay`.
+async fn landed_rig_on(
+    relay: iroh::RelayMode,
+    n: usize,
+    bytes_of: impl Fn(&str) -> Vec<u8>,
+) -> LandedRig {
+    let (tmp, ctx, hub) = signed_in_rig_on(relay).await;
     let root = collab_root(&ctx);
     let node = ctx.iroh_node.lock().await.clone().expect("a bound node");
     assert!(node.collab_store().is_some(), "the collab store is mounted");
@@ -1153,6 +1174,38 @@ pub(crate) struct Instance {
     pub node: Arc<SharedIrohNode>,
     pub root: PathBuf,
     pub control: Arc<InboundControl>,
+    /// Every event the live exchange emitted (Task 18).
+    pub events: Arc<Recorder>,
+    /// The config the live exchange was last armed with (a restart reuses
+    /// it).
+    cfg: std::sync::Mutex<crate::api::collab_live::LiveConfig>,
+}
+
+/// A [`ProgressEmitter`](crate::events::ProgressEmitter) that keeps every
+/// event (Task 18: the deletion choice is counted, not assumed).
+#[derive(Default)]
+pub(crate) struct Recorder(std::sync::Mutex<Vec<(String, serde_json::Value)>>);
+
+impl crate::events::ProgressEmitter for Recorder {
+    fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((event_name.to_string(), payload));
+    }
+}
+
+impl Recorder {
+    /// The payloads emitted under `name`, in order.
+    pub(crate) fn payloads(&self, name: &str) -> Vec<serde_json::Value> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
 }
 
 async fn live_instance(
@@ -1194,6 +1247,8 @@ async fn live_instance(
         node,
         root,
         control: Arc::new(InboundControl::new()),
+        events: Arc::new(Recorder::default()),
+        cfg: std::sync::Mutex::new(live_config()),
     }
 }
 
@@ -1225,19 +1280,22 @@ impl Instance {
 
     /// [`start_live`](Self::start_live) with `cfg`.
     pub(crate) fn start_live_with(&self, cfg: crate::api::collab_live::LiveConfig) {
+        *self.cfg.lock().unwrap() = cfg;
+        let events: Arc<dyn crate::events::ProgressEmitter> = self.events.clone();
         crate::api::collab_live::spawn_with(
             Arc::clone(&self.ctx),
             crate::api::collab_live::GateSource::Fixed(Arc::clone(&self.control)),
-            None,
+            Some(events),
             cfg,
         )
         .expect("armed");
     }
 
-    /// Stop (clean exit) and arm it again.
+    /// Stop (clean exit) and arm it again, with the config it last ran.
     pub(crate) async fn restart_live(&self) {
         crate::api::collab_live::shutdown(&self.ctx).await;
-        self.start_live();
+        let cfg = *self.cfg.lock().unwrap();
+        self.start_live_with(cfg);
     }
 
     pub(crate) fn row(&self, uuid: &str) -> Option<crate::db::collab_frames::LocalFrameRow> {
@@ -1512,22 +1570,32 @@ impl AccountWorld {
     /// `a` publishes `n` frames of 64 KiB and is the account's publishing
     /// device (as its first announce would have made it).
     pub(crate) async fn a_publishes(&self, n: usize) -> Vec<String> {
+        self.a_publishes_timed(n)
+            .await
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect()
+    }
+
+    /// As [`a_publishes`](Self::a_publishes), each uuid with the instant
+    /// just before its announce reached the hub (Task 18).
+    pub(crate) async fn a_publishes_timed(&self, n: usize) -> Vec<(String, std::time::Instant)> {
         self.hub
             .set_publishing_device(PID, "acc-a", &self.a.device());
-        let mut uuids = Vec::new();
+        let mut out = Vec::new();
         for _ in 0..n {
             let i = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let uuid = format!("f{i:03}");
-            publish_as(
+            let at = publish_as(
                 &self.hub,
                 &self.a,
                 &uuid,
                 FetchRig::pattern(&uuid, 1, FETCH_FRAME_BYTES),
             )
             .await;
-            uuids.push(uuid);
+            out.push((uuid, at));
         }
-        uuids
+        out
     }
 
     /// Bring `c` (the other account) in: refreshed and live.
@@ -1548,7 +1616,12 @@ impl AccountWorld {
 /// own row `own_held`, seeded and claimed — THEN the hub's row with the real
 /// hashes, `a`'s device as the announcing device (A6) and `a`'s implicit
 /// claim (so no peer ever asks before `a` can serve).
-async fn publish_as(hub: &FakeHub, a: &Instance, uuid: &String, bytes: Vec<u8>) {
+async fn publish_as(
+    hub: &FakeHub,
+    a: &Instance,
+    uuid: &String,
+    bytes: Vec<u8>,
+) -> std::time::Instant {
     let device = a.device();
     {
         let dir = a.root.join("m31").join("Alice");
@@ -1615,6 +1688,7 @@ async fn publish_as(hub: &FakeHub, a: &Instance, uuid: &String, bytes: Vec<u8>) 
                 )
                 .unwrap();
             }
+            let announced_at = std::time::Instant::now();
             hub.seed_frames_with(PID, "acc-a", &[uuid.as_str()], "published", |f| {
                 f.blake3 = blake3.clone();
                 f.xxh3 = xxh3.clone();
@@ -1622,6 +1696,7 @@ async fn publish_as(hub: &FakeHub, a: &Instance, uuid: &String, bytes: Vec<u8>) 
                 f.file_name = file_name.clone();
                 f.publisher_device_id = Some(device.clone());
             });
+            announced_at
         }
     }
 }
@@ -1632,11 +1707,18 @@ impl World {
     /// version (own_held, seeded, its implicit claim), then the hub's
     /// versions call as A (the hub writes A's implicit claim and bumps).
     pub(crate) async fn a_republishes_changed(&self, uuid: &str) {
-        let row = self.a.row(uuid).expect("A's own row");
+        republish_as(&self.hub, &self.a, "tok-a", uuid).await;
+    }
+}
+
+/// `a` (an "acc-a"/"Alice" device signed in with `token`) publishes a new
+/// version of `uuid`: see [`World::a_republishes_changed`].
+async fn republish_as(hub: &FakeHub, a: &Instance, token: &str, uuid: &str) {
+    {
+        let row = a.row(uuid).expect("A's own row");
         let next = row.content_version + 1;
         let bytes = FetchRig::pattern(uuid, next, row.byte_size as usize);
-        let path = self
-            .a
+        let path = a
             .root
             .join("m31")
             .join("Alice")
@@ -1644,14 +1726,13 @@ impl World {
         std::fs::write(&path, &bytes).unwrap();
         let blake3 = blake3::hash(&bytes).to_hex().to_string();
         let xxh3 = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
-        self.a
-            .node
+        a.node
             .seed_project_frame(PID, uuid, next, &path)
             .await
             .expect("seed A's new version");
         let stamp = crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(&path).unwrap());
         {
-            let conn = crate::api::db(&self.a.ctx).unwrap().conn();
+            let conn = crate::api::db(&a.ctx).unwrap().conn();
             conn.execute(
                 "UPDATE project_frames_local SET content_version = ?3, blake3 = ?4, xxh3 = ?5,
                      landed_path = ?6, size_mtime_seen = ?7, local_state = 'own_held', on_disk = 1
@@ -1669,10 +1750,10 @@ impl World {
             .unwrap();
             crate::db::collab_live::add_implicit_claim(&conn, PID, uuid, next).unwrap();
         }
-        let client = crate::collab::hub_client::CollabClient::new(self.hub.uri()).unwrap();
+        let client = crate::collab::hub_client::CollabClient::new(hub.uri()).unwrap();
         let reply = client
             .frame_versions(
-                "tok-a",
+                token,
                 PID,
                 &[crate::collab::live::wire::VersionInWire {
                     uuid: uuid.to_string(),
@@ -1685,5 +1766,586 @@ impl World {
             .await
             .expect("the hub takes the new version");
         assert_eq!(reply.results[0].content_version, next);
+    }
+}
+
+// ----- three live instances: the spec §12 latency table (Task 18) ---------
+
+use std::time::{Duration, Instant};
+
+use crate::api::collab_live::executor::test_hooks::{sightings, Sighting};
+
+/// The e2e's runtime config: the fake hub's shortened presence rules (as
+/// [`live_config`]), the watcher aggregating for 200 ms and a deletion
+/// settling after 1 s (the spec's 10 s / 60 s would only stretch the run),
+/// and the GC probe at 500 ms beside the 100 ms test GC the three-instance
+/// world arms.
+pub(crate) fn e2e_config() -> crate::api::collab_live::LiveConfig {
+    let mut cfg = live_config();
+    cfg.timings.aggregate = Duration::from_millis(200);
+    cfg.timings.settle = Duration::from_secs(1);
+    cfg.gc_probe = Duration::from_millis(500);
+    cfg
+}
+
+/// The plan's ceiling for any file under a working dir (wave-2 R32): the
+/// personal store never holds a frame's bytes.
+pub(crate) const WORKING_DIR_FILE_CAP: u64 = 64 * 1024;
+
+/// Every regular file under `dir`, recursively.
+pub(crate) fn files_under(dir: &Path) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect()
+}
+
+pub(crate) fn dir_bytes(dir: &Path) -> u64 {
+    files_under(dir)
+        .iter()
+        .filter_map(|p| p.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Bytes a node's endpoint has sent since bind (iroh's socket counters) —
+/// who served payload.
+pub(crate) fn sent_bytes(node: &SharedIrohNode) -> u64 {
+    let c = node.counters_snapshot_for_test();
+    c.send_direct_bytes.saturating_add(c.send_relay_bytes)
+}
+
+/// Every `*.athtmp` landing temp under `dir`.
+pub(crate) fn athtmp_under(dir: &Path) -> Vec<PathBuf> {
+    files_under(dir)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "athtmp"))
+        .collect()
+}
+
+/// The Folders page's "change": clear the designation, designate `dir`;
+/// returns the stored root.
+pub(crate) async fn redesignate(ctx: &ServiceContext, dir: &Path) -> PathBuf {
+    crate::api::scan_roots::clear_collaboration_dir(ctx)
+        .await
+        .expect("clear the Collaboration folder");
+    std::fs::create_dir_all(dir).unwrap();
+    crate::api::scan_roots::set_collaboration_dir(
+        ctx,
+        dir.to_string_lossy().to_string(),
+        &PathPolicy::AllowAll,
+    )
+    .await
+    .expect("re-designate the Collaboration folder");
+    collab_root(ctx)
+}
+
+/// What an instance's disk held before the exchange ran (the ledger's zero):
+/// its Collaboration root and collab store with the store open and empty,
+/// and every file of its working dir with its size.
+pub(crate) struct DiskBaseline {
+    root: PathBuf,
+    /// Bytes of every file under the root outside `.athenaeum`.
+    frame_bytes: u64,
+    store_bytes: u64,
+    working: std::collections::HashMap<PathBuf, u64>,
+}
+
+impl Instance {
+    /// This instance's node id (the key of its executor's sightings).
+    pub(crate) fn node_key(&self) -> crate::sharing::types::NodeId {
+        self.node.node_id()
+    }
+
+    pub(crate) fn working_dir(&self) -> PathBuf {
+        crate::api::sync::sync_dirs(&self.ctx).unwrap().working_dir
+    }
+
+    /// The blake3 of `uuid`'s current version as this instance records it.
+    pub(crate) fn hash_of(&self, uuid: &str) -> iroh_blobs::Hash {
+        self.row(uuid)
+            .expect("a cached row")
+            .blake3
+            .parse()
+            .expect("a blake3 hex")
+    }
+
+    async fn first_sighting(
+        &self,
+        uuid: &str,
+        what: &str,
+        within: Duration,
+        pred: impl Fn(&Sighting) -> bool,
+    ) -> Instant {
+        let deadline = Instant::now() + within;
+        loop {
+            let all = sightings(&self.node_key());
+            if let Some(s) = all.iter().find(|s| s.frame_uuid == uuid && pred(s)) {
+                return s.at;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{uuid}: no {what} within {within:?}; sightings: {:?}",
+                all.iter()
+                    .filter(|s| s.frame_uuid == uuid)
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// When this instance first started fetching `uuid` — spec §12's "starts
+    /// fetching": the executor issues the first get of a fetch right after
+    /// the core's `Start`, which is when this is stamped.
+    pub(crate) async fn first_start_at(&self, uuid: &str, within: Duration) -> Instant {
+        self.first_sighting(uuid, "fetch start", within, |s| s.start)
+            .await
+    }
+
+    /// The first `Start` or provider update of `uuid` naming `device` as a
+    /// provider: from then on this instance can fetch it from `device`.
+    pub(crate) async fn first_start_with_provider(
+        &self,
+        uuid: &str,
+        device: &str,
+        within: Duration,
+    ) -> Instant {
+        self.first_sighting(uuid, "fetch naming the provider", within, |s| {
+            s.providers.iter().any(|p| p == device)
+        })
+        .await
+    }
+
+    /// Whether this instance's live presence lists `device` online and
+    /// serving the project — a provider candidate (spec I5; the provider
+    /// lists are derived from it, so a device absent here is never dialled
+    /// again).
+    pub(crate) fn sees_provider(&self, device: &str) -> bool {
+        crate::api::collab_live::runtime::live_presence(&self.ctx)
+            .is_some_and(|(p, _)| p.is_online_serving(PID, device))
+    }
+
+    async fn wait_seen(&self, device: &str, seen: bool, within: Duration) -> Instant {
+        let deadline = Instant::now() + within;
+        loop {
+            if self.sees_provider(device) == seen {
+                return Instant::now();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "provider {device} {}: not within {within:?}",
+                if seen { "seen" } else { "dropped" }
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Wait until `device` is a provider candidate here; when it became one.
+    pub(crate) async fn wait_provider(&self, device: &str, within: Duration) -> Instant {
+        self.wait_seen(device, true, within).await
+    }
+
+    /// Wait until `device` is no provider candidate here; when it dropped.
+    pub(crate) async fn wait_not_a_provider(&self, device: &str, within: Duration) -> Instant {
+        self.wait_seen(device, false, within).await
+    }
+
+    /// Poll (10 ms) until `uuid` is in `state`; returns the last poll that
+    /// did NOT see it yet — a lower bound on when it got there, so a
+    /// latency measured from it is never understated.
+    pub(crate) async fn wait_state_since(
+        &self,
+        uuid: &str,
+        state: LocalState,
+        within: Duration,
+    ) -> Instant {
+        let deadline = Instant::now() + within;
+        let mut not_yet = Instant::now();
+        loop {
+            let now = Instant::now();
+            if self.row(uuid).is_some_and(|r| r.local_state == state) {
+                return not_yet;
+            }
+            assert!(now < deadline, "{uuid} {state:?}: not within {within:?}");
+            not_yet = now;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Kill this instance as a crash would: the live exchange aborted where
+    /// it stands (no `DELETE /me/presence`, its stream simply drops) and the
+    /// node shut. The instance is unusable afterwards.
+    pub(crate) async fn kill(&self) {
+        crate::api::collab_live::runtime::crash_for_test(&self.ctx).await;
+        self.node.shutdown().await;
+    }
+
+    /// One get of `hash` from `provider` into a fresh store, over this
+    /// node's collab ALPN (a live run naming `provider` alone): how it ended,
+    /// and every verdict the run reached on the provider (`Refused` is the
+    /// provider's `ERR_PERMISSION`).
+    pub(crate) async fn get_from(
+        &self,
+        provider: &Instance,
+        hash: iroh_blobs::Hash,
+    ) -> (ItemOutcome, Vec<LiveVerdict>) {
+        let store = scratch_store();
+        let providers = ProviderSet::Fixed(Arc::new(vec![provider.node.endpoint_addr().id]));
+        let (item, _cancel) = live_item("probe", hash, 0, providers);
+        let dialer = live_dialer(&self.node, &[&provider.node]);
+        let opts = live_opts(1, crate::sharing::noop_provider_telemetry());
+        let mut run = drive_live(&store, dialer, vec![item], opts, async {}).await;
+        (only_outcome(&mut run), run.verdicts)
+    }
+
+    /// Install the production connect gate's collab half on this node (the
+    /// receiver's `api::sync::connect_gate` without the account list, which
+    /// these instances leave empty): a peer is admitted while it is a
+    /// verified member device of a cached project — re-read per connection,
+    /// so a membership refresh that drops a device refuses it (I11).
+    pub(crate) fn install_member_gate(&self) {
+        let db = crate::api::db(&self.ctx).unwrap().clone();
+        self.node.set_connect_gate(Arc::new(move |from| {
+            crate::collab::authz::node_in_any_project(&db.conn(), from)
+        }));
+    }
+
+    /// The ledger's zero for this instance (see [`DiskBaseline`]).
+    pub(crate) fn disk_baseline(&self) -> DiskBaseline {
+        let root = collab_root(&self.ctx);
+        DiskBaseline {
+            frame_bytes: dir_bytes(&root).saturating_sub(dir_bytes(&root.join(".athenaeum"))),
+            store_bytes: dir_bytes(&root.join(".athenaeum")),
+            root,
+            working: files_under(&self.working_dir())
+                .into_iter()
+                .filter_map(|f| f.metadata().ok().map(|m| (f, m.len())))
+                .collect(),
+        }
+    }
+
+    /// The one-copy disk ledger (spec §11; wave-2 R32 baselines), against
+    /// `base`:
+    /// - the Collaboration root holds exactly the frames this instance holds —
+    ///   landed replicas and seeded own files, one file each, byte for byte;
+    /// - its collab store (`.athenaeum`) grew by < 1 % of them (outboards and
+    ///   its database): a landing is a rename, an own frame is seeded in
+    ///   place — never a copy;
+    /// - the working dir grew ≤ 64 KiB and holds no file over 64 KiB but the
+    ///   personal store's preallocated database, untouched;
+    /// - no `*.athtmp` anywhere.
+    pub(crate) fn assert_disk_ledger(&self, base: &DiskBaseline, who: &str) {
+        let root = &base.root;
+        let rows = crate::db::collab_frames::list_for_project(
+            &crate::api::db(&self.ctx).unwrap().conn(),
+            PID,
+        )
+        .unwrap();
+        let held: Vec<PathBuf> = rows
+            .iter()
+            .filter(|r| matches!(r.local_state, LocalState::Held | LocalState::OwnHeld))
+            .filter_map(|r| r.landed_path.as_deref().map(PathBuf::from))
+            .filter(|p| p.starts_with(root))
+            .collect();
+        let payload: u64 = held
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        assert!(payload > 0, "{who}: the ledger needs frames");
+        let frame_files: Vec<PathBuf> = files_under(root)
+            .into_iter()
+            .filter(|p| {
+                !p.strip_prefix(root)
+                    .is_ok_and(|r| r.starts_with(".athenaeum"))
+            })
+            .collect();
+        assert_eq!(
+            frame_files.len(),
+            held.len(),
+            "{who}: one file per held frame, no second copy: {frame_files:?}"
+        );
+        let store_now = dir_bytes(&root.join(".athenaeum"));
+        let grown = (dir_bytes(root) - store_now).saturating_sub(base.frame_bytes);
+        assert_eq!(
+            grown, payload,
+            "{who}: the Collaboration root's frame files grew {grown} B for {payload} B of frames"
+        );
+        let store_grown = store_now.saturating_sub(base.store_bytes);
+        assert!(
+            store_grown * 100 < payload,
+            "{who}: the collab store grew {store_grown} B for {payload} B of frames (a copy?)"
+        );
+        let mut working_total = 0;
+        for f in files_under(&self.working_dir()) {
+            let len = f.metadata().unwrap().len();
+            working_total += len;
+            assert!(
+                len <= WORKING_DIR_FILE_CAP || base.working.get(&f) == Some(&len),
+                "{who}: {} is {len} B under the working dir",
+                f.display()
+            );
+        }
+        let working_base: u64 = base.working.values().sum();
+        assert!(
+            working_total.saturating_sub(working_base) <= WORKING_DIR_FILE_CAP,
+            "{who}: the working dir grew {} B",
+            working_total.saturating_sub(working_base)
+        );
+        for dir in [root.clone(), self.working_dir()] {
+            let temps = athtmp_under(&dir);
+            assert!(temps.is_empty(), "{who}: landing temps left: {temps:?}");
+        }
+        eprintln!(
+            "ledger {who}: frame files +{grown} B for {payload} B of frames ({} frames), store {} -> {store_now} B, working dir +{} B",
+            held.len(),
+            base.store_bytes,
+            working_total.saturating_sub(working_base)
+        );
+    }
+}
+
+/// Spec §12's three instances on one fake hub: A (`send`, the contributor,
+/// publishing), B (`send_receive`, the processor), C (`send_receive`, the
+/// coordinator). Real relay-disabled nodes; A↔B and B↔C are paired, A and C
+/// are NOT — so everything C holds it got from B, and "C can fetch it from
+/// B" is observable. Every store opened here runs the 100 ms test GC (gate
+/// open); every live exchange runs [`e2e_config`].
+pub(crate) struct World3 {
+    pub hub: FakeHub,
+    pub a: Instance,
+    pub b: Instance,
+    pub c: Instance,
+    /// The ledger's zero of A, B and C.
+    pub base: [DiskBaseline; 3],
+    next: std::sync::atomic::AtomicUsize,
+}
+
+pub(crate) async fn three_instances() -> World3 {
+    three_instances_with(None).await
+}
+
+/// As [`three_instances`], A's uploads optionally capped at `bps`.
+pub(crate) async fn three_instances_with(a_upload: Option<u64>) -> World3 {
+    // Every store opened on this thread from here on runs GC every 100 ms.
+    crate::sharing::iroh::node::test_gc::arm(Some(Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    ))));
+    let hub = FakeHub::start().await;
+    hub.set_timings(LIVE_TIMINGS);
+    hub.add_project(
+        PID,
+        "m31",
+        &[
+            ("acc-a", "send", false),
+            ("acc-b", "send_receive", false),
+            ("acc-c", "send_receive", true),
+        ],
+        false,
+    );
+    let a = live_instance(&hub, "tok-a", "acc-a", "Alice").await;
+    let b = live_instance(&hub, "tok-b", "acc-b", "Bob").await;
+    let c = live_instance(&hub, "tok-c", "acc-c", "Carol").await;
+    pair(&a.node, &b.node).await;
+    pair(&b.node, &c.node).await;
+    for i in [&a, &b, &c] {
+        let cards = crate::api::collab::refresh_projects(&i.ctx).await.unwrap();
+        assert!(cards.iter().any(|p| p.project_id == PID));
+        i.install_member_gate();
+    }
+    if let Some(bps) = a_upload {
+        a.node.set_upload_limit(bps);
+    }
+    let base = [a.disk_baseline(), b.disk_baseline(), c.disk_baseline()];
+    for i in [&a, &b, &c] {
+        i.start_live_with(e2e_config());
+    }
+    for i in [&a, &b, &c] {
+        hub.wait_connected(PID, &i.device(), Duration::from_secs(10))
+            .await;
+    }
+    World3 {
+        hub,
+        a,
+        b,
+        c,
+        base,
+        next: std::sync::atomic::AtomicUsize::new(0),
+    }
+}
+
+/// [`three_instances`] with `n` frames of 64 KiB published by A and held by
+/// B and C.
+pub(crate) async fn three_instances_all_held(n: usize) -> (World3, Vec<String>) {
+    let w = three_instances().await;
+    let uuids = w.a_publishes(n).await;
+    w.wait_held_by_b_and_c(&uuids).await;
+    (w, uuids)
+}
+
+impl World3 {
+    fn fresh_uuid(&self) -> String {
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        format!("f{i:03}")
+    }
+
+    /// A publishes `n` frames of `size` bytes; each uuid with the instant
+    /// just before its announce reached the hub.
+    pub(crate) async fn a_publishes_timed(&self, n: usize, size: usize) -> Vec<(String, Instant)> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let uuid = self.fresh_uuid();
+            let at = publish_as(&self.hub, &self.a, &uuid, FetchRig::pattern(&uuid, 1, size)).await;
+            out.push((uuid, at));
+        }
+        out
+    }
+
+    pub(crate) async fn a_publishes_big(&self, n: usize, size: usize) -> Vec<String> {
+        self.a_publishes_timed(n, size)
+            .await
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect()
+    }
+
+    /// A publishes `n` frames of 64 KiB.
+    pub(crate) async fn a_publishes(&self, n: usize) -> Vec<String> {
+        self.a_publishes_big(n, FETCH_FRAME_BYTES).await
+    }
+
+    /// A publishes a new version of `uuid` (see [`World::a_republishes_changed`]).
+    pub(crate) async fn a_republishes_changed(&self, uuid: &str) {
+        republish_as(&self.hub, &self.a, "tok-a", uuid).await;
+    }
+
+    pub(crate) async fn wait_held_by_b_and_c(&self, uuids: &[String]) {
+        for u in uuids {
+            self.b
+                .wait_state(u, LocalState::Held, Duration::from_secs(30))
+                .await;
+            self.c
+                .wait_state(u, LocalState::Held, Duration::from_secs(30))
+                .await;
+        }
+    }
+
+    /// The one-copy disk ledger on A, B and C (see
+    /// [`Instance::assert_disk_ledger`]).
+    pub(crate) fn assert_disk_ledger(&self) {
+        self.a.assert_disk_ledger(&self.base[0], "A");
+        self.b.assert_disk_ledger(&self.base[1], "B");
+        self.c.assert_disk_ledger(&self.base[2], "C");
+    }
+}
+
+// ----- the relay stream measurement (Task 18, plan P21; owner-run) --------
+
+/// A provider holding `n` frames of `size` bytes in its collab store and a
+/// fetcher, both on one real relay, the fetcher dialling the provider by
+/// its relay url ONLY.
+pub(crate) struct RelayPair {
+    provider: LandedRig,
+    fetcher: BareNode,
+    provider_addr: iroh::EndpointAddr,
+}
+
+pub(crate) async fn relay_pair(relay_url: &str, n: usize, size: usize) -> RelayPair {
+    let map = iroh::RelayMap::try_from_iter([relay_url]).expect("a valid relay url");
+    let relay: iroh::RelayUrl = relay_url.parse().expect("a relay url");
+    let provider = landed_rig_on(iroh::RelayMode::Custom(map.clone()), n, |uuid| {
+        FetchRig::pattern(uuid, 1, size)
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let fetcher = SharedIrohNode::bind_with(
+        tmp.path(),
+        tmp.path(),
+        iroh::RelayMode::Custom(map),
+        crate::sharing::iroh::node::NodeOptions::default(),
+    )
+    .await
+    .expect("bind the fetcher on the relay");
+    let fetcher = BareNode {
+        node: fetcher,
+        _tmp: tmp,
+    };
+    for node in [&provider.node, &fetcher.node] {
+        tokio::time::timeout(Duration::from_secs(15), node.endpoint().online())
+            .await
+            .expect("each endpoint reaches the relay");
+        node.handle(crate::sharing::iroh::node::Role::Out)
+            .start()
+            .await
+            .unwrap();
+    }
+    let provider_addr =
+        iroh::EndpointAddr::new(provider.node.endpoint_addr().id).with_relay_url(relay);
+    RelayPair {
+        provider,
+        fetcher,
+        provider_addr,
+    }
+}
+
+impl RelayPair {
+    /// Fetch every frame into a FRESH in-memory store over one live run
+    /// capped at `max_in_flight` streams; the bytes fetched, the time taken,
+    /// and the share of the provider's sent bytes that went over the relay
+    /// (a direct path found by hole punching would not measure the relay).
+    pub(crate) async fn fetch_all_fresh(&self, max_in_flight: usize) -> (u64, Duration, f64) {
+        let store = scratch_store();
+        let id = self.provider_addr.id;
+        let book = self.provider_addr.clone();
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let dialer = Dialer::Collab {
+            pool: crate::sharing::iroh::collab_pool::CollabPool::new(
+                self.fetcher.endpoint(),
+                events,
+            ),
+            addrs: Arc::new(move |n| (*n == id).then(|| book.clone())),
+        };
+        let providers = ProviderSet::Fixed(Arc::new(vec![id]));
+        let (item_tx, item_rx) = tokio::sync::mpsc::channel(self.provider.frames.len().max(1));
+        let mut bytes = 0u64;
+        let mut cancels = Vec::new();
+        for i in 0..self.provider.frames.len() {
+            let (item, cancel) = rig_item(&self.provider, i, providers.clone());
+            bytes += item.item.size;
+            cancels.push(cancel);
+            item_tx.send(item).await.unwrap();
+        }
+        drop(item_tx);
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (verdict_tx, _verdicts) = tokio::sync::mpsc::unbounded_channel();
+        let (_yield_tx, yield_rx) = tokio::sync::watch::channel(false);
+        let mut opts = live_opts(max_in_flight, crate::sharing::noop_provider_telemetry());
+        opts.stall_hard_limit = Duration::from_secs(30);
+        let before = self.provider.node.counters_snapshot_for_test();
+        let t0 = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1800),
+            run_live(&store, dialer, item_rx, opts, done_tx, verdict_tx, yield_rx),
+        )
+        .await
+        .expect("the run ends within 30 minutes");
+        let elapsed = t0.elapsed();
+        while let Ok((key, outcome)) = done_rx.try_recv() {
+            assert!(matches!(outcome, ItemOutcome::Done), "{key}: {outcome:?}");
+        }
+        let after = self.provider.node.counters_snapshot_for_test();
+        let relay = after
+            .send_relay_bytes
+            .saturating_sub(before.send_relay_bytes) as f64;
+        let direct = after
+            .send_direct_bytes
+            .saturating_sub(before.send_direct_bytes) as f64;
+        let share = if relay + direct > 0.0 {
+            relay / (relay + direct)
+        } else {
+            0.0
+        };
+        (bytes, elapsed, share)
     }
 }

@@ -302,6 +302,12 @@ pub(crate) enum LiveCommand {
         sign_out: bool,
         done: oneshot::Sender<()>,
     },
+    /// Test only (Task 18, spec §12 "B is killed"): stop as a crashed
+    /// process does — no presence leave, no oracle change, nothing flushed.
+    #[cfg(test)]
+    Crash {
+        done: oneshot::Sender<()>,
+    },
 }
 
 struct LiveHandle {
@@ -364,6 +370,10 @@ pub(crate) struct LiveConfig {
     /// The presence beat interval (the spec's 15 s; a test against a fake
     /// hub with a shortened silence rule beats faster).
     pub beat: Duration,
+    /// How often rows parked for the collab GC are re-checked
+    /// ([`GC_PROBE_EVERY`]; a test whose store GC runs every 100 ms probes
+    /// as often).
+    pub gc_probe: Duration,
 }
 
 impl Default for LiveConfig {
@@ -372,6 +382,7 @@ impl Default for LiveConfig {
             timings: StorageTimings::default(),
             ready_poll: READY_POLL,
             beat: crate::collab::live::presence::BEAT_INTERVAL,
+            gc_probe: GC_PROBE_EVERY,
         }
     }
 }
@@ -551,6 +562,23 @@ async fn stop(ctx: &ServiceContext, sign_out: bool) {
         }
     }
     handle.shared.set_state(LiveState::Off, None);
+}
+
+/// Test only (Task 18): kill this catalog's live exchange as a crash would
+/// — no presence leave (see [`LiveCommand::Crash`]).
+#[cfg(test)]
+pub(crate) async fn crash_for_test(ctx: &ServiceContext) {
+    let Some(key) = scope(ctx) else {
+        return;
+    };
+    let Some(handle) = registry().remove(&key) else {
+        return;
+    };
+    let (done, rx) = oneshot::channel();
+    if handle.commands.send(LiveCommand::Crash { done }).is_ok() {
+        let _ = tokio::time::timeout(STOP_BOUND, rx).await;
+    }
+    handle.abort.abort();
 }
 
 /// The live presence and this device's id, for the command surface's holder
@@ -788,6 +816,7 @@ struct Runtime {
     session: tokio::task::JoinHandle<()>,
     refused: HashSet<String>,
     next_gc_probe: Instant,
+    gc_probe: Duration,
     burst: Burst,
     serving_dirty: bool,
     attention: BTreeSet<String>,
@@ -948,7 +977,8 @@ impl Runtime {
             stop_tx,
             session,
             refused: HashSet::new(),
-            next_gc_probe: Instant::now() + GC_PROBE_EVERY,
+            next_gc_probe: Instant::now() + cfg.gc_probe,
+            gc_probe: cfg.gc_probe,
             burst: Burst::default(),
             serving_dirty: true,
             attention: BTreeSet::new(),
@@ -1066,6 +1096,12 @@ impl Runtime {
                         self.attention.insert(p);
                     }
                     Some(LiveCommand::SetStreams(n)) => self.exec.set_slots(n),
+                    #[cfg(test)]
+                    Some(LiveCommand::Crash { done }) => {
+                        self.crash();
+                        let _ = done.send(());
+                        return RunEnd::Stopped;
+                    }
                 },
                 changed = self.mount_gen.changed(), if self.mount_open => {
                     if changed.is_ok() {
@@ -1152,6 +1188,19 @@ impl Runtime {
             }
         };
         self.finish(exit).await
+    }
+
+    /// Test only: end as a killed process — every task aborted where it
+    /// stands. The event stream's connection drops with the session task
+    /// (the hub sees a closed stream, never a `DELETE /me/presence`), and
+    /// its beat task ends with it.
+    #[cfg(test)]
+    fn crash(&mut self) {
+        self.session.abort();
+        self.feed_task.abort();
+        self.storage_task.abort();
+        self.exec.shutdown();
+        tracing::warn!("collab live exchange crashed (test hook)");
     }
 
     async fn finish(mut self, exit: Exit) -> RunEnd {
@@ -1515,7 +1564,7 @@ impl Runtime {
     async fn on_timers(&mut self) {
         let now = Instant::now();
         if now >= self.next_gc_probe {
-            self.next_gc_probe = now + GC_PROBE_EVERY;
+            self.next_gc_probe = now + self.gc_probe;
             self.exec.gc_probe().await;
         }
         if self.exec.tick_due() {
