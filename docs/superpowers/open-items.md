@@ -259,11 +259,15 @@ cycle.
   3. Portal: a dictionary editor (today the dictionary is only seeded; there
      is no UI to add `L-eXtreme`, `Dualband`, …), so a coordinator can grow
      the vocabulary the publishers map into.
-  **Spec written and approved 2026-09-28:**
-  `docs/superpowers/specs/2026-09-28-collab-v3-filter-mapping-design.md`
-  (amendment A7 of the per-frame spec) — canonical `None`, kind
-  `unfiltered`, mapping per account e-mail, two `PUT /dictionary` refusals,
-  portal dictionary editor; two plans follow (hub+portal, app).
+  **Spec written and approved 2026-09-28, scope widened the same day to
+  the whole contributor path after a process audit:**
+  `docs/superpowers/specs/2026-09-28-collab-v3-contributor-path-design.md`
+  (amendment A7 of the per-frame spec) — filter mapping (canonical `None`,
+  kind `unfiltered`, mapping per account e-mail, two `PUT /dictionary`
+  refusals, portal dictionary editor) + R3 attestation seeded in place +
+  a blocker list with actions above the gate table + the frame set's
+  Project block/column + the auto-publish switch for every member; two
+  plans follow (hub+portal, app).
 - **Repo hygiene finding:** `Documents/Projects/athenaeum-hub-portal/` is a
   STALE copy of the portal (still the free-text threshold editor); the
   deployed portal is `athenaeum-hub/portal/`. Edit only the latter.

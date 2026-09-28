@@ -650,20 +650,28 @@ project WBPP export lands `<title>/<publisher>/<camera>/<filter>/`.
   - **Trade-off, accepted by the owner.** An owner with two rigs on two
     computers cannot publish into one project from both at once: they
     switch the publishing device, or bring the frames to one machine.
-- **A7 (2026-09-28, owner) — §6.2 filter mapping is built out by
-  `2026-09-28-collab-v3-filter-mapping-design.md`.**
+- **A7 (2026-09-28, owner) — the contributor path is built out by
+  `2026-09-28-collab-v3-contributor-path-design.md`: §6.2 filter mapping,
+  R3 attestation, §6.1's gate actions, §8.2's frame-set Project block.**
   - **Why.** Wave 2 shipped only the exact/alias dictionary match (plan
-    ruling P3) and wave 3 never built the `filter_mappings` table, the
-    normaliser or the publish-flow modal, so a frame without a `FILTER`
-    header, or with a slot name, could not be published at all (owner smoke
-    2026-09-28).
+    ruling P3); wave 3 became the live exchange. The owner smoke of
+    2026-09-28 found a frame without a `FILTER` header unpublishable, and
+    the process audit that followed found the path reachable only with
+    app-built masters, from the project page alone, with gate reasons that
+    name no remedy.
   - **Rulings.** F1: an unset `FILTER` is a frame state, not a camera
     property — no OSC special case, no OSC-derived canonical. F2: the
     mapping is per account, one row per (camera, raw name), no per-project
     override. F3: a proposal is never a write. F4: the dictionary gains a
     default `None` / `unfiltered` entry through a NEW hub migration;
-    migration 0022 and the seed constant stay byte-equal.
+    migration 0022 and the seed constant stay byte-equal. F5: attestation
+    is a frame-set flag and an attested light is seeded in place (A1). F6:
+    every gate reason with a remedy names it. F7: the auto-publish switch
+    belongs to contributing. F8: `meta.calibration` is informational.
   - **Reads.** §6.2's second bullet now means: `collab_filter_mappings`
     keyed by the signed-in e-mail; resolution order explicit mapping →
     dictionary exact/alias → unmapped; the normaliser only preselects the
-    modal's `Select`. The `INSTRUME` display alias remains unbuilt.
+    modal's `Select`. §6.1's "row action" is a blocker list above the
+    gate table. R3's "stamped `CALSTAT`" is superseded by A1's "no stamps".
+    Still unbuilt: the plate-solve precondition, R9, the `INSTRUME` alias,
+    R3's export/stacking half.
