@@ -1197,8 +1197,7 @@ pub fn get_frame_set_project_status(
 
     let set_frames = union_light_frames(&conn, &[frames_set_id]).map_err(internal)?;
     let set_frame_ids: HashSet<i64> = set_frames.iter().map(|(id, _)| *id).collect();
-    let attested = crate::db::collab::frames_set_attested(&conn, frames_set_id).map_err(internal)?;
-    let own_device_id = crate::api::account::own_device_id(ctx).unwrap_or_default();
+    let me = device_for_cards(ctx);
 
     for p in crate::db::collab::list_projects(&conn).map_err(internal)? {
         if !crate::db::collab::is_set_linked(&conn, &p.project_id, frames_set_id).map_err(internal)? {
@@ -1209,24 +1208,28 @@ pub fn get_frame_set_project_status(
 
         let mut counts = ContributorCounts::default();
         let mut frames = Vec::new();
-        for (_identity, row) in gated.iter().filter(|(_, r)| set_frame_ids.contains(&r.frame_id)) {
-            let current_recipe = current_recipe_for_frame(&conn, row.frame_id, attested);
+        for (identity, row) in gated.iter().filter(|(_, r)| set_frame_ids.contains(&r.frame_id)) {
             let own_row = own.get(&row.frame_id);
-            let accepted_reason = own_row.and_then(|o| {
+            // Finding 3: a recipe read stats the light's source file on disk
+            // (`recipe_hash_for`) — only worth paying for a frame this
+            // account has actually published; `derive` ignores it otherwise.
+            let current_recipe =
+                own_row.and_then(|_| current_recipe_for_frame(&conn, row.frame_id, identity.attested));
+            let reject_reason = own_row.and_then(|o| {
                 crate::api::collab_exchange::parse_manifest_wire(
                     &p.project_id,
                     &o.frame_uuid,
                     &o.manifest_json,
                     "get_frame_set_project_status",
                 )
-                .and_then(|w| w.accepted_reason)
+                .and_then(|w| w.reject_reason)
             });
             let facts = own_row.map(|o| OwnRowFacts {
                 state: o.state.as_str(),
                 content_version: o.content_version,
                 recipe_hash: o.recipe_hash.as_deref(),
                 on_disk: o.on_disk,
-                reject_reason: accepted_reason.as_deref(),
+                reject_reason: reject_reason.as_deref(),
             });
             let (state, reason) = derive(
                 facts,
@@ -1242,10 +1245,11 @@ pub fn get_frame_set_project_status(
             });
         }
 
-        let publishing_here = crate::db::collab::publishing_device(&conn, &p.project_id)
-            .map_err(internal)?
-            .map(|b| b.device_id == own_device_id)
-            .unwrap_or(false);
+        let publishing = crate::db::collab::publishing_device(&conn, &p.project_id).map_err(internal)?;
+        let publishing_here = match (&publishing, me.as_deref()) {
+            (Some(publisher), Some(me)) => publisher.device_id == me,
+            _ => false,
+        };
 
         links.push(FrameSetProjectLink {
             project_id: p.project_id.clone(),
@@ -1314,19 +1318,19 @@ pub(crate) fn own_contributor_states(
             continue;
         };
         let current_recipe = current_recipe_for_frame(conn, row.frame_id, identity.attested);
-        let accepted_reason = crate::api::collab_exchange::parse_manifest_wire(
+        let reject_reason = crate::api::collab_exchange::parse_manifest_wire(
             project_id,
             &own_row.frame_uuid,
             &own_row.manifest_json,
             "own_contributor_states",
         )
-        .and_then(|w| w.accepted_reason);
+        .and_then(|w| w.reject_reason);
         let facts = OwnRowFacts {
             state: own_row.state.as_str(),
             content_version: own_row.content_version,
             recipe_hash: own_row.recipe_hash.as_deref(),
             on_disk: own_row.on_disk,
-            reject_reason: accepted_reason.as_deref(),
+            reject_reason: reject_reason.as_deref(),
         };
         let (state, reason) = derive(
             Some(facts),
@@ -2275,15 +2279,25 @@ pub(crate) fn current_recipe_for_frame(
             [frame_id],
             |r| Ok(external_recipe(r.get::<_, i64>(0)?, &r.get::<_, String>(1)?)),
         )
+        .map_err(|e| {
+            tracing::debug!(frame_id, error = %e, "current recipe: could not read the attested light's file row");
+        })
         .ok()
     } else {
-        crate::calibration_library::light_resolve::resolve_frame_inputs(
+        let resolved = crate::calibration_library::light_resolve::resolve_frame_inputs(
             conn,
             frame_id,
             publish_options().flat_norm,
         )
-        .ok()
-        .and_then(|res| recipe_hash_of_inputs(conn, &res).ok())
+        .map_err(|e| {
+            tracing::debug!(frame_id, error = %e, "current recipe: could not resolve the light's calibration inputs");
+        })
+        .ok()?;
+        recipe_hash_of_inputs(conn, &resolved)
+            .map_err(|e| {
+                tracing::debug!(frame_id, error = %e, "current recipe: could not hash the resolved calibration inputs");
+            })
+            .ok()
     }
 }
 
@@ -5878,6 +5892,116 @@ pub(crate) mod tests {
             .unwrap()
             .contains("calibration"));
         let _ = frames;
+    }
+
+    /// An own row's manifest carries two distinct texts — `acceptedReason`
+    /// (the exclude/restore reason) and `rejectReason` (a moderator's
+    /// reject). Review fix round 1, finding 1: the rejected chip must show
+    /// the LATTER, never the former.
+    fn seed_own_rejected_row(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        frame_uuid: &str,
+        source_frame_id: i64,
+        reject_reason: &str,
+        accepted_reason: &str,
+    ) {
+        let wire = crate::collab::hub_client::FrameViewWire {
+            frame_uuid: frame_uuid.into(),
+            frame_seq: 1,
+            publisher_account_id: "acc-me".into(),
+            publisher_display_name: "Me".into(),
+            own: true,
+            publisher_device_id: None,
+            file_name: "c_L_0000.fits".into(),
+            content_version: 1,
+            blake3: "b".repeat(64),
+            byte_size: 4096,
+            xxh3: "0123456789abcdef".into(),
+            filter_raw: "L".into(),
+            filter_canonical: "L".into(),
+            channel: "mono".into(),
+            exptime_sec: 300.0,
+            date_obs: None,
+            meta: serde_json::json!({}),
+            gate_version: 0,
+            accepted: false,
+            accepted_reason: Some(accepted_reason.to_string()),
+            state: "rejected".into(),
+            reject_reason: Some(reject_reason.to_string()),
+            manifest_version: 1,
+            created_at: "2026-07-13T00:00:00Z".into(),
+        };
+        let row = crate::db::collab_frames::LocalFrameRow {
+            project_id: project_id.into(),
+            frame_uuid: frame_uuid.into(),
+            content_version: 1,
+            origin: crate::db::collab_frames::FrameOrigin::Own,
+            publisher_account_id: "acc-me".into(),
+            publisher_display: "Me".into(),
+            file_name: "c_L_0000.fits".into(),
+            filter_canonical: "L".into(),
+            state: "rejected".into(),
+            accepted: false,
+            byte_size: 4096,
+            xxh3: "0123456789abcdef".into(),
+            blake3: "b".repeat(64),
+            manifest_version: 1,
+            manifest_json: serde_json::to_string(&wire).unwrap(),
+            landed_path: None,
+            size_mtime_seen: None,
+            on_disk: true,
+            awaiting_gc: false,
+            source_frame_id: Some(source_frame_id),
+            recipe_hash: None,
+            last_error: None,
+            updated_at: String::new(),
+            local_state: crate::db::collab_frames::LocalState::OwnHeld,
+            frame_seq: Some(1),
+        };
+        crate::db::collab_frames::record_own(conn, &row).unwrap();
+    }
+
+    #[test]
+    fn frame_set_project_status_rejected_own_row_shows_the_reject_reason() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "a@x.io");
+            seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1)
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_own_rejected_row(
+                &conn,
+                "p-1",
+                "u-rej",
+                frames[0],
+                "FWHM too high",
+                "excluded: not the reason under test",
+            );
+        }
+
+        let st = get_frame_set_project_status(&ctx, set_id).unwrap();
+        assert_eq!(st.links.len(), 1);
+        let f = st.links[0]
+            .frames
+            .iter()
+            .find(|f| f.frame_id == frames[0])
+            .unwrap();
+        assert_eq!(f.state, "rejected");
+        assert_eq!(f.reason.as_deref(), Some("FWHM too high"));
+
+        // `own_contributor_states` (the project page's own-frames table) must
+        // agree — same fix, same source field.
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        let project = crate::db::collab::get_project(&conn, "p-1").unwrap().unwrap();
+        let contrib = own_contributor_states(&conn, "p-1", &project);
+        let (state, reason) = contrib.get("u-rej").unwrap();
+        assert_eq!(state, "rejected");
+        assert_eq!(reason.as_deref(), Some("FWHM too high"));
     }
 
     /// End-to-end hub poll (wiremock): a fresh refresh fetches the page + a REAL
