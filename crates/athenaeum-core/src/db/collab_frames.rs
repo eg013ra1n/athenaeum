@@ -1218,19 +1218,22 @@ pub fn find_by_project_and_xxh3(
 
 /// Correct a frame's recorded path without touching its disk-state flags —
 /// the scanner's "moved" repair once it has matched a relocated file back to
-/// its row by `(project, xxh3)`.
+/// its row by `(project, xxh3)`. Returns the rows touched (0 or 1: the
+/// caller decides whether that means "no such row" or a real failure — for
+/// instance `landed_path` is `TEXT UNIQUE` table-wide, so a write that would
+/// collide with another project's row raises a rusqlite error rather than
+/// returning here at all; a `Ok(0)` return is a plain no-match).
 pub fn update_landed_path(
     conn: &Connection,
     project_id: &str,
     frame_uuid: &str,
     path: &str,
-) -> Result<()> {
-    conn.execute(
+) -> Result<usize> {
+    Ok(conn.execute(
         "UPDATE project_frames_local SET landed_path = ?3, updated_at = datetime('now')
          WHERE project_id = ?1 AND frame_uuid = ?2",
         params![project_id, frame_uuid, path],
-    )?;
-    Ok(())
+    )?)
 }
 
 /// The scanner's repair of a moved frame's path with no storage engine

@@ -2194,6 +2194,18 @@ fn is_own_dir_landing(path: &Path, own_dir: &Path) -> bool {
     path.parent() == Some(own_dir)
 }
 
+/// Belt-and-braces alongside [`is_own_dir_landing`] (fix round 2): a row
+/// whose stored recipe is external-shaped is never trusted as a generation
+/// target either, independent of where its `landed_path` happens to sit —
+/// two ways of catching the same crossing, since neither is airtight alone
+/// (a mid-flight `stage_own_file` clears `recipe_hash` to `NULL`; a path
+/// spelling drift could in principle fool the own-dir check).
+fn was_external_recipe(row: &crate::db::collab_frames::LocalFrameRow) -> bool {
+    row.recipe_hash
+        .as_deref()
+        .is_some_and(|r| r.starts_with("external:"))
+}
+
 /// The landing path of a NEW own frame: `<dir>/<name>`, else `<stem>_2`, … —
 /// the first spelling that is neither claimed earlier in this run, nor any
 /// cached frame's `landed_path`, nor (amendment A6) any `fileName` this
@@ -3576,12 +3588,16 @@ async fn run_publish(
                     PublishKind::New => None,
                     PublishKind::Update(row) => match &row.landed_path {
                         // C1: a row whose landed_path is not this
-                        // publisher's own-dir landing was an attested
-                        // original (or is otherwise stale) — never reuse it
-                        // as a generation target; defer to pass 3's
-                        // fresh-name picker exactly like a New frame
-                        // (`is_own_dir_landing` at Update/Adopt above).
-                        Some(p) if is_own_dir_landing(Path::new(p), &own_dir) => {
+                        // publisher's own-dir landing — or whose recipe is
+                        // external-shaped (fix round 2 belt-and-braces) —
+                        // was an attested original (or is otherwise stale):
+                        // never reuse it as a generation target; defer to
+                        // pass 3's fresh-name picker exactly like a New
+                        // frame.
+                        Some(p)
+                            if is_own_dir_landing(Path::new(p), &own_dir)
+                                && !was_external_recipe(row) =>
+                        {
                             Some(std::path::PathBuf::from(p))
                         }
                         Some(p) => {
@@ -3599,7 +3615,10 @@ async fn run_publish(
                         }
                     },
                     PublishKind::Adopt(row) => match &row.landed_path {
-                        Some(p) if is_own_dir_landing(Path::new(p), &own_dir) => {
+                        Some(p)
+                            if is_own_dir_landing(Path::new(p), &own_dir)
+                                && !was_external_recipe(row) =>
+                        {
                             Some(std::path::PathBuf::from(p))
                         }
                         Some(p) => {
@@ -3628,12 +3647,47 @@ async fn run_publish(
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                // The dedup check is for a NEW frame only — an Update or
-                // Adopt reuses the SAME name it already legitimately holds
-                // (it is its own file, unchanged), which `taken_names`
-                // already carries from its own prior publish; checking it
-                // here would refuse a frame against itself.
                 let meta = if matches!(kind, PublishKind::New) {
+                    // Controller ruling (fix round 2, finding 3):
+                    // `landed_path` is `TEXT UNIQUE` table-wide, and a frame
+                    // set is linked, not owned — the SAME set can be linked
+                    // to more than one project. A NEW attested frame whose
+                    // original already backs ANOTHER project's own row
+                    // would hit that constraint only after the hub
+                    // announce succeeded, orphaning it there. Caught here,
+                    // before anything is planned; a read failure holds back
+                    // rather than risk the same orphan (fail-closed).
+                    match crate::db::collab_frames::find_by_landed_path(
+                        &conn,
+                        &path.to_string_lossy(),
+                    ) {
+                        Ok(Some(existing)) if existing.project_id != project_id => {
+                            let title = crate::db::collab::get_project(&conn, &existing.project_id)
+                                .ok()
+                                .flatten()
+                                .map(|p| p.title)
+                                .unwrap_or_else(|| existing.project_id.clone());
+                            tracing::warn!(project_id, frame_id = fid, other_project = %existing.project_id, path = %path.display(), "publish: attested light's original already backs another project's frame");
+                            held_back.push(held(
+                                fid,
+                                &cand.filename,
+                                format!(
+                                    "this file already backs a frame in project \"{title}\" — a file can back one project frame"
+                                ),
+                            ));
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: checking the attested light's landed path failed");
+                            held_back.push(held(
+                                fid,
+                                &cand.filename,
+                                format!("cannot verify this file is not already published elsewhere: {e:#}"),
+                            ));
+                            continue;
+                        }
+                    }
                     // Dedup (F5): a NEW frame only — an Update or Adopt
                     // reuses the SAME name it already legitimately holds
                     // (it is its own file, unchanged), which `taken_names`
@@ -3958,27 +4012,46 @@ async fn run_publish(
                 // where this run actually put the frame's CURRENT bytes,
                 // before any downstream write depends on it agreeing
                 // (`stage_own_file`'s `WHERE landed_path = ?` needs the row
-                // to already match). The stale file is removed ONLY when it
-                // was itself this publisher's own-dir landing — an
-                // app-generated artifact, never an attested original
-                // (F5/A1: that file is never removed, whatever the set's
-                // attestation is now).
+                // to already match). The stale file is removed ONLY when
+                // the move itself actually succeeded AND it was this
+                // publisher's own-dir landing — an app-generated artifact,
+                // never an attested original (F5/A1: that file is never
+                // removed, whatever the set's attestation is now).
+                //
+                // Fix round 2 (finding 2): `landed_path` is `TEXT UNIQUE`
+                // table-wide, and a frame set can be linked to more than one
+                // project — a move CAN fail with a real collision (another
+                // project's own row already holds this exact path). A
+                // failed move must never delete the row's OWN still-current
+                // file: that would leave the row pointing at nothing.
                 let new_landed = w.target.to_string_lossy().to_string();
                 if current.landed_path.as_deref() != Some(new_landed.as_str()) {
                     let moved = db(ctx).map_err(|e| anyhow::anyhow!("{e}")).and_then(|db| {
                         frames_db::update_landed_path(&db.conn(), project_id, &w.uuid, &new_landed)
                     });
-                    match moved {
-                        Ok(()) => tracing::info!(project_id, frame_uuid = %w.uuid, from = current.landed_path.as_deref().unwrap_or(""), to = %new_landed, "publish: own frame's landed path moved"),
-                        Err(e) => tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: moving the own frame's landed path failed"),
-                    }
-                    if let Some(old) = current.landed_path.as_deref() {
-                        let old_path = Path::new(old);
-                        if is_own_dir_landing(old_path, &own_dir) {
-                            match std::fs::remove_file(old_path) {
-                                Ok(()) => tracing::info!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: removed the superseded generated file"),
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: removing the superseded generated file failed"),
+                    let moved_ok = match moved {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(project_id, frame_uuid = %w.uuid, from = current.landed_path.as_deref().unwrap_or(""), to = %new_landed, "publish: own frame's landed path moved");
+                            true
+                        }
+                        Ok(_) => {
+                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, "publish: moving the own frame's landed path matched no row");
+                            false
+                        }
+                        Err(e) => {
+                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, error = %format!("{e:#}"), "publish: moving the own frame's landed path failed");
+                            false
+                        }
+                    };
+                    if moved_ok {
+                        if let Some(old) = current.landed_path.as_deref() {
+                            let old_path = Path::new(old);
+                            if is_own_dir_landing(old_path, &own_dir) {
+                                match std::fs::remove_file(old_path) {
+                                    Ok(()) => tracing::info!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: removed the superseded generated file"),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(e) => tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: removing the superseded generated file failed"),
+                                }
                             }
                         }
                     }
@@ -4008,8 +4081,20 @@ async fn run_publish(
                         size_mtime_seen(&f.written.target).as_deref(),
                     )
                 };
-                if let Err(e) = staged {
-                    tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: recording the regenerated file failed");
+                match staged {
+                    Ok(n) if n == 0 => {
+                        // Fix round 2 (finding 1): a silent no-match here
+                        // means `landed_path` in the row does not (yet, or
+                        // any longer) equal `f.written.target` — most often
+                        // because the move above failed (finding 2) — and
+                        // disk truth is now silently stale until the next
+                        // publish notices the drift.
+                        tracing::error!(project_id, frame_uuid = %f.written.uuid, path = %f.written.target.display(), "publish: recording the regenerated file matched no row");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(project_id, frame_uuid = %f.written.uuid, error = %format!("{e:#}"), "publish: recording the regenerated file failed");
+                    }
                 }
                 updates.push(f);
             }
@@ -9226,6 +9311,188 @@ pub(crate) mod tests {
                 original_mtime,
                 "the original's mtime is untouched"
             );
+        }
+
+        // ── Fix round 2: landed_path is TEXT UNIQUE table-wide, and a frame
+        // set can be linked to more than one project ──────────────────────
+
+        /// A second cached project, linked to the fixture's own set —
+        /// registered on the SAME [`crate::collab::fake_hub::FakeHub`] the
+        /// caller already pointed `fx.ctx` at (frame sets are global, so a
+        /// set can back more than one project's publish).
+        async fn second_project(
+            fx: &PubFx,
+            hub: &crate::collab::fake_hub::FakeHub,
+            project_id: &str,
+            slug: &str,
+        ) {
+            hub.add_project(
+                project_id,
+                slug,
+                &[("acc-Me Myself", "send_receive", false)],
+                false,
+            );
+            let me = DeviceKey::load_or_create(&device_key_path(
+                &crate::api::sync::sync_dirs(&fx.ctx).unwrap().identity_dir,
+            ))
+            .unwrap()
+            .node_id();
+            let members = serde_json::json!([member_json("Me Myself", "send_receive", false, &me)]);
+            {
+                let conn = fx.conn();
+                crate::db::collab::upsert_project(
+                    &conn,
+                    &CollabProjectRow {
+                        project_id: project_id.into(),
+                        slug: slug.into(),
+                        title: slug.to_uppercase(),
+                        data_role: "send_receive".into(),
+                        is_coordinator: false,
+                        require_approval: false,
+                        pending_frames: 0,
+                        project_status: "active".into(),
+                        target_name: "M31".into(),
+                        target_ra_deg: 10.68,
+                        target_dec_deg: 41.27,
+                        target_radius_deg: 1.5,
+                        membership_version: 1,
+                        snapshot_payload_b64: "e30=".into(),
+                        snapshot_signature_b64: "e30=".into(),
+                        members_json: members.to_string(),
+                        thresholds_version: None,
+                        thresholds_rules_json: None,
+                        gov_caps_json: "[]".into(),
+                        auto_replicate: true,
+                        synced_caps_json: "[]".into(),
+                        hub_version: 0,
+                        manifest_cursor: 0,
+                        dictionary_version: None,
+                        dictionary_json: None,
+                        policy_json: r#"{"mode":"all"}"#.into(),
+                        replication_paused: false,
+                        auto_publish: true,
+                        fetched_at: String::new(),
+                        feed_epoch: None,
+                        holder_seq: -1,
+                    },
+                )
+                .unwrap();
+                crate::db::collab::set_dictionary(
+                    &conn,
+                    project_id,
+                    Some(1),
+                    Some(r#"[{"canonical":"L","aliases":["Lum"],"kind":"broadband"}]"#),
+                )
+                .unwrap();
+            }
+            link_frame_set(&fx.ctx, project_id, fx.set_id).unwrap();
+        }
+
+        /// Finding 2 (fix round 2): project B publishes GENERATED before the
+        /// set is attested; once attested, its own row would collide with
+        /// project A's (which already landed the original) on the
+        /// table-wide `landed_path` UNIQUE constraint. The failed move must
+        /// never delete B's still-current own-dir file — B's row keeps
+        /// pointing at it.
+        #[tokio::test]
+        async fn a_landed_path_collision_across_projects_leaves_the_losing_row_intact() {
+            let fx = fixture(1).await;
+            let hub = crate::collab::fake_hub::FakeHub::start().await;
+            let me = crate::api::account::own_device_id(&fx.ctx).unwrap();
+            hub.add_account("tok", "acc-Me Myself", "Me Myself", &me, None);
+            hub.add_project(
+                PID,
+                "m31",
+                &[("acc-Me Myself", "send_receive", false)],
+                false,
+            );
+            wire_hub(&fx.ctx, &hub.uri());
+            second_project(&fx, &hub, "p2", "p2proj").await;
+
+            // B publishes GENERATED first, while the set is not attested.
+            let res_b1 = publish_collab_frames(&fx.ctx, "p2", None).await.unwrap();
+            assert_eq!(res_b1.announced, 1, "{:?}", res_b1.held_back);
+            let b_old_landed = crate::db::collab_frames::get(&fx.conn(), "p2", &fx.uuids[0])
+                .unwrap()
+                .unwrap()
+                .landed_path
+                .unwrap();
+            assert!(PathBuf::from(&b_old_landed).exists());
+
+            // The set is attested; A publishes fresh (New) and lands the
+            // original first.
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            let res_a = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res_a.announced, 1, "{:?}", res_a.held_back);
+            assert_eq!(
+                hub.frame(PID, &fx.uuids[0]).unwrap().file_name,
+                fx.lights[0].file_name().unwrap().to_string_lossy()
+            );
+
+            // B publishes again: now attested too (same set), it crosses
+            // toward the SAME original — colliding with A's row.
+            let _res_b2 = publish_collab_frames(&fx.ctx, "p2", None).await.unwrap();
+            let b_row = crate::db::collab_frames::get(&fx.conn(), "p2", &fx.uuids[0])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                b_row.landed_path.as_deref(),
+                Some(b_old_landed.as_str()),
+                "B's row still points at its own file, not the collided original"
+            );
+            assert!(
+                PathBuf::from(&b_old_landed).exists(),
+                "B's own-dir file must not be deleted when the move failed"
+            );
+        }
+
+        /// Finding 3 (fix round 2): a NEW attested frame whose original
+        /// already backs ANOTHER project's own row is held back before
+        /// anything is planned — never announced (which would orphan it on
+        /// the hub once the local table-wide UNIQUE write failed anyway).
+        #[tokio::test]
+        async fn a_new_attested_frame_whose_original_already_backs_another_project_is_held_back() {
+            let fx = fixture(1).await;
+            let hub = crate::collab::fake_hub::FakeHub::start().await;
+            let me = crate::api::account::own_device_id(&fx.ctx).unwrap();
+            hub.add_account("tok", "acc-Me Myself", "Me Myself", &me, None);
+            hub.add_project(
+                PID,
+                "m31",
+                &[("acc-Me Myself", "send_receive", false)],
+                false,
+            );
+            wire_hub(&fx.ctx, &hub.uri());
+            second_project(&fx, &hub, "p2", "p2proj").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+
+            // A publishes first and lands the original.
+            let res_a = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res_a.announced, 1, "{:?}", res_a.held_back);
+
+            // B, same set, also attested, never published before: New —
+            // held back instead of racing the hub for an orphaned announce.
+            let res_b = publish_collab_frames(&fx.ctx, "p2", None).await.unwrap();
+            assert_eq!(res_b.announced, 0, "{:?}", res_b.held_back);
+            assert_eq!(res_b.held_back.len(), 1, "{:?}", res_b.held_back);
+            assert!(
+                res_b.held_back[0].reasons[0].contains("already backs a frame in project \"M 31\""),
+                "{:?}",
+                res_b.held_back
+            );
+            assert!(
+                crate::db::collab_frames::get(&fx.conn(), "p2", &fx.uuids[0])
+                    .unwrap()
+                    .is_none(),
+                "no B own row"
+            );
+            assert!(hub.frame("p2", &fx.uuids[0]).is_none(), "no hub orphan");
         }
 
         /// F5: two attested originals that resolve to the same basename (a
