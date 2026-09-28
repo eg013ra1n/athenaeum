@@ -192,6 +192,7 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 | **The duplicate-cache rebuild is not the slow part of a scan, and it does not run when nothing changed.** | Any "Phase 4 is quadratic / runs on every monitor poll" proposal | Measured 2026-09-17 on the owner's 40,456-file production catalog: both `rebuild_duplicate_groups_cache` calls plus the O(folders²) folder pass total ~3.6 s (711 folders); a scan with nothing new or modified returns at `new_files.is_empty()` before Phase 4. The minutes the UI showed as "Building duplicate cache…" were the master strong-hash pass reading shortlisted masters in full over an 11.7 MB/s SMB share (now its own `"hashing"` phase with per-file progress), and a 15-minute "nothing new" scan was the content-index job saturating the same share (it now yields to active scans). `docs/backlog-v0.5.6.md` item 9 has the numbers. |
 | **An offline scan root logs `scan root offline (path does not exist)` from `check_scan_root_overlap` — it is not a symlink problem.** | The WARN pair at startup for a root on an unmounted share | Verified 2026-09-17: `/Volumes/Universe` is an SMB mount with no symlink anywhere in the chain; `canonicalize()` fails with `NotFound` exactly while the share is not mounted, the check falls back to the stored path (correct), and the line appears twice because both transfer folders are validated against every root. The message now names the `NotFound` case as "offline" so it is not read as damage. |
 | **`.deb`/`.rpm` installs are refused by the updater by rule — deferred, not a bug.** | `crates/athenaeum-core/src/updates/manifest.rs::platform_supported` | A package-manager install falls back to nothing rather than being handed the AppImage entry and choking on `dpkg -i` after a 100 MB download. The updater plugin itself can install over a `.deb`, so a `linux-x86_64-deb` manifest key plus a `.deb` build/sign leg is a real, scoped follow-up (spec §8 "Out of scope"), pending its own task. |
+| **An unset `FILTER` is a frame state, not a camera property — there is no "OSC" filter convention.** | `collab::filters::match_filter`, `collab::gate`, the hub dictionary, any "map empty FILTER to an OSC canonical" proposal | Owner ruling 2026-09-28. OSC cameras shoot with or without a filter, and mono cameras without a wheel shoot without one too, so an empty `FILTER` cannot be inferred to mean anything from `BAYERPAT`. It is one more unmapped raw name for the spec §6.2 mapping flow (`filter_mappings (instrume, filter_raw) → canonical`, the normaliser, the publish-flow modal), where the PUBLISHER picks the canonical — `L`, `None`, whatever the project offers. A hub-side special case for `channel = "osc"` was proposed on 2026-09-28 and withdrawn the same day. |
 
 ---
 
@@ -199,6 +200,70 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### Collab v3 wave 3 — owner smoke (2026-09-28)
+
+The owner's first hands-on pass over wave 3 (app on local `main`, portal +
+hub on the hub's local `main`; nothing pushed, the test hub NOT redeployed).
+Three findings; two fixed, one is a decided model gap that needs its own
+cycle.
+
+- **FIXED — "Save as new version" with an untouched draft minted a version.**
+  Portal `ThresholdEditor` disables Save while the parsed draft equals the
+  stored rules ("No changes to save."; `3.50` typed over `3.5` is not a
+  change; add/remove/reorder is). Hub `post_thresholds` answers 409 `rules are
+  identical to the current version` by jsonb equality and mints nothing
+  (`tests/thresholds.rs::identical_rules_are_refused`). Hub `f2c1385`.
+  - Owed: the FULL hub suite (`DATABASE_URL=… cargo test` in `athenaeum-hub`)
+    — only `thresholds`, `rules_registry`, `feed_publish`, `collab_flow` ran
+    green before the owner cancelled the run; the change is one early return
+    in one route, but the suite is the gate before any push. Then the
+    test-hub deploy and a portal click-through: open Admin → Quality
+    thresholds untouched → Save disabled with the hint; edit a value → Save
+    enabled → v+1; post the same rules from a second tab → the `Error: rules
+    are identical…` note.
+- **FIXED — the trailed-frames rule read "Trailed frames · reject if ·
+  reject".** The fixed operand word in the portal editor is now `trailed`
+  (same hub commit); the app's project page renders that rule as `Reject
+  trailed frames` instead of `not_trailed — reject when true` (app
+  `f34cf13d`). Owed: a look at both.
+- **DECIDED, NOT BUILT — OSC frames (any frame without a `FILTER` header)
+  cannot be published: `filter "" is not in the project dictionary`.** Root
+  cause: the spec §6.2 mapping mechanism — `filter_mappings (instrume,
+  filter_raw) → canonical` per account, the normaliser, the publish-flow modal
+  listing every unmapped raw name with a Select — was deferred by wave 2
+  (plan ruling P3, "belongs to wave 3") and wave 3 became the live exchange
+  and never built it. Today the ONLY path is an exact match against a
+  dictionary canonical or alias (`collab::filters::match_filter`), so an
+  empty `FILTER` (4353 RGGB lights in the dev catalog) and every foreign
+  spelling (`Filter#1`, `Slot 0`, `1`…`7`, `H`, `O`, `S` in the same
+  catalog) fail the gate with no way out; the hub's coordinator remap
+  (`PATCH …/frames/{uuid}` `filterCanonical`) exists but has no app UI and
+  only works AFTER a publish that cannot happen.
+  **Owner ruling 2026-09-28** (also a standing decision above): an unset
+  `FILTER` is a frame state — OSC or mono — not a camera property, so no
+  `channel = "osc"` special case and no OSC-derived canonical; the empty name
+  is simply one more unmapped raw name in the §6.2 flow and the publisher
+  chooses. **Next cycle, in another session — spec amendment to §6.2, then a
+  two-repo plan:**
+  1. App: `filter_mappings` table, the normaliser from §6.2, the modal before
+     publish (`(no FILTER) · <INSTRUME> → [Select]`, `Filter#1 · <INSTRUME>
+     → [Select]`), remembered per account and asked once; the gate reads the
+     mapping, not only the dictionary.
+  2. Hub: a default dictionary entry for unfiltered frames so there is
+     something to map to — proposed canonical `None`, kind `unfiltered`,
+     aliases `nofilter`, `no filter`, `none` — added as a NEW dictionary
+     version to every existing project (the wave-1 seed constant and
+     migration 0022 must stay byte-equal per
+     `tests/dictionary.rs::migration_backfill_json_matches_default_dictionary`,
+     so this is a new migration, not an edit of 0022).
+  3. Portal: a dictionary editor (today the dictionary is only seeded; there
+     is no UI to add `L-eXtreme`, `Dualband`, …), so a coordinator can grow
+     the vocabulary the publishers map into.
+  The canonical's name and kind are proposals, not decided.
+- **Repo hygiene finding:** `Documents/Projects/athenaeum-hub-portal/` is a
+  STALE copy of the portal (still the free-text threshold editor); the
+  deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
 
 ### Collab v3 wave 3 — the app on the live exchange (2026-09-25 → 27)
 
