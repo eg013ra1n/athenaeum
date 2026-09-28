@@ -185,6 +185,29 @@ pub async fn evaluate_collab_gate(
         .map_err(api_err)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetFilterMappingsArgs {
+    project_id: String,
+    mappings: Vec<api::FilterMappingEdit>,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_collab_filter_mapping_sheet(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<api::FilterMappingSheet>, (axum::http::StatusCode, String)> {
+    api::get_filter_mapping_sheet(&state.ctx, &args.project_id).map(Json).map_err(api_err)
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_collab_filter_mappings(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetFilterMappingsArgs>,
+) -> Result<Json<api::GateReport>, (axum::http::StatusCode, String)> {
+    api::set_filter_mappings(&state.ctx, &args.project_id, args.mappings).map(Json).map_err(api_err)
+}
+
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_collab_link_suggestions(
     State(state): State<WebAppState>,

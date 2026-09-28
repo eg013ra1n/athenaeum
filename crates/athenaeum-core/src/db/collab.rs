@@ -636,6 +636,10 @@ pub fn filter_mappings_for_account(conn: &Connection, account: &str) -> Result<V
     Ok(rows)
 }
 
+/// Trims `instrume`/`filter_raw` itself (defence in depth — the gate and
+/// `api::collab::set_filter_mappings` already trim, but a caller that skips
+/// that step must not silently create a key the gate's trimmed comparison
+/// can never match).
 pub fn upsert_filter_mapping(
     conn: &Connection,
     account: &str,
@@ -643,6 +647,8 @@ pub fn upsert_filter_mapping(
     filter_raw: &str,
     canonical: &str,
 ) -> Result<()> {
+    let instrume = instrume.trim();
+    let filter_raw = filter_raw.trim();
     conn.execute(
         "INSERT INTO collab_filter_mappings (account, instrume, filter_raw, canonical, updated_at) \
          VALUES (?1, ?2, ?3, ?4, datetime('now')) \
@@ -653,8 +659,11 @@ pub fn upsert_filter_mapping(
     Ok(())
 }
 
-/// `true` when a row was removed.
+/// `true` when a row was removed. Trims `instrume`/`filter_raw` (same defence
+/// in depth as [`upsert_filter_mapping`]).
 pub fn delete_filter_mapping(conn: &Connection, account: &str, instrume: &str, filter_raw: &str) -> Result<bool> {
+    let instrume = instrume.trim();
+    let filter_raw = filter_raw.trim();
     let n = conn.execute(
         "DELETE FROM collab_filter_mappings WHERE account = ?1 AND instrume = ?2 AND filter_raw = ?3",
         params![account, instrume, filter_raw],
@@ -1146,7 +1155,16 @@ mod tests {
         assert_eq!(filter_mappings_for_account(&conn, "b@x.io").unwrap()[0].canonical, "R");
         assert!(filter_mappings_for_account(&conn, "nobody@x.io").unwrap().is_empty());
 
-        assert!(delete_filter_mapping(&conn, "a@x.io", "QHY268M", "Slot 0").unwrap());
+        // A padded key trims to the SAME row (defence in depth — the gate
+        // compares trimmed keys, so an untrimmed caller must not fork it).
+        upsert_filter_mapping(&conn, "a@x.io", " QHY268M ", " Slot 0 ", "L").unwrap();
+        let a = filter_mappings_for_account(&conn, "a@x.io").unwrap();
+        assert_eq!(a.len(), 2, "the padded key updated the existing row, not a new one");
+        let slot = a.iter().find(|m| m.filter_raw == "Slot 0").unwrap();
+        assert_eq!(slot.instrume, "QHY268M");
+        assert_eq!(slot.canonical, "L");
+
+        assert!(delete_filter_mapping(&conn, "a@x.io", " QHY268M ", " Slot 0 ").unwrap(), "a padded key also deletes the trimmed row");
         assert!(!delete_filter_mapping(&conn, "a@x.io", "QHY268M", "Slot 0").unwrap());
         assert_eq!(filter_mappings_for_account(&conn, "a@x.io").unwrap().len(), 1);
     }

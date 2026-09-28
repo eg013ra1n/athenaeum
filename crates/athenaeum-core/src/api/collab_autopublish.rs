@@ -93,6 +93,14 @@ pub fn request_auto_publish(project_id: Option<&str>) {
     kick().notify_one();
 }
 
+/// Test-only peek at [`DIRTY`] that does NOT drain it (unlike
+/// [`drain_due_projects`]) — a project-mapping save's assertion that
+/// `request_auto_publish` actually ran, without racing the real drain.
+#[cfg(test)]
+pub(crate) fn is_dirty_for_test(project_id: &str) -> bool {
+    dirty().lock().unwrap().contains(project_id)
+}
+
 /// Mark every project linked to any of the given frame sets dirty. The
 /// mapping happens at drain time (the worker holds the `ServiceContext` this
 /// needs); this call site only records the raw set ids.

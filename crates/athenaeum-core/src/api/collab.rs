@@ -876,6 +876,135 @@ fn project_gate(
         .collect())
 }
 
+// ── Filter mapping sheet (spec 2026-09-28 §5.2) ─────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterMappingRowView {
+    pub instrume: String,
+    pub filter_raw: String,
+    pub frames: i64,
+    /// `mapped` | `mappedToMissing` | `matched` | `unmapped`
+    pub resolution: String,
+    pub canonical: Option<String>,
+    pub proposal: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterMappingSheet {
+    pub project_id: String,
+    pub dictionary: Vec<DictionaryEntry>,
+    pub rows: Vec<FilterMappingRowView>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterMappingEdit {
+    pub instrume: String,
+    pub filter_raw: String,
+    /// `None` = delete the row ("back to automatic").
+    pub canonical: Option<String>,
+}
+
+fn project_dictionary(project: &CollabProjectRow) -> Result<Vec<DictionaryEntry>, ApiError> {
+    match &project.dictionary_json {
+        Some(json) => serde_json::from_str(json).map_err(|e| {
+            tracing::error!(project_id = %project.project_id, error = %e, "cached filter dictionary does not parse");
+            ApiError::Internal(format!("cached filter dictionary does not parse: {e}"))
+        }),
+        None => Err(ApiError::Invalid("the project's filter dictionary has not been fetched yet".into())),
+    }
+}
+
+/// Every distinct (camera, raw FILTER) among the project's candidate frames
+/// with its resolution and a proposal (F3): unresolved rows first, then by
+/// frame count descending, camera, raw name.
+pub fn get_filter_mapping_sheet(ctx: &ServiceContext, project_id: &str) -> Result<FilterMappingSheet, ApiError> {
+    use crate::collab::filters::FilterResolution;
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let project = crate::db::collab::get_project(&conn, project_id).map_err(internal)?
+        .ok_or_else(|| ApiError::NotFound(format!("project {project_id} is not cached — refresh first")))?;
+    let dictionary = project_dictionary(&project)?;
+    let mappings = current_account_email(&conn)
+        .map(|a| crate::db::collab::filter_mappings_for_account(&conn, &a))
+        .transpose().map_err(internal)?
+        .unwrap_or_default();
+    let set_ids = crate::db::collab::linked_set_ids(&conn, project_id).map_err(internal)?;
+    let frames = union_light_frames(&conn, &set_ids).map_err(internal)?;
+    let mut counts: HashMap<(String, String), i64> = HashMap::new();
+    if !frames.is_empty() {
+        let ids: Vec<i64> = frames.iter().map(|(id, _)| *id).collect();
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let mut stmt = conn.prepare(&format!("SELECT instrume, filter FROM frames WHERE id IN ({placeholders})")).map_err(|e| internal(e.into()))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))).map_err(|e| internal(e.into()))?;
+        for row in rows {
+            let (i, f) = row.map_err(|e| internal(e.into()))?;
+            *counts.entry((i.unwrap_or_default().trim().to_string(), f.unwrap_or_default().trim().to_string())).or_default() += 1;
+        }
+    }
+    let mut rows: Vec<FilterMappingRowView> = counts
+        .into_iter()
+        .map(|((instrume, filter_raw), frames)| {
+            let res = crate::collab::filters::resolve_filter(&filter_raw, &instrume, &mappings, &dictionary);
+            let (resolution, canonical) = match &res {
+                FilterResolution::Mapped(c) => ("mapped", Some(c.clone())),
+                FilterResolution::MappedToMissing(c) => ("mappedToMissing", Some(c.clone())),
+                FilterResolution::Matched(c) => ("matched", Some(c.clone())),
+                FilterResolution::Unmapped => ("unmapped", None),
+            };
+            let proposal = if res.is_unresolved() { crate::collab::filters::propose_canonical(&filter_raw, &dictionary) } else { None };
+            FilterMappingRowView { instrume, filter_raw, frames, resolution: resolution.into(), canonical, proposal }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let ua = a.resolution == "unmapped" || a.resolution == "mappedToMissing";
+        let ub = b.resolution == "unmapped" || b.resolution == "mappedToMissing";
+        ub.cmp(&ua).then(b.frames.cmp(&a.frames)).then(a.instrume.cmp(&b.instrume)).then(a.filter_raw.cmp(&b.filter_raw))
+    });
+    tracing::info!(project_id, rows = rows.len(), "filter mapping sheet built");
+    Ok(FilterMappingSheet { project_id: project_id.to_string(), dictionary, rows })
+}
+
+/// Upsert/delete the account's rows in one `BEGIN IMMEDIATE`, refuse a
+/// canonical outside the project's dictionary before writing anything, mark
+/// the project dirty for auto-publish, return the fresh gate report.
+pub fn set_filter_mappings(ctx: &ServiceContext, project_id: &str, edits: Vec<FilterMappingEdit>) -> Result<GateReport, ApiError> {
+    {
+        let db = db(ctx)?;
+        let mut conn = db.conn();
+        let project = crate::db::collab::get_project(&conn, project_id).map_err(internal)?
+            .ok_or_else(|| ApiError::NotFound(format!("project {project_id} is not cached — refresh first")))?;
+        let dictionary = project_dictionary(&project)?;
+        let account = current_account_email(&conn).ok_or_else(|| {
+            tracing::warn!(project_id, "filter mappings refused: signed out");
+            ApiError::SignedOut("Sign in to map filters.".into())
+        })?;
+        for e in &edits {
+            if let Some(c) = &e.canonical {
+                if !dictionary.iter().any(|d| &d.canonical == c) {
+                    tracing::warn!(project_id, canonical = %c, "filter mapping refused: canonical not in the dictionary");
+                    return Err(ApiError::Invalid(format!("{c:?} is not in the project dictionary")));
+                }
+            }
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| internal(e.into()))?;
+        for e in &edits {
+            let instrume = e.instrume.trim();
+            let raw = e.filter_raw.trim();
+            match &e.canonical {
+                Some(c) => crate::db::collab::upsert_filter_mapping(&tx, &account, instrume, raw, c).map_err(internal)?,
+                None => { crate::db::collab::delete_filter_mapping(&tx, &account, instrume, raw).map_err(internal)?; }
+            }
+        }
+        tx.commit().map_err(|e| internal(e.into()))?;
+        tracing::info!(project_id, count = edits.len(), "filter mappings saved");
+    }
+    crate::api::collab_autopublish::request_auto_publish(Some(project_id));
+    evaluate_project_gate(ctx, project_id)
+}
+
 // ── Portal deep-link intent ──────────────────────────────────────────────────
 
 /// Record a "publish as project" intent for a frame set and build the portal
@@ -6077,6 +6206,67 @@ pub(crate) mod tests {
             "not expected + 1"
         );
         assert!(!is_own_lost_reply(1, &ours, None), "unknown → not ours");
+    }
+
+    // ── Filter mapping sheet commands (spec 2026-09-28 §5.2) ────────────────
+
+    #[test]
+    fn mapping_sheet_lists_every_raw_name_with_its_resolution_and_proposal() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn); // dictionary [L]
+            crate::db::collab::set_dictionary(&conn, "p-1", Some(2), Some(
+                r#"[{"canonical":"L","aliases":["lum"],"kind":"luminance"},{"canonical":"Ha","aliases":[],"kind":"narrowband"},{"canonical":"None","aliases":["none"],"kind":"unfiltered"}]"#)).unwrap();
+            sign_in_as(&conn, "a@x.io");
+            let r = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 4);
+            conn.execute("UPDATE frames SET filter = NULL WHERE id IN (?1, ?2)", [r.1[0], r.1[1]]).unwrap();
+            conn.execute("UPDATE frames SET filter = 'H' WHERE id = ?1", [r.1[2]]).unwrap();
+            r
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let sheet = get_filter_mapping_sheet(&ctx, "p-1").unwrap();
+        assert_eq!(sheet.dictionary.len(), 3);
+        let raws: Vec<(&str, &str)> = sheet.rows.iter().map(|r| (r.filter_raw.as_str(), r.resolution.as_str())).collect();
+        assert_eq!(raws, [("", "unmapped"), ("H", "unmapped"), ("L", "matched")], "unresolved first, then by frames desc");
+        assert_eq!(sheet.rows[0].frames, 2);
+        assert_eq!(sheet.rows[0].proposal.as_deref(), Some("None"));
+        assert_eq!(sheet.rows[1].proposal.as_deref(), Some("Ha"));
+        assert_eq!(sheet.rows[2].canonical.as_deref(), Some("L"));
+        assert_eq!(sheet.rows[2].proposal, None, "a resolved row proposes nothing");
+
+        // Save: one valid, one null (no row to delete → fine), one invalid → nothing written.
+        let bad = set_filter_mappings(&ctx, "p-1", vec![FilterMappingEdit { instrume: "ASI2600MM".into(), filter_raw: "H".into(), canonical: Some("Hb".into()) }]);
+        assert!(matches!(bad, Err(crate::api::ApiError::Invalid(m)) if m.contains("\"Hb\" is not in the project dictionary")));
+        let report = set_filter_mappings(&ctx, "p-1", vec![
+            FilterMappingEdit { instrume: "ASI2600MM".into(), filter_raw: "".into(), canonical: Some("None".into()) },
+            FilterMappingEdit { instrume: "ASI2600MM".into(), filter_raw: "H".into(), canonical: Some("Ha".into()) },
+        ]).unwrap();
+        assert!(!report.blockers.iter().any(|b| b.kind == "mapFilter"));
+        let sheet = get_filter_mapping_sheet(&ctx, "p-1").unwrap();
+        assert_eq!(sheet.rows.iter().find(|r| r.filter_raw == "H").unwrap().resolution, "mapped");
+        // The auto-publish dirty mark was requested.
+        assert!(crate::api::collab_autopublish::is_dirty_for_test("p-1"));
+        // Back to automatic.
+        set_filter_mappings(&ctx, "p-1", vec![FilterMappingEdit { instrume: "ASI2600MM".into(), filter_raw: "H".into(), canonical: None }]).unwrap();
+        assert_eq!(get_filter_mapping_sheet(&ctx, "p-1").unwrap().rows.iter().find(|r| r.filter_raw == "H").unwrap().resolution, "unmapped");
+        let _ = frames;
+    }
+
+    #[test]
+    fn mapping_sheet_refuses_without_a_cached_dictionary_or_a_sign_in() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            crate::db::collab::set_dictionary(&conn, "p-1", None, None).unwrap();
+        }
+        assert!(matches!(get_filter_mapping_sheet(&ctx, "p-1"), Err(crate::api::ApiError::Invalid(m)) if m.contains("has not been fetched")));
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::set_dictionary(&conn, "p-1", Some(1), Some(r#"[{"canonical":"L","aliases":[],"kind":"luminance"}]"#)).unwrap();
+        }
+        assert!(matches!(set_filter_mappings(&ctx, "p-1", vec![FilterMappingEdit { instrume: "X".into(), filter_raw: "L".into(), canonical: Some("L".into()) }]), Err(crate::api::ApiError::SignedOut(_))));
     }
 
     // ── Publish per frame (wave 2 Task 7) ───────────────────────────────────

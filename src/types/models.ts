@@ -1910,6 +1910,22 @@ export type GateBlocker = { kind: string, frames: number, sets: Array<number>, n
 
 export type UnmappedFilter = { instrume: string, filterRaw: string, frames: number, };
 
+export type DictionaryEntry = { canonical: string, aliases: Array<string>, kind: string, };
+
+export type FilterMappingRowView = { instrume: string, filterRaw: string, frames: number, 
+/**
+ * `mapped` | `mappedToMissing` | `matched` | `unmapped`
+ */
+resolution: string, canonical: string | null, proposal: string | null, };
+
+export type FilterMappingSheet = { projectId: string, dictionary: Array<DictionaryEntry>, rows: Array<FilterMappingRowView>, };
+
+export type FilterMappingEdit = { instrume: string, filterRaw: string, 
+/**
+ * `None` = delete the row ("back to automatic").
+ */
+canonical: string | null, };
+
 export type Channel = "stable" | "beta";
 
 export type UpdateCheck = { 

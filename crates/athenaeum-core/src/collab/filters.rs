@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// One dictionary entry as the hub's `GET /projects/{id}/dictionary` response
 /// carries it, and as `db::collab::CollabProjectRow::dictionary_json` caches
 /// the array of them (filled by the version-poll, Task 8).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DictionaryEntry {
     pub canonical: String,

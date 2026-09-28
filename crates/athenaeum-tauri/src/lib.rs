@@ -497,6 +497,8 @@ pub fn run() {
             commands::refresh_collab_projects,
             commands::get_collab_project_detail,
             commands::evaluate_collab_gate,
+            commands::get_collab_filter_mapping_sheet,
+            commands::set_collab_filter_mappings,
             commands::list_collab_link_suggestions,
             commands::set_collab_link,
             commands::create_collab_link_intent,

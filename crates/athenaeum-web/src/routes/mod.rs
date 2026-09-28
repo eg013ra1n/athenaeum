@@ -330,6 +330,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/refresh_collab_projects", post(collab::refresh_collab_projects))
         .route("/api/get_collab_project_detail", post(collab::get_collab_project_detail))
         .route("/api/evaluate_collab_gate", post(collab::evaluate_collab_gate))
+        .route("/api/get_collab_filter_mapping_sheet", post(collab::get_collab_filter_mapping_sheet))
+        .route("/api/set_collab_filter_mappings", post(collab::set_collab_filter_mappings))
         .route("/api/list_collab_link_suggestions", post(collab::list_collab_link_suggestions))
         .route("/api/set_collab_link", post(collab::set_collab_link))
         .route("/api/create_collab_link_intent", post(collab::create_collab_link_intent))

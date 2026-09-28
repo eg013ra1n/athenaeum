@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use athenaeum_core::api::collab as api;
 use athenaeum_core::api::collab::{
-    GateReport, LinkSuggestion, ModerationFrameView, PortalNewProjectLink, ProjectCard,
-    ProjectDetail, PublishResult,
+    FilterMappingEdit, FilterMappingSheet, GateReport, LinkSuggestion, ModerationFrameView,
+    PortalNewProjectLink, ProjectCard, ProjectDetail, PublishResult,
 };
 use athenaeum_core::api::collab_exchange as exchange;
 use athenaeum_core::api::collab_exchange::ProjectFrameView;
@@ -51,6 +51,25 @@ pub async fn evaluate_collab_gate(
     project_id: String,
 ) -> Result<GateReport, String> {
     api::evaluate_project_gate(&state.ctx, &project_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_collab_filter_mapping_sheet(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<FilterMappingSheet, String> {
+    api::get_filter_mapping_sheet(&state.ctx, &project_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_collab_filter_mappings(
+    state: State<'_, AppState>,
+    project_id: String,
+    mappings: Vec<FilterMappingEdit>,
+) -> Result<GateReport, String> {
+    api::set_filter_mappings(&state.ctx, &project_id, mappings).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
