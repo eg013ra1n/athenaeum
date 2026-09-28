@@ -93,6 +93,140 @@ async fn wait_for(what: &str, limit: Duration, mut pred: impl FnMut() -> bool) -
     t0.elapsed()
 }
 
+/// A REAL, single-light frames_set for the contributor-path additions
+/// (spec 2026-09-28): one `512×512` FITS the calibrated-light generator can
+/// actually read, at `<root>/src/<name>.fits`, on the fake hub's M31 target
+/// (`fake_hub.rs::add_project` hard-codes `raDeg: 10.68, decDeg: 41.27,
+/// radiusDeg: 1.5`) so the target-radius precondition passes. `filter` goes
+/// into the header verbatim — `None` is a genuinely absent `FILTER` card, not
+/// an empty string. `with_master_dark` links a real `MasterDark` SHELL (no
+/// on-disk file needed — `resolve_master` never counts an unresolved link as
+/// missing, same trick as `api::collab::tests::link_shared_master_dark`) so
+/// the calibration precondition passes too; the attested-light scenario
+/// skips this — F5 never checks calibration for an attested set. Returns
+/// `(set_id, uuid, light_path)`.
+fn seed_one_light(
+    conn: &rusqlite::Connection,
+    root: &std::path::Path,
+    name: &str,
+    filter: Option<&str>,
+    with_master_dark: bool,
+) -> (i64, String, std::path::PathBuf) {
+    const W: usize = 512;
+    const H: usize = 512;
+    conn.execute(
+        "INSERT INTO frames_set (name, objctra, objctdec) VALUES (?1, '00:42:44', '+41:16:09')",
+        [name],
+    )
+    .unwrap();
+    let set_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
+         VALUES (?1, '2026-07-01T20:00:00Z', '2026-07-02T03:00:00Z')",
+        [set_id],
+    )
+    .unwrap();
+    let night_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'ASI2600MM')",
+        [night_id],
+    )
+    .unwrap();
+    let session_id = conn.last_insert_rowid();
+
+    let light = root.join("src").join(format!("{name}.fits"));
+    std::fs::create_dir_all(light.parent().unwrap()).unwrap();
+    crate::fits_writer::write_fits_f32(&light, W, H, 1, &vec![0.5f32; W * H], &[]).unwrap();
+    conn.execute(
+        "INSERT INTO files (path, filename, size, modified_at, format) \
+         VALUES (?1, ?2, 1000, '2026-07-01T21:00:00Z', 'FITS')",
+        rusqlite::params![light.to_string_lossy(), format!("{name}.fits")],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    let uuid = format!("uuid-{name}");
+    conn.execute(
+        "INSERT INTO frames (file_id, imagetyp, object, instrume, ra, dec, xpixsz, focallen, \
+                             exptime, filter, uuid, date_obs) \
+         VALUES (?1, 'Light', 'M31', 'ASI2600MM', 10.68, 41.27, 3.76, 1000.0, 300.0, ?3, ?2, \
+                 '2026-07-01T21:00:00Z')",
+        rusqlite::params![file_id, uuid, filter],
+    )
+    .unwrap();
+    let frame_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+        rusqlite::params![session_id, frame_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO frame_analysis \
+         (frame_id, file_id, stars_detected, median_fwhm, median_eccentricity, median_snr, \
+          median_hfr, frame_snr, snr_weight, psf_signal, background, noise, \
+          detection_threshold, width, height, source_channels, trail_r_squared, possibly_trailed) \
+         VALUES (?1, ?2, 400, 2.0, 0.4, 10.0, 2.0, 10.0, 1.0, 100.0, 10.0, 1.0, 5.0, \
+                 512, 512, 1, 0.0, 0)",
+        rusqlite::params![frame_id, file_id],
+    )
+    .unwrap();
+    if with_master_dark {
+        // A REAL, resolvable master (a genuine file + a `calibration_set_frames`
+        // member) — not just the "shell" `resolve_master` treats as unresolved
+        // (fine for a GATE-only test, but the real generation phase needs
+        // actual pixels to subtract).
+        let master_set_id = 9_000_000 + set_id;
+        let master_path = root.join("masters").join(format!("{name}_dark.fits"));
+        std::fs::create_dir_all(master_path.parent().unwrap()).unwrap();
+        let mut dark = vec![300.0f32; W * H];
+        dark[0] = 5000.0; // a hot pixel, same shape as the real fixture
+        crate::fits_writer::write_fits_f32(&master_path, W, H, 1, &dark, &[]).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library) \
+             VALUES (?1, 'MasterDark', '2026-07-01', 1)",
+            [master_set_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format) \
+             VALUES (?1, ?2, 1000, '2026-07-01T00:00:00Z', 'FITS')",
+            rusqlite::params![master_path.to_string_lossy(), format!("{name}_dark.fits")],
+        )
+        .unwrap();
+        let master_file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp, is_master) VALUES (?1, 'MasterDark', 1)",
+            [master_file_id],
+        )
+        .unwrap();
+        let master_frame_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![master_set_id, master_frame_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames \
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at) \
+             VALUES (?1, 'frame', ?2, 'Dark', '2026-07-01T00:00:00Z')",
+            rusqlite::params![frame_id, master_set_id],
+        )
+        .unwrap();
+    }
+    (set_id, uuid, light)
+}
+
+/// `keys.get("KEYWORD")`, trimmed — `parse_stored_header_keys` strips a
+/// quoted string's quotes but not surrounding whitespace inside them.
+fn header_card(path: &std::path::Path, keyword: &str) -> Option<String> {
+    let header = crate::fits_parser::extract_fits_header(path).unwrap();
+    crate::fits_parser::stored_header::parse_stored_header_keys(
+        crate::models::FileFormat::FITS,
+        &header,
+    )
+    .get(keyword)
+    .map(|v| v.trim().to_string())
+}
+
 /// Scenarios 1 and 2, and the one-copy disk ledger on all three instances.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publish_fetch_and_serve_onward_within_bounds() {
@@ -743,5 +877,106 @@ async fn a5_a_redesignation_mid_run_refetches_into_the_new_folder() {
     eprintln!(
         "ledger A5: new folder frame files {frame_bytes} B for {payload} B of frames, store {store_base} -> {} B",
         store(&new_root)
+    );
+}
+
+/// Contributor-path additions (spec 2026-09-28-collab-v3-contributor-path-design.md):
+/// a light with no `FILTER` header is held back at the REAL gate, resolves
+/// after an explicit account mapping and a second REAL publish, and lands on
+/// the processor with the mapped canonical on both the manifest
+/// (`filterCanonical`) and the file's own header (`ATH_FILT`); a second,
+/// ATTESTED set's light is seeded in place (F5) — byte-for-byte identical on
+/// the processor, no `ATH_PRJ` stamp at all, since it was never generated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unmapped_filter_then_mapped_and_an_attested_set() {
+    log_if_asked();
+    let w = ts::three_instances().await;
+
+    // ---- No FILTER header: held back, then resolved by an account mapping ----
+    let (set_id, uuid, _light) = {
+        let conn = crate::api::db(&w.a.ctx).unwrap().conn();
+        seed_one_light(&conn, &w.a.root, "nofilter", None, true)
+    };
+    crate::api::collab::link_frame_set(&w.a.ctx, ts::PID, set_id).unwrap();
+
+    let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None)
+        .await
+        .unwrap();
+    assert_eq!(res.announced, 0, "{:?}", res.held_back);
+    assert_eq!(res.held_back.len(), 1, "{:?}", res.held_back);
+    assert!(
+        res.held_back[0]
+            .reasons
+            .contains(&"no FILTER header — needs a filter mapping".to_string()),
+        "{:?}",
+        res.held_back
+    );
+
+    {
+        let conn = crate::api::db(&w.a.ctx).unwrap().conn();
+        crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_EMAIL, "alice@example.com")
+            .unwrap();
+    }
+    crate::api::collab::set_filter_mappings(
+        &w.a.ctx,
+        ts::PID,
+        vec![crate::api::collab::FilterMappingEdit {
+            instrume: "ASI2600MM".into(),
+            filter_raw: "".into(),
+            canonical: Some("None".into()),
+        }],
+    )
+    .unwrap();
+
+    let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None)
+        .await
+        .unwrap();
+    assert_eq!(res.announced, 1, "{:?}", res.held_back);
+
+    w.b
+        .wait_state(&uuid, LocalState::Held, Duration::from_secs(30))
+        .await;
+    assert_eq!(
+        w.b.row(&uuid).unwrap().filter_canonical,
+        "None",
+        "the processor's manifest carries the mapped canonical"
+    );
+    let landed = std::path::PathBuf::from(w.b.row(&uuid).unwrap().landed_path.unwrap());
+    assert_eq!(
+        header_card(&landed, "ATH_FILT").as_deref(),
+        Some("None"),
+        "the processor's landed file header carries the mapped canonical"
+    );
+
+    // ---- A second, ATTESTED set: seeded in place, no ATH_PRJ stamp at all ----
+    let (set2_id, uuid2, light2) = {
+        let conn = crate::api::db(&w.a.ctx).unwrap().conn();
+        // Filter "L" (a plain dictionary match): attestation skips the
+        // calibration precondition (F5), never the filter one.
+        seed_one_light(&conn, &w.a.root, "attested", Some("L"), false)
+    };
+    {
+        let conn = crate::api::db(&w.a.ctx).unwrap().conn();
+        crate::db::collab::set_frames_set_attestation(&conn, set2_id, true).unwrap();
+    }
+    crate::api::collab::link_frame_set(&w.a.ctx, ts::PID, set2_id).unwrap();
+
+    let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None)
+        .await
+        .unwrap();
+    assert_eq!(res.announced, 1, "{:?}", res.held_back);
+
+    w.b
+        .wait_state(&uuid2, LocalState::Held, Duration::from_secs(30))
+        .await;
+    let landed2 = std::path::PathBuf::from(w.b.row(&uuid2).unwrap().landed_path.unwrap());
+    assert_eq!(
+        std::fs::read(&landed2).unwrap(),
+        std::fs::read(&light2).unwrap(),
+        "the attested light lands byte-for-byte identical to the contributor's original"
+    );
+    assert!(
+        header_card(&landed2, "ATH_PRJ").is_none_or(|v| v.is_empty()),
+        "an attested light is seeded in place, never generated, so it carries no ATH_PRJ stamp"
     );
 }

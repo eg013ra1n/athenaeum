@@ -80,3 +80,93 @@ Spec `docs/superpowers/specs/2026-09-25-collab-v3-live-exchange-design.md` (inva
 - **Events.** `collab-live-status`, `collab-deletion-choice` (per-occurrence `dedupeKey` with a batch id), `collab-frame-lost` (with the previous folder under A5), `collab-frame-changed`, `collab-attention-changed`; `useCollabNotifications` turns the discrete ones into notifications.
 - **Retired by this wave.** The version poll, the 20-minute replication pass, the maintenance loop, the loss guard and its settings (P33), the per-frame holder lookups, the full holder chunks, `fetch_blobs_assigned`, and three commands on both hosts — the frames refresh, the per-project "sync now" and the loss resolution (Sync now and the attention lists replace them).
 - **Acceptance.** In process (the e2e, relay disabled): every §12 bound holds with a wide margin (A publishes → B starts fetching in ≤ 8 ms against 2 s; C fetches from B 0.7–0.8 s after B lands against 3 s; a clean exit is seen in ≤ 12 ms against 2 s; a killed device is dropped 10.1 s after its last beat against 50 s; a single delete is back in 1.2–1.7 s; a personal transfer waited 1.9 s against a derived 5 s), and the disk ledger shows exactly one copy per frame on every instance, the collab store grown by < 0.4 % of the payload and the working dirs by 0 B. Owed: the same on the real test hub and test relay, the relay stream measurement, the desktop click-through and a one-week soak (`docs/superpowers/open-items.md`).
+
+## Collab v3 — the contributor path (2026-09-28)
+
+Spec `docs/superpowers/specs/2026-09-28-collab-v3-contributor-path-design.md`
+(amendment A7 of the per-frame spec): filter mapping, external attestation,
+the gate's blocker list with actions, and the frame set's Project block/
+column — four new commands (`get_collab_filter_mapping_sheet`,
+`set_collab_filter_mappings`, `get_frame_set_project_status`,
+`set_frame_set_attestation`), mirrored on both hosts.
+
+- **Filter resolution order (§3.2, `collab::filters::resolve_filter`).**
+  1. `Mapped(canonical)` — an account mapping row exists and its canonical
+     is in the project's current dictionary.
+  2. `MappedToMissing(canonical)` — a mapping row exists but the dictionary
+     no longer carries that canonical (the dictionary moved, or a second
+     project has a smaller vocabulary).
+  3. `Matched(canonical)` — no mapping row; the trimmed raw name equals a
+     canonical or alias case-insensitively (`match_filter`, plan ruling
+     P3) — the dictionary's own spelling is returned, never the raw one.
+  4. `Unmapped` — none of the above; an empty raw name with no mapping row
+     is always here (F1).
+
+  Only `Mapped`/`Matched` reach `ATH_FILT` and the announce; the file's own
+  `FILTER` header is never rewritten. A mapping row is scoped to the
+  SIGNED-IN account's e-mail (`collab_filter_mappings`) and never applies
+  while signed out, even if rows exist for some account on this device.
+  `propose_canonical` (§3.3) is the modal's preselection only — trim,
+  collapse whitespace, drop a trailing bandwidth token and vendor tokens,
+  look the remainder up in a fixed synonym table (target must be a
+  dictionary canonical) — never a resolution, never written on its own.
+
+- **External attestation (§6, R3, F5).** `frames_set.calibrated_externally`
+  + `attested_at` (`set_frame_set_attestation`, refuses a zipped set).
+  `frame_cal_verdict` returns `Ok(())` for an attested set's frame BEFORE
+  the export-readiness walk — no calibration links needed at all, and
+  `linkCalibration`/`buildMasters` never appear in its blocker list.
+
+  **The external recipe (§6.4, publish's split).** An attested candidate
+  takes `run_publish`'s external branch: recipe
+  `external:<files.size>:<files.modified_at>` (zero I/O; the scanner's
+  in-place re-parse after an outside recalibration bumps it, turning the
+  next publish into an `Update`); target = the ORIGINAL catalog path for
+  `New`, `Update` and `Adopt` alike — no landing name is picked, no
+  generation runs, no compute permit is taken; seeded by reference from
+  that path; `meta.calibration = { external: true, dark: false, flat:
+  false, bias: false }`; no `ATH_*` stamps, no `CALSTAT`, no WCS rewrite. A
+  duplicate basename within the publisher is held back
+  (`a frame named "…" is already published by you`), never renamed on disk
+  — the app never moves an attested original (A1).
+
+- **Gate blockers (§7.1, `GateReport.blockers`)** — one per cause present,
+  in this order, each with the action `GateBlockers.tsx` (§7.2) offers:
+
+  | `kind` | From failures | Action |
+  | ---- | ---- | ---- |
+  | `analyze` | `no analysis` | `analyze_frame_set` per set |
+  | `solve` | `no coordinates`, `unknown pixel scale` | `plate_solve_batch` over the failing frames |
+  | `linkCalibration` | a "no calibration links" readiness sentence | open the set's Calibration tab |
+  | `buildMasters` | a "Build masters first" / missing-master-file readiness sentence | open the set's Calibration tab |
+  | `attest` | any calibration reason, offered beside the two above | open the set's Calibration tab (the checkbox is there) |
+  | `mapFilter` | the three filter-resolution reasons above | the Filter mapping modal; `names` filled, one per distinct (camera, raw name) |
+  | `threshold` | any rule failure, `frame appears trailed` | none — informational |
+  | `uuid` | `frame has no uuid` | none — re-scan the set |
+  | `outsideTarget` | `outside target radius` | none — informational |
+
+  `linkCalibration`/`buildMasters` fold into ONE calibration line in the UI
+  when both are present; `attest` never renders its own line, it only rides
+  that line's actions.
+
+- **The frame set's Project block/column (§8, `collab::contributor_state::derive`)**
+  — the ONE derivation the frame set's Project block, its lights-table
+  `Project` column and the project page's own-frames table all share, so
+  the three views can never disagree:
+
+  | State | When |
+  | ---- | ---- |
+  | `notPublished` | no own row, the gate row is publishable |
+  | `failsGate` | no own row, the gate row fails (first reason) |
+  | `pendingApproval` | own row `pending` |
+  | `published` | own row `published`, current recipe equals the row's `recipe_hash` |
+  | `updatePending` | own row `published`/`pending`, current recipe ≠ the row's |
+  | `rejected` | own row `rejected` |
+  | `publishedNotOnDisk` | own row published, `landed_path` missing on disk |
+  | `publishedNowFailsGate` | own row published, recipe unchanged, the gate row fails now (informational — thresholds are prospective) |
+
+  `get_frame_set_project_status { framesSetId }` returns every project the
+  set is linked to (per-frame state + counts, `publishingHere`) or, when
+  unlinked, nearby candidate projects (`find_matching_projects`, within
+  target radius, not yet linked); signed out returns both empty, never an
+  error.

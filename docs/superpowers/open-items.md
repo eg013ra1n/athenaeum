@@ -277,6 +277,18 @@ cycle.
     and the in-use count includes `rejected` frames the coordinator never
     sees in coverage. Owner to rule: a remap action in the portal, or
     exclude `rejected` from the count.
+  - Follow-up (app final review 2026-09-29): `project_frames_local.landed_path`
+    is UNIQUE table-wide, so one attested original can back ONE project's own
+    row; a second project's attested publish of the same set is held back
+    with "this file already backs a frame in project …". In an Update
+    collision the hub announce precedes the failed local move and
+    `set_own_version` writes the winner's content identity against the
+    loser's old path. Needs per-project uniqueness (schema change, its own
+    cycle).
+  App plan DONE on branch `contributor-path-app` (`0a796294`): core suite
+  (all targets) + no-default-features check + frontend suite green; OWED:
+  merge on the owner's word, the acceptance smoke of spec §13 steps 2–8
+  against the test hub once the hub plan is deployed.
 - **Repo hygiene finding:** `Documents/Projects/athenaeum-hub-portal/` is a
   STALE copy of the portal (still the free-text threshold editor); the
   deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
