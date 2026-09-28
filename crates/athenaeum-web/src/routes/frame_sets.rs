@@ -97,7 +97,10 @@ fn db_err(msg: impl std::fmt::Display) -> (StatusCode, String) {
 }
 
 fn no_db() -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string())
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Database not initialized".to_string(),
+    )
 }
 
 /// Fetch the FrameSetDetail for the given `frames_set_id` using an open
@@ -130,10 +133,7 @@ fn load_frame_set_detail(
     let nights =
         db::get_imaging_nights_with_sessions(conn, frames_set_id).map_err(|e| e.to_string())?;
 
-    Ok(athenaeum_core::models::FrameSetDetail {
-        frames_set,
-        nights,
-    })
+    Ok(athenaeum_core::models::FrameSetDetail { frames_set, nights })
 }
 
 /// Shared inner logic for creating a custom frame set from a list of frame IDs.
@@ -150,11 +150,9 @@ fn create_frame_set_inner(
         return Err("Cannot create frame set with no frames".to_string());
     }
 
-    let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_from_frame_ids(
-        frame_ids,
-        conn,
-    )
-    .map_err(|e| format!("Failed to calculate metadata: {}", e))?;
+    let metadata =
+        athenaeum_core::frames_set_metadata::calculate_metadata_from_frame_ids(frame_ids, conn)
+            .map_err(|e| format!("Failed to calculate metadata: {}", e))?;
 
     let set_id = db::create_frames_set(
         conn,
@@ -183,24 +181,29 @@ fn create_frame_set_inner(
 
     if detected_nights.is_empty() {
         let now = chrono::Utc::now();
-        let night_start =
-            now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let night_end = (now + chrono::Duration::hours(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let night_start = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let night_end =
+            (now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let night_id = db::create_imaging_night(conn, set_id, &night_start, &night_end)
             .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
 
-        let session_id =
-            db::create_session(conn, night_id, "Unknown", frame_ids.len() as i32, metadata.total_exp_time)
-                .map_err(|e| format!("Failed to create session: {}", e))?;
+        let session_id = db::create_session(
+            conn,
+            night_id,
+            "Unknown",
+            frame_ids.len() as i32,
+            metadata.total_exp_time,
+        )
+        .map_err(|e| format!("Failed to create session: {}", e))?;
 
         db::insert_session_members(conn, session_id, frame_ids)
             .map_err(|e| format!("Failed to add frames to session: {}", e))?;
     } else {
         for night in &detected_nights {
-            let night_id = db::create_imaging_night(conn, set_id, &night.start_time, &night.end_time)
-                .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
+            let night_id =
+                db::create_imaging_night(conn, set_id, &night.start_time, &night.end_time)
+                    .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
 
             for session in &night.sessions {
                 let session_id = db::create_session(
@@ -254,8 +257,7 @@ pub async fn get_frames_sets(
     let conn = db.conn();
 
     let project_id = args.project_id.unwrap_or(1);
-    let sets = athenaeum_core::db::get_frames_sets_by_project(&conn, project_id)
-        .map_err(db_err)?;
+    let sets = athenaeum_core::db::get_frames_sets_by_project(&conn, project_id).map_err(db_err)?;
 
     Ok(Json(
         sets.into_iter()
@@ -315,7 +317,8 @@ pub async fn rename_frames_set(
     let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
-    athenaeum_core::db::update_frames_set_name(&conn, args.frames_set_id, &args.new_name).map_err(db_err)?;
+    athenaeum_core::db::update_frames_set_name(&conn, args.frames_set_id, &args.new_name)
+        .map_err(db_err)?;
     Ok(Json(()))
 }
 
@@ -330,9 +333,11 @@ pub async fn mark_frame_set_custom(
     let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
-    let metadata =
-        athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(args.frames_set_id, &conn)
-            .map_err(|e| db_err(format!("Failed to calculate metadata: {}", e)))?;
+    let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(
+        args.frames_set_id,
+        &conn,
+    )
+    .map_err(|e| db_err(format!("Failed to calculate metadata: {}", e)))?;
 
     db::update_frames_set_metadata(
         &conn,
@@ -501,8 +506,8 @@ pub async fn split_frame_set(
             SplitSelection::Sessions { ids } => {
                 let mut frames = Vec::new();
                 for &session_id in ids {
-                    let session_frames = db::get_frame_ids_for_session(&conn, session_id)
-                        .map_err(db_err)?;
+                    let session_frames =
+                        db::get_frame_ids_for_session(&conn, session_id).map_err(db_err)?;
                     frames.extend(session_frames);
                 }
                 frames
@@ -521,8 +526,7 @@ pub async fn split_frame_set(
             .unwrap_or(6.0);
 
         let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_from_frame_ids(
-            &frame_ids,
-            &conn,
+            &frame_ids, &conn,
         )
         .map_err(db_err)?;
 
@@ -547,8 +551,9 @@ pub async fn split_frame_set(
                 .map_err(db_err)?;
 
         for night in &detected_nights {
-            let night_id = db::create_imaging_night(&conn, new_set_id, &night.start_time, &night.end_time)
-                .map_err(db_err)?;
+            let night_id =
+                db::create_imaging_night(&conn, new_set_id, &night.start_time, &night.end_time)
+                    .map_err(db_err)?;
 
             for session in &night.sessions {
                 let session_id = db::create_session(
@@ -597,11 +602,12 @@ pub async fn split_frame_set(
         }
 
         // Recalculate and persist metadata for the now-smaller source.
-        let source_metadata = athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(
-            args.source_set_id,
-            &conn,
-        )
-        .map_err(db_err)?;
+        let source_metadata =
+            athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(
+                args.source_set_id,
+                &conn,
+            )
+            .map_err(db_err)?;
 
         db::update_frames_set_metadata(
             &conn,
@@ -883,11 +889,8 @@ pub async fn get_frame_set_merge_log(
 ) -> Result<Json<Vec<athenaeum_core::models::MergeLogEntry>>, (StatusCode, String)> {
     let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
-    let entries = athenaeum_core::auto_merge::log_ops::get_log_entries(
-        &conn,
-        args.frames_set_id,
-        args.limit,
-    )
-    .map_err(db_err)?;
+    let entries =
+        athenaeum_core::auto_merge::log_ops::get_log_entries(&conn, args.frames_set_id, args.limit)
+            .map_err(db_err)?;
     Ok(Json(entries))
 }

@@ -101,6 +101,14 @@ pub(crate) fn is_dirty_for_test(project_id: &str) -> bool {
     dirty().lock().unwrap().contains(project_id)
 }
 
+/// [`is_dirty_for_test`]'s sibling for [`DIRTY_SETS`] — a set-scoped
+/// trigger's (e.g. [`request_auto_publish_for_sets`]) assertion that a given
+/// set id was actually marked dirty, without draining it.
+#[cfg(test)]
+pub(crate) fn is_set_dirty_for_test(set_id: i64) -> bool {
+    dirty_sets().lock().unwrap().contains(&set_id)
+}
+
 /// Mark every project linked to any of the given frame sets dirty. The
 /// mapping happens at drain time (the worker holds the `ServiceContext` this
 /// needs); this call site only records the raw set ids.

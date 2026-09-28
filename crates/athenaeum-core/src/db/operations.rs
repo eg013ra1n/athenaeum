@@ -2684,7 +2684,7 @@ pub fn get_frames_sets_by_project(
             archive_operation_id: row.get(15)?,
             uuid: row.get(16)?,
             updated_at: row.get(17)?,
-            calibrated_externally: row.get::<_, i32>(18).unwrap_or(0) == 1,
+            calibrated_externally: row.get::<_, i64>(18)? != 0,
             attested_at: row.get(19)?,
         };
         let member_count: i32 = row.get(9)?;

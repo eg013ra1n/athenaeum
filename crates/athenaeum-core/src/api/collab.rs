@@ -540,8 +540,13 @@ fn frame_gate_inputs(
             .unwrap_or_default()
             .trim()
             .to_string();
-        let instrume = frow.and_then(|f| f.instrume.clone()).unwrap_or_default().trim().to_string();
-        let filter = crate::collab::filters::resolve_filter(&filter_raw, &instrume, mappings, dictionary);
+        let instrume = frow
+            .and_then(|f| f.instrume.clone())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let filter =
+            crate::collab::filters::resolve_filter(&filter_raw, &instrume, mappings, dictionary);
         let uuid = frow
             .and_then(|f| f.uuid.clone())
             .unwrap_or_default()
@@ -855,8 +860,15 @@ fn project_gate(
         })
         .collect();
 
-    let inputs =
-        frame_gate_inputs(conn, &frames, &dictionary, &frame_sets, &mappings, &attested).map_err(internal)?;
+    let inputs = frame_gate_inputs(
+        conn,
+        &frames,
+        &dictionary,
+        &frame_sets,
+        &mappings,
+        &attested,
+    )
+    .map_err(internal)?;
 
     Ok(inputs
         .into_iter()
@@ -916,23 +928,35 @@ fn project_dictionary(project: &CollabProjectRow) -> Result<Vec<DictionaryEntry>
             tracing::error!(project_id = %project.project_id, error = %e, "cached filter dictionary does not parse");
             ApiError::Internal(format!("cached filter dictionary does not parse: {e}"))
         }),
-        None => Err(ApiError::Invalid("the project's filter dictionary has not been fetched yet".into())),
+        None => {
+            tracing::warn!(project_id = %project.project_id, "filter mapping refused: no cached dictionary yet");
+            Err(ApiError::Invalid("the project's filter dictionary has not been fetched yet".into()))
+        }
     }
 }
 
 /// Every distinct (camera, raw FILTER) among the project's candidate frames
 /// with its resolution and a proposal (F3): unresolved rows first, then by
 /// frame count descending, camera, raw name.
-pub fn get_filter_mapping_sheet(ctx: &ServiceContext, project_id: &str) -> Result<FilterMappingSheet, ApiError> {
+pub fn get_filter_mapping_sheet(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<FilterMappingSheet, ApiError> {
     use crate::collab::filters::FilterResolution;
     let db = db(ctx)?;
     let conn = db.conn();
-    let project = crate::db::collab::get_project(&conn, project_id).map_err(internal)?
-        .ok_or_else(|| ApiError::NotFound(format!("project {project_id} is not cached — refresh first")))?;
+    let project = crate::db::collab::get_project(&conn, project_id)
+        .map_err(internal)?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "project {project_id} is not cached — refresh first"
+            ))
+        })?;
     let dictionary = project_dictionary(&project)?;
     let mappings = current_account_email(&conn)
         .map(|a| crate::db::collab::filter_mappings_for_account(&conn, &a))
-        .transpose().map_err(internal)?
+        .transpose()
+        .map_err(internal)?
         .unwrap_or_default();
     let set_ids = crate::db::collab::linked_set_ids(&conn, project_id).map_err(internal)?;
     let frames = union_light_frames(&conn, &set_ids).map_err(internal)?;
@@ -940,45 +964,99 @@ pub fn get_filter_mapping_sheet(ctx: &ServiceContext, project_id: &str) -> Resul
     if !frames.is_empty() {
         let ids: Vec<i64> = frames.iter().map(|(id, _)| *id).collect();
         let placeholders = vec!["?"; ids.len()].join(",");
-        let mut stmt = conn.prepare(&format!("SELECT instrume, filter FROM frames WHERE id IN ({placeholders})")).map_err(|e| internal(e.into()))?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))).map_err(|e| internal(e.into()))?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT instrume, filter FROM frames WHERE id IN ({placeholders})"
+            ))
+            .map_err(|e| internal(e.into()))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .map_err(|e| internal(e.into()))?;
         for row in rows {
             let (i, f) = row.map_err(|e| internal(e.into()))?;
-            *counts.entry((i.unwrap_or_default().trim().to_string(), f.unwrap_or_default().trim().to_string())).or_default() += 1;
+            *counts
+                .entry((
+                    i.unwrap_or_default().trim().to_string(),
+                    f.unwrap_or_default().trim().to_string(),
+                ))
+                .or_default() += 1;
         }
     }
-    let mut rows: Vec<FilterMappingRowView> = counts
+    // Carry `is_unresolved()` alongside each view so the sort below reads it
+    // straight off the `FilterResolution`, not by re-deriving it from the
+    // `resolution` string the view already flattened it into.
+    let mut rows: Vec<(bool, FilterMappingRowView)> = counts
         .into_iter()
         .map(|((instrume, filter_raw), frames)| {
-            let res = crate::collab::filters::resolve_filter(&filter_raw, &instrume, &mappings, &dictionary);
+            let res = crate::collab::filters::resolve_filter(
+                &filter_raw,
+                &instrume,
+                &mappings,
+                &dictionary,
+            );
+            let unresolved = res.is_unresolved();
             let (resolution, canonical) = match &res {
                 FilterResolution::Mapped(c) => ("mapped", Some(c.clone())),
                 FilterResolution::MappedToMissing(c) => ("mappedToMissing", Some(c.clone())),
                 FilterResolution::Matched(c) => ("matched", Some(c.clone())),
                 FilterResolution::Unmapped => ("unmapped", None),
             };
-            let proposal = if res.is_unresolved() { crate::collab::filters::propose_canonical(&filter_raw, &dictionary) } else { None };
-            FilterMappingRowView { instrume, filter_raw, frames, resolution: resolution.into(), canonical, proposal }
+            let proposal = if unresolved {
+                crate::collab::filters::propose_canonical(&filter_raw, &dictionary)
+            } else {
+                None
+            };
+            (
+                unresolved,
+                FilterMappingRowView {
+                    instrume,
+                    filter_raw,
+                    frames,
+                    resolution: resolution.into(),
+                    canonical,
+                    proposal,
+                },
+            )
         })
         .collect();
-    rows.sort_by(|a, b| {
-        let ua = a.resolution == "unmapped" || a.resolution == "mappedToMissing";
-        let ub = b.resolution == "unmapped" || b.resolution == "mappedToMissing";
-        ub.cmp(&ua).then(b.frames.cmp(&a.frames)).then(a.instrume.cmp(&b.instrume)).then(a.filter_raw.cmp(&b.filter_raw))
+    rows.sort_by(|(ua, a), (ub, b)| {
+        ub.cmp(ua)
+            .then(b.frames.cmp(&a.frames))
+            .then(a.instrume.cmp(&b.instrume))
+            .then(a.filter_raw.cmp(&b.filter_raw))
     });
+    let rows: Vec<FilterMappingRowView> = rows.into_iter().map(|(_, r)| r).collect();
     tracing::info!(project_id, rows = rows.len(), "filter mapping sheet built");
-    Ok(FilterMappingSheet { project_id: project_id.to_string(), dictionary, rows })
+    Ok(FilterMappingSheet {
+        project_id: project_id.to_string(),
+        dictionary,
+        rows,
+    })
 }
 
 /// Upsert/delete the account's rows in one `BEGIN IMMEDIATE`, refuse a
 /// canonical outside the project's dictionary before writing anything, mark
 /// the project dirty for auto-publish, return the fresh gate report.
-pub fn set_filter_mappings(ctx: &ServiceContext, project_id: &str, edits: Vec<FilterMappingEdit>) -> Result<GateReport, ApiError> {
+pub fn set_filter_mappings(
+    ctx: &ServiceContext,
+    project_id: &str,
+    edits: Vec<FilterMappingEdit>,
+) -> Result<GateReport, ApiError> {
     {
         let db = db(ctx)?;
         let mut conn = db.conn();
-        let project = crate::db::collab::get_project(&conn, project_id).map_err(internal)?
-            .ok_or_else(|| ApiError::NotFound(format!("project {project_id} is not cached — refresh first")))?;
+        let project = crate::db::collab::get_project(&conn, project_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "project {project_id} is not cached — refresh first"
+                ))
+            })?;
         let dictionary = project_dictionary(&project)?;
         let account = current_account_email(&conn).ok_or_else(|| {
             tracing::warn!(project_id, "filter mappings refused: signed out");
@@ -988,23 +1066,37 @@ pub fn set_filter_mappings(ctx: &ServiceContext, project_id: &str, edits: Vec<Fi
             if let Some(c) = &e.canonical {
                 if !dictionary.iter().any(|d| &d.canonical == c) {
                     tracing::warn!(project_id, canonical = %c, "filter mapping refused: canonical not in the dictionary");
-                    return Err(ApiError::Invalid(format!("{c:?} is not in the project dictionary")));
+                    return Err(ApiError::Invalid(format!(
+                        "{c:?} is not in the project dictionary"
+                    )));
                 }
             }
         }
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| internal(e.into()))?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| internal(e.into()))?;
         for e in &edits {
             let instrume = e.instrume.trim();
             let raw = e.filter_raw.trim();
             match &e.canonical {
-                Some(c) => crate::db::collab::upsert_filter_mapping(&tx, &account, instrume, raw, c).map_err(internal)?,
-                None => { crate::db::collab::delete_filter_mapping(&tx, &account, instrume, raw).map_err(internal)?; }
+                Some(c) => {
+                    crate::db::collab::upsert_filter_mapping(&tx, &account, instrume, raw, c)
+                        .map_err(internal)?
+                }
+                None => {
+                    crate::db::collab::delete_filter_mapping(&tx, &account, instrume, raw)
+                        .map_err(internal)?;
+                }
             }
         }
         tx.commit().map_err(|e| internal(e.into()))?;
         tracing::info!(project_id, count = edits.len(), "filter mappings saved");
     }
-    crate::api::collab_autopublish::request_auto_publish(Some(project_id));
+    // An empty edit list changes nothing — no dirty mark, no auto-publish
+    // wake-up for it.
+    if !edits.is_empty() {
+        crate::api::collab_autopublish::request_auto_publish(Some(project_id));
+    }
     evaluate_project_gate(ctx, project_id)
 }
 
@@ -1200,21 +1292,27 @@ pub fn get_frame_set_project_status(
     let me = device_for_cards(ctx);
 
     for p in crate::db::collab::list_projects(&conn).map_err(internal)? {
-        if !crate::db::collab::is_set_linked(&conn, &p.project_id, frames_set_id).map_err(internal)? {
+        if !crate::db::collab::is_set_linked(&conn, &p.project_id, frames_set_id)
+            .map_err(internal)?
+        {
             continue;
         }
         let gated = project_gate(&conn, &p)?;
-        let own = crate::db::collab_frames::own_by_source_frame(&conn, &p.project_id).map_err(internal)?;
+        let own = crate::db::collab_frames::own_by_source_frame(&conn, &p.project_id)
+            .map_err(internal)?;
 
         let mut counts = ContributorCounts::default();
         let mut frames = Vec::new();
-        for (identity, row) in gated.iter().filter(|(_, r)| set_frame_ids.contains(&r.frame_id)) {
+        for (identity, row) in gated
+            .iter()
+            .filter(|(_, r)| set_frame_ids.contains(&r.frame_id))
+        {
             let own_row = own.get(&row.frame_id);
             // Finding 3: a recipe read stats the light's source file on disk
             // (`recipe_hash_for`) — only worth paying for a frame this
             // account has actually published; `derive` ignores it otherwise.
-            let current_recipe =
-                own_row.and_then(|_| current_recipe_for_frame(&conn, row.frame_id, identity.attested));
+            let current_recipe = own_row
+                .and_then(|_| current_recipe_for_frame(&conn, row.frame_id, identity.attested));
             let reject_reason = own_row.and_then(|o| {
                 crate::api::collab_exchange::parse_manifest_wire(
                     &p.project_id,
@@ -1245,7 +1343,8 @@ pub fn get_frame_set_project_status(
             });
         }
 
-        let publishing = crate::db::collab::publishing_device(&conn, &p.project_id).map_err(internal)?;
+        let publishing =
+            crate::db::collab::publishing_device(&conn, &p.project_id).map_err(internal)?;
         let publishing_here = match (&publishing, me.as_deref()) {
             (Some(publisher), Some(me)) => publisher.device_id == me,
             _ => false,
@@ -1338,7 +1437,10 @@ pub(crate) fn own_contributor_states(
             row.publishable,
             row.failures.first().map(String::as_str),
         );
-        out.insert(own_row.frame_uuid.clone(), (state.key().to_string(), reason));
+        out.insert(
+            own_row.frame_uuid.clone(),
+            (state.key().to_string(), reason),
+        );
     }
     out
 }
@@ -2447,6 +2549,30 @@ fn hub_frame_rule_problem(meta: &crate::collab::frame_meta::FrameMeta) -> Option
     None
 }
 
+/// M4: `build_frame_meta` then `hub_frame_rule_problem`, in one place — both
+/// branches of the publish split's pass 3 (a generated New and an
+/// attested/external New) ran this identical two-step sequence separately
+/// before this helper. `Err(reason)` covers both ways a NEW frame's manifest
+/// fields can hold it back (an unreadable frame, or one the hub's per-frame
+/// rules refuse) and has ALREADY logged its own `error!`/`warn!` — the caller
+/// only needs to `held_back.push(held(fid, &cand.filename, reason))` and
+/// `continue`.
+fn new_frame_meta_or_hold_back(
+    conn: &Connection,
+    project_id: &str,
+    frame_id: i64,
+) -> Result<crate::collab::frame_meta::FrameMeta, String> {
+    let m = crate::collab::frame_meta::build_frame_meta(conn, frame_id).map_err(|e| {
+        tracing::error!(project_id, frame_id, error = %format!("{e:#}"), "publish: frame meta failed");
+        format!("cannot read frame metadata: {e:#}")
+    })?;
+    if let Some(problem) = hub_frame_rule_problem(&m) {
+        tracing::warn!(project_id, frame_id, reason = %problem, "publish: frame breaks a hub rule");
+        return Err(problem);
+    }
+    Ok(m)
+}
+
 /// The publish stamps on one frame's header: `ATH_PRJ` and `ATH_FILT`, and
 /// P4's WCS swap — with a `plate_solves` row the header WCS is replaced by the
 /// solve's; without one it is copied through as is.
@@ -2573,11 +2699,9 @@ struct PublishCandidate {
     filename: String,
     uuid: String,
     filter_canonical: String,
-    /// Spec §6 (F5), copied from [`GateIdentity`]: the frame's linked set,
-    /// and whether that set is attested. The split branches on `attested`
-    /// BEFORE any calibration resolution.
-    #[allow(dead_code)]
-    set_id: Option<i64>,
+    /// Spec §6 (F5), copied from [`GateIdentity`]: whether the frame's linked
+    /// set is attested. The split branches on this BEFORE any calibration
+    /// resolution.
     attested: bool,
 }
 
@@ -2733,7 +2857,11 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
         let recipe = match recipe {
             Some(r) => r,
             None => {
-                tracing::error!(project_id = pid, frame_id = fid, "publish: an attested plan carried no recipe (internal invariant violation)");
+                tracing::error!(
+                    project_id = pid,
+                    frame_id = fid,
+                    "publish: an attested plan carried no recipe (internal invariant violation)"
+                );
                 held_back.push(held(
                     fid,
                     &cand.filename,
@@ -3581,7 +3709,6 @@ async fn run_publish(
                 uuid: id.uuid,
                 // `publishable` implies a dictionary match (P3).
                 filter_canonical: id.filter_canonical.unwrap_or_default(),
-                set_id: id.set_id,
                 attested: id.attested,
             });
         } else {
@@ -4009,24 +4136,13 @@ async fn run_publish(
                         continue;
                     }
                     taken_names.insert(file_name);
-                    let m = match crate::collab::frame_meta::build_frame_meta(&conn, fid) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: frame meta failed");
-                            held_back.push(held(
-                                fid,
-                                &cand.filename,
-                                format!("cannot read frame metadata: {e:#}"),
-                            ));
+                    match new_frame_meta_or_hold_back(&conn, project_id, fid) {
+                        Ok(m) => Some(m),
+                        Err(reason) => {
+                            held_back.push(held(fid, &cand.filename, reason));
                             continue;
                         }
-                    };
-                    if let Some(problem) = hub_frame_rule_problem(&m) {
-                        tracing::warn!(project_id, frame_id = fid, reason = %problem, "publish: frame breaks a hub rule");
-                        held_back.push(held(fid, &cand.filename, problem));
-                        continue;
                     }
-                    Some(m)
                 } else {
                     claimed.insert(path.clone());
                     None
@@ -4061,24 +4177,13 @@ async fn run_publish(
             // meta — a version never re-announces it; the hub keeps the
             // prior meta.
             let meta = if matches!(kind, PublishKind::New) {
-                let m = match crate::collab::frame_meta::build_frame_meta(&conn, fid) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: frame meta failed");
-                        held_back.push(held(
-                            fid,
-                            &cand.filename,
-                            format!("cannot read frame metadata: {e:#}"),
-                        ));
+                match new_frame_meta_or_hold_back(&conn, project_id, fid) {
+                    Ok(m) => Some(m),
+                    Err(reason) => {
+                        held_back.push(held(fid, &cand.filename, reason));
                         continue;
                     }
-                };
-                if let Some(problem) = hub_frame_rule_problem(&m) {
-                    tracing::warn!(project_id, frame_id = fid, reason = %problem, "publish: frame breaks a hub rule");
-                    held_back.push(held(fid, &cand.filename, problem));
-                    continue;
                 }
-                Some(m)
             } else {
                 None
             };
@@ -4109,6 +4214,13 @@ async fn run_publish(
                 ));
                 continue;
             }
+            // M3: without this, a generated New's picked basename never
+            // enters `taken_names` — only the attested/external branch (and
+            // `file_names_of_publisher`'s seed from a PRIOR run) did — so an
+            // attested New later in this SAME run whose basename happens to
+            // match could pass its own `taken_names.contains` check and both
+            // would announce under one fileName.
+            taken_names.insert(file_name);
             plans.push(PlannedFrame {
                 cand,
                 kind,
@@ -4339,9 +4451,13 @@ async fn run_publish(
                             let old_path = Path::new(old);
                             if is_own_dir_landing(old_path, &own_dir) {
                                 match std::fs::remove_file(old_path) {
-                                    Ok(()) => tracing::info!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: removed the superseded generated file"),
+                                    Ok(()) => {
+                                        tracing::info!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: removed the superseded generated file")
+                                    }
                                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(e) => tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: removing the superseded generated file failed"),
+                                    Err(e) => {
+                                        tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: removing the superseded generated file failed")
+                                    }
                                 }
                             }
                         }
@@ -4373,7 +4489,7 @@ async fn run_publish(
                     )
                 };
                 match staged {
-                    Ok(n) if n == 0 => {
+                    Ok(0) => {
                         // Fix round 2 (finding 1): a silent no-match here
                         // means `landed_path` in the row does not (yet, or
                         // any longer) equal `f.written.target` — most often
@@ -5577,7 +5693,12 @@ pub(crate) mod tests {
     }
 
     fn row_of(report: &GateReport, id: i64) -> FrameGateRow {
-        report.rows.iter().find(|r| r.frame_id == id).unwrap().clone()
+        report
+            .rows
+            .iter()
+            .find(|r| r.frame_id == id)
+            .unwrap()
+            .clone()
     }
 
     #[test]
@@ -5587,34 +5708,75 @@ pub(crate) mod tests {
             let conn = crate::api::db(&ctx).unwrap().conn();
             cached_project(&conn);
             sign_in_as(&conn, "A@x.io");
-            let (set_id, frames) = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 3);
+            let (set_id, frames) =
+                seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 3);
             // Frame 0 has no FILTER, frame 1 a slot name, frame 2 stays "L".
-            conn.execute("UPDATE frames SET filter = NULL WHERE id = ?1", [frames[0]]).unwrap();
-            conn.execute("UPDATE frames SET filter = 'Slot 0' WHERE id = ?1", [frames[1]]).unwrap();
+            conn.execute("UPDATE frames SET filter = NULL WHERE id = ?1", [frames[0]])
+                .unwrap();
+            conn.execute(
+                "UPDATE frames SET filter = 'Slot 0' WHERE id = ?1",
+                [frames[1]],
+            )
+            .unwrap();
             (set_id, frames)
         };
         link_frame_set(&ctx, "p-1", set_id).unwrap();
         let report = evaluate_project_gate(&ctx, "p-1").unwrap();
-        let row = |id: i64| report.rows.iter().find(|r| r.frame_id == id).unwrap().clone();
-        assert!(row(frames[0]).failures.contains(&"no FILTER header — needs a filter mapping".to_string()));
-        assert!(row(frames[1]).failures.contains(&"filter \"Slot 0\" needs a filter mapping".to_string()));
+        let row = |id: i64| {
+            report
+                .rows
+                .iter()
+                .find(|r| r.frame_id == id)
+                .unwrap()
+                .clone()
+        };
+        assert!(row(frames[0])
+            .failures
+            .contains(&"no FILTER header — needs a filter mapping".to_string()));
+        assert!(row(frames[1])
+            .failures
+            .contains(&"filter \"Slot 0\" needs a filter mapping".to_string()));
         assert!(!row(frames[2]).failures.iter().any(|f| f.contains("filter")));
-        let map_filter = report.blockers.iter().find(|b| b.kind == "mapFilter").expect("mapFilter blocker");
+        let map_filter = report
+            .blockers
+            .iter()
+            .find(|b| b.kind == "mapFilter")
+            .expect("mapFilter blocker");
         assert_eq!(map_filter.frames, 2);
-        assert_eq!(map_filter.names.iter().map(|n| n.filter_raw.as_str()).collect::<Vec<_>>(), ["", "Slot 0"]);
+        assert_eq!(
+            map_filter
+                .names
+                .iter()
+                .map(|n| n.filter_raw.as_str())
+                .collect::<Vec<_>>(),
+            ["", "Slot 0"]
+        );
         assert_eq!(map_filter.names[0].instrume, "ASI2600MM");
-        assert!(report.blockers.iter().any(|b| b.kind == "linkCalibration" && b.sets == vec![set_id]));
-        assert!(report.blockers.iter().any(|b| b.kind == "attest" && b.frames == 3));
+        assert!(report
+            .blockers
+            .iter()
+            .any(|b| b.kind == "linkCalibration" && b.sets == vec![set_id]));
+        assert!(report
+            .blockers
+            .iter()
+            .any(|b| b.kind == "attest" && b.frames == 3));
 
         // Mapping rows of the signed-in account resolve both; another account's do not.
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
-            crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "", "L").unwrap();
-            crate::db::collab::upsert_filter_mapping(&conn, "b@x.io", "ASI2600MM", "Slot 0", "L").unwrap();
+            crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "", "L")
+                .unwrap();
+            crate::db::collab::upsert_filter_mapping(&conn, "b@x.io", "ASI2600MM", "Slot 0", "L")
+                .unwrap();
         }
         let report = evaluate_project_gate(&ctx, "p-1").unwrap();
-        assert!(!row_of(&report, frames[0]).failures.iter().any(|f| f.contains("filter")));
-        assert!(row_of(&report, frames[1]).failures.contains(&"filter \"Slot 0\" needs a filter mapping".to_string()));
+        assert!(!row_of(&report, frames[0])
+            .failures
+            .iter()
+            .any(|f| f.contains("filter")));
+        assert!(row_of(&report, frames[1])
+            .failures
+            .contains(&"filter \"Slot 0\" needs a filter mapping".to_string()));
     }
 
     #[test]
@@ -5625,16 +5787,28 @@ pub(crate) mod tests {
             cached_project(&conn);
             sign_in_as(&conn, "a@x.io");
             let r = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
-            conn.execute("UPDATE frames SET filter = 'H' WHERE id = ?1", [r.1[0]]).unwrap();
-            crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "H", "Hb").unwrap();
+            conn.execute("UPDATE frames SET filter = 'H' WHERE id = ?1", [r.1[0]])
+                .unwrap();
+            crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "H", "Hb")
+                .unwrap();
             r
         };
         link_frame_set(&ctx, "p-1", set_id).unwrap();
         let report = evaluate_project_gate(&ctx, "p-1").unwrap();
         assert!(row_of(&report, frames[0]).failures.contains(
-            &"filter \"H\" is mapped to \"Hb\", which is not in this project's dictionary".to_string()
+            &"filter \"H\" is mapped to \"Hb\", which is not in this project's dictionary"
+                .to_string()
         ));
-        assert_eq!(report.blockers.iter().find(|b| b.kind == "mapFilter").unwrap().names[0].filter_raw, "H");
+        assert_eq!(
+            report
+                .blockers
+                .iter()
+                .find(|b| b.kind == "mapFilter")
+                .unwrap()
+                .names[0]
+                .filter_raw,
+            "H"
+        );
     }
 
     #[test]
@@ -5650,8 +5824,136 @@ pub(crate) mod tests {
         link_frame_set(&ctx, "p-1", set_id).unwrap();
         let report = evaluate_project_gate(&ctx, "p-1").unwrap();
         let row = row_of(&report, frames[0]);
-        assert!(!row.failures.iter().any(|f| f.contains("calibration")), "{:?}", row.failures);
-        assert!(!report.blockers.iter().any(|b| b.kind == "attest" || b.kind == "linkCalibration"));
+        assert!(
+            !row.failures.iter().any(|f| f.contains("calibration")),
+            "{:?}",
+            row.failures
+        );
+        assert!(!report
+            .blockers
+            .iter()
+            .any(|b| b.kind == "attest" || b.kind == "linkCalibration"));
+    }
+
+    /// Spec §3.2: a mapping row scopes to the SIGNED-IN account only. Signed
+    /// out entirely (no `ACCOUNT_EMAIL` setting), even mapping rows that
+    /// exist for some account must never apply — the frame stays unmapped,
+    /// exactly as if no row existed at all.
+    #[test]
+    fn signed_out_with_mapping_rows_leaves_the_frame_unmapped() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            // Deliberately no `sign_in_as` call.
+            let r = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
+            conn.execute(
+                "UPDATE frames SET filter = 'Slot 0' WHERE id = ?1",
+                [r.1[0]],
+            )
+            .unwrap();
+            // A mapping row exists (from a previous sign-in on this device, or
+            // simply seeded directly here) but must not apply while signed out.
+            crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "Slot 0", "L")
+                .unwrap();
+            r
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert!(row_of(&report, frames[0])
+            .failures
+            .contains(&"filter \"Slot 0\" needs a filter mapping".to_string()));
+    }
+
+    /// Spec §7.1 / F5: C-2's "missing master file" sentence is normally a
+    /// `buildMasters` blocker — attesting the set must clear it from
+    /// `buildMasters` too, not only from `attest`/`linkCalibration` (the two
+    /// kinds [`an_attested_set_passes_the_calibration_precondition`] already
+    /// covers, which only ever exercises the "no calibration links" sentence).
+    #[test]
+    fn attested_set_is_also_absent_from_build_masters() {
+        let (_tmp, ctx) = test_ctx();
+        let out_dir = _tmp.path().join("cal_out");
+        let missing_master_path = _tmp.path().join("missing_master_dark.fits");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+            crate::db::collab::set_dictionary(
+                &conn,
+                "p-1",
+                Some(1),
+                Some(r#"[{"canonical":"L","aliases":[],"kind":"broadband"}]"#),
+            )
+            .unwrap();
+            let set_id =
+                seed_publishable_set(&conn, &out_dir, "Missing Master Set", &["uuid-bm-1"]);
+            let frame_ids = light_frame_ids_of(&conn, set_id);
+            link_missing_master_file(&conn, set_id, frame_ids[0], &missing_master_path);
+            set_id
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        // Before attestation: the missing master FILE blocks under buildMasters.
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert!(
+            report.blockers.iter().any(|b| b.kind == "buildMasters"),
+            "{:?}",
+            report.blockers
+        );
+
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::set_frames_set_attestation(&conn, set_id, true).unwrap();
+        }
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert!(
+            !report.blockers.iter().any(|b| b.kind == "buildMasters"
+                || b.kind == "attest"
+                || b.kind == "linkCalibration"),
+            "{:?}",
+            report.blockers
+        );
+    }
+
+    /// Two `warn!`+fallback paths, both reachable from ONE broken read:
+    /// dropping `frames_set` breaks `frames_set_attested`'s query (fallback:
+    /// treated as not attested), which sends the frame down the normal
+    /// calibration path, where `collect_export_data`'s own `frames_set` read
+    /// (via `get_frame_set_info`) THEN also fails (fallback: the frame is
+    /// treated as not calibrated) — one dropped table exercises both
+    /// `project_gate`/`frame_gate_inputs` fallbacks in a single call, and
+    /// neither one panics or bubbles an `Err` up to the caller.
+    #[test]
+    fn broken_attestation_and_export_data_reads_fall_back_without_erroring() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1)
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            // `foreign_keys=ON` (this codebase's connection default) makes
+            // `DROP TABLE` perform an implicit `DELETE FROM` first, which
+            // would CASCADE through `imaging_nights`/`sessions`/
+            // `session_members` and wipe the very rows this test needs to
+            // survive — turned off on this ONE connection, for this ONE
+            // statement, purely to drop the schema without deleting any data.
+            conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+            conn.execute("DROP TABLE frames_set", []).unwrap();
+        }
+        let report = evaluate_project_gate(&ctx, "p-1").expect(
+            "a broken attestation/export-data read falls back — it must never error the whole gate",
+        );
+        let row = row_of(&report, frames[0]);
+        assert!(!row.publishable);
+        assert!(
+            row.failures.iter().any(|f| f.starts_with("could not verify calibration")),
+            "the attestation-read fallback (treated as not attested) must have sent the frame down the \
+             calibration path, where collect_export_data's own broken read then fails it too: {:?}",
+            row.failures
+        );
     }
 
     /// Insert a fully-populated `plate_solves` row (every NOT NULL column) for
@@ -5867,7 +6169,7 @@ pub(crate) mod tests {
     #[test]
     fn frame_set_project_status_counts_states_and_lists_candidates() {
         let (_tmp, ctx) = test_ctx();
-        let (set_id, frames) = {
+        let (set_id, _frames) = {
             let conn = crate::api::db(&ctx).unwrap().conn();
             cached_project(&conn);
             sign_in_as(&conn, "a@x.io");
@@ -5883,7 +6185,11 @@ pub(crate) mod tests {
         assert!(st.candidates.is_empty());
         assert_eq!(st.links[0].counts.fails_gate, 2, "no calibration links");
         assert_eq!(
-            st.links[0].frames.iter().filter(|f| f.state == "failsGate").count(),
+            st.links[0]
+                .frames
+                .iter()
+                .filter(|f| f.state == "failsGate")
+                .count(),
             2
         );
         assert!(st.links[0].frames[0]
@@ -5891,7 +6197,6 @@ pub(crate) mod tests {
             .as_deref()
             .unwrap()
             .contains("calibration"));
-        let _ = frames;
     }
 
     /// An own row's manifest carries two distinct texts — `acceptedReason`
@@ -5997,11 +6302,183 @@ pub(crate) mod tests {
         // `own_contributor_states` (the project page's own-frames table) must
         // agree — same fix, same source field.
         let conn = crate::api::db(&ctx).unwrap().conn();
-        let project = crate::db::collab::get_project(&conn, "p-1").unwrap().unwrap();
+        let project = crate::db::collab::get_project(&conn, "p-1")
+            .unwrap()
+            .unwrap();
         let contrib = own_contributor_states(&conn, "p-1", &project);
         let (state, reason) = contrib.get("u-rej").unwrap();
         assert_eq!(state, "rejected");
         assert_eq!(reason.as_deref(), Some("FWHM too high"));
+    }
+
+    /// A minimal own `LocalFrameRow`, `record_own`'d directly (no live
+    /// network, no publish run) — a [`seed_own_rejected_row`] sibling that
+    /// lets a test pick `state`/`recipe_hash`/`on_disk` freely, to reach every
+    /// `derive` branch, not just `rejected`.
+    fn seed_own_row(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        frame_uuid: &str,
+        source_frame_id: i64,
+        state: &str,
+        recipe_hash: Option<&str>,
+        on_disk: bool,
+    ) {
+        let wire = crate::collab::hub_client::FrameViewWire {
+            frame_uuid: frame_uuid.into(),
+            frame_seq: 1,
+            publisher_account_id: "acc-me".into(),
+            publisher_display_name: "Me".into(),
+            own: true,
+            publisher_device_id: None,
+            file_name: "c_L_0000.fits".into(),
+            content_version: 1,
+            blake3: "b".repeat(64),
+            byte_size: 4096,
+            xxh3: "0123456789abcdef".into(),
+            filter_raw: "L".into(),
+            filter_canonical: "L".into(),
+            channel: "mono".into(),
+            exptime_sec: 300.0,
+            date_obs: None,
+            meta: serde_json::json!({}),
+            gate_version: 0,
+            accepted: state == "published",
+            accepted_reason: None,
+            state: state.into(),
+            reject_reason: None,
+            manifest_version: 1,
+            created_at: "2026-07-13T00:00:00Z".into(),
+        };
+        let row = crate::db::collab_frames::LocalFrameRow {
+            project_id: project_id.into(),
+            frame_uuid: frame_uuid.into(),
+            content_version: 1,
+            origin: crate::db::collab_frames::FrameOrigin::Own,
+            publisher_account_id: "acc-me".into(),
+            publisher_display: "Me".into(),
+            file_name: "c_L_0000.fits".into(),
+            filter_canonical: "L".into(),
+            state: state.into(),
+            accepted: state == "published",
+            byte_size: 4096,
+            xxh3: "0123456789abcdef".into(),
+            blake3: "b".repeat(64),
+            manifest_version: 1,
+            manifest_json: serde_json::to_string(&wire).unwrap(),
+            landed_path: None,
+            size_mtime_seen: None,
+            on_disk,
+            awaiting_gc: false,
+            source_frame_id: Some(source_frame_id),
+            recipe_hash: recipe_hash.map(str::to_string),
+            last_error: None,
+            updated_at: String::new(),
+            local_state: crate::db::collab_frames::LocalState::OwnHeld,
+            frame_seq: Some(1),
+        };
+        crate::db::collab_frames::record_own(conn, &row).unwrap();
+    }
+
+    /// Spec §8.1: `list_collab_frames`'s own-row `contributorState` chip
+    /// (`api::collab_live::surface::list_collab_frames` →
+    /// `own_contributor_states` → `derive`) for every reachable state, not
+    /// just `rejected` (already pinned above). All three frames share one
+    /// ATTESTED set, so `current_recipe_for_frame` resolves deterministically
+    /// to `external_recipe(1000, "2026-07-01T21:00:00Z")` (`seed_set`'s fixed
+    /// file size/mtime) — matching the stored `recipe_hash` reads as
+    /// published, a stale one reads as an update pending.
+    #[test]
+    fn list_collab_frames_own_row_contributor_state_for_published_update_pending_and_rejected() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "a@x.io");
+            seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 3)
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let current_recipe = external_recipe(1000, "2026-07-01T21:00:00Z");
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::set_frames_set_attestation(&conn, set_id, true).unwrap();
+            seed_own_row(
+                &conn,
+                "p-1",
+                "u-pub",
+                frames[0],
+                "published",
+                Some(&current_recipe),
+                true,
+            );
+            seed_own_row(
+                &conn,
+                "p-1",
+                "u-upd",
+                frames[1],
+                "published",
+                Some("external:999:2000-01-01T00:00:00Z"),
+                true,
+            );
+            seed_own_row(&conn, "p-1", "u-rej", frames[2], "rejected", None, true);
+        }
+        let views = crate::api::collab_live::surface::list_collab_frames(&ctx, "p-1").unwrap();
+        let state_of = |uuid: &str| {
+            views
+                .iter()
+                .find(|v| v.frame_uuid == uuid)
+                .unwrap_or_else(|| panic!("no view for {uuid}"))
+                .contributor_state
+                .clone()
+        };
+        assert_eq!(state_of("u-pub").as_deref(), Some("published"));
+        assert_eq!(state_of("u-upd").as_deref(), Some("updatePending"));
+        assert_eq!(state_of("u-rej").as_deref(), Some("rejected"));
+    }
+
+    /// `FrameSetProjectLink.publishing_here` (spec §8.2, amendment A6) is
+    /// otherwise untested: `false` unbound, `true` once THIS device is the
+    /// account's publishing device, `false` again for a DIFFERENT device.
+    #[test]
+    fn frame_set_project_status_reports_publishing_here() {
+        let (_tmp, ctx) = test_ctx();
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "a@x.io");
+            seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1).0
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        assert!(!get_frame_set_project_status(&ctx, set_id).unwrap().links[0].publishing_here);
+
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::set_publishing_device(
+                &conn,
+                "p-1",
+                Some(&crate::db::collab::PublishingDevice {
+                    device_id: me,
+                    name: None,
+                }),
+            )
+            .unwrap();
+        }
+        assert!(get_frame_set_project_status(&ctx, set_id).unwrap().links[0].publishing_here);
+
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::set_publishing_device(
+                &conn,
+                "p-1",
+                Some(&crate::db::collab::PublishingDevice {
+                    device_id: "someone-else".into(),
+                    name: None,
+                }),
+            )
+            .unwrap();
+        }
+        assert!(!get_frame_set_project_status(&ctx, set_id).unwrap().links[0].publishing_here);
     }
 
     /// End-to-end hub poll (wiremock): a fresh refresh fetches the page + a REAL
@@ -7128,44 +7605,158 @@ pub(crate) mod tests {
     #[test]
     fn mapping_sheet_lists_every_raw_name_with_its_resolution_and_proposal() {
         let (_tmp, ctx) = test_ctx();
-        let (set_id, frames) = {
+        let (set_id, _frames) = {
             let conn = crate::api::db(&ctx).unwrap().conn();
             cached_project(&conn); // dictionary [L]
             crate::db::collab::set_dictionary(&conn, "p-1", Some(2), Some(
                 r#"[{"canonical":"L","aliases":["lum"],"kind":"luminance"},{"canonical":"Ha","aliases":[],"kind":"narrowband"},{"canonical":"None","aliases":["none"],"kind":"unfiltered"}]"#)).unwrap();
             sign_in_as(&conn, "a@x.io");
             let r = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 4);
-            conn.execute("UPDATE frames SET filter = NULL WHERE id IN (?1, ?2)", [r.1[0], r.1[1]]).unwrap();
-            conn.execute("UPDATE frames SET filter = 'H' WHERE id = ?1", [r.1[2]]).unwrap();
+            conn.execute(
+                "UPDATE frames SET filter = NULL WHERE id IN (?1, ?2)",
+                [r.1[0], r.1[1]],
+            )
+            .unwrap();
+            conn.execute("UPDATE frames SET filter = 'H' WHERE id = ?1", [r.1[2]])
+                .unwrap();
             r
         };
         link_frame_set(&ctx, "p-1", set_id).unwrap();
         let sheet = get_filter_mapping_sheet(&ctx, "p-1").unwrap();
         assert_eq!(sheet.dictionary.len(), 3);
-        let raws: Vec<(&str, &str)> = sheet.rows.iter().map(|r| (r.filter_raw.as_str(), r.resolution.as_str())).collect();
-        assert_eq!(raws, [("", "unmapped"), ("H", "unmapped"), ("L", "matched")], "unresolved first, then by frames desc");
+        let raws: Vec<(&str, &str)> = sheet
+            .rows
+            .iter()
+            .map(|r| (r.filter_raw.as_str(), r.resolution.as_str()))
+            .collect();
+        assert_eq!(
+            raws,
+            [("", "unmapped"), ("H", "unmapped"), ("L", "matched")],
+            "unresolved first, then by frames desc"
+        );
         assert_eq!(sheet.rows[0].frames, 2);
         assert_eq!(sheet.rows[0].proposal.as_deref(), Some("None"));
         assert_eq!(sheet.rows[1].proposal.as_deref(), Some("Ha"));
         assert_eq!(sheet.rows[2].canonical.as_deref(), Some("L"));
-        assert_eq!(sheet.rows[2].proposal, None, "a resolved row proposes nothing");
+        assert_eq!(
+            sheet.rows[2].proposal, None,
+            "a resolved row proposes nothing"
+        );
 
-        // Save: one valid, one null (no row to delete → fine), one invalid → nothing written.
-        let bad = set_filter_mappings(&ctx, "p-1", vec![FilterMappingEdit { instrume: "ASI2600MM".into(), filter_raw: "H".into(), canonical: Some("Hb".into()) }]);
-        assert!(matches!(bad, Err(crate::api::ApiError::Invalid(m)) if m.contains("\"Hb\" is not in the project dictionary")));
-        let report = set_filter_mappings(&ctx, "p-1", vec![
-            FilterMappingEdit { instrume: "ASI2600MM".into(), filter_raw: "".into(), canonical: Some("None".into()) },
-            FilterMappingEdit { instrume: "ASI2600MM".into(), filter_raw: "H".into(), canonical: Some("Ha".into()) },
-        ]).unwrap();
+        // Three separate calls: a lone invalid edit refuses outright and
+        // writes nothing; a batch of two valid edits sets both; a later
+        // null-canonical edit deletes its row (back to automatic).
+        let bad = set_filter_mappings(
+            &ctx,
+            "p-1",
+            vec![FilterMappingEdit {
+                instrume: "ASI2600MM".into(),
+                filter_raw: "H".into(),
+                canonical: Some("Hb".into()),
+            }],
+        );
+        assert!(
+            matches!(bad, Err(crate::api::ApiError::Invalid(m)) if m.contains("\"Hb\" is not in the project dictionary"))
+        );
+        let report = set_filter_mappings(
+            &ctx,
+            "p-1",
+            vec![
+                FilterMappingEdit {
+                    instrume: "ASI2600MM".into(),
+                    filter_raw: "".into(),
+                    canonical: Some("None".into()),
+                },
+                FilterMappingEdit {
+                    instrume: "ASI2600MM".into(),
+                    filter_raw: "H".into(),
+                    canonical: Some("Ha".into()),
+                },
+            ],
+        )
+        .unwrap();
         assert!(!report.blockers.iter().any(|b| b.kind == "mapFilter"));
         let sheet = get_filter_mapping_sheet(&ctx, "p-1").unwrap();
-        assert_eq!(sheet.rows.iter().find(|r| r.filter_raw == "H").unwrap().resolution, "mapped");
+        assert_eq!(
+            sheet
+                .rows
+                .iter()
+                .find(|r| r.filter_raw == "H")
+                .unwrap()
+                .resolution,
+            "mapped"
+        );
         // The auto-publish dirty mark was requested.
         assert!(crate::api::collab_autopublish::is_dirty_for_test("p-1"));
         // Back to automatic.
-        set_filter_mappings(&ctx, "p-1", vec![FilterMappingEdit { instrume: "ASI2600MM".into(), filter_raw: "H".into(), canonical: None }]).unwrap();
-        assert_eq!(get_filter_mapping_sheet(&ctx, "p-1").unwrap().rows.iter().find(|r| r.filter_raw == "H").unwrap().resolution, "unmapped");
-        let _ = frames;
+        set_filter_mappings(
+            &ctx,
+            "p-1",
+            vec![FilterMappingEdit {
+                instrume: "ASI2600MM".into(),
+                filter_raw: "H".into(),
+                canonical: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            get_filter_mapping_sheet(&ctx, "p-1")
+                .unwrap()
+                .rows
+                .iter()
+                .find(|r| r.filter_raw == "H")
+                .unwrap()
+                .resolution,
+            "unmapped"
+        );
+    }
+
+    /// A batch mixing a valid and an invalid canonical for the SAME
+    /// (instrume, raw) key must refuse the WHOLE call and write nothing —
+    /// validation (`set_filter_mappings`'s first loop) runs entirely ahead of
+    /// the write transaction, so an earlier entry for the same key in the
+    /// same refused batch must not be left half-applied.
+    #[test]
+    fn mixed_batch_with_one_invalid_canonical_writes_nothing() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            crate::db::collab::set_dictionary(
+                &conn,
+                "p-1",
+                Some(2),
+                Some(r#"[{"canonical":"L","aliases":[],"kind":"luminance"},{"canonical":"Ha","aliases":[],"kind":"narrowband"}]"#),
+            )
+            .unwrap();
+            sign_in_as(&conn, "a@x.io");
+        }
+        let res = set_filter_mappings(
+            &ctx,
+            "p-1",
+            vec![
+                FilterMappingEdit {
+                    instrume: "ASI2600MM".into(),
+                    filter_raw: "H".into(),
+                    canonical: Some("Ha".into()),
+                },
+                FilterMappingEdit {
+                    instrume: "ASI2600MM".into(),
+                    filter_raw: "H".into(),
+                    canonical: Some("Hb".into()),
+                },
+            ],
+        );
+        assert!(
+            matches!(&res, Err(crate::api::ApiError::Invalid(m)) if m.contains("\"Hb\" is not in the project dictionary")),
+            "{res:?}"
+        );
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        let mappings = crate::db::collab::filter_mappings_for_account(&conn, "a@x.io").unwrap();
+        assert!(
+            mappings.is_empty(),
+            "the earlier valid edit in the same refused batch must not have been written either: {mappings:?}"
+        );
     }
 
     #[test]
@@ -7176,12 +7767,31 @@ pub(crate) mod tests {
             cached_project(&conn);
             crate::db::collab::set_dictionary(&conn, "p-1", None, None).unwrap();
         }
-        assert!(matches!(get_filter_mapping_sheet(&ctx, "p-1"), Err(crate::api::ApiError::Invalid(m)) if m.contains("has not been fetched")));
+        assert!(
+            matches!(get_filter_mapping_sheet(&ctx, "p-1"), Err(crate::api::ApiError::Invalid(m)) if m.contains("has not been fetched"))
+        );
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
-            crate::db::collab::set_dictionary(&conn, "p-1", Some(1), Some(r#"[{"canonical":"L","aliases":[],"kind":"luminance"}]"#)).unwrap();
+            crate::db::collab::set_dictionary(
+                &conn,
+                "p-1",
+                Some(1),
+                Some(r#"[{"canonical":"L","aliases":[],"kind":"luminance"}]"#),
+            )
+            .unwrap();
         }
-        assert!(matches!(set_filter_mappings(&ctx, "p-1", vec![FilterMappingEdit { instrume: "X".into(), filter_raw: "L".into(), canonical: Some("L".into()) }]), Err(crate::api::ApiError::SignedOut(_))));
+        assert!(matches!(
+            set_filter_mappings(
+                &ctx,
+                "p-1",
+                vec![FilterMappingEdit {
+                    instrume: "X".into(),
+                    filter_raw: "L".into(),
+                    canonical: Some("L".into())
+                }]
+            ),
+            Err(crate::api::ApiError::SignedOut(_))
+        ));
     }
 
     // ── Publish per frame (wave 2 Task 7) ───────────────────────────────────
@@ -7212,7 +7822,9 @@ pub(crate) mod tests {
         }
 
         impl PubFx {
-            pub(super) fn conn(&self) -> r2d2::PooledConnection<crate::db::SqliteConnectionManager> {
+            pub(super) fn conn(
+                &self,
+            ) -> r2d2::PooledConnection<crate::db::SqliteConnectionManager> {
                 crate::api::db(&self.ctx).unwrap().conn()
             }
         }
@@ -8707,7 +9319,10 @@ pub(crate) mod tests {
             }
             let mut m = ok();
             m.filter_raw = "x".repeat(81);
-            assert!(hub_frame_rule_problem(&m).is_some(), "over 80 chars is refused");
+            assert!(
+                hub_frame_rule_problem(&m).is_some(),
+                "over 80 chars is refused"
+            );
             let mut m = ok();
             m.channel = "rgb".into();
             assert!(hub_frame_rule_problem(&m).is_some());
@@ -9566,13 +10181,19 @@ pub(crate) mod tests {
                 );
             }
             assert_eq!(
-                std::fs::read_dir(own_dir(&fx)).map(|d| d.count()).unwrap_or(0),
+                std::fs::read_dir(own_dir(&fx))
+                    .map(|d| d.count())
+                    .unwrap_or(0),
                 0,
                 "the publisher folder stays empty for attested frames"
             );
             // F5/A1: byte-for-byte and mtime untouched.
             for (i, light) in fx.lights.iter().enumerate() {
-                assert_eq!(std::fs::read(light).unwrap(), before[i].0, "{light:?} bytes changed");
+                assert_eq!(
+                    std::fs::read(light).unwrap(),
+                    before[i].0,
+                    "{light:?} bytes changed"
+                );
                 assert_eq!(
                     std::fs::metadata(light).unwrap().modified().unwrap(),
                     before[i].1,
@@ -9593,11 +10214,17 @@ pub(crate) mod tests {
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
             }
             assert_eq!(
-                publish_collab_frames(&fx.ctx, PID, None).await.unwrap().announced,
+                publish_collab_frames(&fx.ctx, PID, None)
+                    .await
+                    .unwrap()
+                    .announced,
                 1
             );
             assert_eq!(
-                publish_collab_frames(&fx.ctx, PID, None).await.unwrap().unchanged,
+                publish_collab_frames(&fx.ctx, PID, None)
+                    .await
+                    .unwrap()
+                    .unchanged,
                 1
             );
             // The scanner's in-place re-parse bumps files.size/modified_at after
@@ -9618,7 +10245,10 @@ pub(crate) mod tests {
             // publish itself never further touches the file beyond the
             // drift the test itself introduced.
             let row = own_row(&fx, &fx.uuids[0]).unwrap();
-            assert_eq!(row.landed_path.as_deref(), Some(fx.lights[0].to_string_lossy()).as_deref());
+            assert_eq!(
+                row.landed_path.as_deref(),
+                Some(fx.lights[0].to_string_lossy()).as_deref()
+            );
             assert_eq!(
                 std::fs::read(&fx.lights[0]).unwrap(),
                 b"new bytes that differ"
@@ -9630,6 +10260,42 @@ pub(crate) mod tests {
             assert_eq!(
                 row.byte_size,
                 std::fs::metadata(&fx.lights[0]).unwrap().len() as i64
+            );
+        }
+
+        /// I2: an attested light whose ORIGINAL basename breaks the hub's
+        /// `fileName` rule (here, a `:`) is held back at that check —
+        /// `hub_file_name_problem`, exercised on the attested/external
+        /// branch the same as the generated one — never announced under a
+        /// name the hub would refuse the whole atomic batch over.
+        #[tokio::test]
+        async fn attested_light_with_a_hub_illegal_file_name_is_held_back() {
+            let fx = fixture(1).await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+                // Drop the calibration links: attestation alone must carry
+                // the gate (mirrors `attested_lights_are_seeded_in_place_without_generation`).
+                conn.execute("DELETE FROM calibration_set_to_frames", [])
+                    .unwrap();
+                let bad_path = fx.lights[0].with_file_name("bad:name.fits");
+                conn.execute(
+                    "UPDATE files SET path = ?1, filename = ?2 \
+                     WHERE id = (SELECT file_id FROM frames WHERE id = ?3)",
+                    rusqlite::params![bad_path.to_string_lossy(), "bad:name.fits", fx.frame_ids[0]],
+                )
+                .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 0, "{:?}", res.held_back);
+            assert_eq!(res.held_back.len(), 1);
+            assert!(
+                res.held_back[0]
+                    .reasons
+                    .iter()
+                    .any(|r| r.contains("the hub refuses this file name")),
+                "{:?}",
+                res.held_back
             );
         }
 
@@ -9673,7 +10339,10 @@ pub(crate) mod tests {
                 "the original's bytes must never change"
             );
             assert_eq!(
-                std::fs::metadata(&fx.lights[0]).unwrap().modified().unwrap(),
+                std::fs::metadata(&fx.lights[0])
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
                 original_mtime,
                 "the original's mtime must never change"
             );
@@ -9706,7 +10375,10 @@ pub(crate) mod tests {
             let old_landed = own_row(&fx, &fx.uuids[0]).unwrap().landed_path.unwrap();
             let old_path = PathBuf::from(&old_landed);
             assert_eq!(old_path.parent().unwrap(), own_dir(&fx));
-            assert!(old_path.exists(), "the generated file exists before attestation");
+            assert!(
+                old_path.exists(),
+                "the generated file exists before attestation"
+            );
 
             let original_bytes = std::fs::read(&fx.lights[0]).unwrap();
             let original_mtime = std::fs::metadata(&fx.lights[0])
@@ -9738,7 +10410,10 @@ pub(crate) mod tests {
                 "the original itself is untouched"
             );
             assert_eq!(
-                std::fs::metadata(&fx.lights[0]).unwrap().modified().unwrap(),
+                std::fs::metadata(&fx.lights[0])
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
                 original_mtime,
                 "the original's mtime is untouched"
             );
@@ -10011,8 +10686,11 @@ pub(crate) mod tests {
                     ),
                 )
                 .unwrap();
-                conn.execute("UPDATE frames SET filter = NULL WHERE id = ?1", [fx.frame_ids[0]])
-                    .unwrap();
+                conn.execute(
+                    "UPDATE frames SET filter = NULL WHERE id = ?1",
+                    [fx.frame_ids[0]],
+                )
+                .unwrap();
                 crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "", "None")
                     .unwrap();
             }

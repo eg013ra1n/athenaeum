@@ -13,7 +13,7 @@ use crate::api::ApiError;
 use crate::db::{self};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
-use crate::sessions::{RederiveSummary, ReconcileOutcome};
+use crate::sessions::{ReconcileOutcome, RederiveSummary};
 use rusqlite::{Connection, OptionalExtension};
 
 /// A frame set's own center in degrees, parsed from its stored
@@ -60,7 +60,11 @@ fn frame_set_is_custom(conn: &Connection, frames_set_id: i64) -> Result<bool> {
 }
 
 /// Recompute the set's aggregate metadata from its (re-derived) membership.
-fn refresh_frame_set_metadata(conn: &Connection, frames_set_id: i64, is_custom: bool) -> Result<()> {
+fn refresh_frame_set_metadata(
+    conn: &Connection,
+    frames_set_id: i64,
+    is_custom: bool,
+) -> Result<()> {
     let m = crate::frames_set_metadata::calculate_metadata_for_frame_set(frames_set_id, conn)?;
     db::update_frames_set_metadata(
         conn,
@@ -85,9 +89,15 @@ pub fn recalculate_frame_set_nights(
     ctx: &ServiceContext,
     frames_set_id: i64,
 ) -> Result<RederiveSummary> {
-    let db = ctx.db.get().ok_or_else(|| anyhow!("Database not initialized"))?;
+    let db = ctx
+        .db
+        .get()
+        .ok_or_else(|| anyhow!("Database not initialized"))?;
     let mut conn = db.conn();
-    let gap_hours = ctx.settings.get_session_gap_threshold_hours(&conn).unwrap_or(6.0);
+    let gap_hours = ctx
+        .settings
+        .get_session_gap_threshold_hours(&conn)
+        .unwrap_or(6.0);
     let tx = conn.transaction()?;
     let is_custom = frame_set_is_custom(&tx, frames_set_id)?;
     let summary = crate::sessions::rederive_for_frame_set(&tx, frames_set_id, &[], gap_hours)?;
@@ -120,7 +130,10 @@ pub fn reconcile_frame_set_nights(
     ctx: &ServiceContext,
     frames_set_id: i64,
 ) -> Result<ReconcileSummary> {
-    let db = ctx.db.get().ok_or_else(|| anyhow!("Database not initialized"))?;
+    let db = ctx
+        .db
+        .get()
+        .ok_or_else(|| anyhow!("Database not initialized"))?;
     let mut conn = db.conn();
 
     let archived_at: Option<String> = conn
@@ -133,17 +146,28 @@ pub fn reconcile_frame_set_nights(
         .ok_or_else(|| anyhow!("frame set {frames_set_id} not found"))?;
     if archived_at.is_some() {
         tracing::debug!(frames_set_id, "nights unchanged");
-        return Ok(ReconcileSummary { changed: false, nights: 0, sessions: 0 });
+        return Ok(ReconcileSummary {
+            changed: false,
+            nights: 0,
+            sessions: 0,
+        });
     }
 
-    let gap_hours = ctx.settings.get_session_gap_threshold_hours(&conn).unwrap_or(6.0);
+    let gap_hours = ctx
+        .settings
+        .get_session_gap_threshold_hours(&conn)
+        .unwrap_or(6.0);
     let tx = conn.transaction()?;
     let outcome = crate::sessions::reconcile_for_frame_set(&tx, frames_set_id, gap_hours)?;
     let summary = match outcome {
         ReconcileOutcome::Unchanged => {
             tx.commit()?;
             tracing::debug!(frames_set_id, "nights unchanged");
-            return Ok(ReconcileSummary { changed: false, nights: 0, sessions: 0 });
+            return Ok(ReconcileSummary {
+                changed: false,
+                nights: 0,
+                sessions: 0,
+            });
         }
         ReconcileOutcome::Rewritten(summary) => summary,
     };
@@ -156,7 +180,11 @@ pub fn reconcile_frame_set_nights(
         sessions = summary.sessions,
         "nights reconciled"
     );
-    Ok(ReconcileSummary { changed: true, nights: summary.nights, sessions: summary.sessions })
+    Ok(ReconcileSummary {
+        changed: true,
+        nights: summary.nights,
+        sessions: summary.sessions,
+    })
 }
 
 /// Merge `source_id` into `target_id`: every source night moves over, the
@@ -169,9 +197,15 @@ pub fn merge_frame_sets(ctx: &ServiceContext, source_id: i64, target_id: i64) ->
     if source_id == target_id {
         return Err(anyhow!("Cannot merge a frame set into itself"));
     }
-    let db = ctx.db.get().ok_or_else(|| anyhow!("Database not initialized"))?;
+    let db = ctx
+        .db
+        .get()
+        .ok_or_else(|| anyhow!("Database not initialized"))?;
     let mut conn = db.conn();
-    let gap_hours = ctx.settings.get_session_gap_threshold_hours(&conn).unwrap_or(6.0);
+    let gap_hours = ctx
+        .settings
+        .get_session_gap_threshold_hours(&conn)
+        .unwrap_or(6.0);
     let tx = conn.transaction()?;
     frame_set_is_custom(&tx, source_id)?;
     frame_set_is_custom(&tx, target_id)?;
@@ -313,24 +347,34 @@ pub fn auto_generate_frame_sets(
 
         // Collaboration: suggest linking a new set whose center falls inside one
         // of my projects' target radius (spec §7 join-first-shoot-later; never
-        // auto-link — the notification is a suggestion).
-        if let Some((ra, dec)) = frame_set_center_deg(&conn, set_id)? {
-            match crate::api::collab::find_matching_projects(&conn, ra, dec, set_id) {
-                Ok(matches) if !matches.is_empty() => {
-                    crate::events::emit_event(
-                        emitter,
-                        "project-set-match",
-                        &crate::api::collab::ProjectSetMatchEvent {
-                            frames_set_id: set_id,
-                            set_name: cluster.name.clone(),
-                            matches,
-                        },
-                    );
+        // auto-link — the notification is a suggestion). A center-read failure
+        // (a corrupt objctra/objctdec, a DB hiccup) must never abort clustering
+        // for every REMAINING cluster in this batch — sweep item 7: warn and
+        // skip the suggestion for this one set, same fail-open shape as the
+        // `find_matching_projects` arm right below it.
+        match frame_set_center_deg(&conn, set_id) {
+            Ok(Some((ra, dec))) => {
+                match crate::api::collab::find_matching_projects(&conn, ra, dec, set_id) {
+                    Ok(matches) if !matches.is_empty() => {
+                        crate::events::emit_event(
+                            emitter,
+                            "project-set-match",
+                            &crate::api::collab::ProjectSetMatchEvent {
+                                frames_set_id: set_id,
+                                set_name: cluster.name.clone(),
+                                matches,
+                            },
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(set_id, error = %format!("{err:#}"), "project match check failed")
+                    }
                 }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(set_id, error = %format!("{err:#}"), "project match check failed")
-                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(set_id, error = %format!("{err:#}"), "frame set center read failed; skipping the collab set-match suggestion for this set");
             }
         }
 
@@ -441,7 +485,8 @@ mod tests {
         )
         .unwrap();
         let night_id = db::create_imaging_night(conn, set_id, start, end).unwrap();
-        let session_id = db::create_session(conn, night_id, "CamA", ids.len() as i32, None).unwrap();
+        let session_id =
+            db::create_session(conn, night_id, "CamA", ids.len() as i32, None).unwrap();
         db::insert_session_members(conn, session_id, ids).unwrap();
     }
 
@@ -461,14 +506,32 @@ mod tests {
             seed_light_at(&conn, 11, "2025-09-13T23:30:00Z");
             seed_light_at(&conn, 12, "2025-09-13T22:36:00Z");
             seed_light_at(&conn, 13, "2025-09-14T01:59:00Z");
-            seed_set_with_night(&conn, 1, "2025-09-13T21:55:00Z", "2025-09-13T23:30:00Z", &[10, 11]);
-            seed_set_with_night(&conn, 2, "2025-09-13T22:36:00Z", "2025-09-14T01:59:00Z", &[12, 13]);
+            seed_set_with_night(
+                &conn,
+                1,
+                "2025-09-13T21:55:00Z",
+                "2025-09-13T23:30:00Z",
+                &[10, 11],
+            );
+            seed_set_with_night(
+                &conn,
+                2,
+                "2025-09-13T22:36:00Z",
+                "2025-09-14T01:59:00Z",
+                &[12, 13],
+            );
         }
 
         merge_frame_sets(&ctx, 2, 1).unwrap();
 
         let conn = ctx.db.get().unwrap().conn();
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = 1"), 1);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = 1"
+            ),
+            1
+        );
         assert_eq!(
             count(
                 &conn,
@@ -477,10 +540,22 @@ mod tests {
             ),
             4
         );
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames_set WHERE id = 2"), 0);
-        assert_eq!(count(&conn, "SELECT is_custom FROM frames_set WHERE id = 1"), 1);
-        assert!(merge_frame_sets(&ctx, 1, 1).is_err(), "self-merge is refused");
-        assert!(merge_frame_sets(&ctx, 99, 1).is_err(), "a missing source is refused");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM frames_set WHERE id = 2"),
+            0
+        );
+        assert_eq!(
+            count(&conn, "SELECT is_custom FROM frames_set WHERE id = 1"),
+            1
+        );
+        assert!(
+            merge_frame_sets(&ctx, 1, 1).is_err(),
+            "self-merge is refused"
+        );
+        assert!(
+            merge_frame_sets(&ctx, 99, 1).is_err(),
+            "a missing source is refused"
+        );
     }
 
     /// (d) An archived set is skipped outright: `Unchanged`, and its
@@ -506,7 +581,13 @@ mod tests {
         assert_eq!((summary.nights, summary.sessions), (0, 0));
 
         let conn = ctx.db.get().unwrap().conn();
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = 1"), 0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = 1"
+            ),
+            0
+        );
     }
 
     /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
@@ -706,6 +787,11 @@ mod tests {
             conn.last_insert_rowid()
         };
         crate::api::frame_sets::set_frame_set_attestation(&ctx, set_id, true).unwrap();
+        #[cfg(all(feature = "render", feature = "solver"))]
+        assert!(
+            crate::api::collab_autopublish::is_set_dirty_for_test(set_id),
+            "set_frame_set_attestation must mark the set dirty for auto-publish"
+        );
         {
             let conn = crate::api::db(&ctx).unwrap().conn();
             assert!(crate::db::collab::frames_set_attested(&conn, set_id).unwrap());

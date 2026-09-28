@@ -324,17 +324,38 @@ pub struct BlockerRow<'a> {
 /// that sentence (and the sibling `"pre-calibration master file missing on
 /// disk"` / raw-originals sentences some day) without over-matching anything
 /// else `evaluate_frame`/`frame_cal_verdict` can ever produce.
+///
+/// `frame_cal_verdict` (`api::collab::frame_cal_verdict`) is the ONE caller
+/// that ever produces a `cal_blocker`, and it runs ONLY
+/// `check_mode_ready(_, ExportMode::CalibratedLights)` — so every substring
+/// here is commented with the exact arm it matches; a `RawWithMasters`/
+/// `RawWithCalibrationSets` sentence never reaches this classifier at all.
 fn is_calibration_reason(f: &str) -> bool {
+    // CalibratedLights: "{n} light(s) have/has no calibration links".
     f.contains("no calibration links")
-        || f.contains("No calibration is linked")
+        // CalibratedLights: "Build masters first — {n} set(s) without a master".
         || f.contains("Build masters first")
-        || f.contains("no master")
+        // CalibratedLights, C-2: "{n} master file(s) missing on disk — restore from archive first".
         || f.contains("missing on disk")
+        // Not a check_mode_ready arm: frame_cal_verdict's own wrapping when
+        // readiness_from_data/collect_export_data itself errored.
         || f.starts_with("could not verify calibration")
+        // Not a check_mode_ready arm: frame_gate_inputs's defensive case for a
+        // frame with no resolvable frames_set (unreachable in practice).
         || f == "frame set unresolved"
 }
+/// Same source as [`is_calibration_reason`] — only the two `CalibratedLights`
+/// arms that name a missing master. Previously also matched a bare
+/// `"no master"`, which was only ever produced by `RawWithMasters`'s
+/// `"…have no master — build masters first"` sentence; `frame_cal_verdict`
+/// never runs that mode, so the substring never matched anything real and is
+/// dropped along with `is_calibration_reason`'s `RawWith*`-only
+/// `"No calibration is linked"`.
 fn is_build_masters_reason(f: &str) -> bool {
-    f.contains("Build masters first") || f.contains("no master") || f.contains("missing on disk")
+    // CalibratedLights: "Build masters first — {n} set(s) without a master".
+    f.contains("Build masters first")
+        // CalibratedLights, C-2: "{n} master file(s) missing on disk — restore from archive first".
+        || f.contains("missing on disk")
 }
 
 /// Spec §7.1 — the table, applied to every row's failure sentences. A row
@@ -375,7 +396,10 @@ pub fn derive_blockers(rows: &[BlockerRow<'_>]) -> Vec<GateBlocker> {
         }
         if r.filter_unresolved {
             names
-                .entry((r.instrume.trim().to_string(), r.filter_raw.trim().to_string()))
+                .entry((
+                    r.instrume.trim().to_string(),
+                    r.filter_raw.trim().to_string(),
+                ))
                 .or_default()
                 .insert(r.frame_id);
         }
@@ -401,8 +425,15 @@ pub fn derive_blockers(rows: &[BlockerRow<'_>]) -> Vec<GateBlocker> {
             Some(GateBlocker {
                 kind: kind.to_string(),
                 frames: ids.len() as i64,
-                sets: sets.get(kind).map(|s| s.iter().copied().collect()).unwrap_or_default(),
-                names: if *kind == "mapFilter" { unmapped.clone() } else { Vec::new() },
+                sets: sets
+                    .get(kind)
+                    .map(|s| s.iter().copied().collect())
+                    .unwrap_or_default(),
+                names: if *kind == "mapFilter" {
+                    unmapped.clone()
+                } else {
+                    Vec::new()
+                },
             })
         })
         .collect()
@@ -482,7 +513,8 @@ mod tests {
     }
 
     /// A fully passing `GateFrameInput` — the base every reason-specific test
-    /// mutates one field of.
+    /// mutates one field of. See the doc comment above; call sites should not
+    /// repeat it.
     fn passing_input() -> GateFrameInput {
         input(Some(analysis(1.2, 0.4, 400, false)))
     }
@@ -564,7 +596,7 @@ mod tests {
     #[test]
     fn filter_reasons_name_the_raw_name_and_the_missing_canonical() {
         use crate::collab::filters::FilterResolution;
-        let mut i = passing_input(); // the existing helper that builds a fully passing GateFrameInput
+        let mut i = passing_input();
         i.filter_raw = String::new();
         i.filter = FilterResolution::Unmapped;
         let row = evaluate_frame(&i, &target(), &[]);
@@ -590,9 +622,8 @@ mod tests {
         i.filter = FilterResolution::MappedToMissing("Hb".into());
         let row = evaluate_frame(&i, &target(), &[]);
         assert!(
-            row.failures
-                .iter()
-                .any(|f| f == "filter \"H\" is mapped to \"Hb\", which is not in this project's dictionary"),
+            row.failures.iter().any(|f| f
+                == "filter \"H\" is mapped to \"Hb\", which is not in this project's dictionary"),
             "{:?}",
             row.failures
         );
@@ -689,7 +720,11 @@ mod tests {
         assert_eq!(by("linkCalibration").sets, vec![10]);
         assert_eq!(by("buildMasters").frames, 1);
         assert_eq!(by("buildMasters").sets, vec![11]);
-        assert_eq!(by("attest").frames, 2, "every calibration reason offers attest");
+        assert_eq!(
+            by("attest").frames,
+            2,
+            "every calibration reason offers attest"
+        );
         assert_eq!(by("attest").sets, vec![10, 11]);
         assert_eq!(by("mapFilter").frames, 3);
         assert_eq!(by("mapFilter").names.len(), 2);
@@ -743,23 +778,39 @@ mod tests {
         };
         // The three ways `check_mode_ready` refuses `CalibratedLights`
         // (`api/lights.rs::check_mode_ready_truth_table` exercises the same
-        // three against the readiness struct itself).
+        // three against the readiness struct itself), each paired with the
+        // ONE blocker kind its sentence must land under — `is_build_masters_reason`
+        // runs before `is_calibration_reason` in `derive_blockers`'s `else if`
+        // chain, so a masters-shaped sentence never also counts as
+        // `linkCalibration` and vice versa.
         let scenarios = [
-            ExportReadiness {
-                raw_sets_without_master: 2,
-                raw_set_ids_without_master: vec![7, 9],
-                ..ready.clone()
-            },
-            ExportReadiness {
-                unlinked_lights: 3,
-                ..ready.clone()
-            },
-            ExportReadiness {
-                missing_master_files: 2,
-                ..ready.clone()
-            },
+            (
+                ExportReadiness {
+                    raw_sets_without_master: 2,
+                    raw_set_ids_without_master: vec![7, 9],
+                    ..ready.clone()
+                },
+                "buildMasters",
+            ),
+            (
+                ExportReadiness {
+                    unlinked_lights: 3,
+                    ..ready.clone()
+                },
+                "linkCalibration",
+            ),
+            (
+                // C-2: a missing master FILE is a masters problem, not a
+                // linking problem — this is the case the C-2 fix was for, so
+                // it is pinned to `buildMasters` specifically, not "either".
+                ExportReadiness {
+                    missing_master_files: 2,
+                    ..ready.clone()
+                },
+                "buildMasters",
+            ),
         ];
-        for r in &scenarios {
+        for (r, expected_kind) in &scenarios {
             let sentence = check_mode_ready(r, ExportMode::CalibratedLights)
                 .expect_err("this scenario must block CalibratedLights");
             let failures = vec![sentence.clone()];
@@ -778,8 +829,8 @@ mod tests {
                 "{sentence:?} landed under threshold: {kinds:?}"
             );
             assert!(
-                kinds.contains(&"buildMasters") || kinds.contains(&"linkCalibration"),
-                "{sentence:?} landed under neither calibration kind: {kinds:?}"
+                kinds.contains(expected_kind),
+                "{sentence:?} must land under {expected_kind}: {kinds:?}"
             );
             assert!(
                 kinds.contains(&"attest"),

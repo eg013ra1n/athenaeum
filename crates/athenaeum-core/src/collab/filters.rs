@@ -61,14 +61,22 @@ pub enum FilterResolution {
 }
 
 impl FilterResolution {
+    /// The canonical name to stamp/announce, when this resolution has one —
+    /// `Mapped`/`Matched` only; `MappedToMissing`/`Unmapped` withhold it
+    /// because neither may reach `ATH_FILT` or the hub (spec §3.2).
     pub fn canonical(&self) -> Option<&str> {
         match self {
             FilterResolution::Mapped(c) | FilterResolution::Matched(c) => Some(c),
             FilterResolution::MappedToMissing(_) | FilterResolution::Unmapped => None,
         }
     }
+    /// `true` when the frame needs a filter-mapping action before it can
+    /// publish — the two variants `canonical()` refuses.
     pub fn is_unresolved(&self) -> bool {
-        matches!(self, FilterResolution::MappedToMissing(_) | FilterResolution::Unmapped)
+        matches!(
+            self,
+            FilterResolution::MappedToMissing(_) | FilterResolution::Unmapped
+        )
     }
 }
 
@@ -82,7 +90,10 @@ pub fn resolve_filter(
 ) -> FilterResolution {
     let raw = raw.trim();
     let instrume = instrume.trim();
-    if let Some(m) = mappings.iter().find(|m| m.instrume == instrume && m.filter_raw == raw) {
+    if let Some(m) = mappings
+        .iter()
+        .find(|m| m.instrume == instrume && m.filter_raw == raw)
+    {
         return if dict.iter().any(|e| e.canonical == m.canonical) {
             FilterResolution::Mapped(m.canonical.clone())
         } else {
@@ -95,19 +106,51 @@ pub fn resolve_filter(
     }
 }
 
-const VENDOR_TOKENS: [&str; 8] = ["filter", "astronomik", "baader", "optolong", "antlia", "chroma", "zwo", "svbony"];
+const VENDOR_TOKENS: [&str; 8] = [
+    "filter",
+    "astronomik",
+    "baader",
+    "optolong",
+    "antlia",
+    "chroma",
+    "zwo",
+    "svbony",
+];
 
 /// The fixed synonym table of spec §3.3 step 4: normalised key → canonical
 /// NAME (matched against the dictionary case-insensitively, its spelling
 /// returned). Single letters h/o/s come from the dev catalog's 4 228 frames.
-const SYNONYMS: [(&str, &str); 26] = [
-    ("l", "L"), ("lum", "L"), ("luminance", "L"), ("clear", "L"),
-    ("r", "R"), ("red", "R"),
-    ("g", "G"), ("green", "G"),
-    ("b", "B"), ("blue", "B"),
-    ("ha", "Ha"), ("h", "Ha"), ("h-alpha", "Ha"), ("halpha", "Ha"), ("h_alpha", "Ha"), ("hα", "Ha"), ("h-a", "Ha"),
-    ("oiii", "OIII"), ("o3", "OIII"), ("o", "OIII"), ("o-iii", "OIII"), ("o_iii", "OIII"),
-    ("sii", "SII"), ("s2", "SII"), ("s", "SII"), ("s-ii", "SII"),
+const SYNONYMS: [(&str, &str); 27] = [
+    ("l", "L"),
+    ("lum", "L"),
+    ("luminance", "L"),
+    ("clear", "L"),
+    ("r", "R"),
+    ("red", "R"),
+    ("g", "G"),
+    ("green", "G"),
+    ("b", "B"),
+    ("blue", "B"),
+    ("ha", "Ha"),
+    ("h", "Ha"),
+    ("h-alpha", "Ha"),
+    ("halpha", "Ha"),
+    ("h_alpha", "Ha"),
+    ("hα", "Ha"),
+    ("h-a", "Ha"),
+    ("oiii", "OIII"),
+    ("o3", "OIII"),
+    ("o", "OIII"),
+    ("o-iii", "OIII"),
+    ("o_iii", "OIII"),
+    ("sii", "SII"),
+    ("s2", "SII"),
+    ("s", "SII"),
+    ("s-ii", "SII"),
+    // "No Filter" drops the vendor token "filter" down to "no" — without this
+    // entry it would fall through to `match_filter`, whose alias list never
+    // has a bare "no" (only "no filter"/"no-filter"/"nofilter").
+    ("no", "None"),
 ];
 
 /// Spec §3.3: lower-case, trim, collapse spaces; drop a trailing `<n>nm`
@@ -129,7 +172,9 @@ pub fn propose_canonical(raw: &str, dict: &[DictionaryEntry]) -> Option<String> 
     if let Some(idx) = key.rfind("nm") {
         if idx + 2 == key.len() {
             let head = key[..idx].trim_end();
-            let digits_start = head.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.').len();
+            let digits_start = head
+                .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
+                .len();
             if digits_start < head.len() {
                 key = head[..digits_start].trim_end().to_string();
             }
@@ -150,11 +195,20 @@ pub fn propose_canonical(raw: &str, dict: &[DictionaryEntry]) -> Option<String> 
             .and_then(|(_, name)| dict.iter().find(|e| e.canonical.eq_ignore_ascii_case(name)))
             .map(|e| e.canonical.clone())
     };
-    let resolved = [joined_space.as_str(), joined_dash.as_str(), joined_under.as_str(), joined_none.as_str()]
-        .into_iter()
-        .find_map(lookup)
-        .or_else(|| match_filter(&joined_space, dict))
-        .or_else(|| match_filter(&joined_none, dict));
+    // Named rather than a bare tail expression: `lookup`/`match_filter` return
+    // owned `String`s cloned out of `dict`, so nothing here actually borrows
+    // past this point — the binding is only to make the synonym-table result
+    // inspectable before the two `match_filter` fallbacks run.
+    let resolved = [
+        joined_space.as_str(),
+        joined_dash.as_str(),
+        joined_under.as_str(),
+        joined_none.as_str(),
+    ]
+    .into_iter()
+    .find_map(lookup)
+    .or_else(|| match_filter(&joined_space, dict))
+    .or_else(|| match_filter(&joined_none, dict));
     resolved
 }
 
@@ -204,26 +258,60 @@ mod tests {
         .unwrap()
     }
     fn map(instrume: &str, raw: &str, canonical: &str) -> crate::db::collab::FilterMappingRow {
-        crate::db::collab::FilterMappingRow { account: "a@x.io".into(), instrume: instrume.into(), filter_raw: raw.into(), canonical: canonical.into() }
+        crate::db::collab::FilterMappingRow {
+            account: "a@x.io".into(),
+            instrume: instrume.into(),
+            filter_raw: raw.into(),
+            canonical: canonical.into(),
+        }
     }
 
     #[test]
     fn resolution_order_mapping_then_alias_then_unmapped() {
         let d = dict();
-        let m = vec![map("QHY268M", "Slot 0", "Ha"), map("QHY268M", "", "None"), map("QHY268M", "L", "None"), map("ASI294", "H", "Hb")];
-        assert_eq!(resolve_filter("Slot 0", "QHY268M", &m, &d), FilterResolution::Mapped("Ha".into()));
-        assert_eq!(resolve_filter("", "QHY268M", &m, &d), FilterResolution::Mapped("None".into()));
+        let m = vec![
+            map("QHY268M", "Slot 0", "Ha"),
+            map("QHY268M", "", "None"),
+            map("QHY268M", "L", "None"),
+            map("ASI294", "H", "Hb"),
+        ];
+        assert_eq!(
+            resolve_filter("Slot 0", "QHY268M", &m, &d),
+            FilterResolution::Mapped("Ha".into())
+        );
+        assert_eq!(
+            resolve_filter("", "QHY268M", &m, &d),
+            FilterResolution::Mapped("None".into())
+        );
         // Explicit mapping beats the alias hit.
-        assert_eq!(resolve_filter("L", "QHY268M", &m, &d), FilterResolution::Mapped("None".into()));
+        assert_eq!(
+            resolve_filter("L", "QHY268M", &m, &d),
+            FilterResolution::Mapped("None".into())
+        );
         // Alias hit without a mapping row, dictionary spelling returned.
-        assert_eq!(resolve_filter(" red ", "QHY268M", &m, &d), FilterResolution::Matched("R".into()));
+        assert_eq!(
+            resolve_filter(" red ", "QHY268M", &m, &d),
+            FilterResolution::Matched("R".into())
+        );
         // Mapping whose canonical the dictionary lacks.
-        assert_eq!(resolve_filter("H", "ASI294", &m, &d), FilterResolution::MappedToMissing("Hb".into()));
+        assert_eq!(
+            resolve_filter("H", "ASI294", &m, &d),
+            FilterResolution::MappedToMissing("Hb".into())
+        );
         // Another camera: the QHY mapping does not apply.
-        assert_eq!(resolve_filter("Slot 0", "ASI294", &m, &d), FilterResolution::Unmapped);
+        assert_eq!(
+            resolve_filter("Slot 0", "ASI294", &m, &d),
+            FilterResolution::Unmapped
+        );
         // Empty raw without a row is always Unmapped (F1), never alias-matched.
-        assert_eq!(resolve_filter("", "ASI294", &m, &d), FilterResolution::Unmapped);
-        assert_eq!(resolve_filter("Slot 0", "QHY268M", &m, &d).canonical(), Some("Ha"));
+        assert_eq!(
+            resolve_filter("", "ASI294", &m, &d),
+            FilterResolution::Unmapped
+        );
+        assert_eq!(
+            resolve_filter("Slot 0", "QHY268M", &m, &d).canonical(),
+            Some("Ha")
+        );
         assert!(resolve_filter("H", "ASI294", &m, &d).is_unresolved());
         assert!(!resolve_filter(" red ", "QHY268M", &m, &d).is_unresolved());
     }
@@ -232,21 +320,47 @@ mod tests {
     fn normaliser_proposes_only_what_the_dictionary_offers() {
         let d = dict();
         for (raw, want) in [
-            ("Red", Some("R")), ("LUM", Some("L")), ("Clear", Some("L")),
-            ("H", Some("Ha")), ("h-alpha", Some("Ha")), ("Ha 3nm", Some("Ha")), ("Baader Ha 3.5nm", Some("Ha")),
-            ("O", Some("OIII")), ("O3", Some("OIII")), ("S", Some("SII")), ("s2", Some("SII")),
+            ("Red", Some("R")),
+            ("LUM", Some("L")),
+            ("Clear", Some("L")),
+            ("H", Some("Ha")),
+            ("h-alpha", Some("Ha")),
+            ("Ha 3nm", Some("Ha")),
+            ("Baader Ha 3.5nm", Some("Ha")),
+            ("ha3nm", Some("Ha")),
+            ("OIII 6.5nm", Some("OIII")),
+            ("O", Some("OIII")),
+            ("O3", Some("OIII")),
+            ("S", Some("SII")),
+            ("s2", Some("SII")),
             ("Astronomik OIII-filter", Some("OIII")),
-            ("Slot 0", None), ("Filter#1", None), ("1", None), ("UV/IR cut", None), ("Dualband", None),
+            ("No Filter", Some("None")),
+            ("Slot 0", None),
+            ("Filter#1", None),
+            ("1", None),
+            ("UV/IR cut", None),
+            ("Dualband", None),
+            // No digit precedes "nm" — the trailing-bandwidth strip must not fire.
+            ("Custom nm", None),
         ] {
             assert_eq!(propose_canonical(raw, &d).as_deref(), want, "{raw:?}");
         }
         // Empty raw: the sole unfiltered entry.
         assert_eq!(propose_canonical("", &d).as_deref(), Some("None"));
         let mut two = d.clone();
-        two.push(DictionaryEntry { canonical: "Open".into(), aliases: vec![], kind: "unfiltered".into() });
-        assert_eq!(propose_canonical("", &two), None, "two unfiltered entries: no proposal");
+        two.push(DictionaryEntry {
+            canonical: "Open".into(),
+            aliases: vec![],
+            kind: "unfiltered".into(),
+        });
+        assert_eq!(
+            propose_canonical("", &two),
+            None,
+            "two unfiltered entries: no proposal"
+        );
         // A synonym whose target the dictionary lacks: alias fallback, then none.
-        let no_ha: Vec<DictionaryEntry> = d.iter().filter(|e| e.canonical != "Ha").cloned().collect();
+        let no_ha: Vec<DictionaryEntry> =
+            d.iter().filter(|e| e.canonical != "Ha").cloned().collect();
         assert_eq!(propose_canonical("H", &no_ha), None);
         // Green is a synonym but this dictionary has no G.
         assert_eq!(propose_canonical("Green", &d), None);

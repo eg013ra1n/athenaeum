@@ -752,7 +752,12 @@ pub struct ProjectFrameView {
     /// key, the same derivation the frame set's Project block uses (Task 7,
     /// spec §8.1). Filled by `api::collab_live::surface::list_collab_frames`;
     /// `None` for a replica row, or when this cache-only builder ran without
-    /// it (`list_project_frames`).
+    /// it (`list_project_frames`). Also `None` for an ADOPTED own row
+    /// (`source_frame_id IS NULL`, `PublishKind::Adopt`): `own_contributor_states`
+    /// keys its own-row map by `source_frame_id`, so a row the manifest
+    /// delivered rather than this device's own generation has no local frame
+    /// to hang a chip off of — it never gets one, by construction, not by an
+    /// explicit "no chip" branch.
     pub contributor_state: Option<String>,
     pub contributor_reason: Option<String>,
 }

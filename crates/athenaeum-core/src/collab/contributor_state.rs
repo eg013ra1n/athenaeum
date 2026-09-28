@@ -64,14 +64,25 @@ pub fn derive(
             (ContributorState::FailsGate, gate_reason.map(str::to_string))
         };
     };
+    // The hub's own-row `state` is one of "pending"/"published"/"rejected"
+    // (the manifest wire contract); anything else is a hub protocol this
+    // build does not know yet. Never silently treated as "published" without
+    // a trace — the fall-through below still resolves it that way (fail-open,
+    // since a contributor's own frame should not go blank on an unrecognized
+    // state), but the drift must be visible.
+    if !matches!(row.state, "rejected" | "published" | "pending") {
+        tracing::warn!(
+            state = row.state,
+            "own contributor state: unknown row state; treated as published"
+        );
+    }
     if row.state == "rejected" {
         return (
             ContributorState::Rejected,
             row.reject_reason.map(str::to_string),
         );
     }
-    let recipe_moved =
-        matches!((row.recipe_hash, current_recipe), (Some(a), Some(b)) if a != b);
+    let recipe_moved = matches!((row.recipe_hash, current_recipe), (Some(a), Some(b)) if a != b);
     if row.state == "published" && !row.on_disk {
         return (ContributorState::PublishedNotOnDisk, None);
     }
@@ -115,18 +126,41 @@ mod tests {
         assert_eq!(s, ContributorState::FailsGate);
         assert_eq!(r.as_deref(), Some("no analysis"));
         assert_eq!(
-            derive(Some(own("pending", Some("r1"), true)), Some("r1"), true, None).0,
+            derive(
+                Some(own("pending", Some("r1"), true)),
+                Some("r1"),
+                true,
+                None
+            )
+            .0,
             ContributorState::PendingApproval
         );
-        let (s, r) = derive(Some(own("published", Some("r1"), true)), Some("r1"), true, None);
+        let (s, r) = derive(
+            Some(own("published", Some("r1"), true)),
+            Some("r1"),
+            true,
+            None,
+        );
         assert_eq!(s, ContributorState::Published);
         assert_eq!(r.as_deref(), Some("v3"));
         assert_eq!(
-            derive(Some(own("published", Some("r1"), true)), Some("r2"), true, None).0,
+            derive(
+                Some(own("published", Some("r1"), true)),
+                Some("r2"),
+                true,
+                None
+            )
+            .0,
             ContributorState::UpdatePending
         );
         assert_eq!(
-            derive(Some(own("pending", Some("r1"), true)), Some("r2"), true, None).0,
+            derive(
+                Some(own("pending", Some("r1"), true)),
+                Some("r2"),
+                true,
+                None
+            )
+            .0,
             ContributorState::UpdatePending
         );
         let (s, r) = derive(
@@ -141,7 +175,13 @@ mod tests {
         assert_eq!(s, ContributorState::Rejected);
         assert_eq!(r.as_deref(), Some("trailed"));
         assert_eq!(
-            derive(Some(own("published", Some("r1"), false)), Some("r1"), true, None).0,
+            derive(
+                Some(own("published", Some("r1"), false)),
+                Some("r1"),
+                true,
+                None
+            )
+            .0,
             ContributorState::PublishedNotOnDisk
         );
         let (s, r) = derive(
@@ -154,11 +194,23 @@ mod tests {
         assert_eq!(r.as_deref(), Some("FWHM 3.4″ > 3.0″"));
         // Not on disk wins over now-fails; update pending wins over now-fails.
         assert_eq!(
-            derive(Some(own("published", Some("r1"), false)), Some("r1"), false, Some("x")).0,
+            derive(
+                Some(own("published", Some("r1"), false)),
+                Some("r1"),
+                false,
+                Some("x")
+            )
+            .0,
             ContributorState::PublishedNotOnDisk
         );
         assert_eq!(
-            derive(Some(own("published", Some("r1"), true)), Some("r2"), false, Some("x")).0,
+            derive(
+                Some(own("published", Some("r1"), true)),
+                Some("r2"),
+                false,
+                Some("x")
+            )
+            .0,
             ContributorState::UpdatePending
         );
         // A recipe the app cannot compute (cannot resolve the light) reads as update pending only if the row had one.
@@ -167,6 +219,9 @@ mod tests {
             ContributorState::Published
         );
         assert_eq!(ContributorState::UpdatePending.key(), "updatePending");
-        assert_eq!(ContributorState::PublishedNotOnDisk.short_label(), "not on disk");
+        assert_eq!(
+            ContributorState::PublishedNotOnDisk.short_label(),
+            "not on disk"
+        );
     }
 }

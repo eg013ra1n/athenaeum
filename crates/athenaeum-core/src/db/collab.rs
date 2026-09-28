@@ -618,7 +618,10 @@ pub struct FilterMappingRow {
 
 /// Every mapping of `account` (lower-cased by the caller — `api::collab`
 /// lower-cases the signed-in e-mail once).
-pub fn filter_mappings_for_account(conn: &Connection, account: &str) -> Result<Vec<FilterMappingRow>> {
+pub fn filter_mappings_for_account(
+    conn: &Connection,
+    account: &str,
+) -> Result<Vec<FilterMappingRow>> {
     let mut stmt = conn.prepare(
         "SELECT account, instrume, filter_raw, canonical FROM collab_filter_mappings \
          WHERE account = ?1 ORDER BY instrume, filter_raw",
@@ -661,7 +664,12 @@ pub fn upsert_filter_mapping(
 
 /// `true` when a row was removed. Trims `instrume`/`filter_raw` (same defence
 /// in depth as [`upsert_filter_mapping`]).
-pub fn delete_filter_mapping(conn: &Connection, account: &str, instrume: &str, filter_raw: &str) -> Result<bool> {
+pub fn delete_filter_mapping(
+    conn: &Connection,
+    account: &str,
+    instrume: &str,
+    filter_raw: &str,
+) -> Result<bool> {
     let instrume = instrume.trim();
     let filter_raw = filter_raw.trim();
     let n = conn.execute(
@@ -674,7 +682,11 @@ pub fn delete_filter_mapping(conn: &Connection, account: &str, instrume: &str, f
 // ── Frame-set attestation (spec 2026-09-28 §6.1) ────────────────────────────
 
 /// `false` when no such set. Clearing also clears `attested_at`.
-pub fn set_frames_set_attestation(conn: &Connection, frames_set_id: i64, attested: bool) -> Result<bool> {
+pub fn set_frames_set_attestation(
+    conn: &Connection,
+    frames_set_id: i64,
+    attested: bool,
+) -> Result<bool> {
     let n = if attested {
         conn.execute(
             "UPDATE frames_set SET calibrated_externally = 1, attested_at = datetime('now') WHERE id = ?1",
@@ -689,6 +701,8 @@ pub fn set_frames_set_attestation(conn: &Connection, frames_set_id: i64, atteste
     Ok(n > 0)
 }
 
+/// `false` when no such set (the same "missing row reads as unattested"
+/// convention as everywhere else in this module).
 pub fn frames_set_attested(conn: &Connection, frames_set_id: i64) -> Result<bool> {
     let v: Option<i64> = conn
         .query_row(
@@ -697,7 +711,7 @@ pub fn frames_set_attested(conn: &Connection, frames_set_id: i64) -> Result<bool
             |r| r.get(0),
         )
         .optional()?;
-    Ok(v == Some(1))
+    Ok(v.unwrap_or(0) != 0)
 }
 
 #[cfg(test)]
@@ -1151,22 +1165,43 @@ mod tests {
         assert_eq!(a.len(), 2);
         let slot = a.iter().find(|m| m.filter_raw == "Slot 0").unwrap();
         assert_eq!(slot.canonical, "Ha");
-        assert_eq!(a.iter().find(|m| m.filter_raw.is_empty()).unwrap().canonical, "None");
-        assert_eq!(filter_mappings_for_account(&conn, "b@x.io").unwrap()[0].canonical, "R");
-        assert!(filter_mappings_for_account(&conn, "nobody@x.io").unwrap().is_empty());
+        assert_eq!(
+            a.iter()
+                .find(|m| m.filter_raw.is_empty())
+                .unwrap()
+                .canonical,
+            "None"
+        );
+        assert_eq!(
+            filter_mappings_for_account(&conn, "b@x.io").unwrap()[0].canonical,
+            "R"
+        );
+        assert!(filter_mappings_for_account(&conn, "nobody@x.io")
+            .unwrap()
+            .is_empty());
 
         // A padded key trims to the SAME row (defence in depth — the gate
         // compares trimmed keys, so an untrimmed caller must not fork it).
         upsert_filter_mapping(&conn, "a@x.io", " QHY268M ", " Slot 0 ", "L").unwrap();
         let a = filter_mappings_for_account(&conn, "a@x.io").unwrap();
-        assert_eq!(a.len(), 2, "the padded key updated the existing row, not a new one");
+        assert_eq!(
+            a.len(),
+            2,
+            "the padded key updated the existing row, not a new one"
+        );
         let slot = a.iter().find(|m| m.filter_raw == "Slot 0").unwrap();
         assert_eq!(slot.instrume, "QHY268M");
         assert_eq!(slot.canonical, "L");
 
-        assert!(delete_filter_mapping(&conn, "a@x.io", " QHY268M ", " Slot 0 ").unwrap(), "a padded key also deletes the trimmed row");
+        assert!(
+            delete_filter_mapping(&conn, "a@x.io", " QHY268M ", " Slot 0 ").unwrap(),
+            "a padded key also deletes the trimmed row"
+        );
         assert!(!delete_filter_mapping(&conn, "a@x.io", "QHY268M", "Slot 0").unwrap());
-        assert_eq!(filter_mappings_for_account(&conn, "a@x.io").unwrap().len(), 1);
+        assert_eq!(
+            filter_mappings_for_account(&conn, "a@x.io").unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -1174,22 +1209,47 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Database::new(tmp.path().join("c.db")).unwrap();
         let conn = db.conn();
-        conn.execute("INSERT INTO frames_set (name) VALUES ('S')", []).unwrap();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('S')", [])
+            .unwrap();
         let id = conn.last_insert_rowid();
         assert!(!frames_set_attested(&conn, id).unwrap());
         assert!(set_frames_set_attestation(&conn, id, true).unwrap());
         assert!(frames_set_attested(&conn, id).unwrap());
-        let at: Option<String> = conn.query_row("SELECT attested_at FROM frames_set WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        let at: Option<String> = conn
+            .query_row(
+                "SELECT attested_at FROM frames_set WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(at.is_some());
         assert!(set_frames_set_attestation(&conn, id, false).unwrap());
         assert!(!frames_set_attested(&conn, id).unwrap());
-        let at: Option<String> = conn.query_row("SELECT attested_at FROM frames_set WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        let at: Option<String> = conn
+            .query_row(
+                "SELECT attested_at FROM frames_set WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(at.is_none());
         assert!(!set_frames_set_attestation(&conn, 9999, true).unwrap());
         // The set reader carries the flag.
         set_frames_set_attestation(&conn, id, true).unwrap();
-        let (set, _) = crate::db::get_frames_sets_by_project(&conn, 1).unwrap().into_iter().find(|(s, _)| s.id == Some(id)).unwrap();
+        let (set, _) = crate::db::get_frames_sets_by_project(&conn, 1)
+            .unwrap()
+            .into_iter()
+            .find(|(s, _)| s.id == Some(id))
+            .unwrap();
         assert!(set.calibrated_externally);
         assert!(set.attested_at.is_some());
+    }
+
+    #[test]
+    fn frames_set_attested_missing_id_reads_as_unattested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::new(tmp.path().join("c.db")).unwrap();
+        let conn = db.conn();
+        assert!(!frames_set_attested(&conn, 9999).unwrap());
     }
 }

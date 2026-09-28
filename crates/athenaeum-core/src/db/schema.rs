@@ -1,8 +1,13 @@
 use rusqlite::{Connection, OptionalExtension, Result};
 
 pub const UUID_TABLES: [&str; 7] = [
-    "files", "frames", "frames_set", "sessions",
-    "calibration_set", "tags", "export_templates",
+    "files",
+    "frames",
+    "frames_set",
+    "sessions",
+    "calibration_set",
+    "tags",
+    "export_templates",
 ];
 
 /// (Re)create the `calibration_set_empty_prune` trigger (B2). Factored out so
@@ -23,7 +28,9 @@ pub const UUID_TABLES: [&str; 7] = [
 ///   so pruning such a set would abort the caller's own DELETE with a
 ///   foreign-key failure (and losing the row would orphan the master's
 ///   provenance anchor even if it didn't).
-pub(crate) fn create_calibration_set_empty_prune_trigger(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn create_calibration_set_empty_prune_trigger(
+    conn: &Connection,
+) -> rusqlite::Result<()> {
     conn.execute(
         "CREATE TRIGGER IF NOT EXISTS calibration_set_empty_prune
          AFTER DELETE ON calibration_set_frames
@@ -938,10 +945,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_frames_instrume_stats ON frames(instrume, exptime, date_obs)",
         [],
     )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_frames_ra ON frames(ra)",
-        [],
-    )?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_ra ON frames(ra)", [])?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_frames_dec ON frames(dec)",
         [],
@@ -1397,9 +1401,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // Idempotent (a no-op once all rows are fingerprinted); non-fatal so a
     // backfill hiccup never blocks startup.
     match super::operations::backfill_null_header_fingerprints(conn) {
-        Ok(n) if n > 0 => tracing::info!(table = "fits_header", count = n, "backfilled legacy header fingerprints"),
+        Ok(n) if n > 0 => tracing::info!(
+            table = "fits_header",
+            count = n,
+            "backfilled legacy header fingerprints"
+        ),
         Ok(_) => {}
-        Err(e) => tracing::warn!(table = "fits_header", error = %e, "header-fingerprint backfill skipped (non-fatal)"),
+        Err(e) => {
+            tracing::warn!(table = "fits_header", error = %e, "header-fingerprint backfill skipped (non-fatal)")
+        }
     }
 
     // Add content_hash to files table (migration for existing databases)
@@ -1409,10 +1419,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_content_hash {
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN content_hash TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE files ADD COLUMN content_hash TEXT", [])?;
     }
 
     // Full-file hash, used ONLY to decide master/processed duplicates.
@@ -1453,7 +1460,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         if n > 0 {
             conn.execute("DROP INDEX IF EXISTS idx_files_metadata_hash", [])?;
             conn.execute("ALTER TABLE files DROP COLUMN metadata_hash", [])?;
-            tracing::info!(table = "files", column = "metadata_hash", "dropped write-only column");
+            tracing::info!(
+                table = "files",
+                column = "metadata_hash",
+                "dropped write-only column"
+            );
         }
     }
 
@@ -1464,10 +1475,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_date_obs_start {
-        conn.execute(
-            "ALTER TABLE frames_set ADD COLUMN date_obs_start TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frames_set ADD COLUMN date_obs_start TEXT", [])?;
     }
 
     // Add date_obs_end to frames_set table (migration for existing databases)
@@ -1477,10 +1485,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_date_obs_end {
-        conn.execute(
-            "ALTER TABLE frames_set ADD COLUMN date_obs_end TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frames_set ADD COLUMN date_obs_end TEXT", [])?;
     }
 
     // Add flat_pattern to frames_set table (migration for existing databases)
@@ -1490,17 +1495,17 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_flat_pattern {
-        conn.execute(
-            "ALTER TABLE frames_set ADD COLUMN flat_pattern TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frames_set ADD COLUMN flat_pattern TEXT", [])?;
     }
 
     // Contributor path (spec 2026-09-28 §6.1, F5): "calibrated by an
     // external tool" — the user's word that the lights are already
     // calibrated single-channel frames; projects seed them in place.
     if !column_exists(conn, "frames_set", "calibrated_externally")? {
-        conn.execute("ALTER TABLE frames_set ADD COLUMN calibrated_externally INTEGER NOT NULL DEFAULT 0", [])?;
+        conn.execute(
+            "ALTER TABLE frames_set ADD COLUMN calibrated_externally INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
     }
     if !column_exists(conn, "frames_set", "attested_at")? {
         conn.execute("ALTER TABLE frames_set ADD COLUMN attested_at TEXT", [])?;
@@ -1527,10 +1532,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_telescop {
-        conn.execute(
-            "ALTER TABLE calibration_set ADD COLUMN telescop TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE calibration_set ADD COLUMN telescop TEXT", [])?;
     }
 
     // Add unique_camera to scan_roots table (migration for existing databases)
@@ -1555,10 +1557,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_bayerpat {
-        conn.execute(
-            "ALTER TABLE frames ADD COLUMN bayerpat TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frames ADD COLUMN bayerpat TEXT", [])?;
     }
 
     // Add xbayroff/ybayroff/roworder to frames table (migration for existing databases)
@@ -1571,10 +1570,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_xbayroff {
-        conn.execute(
-            "ALTER TABLE frames ADD COLUMN xbayroff INTEGER",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frames ADD COLUMN xbayroff INTEGER", [])?;
     }
 
     let has_ybayroff: Result<i64, _> = conn.query_row(
@@ -1583,10 +1579,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_ybayroff {
-        conn.execute(
-            "ALTER TABLE frames ADD COLUMN ybayroff INTEGER",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frames ADD COLUMN ybayroff INTEGER", [])?;
     }
 
     let has_roworder: Result<i64, _> = conn.query_row(
@@ -1595,10 +1588,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_roworder {
-        conn.execute(
-            "ALTER TABLE frames ADD COLUMN roworder TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frames ADD COLUMN roworder TEXT", [])?;
     }
 
     // Add rotation to frames table (migration for existing databases)
@@ -1609,10 +1599,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_rotation {
-        conn.execute(
-            "ALTER TABLE frames ADD COLUMN rotation REAL",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frames ADD COLUMN rotation REAL", [])?;
     }
 
     // Add rotation stats to frames_set table (migration for existing databases)
@@ -1796,10 +1783,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_median_beta {
-        conn.execute(
-            "ALTER TABLE frame_analysis ADD COLUMN median_beta REAL",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frame_analysis ADD COLUMN median_beta REAL", [])?;
     }
 
     // Migration: rename snr_db → frame_snr (rustafits 0.7.1)
@@ -1809,7 +1793,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(1) = has_snr_db {
-        conn.execute("ALTER TABLE frame_analysis RENAME COLUMN snr_db TO frame_snr", [])?;
+        conn.execute(
+            "ALTER TABLE frame_analysis RENAME COLUMN snr_db TO frame_snr",
+            [],
+        )?;
     }
 
     // Calibration set originals table - stores original metadata values before custom edits
@@ -1882,10 +1869,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             "ALTER TABLE plate_solves ADD COLUMN expected_catalog_stars_in_fov INTEGER",
             [],
         )?;
-        conn.execute(
-            "ALTER TABLE plate_solves ADD COLUMN inlier_ratio REAL",
-            [],
-        )?;
+        conn.execute("ALTER TABLE plate_solves ADD COLUMN inlier_ratio REAL", [])?;
     }
 
     // Add archived_at to frames_set table (ZIP archive feature)
@@ -1895,10 +1879,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_archived_at {
-        conn.execute(
-            "ALTER TABLE frames_set ADD COLUMN archived_at TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE frames_set ADD COLUMN archived_at TEXT", [])?;
     }
 
     // Add archive_operation_id to frames_set table (ZIP archive feature)
@@ -1934,10 +1915,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_archive_zip_path {
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN archive_zip_path TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE files ADD COLUMN archive_zip_path TEXT", [])?;
     }
 
     // Add archive_path_in_zip to files table (ZIP archive feature)
@@ -1947,10 +1925,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     );
     if let Ok(0) = has_archive_path_in_zip {
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN archive_path_in_zip TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE files ADD COLUMN archive_path_in_zip TEXT", [])?;
     }
 
     // ---- Phase 2: calibration library ----
@@ -2116,7 +2091,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         // FK constraints live on the child side, so checking these covers
         // both directions — rather than a whole-DB check, so an unrelated
         // pre-existing violation elsewhere can't brick catalog startup.
-        for table in ["archive_operations", "archive_operation_files", "archive_operation_steps"] {
+        for table in [
+            "archive_operations",
+            "archive_operation_files",
+            "archive_operation_steps",
+        ] {
             let violations: i64 = conn.query_row(
                 &format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{table}')"),
                 [],
@@ -2133,7 +2112,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             }
         }
         // Recreate the two indexes the rebuild dropped
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_ops_status ON archive_operations(status)", [])?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_archive_ops_status ON archive_operations(status)",
+            [],
+        )?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_ops_frames_set ON archive_operations(frames_set_id)", [])?;
     }
     // calibration_set_id is guaranteed to exist by this point on both a
@@ -3389,19 +3371,27 @@ mod identity_schema_tests {
     fn catalog_meta_seeded_once_and_stable() {
         let conn = mem_db();
         let (uuid1, ver): (String, i64) = conn
-            .query_row("SELECT catalog_uuid, schema_version FROM catalog_meta WHERE id = 1", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT catalog_uuid, schema_version FROM catalog_meta WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(ver, 1);
         assert_eq!(uuid1.len(), 36, "catalog_uuid must be a hyphenated UUID");
         // re-running init_db must NOT regenerate the uuid
         init_db(&conn).unwrap();
         let uuid2: String = conn
-            .query_row("SELECT catalog_uuid FROM catalog_meta WHERE id = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT catalog_uuid FROM catalog_meta WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(uuid1, uuid2);
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM catalog_meta", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM catalog_meta", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -3436,15 +3426,17 @@ mod identity_schema_tests {
         // impossible after init_db, so emulate by clearing uuid on an inserted row and
         // re-running init_db (backfill must repair NULL uuids idempotently).
         let conn = mem_db();
-        conn.execute(
-            "INSERT INTO tags (name, color) VALUES ('legacy', NULL)", [],
-        ).unwrap();
-        conn.execute("UPDATE tags SET uuid = NULL, updated_at = NULL", []).unwrap();
+        conn.execute("INSERT INTO tags (name, color) VALUES ('legacy', NULL)", [])
+            .unwrap();
+        conn.execute("UPDATE tags SET uuid = NULL, updated_at = NULL", [])
+            .unwrap();
         init_db(&conn).unwrap();
         let (u, ts): (Option<String>, Option<String>) = conn
-            .query_row("SELECT uuid, updated_at FROM tags WHERE name='legacy'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT uuid, updated_at FROM tags WHERE name='legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         let u = u.expect("uuid backfilled");
         assert_eq!(u.len(), 36);
@@ -3599,10 +3591,17 @@ mod identity_schema_tests {
         )
         .unwrap();
         let file_id: i64 = conn
-            .query_row("SELECT id FROM files WHERE path = '/data/a.fits'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM files WHERE path = '/data/a.fits'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        conn.execute("INSERT INTO frames (file_id, object) VALUES (?1, 'M42')", rusqlite::params![file_id])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO frames (file_id, object) VALUES (?1, 'M42')",
+            rusqlite::params![file_id],
+        )
+        .unwrap();
 
         // 3) Seed a row in every transfer table (all shapes are already correct here).
         conn.execute(
@@ -3670,7 +3669,11 @@ mod identity_schema_tests {
         .unwrap();
         assert!(!column_exists(&conn, "sync_inbound", "batch_uuid").unwrap());
         for t in transfer_tables {
-            assert_eq!(count(&conn, t), 1, "seed: {t} has one row before the upgrade wipe");
+            assert_eq!(
+                count(&conn, t),
+                1,
+                "seed: {t} has one row before the upgrade wipe"
+            );
         }
 
         // 5) Upgrade init: the wipe fires (batch_uuid absent) and empties every
@@ -3679,8 +3682,16 @@ mod identity_schema_tests {
         for t in transfer_tables {
             assert_eq!(count(&conn, t), 0, "upgrade wipe emptied {t}");
         }
-        assert_eq!(count(&conn, "files"), 1, "catalog files row survives the wipe");
-        assert_eq!(count(&conn, "frames"), 1, "catalog frames row survives the wipe");
+        assert_eq!(
+            count(&conn, "files"),
+            1,
+            "catalog files row survives the wipe"
+        );
+        assert_eq!(
+            count(&conn, "frames"),
+            1,
+            "catalog frames row survives the wipe"
+        );
         // The batch-model columns + unique index now exist.
         assert!(column_exists(&conn, "sync_inbound", "batch_uuid").unwrap());
         assert!(column_exists(&conn, "sync_inbound", "project_id").unwrap());
@@ -3703,8 +3714,16 @@ mod identity_schema_tests {
         )
         .unwrap();
         init_db(&conn).unwrap();
-        assert_eq!(count(&conn, "sync_outbound"), 1, "second init must NOT re-wipe (sentinel survives)");
-        assert_eq!(count(&conn, "files"), 1, "catalog still intact after the second init");
+        assert_eq!(
+            count(&conn, "sync_outbound"),
+            1,
+            "second init must NOT re-wipe (sentinel survives)"
+        );
+        assert_eq!(
+            count(&conn, "files"),
+            1,
+            "catalog still intact after the second init"
+        );
     }
 
     /// Transfers Batch Model (review fix, tvb B2): a beta.1/beta.2 DB predates
@@ -3751,10 +3770,17 @@ mod identity_schema_tests {
         )
         .unwrap();
         let file_id: i64 = conn
-            .query_row("SELECT id FROM files WHERE path = '/data/b.fits'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM files WHERE path = '/data/b.fits'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        conn.execute("INSERT INTO frames (file_id, object) VALUES (?1, 'M31')", rusqlite::params![file_id])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO frames (file_id, object) VALUES (?1, 'M31')",
+            rusqlite::params![file_id],
+        )
+        .unwrap();
 
         // 3) Seed the beta.1-era tables — sync_outbound / sync_history — with rows.
         conn.execute(
@@ -3774,18 +3800,45 @@ mod identity_schema_tests {
         //    only in beta.3 / Task 11) — drop it entirely, not just its batch_uuid
         //    column.
         conn.execute("DROP TABLE sync_inbound", []).unwrap();
-        assert!(!table_exists(&conn, "sync_inbound"), "sanity: sync_inbound absent (the beta.1 shape)");
-        assert_eq!(count(&conn, "sync_outbound"), 1, "seed: sync_outbound has one row before the upgrade wipe");
-        assert_eq!(count(&conn, "sync_history"), 1, "seed: sync_history has one row before the upgrade wipe");
+        assert!(
+            !table_exists(&conn, "sync_inbound"),
+            "sanity: sync_inbound absent (the beta.1 shape)"
+        );
+        assert_eq!(
+            count(&conn, "sync_outbound"),
+            1,
+            "seed: sync_outbound has one row before the upgrade wipe"
+        );
+        assert_eq!(
+            count(&conn, "sync_history"),
+            1,
+            "seed: sync_history has one row before the upgrade wipe"
+        );
 
         // 5) Upgrade init: the wipe must fire — sync_inbound is absent, but the
         //    legacy sync_outbound/sync_history tables are present — emptying both;
         //    the catalog is untouched.
         init_db(&conn).unwrap();
-        assert_eq!(count(&conn, "sync_outbound"), 0, "upgrade wipe emptied sync_outbound");
-        assert_eq!(count(&conn, "sync_history"), 0, "upgrade wipe emptied sync_history");
-        assert_eq!(count(&conn, "files"), 1, "catalog files row survives the wipe");
-        assert_eq!(count(&conn, "frames"), 1, "catalog frames row survives the wipe");
+        assert_eq!(
+            count(&conn, "sync_outbound"),
+            0,
+            "upgrade wipe emptied sync_outbound"
+        );
+        assert_eq!(
+            count(&conn, "sync_history"),
+            0,
+            "upgrade wipe emptied sync_history"
+        );
+        assert_eq!(
+            count(&conn, "files"),
+            1,
+            "catalog files row survives the wipe"
+        );
+        assert_eq!(
+            count(&conn, "frames"),
+            1,
+            "catalog frames row survives the wipe"
+        );
         // sync_inbound is recreated, migrated, with the flag present.
         assert!(table_exists(&conn, "sync_inbound"));
         assert!(column_exists(&conn, "sync_inbound", "batch_uuid").unwrap());
@@ -3798,14 +3851,24 @@ mod identity_schema_tests {
         )
         .unwrap();
         init_db(&conn).unwrap();
-        assert_eq!(count(&conn, "sync_outbound"), 1, "second init must NOT re-wipe (sentinel survives)");
-        assert_eq!(count(&conn, "files"), 1, "catalog still intact after the second init");
+        assert_eq!(
+            count(&conn, "sync_outbound"),
+            1,
+            "second init must NOT re-wipe (sentinel survives)"
+        );
+        assert_eq!(
+            count(&conn, "files"),
+            1,
+            "catalog still intact after the second init"
+        );
     }
 
     fn assert_v4_shape(u: &str) {
         assert_eq!(u.len(), 36);
         let b: Vec<char> = u.chars().collect();
-        for i in [8, 13, 18, 23] { assert_eq!(b[i], '-', "dash at {i} in {u}"); }
+        for i in [8, 13, 18, 23] {
+            assert_eq!(b[i], '-', "dash at {i} in {u}");
+        }
         assert_eq!(b[14], '4', "version nibble in {u}");
         assert!("89ab".contains(b[19]), "variant nibble in {u}");
     }
@@ -3813,11 +3876,14 @@ mod identity_schema_tests {
     #[test]
     fn insert_trigger_fills_uuid_and_updated_at() {
         let conn = mem_db();
-        conn.execute("INSERT INTO tags (name, color) VALUES ('t1', NULL)", []).unwrap();
+        conn.execute("INSERT INTO tags (name, color) VALUES ('t1', NULL)", [])
+            .unwrap();
         let (u, ts): (String, String) = conn
-            .query_row("SELECT uuid, updated_at FROM tags WHERE name='t1'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT uuid, updated_at FROM tags WHERE name='t1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_v4_shape(&u);
         assert!(ts.ends_with('Z') && ts.contains('T'));
@@ -3826,15 +3892,33 @@ mod identity_schema_tests {
     #[test]
     fn update_trigger_bumps_updated_at_but_respects_explicit_set() {
         let conn = mem_db();
-        conn.execute("INSERT INTO tags (name, color) VALUES ('t2', NULL)", []).unwrap();
-        let ts0: String = conn.query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO tags (name, color) VALUES ('t2', NULL)", [])
+            .unwrap();
+        let ts0: String = conn
+            .query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        conn.execute("UPDATE tags SET color = 'red' WHERE name='t2'", []).unwrap();
-        let ts1: String = conn.query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| r.get(0)).unwrap();
+        conn.execute("UPDATE tags SET color = 'red' WHERE name='t2'", [])
+            .unwrap();
+        let ts1: String = conn
+            .query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_ne!(ts0, ts1, "touch trigger must bump updated_at");
         // explicit set wins (future sync import path)
-        conn.execute("UPDATE tags SET color='blue', updated_at='2020-01-01T00:00:00.000Z' WHERE name='t2'", []).unwrap();
-        let ts2: String = conn.query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "UPDATE tags SET color='blue', updated_at='2020-01-01T00:00:00.000Z' WHERE name='t2'",
+            [],
+        )
+        .unwrap();
+        let ts2: String = conn
+            .query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(ts2, "2020-01-01T00:00:00.000Z");
     }
 
@@ -3854,8 +3938,14 @@ mod identity_schema_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(u, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "identity trigger must not clobber explicit uuid");
-        assert_eq!(ts, "2021-06-01T12:00:00.000Z", "identity trigger must preserve explicit updated_at");
+        assert_eq!(
+            u, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "identity trigger must not clobber explicit uuid"
+        );
+        assert_eq!(
+            ts, "2021-06-01T12:00:00.000Z",
+            "identity trigger must preserve explicit updated_at"
+        );
     }
 
     #[test]
@@ -3866,10 +3956,17 @@ mod identity_schema_tests {
             [],
         ).unwrap();
         let (u, ts): (Option<String>, String) = conn
-            .query_row("SELECT uuid, updated_at FROM tags WHERE name='q3'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT uuid, updated_at FROM tags WHERE name='q3'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert!(u.is_some(), "uuid generated");
-        assert_eq!(ts, "2022-03-03T03:03:03.000Z", "explicit updated_at must survive the trigger cascade");
+        assert_eq!(
+            ts, "2022-03-03T03:03:03.000Z",
+            "explicit updated_at must survive the trigger cascade"
+        );
     }
 
     #[test]
@@ -3880,10 +3977,17 @@ mod identity_schema_tests {
             [],
         ).unwrap();
         let (u, ts): (String, Option<String>) = conn
-            .query_row("SELECT uuid, updated_at FROM tags WHERE name='q2'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT uuid, updated_at FROM tags WHERE name='q2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(u, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff");
-        assert!(ts.is_some(), "updated_at must be filled at insert, not at next startup");
+        assert!(
+            ts.is_some(),
+            "updated_at must be filled at insert, not at next startup"
+        );
     }
 }
 
@@ -3896,12 +4000,18 @@ mod archive_schema_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        for table in &["archive_operations", "archive_operation_files", "archive_operation_steps"] {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                [table],
-                |row| row.get(0),
-            ).unwrap();
+        for table in &[
+            "archive_operations",
+            "archive_operation_files",
+            "archive_operation_steps",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(count, 1, "expected table {} to exist", table);
         }
     }
@@ -3911,12 +4021,18 @@ mod archive_schema_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        for table in &["file_operations", "file_operation_files", "file_operation_steps"] {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                [table],
-                |row| row.get(0),
-            ).unwrap();
+        for table in &[
+            "file_operations",
+            "file_operation_files",
+            "file_operation_steps",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(count, 1, "expected table {} to exist", table);
         }
     }
@@ -3928,21 +4044,29 @@ mod archive_schema_tests {
 
         // frames_set columns
         for col in &["archived_at", "archive_operation_id"] {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name=?1",
-                [col],
-                |row| row.get(0),
-            ).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name=?1",
+                    [col],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(count, 1, "expected frames_set.{} to exist", col);
         }
 
         // files columns
-        for col in &["archived_in_operation", "archive_zip_path", "archive_path_in_zip"] {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name=?1",
-                [col],
-                |row| row.get(0),
-            ).unwrap();
+        for col in &[
+            "archived_in_operation",
+            "archive_zip_path",
+            "archive_path_in_zip",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name=?1",
+                    [col],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(count, 1, "expected files.{} to exist", col);
         }
     }
@@ -3951,16 +4075,23 @@ mod archive_schema_tests {
         conn.execute(
             "INSERT INTO calibration_set (id, imagetyp, date) VALUES (?1, ?2, '2025-01-01')",
             rusqlite::params![id, imagetyp],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
-    fn insert_subcal_link(conn: &Connection, source_id: i64, target_id: i64, calibration_type: &str) {
+    fn insert_subcal_link(
+        conn: &Connection,
+        source_id: i64,
+        target_id: i64,
+        calibration_type: &str,
+    ) {
         conn.execute(
             "INSERT INTO calibration_set_to_frames
              (source_id, source_type, calibration_set_id, calibration_type, matched_at)
              VALUES (?1, 'calibration_set', ?2, ?3, '2025-01-01T00:00:00Z')",
             rusqlite::params![source_id, target_id, calibration_type],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3981,12 +4112,16 @@ mod archive_schema_tests {
             [], |r| r.get(0)).unwrap();
         assert_eq!(before, 1, "sub-cal link should be present before delete");
 
-        conn.execute("DELETE FROM calibration_set WHERE id = 100", []).unwrap();
+        conn.execute("DELETE FROM calibration_set WHERE id = 100", [])
+            .unwrap();
 
         let after: i64 = conn.query_row(
             "SELECT COUNT(*) FROM calibration_set_to_frames WHERE source_id=100 AND source_type='calibration_set'",
             [], |r| r.get(0)).unwrap();
-        assert_eq!(after, 0, "trigger must have removed the orphaned sub-cal link");
+        assert_eq!(
+            after, 0,
+            "trigger must have removed the orphaned sub-cal link"
+        );
     }
 
     #[test]
@@ -4105,11 +4240,13 @@ mod archive_schema_tests {
                 format!("/test/dummy_{}.fits", id),
                 format!("dummy_{}.fits", id),
             ],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO frames (id, file_id) VALUES (?1, ?2)",
             rusqlite::params![id, file_id],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4127,23 +4264,33 @@ mod archive_schema_tests {
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (500, 7000)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Sanity: the set is present.
-        let before: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = 500",
-            [], |r| r.get(0)).unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 500",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(before, 1);
 
         // Deleting the lone member triggers the prune.
         conn.execute(
             "DELETE FROM calibration_set_frames WHERE set_id = 500 AND frame_id = 7000",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let after: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = 500",
-            [], |r| r.get(0)).unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 500",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(after, 0, "trigger must prune empty parent set");
     }
 
@@ -4159,22 +4306,29 @@ mod archive_schema_tests {
             "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
              VALUES (501, 'MasterDark', '2025-01-01', 1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         insert_dummy_frame(&conn, 7001);
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (501, 7001)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
-        conn.execute(
-            "DELETE FROM calibration_set_frames WHERE set_id = 501",
-            [],
-        ).unwrap();
+        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 501", [])
+            .unwrap();
 
-        let still_there: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = 501",
-            [], |r| r.get(0)).unwrap();
-        assert_eq!(still_there, 1, "master library sets must survive losing their member");
+        let still_there: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 501",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_there, 1,
+            "master library sets must survive losing their member"
+        );
     }
 
     #[test]
@@ -4188,17 +4342,25 @@ mod archive_schema_tests {
         // adding any membership rows.
         insert_dummy_calibration_set(&conn, 502, "Bias");
 
-        let before: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = 502",
-            [], |r| r.get(0)).unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 502",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(before, 1);
 
         // Re-run init_db to fire the sweep.
         init_db(&conn).unwrap();
 
-        let after: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = 502",
-            [], |r| r.get(0)).unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 502",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(after, 0, "startup sweep should remove the empty set");
     }
 
@@ -4213,11 +4375,13 @@ mod archive_schema_tests {
             "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
              VALUES (?1, 'MasterDark', '2025-01-01', 1)",
             [master_id],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
             rusqlite::params![master_id, raw_id],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO master_provenance
              (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
@@ -4228,7 +4392,8 @@ mod archive_schema_tests {
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![raw_id, frame_id],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4238,12 +4403,20 @@ mod archive_schema_tests {
         seed_superseded_set(&conn, 510, 511, 7010);
 
         // Must neither FK-error nor prune the frozen set.
-        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 510", []).unwrap();
+        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 510", [])
+            .unwrap();
 
-        let still_there: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = 510",
-            [], |r| r.get(0)).unwrap();
-        assert_eq!(still_there, 1, "superseded set must survive losing its members");
+        let still_there: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 510",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_there, 1,
+            "superseded set must survive losing its members"
+        );
     }
 
     #[test]
@@ -4254,13 +4427,18 @@ mod archive_schema_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         seed_superseded_set(&conn, 512, 513, 7011);
-        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 512", []).unwrap();
+        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 512", [])
+            .unwrap();
 
         init_db(&conn).unwrap();
 
-        let still_there: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = 512",
-            [], |r| r.get(0)).unwrap();
+        let still_there: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 512",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(still_there, 1, "startup sweep must spare superseded sets");
     }
 
@@ -4411,7 +4589,8 @@ mod archive_schema_tests {
         // Lineage set 514 (raw, superseded by master 515, provenance anchor)
         // whose sole member we then remove, leaving it an empty shell.
         seed_superseded_set(&conn, 514, 515, 7012);
-        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 514", []).unwrap();
+        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 514", [])
+            .unwrap();
 
         // Plain orphan 516: no members, no references — pure zombie.
         insert_dummy_calibration_set(&conn, 516, "Bias");
@@ -4419,17 +4598,32 @@ mod archive_schema_tests {
         let pruned = super::prune_orphaned_calibration_sets(&conn).unwrap();
         assert_eq!(pruned, 1, "only the plain orphan should be pruned");
 
-        let lineage: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = 514",
-            [], |r| r.get(0)).unwrap();
-        assert_eq!(lineage, 1, "superseded/provenance-anchor shell must survive");
-        let provenance: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM master_provenance WHERE source_set_id = 514",
-            [], |r| r.get(0)).unwrap();
+        let lineage: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 514",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lineage, 1,
+            "superseded/provenance-anchor shell must survive"
+        );
+        let provenance: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM master_provenance WHERE source_set_id = 514",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(provenance, 1, "provenance row must be preserved intact");
-        let orphan: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = 516",
-            [], |r| r.get(0)).unwrap();
+        let orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 516",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(orphan, 0, "plain member-less set must be pruned");
     }
 
@@ -4448,7 +4642,8 @@ mod archive_schema_tests {
              (source_id, source_type, calibration_set_id, calibration_type, matched_at)
              VALUES (999, 'calibration_set', 200, 'Bias', '2025-01-01T00:00:00Z')",
             [],
-        ).unwrap_err();
+        )
+        .unwrap_err();
         // The line above fails because calibration_set_id=200 doesn't exist
         // (FK CASCADE requires it). Set up a valid target first.
         insert_dummy_calibration_set(&conn, 200, "Bias");
@@ -4457,23 +4652,32 @@ mod archive_schema_tests {
              (source_id, source_type, calibration_set_id, calibration_type, matched_at)
              VALUES (999, 'calibration_set', 200, 'Bias', '2025-01-01T00:00:00Z')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let orphans_before: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set_to_frames
+        let orphans_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_to_frames
              WHERE source_type='calibration_set'
                AND source_id NOT IN (SELECT id FROM calibration_set)",
-            [], |r| r.get(0)).unwrap();
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(orphans_before, 1, "test set up an orphan to be cleaned");
 
         // Re-run init_db (idempotent) to trigger the sweep.
         init_db(&conn).unwrap();
 
-        let orphans_after: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set_to_frames
+        let orphans_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_to_frames
              WHERE source_type='calibration_set'
                AND source_id NOT IN (SELECT id FROM calibration_set)",
-            [], |r| r.get(0)).unwrap();
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(orphans_after, 0, "init_db should have swept orphans away");
     }
 
@@ -4481,9 +4685,14 @@ mod archive_schema_tests {
     fn scan_roots_kind_column_and_default() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/a')", []).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/a')", [])
+            .unwrap();
         let kind: String = conn
-            .query_row("SELECT kind FROM scan_roots WHERE path='/data/a'", [], |r| r.get(0))
+            .query_row(
+                "SELECT kind FROM scan_roots WHERE path='/data/a'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(kind, "normal");
     }
@@ -4502,11 +4711,15 @@ mod archive_schema_tests {
                 last_scan TEXT
             )",
             [],
-        ).unwrap();
-        conn.execute("INSERT INTO scan_roots (path) VALUES ('/old')", []).unwrap();
+        )
+        .unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/old')", [])
+            .unwrap();
         init_db(&conn).unwrap();
         let kind: String = conn
-            .query_row("SELECT kind FROM scan_roots WHERE path='/old'", [], |r| r.get(0))
+            .query_row("SELECT kind FROM scan_roots WHERE path='/old'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(kind, "normal");
     }
@@ -4516,10 +4729,16 @@ mod archive_schema_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         conn.execute(
-            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-01-01')", [],
-        ).unwrap();
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-01-01')",
+            [],
+        )
+        .unwrap();
         let v: Option<i64> = conn
-            .query_row("SELECT superseded_by_set_id FROM calibration_set WHERE id=1", [], |r| r.get(0))
+            .query_row(
+                "SELECT superseded_by_set_id FROM calibration_set WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(v, None);
     }
@@ -4536,7 +4755,9 @@ mod archive_schema_tests {
              VALUES (1, NULL, '{}', '[]', 'abc', '2026-01-01T00:00:00Z')",
             [],
         ).unwrap();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM master_provenance", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM master_provenance", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -4556,11 +4777,15 @@ mod archive_schema_tests {
              (frames_set_id, calibration_set_id, archive_root_path, compression, status, started_at)
              VALUES (NULL, 42, '/arch', 'store', 'planning', '2026-01-01T00:00:00Z')",
             [],
-        ).unwrap();
-        let (fs, cs): (Option<i64>, Option<i64>) = conn.query_row(
-            "SELECT frames_set_id, calibration_set_id FROM archive_operations WHERE id=1",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        )
+        .unwrap();
+        let (fs, cs): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT frames_set_id, calibration_set_id FROM archive_operations WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!((fs, cs), (None, Some(42)));
     }
 
@@ -4568,19 +4793,23 @@ mod archive_schema_tests {
     fn archive_operations_rebuild_preserves_existing_rows() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO frames_set (name) VALUES ('M31')", [],
-        ).unwrap();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('M31')", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO archive_operations
              (frames_set_id, archive_root_path, compression, status, started_at)
              VALUES (1, '/arch', 'store', 'completed', '2026-01-01T00:00:00Z')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Re-running init_db (idempotent) must keep the row intact
         init_db(&conn).unwrap();
         let fs: Option<i64> = conn
-            .query_row("SELECT frames_set_id FROM archive_operations WHERE id=1", [], |r| r.get(0))
+            .query_row(
+                "SELECT frames_set_id FROM archive_operations WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(fs, Some(1));
     }
@@ -4610,7 +4839,8 @@ mod archive_schema_tests {
                 total_exp_time REAL
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "CREATE TABLE archive_operations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4628,8 +4858,10 @@ mod archive_schema_tests {
                 FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
             )",
             [],
-        ).unwrap();
-        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        )
+        .unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO archive_operations (id, frames_set_id, archive_root_path, compression, status, started_at)
              VALUES (1, 1, '/arch1', 'store', 'completed', '2026-01-01T00:00:00Z')",
@@ -4643,7 +4875,8 @@ mod archive_schema_tests {
         // Retire id 5 (e.g. its frames_set was deleted elsewhere, cascading
         // here) — leaves a gap between the surviving max id (1) and the
         // historical high-water mark (5).
-        conn.execute("DELETE FROM archive_operations WHERE id = 5", []).unwrap();
+        conn.execute("DELETE FROM archive_operations WHERE id = 5", [])
+            .unwrap();
 
         init_db(&conn).unwrap();
 
@@ -4653,9 +4886,16 @@ mod archive_schema_tests {
             [],
         ).unwrap();
         let new_id: i64 = conn
-            .query_row("SELECT id FROM archive_operations WHERE archive_root_path='/arch3'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM archive_operations WHERE archive_root_path='/arch3'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(new_id > 5, "post-rebuild insert must not reuse a retired id (got {new_id})");
+        assert!(
+            new_id > 5,
+            "post-rebuild insert must not reuse a retired id (got {new_id})"
+        );
     }
 
     // Regression pin for the FK cascade wipe (review finding): with
@@ -4687,7 +4927,8 @@ mod archive_schema_tests {
                 total_exp_time REAL
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "CREATE TABLE archive_operations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4705,7 +4946,8 @@ mod archive_schema_tests {
                 FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "CREATE TABLE archive_operation_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4721,7 +4963,8 @@ mod archive_schema_tests {
                 FOREIGN KEY (operation_id) REFERENCES archive_operations(id) ON DELETE CASCADE
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "CREATE TABLE archive_operation_steps (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4738,7 +4981,8 @@ mod archive_schema_tests {
             )",
             [],
         ).unwrap();
-        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO archive_operations (id, frames_set_id, archive_root_path, compression, status, started_at)
              VALUES (1, 1, '/arch', 'store', 'completed', '2026-01-01T00:00:00Z')",
@@ -4761,21 +5005,42 @@ mod archive_schema_tests {
         init_db(&conn).unwrap();
 
         let files: i64 = conn
-            .query_row("SELECT COUNT(*) FROM archive_operation_files WHERE operation_id = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM archive_operation_files WHERE operation_id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(files, 1, "rebuild must not cascade-wipe the operation's file manifest");
+        assert_eq!(
+            files, 1,
+            "rebuild must not cascade-wipe the operation's file manifest"
+        );
         let steps: i64 = conn
-            .query_row("SELECT COUNT(*) FROM archive_operation_steps WHERE operation_id = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM archive_operation_steps WHERE operation_id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(steps, 1, "rebuild must not cascade-wipe the operation's audit log");
+        assert_eq!(
+            steps, 1,
+            "rebuild must not cascade-wipe the operation's audit log"
+        );
         // And the whole parent→children JOIN chain must still resolve.
-        let joined: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM archive_operations ao
+        let joined: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM archive_operations ao
              JOIN archive_operation_files aof ON aof.operation_id = ao.id
              JOIN archive_operation_steps aos ON aos.operation_id = ao.id
              WHERE ao.id = 1",
-            [], |r| r.get(0)).unwrap();
-        assert_eq!(joined, 1, "parent and both children must survive the rebuild joinable");
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            joined, 1,
+            "parent and both children must survive the rebuild joinable"
+        );
     }
 }
 
@@ -4981,8 +5246,14 @@ mod duplicate_cache_tests {
 
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        assert!(!has_column(&conn), "a fresh catalog must not create metadata_hash");
-        assert!(!has_index(&conn), "a fresh catalog must not create idx_files_metadata_hash");
+        assert!(
+            !has_column(&conn),
+            "a fresh catalog must not create metadata_hash"
+        );
+        assert!(
+            !has_index(&conn),
+            "a fresh catalog must not create idx_files_metadata_hash"
+        );
 
         // Reproduce the pre-cleanup shape: the column, its index, and a row
         // carrying a value — DROP COLUMN rewrites the table, so the row is
@@ -5000,14 +5271,25 @@ mod duplicate_cache_tests {
             [],
         )
         .unwrap();
-        assert!(has_column(&conn) && has_index(&conn), "old shape must be in place — otherwise this test proves nothing");
+        assert!(
+            has_column(&conn) && has_index(&conn),
+            "old shape must be in place — otherwise this test proves nothing"
+        );
 
         // Next app start.
         init_db(&conn).unwrap();
-        assert!(!has_column(&conn), "init_db must drop metadata_hash from an old catalog");
-        assert!(!has_index(&conn), "init_db must drop idx_files_metadata_hash with it");
+        assert!(
+            !has_column(&conn),
+            "init_db must drop metadata_hash from an old catalog"
+        );
+        assert!(
+            !has_index(&conn),
+            "init_db must drop idx_files_metadata_hash with it"
+        );
         let (path, size): (String, i64) = conn
-            .query_row("SELECT path, size FROM files", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row("SELECT path, size FROM files", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .expect("the row must survive the column drop");
         assert_eq!((path.as_str(), size), ("/a/b.fits", 10));
 
