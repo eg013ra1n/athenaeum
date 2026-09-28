@@ -503,6 +503,7 @@ pub fn run() {
             commands::list_collab_link_suggestions,
             commands::set_collab_link,
             commands::create_collab_link_intent,
+            commands::get_frame_set_project_status,
             commands::publish_collab_frames,
             commands::republish_collab_frames,
             commands::list_collab_frames,

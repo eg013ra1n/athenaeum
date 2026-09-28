@@ -1588,7 +1588,11 @@ export type GateReport = { projectId: string, total: number, publishable: number
  */
 blockers: Array<GateBlocker>, };
 
-export type ProjectSetMatch = { projectId: string, projectTitle: string, projectSlug: string, };
+export type ProjectSetMatch = { projectId: string, projectTitle: string, projectSlug: string, 
+/**
+ * Angular distance (deg) from the queried point to the project target.
+ */
+distanceDeg: number, };
 
 export type ProjectSetMatchEvent = { framesSetId: number, setName: string | null, matches: Array<ProjectSetMatch>, };
 
@@ -1677,7 +1681,15 @@ eccentricity: number | null,
 /**
  * Parsed from `meta.starsDetected`.
  */
-starsDetected: number | null, };
+starsDetected: number | null, 
+/**
+ * Own rows only — a [`crate::collab::contributor_state::ContributorState`]
+ * key, the same derivation the frame set's Project block uses (Task 7,
+ * spec §8.1). Filled by `api::collab_live::surface::list_collab_frames`;
+ * `None` for a replica row, or when this cache-only builder ran without
+ * it (`list_project_frames`).
+ */
+contributorState: string | null, contributorReason: string | null, };
 
 export type FramesChangeKind = "newFrames" | "pendingFrames" | "approved" | "rejected" | "excluded" | "newVersions";
 
@@ -1925,6 +1937,25 @@ export type FilterMappingEdit = { instrume: string, filterRaw: string,
  * `None` = delete the row ("back to automatic").
  */
 canonical: string | null, };
+
+export type FrameSetProjectStatus = { links: Array<FrameSetProjectLink>, candidates: Array<FrameSetProjectCandidate>, };
+
+export type FrameSetProjectLink = { projectId: string, slug: string, title: string, 
+/**
+ * Amendment A6: this device is the account's publishing device for the
+ * project.
+ */
+publishingHere: boolean, autoPublish: boolean, counts: ContributorCounts, frames: Array<FrameProjectState>, };
+
+export type FrameProjectState = { frameId: number, 
+/**
+ * A [`crate::collab::contributor_state::ContributorState`] key.
+ */
+state: string, reason: string | null, };
+
+export type ContributorCounts = { notPublished: number, failsGate: number, pendingApproval: number, published: number, updatePending: number, rejected: number, publishedNotOnDisk: number, publishedNowFailsGate: number, };
+
+export type FrameSetProjectCandidate = { projectId: string, slug: string, title: string, distanceDeg: number, };
 
 export type Channel = "stable" | "beta";
 

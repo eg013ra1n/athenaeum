@@ -2,6 +2,12 @@
 //! and the quality gate. Catalog-side only — the exchange layer is slice 4.
 
 pub mod authz;
+// The ONE per-frame contributor-state derivation (spec 2026-09-28 §8.1): pure,
+// no DB/render dependency, so the headless build carries it — used by both
+// the frame set's Project block/column and the project page's own-frames
+// table (`api::collab::get_frame_set_project_status`,
+// `api::collab_live::surface::list_collab_frames`).
+pub mod contributor_state;
 // A stateful fake of the hub's collab v3 api for tests (plan P16).
 #[cfg(test)]
 pub mod fake_hub;

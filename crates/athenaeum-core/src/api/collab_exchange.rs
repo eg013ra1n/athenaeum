@@ -748,6 +748,13 @@ pub struct ProjectFrameView {
     pub eccentricity: Option<f64>,
     /// Parsed from `meta.starsDetected`.
     pub stars_detected: Option<i64>,
+    /// Own rows only — a [`crate::collab::contributor_state::ContributorState`]
+    /// key, the same derivation the frame set's Project block uses (Task 7,
+    /// spec §8.1). Filled by `api::collab_live::surface::list_collab_frames`;
+    /// `None` for a replica row, or when this cache-only builder ran without
+    /// it (`list_project_frames`).
+    pub contributor_state: Option<String>,
+    pub contributor_reason: Option<String>,
 }
 
 /// What the live exchange knows about a frame beyond its catalog row: other
@@ -815,6 +822,8 @@ impl ProjectFrameView {
             fwhm_arcsec,
             eccentricity,
             stars_detected,
+            contributor_state: None,
+            contributor_reason: None,
         }
     }
 }

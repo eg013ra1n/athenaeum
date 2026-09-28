@@ -105,6 +105,17 @@ pub async fn create_collab_link_intent(
     api::record_project_link_intent(&state.ctx, frames_set_id).map_err(|e| e.to_string())
 }
 
+/// Spec §8.2 — what the frame set's page shows about projects: its links
+/// (per-frame contributor state + counts) or, unlinked, nearby candidates.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_frame_set_project_status(
+    state: State<'_, AppState>,
+    frames_set_id: i64,
+) -> Result<athenaeum_core::api::collab::FrameSetProjectStatus, String> {
+    api::get_frame_set_project_status(&state.ctx, frames_set_id).map_err(|e| e.to_string())
+}
+
 // ── Exchange (Task 11): publish, poll, list, download, moderate ──────────────
 
 /// Publish the project's gate-passing calibrated lights per frame: calibrate

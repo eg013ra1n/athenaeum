@@ -518,5 +518,7 @@ function ownFrame(): ProjectFrameView {
     localState: 'own_held',
     lastError: null,
     acceptedReason: null,
+    contributorState: null,
+    contributorReason: null,
   } as ProjectFrameView;
 }

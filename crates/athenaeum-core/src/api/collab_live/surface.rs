@@ -342,19 +342,37 @@ pub fn list_collab_frames(
     ctx: &ServiceContext,
     project_id: &str,
 ) -> Result<Vec<ProjectFrameView>, ApiError> {
-    let counts = {
+    let (counts, contributor) = {
         let db = db(ctx)?;
         let conn = db.conn();
         match crate::db::collab::get_project(&conn, project_id)? {
             Some(project) => {
-                ProjectHolderCounts::load(&conn, &project, super::live_presence(ctx).as_ref())?
+                let counts =
+                    ProjectHolderCounts::load(&conn, &project, super::live_presence(ctx).as_ref())?;
+                let contributor =
+                    crate::api::collab::own_contributor_states(&conn, project_id, &project);
+                (counts, contributor)
             }
-            None => None,
+            None => (None, HashMap::new()),
         }
     };
-    crate::api::collab_exchange::list_project_frames_with(ctx, project_id, |row| {
+    let mut views = crate::api::collab_exchange::list_project_frames_with(ctx, project_id, |row| {
         counts.as_ref().map(|c| c.frame(row)).unwrap_or_default()
-    })
+    })?;
+    // Task 7 (spec §8.1): the own-frames table shows the same contributor
+    // chip as the frame set's Project block — filled here rather than in
+    // `from_local_row` because the gate evaluation is render+solver-gated
+    // (`api::collab::project_gate`) and this call site already is.
+    for view in &mut views {
+        if !view.own {
+            continue;
+        }
+        if let Some((state, reason)) = contributor.get(&view.frame_uuid) {
+            view.contributor_state = Some(state.clone());
+            view.contributor_reason = reason.clone();
+        }
+    }
+    Ok(views)
 }
 
 /// A project's attention lists (L4–L6, P26).

@@ -241,6 +241,18 @@ pub async fn create_collab_link_intent(
         .map_err(api_err)
 }
 
+/// Spec §8.2 — what the frame set's page shows about projects: its links
+/// (per-frame contributor state + counts) or, unlinked, nearby candidates.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_frame_set_project_status(
+    State(state): State<WebAppState>,
+    Json(args): Json<IntentArgs>,
+) -> Result<Json<api::FrameSetProjectStatus>, (axum::http::StatusCode, String)> {
+    api::get_frame_set_project_status(&state.ctx, args.frames_set_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
 // ── Exchange (Task 11): publish, poll, list, download, moderate ──────────────
 
 #[tracing::instrument(skip_all, err(Debug))]

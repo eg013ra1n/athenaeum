@@ -34,6 +34,8 @@ function frame(overrides: Partial<ProjectFrameView>): ProjectFrameView {
     fwhmArcsec: 2.1,
     eccentricity: 0.3,
     starsDetected: 500,
+    contributorState: null,
+    contributorReason: null,
     ...overrides,
   };
 }

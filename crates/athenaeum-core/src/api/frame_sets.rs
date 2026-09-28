@@ -16,6 +16,35 @@ use crate::services::ServiceContext;
 use crate::sessions::{RederiveSummary, ReconcileOutcome};
 use rusqlite::{Connection, OptionalExtension};
 
+/// A frame set's own center in degrees, parsed from its stored
+/// `objctra`/`objctdec` — the derivation `auto_generate_frame_sets` uses for
+/// its `project-set-match` hook right after creating a set, extracted (Task
+/// 7) so a caller with just a set id (not fresh clustering metadata) can
+/// compute the same thing. `None` when the set doesn't exist or has no
+/// usable center coordinates — never an error, same as
+/// `record_project_link_intent`'s own read of these two columns.
+pub fn frame_set_center_deg(conn: &Connection, frames_set_id: i64) -> Result<Option<(f64, f64)>> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT objctra, objctdec FROM frames_set WHERE id = ?1",
+            [frames_set_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(ra_str), Some(dec_str))) = row else {
+        return Ok(None);
+    };
+    Ok(
+        match (
+            crate::coordinates::parse_ra_sexagesimal(&ra_str),
+            crate::coordinates::parse_dec_sexagesimal(&dec_str),
+        ) {
+            (Ok(ra), Ok(dec)) => Some((ra, dec)),
+            _ => None,
+        },
+    )
+}
+
 /// `is_custom` of a frame set, or an error naming the id when there is no
 /// such set.
 fn frame_set_is_custom(conn: &Connection, frames_set_id: i64) -> Result<bool> {
@@ -285,27 +314,22 @@ pub fn auto_generate_frame_sets(
         // Collaboration: suggest linking a new set whose center falls inside one
         // of my projects' target radius (spec §7 join-first-shoot-later; never
         // auto-link — the notification is a suggestion).
-        if let (Some(ra_str), Some(dec_str)) = (&metadata.objctra, &metadata.objctdec) {
-            if let (Ok(ra), Ok(dec)) = (
-                crate::coordinates::parse_ra_sexagesimal(ra_str),
-                crate::coordinates::parse_dec_sexagesimal(dec_str),
-            ) {
-                match crate::api::collab::find_matching_projects(&conn, ra, dec, set_id) {
-                    Ok(matches) if !matches.is_empty() => {
-                        crate::events::emit_event(
-                            emitter,
-                            "project-set-match",
-                            &crate::api::collab::ProjectSetMatchEvent {
-                                frames_set_id: set_id,
-                                set_name: cluster.name.clone(),
-                                matches,
-                            },
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        tracing::warn!(set_id, error = %format!("{err:#}"), "project match check failed")
-                    }
+        if let Some((ra, dec)) = frame_set_center_deg(&conn, set_id)? {
+            match crate::api::collab::find_matching_projects(&conn, ra, dec, set_id) {
+                Ok(matches) if !matches.is_empty() => {
+                    crate::events::emit_event(
+                        emitter,
+                        "project-set-match",
+                        &crate::api::collab::ProjectSetMatchEvent {
+                            frames_set_id: set_id,
+                            set_name: cluster.name.clone(),
+                            matches,
+                        },
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(set_id, error = %format!("{err:#}"), "project match check failed")
                 }
             }
         }

@@ -106,6 +106,8 @@ pub struct ProjectSetMatch {
     pub project_id: String,
     pub project_title: String,
     pub project_slug: String,
+    /// Angular distance (deg) from the queried point to the project target.
+    pub distance_deg: f64,
 }
 
 /// The `project-set-match` event payload: a newly-generated frame set whose
@@ -1085,10 +1087,256 @@ pub fn find_matching_projects(
                 project_id: p.project_id,
                 project_title: p.title,
                 project_slug: p.slug,
+                distance_deg: d,
             });
         }
     }
     Ok(out)
+}
+
+// ── Frame set's project status (Task 7, spec §8.2) ──────────────────────────
+
+/// One linked project's per-frame contributor state over one frame set's
+/// LIGHT frames.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameSetProjectLink {
+    pub project_id: String,
+    pub slug: String,
+    pub title: String,
+    /// Amendment A6: this device is the account's publishing device for the
+    /// project.
+    pub publishing_here: bool,
+    pub auto_publish: bool,
+    pub counts: ContributorCounts,
+    pub frames: Vec<FrameProjectState>,
+}
+
+/// One LIGHT frame's contributor state within a [`FrameSetProjectLink`].
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameProjectState {
+    pub frame_id: i64,
+    /// A [`crate::collab::contributor_state::ContributorState`] key.
+    pub state: String,
+    pub reason: Option<String>,
+}
+
+/// Per-state tally of a [`FrameSetProjectLink`]'s frames — one field per
+/// [`crate::collab::contributor_state::ContributorState`] variant.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ContributorCounts {
+    pub not_published: i64,
+    pub fails_gate: i64,
+    pub pending_approval: i64,
+    pub published: i64,
+    pub update_pending: i64,
+    pub rejected: i64,
+    pub published_not_on_disk: i64,
+    pub published_now_fails_gate: i64,
+}
+
+impl ContributorCounts {
+    fn bump(&mut self, state: crate::collab::contributor_state::ContributorState) {
+        use crate::collab::contributor_state::ContributorState as S;
+        match state {
+            S::NotPublished => self.not_published += 1,
+            S::FailsGate => self.fails_gate += 1,
+            S::PendingApproval => self.pending_approval += 1,
+            S::Published => self.published += 1,
+            S::UpdatePending => self.update_pending += 1,
+            S::Rejected => self.rejected += 1,
+            S::PublishedNotOnDisk => self.published_not_on_disk += 1,
+            S::PublishedNowFailsGate => self.published_now_fails_gate += 1,
+        }
+    }
+}
+
+/// A cached project not yet linked to the set but whose target radius
+/// contains it ([`find_matching_projects`], carried through with its
+/// distance).
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameSetProjectCandidate {
+    pub project_id: String,
+    pub slug: String,
+    pub title: String,
+    pub distance_deg: f64,
+}
+
+/// What the frame set's page shows about projects: every project it is
+/// linked to (with per-frame contributor state + counts), or, when unlinked,
+/// nearby candidate projects.
+#[derive(Debug, Clone, Default, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameSetProjectStatus {
+    pub links: Vec<FrameSetProjectLink>,
+    pub candidates: Vec<FrameSetProjectCandidate>,
+}
+
+/// Spec §8.2 — what the frame set's page shows about projects: every project
+/// the set is linked to, with the same per-frame contributor state
+/// [`crate::collab::contributor_state::derive`] computes everywhere else, or,
+/// when the set isn't linked to anything yet, nearby candidate projects
+/// ([`find_matching_projects`], reused here for a set the user is looking at
+/// directly rather than one just auto-clustered). Signed out returns empty
+/// links and candidates, never an error (spec §3.1's fail-closed default).
+pub fn get_frame_set_project_status(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+) -> Result<FrameSetProjectStatus, ApiError> {
+    use crate::collab::contributor_state::{derive, OwnRowFacts};
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let mut links = Vec::new();
+    let mut candidates = Vec::new();
+    if current_account_email(&conn).is_none() {
+        return Ok(FrameSetProjectStatus { links, candidates });
+    }
+
+    let set_frames = union_light_frames(&conn, &[frames_set_id]).map_err(internal)?;
+    let set_frame_ids: HashSet<i64> = set_frames.iter().map(|(id, _)| *id).collect();
+    let attested = crate::db::collab::frames_set_attested(&conn, frames_set_id).map_err(internal)?;
+    let own_device_id = crate::api::account::own_device_id(ctx).unwrap_or_default();
+
+    for p in crate::db::collab::list_projects(&conn).map_err(internal)? {
+        if !crate::db::collab::is_set_linked(&conn, &p.project_id, frames_set_id).map_err(internal)? {
+            continue;
+        }
+        let gated = project_gate(&conn, &p)?;
+        let own = crate::db::collab_frames::own_by_source_frame(&conn, &p.project_id).map_err(internal)?;
+
+        let mut counts = ContributorCounts::default();
+        let mut frames = Vec::new();
+        for (_identity, row) in gated.iter().filter(|(_, r)| set_frame_ids.contains(&r.frame_id)) {
+            let current_recipe = current_recipe_for_frame(&conn, row.frame_id, attested);
+            let own_row = own.get(&row.frame_id);
+            let accepted_reason = own_row.and_then(|o| {
+                crate::api::collab_exchange::parse_manifest_wire(
+                    &p.project_id,
+                    &o.frame_uuid,
+                    &o.manifest_json,
+                    "get_frame_set_project_status",
+                )
+                .and_then(|w| w.accepted_reason)
+            });
+            let facts = own_row.map(|o| OwnRowFacts {
+                state: o.state.as_str(),
+                content_version: o.content_version,
+                recipe_hash: o.recipe_hash.as_deref(),
+                on_disk: o.on_disk,
+                reject_reason: accepted_reason.as_deref(),
+            });
+            let (state, reason) = derive(
+                facts,
+                current_recipe.as_deref(),
+                row.publishable,
+                row.failures.first().map(String::as_str),
+            );
+            counts.bump(state);
+            frames.push(FrameProjectState {
+                frame_id: row.frame_id,
+                state: state.key().to_string(),
+                reason,
+            });
+        }
+
+        let publishing_here = crate::db::collab::publishing_device(&conn, &p.project_id)
+            .map_err(internal)?
+            .map(|b| b.device_id == own_device_id)
+            .unwrap_or(false);
+
+        links.push(FrameSetProjectLink {
+            project_id: p.project_id.clone(),
+            slug: p.slug.clone(),
+            title: p.title.clone(),
+            publishing_here,
+            auto_publish: p.auto_publish,
+            counts,
+            frames,
+        });
+    }
+
+    if links.is_empty() {
+        if let Some((ra, dec)) =
+            crate::api::frame_sets::frame_set_center_deg(&conn, frames_set_id).map_err(internal)?
+        {
+            for m in find_matching_projects(&conn, ra, dec, frames_set_id).map_err(internal)? {
+                candidates.push(FrameSetProjectCandidate {
+                    project_id: m.project_id,
+                    slug: m.project_slug,
+                    title: m.project_title,
+                    distance_deg: m.distance_deg,
+                });
+            }
+        }
+    }
+
+    tracing::info!(
+        frames_set_id,
+        links = links.len(),
+        candidates = candidates.len(),
+        "frame set project status built"
+    );
+    Ok(FrameSetProjectStatus { links, candidates })
+}
+
+/// Every own row's contributor state, keyed by frame uuid (Task 7) — the same
+/// [`crate::collab::contributor_state::derive`] [`get_frame_set_project_status`]
+/// uses, so the project page's own-frames table
+/// ([`crate::api::collab_live::surface::list_collab_frames`]) shows the
+/// identical chip. A gate or own-row read failure is logged and leaves the
+/// map empty — never a hard error out of a frames list.
+pub(crate) fn own_contributor_states(
+    conn: &Connection,
+    project_id: &str,
+    project: &CollabProjectRow,
+) -> HashMap<String, (String, Option<String>)> {
+    use crate::collab::contributor_state::{derive, OwnRowFacts};
+    let gated = match project_gate(conn, project) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "gate evaluation failed; own contributor state left blank");
+            return HashMap::new();
+        }
+    };
+    let own = match crate::db::collab_frames::own_by_source_frame(conn, project_id) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "own-frame read failed; own contributor state left blank");
+            return HashMap::new();
+        }
+    };
+    let mut out = HashMap::new();
+    for (identity, row) in &gated {
+        let Some(own_row) = own.get(&row.frame_id) else {
+            continue;
+        };
+        let current_recipe = current_recipe_for_frame(conn, row.frame_id, identity.attested);
+        let accepted_reason = crate::api::collab_exchange::parse_manifest_wire(
+            project_id,
+            &own_row.frame_uuid,
+            &own_row.manifest_json,
+            "own_contributor_states",
+        )
+        .and_then(|w| w.accepted_reason);
+        let facts = OwnRowFacts {
+            state: own_row.state.as_str(),
+            content_version: own_row.content_version,
+            recipe_hash: own_row.recipe_hash.as_deref(),
+            on_disk: own_row.on_disk,
+            reject_reason: accepted_reason.as_deref(),
+        };
+        let (state, reason) = derive(
+            Some(facts),
+            current_recipe.as_deref(),
+            row.publishable,
+            row.failures.first().map(String::as_str),
+        );
+        out.insert(own_row.frame_uuid.clone(), (state.key().to_string(), reason));
+    }
+    out
 }
 
 // ── Hub poll: cards, detail, refresh ─────────────────────────────────────────
@@ -2008,6 +2256,35 @@ fn recipe_hash_of_inputs(
 /// moves the recipe, which the split reads as an `Update`.
 pub(crate) fn external_recipe(size: i64, modified_at: &str) -> String {
     format!("external:{size}:{modified_at}")
+}
+
+/// Task 7 (spec §8.1/§8.2): the recipe a publish would compute for
+/// `frame_id` right now — [`external_recipe`] for an attested light, else
+/// [`recipe_hash_of_inputs`] over its resolved calibration links. `None` when
+/// the light cannot be resolved (a deleted source frame, e.g., or no
+/// calibration links at all) — the contributor-state derivation reads that as
+/// "can't tell", never as an error.
+pub(crate) fn current_recipe_for_frame(
+    conn: &Connection,
+    frame_id: i64,
+    attested: bool,
+) -> Option<String> {
+    if attested {
+        conn.query_row(
+            "SELECT fi.size, fi.modified_at FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
+            [frame_id],
+            |r| Ok(external_recipe(r.get::<_, i64>(0)?, &r.get::<_, String>(1)?)),
+        )
+        .ok()
+    } else {
+        crate::calibration_library::light_resolve::resolve_frame_inputs(
+            conn,
+            frame_id,
+            publish_options().flat_norm,
+        )
+        .ok()
+        .and_then(|res| recipe_hash_of_inputs(conn, &res).ok())
+    }
 }
 
 /// Spec §6 (F8) — informational only, carried on every NEW frame's announce:
@@ -5571,6 +5848,36 @@ pub(crate) mod tests {
         assert!(find_matching_projects(&conn, 210.8, 54.35, set_id)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn frame_set_project_status_counts_states_and_lists_candidates() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "a@x.io");
+            seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 2)
+        };
+        let st = get_frame_set_project_status(&ctx, set_id).unwrap();
+        assert!(st.links.is_empty());
+        assert_eq!(st.candidates.len(), 1, "within radius, not linked");
+        assert_eq!(st.candidates[0].project_id, "p-1");
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let st = get_frame_set_project_status(&ctx, set_id).unwrap();
+        assert_eq!(st.links.len(), 1);
+        assert!(st.candidates.is_empty());
+        assert_eq!(st.links[0].counts.fails_gate, 2, "no calibration links");
+        assert_eq!(
+            st.links[0].frames.iter().filter(|f| f.state == "failsGate").count(),
+            2
+        );
+        assert!(st.links[0].frames[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("calibration"));
+        let _ = frames;
     }
 
     /// End-to-end hub poll (wiremock): a fresh refresh fetches the page + a REAL
