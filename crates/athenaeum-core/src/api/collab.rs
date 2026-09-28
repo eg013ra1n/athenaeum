@@ -2183,6 +2183,17 @@ fn stamp_publish_cards(
     Ok(())
 }
 
+/// F5/C1: whether `path` is a landing this publisher's own generation chose
+/// (`<own_dir>/<name>`, via [`new_frame_target`]) — the ONE shape a
+/// generated Update/Adopt may safely reuse as its target. Anything else
+/// (an attested original, a path from a previous own-dir spelling) is never
+/// reused: a set that was attested and is now un-attested (or vice versa)
+/// must never let a generation write over — or an attestation seed read as
+/// though it owned — a file this publisher did not itself land there.
+fn is_own_dir_landing(path: &Path, own_dir: &Path) -> bool {
+    path.parent() == Some(own_dir)
+}
+
 /// The landing path of a NEW own frame: `<dir>/<name>`, else `<stem>_2`, … —
 /// the first spelling that is neither claimed earlier in this run, nor any
 /// cached frame's `landed_path`, nor (amendment A6) any `fileName` this
@@ -2412,7 +2423,22 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             ..
         } = plan;
         let fid = cand.frame_id;
-        let recipe = recipe.unwrap_or_default();
+        // M2: an external plan always carries `Some` recipe by construction
+        // (pass 3) — a `None` here is a broken invariant, not a value to
+        // paper over with an empty string (which would force a republish
+        // every run).
+        let recipe = match recipe {
+            Some(r) => r,
+            None => {
+                tracing::error!(project_id = pid, frame_id = fid, "publish: an attested plan carried no recipe (internal invariant violation)");
+                held_back.push(held(
+                    fid,
+                    &cand.filename,
+                    "internal error: no recipe for an attested light".into(),
+                ));
+                continue;
+            }
+        };
         let xxh3 = match xxh3_full_file(&target) {
             Ok(h) => h,
             Err(e) => {
@@ -2436,6 +2462,28 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
                 ));
                 continue;
             }
+        };
+        // I3: an Update/Adopt's blake3, over the ORIGINAL — so the same
+        // `identical` shortcut the generated path uses (P19) also catches a
+        // `touch`, an archive round-trip, or a copy that moved
+        // `modified_at` without changing the bytes. A New frame has no hub
+        // blake3 to compare against, so this stays `None` for it, exactly
+        // as the generated loop does.
+        let staged_blake3 = if kind.row().is_some() {
+            match blake3_file(&target) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::error!(project_id = pid, frame_id = fid, path = %target.display(), error = %format!("{e:#}"), "publish: hashing the attested light for the identity check failed");
+                    held_back.push(held(
+                        fid,
+                        &cand.filename,
+                        format!("cannot hash the attested light: {e:#}"),
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
         };
         if let Some(m) = meta.as_mut() {
             m.meta["calibration"] = calibration_meta(None, true);
@@ -2464,7 +2512,7 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             byte_size,
             meta,
             identical: false,
-            staged_blake3: None,
+            staged_blake3,
         });
     }
 
@@ -3343,14 +3391,22 @@ async fn run_publish(
     let opts = publish_options();
     let mut unchanged = 0usize;
     let mut plans: Vec<PlannedFrame> = Vec::new();
+    // Hoisted out of the split's block (below) so the seed-by-reference
+    // section (F5/C1/I1) can also tell an own-dir landing apart from an
+    // attested original.
+    let own_dir = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        publisher_folder(&conn, &collab_root, &project, &account_id, &display, "own").map_err(
+            |e| {
+                tracing::error!(project_id, error = %format!("{e:#}"), "publish: own folder failed");
+                internal(e)
+            },
+        )?
+    };
     {
         let db = db(ctx)?;
         let conn = db.conn();
-        let own_dir = publisher_folder(&conn, &collab_root, &project, &account_id, &display, "own")
-            .map_err(|e| {
-                tracing::error!(project_id, error = %format!("{e:#}"), "publish: own folder failed");
-                internal(e)
-            })?;
         let own_devices = crate::api::collab_exchange::own_devices(ctx, &conn, &project)?;
         let own = frames_db::own_by_source_frame(&conn, project_id).map_err(|e| {
             tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
@@ -3378,19 +3434,15 @@ async fn run_publish(
                     );
                     match row {
                         Ok((path, size, modified)) => {
-                            let osc = conn
-                                .query_row(
-                                    "SELECT bayerpat FROM frames WHERE id = ?1",
-                                    [fid],
-                                    |r| r.get::<_, Option<String>>(0),
-                                )
-                                .ok()
-                                .flatten()
-                                .is_some();
+                            // M1: `osc` (`opts.debayer_osc && osc`) only ever
+                            // feeds `calibrated_output_filename` — dead on
+                            // this branch, which never calls it (an
+                            // attested light's name is its own basename).
+                            // Never queried, so there is nothing to swallow.
                             let recipe = external_recipe(size, &modified);
                             (
                                 recipe.clone(),
-                                osc,
+                                false,
                                 Some((std::path::PathBuf::from(path), recipe)),
                             )
                         }
@@ -3523,7 +3575,19 @@ async fn run_publish(
                 match &kind {
                     PublishKind::New => None,
                     PublishKind::Update(row) => match &row.landed_path {
-                        Some(p) => Some(std::path::PathBuf::from(p)),
+                        // C1: a row whose landed_path is not this
+                        // publisher's own-dir landing was an attested
+                        // original (or is otherwise stale) — never reuse it
+                        // as a generation target; defer to pass 3's
+                        // fresh-name picker exactly like a New frame
+                        // (`is_own_dir_landing` at Update/Adopt above).
+                        Some(p) if is_own_dir_landing(Path::new(p), &own_dir) => {
+                            Some(std::path::PathBuf::from(p))
+                        }
+                        Some(p) => {
+                            tracing::info!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, path = %p, "publish: own frame's landed path is not this publisher's landing (un-attested or moved); picking a fresh one");
+                            None
+                        }
                         None => {
                             tracing::error!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, "publish: own frame has no landed path");
                             held_back.push(held(
@@ -3534,12 +3598,16 @@ async fn run_publish(
                             continue;
                         }
                     },
-                    PublishKind::Adopt(row) => Some(
-                        row.landed_path
-                            .as_ref()
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(|| own_dir.join(&row.file_name)),
-                    ),
+                    PublishKind::Adopt(row) => match &row.landed_path {
+                        Some(p) if is_own_dir_landing(Path::new(p), &own_dir) => {
+                            Some(std::path::PathBuf::from(p))
+                        }
+                        Some(p) => {
+                            tracing::info!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, path = %p, "publish: own frame's landed path is not this publisher's landing (un-attested or moved); picking a fresh one");
+                            None
+                        }
+                        None => Some(own_dir.join(&row.file_name)),
+                    },
                 }
             };
             if let Some(t) = &target {
@@ -3565,7 +3633,12 @@ async fn run_publish(
                 // (it is its own file, unchanged), which `taken_names`
                 // already carries from its own prior publish; checking it
                 // here would refuse a frame against itself.
-                if matches!(kind, PublishKind::New) {
+                let meta = if matches!(kind, PublishKind::New) {
+                    // Dedup (F5): a NEW frame only — an Update or Adopt
+                    // reuses the SAME name it already legitimately holds
+                    // (it is its own file, unchanged), which `taken_names`
+                    // already carries from its own prior publish; checking
+                    // it here would refuse a frame against itself.
                     if taken_names.contains(&file_name) || !claimed.insert(path.clone()) {
                         tracing::warn!(project_id, frame_id = fid, file_name = %file_name, "publish: attested basename already published by this publisher");
                         held_back.push(held(
@@ -3577,11 +3650,20 @@ async fn run_publish(
                         ));
                         continue;
                     }
+                    // I2: the hub's per-file-name rule — an original's
+                    // basename is not chosen by the app the way a generated
+                    // `c_<stem>.fits` is, and can break it (`:`, surrounding
+                    // whitespace, empty).
+                    if let Some(problem) = hub_file_name_problem(&file_name) {
+                        tracing::warn!(project_id, frame_id = fid, path = %path.display(), reason = problem, "publish: attested file name breaks the hub rule");
+                        held_back.push(held(
+                            fid,
+                            &cand.filename,
+                            format!("the hub refuses this file name ({problem}): {file_name}"),
+                        ));
+                        continue;
+                    }
                     taken_names.insert(file_name);
-                } else {
-                    claimed.insert(path.clone());
-                }
-                let meta = if matches!(kind, PublishKind::New) {
                     let m = match crate::collab::frame_meta::build_frame_meta(&conn, fid) {
                         Ok(m) => m,
                         Err(e) => {
@@ -3601,6 +3683,7 @@ async fn run_publish(
                     }
                     Some(m)
                 } else {
+                    claimed.insert(path.clone());
                     None
                 };
                 plans.push(PlannedFrame {
@@ -3624,23 +3707,36 @@ async fn run_publish(
                 });
                 continue;
             }
-            let meta = match crate::collab::frame_meta::build_frame_meta(&conn, fid) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: frame meta failed");
-                    held_back.push(held(
-                        fid,
-                        &cand.filename,
-                        format!("cannot read frame metadata: {e:#}"),
-                    ));
+            // C1/I1: this fallback now also serves a generated Update/Adopt
+            // whose PREVIOUS landed_path was not this publisher's own-dir
+            // landing (pass 2, `is_own_dir_landing`) — an un-attested light,
+            // or one whose landing folder otherwise changed. It picks a
+            // fresh own-dir name exactly like a New frame, but keeps its
+            // row (`kind` stays `Update`/`Adopt`) and carries no manifest
+            // meta — a version never re-announces it; the hub keeps the
+            // prior meta.
+            let meta = if matches!(kind, PublishKind::New) {
+                let m = match crate::collab::frame_meta::build_frame_meta(&conn, fid) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: frame meta failed");
+                        held_back.push(held(
+                            fid,
+                            &cand.filename,
+                            format!("cannot read frame metadata: {e:#}"),
+                        ));
+                        continue;
+                    }
+                };
+                if let Some(problem) = hub_frame_rule_problem(&m) {
+                    tracing::warn!(project_id, frame_id = fid, reason = %problem, "publish: frame breaks a hub rule");
+                    held_back.push(held(fid, &cand.filename, problem));
                     continue;
                 }
+                Some(m)
+            } else {
+                None
             };
-            if let Some(problem) = hub_frame_rule_problem(&meta) {
-                tracing::warn!(project_id, frame_id = fid, reason = %problem, "publish: frame breaks a hub rule");
-                held_back.push(held(fid, &cand.filename, problem));
-                continue;
-            }
             let name = crate::export::calibrated_output_filename(
                 &cand.filename,
                 opts.debayer_osc && osc,
@@ -3672,7 +3768,7 @@ async fn run_publish(
                 cand,
                 kind,
                 target,
-                meta: Some(meta),
+                meta,
                 external: false,
                 recipe: None,
             });
@@ -3857,6 +3953,36 @@ async fn run_publish(
             .await
         {
             Ok(hash) => {
+                // C1/I1: the landing crossed between generated and attested
+                // (or its folder otherwise changed) — move `landed_path` to
+                // where this run actually put the frame's CURRENT bytes,
+                // before any downstream write depends on it agreeing
+                // (`stage_own_file`'s `WHERE landed_path = ?` needs the row
+                // to already match). The stale file is removed ONLY when it
+                // was itself this publisher's own-dir landing — an
+                // app-generated artifact, never an attested original
+                // (F5/A1: that file is never removed, whatever the set's
+                // attestation is now).
+                let new_landed = w.target.to_string_lossy().to_string();
+                if current.landed_path.as_deref() != Some(new_landed.as_str()) {
+                    let moved = db(ctx).map_err(|e| anyhow::anyhow!("{e}")).and_then(|db| {
+                        frames_db::update_landed_path(&db.conn(), project_id, &w.uuid, &new_landed)
+                    });
+                    match moved {
+                        Ok(()) => tracing::info!(project_id, frame_uuid = %w.uuid, from = current.landed_path.as_deref().unwrap_or(""), to = %new_landed, "publish: own frame's landed path moved"),
+                        Err(e) => tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: moving the own frame's landed path failed"),
+                    }
+                    if let Some(old) = current.landed_path.as_deref() {
+                        let old_path = Path::new(old);
+                        if is_own_dir_landing(old_path, &own_dir) {
+                            match std::fs::remove_file(old_path) {
+                                Ok(()) => tracing::info!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: removed the superseded generated file"),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: removing the superseded generated file failed"),
+                            }
+                        }
+                    }
+                }
                 let mut f = SeededFrame {
                     blake3: hash.to_hex().to_string(),
                     content_version: version,
@@ -8872,6 +8998,19 @@ pub(crate) mod tests {
         async fn attested_lights_are_seeded_in_place_without_generation() {
             let fx = fixture(2).await;
             mount_hub(&fx.server, "published").await;
+            // I4: snapshot the originals BEFORE publish — the covering
+            // assertion is that the run never touches them, not merely that
+            // the row ends up pointing at them.
+            let before: Vec<(Vec<u8>, std::time::SystemTime)> = fx
+                .lights
+                .iter()
+                .map(|p| {
+                    (
+                        std::fs::read(p).unwrap(),
+                        std::fs::metadata(p).unwrap().modified().unwrap(),
+                    )
+                })
+                .collect();
             {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
@@ -8915,6 +9054,15 @@ pub(crate) mod tests {
                 0,
                 "the publisher folder stays empty for attested frames"
             );
+            // F5/A1: byte-for-byte and mtime untouched.
+            for (i, light) in fx.lights.iter().enumerate() {
+                assert_eq!(std::fs::read(light).unwrap(), before[i].0, "{light:?} bytes changed");
+                assert_eq!(
+                    std::fs::metadata(light).unwrap().modified().unwrap(),
+                    before[i].1,
+                    "{light:?} mtime changed"
+                );
+            }
         }
 
         /// F5: the recipe is `external:<size>:<modified_at>` — unchanged
@@ -8950,6 +9098,134 @@ pub(crate) mod tests {
             std::fs::write(&fx.lights[0], b"new bytes that differ").unwrap();
             let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
             assert_eq!(res.updated, 1, "{:?}", res.held_back);
+            // I4: the own row describes the (drifted) original, and the
+            // publish itself never further touches the file beyond the
+            // drift the test itself introduced.
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(row.landed_path.as_deref(), Some(fx.lights[0].to_string_lossy()).as_deref());
+            assert_eq!(
+                std::fs::read(&fx.lights[0]).unwrap(),
+                b"new bytes that differ"
+            );
+            assert_eq!(
+                row.xxh3,
+                crate::package::xxh3_full_file(&fx.lights[0]).unwrap()
+            );
+            assert_eq!(
+                row.byte_size,
+                std::fs::metadata(&fx.lights[0]).unwrap().len() as i64
+            );
+        }
+
+        /// C1 (critical, fix round 1): a set attested, published, then
+        /// UN-attested with its real calibration links still present — the
+        /// frame is now a normal generated Update. It must land at a FRESH
+        /// own-dir name, never write over the original: `landed_path` moves
+        /// off it, and its bytes/mtime never change.
+        #[tokio::test]
+        async fn un_attesting_a_published_set_never_overwrites_the_original() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{:?}", res.held_back);
+            assert_eq!(
+                own_row(&fx, &fx.uuids[0]).unwrap().landed_path.as_deref(),
+                Some(fx.lights[0].to_string_lossy()).as_deref(),
+                "seeded in place, as attested"
+            );
+            let original_bytes = std::fs::read(&fx.lights[0]).unwrap();
+            let original_mtime = std::fs::metadata(&fx.lights[0])
+                .unwrap()
+                .modified()
+                .unwrap();
+
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, false).unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.updated, 1, "{:?}", res.held_back);
+
+            // C1: the original is byte-for-byte and mtime untouched.
+            assert_eq!(
+                std::fs::read(&fx.lights[0]).unwrap(),
+                original_bytes,
+                "the original's bytes must never change"
+            );
+            assert_eq!(
+                std::fs::metadata(&fx.lights[0]).unwrap().modified().unwrap(),
+                original_mtime,
+                "the original's mtime must never change"
+            );
+
+            // A generated file now exists in own_dir, and landed_path moved
+            // there — never back onto the original.
+            let names: Vec<String> = std::fs::read_dir(own_dir(&fx))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            assert_eq!(names, vec!["c_L_0000.fits".to_string()], "{names:?}");
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            let landed = PathBuf::from(row.landed_path.unwrap());
+            assert_eq!(landed, own_dir(&fx).join("c_L_0000.fits"));
+            assert!(!row.recipe_hash.as_deref().unwrap().starts_with("external:"));
+        }
+
+        /// I1: the reverse crossing — a frame first published GENERATED,
+        /// then its set is attested. The next publish becomes an external
+        /// Update targeting the original: `landed_path` moves there, and
+        /// the now-superseded generated file (this publisher's own
+        /// artifact, never the user's data) is removed. The original itself
+        /// is untouched throughout, same guarantee as the other direction.
+        #[tokio::test]
+        async fn attesting_after_a_generated_publish_moves_landed_path_and_removes_the_old_file() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{:?}", res.held_back);
+            let old_landed = own_row(&fx, &fx.uuids[0]).unwrap().landed_path.unwrap();
+            let old_path = PathBuf::from(&old_landed);
+            assert_eq!(old_path.parent().unwrap(), own_dir(&fx));
+            assert!(old_path.exists(), "the generated file exists before attestation");
+
+            let original_bytes = std::fs::read(&fx.lights[0]).unwrap();
+            let original_mtime = std::fs::metadata(&fx.lights[0])
+                .unwrap()
+                .modified()
+                .unwrap();
+
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.updated, 1, "{:?}", res.held_back);
+
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(
+                row.landed_path.as_deref(),
+                Some(fx.lights[0].to_string_lossy()).as_deref(),
+                "landed_path moved to the original"
+            );
+            assert!(row.recipe_hash.as_deref().unwrap().starts_with("external:"));
+            assert!(
+                !old_path.exists(),
+                "the superseded generated file is removed"
+            );
+            assert_eq!(
+                std::fs::read(&fx.lights[0]).unwrap(),
+                original_bytes,
+                "the original itself is untouched"
+            );
+            assert_eq!(
+                std::fs::metadata(&fx.lights[0]).unwrap().modified().unwrap(),
+                original_mtime,
+                "the original's mtime is untouched"
+            );
         }
 
         /// F5: two attested originals that resolve to the same basename (a
