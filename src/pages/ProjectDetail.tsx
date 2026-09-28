@@ -27,6 +27,7 @@ import type {
   ProjectFrameView,
   PublishResult,
 } from '../types/models';
+import type { AnalysisCompleteEvent } from '../types/helpers';
 
 type Tab = 'contribute' | 'receive' | 'moderation' | 'overview';
 
@@ -180,9 +181,15 @@ export default function ProjectDetail() {
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    api.listen('analysis-complete', () => {
+    api.listen<AnalysisCompleteEvent>('analysis-complete', (payload) => {
       if (cancelled) return;
-      setAnalyzeBusy(new Set());
+      // Clear only the SET that just finished — a still-running analyze on
+      // another linked set must keep its Analyze button disabled.
+      setAnalyzeBusy((s) => {
+        const next = new Set(s);
+        next.delete(payload.frame_set_id);
+        return next;
+      });
       void loadGate();
     })
       .then((fn) => { if (cancelled) fn(); else unlisten = fn; })

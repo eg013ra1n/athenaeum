@@ -519,6 +519,29 @@ export default function FrameSetDetail() {
     }
   }, [id]);
 
+  // Task 9 sweep: `AttestationToggle`/`FrameSetProjectBlock` changing the
+  // set's attestation or its project link must not re-trigger `loadData`'s
+  // full-page spinner — the hierarchy refresh above, plus a quiet detail
+  // (for `calibrated_externally`) and project-status refetch, is enough to
+  // reflect the change.
+  const refreshAfterCollabChange = useCallback(async () => {
+    if (!id) return;
+    await refreshCalibrationHierarchy();
+    try {
+      const [detailResult, projectStatusResult] = await Promise.all([
+        api.invoke<FrameSetDetail>('get_frame_set_detail', { framesSetId: parseInt(id) }),
+        api.invoke<FrameSetProjectStatus>('get_frame_set_project_status', { framesSetId: parseInt(id) }).catch((err) => {
+          console.error('[projects] get_frame_set_project_status failed:', err);
+          return null;
+        }),
+      ]);
+      setDetail(detailResult);
+      setProjectStatus(projectStatusResult);
+    } catch (err) {
+      console.error('[projects] quiet refresh after a collab change failed:', err);
+    }
+  }, [id, refreshCalibrationHierarchy]);
+
   const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
     setAlertDialog({ isOpen: true, title, message, variant });
   };
@@ -909,22 +932,22 @@ export default function FrameSetDetail() {
               <span><span className="font-medium text-success">{calibrationHierarchy?.calibrated_frames ?? '-'}</span> calibrated</span>
               <span>·</span>
               <span><span className="font-medium text-warning">{calibrationHierarchy?.uncalibrated_frames ?? '-'}</span> uncalibrated</span>
-              <span>·</span>
-              <span><span className="font-medium text-accent">{calibrationHierarchy?.date_groups.length ?? '-'}</span> sessions</span>
-              <span>·</span>
-              <span className="font-medium text-content">{formatExposureTime(detail.frames_set?.total_exp_time)}</span>
               {detail.frames_set?.calibrated_externally && (
                 <>
                   <span>·</span>
                   <span className="font-medium text-accent">attested</span>
                 </>
               )}
+              <span>·</span>
+              <span><span className="font-medium text-accent">{calibrationHierarchy?.date_groups.length ?? '-'}</span> sessions</span>
+              <span>·</span>
+              <span className="font-medium text-content">{formatExposureTime(detail.frames_set?.total_exp_time)}</span>
             </div>
           </div>
         </div>
-        {projectStatus && (
+        {projectStatus && (projectStatus.links.length > 0 || projectStatus.candidates.length > 0) && (
           <div className="mt-2">
-            <FrameSetProjectBlock framesSetId={parseInt(id!)} status={projectStatus} onChanged={loadData} />
+            <FrameSetProjectBlock framesSetId={parseInt(id!)} status={projectStatus} onChanged={refreshAfterCollabChange} />
           </div>
         )}
       </div>
@@ -1030,7 +1053,7 @@ export default function FrameSetDetail() {
                 framesSetId={parseInt(id!)}
                 calibratedExternally={detail.frames_set?.calibrated_externally ?? false}
                 linkedCalibrationSets={linkedCalibrationSetsCount}
-                onChanged={loadData}
+                onChanged={refreshAfterCollabChange}
               />
               <div className="flex-1 min-h-0">
                 <CalibrationHierarchyViewComponent

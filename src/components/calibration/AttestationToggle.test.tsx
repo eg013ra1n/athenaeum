@@ -34,6 +34,22 @@ describe('AttestationToggle', () => {
     expect(screen.getByRole('button', { name: 'Attest' })).toBeInTheDocument();
   });
 
+  it('Cancel closes the confirm and never invokes set_frame_set_attestation or onChanged', async () => {
+    const onChanged = vi.fn();
+    render(
+      <AttestationToggle framesSetId={5} calibratedExternally={false} linkedCalibrationSets={2} onChanged={onChanged} />
+    );
+    fireEvent.click(screen.getByRole('checkbox'));
+    expect(screen.getByText('Attest external calibration?')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByText('Attest external calibration?')).not.toBeInTheDocument();
+    expect(api.invoke).not.toHaveBeenCalled();
+    expect(onChanged).not.toHaveBeenCalled();
+    // The checkbox itself is unaffected — still unchecked, still enabled.
+    expect(screen.getByRole('checkbox')).not.toBeChecked();
+    expect(screen.getByRole('checkbox')).not.toBeDisabled();
+  });
+
   it('invokes set_frame_set_attestation with attested: true on confirm', async () => {
     vi.mocked(api.invoke).mockResolvedValue(undefined);
     const onChanged = vi.fn();

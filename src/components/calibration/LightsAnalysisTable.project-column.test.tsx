@@ -6,7 +6,10 @@ import { LightsAnalysisTable, type EnrichedLightFrame } from './LightsAnalysisTa
 function frame(id: number): EnrichedLightFrame {
   return {
     frame_id: id,
-    file_id: id,
+    // Deliberately NOT equal to `frame_id` — the Project column keys
+    // `projectStates` by `frame_id`; a fixture where the two happened to
+    // match would still pass if the lookup used `file_id` by mistake.
+    file_id: id + 1000,
     filename: `frame-${id}.fits`,
     file_path: `/data/frame-${id}.fits`,
     date_obs: '2026-09-01T00:00:00',

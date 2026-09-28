@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
-import { MemoryRouter, Routes, Route } from 'react-router-dom';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { NotificationProvider } from '../contexts/NotificationContext';
 import { SessionStateProvider } from '../contexts/SessionStateContext';
 import { NavHistoryProvider } from '../contexts/NavHistoryContext';
@@ -64,9 +64,14 @@ function gateFixture(overrides: Partial<GateReport> = {}): GateReport {
 }
 
 let publishedListener: ((res: unknown) => void) | undefined;
+/** Every `api.listen` registration this render made, by event name — lets a
+ *  test fire `analysis-complete`/`plate-solve-complete` (or any other event)
+ *  without a dedicated capture variable per event. */
+const listeners: Record<string, ((payload: unknown) => void) | undefined> = {};
 
 beforeEach(() => {
   publishedListener = undefined;
+  for (const k of Object.keys(listeners)) delete listeners[k];
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
   vi.mocked(api.invoke).mockImplementation(((command: string) => {
@@ -92,6 +97,7 @@ beforeEach(() => {
     }
   }) as never);
   vi.mocked(api.listen).mockImplementation((<T,>(event: string, cb: (p: T) => void) => {
+    listeners[event] = cb as unknown as (payload: unknown) => void;
     if (event === 'collab-published') {
       publishedListener = cb as unknown as (res: unknown) => void;
     }
@@ -108,6 +114,13 @@ function CollabNotificationsHarness() {
   return null;
 }
 
+/** Renders wherever `onOpenCalibration`'s `navigate` sends the page, so a
+ *  test can assert the exact path + query it landed on. */
+function LocationDisplay() {
+  const location = useLocation();
+  return <div data-testid="location">{location.pathname}{location.search}</div>;
+}
+
 function renderProjectDetail() {
   return render(
     <MemoryRouter initialEntries={['/projects/proj-1']}>
@@ -117,6 +130,7 @@ function renderProjectDetail() {
             <CollabNotificationsHarness />
             <Routes>
               <Route path="/projects/:id" element={<ProjectDetail />} />
+              <Route path="/objects/:id" element={<LocationDisplay />} />
             </Routes>
             <ToastStack />
           </NotificationProvider>
@@ -537,7 +551,7 @@ describe('ProjectDetail contribute header (F7, dead decision-C hint removed)', (
                 starsDetected: null,
                 trailed: null,
                 publishable: false,
-                failures: ['3 lights have no calibration links'],
+                failures: ['not calibrated — 3 lights have no calibration links'],
               } as FrameGateRow,
             ],
           }),
@@ -547,6 +561,104 @@ describe('ProjectDetail contribute header (F7, dead decision-C hint removed)', (
 
     await screen.findByRole('button', { name: /Publish 0 passing frames/ });
     expect(screen.queryByText(/not available in this version/)).not.toBeInTheDocument();
+  });
+});
+
+describe('ProjectDetail gate blockers (GateBlockers wiring)', () => {
+  it('Analyze sends the blocked set\'s id as analyze_frame_set { frameSetId }', async () => {
+    mockCommands(projectCard(), {
+      evaluate_collab_gate: () =>
+        Promise.resolve(
+          gateFixture({ blockers: [{ kind: 'analyze', frames: 2, sets: [42], names: [] }] }),
+        ),
+    });
+    renderProjectDetail();
+
+    const btn = await screen.findByRole('button', { name: 'Analyze' });
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('analyze_frame_set', { frameSetId: 42 }),
+    );
+  });
+
+  it('Solve sends the failing rows\' ids as plate_solve_batch { frameIds }', async () => {
+    mockCommands(projectCard(), {
+      evaluate_collab_gate: () =>
+        Promise.resolve(
+          gateFixture({
+            blockers: [{ kind: 'solve', frames: 1, sets: [], names: [] }],
+            rows: [
+              {
+                frameId: 7,
+                filename: 'a.fits',
+                fwhmArcsec: null,
+                eccentricity: null,
+                starsDetected: null,
+                trailed: null,
+                publishable: false,
+                failures: ['unknown pixel scale'],
+              } as FrameGateRow,
+            ],
+          }),
+        ),
+    });
+    renderProjectDetail();
+
+    const btn = await screen.findByRole('button', { name: /Solve 1 frames?/ });
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('plate_solve_batch', { frameIds: [7] }),
+    );
+  });
+
+  it('"Open calibration" navigates to the set\'s /objects/<id>?tab=calibration', async () => {
+    mockCommands(projectCard(), {
+      evaluate_collab_gate: () =>
+        Promise.resolve(
+          gateFixture({ blockers: [{ kind: 'linkCalibration', frames: 3, sets: [99], names: [] }] }),
+        ),
+    });
+    renderProjectDetail();
+
+    const btn = await screen.findByRole('button', { name: 'Open calibration' });
+    fireEvent.click(btn);
+    const loc = await screen.findByTestId('location');
+    expect(loc.textContent).toBe('/objects/99?tab=calibration');
+  });
+
+  it('re-fetches the gate when analysis-complete fires', async () => {
+    mockCommands(projectCard());
+    renderProjectDetail();
+    await screen.findByRole('heading', { name: /M42 Mosaic/ });
+    const before = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
+    act(() => {
+      listeners['analysis-complete']?.({
+        frame_set_id: 42,
+        analyzed: 2,
+        skipped: 0,
+        failed: 0,
+        errors: [],
+        cancelled: false,
+      });
+    });
+    await waitFor(() => {
+      const after = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
+      expect(after).toBeGreaterThan(before);
+    });
+  });
+
+  it('re-fetches the gate when plate-solve-complete fires', async () => {
+    mockCommands(projectCard());
+    renderProjectDetail();
+    await screen.findByRole('heading', { name: /M42 Mosaic/ });
+    const before = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
+    act(() => {
+      listeners['plate-solve-complete']?.({});
+    });
+    await waitFor(() => {
+      const after = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
+      expect(after).toBeGreaterThan(before);
+    });
   });
 });
 

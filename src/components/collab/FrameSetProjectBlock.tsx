@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Loader2, Users } from 'lucide-react';
 import { api } from '../../api';
+import { useNotifications } from '../../contexts/NotificationContext';
 import type { FrameSetProjectLink, FrameSetProjectStatus } from '../../types/models';
 
 function summary(l: FrameSetProjectLink): string {
@@ -20,6 +21,7 @@ function summary(l: FrameSetProjectLink): string {
 
 /** Spec 2026-09-28 §8.3 — the set's Project block under the header stats. */
 export default function FrameSetProjectBlock({ framesSetId, status, onChanged }: { framesSetId: number; status: FrameSetProjectStatus; onChanged: () => void }) {
+  const { notify } = useNotifications();
   const [busy, setBusy] = useState<string | null>(null);
   if (status.links.length === 0 && status.candidates.length === 0) return null;
   const link = async (projectId: string) => {
@@ -29,6 +31,7 @@ export default function FrameSetProjectBlock({ framesSetId, status, onChanged }:
       onChanged();
     } catch (err) {
       console.error('[projects] link from the set page failed:', err);
+      notify({ title: 'Could not link to the project', detail: err instanceof Error ? err.message : String(err), kind: 'project', tone: 'warning' });
     } finally {
       setBusy(null);
     }
@@ -39,7 +42,7 @@ export default function FrameSetProjectBlock({ framesSetId, status, onChanged }:
         <div key={l.projectId} className="flex flex-wrap items-center gap-2 text-content-secondary">
           <Users size={14} className="text-content-muted" />
           <span><span className="text-content">Project {l.title}</span> · {summary(l)}</span>
-          <Link to={`/projects/${l.projectId}`} className="rounded border border-border px-2 py-0.5 text-xs hover:bg-surface-hover">Open project</Link>
+          <Link to={`/projects/${l.projectId}?tab=contribute`} className="rounded border border-border px-2 py-0.5 text-xs hover:bg-surface-hover">Open project</Link>
         </div>
       ))}
       {status.links.length === 0 && status.candidates.map((c) => (

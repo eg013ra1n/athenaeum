@@ -80,4 +80,21 @@ describe('FilterMappingDialog', () => {
     render(<FilterMappingDialog projectId="p" onClose={vi.fn()} onSaved={vi.fn()} />);
     await waitFor(() => expect(screen.getByText(/has not been fetched yet/)).toBeInTheDocument());
   });
+
+  it('is an accessible dialog, Escape closes it, and a resolved row has no blank option', async () => {
+    const onClose = vi.fn();
+    render(<FilterMappingDialog projectId="p" onClose={onClose} onSaved={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByRole('combobox')).toHaveLength(4));
+    const dialog = screen.getByRole('dialog', { name: 'Filter mapping' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+
+    // Row 3 is `matched` (resolved): only "— automatic —" plus the
+    // dictionary entries, never a blank placeholder option.
+    const resolvedSelect = screen.getAllByRole('combobox')[3];
+    const optionTexts = Array.from(resolvedSelect.querySelectorAll('option')).map((o) => o.value);
+    expect(optionTexts).not.toContain('');
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalled();
+  });
 });

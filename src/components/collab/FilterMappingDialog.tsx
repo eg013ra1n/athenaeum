@@ -41,6 +41,12 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
   const edits = useMemo<FilterMappingEdit[]>(() => {
     if (!sheet) return [];
     const out: FilterMappingEdit[] = [];
@@ -87,7 +93,7 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
         value={choice[key(r)] ?? ''}
         onChange={(e) => setChoice({ ...choice, [key(r)]: e.target.value })}
       >
-        <option value="">{r.resolution === 'mapped' || r.resolution === 'matched' ? '' : '— choose —'}</option>
+        {r.resolution !== 'mapped' && r.resolution !== 'matched' && <option value="">— choose —</option>}
         {(r.resolution === 'mapped' || r.resolution === 'matched') && <option value={AUTO}>— automatic —</option>}
         {sheet!.dictionary.map((d) => (
           <option key={d.canonical} value={d.canonical}>{d.canonical} · {d.kind}</option>
@@ -98,7 +104,13 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div className="max-h-[80vh] w-[40rem] overflow-auto rounded-lg border border-border bg-surface p-4" onClick={(e) => e.stopPropagation()}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Filter mapping"
+        className="max-h-[80vh] w-[40rem] overflow-auto rounded-lg border border-border bg-surface p-4"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="mb-2 flex items-center justify-between">
           <h2 className="text-base font-semibold text-content">Filter mapping</h2>
           <button type="button" onClick={onClose} aria-label="Close" className="text-content-muted hover:text-content"><X size={16} /></button>

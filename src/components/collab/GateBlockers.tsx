@@ -1,19 +1,27 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ChevronDown } from 'lucide-react';
 import type { GateBlocker, GateReport } from '../../types/models';
 
 const SOLVE_REASONS = new Set(['no coordinates', 'unknown pixel scale']);
 
+/** `1 frame has…` / `2 frames have…` (and `is`/`are`, `fails`/`fail`) — every
+ * count-driven line pluralises both the noun and its verb. */
+function frames(n: number, verb: 'have' | 'are' | 'fail'): string {
+  const noun = `${n} frame${n === 1 ? '' : 's'}`;
+  const singular = { have: 'has', are: 'is', fail: 'fails' }[verb];
+  return `${noun} ${n === 1 ? singular : verb}`;
+}
+
 function line(b: GateBlocker): string {
   switch (b.kind) {
-    case 'analyze': return `${b.frames} frames have no analysis`;
-    case 'solve': return `${b.frames} frames have no coordinates or pixel scale`;
+    case 'analyze': return `${frames(b.frames, 'have')} no analysis`;
+    case 'solve': return `${frames(b.frames, 'have')} no coordinates or pixel scale`;
     case 'linkCalibration':
-    case 'buildMasters': return `${b.frames} frames are not calibrated`;
-    case 'mapFilter': return `${b.names.length} filter name${b.names.length === 1 ? '' : 's'} need a mapping`;
-    case 'threshold': return `${b.frames} frames fail a threshold`;
-    case 'uuid': return `${b.frames} frames have no uuid — re-scan their folder`;
-    case 'outsideTarget': return `${b.frames} frames are outside the target`;
+    case 'buildMasters': return `${frames(b.frames, 'are')} not calibrated`;
+    case 'mapFilter': return `${b.names.length} filter name${b.names.length === 1 ? '' : 's'} ${b.names.length === 1 ? 'needs' : 'need'} a mapping`;
+    case 'threshold': return `${frames(b.frames, 'fail')} a threshold`;
+    case 'uuid': return `${frames(b.frames, 'have')} no uuid — re-scan their folder`;
+    case 'outsideTarget': return `${frames(b.frames, 'are')} outside the target`;
     default: return '';
   }
 }
@@ -37,6 +45,25 @@ export default function GateBlockers({
   onAnalyze: (setId: number) => void;
 }) {
   const [menuFor, setMenuFor] = useState<string | null>(null);
+  const menuRef = useRef<HTMLSpanElement>(null);
+
+  // Escape or a click outside the open menu closes it — the ONE open menu at
+  // a time `menuFor` tracks, so one ref (attached only to whichever
+  // `setPicker` call is currently open) is enough.
+  useEffect(() => {
+    if (!menuFor) return;
+    const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenuFor(null); };
+    const onPointerDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuFor(null);
+    };
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('mousedown', onPointerDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('mousedown', onPointerDown);
+    };
+  }, [menuFor]);
+
   const hasLinkCalibration = gate.blockers.some((b) => b.kind === 'linkCalibration');
   // `buildMasters` only carries the calibration line when there is no
   // `linkCalibration` blocker to carry it instead — the two never both
@@ -52,16 +79,32 @@ export default function GateBlockers({
   const calFrames = calBlockers.reduce((n, b) => Math.max(n, b.frames), 0);
   const solveIds = gate.rows.filter((r) => r.failures.some((f) => SOLVE_REASONS.has(f))).map((r) => r.frameId);
 
-  const setPicker = (key: string, label: string, sets: number[], pick: (id: number) => void) =>
+  const setPicker = (
+    key: string,
+    label: string,
+    sets: number[],
+    pick: (id: number) => void,
+    isBusy: (id: number) => boolean = () => false,
+  ) =>
     sets.length === 1 ? (
-      <button type="button" className={BTN} onClick={() => pick(sets[0])}>{label}</button>
+      <button type="button" className={BTN} disabled={isBusy(sets[0])} onClick={() => pick(sets[0])}>{label}</button>
     ) : (
-      <span className="relative">
+      <span className="relative" ref={menuFor === key ? menuRef : undefined}>
         <button type="button" className={BTN} onClick={() => setMenuFor(menuFor === key ? null : key)}>{label} <ChevronDown size={11} /></button>
         {menuFor === key && (
           <ul role="menu" className="absolute z-10 mt-1 rounded border border-border bg-surface p-1 text-xs shadow">
             {sets.map((s) => (
-              <li key={s} role="menuitem" className="cursor-pointer rounded px-2 py-1 hover:bg-surface-hover" onClick={() => { setMenuFor(null); pick(s); }}>Set #{s}</li>
+              <li key={s} role="none">
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={isBusy(s)}
+                  className="block w-full rounded px-2 py-1 text-left hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={() => { if (isBusy(s)) return; setMenuFor(null); pick(s); }}
+                >
+                  Set #{s}{isBusy(s) ? ' (busy…)' : ''}
+                </button>
+              </li>
             ))}
           </ul>
         )}
@@ -81,10 +124,10 @@ export default function GateBlockers({
           }
           return (
             <li key={b.kind} className="flex flex-wrap items-center gap-2 text-content-secondary">
-              <span>{isCalibration ? `${calFrames} frames are not calibrated` : line(b)}</span>
-              {b.kind === 'analyze' && setPicker('analyze', 'Analyze', b.sets, onAnalyze)}
+              <span>{isCalibration ? `${frames(calFrames, 'are')} not calibrated` : line(b)}</span>
+              {b.kind === 'analyze' && setPicker('analyze', 'Analyze', b.sets, onAnalyze, (id) => analyzeBusy.has(id))}
               {b.kind === 'solve' && (
-                <button type="button" className={BTN} disabled={solveBusy} onClick={() => onSolve(solveIds)}>Solve {b.frames} frames</button>
+                <button type="button" className={BTN} disabled={solveBusy} onClick={() => onSolve(solveIds)}>Solve {b.frames} frame{b.frames === 1 ? '' : 's'}</button>
               )}
               {isCalibration && (
                 <>
