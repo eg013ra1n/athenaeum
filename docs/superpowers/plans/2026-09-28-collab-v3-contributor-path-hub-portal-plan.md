@@ -905,6 +905,18 @@ git commit -m "feat(portal): Admin filter-dictionary editor — rows, inline hub
 - Modify: `README.md` (route table lines 113–114: mention `unfiltered` and the two 409s; the dictionary paragraph around line 609 if it lists the seven canonicals)
 - Modify (app repo): `docs/superpowers/open-items.md` — a line under the contributor-path entry: hub branch `contributor-path-hub` done, suites green, test-hub deploy owed.
 
+- [ ] **Step 0 (added in execution): the sweep of deferred review minors**
+
+Fix each, with a test where one is named, before the full suites in Steps 1–2:
+
+1. `src/routes/projects.rs:~640` doc: the coverage `kind` is one of the four kinds (`unfiltered` included).
+2. `src/routes/dictionary.rs::default_dictionary` doc: restore the pointer "used by `seed_default_tx`, called from `create_project_core`; 0026 backfills older projects".
+3. `src/routes/frames.rs` `filterRaw` rule: count `chars().count()` and keep the sentence `at most 80 chars` (the sentence and the count must agree); add a `tests/frames.rs` case where exactly 80 trimmed chars (padded with spaces on both sides) is accepted.
+4. `migrations/0026_unfiltered_dictionary_entry.sql` (undeployed, safe to edit): in `eligible` add `AND jsonb_typeof(l.entries) = 'array'` and `AND jsonb_array_length(l.entries) < 50`; in `tests/dictionary.rs` add one test where a project's v1 is a 50-entry array (seven + 43 synthetic `X1..X43` broadband canonicals) → skipped, and one where `entries` is `'"not an array"'::jsonb` → skipped and the migration SQL still runs.
+5. `src/routes/dictionary.rs`: move the "— 409 when …" sentence from `validate_dictionary`'s doc to a `///` on `put_dictionary` (which has none).
+6. `tests/dictionary.rs::removing_a_canonical_in_use_is_refused`: assert the whole sentence `canonical "Ha" is used by 1 frame — remap them first` (exact, singular) and that the case-rename body names `"Ha"`; add a step that removes an alias from `Ha` (in use) and expects 200 / v+1.
+7. `src/routes/frames.rs` remap route (`PATCH …/frames/{uuid}` with `filterCanonical`, ~line 1060): take `SELECT id FROM projects WHERE id = $1 FOR UPDATE` at the top of its transaction before reading `canonical_filters_tx`, matching announce and `put_dictionary` (closes the race where a remap to a canonical being dropped commits after the PUT); add a comment naming why.
+
 - [ ] **Step 1: Run the full hub suite**
 
 Run: `DATABASE_URL=postgres://hub:hub@localhost:5432/hub cargo test 2>&1 | tail -30`
