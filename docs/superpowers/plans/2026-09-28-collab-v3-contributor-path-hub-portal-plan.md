@@ -916,6 +916,7 @@ Fix each, with a test where one is named, before the full suites in Steps 1–2:
 5. `src/routes/dictionary.rs`: move the "— 409 when …" sentence from `validate_dictionary`'s doc to a `///` on `put_dictionary` (which has none).
 6. `tests/dictionary.rs::removing_a_canonical_in_use_is_refused`: assert the whole sentence `canonical "Ha" is used by 1 frame — remap them first` (exact, singular) and that the case-rename body names `"Ha"`; add a step that removes an alias from `Ha` (in use) and expects 200 / v+1.
 7. `src/routes/frames.rs` remap route (`PATCH …/frames/{uuid}` with `filterCanonical`, ~line 1060): take `SELECT id FROM projects WHERE id = $1 FOR UPDATE` at the top of its transaction before reading `canonical_filters_tx`, matching announce and `put_dictionary` (closes the race where a remap to a canonical being dropped commits after the PUT); add a comment naming why.
+8. Portal `DictionaryEditor.tsx`: (a) key alias ownership by row index and keep the display name separately, so a repeated alias inside a row with an empty canonical reads `listed twice` and two rows sharing a canonical name the other entry; (b) error-line React keys `${i}-${n}`, never the message text; (c) pass `aria-invalid={errors[i].length > 0}` on the row's `Field`s. Add one test: an alias equal to ANOTHER entry's canonical is allowed (Save enabled) — the hub keeps the two namespaces separate.
 
 - [ ] **Step 1: Run the full hub suite**
 
