@@ -214,10 +214,9 @@ cycle.
   change; add/remove/reorder is). Hub `post_thresholds` answers 409 `rules are
   identical to the current version` by jsonb equality and mints nothing
   (`tests/thresholds.rs::identical_rules_are_refused`). Hub `f2c1385`.
-  - Owed: the FULL hub suite (`DATABASE_URL=… cargo test` in `athenaeum-hub`)
-    — only `thresholds`, `rules_registry`, `feed_publish`, `collab_flow` ran
-    green before the owner cancelled the run; the change is one early return
-    in one route, but the suite is the gate before any push. Then the
+  - The FULL hub suite ran green on 2026-09-28 (`DATABASE_URL=… cargo test`
+    in `athenaeum-hub`, exit 0; the earlier run had been cancelled after
+    `thresholds`, `rules_registry`, `feed_publish`, `collab_flow`). Owed: the
     test-hub deploy and a portal click-through: open Admin → Quality
     thresholds untouched → Save disabled with the hint; edit a value → Save
     enabled → v+1; post the same rules from a second tab → the `Error: rules
@@ -260,7 +259,11 @@ cycle.
   3. Portal: a dictionary editor (today the dictionary is only seeded; there
      is no UI to add `L-eXtreme`, `Dualband`, …), so a coordinator can grow
      the vocabulary the publishers map into.
-  The canonical's name and kind are proposals, not decided.
+  **Spec written and approved 2026-09-28:**
+  `docs/superpowers/specs/2026-09-28-collab-v3-filter-mapping-design.md`
+  (amendment A7 of the per-frame spec) — canonical `None`, kind
+  `unfiltered`, mapping per account e-mail, two `PUT /dictionary` refusals,
+  portal dictionary editor; two plans follow (hub+portal, app).
 - **Repo hygiene finding:** `Documents/Projects/athenaeum-hub-portal/` is a
   STALE copy of the portal (still the free-text threshold editor); the
   deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
