@@ -9,6 +9,7 @@ import ProjectDetail from './ProjectDetail';
 import { useCollabNotifications } from '../hooks/useCollabNotifications';
 import { api } from '../api';
 import type {
+  FrameGateRow,
   GateReport,
   ProjectCard,
   ProjectDetail as Detail,
@@ -58,8 +59,8 @@ function detailFixture(card: ProjectCard = projectCard()): Detail {
   };
 }
 
-function gateFixture(): GateReport {
-  return { projectId: 'proj-1', total: 2, publishable: 2, rows: [], blockers: [] };
+function gateFixture(overrides: Partial<GateReport> = {}): GateReport {
+  return { projectId: 'proj-1', total: 2, publishable: 2, rows: [], blockers: [], ...overrides };
 }
 
 let publishedListener: ((res: unknown) => void) | undefined;
@@ -502,6 +503,50 @@ describe('ProjectDetail publishing device (A6)', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Switch' }));
     expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
     expect(screen.queryByTestId('publishing-refusal')).not.toBeInTheDocument();
+  });
+});
+
+describe('ProjectDetail contribute header (F7, dead decision-C hint removed)', () => {
+  it('auto_publish_switch_visible_without_receive', async () => {
+    mockCommands(projectCard({ dataRole: 'send' }));
+    renderProjectDetail();
+
+    const toggle = await screen.findByRole('checkbox', { name: /Auto-publish my frames/ });
+    // The fixture's `autoPublish` defaults to true; the click toggles it off.
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('set_project_auto_publish', {
+        projectId: 'proj-1',
+        enabled: false,
+      }),
+    );
+  });
+
+  it('never shows the dead "not available in this version" hint, even when every candidate fails only on calibration', async () => {
+    mockCommands(projectCard(), {
+      evaluate_collab_gate: () =>
+        Promise.resolve(
+          gateFixture({
+            publishable: 0,
+            rows: [
+              {
+                frameId: 1,
+                filename: 'a.fits',
+                fwhmArcsec: null,
+                eccentricity: null,
+                starsDetected: null,
+                trailed: null,
+                publishable: false,
+                failures: ['3 lights have no calibration links'],
+              } as FrameGateRow,
+            ],
+          }),
+        ),
+    });
+    renderProjectDetail();
+
+    await screen.findByRole('button', { name: /Publish 0 passing frames/ });
+    expect(screen.queryByText(/not available in this version/)).not.toBeInTheDocument();
   });
 });
 

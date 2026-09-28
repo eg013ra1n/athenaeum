@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useParams, useSearchParams } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { ExternalLink, Loader2, Monitor, Plus, RefreshCw, Send, Target } from 'lucide-react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
@@ -8,12 +8,16 @@ import { openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
 import AutoReplicateBar from '../components/collab/AutoReplicateBar';
+import AutoPublishSwitch from '../components/collab/AutoPublishSwitch';
+import GateBlockers from '../components/collab/GateBlockers';
+import FilterMappingDialog from '../components/collab/FilterMappingDialog';
 import LinkObjectDialog from '../components/collab/LinkObjectDialog';
 import ReceiveTab from '../components/collab/ReceiveTab';
 import ModerationQueue from '../components/collab/ModerationQueue';
 import UpdateRequired from '../components/collab/UpdateRequired';
 import CollabLiveStatus from '../components/collab/CollabLiveStatus';
 import { formatBytes } from '../components/collab/format';
+import { SHORT as CONTRIBUTOR_STATE_LABEL } from '../components/collab/contributorState';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import type {
   FrameGateRow,
@@ -95,6 +99,7 @@ function leading(name: string): string {
 
 export default function ProjectDetail() {
   const { id } = useParams();
+  const navigate = useNavigate();
   const { notify } = useNotifications();
   const [detail, setDetail] = useState<Detail | null>(null);
   const [gate, setGate] = useState<GateReport | null>(null);
@@ -130,6 +135,27 @@ export default function ProjectDetail() {
   const [refusedBy, setRefusedBy] = useState<string | null>(null);
   const [switchConfirm, setSwitchConfirm] = useState(false);
   const [switchBusy, setSwitchBusy] = useState(false);
+  const [mapOpen, setMapOpen] = useState(false);
+  const [solveBusy, setSolveBusy] = useState(false);
+  const [analyzeBusy, setAnalyzeBusy] = useState<Set<number>>(new Set());
+
+  // The gate is evaluated locally over the linked sets, in its own try so a
+  // gate failure never masquerades as "project not found" — keep the detail
+  // rendered and surface an inline gate error instead. Its own callback so
+  // the analysis/solve completion listeners below can re-run just the gate
+  // without reloading the whole project detail.
+  const loadGate = useCallback(async () => {
+    if (!id) return;
+    setGateError(false);
+    try {
+      const g = await api.invoke<GateReport>('evaluate_collab_gate', { projectId: id });
+      setGate(g);
+    } catch (err) {
+      console.error('[projects] gate evaluation failed:', err);
+      setGate(null);
+      setGateError(true);
+    }
+  }, [id]);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -145,19 +171,37 @@ export default function ProjectDetail() {
       setMissing(true);
       return;
     }
-    // The gate is evaluated locally over the linked sets, in its own try so a
-    // gate failure never masquerades as "project not found" — keep the detail
-    // rendered and surface an inline gate error instead.
-    setGateError(false);
-    try {
-      const g = await api.invoke<GateReport>('evaluate_collab_gate', { projectId: id });
-      setGate(g);
-    } catch (err) {
-      console.error('[projects] gate evaluation failed:', err);
-      setGate(null);
-      setGateError(true);
-    }
-  }, [id]);
+    await loadGate();
+  }, [id, loadGate]);
+
+  // Re-run the gate and clear the corresponding busy state once an analyze
+  // or solve run this page kicked off finishes — StrictMode-safe listener
+  // pattern (CLAUDE.md).
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api.listen('analysis-complete', () => {
+      if (cancelled) return;
+      setAnalyzeBusy(new Set());
+      void loadGate();
+    })
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+      .catch((err) => console.error('[projects] analysis-complete listen failed:', err));
+    return () => { cancelled = true; unlisten?.(); };
+  }, [loadGate]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api.listen('plate-solve-complete', () => {
+      if (cancelled) return;
+      setSolveBusy(false);
+      void loadGate();
+    })
+      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
+      .catch((err) => console.error('[projects] plate-solve-complete listen failed:', err));
+    return () => { cancelled = true; unlisten?.(); };
+  }, [loadGate]);
 
   const loadFrames = useCallback(async () => {
     if (!id) return;
@@ -365,22 +409,7 @@ export default function ProjectDetail() {
   const needsApproval = c.requireApproval && !c.coordinator;
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
   const publishable = gate?.publishable ?? 0;
-  // Decision C (spec 2026-08-31 §8a): the calibration precondition resolves to
-  // `NotCalibrated` unconditionally for every candidate frame, so as long as
-  // there IS at least one candidate frame, that is always the reason the gate
-  // is fully closed — check the rows rather than hard-coding "always show
-  // this" so a future generate-at-publish rework (which gives the status a
-  // real resolver again) doesn't leave a permanently-wrong message behind.
-  const publishBlockedByCalibration =
-    !!gate &&
-    gate.total > 0 &&
-    publishable === 0 &&
-    gate.rows.every((r) => r.failures.some((f) => f.startsWith('not calibrated')));
-  const publishTooltip = publishBlockedByCalibration
-    ? 'Publishing calibrated lights from this device is not available in this version — export or send them instead.'
-    : publishable === 0
-      ? 'No passing frames to publish yet'
-      : undefined;
+  const publishTooltip = publishable === 0 ? 'No passing frames to publish yet' : undefined;
   const own = frames?.filter((f) => f.own) ?? [];
   // The project's published volume, client-side from the rows already listed.
   const publishedBytes =
@@ -455,7 +484,6 @@ export default function ProjectDetail() {
         <AutoReplicateBar
           projectId={id}
           autoReplicate={c.autoReplicate}
-          autoPublish={c.autoPublish}
           publishedBytes={publishedBytes}
           onToggled={() => void load()}
         />
@@ -484,7 +512,7 @@ export default function ProjectDetail() {
 
       {activeTab === 'contribute' && (
         <div className="space-y-4">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <span className="text-sm font-medium text-content">Linked objects</span>
             <button
               onClick={() => setLinkOpen(true)}
@@ -492,6 +520,9 @@ export default function ProjectDetail() {
             >
               <Plus size={12} /> Link an object
             </button>
+            {id && (
+              <AutoPublishSwitch projectId={id} enabled={c.autoPublish} onToggled={() => void load()} />
+            )}
           </div>
 
           {detail.links.length === 0 ? (
@@ -514,7 +545,40 @@ export default function ProjectDetail() {
           {gateError ? (
             <p className="text-sm text-error">Gate evaluation failed — see console.</p>
           ) : (
-            <GateTable gate={gate} />
+            <>
+              {gate && (
+                <GateBlockers
+                  gate={gate}
+                  solveBusy={solveBusy}
+                  analyzeBusy={analyzeBusy}
+                  onMapFilters={() => setMapOpen(true)}
+                  onOpenCalibration={(setId) => navigate(`/objects/${setId}?tab=calibration`)}
+                  onSolve={async (ids) => {
+                    setSolveBusy(true);
+                    try {
+                      await api.invoke('plate_solve_batch', { frameIds: ids });
+                    } catch (err) {
+                      console.error('[projects] solve failed:', err);
+                      setSolveBusy(false);
+                    }
+                  }}
+                  onAnalyze={async (setId) => {
+                    setAnalyzeBusy((s) => new Set(s).add(setId));
+                    try {
+                      await api.invoke('analyze_frame_set', { frameSetId: setId });
+                    } catch (err) {
+                      console.error('[projects] analyze failed:', err);
+                      setAnalyzeBusy((s) => {
+                        const n = new Set(s);
+                        n.delete(setId);
+                        return n;
+                      });
+                    }
+                  }}
+                />
+              )}
+              <GateTable gate={gate} />
+            </>
           )}
 
           <div className="flex flex-wrap items-center gap-2">
@@ -530,13 +594,6 @@ export default function ProjectDetail() {
               >
                 <Send size={14} /> Publish {publishable} passing frames
               </button>
-              {/* Honest line near the button (D-2, review fix) — the tooltip alone
-                  is easy to miss on a dead-looking disabled button, and decision C
-                  means this is not a temporary/data-dependent state a user could
-                  fix by linking more objects or waiting for analysis. */}
-              {publishBlockedByCalibration && (
-                <p className="text-xs text-content-muted">{publishTooltip}</p>
-              )}
               {publishError && !publishConfirm && <p className="text-sm text-error">{publishError}</p>}
             </div>
 
@@ -630,6 +687,17 @@ export default function ProjectDetail() {
           projectId={id}
           onClose={() => setLinkOpen(false)}
           onChanged={() => void load()}
+        />
+      )}
+
+      {mapOpen && id && (
+        <FilterMappingDialog
+          projectId={id}
+          onClose={() => setMapOpen(false)}
+          onSaved={(r) => {
+            setGate(r);
+            setMapOpen(false);
+          }}
         />
       )}
 
@@ -776,6 +844,14 @@ function PublicationHistory({
                   v{f.contentVersion} · {formatBytes(f.byteSize)}
                 </span>
                 <StateChip state={f.state} rejectReason={f.acceptedReason} />
+                {f.contributorState && (
+                  <span
+                    className="rounded bg-surface-hover px-1.5 text-[10px] text-content-muted"
+                    title={f.contributorReason ?? undefined}
+                  >
+                    {CONTRIBUTOR_STATE_LABEL[f.contributorState] ?? f.contributorState}
+                  </span>
+                )}
               </div>
               <p className="mt-0.5 text-[11px] text-content-muted">
                 held by {f.holdersOnline} online / {f.holdersTotal}

@@ -18,7 +18,6 @@ function renderBar(onToggled = () => {}) {
     <AutoReplicateBar
       projectId="proj-1"
       autoReplicate
-      autoPublish={false}
       publishedBytes={2048}
       onToggled={onToggled}
     />,
@@ -32,17 +31,18 @@ describe('AutoReplicateBar', () => {
     expect(screen.getByText('2.0 KB published')).toBeInTheDocument();
   });
 
-  it('writes the local preferences and re-reads them', async () => {
+  it('writes the local preference and re-reads it', async () => {
     const onToggled = vi.fn();
     renderBar(onToggled);
     fireEvent.click(screen.getByRole('checkbox', { name: /Auto-download contributions/ }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('set_project_auto_replicate', { projectId: 'proj-1', enabled: false }),
     );
-    fireEvent.click(screen.getByRole('checkbox', { name: /Auto-publish my frames/ }));
-    await waitFor(() =>
-      expect(api.invoke).toHaveBeenCalledWith('set_project_auto_publish', { projectId: 'proj-1', enabled: true }),
-    );
-    expect(onToggled).toHaveBeenCalledTimes(2);
+    expect(onToggled).toHaveBeenCalledTimes(1);
+  });
+
+  it('no longer has an auto-publish switch — that moved to AutoPublishSwitch', () => {
+    renderBar();
+    expect(screen.queryByRole('checkbox', { name: /Auto-publish my frames/ })).not.toBeInTheDocument();
   });
 });
