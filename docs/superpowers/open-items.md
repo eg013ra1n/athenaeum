@@ -271,6 +271,12 @@ cycle.
   Hub+portal plan DONE on branch `contributor-path-hub` (`2aae815`): full hub
   suite + portal suite green; OWED: merge on the owner's word, test-hub
   deploy, the portal click-through of acceptance step 1.
+  - Follow-up (final review of the hub branch, 2026-09-28): "remap them
+    first" names a control neither the portal nor the app has — the
+    coordinator remap (`PATCH …/frames/{uuid}` `filterCanonical`) has no UI;
+    and the in-use count includes `rejected` frames the coordinator never
+    sees in coverage. Owner to rule: a remap action in the portal, or
+    exclude `rejected` from the count.
 - **Repo hygiene finding:** `Documents/Projects/athenaeum-hub-portal/` is a
   STALE copy of the portal (still the free-text threshold editor); the
   deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
