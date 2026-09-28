@@ -268,6 +268,9 @@ cycle.
   a blocker list with actions above the gate table + the frame set's
   Project block/column + the auto-publish switch for every member; two
   plans follow (hub+portal, app).
+  Hub+portal plan DONE on branch `contributor-path-hub` (`2aae815`): full hub
+  suite + portal suite green; OWED: merge on the owner's word, test-hub
+  deploy, the portal click-through of acceptance step 1.
 - **Repo hygiene finding:** `Documents/Projects/athenaeum-hub-portal/` is a
   STALE copy of the portal (still the free-text threshold editor); the
   deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
