@@ -105,11 +105,10 @@ pub struct GateFrameInput {
     pub analysis: Option<FrameAnalysis>,
     /// The frame's trimmed `FILTER` header, as read from the catalog.
     pub filter_raw: String,
-    /// `filter_raw` matched against the project's cached dictionary (plan
-    /// ruling P3, `collab::filters::match_filter`) — the dictionary's own
-    /// canonical spelling on a hit, `None` on no match (or an empty
-    /// dictionary).
-    pub filter_canonical: Option<String>,
+    /// `filter_raw` resolved against the account's explicit mappings and the
+    /// project's cached dictionary (spec 2026-09-28 §3.2,
+    /// `collab::filters::FilterResolution`/`resolve_filter`).
+    pub filter: crate::collab::filters::FilterResolution,
     /// `frames.uuid` (plan ruling P18 — also `ATH_CSRC`). Empty when the
     /// frame carries none.
     pub uuid: String,
@@ -131,8 +130,10 @@ pub struct FrameGateRow {
     pub publishable: bool,
     /// Human-readable failure reasons, empty when publishable (e.g.
     /// `FWHM 3.4″ > 3.0″`, the caller's `cal_blocker` sentence verbatim, `frame
-    /// has no uuid`, `filter "OIII" is not in the project dictionary`,
-    /// `no analysis`, `unknown pixel scale`,
+    /// has no uuid`, `no FILTER header — needs a filter mapping`,
+    /// `filter "OIII" needs a filter mapping`,
+    /// `filter "H" is mapped to "Hb", which is not in this project's
+    /// dictionary`, `no analysis`, `unknown pixel scale`,
     /// `outside target radius (2.1° > 1.5°)`).
     pub failures: Vec<String>,
 }
@@ -155,11 +156,26 @@ pub fn evaluate_frame(
     if input.uuid.trim().is_empty() {
         failures.push("frame has no uuid".to_string());
     }
-    if input.filter_canonical.is_none() {
-        failures.push(format!(
-            "filter \"{}\" is not in the project dictionary",
-            input.filter_raw
-        ));
+    {
+        use crate::collab::filters::FilterResolution;
+        match &input.filter {
+            FilterResolution::Mapped(_) | FilterResolution::Matched(_) => {}
+            FilterResolution::Unmapped if input.filter_raw.trim().is_empty() => {
+                failures.push("no FILTER header — needs a filter mapping".to_string());
+            }
+            FilterResolution::Unmapped => {
+                failures.push(format!(
+                    "filter \"{}\" needs a filter mapping",
+                    input.filter_raw.trim()
+                ));
+            }
+            FilterResolution::MappedToMissing(c) => {
+                failures.push(format!(
+                    "filter \"{}\" is mapped to \"{c}\", which is not in this project's dictionary",
+                    input.filter_raw.trim()
+                ));
+            }
+        }
     }
     let analysis = input.analysis.as_ref();
     if analysis.is_none() {
@@ -255,6 +271,134 @@ pub fn evaluate_frame(
     }
 }
 
+/// Spec 2026-09-28 §7.1: one distinct (camera, raw name) needing a mapping.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnmappedFilter {
+    pub instrume: String,
+    pub filter_raw: String,
+    pub frames: i64,
+}
+
+/// One cause that blocks publishing, with the frames it holds back, the
+/// sets they belong to (for the set-scoped actions) and, for `mapFilter`,
+/// the raw names (§7.1 table). Kinds in `BLOCKER_ORDER` order.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GateBlocker {
+    pub kind: String,
+    pub frames: i64,
+    pub sets: Vec<i64>,
+    pub names: Vec<UnmappedFilter>,
+}
+
+pub const BLOCKER_ORDER: [&str; 9] = [
+    "analyze",
+    "solve",
+    "linkCalibration",
+    "buildMasters",
+    "attest",
+    "mapFilter",
+    "threshold",
+    "uuid",
+    "outsideTarget",
+];
+
+/// What `derive_blockers` needs per gate row — the caller pairs each
+/// `FrameGateRow` with its set and raw filter.
+pub struct BlockerRow<'a> {
+    pub frame_id: i64,
+    pub set_id: Option<i64>,
+    pub instrume: &'a str,
+    pub filter_raw: &'a str,
+    pub filter_unresolved: bool,
+    pub failures: &'a [String],
+}
+
+fn is_calibration_reason(f: &str) -> bool {
+    f.contains("no calibration links")
+        || f.contains("No calibration is linked")
+        || f.contains("Build masters first")
+        || f.contains("no master")
+        || f.contains("master file missing")
+        || f.starts_with("could not verify calibration")
+        || f == "frame set unresolved"
+}
+fn is_build_masters_reason(f: &str) -> bool {
+    f.contains("Build masters first") || f.contains("no master") || f.contains("master file missing")
+}
+
+/// Spec §7.1 — the table, applied to every row's failure sentences. A row
+/// may count under several kinds; each kind counts a frame once.
+pub fn derive_blockers(rows: &[BlockerRow<'_>]) -> Vec<GateBlocker> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut frames: BTreeMap<&str, BTreeSet<i64>> = BTreeMap::new();
+    let mut sets: BTreeMap<&str, BTreeSet<i64>> = BTreeMap::new();
+    let mut names: BTreeMap<(String, String), BTreeSet<i64>> = BTreeMap::new();
+    for r in rows {
+        let mut add = |kind: &'static str| {
+            frames.entry(kind).or_default().insert(r.frame_id);
+            if let Some(s) = r.set_id {
+                sets.entry(kind).or_default().insert(s);
+            }
+        };
+        for f in r.failures {
+            let f = f.as_str();
+            if f == "no analysis" {
+                add("analyze");
+            } else if f == "no coordinates" || f == "unknown pixel scale" {
+                add("solve");
+            } else if is_build_masters_reason(f) {
+                add("buildMasters");
+                add("attest");
+            } else if is_calibration_reason(f) {
+                add("linkCalibration");
+                add("attest");
+            } else if f.contains("needs a filter mapping") || f.contains("is mapped to") {
+                add("mapFilter");
+            } else if f == "frame has no uuid" {
+                add("uuid");
+            } else if f.starts_with("outside target radius") {
+                add("outsideTarget");
+            } else {
+                add("threshold");
+            }
+        }
+        if r.filter_unresolved {
+            names
+                .entry((r.instrume.trim().to_string(), r.filter_raw.trim().to_string()))
+                .or_default()
+                .insert(r.frame_id);
+        }
+    }
+    let mut unmapped: Vec<UnmappedFilter> = names
+        .into_iter()
+        .map(|((instrume, filter_raw), ids)| UnmappedFilter {
+            instrume,
+            filter_raw,
+            frames: ids.len() as i64,
+        })
+        .collect();
+    unmapped.sort_by(|a, b| {
+        b.frames
+            .cmp(&a.frames)
+            .then(a.instrume.cmp(&b.instrume))
+            .then(a.filter_raw.cmp(&b.filter_raw))
+    });
+    BLOCKER_ORDER
+        .iter()
+        .filter_map(|kind| {
+            let ids = frames.get(kind)?;
+            Some(GateBlocker {
+                kind: kind.to_string(),
+                frames: ids.len() as i64,
+                sets: sets.get(kind).map(|s| s.iter().copied().collect()).unwrap_or_default(),
+                names: if *kind == "mapFilter" { unmapped.clone() } else { Vec::new() },
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,9 +467,15 @@ mod tests {
             cal_blocker: None,
             analysis: analysis_opt,
             filter_raw: "L".into(),
-            filter_canonical: Some("L".into()),
+            filter: crate::collab::filters::FilterResolution::Matched("L".into()),
             uuid: "11111111-1111-1111-1111-111111111111".into(),
         }
+    }
+
+    /// A fully passing `GateFrameInput` — the base every reason-specific test
+    /// mutates one field of.
+    fn passing_input() -> GateFrameInput {
+        input(Some(analysis(1.2, 0.4, 400, false)))
     }
 
     fn target() -> ProjectTarget {
@@ -399,22 +549,159 @@ mod tests {
         assert!(row.failures.iter().any(|f| f == "no coordinates"));
     }
 
-    /// P3: an unmapped filter fails with its own raw name quoted, not a
-    /// generic sentence — the operator has to see WHICH filter didn't map.
+    /// P3 / spec §5.1: the three filter-resolution reasons, each naming the
+    /// raw header and (for `MappedToMissing`) the canonical it resolved to —
+    /// the operator has to see WHICH filter didn't map and WHY.
     #[test]
-    fn unmapped_filter_fails_with_its_name() {
-        let mut i = input(Some(analysis(1.2, 0.4, 400, false)));
-        i.filter_raw = "OIII".to_string();
-        i.filter_canonical = None;
-        let row = evaluate_frame(&i, &target(), &rules());
-        assert!(!row.publishable);
+    fn filter_reasons_name_the_raw_name_and_the_missing_canonical() {
+        use crate::collab::filters::FilterResolution;
+        let mut i = passing_input(); // the existing helper that builds a fully passing GateFrameInput
+        i.filter_raw = String::new();
+        i.filter = FilterResolution::Unmapped;
+        let row = evaluate_frame(&i, &target(), &[]);
         assert!(
             row.failures
                 .iter()
-                .any(|f| f == "filter \"OIII\" is not in the project dictionary"),
+                .any(|f| f == "no FILTER header — needs a filter mapping"),
             "{:?}",
             row.failures
         );
+
+        i.filter_raw = "Slot 0".into();
+        let row = evaluate_frame(&i, &target(), &[]);
+        assert!(
+            row.failures
+                .iter()
+                .any(|f| f == "filter \"Slot 0\" needs a filter mapping"),
+            "{:?}",
+            row.failures
+        );
+
+        i.filter_raw = "H".into();
+        i.filter = FilterResolution::MappedToMissing("Hb".into());
+        let row = evaluate_frame(&i, &target(), &[]);
+        assert!(
+            row.failures
+                .iter()
+                .any(|f| f == "filter \"H\" is mapped to \"Hb\", which is not in this project's dictionary"),
+            "{:?}",
+            row.failures
+        );
+
+        i.filter = FilterResolution::Matched("Ha".into());
+        assert!(evaluate_frame(&i, &target(), &[]).publishable);
+    }
+
+    /// Spec §7.1: a row counts under every blocker kind it fails, in
+    /// `BLOCKER_ORDER` order; `attest` picks up every calibration reason;
+    /// `mapFilter` names the distinct (camera, raw) pairs, most-frames-first.
+    #[test]
+    fn a_row_counts_under_every_blocker_it_fails() {
+        let f1 = vec![
+            "3 lights have no calibration links".to_string(),
+            "filter \"Slot 0\" needs a filter mapping".to_string(),
+        ];
+        let f2 = vec![
+            "no analysis".to_string(),
+            "unknown pixel scale".to_string(),
+            "no coordinates".to_string(),
+        ];
+        let f3 = vec![
+            "Build masters first — 1 set without a master".to_string(),
+            "FWHM 3.40″ > 3.00″".to_string(),
+        ];
+        let f4 = vec![
+            "frame has no uuid".to_string(),
+            "outside target radius (2.1° > 1.5°)".to_string(),
+            "no FILTER header — needs a filter mapping".to_string(),
+        ];
+        let rows = vec![
+            BlockerRow {
+                frame_id: 1,
+                set_id: Some(10),
+                instrume: "QHY268M",
+                filter_raw: "Slot 0",
+                filter_unresolved: true,
+                failures: &f1,
+            },
+            BlockerRow {
+                frame_id: 2,
+                set_id: Some(10),
+                instrume: "QHY268M",
+                filter_raw: "L",
+                filter_unresolved: false,
+                failures: &f2,
+            },
+            BlockerRow {
+                frame_id: 3,
+                set_id: Some(11),
+                instrume: "ASI294",
+                filter_raw: "L",
+                filter_unresolved: false,
+                failures: &f3,
+            },
+            BlockerRow {
+                frame_id: 4,
+                set_id: Some(11),
+                instrume: "ATR2600M",
+                filter_raw: "",
+                filter_unresolved: true,
+                failures: &f4,
+            },
+            BlockerRow {
+                frame_id: 5,
+                set_id: Some(11),
+                instrume: "ATR2600M",
+                filter_raw: "",
+                filter_unresolved: true,
+                failures: &f4,
+            },
+        ];
+        let b = derive_blockers(&rows);
+        let kinds: Vec<&str> = b.iter().map(|x| x.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "analyze",
+                "solve",
+                "linkCalibration",
+                "buildMasters",
+                "attest",
+                "mapFilter",
+                "threshold",
+                "uuid",
+                "outsideTarget"
+            ]
+        );
+        let by = |k: &str| b.iter().find(|x| x.kind == k).unwrap();
+        assert_eq!(by("analyze").frames, 1);
+        assert_eq!(by("solve").frames, 1, "one frame, two solve reasons");
+        assert_eq!(by("linkCalibration").frames, 1);
+        assert_eq!(by("linkCalibration").sets, vec![10]);
+        assert_eq!(by("buildMasters").frames, 1);
+        assert_eq!(by("buildMasters").sets, vec![11]);
+        assert_eq!(by("attest").frames, 2, "every calibration reason offers attest");
+        assert_eq!(by("attest").sets, vec![10, 11]);
+        assert_eq!(by("mapFilter").frames, 3);
+        assert_eq!(by("mapFilter").names.len(), 2);
+        assert_eq!(by("mapFilter").names[0].filter_raw, "", "most frames first");
+        assert_eq!(by("mapFilter").names[0].frames, 2);
+        assert_eq!(by("mapFilter").names[1].filter_raw, "Slot 0");
+        assert_eq!(by("threshold").frames, 1);
+        assert_eq!(by("uuid").frames, 2);
+        assert_eq!(by("outsideTarget").frames, 2);
+        assert!(derive_blockers(&[]).is_empty());
+        // A passing row contributes nothing.
+        let none: Vec<String> = vec![];
+        assert!(derive_blockers(&[BlockerRow {
+            frame_id: 9,
+            set_id: Some(1),
+            instrume: "",
+            filter_raw: "L",
+            filter_unresolved: false,
+            failures: &none
+        }])
+        .is_empty());
     }
 
     /// P18: a frame with no `frames.uuid` fails the gate — it could never be

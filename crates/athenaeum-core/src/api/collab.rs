@@ -516,7 +516,12 @@ fn frame_gate_inputs(
             .unwrap_or_default()
             .trim()
             .to_string();
-        let filter_canonical = match_filter(&filter_raw, dictionary);
+        // Task 3 makes this compile against the new `FilterResolution` field;
+        // Task 4 rewrites this to `resolve_filter` (explicit mappings first).
+        let filter = match match_filter(&filter_raw, dictionary) {
+            Some(c) => crate::collab::filters::FilterResolution::Matched(c),
+            None => crate::collab::filters::FilterResolution::Unmapped,
+        };
         let uuid = frow
             .and_then(|f| f.uuid.clone())
             .unwrap_or_default()
@@ -558,7 +563,7 @@ fn frame_gate_inputs(
             cal_blocker,
             analysis: analyses.get(frame_id).cloned(),
             filter_raw,
-            filter_canonical,
+            filter,
             uuid,
         });
     }
@@ -785,7 +790,7 @@ fn project_gate(
             (
                 GateIdentity {
                     uuid: i.uuid,
-                    filter_canonical: i.filter_canonical,
+                    filter_canonical: i.filter.canonical().map(str::to_string),
                 },
                 row,
             )
