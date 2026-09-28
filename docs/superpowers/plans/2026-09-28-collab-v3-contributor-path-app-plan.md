@@ -2203,6 +2203,24 @@ git commit -m "feat(collab): the frame set's attestation toggle, Project block a
 - Modify: `crates/athenaeum-core/src/api/collab_v3_live_e2e_tests.rs` (one frame without `FILTER`; one attested set)
 - Modify: `CLAUDE.md` (the Transfers/collab summary: one sentence on mappings + attestation), `docs/transfers/README.md` (the collab section: §3.2 resolution order, F5 in-place seeding, the blockers), `docs/superpowers/open-items.md`
 
+- [ ] **Step 0 (added in execution): the sweep of deferred review minors**
+
+Small, each with the test it names; commit as one or two sweep commits before the e2e and the gates:
+
+1. `db/operations.rs::get_frames_sets_by_project`: read the new column with `?` (`row.get::<_, i64>(18)? != 0`), not `unwrap_or(0)`; `db::collab::frames_set_attested` returns `!= 0`; add a `frames_set_attested` test on a missing id. `rustfmt` the files this cycle touched (`db/collab.rs`, `db/schema.rs`, `api/collab.rs`, `collab/filters.rs`, `collab/gate.rs`, `collab/contributor_state.rs`, web/tauri `collab.rs`/`frame_sets.rs`) — `rustfmt <files>`, never `cargo fmt -p`.
+2. `collab/filters.rs`: synonym `no → None` (so `No Filter` proposes `None` after the vendor token drops `filter`); pin `ha3nm`, `OIII 6.5nm` and a no-digit `…nm` name in the normaliser test; a one-line comment on the `let resolved = …; resolved` temporary-lifetime shape; doc comments on `canonical()` and `is_unresolved()`.
+3. `collab/gate.rs`: comment each readiness substring with the `check_mode_ready` arm it stands for and drop the two that only RawWith* modes produce; fix the stale "the existing helper" comment near `passing_input()`; tighten the readiness test so the missing-master case asserts `buildMasters` specifically.
+4. `api/collab.rs` gate inputs: tests for signed-out-with-rows (frame stays unmapped), attested frames absent from `buildMasters`, and both `warn!` fallback paths (a failing attestation read via a dropped table is enough).
+5. `api/collab.rs` mapping sheet/save: a mixed-batch refusal test (`[H→Ha, H→Hb]` → `Invalid`, `H` still `unmapped`, fix the misleading comment); sort on `res.is_unresolved()` not string compares; log the missing-dictionary refusal in `project_dictionary`; skip `request_auto_publish` when the edit list is empty.
+6. `api/collab.rs` publish: the generated branch inserts its picked basename into `taken_names` so an attested New and a generated New with the same name cannot both announce (M3), with a test; extract the duplicated `build_frame_meta` + `hub_frame_rule_problem` block into one helper (M4); drop the dead `PublishCandidate.set_id` or use it (M5); the attestation test asserts `is_dirty_for_test`-style dirtiness via `request_auto_publish_for_sets`'s set-dirty helper (add one if the module has none) (M6); `Ok(n) if n == 0` → `Ok(0)`; a unit test for the attested `hub_file_name_problem` hold-back (a fixture light renamed to `bad:name.fits`).
+7. `api/collab.rs` contributor state: tests through `list_collab_frames` for an own row in `published` / `updatePending` / `rejected` and `publishingHere`; remove `let _ = frames;`; `frame_sets.rs::frame_set_center_deg` errors in the set-match hook become a `warn!` instead of aborting clustering; doc line on `ProjectFrameView` that adopted own rows (no `source_frame_id`) carry no chip; `derive` warns on an unknown row state.
+8. Frontend `GateBlockers.tsx`: clear only the finished set from `analyzeBusy` (the event payload carries `frameSetId`); disable Analyze while its set is busy; set menu items as `<button role="menuitem">` with Escape/outside-click close; pluralise (`1 frame has…`, `1 filter name needs a mapping`). `FilterMappingDialog.tsx`: `role="dialog"`, `aria-modal`, Escape closes; no blank option on resolved rows. `ProjectDetail.test.tsx`: the dead-hint test uses a `not calibrated…` failure; add page-level tests for the `plate_solve_batch { frameIds }` / `analyze_frame_set { frameSetId }` payloads, the `/objects/<id>?tab=calibration` navigation, and the gate re-fetch on `analysis-complete` / `plate-solve-complete`.
+9. Task 9's deferred minors (added when its review lands).
+
+- [ ] **Step 0b: open-items follow-ups (docs only)**
+
+Under the contributor-path entry in `docs/superpowers/open-items.md` add: `- Follow-up (app final review 2026-09-29): \`project_frames_local.landed_path\` is UNIQUE table-wide, so one attested original can back ONE project's own row; a second project's attested publish of the same set is held back with "this file already backs a frame in project …". In an Update collision the hub announce precedes the failed local move and \`set_own_version\` writes the winner's content identity against the loser's old path. Needs per-project uniqueness (schema change, its own cycle).`
+
 - [ ] **Step 1: E2E**
 
 Read the three-instance e2e's fixture; add, on the contributor, a LIGHT with `filter = NULL` and assert: after the first publish it is held back with `no FILTER header — needs a filter mapping`; after `set_filter_mappings(ctx, pid, [{instrume, "", Some("None")}])` and a second publish it lands on the processor with the manifest `filter_canonical == "None"` and the landed file's header carrying `ATH_FILT = 'None'` (read the card with the FITS header reader). Add a second linked set on the contributor, attested, with one light: after publish the processor's landed bytes equal the contributor's original (`std::fs::read` both) and the header has no `ATH_PRJ` card.
@@ -2215,7 +2233,7 @@ Run, one at a time:
 - `cargo test -p athenaeum-core` (ALL targets — `tests/ts_contract.rs` included)
 - `cargo check -p athenaeum-core --no-default-features`
 - `cargo test -p athenaeum-tauri && cargo test -p athenaeum-web` (if they have tests; at least `cargo check` both)
-- `npm test && npx tsc --noEmit -p . && npm run lint`
+- `npx vitest run && npx tsc --noEmit -p .` (there is no lint script in this repo)
 Expected: all green. Paste the summary lines into the commit message of Step 4.
 
 - [ ] **Step 3: Docs**
