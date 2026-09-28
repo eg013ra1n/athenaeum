@@ -253,6 +253,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::collab_live::surface::ReplaceOutcomeView,
             crate::collab::gate::FrameGateRow,
             crate::collab::gate::ThresholdRuleView,
+            crate::collab::gate::GateBlocker,
+            crate::collab::gate::UnmappedFilter,
             crate::updates::manifest::Channel,
             crate::updates::UpdateCheck,
             crate::updates::WhatsNew,

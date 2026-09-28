@@ -36,7 +36,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::account::keys::{device_key_path, DeviceKey};
 use crate::api::lights::check_mode_ready;
 use crate::api::{db, ApiError};
-use crate::collab::filters::{match_filter, DictionaryEntry};
+use crate::collab::filters::DictionaryEntry;
 use crate::collab::gate::{
     evaluate_frame, header_pixel_scale_arcsec, FrameGateRow, GateFrameInput, ProjectTarget,
     ThresholdRuleView,
@@ -95,6 +95,8 @@ pub struct GateReport {
     pub total: i64,
     pub publishable: i64,
     pub rows: Vec<FrameGateRow>,
+    /// Spec §7.1 — the same rows, grouped into causes with a batch action.
+    pub blockers: Vec<crate::collab::gate::GateBlocker>,
 }
 
 /// A cached project whose target field contains a queried point (auto-link hook).
@@ -338,6 +340,19 @@ struct FrameRow {
     focallen: Option<f64>,
     filter: Option<String>,
     uuid: Option<String>,
+    instrume: Option<String>,
+}
+
+/// The signed-in e-mail, lower-cased — the scope of `collab_filter_mappings`
+/// (spec 2026-09-28 §3.1). `None` while signed out.
+pub(crate) fn current_account_email(conn: &Connection) -> Option<String> {
+    match crate::db::get_setting(conn, crate::settings::keys::ACCOUNT_EMAIL) {
+        Ok(v) => v.map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()),
+        Err(e) => {
+            tracing::warn!(error = %e, "reading the account e-mail failed; no filter mappings apply");
+            None
+        }
+    }
 }
 
 /// The per-frame "calibrated" verdict (P7): `Ok` when this frame, run alone
@@ -383,20 +398,26 @@ pub(crate) fn publish_options() -> CalibratedLightOptions {
     }
 }
 
-/// Batch-assemble one [`GateFrameInput`] per `(frame_id, filename)` —
-/// conn-only, no settings needed. Reads `plate_solves`, `frames`, and the
-/// analyses in three batched queries, then resolves each frame's center
-/// (crval → ra/dec → parsed objctra/objctdec), pixel scale (plate-solve →
-/// header `atan(xpixsz/focallen)`, no binning multiply), P7's per-frame
-/// calibrated verdict (via `frame_set_id_by_frame`, one `collect_export_data`
-/// per DISTINCT set — fix round 1, ruling R7), and P3's dictionary filter
-/// match.
+/// Batch-assemble one `(`[`GateFrameInput`]`, instrume)` pair per
+/// `(frame_id, filename)` — conn-only, no settings needed. Reads
+/// `plate_solves`, `frames`, and the analyses in three batched queries, then
+/// resolves each frame's center (crval → ra/dec → parsed objctra/objctdec),
+/// pixel scale (plate-solve → header `atan(xpixsz/focallen)`, no binning
+/// multiply), P7's per-frame calibrated verdict (via `frame_set_id_by_frame`,
+/// one `collect_export_data` per DISTINCT set — fix round 1, ruling R7,
+/// skipped entirely for an attested set — F5), and spec §3.2's filter
+/// resolution (`resolve_filter`: the account's mappings first, then P3's
+/// dictionary match). The `instrume` alongside each input is the frame's own
+/// camera, trimmed — `project_gate` needs it for the blocker table (§7.1)
+/// even though the gate engine itself never reads it.
 fn frame_gate_inputs(
     conn: &rusqlite::Connection,
     frames: &[(i64, String)],
     dictionary: &[DictionaryEntry],
     frame_set_id_by_frame: &HashMap<i64, i64>,
-) -> anyhow::Result<Vec<GateFrameInput>> {
+    mappings: &[crate::db::collab::FilterMappingRow],
+    attested_sets: &HashSet<i64>,
+) -> anyhow::Result<Vec<(GateFrameInput, String)>> {
     if frames.is_empty() {
         return Ok(Vec::new());
     }
@@ -429,7 +450,7 @@ fn frame_gate_inputs(
     let mut rows_by_id: HashMap<i64, FrameRow> = HashMap::new();
     {
         let sql = format!(
-            "SELECT id, ra, dec, objctra, objctdec, xpixsz, focallen, filter, uuid \
+            "SELECT id, ra, dec, objctra, objctdec, xpixsz, focallen, filter, uuid, instrume \
              FROM frames WHERE id IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -445,6 +466,7 @@ fn frame_gate_inputs(
                     focallen: r.get(6)?,
                     filter: r.get(7)?,
                     uuid: r.get(8)?,
+                    instrume: r.get(9)?,
                 },
             ))
         })?;
@@ -516,19 +538,19 @@ fn frame_gate_inputs(
             .unwrap_or_default()
             .trim()
             .to_string();
-        // Task 3 makes this compile against the new `FilterResolution` field;
-        // Task 4 rewrites this to `resolve_filter` (explicit mappings first).
-        let filter = match match_filter(&filter_raw, dictionary) {
-            Some(c) => crate::collab::filters::FilterResolution::Matched(c),
-            None => crate::collab::filters::FilterResolution::Unmapped,
-        };
+        let instrume = frow.and_then(|f| f.instrume.clone()).unwrap_or_default().trim().to_string();
+        let filter = crate::collab::filters::resolve_filter(&filter_raw, &instrume, mappings, dictionary);
         let uuid = frow
             .and_then(|f| f.uuid.clone())
             .unwrap_or_default()
             .trim()
             .to_string();
-        // P7: the real gate, replacing decision C's constant.
+        // P7: the real gate, replacing decision C's constant. F5: an attested
+        // set's frames skip the export-readiness walk entirely — the operator
+        // has already told the app "the pixels are handled elsewhere", so
+        // nothing about calibration is checked for them.
         let cal_blocker = match frame_set_id_by_frame.get(frame_id) {
+            Some(&set_id) if attested_sets.contains(&set_id) => None,
             Some(&set_id) => {
                 let data = export_data_cache.entry(set_id).or_insert_with(|| {
                     crate::export::collect_export_data(conn, set_id).map_err(|e| {
@@ -555,17 +577,20 @@ fn frame_gate_inputs(
             }
         };
 
-        out.push(GateFrameInput {
-            frame_id: *frame_id,
-            filename: filename.clone(),
-            center,
-            pixel_scale_arcsec,
-            cal_blocker,
-            analysis: analyses.get(frame_id).cloned(),
-            filter_raw,
-            filter,
-            uuid,
-        });
+        out.push((
+            GateFrameInput {
+                frame_id: *frame_id,
+                filename: filename.clone(),
+                center,
+                pixel_scale_arcsec,
+                cal_blocker,
+                analysis: analyses.get(frame_id).cloned(),
+                filter_raw,
+                filter,
+                uuid,
+            },
+            instrume,
+        ));
     }
     Ok(out)
 }
@@ -715,6 +740,18 @@ pub fn evaluate_project_gate(
             ))
         })?;
     let gated = project_gate(&conn, &project)?;
+    let blocker_rows: Vec<crate::collab::gate::BlockerRow<'_>> = gated
+        .iter()
+        .map(|(id, row)| crate::collab::gate::BlockerRow {
+            frame_id: row.frame_id,
+            set_id: id.set_id,
+            instrume: &id.instrume,
+            filter_raw: &id.filter_raw,
+            filter_unresolved: id.filter_unresolved,
+            failures: &row.failures,
+        })
+        .collect();
+    let blockers = crate::collab::gate::derive_blockers(&blocker_rows);
     let rows: Vec<FrameGateRow> = gated.into_iter().map(|(_, row)| row).collect();
     let publishable = rows.iter().filter(|r| r.publishable).count() as i64;
     tracing::info!(
@@ -728,14 +765,25 @@ pub fn evaluate_project_gate(
         total: rows.len() as i64,
         publishable,
         rows,
+        blockers,
     })
 }
 
 /// What publish needs from a gate input beyond the verdict row: the frame's
-/// uuid (P18) and its dictionary filter match (P3).
+/// uuid (P18), its dictionary filter match (P3), and the blocker-derivation
+/// context (spec 2026-09-28 §7.1) — its linked set, whether that set is
+/// attested, its camera and raw filter name, and whether the filter resolved.
 struct GateIdentity {
     uuid: String,
     filter_canonical: Option<String>,
+    set_id: Option<i64>,
+    /// Not read by anything in this task — Task 5/6's publish surface reads
+    /// it alongside `set_id`.
+    #[allow(dead_code)]
+    attested: bool,
+    instrume: String,
+    filter_raw: String,
+    filter_unresolved: bool,
 }
 
 /// The gate over the union of LIGHT frames across `project`'s linked sets —
@@ -781,16 +829,46 @@ fn project_gate(
     let set_ids = crate::db::collab::linked_set_ids(conn, project_id).map_err(internal)?;
     let frames = union_light_frames(conn, &set_ids).map_err(internal)?;
     let frame_sets = frame_set_ids(conn, &set_ids).map_err(internal)?;
-    let inputs = frame_gate_inputs(conn, &frames, &dictionary, &frame_sets).map_err(internal)?;
+
+    // Spec §3.2: an explicit mapping only ever applies within the signed-in
+    // account's own scope; signed out (or a read failure — fail-closed, see
+    // `current_account_email`) means no mappings at all, never a mix-up with
+    // someone else's.
+    let mappings = current_account_email(conn)
+        .map(|account| crate::db::collab::filter_mappings_for_account(conn, &account))
+        .transpose()
+        .map_err(internal)?
+        .unwrap_or_default();
+    // F5 / a failed attestation read (fail-closed) is treated as not attested
+    // — never a silent skip of the calibration precondition.
+    let attested: HashSet<i64> = set_ids
+        .iter()
+        .copied()
+        .filter(|s| {
+            crate::db::collab::frames_set_attested(conn, *s).unwrap_or_else(|e| {
+                tracing::warn!(set_id = s, error = %e, "attestation read failed; treated as not attested");
+                false
+            })
+        })
+        .collect();
+
+    let inputs =
+        frame_gate_inputs(conn, &frames, &dictionary, &frame_sets, &mappings, &attested).map_err(internal)?;
 
     Ok(inputs
         .into_iter()
-        .map(|i| {
+        .map(|(i, instrume)| {
             let row = evaluate_frame(&i, &target, &rules);
+            let set_id = frame_sets.get(&i.frame_id).copied();
             (
                 GateIdentity {
                     uuid: i.uuid,
                     filter_canonical: i.filter.canonical().map(str::to_string),
+                    attested: set_id.is_some_and(|s| attested.contains(&s)),
+                    set_id,
+                    instrume,
+                    filter_unresolved: i.filter.is_unresolved(),
+                    filter_raw: i.filter_raw,
                 },
                 row,
             )
@@ -4387,7 +4465,12 @@ pub(crate) mod tests {
     /// Cached project fixture: target M101 (210.8, +54.35), radius 1.5°, one
     /// threshold rule (reject trailed frames), a dictionary that recognizes
     /// `seed_set`'s `L` filter (P3) so the gate tests below aren't ALSO
-    /// blocked by an unmapped filter.
+    /// blocked by an unmapped filter. `dictionary_version`/`dictionary_json`
+    /// on the literal below are for the reader only — `upsert_project`
+    /// deliberately leaves both columns untouched (only [`set_dictionary`]
+    /// writes them, so a wholesale poll refresh can never clobber the hub's
+    /// dictionary cursor) — so the explicit call below is what actually seeds
+    /// the dictionary this fixture's doc comment promises.
     fn cached_project(conn: &rusqlite::Connection) {
         crate::db::collab::upsert_project(
             conn,
@@ -4429,6 +4512,13 @@ pub(crate) mod tests {
                 feed_epoch: None,
                 holder_seq: -1,
             },
+        )
+        .unwrap();
+        crate::db::collab::set_dictionary(
+            conn,
+            "p-1",
+            Some(1),
+            Some(r#"[{"canonical":"L","aliases":[],"kind":"broadband"}]"#),
         )
         .unwrap();
     }
@@ -4576,6 +4666,88 @@ pub(crate) mod tests {
 
         unlink_frame_set(&ctx, "p-1", set_id).unwrap();
         assert_eq!(evaluate_project_gate(&ctx, "p-1").unwrap().total, 0);
+    }
+
+    fn sign_in_as(conn: &rusqlite::Connection, email: &str) {
+        crate::db::set_setting(conn, crate::settings::keys::ACCOUNT_EMAIL, email).unwrap();
+    }
+
+    fn row_of(report: &GateReport, id: i64) -> FrameGateRow {
+        report.rows.iter().find(|r| r.frame_id == id).unwrap().clone()
+    }
+
+    #[test]
+    fn gate_resolves_through_the_account_mapping_and_reports_blockers() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "A@x.io");
+            let (set_id, frames) = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 3);
+            // Frame 0 has no FILTER, frame 1 a slot name, frame 2 stays "L".
+            conn.execute("UPDATE frames SET filter = NULL WHERE id = ?1", [frames[0]]).unwrap();
+            conn.execute("UPDATE frames SET filter = 'Slot 0' WHERE id = ?1", [frames[1]]).unwrap();
+            (set_id, frames)
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        let row = |id: i64| report.rows.iter().find(|r| r.frame_id == id).unwrap().clone();
+        assert!(row(frames[0]).failures.contains(&"no FILTER header — needs a filter mapping".to_string()));
+        assert!(row(frames[1]).failures.contains(&"filter \"Slot 0\" needs a filter mapping".to_string()));
+        assert!(!row(frames[2]).failures.iter().any(|f| f.contains("filter")));
+        let map_filter = report.blockers.iter().find(|b| b.kind == "mapFilter").expect("mapFilter blocker");
+        assert_eq!(map_filter.frames, 2);
+        assert_eq!(map_filter.names.iter().map(|n| n.filter_raw.as_str()).collect::<Vec<_>>(), ["", "Slot 0"]);
+        assert_eq!(map_filter.names[0].instrume, "ASI2600MM");
+        assert!(report.blockers.iter().any(|b| b.kind == "linkCalibration" && b.sets == vec![set_id]));
+        assert!(report.blockers.iter().any(|b| b.kind == "attest" && b.frames == 3));
+
+        // Mapping rows of the signed-in account resolve both; another account's do not.
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "", "L").unwrap();
+            crate::db::collab::upsert_filter_mapping(&conn, "b@x.io", "ASI2600MM", "Slot 0", "L").unwrap();
+        }
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert!(!row_of(&report, frames[0]).failures.iter().any(|f| f.contains("filter")));
+        assert!(row_of(&report, frames[1]).failures.contains(&"filter \"Slot 0\" needs a filter mapping".to_string()));
+    }
+
+    #[test]
+    fn mapped_to_missing_reason_names_both() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "a@x.io");
+            let r = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
+            conn.execute("UPDATE frames SET filter = 'H' WHERE id = ?1", [r.1[0]]).unwrap();
+            crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "H", "Hb").unwrap();
+            r
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert!(row_of(&report, frames[0]).failures.contains(
+            &"filter \"H\" is mapped to \"Hb\", which is not in this project's dictionary".to_string()
+        ));
+        assert_eq!(report.blockers.iter().find(|b| b.kind == "mapFilter").unwrap().names[0].filter_raw, "H");
+    }
+
+    #[test]
+    fn an_attested_set_passes_the_calibration_precondition() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            let r = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
+            crate::db::collab::set_frames_set_attestation(&conn, r.0, true).unwrap();
+            r
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        let row = row_of(&report, frames[0]);
+        assert!(!row.failures.iter().any(|f| f.contains("calibration")), "{:?}", row.failures);
+        assert!(!report.blockers.iter().any(|b| b.kind == "attest" || b.kind == "linkCalibration"));
     }
 
     /// Insert a fully-populated `plate_solves` row (every NOT NULL column) for

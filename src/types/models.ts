@@ -139,7 +139,12 @@ export type ScanCompleteEvent = { root_id: number, files_found: number, files_pr
 
 export type FileWithFrame = { file: File, frame: Frame | null, };
 
-export type FramesSet = { id: number | null, name: string | null, is_custom: boolean, is_archived: boolean, date_obs_start: string | null, date_obs_end: string | null, objctra: string | null, objctdec: string | null, total_exp_time: number | null, flat_pattern: string | null, avg_rotation: number | null, min_rotation: number | null, max_rotation: number | null, archived_at: string | null, archive_operation_id: number | null, uuid: string | null, updated_at: string | null, };
+export type FramesSet = { id: number | null, name: string | null, is_custom: boolean, is_archived: boolean, date_obs_start: string | null, date_obs_end: string | null, objctra: string | null, objctdec: string | null, total_exp_time: number | null, flat_pattern: string | null, avg_rotation: number | null, min_rotation: number | null, max_rotation: number | null, archived_at: string | null, archive_operation_id: number | null, uuid: string | null, updated_at: string | null, 
+/**
+ * Spec 2026-09-28 F5: the user attested the lights as calibrated by an
+ * external tool; projects seed them in place.
+ */
+calibrated_externally: boolean, attested_at: string | null, };
 
 export type Setting = { key: string, value: string, updated_at: string | null, };
 
@@ -1577,7 +1582,11 @@ export type LinkSuggestion = { framesSetId: number, name: string | null, lightCo
  */
 distanceDeg: number | null, withinRadius: boolean, alreadyLinked: boolean, };
 
-export type GateReport = { projectId: string, total: number, publishable: number, rows: Array<FrameGateRow>, };
+export type GateReport = { projectId: string, total: number, publishable: number, rows: Array<FrameGateRow>, 
+/**
+ * Spec §7.1 — the same rows, grouped into causes with a batch action.
+ */
+blockers: Array<GateBlocker>, };
 
 export type ProjectSetMatch = { projectId: string, projectTitle: string, projectSlug: string, };
 
@@ -1881,8 +1890,10 @@ export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: numb
 /**
  * Human-readable failure reasons, empty when publishable (e.g.
  * `FWHM 3.4″ > 3.0″`, the caller's `cal_blocker` sentence verbatim, `frame
- * has no uuid`, `filter "OIII" is not in the project dictionary`,
- * `no analysis`, `unknown pixel scale`,
+ * has no uuid`, `no FILTER header — needs a filter mapping`,
+ * `filter "OIII" needs a filter mapping`,
+ * `filter "H" is mapped to "Hb", which is not in this project's
+ * dictionary`, `no analysis`, `unknown pixel scale`,
  * `outside target radius (2.1° > 1.5°)`).
  */
 failures: Array<string>, };
@@ -1894,6 +1905,10 @@ export type ThresholdRuleView = { metricKey: string, op: string,
  * (the hub validates rule values to number|bool, so this is exact).
  */
 value: number | boolean, };
+
+export type GateBlocker = { kind: string, frames: number, sets: Array<number>, names: Array<UnmappedFilter>, };
+
+export type UnmappedFilter = { instrume: string, filterRaw: string, frames: number, };
 
 export type Channel = "stable" | "beta";
 

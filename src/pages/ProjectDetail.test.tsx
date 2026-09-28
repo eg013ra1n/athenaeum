@@ -59,7 +59,7 @@ function detailFixture(card: ProjectCard = projectCard()): Detail {
 }
 
 function gateFixture(): GateReport {
-  return { projectId: 'proj-1', total: 2, publishable: 2, rows: [] };
+  return { projectId: 'proj-1', total: 2, publishable: 2, rows: [], blockers: [] };
 }
 
 let publishedListener: ((res: unknown) => void) | undefined;
