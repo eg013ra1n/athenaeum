@@ -1381,6 +1381,10 @@ If `GenerationSpec` exposes typed master fields (`spec.inputs.dark`, `.flat`, `.
 
 In the seed loop, an external `Update` must not `rename(staged, target)` (they are the same path): guard with `if w.staged != w.target { rename… }`. `remove_temp` on an external frame is a no-op by the same guard (never delete the original — check every `remove_temp(pid, &staged)` call site inside the generation loop is on the generated path only; the external loop has none).
 
+- [ ] **Step 4b: The hub's `filterRaw` rule mirror (controller ruling 2026-09-28)**
+
+The hub now accepts an empty `filterRaw` (`0..=80` after trimming; hub plan Task 7). Mirror it: in `api/collab.rs::hub_frame_rule_problem` replace the `filter.is_empty() || filter.len() > 80` check with `filter.len() > 80` and the sentence `the filter name must be at most 80 bytes, is {} bytes`; in `collab/fake_hub.rs` (the announce validation near `filterRaw must be 1..=80 chars`) accept an empty trimmed `filter_raw` and refuse only `> 80`. Add to the publish tests a frame with `filter = NULL` mapped to `None` (via `crate::db::collab::upsert_filter_mapping` for the fixture's signed-in e-mail, or a dictionary alias on the fake hub) that announces with `filterRaw == ""` and `filterCanonical == "None"`.
+
 - [ ] **Step 5: Run the publish tests, then the whole collab module**
 
 Run: `cargo test -p athenaeum-core --lib api::collab api::frame_sets && cargo check -p athenaeum-tauri && cargo check -p athenaeum-web`

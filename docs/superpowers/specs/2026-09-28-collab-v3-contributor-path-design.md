@@ -192,8 +192,12 @@ The `INSTRUME` display alias of §6.2 is out of scope (§12).
   an unknown kind; the portal `CoverageFilter.kind` union gains
   `'unfiltered'` and renders it like the others (no new visual).
 - Announce and the coordinator remap (`PATCH …/frames/{uuid}
-  filterCanonical`) are unchanged: they validate against the current
-  dictionary and `None` is simply one more canonical.
+  filterCanonical`) validate against the current dictionary as before;
+  `None` is simply one more canonical. **One rule changes** (found in
+  execution, 2026-09-28): announce accepted `filterRaw` only when
+  `1..=80` chars, so a header-less frame could never be announced. It now
+  accepts `0..=80` after trimming (stored `""`); the app's mirror of the
+  rule (`api::collab::hub_frame_rule_problem`) and its fake hub follow.
 
 ### 4.2 `PUT /projects/{id}/dictionary` — two refusals
 

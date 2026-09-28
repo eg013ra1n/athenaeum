@@ -934,3 +934,91 @@ git commit -m "docs(hub): README — dictionary kinds, the None entry and the tw
 Then in the app repo append to the ledger entry "Collab v3 wave 3 — owner smoke (2026-09-28)" under the spec line: `Hub+portal plan DONE on branch \`contributor-path-hub\` (<sha>): full hub suite + portal suite green; OWED: merge on the owner's word, test-hub deploy, the portal click-through of acceptance step 1.` Commit that in the app repo.
 
 Stop here: merging to hub `main`, pushing and deploying happen only on the owner's word (memory: deploy discipline).
+
+---
+
+### Task 7: Announce accepts an empty `filterRaw` (executed right after Task 1)
+
+Added 2026-09-28 during execution (controller ruling, ledger). Task 1's
+implementer found that `routes/frames.rs::validate` refuses a blank
+`filterRaw` (`1..=80 chars`), so a frame without a `FILTER` header could
+never be announced even once mapped to `None`. The app's own mirror of that
+rule (`api::collab::hub_frame_rule_problem`) and its fake hub have the same
+check — the app plan carries the mirror change (its Task 6).
+
+**Files:**
+- Modify: `src/routes/frames.rs:179-184` (the `filterRaw` rule)
+- Modify: `tests/dictionary.rs` (`new_project_has_none_and_announce_accepts_it` announces `filterRaw: ""` again, as the plan's Task 1 wrote it)
+- Modify: `README.md` (the announce rule line, if it states `1..=80`)
+- Test: `tests/frames.rs`
+
+**Interfaces:**
+- Produces: `filterRaw` valid when `0..=80` chars after trimming; stored trimmed (`""` for a header-less frame). The refusal sentence becomes `filterRaw must be at most 80 chars`.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `tests/frames.rs` add, next to the existing validation test:
+
+```rust
+/// Contributor path (spec 2026-09-28 F1): a frame without a FILTER header
+/// announces with an empty `filterRaw` and a canonical the publisher mapped.
+#[sqlx::test]
+async fn announce_accepts_an_empty_filter_raw(pool: PgPool) {
+    let (app, mailer) = app_with_capture(pool);
+    let (coord, _) = register_device(&app, &mailer, "coord@example.com", 1, "Desktop").await;
+    let project = create_project_via(&app, &coord, "P", false).await;
+    let id = project["id"].as_str().unwrap();
+    let mut f = frame_body(1);
+    f["filterRaw"] = json!("   ");
+    f["filterCanonical"] = json!("None");
+    let (status, body) = send(&app, post(&format!("/api/v1/projects/{id}/frames"), &json!({"frames": [f]}), Some(&coord))).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (stored,): (String,) = sqlx::query_as("SELECT filter_raw FROM project_frames WHERE project_id = $1::uuid AND frame_uuid = $2::uuid")
+        .bind(id).bind(frame_uuid(1)).fetch_one(&pool).await.unwrap();
+    assert_eq!(stored, "", "stored trimmed");
+    // Too long is still refused.
+    let mut g = frame_body(2);
+    g["filterRaw"] = json!("x".repeat(81));
+    let (status, body) = send(&app, post(&format!("/api/v1/projects/{id}/frames"), &json!({"frames": [g]}), Some(&coord))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("at most 80"));
+}
+```
+
+If `frame_uuid` is a `String` and the column is `uuid`, bind `Uuid::parse_str(&frame_uuid(1)).unwrap()` instead of the cast; match how `tests/frames.rs` already reads `project_frames`.
+
+In `tests/dictionary.rs::new_project_has_none_and_announce_accepts_it` change `f["filterRaw"] = json!("None");` back to `f["filterRaw"] = json!("");` and delete the NOTE comment Task 1 left.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `DATABASE_URL=postgres://hub:hub@localhost:5432/hub cargo test --test frames announce_accepts_an_empty_filter_raw --test dictionary new_project_has_none`
+Expected: both 400 `filterRaw must be 1..=80 chars`.
+
+- [ ] **Step 3: Implement**
+
+In `src/routes/frames.rs` replace the rule:
+
+```rust
+    // Contributor path (spec 2026-09-28 F1): a frame without a FILTER header
+    // announces with an empty filterRaw; the canonical carries the meaning.
+    if f.filter_raw.trim().len() > 80 {
+        return Err(ApiError::bad_request(format!(
+            "{}: filterRaw must be at most 80 chars",
+            f.file_name
+        )));
+    }
+```
+
+The INSERT already binds `f.filter_raw.trim()`. Update the README's announce rule text if it mentions `1..=80` for `filterRaw`.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `DATABASE_URL=postgres://hub:hub@localhost:5432/hub cargo test --test frames --test dictionary`
+Expected: all pass; any existing test that asserted the old refusal on an EMPTY filterRaw is updated to assert the new behaviour (an empty one is accepted) — keep the over-length assertion.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/routes/frames.rs tests/frames.rs tests/dictionary.rs README.md
+git commit -m "fix(hub): announce accepts an empty filterRaw — a header-less frame announces under its mapped canonical (F1)"
+```
