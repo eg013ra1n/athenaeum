@@ -315,17 +315,26 @@ pub struct BlockerRow<'a> {
     pub failures: &'a [String],
 }
 
+/// Fix round 1: `check_mode_ready(.., ExportMode::CalibratedLights)`'s real
+/// C-2 sentence is `"{n} master file(s) missing on disk — restore from
+/// archive first"` (`api/lights.rs::check_mode_ready`) — the parenthesized
+/// `(s)` and the word order mean the old `"master file missing"` substring
+/// never matched it, so a frame whose master file was archived or moved fell
+/// through to `threshold` with no `attest` entry. `"missing on disk"` matches
+/// that sentence (and the sibling `"pre-calibration master file missing on
+/// disk"` / raw-originals sentences some day) without over-matching anything
+/// else `evaluate_frame`/`frame_cal_verdict` can ever produce.
 fn is_calibration_reason(f: &str) -> bool {
     f.contains("no calibration links")
         || f.contains("No calibration is linked")
         || f.contains("Build masters first")
         || f.contains("no master")
-        || f.contains("master file missing")
+        || f.contains("missing on disk")
         || f.starts_with("could not verify calibration")
         || f == "frame set unresolved"
 }
 fn is_build_masters_reason(f: &str) -> bool {
-    f.contains("Build masters first") || f.contains("no master") || f.contains("master file missing")
+    f.contains("Build masters first") || f.contains("no master") || f.contains("missing on disk")
 }
 
 /// Spec §7.1 — the table, applied to every row's failure sentences. A row
@@ -702,6 +711,81 @@ mod tests {
             failures: &none
         }])
         .is_empty());
+    }
+
+    /// Fix round 1: every failure sentence `check_mode_ready(&_,
+    /// ExportMode::CalibratedLights)` can produce — the ONE mode
+    /// `frame_cal_verdict` runs (`api::collab::frame_cal_verdict`) — must
+    /// classify as a calibration blocker (`buildMasters` or
+    /// `linkCalibration`, always with `attest`), never `threshold`. Built
+    /// from real `ExportReadiness` values run through the real gate, not
+    /// hand-copied strings, so this module's substrings and `api::lights`'
+    /// sentences cannot drift apart again — the C-2 mismatch (`"master file
+    /// missing"` vs. the real `"master file(s) missing on disk"`) this fix
+    /// round found and this test now pins.
+    #[test]
+    fn every_calibrated_lights_readiness_sentence_is_a_calibration_blocker() {
+        use crate::api::lights::{check_mode_ready, ExportReadiness};
+        use crate::export::models::ExportMode;
+
+        let ready = ExportReadiness {
+            total: 4,
+            unlinked_lights: 0,
+            raw_sets_without_master: 0,
+            raw_set_ids_without_master: vec![],
+            missing_master_files: 0,
+            missing_raw_calibration_files: 0,
+            file_counts: Default::default(),
+            raw_sets_buildable: vec![],
+            raw_sets_unbuildable: vec![],
+            masters_rebuildable: vec![],
+            masters_unrebuildable: vec![],
+        };
+        // The three ways `check_mode_ready` refuses `CalibratedLights`
+        // (`api/lights.rs::check_mode_ready_truth_table` exercises the same
+        // three against the readiness struct itself).
+        let scenarios = [
+            ExportReadiness {
+                raw_sets_without_master: 2,
+                raw_set_ids_without_master: vec![7, 9],
+                ..ready.clone()
+            },
+            ExportReadiness {
+                unlinked_lights: 3,
+                ..ready.clone()
+            },
+            ExportReadiness {
+                missing_master_files: 2,
+                ..ready.clone()
+            },
+        ];
+        for r in &scenarios {
+            let sentence = check_mode_ready(r, ExportMode::CalibratedLights)
+                .expect_err("this scenario must block CalibratedLights");
+            let failures = vec![sentence.clone()];
+            let rows = [BlockerRow {
+                frame_id: 1,
+                set_id: Some(10),
+                instrume: "",
+                filter_raw: "L",
+                filter_unresolved: false,
+                failures: &failures,
+            }];
+            let blockers = derive_blockers(&rows);
+            let kinds: Vec<&str> = blockers.iter().map(|b| b.kind.as_str()).collect();
+            assert!(
+                !kinds.contains(&"threshold"),
+                "{sentence:?} landed under threshold: {kinds:?}"
+            );
+            assert!(
+                kinds.contains(&"buildMasters") || kinds.contains(&"linkCalibration"),
+                "{sentence:?} landed under neither calibration kind: {kinds:?}"
+            );
+            assert!(
+                kinds.contains(&"attest"),
+                "{sentence:?} must also offer attest: {kinds:?}"
+            );
+        }
     }
 
     /// P18: a frame with no `frames.uuid` fails the gate — it could never be
