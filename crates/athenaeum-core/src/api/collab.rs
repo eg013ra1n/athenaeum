@@ -777,9 +777,10 @@ struct GateIdentity {
     uuid: String,
     filter_canonical: Option<String>,
     set_id: Option<i64>,
-    /// Not read by anything in this task — Task 5/6's publish surface reads
-    /// it alongside `set_id`.
-    #[allow(dead_code)]
+    /// Spec §6 (F5): whether this frame's linked set has attested its own
+    /// calibration. The publish split (`run_publish`) copies this onto
+    /// [`PublishCandidate`] and branches on it BEFORE any calibration
+    /// resolution — an attested light is never resolved or regenerated.
     attested: bool,
     instrume: String,
     filter_raw: String,
@@ -2000,6 +2001,32 @@ fn recipe_hash_of_inputs(
     recipe_hash_for(conn, masters, &resolved.light_path)
 }
 
+/// Spec §6 (F5): the recipe of an attested (externally calibrated) light —
+/// no masters, no engine version, just the catalog's own drift detector.
+/// Any change to `files.size`/`files.modified_at` (the scanner's in-place
+/// re-parse after the user overwrites the file with a new external pass)
+/// moves the recipe, which the split reads as an `Update`.
+pub(crate) fn external_recipe(size: i64, modified_at: &str) -> String {
+    format!("external:{size}:{modified_at}")
+}
+
+/// Spec §6 (F8) — informational only, carried on every NEW frame's announce:
+/// which masters a generation actually used, or `external: true` for an
+/// attested light that was never calibrated by this app at all. Reads the
+/// resolved `GenerationSpec`'s own typed master fields rather than a
+/// path-name heuristic, so it can never disagree with what was applied.
+pub(crate) fn calibration_meta(
+    spec: Option<&crate::export::GenerationSpec>,
+    external: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "dark": spec.is_some_and(|s| s.inputs.dark_path.is_some()),
+        "flat": spec.is_some_and(|s| s.inputs.flat_path.is_some()),
+        "bias": spec.is_some_and(|s| s.inputs.bias_path.is_some()),
+        "external": external,
+    })
+}
+
 fn recipe_hash_for(
     conn: &Connection,
     master_paths: std::collections::BTreeSet<std::path::PathBuf>,
@@ -2101,11 +2128,14 @@ fn hub_frame_rule_problem(meta: &crate::collab::frame_meta::FrameMeta) -> Option
             meta.exptime_sec
         ));
     }
+    // Controller ruling 2026-09-28: the hub accepts an EMPTY filterRaw (an
+    // unfiltered light with no dictionary mapping yet, or one mapped to the
+    // dictionary's own `None` entry) — 0..=80 characters after trimming.
     let filter = meta.filter_raw.trim();
-    if filter.is_empty() || filter.len() > 80 {
+    if filter.chars().count() > 80 {
         return Some(format!(
-            "the filter name must be 1 to 80 bytes, is {} bytes",
-            filter.len()
+            "the filter name must be at most 80 characters, is {} characters",
+            filter.chars().count()
         ));
     }
     if !matches!(
@@ -2229,6 +2259,12 @@ struct PublishCandidate {
     filename: String,
     uuid: String,
     filter_canonical: String,
+    /// Spec §6 (F5), copied from [`GateIdentity`]: the frame's linked set,
+    /// and whether that set is attested. The split branches on `attested`
+    /// BEFORE any calibration resolution.
+    #[allow(dead_code)]
+    set_id: Option<i64>,
+    attested: bool,
 }
 
 /// What a publish run does with one frame, decided by the pre-permit split.
@@ -2261,6 +2297,15 @@ struct PlannedFrame {
     /// Manifest fields of a NEW frame, built and checked against the hub's
     /// per-frame rules by the split (M1); `None` otherwise.
     meta: Option<crate::collab::frame_meta::FrameMeta>,
+    /// Spec §6 (F5): an attested light, seeded in place with no generation —
+    /// `target` is the frame's current catalog path, never a landing name
+    /// the split picked.
+    external: bool,
+    /// The split's `external:<size>:<modified_at>` recipe (F5), carried
+    /// through for an external plan only. A generated plan recomputes its
+    /// own recipe from the resolved `GenerationSpec` (unchanged behavior),
+    /// so this stays `None` there.
+    recipe: Option<String>,
 }
 
 /// A generated frame on disk, ready to seed.
@@ -2334,11 +2379,13 @@ fn remove_temp(project_id: &str, path: &Path) {
     }
 }
 
-/// The generation phase of a publish run, on a blocking thread under ONE
-/// `ComputeQueue` permit (the `sync_prepare::open_generation` pattern). Only
-/// entered when the split found something to generate (ruling R9). Resolves
-/// every planned frame in one catalog borrow, stats the masters it reads,
-/// then calibrates each exactly once — a new frame straight into its landing
+/// The generation phase of a publish run. F5: an attested (external) plan is
+/// handled first and needs no compute at all — hashed and stat'd straight
+/// from its catalog path. Whatever remains runs on a blocking thread under
+/// ONE `ComputeQueue` permit (the `sync_prepare::open_generation` pattern,
+/// taken only when there is something to generate), resolving every planned
+/// frame in one catalog borrow, stating the masters it reads, then
+/// calibrating each exactly once — a new frame straight into its landing
 /// path, an update or adoption into a sibling temp whose BLAKE3 decides
 /// whether anything changed. A failing frame is held back with its reason;
 /// the run goes on.
@@ -2346,6 +2393,89 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     use crate::services::compute_queue::ComputeJobKind;
 
     let pid = job.project_id.as_str();
+    let mut held_back: Vec<HeldBackFrame> = Vec::new();
+    let mut written: Vec<WrittenFrame> = Vec::new();
+    let mut unchanged = 0usize;
+
+    // F5/A1: an attested light is never regenerated, renamed or copied — it
+    // is hashed and stat'd IN PLACE, with no compute permit and no spec.
+    let (external_plans, generated_plans): (Vec<PlannedFrame>, Vec<PlannedFrame>) =
+        job.plans.into_iter().partition(|p| p.external);
+
+    for plan in external_plans {
+        let PlannedFrame {
+            cand,
+            kind,
+            target,
+            mut meta,
+            recipe,
+            ..
+        } = plan;
+        let fid = cand.frame_id;
+        let recipe = recipe.unwrap_or_default();
+        let xxh3 = match xxh3_full_file(&target) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(project_id = pid, frame_id = fid, path = %target.display(), error = %format!("{e:#}"), "publish: hashing the attested light failed");
+                held_back.push(held(
+                    fid,
+                    &cand.filename,
+                    format!("cannot read the attested light: {e:#}"),
+                ));
+                continue;
+            }
+        };
+        let byte_size = match std::fs::metadata(&target) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                tracing::error!(project_id = pid, frame_id = fid, path = %target.display(), error = %e, "publish: stat of the attested light failed");
+                held_back.push(held(
+                    fid,
+                    &cand.filename,
+                    format!("cannot read the attested light: {e}"),
+                ));
+                continue;
+            }
+        };
+        if let Some(m) = meta.as_mut() {
+            m.meta["calibration"] = calibration_meta(None, true);
+        }
+        tracing::debug!(
+            project_id = pid,
+            frame_id = fid,
+            path = %target.display(),
+            bytes = byte_size,
+            "publish: attested light staged in place"
+        );
+        written.push(WrittenFrame {
+            frame_id: fid,
+            filename: cand.filename,
+            // An update or adoption keeps the uuid the hub knows the frame by.
+            uuid: match kind.row() {
+                Some(row) => row.frame_uuid.clone(),
+                None => cand.uuid,
+            },
+            filter_canonical: cand.filter_canonical,
+            kind,
+            target: target.clone(),
+            staged: target,
+            recipe,
+            xxh3,
+            byte_size,
+            meta,
+            identical: false,
+            staged_blake3: None,
+        });
+    }
+
+    if generated_plans.is_empty() {
+        return Ok(GenerationOutcome {
+            written,
+            unchanged,
+            held_back,
+        });
+    }
+
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (permit, _job_id) = job
         .queue
@@ -2361,14 +2491,12 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
 
     let opts = publish_options();
     let scratch_dir = std::env::temp_dir();
-    let mut held_back: Vec<HeldBackFrame> = Vec::new();
-    let mut unchanged = 0usize;
     let mut prepared: Vec<(PlannedFrame, crate::export::GenerationSpec, String)> = Vec::new();
     {
         let conn = job.db.conn();
         let mut divisors = crate::export::DivisorCache::new();
         let mut master_ok: HashMap<std::path::PathBuf, bool> = HashMap::new();
-        for plan in job.plans {
+        for plan in generated_plans {
             let fid = plan.cand.frame_id;
             let name = plan.cand.filename.clone();
             let mut spec = match crate::export::resolve_generation_cached(
@@ -2433,7 +2561,6 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
 
     // Pixel phase: no catalog connection held.
     let mut hot_maps = HashMap::new();
-    let mut written: Vec<WrittenFrame> = Vec::new();
     // (frame_uuid, recipe, verified blake3, regenerated xxh3)
     let mut identical: Vec<(String, String, String, String)> = Vec::new();
     for (plan, spec, recipe) in prepared {
@@ -2441,7 +2568,8 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             cand,
             kind,
             target,
-            meta,
+            mut meta,
+            ..
         } = plan;
         let fid = cand.frame_id;
         let is_temp = kind.row().is_some();
@@ -2531,6 +2659,12 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             bytes = generated.byte_size,
             "publish: calibrated light written"
         );
+        // F8: which masters this generation actually used — a NEW frame
+        // only (`meta` stays `None` for an update, which keeps the hub's
+        // prior meta).
+        if let Some(m) = meta.as_mut() {
+            m.meta["calibration"] = calibration_meta(Some(&spec), false);
+        }
         written.push(WrittenFrame {
             frame_id: fid,
             filename: cand.filename,
@@ -3096,6 +3230,8 @@ async fn run_publish(
                 uuid: id.uuid,
                 // `publishable` implies a dictionary match (P3).
                 filter_canonical: id.filter_canonical.unwrap_or_default(),
+                set_id: id.set_id,
+                attested: id.attested,
             });
         } else {
             held_back.push(HeldBackFrame {
@@ -3220,38 +3356,86 @@ async fn run_publish(
             tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
             internal(e)
         })?;
-        // Pass 1: what each candidate is (new / update / adopt).
-        let mut split: Vec<(PublishCandidate, PublishKind, bool)> = Vec::new();
+        // Pass 1: what each candidate is (new / update / adopt). F5: an
+        // attested candidate is branched here, BEFORE any calibration
+        // resolution — an attested light is never resolved or calibrated,
+        // only hashed and stat'd in place (the generation phase).
+        let mut split: Vec<(
+            PublishCandidate,
+            PublishKind,
+            bool,
+            Option<(std::path::PathBuf, String)>,
+        )> = Vec::new();
         for cand in candidates {
             let fid = cand.frame_id;
-            let resolved = match crate::calibration_library::light_resolve::resolve_frame_inputs(
-                &conn,
-                fid,
-                opts.flat_norm,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: cannot resolve this light");
-                    held_back.push(held(
-                        fid,
-                        &cand.filename,
-                        format!("cannot calibrate: {e:#}"),
-                    ));
-                    continue;
-                }
-            };
-            let recipe = match recipe_hash_of_inputs(&conn, &resolved) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: recipe hash failed");
-                    held_back.push(held(
-                        fid,
-                        &cand.filename,
-                        format!("cannot read the calibration inputs: {e:#}"),
-                    ));
-                    continue;
-                }
-            };
+            let (recipe, osc, external): (String, bool, Option<(std::path::PathBuf, String)>) =
+                if cand.attested {
+                    let row: rusqlite::Result<(String, i64, String)> = conn.query_row(
+                        "SELECT fi.path, fi.size, fi.modified_at FROM frames f \
+                         JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
+                        [fid],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    );
+                    match row {
+                        Ok((path, size, modified)) => {
+                            let osc = conn
+                                .query_row(
+                                    "SELECT bayerpat FROM frames WHERE id = ?1",
+                                    [fid],
+                                    |r| r.get::<_, Option<String>>(0),
+                                )
+                                .ok()
+                                .flatten()
+                                .is_some();
+                            let recipe = external_recipe(size, &modified);
+                            (
+                                recipe.clone(),
+                                osc,
+                                Some((std::path::PathBuf::from(path), recipe)),
+                            )
+                        }
+                        Err(e) => {
+                            tracing::error!(project_id, frame_id = fid, error = %e, "publish: reading the attested light failed");
+                            held_back.push(held(
+                                fid,
+                                &cand.filename,
+                                format!("cannot read the attested light: {e}"),
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    let resolved =
+                        match crate::calibration_library::light_resolve::resolve_frame_inputs(
+                            &conn,
+                            fid,
+                            opts.flat_norm,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: cannot resolve this light");
+                                held_back.push(held(
+                                    fid,
+                                    &cand.filename,
+                                    format!("cannot calibrate: {e:#}"),
+                                ));
+                                continue;
+                            }
+                        };
+                    let recipe = match recipe_hash_of_inputs(&conn, &resolved) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: recipe hash failed");
+                            held_back.push(held(
+                                fid,
+                                &cand.filename,
+                                format!("cannot read the calibration inputs: {e:#}"),
+                            ));
+                            continue;
+                        }
+                    };
+                    (recipe, resolved.cfa_geometry.is_some(), None)
+                };
             let kind = match own.get(&fid) {
                 Some(row) if force || row.recipe_hash.as_deref() != Some(recipe.as_str()) => {
                     PublishKind::Update(row.clone())
@@ -3305,14 +3489,19 @@ async fn run_publish(
                     }
                 }
             }
-            split.push((cand, kind, resolved.cfa_geometry.is_some()));
+            split.push((cand, kind, osc, external));
         }
         // Pass 2 (final review I1): every update and adoption target is
         // reserved BEFORE any new frame picks its name — an adoption without
         // a recorded path lands at `<own>/<fileName>`, which no row
         // references yet, so a new frame could otherwise pick the same file.
+        // F5: an external candidate's target is always deferred to pass 3
+        // (its own CURRENT catalog path, dedup-checked there) regardless of
+        // kind — never the previous own row's `landed_path`, which for a
+        // frame attested after an earlier generated publish would still name
+        // the old calibrated file, not the original.
         let mut claimed: HashSet<std::path::PathBuf> = HashSet::new();
-        let taken_names = if account_id.is_empty() {
+        let mut taken_names = if account_id.is_empty() {
             HashSet::new()
         } else {
             frames_db::file_names_of_publisher(&conn, project_id, &account_id).map_err(|e| {
@@ -3325,45 +3514,113 @@ async fn run_publish(
             PublishKind,
             bool,
             Option<std::path::PathBuf>,
+            Option<(std::path::PathBuf, String)>,
         )> = Vec::with_capacity(split.len());
-        for (cand, kind, osc) in split {
-            let target = match &kind {
-                PublishKind::New => None,
-                PublishKind::Update(row) => match &row.landed_path {
-                    Some(p) => Some(std::path::PathBuf::from(p)),
-                    None => {
-                        tracing::error!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, "publish: own frame has no landed path");
-                        held_back.push(held(
-                            cand.frame_id,
-                            &cand.filename,
-                            "own frame has no file path".into(),
-                        ));
-                        continue;
-                    }
-                },
-                PublishKind::Adopt(row) => Some(
-                    row.landed_path
-                        .as_ref()
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| own_dir.join(&row.file_name)),
-                ),
+        for (cand, kind, osc, external) in split {
+            let target = if external.is_some() {
+                None
+            } else {
+                match &kind {
+                    PublishKind::New => None,
+                    PublishKind::Update(row) => match &row.landed_path {
+                        Some(p) => Some(std::path::PathBuf::from(p)),
+                        None => {
+                            tracing::error!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, "publish: own frame has no landed path");
+                            held_back.push(held(
+                                cand.frame_id,
+                                &cand.filename,
+                                "own frame has no file path".into(),
+                            ));
+                            continue;
+                        }
+                    },
+                    PublishKind::Adopt(row) => Some(
+                        row.landed_path
+                            .as_ref()
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| own_dir.join(&row.file_name)),
+                    ),
+                }
             };
             if let Some(t) = &target {
                 claimed.insert(t.clone());
             }
-            targeted.push((cand, kind, osc, target));
+            targeted.push((cand, kind, osc, target, external));
         }
         // Pass 3: new frames — their manifest fields checked against the
         // hub's per-frame rules (M1: one bad frame refuses a whole atomic
-        // batch), then a free landing name.
-        for (cand, kind, osc, target) in targeted {
+        // batch), then a free landing name. F5: an external candidate never
+        // picks a landing name — its target IS the frame's current catalog
+        // path, and a basename collision within this publisher is held back,
+        // never renamed on disk.
+        for (cand, kind, osc, target, external) in targeted {
             let fid = cand.frame_id;
+            if let Some((path, recipe)) = external {
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                // The dedup check is for a NEW frame only — an Update or
+                // Adopt reuses the SAME name it already legitimately holds
+                // (it is its own file, unchanged), which `taken_names`
+                // already carries from its own prior publish; checking it
+                // here would refuse a frame against itself.
+                if matches!(kind, PublishKind::New) {
+                    if taken_names.contains(&file_name) || !claimed.insert(path.clone()) {
+                        tracing::warn!(project_id, frame_id = fid, file_name = %file_name, "publish: attested basename already published by this publisher");
+                        held_back.push(held(
+                            fid,
+                            &cand.filename,
+                            format!(
+                                "a frame named {file_name:?} is already published by you — rename the file"
+                            ),
+                        ));
+                        continue;
+                    }
+                    taken_names.insert(file_name);
+                } else {
+                    claimed.insert(path.clone());
+                }
+                let meta = if matches!(kind, PublishKind::New) {
+                    let m = match crate::collab::frame_meta::build_frame_meta(&conn, fid) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: frame meta failed");
+                            held_back.push(held(
+                                fid,
+                                &cand.filename,
+                                format!("cannot read frame metadata: {e:#}"),
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Some(problem) = hub_frame_rule_problem(&m) {
+                        tracing::warn!(project_id, frame_id = fid, reason = %problem, "publish: frame breaks a hub rule");
+                        held_back.push(held(fid, &cand.filename, problem));
+                        continue;
+                    }
+                    Some(m)
+                } else {
+                    None
+                };
+                plans.push(PlannedFrame {
+                    cand,
+                    kind,
+                    target: path,
+                    meta,
+                    external: true,
+                    recipe: Some(recipe),
+                });
+                continue;
+            }
             if let Some(target) = target {
                 plans.push(PlannedFrame {
                     cand,
                     kind,
                     target,
                     meta: None,
+                    external: false,
+                    recipe: None,
                 });
                 continue;
             }
@@ -3416,6 +3673,8 @@ async fn run_publish(
                 kind,
                 target,
                 meta: Some(meta),
+                external: false,
+                recipe: None,
             });
         }
         if let Some(hook) = after_split {
@@ -3508,7 +3767,11 @@ async fn run_publish(
             Ok(Some(row)) if row.origin == FrameOrigin::Own => row,
             Ok(_) => {
                 tracing::error!(project_id, frame_uuid = %w.uuid, "publish: the own frame row vanished before seeding");
-                remove_temp(project_id, &w.staged);
+                // F5/A1: `staged == target` for an external frame — its
+                // original is never removed.
+                if w.staged != w.target {
+                    remove_temp(project_id, &w.staged);
+                }
                 held_back.push(held(
                     w.frame_id,
                     &w.filename,
@@ -3518,7 +3781,9 @@ async fn run_publish(
             }
             Err(e) => {
                 tracing::error!(project_id, frame_uuid = %w.uuid, error = %format!("{e:#}"), "publish: re-reading the own frame failed");
-                remove_temp(project_id, &w.staged);
+                if w.staged != w.target {
+                    remove_temp(project_id, &w.staged);
+                }
                 held_back.push(held(
                     w.frame_id,
                     &w.filename,
@@ -3532,7 +3797,10 @@ async fn run_publish(
             // C1c: another run already versioned exactly these bytes.
             tracing::info!(project_id, frame_uuid = %w.uuid, content_version = current.content_version, "publish: the hub already has these bytes; no new version");
             if let PublishKind::Update(_) = &w.kind {
-                remove_temp(project_id, &w.staged);
+                // F5/A1: never remove an external frame's original.
+                if w.staged != w.target {
+                    remove_temp(project_id, &w.staged);
+                }
                 let written = {
                     let db = db(ctx)?;
                     let conn = db.conn();
@@ -3569,15 +3837,20 @@ async fn run_publish(
             }
             prior_version + 1
         };
-        if let Err(e) = std::fs::rename(&w.staged, &w.target) {
-            tracing::error!(project_id, frame_uuid = %w.uuid, src = %w.staged.display(), dest = %w.target.display(), error = %e, "publish: replacing the landed frame failed");
-            remove_temp(project_id, &w.staged);
-            held_back.push(held(
-                w.frame_id,
-                &w.filename,
-                format!("cannot replace the published file: {e}"),
-            ));
-            continue;
+        // F5/A1: an external Update's `staged` IS `target` — the same
+        // original path — so there is nothing to rename, and never a
+        // `remove_temp` on it either.
+        if w.staged != w.target {
+            if let Err(e) = std::fs::rename(&w.staged, &w.target) {
+                tracing::error!(project_id, frame_uuid = %w.uuid, src = %w.staged.display(), dest = %w.target.display(), error = %e, "publish: replacing the landed frame failed");
+                remove_temp(project_id, &w.staged);
+                held_back.push(held(
+                    w.frame_id,
+                    &w.filename,
+                    format!("cannot replace the published file: {e}"),
+                ));
+                continue;
+            }
         }
         match node
             .seed_project_frame(project_id, &w.uuid, version, &w.target)
@@ -6289,10 +6562,17 @@ pub(crate) mod tests {
             pub server: MockServer,
             pub node: Arc<crate::sharing::iroh::node::SharedIrohNode>,
             pub collab: PathBuf,
+            pub set_id: i64,
             pub frame_ids: Vec<i64>,
             pub lights: Vec<PathBuf>,
             pub master: PathBuf,
             pub uuids: Vec<String>,
+        }
+
+        impl PubFx {
+            pub(super) fn conn(&self) -> r2d2::PooledConnection<crate::db::SqliteConnectionManager> {
+                crate::api::db(&self.ctx).unwrap().conn()
+            }
         }
 
         /// A real relay-disabled node installed on `ctx` — where
@@ -6841,6 +7121,7 @@ pub(crate) mod tests {
                 server,
                 node,
                 collab,
+                set_id: set.set_id,
                 frame_ids: set.frame_ids,
                 lights: set.lights,
                 master: set.master,
@@ -7770,11 +8051,21 @@ pub(crate) mod tests {
                 None,
                 "the upper bound is inclusive"
             );
-            for filter in ["", "   ", &"x".repeat(81)] {
+            // Controller ruling 2026-09-28: an empty (or whitespace-only,
+            // which trims to empty) filter is now accepted — only over 80
+            // characters is refused.
+            for filter in ["", "   "] {
                 let mut m = ok();
                 m.filter_raw = filter.to_string();
-                assert!(hub_frame_rule_problem(&m).is_some(), "{filter:?}");
+                assert_eq!(
+                    hub_frame_rule_problem(&m),
+                    None,
+                    "an empty filter is accepted: {filter:?}"
+                );
             }
+            let mut m = ok();
+            m.filter_raw = "x".repeat(81);
+            assert!(hub_frame_rule_problem(&m).is_some(), "over 80 chars is refused");
             let mut m = ok();
             m.channel = "rgb".into();
             assert!(hub_frame_rule_problem(&m).is_some());
@@ -8569,6 +8860,193 @@ pub(crate) mod tests {
                 1,
                 "another device's frame is never versioned here"
             );
+        }
+
+        // ── Spec 2026-09-28 §6: attestation and the external publish branch ──
+
+        /// F5: attesting the set alone carries the gate (calibration links
+        /// dropped), and every light is seeded IN PLACE — no generation, the
+        /// publisher folder stays empty, the recipe is `external:…`, and
+        /// `meta.calibration` names it external.
+        #[tokio::test]
+        async fn attested_lights_are_seeded_in_place_without_generation() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+                // Drop the calibration links: attestation alone must carry the gate.
+                conn.execute("DELETE FROM calibration_set_to_frames", [])
+                    .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 2, "{:?}", res.held_back);
+            let bodies = announce_bodies(&fx.server).await;
+            assert_eq!(bodies.len(), 1);
+            let frames = bodies[0]["frames"].as_array().unwrap();
+            assert_eq!(frames.len(), 2);
+            for f in frames {
+                assert_eq!(
+                    f["meta"]["calibration"],
+                    serde_json::json!({"dark": false, "flat": false, "bias": false, "external": true})
+                );
+                let uuid = f["frameUuid"].as_str().unwrap();
+                let row = crate::db::collab_frames::get(&fx.conn(), PID, uuid)
+                    .unwrap()
+                    .unwrap();
+                let landed = PathBuf::from(row.landed_path.clone().unwrap());
+                assert!(
+                    fx.lights.contains(&landed),
+                    "landed path is the original: {}",
+                    landed.display()
+                );
+                assert!(row.recipe_hash.as_deref().unwrap().starts_with("external:"));
+                assert_eq!(
+                    f["fileName"].as_str().unwrap(),
+                    landed.file_name().unwrap().to_string_lossy()
+                );
+                assert_eq!(
+                    f["xxh3"].as_str().unwrap(),
+                    crate::package::xxh3_full_file(&landed).unwrap()
+                );
+            }
+            assert_eq!(
+                std::fs::read_dir(own_dir(&fx)).map(|d| d.count()).unwrap_or(0),
+                0,
+                "the publisher folder stays empty for attested frames"
+            );
+        }
+
+        /// F5: the recipe is `external:<size>:<modified_at>` — unchanged
+        /// inputs are `unchanged`, a catalog-visible drift (the scanner's
+        /// in-place re-parse after an external overwrite) is `updated`.
+        #[tokio::test]
+        async fn external_recipe_changes_with_size_or_mtime() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            assert_eq!(
+                publish_collab_frames(&fx.ctx, PID, None).await.unwrap().announced,
+                1
+            );
+            assert_eq!(
+                publish_collab_frames(&fx.ctx, PID, None).await.unwrap().unchanged,
+                1
+            );
+            // The scanner's in-place re-parse bumps files.size/modified_at after
+            // an external overwrite.
+            {
+                let conn = fx.conn();
+                conn.execute(
+                    "UPDATE files SET size = size + 1, modified_at = '2027-01-01T00:00:00Z' \
+                     WHERE id = (SELECT file_id FROM frames WHERE id = ?1)",
+                    [fx.frame_ids[0]],
+                )
+                .unwrap();
+            }
+            std::fs::write(&fx.lights[0], b"new bytes that differ").unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.updated, 1, "{:?}", res.held_back);
+        }
+
+        /// F5: two attested originals that resolve to the same basename (a
+        /// different folder each) are never renamed on disk — the second is
+        /// held back.
+        #[tokio::test]
+        async fn attested_duplicate_basename_is_held_back() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+                // Two originals with the same basename in different folders.
+                let dup = fx.lights[0]
+                    .parent()
+                    .unwrap()
+                    .join("other")
+                    .join(fx.lights[0].file_name().unwrap());
+                std::fs::create_dir_all(dup.parent().unwrap()).unwrap();
+                std::fs::copy(&fx.lights[1], &dup).unwrap();
+                conn.execute(
+                    "UPDATE files SET path = ?1, filename = ?2 WHERE id = (SELECT file_id FROM frames WHERE id = ?3)",
+                    rusqlite::params![
+                        dup.to_string_lossy(),
+                        fx.lights[0].file_name().unwrap().to_string_lossy(),
+                        fx.frame_ids[1]
+                    ],
+                )
+                .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{:?}", res.held_back);
+            assert_eq!(res.held_back.len(), 1, "{:?}", res.held_back);
+            assert!(
+                res.held_back[0].reasons[0].contains("already published by you — rename the file"),
+                "{:?}",
+                res.held_back
+            );
+        }
+
+        /// F8: a generated (non-external) light's `meta.calibration` names
+        /// the masters the generation actually used.
+        #[tokio::test]
+        async fn generated_lights_report_their_masters_in_meta() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{:?}", res.held_back);
+            let bodies = announce_bodies(&fx.server).await;
+            let f = &bodies[0]["frames"].as_array().unwrap()[0];
+            assert_eq!(f["meta"]["calibration"]["external"], false);
+            assert_eq!(
+                f["meta"]["calibration"]["dark"], true,
+                "the fixture links a master dark"
+            );
+        }
+
+        /// Controller ruling 2026-09-28 (Step 4b): the hub now accepts an
+        /// empty `filterRaw` — an unmapped-to-nothing light (FILTER NULL,
+        /// mapped to the dictionary's `None`) announces with `filterRaw ==
+        /// ""` and `filterCanonical == "None"`, and the (fake) hub accepts it.
+        #[tokio::test]
+        async fn a_null_filter_light_announces_with_empty_filter_raw_and_none_canonical() {
+            let fx = fixture(1).await;
+            let hub = crate::collab::fake_hub::FakeHub::start().await;
+            let me = crate::api::account::own_device_id(&fx.ctx).unwrap();
+            hub.add_account("tok", "acc-Me Myself", "Me Myself", &me, None);
+            hub.add_project(
+                PID,
+                "m31",
+                &[("acc-Me Myself", "send_receive", false)],
+                false,
+            );
+            wire_hub(&fx.ctx, &hub.uri());
+            {
+                let conn = fx.conn();
+                sign_in_as(&conn, "a@x.io");
+                crate::db::collab::set_dictionary(
+                    &conn,
+                    PID,
+                    Some(2),
+                    Some(
+                        r#"[{"canonical":"L","aliases":["Lum"],"kind":"broadband"},
+                            {"canonical":"None","aliases":["none"],"kind":"unfiltered"}]"#,
+                    ),
+                )
+                .unwrap();
+                conn.execute("UPDATE frames SET filter = NULL WHERE id = ?1", [fx.frame_ids[0]])
+                    .unwrap();
+                crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "", "None")
+                    .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{:?}", res.held_back);
+            let f = hub.frame(PID, &fx.uuids[0]).expect("announced");
+            assert_eq!(f.filter_raw, "");
+            assert_eq!(f.filter_canonical, "None");
         }
     }
 }

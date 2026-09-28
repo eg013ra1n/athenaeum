@@ -9,6 +9,12 @@
 //! fallbacks stay for scale/centre, the plate-solved precondition is wave
 //! 3): present with a FITS 1-based `crpix` only when the frame has a
 //! `plate_solves` row, omitted otherwise — never the header WCS.
+//!
+//! `meta.calibration` (spec §6, F8) is NOT built here — this module has no
+//! `GenerationSpec` to read. `api::collab::run_publish_generation` stamps it
+//! onto a NEW frame's `meta` after generation (`{dark, flat, bias}` from the
+//! resolved spec's own master fields) or, for an attested light, in place of
+//! generation (`external: true`, the other three `false`).
 
 use anyhow::Result;
 use rusqlite::Connection;

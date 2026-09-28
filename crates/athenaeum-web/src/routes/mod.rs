@@ -129,6 +129,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/recalculate_frame_set_nights", post(frame_sets::recalculate_frame_set_nights))
         .route("/api/reconcile_frame_set_nights", post(frame_sets::reconcile_frame_set_nights))
         .route("/api/get_frame_set_merge_log", post(frame_sets::get_frame_set_merge_log))
+        .route("/api/set_frame_set_attestation", post(frame_sets::set_frame_set_attestation))
         // Excluded frames
         .route("/api/get_excluded_frames_with_metadata", post(frame_sets::get_excluded_frames_with_metadata))
         .route("/api/remove_files_from_excluded", post(frame_sets::remove_files_from_excluded))

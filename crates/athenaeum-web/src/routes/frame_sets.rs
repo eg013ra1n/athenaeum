@@ -3,6 +3,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 
+use crate::routes::api_err;
 use crate::WebAppState;
 
 // ── Request body types ────────────────────────────────────────────────────────
@@ -64,6 +65,13 @@ pub struct CreateFrameSetFromSelectionArgs {
 pub struct AutoGenerateFrameSetsArgs {
     pub project_id: Option<i64>,
     pub threshold_deg: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAttestationArgs {
+    pub frames_set_id: i64,
+    pub attested: bool,
 }
 
 // ── Response types ────────────────────────────────────────────────────────────
@@ -397,6 +405,22 @@ pub async fn reconcile_frame_set_nights(
         athenaeum_core::api::frame_sets::reconcile_frame_set_nights(&state.ctx, args.frames_set_id)
             .map_err(db_err)?;
     Ok(Json(summary))
+}
+
+/// Spec 2026-09-28 §6.1 (F5): the user's word that the set's lights are
+/// calibrated by an external tool. Mirrors the Tauri command.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_frame_set_attestation(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetAttestationArgs>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    athenaeum_core::api::frame_sets::set_frame_set_attestation(
+        &state.ctx,
+        args.frames_set_id,
+        args.attested,
+    )
+    .map_err(api_err)?;
+    Ok(StatusCode::OK)
 }
 
 /// Split the selected items out of a frame set into a new frame set.

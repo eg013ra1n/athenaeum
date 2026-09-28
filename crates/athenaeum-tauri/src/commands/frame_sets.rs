@@ -176,6 +176,19 @@ pub async fn reconcile_frame_set_nights(
         .map_err(|e| e.to_string())
 }
 
+/// Spec 2026-09-28 §6.1 (F5): the user's word that the set's lights are
+/// calibrated by an external tool.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_frame_set_attestation(
+    frames_set_id: i64,
+    attested: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    athenaeum_core::api::frame_sets::set_frame_set_attestation(&state.ctx, frames_set_id, attested)
+        .map_err(|e| e.to_string())
+}
+
 /// Split selected items from a frame set into a new frame set
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]

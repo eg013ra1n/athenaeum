@@ -9,6 +9,7 @@
 
 use anyhow::{anyhow, Result};
 
+use crate::api::ApiError;
 use crate::db::{self};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
@@ -346,6 +347,47 @@ pub fn auto_generate_frame_sets(
     })
 }
 
+/// Spec 2026-09-28 §6.1 (F5): the user's word that the set's lights are
+/// calibrated by an external tool. Refuses a zipped set (its files are not
+/// on disk to seed). Marks the set dirty for auto-publish.
+pub fn set_frame_set_attestation(
+    ctx: &ServiceContext,
+    frames_set_id: i64,
+    attested: bool,
+) -> Result<(), ApiError> {
+    let db = crate::api::db(ctx)?;
+    let conn = db.conn();
+    let zipped: Option<Option<String>> = conn
+        .query_row(
+            "SELECT archived_at FROM frames_set WHERE id = ?1",
+            [frames_set_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::Internal(format!("read frames_set: {e}")))?;
+    match zipped {
+        None => {
+            tracing::warn!(frames_set_id, "attestation refused: no such set");
+            return Err(ApiError::NotFound(format!(
+                "frame set {frames_set_id} not found"
+            )));
+        }
+        Some(Some(_)) => {
+            tracing::warn!(frames_set_id, "attestation refused: the set is zipped");
+            return Err(ApiError::Invalid(
+                "This set is zipped — unarchive it before attesting its calibration.".into(),
+            ));
+        }
+        Some(None) => {}
+    }
+    crate::db::collab::set_frames_set_attestation(&conn, frames_set_id, attested)
+        .map_err(|e| ApiError::Internal(format!("write attestation: {e:#}")))?;
+    tracing::info!(frames_set_id, attested, "frame set attestation set");
+    #[cfg(all(feature = "render", feature = "solver"))]
+    crate::api::collab_autopublish::request_auto_publish_for_sets(&[frames_set_id]);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +668,36 @@ mod tests {
         assert_eq!(second.sets_created, 0);
         assert_eq!(second.frames_clustered, 0);
         assert_eq!(second.frames_already_in_sets, 2);
+    }
+
+    /// Spec §6.1 (F5): flips `calibrated_externally`/`attested_at`, refuses a
+    /// zipped set, and refuses a set that does not exist.
+    #[test]
+    fn attestation_command_flips_the_flag_marks_dirty_and_refuses_a_zipped_set() {
+        let (_tmp, ctx) = test_ctx();
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            conn.execute("INSERT INTO frames_set (name) VALUES ('S')", [])
+                .unwrap();
+            conn.last_insert_rowid()
+        };
+        crate::api::frame_sets::set_frame_set_attestation(&ctx, set_id, true).unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            assert!(crate::db::collab::frames_set_attested(&conn, set_id).unwrap());
+            conn.execute(
+                "UPDATE frames_set SET is_archived = 1, archived_at = '2026-09-01T00:00:00Z' WHERE id = ?1",
+                [set_id],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            crate::api::frame_sets::set_frame_set_attestation(&ctx, set_id, false),
+            Err(crate::api::ApiError::Invalid(_))
+        ));
+        assert!(matches!(
+            crate::api::frame_sets::set_frame_set_attestation(&ctx, 4242, true),
+            Err(crate::api::ApiError::NotFound(_))
+        ));
     }
 }

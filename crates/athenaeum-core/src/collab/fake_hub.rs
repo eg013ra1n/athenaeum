@@ -2427,8 +2427,11 @@ fn validate_frame(f: &FrameIn) -> Result<(), String> {
     if !(f.exptime_sec > 0.0 && f.exptime_sec <= 86400.0) {
         return Err(format!("{}: exptimeSec must be in (0, 86400]", f.file_name));
     }
-    if f.filter_raw.trim().is_empty() || f.filter_raw.trim().len() > 80 {
-        return Err(format!("{}: filterRaw must be 1..=80 chars", f.file_name));
+    // Controller ruling 2026-09-28: the hub accepts an EMPTY filterRaw
+    // (0..=80 chars after trimming) — an unfiltered light with no dictionary
+    // mapping yet, or one mapped to the dictionary's own `None` entry.
+    if f.filter_raw.trim().chars().count() > 80 {
+        return Err(format!("{}: filterRaw must be at most 80 chars", f.file_name));
     }
     let meta_len = serde_json::to_vec(&f.meta)
         .map(|b| b.len())

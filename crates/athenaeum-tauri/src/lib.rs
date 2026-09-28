@@ -304,6 +304,7 @@ pub fn run() {
             commands::recalculate_frame_set_nights,
             commands::reconcile_frame_set_nights,
             commands::get_frame_set_merge_log,
+            commands::set_frame_set_attestation,
             commands::get_equipment_cameras,
             commands::get_dark_library,
             commands::has_dark_library,
