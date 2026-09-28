@@ -2,12 +2,14 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, Users, SquareStack } from 'lucide-react';
-import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink, ReconcileSummary } from '../types/models';
+import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, PortalNewProjectLink, ReconcileSummary, FrameSetProjectStatus } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
+import FrameSetProjectBlock from '../components/collab/FrameSetProjectBlock';
+import { AttestationToggle } from '../components/calibration/AttestationToggle';
 import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
 import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
 import { HistoryNav } from '../components/HistoryNav';
@@ -72,6 +74,10 @@ export default function FrameSetDetail() {
   // Calibration hierarchy data (loaded on mount)
   const [calibrationHierarchy, setCalibrationHierarchy] = useState<CalibrationHierarchyView | null>(null);
   const [loadingCalibration, setLoadingCalibration] = useState(false);
+
+  // This set's collaboration-project links/candidates (spec §8.3). Kept
+  // `null` on load failure — the Project block and column just don't render.
+  const [projectStatus, setProjectStatus] = useState<FrameSetProjectStatus | null>(null);
 
   // Tab + highlight state. Initial values seed from URL params on first
   // render to avoid the analysis-tab flash when arriving via a cross-page
@@ -380,6 +386,38 @@ export default function FrameSetDetail() {
     return out;
   }, [detail]);
 
+  // Frame id → contributor state for the lights table's "Project" column
+  // (spec §8.1–§8.2). Only the first link's frame list is used — a set is
+  // expected to be linked to at most one project at a time in practice, and
+  // the column is a per-set-page convenience, not a multi-project view.
+  const projectStates = useMemo(() => {
+    const map = new Map<number, { state: string; reason: string | null }>();
+    const link = projectStatus?.links[0];
+    if (!link) return map;
+    for (const f of link.frames) map.set(f.frameId, { state: f.state, reason: f.reason });
+    return map;
+  }, [projectStatus]);
+
+  // Count of calibration sets currently linked to this set's lights — used
+  // only to word the AttestationToggle's confirm ("This set has N linked
+  // calibration sets…"). `CalibrationHierarchyView` doesn't expose a flat
+  // list, so this walks the same date/camera/filter tree
+  // `CalibrationHierarchyView.tsx`'s "Create all masters" count does.
+  const linkedCalibrationSetsCount = useMemo(() => {
+    if (!calibrationHierarchy) return 0;
+    const ids = new Set<number>();
+    for (const dg of calibrationHierarchy.date_groups) {
+      for (const cg of dg.camera_groups) {
+        for (const fg of cg.filter_groups) {
+          for (const fs of fg.flat_sets) if (fs.set.id != null) ids.add(fs.set.id);
+          for (const ds of fg.dark_sets) if (ds.set.id != null) ids.add(ds.set.id);
+          for (const bs of fg.bias_sets) if (bs.set.id != null) ids.add(bs.set.id);
+        }
+      }
+    }
+    return ids.size;
+  }, [calibrationHierarchy]);
+
   // Load data on mount and when navigating back. Before that, a cheap
   // idempotent nights/sessions check runs unconditionally — it only writes
   // when the stored rows actually disagree with a fresh derivation (see
@@ -432,7 +470,7 @@ export default function FrameSetDetail() {
       setError(null);
 
       // Load all in parallel
-      const [detailResult, hierarchyResult, analysisResult, referenceResult] = await Promise.all([
+      const [detailResult, hierarchyResult, analysisResult, referenceResult, projectStatusResult] = await Promise.all([
         api.invoke<FrameSetDetail>('get_frame_set_detail', {
           framesSetId: parseInt(id),
         }),
@@ -445,6 +483,12 @@ export default function FrameSetDetail() {
         api.invoke<FrameSetReference | null>('get_frame_set_reference', {
           framesSetId: parseInt(id),
         }).catch(() => null),
+        api.invoke<FrameSetProjectStatus>('get_frame_set_project_status', {
+          framesSetId: parseInt(id),
+        }).catch((err) => {
+          console.error('[projects] get_frame_set_project_status failed:', err);
+          return null;
+        }),
       ]);
 
       setDetail(detailResult);
@@ -453,6 +497,7 @@ export default function FrameSetDetail() {
       for (const a of analysisResult) aMap.set(a.frame_id, a);
       setAnalysisData(aMap);
       setReferenceFrameId(referenceResult?.referenceFrameId ?? null);
+      setProjectStatus(projectStatusResult);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -868,9 +913,20 @@ export default function FrameSetDetail() {
               <span><span className="font-medium text-accent">{calibrationHierarchy?.date_groups.length ?? '-'}</span> sessions</span>
               <span>·</span>
               <span className="font-medium text-content">{formatExposureTime(detail.frames_set?.total_exp_time)}</span>
+              {detail.frames_set?.calibrated_externally && (
+                <>
+                  <span>·</span>
+                  <span className="font-medium text-accent">attested</span>
+                </>
+              )}
             </div>
           </div>
         </div>
+        {projectStatus && (
+          <div className="mt-2">
+            <FrameSetProjectBlock framesSetId={parseInt(id!)} status={projectStatus} onChanged={loadData} />
+          </div>
+        )}
       </div>
 
       {/* Tab Bar */}
@@ -969,21 +1025,31 @@ export default function FrameSetDetail() {
               frameSetName={detail?.frames_set?.name ?? undefined}
             />
           ) : activeTab === 'calibration' ? (
-            <CalibrationHierarchyViewComponent
-              data={calibrationHierarchy}
-              blackholedFileIds={blackholedFileIds}
-              filterSnrMap={calibrationFilterSnrMap}
-              analysisData={analysisData}
-              frameSetId={parseInt(id!)}
-              frameSetName={detail.frames_set?.name || 'Untitled'}
-              onCalibrationComplete={loadData}
-              onRefresh={refreshCalibrationHierarchy}
-              onBlink={handleBlink}
-              onSplit={handleOpenSplitDialog}
-              onCreateCustomSet={handleOpenCreateDialog}
-              highlightCalSet={pendingHighlightCalSet}
-              onHighlightConsumed={() => setPendingHighlightCalSet(null)}
-            />
+            <div className="flex flex-col gap-3 h-full min-h-0">
+              <AttestationToggle
+                framesSetId={parseInt(id!)}
+                calibratedExternally={detail.frames_set?.calibrated_externally ?? false}
+                linkedCalibrationSets={linkedCalibrationSetsCount}
+                onChanged={loadData}
+              />
+              <div className="flex-1 min-h-0">
+                <CalibrationHierarchyViewComponent
+                  data={calibrationHierarchy}
+                  blackholedFileIds={blackholedFileIds}
+                  filterSnrMap={calibrationFilterSnrMap}
+                  analysisData={analysisData}
+                  frameSetId={parseInt(id!)}
+                  frameSetName={detail.frames_set?.name || 'Untitled'}
+                  onCalibrationComplete={loadData}
+                  onRefresh={refreshCalibrationHierarchy}
+                  onBlink={handleBlink}
+                  onSplit={handleOpenSplitDialog}
+                  onCreateCustomSet={handleOpenCreateDialog}
+                  highlightCalSet={pendingHighlightCalSet}
+                  onHighlightConsumed={() => setPendingHighlightCalSet(null)}
+                />
+              </div>
+            </div>
           ) : (
             <LightsAnalysisView
               hierarchy={calibrationHierarchy}
@@ -997,6 +1063,7 @@ export default function FrameSetDetail() {
               hideLocateColumn={!!detail?.frames_set?.archived_at}
               referenceFrameId={referenceFrameId ?? null}
               onReferenceChanged={(ref) => setReferenceFrameId(ref?.referenceFrameId ?? null)}
+              projectStates={projectStates}
             />
           )
         ) : (

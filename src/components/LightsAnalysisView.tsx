@@ -36,9 +36,12 @@ interface LightsAnalysisViewProps {
    *  parent provides this, the component will use it instead of loading it
    *  independently (avoids a double fetch). */
   referenceFrameId?: number | null;
+  /** Frame id → this set's linked-project contributor state (spec §8.1–§8.2),
+   *  threaded straight through to `LightsAnalysisTable`'s "Project" column. */
+  projectStates?: Map<number, { state: string; reason: string | null }>;
 }
 
-export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp }: LightsAnalysisViewProps) {
+export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp, projectStates }: LightsAnalysisViewProps) {
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-camera');
 
@@ -895,6 +898,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                   referenceFrameId={effectiveReferenceFrameId}
                   onSetReference={onReferenceChanged !== undefined ? handleSetReference : undefined}
                   settingReference={settingReference}
+                  projectStates={projectStates}
                 />
               </div>
             ) : (

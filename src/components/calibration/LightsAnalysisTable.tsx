@@ -2,6 +2,7 @@ import { useState, useMemo, useCallback, useRef } from 'react';
 import { FolderOpen, AlertTriangle, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
+import { SHORT } from '../collab/contributorState';
 
 type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta' | 'wcs' | 'reference';
 type SortDirection = 'asc' | 'desc';
@@ -33,6 +34,9 @@ interface LightsAnalysisTableProps {
   onSetReference?: (frameId: number) => void;
   /** Whether a reference-set action is in progress (disables buttons). */
   settingReference?: boolean;
+  /** Frame id → this set's linked-project contributor state (spec §8.1–§8.2).
+   *  The "Project" column renders only when this map is non-empty. */
+  projectStates?: Map<number, { state: string; reason: string | null }>;
 }
 
 function formatDateTime(dateStr: string | null): string {
@@ -117,8 +121,10 @@ export function LightsAnalysisTable({
   referenceFrameId,
   onSetReference,
   settingReference,
+  projectStates,
 }: LightsAnalysisTableProps) {
   const navigate = useNavigate();
+  const showProjectColumn = !!projectStates && projectStates.size > 0;
   const [sortField, setSortField] = useState<SortField | null>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
 
@@ -372,6 +378,11 @@ export function LightsAnalysisTable({
                 Locate
               </th>
             )}
+            {showProjectColumn && (
+              <th scope="col" className="w-16 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
+                Project
+              </th>
+            )}
           </tr>
         </thead>
         <tbody className="divide-y divide-border">
@@ -513,6 +524,23 @@ export function LightsAnalysisTable({
                     </button>
                   </td>
                 )}
+                {showProjectColumn && (() => {
+                  const s = projectStates!.get(frame.frame_id);
+                  return (
+                    <td className="w-16 px-1.5 py-1 text-center">
+                      {s ? (
+                        <span
+                          className="rounded bg-surface-hover px-1.5 text-[10px] text-content-muted"
+                          title={s.reason ?? undefined}
+                        >
+                          {SHORT[s.state] ?? s.state}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-content-muted">—</span>
+                      )}
+                    </td>
+                  );
+                })()}
               </tr>
             );
           })}
