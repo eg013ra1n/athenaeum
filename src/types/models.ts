@@ -1687,12 +1687,14 @@ starsDetected: number | null,
  * key, the same derivation the frame set's Project block uses (Task 7,
  * spec §8.1). Filled by `api::collab_live::surface::list_collab_frames`;
  * `None` for a replica row, or when this cache-only builder ran without
- * it (`list_project_frames`). Also `None` for an ADOPTED own row
- * (`source_frame_id IS NULL`, `PublishKind::Adopt`): `own_contributor_states`
- * keys its own-row map by `source_frame_id`, so a row the manifest
- * delivered rather than this device's own generation has no local frame
- * to hang a chip off of — it never gets one, by construction, not by an
- * explicit "no chip" branch.
+ * it (`list_project_frames`). Also `None` for an own row NOT YET
+ * ADOPTED (`source_frame_id IS NULL` — a manifest-delivered row
+ * `db::collab_frames::adopt_own` has not yet bound to a local frame;
+ * `adopt_own` is what SETS `source_frame_id`, so a null one is the
+ * pre-adoption state, never the post-adoption one): `own_contributor_states`
+ * keys its own-row map by `source_frame_id`, so a row with no local
+ * frame bound yet has no local frame to hang a chip off of — it never
+ * gets one, by construction, not by an explicit "no chip" branch.
  */
 contributorState: string | null, contributorReason: string | null, };
 

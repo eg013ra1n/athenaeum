@@ -99,12 +99,13 @@ async fn wait_for(what: &str, limit: Duration, mut pred: impl FnMut() -> bool) -
 /// (`fake_hub.rs::add_project` hard-codes `raDeg: 10.68, decDeg: 41.27,
 /// radiusDeg: 1.5`) so the target-radius precondition passes. `filter` goes
 /// into the header verbatim — `None` is a genuinely absent `FILTER` card, not
-/// an empty string. `with_master_dark` links a real `MasterDark` SHELL (no
-/// on-disk file needed — `resolve_master` never counts an unresolved link as
-/// missing, same trick as `api::collab::tests::link_shared_master_dark`) so
-/// the calibration precondition passes too; the attested-light scenario
-/// skips this — F5 never checks calibration for an attested set. Returns
-/// `(set_id, uuid, light_path)`.
+/// an empty string. `with_master_dark` links a REAL, resolvable `MasterDark`
+/// — an actual on-disk file plus a `calibration_set_frames` member, the same
+/// shape `api::collab::tests::seed_real_light_set` builds — so the real
+/// generation phase (not just the gate's readiness count) can actually
+/// calibrate against it; the attested-light scenario skips this — F5 never
+/// checks calibration for an attested set. Returns `(set_id, uuid,
+/// light_path)`.
 fn seed_one_light(
     conn: &rusqlite::Connection,
     root: &std::path::Path,

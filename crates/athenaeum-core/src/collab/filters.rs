@@ -195,10 +195,8 @@ pub fn propose_canonical(raw: &str, dict: &[DictionaryEntry]) -> Option<String> 
             .and_then(|(_, name)| dict.iter().find(|e| e.canonical.eq_ignore_ascii_case(name)))
             .map(|e| e.canonical.clone())
     };
-    // Named rather than a bare tail expression: `lookup`/`match_filter` return
-    // owned `String`s cloned out of `dict`, so nothing here actually borrows
-    // past this point — the binding is only to make the synonym-table result
-    // inspectable before the two `match_filter` fallbacks run.
+    // bound, not a tail expression: in edition 2021 the &str-array temporary
+    // would outlive joined_* (E0597).
     let resolved = [
         joined_space.as_str(),
         joined_dash.as_str(),

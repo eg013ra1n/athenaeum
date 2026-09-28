@@ -10639,6 +10639,125 @@ pub(crate) mod tests {
             );
         }
 
+        /// A second frames_set of ONE ATTESTED light named `name`, linked to
+        /// no calibration (F5 never checks it), on the same M31 target and
+        /// filter `L` fixture's own set uses — so only the basename check
+        /// under test can hold it back. Returns the new set's id.
+        fn seed_attested_set(conn: &rusqlite::Connection, root: &Path, name: &str, uuid: &str) -> i64 {
+            conn.execute(
+                "INSERT INTO frames_set (name, objctra, objctdec) VALUES ('M31 Set 2', '00:42:44', '+41:16:09')",
+                [],
+            )
+            .unwrap();
+            let set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
+                 VALUES (?1, '2026-07-01T20:00:00Z', '2026-07-02T03:00:00Z')",
+                [set_id],
+            )
+            .unwrap();
+            let night_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'ASI2600MM')",
+                [night_id],
+            )
+            .unwrap();
+            let session_id = conn.last_insert_rowid();
+
+            let light = root.join("src2").join(name);
+            write_plane(&light, |x, y| 500.0 + ((x * 3 + y) % 7) as f32);
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) \
+                 VALUES (?1, ?2, 1000, '2026-07-01T21:00:00Z', 'FITS')",
+                rusqlite::params![light.to_string_lossy(), name],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, object, instrume, ra, dec, xpixsz, focallen, \
+                                     exptime, filter, uuid, date_obs) \
+                 VALUES (?1, 'Light', 'M31', 'ASI2600MM', 10.68, 41.27, 3.76, 1000.0, 300.0, 'L', ?2, \
+                         '2026-07-01T21:00:00Z')",
+                rusqlite::params![file_id, uuid],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![session_id, frame_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frame_analysis \
+                 (frame_id, file_id, stars_detected, median_fwhm, median_eccentricity, median_snr, \
+                  median_hfr, frame_snr, snr_weight, psf_signal, background, noise, \
+                  detection_threshold, width, height, source_channels, trail_r_squared, possibly_trailed) \
+                 VALUES (?1, ?2, 400, 2.0, 0.4, 10.0, 2.0, 10.0, 1.0, 100.0, 10.0, 1.0, 5.0, \
+                         512, 512, 1, 0.0, 0)",
+                rusqlite::params![frame_id, file_id],
+            )
+            .unwrap();
+            set_id
+        }
+
+        /// M3 (sweep item 6): the GENERATED branch must insert its picked
+        /// basename into `taken_names` too — before this fix only the
+        /// attested/external branch did, so an attested New and a generated
+        /// New could announce under the very same `fileName`.
+        ///
+        /// Two sets: `fixture(1)`'s un-attested `L_0000.fits` (generates
+        /// `c_L_0000.fits`) is planned FIRST — `project_gate`'s union is
+        /// ordered by `frame_id`, and this set's light was created first, so
+        /// its frame_id is smaller — and a second, ATTESTED set whose
+        /// ORIGINAL is already named `c_L_0000.fits`, planned second. Load
+        /// bearing: reverting the one-line `taken_names.insert(file_name)`
+        /// this test guards makes it fail — verified by hand (temporarily
+        /// commenting the line out reproduces `res.announced == 2` and no
+        /// held-back frame; see the fix report for Task 10 fix round 1).
+        #[tokio::test]
+        async fn a_generated_new_blocks_an_attested_new_picking_its_same_output_name() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            let collision_name = crate::export::calibrated_output_filename(
+                fx.lights[0].file_name().unwrap().to_str().unwrap(),
+                false,
+                crate::fits_writer::OutputFormat::Fits,
+            );
+            assert_eq!(collision_name, "c_L_0000.fits");
+            {
+                let conn = fx.conn();
+                let set2_id =
+                    seed_attested_set(&conn, fx.tmp.path(), &collision_name, "uuid-m3-collision");
+                crate::db::collab::set_frames_set_attestation(&conn, set2_id, true).unwrap();
+                drop(conn);
+                link_frame_set(&fx.ctx, PID, set2_id).unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{:?}", res.held_back);
+            assert_eq!(res.held_back.len(), 1, "{:?}", res.held_back);
+            assert!(
+                res.held_back[0]
+                    .reasons
+                    .iter()
+                    .any(|r| r.contains(&format!("a frame named {collision_name:?} is already published by you"))),
+                "{:?}",
+                res.held_back
+            );
+            let bodies = announce_bodies(&fx.server).await;
+            assert_eq!(bodies.len(), 1, "only one announce call: {bodies:?}");
+            let names: Vec<&str> = bodies[0]["frames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["fileName"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                vec![collision_name.as_str()],
+                "only the generated candidate announced, under its own name"
+            );
+        }
+
         /// F8: a generated (non-external) light's `meta.calibration` names
         /// the masters the generation actually used.
         #[tokio::test]
