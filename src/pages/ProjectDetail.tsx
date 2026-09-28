@@ -609,7 +609,9 @@ export default function ProjectDetail() {
                 {detail.thresholds.map((r, i) => (
                   <li key={`${r.metricKey}-${i}`} className="break-words">
                     {r.op === 'reject_if'
-                      ? `${r.metricKey} — reject when ${String(r.value)}`
+                      ? r.metricKey === 'not_trailed'
+                        ? 'Reject trailed frames'
+                        : `${r.metricKey} — reject if ${String(r.value)}`
                       : `${r.metricKey} ${r.op === 'lte' ? '≤' : r.op === 'gte' ? '≥' : r.op} ${String(r.value)}`}
                   </li>
                 ))}
