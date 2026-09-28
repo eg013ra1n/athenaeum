@@ -713,6 +713,7 @@ pub fn default_dictionary() -> Vec<DictionaryEntry> {
         entry("Ha", &["H-alpha", "Halpha"], "narrowband"),
         entry("OIII", &["O3"], "narrowband"),
         entry("SII", &["S2"], "narrowband"),
+        entry("None", &["none", "nofilter", "no filter", "no-filter", "unfiltered"], "unfiltered"),
     ]
 }
 
