@@ -606,6 +606,91 @@ pub fn delete_intents_older_than(conn: &Connection, days: i64) -> Result<usize> 
     Ok(removed)
 }
 
+// ── Filter mappings (spec 2026-09-28 §3.1) ──────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterMappingRow {
+    pub account: String,
+    pub instrume: String,
+    pub filter_raw: String,
+    pub canonical: String,
+}
+
+/// Every mapping of `account` (lower-cased by the caller — `api::collab`
+/// lower-cases the signed-in e-mail once).
+pub fn filter_mappings_for_account(conn: &Connection, account: &str) -> Result<Vec<FilterMappingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT account, instrume, filter_raw, canonical FROM collab_filter_mappings \
+         WHERE account = ?1 ORDER BY instrume, filter_raw",
+    )?;
+    let rows = stmt
+        .query_map(params![account], |r| {
+            Ok(FilterMappingRow {
+                account: r.get(0)?,
+                instrume: r.get(1)?,
+                filter_raw: r.get(2)?,
+                canonical: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn upsert_filter_mapping(
+    conn: &Connection,
+    account: &str,
+    instrume: &str,
+    filter_raw: &str,
+    canonical: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO collab_filter_mappings (account, instrume, filter_raw, canonical, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, datetime('now')) \
+         ON CONFLICT(account, instrume, filter_raw) DO UPDATE SET \
+           canonical = excluded.canonical, updated_at = excluded.updated_at",
+        params![account, instrume, filter_raw, canonical],
+    )?;
+    Ok(())
+}
+
+/// `true` when a row was removed.
+pub fn delete_filter_mapping(conn: &Connection, account: &str, instrume: &str, filter_raw: &str) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM collab_filter_mappings WHERE account = ?1 AND instrume = ?2 AND filter_raw = ?3",
+        params![account, instrume, filter_raw],
+    )?;
+    Ok(n > 0)
+}
+
+// ── Frame-set attestation (spec 2026-09-28 §6.1) ────────────────────────────
+
+/// `false` when no such set. Clearing also clears `attested_at`.
+pub fn set_frames_set_attestation(conn: &Connection, frames_set_id: i64, attested: bool) -> Result<bool> {
+    let n = if attested {
+        conn.execute(
+            "UPDATE frames_set SET calibrated_externally = 1, attested_at = datetime('now') WHERE id = ?1",
+            params![frames_set_id],
+        )?
+    } else {
+        conn.execute(
+            "UPDATE frames_set SET calibrated_externally = 0, attested_at = NULL WHERE id = ?1",
+            params![frames_set_id],
+        )?
+    };
+    Ok(n > 0)
+}
+
+pub fn frames_set_attested(conn: &Connection, frames_set_id: i64) -> Result<bool> {
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT calibrated_externally FROM frames_set WHERE id = ?1",
+            params![frames_set_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v == Some(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,5 +1125,53 @@ mod tests {
             .map(|(id, ..)| id)
             .collect();
         assert_eq!(remaining, vec![fresh], "the fresh intent survives");
+    }
+
+    #[test]
+    fn filter_mappings_are_scoped_by_account_and_upserted_by_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::new(tmp.path().join("c.db")).unwrap();
+        let conn = db.conn();
+        upsert_filter_mapping(&conn, "a@x.io", "QHY268M", "Slot 0", "L").unwrap();
+        upsert_filter_mapping(&conn, "a@x.io", "QHY268M", "", "None").unwrap();
+        upsert_filter_mapping(&conn, "b@x.io", "QHY268M", "Slot 0", "R").unwrap();
+        // Same key again: replaced, not duplicated.
+        upsert_filter_mapping(&conn, "a@x.io", "QHY268M", "Slot 0", "Ha").unwrap();
+
+        let a = filter_mappings_for_account(&conn, "a@x.io").unwrap();
+        assert_eq!(a.len(), 2);
+        let slot = a.iter().find(|m| m.filter_raw == "Slot 0").unwrap();
+        assert_eq!(slot.canonical, "Ha");
+        assert_eq!(a.iter().find(|m| m.filter_raw.is_empty()).unwrap().canonical, "None");
+        assert_eq!(filter_mappings_for_account(&conn, "b@x.io").unwrap()[0].canonical, "R");
+        assert!(filter_mappings_for_account(&conn, "nobody@x.io").unwrap().is_empty());
+
+        assert!(delete_filter_mapping(&conn, "a@x.io", "QHY268M", "Slot 0").unwrap());
+        assert!(!delete_filter_mapping(&conn, "a@x.io", "QHY268M", "Slot 0").unwrap());
+        assert_eq!(filter_mappings_for_account(&conn, "a@x.io").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn frames_set_attestation_flag_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::new(tmp.path().join("c.db")).unwrap();
+        let conn = db.conn();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('S')", []).unwrap();
+        let id = conn.last_insert_rowid();
+        assert!(!frames_set_attested(&conn, id).unwrap());
+        assert!(set_frames_set_attestation(&conn, id, true).unwrap());
+        assert!(frames_set_attested(&conn, id).unwrap());
+        let at: Option<String> = conn.query_row("SELECT attested_at FROM frames_set WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert!(at.is_some());
+        assert!(set_frames_set_attestation(&conn, id, false).unwrap());
+        assert!(!frames_set_attested(&conn, id).unwrap());
+        let at: Option<String> = conn.query_row("SELECT attested_at FROM frames_set WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert!(at.is_none());
+        assert!(!set_frames_set_attestation(&conn, 9999, true).unwrap());
+        // The set reader carries the flag.
+        set_frames_set_attestation(&conn, id, true).unwrap();
+        let (set, _) = crate::db::get_frames_sets_by_project(&conn, 1).unwrap().into_iter().find(|(s, _)| s.id == Some(id)).unwrap();
+        assert!(set.calibrated_externally);
+        assert!(set.attested_at.is_some());
     }
 }

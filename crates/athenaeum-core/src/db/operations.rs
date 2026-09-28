@@ -2656,7 +2656,7 @@ pub fn get_frames_sets_by_project(
     let mut stmt = conn.prepare(
         "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time, fs.flat_pattern,
                 COUNT(DISTINCT sm.frame_id) as member_count, fs.avg_rotation, fs.min_rotation, fs.max_rotation, fs.is_archived,
-                fs.archived_at, fs.archive_operation_id, fs.uuid, fs.updated_at
+                fs.archived_at, fs.archive_operation_id, fs.uuid, fs.updated_at, fs.calibrated_externally, fs.attested_at
          FROM frames_set fs
          LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
          LEFT JOIN sessions s ON in_tbl.id = s.imaging_night_id
@@ -2684,6 +2684,8 @@ pub fn get_frames_sets_by_project(
             archive_operation_id: row.get(15)?,
             uuid: row.get(16)?,
             updated_at: row.get(17)?,
+            calibrated_externally: row.get::<_, i32>(18).unwrap_or(0) == 1,
+            attested_at: row.get(19)?,
         };
         let member_count: i32 = row.get(9)?;
         Ok((set, member_count as usize))

@@ -1496,6 +1496,16 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Contributor path (spec 2026-09-28 §6.1, F5): "calibrated by an
+    // external tool" — the user's word that the lights are already
+    // calibrated single-channel frames; projects seed them in place.
+    if !column_exists(conn, "frames_set", "calibrated_externally")? {
+        conn.execute("ALTER TABLE frames_set ADD COLUMN calibrated_externally INTEGER NOT NULL DEFAULT 0", [])?;
+    }
+    if !column_exists(conn, "frames_set", "attested_at")? {
+        conn.execute("ALTER TABLE frames_set ADD COLUMN attested_at TEXT", [])?;
+    }
+
     // Add is_manual_override to calibration_set_to_frames table (migration for existing databases)
     let has_is_manual_override: Result<i64, _> = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('calibration_set_to_frames') WHERE name='is_manual_override'",
@@ -2710,6 +2720,22 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             project_id TEXT,
             size_mtime TEXT,
             seen_at    TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )?;
+
+    // Contributor path (spec 2026-09-28 §3.1, F2): the publisher's filter
+    // mappings, one row per (account e-mail, camera, raw FILTER). `''` is
+    // a real key — a frame without a FILTER header (F1). Never cleared at
+    // sign-out; the account e-mail is the scope.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS collab_filter_mappings (
+            account    TEXT NOT NULL,
+            instrume   TEXT NOT NULL,
+            filter_raw TEXT NOT NULL,
+            canonical  TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (account, instrume, filter_raw)
         )",
         [],
     )?;

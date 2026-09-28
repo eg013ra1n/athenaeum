@@ -280,6 +280,12 @@ pub struct FramesSet {
     pub archive_operation_id: Option<i64>,
     pub uuid: Option<String>,
     pub updated_at: Option<String>,
+    /// Spec 2026-09-28 F5: the user attested the lights as calibrated by an
+    /// external tool; projects seed them in place.
+    #[serde(default)]
+    pub calibrated_externally: bool,
+    #[serde(default)]
+    pub attested_at: Option<String>,
 }
 
 /// Application settings
