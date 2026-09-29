@@ -1645,6 +1645,11 @@ fwhmArcsec: number | null, createdAt: string, };
 
 export type ProjectFrameView = { frameUuid: string, fileName: string, publisher: string, 
 /**
+ * The publisher's hub account id (Task 6 — Library table Publisher
+ * grouping, distinct from `publisher`, the display name).
+ */
+publisherAccountId: string, 
+/**
  * I published this frame.
  */
 own: boolean, filter: string, exptimeSec: number, dateObs: string | null, 
@@ -1687,6 +1692,24 @@ eccentricity: number | null,
  * Parsed from `meta.starsDetected`.
  */
 starsDetected: number | null, 
+/**
+ * Parsed from `meta.instrume`.
+ */
+camera: string | null, 
+/**
+ * Parsed from `meta.telescope`.
+ */
+telescope: string | null, 
+/**
+ * Parsed from `meta.medianSnr`.
+ */
+medianSnr: number | null, 
+/**
+ * The UTC date of `dateObs − 12 h` ([`night_of_date_obs`]) — there is no
+ * catalog `imaging_nights` row for another member's frame, so this is
+ * the best a cached manifest row can do.
+ */
+night: string | null, 
 /**
  * Own rows only — a [`crate::collab::contributor_state::ContributorState`]
  * key, the same derivation the frame set's Project block uses (Task 7,

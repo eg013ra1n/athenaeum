@@ -706,6 +706,23 @@ pub(crate) fn parse_manifest_wire(
     }
 }
 
+/// The night a frame belongs to when all we have is its `DATE-OBS` (another
+/// member's frame): the UTC date of `dateObs − 12 h` (spec 2026-09-29 §5.2).
+pub(crate) fn night_of_date_obs(date_obs: &str) -> Option<String> {
+    use chrono::{DateTime, NaiveDateTime, Utc};
+    let t: DateTime<Utc> = DateTime::parse_from_rfc3339(date_obs)
+        .map(|d| d.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(date_obs, "%Y-%m-%dT%H:%M:%S%.f").map(|n| n.and_utc())
+        })
+        .ok()?;
+    Some(
+        (t - chrono::Duration::hours(12))
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
+}
+
 /// One cached per-frame manifest row of a project (mine or a peer's),
 /// projected for the frames list (wave 2 Task 11; wave 3 Task 16: the local
 /// state and the live holder counts replace the retired on-disk / GC /
@@ -716,6 +733,9 @@ pub struct ProjectFrameView {
     pub frame_uuid: String,
     pub file_name: String,
     pub publisher: String,
+    /// The publisher's hub account id (Task 6 — Library table Publisher
+    /// grouping, distinct from `publisher`, the display name).
+    pub publisher_account_id: String,
     /// I published this frame.
     pub own: bool,
     pub filter: String,
@@ -748,6 +768,16 @@ pub struct ProjectFrameView {
     pub eccentricity: Option<f64>,
     /// Parsed from `meta.starsDetected`.
     pub stars_detected: Option<i64>,
+    /// Parsed from `meta.instrume`.
+    pub camera: Option<String>,
+    /// Parsed from `meta.telescope`.
+    pub telescope: Option<String>,
+    /// Parsed from `meta.medianSnr`.
+    pub median_snr: Option<f64>,
+    /// The UTC date of `dateObs − 12 h` ([`night_of_date_obs`]) — there is no
+    /// catalog `imaging_nights` row for another member's frame, so this is
+    /// the best a cached manifest row can do.
+    pub night: Option<String>,
     /// Own rows only — a [`crate::collab::contributor_state::ContributorState`]
     /// key, the same derivation the frame set's Project block uses (Task 7,
     /// spec §8.1). Filled by `api::collab_live::surface::list_collab_frames`;
@@ -790,26 +820,47 @@ impl ProjectFrameView {
             &row.manifest_json,
             "list_project_frames",
         );
-        let (exptime_sec, date_obs, accepted_reason, fwhm_arcsec, eccentricity, stars_detected) =
-            match &wire {
-                Some(w) => (
-                    w.exptime_sec,
-                    w.date_obs.clone(),
-                    w.accepted_reason.clone(),
-                    w.meta.get("fwhmArcsec").and_then(serde_json::Value::as_f64),
-                    w.meta
-                        .get("eccentricity")
-                        .and_then(serde_json::Value::as_f64),
-                    w.meta
-                        .get("starsDetected")
-                        .and_then(serde_json::Value::as_i64),
-                ),
-                None => (0.0, None, None, None, None, None),
-            };
+        let (
+            exptime_sec,
+            date_obs,
+            accepted_reason,
+            fwhm_arcsec,
+            eccentricity,
+            stars_detected,
+            camera,
+            telescope,
+            median_snr,
+            night,
+        ) = match &wire {
+            Some(w) => (
+                w.exptime_sec,
+                w.date_obs.clone(),
+                w.accepted_reason.clone(),
+                w.meta.get("fwhmArcsec").and_then(serde_json::Value::as_f64),
+                w.meta
+                    .get("eccentricity")
+                    .and_then(serde_json::Value::as_f64),
+                w.meta
+                    .get("starsDetected")
+                    .and_then(serde_json::Value::as_i64),
+                w.meta
+                    .get("instrume")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                w.meta
+                    .get("telescope")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                w.meta.get("medianSnr").and_then(serde_json::Value::as_f64),
+                w.date_obs.as_deref().and_then(night_of_date_obs),
+            ),
+            None => (0.0, None, None, None, None, None, None, None, None, None),
+        };
         ProjectFrameView {
             frame_uuid: row.frame_uuid,
             file_name: row.file_name,
             publisher: row.publisher_display,
+            publisher_account_id: row.publisher_account_id.clone(),
             own: row.origin == FrameOrigin::Own,
             filter: row.filter_canonical,
             exptime_sec,
@@ -829,6 +880,10 @@ impl ProjectFrameView {
             fwhm_arcsec,
             eccentricity,
             stars_detected,
+            camera,
+            telescope,
+            median_snr,
+            night,
             contributor_state: None,
             contributor_reason: None,
         }
@@ -2086,10 +2141,12 @@ mod tests {
     }
 
     /// `list_project_frames` (wave 2 Task 11) reads the reliable local columns
-    /// AND parses `meta.fwhmArcsec`/`meta.eccentricity`/`meta.starsDetected`
-    /// out of the retained manifest row (`build_frame_meta`'s camelCase keys)
-    /// — the metrics the frames table shows without a second query. Scoped to
-    /// the requested project, like every other cache-only list view.
+    /// AND parses `meta.fwhmArcsec`/`meta.eccentricity`/`meta.starsDetected`/
+    /// `meta.instrume`/`meta.telescope`/`meta.medianSnr` out of the retained
+    /// manifest row (`build_frame_meta`'s camelCase keys) — the metrics the
+    /// frames table shows without a second query — and derives `night` from
+    /// `dateObs` (Task 6). Scoped to the requested project, like every other
+    /// cache-only list view.
     #[test]
     fn list_project_frames_reads_metrics_from_meta() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2098,8 +2155,11 @@ mod tests {
             "frameUuid": "u-1", "publisherAccountId": "acc-alice", "publisherDisplayName": "Alice",
             "own": false, "fileName": "c_u-1.fits", "contentVersion": 1, "blake3": "b".repeat(64),
             "byteSize": 4096, "xxh3": "0123456789abcdef", "filterRaw": "Red", "filterCanonical": "R",
-            "channel": "mono", "exptimeSec": 300.0, "dateObs": "2026-07-01T21:00:00Z",
-            "meta": {"fwhmArcsec": 2.4, "eccentricity": 0.35, "starsDetected": 512},
+            "channel": "mono", "exptimeSec": 300.0, "dateObs": "2026-09-27T03:10:00",
+            "meta": {
+                "fwhmArcsec": 2.4, "eccentricity": 0.35, "starsDetected": 512,
+                "instrume": "ASI6200MM Pro", "telescope": "RC8", "medianSnr": 41.5
+            },
             "gateVersion": 0, "accepted": true, "state": "published", "manifestVersion": 1,
             "createdAt": "2026-07-13T00:00:00Z"
         }))
@@ -2125,7 +2185,7 @@ mod tests {
         assert!(!f.own);
         assert_eq!(f.filter, "R");
         assert_eq!(f.exptime_sec, 300.0);
-        assert_eq!(f.date_obs.as_deref(), Some("2026-07-01T21:00:00Z"));
+        assert_eq!(f.date_obs.as_deref(), Some("2026-09-27T03:10:00"));
         assert_eq!(f.state, "published");
         assert!(f.accepted);
         // v3 wave 3 (Task 16): the hub's holder count is gone; the live
@@ -2145,6 +2205,46 @@ mod tests {
             Some(512),
             "parsed from meta.starsDetected"
         );
+        assert_eq!(
+            f.camera.as_deref(),
+            Some("ASI6200MM Pro"),
+            "parsed from meta.instrume"
+        );
+        assert_eq!(
+            f.telescope.as_deref(),
+            Some("RC8"),
+            "parsed from meta.telescope"
+        );
+        assert_eq!(f.median_snr, Some(41.5), "parsed from meta.medianSnr");
+        assert_eq!(
+            f.night.as_deref(),
+            Some("2026-09-26"),
+            "UTC date of dateObs - 12h"
+        );
+        assert_eq!(f.publisher_account_id, "acc-alice");
+    }
+
+    /// The UTC date of `dateObs − 12 h` — the night boundary for a frame we
+    /// only know through its cached manifest (Task 6, spec 2026-09-29 §5.2).
+    #[test]
+    fn night_of_date_obs_shifts_twelve_hours_in_utc() {
+        assert_eq!(
+            night_of_date_obs("2026-09-27T11:59:59Z").as_deref(),
+            Some("2026-09-26")
+        );
+        assert_eq!(
+            night_of_date_obs("2026-09-27T12:00:00Z").as_deref(),
+            Some("2026-09-27")
+        );
+        assert_eq!(
+            night_of_date_obs("2026-09-27T03:10:00").as_deref(),
+            Some("2026-09-26")
+        );
+        assert_eq!(
+            night_of_date_obs("2026-09-27T03:10:00.250").as_deref(),
+            Some("2026-09-26")
+        );
+        assert_eq!(night_of_date_obs("garbage"), None);
     }
 
     /// This device's node id for `ctx`'s sync dir — the identity a member's
