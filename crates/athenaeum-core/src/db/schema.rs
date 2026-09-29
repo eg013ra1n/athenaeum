@@ -2585,6 +2585,27 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
         sp.commit()?;
     }
+    // `announced_at` (collab observability wave 1, Task 4): the first time an
+    // own row was written by `record_own` — the timestamp the project page's
+    // "Published" table shows. `record_own` carries it through explicitly
+    // (COALESCE with the existing value) so a re-publish never pushes it
+    // forward. Backfill is approximate for rows announced before this column
+    // existed: the closest recorded timestamps are `state_changed_at` (set
+    // whenever the local state machine last moved) falling back to
+    // `updated_at`, for every existing 'own' row.
+    if !column_exists(conn, "project_frames_local", "announced_at")? {
+        let sp = crate::db::operations::SavepointGuard::new(conn, "announced_at_column")?;
+        conn.execute(
+            "ALTER TABLE project_frames_local ADD COLUMN announced_at TEXT",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE project_frames_local SET announced_at = COALESCE(state_changed_at, updated_at) \
+             WHERE origin = 'own'",
+            [],
+        )?;
+        sp.commit()?;
+    }
     // `prev_stamp` (wave 3, Task 11 fix rounds 1+2, L5/C38): the
     // `size:mtime` of the landed file as last verified, kept when a new
     // version (or a parked frame's release) clears `size_mtime_seen` on a

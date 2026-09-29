@@ -881,17 +881,31 @@ pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
         (FrameOrigin::Replica, true) => LocalState::Held,
         (FrameOrigin::Replica, false) => LocalState::Missing,
     };
+    // `announced_at` is likewise reset to NULL by `INSERT OR REPLACE` unless
+    // carried through: read the existing value first so a re-publish of an
+    // already-announced frame keeps its original stamp (first announce
+    // wins). A brand-new row gets `now`.
+    let existing_announced_at: Option<String> = conn
+        .query_row(
+            "SELECT announced_at FROM project_frames_local WHERE project_id = ?1 AND frame_uuid = ?2",
+            params![row.project_id, row.frame_uuid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let announced_at = existing_announced_at.unwrap_or_else(crate::sync::now_iso);
     conn.execute(
         "INSERT OR REPLACE INTO project_frames_local
             (project_id, frame_uuid, content_version, origin, publisher_account_id,
              publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3,
              blake3, manifest_version, manifest_json, landed_path, size_mtime_seen,
              on_disk, awaiting_gc, source_frame_id, recipe_hash, last_error,
-             local_state, frame_seq, state_changed_at, updated_at)
+             local_state, frame_seq, announced_at, state_changed_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
                  ?19, ?20, ?21, ?22, ?23,
                  COALESCE(?24, (SELECT frame_seq FROM project_frames_local
                                 WHERE project_id = ?1 AND frame_uuid = ?2)),
+                 ?25,
                  datetime('now'), datetime('now'))",
         params![
             row.project_id,
@@ -918,9 +932,29 @@ pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
             row.last_error,
             local_state.as_db_str(),
             row.frame_seq,
+            announced_at,
         ],
     )?;
     Ok(())
+}
+
+/// The first time this own frame was announced (first `record_own` write of
+/// its row) — the timestamp the project page's "Published" table shows for a
+/// frame of mine. `None` for a replica row, or one written before this
+/// column existed and never backfilled (should not happen post-migration).
+pub fn announced_at(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuid: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT announced_at FROM project_frames_local WHERE project_id = ?1 AND frame_uuid = ?2",
+            params![project_id, frame_uuid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// Mark a frame landed on disk: sets `landed_path`/`size_mtime_seen`,
@@ -1350,7 +1384,11 @@ pub fn publisher_dir(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows
         .into_iter()
-        .filter(|(_, recipe)| !recipe.as_deref().is_some_and(|r| r.starts_with("external:")))
+        .filter(|(_, recipe)| {
+            !recipe
+                .as_deref()
+                .is_some_and(|r| r.starts_with("external:"))
+        })
         .map(|(p, _)| PathBuf::from(p))
         .find(|p| p.parent().and_then(Path::parent) == Some(project_dir.as_path()))
         .and_then(|p| p.parent().map(PathBuf::from)))

@@ -6642,6 +6642,26 @@ pub(crate) mod tests {
         crate::db::collab_frames::record_own(conn, &row).unwrap();
     }
 
+    /// First announce wins: a re-publish of the same own row (`record_own`
+    /// again, `INSERT OR REPLACE`) must not push `announced_at` forward.
+    #[test]
+    fn record_own_stamps_announced_at_once() {
+        let (_d, ctx) = test_ctx();
+        let db = crate::api::db(&ctx).unwrap();
+        let conn = db.conn();
+        cached_project(&conn);
+        let (_set, ids) = seed_set(&conn, "S", "00 42 44", "+41 16 09", 10.68, 41.27, 2);
+        seed_own_row(&conn, "p-1", "u-1", ids[0], "published", None, true);
+        let first = crate::db::collab_frames::announced_at(&conn, "p-1", "u-1").unwrap();
+        assert!(first.is_some());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        seed_own_row(&conn, "p-1", "u-1", ids[0], "published", None, true); // a re-publish
+        assert_eq!(
+            crate::db::collab_frames::announced_at(&conn, "p-1", "u-1").unwrap(),
+            first
+        );
+    }
+
     /// Spec §8.1: `list_collab_frames`'s own-row `contributorState` chip
     /// (`api::collab_live::surface::list_collab_frames` →
     /// `own_contributor_states` → `derive`) for every reachable state, not
