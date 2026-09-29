@@ -1291,3 +1291,71 @@ async fn the_serving_side_meters_what_it_sends_and_to_whom() {
         "finished serves leave nothing in flight"
     );
 }
+
+/// Task 12 (spec 2026-09-29 §6.4): B's runtime emits
+/// `collab-exchange-progress` naming A's device as the source of what it
+/// receives, then — once nothing moves — the quiet payload for the project,
+/// every receive flow `moving: false` (its final byte total riding along).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_receiver_emits_live_flows_from_the_publisher_then_a_quiet_event() {
+    let w = ts::two_instances().await;
+    let uuids = w.a_publishes(3).await;
+    for u in &uuids {
+        w.b.wait_state(u, LocalState::Held, Duration::from_secs(20))
+            .await;
+    }
+    let a_device = w.a.device();
+    let event = crate::api::collab_live::COLLAB_EXCHANGE_PROGRESS_EVENT;
+    let recv_of = |e: &serde_json::Value| -> Vec<serde_json::Value> {
+        e["projects"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p["projectId"] == ts::PID)
+            .flat_map(|p| p["recv"].as_array().cloned().unwrap_or_default())
+            .collect()
+    };
+    let names_a = |e: &serde_json::Value| {
+        recv_of(e).iter().any(|f| {
+            f["device"] == a_device.as_str() && f["bytesSession"].as_i64().unwrap_or(0) > 0
+        })
+    };
+    let is_quiet = |e: &serde_json::Value| {
+        let recv = recv_of(e);
+        !recv.is_empty() && recv.iter().all(|f| f["moving"] == false)
+    };
+    ts::wait_until(
+        "a progress event naming A, then a quiet one",
+        crate::collab::live::meter::MOVING + Duration::from_secs(15),
+        || {
+            let events = w.b.events.payloads(event);
+            events
+                .iter()
+                .position(|e| names_a(e))
+                .is_some_and(|i| events[i + 1..].iter().any(|e| is_quiet(e)))
+        },
+    )
+    .await;
+    let events = w.b.events.payloads(event);
+    let quiet = events
+        .iter()
+        .rev()
+        .find(|e| is_quiet(e))
+        .expect("quiet event");
+    let from_a = recv_of(quiet)
+        .into_iter()
+        .find(|f| f["device"] == a_device.as_str())
+        .expect("the quiet payload keeps A's flow with its final total");
+    assert!(
+        from_a["bytesSession"].as_i64().unwrap_or(0) >= 3 * ts::FETCH_FRAME_BYTES as i64,
+        "{from_a}"
+    );
+    assert_eq!(from_a["completed"], 3, "{from_a}");
+    assert_eq!(from_a["rateBps"], 0.0, "{from_a}");
+    assert_eq!(quiet["projects"][0]["toGo"], 0, "{quiet}");
+    assert!(
+        quiet["projects"][0]["waitingForPublisher"].is_null(),
+        "the event never reads the catalog: {quiet}"
+    );
+}

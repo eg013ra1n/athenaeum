@@ -204,6 +204,18 @@ pub async fn get_collab_member_summary(
     surface::get_collab_member_summary(&state.ctx, &project_id).map_err(|e| e.to_string())
 }
 
+/// The live exchange's flows (spec 2026-09-29 §6.4): what Transfers and the
+/// project's Exchange tab load on mount, peers named. Empty when no live
+/// exchange runs.
+#[tauri::command]
+#[tracing::instrument(level = "debug", skip_all, err)]
+pub async fn get_collab_exchange(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+) -> Result<surface::ExchangeSnapshot, String> {
+    surface::get_collab_exchange(&state.ctx, project_id.as_deref()).map_err(|e| e.to_string())
+}
+
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
 /// the hub never learns of it). The live exchange re-reads the project's need
 /// set at once.

@@ -2979,6 +2979,7 @@ mod tests {
                 guard: &guard,
                 started_at: &started_at,
                 hooks: &hooks,
+                sources: &[],
             };
             let tag = crate::sharing::iroh::node::project_frame_tag(PID, "f1", 1);
             let rename = |from: &str, to: &str| {

@@ -46,6 +46,7 @@ use crate::api::collab_live::landing::{
 };
 use crate::api::db;
 use crate::collab::live::holders::{providers, FrameRef};
+use crate::collab::live::meter::{device_id_of, ExchangeMeter, FlowDirection};
 use crate::collab::live::presence::PresenceBook;
 use crate::collab::scheduler::core::{
     CancelReason, Command, Core, FetchResult, FrameKey, Input, ProviderList, ProviderRef, Want,
@@ -77,6 +78,9 @@ pub(crate) struct ExecEnv {
     pub root: PathBuf,
     pub guard: Arc<StoreGuard>,
     pub control: Arc<InboundControl>,
+    /// The node's exchange meter (spec 2026-09-29 §6): every fetch is
+    /// registered here and the fetch loop's per-provider deltas land on it.
+    pub(crate) meter: Arc<ExchangeMeter>,
 }
 
 /// What the provider derivation reads (spec §6.1, I4/I5): the holder maps,
@@ -480,6 +484,14 @@ impl Executor {
         Some(Instant::now() + Duration::from_millis(wait))
     }
 
+    /// How many frames of a project are still to fetch (the exchange's
+    /// "to go", spec 2026-09-29 §6.4) — in memory, no catalog read. The
+    /// core's want set, not `need`: a landed frame leaves the core's at once,
+    /// while `need` keeps it until the project's need set is next re-read.
+    pub(crate) fn need_len(&self, project_id: &str) -> usize {
+        self.core.wants_of(project_id)
+    }
+
     /// Step the core and perform what comes out.
     pub(crate) fn step(&mut self, input: Input) {
         let cmds = self.core.step(now_ms(), input);
@@ -880,9 +892,14 @@ impl Executor {
                 max_in_flight: Arc::clone(&self.slots),
                 limit_changed: Some(self.slots_tx.subscribe()),
                 unit_cap_bytes: WORK_UNIT_MAX_BYTES,
-                // Wired to the exchange meter in Task 12; this task only adds
-                // the plumbing.
-                delivered: None,
+                // Per-provider deltas, straight from the fetch loop, onto the
+                // item registered in `on_prepared` (same key: `item_name`).
+                delivered: Some({
+                    let meter = Arc::clone(&self.env.meter);
+                    Arc::new(move |key: &str, provider: [u8; 32], delta: u64| {
+                        meter.delivered(key, &device_id_of(&provider), delta, Instant::now())
+                    }) as crate::sharing::iroh::assign::DeliveredSink
+                }),
             };
             let store = self.env.store.clone();
             let done = self.done_tx.clone();
@@ -976,6 +993,14 @@ impl Executor {
                     return;
                 };
                 let item = self.items.get_mut(&name).expect("checked above");
+                self.env.meter.register(
+                    &name,
+                    FlowDirection::Recv,
+                    &item.key.0,
+                    &item.key.1,
+                    &row.file_name,
+                    row.byte_size.max(0) as u64,
+                );
                 let live = LiveItem {
                     item: FetchItem {
                         key: name.clone(),
@@ -1065,6 +1090,10 @@ impl Executor {
             return;
         };
         item.phase = Phase::Landing;
+        // The fetch is over: its per-device bytes, largest first (the top
+        // device is credited the completion) — what the landing records as
+        // the frame's sources.
+        let sources = self.env.meter.finish(name, true, Instant::now());
         let env = Arc::clone(&self.env);
         let hash = item.hash;
         let started_at = item.started_at.clone();
@@ -1072,7 +1101,7 @@ impl Executor {
         let tx = self.events_tx.clone();
         let kind = TaskKind::Item(name.clone());
         let task = self.tasks.spawn(async move {
-            let landed = land(&env, &row, hash, &started_at).await;
+            let landed = land(&env, &row, hash, &started_at, &sources).await;
             let _ = tx.send(ExecEvent::Landed { name, landed });
         });
         self.task_kinds.insert(task.id(), kind);
@@ -1121,6 +1150,10 @@ impl Executor {
         let Some(item) = self.items.remove(name) else {
             return;
         };
+        // Nothing lands: its in-flight row goes, nothing is completed (a
+        // fetch never registered — cancelled before it was sent — is a
+        // no-op). Its delivered bytes stay on their flows.
+        self.env.meter.finish(name, false, Instant::now());
         let same_version_runs = self
             .items
             .values()
@@ -1492,6 +1525,8 @@ async fn prepare(
                 guard: &env.guard,
                 started_at: &started_at,
                 hooks: &hooks,
+                // Linked, not fetched: no peer delivered anything.
+                sources: &[],
             };
             return Prepared::Settled(link_identical(&landing, &row, &src).await);
         }
@@ -1545,7 +1580,13 @@ async fn own_file_holds(env: &ExecEnv, row: &LocalFrameRow, path: &std::path::Pa
 }
 
 /// Land one fetched frame through the moved wave-2 landing (Task 11).
-async fn land(env: &ExecEnv, row: &LocalFrameRow, hash: Hash, started_at: &str) -> Landed {
+async fn land(
+    env: &ExecEnv,
+    row: &LocalFrameRow,
+    hash: Hash,
+    started_at: &str,
+    sources: &[(String, u64)],
+) -> Landed {
     #[cfg(test)]
     if test_hooks::take_landing_panic(&env.root) {
         panic!("injected landing panic (test hook)");
@@ -1570,6 +1611,7 @@ async fn land(env: &ExecEnv, row: &LocalFrameRow, hash: Hash, started_at: &str) 
         guard: &env.guard,
         started_at,
         hooks: &hooks,
+        sources,
     };
     land_frame(&landing, row, hash).await
 }
@@ -1832,6 +1874,7 @@ mod tests {
                 root: root.clone(),
                 guard: Arc::new(StoreGuard::new(root, me, None)),
                 control: Arc::new(InboundControl::new()),
+                meter: Arc::new(ExchangeMeter::new()),
             },
             2,
             7,
@@ -1891,6 +1934,7 @@ mod tests {
                 root: root.clone(),
                 guard: Arc::new(StoreGuard::new(root, me, None)),
                 control: Arc::new(InboundControl::new()),
+                meter: Arc::new(ExchangeMeter::new()),
             },
             2,
             7,
@@ -1937,6 +1981,7 @@ mod tests {
                 root: rig.root.clone(),
                 guard: Arc::new(StoreGuard::new(rig.root.clone(), me, None)),
                 control: Arc::new(InboundControl::new()),
+                meter: Arc::new(ExchangeMeter::new()),
             },
             2,
             7,
@@ -1969,6 +2014,7 @@ mod tests {
                 root: root.clone(),
                 guard: Arc::new(StoreGuard::new(root, me, None)),
                 control,
+                meter: Arc::new(ExchangeMeter::new()),
             },
             2,
             7,

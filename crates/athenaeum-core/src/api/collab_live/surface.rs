@@ -16,6 +16,7 @@ use crate::api::{db, ApiError, PathPolicy};
 use crate::collab::live::holders::{
     redundancy, waiting_for_publisher, FrameRef, ProjectHolders, Redundancy,
 };
+use crate::collab::live::meter::{FlowDirection, FlowView};
 use crate::collab::live::presence::PresenceBook;
 use crate::collab::snapshot::SnapshotMember;
 use crate::collab::storage::deletions;
@@ -916,6 +917,150 @@ pub async fn resolve_collab_changed_file(
     super::notify_local_change(ctx, project_id);
     Ok(ChangedFileOutcome {
         trashed: out.trashed,
+    })
+}
+
+// ── the exchange's live flows ──────────────────────────────────────────────
+
+/// One project's live flows (spec 2026-09-29 §6.4): the payload of
+/// `collab-exchange-progress` and the `get_collab_exchange` snapshot.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFlows {
+    pub project_id: String,
+    pub recv: Vec<FlowView>,
+    pub send: Vec<FlowView>,
+    /// Frames this device still has to fetch in the project (the
+    /// scheduler's want set: a landed frame leaves it at once).
+    pub to_go: i64,
+    /// Only in the command snapshot (needs a catalog read); `None` in events.
+    pub waiting_for_publisher: Option<i64>,
+}
+
+/// Payload of [`COLLAB_EXCHANGE_PROGRESS_EVENT`](super::COLLAB_EXCHANGE_PROGRESS_EVENT)
+/// — device ids only, never names (no catalog read on the emit path).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabExchangeProgress {
+    pub projects: Vec<ProjectFlows>,
+}
+
+/// A flow's peer device named from the catalog (the snapshot only).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceNameView {
+    pub project_id: String,
+    pub device: String,
+    pub member_name: Option<String>,
+    pub device_name: Option<String>,
+}
+
+/// What `get_collab_exchange` answers: the flows and their peers' names.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeSnapshot {
+    pub projects: Vec<ProjectFlows>,
+    pub names: Vec<DeviceNameView>,
+}
+
+/// Splits the meter's flows into one [`ProjectFlows`] per listed project, in
+/// the listed order — a listed project without flows is an empty (quiet)
+/// entry. Pure: no catalog, no lock.
+pub(crate) fn project_flows(
+    flows: &[FlowView],
+    projects: &[String],
+    to_go: &dyn Fn(&str) -> usize,
+) -> Vec<ProjectFlows> {
+    projects
+        .iter()
+        .map(|p| ProjectFlows {
+            project_id: p.clone(),
+            recv: flows
+                .iter()
+                .filter(|f| &f.project_id == p && f.direction == FlowDirection::Recv)
+                .cloned()
+                .collect(),
+            send: flows
+                .iter()
+                .filter(|f| &f.project_id == p && f.direction == FlowDirection::Send)
+                .cloned()
+                .collect(),
+            to_go: to_go(p) as i64,
+            waiting_for_publisher: None,
+        })
+        .collect()
+}
+
+/// Spec 2026-09-29 §6.4 — the snapshot both Transfers and the Exchange tab
+/// load on mount; names resolved here (catalog read), never in the event.
+/// No running live exchange (signed out, storage unavailable, app just
+/// started) answers an empty snapshot (review focus 5).
+pub fn get_collab_exchange(
+    ctx: &ServiceContext,
+    project_id: Option<&str>,
+) -> Result<ExchangeSnapshot, ApiError> {
+    let empty = ExchangeSnapshot {
+        projects: vec![],
+        names: vec![],
+    };
+    let Some((meter, to_go)) = super::runtime::exchange_view(ctx) else {
+        return Ok(empty);
+    };
+    let flows = meter.snapshot(std::time::Instant::now());
+    let mut projects: Vec<String> = flows.iter().map(|f| f.project_id.clone()).collect();
+    projects.sort();
+    projects.dedup();
+    if let Some(p) = project_id {
+        projects.retain(|x| x == p);
+        if projects.is_empty() {
+            projects.push(p.to_string());
+        }
+    }
+    let mut out = project_flows(&flows, &projects, &|p| to_go.get(p).copied().unwrap_or(0));
+    // `list_collab_frames` takes its own pooled connection: counted first,
+    // before this function holds one (never two at once).
+    for pf in &mut out {
+        let waiting = list_collab_frames(ctx, &pf.project_id, false)?
+            .iter()
+            .filter(|v| v.waiting_for_publisher)
+            .count();
+        pf.waiting_for_publisher = Some(waiting as i64);
+    }
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let mut names = Vec::new();
+    for pf in &out {
+        if pf.recv.is_empty() && pf.send.is_empty() {
+            continue;
+        }
+        let Some(project) = crate::db::collab::get_project(&conn, &pf.project_id)? else {
+            tracing::debug!(project_id = %pf.project_id, "exchange flows for a project not cached; peers unnamed");
+            continue;
+        };
+        let members: Vec<SnapshotMember> = serde_json::from_str(&project.members_json)
+            .unwrap_or_else(|e| {
+                tracing::warn!(project_id = %pf.project_id, error = %e, "members_json unreadable; exchange peers named by device only");
+                Vec::new()
+            });
+        let (devices, _) = live_db::load_holders(&conn, &pf.project_id)?;
+        for f in pf.recv.iter().chain(pf.send.iter()) {
+            names.push(DeviceNameView {
+                project_id: pf.project_id.clone(),
+                device: f.device.clone(),
+                member_name: member_of_device(&members, &f.device).map(|m| m.display_name.clone()),
+                device_name: devices
+                    .iter()
+                    .find(|d| d.device == f.device)
+                    .map(|d| d.display_name.clone())
+                    .filter(|n| !n.is_empty()),
+            });
+        }
+    }
+    names.sort_by(|a, b| (&a.project_id, &a.device).cmp(&(&b.project_id, &b.device)));
+    names.dedup();
+    Ok(ExchangeSnapshot {
+        projects: out,
+        names,
     })
 }
 
@@ -2252,5 +2397,62 @@ mod tests {
         assert_eq!(median(&mut vec![3.0, 1.0, 2.0]), Some(2.0));
         assert_eq!(median(&mut vec![4.0, 1.0]), Some(2.5));
         assert_eq!(median(&mut vec![]), None);
+    }
+    /// Review focus 5: no live runtime (signed out, storage unavailable,
+    /// app just started) answers an empty exchange snapshot, never an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exchange_snapshot_is_empty_without_a_runtime() {
+        let (_d, ctx, _hub) = ts::signed_in_rig().await;
+        assert_eq!(
+            get_collab_exchange(&ctx, None).unwrap(),
+            ExchangeSnapshot {
+                projects: vec![],
+                names: vec![]
+            }
+        );
+        assert_eq!(
+            get_collab_exchange(&ctx, Some(ts::PID)).unwrap(),
+            ExchangeSnapshot {
+                projects: vec![],
+                names: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn project_flows_split_directions_and_zero_quiet_projects() {
+        use crate::collab::live::meter::{FlowDirection, FlowView};
+        let f = |p: &str, d: FlowDirection| FlowView {
+            project_id: p.into(),
+            device: "D=".into(),
+            direction: d,
+            bytes_session: 1,
+            rate_bps: 1.0,
+            eta_secs: None,
+            moving: true,
+            completed: 0,
+            in_flight: vec![],
+        };
+        let flows = vec![f("p1", FlowDirection::Recv), f("p1", FlowDirection::Send)];
+        let out = project_flows(&flows, &["p1".into(), "p2".into()], &|p| {
+            if p == "p1" {
+                7
+            } else {
+                0
+            }
+        });
+        assert_eq!(
+            (out[0].recv.len(), out[0].send.len(), out[0].to_go),
+            (1, 1, 7)
+        );
+        assert_eq!(
+            (
+                out[1].project_id.as_str(),
+                out[1].recv.len(),
+                out[1].send.len()
+            ),
+            ("p2", 0, 0)
+        );
+        assert!(out.iter().all(|p| p.waiting_for_publisher.is_none()));
     }
 }

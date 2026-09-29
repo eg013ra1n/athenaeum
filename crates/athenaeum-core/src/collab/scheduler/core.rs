@@ -685,6 +685,15 @@ impl Core {
             .map(|f| (f.fetch_id, f.content_version))
     }
 
+    /// How many frames of `project_id` are still wanted (fed by the latest
+    /// need set, not landed since) — a project's "to go".
+    pub fn wants_of(&self, project_id: &str) -> usize {
+        self.wants
+            .range((project_id.to_string(), String::new())..)
+            .take_while(|(k, _)| k.0 == project_id)
+            .count()
+    }
+
     /// The fetches in flight, `(key, content_version)`, sorted by key.
     pub fn in_flight(&self) -> Vec<(FrameKey, i32)> {
         self.in_flight
@@ -1033,6 +1042,37 @@ mod tests {
             "the permit goes back first (spec §8), then work re-queues"
         );
         assert!(!c.lane());
+    }
+
+    /// Task 12: a project's "to go" is its want set — a landed frame leaves
+    /// it at once, a failed one stays; other projects never count.
+    #[test]
+    fn wants_of_counts_one_project_and_drops_what_landed() {
+        let mut c = Core::new(1, 4);
+        c.step(0, Input::Storage { fetching: true });
+        c.step(0, need(vec![want("a", 1, 0), want("b", 1, 0)]));
+        c.step(
+            0,
+            Input::NeedSet {
+                project_id: "p2".into(),
+                wants: vec![Want {
+                    key: ("p2".into(), "z".into()),
+                    ..want("z", 1, 0)
+                }],
+            },
+        );
+        c.step(0, provs("a", 1, &["X"]));
+        c.step(0, provs("b", 1, &["X"]));
+        c.step(0, Input::Lane { admitted: true });
+        assert_eq!(
+            (c.wants_of("p1"), c.wants_of("p2"), c.wants_of("p")),
+            (2, 1, 0)
+        );
+        let f = fin(&c, "a", FetchResult::Landed);
+        c.step(1, f);
+        let f = fin(&c, "b", FetchResult::Failed);
+        c.step(1, f);
+        assert_eq!(c.wants_of("p1"), 1, "landed a leaves, failed b stays");
     }
 
     #[test]

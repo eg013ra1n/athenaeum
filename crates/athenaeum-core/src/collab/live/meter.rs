@@ -75,6 +75,11 @@ struct State {
 #[derive(Default)]
 pub struct ExchangeMeter {
     state: Mutex<State>,
+    /// Woken when a flow starts moving (a new flow, or one re-seeded after a
+    /// pause): the deltas land here from the fetch and serve loops, never
+    /// through the live runtime's loop, which would otherwise sleep until
+    /// its next timer and miss the start of a transfer.
+    started: tokio::sync::Notify,
 }
 
 impl ExchangeMeter {
@@ -135,9 +140,9 @@ impl ExchangeMeter {
         if delta == 0 {
             return;
         }
-        self.with(|s| {
+        let started = self.with(|s| {
             let Some(item) = s.items.get_mut(key) else {
-                return;
+                return false;
             };
             *item.per_device.entry(device.to_string()).or_default() += delta;
             let fk = (item.project_id.clone(), device.to_string(), item.dir);
@@ -184,7 +189,28 @@ impl ExchangeMeter {
                     flow.sample_bytes = 0;
                 }
             }
+            !existed || was_quiet
         });
+        if started {
+            self.started.notify_one();
+        }
+    }
+
+    /// Resolves once a flow started moving since the last wait (a start seen
+    /// while nobody waits is kept for the next wait — one permit).
+    pub async fn flow_started(&self) {
+        self.started.notified().await;
+    }
+
+    /// True while a progress event may be owed: an item has delivered bytes
+    /// in flight, or a flow moved within [`MOVING`].
+    pub fn needs_progress(&self, now: Instant) -> bool {
+        self.with(|s| {
+            s.items.values().any(|i| !i.per_device.is_empty())
+                || s.flows
+                    .values()
+                    .any(|f| now.saturating_duration_since(f.last_moved) <= MOVING)
+        })
     }
 
     /// Ends an item; returns its per-device bytes, largest first. `completed`
@@ -533,5 +559,30 @@ mod tests {
             device_id_of(&[0u8; 32]),
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         );
+    }
+    /// Task 12: a flow that starts moving wakes the runtime once (its
+    /// continuing deltas do not); a progress event is owed while bytes are in
+    /// flight or a flow moved within `MOVING`, and no longer after.
+    #[tokio::test]
+    async fn a_starting_flow_wakes_once_and_progress_is_owed_until_quiet() {
+        let m = ExchangeMeter::new();
+        let t = t0();
+        let wait = || tokio::time::timeout(Duration::from_millis(100), m.flow_started());
+        assert!(!m.needs_progress(t));
+        m.register("u1#1", FlowDirection::Recv, "p", "u1", "a.fits", 100);
+        m.delivered("u1#1", "DEV=", 10, t);
+        assert!(wait().await.is_ok(), "a new flow wakes");
+        m.delivered("u1#1", "DEV=", 10, t + Duration::from_millis(500));
+        assert!(wait().await.is_err(), "a moving flow's next delta does not");
+        assert!(
+            m.needs_progress(t + Duration::from_secs(30)),
+            "bytes in flight"
+        );
+        m.finish("u1#1", true, t + Duration::from_secs(1));
+        assert!(m.needs_progress(t + Duration::from_secs(1) + MOVING));
+        assert!(!m.needs_progress(t + Duration::from_secs(2) + MOVING));
+        m.register("u2#2", FlowDirection::Recv, "p", "u2", "b.fits", 100);
+        m.delivered("u2#2", "DEV=", 10, t + Duration::from_secs(10));
+        assert!(wait().await.is_ok(), "a flow re-seeded after a pause wakes");
     }
 }

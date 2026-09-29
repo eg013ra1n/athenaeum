@@ -69,6 +69,10 @@ pub struct LandingEnv<'a> {
     pub started_at: &'a str,
     /// The exports' test seams — production passes a default value.
     pub(crate) hooks: &'a ExportHooks,
+    /// Who delivered the frame's bytes, largest first (the exchange meter's
+    /// per-device totals for this fetch; empty for a link). Recorded as the
+    /// frame's sources by the receive-session writer (Task 13).
+    pub sources: &'a [(String, u64)],
 }
 
 impl LandingEnv<'_> {

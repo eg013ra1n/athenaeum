@@ -24,18 +24,20 @@ use crate::api::collab_live::holdings::{member_devices, HolderMaps};
 use crate::api::collab_live::storage_task::{
     HolderView, StorageEngine, StorageEvent, StorageTimings,
 };
+use crate::api::collab_live::surface::{project_flows, CollabExchangeProgress};
 use crate::api::collab_live::workers::{
     FeedOut, FeedWork, FeedWorker, SharedHolders, StorageOut, StorageWork,
 };
 use crate::api::collab_live::{
     CollabAttentionChanged, CollabDeletionChoice, CollabFrameChanged, CollabFrameLost,
     CollabLiveStatus, LiveState, StorageStateView, COLLAB_ATTENTION_EVENT,
-    COLLAB_DELETION_CHOICE_EVENT, COLLAB_FRAME_CHANGED_EVENT, COLLAB_FRAME_LOST_EVENT,
-    COLLAB_LIVE_STATUS_EVENT,
+    COLLAB_DELETION_CHOICE_EVENT, COLLAB_EXCHANGE_PROGRESS_EVENT, COLLAB_FRAME_CHANGED_EVENT,
+    COLLAB_FRAME_LOST_EVENT, COLLAB_LIVE_STATUS_EVENT,
 };
 use crate::api::{db, ApiError};
 use crate::collab::hub_client::CollabClient;
 use crate::collab::live::holders::{redundancy, FrameRef, Redundancy};
+use crate::collab::live::meter::{ExchangeMeter, ProgressGate, PROGRESS_PERIOD};
 use crate::collab::live::presence::PresenceBook;
 use crate::collab::live::wire::LiveEvent;
 use crate::collab::scheduler::core::Input;
@@ -105,6 +107,12 @@ pub(crate) struct Shared {
     /// A runtime (its loop and both workers) runs right now — false while
     /// `supervise` waits to start one, restarts it, or after it stopped.
     running: std::sync::atomic::AtomicBool,
+    /// The bound node's exchange meter, set by every runtime start (a
+    /// rebound node brings its own), read by `get_collab_exchange`.
+    meter: RwLock<Option<Arc<ExchangeMeter>>>,
+    /// Each project's "to go" as the last progress event counted it (the
+    /// scheduler's want set lives on the loop; the snapshot reads this copy).
+    to_go: RwLock<HashMap<String, usize>>,
     /// Test only (final fix A-I3): how many runtimes this handle started.
     #[cfg(test)]
     starts: AtomicUsize,
@@ -137,6 +145,8 @@ impl Shared {
             presence: RwLock::new(PresenceBook::default()),
             me: RwLock::new(None),
             running: std::sync::atomic::AtomicBool::new(false),
+            meter: RwLock::new(None),
+            to_go: RwLock::new(HashMap::new()),
             #[cfg(test)]
             starts: AtomicUsize::new(0),
         }
@@ -384,6 +394,31 @@ fn scope(ctx: &ServiceContext) -> Option<String> {
 fn handle_shared(ctx: &ServiceContext) -> Option<Arc<Shared>> {
     let key = scope(ctx)?;
     registry().get(&key).map(|h| Arc::clone(&h.shared))
+}
+
+/// The running live exchange's meter and its last "to go" counts, for the
+/// `get_collab_exchange` snapshot. `None` when no runtime runs (signed out,
+/// waiting for its folder or storage, just started).
+pub(crate) fn exchange_view(
+    ctx: &ServiceContext,
+) -> Option<(Arc<ExchangeMeter>, HashMap<String, usize>)> {
+    let shared = handle_shared(ctx)?;
+    if !shared.running.load(Ordering::SeqCst) {
+        return None;
+    }
+    let meter = shared
+        .meter
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()?;
+    let to_go = match shared.to_go.read() {
+        Ok(g) => g.clone(),
+        Err(p) => {
+            tracing::warn!("exchange to-go cache poisoned; continuing with its data");
+            p.into_inner().clone()
+        }
+    };
+    Some((meter, to_go))
 }
 
 fn send(ctx: &ServiceContext, cmd: LiveCommand) -> bool {
@@ -1020,6 +1055,13 @@ struct Runtime {
     /// The serve oracle this runtime installed: `finish` replaces only it
     /// (final fix A-M1).
     oracle: Arc<dyn crate::collab::serve::ServeOracle>,
+    /// The node's exchange meter (the executor's fetches and the node's
+    /// serves write it; `flush_exchange` reads it).
+    meter: Arc<ExchangeMeter>,
+    /// Throttles `collab-exchange-progress` (spec 2026-09-29 §6.4).
+    exchange_gate: ProgressGate,
+    /// When the progress gate is polled next.
+    next_exchange: Instant,
 }
 
 impl Runtime {
@@ -1102,6 +1144,13 @@ impl Runtime {
         };
         r.node.set_collab_upload_limit(upload);
         let seed = uuid::Uuid::new_v4().as_u128() as u64;
+        let meter = r.node.exchange_meter();
+        *shared.meter.write().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&meter));
+        shared
+            .to_go
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         let exec = Executor::new(
             ExecEnv {
                 ctx: Arc::clone(&ctx),
@@ -1110,6 +1159,7 @@ impl Runtime {
                 root: r.root,
                 guard,
                 control: r.control,
+                meter: Arc::clone(&meter),
             },
             receive,
             seed,
@@ -1187,6 +1237,9 @@ impl Runtime {
             policy_tx,
             policy_rx,
             oracle,
+            meter,
+            exchange_gate: ProgressGate::default(),
+            next_exchange: Instant::now(),
             shared,
         };
         rt.publish_storage();
@@ -1271,6 +1324,12 @@ impl Runtime {
                 d = d.min(*last + LANDED_BURST);
             }
         }
+        // Something in flight or moving, or a quiet payload owed: the
+        // progress gate is polled once a period (a flow that starts moving
+        // wakes the loop through `flow_started`).
+        if self.exchange_gate.armed() || self.meter.needs_progress(Instant::now()) {
+            d = d.min(self.next_exchange);
+        }
         d
     }
 
@@ -1296,6 +1355,7 @@ impl Runtime {
                 return self.finish(exit).await;
             }
         }
+        let meter = Arc::clone(&self.meter);
         let exit = loop {
             self.flush_dirty();
             let mut deadline = self.deadline();
@@ -1414,6 +1474,9 @@ impl Runtime {
                         self.checks_open = false;
                     }
                 },
+                // A flow started moving: nothing to do but re-read the
+                // deadline (the progress gate is due now).
+                _ = meter.flow_started() => {}
                 _ = tokio::time::sleep_until(deadline.into()) => self.on_timers().await,
             }
         };
@@ -1923,6 +1986,44 @@ impl Runtime {
             self.exec.step(Input::Tick);
         }
         self.flush_bursts(now);
+        self.flush_exchange(now);
+    }
+
+    /// Spec 2026-09-29 §6.4: at most once a second while something moves,
+    /// then one quiet payload per project. No catalog access here: flows
+    /// come from the in-memory meter, "to go" from the scheduler's want set.
+    fn flush_exchange(&mut self, now: Instant) {
+        if now < self.next_exchange {
+            return;
+        }
+        self.next_exchange = now + PROGRESS_PERIOD;
+        let flows = self.meter.snapshot(now);
+        let moving: BTreeSet<String> = flows
+            .iter()
+            .filter(|f| f.moving)
+            .map(|f| f.project_id.clone())
+            .collect();
+        let Some(emit) = self.exchange_gate.poll(now, moving) else {
+            return;
+        };
+        let listed: Vec<String> = emit
+            .projects
+            .iter()
+            .chain(emit.quiet.iter())
+            .cloned()
+            .collect();
+        let to_go: HashMap<String, usize> = listed
+            .iter()
+            .map(|p| (p.clone(), self.exec.need_len(p)))
+            .collect();
+        match self.shared.to_go.write() {
+            Ok(mut g) => g.extend(to_go.iter().map(|(p, n)| (p.clone(), *n))),
+            Err(e) => tracing::warn!(error = %e, "exchange to-go cache poisoned"),
+        }
+        let payload = CollabExchangeProgress {
+            projects: project_flows(&flows, &listed, &|p| to_go.get(p).copied().unwrap_or(0)),
+        };
+        self.emit(COLLAB_EXCHANGE_PROGRESS_EVENT, &payload);
     }
 
     /// Sync now's reconciliation (P26): the refused projects are retried, a

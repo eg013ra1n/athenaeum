@@ -1100,6 +1100,7 @@ impl FetchRig {
             guard: &self.guard,
             started_at: &started_at,
             hooks: &self.hooks,
+            sources: &[],
         };
         match link_identical(&env, &row, src).await {
             Landed::Yes(p) => Ok(p),
@@ -1133,6 +1134,7 @@ impl FetchRig {
             guard: &self.guard,
             started_at: &started_at,
             hooks: &self.hooks,
+            sources: &[],
         };
         match land_frame(&env, &row, hash).await {
             Landed::Yes(p) => Ok(p),
@@ -1253,7 +1255,11 @@ async fn live_instance(
     }
 }
 
-async fn wait_until(what: &str, within: std::time::Duration, mut pred: impl FnMut() -> bool) {
+pub(crate) async fn wait_until(
+    what: &str,
+    within: std::time::Duration,
+    mut pred: impl FnMut() -> bool,
+) {
     let deadline = std::time::Instant::now() + within;
     loop {
         if pred() {

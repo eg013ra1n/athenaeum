@@ -1941,6 +1941,23 @@ export type CameraQuality = { camera: string, filter: string, frames: number, me
 
 export type MemberSummary = { accountId: string, displayName: string, dataRole: string, coordinator: boolean, devices: Array<MemberDeviceView>, online: boolean, lastSeenAt: string | null, publishedFrames: number, secondsByFilter: { [key in string]: number }, qualityByCamera: Array<CameraQuality>, holdsFrames: number, holdsBytes: number, holdsShare: number, };
 
+export type ProjectFlows = { projectId: string, recv: Array<FlowView>, send: Array<FlowView>, 
+/**
+ * Frames this device still has to fetch in the project (the
+ * scheduler's want set: a landed frame leaves it at once).
+ */
+toGo: number, 
+/**
+ * Only in the command snapshot (needs a catalog read); `None` in events.
+ */
+waitingForPublisher: number | null, };
+
+export type CollabExchangeProgress = { projects: Array<ProjectFlows>, };
+
+export type DeviceNameView = { projectId: string, device: string, memberName: string | null, deviceName: string | null, };
+
+export type ExchangeSnapshot = { projects: Array<ProjectFlows>, names: Array<DeviceNameView>, };
+
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**
  * Human-readable failure reasons, empty when publishable (e.g.

@@ -107,6 +107,10 @@ pub const COLLAB_FRAME_CHANGED_EVENT: &str = "collab-frame-changed";
 /// A project's attention lists (changed files, not kept, awaiting a
 /// choice, lost) changed — reload them.
 pub const COLLAB_ATTENTION_EVENT: &str = "collab-attention-changed";
+/// The live exchange's flows per project (spec 2026-09-29 §6.4): at most
+/// once a second while something moves, then one quiet payload per project.
+/// Ids only — names come from `get_collab_exchange`.
+pub const COLLAB_EXCHANGE_PROGRESS_EVENT: &str = "collab-exchange-progress";
 
 /// Payload of [`COLLAB_DELETION_CHOICE_EVENT`].
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]

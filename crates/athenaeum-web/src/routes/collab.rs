@@ -22,6 +22,14 @@ pub struct ProjectIdArgs {
     project_id: String,
 }
 
+/// `projectId` absent or `null`: every project.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionalProjectArgs {
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
 /// I1: `withContributorState` (default `false`) opts into the own-row
 /// contributor chip — see `list_collab_frames`'s doc comment.
 #[derive(Deserialize)]
@@ -346,6 +354,19 @@ pub async fn get_collab_member_summary(
     Json(args): Json<ProjectIdArgs>,
 ) -> Result<Json<Vec<surface::MemberSummary>>, (axum::http::StatusCode, String)> {
     surface::get_collab_member_summary(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// The live exchange's flows (spec 2026-09-29 §6.4): what Transfers and the
+/// project's Exchange tab load on mount, peers named. Empty when no live
+/// exchange runs.
+#[tracing::instrument(level = "debug", skip_all, err(Debug))]
+pub async fn get_collab_exchange(
+    State(state): State<WebAppState>,
+    Json(args): Json<OptionalProjectArgs>,
+) -> Result<Json<surface::ExchangeSnapshot>, (axum::http::StatusCode, String)> {
+    surface::get_collab_exchange(&state.ctx, args.project_id.as_deref())
         .map(Json)
         .map_err(api_err)
 }
