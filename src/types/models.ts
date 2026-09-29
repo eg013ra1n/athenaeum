@@ -1967,6 +1967,12 @@ export type UnmappedFilter = { instrume: string, filterRaw: string, frames: numb
 
 export type DictionaryEntry = { canonical: string, aliases: Array<string>, kind: string, };
 
+export type FlowDirection = "recv" | "send";
+
+export type InFlightView = { frameUuid: string, fileName: string, size: number, done: number, };
+
+export type FlowView = { projectId: string, device: string, direction: FlowDirection, bytesSession: number, rateBps: number, etaSecs: number | null, moving: boolean, completed: number, inFlight: Array<InFlightView>, };
+
 export type FilterMappingRowView = { instrume: string, filterRaw: string, frames: number, 
 /**
  * `mapped` | `mappedToMissing` | `matched` | `unmapped`

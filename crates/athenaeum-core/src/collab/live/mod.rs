@@ -10,6 +10,7 @@ pub mod backoff;
 pub mod cursor;
 pub mod digest;
 pub mod holders;
+pub mod meter;
 pub mod outbox;
 pub mod presence;
 pub mod sse;
