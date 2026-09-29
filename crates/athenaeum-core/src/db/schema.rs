@@ -2497,6 +2497,23 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // Hub project-page extras (spec 2026-09-29 §5.5/§5.6): the goals JSON and
+    // the members-seen JSON, written only by `db::collab::set_page_extras`
+    // (an `upsert_project` wholesale refresh leaves both columns out).
+    for (col, ddl) in [
+        (
+            "goals_json",
+            "ALTER TABLE collab_projects ADD COLUMN goals_json TEXT",
+        ),
+        (
+            "members_seen_json",
+            "ALTER TABLE collab_projects ADD COLUMN members_seen_json TEXT NOT NULL DEFAULT '[]'",
+        ),
+    ] {
+        if !column_exists(conn, "collab_projects", col)? {
+            conn.execute(ddl, [])?;
+        }
+    }
     // `local_state`/`frame_seq`/`state_changed_at`: the per-frame local state
     // machine (P8) — `db::collab_frames::set_local_state` is the ONLY writer
     // of `on_disk` going forward (the wave-2 writers keep writing it

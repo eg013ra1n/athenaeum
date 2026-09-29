@@ -349,6 +349,30 @@ pub fn set_dictionary(
     Ok(())
 }
 
+/// Hub project-page extras (spec 2026-09-29 §5.5/§5.6): the goals JSON and
+/// `[{displayName, lastSeenAt}]`. Written only here, beside `upsert_project`.
+pub fn set_page_extras(
+    conn: &Connection,
+    project_id: &str,
+    goals_json: Option<&str>,
+    members_seen_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE collab_projects SET goals_json = ?2, members_seen_json = ?3 WHERE project_id = ?1",
+        params![project_id, goals_json, members_seen_json],
+    )?;
+    Ok(())
+}
+
+/// The project-page extras as last cached (`(None, "[]")` when never set).
+pub fn page_extras(conn: &Connection, project_id: &str) -> Result<(Option<String>, String)> {
+    Ok(conn.query_row(
+        "SELECT goals_json, members_seen_json FROM collab_projects WHERE project_id = ?1",
+        params![project_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
 /// Advance the feed's version cursor (plan P5: `hub_version` is that cursor)
 /// and stamp `feed_epoch`. The only writer of `feed_epoch` besides
 /// [`set_holder_seq`] and [`mark_lost`] (which resets it); `hub_version` is

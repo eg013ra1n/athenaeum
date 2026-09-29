@@ -89,6 +89,11 @@ pub struct ProjectWire {
     /// `None` on a hub that predates it.
     #[serde(default)]
     pub version: Option<i64>,
+    /// Per-filter integration goals (`{canonical: seconds}`, spec
+    /// 2026-09-29 §5.5). `None` when the hub has none set, or predates the
+    /// field.
+    #[serde(default)]
+    pub goals: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,6 +102,12 @@ pub struct MemberWire {
     pub display_name: String,
     pub data_role: String,
     pub coordinator: bool,
+    /// This member's last-seen timestamp (ISO 8601), filled by the hub only
+    /// for an authenticated co-member (spec 2026-09-29 §5.6/D8) — `None` on
+    /// an anonymous fetch, for a member who has never been seen, or on a hub
+    /// that predates the field.
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
 }
 
 /// Public project page — only the fields slice 3 consumes; unknown fields
@@ -453,12 +464,15 @@ impl CollabClient {
             .await
     }
 
-    /// Public page (no token) — target/members for the cache.
+    /// Project page — sent WITH the device token so the hub's member-only
+    /// fields (`lastSeenAt`, spec 2026-09-29 D8) are filled; `None` keeps the
+    /// anonymous public view.
     pub async fn project_page(
         &self,
         id_or_slug: &str,
+        token: Option<&str>,
     ) -> Result<ProjectPageWire, AccountClientError> {
-        self.get_json(&format!("/projects/{id_or_slug}"), None, "project page")
+        self.get_json(&format!("/projects/{id_or_slug}"), token, "project page")
             .await
     }
 
@@ -1005,11 +1019,38 @@ mod tests {
             .mount(&server)
             .await;
         let client = CollabClient::new(server.uri()).unwrap();
-        let page = client.project_page("m101").await.unwrap();
+        let page = client.project_page("m101", None).await.unwrap();
         assert_eq!(page.project.target.radius_deg, 1.5);
         assert_eq!(page.members[0].display_name, "Vilen");
         let th = client.thresholds("tok", "p-1").await.unwrap();
         assert_eq!(th.current.unwrap().version, 3);
+    }
+
+    #[tokio::test]
+    async fn project_page_sends_the_device_token_and_decodes_goals_and_last_seen() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p1"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "project": {"id": "p1", "slug": "m31", "title": "M31", "status": "active",
+                            "requireApproval": false,
+                            "target": {"name": "M31", "raDeg": 10.68, "decDeg": 41.27, "radiusDeg": 1.5},
+                            "version": 3, "goals": {"Ha": 216000}},
+                "members": [{"displayName": "Anna", "dataRole": "send", "coordinator": false,
+                             "lastSeenAt": "2026-09-27T08:30:00Z"},
+                            {"displayName": "Bo", "dataRole": "send", "coordinator": true, "lastSeenAt": null}]
+            })))
+            .mount(&server)
+            .await;
+        let client = CollabClient::new(&server.uri()).unwrap();
+        let page = client.project_page("p1", Some("tok")).await.unwrap();
+        assert_eq!(page.project.goals, Some(serde_json::json!({"Ha": 216000})));
+        assert_eq!(
+            page.members[0].last_seen_at.as_deref(),
+            Some("2026-09-27T08:30:00Z")
+        );
+        assert_eq!(page.members[1].last_seen_at, None);
     }
 
     // ---- per-frame api (collab v3 wave 2, Task 1) ----

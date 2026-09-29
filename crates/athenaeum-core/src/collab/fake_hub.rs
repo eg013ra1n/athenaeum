@@ -391,6 +391,12 @@ pub struct FakeHubState {
     /// Revoked or retired device pubkeys (A6 fix round 2, M5): a device is
     /// in service while NOT in this set, like the hub's `revoked_at IS NULL`.
     pub revoked: HashSet<String>,
+    /// Per-project integration goals (spec 2026-09-29 §5.5), served as
+    /// `project.goals` on the project page.
+    pub goals: HashMap<String, Value>,
+    /// (project id, display name) → last-seen ISO timestamp (spec 2026-09-29
+    /// §5.6/D8), served as each member's `lastSeenAt` on the project page.
+    pub last_seen: HashMap<(String, String), String>,
     session_seq: u64,
     /// Every event published, oldest first, capped at 256 — test-only,
     /// `FakeHub::last_event` reads from here so a test can inspect the exact
@@ -713,7 +719,11 @@ pub fn default_dictionary() -> Vec<DictionaryEntry> {
         entry("Ha", &["H-alpha", "Halpha"], "narrowband"),
         entry("OIII", &["O3"], "narrowband"),
         entry("SII", &["S2"], "narrowband"),
-        entry("None", &["none", "nofilter", "no filter", "no-filter", "unfiltered"], "unfiltered"),
+        entry(
+            "None",
+            &["none", "nofilter", "no filter", "no-filter", "unfiltered"],
+            "unfiltered",
+        ),
     ]
 }
 
@@ -752,6 +762,8 @@ impl FakeHub {
             dropped_events: HashMap::new(),
             api_outdated: false,
             revoked: HashSet::new(),
+            goals: HashMap::new(),
+            last_seen: HashMap::new(),
             session_seq: 0,
             event_log: VecDeque::new(),
         }));
@@ -1115,6 +1127,22 @@ impl FakeHub {
             prev
         };
         st.publish_bump(project_id, prev, &["dictionary"], &[]);
+    }
+
+    /// Set (or clear, `Value::Null`) a project's integration goals (spec
+    /// 2026-09-29 §5.5) — no bump, no event; the next project-page fetch just
+    /// sees it.
+    pub fn set_goals(&self, pid: &str, goals: Value) {
+        let mut st = self.lock();
+        st.goals.insert(pid.to_string(), goals);
+    }
+
+    /// Set one member's last-seen timestamp (spec 2026-09-29 §5.6/D8) as the
+    /// project page reports it — no bump, no event.
+    pub fn set_last_seen(&self, pid: &str, display_name: &str, iso: &str) {
+        let mut st = self.lock();
+        st.last_seen
+            .insert((pid.to_string(), display_name.to_string()), iso.to_string());
     }
 
     /// Insert frames straight into the hub as `publisher_account` in one
@@ -2096,10 +2124,13 @@ fn project_page(st: &FakeHubState, pid: &str) -> ResponseTemplate {
         .members
         .iter()
         .map(|m| {
+            let display_name = st.display_of(&m.account_id);
+            let last_seen_at = st.last_seen.get(&(pid.to_string(), display_name.clone()));
             json!({
-                "displayName": st.display_of(&m.account_id),
+                "displayName": display_name,
                 "dataRole": m.data_role,
                 "coordinator": m.coordinator,
+                "lastSeenAt": last_seen_at,
             })
         })
         .collect();
@@ -2112,6 +2143,7 @@ fn project_page(st: &FakeHubState, pid: &str) -> ResponseTemplate {
             "requireApproval": p.require_approval,
             "target": {"name": "M31", "raDeg": 10.68, "decDeg": 41.27, "radiusDeg": 1.5},
             "version": p.version,
+            "goals": st.goals.get(pid),
         },
         "members": members,
     }))
@@ -2431,7 +2463,10 @@ fn validate_frame(f: &FrameIn) -> Result<(), String> {
     // (0..=80 chars after trimming) — an unfiltered light with no dictionary
     // mapping yet, or one mapped to the dictionary's own `None` entry.
     if f.filter_raw.trim().chars().count() > 80 {
-        return Err(format!("{}: filterRaw must be at most 80 chars", f.file_name));
+        return Err(format!(
+            "{}: filterRaw must be at most 80 chars",
+            f.file_name
+        ));
     }
     let meta_len = serde_json::to_vec(&f.meta)
         .map(|b| b.len())

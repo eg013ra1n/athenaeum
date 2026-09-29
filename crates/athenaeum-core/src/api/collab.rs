@@ -1693,9 +1693,10 @@ async fn fetch_one_project(
     prev: Option<&CollabProjectRow>,
 ) -> Result<FetchedProject, FetchError> {
     let page = client
-        .project_page(&p.id)
+        .project_page(&p.id, Some(token))
         .await
         .map_err(|e| FetchError::Transport(e.into()))?;
+    let (goals_json, members_seen_json) = page_extras_of(&page);
     let snapshot_wire = client
         .membership_snapshot(token, &p.id)
         .await
@@ -1798,15 +1799,57 @@ async fn fetch_one_project(
         feed_epoch: None,
         holder_seq: -1,
     };
-    Ok(FetchedProject { row, dictionary })
+    Ok(FetchedProject {
+        row,
+        dictionary,
+        goals_json,
+        members_seen_json,
+    })
 }
 
 /// One project as a refresh fetched it: the cache row, plus the dictionary
 /// when it was due (`Some((version, entries JSON))`, both `None` when the
-/// hub has no dictionary).
+/// hub has no dictionary), plus the page extras (spec 2026-09-29 §5.5/§5.6)
+/// this refresh always fetches.
 struct FetchedProject {
     row: CollabProjectRow,
     dictionary: Option<(Option<i32>, Option<String>)>,
+    goals_json: Option<String>,
+    members_seen_json: String,
+}
+
+/// One member's last-seen as the hub reported it on the project page.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberSeen {
+    pub display_name: String,
+    pub last_seen_at: Option<String>,
+}
+
+/// The two project-page extras the cache keeps beside the row: the goals JSON
+/// (`None` when the hub has none set, or it decoded to `null`) and the
+/// members-seen JSON (always an array, `"[]"` when the page had no members).
+pub fn page_extras_of(
+    page: &crate::collab::hub_client::ProjectPageWire,
+) -> (Option<String>, String) {
+    let goals = page
+        .project
+        .goals
+        .as_ref()
+        .filter(|v| !v.is_null())
+        .map(|v| v.to_string());
+    let seen: Vec<MemberSeen> = page
+        .members
+        .iter()
+        .map(|m| MemberSeen {
+            display_name: m.display_name.clone(),
+            last_seen_at: m.last_seen_at.clone(),
+        })
+        .collect();
+    (
+        goals,
+        serde_json::to_string(&seen).unwrap_or_else(|_| "[]".into()),
+    )
 }
 
 /// This member's caps as the caps rule (P9) compares them: the hub's
@@ -1971,7 +2014,12 @@ pub(crate) async fn refresh_projects_reporting(
         }
         let prev = previous.get(&p.id);
         match fetch_one_project(&client, &token, &pinned, p, prev).await {
-            Ok(FetchedProject { row, dictionary }) => {
+            Ok(FetchedProject {
+                row,
+                dictionary,
+                goals_json,
+                members_seen_json,
+            }) => {
                 if !previous_ids.contains(&row.project_id) {
                     new_targets.push((
                         row.project_id.clone(),
@@ -1993,6 +2041,13 @@ pub(crate) async fn refresh_projects_reporting(
                 let db = db(ctx)?;
                 let conn = db.conn();
                 crate::db::collab::upsert_project(&conn, &row).map_err(internal)?;
+                crate::db::collab::set_page_extras(
+                    &conn,
+                    &row.project_id,
+                    goals_json.as_deref(),
+                    &members_seen_json,
+                )
+                .map_err(internal)?;
                 if let Some((version, entries)) = dictionary {
                     crate::db::collab::set_dictionary(
                         &conn,
@@ -5607,6 +5662,63 @@ pub(crate) mod tests {
             Some(r#"[{"canonical":"L","aliases":[],"kind":"broadband"}]"#),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn page_extras_carry_goals_and_member_last_seen() {
+        let page: crate::collab::hub_client::ProjectPageWire = serde_json::from_value(serde_json::json!({
+            "project": {"id": "p1", "slug": "m31", "title": "M31", "status": "active", "requireApproval": false,
+                        "target": {"name": "M31", "raDeg": 1.0, "decDeg": 2.0, "radiusDeg": 1.0}, "goals": {"Ha": 3600}},
+            "members": [{"displayName": "Anna", "dataRole": "send", "coordinator": false, "lastSeenAt": "2026-09-27T08:30:00Z"}]
+        })).unwrap();
+        let (goals, seen) = page_extras_of(&page);
+        assert_eq!(goals.as_deref(), Some(r#"{"Ha":3600}"#));
+        let seen: Vec<MemberSeen> = serde_json::from_str(&seen).unwrap();
+        assert_eq!(
+            seen,
+            vec![MemberSeen {
+                display_name: "Anna".into(),
+                last_seen_at: Some("2026-09-27T08:30:00Z".into())
+            }]
+        );
+    }
+
+    #[test]
+    fn page_extras_round_trip_through_the_catalog() {
+        let (_d, ctx) = test_ctx();
+        let db = crate::api::db(&ctx).unwrap();
+        let conn = db.conn();
+        cached_project(&conn);
+        assert_eq!(
+            crate::db::collab::page_extras(&conn, "p-1").unwrap(),
+            (None, "[]".to_string())
+        );
+        crate::db::collab::set_page_extras(
+            &conn,
+            "p-1",
+            Some(r#"{"L":7200}"#),
+            r#"[{"displayName":"A","lastSeenAt":null}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::db::collab::page_extras(&conn, "p-1").unwrap(),
+            (
+                Some(r#"{"L":7200}"#.to_string()),
+                r#"[{"displayName":"A","lastSeenAt":null}]"#.to_string()
+            )
+        );
+        // A wholesale refresh of the row must not wipe them.
+        let row = crate::db::collab::get_project(&conn, "p-1")
+            .unwrap()
+            .unwrap();
+        crate::db::collab::upsert_project(&conn, &row).unwrap();
+        assert_eq!(
+            crate::db::collab::page_extras(&conn, "p-1")
+                .unwrap()
+                .0
+                .as_deref(),
+            Some(r#"{"L":7200}"#)
+        );
     }
 
     /// A frames_set whose center is (`objctra`, `objctdec`), holding `lights`
@@ -10729,7 +10841,8 @@ pub(crate) mod tests {
             assert_eq!(
                 (res.announced, res.updated, res.unchanged),
                 (0, 0, 1),
-                "{:?}", res.held_back
+                "{:?}",
+                res.held_back
             );
 
             let after = own_row(&fx, &fx.uuids[0]).unwrap();
@@ -10969,7 +11082,12 @@ pub(crate) mod tests {
         /// no calibration (F5 never checks it), on the same M31 target and
         /// filter `L` fixture's own set uses — so only the basename check
         /// under test can hold it back. Returns the new set's id.
-        fn seed_attested_set(conn: &rusqlite::Connection, root: &Path, name: &str, uuid: &str) -> i64 {
+        fn seed_attested_set(
+            conn: &rusqlite::Connection,
+            root: &Path,
+            name: &str,
+            uuid: &str,
+        ) -> i64 {
             conn.execute(
                 "INSERT INTO frames_set (name, objctra, objctdec) VALUES ('M31 Set 2', '00:42:44', '+41:16:09')",
                 [],
@@ -11062,10 +11180,9 @@ pub(crate) mod tests {
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             assert_eq!(res.held_back.len(), 1, "{:?}", res.held_back);
             assert!(
-                res.held_back[0]
-                    .reasons
-                    .iter()
-                    .any(|r| r.contains(&format!("a frame named {collision_name:?} is already published by you"))),
+                res.held_back[0].reasons.iter().any(|r| r.contains(&format!(
+                    "a frame named {collision_name:?} is already published by you"
+                ))),
                 "{:?}",
                 res.held_back
             );
