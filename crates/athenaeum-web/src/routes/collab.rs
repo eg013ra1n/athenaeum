@@ -338,6 +338,18 @@ pub async fn get_collab_frame_holders(
         .map_err(api_err)
 }
 
+/// The project page's Members tab (spec 2026-09-29 §5.4): role, devices,
+/// published contribution, per-camera quality, holdings share, last seen.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_collab_member_summary(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<Vec<surface::MemberSummary>>, (axum::http::StatusCode, String)> {
+    surface::get_collab_member_summary(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
 /// the hub never learns of it). The live exchange re-reads the project's need
 /// set at once.

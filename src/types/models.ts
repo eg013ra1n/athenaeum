@@ -1935,6 +1935,12 @@ export type ReplaceOutcomeView = { scanned: number, adopted: number, };
 
 export type FrameHolderView = { memberName: string | null, deviceName: string | null, device: string, deviceShort: string, online: boolean, isPublisher: boolean, contentVersion: number, };
 
+export type MemberDeviceView = { device: string, name: string | null, online: boolean, };
+
+export type CameraQuality = { camera: string, filter: string, frames: number, medianFwhm: number | null, medianEcc: number | null, };
+
+export type MemberSummary = { accountId: string, displayName: string, dataRole: string, coordinator: boolean, devices: Array<MemberDeviceView>, online: boolean, lastSeenAt: string | null, publishedFrames: number, secondsByFilter: { [key in string]: number }, qualityByCamera: Array<CameraQuality>, holdsFrames: number, holdsBytes: number, holdsShare: number, };
+
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**
  * Human-readable failure reasons, empty when publishable (e.g.

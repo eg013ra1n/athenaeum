@@ -243,6 +243,50 @@ pub struct FrameHolderView {
     pub content_version: i32,
 }
 
+/// One member's device on the Members tab (spec 2026-09-29 §5.4): named
+/// when a holder snapshot has named it, online per live presence.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberDeviceView {
+    pub device: String,
+    pub name: Option<String>,
+    pub online: bool,
+}
+
+/// One (camera, filter) pair's quality for one member's published+accepted
+/// frames — median FWHM/eccentricity over that pair (spec 2026-09-29 §5.4).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraQuality {
+    pub camera: String,
+    pub filter: String,
+    pub frames: i64,
+    pub median_fwhm: Option<f64>,
+    pub median_ecc: Option<f64>,
+}
+
+/// One row of the project page's Members tab (spec 2026-09-29 §5.4): role,
+/// devices online, published contribution (seconds per filter, per-camera
+/// median quality), how much of the project's published frames this
+/// member's devices hold, and last seen.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberSummary {
+    pub account_id: String,
+    pub display_name: String,
+    pub data_role: String,
+    pub coordinator: bool,
+    pub devices: Vec<MemberDeviceView>,
+    pub online: bool,
+    pub last_seen_at: Option<String>,
+    pub published_frames: i64,
+    pub seconds_by_filter: std::collections::BTreeMap<String, f64>,
+    pub quality_by_camera: Vec<CameraQuality>,
+    pub holds_frames: i64,
+    pub holds_bytes: i64,
+    pub holds_share: f64,
+}
+
 // ── holder counts ───────────────────────────────────────────────────────────
 
 /// One project's persisted holder map, read once, with the live presence:
@@ -555,6 +599,184 @@ pub fn get_collab_frame_holders(
             .then(a.member_name.cmp(&b.member_name))
             .then(a.device.cmp(&b.device))
     });
+    Ok(out)
+}
+
+// ── member summary ──────────────────────────────────────────────────────────
+
+/// A value's median: `None` for an empty slice, the mean of the two middle
+/// values for an even count. Sorts `values` in place.
+pub(crate) fn median(values: &mut Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let m = values.len() / 2;
+    Some(if values.len() % 2 == 1 {
+        values[m]
+    } else {
+        (values[m - 1] + values[m]) / 2.0
+    })
+}
+
+/// The project page's Members tab (spec 2026-09-29 §5.4): one row per
+/// project member — role, devices online, published contribution (seconds
+/// per filter, per-camera median quality), how much of the project's
+/// published frames this member's devices hold, and last seen.
+///
+/// "Published" = local rows with `state == "published"` AND `accepted`; a
+/// hold counts only a claim on the frame's CURRENT content version (a claim
+/// on a stale version is not a hold). `holds_share` is
+/// `holds_frames / published_frames_total` across EVERY member's published
+/// frames, `0.0` when the project has none. Last seen is attributed only
+/// when the display name is unique among members AND appears exactly once
+/// in the hub's last-seen cache — otherwise `None` (never another member's
+/// time).
+pub fn get_collab_member_summary(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<Vec<MemberSummary>, ApiError> {
+    use std::collections::BTreeMap;
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let project = crate::db::collab::get_project(&conn, project_id)?.ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "project {project_id} is not cached — refresh first"
+        ))
+    })?;
+    let members: Vec<SnapshotMember> = serde_json::from_str(&project.members_json)
+        .map_err(|e| ApiError::Internal(format!("members_json for {project_id}: {e}")))?;
+    let rows = frames_db::list_for_project(&conn, project_id)?;
+    let published: Vec<&LocalFrameRow> = rows
+        .iter()
+        .filter(|r| r.state == "published" && r.accepted)
+        .collect();
+    let (devices, claims) = live_db::load_holders(&conn, project_id)?;
+    let holders = ProjectHolders::from_rows(&devices, &claims);
+    let presence = super::live_presence(ctx);
+    // Never swallow a bad cache silently: both the DB read and a JSON parse
+    // failure fall back to an empty list, but only after a `warn!`.
+    let seen: Vec<crate::api::collab::MemberSeen> =
+        match crate::db::collab::page_extras(&conn, project_id) {
+            Ok((_, s)) => serde_json::from_str(&s).unwrap_or_else(|e| {
+                tracing::warn!(project_id, error = %e, "member last-seen cache unreadable");
+                Vec::new()
+            }),
+            Err(e) => {
+                tracing::warn!(project_id, error = %e, "member last-seen cache unreadable");
+                Vec::new()
+            }
+        };
+
+    let mut out = Vec::with_capacity(members.len());
+    for m in &members {
+        let mine: Vec<&&LocalFrameRow> = published
+            .iter()
+            .filter(|r| r.publisher_account_id == m.account_id)
+            .collect();
+        let mut seconds: BTreeMap<String, f64> = BTreeMap::new();
+        let mut quality: BTreeMap<(String, String), (i64, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+        for r in &mine {
+            let Some(w) = crate::api::collab_exchange::parse_manifest_wire(
+                project_id,
+                &r.frame_uuid,
+                &r.manifest_json,
+                "member_summary",
+            ) else {
+                continue;
+            };
+            *seconds.entry(r.filter_canonical.clone()).or_default() += w.exptime_sec;
+            let camera = w
+                .meta
+                .get("instrume")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let e = quality
+                .entry((camera, r.filter_canonical.clone()))
+                .or_default();
+            e.0 += 1;
+            if let Some(f) = w.meta.get("fwhmArcsec").and_then(serde_json::Value::as_f64) {
+                e.1.push(f);
+            }
+            if let Some(x) = w
+                .meta
+                .get("eccentricity")
+                .and_then(serde_json::Value::as_f64)
+            {
+                e.2.push(x);
+            }
+        }
+        let (mut holds_frames, mut holds_bytes) = (0i64, 0i64);
+        for r in &published {
+            let Some(seq) = r.frame_seq else { continue };
+            if holders
+                .claimants(seq, r.content_version)
+                .iter()
+                .any(|d| m.nodes.iter().any(|n| n == d))
+            {
+                holds_frames += 1;
+                holds_bytes += r.byte_size;
+            }
+        }
+        let online = presence
+            .as_ref()
+            .is_some_and(|(p, _)| m.nodes.iter().any(|d| p.is_connected(project_id, d)));
+        let same_name: Vec<&crate::api::collab::MemberSeen> = seen
+            .iter()
+            .filter(|s| s.display_name == m.display_name)
+            .collect();
+        let name_unique = members
+            .iter()
+            .filter(|o| o.display_name == m.display_name)
+            .count()
+            == 1;
+        let last_seen_at = (name_unique && same_name.len() == 1)
+            .then(|| same_name[0].last_seen_at.clone())
+            .flatten();
+        out.push(MemberSummary {
+            account_id: m.account_id.clone(),
+            display_name: m.display_name.clone(),
+            data_role: m.data_role.clone(),
+            coordinator: m.coordinator,
+            devices: m
+                .nodes
+                .iter()
+                .map(|d| MemberDeviceView {
+                    device: d.clone(),
+                    name: holders
+                        .devices
+                        .get(d)
+                        .map(|i| i.display_name.clone())
+                        .filter(|n| !n.is_empty()),
+                    online: presence
+                        .as_ref()
+                        .is_some_and(|(p, _)| p.is_connected(project_id, d)),
+                })
+                .collect(),
+            online,
+            last_seen_at,
+            published_frames: mine.len() as i64,
+            seconds_by_filter: seconds,
+            quality_by_camera: quality
+                .into_iter()
+                .map(|((camera, filter), (frames, mut f, mut e))| CameraQuality {
+                    camera,
+                    filter,
+                    frames,
+                    median_fwhm: median(&mut f),
+                    median_ecc: median(&mut e),
+                })
+                .collect(),
+            holds_frames,
+            holds_bytes,
+            holds_share: if published.is_empty() {
+                0.0
+            } else {
+                holds_frames as f64 / published.len() as f64
+            },
+        });
+    }
     Ok(out)
 }
 
@@ -1657,6 +1879,77 @@ mod tests {
         .unwrap();
     }
 
+    /// A `project_frames_local` replica row with a real `manifest_json`
+    /// (built the way `api::collab`'s `seed_own_row` builds its
+    /// `FrameViewWire`) so `get_collab_member_summary` has `exptimeSec`,
+    /// `filterCanonical` and `meta.{instrume,fwhmArcsec}` to read — Task 8
+    /// (spec §5.4).
+    #[allow(clippy::too_many_arguments)]
+    fn seed_replica_row_full(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        frame_uuid: &str,
+        frame_seq: i32,
+        content_version: i32,
+        publisher_account_id: &str,
+        filter_canonical: &str,
+        exptime_sec: f64,
+        instrume: &str,
+        fwhm_arcsec: f64,
+        byte_size: i64,
+        state: &str,
+        accepted: bool,
+    ) {
+        let file_name = format!("{frame_uuid}.fits");
+        let wire = crate::collab::hub_client::FrameViewWire {
+            frame_uuid: frame_uuid.into(),
+            frame_seq,
+            publisher_account_id: publisher_account_id.into(),
+            publisher_display_name: publisher_account_id.into(),
+            own: false,
+            publisher_device_id: None,
+            file_name: file_name.clone(),
+            content_version,
+            blake3: "b".repeat(64),
+            byte_size,
+            xxh3: "0123456789abcdef".into(),
+            filter_raw: filter_canonical.into(),
+            filter_canonical: filter_canonical.into(),
+            channel: "mono".into(),
+            exptime_sec,
+            date_obs: None,
+            meta: serde_json::json!({ "instrume": instrume, "fwhmArcsec": fwhm_arcsec }),
+            gate_version: 0,
+            accepted,
+            accepted_reason: None,
+            state: state.into(),
+            reject_reason: None,
+            manifest_version: 1,
+            created_at: "2026-09-27T00:00:00Z".into(),
+        };
+        conn.execute(
+            "INSERT INTO project_frames_local
+                (project_id, frame_uuid, content_version, origin, publisher_account_id,
+                 publisher_display, file_name, filter_canonical, state, accepted, byte_size,
+                 xxh3, blake3, manifest_json, frame_seq)
+             VALUES (?1, ?2, ?3, 'replica', ?4, ?4, ?5, ?6, ?7, ?8, ?9, 'x', 'x', ?10, ?11)",
+            rusqlite::params![
+                project_id,
+                frame_uuid,
+                content_version,
+                publisher_account_id,
+                file_name,
+                filter_canonical,
+                state,
+                accepted,
+                byte_size,
+                serde_json::to_string(&wire).unwrap(),
+                frame_seq,
+            ],
+        )
+        .unwrap();
+    }
+
     /// Task 7 (spec §5.3): the drawer's holder list names members by device,
     /// keeps a device no member lists, and flags the publisher's device.
     #[tokio::test]
@@ -1719,5 +2012,151 @@ mod tests {
             v.iter().all(|h| !h.online),
             "no live runtime in this rig → nobody is online"
         );
+    }
+
+    /// Task 8 (spec §5.4): published contribution, per-camera quality, the
+    /// current-version-only holds share, and last seen mapped from the hub's
+    /// display-name cache.
+    #[tokio::test]
+    async fn member_summary_sums_published_holds_current_versions_and_maps_last_seen() {
+        let (_d, ctx, _hub) = ts::signed_in_rig().await;
+        let pid = ts::PID;
+        {
+            let db = crate::api::db(&ctx).unwrap();
+            let conn = db.conn();
+            // Anna has two devices; Bo one.
+            seed_project_with_members(
+                &conn,
+                pid,
+                &[
+                    ("acc-anna", "Anna", &["AAA=", "AA2="]),
+                    ("acc-bo", "Bo", &["BBB="]),
+                ],
+            );
+            // Two published+accepted Anna frames (Ha 300 s each, ASI6200,
+            // fwhm 2.0 / 3.0, 100 MB), one pending (ignored).
+            seed_replica_row_full(
+                &conn,
+                pid,
+                "u1",
+                1,
+                1,
+                "acc-anna",
+                "Ha",
+                300.0,
+                "ASI6200",
+                2.0,
+                100_000_000,
+                "published",
+                true,
+            );
+            seed_replica_row_full(
+                &conn,
+                pid,
+                "u2",
+                2,
+                1,
+                "acc-anna",
+                "Ha",
+                300.0,
+                "ASI6200",
+                3.0,
+                100_000_000,
+                "published",
+                true,
+            );
+            seed_replica_row_full(
+                &conn,
+                pid,
+                "u3",
+                3,
+                1,
+                "acc-anna",
+                "Ha",
+                300.0,
+                "ASI6200",
+                2.5,
+                100_000_000,
+                "pending",
+                true,
+            );
+            // Bo holds u1 (current version) from one device and u2 at an OLD
+            // version (not counted).
+            live_db::replace_holders(
+                &conn,
+                pid,
+                &[live_db::HolderDeviceRow {
+                    device: "BBB=".into(),
+                    display_name: "bo-mac".into(),
+                    relay_url: None,
+                }],
+                &[("BBB=".to_string(), 1, 1), ("BBB=".to_string(), 2, 0)],
+            )
+            .unwrap();
+            crate::db::collab::set_page_extras(
+                &conn,
+                pid,
+                None,
+                r#"[{"displayName":"Anna","lastSeenAt":"2026-09-27T08:30:00Z"},{"displayName":"Bo","lastSeenAt":null}]"#,
+            )
+            .unwrap();
+        }
+        let s = get_collab_member_summary(&ctx, pid).unwrap();
+        let anna = s.iter().find(|m| m.display_name == "Anna").unwrap();
+        assert_eq!(anna.published_frames, 2);
+        assert_eq!(anna.seconds_by_filter.get("Ha"), Some(&600.0));
+        assert_eq!(
+            anna.quality_by_camera,
+            vec![CameraQuality {
+                camera: "ASI6200".into(),
+                filter: "Ha".into(),
+                frames: 2,
+                median_fwhm: Some(2.5),
+                median_ecc: None,
+            }]
+        );
+        assert_eq!(anna.devices.len(), 2);
+        assert_eq!(anna.last_seen_at.as_deref(), Some("2026-09-27T08:30:00Z"));
+        let bo = s.iter().find(|m| m.display_name == "Bo").unwrap();
+        assert_eq!((bo.holds_frames, bo.holds_bytes), (1, 100_000_000));
+        assert!(
+            (bo.holds_share - 0.5).abs() < 1e-9,
+            "1 of 2 published frames"
+        );
+        assert_eq!(bo.last_seen_at, None);
+    }
+
+    /// Review Focus: never show another member's time — an ambiguous display
+    /// name (shared by two members, or appearing more than once in the
+    /// hub's cache) gets no last-seen at all.
+    #[tokio::test]
+    async fn ambiguous_display_name_gets_no_last_seen() {
+        let (_d, ctx, _hub) = ts::signed_in_rig().await;
+        let pid = ts::PID;
+        {
+            let db = crate::api::db(&ctx).unwrap();
+            let conn = db.conn();
+            seed_project_with_members(
+                &conn,
+                pid,
+                &[("acc-1", "Sam", &["S1A="]), ("acc-2", "Sam", &["S2A="])],
+            );
+            crate::db::collab::set_page_extras(
+                &conn,
+                pid,
+                None,
+                r#"[{"displayName":"Sam","lastSeenAt":"2026-09-27T08:30:00Z"},{"displayName":"Sam","lastSeenAt":"2026-09-20T08:30:00Z"}]"#,
+            )
+            .unwrap();
+        }
+        let s = get_collab_member_summary(&ctx, pid).unwrap();
+        assert!(s.iter().all(|m| m.last_seen_at.is_none()));
+    }
+
+    #[test]
+    fn median_of_even_and_odd() {
+        assert_eq!(median(&mut vec![3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(median(&mut vec![4.0, 1.0]), Some(2.5));
+        assert_eq!(median(&mut vec![]), None);
     }
 }
