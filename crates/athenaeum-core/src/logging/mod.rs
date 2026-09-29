@@ -1,6 +1,8 @@
 pub mod config;
+mod expected_gc_exit;
 mod panic_hook;
 pub use config::LoggingConfig;
+pub(crate) use expected_gc_exit::expect_blob_gc_exit;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -157,6 +159,7 @@ pub fn init(process: Process) -> Option<LoggingHandle> {
     // console) rather than filtering just one of them.
     tracing_subscriber::registry()
         .with(filter)
+        .with(expected_gc_exit::ExpectedGcExit::new())
         .with(file_layer)
         .with(console_layer)
         .try_init()

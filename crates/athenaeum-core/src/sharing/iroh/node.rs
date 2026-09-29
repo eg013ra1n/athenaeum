@@ -1026,7 +1026,11 @@ impl StoreGc {
     /// releases meets the (already shut) store and fails, and the task
     /// drops its store handle.
     pub(crate) fn close(&self) {
-        self.0.closed.store(true, Ordering::SeqCst);
+        // The first close only: the one failed run it causes is expected, so
+        // logging drops iroh-blobs' ERROR for it.
+        if !self.0.closed.swap(true, Ordering::SeqCst) {
+            crate::logging::expect_blob_gc_exit();
+        }
         self.0.wake.notify_waiters();
     }
 
