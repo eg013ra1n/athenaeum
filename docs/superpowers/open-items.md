@@ -285,7 +285,7 @@ cycle.
     `set_own_version` writes the winner's content identity against the
     loser's old path. Needs per-project uniqueness (schema change, its own
     cycle).
-  App plan DONE on branch `contributor-path-app` (`0a796294`): core suite
+  App plan DONE on branch `contributor-path-app` (`73cc81bb` after the final review + fix wave; trailers added by rebase): core suite
   (all targets) + no-default-features check + frontend suite green; OWED:
   merge on the owner's word, the acceptance smoke of spec §13 steps 2–8
   against the test hub once the hub plan is deployed.
@@ -297,6 +297,7 @@ cycle.
     `threshold`; passing `cal_blocker` separately would be future-proof.
   - The attestation confirm does not repeat the §6.5 debayered-RGB caveat
     (the help line does).
+- Parked (app final re-review 2026-09-29, rulings in the SDD ledger): the I2 identical-bytes `landed_path` move is not gated on `w.staged == w.target` (only reachable in the C1c race; add the gate when next in that code); the project page's mount effect passes `tab === 'contribute'` where `activeTab` is the rendered tab (a stored, unavailable tab loads without chips until a publish/mapping save); the removal-site `was_external_recipe` skip has no isolating test; the lookup-error warn text says "a files row still references it".
 - **Repo hygiene finding:** `Documents/Projects/athenaeum-hub-portal/` is a
   STALE copy of the portal (still the free-text threshold editor); the
   deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
