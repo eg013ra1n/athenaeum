@@ -358,6 +358,48 @@ fn is_build_masters_reason(f: &str) -> bool {
         || f.contains("missing on disk")
 }
 
+/// Spec §7.1's classification table for a single failure sentence — the one
+/// source [`derive_blockers`] and [`row_failures`] both read. A failure can
+/// classify under more than one kind (e.g. every calibration reason also
+/// carries `attest`); order matches the table and is significant — index 0
+/// is the failure's primary kind (see [`row_failures`]).
+pub fn failure_kinds(failure: &str) -> &'static [&'static str] {
+    if failure == "no analysis" {
+        &["analyze"]
+    } else if failure == "no coordinates" || failure == "unknown pixel scale" {
+        &["solve"]
+    } else if is_build_masters_reason(failure) {
+        &["buildMasters", "attest"]
+    } else if is_calibration_reason(failure) {
+        &["linkCalibration", "attest"]
+    } else if failure.contains("needs a filter mapping") || failure.contains("is mapped to") {
+        &["mapFilter"]
+    } else if failure == "frame has no uuid" {
+        &["uuid"]
+    } else if failure.starts_with("outside target radius") {
+        &["outsideTarget"]
+    } else {
+        &["threshold"]
+    }
+}
+
+/// Each failure with its primary kind (the first of [`failure_kinds`]),
+/// ordered like the Held-back groups: by [`BLOCKER_ORDER`], ties kept in
+/// gate order.
+pub fn row_failures(failures: &[String]) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = failures
+        .iter()
+        .map(|f| (failure_kinds(f)[0], f.clone()))
+        .collect();
+    out.sort_by_key(|(k, _)| {
+        BLOCKER_ORDER
+            .iter()
+            .position(|o| o == k)
+            .unwrap_or(usize::MAX)
+    });
+    out
+}
+
 /// Spec §7.1 — the table, applied to every row's failure sentences. A row
 /// may count under several kinds; each kind counts a frame once.
 pub fn derive_blockers(rows: &[BlockerRow<'_>]) -> Vec<GateBlocker> {
@@ -373,25 +415,8 @@ pub fn derive_blockers(rows: &[BlockerRow<'_>]) -> Vec<GateBlocker> {
             }
         };
         for f in r.failures {
-            let f = f.as_str();
-            if f == "no analysis" {
-                add("analyze");
-            } else if f == "no coordinates" || f == "unknown pixel scale" {
-                add("solve");
-            } else if is_build_masters_reason(f) {
-                add("buildMasters");
-                add("attest");
-            } else if is_calibration_reason(f) {
-                add("linkCalibration");
-                add("attest");
-            } else if f.contains("needs a filter mapping") || f.contains("is mapped to") {
-                add("mapFilter");
-            } else if f == "frame has no uuid" {
-                add("uuid");
-            } else if f.starts_with("outside target radius") {
-                add("outsideTarget");
-            } else {
-                add("threshold");
+            for kind in failure_kinds(f.as_str()) {
+                add(*kind);
             }
         }
         if r.filter_unresolved {
@@ -746,6 +771,48 @@ mod tests {
             failures: &none
         }])
         .is_empty());
+    }
+
+    #[test]
+    fn failure_kinds_match_the_blocker_classification() {
+        assert_eq!(failure_kinds("no analysis"), &["analyze"]);
+        assert_eq!(failure_kinds("no coordinates"), &["solve"]);
+        assert_eq!(failure_kinds("unknown pixel scale"), &["solve"]);
+        assert_eq!(
+            failure_kinds("Build masters first"),
+            &["buildMasters", "attest"]
+        );
+        assert_eq!(
+            failure_kinds("no calibration links"),
+            &["linkCalibration", "attest"]
+        );
+        assert_eq!(
+            failure_kinds(r#"filter "OIII" needs a filter mapping"#),
+            &["mapFilter"]
+        );
+        assert_eq!(failure_kinds("frame has no uuid"), &["uuid"]);
+        assert_eq!(
+            failure_kinds("outside target radius (2.1° > 1.5°)"),
+            &["outsideTarget"]
+        );
+        assert_eq!(failure_kinds("FWHM 3.4″ > 3.0″"), &["threshold"]);
+    }
+
+    #[test]
+    fn row_failures_sort_by_blocker_order() {
+        let f = vec![
+            "FWHM 3.4″ > 3.0″".to_string(),
+            "no coordinates".to_string(),
+            "no analysis".to_string(),
+        ];
+        assert_eq!(
+            row_failures(&f),
+            vec![
+                ("analyze", "no analysis".to_string()),
+                ("solve", "no coordinates".to_string()),
+                ("threshold", "FWHM 3.4″ > 3.0″".to_string())
+            ]
+        );
     }
 
     /// Fix round 1: every failure sentence `check_mode_ready(&_,
