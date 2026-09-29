@@ -226,6 +226,23 @@ impl From<replace::ReplaceOutcome> for ReplaceOutcomeView {
     }
 }
 
+/// Who holds one frame — the project page's frame drawer (spec 2026-09-29
+/// §5.3). One row per device claiming the frame's CURRENT content version:
+/// member-named when the device belongs to a known project member, kept
+/// with no name when it does not (a departed member's device, or one not
+/// yet named by a snapshot, still holds real bytes).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameHolderView {
+    pub member_name: Option<String>,
+    pub device_name: Option<String>,
+    pub device: String,
+    pub device_short: String,
+    pub online: bool,
+    pub is_publisher: bool,
+    pub content_version: i32,
+}
+
 // ── holder counts ───────────────────────────────────────────────────────────
 
 /// One project's persisted holder map, read once, with the live presence:
@@ -465,6 +482,80 @@ pub fn list_collab_attention(
         not_kept,
         other_files,
     })
+}
+
+/// The project member whose `nodes` lists `device` — plain string
+/// membership: device ids are the base64 pubkeys, the same string in
+/// `SnapshotMember.nodes`, `collab_holder_devices.device` and presence.
+/// Reused by Tasks 8, 12 and 13.
+pub(crate) fn member_of_device<'a>(
+    members: &'a [SnapshotMember],
+    device: &str,
+) -> Option<&'a SnapshotMember> {
+    members.iter().find(|m| m.nodes.iter().any(|n| n == device))
+}
+
+/// Who holds one frame (spec 2026-09-29 §5.3) — the project page's frame
+/// drawer. Every device claiming the frame's current content version, sorted
+/// publisher-first then by member name then by device. `online` is `false`
+/// for everyone when no live exchange runs (no presence at all).
+pub fn get_collab_frame_holders(
+    ctx: &ServiceContext,
+    project_id: &str,
+    frame_uuid: &str,
+) -> Result<Vec<FrameHolderView>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let project = crate::db::collab::get_project(&conn, project_id)?.ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "project {project_id} is not cached — refresh first"
+        ))
+    })?;
+    let Some(row) = frames_db::get(&conn, project_id, frame_uuid)? else {
+        return Err(ApiError::NotFound(format!(
+            "frame {frame_uuid} is not in project {project_id}"
+        )));
+    };
+    let Some(seq) = row.frame_seq else {
+        return Ok(Vec::new());
+    };
+    let members: Vec<SnapshotMember> =
+        serde_json::from_str(&project.members_json).unwrap_or_else(|e| {
+            tracing::warn!(project_id, error = %e, "members_json unreadable; holders listed without names");
+            Vec::new()
+        });
+    let (devices, claims) = live_db::load_holders(&conn, project_id)?;
+    let holders = ProjectHolders::from_rows(&devices, &claims);
+    let presence = super::live_presence(ctx);
+    let publisher = members
+        .iter()
+        .find(|m| m.account_id == row.publisher_account_id);
+    let mut out: Vec<FrameHolderView> = holders
+        .claimants(seq, row.content_version)
+        .into_iter()
+        .map(|device| FrameHolderView {
+            member_name: member_of_device(&members, device).map(|m| m.display_name.clone()),
+            device_name: holders
+                .devices
+                .get(device)
+                .map(|d| d.display_name.clone())
+                .filter(|n| !n.is_empty()),
+            device: device.to_string(),
+            device_short: device.chars().take(8).collect(),
+            online: presence
+                .as_ref()
+                .is_some_and(|(p, _)| p.is_connected(project_id, device)),
+            is_publisher: publisher.is_some_and(|m| m.nodes.iter().any(|n| n == device)),
+            content_version: row.content_version,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.is_publisher
+            .cmp(&a.is_publisher)
+            .then(a.member_name.cmp(&b.member_name))
+            .then(a.device.cmp(&b.device))
+    });
+    Ok(out)
 }
 
 /// Answer the deletion choice (L4) for every awaiting frame of the project,
@@ -1505,5 +1596,128 @@ mod tests {
         );
         let next = CollabDeletionChoice::new(1, vec!["p1".into(), "p2".into()], 18);
         assert_ne!(next.dedupe_key, p.dedupe_key, "a new batch notifies again");
+    }
+
+    /// Overwrite the signed-in rig's project row's `members_json` with
+    /// `(account_id, display_name, nodes)` triples — no seeder for this
+    /// exists yet (`seed_local_project` in `test_support.rs` writes a fixed
+    /// single-member row).
+    fn seed_project_with_members(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        members: &[(&str, &str, &[&str])],
+    ) {
+        let members_json = serde_json::to_string(
+            &members
+                .iter()
+                .map(|(account_id, display_name, nodes)| {
+                    serde_json::json!({
+                        "accountId": account_id,
+                        "displayName": display_name,
+                        "dataRole": "send_receive",
+                        "coordinator": false,
+                        "nodes": nodes,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE collab_projects SET members_json = ?2 WHERE project_id = ?1",
+            rusqlite::params![project_id, members_json],
+        )
+        .unwrap();
+    }
+
+    /// A minimal `project_frames_local` replica row: only the NOT NULL
+    /// columns without a schema default, plus `frame_seq` (nullable, but
+    /// `get_collab_frame_holders` needs it set).
+    fn seed_replica_row(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        frame_uuid: &str,
+        frame_seq: i32,
+        content_version: i32,
+        publisher_account_id: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO project_frames_local
+                (project_id, frame_uuid, content_version, origin, publisher_account_id,
+                 publisher_display, file_name, filter_canonical, state, byte_size, xxh3, blake3,
+                 frame_seq)
+             VALUES (?1, ?2, ?3, 'replica', ?4, ?4, 'f.fits', 'L', 'published', 0, 'x', 'x', ?5)",
+            rusqlite::params![
+                project_id,
+                frame_uuid,
+                content_version,
+                publisher_account_id,
+                frame_seq
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Task 7 (spec §5.3): the drawer's holder list names members by device,
+    /// keeps a device no member lists, and flags the publisher's device.
+    #[tokio::test]
+    async fn frame_holders_name_members_keep_unknown_devices_and_flag_the_publisher() {
+        let (_d, ctx, _hub) = ts::signed_in_rig().await;
+        let pid = ts::PID;
+        {
+            let db = crate::api::db(&ctx).unwrap();
+            let conn = db.conn();
+            seed_project_with_members(
+                &conn,
+                pid,
+                &[("acc-anna", "Anna", &["AAA="]), ("acc-bo", "Bo", &["BBB="])],
+            );
+            seed_replica_row(&conn, pid, "u1", 1, 1, "acc-anna");
+            let devices = vec![
+                live_db::HolderDeviceRow {
+                    device: "AAA=".into(),
+                    display_name: "anna-obs".into(),
+                    relay_url: None,
+                },
+                live_db::HolderDeviceRow {
+                    device: "BBB=".into(),
+                    display_name: "bo-mac".into(),
+                    relay_url: None,
+                },
+                live_db::HolderDeviceRow {
+                    device: "ZZZ=".into(),
+                    display_name: "stranger".into(),
+                    relay_url: None,
+                },
+            ];
+            let claims = vec![
+                ("AAA=".to_string(), 1, 1),
+                ("BBB=".to_string(), 1, 1),
+                ("ZZZ=".to_string(), 1, 1),
+            ];
+            live_db::replace_holders(&conn, pid, &devices, &claims).unwrap();
+        }
+        let mut v = get_collab_frame_holders(&ctx, pid, "u1").unwrap();
+        v.sort_by(|a, b| a.device.cmp(&b.device));
+        assert_eq!(v.len(), 3);
+        assert_eq!(
+            (
+                v[0].member_name.as_deref(),
+                v[0].device_name.as_deref(),
+                v[0].is_publisher
+            ),
+            (Some("Anna"), Some("anna-obs"), true)
+        );
+        assert_eq!(
+            (v[1].member_name.as_deref(), v[1].is_publisher),
+            (Some("Bo"), false)
+        );
+        assert_eq!(
+            (v[2].member_name.clone(), v[2].device_short.as_str()),
+            (None, "ZZZ=")
+        );
+        assert!(
+            v.iter().all(|h| !h.online),
+            "no live runtime in this rig → nobody is online"
+        );
     }
 }

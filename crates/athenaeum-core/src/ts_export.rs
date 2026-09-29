@@ -251,6 +251,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::collab_live::surface::UnknownDeviceView,
             crate::api::collab_live::surface::CollabStorageStatus,
             crate::api::collab_live::surface::ReplaceOutcomeView,
+            crate::api::collab_live::surface::FrameHolderView,
             crate::collab::gate::FrameGateRow,
             crate::collab::gate::ThresholdRuleView,
             crate::collab::gate::GateBlocker,

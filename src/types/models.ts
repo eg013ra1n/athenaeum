@@ -1933,6 +1933,8 @@ unknownDevice: UnknownDeviceView | null, };
 
 export type ReplaceOutcomeView = { scanned: number, adopted: number, };
 
+export type FrameHolderView = { memberName: string | null, deviceName: string | null, device: string, deviceShort: string, online: boolean, isPublisher: boolean, contentVersion: number, };
+
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**
  * Human-readable failure reasons, empty when publishable (e.g.

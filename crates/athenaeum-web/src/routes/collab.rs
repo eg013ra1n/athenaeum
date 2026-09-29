@@ -48,6 +48,13 @@ pub struct IntentArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FrameArgs {
+    project_id: String,
+    frame_uuid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AutoReplicateArgs {
     project_id: String,
     enabled: bool,
@@ -315,6 +322,18 @@ pub async fn list_project_own_frames(
     Json(args): Json<ProjectIdArgs>,
 ) -> Result<Json<Vec<api::OwnFrameRow>>, (axum::http::StatusCode, String)> {
     api::list_project_own_frames(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Who holds one frame (spec 2026-09-29 §5.3) — the project page's frame
+/// drawer.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_collab_frame_holders(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameArgs>,
+) -> Result<Json<Vec<surface::FrameHolderView>>, (axum::http::StatusCode, String)> {
+    surface::get_collab_frame_holders(&state.ctx, &args.project_id, &args.frame_uuid)
         .map(Json)
         .map_err(api_err)
 }

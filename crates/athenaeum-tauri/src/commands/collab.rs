@@ -180,6 +180,19 @@ pub async fn list_project_own_frames(
     api::list_project_own_frames(&state.ctx, &project_id).map_err(|e| e.to_string())
 }
 
+/// Who holds one frame (spec 2026-09-29 §5.3) — the project page's frame
+/// drawer.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_collab_frame_holders(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame_uuid: String,
+) -> Result<Vec<surface::FrameHolderView>, String> {
+    surface::get_collab_frame_holders(&state.ctx, &project_id, &frame_uuid)
+        .map_err(|e| e.to_string())
+}
+
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
 /// the hub never learns of it). The live exchange re-reads the project's need
 /// set at once.
