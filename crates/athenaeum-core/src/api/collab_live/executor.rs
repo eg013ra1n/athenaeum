@@ -81,6 +81,10 @@ pub(crate) struct ExecEnv {
     /// The node's exchange meter (spec 2026-09-29 §6): every fetch is
     /// registered here and the fetch loop's per-provider deltas land on it.
     pub(crate) meter: Arc<ExchangeMeter>,
+    /// Each live project's "to go" (the scheduler's want count), published
+    /// by [`Executor::step`] whenever it can change; the runtime's shared
+    /// copy, read by the `get_collab_exchange` snapshot (spec §6.2).
+    pub(crate) to_go: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 /// What the provider derivation reads (spec §6.1, I4/I5): the holder maps,
@@ -492,10 +496,41 @@ impl Executor {
         self.core.wants_of(project_id)
     }
 
-    /// Step the core and perform what comes out.
+    /// Step the core and perform what comes out. The ONE place the core's
+    /// wants change (a need set, a finished fetch, a gone project): the
+    /// project's "to go" is published here (spec §6.2), pruned at zero.
     pub(crate) fn step(&mut self, input: Input) {
+        let touched = match &input {
+            Input::NeedSet { project_id, .. } | Input::ProjectGone { project_id } => {
+                Some(project_id.clone())
+            }
+            Input::Finished { key, .. } => Some(key.0.clone()),
+            _ => None,
+        };
         let cmds = self.core.step(now_ms(), input);
+        if let Some(pid) = touched {
+            self.publish_to_go(&pid);
+        }
         self.execute(cmds);
+    }
+
+    fn publish_to_go(&self, project_id: &str) {
+        let n = self.core.wants_of(project_id);
+        let mut g = match self.env.to_go.write() {
+            Ok(g) => g,
+            Err(p) => {
+                tracing::warn!(
+                    project_id,
+                    "exchange to-go cache poisoned; continuing with its data"
+                );
+                p.into_inner()
+            }
+        };
+        if n == 0 {
+            g.remove(project_id);
+        } else {
+            g.insert(project_id.to_string(), n);
+        }
     }
 
     pub(crate) fn set_slots(&mut self, n: usize) {
@@ -1424,8 +1459,13 @@ impl Executor {
         self.tasks.abort_all();
         self.task_kinds.clear();
         self.permit = None;
-        for item in self.items.values() {
+        // The meter is the node's and outlives this executor (a remount, a
+        // restart): every fetch dropped here leaves it, or its in-flight row
+        // and the next runtime's progress wake would stay forever.
+        let now = Instant::now();
+        for (name, item) in &self.items {
             item.cancel.send_replace(true);
+            self.env.meter.finish(name, false, now);
         }
     }
 }
@@ -1875,6 +1915,7 @@ mod tests {
                 guard: Arc::new(StoreGuard::new(root, me, None)),
                 control: Arc::new(InboundControl::new()),
                 meter: Arc::new(ExchangeMeter::new()),
+                to_go: Default::default(),
             },
             2,
             7,
@@ -1935,6 +1976,7 @@ mod tests {
                 guard: Arc::new(StoreGuard::new(root, me, None)),
                 control: Arc::new(InboundControl::new()),
                 meter: Arc::new(ExchangeMeter::new()),
+                to_go: Default::default(),
             },
             2,
             7,
@@ -1982,6 +2024,7 @@ mod tests {
                 guard: Arc::new(StoreGuard::new(rig.root.clone(), me, None)),
                 control: Arc::new(InboundControl::new()),
                 meter: Arc::new(ExchangeMeter::new()),
+                to_go: Default::default(),
             },
             2,
             7,
@@ -2015,6 +2058,7 @@ mod tests {
                 guard: Arc::new(StoreGuard::new(root, me, None)),
                 control,
                 meter: Arc::new(ExchangeMeter::new()),
+                to_go: Default::default(),
             },
             2,
             7,
@@ -2082,6 +2126,57 @@ mod tests {
         .await;
         exec.end_run(7, FetchResult::Failed).await; // what the panic's reaping does
         assert_eq!(exec.finished, vec![(key, FetchResult::Failed)]);
+        exec.shutdown();
+    }
+
+    /// Task 12 fix round 1: a shutdown (stop, remount, restart, crash)
+    /// finishes every fetch it drops in the node-owned meter — no frozen
+    /// in-flight row, no 1 Hz wake of the next runtime forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_leaves_nothing_in_flight_in_the_meter() {
+        let (_tmp, mut exec, name, key) = a_run_that_ended_unreaped().await;
+        let meter = Arc::clone(&exec.env.meter);
+        meter.register(&name, FlowDirection::Recv, &key.0, &key.1, "y1.fits", 100);
+        meter.delivered(&name, "DEV=", 10, Instant::now());
+        assert!(meter.any_in_flight());
+        exec.shutdown();
+        let now = Instant::now();
+        assert!(!meter.any_in_flight(), "the dropped fetch left the meter");
+        assert!(
+            !meter
+                .needs_progress(now + crate::collab::live::meter::MOVING + Duration::from_secs(1)),
+            "nothing keeps waking the next runtime"
+        );
+    }
+
+    /// Task 12 fix round 1 (spec §6.2): "to go" is published from the
+    /// scheduler whenever its wants change — a project with wanted frames
+    /// and no traffic reads its count, a gone project is pruned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn to_go_follows_the_schedulers_wants_without_any_traffic() {
+        let (_tmp, mut exec, _name, _key) = a_run_that_ended_unreaped().await;
+        let want = |u: &str| Want {
+            key: (ts::PID.to_string(), u.to_string()),
+            content_version: 1,
+            blake3: format!("b-{u}"),
+            byte_size: 10,
+            since_ms: 0,
+        };
+        let to_go = Arc::clone(&exec.env.to_go);
+        exec.step(Input::NeedSet {
+            project_id: ts::PID.to_string(),
+            wants: vec![want("w1"), want("w2")],
+        });
+        assert_eq!(to_go.read().unwrap().get(ts::PID), Some(&2));
+        exec.step(Input::NeedSet {
+            project_id: ts::PID.to_string(),
+            wants: vec![want("w1")],
+        });
+        assert_eq!(to_go.read().unwrap().get(ts::PID), Some(&1));
+        exec.step(Input::ProjectGone {
+            project_id: ts::PID.to_string(),
+        });
+        assert!(to_go.read().unwrap().is_empty(), "a gone project is pruned");
         exec.shutdown();
     }
 

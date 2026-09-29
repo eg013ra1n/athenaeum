@@ -110,9 +110,9 @@ pub(crate) struct Shared {
     /// The bound node's exchange meter, set by every runtime start (a
     /// rebound node brings its own), read by `get_collab_exchange`.
     meter: RwLock<Option<Arc<ExchangeMeter>>>,
-    /// Each project's "to go" as the last progress event counted it (the
-    /// scheduler's want set lives on the loop; the snapshot reads this copy).
-    to_go: RwLock<HashMap<String, usize>>,
+    /// Each live project's "to go", published by `Executor::step` whenever
+    /// the scheduler's wants change (spec §6.2); the snapshot reads it.
+    to_go: Arc<RwLock<HashMap<String, usize>>>,
     /// Test only (final fix A-I3): how many runtimes this handle started.
     #[cfg(test)]
     starts: AtomicUsize,
@@ -146,7 +146,7 @@ impl Shared {
             me: RwLock::new(None),
             running: std::sync::atomic::AtomicBool::new(false),
             meter: RwLock::new(None),
-            to_go: RwLock::new(HashMap::new()),
+            to_go: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             starts: AtomicUsize::new(0),
         }
@@ -1160,6 +1160,7 @@ impl Runtime {
                 guard,
                 control: r.control,
                 meter: Arc::clone(&meter),
+                to_go: Arc::clone(&shared.to_go),
             },
             receive,
             seed,
@@ -2012,16 +2013,10 @@ impl Runtime {
             .chain(emit.quiet.iter())
             .cloned()
             .collect();
-        let to_go: HashMap<String, usize> = listed
-            .iter()
-            .map(|p| (p.clone(), self.exec.need_len(p)))
-            .collect();
-        match self.shared.to_go.write() {
-            Ok(mut g) => g.extend(to_go.iter().map(|(p, n)| (p.clone(), *n))),
-            Err(e) => tracing::warn!(error = %e, "exchange to-go cache poisoned"),
-        }
+        // "To go" straight from the scheduler (the snapshot's shared copy is
+        // published by `Executor::step`, never here).
         let payload = CollabExchangeProgress {
-            projects: project_flows(&flows, &listed, &|p| to_go.get(p).copied().unwrap_or(0)),
+            projects: project_flows(&flows, &listed, &|p| self.exec.need_len(p)),
         };
         self.emit(COLLAB_EXCHANGE_PROGRESS_EVENT, &payload);
     }
