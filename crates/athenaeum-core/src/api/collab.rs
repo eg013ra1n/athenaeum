@@ -1318,7 +1318,6 @@ pub fn get_frame_set_project_status(
     ctx: &ServiceContext,
     frames_set_id: i64,
 ) -> Result<FrameSetProjectStatus, ApiError> {
-    use crate::collab::contributor_state::{derive, OwnRowFacts};
     let db = db(ctx)?;
     let conn = db.conn();
     let mut links = Vec::new();
@@ -1348,32 +1347,15 @@ pub fn get_frame_set_project_status(
             .filter(|(_, r)| set_frame_ids.contains(&r.frame_id))
         {
             let own_row = own.get(&row.frame_id);
-            // Finding 3: a recipe read stats the light's source file on disk
-            // (`recipe_hash_for`) — only worth paying for a frame this
-            // account has actually published; `derive` ignores it otherwise.
-            let current_recipe = own_row
-                .and_then(|_| current_recipe_for_frame(&conn, row.frame_id, identity.attested));
-            let reject_reason = own_row.and_then(|o| {
-                crate::api::collab_exchange::parse_manifest_wire(
-                    &p.project_id,
-                    &o.frame_uuid,
-                    &o.manifest_json,
-                    "get_frame_set_project_status",
-                )
-                .and_then(|w| w.reject_reason)
-            });
-            let facts = own_row.map(|o| OwnRowFacts {
-                state: o.state.as_str(),
-                content_version: o.content_version,
-                recipe_hash: o.recipe_hash.as_deref(),
-                on_disk: o.on_disk,
-                reject_reason: reject_reason.as_deref(),
-            });
-            let (state, reason) = derive(
-                facts,
-                current_recipe.as_deref(),
+            let (state, reason, _wire) = own_contributor_state(
+                &conn,
+                &p.project_id,
+                row.frame_id,
+                identity.attested,
+                own_row,
                 row.publishable,
                 row.failures.first().map(String::as_str),
+                "get_frame_set_project_status",
             );
             counts.bump(state);
             frames.push(FrameProjectState {
@@ -1436,7 +1418,6 @@ pub(crate) fn own_contributor_states(
     project_id: &str,
     project: &CollabProjectRow,
 ) -> HashMap<String, (String, Option<String>)> {
-    use crate::collab::contributor_state::{derive, OwnRowFacts};
     let gated = match project_gate(conn, project) {
         Ok(g) => g,
         Err(e) => {
@@ -1456,26 +1437,15 @@ pub(crate) fn own_contributor_states(
         let Some(own_row) = own.get(&row.frame_id) else {
             continue;
         };
-        let current_recipe = current_recipe_for_frame(conn, row.frame_id, identity.attested);
-        let reject_reason = crate::api::collab_exchange::parse_manifest_wire(
+        let (state, reason, _wire) = own_contributor_state(
+            conn,
             project_id,
-            &own_row.frame_uuid,
-            &own_row.manifest_json,
-            "own_contributor_states",
-        )
-        .and_then(|w| w.reject_reason);
-        let facts = OwnRowFacts {
-            state: own_row.state.as_str(),
-            content_version: own_row.content_version,
-            recipe_hash: own_row.recipe_hash.as_deref(),
-            on_disk: own_row.on_disk,
-            reject_reason: reject_reason.as_deref(),
-        };
-        let (state, reason) = derive(
-            Some(facts),
-            current_recipe.as_deref(),
+            row.frame_id,
+            identity.attested,
+            Some(own_row),
             row.publishable,
             row.failures.first().map(String::as_str),
+            "own_contributor_states",
         );
         out.insert(
             own_row.frame_uuid.clone(),
@@ -1483,6 +1453,60 @@ pub(crate) fn own_contributor_states(
         );
     }
     out
+}
+
+/// Fix round 1 (review finding, plan-mandated): the ONE derivation of a
+/// frame's contributor state — [`get_frame_set_project_status`],
+/// [`own_contributor_states`] and [`list_project_own_frames`] each used to
+/// hand-repeat this block, which is exactly how the three views could drift.
+/// Resolves the current recipe (Finding 3: only when `own_row` exists — a
+/// recipe read stats the light's source file on disk, worth paying for only
+/// once this account has actually published), reads the row's
+/// `reject_reason` off its manifest wire, and hands both plus the gate
+/// verdict to [`crate::collab::contributor_state::derive`]. Returns the
+/// parsed wire too, since [`list_project_own_frames`] also needs
+/// `accepted_reason` off it without re-parsing `manifest_json` a second
+/// time. `caller` is forwarded to `parse_manifest_wire`'s log label, so a
+/// parse-failure warning still names the call site.
+fn own_contributor_state(
+    conn: &Connection,
+    project_id: &str,
+    frame_id: i64,
+    attested: bool,
+    own_row: Option<&crate::db::collab_frames::LocalFrameRow>,
+    gate_publishable: bool,
+    gate_first_failure: Option<&str>,
+    caller: &str,
+) -> (
+    crate::collab::contributor_state::ContributorState,
+    Option<String>,
+    Option<crate::collab::hub_client::FrameViewWire>,
+) {
+    use crate::collab::contributor_state::{derive, OwnRowFacts};
+    let current_recipe = own_row.and_then(|_| current_recipe_for_frame(conn, frame_id, attested));
+    let wire = own_row.and_then(|o| {
+        crate::api::collab_exchange::parse_manifest_wire(
+            project_id,
+            &o.frame_uuid,
+            &o.manifest_json,
+            caller,
+        )
+    });
+    let reject_reason = wire.as_ref().and_then(|w| w.reject_reason.clone());
+    let facts = own_row.map(|o| OwnRowFacts {
+        state: o.state.as_str(),
+        content_version: o.content_version,
+        recipe_hash: o.recipe_hash.as_deref(),
+        on_disk: o.on_disk,
+        reject_reason: reject_reason.as_deref(),
+    });
+    let (state, reason) = derive(
+        facts,
+        current_recipe.as_deref(),
+        gate_publishable,
+        gate_first_failure,
+    );
+    (state, reason, wire)
 }
 
 // ── Own frames (Task 5, spec 2026-09-29 §5.1) ────────────────────────────────
@@ -1643,7 +1667,6 @@ pub fn list_project_own_frames(
     ctx: &ServiceContext,
     project_id: &str,
 ) -> Result<Vec<OwnFrameRow>, ApiError> {
-    use crate::collab::contributor_state::{derive, OwnRowFacts};
     let db = db(ctx)?;
     let conn = db.conn();
     let project = crate::db::collab::get_project(&conn, project_id)
@@ -1674,29 +1697,15 @@ pub fn list_project_own_frames(
     let mut out = Vec::with_capacity(gated.len());
     for (identity, row) in gated {
         let own_row = own.get(&row.frame_id);
-        let current_recipe =
-            own_row.and_then(|_| current_recipe_for_frame(&conn, row.frame_id, identity.attested));
-        let wire = own_row.and_then(|o| {
-            crate::api::collab_exchange::parse_manifest_wire(
-                project_id,
-                &o.frame_uuid,
-                &o.manifest_json,
-                "list_project_own_frames",
-            )
-        });
-        let reject_reason = wire.as_ref().and_then(|w| w.reject_reason.clone());
-        let facts_own = own_row.map(|o| OwnRowFacts {
-            state: o.state.as_str(),
-            content_version: o.content_version,
-            recipe_hash: o.recipe_hash.as_deref(),
-            on_disk: o.on_disk,
-            reject_reason: reject_reason.as_deref(),
-        });
-        let (state, reason) = derive(
-            facts_own,
-            current_recipe.as_deref(),
+        let (state, reason, wire) = own_contributor_state(
+            &conn,
+            project_id,
+            row.frame_id,
+            identity.attested,
+            own_row,
             row.publishable,
             row.failures.first().map(String::as_str),
+            "list_project_own_frames",
         );
         let live = own_row.and_then(|o| counts.as_ref().map(|c| c.frame(o)));
         let f = facts.get(&row.frame_id);
