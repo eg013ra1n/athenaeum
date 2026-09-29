@@ -150,14 +150,26 @@ impl ExchangeMeter {
                 sample_bytes: 0,
                 last_moved: now,
             });
+            // A flow that's been quiet (no delivery) for longer than
+            // `MOVING` re-seeds exactly like a brand-new one: without this,
+            // a paused flow's frozen `sample_at`/`rate` would let the
+            // resumed delta's `dt` span the whole idle gap, producing a
+            // wildly wrong rate/ETA for ~`RATE_WINDOW`-scaled seconds after
+            // every pause (a stalled connection, a backoff retry, …).
+            let was_quiet = existed && now.saturating_duration_since(flow.last_moved) > MOVING;
             flow.bytes_session += delta;
             flow.last_moved = now;
-            // A brand-new flow's own creating delta anchors `sample_at` at
-            // this instant (zero elapsed time behind it) — folding it into
-            // `sample_bytes` too would double-count it against the NEXT
-            // window's duration and transiently spike the rate. Only a flow
-            // that already existed accumulates into the sample window.
-            if existed {
+            // A brand-new (or just-re-seeded) flow's own delta anchors
+            // `sample_at` at this instant (zero elapsed time behind it) —
+            // folding it into `sample_bytes` too would double-count it
+            // against the NEXT window's duration and transiently spike the
+            // rate. Only a flow that already existed AND wasn't quiet
+            // accumulates into the sample window this call.
+            if !existed || was_quiet {
+                flow.rate = 0.0;
+                flow.sample_at = now;
+                flow.sample_bytes = 0;
+            } else {
                 flow.sample_bytes += delta;
                 let dt = now.saturating_duration_since(flow.sample_at);
                 if dt >= SAMPLE {
@@ -235,7 +247,12 @@ impl ExchangeMeter {
                             frame_uuid: i.frame_uuid.clone(),
                             file_name: i.file_name.clone(),
                             size: i.size as i64,
-                            done: d.min(i.size.max(d)) as i64,
+                            // A hedged overlap (or a retry re-delivering
+                            // past what a known size expects) must not read
+                            // above 100%; with `size == 0` (serve before
+                            // `Started`) there's nothing to clamp to, so it
+                            // shows raw bytes.
+                            done: (if i.size > 0 { d.min(i.size) } else { d }) as i64,
                         })
                         .collect();
                     in_flight.sort_by(|a, b| a.frame_uuid.cmp(&b.frame_uuid));
@@ -403,6 +420,19 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_done_is_clamped_to_a_known_size() {
+        let m = ExchangeMeter::new();
+        let t = t0();
+        m.register("k", FlowDirection::Recv, "p", "u", "f", 1000);
+        m.delivered("k", "A=", 700, t);
+        // A retry re-delivering past what the known size expects (e.g. a
+        // resend reusing the same key) must not read above 100%.
+        m.delivered("k", "A=", 700, t);
+        let v = m.snapshot(t);
+        assert_eq!(v[0].in_flight[0].done, 1000);
+    }
+
+    #[test]
     fn one_uuid_in_two_projects_never_crosses() {
         let m = ExchangeMeter::new();
         let t = t0();
@@ -431,6 +461,46 @@ mod tests {
         let v = m.snapshot(t + Duration::from_secs(1));
         let eta = v[0].eta_secs.unwrap();
         assert!(eta > 0.5 && eta < 4.0, "2 MB left at ~1 MB/s: {eta}");
+    }
+
+    #[test]
+    fn rate_reseeds_after_a_pause_instead_of_reading_the_stale_average() {
+        let m = ExchangeMeter::new();
+        let t = t0();
+        m.register("k", FlowDirection::Recv, "p", "u", "f", 100_000_000);
+        // A steady 2 MB/s at the SAMPLE granularity: 500,000 B every 250 ms
+        // for 2 s.
+        for i in 1..=8 {
+            m.delivered("k", "A=", 500_000, t + Duration::from_millis(250 * i));
+        }
+        let before = m.snapshot(t + Duration::from_millis(2_000));
+        assert!(
+            (before[0].rate_bps - 2_000_000.0).abs() < 1.0,
+            "steady state should read exactly 2 MB/s, got {}",
+            before[0].rate_bps
+        );
+
+        // A 10 s pause (a stalled connection, a backoff retry, …), then the
+        // exact same cadence resumes.
+        let resume = t + Duration::from_millis(2_000) + Duration::from_secs(10);
+        m.delivered("k", "A=", 500_000, resume);
+        for i in 1..=4 {
+            m.delivered("k", "A=", 500_000, resume + Duration::from_millis(250 * i));
+        }
+        // Checkpoint at 1s after resume, deliberately past the single
+        // reseed delivery: the resumed delivery at `resume` only re-seeds
+        // sample_at/sample_bytes/rate (the same rule as a brand-new flow),
+        // and the very next 250 ms sample (at `resume + 250ms`) already
+        // recomputes inst = 500,000 / 0.25s = 2,000,000 exactly — so by 1s
+        // in (four steady post-pause samples deep) there is no EMA lag left
+        // to wait out, and the rate has been exactly 2,000,000 for 750ms.
+        let v = m.snapshot(resume + Duration::from_secs(1));
+        assert!(v[0].moving);
+        assert!(
+            (v[0].rate_bps - 2_000_000.0).abs() < 200_000.0,
+            "within 10% of 2 MB/s by 1s after resume, got {}",
+            v[0].rate_bps
+        );
     }
 
     #[test]
