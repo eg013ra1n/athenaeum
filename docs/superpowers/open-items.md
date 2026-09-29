@@ -289,6 +289,14 @@ cycle.
   (all targets) + no-default-features check + frontend suite green; OWED:
   merge on the owner's word, the acceptance smoke of spec §13 steps 2–8
   against the test hub once the hub plan is deployed.
+  - Final-review fix wave (2026-09-29), informational, do not re-flag:
+    `meta.calibration` goes stale after an attested↔generated transition
+    (versions carry no meta) — informational (F8); a version post could
+    re-send meta in a later cycle.
+  - `derive_blockers`: a readiness sentence matching no substring lands in
+    `threshold`; passing `cal_blocker` separately would be future-proof.
+  - The attestation confirm does not repeat the §6.5 debayered-RGB caveat
+    (the help line does).
 - **Repo hygiene finding:** `Documents/Projects/athenaeum-hub-portal/` is a
   STALE copy of the portal (still the free-text threshold editor); the
   deployed portal is `athenaeum-hub/portal/`. Edit only the latter.
