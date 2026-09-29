@@ -4354,6 +4354,31 @@ async fn run_publish(
                 if w.staged != w.target {
                     remove_temp(project_id, &w.staged);
                 }
+                // I2: an attested original moved on disk (the app's own file
+                // browser, or a forced Republish reading its CURRENT catalog
+                // path) keeps identical bytes and size/mtime, so the recipe
+                // is unchanged and this identical-bytes branch is the one
+                // that runs — but `landed_path` still names the OLD location
+                // unless moved here too, or the row reads "not on disk"
+                // forever. Same `update_landed_path` + UNIQUE-failure
+                // handling as the generated-file move above.
+                let new_landed = w.target.to_string_lossy().to_string();
+                if current.landed_path.as_deref() != Some(new_landed.as_str()) {
+                    let moved = db(ctx).map_err(|e| anyhow::anyhow!("{e}")).and_then(|db| {
+                        frames_db::update_landed_path(&db.conn(), project_id, &w.uuid, &new_landed)
+                    });
+                    match moved {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(project_id, frame_uuid = %w.uuid, from = current.landed_path.as_deref().unwrap_or(""), to = %new_landed, "publish: own frame's landed path moved (identical bytes, moved on disk)");
+                        }
+                        Ok(_) => {
+                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, "publish: moving the own frame's landed path matched no row");
+                        }
+                        Err(e) => {
+                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %new_landed, error = %format!("{e:#}"), "publish: moving the own frame's landed path failed");
+                        }
+                    }
+                }
                 let written = {
                     let db = db(ctx)?;
                     let conn = db.conn();
@@ -4450,13 +4475,54 @@ async fn run_publish(
                         if let Some(old) = current.landed_path.as_deref() {
                             let old_path = Path::new(old);
                             if is_own_dir_landing(old_path, &own_dir) {
-                                match std::fs::remove_file(old_path) {
-                                    Ok(()) => {
-                                        tracing::info!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: removed the superseded generated file")
+                                // C1 fix round 3, part 1: `is_own_dir_landing`
+                                // only tells us the path SITS in our own
+                                // folder shape — not that WE put it there. A
+                                // user can move (or attest) their own light
+                                // straight into that folder; deleting it
+                                // would be real data loss. Two independent
+                                // guards, belt-and-braces with the
+                                // `publisher_dir` fix above:
+                                //   - a `files` row still referencing this
+                                //     exact path means it is catalogued —
+                                //     generated files are never catalogued,
+                                //     so this check is exact, no false
+                                //     positive possible.
+                                //   - `was_external_recipe(&current)`: the
+                                //     row we are moving OFF of was itself an
+                                //     attested (external) landing.
+                                let catalogued = {
+                                    let conn = match db(ctx) {
+                                        Ok(db) => Some(db.conn()),
+                                        Err(e) => {
+                                            tracing::error!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: checking whether the superseded path is catalogued failed; not removing it");
+                                            None
+                                        }
+                                    };
+                                    match conn {
+                                        Some(conn) => {
+                                            crate::db::file_exists(&conn, old)
+                                                .unwrap_or_else(|e| {
+                                                    tracing::error!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %format!("{e:#}"), "publish: checking whether the superseded path is catalogued failed; not removing it");
+                                                    true
+                                                })
+                                        }
+                                        None => true,
                                     }
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(e) => {
-                                        tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: removing the superseded generated file failed")
+                                };
+                                if catalogued {
+                                    tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: skipped removing the superseded path — a files row still references it");
+                                } else if was_external_recipe(&current) {
+                                    tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: skipped removing the superseded path — its recipe was external");
+                                } else {
+                                    match std::fs::remove_file(old_path) {
+                                        Ok(()) => {
+                                            tracing::info!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), "publish: removed the superseded generated file")
+                                        }
+                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                        Err(e) => {
+                                            tracing::warn!(project_id, frame_uuid = %w.uuid, path = %old_path.display(), error = %e, "publish: removing the superseded generated file failed")
+                                        }
                                     }
                                 }
                             }
@@ -6422,7 +6488,8 @@ pub(crate) mod tests {
             );
             seed_own_row(&conn, "p-1", "u-rej", frames[2], "rejected", None, true);
         }
-        let views = crate::api::collab_live::surface::list_collab_frames(&ctx, "p-1").unwrap();
+        let views =
+            crate::api::collab_live::surface::list_collab_frames(&ctx, "p-1", true).unwrap();
         let state_of = |uuid: &str| {
             views
                 .iter()
@@ -6434,6 +6501,23 @@ pub(crate) mod tests {
         assert_eq!(state_of("u-pub").as_deref(), Some("published"));
         assert_eq!(state_of("u-upd").as_deref(), Some("updatePending"));
         assert_eq!(state_of("u-rej").as_deref(), Some("rejected"));
+
+        // I1: the default (`false`, the reload `ReceiveTab` fires on every
+        // `collab-frames-landed` event) skips the gate + per-row recipe read
+        // entirely — every own row's chip comes back `None`, not stale data.
+        let unfilled =
+            crate::api::collab_live::surface::list_collab_frames(&ctx, "p-1", false).unwrap();
+        for uuid in ["u-pub", "u-upd", "u-rej"] {
+            assert_eq!(
+                unfilled
+                    .iter()
+                    .find(|v| v.frame_uuid == uuid)
+                    .unwrap_or_else(|| panic!("no view for {uuid}"))
+                    .contributor_state,
+                None,
+                "{uuid}: withContributorState=false must leave the chip unfilled"
+            );
+        }
     }
 
     /// `FrameSetProjectLink.publishing_here` (spec §8.2, amendment A6) is
@@ -10417,6 +10501,248 @@ pub(crate) mod tests {
                 original_mtime,
                 "the original's mtime is untouched"
             );
+        }
+
+        /// C1 (fix round 3, critical): the same un-attest transition as
+        /// [`un_attesting_a_published_set_never_overwrites_the_original`],
+        /// but with the original INSIDE the Collaboration root at
+        /// `<root>/src/…` — the shape spec §10 allows and the shape
+        /// `collab_v3_live_e2e_tests.rs`'s `seed_one_light` actually uses.
+        /// Before the fix, `publisher_dir` read this attested-in-place
+        /// landing back as "this publisher's own folder" (it is the only
+        /// own row and its path sits under the root), so the un-attest
+        /// publish's own_dir resolved to `<root>/src` instead of
+        /// `<root>/m31/me-myself`, and the post-move cleanup then deleted
+        /// the user's original out from under them.
+        #[tokio::test]
+        async fn un_attesting_inside_the_collaboration_root_never_deletes_the_original() {
+            let fx = fixture(1).await;
+            // Relocate the fixture's light from outside the Collaboration
+            // root to `<root>/src/…`, matching the e2e layout, and keep the
+            // catalog's `files` row in sync with the move.
+            let original_path = fx.collab.join("src").join("L_0000.fits");
+            std::fs::create_dir_all(original_path.parent().unwrap()).unwrap();
+            std::fs::rename(&fx.lights[0], &original_path).unwrap();
+            {
+                let conn = fx.conn();
+                conn.execute(
+                    "UPDATE files SET path = ?1 WHERE path = ?2",
+                    rusqlite::params![
+                        original_path.to_string_lossy(),
+                        fx.lights[0].to_string_lossy()
+                    ],
+                )
+                .unwrap();
+            }
+
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{:?}", res.held_back);
+            assert_eq!(
+                own_row(&fx, &fx.uuids[0]).unwrap().landed_path.as_deref(),
+                Some(original_path.to_string_lossy()).as_deref(),
+                "seeded in place, as attested, still under the Collaboration root"
+            );
+            let original_bytes = std::fs::read(&original_path).unwrap();
+            let original_mtime = std::fs::metadata(&original_path)
+                .unwrap()
+                .modified()
+                .unwrap();
+
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, false).unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.updated, 1, "{:?}", res.held_back);
+
+            // C1: the original, still cataloged under the Collaboration
+            // root, is byte-for-byte and mtime untouched — and still there.
+            assert!(original_path.exists(), "the original must not be deleted");
+            assert_eq!(
+                std::fs::read(&original_path).unwrap(),
+                original_bytes,
+                "the original's bytes must never change"
+            );
+            assert_eq!(
+                std::fs::metadata(&original_path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                original_mtime,
+                "the original's mtime must never change"
+            );
+
+            // own_dir resolves to the real own folder, not `<root>/src`, and
+            // the generated file lands there with landed_path moved onto it.
+            let names: Vec<String> = std::fs::read_dir(own_dir(&fx))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            assert_eq!(names, vec!["c_L_0000.fits".to_string()], "{names:?}");
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            let landed = PathBuf::from(row.landed_path.unwrap());
+            assert_eq!(landed, own_dir(&fx).join("c_L_0000.fits"));
+            assert!(!row.recipe_hash.as_deref().unwrap().starts_with("external:"));
+        }
+
+        /// C1 (fix round 3, critical), part 1 in isolation: the original
+        /// sits DIRECTLY in this publisher's own folder — "a user who moves
+        /// lights into their own publisher folder" (fix brief) — so
+        /// `own_dir` resolves correctly (this test never depends on the
+        /// `publisher_dir` fix; the row is excluded from consideration by
+        /// its `external:` recipe hash regardless of the path-shape filter)
+        /// and yet `is_own_dir_landing` is legitimately true for the
+        /// original's path once un-attested. Only the removal-site guard —
+        /// the `files` row lookup and `was_external_recipe` check — stands
+        /// between this and deleting the user's data. Confirmed load-bearing
+        /// by temporarily reverting just that guard: this test then fails
+        /// (the original is deleted) while
+        /// `un_attesting_inside_the_collaboration_root_never_deletes_the_original`
+        /// above still passes, since that one's protection comes entirely
+        /// from the `publisher_dir` fix.
+        #[tokio::test]
+        async fn un_attesting_never_deletes_an_original_moved_into_the_own_folder() {
+            let fx = fixture(1).await;
+            let original_path = own_dir(&fx).join("L_0000.fits");
+            std::fs::create_dir_all(original_path.parent().unwrap()).unwrap();
+            std::fs::rename(&fx.lights[0], &original_path).unwrap();
+            {
+                let conn = fx.conn();
+                conn.execute(
+                    "UPDATE files SET path = ?1 WHERE path = ?2",
+                    rusqlite::params![
+                        original_path.to_string_lossy(),
+                        fx.lights[0].to_string_lossy()
+                    ],
+                )
+                .unwrap();
+            }
+
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{:?}", res.held_back);
+            assert_eq!(
+                own_row(&fx, &fx.uuids[0]).unwrap().landed_path.as_deref(),
+                Some(original_path.to_string_lossy()).as_deref(),
+                "seeded in place, as attested, already inside the own folder"
+            );
+            let original_bytes = std::fs::read(&original_path).unwrap();
+            let original_mtime = std::fs::metadata(&original_path)
+                .unwrap()
+                .modified()
+                .unwrap();
+
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, false).unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.updated, 1, "{:?}", res.held_back);
+
+            // C1: the original, still sitting right where the user put it
+            // (in their own publisher folder), is never deleted.
+            assert!(
+                original_path.exists(),
+                "the original must not be deleted, even inside the own folder"
+            );
+            assert_eq!(
+                std::fs::read(&original_path).unwrap(),
+                original_bytes,
+                "the original's bytes must never change"
+            );
+            assert_eq!(
+                std::fs::metadata(&original_path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                original_mtime,
+                "the original's mtime must never change"
+            );
+
+            // A freshly generated file lands ALONGSIDE it, and landed_path
+            // moves onto the new file, never back onto the original.
+            let mut names: Vec<String> = std::fs::read_dir(own_dir(&fx))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            assert_eq!(
+                names,
+                vec!["L_0000.fits".to_string(), "c_L_0000.fits".to_string()],
+                "{names:?}"
+            );
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            let landed = PathBuf::from(row.landed_path.unwrap());
+            assert_eq!(landed, own_dir(&fx).join("c_L_0000.fits"));
+        }
+
+        /// I2: an attested original moved with the app's own file browser —
+        /// size and mtime survive a plain rename, so the recipe
+        /// (`external_recipe(size, mtime)`) is unchanged and a forced
+        /// Republish takes the identical-bytes branch (`identical &&
+        /// !w.identical`). Before the fix that branch just `continue`d:
+        /// `landed_path` stayed pointed at the OLD path forever, reading
+        /// "not on disk" even though the file is right there under a new
+        /// name.
+        #[tokio::test]
+        async fn republish_after_moving_an_attested_original_moves_landed_path() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            {
+                let conn = fx.conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(res.announced, 1, "{:?}", res.held_back);
+            let before = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(
+                before.landed_path.as_deref(),
+                Some(fx.lights[0].to_string_lossy()).as_deref()
+            );
+
+            // Move the original to a sibling folder — same bytes, same size,
+            // same mtime, a fresh `files.path`.
+            let sibling = fx.lights[0].parent().unwrap().join("moved");
+            std::fs::create_dir_all(&sibling).unwrap();
+            let new_path = sibling.join(fx.lights[0].file_name().unwrap());
+            std::fs::rename(&fx.lights[0], &new_path).unwrap();
+            {
+                let conn = fx.conn();
+                conn.execute(
+                    "UPDATE files SET path = ?1 WHERE path = ?2",
+                    rusqlite::params![new_path.to_string_lossy(), fx.lights[0].to_string_lossy()],
+                )
+                .unwrap();
+            }
+            let original_bytes = std::fs::read(&new_path).unwrap();
+
+            let res = republish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            assert_eq!(
+                (res.announced, res.updated, res.unchanged),
+                (0, 0, 1),
+                "{:?}", res.held_back
+            );
+
+            let after = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(
+                after.landed_path.as_deref(),
+                Some(new_path.to_string_lossy()).as_deref(),
+                "landed_path follows the file to its new location"
+            );
+            assert_eq!(
+                after.content_version, before.content_version,
+                "no new version — the bytes never changed"
+            );
+            assert_eq!(std::fs::read(&new_path).unwrap(), original_bytes);
         }
 
         // ── Fix round 2: landed_path is TEXT UNIQUE table-wide, and a frame

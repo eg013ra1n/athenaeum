@@ -617,7 +617,7 @@ async fn the_frames_list_counts_live_holders_and_a_departure() {
     let uuids = w.a_publishes(2).await;
     w.b.wait_all_held(Duration::from_secs(20)).await;
     let counts = |ctx: &crate::services::ServiceContext| {
-        surface::list_collab_frames(ctx, ts::PID)
+        surface::list_collab_frames(ctx, ts::PID, false)
             .unwrap()
             .into_iter()
             .filter(|f| uuids.contains(&f.frame_uuid))

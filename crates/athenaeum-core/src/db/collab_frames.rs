@@ -1302,26 +1302,57 @@ pub fn own_by_source_frame(
 /// a previous folder (a re-designation, Task 15 fix round 1) or an own
 /// frame's file outside it never counts. `None` when nothing from that
 /// publisher has landed under `root` yet.
+///
+/// C1 fix round 3: a candidate `landed_path` is trusted as "this publisher's
+/// own folder" only when it is BOTH:
+///   1. not an attested original — `recipe_hash` starting `external:` marks
+///      one (the same test [`crate::api::collab::was_external_recipe`] uses
+///      independently at the removal site), and
+///   2. shaped like a generated landing — [`crate::api::collab_exchange::publisher_folder`]
+///      always writes `<root>/<project-slug>/<own-folder-name>/<file>`, so
+///      the file's grandparent is always exactly `<root>/<project-slug>/`,
+///      never the Collaboration root itself or anything shallower/deeper.
+/// Either filter alone already excludes an attested original that happens to
+/// sit at `<root>/<some-folder>/<file>` (spec §10 allows attestation of a
+/// set anywhere under the root, including the user's own working folder);
+/// both are kept because neither is airtight alone (a mid-flight
+/// `stage_own_file` clears `recipe_hash` to `NULL` before the row is
+/// re-classified, and a path spelling drift could in principle satisfy the
+/// shape check). Trusting an attested original's folder as "own" would let a
+/// later generation step write into — and its cleanup delete out of — a
+/// directory this publisher never actually owns (C1).
 pub fn publisher_dir(
     conn: &Connection,
     project_id: &str,
     publisher_account_id: &str,
     root: &Path,
 ) -> Result<Option<PathBuf>> {
+    let slug: Option<String> = conn
+        .query_row(
+            "SELECT slug FROM collab_projects WHERE project_id = ?1",
+            params![project_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(slug) = slug else {
+        return Ok(None);
+    };
+    let project_dir = root.join(crate::sync::ingest::sanitize_slug(&slug));
     let mut stmt = conn.prepare(
-        "SELECT landed_path FROM project_frames_local
+        "SELECT landed_path, recipe_hash FROM project_frames_local
          WHERE project_id = ?1 AND publisher_account_id = ?2 AND landed_path IS NOT NULL
          ORDER BY frame_uuid",
     )?;
-    let landed = stmt
+    let rows = stmt
         .query_map(params![project_id, publisher_account_id], |r| {
-            r.get::<_, String>(0)
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(landed
+    Ok(rows
         .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.starts_with(root))
+        .filter(|(_, recipe)| !recipe.as_deref().is_some_and(|r| r.starts_with("external:")))
+        .map(|(p, _)| PathBuf::from(p))
+        .find(|p| p.parent().and_then(Path::parent) == Some(project_dir.as_path()))
         .and_then(|p| p.parent().map(PathBuf::from)))
 }
 

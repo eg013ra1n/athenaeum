@@ -449,7 +449,7 @@ async fn edited_touched_and_deleted_replicas() {
         "scenario 8: B sees v2 waiting",
         Duration::from_secs(10),
         || {
-            crate::api::collab_live::surface::list_collab_frames(&w.b.ctx, ts::PID)
+            crate::api::collab_live::surface::list_collab_frames(&w.b.ctx, ts::PID, false)
                 .unwrap()
                 .into_iter()
                 .any(|f| &f.frame_uuid == u && f.new_version_waiting)

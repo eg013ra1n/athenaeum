@@ -338,9 +338,18 @@ fn require_live(ctx: &ServiceContext, project_id: &str) -> Result<CollabProjectR
 
 /// Every cached frame of a project with its local state and live holder
 /// counts (`list_collab_frames`).
+///
+/// I1: `own_contributor_states` runs the full project gate plus a per-own-row
+/// recipe read — real work under the catalog lock. `ReceiveTab` reloads this
+/// list on every `collab-frames-landed` event (up to once a second) purely
+/// for the live holder counts; it never reads the contributor chip. Computing
+/// the chip is now opt-in (`with_contributor_state`, default `false`) so that
+/// hot reload path skips it entirely — only the project page's own Contribute
+/// tab (which renders the chip) asks for it.
 pub fn list_collab_frames(
     ctx: &ServiceContext,
     project_id: &str,
+    with_contributor_state: bool,
 ) -> Result<Vec<ProjectFrameView>, ApiError> {
     let (counts, contributor) = {
         let db = db(ctx)?;
@@ -349,8 +358,11 @@ pub fn list_collab_frames(
             Some(project) => {
                 let counts =
                     ProjectHolderCounts::load(&conn, &project, super::live_presence(ctx).as_ref())?;
-                let contributor =
-                    crate::api::collab::own_contributor_states(&conn, project_id, &project);
+                let contributor = if with_contributor_state {
+                    crate::api::collab::own_contributor_states(&conn, project_id, &project)
+                } else {
+                    HashMap::new()
+                };
                 (counts, contributor)
             }
             None => (None, HashMap::new()),
@@ -1037,7 +1049,7 @@ mod tests {
 
         // The frames list carries the local state in place of the retired
         // on-disk / declined / holder-count fields.
-        let frames = list_collab_frames(&rig.ctx, &pid).unwrap();
+        let frames = list_collab_frames(&rig.ctx, &pid, false).unwrap();
         let state_of = |uuid: &str| {
             frames
                 .iter()
