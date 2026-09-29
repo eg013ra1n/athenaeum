@@ -203,6 +203,46 @@ pub struct ProjectDetail {
     pub thresholds: Vec<ThresholdRuleView>,
     pub links: Vec<LinkedSetView>,
     pub portal_base: String,
+    /// The hub's per-filter goals (`{canonical: seconds}`), strictly parsed
+    /// by [`parse_goals`] — `None` when the hub sent nothing usable.
+    pub goals: Option<std::collections::BTreeMap<String, f64>>,
+}
+
+/// Goals as the hub guarantees them since wave 0 (`{canonical: seconds}`,
+/// every value > 0). Anything else is logged and read as "no goals".
+pub fn parse_goals(
+    project_id: &str,
+    json: Option<&str>,
+) -> Option<std::collections::BTreeMap<String, f64>> {
+    let raw = json?;
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "project goals are not JSON; ignored");
+            return None;
+        }
+    };
+    let obj = value.as_object().filter(|o| !o.is_empty());
+    let Some(obj) = obj else {
+        tracing::warn!(
+            project_id,
+            "project goals are not a non-empty object; ignored"
+        );
+        return None;
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in obj {
+        match v.as_f64().filter(|s| s.is_finite() && *s > 0.0) {
+            Some(s) => {
+                out.insert(k.clone(), s);
+            }
+            None => {
+                tracing::warn!(project_id, canonical = %k, "project goal is not a positive number; goals ignored");
+                return None;
+            }
+        }
+    }
+    Some(out)
 }
 
 // ── Shared internal helpers (also used by Task 5) ────────────────────────────
@@ -1616,7 +1656,7 @@ pub fn get_project_detail(
     ctx: &ServiceContext,
     project_id: &str,
 ) -> Result<ProjectDetail, ApiError> {
-    let (row, links, portal_base) = {
+    let (row, links, portal_base, goals_json) = {
         let db = db(ctx)?;
         let conn = db.conn();
         let row = crate::db::collab::get_project(&conn, project_id)
@@ -1632,7 +1672,9 @@ pub fn get_project_detail(
             crate::settings::keys::ACCOUNT_HUB_URL,
             crate::settings::defaults::ACCOUNT_HUB_URL,
         )?;
-        (row, links, portal_base)
+        let (goals_json, _members_seen_json) =
+            crate::db::collab::page_extras(&conn, project_id).map_err(internal)?;
+        (row, links, portal_base, goals_json)
     };
 
     let members: Vec<ProjectMemberView> = serde_json::from_str(&row.members_json)
@@ -1652,6 +1694,7 @@ pub fn get_project_detail(
     };
     let thresholds_version = row.thresholds_version;
     let me = device_for_cards(ctx);
+    let goals = parse_goals(project_id, goals_json.as_deref());
     let card = card_from_row(ctx, row, me.as_deref())?;
 
     Ok(ProjectDetail {
@@ -1661,6 +1704,7 @@ pub fn get_project_detail(
         thresholds,
         links,
         portal_base,
+        goals,
     })
 }
 
@@ -5718,6 +5762,46 @@ pub(crate) mod tests {
                 .0
                 .as_deref(),
             Some(r#"{"L":7200}"#)
+        );
+    }
+
+    #[test]
+    fn goals_parse_strictly() {
+        assert_eq!(parse_goals("p", None), None);
+        assert_eq!(
+            parse_goals("p", Some(r#"{"Ha":3600,"L":7200.5}"#)),
+            Some(
+                [("Ha".to_string(), 3600.0), ("L".to_string(), 7200.5)]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        // Anything else is logged and treated as no goals — never guessed at.
+        for bad in [
+            r#"[1]"#,
+            r#"{"Ha":"3600"}"#,
+            r#"{"Ha":0}"#,
+            r#"{"Ha":-1}"#,
+            "not json",
+            r#"{}"#,
+        ] {
+            assert_eq!(parse_goals("p", Some(bad)), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn project_detail_carries_goals() {
+        let (_d, ctx) = test_ctx();
+        {
+            let db = crate::api::db(&ctx).unwrap();
+            let conn = db.conn();
+            cached_project(&conn);
+            crate::db::collab::set_page_extras(&conn, "p-1", Some(r#"{"L":7200}"#), "[]").unwrap();
+        }
+        let detail = get_project_detail(&ctx, "p-1").unwrap();
+        assert_eq!(
+            detail.goals,
+            Some([("L".to_string(), 7200.0)].into_iter().collect())
         );
     }
 

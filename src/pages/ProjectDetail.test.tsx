@@ -56,6 +56,7 @@ function detailFixture(card: ProjectCard = projectCard()): Detail {
     thresholds: [],
     links: [],
     portalBase: 'https://hub.example',
+    goals: null,
   };
 }
 

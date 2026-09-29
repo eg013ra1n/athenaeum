@@ -1569,7 +1569,12 @@ publishingDevice: PublishingDeviceView | null,
  */
 publishingHere: boolean, };
 
-export type ProjectDetail = { card: ProjectCard, members: Array<ProjectMemberView>, thresholdsVersion: number | null, thresholds: Array<ThresholdRuleView>, links: Array<LinkedSetView>, portalBase: string, };
+export type ProjectDetail = { card: ProjectCard, members: Array<ProjectMemberView>, thresholdsVersion: number | null, thresholds: Array<ThresholdRuleView>, links: Array<LinkedSetView>, portalBase: string, 
+/**
+ * The hub's per-filter goals (`{canonical: seconds}`), strictly parsed
+ * by [`parse_goals`] — `None` when the hub sent nothing usable.
+ */
+goals: { [key in string]: number } | null, };
 
 export type ProjectMemberView = { displayName: string, dataRole: string, coordinator: boolean, };
 
