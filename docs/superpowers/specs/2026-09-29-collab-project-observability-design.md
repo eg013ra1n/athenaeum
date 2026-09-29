@@ -227,6 +227,8 @@ reads it.
   `0 < seconds ≤ 36 000 000` (10 000 h). Refusals name the offending entry:
   `goal for "Hb": not in this project's filter dictionary`, `goal for "Ha" must be a positive number of
   seconds`.
+  On PATCH, `goals: {}` clears them (stored `NULL`); an absent or `null` field keeps the stored value (the
+  route's existing `COALESCE` semantics).
 - **Migration**: an existing row whose `goals` does not have that shape is set to `NULL`, each one logged at
   `warn` with the project id. Prod v3 is not deployed; the test hub is the only affected data.
 - **Dictionary changes**: `put_dictionary` removes goals for canonicals it drops, in the same transaction.
@@ -245,7 +247,7 @@ reads it.
 
 #### 5.6.3 Hub tests
 
-Goals: unknown filter, zero, negative, NaN/string, `null` resets, a dictionary edit dropping a canonical drops
+Goals: unknown filter, zero, negative, NaN/string, `{}` clears (stored NULL) while `null`/absent keeps them, a dictionary edit dropping a canonical drops
 its goal, the migration nulls a malformed row and keeps a valid one. Last seen: a member sees co-members'
 values, a non-member and an anonymous viewer get `null`, a revoked device is ignored, the max across two
 devices is taken. Portal: the goals editor (render per dictionary canonical, blur parse, empty clears, refusal
