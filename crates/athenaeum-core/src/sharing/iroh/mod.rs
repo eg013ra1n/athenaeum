@@ -1176,7 +1176,10 @@ pub(crate) fn spawn_collab_provider_events(
     oracle: SharedServeOracle,
     gauge: Arc<StreamGauge>,
     conns: Arc<ConnRegistry>,
+    meter: Arc<crate::collab::live::meter::ExchangeMeter>,
 ) -> tokio::task::JoinHandle<()> {
+    use crate::collab::live::meter::{device_id_of, FlowDirection};
+
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -1184,6 +1187,14 @@ pub(crate) fn spawn_collab_provider_events(
                     let oracle = current_oracle(&oracle);
                     let gauge = Arc::clone(&gauge);
                     let from = conns.peer_label(m.inner.connection_id);
+                    // Captured BEFORE the spawn: the connection may already be
+                    // forgotten (peer disconnected) by the time the task below
+                    // runs its first await.
+                    let peer = conns
+                        .peer_of(m.inner.connection_id)
+                        .map(|n| device_id_of(&n));
+                    let key = format!("serve:{}:{}", m.inner.connection_id, m.inner.request_id);
+                    let meter = Arc::clone(&meter);
                     tokio::spawn(async move {
                         let hash = m.inner.request.hash;
                         // Only a plain blob request is checked (and fetched by
@@ -1200,20 +1211,75 @@ pub(crate) fn spawn_collab_provider_events(
                             );
                             Err(AbortReason::Permission)
                         };
-                        let permit = match verdict {
-                            Ok(permit) => {
+                        let (permit, record) = match verdict {
+                            Ok((permit, rec)) => {
                                 m.tx.send(Ok(())).await.ok();
-                                permit
+                                (permit, rec)
                             }
                             Err(reason) => {
                                 m.tx.send(Err(reason)).await.ok();
-                                None
+                                (None, None)
                             }
                         };
+                        // Task 11: meter this serve only when it is an
+                        // admitted, attributed get — a real peer behind the
+                        // connection AND a catalog record for what it pulled.
+                        let metered = match (&record, &peer) {
+                            (Some(r), Some(_)) => {
+                                let name = r
+                                    .path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                meter.register(
+                                    &key,
+                                    FlowDirection::Send,
+                                    &r.project_id,
+                                    &r.frame_uuid,
+                                    &name,
+                                    0,
+                                );
+                                true
+                            }
+                            _ => false,
+                        };
                         // SAFETY RULE: drain the update stream for the whole
-                        // transfer; the permit is held until it ends.
+                        // transfer; the permit is held until it ends — every
+                        // branch keeps draining even when the get was not
+                        // metered.
                         let mut updates = m.rx;
-                        while let Ok(Some(_)) = updates.recv().await {}
+                        let mut acc = UploadAccumulator::new();
+                        let mut reported = 0u64;
+                        let mut completed = false;
+                        while let Ok(Some(update)) = updates.recv().await {
+                            if !metered {
+                                continue;
+                            }
+                            match update {
+                                RequestUpdate::Started(t) => {
+                                    acc.on_started();
+                                    meter.set_size(&key, t.size);
+                                }
+                                RequestUpdate::Progress(p) => {
+                                    acc.on_progress(p.end_offset);
+                                    let total = acc.total();
+                                    if let Some(dev) = &peer {
+                                        meter.delivered(
+                                            &key,
+                                            dev,
+                                            total.saturating_sub(reported),
+                                            std::time::Instant::now(),
+                                        );
+                                    }
+                                    reported = reported.max(total);
+                                }
+                                RequestUpdate::Completed(_) => completed = true,
+                                RequestUpdate::Aborted(_) => {}
+                            }
+                        }
+                        if metered {
+                            meter.finish(&key, completed, std::time::Instant::now());
+                        }
                         drop(permit);
                     });
                 }
@@ -1298,15 +1364,24 @@ fn current_oracle(slot: &SharedServeOracle) -> Option<Arc<dyn crate::collab::ser
 /// The serve check of one collab get/observe (spec §9.3). The oracle's
 /// catalog read and the file stat run on a blocking thread. Without an
 /// oracle only the upload stream limit is checked (see
-/// [`SharedServeOracle`]). `Ok(Some(permit))` admits a counted get;
-/// `Ok(None)` an observe or a get with `count_stream == false`.
+/// [`SharedServeOracle`]). `Ok((Some(permit), rec))` admits a counted get;
+/// `Ok((None, rec))` an observe or a get with `count_stream == false`. `rec`
+/// is the looked-up [`ServeRecord`](crate::collab::serve::ServeRecord)
+/// whenever an oracle is installed and found one — `None` when there is no
+/// oracle to ask (Task 11: the caller meters an admitted get by it).
 async fn collab_serve_verdict(
     oracle: Option<Arc<dyn crate::collab::serve::ServeOracle>>,
     hash: Hash,
     gauge: &Arc<StreamGauge>,
     count_stream: bool,
     from: &str,
-) -> Result<Option<StreamPermit>, AbortReason> {
+) -> Result<
+    (
+        Option<StreamPermit>,
+        Option<crate::collab::serve::ServeRecord>,
+    ),
+    AbortReason,
+> {
     use crate::collab::serve::{decide, ServeDecision};
     use crate::collab::storage::sweep::Stamp;
 
@@ -1320,10 +1395,10 @@ async fn collab_serve_verdict(
         // No record/stamp check (see `SharedServeOracle`), but a counted get
         // still takes a stream under the limit — or is refused with
         // `ERR_LIMIT`, which the fetcher retries (Task 12, ruling R2).
-        None if !count_stream => return Ok(None),
+        None if !count_stream => return Ok((None, None)),
         None => {
             return match gauge.try_acquire() {
-                Some(permit) => Ok(Some(permit)),
+                Some(permit) => Ok((Some(permit), None)),
                 None => {
                     tracing::debug!(
                         from,
@@ -1361,9 +1436,9 @@ async fn collab_serve_verdict(
         }
     };
     match decision {
-        ServeDecision::Serve if !count_stream => Ok(None),
+        ServeDecision::Serve if !count_stream => Ok((None, rec)),
         ServeDecision::Serve => match gauge.try_acquire() {
-            Some(permit) => Ok(Some(permit)),
+            Some(permit) => Ok((Some(permit), rec)),
             // Lost the race for the last stream after the check said Serve.
             None => {
                 tracing::debug!(

@@ -1258,3 +1258,36 @@ async fn a_folder_copied_then_deleted_keeps_serving_from_its_new_place() {
         "one file per frame"
     );
 }
+
+/// Task 11: A's node meters every collab serve to B under
+/// `FlowDirection::Send`, keyed by the peer that pulled it, and the item
+/// leaves nothing in flight once the transfer completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_serving_side_meters_what_it_sends_and_to_whom() {
+    let w = ts::two_instances().await;
+    let uuids = w.a_publishes(2).await;
+    for u in &uuids {
+        w.b.wait_state(u, LocalState::Held, Duration::from_secs(20))
+            .await;
+    }
+    let flows =
+        w.a.node
+            .exchange_meter()
+            .snapshot(std::time::Instant::now());
+    let to_b = flows
+        .iter()
+        .find(|f| {
+            f.direction == crate::collab::live::meter::FlowDirection::Send
+                && f.device == w.b.device()
+        })
+        .expect("A metered its upload to B");
+    assert_eq!(to_b.project_id, ts::PID);
+    assert!(
+        to_b.bytes_session >= 2 * ts::FETCH_FRAME_BYTES as i64,
+        "{to_b:?}"
+    );
+    assert!(
+        to_b.in_flight.is_empty(),
+        "finished serves leave nothing in flight"
+    );
+}

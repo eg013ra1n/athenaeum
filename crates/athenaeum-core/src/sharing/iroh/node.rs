@@ -898,6 +898,12 @@ pub struct SharedIrohNode {
     collab_gauge: Arc<StreamGauge>,
     /// Every accepted collab connection (plan P16), for the I11 close.
     collab_conns: Arc<ConnRegistry>,
+    /// Live exchange telemetry for every collab serve this node admits
+    /// (spec 2026-09-29 §6.1). The SAME `Arc` is held by the collab
+    /// provider-events consumer spawned in this fn, so every metered get
+    /// lands here; [`exchange_meter`](Self::exchange_meter) hands the live
+    /// runtime a clone to read (Task 12).
+    exchange_meter: Arc<crate::collab::live::meter::ExchangeMeter>,
     /// Serializes [`set_collab_root`](Self::set_collab_root) calls (open → sweep
     /// → swap → shut old) and fences them against [`shutdown`](Self::shutdown).
     collab_mount: tokio::sync::Mutex<()>,
@@ -1263,6 +1269,10 @@ impl SharedIrohNode {
         let collab_oracle: SharedServeOracle = Arc::new(RwLock::new(None));
         let collab_gauge = StreamGauge::new(default_collab_upload_streams());
         let collab_conns = Arc::new(ConnRegistry::new("collab"));
+        // Live exchange telemetry (spec 2026-09-29 §6.1, Task 11): created
+        // before the consumer so the SAME `Arc` metering every served get is
+        // the one `exchange_meter()` hands the live runtime.
+        let exchange_meter = Arc::new(crate::collab::live::meter::ExchangeMeter::new());
         let (collab_events, collab_rx) = provider_event_channel();
         spawn_collab_provider_events(
             collab_rx,
@@ -1270,6 +1280,7 @@ impl SharedIrohNode {
             Arc::clone(&collab_oracle),
             Arc::clone(&collab_gauge),
             Arc::clone(&collab_conns),
+            Arc::clone(&exchange_meter),
         );
         // Shared node: `EventSink::Demux` (inbound events fan out through the demux,
         // Task 2/Д4, not a single shared stream), and `flush_store_on_shutdown:
@@ -1355,6 +1366,7 @@ impl SharedIrohNode {
             collab_oracle,
             collab_gauge,
             collab_conns,
+            exchange_meter,
             collab_mount: tokio::sync::Mutex::new(()),
             collab_mount_gen: tokio::sync::watch::Sender::new(0),
             home_relay_tx: Mutex::new(None),
@@ -1442,6 +1454,11 @@ impl SharedIrohNode {
     /// How many collab gets are being served right now.
     pub fn collab_streams_in_use(&self) -> usize {
         self.collab_gauge.in_use()
+    }
+
+    /// Live exchange telemetry for this node (spec 2026-09-29 §6.1).
+    pub(crate) fn exchange_meter(&self) -> Arc<crate::collab::live::meter::ExchangeMeter> {
+        Arc::clone(&self.exchange_meter)
     }
 
     /// I11 (plan P16): close every accepted collab connection whose remote
