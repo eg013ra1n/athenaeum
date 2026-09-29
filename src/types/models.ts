@@ -1969,6 +1969,14 @@ export type ContributorCounts = { notPublished: number, failsGate: number, pendi
 
 export type FrameSetProjectCandidate = { projectId: string, slug: string, title: string, distanceDeg: number, };
 
+export type GateFailure = { kind: string, text: string, };
+
+export type OwnFrameRow = { frameId: number, frameUuid: string | null, fileName: string, setId: number | null, setName: string | null, night: string | null, filter: string, filterMapped: boolean, camera: string, exptimeSec: number | null, byteSize: number, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, medianSnr: number | null, 
+/**
+ * "ready" | "published" | "held"
+ */
+segment: string, contributorState: string, contributorReason: string | null, failures: Array<GateFailure>, contentVersion: number | null, pubState: string | null, acceptedReason: string | null, holdersOnline: number | null, holdersTotal: number | null, localState: string | null, publishedAt: string | null, lastError: string | null, };
+
 export type Channel = "stable" | "beta";
 
 export type UpdateCheck = { 

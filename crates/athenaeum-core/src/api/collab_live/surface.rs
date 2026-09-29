@@ -230,7 +230,7 @@ impl From<replace::ReplaceOutcome> for ReplaceOutcomeView {
 
 /// One project's persisted holder map, read once, with the live presence:
 /// the holder counts of any of its frames without re-reading the map.
-struct ProjectHolderCounts {
+pub(crate) struct ProjectHolderCounts {
     project_id: String,
     map: ProjectHolders,
     presence: PresenceBook,
@@ -242,7 +242,7 @@ struct ProjectHolderCounts {
 
 impl ProjectHolderCounts {
     /// `None` when no live exchange runs (no presence, no device id).
-    fn load(
+    pub(crate) fn load(
         conn: &rusqlite::Connection,
         project: &CollabProjectRow,
         live: Option<&(PresenceBook, String)>,
@@ -269,7 +269,7 @@ impl ProjectHolderCounts {
         }))
     }
 
-    fn frame(&self, row: &LocalFrameRow) -> FrameLiveInfo {
+    pub(crate) fn frame(&self, row: &LocalFrameRow) -> FrameLiveInfo {
         let Some(frame_seq) = row.frame_seq else {
             return FrameLiveInfo::default();
         };
@@ -368,9 +368,10 @@ pub fn list_collab_frames(
             None => (None, HashMap::new()),
         }
     };
-    let mut views = crate::api::collab_exchange::list_project_frames_with(ctx, project_id, |row| {
-        counts.as_ref().map(|c| c.frame(row)).unwrap_or_default()
-    })?;
+    let mut views =
+        crate::api::collab_exchange::list_project_frames_with(ctx, project_id, |row| {
+            counts.as_ref().map(|c| c.frame(row)).unwrap_or_default()
+        })?;
     // Task 7 (spec §8.1): the own-frames table shows the same contributor
     // chip as the frame set's Project block — filled here rather than in
     // `from_local_row` because the gate evaluation is render+solver-gated

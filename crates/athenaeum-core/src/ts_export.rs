@@ -264,6 +264,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::collab::FrameProjectState,
             crate::api::collab::ContributorCounts,
             crate::api::collab::FrameSetProjectCandidate,
+            crate::api::collab::GateFailure,
+            crate::api::collab::OwnFrameRow,
             crate::updates::manifest::Channel,
             crate::updates::UpdateCheck,
             crate::updates::WhatsNew,

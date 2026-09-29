@@ -1485,6 +1485,277 @@ pub(crate) fn own_contributor_states(
     out
 }
 
+// ── Own frames (Task 5, spec 2026-09-29 §5.1) ────────────────────────────────
+
+/// One gate-row failure, pre-classified and ordered ([`crate::collab::gate::row_failures`]).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct GateFailure {
+    pub kind: String,
+    pub text: String,
+}
+
+/// One LIGHT frame of a project's linked sets, for the project page's "My
+/// frames" tab (Ready / Published / Held back). Combines the gate verdict
+/// (`FrameGateRow`), the contributor-state derivation
+/// (`crate::collab::contributor_state::derive`, the same one the frame set's
+/// Project block and `list_collab_frames`'s own-row chip use) and, when this
+/// account has published the frame, its own publication row and live holder
+/// counts.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnFrameRow {
+    pub frame_id: i64,
+    pub frame_uuid: Option<String>,
+    pub file_name: String,
+    pub set_id: Option<i64>,
+    pub set_name: Option<String>,
+    pub night: Option<String>,
+    pub filter: String,
+    pub filter_mapped: bool,
+    pub camera: String,
+    pub exptime_sec: Option<f64>,
+    pub byte_size: i64,
+    pub fwhm_arcsec: Option<f64>,
+    pub eccentricity: Option<f64>,
+    pub stars_detected: Option<i64>,
+    pub median_snr: Option<f64>,
+    /// "ready" | "published" | "held"
+    pub segment: String,
+    pub contributor_state: String,
+    pub contributor_reason: Option<String>,
+    pub failures: Vec<GateFailure>,
+    pub content_version: Option<i32>,
+    pub pub_state: Option<String>,
+    pub accepted_reason: Option<String>,
+    pub holders_online: Option<i64>,
+    pub holders_total: Option<i64>,
+    pub local_state: Option<String>,
+    pub published_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// The "My frames" tab segment a [`crate::collab::contributor_state::ContributorState`]
+/// falls into: not-yet-published reads as ready to go, a gate failure holds
+/// it back, and every other state (pending/published/update/rejected/…) has
+/// already been sent to the hub, so it belongs with the rest of what was
+/// published.
+pub fn segment_of(state: crate::collab::contributor_state::ContributorState) -> &'static str {
+    use crate::collab::contributor_state::ContributorState as S;
+    match state {
+        S::NotPublished => "ready",
+        S::FailsGate => "held",
+        _ => "published",
+    }
+}
+
+/// Catalog facts the gate row does not carry, for a batch of frames.
+struct FrameFacts {
+    exptime: Option<f64>,
+    size: i64,
+    median_snr: Option<f64>,
+    /// `DATE(imaging_nights.start_time, '-12 hours')` via
+    /// `session_members → sessions → imaging_nights`, else
+    /// `DATE(frames.date_obs, '-12 hours')` (global-constraints night rule).
+    night: Option<String>,
+}
+
+fn frame_facts(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, FrameFacts>, ApiError> {
+    let mut out = HashMap::new();
+    for chunk in ids.chunks(500) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let marks = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT f.id, f.exptime, fi.size, \
+                    (SELECT fa.median_snr FROM frame_analysis fa WHERE fa.frame_id = f.id ORDER BY fa.id DESC LIMIT 1), \
+                    COALESCE( \
+                      (SELECT DATE(n.start_time, '-12 hours') FROM session_members sm \
+                         JOIN sessions s ON s.id = sm.session_id \
+                         JOIN imaging_nights n ON n.id = s.imaging_night_id \
+                        WHERE sm.frame_id = f.id ORDER BY n.start_time LIMIT 1), \
+                      DATE(f.date_obs, '-12 hours')) \
+             FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id IN ({marks})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| ApiError::Internal(format!("frame facts: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    FrameFacts {
+                        exptime: r.get(1)?,
+                        size: r.get(2)?,
+                        median_snr: r.get(3)?,
+                        night: r.get(4)?,
+                    },
+                ))
+            })
+            .map_err(|e| ApiError::Internal(format!("frame facts: {e}")))?;
+        for row in rows {
+            let (id, f) = row.map_err(|e| ApiError::Internal(format!("frame facts: {e}")))?;
+            out.insert(id, f);
+        }
+    }
+    Ok(out)
+}
+
+/// `frames` carries no `frames_set_id` column (membership is only through
+/// `session_members → sessions → imaging_nights`, same as [`frame_set_ids`]) —
+/// so a row's set name is looked up in Rust from [`GateIdentity::set_id`]
+/// rather than a correlated subquery.
+fn frames_set_names(
+    conn: &Connection,
+    set_ids: &HashSet<i64>,
+) -> Result<HashMap<i64, String>, ApiError> {
+    if set_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<i64> = set_ids.iter().copied().collect();
+    let marks = vec!["?"; ids.len()].join(",");
+    let sql = format!("SELECT id, name FROM frames_set WHERE id IN ({marks})");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| ApiError::Internal(format!("frames_set names: {e}")))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| ApiError::Internal(format!("frames_set names: {e}")))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (id, name) = row.map_err(|e| ApiError::Internal(format!("frames_set names: {e}")))?;
+        if let Some(name) = name {
+            out.insert(id, name);
+        }
+    }
+    Ok(out)
+}
+
+/// Spec 2026-09-29 §5.1 — one row per LIGHT frame of the project's linked
+/// sets, for the "My frames" tab. Reuses [`project_gate`] (the same gate the
+/// report and publish share, so this list can never disagree with either)
+/// and layers on the per-frame catalog facts the gate row doesn't carry, this
+/// account's own publication row when one exists, and its live holder counts.
+pub fn list_project_own_frames(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<Vec<OwnFrameRow>, ApiError> {
+    use crate::collab::contributor_state::{derive, OwnRowFacts};
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let project = crate::db::collab::get_project(&conn, project_id)
+        .map_err(internal)?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "project {project_id} is not cached — refresh first"
+            ))
+        })?;
+    let gated = project_gate(&conn, &project)?;
+    let ids: Vec<i64> = gated.iter().map(|(_, r)| r.frame_id).collect();
+    let facts = frame_facts(&conn, &ids)?;
+    let set_ids: HashSet<i64> = gated.iter().filter_map(|(i, _)| i.set_id).collect();
+    let set_names = frames_set_names(&conn, &set_ids)?;
+    let own: HashMap<i64, crate::db::collab_frames::LocalFrameRow> =
+        crate::db::collab_frames::own_by_source_frame(&conn, project_id).map_err(internal)?;
+    let counts = match crate::api::collab_live::surface::ProjectHolderCounts::load(
+        &conn,
+        &project,
+        crate::api::collab_live::live_presence(ctx).as_ref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "holder counts unavailable for own frames");
+            None
+        }
+    };
+    let mut out = Vec::with_capacity(gated.len());
+    for (identity, row) in gated {
+        let own_row = own.get(&row.frame_id);
+        let current_recipe =
+            own_row.and_then(|_| current_recipe_for_frame(&conn, row.frame_id, identity.attested));
+        let wire = own_row.and_then(|o| {
+            crate::api::collab_exchange::parse_manifest_wire(
+                project_id,
+                &o.frame_uuid,
+                &o.manifest_json,
+                "list_project_own_frames",
+            )
+        });
+        let reject_reason = wire.as_ref().and_then(|w| w.reject_reason.clone());
+        let facts_own = own_row.map(|o| OwnRowFacts {
+            state: o.state.as_str(),
+            content_version: o.content_version,
+            recipe_hash: o.recipe_hash.as_deref(),
+            on_disk: o.on_disk,
+            reject_reason: reject_reason.as_deref(),
+        });
+        let (state, reason) = derive(
+            facts_own,
+            current_recipe.as_deref(),
+            row.publishable,
+            row.failures.first().map(String::as_str),
+        );
+        let live = own_row.and_then(|o| counts.as_ref().map(|c| c.frame(o)));
+        let f = facts.get(&row.frame_id);
+        out.push(OwnFrameRow {
+            frame_id: row.frame_id,
+            frame_uuid: own_row
+                .map(|o| o.frame_uuid.clone())
+                .or_else(|| (!identity.uuid.is_empty()).then(|| identity.uuid.clone())),
+            file_name: row.filename.clone(),
+            set_id: identity.set_id,
+            set_name: identity.set_id.and_then(|s| set_names.get(&s).cloned()),
+            night: f.and_then(|f| f.night.clone()),
+            filter: identity
+                .filter_canonical
+                .clone()
+                .unwrap_or_else(|| identity.filter_raw.clone()),
+            filter_mapped: identity.filter_canonical.is_some(),
+            camera: identity.instrume.clone(),
+            exptime_sec: f.and_then(|f| f.exptime),
+            byte_size: f.map(|f| f.size).unwrap_or(0),
+            fwhm_arcsec: row.fwhm_arcsec,
+            eccentricity: row.eccentricity,
+            stars_detected: row.stars_detected,
+            median_snr: f.and_then(|f| f.median_snr),
+            segment: segment_of(state).to_string(),
+            contributor_state: state.key().to_string(),
+            contributor_reason: reason,
+            failures: crate::collab::gate::row_failures(&row.failures)
+                .into_iter()
+                .map(|(kind, text)| GateFailure {
+                    kind: kind.to_string(),
+                    text,
+                })
+                .collect(),
+            content_version: own_row.map(|o| o.content_version),
+            pub_state: own_row.map(|o| o.state.clone()),
+            accepted_reason: wire.as_ref().and_then(|w| w.accepted_reason.clone()),
+            holders_online: live.as_ref().map(|l| l.holders_online as i64),
+            holders_total: live.as_ref().map(|l| l.holders_total as i64),
+            local_state: own_row.map(|o| o.local_state.as_db_str().to_string()),
+            published_at: own_row.and_then(|o| {
+                crate::db::collab_frames::announced_at(&conn, project_id, &o.frame_uuid)
+                    .map_err(|e| {
+                        tracing::warn!(project_id, frame_uuid = %o.frame_uuid, error = %e, "announced_at read failed")
+                    })
+                    .ok()
+                    .flatten()
+            }),
+            last_error: own_row.and_then(|o| o.last_error.clone()),
+        });
+    }
+    tracing::info!(
+        project_id,
+        total = out.len() as i64,
+        "listed own frames for project"
+    );
+    Ok(out)
+}
+
 // ── Hub poll: cards, detail, refresh ─────────────────────────────────────────
 
 /// User-facing message for a hub `409 collab_api_outdated` refusal — this
@@ -6734,6 +7005,101 @@ pub(crate) mod tests {
                 "{uuid}: withContributorState=false must leave the chip unfilled"
             );
         }
+    }
+
+    // ── Task 5: list_project_own_frames ─────────────────────────────────────
+
+    #[test]
+    fn segment_follows_contributor_state_only() {
+        use crate::collab::contributor_state::ContributorState as S;
+        assert_eq!(segment_of(S::NotPublished), "ready");
+        assert_eq!(segment_of(S::FailsGate), "held");
+        for s in [
+            S::PendingApproval,
+            S::Published,
+            S::UpdatePending,
+            S::Rejected,
+            S::PublishedNotOnDisk,
+            S::PublishedNowFailsGate,
+        ] {
+            assert_eq!(segment_of(s), "published", "{s:?}");
+        }
+    }
+
+    #[test]
+    fn own_frames_cover_every_linked_light_with_segment_night_camera_and_kinds() {
+        let (_d, ctx) = test_ctx();
+        let set_id = {
+            let db = crate::api::db(&ctx).unwrap();
+            let conn = db.conn();
+            cached_project(&conn);
+            let (set_id, ids) =
+                seed_set(&conn, "M101 set", "14 03 12", "+54 20 56", 210.8, 54.35, 3);
+            // Attested (F5): skips the calibration-link precondition, so the
+            // only remaining gate failure is the trailed threshold rule below
+            // — an unattested set would ALSO fail every frame on "no
+            // calibration links" (linkCalibration ranks before threshold in
+            // BLOCKER_ORDER), confounding the "held ⇒ threshold" assertion.
+            crate::db::collab::set_frames_set_attestation(&conn, set_id, true).unwrap();
+            seed_own_row(&conn, "p-1", "u-pub", ids[2], "published", None, true);
+            set_id
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        let rows = list_project_own_frames(&ctx, "p-1").unwrap();
+        assert_eq!(rows.len(), 3);
+        for r in &rows {
+            assert_eq!(
+                r.night.as_deref(),
+                Some("2026-07-01"),
+                "seed_set's night starts 2026-07-01T20:00Z"
+            );
+            assert_eq!(r.camera, "ASI2600MM");
+            assert_eq!(r.set_id, Some(set_id));
+            assert_eq!(r.set_name.as_deref(), Some("M101 set"));
+        }
+        // Frame 1 is trailed in seed_set → held with a threshold failure.
+        let held = rows
+            .iter()
+            .find(|r| r.segment == "held")
+            .expect("a held row");
+        assert_eq!(held.failures[0].kind, "threshold");
+        // The frame with an own published row is in "published" and carries the row's facts.
+        let published = rows
+            .iter()
+            .find(|r| r.frame_uuid.as_deref() == Some("u-pub"))
+            .unwrap();
+        assert_eq!(published.segment, "published");
+        assert_eq!(published.pub_state.as_deref(), Some("published"));
+        assert!(published.published_at.is_some());
+    }
+
+    #[test]
+    fn a_frame_with_no_night_falls_back_to_date_obs() {
+        // Detach the frame from its session and check
+        // night = DATE(date_obs,'-12 hours'). Exercises `frame_facts`
+        // directly rather than the full `list_project_own_frames` pipeline:
+        // a frame that reaches that pipeline at all is, by construction, a
+        // `union_light_frames` hit — the SAME session_members → sessions →
+        // imaging_nights join `frame_facts`'s correlated subquery uses for
+        // the night — so a project-gate candidate always has a
+        // session-derived night; the COALESCE fallback below is real (the
+        // global-constraints night rule, shared with other night lookups
+        // that don't gate candidacy through a session join) but unreachable
+        // from THIS entry point once a frame is detached from every session,
+        // since it then drops out of the gate's candidate set entirely.
+        let (_d, ctx) = test_ctx();
+        let db = crate::api::db(&ctx).unwrap();
+        let conn = db.conn();
+        let (_set_id, ids) = seed_set(&conn, "S", "14 03 12", "+54 20 56", 210.8, 54.35, 1);
+        conn.execute("DELETE FROM session_members WHERE frame_id = ?1", [ids[0]])
+            .unwrap();
+        conn.execute(
+            "UPDATE frames SET date_obs = '2026-07-02T03:30:00' WHERE id = ?1",
+            [ids[0]],
+        )
+        .unwrap();
+        let facts = frame_facts(&conn, &ids).unwrap();
+        assert_eq!(facts[&ids[0]].night.as_deref(), Some("2026-07-01"));
     }
 
     /// `FrameSetProjectLink.publishing_here` (spec §8.2, amendment A6) is

@@ -307,6 +307,18 @@ pub async fn list_collab_frames(
         .map_err(api_err)
 }
 
+/// One row per LIGHT frame of the project's linked sets (spec 2026-09-29
+/// §5.1) — the project page's "My frames" tab.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn list_project_own_frames(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<Vec<api::OwnFrameRow>>, (axum::http::StatusCode, String)> {
+    api::list_project_own_frames(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
 /// the hub never learns of it). The live exchange re-reads the project's need
 /// set at once.

@@ -507,6 +507,7 @@ pub fn run() {
             commands::publish_collab_frames,
             commands::republish_collab_frames,
             commands::list_collab_frames,
+            commands::list_project_own_frames,
             commands::set_project_auto_replicate,
             commands::set_project_auto_publish,
             commands::set_collab_publishing_device,

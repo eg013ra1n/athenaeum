@@ -6,7 +6,7 @@ use std::sync::Arc;
 use athenaeum_core::api::collab as api;
 use athenaeum_core::api::collab::{
     FilterMappingEdit, FilterMappingSheet, GateReport, LinkSuggestion, ModerationFrameView,
-    PortalNewProjectLink, ProjectCard, ProjectDetail, PublishResult,
+    OwnFrameRow, PortalNewProjectLink, ProjectCard, ProjectDetail, PublishResult,
 };
 use athenaeum_core::api::collab_exchange as exchange;
 use athenaeum_core::api::collab_exchange::ProjectFrameView;
@@ -161,8 +161,23 @@ pub async fn list_collab_frames(
     project_id: String,
     with_contributor_state: Option<bool>,
 ) -> Result<Vec<ProjectFrameView>, String> {
-    surface::list_collab_frames(&state.ctx, &project_id, with_contributor_state.unwrap_or(false))
-        .map_err(|e| e.to_string())
+    surface::list_collab_frames(
+        &state.ctx,
+        &project_id,
+        with_contributor_state.unwrap_or(false),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// One row per LIGHT frame of the project's linked sets (spec 2026-09-29
+/// §5.1) — the project page's "My frames" tab.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_project_own_frames(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<OwnFrameRow>, String> {
+    api::list_project_own_frames(&state.ctx, &project_id).map_err(|e| e.to_string())
 }
 
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
