@@ -647,10 +647,33 @@ describe('ProjectDetail gate blockers (GateBlockers wiring)', () => {
     });
   });
 
-  it('re-fetches the gate when plate-solve-complete fires', async () => {
-    mockCommands(projectCard());
+  it('re-fetches the gate when plate-solve-complete fires, after this page started a solve', async () => {
+    mockCommands(projectCard(), {
+      evaluate_collab_gate: () =>
+        Promise.resolve(
+          gateFixture({
+            blockers: [{ kind: 'solve', frames: 1, sets: [], names: [] }],
+            rows: [
+              {
+                frameId: 7,
+                filename: 'a.fits',
+                fwhmArcsec: null,
+                eccentricity: null,
+                starsDetected: null,
+                trailed: null,
+                publishable: false,
+                failures: ['unknown pixel scale'],
+              } as FrameGateRow,
+            ],
+          }),
+        ),
+    });
     renderProjectDetail();
-    await screen.findByRole('heading', { name: /M42 Mosaic/ });
+    const btn = await screen.findByRole('button', { name: /Solve 1 frames?/ });
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('plate_solve_batch', { frameIds: [7] }),
+    );
     const before = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
     act(() => {
       listeners['plate-solve-complete']?.({});
@@ -659,6 +682,67 @@ describe('ProjectDetail gate blockers (GateBlockers wiring)', () => {
       const after = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
       expect(after).toBeGreaterThan(before);
     });
+  });
+
+  it('final-review minor: plate-solve-complete is a global event — it does not re-fetch this page\'s gate when this page never started a solve', async () => {
+    mockCommands(projectCard());
+    renderProjectDetail();
+    await screen.findByRole('heading', { name: /M42 Mosaic/ });
+    const before = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
+    act(() => {
+      listeners['plate-solve-complete']?.({});
+    });
+    // No `await waitFor` for a positive assertion here — give any (wrongly)
+    // scheduled re-fetch a tick to land, then assert it did not.
+    await new Promise((r) => setTimeout(r, 0));
+    const after = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
+    expect(after).toBe(before);
+  });
+
+  it('final-review minor: a failed Solve invoke notifies', async () => {
+    mockCommands(projectCard(), {
+      evaluate_collab_gate: () =>
+        Promise.resolve(
+          gateFixture({
+            blockers: [{ kind: 'solve', frames: 1, sets: [], names: [] }],
+            rows: [
+              {
+                frameId: 7,
+                filename: 'a.fits',
+                fwhmArcsec: null,
+                eccentricity: null,
+                starsDetected: null,
+                trailed: null,
+                publishable: false,
+                failures: ['unknown pixel scale'],
+              } as FrameGateRow,
+            ],
+          }),
+        ),
+      plate_solve_batch: () => Promise.reject(new Error('solver unavailable')),
+    });
+    renderProjectDetail();
+    const btn = await screen.findByRole('button', { name: /Solve 1 frames?/ });
+    fireEvent.click(btn);
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Could not start the solve');
+  });
+
+  it('final-review minor: a failed Analyze invoke notifies', async () => {
+    mockCommands(projectCard(), {
+      evaluate_collab_gate: () =>
+        Promise.resolve(
+          gateFixture({ blockers: [{ kind: 'analyze', frames: 2, sets: [42], names: [] }] }),
+        ),
+      analyze_frame_set: () => Promise.reject(new Error('analysis unavailable')),
+    });
+    renderProjectDetail();
+    const btn = await screen.findByRole('button', { name: 'Analyze' });
+    fireEvent.click(btn);
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Could not start the analysis');
   });
 });
 

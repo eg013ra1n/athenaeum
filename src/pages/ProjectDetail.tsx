@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { ExternalLink, Loader2, Monitor, Plus, RefreshCw, Send, Target } from 'lucide-react';
 import { api } from '../api';
@@ -139,6 +139,11 @@ export default function ProjectDetail() {
   const [mapOpen, setMapOpen] = useState(false);
   const [solveBusy, setSolveBusy] = useState(false);
   const [analyzeBusy, setAnalyzeBusy] = useState<Set<number>>(new Set());
+  // `plate-solve-complete` is a global event — plate solving can be kicked
+  // off from other pages too. Only clear `solveBusy` when THIS page is the
+  // one that started it, or an unrelated solve elsewhere would wrongly mark
+  // this page's batch done.
+  const solveStartedHereRef = useRef(false);
 
   // The gate is evaluated locally over the linked sets, in its own try so a
   // gate failure never masquerades as "project not found" — keep the detail
@@ -202,6 +207,8 @@ export default function ProjectDetail() {
     let unlisten: (() => void) | undefined;
     api.listen('plate-solve-complete', () => {
       if (cancelled) return;
+      if (!solveStartedHereRef.current) return;
+      solveStartedHereRef.current = false;
       setSolveBusy(false);
       void loadGate();
     })
@@ -210,11 +217,21 @@ export default function ProjectDetail() {
     return () => { cancelled = true; unlisten?.(); };
   }, [loadGate]);
 
-  const loadFrames = useCallback(async () => {
+  // I1: `withContributorState` runs the full project gate plus a per-own-row
+  // recipe read under the catalog lock — worth it for the Contribute tab's
+  // own-frame chip, wasted work for `ReceiveTab`'s landed-event reloads
+  // (up to once a second). Callers state which they need; the default is the
+  // cheap path.
+  const loadFrames = useCallback(async (withContributorState = false) => {
     if (!id) return;
     setFramesError(false);
     try {
-      setFrames(await api.invoke<ProjectFrameView[]>('list_collab_frames', { projectId: id }));
+      setFrames(
+        await api.invoke<ProjectFrameView[]>('list_collab_frames', {
+          projectId: id,
+          withContributorState,
+        }),
+      );
     } catch (err) {
       console.error('[projects] list frames failed:', err);
       setFramesError(true);
@@ -226,8 +243,8 @@ export default function ProjectDetail() {
   }, [load]);
 
   useEffect(() => {
-    void loadFrames();
-  }, [loadFrames]);
+    void loadFrames(tab === 'contribute');
+  }, [loadFrames, tab]);
 
   const openPortal = async (path: string) => {
     if (!detail) return;
@@ -313,7 +330,7 @@ export default function ProjectDetail() {
       const res = await api.invoke<PublishResult>('publish_collab_frames', { projectId: id });
       setPublishConfirm(false);
       setRefusedBy(heldForPublishingDevice(res));
-      await loadFrames();
+      await loadFrames(true);
       await load();
     } catch (err) {
       // S6 — a failed publish surfaces inline AND as a toast, never silently
@@ -362,7 +379,7 @@ export default function ProjectDetail() {
       const res = await api.invoke<PublishResult>('republish_collab_frames', { projectId: id });
       setRepublishConfirm(false);
       setRefusedBy(heldForPublishingDevice(res));
-      await loadFrames();
+      await loadFrames(true);
       await load();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -562,11 +579,23 @@ export default function ProjectDetail() {
                   onOpenCalibration={(setId) => navigate(`/objects/${setId}?tab=calibration`)}
                   onSolve={async (ids) => {
                     setSolveBusy(true);
+                    solveStartedHereRef.current = true;
                     try {
                       await api.invoke('plate_solve_batch', { frameIds: ids });
                     } catch (err) {
                       console.error('[projects] solve failed:', err);
+                      solveStartedHereRef.current = false;
                       setSolveBusy(false);
+                      const msg = err instanceof Error ? err.message : String(err);
+                      notify({
+                        title: 'Could not start the solve',
+                        detail: msg,
+                        kind: 'project',
+                        tone: 'warning',
+                        hasErrors: true,
+                        link: `/projects/${id}`,
+                        dedupeKey: `solve-failed-${id}-${Date.now()}`,
+                      });
                     }
                   }}
                   onAnalyze={async (setId) => {
@@ -579,6 +608,16 @@ export default function ProjectDetail() {
                         const n = new Set(s);
                         n.delete(setId);
                         return n;
+                      });
+                      const msg = err instanceof Error ? err.message : String(err);
+                      notify({
+                        title: 'Could not start the analysis',
+                        detail: msg,
+                        kind: 'project',
+                        tone: 'warning',
+                        hasErrors: true,
+                        link: `/projects/${id}`,
+                        dedupeKey: `analyze-failed-${id}-${Date.now()}`,
                       });
                     }
                   }}
@@ -704,6 +743,9 @@ export default function ProjectDetail() {
           onSaved={(r) => {
             setGate(r);
             setMapOpen(false);
+            // I1 (final-review minor 10): a mapping can change which own
+            // frames pass the gate — reload so their chips are not stale.
+            void loadFrames(true);
           }}
         />
       )}

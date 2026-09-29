@@ -52,10 +52,18 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
     const out: FilterMappingEdit[] = [];
     for (const r of sheet.rows) {
       const c = choice[key(r)] ?? '';
-      // The user explicitly picked "— automatic —": always send null. It is
-      // a genuine delete for a `mapped`/`mappedToMissing` row and a harmless
-      // no-op for a `matched` row with nothing stored.
-      if (c === AUTO) { out.push({ instrume: r.instrume, filterRaw: r.filterRaw, canonical: null }); continue; }
+      // The user explicitly picked "— automatic —": a genuine delete for a
+      // `mapped`/`mappedToMissing` row (there is a real mapping to clear),
+      // but a `matched` row already resolves through the dictionary alone
+      // with nothing stored — sending it anyway is harmless (an idempotent
+      // no-op delete) but must not count as a pending change, or Save would
+      // light up for a no-op edit.
+      if (c === AUTO) {
+        if (r.resolution !== 'matched') {
+          out.push({ instrume: r.instrume, filterRaw: r.filterRaw, canonical: null });
+        }
+        continue;
+      }
       if (c === '') continue; // no choice on an unresolved row: not sent
       // The row's current effective value with nothing chosen: `null` only
       // when nothing is resolved yet (`unmapped`).
@@ -70,7 +78,11 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
     setError(null);
     try {
       const report = await api.invoke<GateReport>('set_collab_filter_mappings', { projectId, mappings: edits });
-      notify({ title: 'Filter mappings saved', detail: `${report.publishable} frames now pass the gate`, kind: 'project', tone: 'success' });
+      // `GateReport` carries only the absolute `publishable` count, not a
+      // "newly passing" delta — word it as a plain count, not as a change,
+      // and pluralize correctly (it was always "frames", even for 1).
+      const n = report.publishable;
+      notify({ title: 'Filter mappings saved', detail: `${n} frame${n === 1 ? '' : 's'} pass the gate`, kind: 'project', tone: 'success' });
       onSaved(report);
     } catch (err) {
       console.error('[projects] set_collab_filter_mappings failed:', err);
@@ -94,7 +106,10 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
         onChange={(e) => setChoice({ ...choice, [key(r)]: e.target.value })}
       >
         {r.resolution !== 'mapped' && r.resolution !== 'matched' && <option value="">— choose —</option>}
-        {(r.resolution === 'mapped' || r.resolution === 'matched') && <option value={AUTO}>— automatic —</option>}
+        {/* `mappedToMissing`'s stored canonical is no longer in this
+            project's dictionary — "— automatic —" is how the user deletes
+            that stale mapping instead of having to pick a replacement. */}
+        {r.resolution !== 'unmapped' && <option value={AUTO}>— automatic —</option>}
         {sheet!.dictionary.map((d) => (
           <option key={d.canonical} value={d.canonical}>{d.canonical} · {d.kind}</option>
         ))}

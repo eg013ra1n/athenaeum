@@ -76,7 +76,14 @@ export default function GateBlockers({
   if (shown.length === 0) return null;
   const calBlockers = gate.blockers.filter((b) => b.kind === 'linkCalibration' || b.kind === 'buildMasters');
   const calSets = Array.from(new Set(calBlockers.flatMap((b) => b.sets)));
-  const calFrames = calBlockers.reduce((n, b) => Math.max(n, b.frames), 0);
+  // `linkCalibration` and `buildMasters` count DISJOINT frame sets (a frame
+  // is either unlinked or linked-but-masterless, never counted under both),
+  // so the max of the two undercounts whenever both are non-empty. The
+  // backend's `attest` blocker (`derive_blockers`, `collab/gate.rs`) is added
+  // alongside EITHER of them and carries the true union — use it, falling
+  // back to the max only if it is somehow absent.
+  const attestBlocker = gate.blockers.find((b) => b.kind === 'attest');
+  const calFrames = attestBlocker?.frames ?? calBlockers.reduce((n, b) => Math.max(n, b.frames), 0);
   const solveIds = gate.rows.filter((r) => r.failures.some((f) => SOLVE_REASONS.has(f))).map((r) => r.frameId);
 
   const setPicker = (
@@ -102,6 +109,10 @@ export default function GateBlockers({
                   className="block w-full rounded px-2 py-1 text-left hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
                   onClick={() => { if (isBusy(s)) return; setMenuFor(null); pick(s); }}
                 >
+                  {/* `GateBlocker.sets` (models.ts) is `Array<number>` — ids
+                      only, no name. Showing the set's actual name here would
+                      need the backend to carry it; no backend change this
+                      wave, so `Set #id` stays until it does. */}
                   Set #{s}{isBusy(s) ? ' (busy…)' : ''}
                 </button>
               </li>

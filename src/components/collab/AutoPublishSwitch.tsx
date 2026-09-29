@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { api } from '../../api';
+import { Checkbox } from '../settings/Checkbox';
 
 /**
  * Collab v3 wave 2 Task 10 (R16, P13), moved into its own component in the
@@ -42,24 +43,14 @@ export default function AutoPublishSwitch({
   };
 
   return (
-    <div className="space-y-1">
-      <label className="flex max-w-xl cursor-pointer items-start gap-2.5">
-        <input
-          type="checkbox"
-          checked={enabled}
-          disabled={saving}
-          onChange={(e) => void setEnabled(e.target.checked)}
-          className="mt-0.5 h-4 w-4 rounded border-border bg-surface-hover text-accent focus:ring-accent disabled:opacity-50"
-        />
-        <span>
-          <span className="block text-sm font-medium text-content-secondary">
-            Auto-publish my frames
-          </span>
-          <span className="mt-0.5 block text-xs text-content-muted">
-            Passing frames publish automatically as scans, analysis and links change.
-          </span>
-        </span>
-      </label>
+    <div className="max-w-xl space-y-1">
+      <Checkbox
+        checked={enabled}
+        onChange={(checked) => void setEnabled(checked)}
+        disabled={saving}
+        label="Auto-publish my frames"
+        description="Passing frames publish automatically as scans, analysis and links change."
+      />
       {error && <p className="text-sm text-error">{error}</p>}
     </div>
   );

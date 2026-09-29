@@ -22,6 +22,16 @@ pub struct ProjectIdArgs {
     project_id: String,
 }
 
+/// I1: `withContributorState` (default `false`) opts into the own-row
+/// contributor chip — see `list_collab_frames`'s doc comment.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListCollabFramesArgs {
+    project_id: String,
+    #[serde(default)]
+    with_contributor_state: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLinkArgs {
@@ -290,9 +300,9 @@ pub async fn republish_collab_frames(
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_collab_frames(
     State(state): State<WebAppState>,
-    Json(args): Json<ProjectIdArgs>,
+    Json(args): Json<ListCollabFramesArgs>,
 ) -> Result<Json<Vec<exchange::ProjectFrameView>>, (axum::http::StatusCode, String)> {
-    surface::list_collab_frames(&state.ctx, &args.project_id)
+    surface::list_collab_frames(&state.ctx, &args.project_id, args.with_contributor_state)
         .map(Json)
         .map_err(api_err)
 }

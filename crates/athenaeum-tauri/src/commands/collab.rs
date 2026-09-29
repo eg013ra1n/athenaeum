@@ -149,14 +149,20 @@ pub async fn republish_collab_frames(
 }
 
 /// Every cached frame of a project (cache-only — no hub call), with its local
-/// state and the live holder counts.
+/// state and the live holder counts. `with_contributor_state` (I1, default
+/// `false`) opts into the own-row contributor chip, which runs the full
+/// project gate plus a per-own-row recipe read — real work under the catalog
+/// lock. Only the project page's Contribute tab load needs it; the frequent
+/// `collab-frames-landed` reload never should.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn list_collab_frames(
     state: State<'_, AppState>,
     project_id: String,
+    with_contributor_state: Option<bool>,
 ) -> Result<Vec<ProjectFrameView>, String> {
-    surface::list_collab_frames(&state.ctx, &project_id).map_err(|e| e.to_string())
+    surface::list_collab_frames(&state.ctx, &project_id, with_contributor_state.unwrap_or(false))
+        .map_err(|e| e.to_string())
 }
 
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —

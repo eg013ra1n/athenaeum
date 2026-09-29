@@ -61,7 +61,7 @@ describe('FilterMappingDialog', () => {
     });
   });
 
-  it('sends null for a row set back to automatic and disables Save when nothing changed', async () => {
+  it('disables Save when nothing changed, including AUTO on an already-matched row (a no-op)', async () => {
     render(<FilterMappingDialog projectId="p" onClose={vi.fn()} onSaved={vi.fn()} />);
     await waitFor(() => expect(screen.getAllByRole('combobox')).toHaveLength(4));
     const selects = screen.getAllByRole('combobox');
@@ -69,10 +69,28 @@ describe('FilterMappingDialog', () => {
     fireEvent.change(selects[0], { target: { value: '' } });
     fireEvent.change(selects[2], { target: { value: '' } });
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
-    // The matched row → automatic sends null.
+    // The `matched` row already resolves through the dictionary alone —
+    // nothing is stored, so "— automatic —" on it is a no-op and must not
+    // enable Save.
     fireEvent.change(selects[3], { target: { value: '__auto__' } });
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+  });
+
+  it('AUTO on a mappedToMissing row deletes its stale mapping', async () => {
+    render(<FilterMappingDialog projectId="p" onClose={vi.fn()} onSaved={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByRole('combobox')).toHaveLength(4));
+    const selects = screen.getAllByRole('combobox');
+    // Undo the two proposed unresolved rows: no pending change from them.
+    fireEvent.change(selects[0], { target: { value: '' } });
+    // The stale `mappedToMissing` mapping ("Hb", no longer in this project's
+    // dictionary) is cleared back to automatic instead of forcing a pick.
+    fireEvent.change(selects[2], { target: { value: '__auto__' } });
+    expect(screen.getByRole('button', { name: 'Save' })).not.toBeDisabled();
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
-    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('set_collab_filter_mappings', { projectId: 'p', mappings: [{ instrume: 'QHY268M', filterRaw: 'L', canonical: null }] }));
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('set_collab_filter_mappings', {
+      projectId: 'p',
+      mappings: [{ instrume: 'ASI294MM Pro', filterRaw: 'H', canonical: null }],
+    }));
   });
 
   it('shows the sheet refusal inline', async () => {
