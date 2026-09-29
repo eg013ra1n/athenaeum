@@ -632,6 +632,15 @@ pub(crate) fn median(values: &mut Vec<f64>) -> Option<f64> {
 /// when the display name is unique among members AND appears exactly once
 /// in the hub's last-seen cache — otherwise `None` (never another member's
 /// time).
+///
+/// Fix round 1 (review, plan-mandated for the 78-member / 10k-frame target):
+/// a single pass over `published` builds every member's contribution and
+/// holdings at once — `device → account` resolved from a map built once, and
+/// [`ProjectHolders::claimants`] called ONCE per published row (not once per
+/// `(member, row)` pair, which was O(members × frames × devices) with a
+/// fresh allocating, sorting `Vec` per call). A member with two devices that
+/// both claim the same frame is still counted once — `counted` dedupes by
+/// account per row, the same behavior the old per-member `.any()` had.
 pub fn get_collab_member_summary(
     ctx: &ServiceContext,
     project_id: &str,
@@ -668,31 +677,49 @@ pub fn get_collab_member_summary(
             }
         };
 
-    let mut out = Vec::with_capacity(members.len());
-    for m in &members {
-        let mine: Vec<&&LocalFrameRow> = published
-            .iter()
-            .filter(|r| r.publisher_account_id == m.account_id)
-            .collect();
-        let mut seconds: BTreeMap<String, f64> = BTreeMap::new();
-        let mut quality: BTreeMap<(String, String), (i64, Vec<f64>, Vec<f64>)> = BTreeMap::new();
-        for r in &mine {
-            let Some(w) = crate::api::collab_exchange::parse_manifest_wire(
-                project_id,
-                &r.frame_uuid,
-                &r.manifest_json,
-                "member_summary",
-            ) else {
-                continue;
-            };
-            *seconds.entry(r.filter_canonical.clone()).or_default() += w.exptime_sec;
+    // device → account, built once so the holds pass below never re-walks
+    // every member's `nodes` per published row.
+    let device_account: HashMap<&str, &str> = members
+        .iter()
+        .flat_map(|m| {
+            m.nodes
+                .iter()
+                .map(move |n| (n.as_str(), m.account_id.as_str()))
+        })
+        .collect();
+
+    #[derive(Default)]
+    struct Contribution {
+        published_frames: i64,
+        seconds_by_filter: BTreeMap<String, f64>,
+        quality: BTreeMap<(String, String), (i64, Vec<f64>, Vec<f64>)>,
+    }
+    // account → its published contribution, and account → its (holds_frames,
+    // holds_bytes) — both filled by the ONE pass over `published` below.
+    let mut contribution: HashMap<&str, Contribution> = HashMap::new();
+    let mut holds: HashMap<&str, (i64, i64)> = HashMap::new();
+    for r in &published {
+        let c = contribution
+            .entry(r.publisher_account_id.as_str())
+            .or_default();
+        c.published_frames += 1;
+        if let Some(w) = crate::api::collab_exchange::parse_manifest_wire(
+            project_id,
+            &r.frame_uuid,
+            &r.manifest_json,
+            "member_summary",
+        ) {
+            *c.seconds_by_filter
+                .entry(r.filter_canonical.clone())
+                .or_default() += w.exptime_sec;
             let camera = w
                 .meta
                 .get("instrume")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let e = quality
+            let e = c
+                .quality
                 .entry((camera, r.filter_canonical.clone()))
                 .or_default();
             e.0 += 1;
@@ -707,18 +734,29 @@ pub fn get_collab_member_summary(
                 e.2.push(x);
             }
         }
-        let (mut holds_frames, mut holds_bytes) = (0i64, 0i64);
-        for r in &published {
-            let Some(seq) = r.frame_seq else { continue };
-            if holders
-                .claimants(seq, r.content_version)
-                .iter()
-                .any(|d| m.nodes.iter().any(|n| n == d))
-            {
-                holds_frames += 1;
-                holds_bytes += r.byte_size;
+
+        let Some(seq) = r.frame_seq else { continue };
+        let mut counted: HashSet<&str> = HashSet::new();
+        for device in holders.claimants(seq, r.content_version) {
+            let Some(&account) = device_account.get(device) else {
+                continue;
+            };
+            if counted.insert(account) {
+                let h = holds.entry(account).or_insert((0, 0));
+                h.0 += 1;
+                h.1 += r.byte_size;
             }
         }
+    }
+    let published_total = published.len() as f64;
+
+    let mut out = Vec::with_capacity(members.len());
+    for m in &members {
+        let c = contribution
+            .remove(m.account_id.as_str())
+            .unwrap_or_default();
+        let (holds_frames, holds_bytes) =
+            holds.get(m.account_id.as_str()).copied().unwrap_or((0, 0));
         let online = presence
             .as_ref()
             .is_some_and(|(p, _)| m.nodes.iter().any(|d| p.is_connected(project_id, d)));
@@ -756,9 +794,10 @@ pub fn get_collab_member_summary(
                 .collect(),
             online,
             last_seen_at,
-            published_frames: mine.len() as i64,
-            seconds_by_filter: seconds,
-            quality_by_camera: quality
+            published_frames: c.published_frames,
+            seconds_by_filter: c.seconds_by_filter,
+            quality_by_camera: c
+                .quality
                 .into_iter()
                 .map(|((camera, filter), (frames, mut f, mut e))| CameraQuality {
                     camera,
@@ -770,10 +809,10 @@ pub fn get_collab_member_summary(
                 .collect(),
             holds_frames,
             holds_bytes,
-            holds_share: if published.is_empty() {
+            holds_share: if published_total == 0.0 {
                 0.0
             } else {
-                holds_frames as f64 / published.len() as f64
+                holds_frames as f64 / published_total
             },
         });
     }
@@ -2151,6 +2190,61 @@ mod tests {
         }
         let s = get_collab_member_summary(&ctx, pid).unwrap();
         assert!(s.iter().all(|m| m.last_seen_at.is_none()));
+    }
+
+    /// Fix round 1 (review, plan-mandated): a member with TWO devices that
+    /// both claim the same current-version frame is counted once — the
+    /// single-pass rewrite's per-row `counted` dedup must match the old
+    /// per-member `.any()` behavior exactly.
+    #[tokio::test]
+    async fn a_members_two_devices_claiming_the_same_frame_count_it_once() {
+        let (_d, ctx, _hub) = ts::signed_in_rig().await;
+        let pid = ts::PID;
+        {
+            let db = crate::api::db(&ctx).unwrap();
+            let conn = db.conn();
+            seed_project_with_members(&conn, pid, &[("acc-anna", "Anna", &["AAA=", "AA2="])]);
+            seed_replica_row_full(
+                &conn,
+                pid,
+                "u1",
+                1,
+                1,
+                "acc-anna",
+                "Ha",
+                300.0,
+                "ASI6200",
+                2.0,
+                100_000_000,
+                "published",
+                true,
+            );
+            live_db::replace_holders(
+                &conn,
+                pid,
+                &[
+                    live_db::HolderDeviceRow {
+                        device: "AAA=".into(),
+                        display_name: "anna-obs".into(),
+                        relay_url: None,
+                    },
+                    live_db::HolderDeviceRow {
+                        device: "AA2=".into(),
+                        display_name: "anna-phone".into(),
+                        relay_url: None,
+                    },
+                ],
+                &[("AAA=".to_string(), 1, 1), ("AA2=".to_string(), 1, 1)],
+            )
+            .unwrap();
+        }
+        let s = get_collab_member_summary(&ctx, pid).unwrap();
+        let anna = s.iter().find(|m| m.display_name == "Anna").unwrap();
+        assert_eq!(
+            (anna.holds_frames, anna.holds_bytes),
+            (1, 100_000_000),
+            "both devices claim u1 — counted once, not twice"
+        );
     }
 
     #[test]
