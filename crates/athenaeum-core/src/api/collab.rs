@@ -6863,6 +6863,37 @@ pub(crate) mod tests {
         }
     }
 
+    /// Fix round 1: the page extras flow end to end through a refresh, driven
+    /// by the fake hub rather than a hand-mocked `/projects/{id}` body — this
+    /// is the only test that exercises the fake hub's D8 caller gate
+    /// (`lastSeenAt` filled only for a fetch that is both authenticated AND a
+    /// current member) via the real `fetch_one_project` call site.
+    #[tokio::test]
+    async fn refresh_caches_goals_and_member_last_seen_through_the_fake_hub() {
+        let hub = crate::collab::fake_hub::FakeHub::start().await;
+        hub.add_account("tok", "acc-1", "Anna", "dev-1-pubkey", None);
+        hub.add_project("p-1", "m101", &[("acc-1", "send_receive", true)], false);
+        hub.set_goals("p-1", serde_json::json!({"Ha": 7200}));
+        hub.set_last_seen("p-1", "Anna", "2026-09-27T08:30:00Z");
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &hub.uri());
+
+        refresh_projects(&ctx).await.unwrap();
+
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        let (goals, seen) = crate::db::collab::page_extras(&conn, "p-1").unwrap();
+        assert_eq!(goals.as_deref(), Some(r#"{"Ha":7200}"#));
+        let seen: Vec<MemberSeen> = serde_json::from_str(&seen).unwrap();
+        assert_eq!(
+            seen,
+            vec![MemberSeen {
+                display_name: "Anna".into(),
+                last_seen_at: Some("2026-09-27T08:30:00Z".into())
+            }]
+        );
+    }
+
     // ── Publish (Task 7) ─────────────────────────────────────────────────────
 
     use wiremock::matchers::{method as wm_method, path as wm_path};

@@ -2072,7 +2072,10 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
         ("GET", ["collab", "pubkey"]) => {
             return ok(json!({ "pubkey": B64.encode(key.verifying_key().to_bytes()) }))
         }
-        ("GET", ["projects", pid]) => return project_page(st, pid),
+        ("GET", ["projects", pid]) => {
+            let caller = bearer(req).and_then(|t| st.tokens.get(&t).cloned());
+            return project_page(st, pid, caller.as_ref());
+        }
         (_, ["announcements", ..])
         | (_, ["projects", _, "announcements", ..])
         | (_, ["projects", _, "have"])
@@ -2116,16 +2119,26 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
     }
 }
 
-fn project_page(st: &FakeHubState, pid: &str) -> ResponseTemplate {
+/// `caller` is the resolved bearer account, if the request carried one (a
+/// valid token, whether or not it belongs to a member of `pid`) — `None` for
+/// an anonymous fetch. Spec 2026-09-29 D8: `lastSeenAt` is filled ONLY when
+/// the caller is a CURRENT member of `pid`; every other viewer (anonymous or
+/// a member of some other project) sees `null` for every member, exactly
+/// like the goals-carrying page an outsider gets. Goals stay public either
+/// way — D8 only gates `lastSeenAt`.
+fn project_page(st: &FakeHubState, pid: &str, caller: Option<&FakeAccount>) -> ResponseTemplate {
     let Some(p) = st.projects.get(pid) else {
         return not_found_project();
     };
+    let caller_is_member = caller.is_some_and(|a| p.member(&a.account_id).is_some());
     let members: Vec<Value> = p
         .members
         .iter()
         .map(|m| {
             let display_name = st.display_of(&m.account_id);
-            let last_seen_at = st.last_seen.get(&(pid.to_string(), display_name.clone()));
+            let last_seen_at = caller_is_member
+                .then(|| st.last_seen.get(&(pid.to_string(), display_name.clone())))
+                .flatten();
             json!({
                 "displayName": display_name,
                 "dataRole": m.data_role,
