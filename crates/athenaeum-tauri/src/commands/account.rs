@@ -2,6 +2,8 @@
 // Business logic lives in `athenaeum_core::api::account`; mirrors the Axum
 // routes in `crates/athenaeum-web/src/routes/account.rs`.
 
+use std::sync::Arc;
+
 use tauri::State;
 
 use athenaeum_core::account::{AccountDevice, AccountStatus};
@@ -20,13 +22,21 @@ pub async fn account_sign_in_start(state: State<'_, AppState>, email: String) ->
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn account_sign_in_verify(
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     email: String,
     code: String,
 ) -> Result<AccountStatus, String> {
-    api::sign_in_verify(&state.ctx, email, code)
+    let status = api::sign_in_verify(&state.ctx, email, code)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    athenaeum_core::api::sync::spawn_autostart_after_sign_in(
+        Arc::clone(&state.ctx),
+        Arc::clone(&state.sync),
+        Arc::clone(&state.sync_sender),
+        Arc::new(crate::tauri_events::TauriProgressEmitter(app_handle)),
+    );
+    Ok(status)
 }
 
 /// This device's account state (offline-resolvable).

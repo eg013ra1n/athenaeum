@@ -1431,6 +1431,28 @@ pub async fn autostart_if_enabled(
 /// OR this device being signed in (any Athenaeum node — no role gate). Factored
 /// out for a fast, network-free unit test of the exact matrix (task A7
 /// fix-review, broadened in sync Phase 2A).
+/// Sign-in is the other moment [`autostart_gate`] can flip to `true`: a device
+/// that started signed out never ran the boot autostart, so without this the
+/// transport — and the collab live exchange armed with it — stayed down until
+/// the next launch ("Collaboration is off" right after signing in). A sign-out
+/// followed by a sign-in re-arms the live exchange the same way. Fire-and-forget
+/// like the boot sites; idempotent, so an already-running node only re-arms
+/// what is missing.
+pub fn spawn_autostart_after_sign_in(
+    ctx: Arc<ServiceContext>,
+    sync: Arc<SyncRuntime>,
+    sync_sender: Arc<SyncSenderRuntime>,
+    emitter: Arc<dyn ProgressEmitter>,
+) {
+    tokio::spawn(async move {
+        match autostart_if_enabled(ctx, sync, sync_sender, emitter).await {
+            Ok(true) => tracing::info!("personal sync receiver started after sign-in"),
+            Ok(false) => tracing::warn!("signed in but the sync autostart gate stayed closed"),
+            Err(e) => tracing::error!(error = %e, "sync autostart after sign-in failed"),
+        }
+    });
+}
+
 fn autostart_gate(dev: bool, signed_in: bool) -> bool {
     dev || signed_in
 }

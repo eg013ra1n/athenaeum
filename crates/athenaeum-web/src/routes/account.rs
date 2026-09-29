@@ -2,6 +2,8 @@
 // Business logic lives in `athenaeum_core::api::account`; mirrors the Tauri
 // commands in `crates/athenaeum-tauri/src/commands/account.rs`.
 
+use std::sync::Arc;
+
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 
@@ -55,10 +57,16 @@ pub async fn account_sign_in_verify(
     State(state): State<WebAppState>,
     Json(req): Json<SignInVerifyReq>,
 ) -> Result<Json<AccountStatus>, (StatusCode, String)> {
-    api::sign_in_verify(&state.ctx, req.email, req.code)
+    let status = api::sign_in_verify(&state.ctx, req.email, req.code)
         .await
-        .map(Json)
-        .map_err(api_err)
+        .map_err(api_err)?;
+    athenaeum_core::api::sync::spawn_autostart_after_sign_in(
+        Arc::clone(&state.ctx),
+        Arc::clone(&state.sync),
+        Arc::clone(&state.sync_sender),
+        Arc::new(crate::events::SseProgressEmitter::new(state.event_tx.clone())),
+    );
+    Ok(Json(status))
 }
 
 /// POST /api/account_status
