@@ -1658,6 +1658,7 @@ pub(crate) async fn fetch_collection_multi(
                         // out so this literal reads as the collection path.
                         alpn: iroh_blobs::ALPN,
                         fail_mode: FailMode::FailFast,
+                        delivered: None,
                     },
                 )
                 .await?;

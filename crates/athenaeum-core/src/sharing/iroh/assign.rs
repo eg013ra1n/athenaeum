@@ -419,6 +419,11 @@ struct HedgeLedger {
 
 type Ledger = Arc<Mutex<HedgeLedger>>;
 
+/// Byte deltas per (item, provider), exact — unlike `ProviderTelemetrySink`
+/// this is fed from our own transfer loop, not the downloader's sampled
+/// channel. Advisory UI data (spec 2026-09-29 §6.2).
+pub(crate) type DeliveredSink = Arc<dyn Fn(&str, [u8; 32], u64) + Send + Sync>;
+
 /// Knobs for one assignment run.
 #[derive(Clone)]
 pub(crate) struct AssignmentOptions {
@@ -443,6 +448,9 @@ pub(crate) struct AssignmentOptions {
     /// What one item's failure does to the rest of the call.
     /// [`fetch_children_assigned`] forces [`FailMode::FailFast`].
     pub fail_mode: FailMode,
+    /// Fed the exact bytes a transfer just moved, per (item key, provider) —
+    /// `None` for every caller that has no receive-feed UI to keep (Task 10).
+    pub delivered: Option<DeliveredSink>,
 }
 
 /// What one item exhausting its ladder does to the rest of the call.
@@ -724,6 +732,10 @@ pub(crate) struct LiveRunOptions {
     /// The work-unit cap: at a yield, an item larger than this is cut once it
     /// has moved this many bytes since the yield.
     pub unit_cap_bytes: u64,
+    /// Fed the exact bytes a transfer just moved, per (item key, provider) —
+    /// forwarded into every child [`AssignmentOptions`] this run builds
+    /// (Task 10). `None` when nothing downstream wants the receive feed.
+    pub delivered: Option<DeliveredSink>,
 }
 
 #[cfg(test)]
@@ -1292,6 +1304,7 @@ pub(crate) async fn run_live(
         telemetry: Arc::clone(&opts.telemetry),
         alpn: super::COLLAB_BLOBS_ALPN,
         fail_mode: FailMode::Isolate,
+        delivered: opts.delivered.clone(),
     };
     let mut set: tokio::task::JoinSet<ItemOutcome> = tokio::task::JoinSet::new();
     let mut labels: HashMap<tokio::task::Id, ItemLabel> = HashMap::new();
@@ -1685,6 +1698,12 @@ async fn run_child(
         // missing from a different provider; whichever side finishes, the other
         // is dropped, which resets its QUIC stream (see the module doc).
         let primary_progress = Arc::new(AtomicU64::new(0));
+        let on_bytes = opts.delivered.as_ref().map(|sink| {
+            let sink = Arc::clone(sink);
+            let key = item.key.clone();
+            let who = *provider.as_bytes();
+            Arc::new(move |d: u64| sink(&key, who, d)) as Arc<dyn Fn(u64) + Send + Sync>
+        });
         let mut primary: BoxedTransfer = Box::pin(transfer_once(
             dialer.clone(),
             remote.clone(),
@@ -1692,6 +1711,7 @@ async fn run_child(
             missing,
             opts.stall_hard_limit,
             Arc::clone(&primary_progress),
+            on_bytes,
         ));
         let mut hedge: Option<HedgeRun> = None;
         // Set when the primary failed while a hedge was live: the hedge is
@@ -2333,6 +2353,12 @@ async fn try_arm_hedge(
 
     let hedge_provider = claim.provider();
     let progress = Arc::new(AtomicU64::new(0));
+    let on_bytes = opts.delivered.as_ref().map(|sink| {
+        let sink = Arc::clone(sink);
+        let key = item.key.clone();
+        let who = *hedge_provider.as_bytes();
+        Arc::new(move |d: u64| sink(&key, who, d)) as Arc<dyn Fn(u64) + Send + Sync>
+    });
     let fut: BoxedTransfer = Box::pin(transfer_once(
         dialer.clone(),
         remote.clone(),
@@ -2340,6 +2366,7 @@ async fn try_arm_hedge(
         request,
         opts.stall_hard_limit,
         Arc::clone(&progress),
+        on_bytes,
     ));
     {
         let mut l = ledger.lock().expect("hedge ledger mutex poisoned");
@@ -2378,6 +2405,11 @@ async fn try_arm_hedge(
 /// `'static` and can be boxed beside a sibling in a `select!`. In the stall case the
 /// `GetProgress` stream is dropped on the way out, which resets the QUIC stream
 /// — see the module doc's cancellation note for why that is enough.
+///
+/// `on_bytes`, when set, is fed each round's exact byte delta as it is
+/// observed, plus the tail on `Done` — the sum equals `payload_bytes_read`
+/// (Task 10's [`DeliveredSink`] plumbing; `None` for every caller with no
+/// receive feed to keep).
 async fn transfer_once(
     dialer: Dialer,
     remote: Remote,
@@ -2385,6 +2417,7 @@ async fn transfer_once(
     request: GetRequest,
     stall_hard_limit: Duration,
     progress: Arc<AtomicU64>,
+    on_bytes: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 ) -> std::result::Result<Stats, TransferFault> {
     let conn = dial(&dialer, provider).await?;
 
@@ -2403,6 +2436,9 @@ async fn transfer_once(
         match tokio::time::timeout(slice, stream.next()).await {
             Ok(Some(GetProgressItem::Progress(b))) => {
                 if b > last_bytes {
+                    if let Some(f) = &on_bytes {
+                        f(b - last_bytes);
+                    }
                     last_bytes = b;
                     last_growth = Instant::now();
                     // Published so the caller can still read this assignment's
@@ -2412,7 +2448,15 @@ async fn transfer_once(
                     progress.store(b, Ordering::Relaxed);
                 }
             }
-            Ok(Some(GetProgressItem::Done(stats))) => return Ok(stats),
+            Ok(Some(GetProgressItem::Done(stats))) => {
+                if let Some(f) = &on_bytes {
+                    let tail = stats.payload_bytes_read.saturating_sub(last_bytes);
+                    if tail > 0 {
+                        f(tail);
+                    }
+                }
+                return Ok(stats);
+            }
             Ok(Some(GetProgressItem::Error(e))) => {
                 return Err(classify_get_error(&e, last_bytes, provider));
             }

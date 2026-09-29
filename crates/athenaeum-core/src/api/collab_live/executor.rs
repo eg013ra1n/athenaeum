@@ -880,6 +880,9 @@ impl Executor {
                 max_in_flight: Arc::clone(&self.slots),
                 limit_changed: Some(self.slots_tx.subscribe()),
                 unit_cap_bytes: WORK_UNIT_MAX_BYTES,
+                // Wired to the exchange meter in Task 12; this task only adds
+                // the plumbing.
+                delivered: None,
             };
             let store = self.env.store.clone();
             let done = self.done_tx.clone();

@@ -4642,6 +4642,7 @@ fn raw_item_opts(
         telemetry,
         alpn: COLLAB_BLOBS_ALPN,
         fail_mode,
+        delivered: None,
     }
 }
 
@@ -4913,6 +4914,7 @@ async fn hedge_fires_on_raw_items_before_the_stall_ceiling() {
         telemetry,
         alpn: COLLAB_BLOBS_ALPN,
         fail_mode: FailMode::Isolate,
+        delivered: None,
     };
     let collapse = {
         let slow = Arc::clone(&s);
@@ -5139,6 +5141,45 @@ mod live_run {
         assert!(matches!(out, ItemOutcome::Done), "{out:?}");
         assert!(report.total_bytes() > 0);
         assert!(store.blobs().has(rig.hash_of(0)).await.unwrap());
+    }
+
+    /// Task 10: `LiveRunOptions.delivered` is forwarded into every child
+    /// [`crate::sharing::iroh::assign::AssignmentOptions`] `run_live` builds,
+    /// and `transfer_once` feeds it the exact bytes each provider delivered —
+    /// their sum equals what the report records for the run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivered_deltas_sum_to_the_reported_payload_bytes() {
+        let rig = ts::landed_rig(2).await;
+        let me = ts::bare_node().await;
+        ts::pair(&me, &rig.node).await;
+        let store = ts::scratch_store();
+        let provider = rig.node.endpoint_addr().id;
+        let seen: Arc<std::sync::Mutex<Vec<(String, [u8; 32], u64)>>> = Default::default();
+        let sink: crate::sharing::iroh::assign::DeliveredSink = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |k: &str, p: [u8; 32], d: u64| {
+                seen.lock().unwrap().push((k.to_string(), p, d))
+            })
+        };
+        let mut opts = ts::live_opts(2, crate::sharing::noop_provider_telemetry());
+        opts.delivered = Some(sink);
+        let (item0, _c0) = ts::rig_item(&rig, 0, ProviderSet::Fixed(Arc::new(vec![provider])));
+        let (item1, _c1) = ts::rig_item(&rig, 1, ProviderSet::Fixed(Arc::new(vec![provider])));
+        let run = ts::drive_live(
+            &store,
+            ts::live_dialer(&me, &[&rig.node]),
+            vec![item0, item1],
+            opts,
+            async {},
+        )
+        .await;
+        let seen = seen.lock().unwrap();
+        let total: u64 = seen.iter().map(|(_, _, d)| d).sum();
+        assert_eq!(total, run.report.total_bytes());
+        assert!(seen.iter().all(|(_, p, _)| *p == *provider.as_bytes()));
+        let keys: std::collections::BTreeSet<&str> =
+            seen.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert_eq!(keys.len(), 2, "both items reported under their own keys");
     }
 
     /// Task 15 (T12 carry): raising the stream limit takes a queued item at

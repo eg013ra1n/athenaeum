@@ -392,6 +392,7 @@ pub(crate) fn live_opts(
         max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(max_in_flight)),
         limit_changed: None,
         unit_cap_bytes: TEST_UNIT_CAP,
+        delivered: None,
     }
 }
 
