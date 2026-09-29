@@ -1,0 +1,785 @@
+<title>Collab Project Layout</title>
+<style>
+:root{
+  color-scheme: dark;
+  --bg:#2e3440; --elev:#3b4252; --hover:#434c5e; --border:#4c566a; --line:rgba(76,86,106,.55);
+  --text:#eceff4; --text2:#e5e9f0; --muted:#d8dee9; --faint:rgba(216,222,233,.62); --ghost:rgba(216,222,233,.38);
+  --accent:#88c0d0; --accent-h:#81a1c1; --accent-m:#5e81ac;
+  --success:#a3be8c; --success-m:rgba(163,190,140,.22);
+  --warning:#ebcb8b; --warning-m:rgba(235,203,139,.22);
+  --error:#bf616a; --error-m:rgba(191,97,106,.22);
+  --info:#81a1c1; --info-m:rgba(129,161,193,.22);
+  --orange:#d08770; --purple:#b48ead; --teal:#8fbcbb;
+  --note:#ebcb8b;
+  --mono: ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font:13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+select,input[type=text]{font:inherit;color:var(--text);background:var(--elev);border:1px solid var(--border);border-radius:4px;padding:3px 6px;height:26px}
+.app{display:flex;min-height:100%}
+.side{width:56px;flex:none;background:#272c36;border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding-block:12px;gap:6px}
+.side .ico{width:36px;height:36px;border-radius:6px;display:grid;place-items:center;color:var(--faint);font-size:10px;text-align:center;line-height:1.1}
+.side .ico.on{background:var(--elev);color:var(--accent)}
+.main{flex:1;min-width:0;padding:16px 20px 40px}
+.mockbar{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding:6px 10px;border:1px dashed rgba(235,203,139,.45);border-radius:6px;margin-bottom:14px;color:var(--faint);font-size:12px}
+.mockbar b{color:var(--note);font-weight:600;letter-spacing:.04em;text-transform:uppercase;font-size:10.5px}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:5px;overflow:hidden}
+.seg button{padding:3px 10px;color:var(--faint);border-right:1px solid var(--border)}
+.seg button:last-child{border-right:0}
+.seg button.on{background:var(--elev);color:var(--text)}
+.note{border-left:2px solid var(--note);background:rgba(235,203,139,.06);color:var(--faint);padding:6px 10px;font-size:12px;margin:8px 0;border-radius:0 4px 4px 0;max-width:980px}
+.note b{color:var(--note);font-weight:600}
+body.nonotes .note{display:none}
+h1{font-size:17px;font-weight:600;margin:0}
+.head{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px}
+.meta{color:var(--faint);font-size:12px;display:flex;align-items:center;gap:6px}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:1px 8px;border-radius:999px;font-size:11.5px;background:var(--elev);color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
+.live-dot{background:var(--success);box-shadow:0 0 0 3px rgba(163,190,140,.18)}
+.chip{display:inline-flex;align-items:center;gap:4px;padding:0 6px;border-radius:3px;font-size:11px;line-height:18px;white-space:nowrap}
+.c-ok{background:var(--success-m);color:var(--success)}
+.c-warn{background:var(--warning-m);color:var(--warning)}
+.c-err{background:var(--error-m);color:var(--error)}
+.c-info{background:var(--info-m);color:var(--info)}
+.c-mute{background:var(--hover);color:var(--muted)}
+.linkbtn{color:var(--accent)}
+.linkbtn:hover{text-decoration:underline}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:12px;white-space:nowrap}
+.btn:hover{background:var(--hover)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--bg);font-weight:600}
+.btn.pri:hover{background:var(--accent-h)}
+.btn.sm{padding:1px 7px;font-size:11px}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-top:14px;overflow-x:auto}
+.tabs button{padding:8px 14px;color:var(--faint);border-bottom:2px solid transparent;white-space:nowrap;display:inline-flex;gap:6px;align-items:center}
+.tabs button.on{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
+.tabs .cnt{font-size:10.5px;padding:0 5px;border-radius:999px;background:var(--hover);color:var(--muted);font-weight:500}
+.tabs .cnt.w{background:var(--warning-m);color:var(--warning)}
+.panel{padding-top:14px}
+.segs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.segs button{display:flex;flex-direction:column;align-items:flex-start;gap:1px;padding:7px 14px;border:1px solid var(--border);border-radius:6px;min-width:150px;text-align:left}
+.segs button .n{font-size:18px;font-weight:600;color:var(--text)}
+.segs button .l{font-size:12px;color:var(--faint)}
+.segs button.on{border-color:var(--accent);background:rgba(136,192,208,.08)}
+.segs button.on .l{color:var(--accent)}
+.toolbar{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;padding:8px 0}
+.toolbar .lbl{color:var(--faint);font-size:11.5px;margin-right:-4px}
+.fchip{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border:1px solid var(--border);border-radius:999px;font-size:12px;color:var(--muted)}
+.fchip .k{font-size:10.5px;color:var(--faint)}
+.fchip.on{border-color:var(--accent);background:rgba(136,192,208,.12);color:var(--text)}
+.fchip.zero{opacity:.4}
+.sep{width:1px;height:18px;background:var(--line)}
+.totals{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding:7px 10px;background:var(--elev);border:1px solid var(--line);border-bottom:0;border-radius:6px 6px 0 0;font-size:12px;color:var(--muted)}
+.totals strong{color:var(--text);font-weight:600}
+.totals .sp{flex:1}
+.tscroll{height:560px;overflow:auto;border:1px solid var(--line);border-radius:0 0 6px 6px;background:var(--bg);position:relative}
+table.ft{border-collapse:separate;border-spacing:0;table-layout:fixed;width:100%}
+table.ft th{position:sticky;top:0;z-index:2;background:#333a47;color:var(--faint);font-weight:500;font-size:11.5px;text-align:left;padding:0 8px;height:30px;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;user-select:none}
+table.ft th.num,table.ft td.num{text-align:right}
+table.ft th.s{cursor:pointer}
+table.ft th.s:hover{color:var(--text)}
+table.ft th.sorted{color:var(--accent)}
+table.ft td{height:28px;padding:0 8px;border-bottom:1px solid rgba(76,86,106,.28);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text2)}
+table.ft tr.fr{cursor:pointer}
+table.ft tr.fr:hover td{background:rgba(67,76,94,.55)}
+table.ft tr.fr.sel td{background:rgba(136,192,208,.08)}
+table.ft tr.fr.act td{background:rgba(136,192,208,.16)}
+table.ft tr.g td{background:#323946;color:var(--text);font-weight:500}
+table.ft tr.g.l1 td{background:#353c4a}
+table.ft tr.g td.num{color:var(--muted);font-weight:400}
+table.ft tr.g:hover td{background:#3a4251}
+.fname{font-family:var(--mono);font-size:12px}
+.caret{display:inline-block;width:14px;color:var(--faint);cursor:pointer}
+.gcount{font-size:11px;color:var(--faint);font-weight:400;margin-left:6px}
+.cb{display:inline-block;width:13px;height:13px;border:1px solid var(--border);border-radius:3px;vertical-align:-2px;cursor:pointer;background:var(--bg);position:relative}
+.cb.on{background:var(--accent);border-color:var(--accent)}
+.cb.on::after{content:"";position:absolute;left:3.5px;top:0.5px;width:3px;height:7px;border:solid var(--bg);border-width:0 2px 2px 0;transform:rotate(45deg)}
+.cb.mid{background:var(--accent-m);border-color:var(--accent-m)}
+.cb.mid::after{content:"";position:absolute;left:2px;top:5px;width:7px;height:2px;background:var(--text)}
+.bar{display:flex;height:8px;border-radius:2px;overflow:hidden;background:var(--hover);width:100%}
+.bar i{display:block;height:100%}
+.pbar{height:4px;border-radius:2px;background:var(--hover);overflow:hidden}
+.pbar i{display:block;height:100%;background:var(--accent)}
+.fdot{width:8px;height:8px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:0}
+.pop{position:absolute;z-index:20;background:var(--elev);border:1px solid var(--border);border-radius:6px;padding:8px 10px;box-shadow:0 8px 24px rgba(0,0,0,.35);display:grid;gap:4px;min-width:170px}
+.pop label{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--muted);cursor:pointer}
+.relative{position:relative}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:400px;max-width:100%;background:var(--elev);border-left:1px solid var(--border);z-index:40;overflow:auto;padding:16px 18px 30px;box-shadow:-12px 0 30px rgba(0,0,0,.35)}
+.drawer h3{font-size:13px;font-weight:600;margin:16px 0 6px;color:var(--text)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 14px;font-size:12px}
+.kv dt{color:var(--faint)} .kv dd{margin:0;color:var(--text2)}
+.gate{display:grid;grid-template-columns:1fr auto auto auto;gap:3px 12px;font-size:12px;align-items:center}
+.gate .h{color:var(--faint);font-size:11px}
+.card{background:var(--elev);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+.card h2{font-size:13px;font-weight:600;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+.card h2 .sub{font-weight:400;color:var(--faint);font-size:12px}
+.grid-ov{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:14px;align-items:start}
+.goal{display:grid;grid-template-columns:54px 1fr 150px;gap:10px;align-items:center;margin:9px 0}
+.goal .gb{position:relative;height:14px;border-radius:3px;background:var(--hover);overflow:visible}
+.goal .gb .fill{display:flex;height:100%;border-radius:3px;overflow:hidden}
+.goal .gb .fill i{display:block;height:100%}
+.goal .gb .over{position:absolute;right:-1px;top:-3px;bottom:-3px;width:2px;background:var(--text)}
+.goal .gt{font-size:12px;color:var(--muted);text-align:right}
+.goal .gt b{color:var(--text);font-weight:600}
+.legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:11.5px;color:var(--faint);margin-top:8px}
+.mine3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.mine3 button{text-align:left;padding:8px 10px;border:1px solid var(--line);border-radius:6px}
+.mine3 button:hover{border-color:var(--accent)}
+.mine3 .n{font-size:20px;font-weight:600;display:block}
+.mine3 .l{font-size:11.5px;color:var(--faint)}
+.att{display:flex;gap:10px;align-items:flex-start;padding:7px 0;border-top:1px solid var(--line);font-size:12.5px}
+.att:first-of-type{border-top:0}
+.att .t{flex:1}
+.att .t small{display:block;color:var(--faint);font-size:11.5px}
+table.plain{border-collapse:collapse;width:100%;font-size:12.5px}
+table.plain th{color:var(--faint);font-weight:500;font-size:11.5px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+table.plain td{padding:6px 8px;border-bottom:1px solid rgba(76,86,106,.3);white-space:nowrap}
+table.plain th.num,table.plain td.num{text-align:right}
+table.plain tr.x{cursor:pointer}
+table.plain tr.x:hover td{background:rgba(67,76,94,.45)}
+table.plain th.s{cursor:pointer}
+table.plain th.sorted{color:var(--accent)}
+.hscroll{overflow-x:auto}
+.peer{display:grid;grid-template-columns:28px minmax(140px,1.2fr) minmax(160px,2fr) 90px 128px 70px;gap:10px;align-items:center;padding:9px 4px;border-top:1px solid var(--line);cursor:pointer}
+.peer:first-of-type{border-top:0}
+.peer:hover{background:rgba(67,76,94,.3)}
+.av{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:11px;font-weight:700;color:var(--bg)}
+.peer .who b{display:block;font-weight:600}
+.peer .who small{color:var(--faint);font-size:11.5px}
+.peer .rate{font-weight:600;text-align:right}
+.peer .eta{color:var(--faint);font-size:12px;text-align:right}
+.inflight{padding:2px 0 8px 42px;display:grid;gap:5px}
+.inflight .row{display:grid;grid-template-columns:minmax(0,1fr) 160px 80px;gap:10px;align-items:center;font-size:12px;color:var(--muted)}
+.empty{color:var(--faint);font-size:12.5px;padding:10px 0}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:8px 14px;border-radius:6px;font-size:12.5px;z-index:60;box-shadow:0 6px 20px rgba(0,0,0,.4)}
+.tgroup{border:1px solid var(--line);border-radius:6px;margin-bottom:8px;background:var(--elev)}
+.tgroup .th{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;padding:9px 12px;cursor:pointer}
+.tgroup .th .ttl{font-weight:600}
+.tgroup .body{border-top:1px solid var(--line);padding:0 12px}
+@media (max-width:900px){.grid-ov{grid-template-columns:1fr}.side{display:none}.main{padding:12px 16px 40px}}
+@media (max-width:640px){.peer{grid-template-columns:28px 1fr 80px}.peer .pb,.peer .spark,.peer .eta{display:none}.mine3{grid-template-columns:1fr}.goal{grid-template-columns:44px 1fr}.goal .gt{grid-column:2;text-align:left}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="app">
+  <nav class="side" aria-label="App sections">
+    <div class="ico">Files</div><div class="ico">Objects</div><div class="ico" id="nav-projects">Proj&shy;ects</div><div class="ico" id="nav-transfers">Trans&shy;fers</div><div class="ico">Settings</div>
+  </nav>
+  <main class="main" id="main"></main>
+</div>
+<div id="drawer-root"></div>
+<div id="toast-root"></div>
+
+<script>
+(function(){
+'use strict';
+// ───────────────────────── deterministic sample data ─────────────────────────
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const R=mulberry32(20260929);
+const rnd=(a,b)=>a+R()*(b-a);
+const ri=(a,b)=>Math.floor(rnd(a,b+1));
+const pick=a=>a[Math.floor(R()*a.length)];
+const gauss=()=>{let u=0,v=0;while(!u)u=R();while(!v)v=R();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v)};
+
+const FILTERS=['L','R','G','B','Ha','OIII','SII','OSC'];
+const FCOL={L:'#e5e9f0',R:'#bf616a',G:'#a3be8c',B:'#5e81ac',Ha:'#d08770',OIII:'#88c0d0',SII:'#b48ead',OSC:'#ebcb8b'};
+const GOALS={L:40,R:12,G:12,B:12,Ha:60,OIII:30,SII:24,OSC:20}; // hours
+const BASE=new Date(Date.UTC(2026,8,28));
+const nightStr=d=>{const x=new Date(BASE.getTime()-d*864e5);return x.toISOString().slice(0,10)};
+const WD=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const nightLabel=s=>{const d=new Date(s+'T00:00:00Z');return s+' · '+WD[d.getUTCDay()]};
+
+const MEMBERS=[
+ {id:'you',name:'You',role:'Coordinator',data:'Processor',color:'#88c0d0',online:true,seen:'now',devices:[{n:'This Mac',on:true},{n:'Observatory NUC',on:true}],cams:['ASI2600MM Pro']},
+ {id:'kostya',name:'Kostya',role:'Processor',color:'#a3be8c',online:true,seen:'now',devices:[{n:'kostya-studio',on:true},{n:'kostya-obs',on:true}],cams:['ASI6200MM Pro']},
+ {id:'masha',name:'Masha',role:'Contributor',color:'#b48ead',online:true,seen:'now',devices:[{n:'Masha MacBook',on:true}],cams:['QHY268M']},
+ {id:'andrei',name:'Andrei',role:'Processor',color:'#ebcb8b',online:true,seen:'now',devices:[{n:'andrei-pc',on:true}],cams:['ASI2600MC Pro']},
+ {id:'olga',name:'Olga',role:'Processor',color:'#d08770',online:false,seen:'3 days ago',devices:[{n:'olga-home',on:false}],cams:['ASI2600MM Pro']},
+ {id:'dmitri',name:'Dmitri',role:'Contributor',color:'#81a1c1',online:false,seen:'5 h ago',devices:[{n:'dmitri-laptop',on:false}],cams:['ASI294MM Pro']},
+ {id:'pavel',name:'Pavel',role:'Contributor',color:'#8fbcbb',online:true,seen:'now',devices:[{n:'pavel-imac',on:true}],cams:['ASI2600MM Pro','ASI533MC Pro']},
+ {id:'irina',name:'Irina',role:'Contributor',color:'#bf616a',online:false,seen:'1 day ago',devices:[{n:'irina-obs',on:false}],cams:['QHY600M']},
+];
+const MBY=Object.fromEntries(MEMBERS.map(m=>[m.id,m]));
+const PROCESSORS=['kostya','olga','andrei'];
+
+const REASONS={
+ solve:{label:'Not plate-solved',action:'Solve',order:1},
+ analyze:{label:'Not analyzed',action:'Analyze',order:2},
+ map:{label:'Filter not mapped',action:'Map filter',order:3},
+ flat:{label:'No master flat linked',action:'Open calibration',order:4},
+ fwhm:{label:'FWHM above 3.00″',order:5,quality:true},
+ ecc:{label:'Eccentricity above 0.55',order:6,quality:true},
+ stars:{label:'Fewer than 150 stars',order:7,quality:true},
+};
+
+let fid=0;const FRAMES=[];
+function mkFrame(o){
+  const f=Object.assign({id:++fid},o);
+  f.name=`Light_M31_${f.filter==='OSC'?'OSC':f.filter}_${f.exp}s_${f.night.replace(/-/g,'')}_${String(f.seq).padStart(4,'0')}.fits`;
+  f.size=f.camera.indexOf('6200')>=0||f.camera.indexOf('600M')>=0?122e6:(f.camera.indexOf('294')>=0?46e6:(f.camera.indexOf('533')>=0?36e6:62e6));
+  f.size=Math.round(f.size*(f.filter==='OSC'?1:1)*rnd(.995,1.005));
+  FRAMES.push(f);return f;
+}
+function quality(base){
+  const fwhm=Math.max(1.4,base+gauss()*0.28);
+  const ecc=Math.min(0.85,Math.max(0.2,0.41+gauss()*0.07+(R()<0.04?0.2:0)));
+  const stars=Math.max(40,Math.round(1250-(fwhm-2)*380+gauss()*160));
+  const snr=+(48-(fwhm-2)*9+gauss()*4).toFixed(1);
+  return {fwhm:+fwhm.toFixed(2),ecc:+ecc.toFixed(2),stars,snr};
+}
+function holdersFor(pub,mine){
+  const h=[pub];
+  if(pub!=='kostya'&&R()<0.96)h.push('kostya');
+  if(pub!=='olga'&&R()<0.8)h.push('olga');
+  if(pub!=='andrei'&&R()<0.7)h.push('andrei');
+  if(mine&&pub!=='you')h.push('you');
+  return [...new Set(h)];
+}
+
+// ── own frames ──
+const ownPlan=[[0,['Ha','OIII']],[1,['Ha','SII']],[2,['L','R','G']],[3,['SII','Ha']],[5,['OIII']],[6,['Ha','B']],[8,['Ha','OIII','SII']],[9,['L']],[11,['Ha','OIII']],[13,['R','G','B']],[14,['Ha']],[17,['L','SII']],[19,['OIII','Ha']]];
+for(const [d,fl] of ownPlan){
+  const night=nightStr(d);const base=rnd(1.95,2.75);
+  for(const filter of fl){
+    const nb=['Ha','OIII','SII'].includes(filter);const exp=nb?300:120;const n=nb?ri(24,48):ri(40,70);
+    for(let s=1;s<=n;s++){
+      const q=quality(base+(d===9?0.45:0));
+      const reasons=[];
+      if(d===2)reasons.push({code:'solve',detail:'No WCS — solve the frame'});
+      if(d===5)reasons.push({code:'analyze',detail:'No analysis yet'});
+      if(d===3&&filter==='SII')reasons.push({code:'map',detail:'Raw FILTER “S2 6nm” has no mapping'});
+      if(d===6&&filter==='B')reasons.push({code:'flat',detail:'No master flat for B, bin 1'});
+      if(d!==5){
+        if(q.fwhm>3)reasons.push({code:'fwhm',detail:`FWHM ${q.fwhm.toFixed(2)}″ > 3.00″`});
+        if(q.ecc>0.55)reasons.push({code:'ecc',detail:`Ecc ${q.ecc.toFixed(2)} > 0.55`});
+        if(q.stars<150)reasons.push({code:'stars',detail:`${q.stars} stars < 150`});
+      }
+      reasons.sort((a,b)=>REASONS[a.code].order-REASONS[b.code].order);
+      let seg=reasons.length?'held':(d<=1?'ready':'published');
+      const f=mkFrame({own:true,publisher:'you',filter,camera:'ASI2600MM Pro',exp,night,seq:s,set:'M31 · 2026 autumn',...q,zp:+(21.4+gauss()*0.15).toFixed(2),reasons,seg});
+      if(seg==='published'){
+        f.version=R()<0.08?2:1;
+        f.pub=d===3?(R()<0.5?'pending':'published'):'published';
+        if(R()<0.004)f.pub='rejected';
+        if(R()<0.006)f.pub='excluded';
+        f.holders=holdersFor('you',false);
+        f.disk=R()<0.01?'missing':(R()<0.006?'changed':'on');
+        f.publishedAt=nightStr(d-1)+' '+String(ri(8,11)).padStart(2,'0')+':'+String(ri(0,59)).padStart(2,'0')+':'+String(ri(0,59)).padStart(2,'0');
+      }
+    }
+  }
+}
+// ── other members' frames ──
+const otherPlan={kostya:{nights:12,f:['L','R','G','B','Ha','OIII','SII'],nb:0.6},masha:{nights:8,f:['Ha','OIII','SII'],nb:1},andrei:{nights:9,f:['OSC'],nb:0},olga:{nights:7,f:['Ha','OIII','L'],nb:0.7},dmitri:{nights:6,f:['Ha','OIII'],nb:1},pavel:{nights:7,f:['L','R','G','B','OSC'],nb:0},irina:{nights:4,f:['Ha','SII'],nb:1}};
+for(const [mid,p] of Object.entries(otherPlan)){
+  const m=MBY[mid];const used=new Set();
+  for(let i=0;i<p.nights;i++){
+    let d;do{d=ri(0,29)}while(used.has(d));used.add(d);
+    const night=nightStr(d);const base=rnd(1.9,2.8);
+    const fl=[...new Set([pick(p.f),pick(p.f)])];
+    for(const filter of fl){
+      const camera=filter==='OSC'?(mid==='pavel'?'ASI533MC Pro':m.cams[0]):m.cams[0];
+      const nb=['Ha','OIII','SII'].includes(filter);const exp=nb?(mid==='irina'?600:300):(filter==='OSC'?180:120);
+      const n=nb?ri(18,42):ri(30,60);
+      for(let s=1;s<=n;s++){
+        const q=quality(base);
+        if(q.fwhm>3||q.ecc>0.55||q.stars<150)continue; // never published
+        const f=mkFrame({own:false,publisher:mid,filter,camera,exp,night,seq:s,set:null,...q,zp:+(21.2+gauss()*0.3).toFixed(2),reasons:[],seg:'library'});
+        f.version=1;
+        f.pub=(mid==='irina'&&d<6)||(mid==='pavel'&&d<3)?'pending':'published';
+        if(f.pub==='published'&&R()<0.004)f.pub='excluded';
+        f.publishedAt=nightStr(d-1)+' 09:'+String(ri(10,59)).padStart(2,'0')+':00';
+        let mine;const r=R();
+        if(mid==='irina')mine=r<0.55?'have':(r<0.9?'missing':'notkept');
+        else if(d<=1&&(mid==='kostya'||mid==='masha'))mine=r<0.5?'have':(r<0.62?'downloading':'queued');
+        else mine=r<0.9?'have':(r<0.94?'queued':(r<0.97?'missing':'notkept'));
+        f.mine=mine;
+        if(mine==='downloading')f.progress=ri(8,92);
+        if(mine==='missing')f.missingWhy=mid==='irina'?'Publisher offline 1 day, no other copy online':'Only holder offline (Olga)';
+        if(mine==='queued')f.missingWhy='Queued';
+        f.holders=holdersFor(mid,mine==='have');
+        if(mine==='missing'){f.holders=f.holders.filter(h=>!MBY[h].online||h===mid)}
+        f.disk=null;
+      }
+    }
+  }
+}
+const onlineCount=f=>f.holders?f.holders.filter(h=>MBY[h].online).length:0;
+
+// ───────────────────────── formatting ─────────────────────────
+const fmtB=b=>b>=1e12?(b/1e12).toFixed(2)+' TB':b>=1e9?(b/1e9).toFixed(1)+' GB':b>=1e6?(b/1e6).toFixed(0)+' MB':(b/1e3).toFixed(0)+' KB';
+const fmtDur=s=>{const h=Math.floor(s/3600),m=Math.round((s%3600)/60);return h?`${h}h ${String(m).padStart(2,'0')}m`:`${m}m`};
+const fmtRate=b=>(b/1e6).toFixed(1)+' MB/s';
+const median=a=>{if(!a.length)return null;const s=[...a].sort((x,y)=>x-y);const m=s.length>>1;return s.length%2?s[m]:(s[m-1]+s[m])/2};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fdot=f=>`<span class="fdot" style="background:${FCOL[f]||'#999'}"></span>`;
+const mdot=id=>`<span class="dot" style="background:${MBY[id].color}"></span>`;
+
+// ───────────────────────── table configuration ─────────────────────────
+const COLS={
+ name:{label:'Frame',get:f=>f.name},
+ publisher:{label:'Publisher',w:108,get:f=>MBY[f.publisher].name,cell:f=>`${mdot(f.publisher)} ${esc(MBY[f.publisher].name)}`,agg:fs=>{const n=new Set(fs.map(f=>f.publisher)).size;return n===1?`${mdot(fs[0].publisher)} ${MBY[fs[0].publisher].name}`:`${n} members`}},
+ night:{label:'Night',w:98,get:f=>f.night,agg:fs=>{const s=[...new Set(fs.map(f=>f.night))].sort();return s.length===1?s[0]:`${s.length} nights`}},
+ filter:{label:'Filter',w:70,get:f=>FILTERS.indexOf(f.filter),cell:f=>`${fdot(f.filter)}${f.filter}`,agg:fs=>{const s=[...new Set(fs.map(f=>f.filter))];return s.length===1?`${fdot(s[0])}${s[0]}`:`${s.length} filters`}},
+ camera:{label:'Camera',w:122,get:f=>f.camera,agg:fs=>{const s=[...new Set(fs.map(f=>f.camera))];return s.length===1?s[0]:`${s.length} cameras`}},
+ exp:{label:'Exp / Σ',w:82,num:1,get:f=>f.exp,cell:f=>f.exp+' s',aggv:fs=>fs.reduce((a,f)=>a+f.exp,0),agg:fs=>fmtDur(fs.reduce((a,f)=>a+f.exp,0))},
+ fwhm:{label:'FWHM″',w:66,num:1,get:f=>f.fwhm,cell:f=>f.fwhm.toFixed(2),aggv:fs=>median(fs.map(f=>f.fwhm)),agg:fs=>'x̃ '+median(fs.map(f=>f.fwhm)).toFixed(2)},
+ ecc:{label:'Ecc',w:60,num:1,get:f=>f.ecc,cell:f=>f.ecc.toFixed(2),aggv:fs=>median(fs.map(f=>f.ecc)),agg:fs=>'x̃ '+median(fs.map(f=>f.ecc)).toFixed(2)},
+ stars:{label:'Stars',w:64,num:1,get:f=>f.stars,cell:f=>f.stars.toLocaleString('en-US'),aggv:fs=>median(fs.map(f=>f.stars)),agg:fs=>'x̃ '+Math.round(median(fs.map(f=>f.stars))).toLocaleString('en-US')},
+ snr:{label:'SNR',w:58,num:1,get:f=>f.snr,cell:f=>f.snr.toFixed(1),aggv:fs=>median(fs.map(f=>f.snr)),agg:fs=>'x̃ '+median(fs.map(f=>f.snr)).toFixed(1)},
+ zp:{label:'ZP',w:60,num:1,get:f=>f.zp,cell:f=>f.zp.toFixed(2),aggv:fs=>median(fs.map(f=>f.zp)),agg:fs=>'x̃ '+median(fs.map(f=>f.zp)).toFixed(2)},
+ size:{label:'Size',w:78,num:1,get:f=>f.size,cell:f=>fmtB(f.size),aggv:fs=>fs.reduce((a,f)=>a+f.size,0),agg:fs=>fmtB(fs.reduce((a,f)=>a+f.size,0))},
+ reason:{label:'Why held back',w:230,get:f=>REASONS[f.reasons[0].code].order,cell:f=>{const r=f.reasons[0];const q=REASONS[r.code].quality;return `<span class="chip ${q?'c-err':'c-warn'}">${esc(r.detail)}</span>${f.reasons.length>1?` <span class="gcount">+${f.reasons.length-1}</span>`:''}`},agg:fs=>{const c={};fs.forEach(f=>{const k=f.reasons[0].code;c[k]=(c[k]||0)+1});const k=Object.keys(c);return k.length===1?'':`${k.length} causes`}},
+ version:{label:'Ver',w:44,num:1,get:f=>f.version,cell:f=>'v'+f.version},
+ pub:{label:'Status',w:112,get:f=>f.pub,cell:f=>pubChip(f.pub),agg:fs=>{const c={};fs.forEach(f=>c[f.pub]=(c[f.pub]||0)+1);const bad=(c.pending||0)+(c.rejected||0)+(c.excluded||0);return bad?Object.entries(c).filter(([k])=>k!=='published').map(([k,v])=>`${pubChip(k,v)}`).join(' '):pubChip('published',c.published)}},
+ holders:{label:'Holders',w:88,num:1,get:f=>f.holders.length,cell:f=>{const t=f.holders.length,o=onlineCount(f);return `${t===1?'<span class="chip c-warn" title="Only one copy in the project">1 copy</span>':`${o} on / ${t}`}`},aggv:fs=>Math.min(...fs.map(f=>f.holders.length)),agg:fs=>{const one=fs.filter(f=>f.holders.length===1).length;return one?`<span class="chip c-warn">${one} single</span>`:'min '+Math.min(...fs.map(f=>f.holders.length))}},
+ disk:{label:'On disk',w:84,get:f=>f.disk,cell:f=>f.disk==='on'?'<span style="color:var(--faint)">yes</span>':f.disk==='missing'?'<span class="chip c-err">missing</span>':'<span class="chip c-warn">changed</span>',agg:fs=>{const m=fs.filter(f=>f.disk!=='on').length;return m?`<span class="chip c-err">${m}</span>`:''}},
+ publishedAt:{label:'Published',w:142,get:f=>f.publishedAt,cell:f=>`<span style="color:var(--faint)">${f.publishedAt}</span>`},
+ mine:{label:'On this device',w:168,get:f=>['missing','notkept','queued','downloading','have'].indexOf(f.mine),cell:f=>mineCell(f),agg:fs=>mineBar(fs)},
+};
+function pubChip(s,n){const cls={published:'c-ok',pending:'c-warn',rejected:'c-err',excluded:'c-mute'}[s];return `<span class="chip ${cls}">${n!=null?n+' ':''}${s}</span>`}
+function mineCell(f){
+  if(f.mine==='have')return '<span style="color:var(--success)">● have</span>';
+  if(f.mine==='downloading')return `<span style="display:inline-flex;align-items:center;gap:6px;width:100%"><span class="pbar" style="flex:1"><i style="width:${f.progress}%"></i></span><span style="color:var(--accent)">${f.progress}%</span></span>`;
+  if(f.mine==='queued')return '<span style="color:var(--faint)">○ queued</span>';
+  if(f.mine==='missing')return `<span class="chip c-err" title="${esc(f.missingWhy)}">missing</span> <span style="color:var(--faint);font-size:11px">${f.missingWhy.indexOf('Olga')>=0?'holder offline':'publisher offline'}</span>`;
+  return '<span style="color:var(--ghost)">not kept</span>';
+}
+function mineBar(fs){
+  const c={have:0,downloading:0,queued:0,missing:0,notkept:0};fs.forEach(f=>c[f.mine]++);const t=fs.length;
+  const seg=(k,col)=>c[k]?`<i style="width:${c[k]/t*100}%;background:${col}" title="${c[k]} ${k}"></i>`:'';
+  const txt=c.missing?`<span style="color:var(--error)">${c.missing} missing</span>`:c.downloading||c.queued?`<span style="color:var(--accent)">${c.downloading+c.queued} to go</span>`:`<span style="color:var(--faint)">${c.have}/${t}</span>`;
+  return `<span style="display:inline-flex;align-items:center;gap:6px;width:100%"><span class="bar" style="flex:1">${seg('have','var(--success)')}${seg('downloading','var(--accent)')}${seg('queued','var(--accent-m)')}${seg('missing','var(--error)')}${seg('notkept','var(--border)')}</span><span style="font-size:11px">${txt}</span></span>`;
+}
+
+const GROUPS={
+ night:{label:'Night',key:f=>f.night,lab:k=>nightLabel(k),order:(a,b)=>a<b?1:-1},
+ filter:{label:'Filter',key:f=>f.filter,lab:k=>`${fdot(k)}${k}`,order:(a,b)=>FILTERS.indexOf(a)-FILTERS.indexOf(b)},
+ camera:{label:'Camera',key:f=>f.camera,lab:k=>esc(k),order:(a,b)=>a.localeCompare(b)},
+ publisher:{label:'Publisher',key:f=>f.publisher,lab:k=>`${mdot(k)} ${esc(MBY[k].name)}`,order:(a,b)=>MBY[a].name.localeCompare(MBY[b].name)},
+ reason:{label:'Reason',key:f=>f.reasons[0].code,lab:k=>esc(REASONS[k].label),order:(a,b)=>REASONS[a].order-REASONS[b].order},
+ set:{label:'Object',key:f=>f.set||'—',lab:k=>esc(k),order:(a,b)=>a.localeCompare(b)},
+ pub:{label:'Status',key:f=>f.pub,lab:k=>pubChip(k),order:(a,b)=>a.localeCompare(b)},
+ none:{label:'None'},
+};
+
+const TABLES={
+ ready:{rows:()=>FRAMES.filter(f=>f.own&&f.seg==='ready'),groups:['night','filter','camera','set','none'],def:['night','filter'],cols:['name','night','filter','camera','exp','fwhm','ecc','stars','snr','zp','size'],defCols:['name','filter','camera','exp','fwhm','ecc','stars','size'],state:null,
+   actions:[{label:'Publish',el:f=>true,pri:1}],allLabel:'Publish all'},
+ held:{rows:()=>FRAMES.filter(f=>f.own&&f.seg==='held'),groups:['reason','night','filter','camera','set','none'],def:['reason','night'],cols:['name','reason','night','filter','camera','exp','fwhm','ecc','stars','snr','size'],defCols:['name','reason','night','filter','exp','fwhm','ecc','stars'],
+   state:{label:'Reason',opts:Object.keys(REASONS).map(k=>[k,REASONS[k].label]),test:(f,v)=>f.reasons.some(r=>r.code===v)},
+   actions:[{label:'Solve',el:f=>f.reasons.some(r=>r.code==='solve')},{label:'Analyze',el:f=>f.reasons.some(r=>r.code==='analyze')}]},
+ published:{rows:()=>FRAMES.filter(f=>f.own&&f.seg==='published'),groups:['night','filter','pub','camera','none'],def:['night','filter'],cols:['name','night','filter','camera','exp','version','pub','holders','disk','publishedAt','fwhm','ecc','size'],defCols:['name','filter','exp','version','pub','holders','disk','publishedAt','size'],
+   state:{label:'Status',opts:[['published','Published'],['pending','Pending approval'],['rejected','Rejected'],['excluded','Excluded'],['single','Only one copy'],['disk','Not on disk / changed']],test:(f,v)=>v==='single'?f.holders.length===1:v==='disk'?f.disk!=='on':f.pub===v},
+   actions:[{label:'Ask to exclude',el:f=>f.pub==='published'},{label:'Republish',el:f=>f.disk==='changed'}]},
+ library:{rows:()=>FRAMES.filter(f=>!f.own&&f.pub!=='pending'),groups:['publisher','filter','camera','night','none'],def:['publisher','filter'],cols:['name','publisher','night','filter','camera','exp','fwhm','ecc','stars','snr','zp','holders','mine','size'],defCols:['name','publisher','night','filter','camera','exp','fwhm','ecc','holders','mine','size'],publisherFacet:1,
+   state:{label:'On this device',opts:[['have','Have'],['downloading','Downloading'],['queued','Queued'],['missing','Missing'],['notkept','Not kept']],test:(f,v)=>f.mine===v},
+   actions:[{label:'Download',el:f=>f.mine==='missing'||f.mine==='notkept'},{label:'Stop keeping',el:f=>f.mine==='have'},{label:'Exclude',el:f=>f.pub==='published',coord:1}]},
+ moderation:{rows:()=>FRAMES.filter(f=>!f.own&&f.pub==='pending'),groups:['publisher','night','filter','camera','none'],def:['publisher','night'],cols:['name','publisher','night','filter','camera','exp','fwhm','ecc','stars','snr','zp','size'],defCols:['name','publisher','night','filter','camera','exp','fwhm','ecc','stars','snr'],publisherFacet:1,state:null,
+   actions:[{label:'Approve',el:f=>true,pri:1},{label:'Reject',el:f=>true}],allLabel:'Approve all'},
+};
+
+// ───────────────────────── state ─────────────────────────
+const S={view:'project',role:'coordinator',tab:'overview',seg:'ready',drawer:null,t:{},memberSort:{k:'published',d:-1},memberOpen:null,peerOpen:{},tOpen:{proj:true}};
+function T(key){
+  if(!S.t[key]){const c=TABLES[key];S.t[key]={filters:new Set(),camera:'',night:'',publisher:'',state:'',q:'',group:[...c.def],sort:{k:'name',d:1},cols:new Set(c.defCols),exp:null,sel:new Set(),scroll:0,colsOpen:false}}
+  return S.t[key];
+}
+try{const n=localStorage.getItem('mock.notes');if(n==='0')document.body.classList.add('nonotes')}catch(e){}
+
+// ───────────────────────── table engine ─────────────────────────
+const NIGHTS={'':'All nights','1':'Last night','7':'Last 7 nights','30':'Last 30 nights'};
+function nightOk(f,v){if(!v)return true;const d=(BASE-new Date(f.night+'T00:00:00Z'))/864e5;return d<Number(v)}
+function filtered(key,except){
+  const t=T(key),c=TABLES[key];const q=t.q.trim().toLowerCase();
+  return c.rows().filter(f=>
+    (except==='filter'||!t.filters.size||t.filters.has(f.filter))&&
+    (except==='camera'||!t.camera||f.camera===t.camera)&&
+    (except==='night'||nightOk(f,t.night))&&
+    (except==='publisher'||!t.publisher||f.publisher===t.publisher)&&
+    (except==='state'||!t.state||c.state.test(f,t.state))&&
+    (!q||f.name.toLowerCase().includes(q)));
+}
+function sortFrames(fs,t){const col=COLS[t.sort.k];const d=t.sort.d;return fs.sort((a,b)=>{const x=col.get(a),y=col.get(b);return (x<y?-1:x>y?1:0)*d||(a.name<b.name?-1:1)})}
+function buildTree(fs,levels,t,prefix,depth){
+  const lv=levels[0];
+  if(!lv||lv==='none')return {frames:sortFrames(fs,t)};
+  const G=GROUPS[lv];const m=new Map();
+  for(const f of fs){const k=G.key(f);if(!m.has(k))m.set(k,[]);m.get(k).push(f)}
+  const col=COLS[t.sort.k];
+  let keys=[...m.keys()];
+  if(col.aggv&&t.sort.k!=='name')keys.sort((a,b)=>((col.aggv(m.get(a))-col.aggv(m.get(b)))*t.sort.d)||G.order(a,b));
+  else keys.sort(G.order);
+  return {groups:keys.map(k=>{const path=prefix+lv+':'+k;return {lv,k,path,depth,frames:m.get(k),child:buildTree(m.get(k),levels.slice(1),t,path+'|',depth+1)}})};
+}
+function flatten(tree,t,out){
+  if(tree.frames){for(const f of tree.frames)out.push({type:'f',f,depth:(tree.depth||0)});return out}
+  for(const g of tree.groups){out.push({type:'g',g});if(t.exp.has(g.path)){const c=g.child;if(c.frames){for(const f of c.frames)out.push({type:'f',f,depth:g.depth+1})}else flatten(c,t,out)}}
+  return out;
+}
+const CACHE={};
+function computeRows(key){
+  const t=T(key);const fs=filtered(key);
+  const levels=t.group.filter(x=>x&&x!=='none');
+  const tree=buildTree(fs,levels,t,'',0);
+  if(!t.exp){t.exp=new Set();if(tree.groups&&tree.groups[0]){t.exp.add(tree.groups[0].path);const c=tree.groups[0].child;if(c.groups&&c.groups[0])t.exp.add(c.groups[0].path)}}
+  const rows=levels.length?flatten(tree,t,[]):tree.frames.map(f=>({type:'f',f,depth:0}));
+  CACHE[key]={rows,fs,tree};return CACHE[key];
+}
+function visibleCols(key){const t=T(key);return TABLES[key].cols.filter(k=>t.cols.has(k))}
+function cbState(fs,sel){let n=0;for(const f of fs)if(sel.has(f.id))n++;return n===0?'':n===fs.length?'on':'mid'}
+function rowHtml(key,r,cols){
+  const t=T(key);
+  if(r.type==='g'){
+    const g=r.g,open=t.exp.has(g.path),G=GROUPS[g.lv];
+    let extra='';
+    if(g.lv==='reason'){const R0=REASONS[g.k];extra=R0.action?` <button class="btn sm" data-act="gact" data-v="${esc(R0.action)}" data-n="${g.frames.length}">${esc(R0.action)} ${g.frames.length}</button>`:` <span class="gcount" style="margin-left:8px">quality — the frames themselves</span>`}
+    const cells=cols.map(k=>{if(k==='name')return `<td style="padding-left:${8+g.depth*18}px"><span class="caret" data-act="tg" data-p="${esc(g.path)}">${open?'▾':'▸'}</span><span data-act="tg" data-p="${esc(g.path)}" style="cursor:pointer">${G.lab(g.k)}</span><span class="gcount">${g.frames.length} fr</span>${extra}</td>`;const c=COLS[k];if(k===g.lv||(g.lv==='pub'&&k==='pub'))return '<td></td>';return `<td class="${c.num?'num':''}">${c.agg?c.agg(g.frames):''}</td>`}).join('');
+    return `<tr class="g l${g.depth}"><td><span class="cb ${cbState(g.frames,t.sel)}" data-act="selg" data-p="${esc(g.path)}" role="checkbox" aria-label="Select group"></span></td>${cells}</tr>`;
+  }
+  const f=r.f;const on=t.sel.has(f.id);
+  const cells=cols.map(k=>{const c=COLS[k];if(k==='name')return `<td style="padding-left:${8+r.depth*18+14}px" class="fname" title="${esc(f.name)}">${esc(f.name)}</td>`;return `<td class="${c.num?'num':''}">${c.cell?c.cell(f):esc(c.get(f))}</td>`}).join('');
+  return `<tr class="fr${on?' sel':''}${S.drawer===f.id?' act':''}" data-fid="${f.id}"><td><span class="cb ${on?'on':''}" data-act="sel" data-id="${f.id}" role="checkbox" aria-label="Select frame"></span></td>${cells}</tr>`;
+}
+const RH=29;
+function renderBody(key){
+  const el=document.getElementById('ts-'+key);if(!el)return;
+  const tb=el.querySelector('tbody');const rows=CACHE[key].rows;const cols=visibleCols(key);
+  const st=el.scrollTop,h=el.clientHeight||560;
+  const a=Math.max(0,Math.floor(st/RH)-12),b=Math.min(rows.length,a+Math.ceil(h/RH)+24);
+  let html=`<tr style="height:${a*RH}px"><td colspan="${cols.length+1}" style="padding:0;border:0;height:${a*RH}px"></td></tr>`;
+  for(let i=a;i<b;i++)html+=rowHtml(key,rows[i],cols);
+  html+=`<tr style="height:${(rows.length-b)*RH}px"><td colspan="${cols.length+1}" style="padding:0;border:0;height:${(rows.length-b)*RH}px"></td></tr>`;
+  if(!rows.length)html=`<tr><td colspan="${cols.length+1}" class="empty" style="height:auto;padding:18px 12px">No frames match these filters.</td></tr>`;
+  tb.innerHTML=html;
+}
+function tableHtml(key){
+  const t=T(key),c=TABLES[key];const {fs}=computeRows(key);
+  const all=c.rows();
+  // facets
+  const fcount={};filtered(key,'filter').forEach(f=>fcount[f.filter]=(fcount[f.filter]||0)+1);
+  const present=FILTERS.filter(x=>all.some(f=>f.filter===x));
+  const chips=present.map(x=>`<button class="fchip${t.filters.has(x)?' on':''}${fcount[x]?'':' zero'}" data-act="chip" data-t="${key}" data-v="${x}">${fdot(x)}${x}<span class="k">${fcount[x]||0}</span></button>`).join('');
+  const cams=[...new Set(all.map(f=>f.camera))].sort();const ccount={};filtered(key,'camera').forEach(f=>ccount[f.camera]=(ccount[f.camera]||0)+1);
+  const camSel=`<select id="cam-${key}" data-act="facet" data-t="${key}" data-f="camera" aria-label="Camera"><option value="">All cameras</option>${cams.map(x=>`<option value="${esc(x)}"${t.camera===x?' selected':''}>${esc(x)} (${ccount[x]||0})</option>`).join('')}</select>`;
+  const ncount={};const nf=filtered(key,'night');for(const v of Object.keys(NIGHTS))ncount[v]=nf.filter(f=>nightOk(f,v)).length;
+  const nightSel=`<select id="night-${key}" data-act="facet" data-t="${key}" data-f="night" aria-label="Night">${Object.entries(NIGHTS).map(([v,l])=>`<option value="${v}"${t.night===v?' selected':''}>${l} (${ncount[v]})</option>`).join('')}</select>`;
+  let pubSel='';
+  if(c.publisherFacet){const pc={};filtered(key,'publisher').forEach(f=>pc[f.publisher]=(pc[f.publisher]||0)+1);const ps=[...new Set(all.map(f=>f.publisher))];pubSel=`<select id="pub-${key}" data-act="facet" data-t="${key}" data-f="publisher" aria-label="Publisher"><option value="">All publishers</option>${ps.map(p=>`<option value="${p}"${t.publisher===p?' selected':''}>${MBY[p].name} (${pc[p]||0})</option>`).join('')}</select>`}
+  let stSel='';
+  if(c.state){const sf=filtered(key,'state');stSel=`<select id="st-${key}" data-act="facet" data-t="${key}" data-f="state" aria-label="${c.state.label}"><option value="">${c.state.label}: any</option>${c.state.opts.map(([v,l])=>`<option value="${v}"${t.state===v?' selected':''}>${l} (${sf.filter(f=>c.state.test(f,v)).length})</option>`).join('')}</select>`}
+  const gopt=(i)=>`<select id="g${i}-${key}" data-act="group" data-t="${key}" data-i="${i}" aria-label="Group level ${i+1}">${c.groups.filter(g=>i===1||g!=='none'||true).map(g=>`<option value="${g}"${(t.group[i]||'none')===g?' selected':''}>${GROUPS[g].label}</option>`).join('')}</select>`;
+  const colsPop=t.colsOpen?`<div class="pop" style="right:0;top:30px">${c.cols.filter(k=>k!=='name').map(k=>`<label><span class="cb ${t.cols.has(k)?'on':''}" data-act="col" data-t="${key}" data-k="${k}"></span><span data-act="col" data-t="${key}" data-k="${k}">${COLS[k].label}</span></label>`).join('')}</div>`:'';
+  const any=t.filters.size||t.camera||t.night||t.publisher||t.state||t.q;
+  // totals + actions
+  const sel=fs.filter(f=>t.sel.has(f.id));
+  const secs=fs.reduce((a,f)=>a+f.exp,0),bytes=fs.reduce((a,f)=>a+f.size,0);
+  const acts=c.actions.filter(a=>!a.coord||S.role==='coordinator').map((a,i)=>{
+    if(!sel.length){if(a.pri&&c.allLabel)return `<button class="btn pri" data-act="bulk" data-t="${key}" data-i="${i}" data-all="1"${fs.length?'':' disabled'}>${c.allLabel} ${fs.length}</button>`;return ''}
+    const el=sel.filter(a.el).length;
+    return `<button class="btn${a.pri?' pri':''}" data-act="bulk" data-t="${key}" data-i="${i}"${el?'':' disabled'}>${a.label} ${el===sel.length?el:`${el} of ${sel.length}`}</button>`}).join('');
+  const cols=visibleCols(key);
+  const head=`<th style="width:34px"><span class="cb ${cbState(fs,t.sel)}" data-act="selall" data-t="${key}" role="checkbox" aria-label="Select all"></span></th>`+cols.map(k=>{const cc=COLS[k];const s=t.sort.k===k;return `<th class="s${cc.num?' num':''}${s?' sorted':''}" data-act="sort" data-t="${key}" data-k="${k}"${cc.w?` style="width:${cc.w}px"`:''}>${cc.label}${s?(t.sort.d>0?' ↑':' ↓'):''}</th>`}).join('');
+  const minW=cols.reduce((a,k)=>a+(COLS[k].w||0),34)+300;
+  return `
+  <div class="toolbar">
+    <span class="lbl">Filter</span>${chips}
+    <span class="sep"></span>${camSel}${nightSel}${pubSel}${stSel}
+    <input type="text" id="q-${key}" data-act="search" data-t="${key}" placeholder="Search file name" value="${esc(t.q)}" style="width:170px" aria-label="Search file name">
+    ${any?`<button class="linkbtn" data-act="clear" data-t="${key}" style="font-size:12px">Clear filters</button>`:''}
+  </div>
+  <div class="toolbar" style="padding-top:0">
+    <span class="lbl">Group by</span>${gopt(0)}<span style="color:var(--faint)">▸</span>${gopt(1)}
+    <button class="linkbtn" data-act="expall" data-t="${key}" style="font-size:12px">Expand all</button>
+    <button class="linkbtn" data-act="colall" data-t="${key}" style="font-size:12px">Collapse all</button>
+    <span style="flex:1"></span>
+    <span class="relative"><button class="btn" data-act="colsbtn" data-t="${key}">Columns ⚙</button>${colsPop}</span>
+  </div>
+  <div class="totals">
+    <span>Showing <strong>${fs.length.toLocaleString('en-US')}</strong> of ${all.length.toLocaleString('en-US')} frames</span>
+    <span>Σ <strong>${fmtDur(secs)}</strong></span><span><strong>${fmtB(bytes)}</strong></span>
+    ${fs.length?`<span>FWHM x̃ <strong>${median(fs.map(f=>f.fwhm)).toFixed(2)}″</strong></span>`:''}
+    ${sel.length?`<span style="color:var(--accent)">${sel.length} selected · <button class="linkbtn" data-act="selnone" data-t="${key}">clear</button></span>`:''}
+    <span class="sp"></span>${acts}
+  </div>
+  <div class="tscroll" id="ts-${key}" data-t="${key}"><table class="ft" style="min-width:${minW}px"><thead><tr>${head}</tr></thead><tbody></tbody></table></div>`;
+}
+
+// ───────────────────────── live exchange simulation ─────────────────────────
+function mkLive(peer,dev,rate,n,queue){return {peer,dev,base:rate,rate,hist:Array.from({length:40},()=>rate*rnd(.8,1.1)),frames:Array.from({length:n},()=>({name:'',size:0,done:0})),queue,landed:0,bytesDone:0}}
+const libQueue=FRAMES.filter(f=>!f.own&&(f.mine==='downloading'||f.mine==='queued'));
+const ownPub=FRAMES.filter(f=>f.own&&f.seg==='published');
+const LIVE={recv:[mkLive('kostya','kostya-obs',34e6,2,31),mkLive('masha','Masha MacBook',9.5e6,1,12)],send:[mkLive('kostya','kostya-studio',19e6,2,58),mkLive('andrei','andrei-pc',6.2e6,1,140)]};
+function refill(l,dir){l.frames.forEach(fr=>{if(!fr.name||fr.done>=fr.size){const first=!fr.name;if(!first){l.landed++;l.queue=Math.max(0,l.queue-1)}const own=libQueue.filter(f=>f.publisher===l.peer);const src=dir==='recv'?pick(own.length?own:libQueue):pick(ownPub);fr.name=src.name;fr.size=src.size;fr.done=first?rnd(0,src.size*0.7):0}})}
+LIVE.recv.forEach(l=>refill(l,'recv'));LIVE.send.forEach(l=>refill(l,'send'));
+function tick(){
+  for(const dir of ['recv','send'])for(const l of LIVE[dir]){
+    l.rate=Math.max(l.base*0.3,l.rate*0.7+l.base*rnd(0.75,1.2)*0.3);l.hist.push(l.rate);l.hist.shift();
+    const per=l.rate/l.frames.length;l.frames.forEach(fr=>{fr.done=Math.min(fr.size,fr.done+per*rnd(.8,1.2))});l.bytesDone+=l.rate;
+    refill(l,dir);
+  }
+  const el=document.getElementById('live');if(el)el.innerHTML=liveHtml(false);
+  const mini=document.getElementById('live-mini');if(mini)mini.innerHTML=liveMini();
+  const tl=document.getElementById('tlive');if(tl)tl.innerHTML=transfersLive();
+}
+setInterval(tick,1000);
+function spark(h,col){const mx=Math.max(...h)*1.1||1;const pts=h.map((v,i)=>`${(i/(h.length-1)*120).toFixed(1)},${(24-v/mx*22).toFixed(1)}`).join(' ');return `<svg class="spark" width="120" height="26" viewBox="0 0 120 26" aria-hidden="true"><polyline points="0,25 ${pts} 120,25" fill="${col}" fill-opacity=".12" stroke="none"></polyline><polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.4"></polyline></svg>`}
+function peerRow(l,dir,key){
+  const m=MBY[l.peer];const inflight=l.frames.reduce((a,f)=>a+(f.size-f.done),0);
+  const avg=l.hist.reduce((a,b)=>a+b,0)/l.hist.length;
+  const qb=l.queue*62e6+inflight;const eta=qb/avg;
+  const totalQ=l.landed+l.queue+l.frames.length;const doneFrac=l.landed/(totalQ||1);
+  const open=S.peerOpen[key];
+  const verb=dir==='recv'?'from':'to';
+  return `<div class="peer" data-act="peer" data-k="${key}">
+    <span class="av" style="background:${m.color}">${m.name[0]}</span>
+    <span class="who"><b>${dir==='recv'?'↓':'↑'} ${verb} ${esc(m.name)}</b><small>${esc(l.dev)} · ${l.frames.length} in flight · ${l.queue} queued</small></span>
+    <span class="pb"><span class="pbar"><i style="width:${(doneFrac*100).toFixed(1)}%;background:${dir==='recv'?'var(--accent)':'var(--success)'}"></i></span><small style="color:var(--faint);font-size:11px">${l.landed} ${dir==='recv'?'landed':'served'} this session · ${fmtB(l.bytesDone)}</small></span>
+    <span class="rate">${fmtRate(l.rate)}</span>
+    ${spark(l.hist,dir==='recv'?'#88c0d0':'#a3be8c')}
+    <span class="eta">ETA ${fmtDur(eta)}</span>
+  </div>
+  ${open?`<div class="inflight">${l.frames.map(fr=>`<div class="row"><span class="fname" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(fr.name)}</span><span class="pbar"><i style="width:${(fr.done/fr.size*100).toFixed(0)}%"></i></span><span style="text-align:right">${fmtB(fr.done)} / ${fmtB(fr.size)}</span></div>`).join('')}</div>`:''}`;
+}
+function liveHtml(){
+  const rr=LIVE.recv.reduce((a,l)=>a+l.rate,0),sr=LIVE.send.reduce((a,l)=>a+l.rate,0);
+  const recvAllowed=S.role!=='contributor';
+  return `<div class="card"><h2>Receiving <span class="sub">${recvAllowed?`${fmtRate(rr)} from ${LIVE.recv.length} members · ${libQueue.length} frames to go · waiting for publisher: 12`:'Your role does not receive project data'}</span></h2>
+    ${recvAllowed?LIVE.recv.map((l,i)=>peerRow(l,'recv','r'+i)).join(''):'<p class="empty">Contributors only send. Ask the coordinator for the Processor role to receive the project.</p>'}
+  </div>
+  <div class="card" style="margin-top:12px"><h2>Sending <span class="sub">${fmtRate(sr)} to ${LIVE.send.length} members · upload streams 3 of 4</span></h2>
+    ${LIVE.send.map((l,i)=>peerRow(l,'send','s'+i)).join('')}
+  </div>`;
+}
+function liveMini(){
+  const rr=LIVE.recv.reduce((a,l)=>a+l.rate,0),sr=LIVE.send.reduce((a,l)=>a+l.rate,0);
+  const r=S.role!=='contributor'?`<span>↓ <b>${fmtRate(rr)}</b> from ${LIVE.recv.map(l=>MBY[l.peer].name).join(', ')}</span>`:'';
+  return `${r}<span>↑ <b>${fmtRate(sr)}</b> to ${LIVE.send.map(l=>MBY[l.peer].name).join(', ')}</span>`;
+}
+
+// ───────────────────────── views ─────────────────────────
+function tabsFor(){
+  const t=[['overview','Overview'],['mine','My frames'],];
+  if(S.role!=='contributor')t.push(['library','Library']);
+  t.push(['members','Members'],['exchange','Exchange']);
+  if(S.role==='coordinator')t.push(['moderation','Moderation']);
+  return t;
+}
+function counts(){
+  const own=FRAMES.filter(f=>f.own);
+  return {ready:own.filter(f=>f.seg==='ready').length,held:own.filter(f=>f.seg==='held').length,published:own.filter(f=>f.seg==='published').length,pending:FRAMES.filter(f=>!f.own&&f.pub==='pending').length,libMissing:FRAMES.filter(f=>!f.own&&f.pub!=='pending'&&f.mine!=='have'&&f.mine!=='notkept').length};
+}
+function projectView(){
+  const c=counts();
+  const tabs=tabsFor();if(!tabs.some(x=>x[0]===S.tab))S.tab='overview';
+  const badge={mine:c.ready?`<span class="cnt">${c.ready} ready</span>`:'',moderation:c.pending?`<span class="cnt w">${c.pending}</span>`:'',library:S.role!=='contributor'?`<span class="cnt">${c.libMissing} to go</span>`:''};
+  return `
+  <div class="head">
+    <button class="linkbtn" style="color:var(--faint)">← Projects</button>
+    <h1>M31 Deep Field 2026</h1>
+    <span class="meta">◎ M31 · r 1.5° · ${MEMBERS.length} members</span>
+    ${S.role==='coordinator'?'<span class="chip c-info">coordinator</span>':''}
+    <span style="flex:1"></span>
+    <span class="pill"><span class="dot live-dot"></span>Live · synced 4 s ago</span>
+    <button class="linkbtn" style="font-size:12px">Manage on portal ↗</button>
+  </div>
+  <div class="meta" style="margin-top:6px">▣ Publishing from this device · Auto-publish on · Auto-replicate on</div>
+  <div class="tabs" role="tablist">${tabs.map(([k,l])=>`<button role="tab" class="${S.tab===k?'on':''}" data-act="tab" data-v="${k}">${l}${badge[k]||''}</button>`).join('')}</div>
+  <div class="panel">${({overview:overviewView,mine:mineView,library:()=>libraryView(),members:membersView,exchange:exchangeView,moderation:moderationView})[S.tab]()}</div>`;
+}
+function overviewView(){
+  const c=counts();
+  const pub=FRAMES.filter(f=>(f.own?f.seg==='published':true)&&f.pub==='published');
+  const byF={};for(const f of pub){(byF[f.filter]=byF[f.filter]||{});byF[f.filter][f.publisher]=(byF[f.filter][f.publisher]||0)+f.exp}
+  const goals=FILTERS.map(fl=>{
+    const m=byF[fl]||{};const tot=Object.values(m).reduce((a,b)=>a+b,0);const goal=GOALS[fl]*3600;const scale=Math.max(goal,tot);
+    const segs=MEMBERS.filter(x=>m[x.id]).map(x=>`<i style="width:${m[x.id]/tot*100}%;background:${x.color}" title="${x.name}: ${fmtDur(m[x.id])}"></i>`).join('');
+    const left=goal-tot;
+    return `<div class="goal"><span>${fdot(fl)}<b>${fl}</b></span><div class="gb"><div class="fill" style="width:${tot/scale*100}%">${segs}</div><span class="over" title="Goal ${GOALS[fl]}h" style="right:auto;left:calc(${goal/scale*100}% - 1px)"></span></div><span class="gt"><b>${fmtDur(tot)}</b> of ${GOALS[fl]}h · ${left>0?`<span style="color:var(--warning)">${fmtDur(left)} to go</span>`:'<span style="color:var(--success)">goal met</span>'}</span></div>`}).join('');
+  const single=FRAMES.filter(f=>f.holders&&f.pub==='published'&&f.holders.length===1);
+  const singleB=single.reduce((a,f)=>a+f.size,0);
+  const noSolve=FRAMES.filter(f=>f.own&&f.seg==='held'&&f.reasons[0].code==='solve').length;
+  const unmapped=FRAMES.filter(f=>f.own&&f.seg==='held'&&f.reasons[0].code==='map').length;
+  const olgaOnly=FRAMES.filter(f=>!f.own&&f.mine==='missing').length;
+  return `
+  <div class="note"><b>Overview</b> answers “where is the campaign” without a table: goal per filter coloured by who contributed, my three numbers (each opens its segment), what needs attention, live traffic. Thresholds move here from the old overview.</div>
+  <div class="grid-ov">
+    <div class="card"><h2>Integration toward goal <span class="sub">published, accepted frames · by member</span></h2>${goals}
+      <div class="legend">${MEMBERS.map(m=>`<span>${mdot(m.id)} ${m.name}</span>`).join('')}</div></div>
+    <div style="display:grid;gap:14px">
+      <div class="card"><h2>My contribution</h2><div class="mine3">
+        <button data-act="goseg" data-v="ready"><span class="n" style="color:var(--accent)">${c.ready}</span><span class="l">ready to publish</span></button>
+        <button data-act="goseg" data-v="published"><span class="n" style="color:var(--success)">${c.published}</span><span class="l">published</span></button>
+        <button data-act="goseg" data-v="held"><span class="n" style="color:var(--warning)">${c.held}</span><span class="l">held back</span></button>
+      </div></div>
+      <div class="card"><h2>Needs attention</h2>
+        <div class="att"><span class="chip c-warn">${noSolve}</span><span class="t">frames from ${nightStr(2)} are not plate-solved<small>They cannot be published until solved.</small></span><button class="btn sm" data-act="goseg" data-v="held">Review</button></div>
+        <div class="att"><span class="chip c-warn">${unmapped}</span><span class="t">frames with an unmapped filter “S2 6nm”<small>Map it to SII once; the gate re-checks them.</small></span><button class="btn sm" data-act="goseg" data-v="held">Map</button></div>
+        <div class="att"><span class="chip c-err">${single.length}</span><span class="t">published frames exist in one copy only · ${fmtB(singleB)}<small>If that device is lost, the project loses them.</small></span><button class="btn sm" data-act="tab" data-v="library">Show</button></div>
+        ${S.role!=='contributor'?`<div class="att"><span class="chip c-err">${olgaOnly}</span><span class="t">frames missing here because their holders are offline<small>Irina offline 1 day, Olga offline 3 days.</small></span><button class="btn sm" data-act="tab" data-v="library">Show</button></div>`:''}
+        ${S.role==='coordinator'?`<div class="att"><span class="chip c-warn">${c.pending}</span><span class="t">frames wait for your approval<small>First publications by Irina and Pavel.</small></span><button class="btn sm" data-act="tab" data-v="moderation">Moderate</button></div>`:''}
+      </div>
+      <div class="card"><h2>Exchange now <button class="linkbtn" data-act="tab" data-v="exchange" style="font-weight:400;font-size:12px;margin-left:auto">Open Exchange →</button></h2><div id="live-mini" style="display:grid;gap:4px;font-size:12.5px;color:var(--muted)">${liveMini()}</div></div>
+      <div class="card"><h2>Quality thresholds <span class="sub">v3 · set by the coordinator</span></h2><div style="font-size:12.5px;color:var(--muted);display:grid;gap:2px"><span>FWHM ≤ 3.00″</span><span>Eccentricity ≤ 0.55</span><span>Stars ≥ 150</span><span>Reject trailed frames</span></div></div>
+    </div>
+  </div>`;
+}
+function mineView(){
+  const c=counts();
+  const segs=[['ready','Ready to publish',c.ready,'var(--accent)'],['published','Published',c.published,'var(--success)'],['held','Held back',c.held,'var(--warning)']];
+  const note={ready:'<b>Ready</b>: pass the gate, not announced yet. Default grouping Night ▸ Filter because a contributor publishes night by night. Aggregates sit under their own columns (Σ exposure under Exp, median under FWHM). Publish acts on the selection, or on everything visible when nothing is selected.',
+    published:'<b>Published</b>: moderation status and distribution. Holders counts come from the holder claims (decision 2A); “1 copy” is the risk flag. Filter Status → “Only one copy” to see what is at risk. Click a row: the drawer lists who holds the frame.',
+    held:'<b>Held back</b>: grouped by the <i>first blocking cause</i>, the fix sits on the group header (“Solve 44”). Quality causes have no button: the frames themselves are the problem. Each frame shows its failing value against the threshold.'}[S.seg];
+  return `<div class="segs">${segs.map(([k,l,n,col])=>`<button class="${S.seg===k?'on':''}" data-act="seg" data-v="${k}"><span class="n" style="color:${col}">${n.toLocaleString('en-US')}</span><span class="l">${l}</span></button>`).join('')}
+    <span style="align-self:center;margin-left:auto;display:flex;gap:8px"><button class="btn">+ Link an object</button><button class="btn">Recalibrate and republish all</button></span></div>
+    <div class="note">${note}</div>${tableHtml(S.seg)}`;
+}
+function libraryView(){
+  return `<div class="note"><b>Library</b>: everyone else’s frames and their state on this device. Default grouping Publisher ▸ Filter (the processor’s stacking unit); switch the first level to Camera to see pixel-scale families. The group row’s bar is have / downloading / queued / missing / not kept. Missing always says why.</div>${tableHtml('library')}`;
+}
+function moderationView(){
+  return `<div class="note"><b>Moderation</b>: the same table over pending first publications, grouped Publisher ▸ Night, metrics visible by default so the coordinator judges quality before approving.</div>${tableHtml('moderation')}`;
+}
+function memberStats(){
+  return MEMBERS.map(m=>{
+    const pubd=FRAMES.filter(f=>f.publisher===m.id&&(f.own?f.seg==='published':true)&&f.pub==='published');
+    const perF={};pubd.forEach(f=>perF[f.filter]=(perF[f.filter]||0)+f.exp);
+    const held=FRAMES.filter(f=>f.holders&&f.holders.includes(m.id)&&f.pub!=='pending');
+    const allP=FRAMES.filter(f=>f.holders&&f.pub==='published');
+    return {m,published:pubd.length,perF,int:pubd.reduce((a,f)=>a+f.exp,0),fwhm:median(pubd.map(f=>f.fwhm)),holds:held.length,holdsB:held.reduce((a,f)=>a+f.size,0),share:held.length/allP.length,pubd};
+  });
+}
+function membersView(){
+  const st=memberStats();const s=S.memberSort;
+  const val={name:x=>x.m.name,role:x=>x.m.role,published:x=>x.published,int:x=>x.int,fwhm:x=>x.fwhm??99,holds:x=>x.holds};
+  FILTERS.forEach(fl=>val['f_'+fl]=x=>x.perF[fl]||0);
+  st.sort((a,b)=>{const x=val[s.k](a),y=val[s.k](b);return (x<y?-1:x>y?1:0)*s.d});
+  const th=(k,l,num)=>`<th class="s${num?' num':''}${s.k===k?' sorted':''}" data-act="msort" data-k="${k}">${l}${s.k===k?(s.d>0?' ↑':' ↓'):''}</th>`;
+  const rows=st.map(x=>{
+    const open=S.memberOpen===x.m.id;
+    const main=`<tr class="x" data-act="mopen" data-v="${x.m.id}"><td>${mdot(x.m.id)} <b>${x.m.name}</b></td><td>${x.m.role}${x.m.id==='you'?' <span style="color:var(--faint)">(Processor data)</span>':''}</td><td>${x.m.devices.map(d=>`<span class="dot" title="${esc(d.n)}" style="background:${d.on?'var(--success)':'var(--border)'};margin-right:2px"></span>`).join('')}</td>
+      <td class="num">${x.published.toLocaleString('en-US')}</td>${FILTERS.map(fl=>`<td class="num" style="color:${x.perF[fl]?'var(--text2)':'var(--ghost)'}">${x.perF[fl]?fmtDur(x.perF[fl]):'—'}</td>`).join('')}
+      <td class="num"><b>${x.int?fmtDur(x.int):'—'}</b></td><td class="num">${x.fwhm?x.fwhm.toFixed(2)+'″':'—'}</td>
+      <td class="num">${x.holds.toLocaleString('en-US')} fr · ${fmtB(x.holdsB)} <span style="color:var(--faint)">${(x.share*100).toFixed(0)}%</span></td><td style="color:${x.m.online?'var(--success)':'var(--faint)'}">${x.m.seen}</td></tr>`;
+    if(!open)return main;
+    const byCam={};x.pubd.forEach(f=>{(byCam[f.camera]=byCam[f.camera]||[]).push(f)});
+    const det=Object.entries(byCam).map(([cam,fs])=>{const byF={};fs.forEach(f=>(byF[f.filter]=byF[f.filter]||[]).push(f));return `<div style="margin:4px 0"><b style="font-weight:600">${esc(cam)}</b> — ${Object.entries(byF).map(([fl,a])=>`${fdot(fl)}${fl} ${a.length} fr · x̃ FWHM ${median(a.map(f=>f.fwhm)).toFixed(2)}″ · x̃ ecc ${median(a.map(f=>f.ecc)).toFixed(2)}`).join(' &nbsp;·&nbsp; ')}</div>`}).join('')||'<span style="color:var(--faint)">Nothing published yet.</span>';
+    return main+`<tr><td colspan="${6+FILTERS.length+3}" style="background:rgba(59,66,82,.6);white-space:normal;font-size:12px;color:var(--muted);padding:8px 14px">${det}<div style="margin-top:4px;color:var(--faint)">Devices: ${x.m.devices.map(d=>`${esc(d.n)} (${d.on?'online':'offline'})`).join(', ')}</div></td></tr>`;
+  }).join('');
+  return `<div class="note"><b>Members</b>: people, not frames. Filter columns are hours of published integration; Holds is how many project frames this person keeps (claims mapped to accounts through their devices) and the share of the project. Click a member for cameras and quality per filter.</div>
+  <div class="card" style="padding:0"><div class="hscroll"><table class="plain"><thead><tr>${th('name','Member')}${th('role','Role')}<th>Devices</th>${th('published','Published',1)}${FILTERS.map(fl=>th('f_'+fl,fdot(fl)+fl,1)).join('')}${th('int','Σ',1)}${th('fwhm','FWHM x̃',1)}${th('holds','Holds',1)}<th>Last seen</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+const HIST=(()=>{const a=[];for(let i=0;i<14;i++){const d=Math.floor(i/2);const peers=[pick(['kostya','masha','olga','andrei','pavel'])];if(R()<0.5)peers.push(pick(['kostya','olga']));const fr=ri(8,90);const b=fr*rnd(55e6,110e6);const dur=b/rnd(12e6,38e6);a.push({at:`${nightStr(d)} ${String(ri(10,23)).padStart(2,'0')}:${String(ri(0,59)).padStart(2,'0')}:${String(ri(0,59)).padStart(2,'0')}`,peers:[...new Set(peers)],fr,b,dur,failed:R()<0.15?ri(1,3):0})}return a.sort((x,y)=>x.at<y.at?1:-1)})();
+function exchangeView(){
+  return `<div class="note"><b>Exchange</b>: live, aggregated per member and direction — never a row per frame. Rate and ETA come from the core’s exchange meter (one event per second while something flows). Click a member to see frames in flight. History lists receive sessions with their real sources; serving is live-only (decision 2A: no send journal).</div>
+  <div id="live">${liveHtml()}</div>
+  <div class="card" style="margin-top:12px;padding:12px 0 4px"><h2 style="padding:0 16px">Received <span class="sub">sessions · a session ends after 5 min without a landing</span></h2>
+  <div class="hscroll"><table class="plain"><thead><tr><th>Started</th><th>From</th><th class="num">Frames</th><th class="num">Size</th><th class="num">Duration</th><th class="num">Avg rate</th><th>Outcome</th></tr></thead><tbody>
+  ${HIST.map(h=>`<tr><td style="color:var(--faint)">${h.at}</td><td>${h.peers.map(p=>`${mdot(p)} ${MBY[p].name}`).join(', ')}</td><td class="num">${h.fr}</td><td class="num">${fmtB(h.b)}</td><td class="num">${fmtDur(h.dur)}</td><td class="num">${fmtRate(h.b/h.dur)}</td><td>${h.failed?`<span class="chip c-warn">${h.failed} retried</span>`:'<span class="chip c-ok">landed</span>'}</td></tr>`).join('')}
+  </tbody></table></div></div>`;
+}
+function transfersLive(){
+  const rr=LIVE.recv.reduce((a,l)=>a+l.rate,0),sr=LIVE.send.reduce((a,l)=>a+l.rate,0);
+  const open=S.tOpen.proj;
+  return `
+  <div class="tgroup"><div class="th"><span class="av" style="background:var(--accent-m);color:var(--text);width:22px;height:22px;font-size:10px">⇄</span><span class="ttl">Observatory NUC → This Mac</span><span class="chip c-mute">personal</span><span style="color:var(--faint)">NGC 7000 · 214 files · 18.2 / 41.0 GB</span><span style="flex:1"></span><b>22.4 MB/s</b><span style="color:var(--faint)">ETA 17m</span></div></div>
+  <div class="tgroup"><div class="th" data-act="tproj"><span class="caret">${open?'▾':'▸'}</span><span class="ttl">M31 Deep Field 2026</span><span class="chip c-info">project</span><span style="color:var(--faint)">↓ ${fmtRate(rr)} from ${LIVE.recv.length} · ↑ ${fmtRate(sr)} to ${LIVE.send.length} · ${libQueue.length} frames to go</span><span style="flex:1"></span><button class="linkbtn" data-act="gotoexchange" style="font-size:12px">Open in project →</button></div>
+  ${open?`<div class="body">${LIVE.recv.map((l,i)=>peerRow(l,'recv','tr'+i)).join('')}${LIVE.send.map((l,i)=>peerRow(l,'send','ts'+i)).join('')}</div>`:''}</div>`;
+}
+function transfersView(){
+  return `<div class="head"><h1>Transfers</h1><span class="meta">everything flowing through this device</span></div>
+  <div class="note" style="margin-top:10px"><b>Transfers</b> (decision 1A): personal transfers keep their rows; each project appears as one expandable group with the same per-member rows as the project’s Exchange tab — one source of data in the core.</div>
+  <h3 style="font-size:13px;margin:14px 0 8px">Active</h3><div id="tlive">${transfersLive()}</div>
+  <h3 style="font-size:13px;margin:18px 0 8px">History</h3>
+  <div class="card" style="padding:4px 0"><div class="hscroll"><table class="plain"><thead><tr><th>Started</th><th>What</th><th>From / to</th><th class="num">Size</th><th>Outcome</th></tr></thead><tbody>
+  <tr><td style="color:var(--faint)">${nightStr(0)} 09:14:02</td><td>NGC 7000 lights · 186 files</td><td>Observatory NUC → This Mac</td><td class="num">35.8 GB</td><td><span class="chip c-ok">confirmed</span></td></tr>
+  ${HIST.slice(0,6).map(h=>`<tr><td style="color:var(--faint)">${h.at}</td><td>M31 Deep Field 2026 · ${h.fr} frames <span class="chip c-info">project</span></td><td>from ${h.peers.map(p=>MBY[p].name).join(', ')}</td><td class="num">${fmtB(h.b)}</td><td>${h.failed?`<span class="chip c-warn">${h.failed} retried</span>`:'<span class="chip c-ok">landed</span>'}</td></tr>`).join('')}
+  </tbody></table></div></div>`;
+}
+
+// ───────────────────────── drawer ─────────────────────────
+function drawerHtml(){
+  if(!S.drawer)return '';const f=FRAMES.find(x=>x.id===S.drawer);if(!f)return '';
+  const rules=[['FWHM',f.fwhm.toFixed(2)+'″','≤ 3.00″',f.fwhm<=3],['Eccentricity',f.ecc.toFixed(2),'≤ 0.55',f.ecc<=0.55],['Stars',f.stars,'≥ 150',f.stars>=150],['Plate-solved',f.reasons.some(r=>r.code==='solve')?'no':'yes','required',!f.reasons.some(r=>r.code==='solve')],['Analyzed',f.reasons.some(r=>r.code==='analyze')?'no':'yes','required',!f.reasons.some(r=>r.code==='analyze')],['Filter mapped',f.reasons.some(r=>r.code==='map')?'S2 6nm → ?':f.filter,'required',!f.reasons.some(r=>r.code==='map')],['Calibration',f.reasons.some(r=>r.code==='flat')?'no master flat':'dark · flat · bias','masters linked',!f.reasons.some(r=>r.code==='flat')]];
+  const holders=f.holders?f.holders.map(h=>{const m=MBY[h];return `<div style="display:flex;align-items:center;gap:8px;font-size:12.5px;padding:2px 0"><span class="dot" style="background:${m.online?'var(--success)':'var(--border)'}"></span>${mdot(h)} ${m.name}${h===f.publisher?' <span class="chip c-mute">publisher</span>':''}<span style="margin-left:auto;color:var(--faint)">${m.devices[0].n}</span></div>`}).join(''):'<span class="empty">Not published — nobody holds it yet.</span>';
+  const status=f.own?(f.seg==='held'?'<span class="chip c-warn">held back</span>':f.seg==='ready'?'<span class="chip c-info">ready</span>':pubChip(f.pub)):(pubChip(f.pub)+' '+mineCell(f));
+  return `<aside class="drawer" aria-label="Frame details"><div style="display:flex;gap:8px;align-items:flex-start"><div style="flex:1;min-width:0"><div class="fname" style="word-break:break-all;font-size:12.5px;color:var(--text)">${esc(f.name)}</div><div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">${status}</div></div><button class="btn sm" data-act="close" aria-label="Close">✕</button></div>
+  <h3>Frame</h3><dl class="kv"><dt>Publisher</dt><dd>${mdot(f.publisher)} ${MBY[f.publisher].name}</dd><dt>Night</dt><dd>${nightLabel(f.night)}</dd><dt>Filter</dt><dd>${fdot(f.filter)}${f.filter}</dd><dt>Camera</dt><dd>${esc(f.camera)}</dd><dt>Exposure</dt><dd>${f.exp} s</dd><dt>Size</dt><dd>${fmtB(f.size)}</dd>${f.version?`<dt>Version</dt><dd>v${f.version}${f.version>1?' · v1 superseded':''}</dd>`:''}${f.publishedAt?`<dt>Published</dt><dd>${f.publishedAt}</dd>`:''}</dl>
+  <h3>Metrics</h3><dl class="kv"><dt>FWHM</dt><dd>${f.fwhm.toFixed(2)}″</dd><dt>Eccentricity</dt><dd>${f.ecc.toFixed(2)}</dd><dt>Stars</dt><dd>${f.stars}</dd><dt>SNR</dt><dd>${f.snr}</dd><dt>Zero point</dt><dd>${f.zp} mag</dd></dl>
+  ${f.own?`<h3>Gate <span style="font-weight:400;color:var(--faint)">thresholds v3</span></h3><div class="gate"><span class="h">Rule</span><span class="h">Value</span><span class="h">Needs</span><span></span>${rules.map(r=>`<span>${r[0]}</span><span>${r[1]}</span><span style="color:var(--faint)">${r[2]}</span><span style="color:${r[3]?'var(--success)':'var(--error)'}">${r[3]?'✓':'✕'}</span>`).join('')}</div>`:''}
+  <h3>Who holds it ${f.holders?`<span style="font-weight:400;color:var(--faint)">${onlineCount(f)} online of ${f.holders.length}</span>`:''}</h3>${holders}
+  ${f.own?`<h3>On this device</h3><div class="fname" style="font-size:11.5px;color:var(--faint);word-break:break-all">/Volumes/Astro/M31/2026-autumn/${esc(f.night)}/${esc(f.name)}</div>`:''}
+  </aside>`;
+}
+
+// ───────────────────────── render ─────────────────────────
+function render(){
+  const active=document.activeElement;const aid=active&&active.id;const caret=active&&active.selectionStart;
+  const keys=Object.keys(S.t);keys.forEach(k=>{const el=document.getElementById('ts-'+k);if(el)S.t[k].scroll=el.scrollTop});
+  const main=document.getElementById('main');
+  main.innerHTML=`<div class="mockbar"><b>Mockup</b><span>View</span><span class="seg"><button class="${S.view==='project'?'on':''}" data-act="view" data-v="project">Project page</button><button class="${S.view==='transfers'?'on':''}" data-act="view" data-v="transfers">Transfers page</button></span>
+    <span>Your role</span><span class="seg">${[['contributor','Contributor'],['processor','Processor'],['coordinator','Coordinator']].map(([k,l])=>`<button class="${S.role===k?'on':''}" data-act="role" data-v="${k}">${l}</button>`).join('')}</span>
+    <label style="display:inline-flex;gap:6px;align-items:center;cursor:pointer"><span class="cb ${document.body.classList.contains('nonotes')?'':'on'}" data-act="notes"></span><span data-act="notes">Design notes</span></label>
+    <span>Sample data: ${FRAMES.length.toLocaleString('en-US')} frames · ${MEMBERS.length} members</span></div>`+(S.view==='project'?projectView():transfersView());
+  document.getElementById('nav-projects').classList.toggle('on',S.view==='project');
+  document.getElementById('nav-transfers').classList.toggle('on',S.view==='transfers');
+  document.querySelectorAll('.tscroll').forEach(el=>{const k=el.dataset.t;el.scrollTop=S.t[k]?S.t[k].scroll:0;renderBody(k);el.addEventListener('scroll',()=>{if(el._raf)return;el._raf=requestAnimationFrame(()=>{el._raf=0;renderBody(k)})},{passive:true})});
+  document.getElementById('drawer-root').innerHTML=drawerHtml();
+  if(aid){const el=document.getElementById(aid);if(el){el.focus();if(caret!=null&&el.setSelectionRange)try{el.setSelectionRange(caret,caret)}catch(e){}}}
+}
+function refreshBody(key){computeRows(key);renderBody(key)}
+function toast(msg){const r=document.getElementById('toast-root');r.innerHTML=`<div class="toast">${esc(msg)}</div>`;clearTimeout(toast._t);toast._t=setTimeout(()=>r.innerHTML='',2200)}
+function groupByPath(key,path){
+  const find=(tree)=>{if(!tree.groups)return null;for(const g of tree.groups){if(g.path===path)return g;const x=find(g.child);if(x)return x}return null};
+  return find(CACHE[key].tree);
+}
+function allPaths(tree,out){if(tree.groups)for(const g of tree.groups){out.push(g.path);allPaths(g.child,out)}return out}
+
+document.addEventListener('click',e=>{
+  const a=e.target.closest('[data-act]');
+  const row=e.target.closest('tr.fr');
+  if(!a&&row){S.drawer=Number(row.dataset.fid);document.getElementById('drawer-root').innerHTML=drawerHtml();const k=row.closest('.tscroll').dataset.t;renderBody(k);return}
+  if(!a){const t=Object.values(S.t).find(x=>x.colsOpen);if(t&&!e.target.closest('.pop')){t.colsOpen=false;render()}return}
+  const act=a.dataset.act,key=a.dataset.t,t=key?T(key):null;
+  switch(act){
+    case 'view':S.view=a.dataset.v;S.drawer=null;render();break;
+    case 'role':S.role=a.dataset.v;render();break;
+    case 'notes':document.body.classList.toggle('nonotes');try{localStorage.setItem('mock.notes',document.body.classList.contains('nonotes')?'0':'1')}catch(err){}render();break;
+    case 'tab':S.view='project';S.tab=a.dataset.v;S.drawer=null;render();window.scrollTo(0,0);break;
+    case 'seg':S.seg=a.dataset.v;S.drawer=null;render();break;
+    case 'goseg':S.tab='mine';S.seg=a.dataset.v;render();window.scrollTo(0,0);break;
+    case 'chip':{const v=a.dataset.v;t.filters.has(v)?t.filters.delete(v):t.filters.add(v);t.exp=null;render();break}
+    case 'clear':Object.assign(t,{camera:'',night:'',publisher:'',state:'',q:''});t.filters.clear();t.exp=null;render();break;
+    case 'sort':{const k=a.dataset.k;if(t.sort.k===k)t.sort.d*=-1;else t.sort={k,d:COLS[k].num?-1:1};render();break}
+    case 'tg':{const p=a.dataset.p;t.exp.has(p)?t.exp.delete(p):t.exp.add(p);refreshBody(key||a.closest('.tscroll').dataset.t);break}
+    case 'expall':allPaths(CACHE[key].tree,[]).forEach(p=>t.exp.add(p));refreshBody(key);break;
+    case 'colall':t.exp.clear();refreshBody(key);break;
+    case 'sel':{const k=a.closest('.tscroll').dataset.t;const tt=T(k);const id=Number(a.dataset.id);tt.sel.has(id)?tt.sel.delete(id):tt.sel.add(id);render();break}
+    case 'selg':{const k=a.closest('.tscroll').dataset.t;const tt=T(k);const g=groupByPath(k,a.dataset.p);const on=cbState(g.frames,tt.sel)==='on';g.frames.forEach(f=>on?tt.sel.delete(f.id):tt.sel.add(f.id));render();break}
+    case 'selall':{const fs=CACHE[key].fs;const on=cbState(fs,t.sel)==='on';fs.forEach(f=>on?t.sel.delete(f.id):t.sel.add(f.id));render();break}
+    case 'selnone':t.sel.clear();render();break;
+    case 'colsbtn':t.colsOpen=!t.colsOpen;render();break;
+    case 'col':{const k=a.dataset.k;t.cols.has(k)?t.cols.delete(k):t.cols.add(k);render();break}
+    case 'bulk':{const c=TABLES[key];const ac=c.actions.filter(x=>!x.coord||S.role==='coordinator')[Number(a.dataset.i)];const fs=a.dataset.all?CACHE[key].fs:CACHE[key].fs.filter(f=>t.sel.has(f.id));const n=fs.filter(ac.el).length;toast(`Mockup: ${a.dataset.all?(c.allLabel||ac.label):ac.label} → ${n} frames`);break}
+    case 'gact':toast(`Mockup: ${a.dataset.v} → ${a.dataset.n} frames`);break;
+    case 'close':S.drawer=null;document.getElementById('drawer-root').innerHTML='';document.querySelectorAll('.tscroll').forEach(el=>renderBody(el.dataset.t));break;
+    case 'msort':{const k=a.dataset.k;if(S.memberSort.k===k)S.memberSort.d*=-1;else S.memberSort={k,d:k==='name'||k==='role'?1:-1};render();break}
+    case 'mopen':S.memberOpen=S.memberOpen===a.dataset.v?null:a.dataset.v;render();break;
+    case 'peer':S.peerOpen[a.dataset.k]=!S.peerOpen[a.dataset.k];tick();break;
+    case 'tproj':if(e.target.closest('[data-act="gotoexchange"]'))break;S.tOpen.proj=!S.tOpen.proj;tick();break;
+    case 'gotoexchange':S.view='project';S.tab='exchange';render();window.scrollTo(0,0);break;
+  }
+});
+document.addEventListener('change',e=>{
+  const a=e.target;if(!a.dataset||!a.dataset.act)return;const t=T(a.dataset.t);
+  if(a.dataset.act==='facet'){t[a.dataset.f]=a.value;t.exp=null;render()}
+  if(a.dataset.act==='group'){t.group[Number(a.dataset.i)]=a.value;if(Number(a.dataset.i)===0&&a.value==='none')t.group[1]='none';if(t.group[0]===t.group[1])t.group[1]='none';t.exp=null;render()}
+});
+let qT;document.addEventListener('input',e=>{const a=e.target;if(a.dataset&&a.dataset.act==='search'){const t=T(a.dataset.t);t.q=a.value;clearTimeout(qT);qT=setTimeout(()=>{t.exp=null;render()},160)}});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&S.drawer){S.drawer=null;document.getElementById('drawer-root').innerHTML='';document.querySelectorAll('.tscroll').forEach(el=>renderBody(el.dataset.t))}});
+render();
+})();
+</script>
