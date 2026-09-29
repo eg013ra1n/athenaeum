@@ -196,6 +196,9 @@ MemberSummary {
   otherwise the hub's `lastSeenAt` from the project response (§5.6.2), shown as `YYYY-MM-DD HH:MM:SS` with a
   relative "3 days ago" beside it; `null` = never seen. The summary carries `online: bool` and
   `lastSeenAt: string?`.
+- Wave 1 contract: `HubClient::project_page` must send the device token (today it calls
+  `/projects/{id}` anonymously, and under D8 an anonymous caller always gets `lastSeenAt: null`), and the
+  app's `ProjectWire` / `MemberWire` gain `goals` / `lastSeenAt`.
 - Devices in the expanded row show online/offline only; per-device last-seen is not exposed (it would need a
   holders-snapshot change).
 - The Members table sorts on every column (last seen included); a row expands to cameras and per-filter
