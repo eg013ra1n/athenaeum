@@ -1,11 +1,11 @@
 # Collab project page and exchange observability — design
 
-**Date:** 2026-09-29 · **Status:** approved in dialogue, awaiting written-spec review
+**Date:** 2026-09-29 · **Status:** approved in dialogue (hub-first amendment included), awaiting written-spec review
 **Builds on:** `2026-09-23-collab-v3-per-frame-model-design.md` (§8.1 R2, the six-tab page that was never built),
 `2026-09-25-collab-v3-live-exchange-design.md`, `2026-09-28-collab-v3-contributor-path-design.md`.
 **Visual reference (approved):** `docs/superpowers/research/2026-09-29-collab-project-layout-mockup.html`
 — the layouts, groupings, columns and copy in this spec follow it. Where the two disagree, this spec wins
-(the one known difference is §5.4 "Last seen").
+(no known differences).
 
 ## 1. Problem
 
@@ -33,7 +33,9 @@ The owner's smoke of the collab exchange found two things that do not read as a 
 | D3 | The project page has six tabs: **Overview · My frames · Library · Members · Exchange · Moderation**. My frames is one tab with three segments — **Ready · Published · Held back** — because it is one pipeline. |
 | D4 | Every frame list is a **grouped table with drill-down**: each tab has its own default grouping, aggregates sit under their own columns, a flat list is "Group by: None". Facet filters (filter, camera, night, publisher, state, name search), column sort, column visibility, selection with `(N of M)` actions. |
 | D5 | Live telemetry is an in-memory **exchange meter** in the core, read by a snapshot command plus a throttled event (approach 1). The frontend does not aggregate per-frame events. |
-| D6 | Stacking and Export are not project tabs in this cycle. The portal is not touched. The wire is not touched. |
+| D6 | Stacking and Export are not project tabs in this cycle. The iroh wire is not touched. |
+| D7 | **Hub first.** Per-filter goals become a validated, editable hub field (portal Admin editor), and member last-seen is exposed by the hub, before the app work starts (§5.6, wave 0). |
+| D8 | Last seen is visible to **current members of the same project** only; anonymous and non-member viewers get `null`. |
 
 ## 3. Who reads the tables, and for what
 
@@ -190,16 +192,64 @@ MemberSummary {
 - Published counts and seconds come from the local manifest mirror (published, accepted rows).
 - Holds = holder claims on the frame's current content version, mapped to the account through its devices,
   joined to `project_frames_local` on `frame_seq`.
-- **No "Last seen" column** (differs from the mockup): only "connected now" is known (presence book); a
-  last-seen time is not stored anywhere. Online/offline dots only. Last-seen is a follow-up item.
-- The Members table sorts on every column; a row expands to cameras and per-filter median FWHM/ecc.
+- `lastSeenAt` (member level): "now" when any of the member's devices is connected per the presence book;
+  otherwise the hub's `lastSeenAt` from the project response (§5.6.2), shown as `YYYY-MM-DD HH:MM:SS` with a
+  relative "3 days ago" beside it; `null` = never seen. The summary carries `online: bool` and
+  `lastSeenAt: string?`.
+- Devices in the expanded row show online/offline only; per-device last-seen is not exposed (it would need a
+  holders-snapshot change).
+- The Members table sorts on every column (last seen included); a row expands to cameras and per-filter
+  median FWHM/ecc.
 
 ### 5.5 Overview goals
 
-The hub stores `goals` as free-form JSON and returns it with the project; the app does not read it today and
-the portal has no goal editor. The app parses `goals` when it has the v3 spec §3.1 shape
-`{ "<canonical filter>": <seconds> }` and draws a goal marker and "N to go"; otherwise the bars show accumulated
-integration only. A goal editor on the portal is out of scope (open item).
+After wave 0 (§5.6.1) the hub guarantees `goals` is `null` or `{ "<canonical filter>": <seconds> }` with every
+key in the project's dictionary. The app reads it from the project response it already fetches, strictly (a
+malformed value is logged at `warn` and treated as `null`, never guessed at). A filter with a goal draws the
+goal marker and "N to go" / "goal met"; a filter without one shows accumulated integration only; a goal for a
+filter with no frames yet still gets its (empty) bar so the shortfall is visible.
+
+### 5.6 Hub and portal (wave 0, repo `athenaeum-hub`)
+
+Branch `project-observability-hub`, cut from `contributor-path-hub` (unmerged, awaiting the owner's §13
+smoke; the app on `main` already targets it).
+
+What exists: the portal types `goals` as `Record<canonical, seconds> | null`, the public project page's
+coverage already carries `goalSeconds` per filter, and `project.edit`'s help text names goals. What is missing:
+write-side validation (today only a 4 KB size cap in `validate_project_texts`) and any editor. The hub stores
+`devices.last_seen_at`, stamped at most once a minute by both auth middlewares, but only the operator console
+reads it.
+
+#### 5.6.1 Goals
+
+- **Validation** in `create_project` and `update_project`: `goals` is `null` or an object whose keys are
+  canonical names in the project's filter dictionary and whose values are finite numbers with
+  `0 < seconds ≤ 36 000 000` (10 000 h). Refusals name the offending entry:
+  `goal for "Hb": not in this project's filter dictionary`, `goal for "Ha" must be a positive number of
+  seconds`.
+- **Migration**: an existing row whose `goals` does not have that shape is set to `NULL`, each one logged at
+  `warn` with the project id. Prod v3 is not deployed; the test hub is the only affected data.
+- **Dictionary changes**: `put_dictionary` removes goals for canonicals it drops, in the same transaction.
+- **Portal editor**: Admin → Settings gains a "Goals" block — one row per dictionary canonical (kind shown as
+  on the dictionary editor), an hours input, empty = no goal, parsed on blur like the wave-0 threshold editor;
+  visible and writable with `project.edit` or as coordinator; saved through the existing project update.
+  Setting goals at creation (NewProject) is not added.
+
+#### 5.6.2 Last seen
+
+- `MemberPublicView` gains `lastSeenAt: DateTime<Utc> | null` = `max(devices.last_seen_at)` over the
+  member's non-revoked devices.
+- Filled only when the viewer is a current member of this project (D8); otherwise `null` for every row.
+- Portal: the members list shows it for member viewers (relative time, absolute on hover).
+- No new stamping: the existing throttled stamp is the source.
+
+#### 5.6.3 Hub tests
+
+Goals: unknown filter, zero, negative, NaN/string, `null` resets, a dictionary edit dropping a canonical drops
+its goal, the migration nulls a malformed row and keeps a valid one. Last seen: a member sees co-members'
+values, a non-member and an anonymous viewer get `null`, a revoked device is ignored, the max across two
+devices is taken. Portal: the goals editor (render per dictionary canonical, blur parse, empty clears, refusal
+shown) and the members-list line.
 
 ## 6. The exchange meter
 
@@ -310,12 +360,16 @@ Both hosts, each Tauri command with its Axum mirror (`#[tracing::instrument(skip
 | ---- | ---- |
 | `list_project_own_frames` | `list_collab_frames` (§5.2 fields) |
 | `get_collab_frame_holders` | `list_sync_history` (excludes collab landings) |
-| `get_collab_member_summary` | `get_collab_project_detail` (parsed goals, §5.5) |
+| `get_collab_member_summary` | `get_collab_project_detail` (goals, member `lastSeenAt`; §5.5, §5.6) |
 | `get_collab_exchange` | |
 | `list_collab_receive_sessions` | |
 
 New event: `collab-exchange-progress`. Schema: `collab_receive_sessions` and `project_frames_local.announced_at`
 (§5.1). The CLAUDE.md command count and module list are updated in the same change.
+
+Hub (wave 0): `create_project` / `update_project` validate `goals`; `put_dictionary` prunes goals; the project
+response's members carry `lastSeenAt`; one migration normalises existing `goals`; portal Admin goals editor
+and members-list last seen. No new hub endpoint.
 
 ## 10. Testing
 
@@ -337,23 +391,26 @@ New event: `collab-exchange-progress`. Schema: `collab_receive_sessions` and `pr
 groups, `(N of M)` eligibility, windowing slice maths, Transfers history merge order, indicator on collab-only
 traffic, role-dependent tabs.
 
-**Owner smoke (three instances on the test hub):** A publishes, B receives from A and C; both ends show
+**Owner smoke (three instances on the test hub):** the coordinator sets goals on the portal and the app's
+Overview draws them; a member who quit an hour ago shows that time in Members; A publishes, B receives from A and C; both ends show
 live rows with names, rate and ETA; B's Transfers shows the project group and a session in history with both
 sources; A's Published shows B as holder in the drawer; Members holds match.
 
 ## 11. Delivery
 
-Two waves, one plan each:
+Three waves, one plan each, in order:
 
+0. **Hub and portal** (§5.6): goals validation, migration, dictionary pruning, Admin goals editor, member
+   `lastSeenAt`; hub and portal tests. Deployed to the test hub before wave 1's owner smoke.
 1. **Core and commands**: meter + feeds, snapshot/event, own-frames/holders/member-summary commands,
-   `ProjectFrameView` fields, sessions + provenance + history filter, goals parsing; both hosts; tests.
+   `ProjectFrameView` fields, sessions + provenance + history filter, goals and `lastSeenAt` reading; both
+   hosts; tests.
 2. **Frontend**: `ProjectFrameTable` + pure modules, the six tabs, drawer, Exchange tab, Transfers groups and
    history, sidebar indicator; tests.
 
 ## 12. Open items (not this cycle)
 
-- Portal goal editor with the `{ filter: seconds }` shape (§5.5).
-- Member "last seen" (needs the hub or presence to persist it).
+- Goals at project creation (NewProject); per-device last seen.
 - Send journal, if D2 is ever revisited.
 - Relay/direct per peer.
 - Project Stacking and Export tabs (v3 §8.1).
