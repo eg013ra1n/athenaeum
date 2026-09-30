@@ -1,38 +1,64 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { ExternalLink, Loader2, Monitor, Plus, RefreshCw, Send, Target } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useParams, useSearchParams } from 'react-router-dom';
+import { ExternalLink, Loader2, Monitor, Send, Target } from 'lucide-react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
 import { useSessionState } from '../contexts/SessionStateContext';
+import { useCollabExchange } from '../contexts/CollabExchangeContext';
 import { openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
 import AutoReplicateBar from '../components/collab/AutoReplicateBar';
-import AutoPublishSwitch from '../components/collab/AutoPublishSwitch';
-import GateBlockers from '../components/collab/GateBlockers';
-import FilterMappingDialog from '../components/collab/FilterMappingDialog';
-import LinkObjectDialog from '../components/collab/LinkObjectDialog';
-import ReceiveTab from '../components/collab/ReceiveTab';
-import ModerationQueue from '../components/collab/ModerationQueue';
 import UpdateRequired from '../components/collab/UpdateRequired';
 import CollabLiveStatus from '../components/collab/CollabLiveStatus';
 import { formatBytes } from '../components/collab/format';
-import { SHORT as CONTRIBUTOR_STATE_LABEL } from '../components/collab/contributorState';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import OverviewTab from '../components/collab/project/OverviewTab';
+import MyFramesTab, { type Segment } from '../components/collab/project/MyFramesTab';
+import LibraryTab, { libraryInFlight, libraryToCome } from '../components/collab/project/LibraryTab';
+import MembersTab from '../components/collab/project/MembersTab';
+import ExchangeTab from '../components/collab/project/ExchangeTab';
+import ModerationTab from '../components/collab/project/ModerationTab';
+import FrameDrawer from '../components/collab/project/FrameDrawer';
+import RepublishGuardDialog from '../components/collab/project/RepublishGuardDialog';
+import { deviceLabel, leading, OTHER_DEVICE, usePublishing } from '../components/collab/project/usePublishing';
+import type { FrameVM } from '../components/collab/project/frames';
 import type {
-  FrameGateRow,
-  GateReport,
-  ProjectCard,
+  MemberSummary,
+  OwnFrameRow,
   ProjectDetail as Detail,
   ProjectFrameView,
-  PublishResult,
 } from '../types/models';
-import type { AnalysisCompleteEvent } from '../types/helpers';
 
-type Tab = 'contribute' | 'receive' | 'moderation' | 'overview';
+type Tab = 'overview' | 'mine' | 'library' | 'members' | 'exchange' | 'moderation';
 
-function isTab(v: string | null): v is Tab {
-  return v === 'contribute' || v === 'receive' || v === 'moderation' || v === 'overview';
+const TAB_LABEL: Record<Tab, string> = {
+  overview: 'Overview',
+  mine: 'My frames',
+  library: 'Library',
+  members: 'Members',
+  exchange: 'Exchange',
+  moderation: 'Moderation',
+};
+
+/** Every accepted `?tab=` value (and stored session value) → its tab. The
+ *  old four-tab page's ids stay valid: `receive` (collab notifications,
+ *  `CollabAttention`) → Library, `contribute` → My frames; `moderation` and
+ *  `overview` kept their names. A Map, so an arbitrary string can never hit
+ *  an `Object.prototype` key. */
+const TAB_ALIASES = new Map<string, Tab>([
+  ['overview', 'overview'],
+  ['mine', 'mine'],
+  ['library', 'library'],
+  ['members', 'members'],
+  ['exchange', 'exchange'],
+  ['moderation', 'moderation'],
+  ['receive', 'library'],
+  ['contribute', 'mine'],
+]);
+
+function resolveTab(v: string | null | undefined): Tab | null {
+  return v ? (TAB_ALIASES.get(v) ?? null) : null;
 }
 
 // Rough per-frame size for the PRE-publish confirm estimate only (a calibrated
@@ -41,197 +67,91 @@ function isTab(v: string | null): v is Tab {
 // an authoritative stored value (S6).
 const APPROX_FRAME_BYTES = 45 * 1024 * 1024;
 
-/** A hub call refused this build with the stable `collab_api_outdated`
- *  prefix (P17). */
-function isOutdated(msg: string): boolean {
-  return msg.startsWith('collab_api_outdated');
-}
+const BADGE = 'rounded-full px-1.5 text-[10px] font-medium';
 
-/** The backend's refusal while another publish run of the same project
- *  (manual, republish or the background auto-publish) is in progress —
- *  `api::collab::PUBLISH_BUSY_MSG`, owner decision 2026-09-24: refused,
- *  never queued. */
-const PUBLISH_BUSY = 'publication of this project is already running';
-
-function isPublishBusy(msg: string): boolean {
-  return msg.includes(PUBLISH_BUSY);
-}
-
-/** Inline text + toast for a busy refusal: not a failure of the user's
- *  data, just "try again once the running one ends". */
-const PUBLISH_BUSY_INLINE =
-  'Publication of this project is already running — wait for it to finish, then try again.';
-
-/** Amendment A6: another device of this account is the project's publishing
- *  device. A publish/republish rejects with
- *  `collab_publishing_device:<name>` (`account::client::publishing_device_msg`)
- *  when nothing else went out; the prefix is stable, the rest is the device
- *  name or `OTHER_DEVICE`. */
-const PUBLISHING_DEVICE_PREFIX = 'collab_publishing_device:';
-
-/** The name core uses for a bound device the hub reports without one
- *  (`account::client::publishing_device_label`). */
-const OTHER_DEVICE = 'another device of this account';
-
-function publishingDeviceRefusal(msg: string): string | null {
-  if (!msg.startsWith(PUBLISHING_DEVICE_PREFIX)) return null;
-  return msg.slice(PUBLISHING_DEVICE_PREFIX.length).trim() || OTHER_DEVICE;
-}
-
-/** A run that ALSO posted versions resolves Ok, with the refused new frames
- *  in `heldBack` carrying `publishingDevice` — the bound device's name (or
- *  `OTHER_DEVICE`). Keyed on that field only, never on the reason text. */
-function heldForPublishingDevice(res: PublishResult | null | undefined): string | null {
-  for (const frame of res?.heldBack ?? []) {
-    if (frame.publishingDevice != null) return deviceLabel(frame.publishingDevice);
-  }
-  return null;
-}
-
-/** The bound device's name for display; never "this device". */
-function deviceLabel(name: string | null | undefined): string {
-  return name?.trim() || OTHER_DEVICE;
-}
-
-/** A device name at the start of a sentence. */
-function leading(name: string): string {
-  return name === OTHER_DEVICE ? 'Another device of this account' : name;
-}
-
+/**
+ * A collab project: the header (title, target, publishing device, live
+ * status, portal link, auto-replication) and six tabs — Overview, My frames,
+ * Library, Members, Exchange, Moderation. The shell owns the loads shared by
+ * several tabs, the tab/segment state and deep links, the frame drawer, and
+ * the publish confirm + republish guard (orchestration in `usePublishing`).
+ * Every tab body is its own component under `components/collab/project/`.
+ */
 export default function ProjectDetail() {
   const { id } = useParams();
-  const navigate = useNavigate();
+  // Keyed on the project: the router keeps this element mounted across
+  // `/projects/a` → `/projects/b`, and nothing of one project (rows, drawer,
+  // a pending confirm's frame ids, busy flags) may carry over to the next.
+  return <ProjectPage key={id} id={id} />;
+}
+
+function ProjectPage({ id }: { id: string | undefined }) {
   const { notify } = useNotifications();
+  const { state: exchange } = useCollabExchange();
   const [detail, setDetail] = useState<Detail | null>(null);
-  const [gate, setGate] = useState<GateReport | null>(null);
-  const [gateError, setGateError] = useState(false);
+  const [missing, setMissing] = useState(false);
+  const [own, setOwn] = useState<OwnFrameRow[] | null>(null);
+  const [ownError, setOwnError] = useState(false);
+  const [frames, setFrames] = useState<ProjectFrameView[] | null>(null);
+  const [framesError, setFramesError] = useState(false);
+  const [members, setMembers] = useState<MemberSummary[] | null>(null);
+  const [membersError, setMembersError] = useState(false);
+  const [drawer, setDrawer] = useState<FrameVM | null>(null);
+  /** The publish confirm's requested frame ids; `null` = closed. */
+  const [publishIds, setPublishIds] = useState<number[] | null>(null);
+  /** The republish guard's request (`ids: null` = "all"); `null` = closed. */
+  const [republishReq, setRepublishReq] = useState<{ ids: number[] | null } | null>(null);
+  const [switchConfirm, setSwitchConfirm] = useState(false);
+
   // Session-scoped so stepping into a linked object and back returns to the
-  // tab you were on.
-  const [tab, setTab] = useSessionState<Tab>('projectDetail.tab', 'contribute');
-  // `?tab=receive` (from a collab notification's link, e.g. a replication
-  // pause or a landed-frames toast — see `useCollabNotifications`) jumps to
-  // that tab on arrival, then cleans the URL. Mirrors `FrameSetDetail`'s
-  // `?tab=…` pattern.
+  // tab and segment you were on. A value stored by the old four-tab page
+  // resolves through the same alias table as a deep link.
+  const [storedTab, setTab] = useSessionState<string>('projectDetail.tab', 'overview');
+  const [segment, setSegment] = useSessionState<Segment>('projectDetail.segment', 'ready');
+
+  // `?tab=…` (a collab notification's link, `CollabAttention`, the frame
+  // set's Project block) jumps to that tab on arrival, then cleans the URL.
   const [searchParams, setSearchParams] = useSearchParams();
   useEffect(() => {
-    const tabParam = searchParams.get('tab');
-    if (!isTab(tabParam)) return;
-    setTab(tabParam);
+    const t = resolveTab(searchParams.get('tab'));
+    if (!t) return;
+    setTab(t);
     const next = new URLSearchParams(searchParams);
     next.delete('tab');
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams, setTab]);
-  const [linkOpen, setLinkOpen] = useState(false);
-  const [missing, setMissing] = useState(false);
-  const [updateRequired, setUpdateRequired] = useState(false);
-  const [frames, setFrames] = useState<ProjectFrameView[] | null>(null);
-  const [framesError, setFramesError] = useState(false);
-  const [publishConfirm, setPublishConfirm] = useState(false);
-  const [publishBusy, setPublishBusy] = useState(false);
-  const [publishError, setPublishError] = useState<string | null>(null);
-  const [republishConfirm, setRepublishConfirm] = useState(false);
-  const [republishBusy, setRepublishBusy] = useState(false);
-  const [republishError, setRepublishError] = useState<string | null>(null);
-  /** The publishing device a publish/republish was refused for (A6). */
-  const [refusedBy, setRefusedBy] = useState<string | null>(null);
-  const [switchConfirm, setSwitchConfirm] = useState(false);
-  const [switchBusy, setSwitchBusy] = useState(false);
-  const [mapOpen, setMapOpen] = useState(false);
-  const [solveBusy, setSolveBusy] = useState(false);
-  const [analyzeBusy, setAnalyzeBusy] = useState<Set<number>>(new Set());
-  // `plate-solve-complete` is a global event — plate solving can be kicked
-  // off from other pages too. Only clear `solveBusy` when THIS page is the
-  // one that started it, or an unrelated solve elsewhere would wrongly mark
-  // this page's batch done.
-  const solveStartedHereRef = useRef(false);
 
-  // The gate is evaluated locally over the linked sets, in its own try so a
-  // gate failure never masquerades as "project not found" — keep the detail
-  // rendered and surface an inline gate error instead. Its own callback so
-  // the analysis/solve completion listeners below can re-run just the gate
-  // without reloading the whole project detail.
-  const loadGate = useCallback(async () => {
-    if (!id) return;
-    setGateError(false);
-    try {
-      const g = await api.invoke<GateReport>('evaluate_collab_gate', { projectId: id });
-      setGate(g);
-    } catch (err) {
-      console.error('[projects] gate evaluation failed:', err);
-      setGate(null);
-      setGateError(true);
-    }
-  }, [id]);
-
-  const load = useCallback(async () => {
+  // Detail comes from the local cache of VERIFIED snapshots (core owns
+  // verification). Its failure means "not in my local list".
+  const loadDetail = useCallback(async () => {
     if (!id) return;
     setMissing(false);
-    // Detail comes from the local cache of VERIFIED snapshots (core owns
-    // verification). Its failure means "not in my local list".
-    let d: Detail;
     try {
-      d = await api.invoke<Detail>('get_collab_project_detail', { projectId: id });
-      setDetail(d);
+      setDetail(await api.invoke<Detail>('get_collab_project_detail', { projectId: id }));
     } catch (err) {
       console.error('[projects] detail load failed:', err);
       setMissing(true);
-      return;
     }
-    await loadGate();
-  }, [id, loadGate]);
+  }, [id]);
 
-  // Re-run the gate and clear the corresponding busy state once an analyze
-  // or solve run this page kicked off finishes — StrictMode-safe listener
-  // pattern (CLAUDE.md).
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    api.listen<AnalysisCompleteEvent>('analysis-complete', (payload) => {
-      if (cancelled) return;
-      // Clear only the SET that just finished — a still-running analyze on
-      // another linked set must keep its Analyze button disabled.
-      setAnalyzeBusy((s) => {
-        const next = new Set(s);
-        next.delete(payload.frame_set_id);
-        return next;
-      });
-      void loadGate();
-    })
-      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
-      .catch((err) => console.error('[projects] analysis-complete listen failed:', err));
-    return () => { cancelled = true; unlisten?.(); };
-  }, [loadGate]);
+  const loadOwn = useCallback(async () => {
+    if (!id) return;
+    setOwnError(false);
+    try {
+      setOwn(await api.invoke<OwnFrameRow[]>('list_project_own_frames', { projectId: id }));
+    } catch (err) {
+      console.error('[projects] list own frames failed:', err);
+      setOwnError(true);
+    }
+  }, [id]);
 
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    api.listen('plate-solve-complete', () => {
-      if (cancelled) return;
-      if (!solveStartedHereRef.current) return;
-      solveStartedHereRef.current = false;
-      setSolveBusy(false);
-      void loadGate();
-    })
-      .then((fn) => { if (cancelled) fn(); else unlisten = fn; })
-      .catch((err) => console.error('[projects] plate-solve-complete listen failed:', err));
-    return () => { cancelled = true; unlisten?.(); };
-  }, [loadGate]);
-
-  // I1: `withContributorState` runs the full project gate plus a per-own-row
-  // recipe read under the catalog lock — worth it for the Contribute tab's
-  // own-frame chip, wasted work for `ReceiveTab`'s landed-event reloads
-  // (up to once a second). Callers state which they need; the default is the
-  // cheap path.
-  const loadFrames = useCallback(async (withContributorState = false) => {
+  // The project's manifest mirror: the Library and Moderation tabs' rows and
+  // the published volume the auto-replication bar shows.
+  const loadLibrary = useCallback(async () => {
     if (!id) return;
     setFramesError(false);
     try {
-      setFrames(
-        await api.invoke<ProjectFrameView[]>('list_collab_frames', {
-          projectId: id,
-          withContributorState,
-        }),
-      );
+      setFrames(await api.invoke<ProjectFrameView[]>('list_collab_frames', { projectId: id }));
     } catch (err) {
       console.error('[projects] list frames failed:', err);
       setFramesError(true);
@@ -239,12 +159,53 @@ export default function ProjectDetail() {
   }, [id]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    void loadDetail();
+  }, [loadDetail]);
 
   useEffect(() => {
-    void loadFrames(tab === 'contribute');
-  }, [loadFrames, tab]);
+    void loadOwn();
+  }, [loadOwn]);
+
+  // Re-read on every tab change, as the old page did — cheap, and it keeps
+  // the Library badge and the replication bar's volume current.
+  useEffect(() => {
+    void loadLibrary();
+  }, [loadLibrary, storedTab]);
+
+  // Loaded once here for the Overview and Exchange tabs; the Members tab
+  // refreshes it through `onMembers` whenever it mounts.
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    setMembersError(false);
+    api
+      .invoke<MemberSummary[]>('get_collab_member_summary', { projectId: id })
+      .then((list) => {
+        if (!cancelled) setMembers(list);
+      })
+      .catch((err) => {
+        console.error('[projects] member summary failed:', err);
+        if (!cancelled) setMembersError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  const publishing = usePublishing(id, {
+    reloadDetail: loadDetail,
+    reloadOwn: loadOwn,
+    onCard: (card) => setDetail((d) => (d ? { ...d, card } : d)),
+    closeConfirm: () => {
+      setPublishIds(null);
+      setRepublishReq(null);
+    },
+  });
+
+  const toCome = useMemo(
+    () => libraryToCome(frames, libraryInFlight(exchange.projects, id ?? '')),
+    [frames, exchange.projects, id],
+  );
 
   const openPortal = async (path: string) => {
     if (!detail) return;
@@ -263,168 +224,13 @@ export default function ProjectDetail() {
     await openUrl(safe);
   };
 
-  // R29 fix round 2: the backend always emits `collab-published` on a
-  // successful publish/republish (manual or auto), and the app-root
-  // `useCollabNotifications` hook is the one place that turns it into a
-  // toast — a second, inline success notify here would double-toast on
-  // every manual click. `doPublish`/`doRepublish` below do their own local
-  // UI work (close the confirm dialog, reload the frames/detail) and raise
-  // a notify() only for a failed invoke, which the backend never emits an
-  // event for — nothing else would ever tell the user. The live listener
-  // sets no dedupeKey at all (final review I4), and these error toasts use a
-  // per-click `Date.now()` key, so neither can swallow the other. A busy
-  // refusal (another run of this project in progress) is an info toast, not
-  // a failure.
-
-  /** A6 refusal: the other device publishes new frames here. Inline with
-   *  the switch action, plus one warning toast (the backend raises no event
-   *  for a rejected run); the reload picks up the binding core recorded. */
-  const showPublishingDeviceRefusal = (name: string) => {
-    setRefusedBy(name);
-    notify({
-      title: `${leading(name)} publishes new frames to this project`,
-      detail: 'Use "Publish from this device" on the project page to publish new frames from here.',
-      kind: 'project',
-      tone: 'warning',
-      link: `/projects/${id}`,
-      dedupeKey: `publishing-device-${id}-${Date.now()}`,
-    });
-    void load();
-  };
-
-  /** "Publish from this device": moves the binding here (confirmed first). */
-  const doSwitch = async () => {
-    if (!id) return;
-    setSwitchConfirm(false);
-    setSwitchBusy(true);
-    try {
-      const card = await api.invoke<ProjectCard>('set_collab_publishing_device', { projectId: id });
-      setDetail((d) => (d ? { ...d, card } : d));
-      setRefusedBy(null);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('[projects] set publishing device failed:', err);
-      if (isOutdated(msg)) {
-        setUpdateRequired(true);
-      } else {
-        notify({
-          title: 'Could not publish from this device',
-          detail: msg,
-          kind: 'project',
-          tone: 'warning',
-          hasErrors: true,
-          link: `/projects/${id}`,
-          dedupeKey: `publishing-device-switch-failed-${id}-${Date.now()}`,
-        });
-      }
-    } finally {
-      setSwitchBusy(false);
-    }
-  };
-
-  const doPublish = async () => {
-    if (!id) return;
-    setPublishBusy(true);
-    setPublishError(null);
-    try {
-      const res = await api.invoke<PublishResult>('publish_collab_frames', { projectId: id });
-      setPublishConfirm(false);
-      setRefusedBy(heldForPublishingDevice(res));
-      await loadFrames(true);
-      await load();
-    } catch (err) {
-      // S6 — a failed publish surfaces inline AND as a toast, never silently
-      // swallowed (the backend raises no event to notify from otherwise).
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('[projects] publish failed:', err);
-      const refused = publishingDeviceRefusal(msg);
-      if (isOutdated(msg)) {
-        setPublishConfirm(false);
-        setUpdateRequired(true);
-      } else if (refused) {
-        setPublishConfirm(false);
-        showPublishingDeviceRefusal(refused);
-      } else if (isPublishBusy(msg)) {
-        setPublishError(PUBLISH_BUSY_INLINE);
-        notify({
-          title: 'Publication already running',
-          detail: 'Wait for the current run of this project to finish, then publish again.',
-          kind: 'project',
-          tone: 'info',
-          link: `/projects/${id}`,
-          dedupeKey: `publish-busy-${id}-${Date.now()}`,
-        });
-      } else {
-        setPublishError(msg);
-        notify({
-          title: 'Publish failed',
-          detail: msg,
-          kind: 'project',
-          tone: 'warning',
-          hasErrors: true,
-          link: `/projects/${id}`,
-          dedupeKey: `publish-failed-${id}-${Date.now()}`,
-        });
-      }
-    } finally {
-      setPublishBusy(false);
-    }
-  };
-
-  const doRepublish = async () => {
-    if (!id) return;
-    setRepublishBusy(true);
-    setRepublishError(null);
-    try {
-      const res = await api.invoke<PublishResult>('republish_collab_frames', { projectId: id });
-      setRepublishConfirm(false);
-      setRefusedBy(heldForPublishingDevice(res));
-      await loadFrames(true);
-      await load();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('[projects] republish failed:', err);
-      const refused = publishingDeviceRefusal(msg);
-      if (isOutdated(msg)) {
-        setRepublishConfirm(false);
-        setUpdateRequired(true);
-      } else if (refused) {
-        setRepublishConfirm(false);
-        showPublishingDeviceRefusal(refused);
-      } else if (isPublishBusy(msg)) {
-        setRepublishError(PUBLISH_BUSY_INLINE);
-        notify({
-          title: 'Publication already running',
-          detail: 'Wait for the current run of this project to finish, then republish again.',
-          kind: 'project',
-          tone: 'info',
-          link: `/projects/${id}`,
-          dedupeKey: `republish-busy-${id}-${Date.now()}`,
-        });
-      } else {
-        setRepublishError(msg);
-        notify({
-          title: 'Republish failed',
-          detail: msg,
-          kind: 'project',
-          tone: 'warning',
-          hasErrors: true,
-          link: `/projects/${id}`,
-          dedupeKey: `republish-failed-${id}-${Date.now()}`,
-        });
-      }
-    } finally {
-      setRepublishBusy(false);
-    }
-  };
-
   if (missing)
     return (
       <p className="p-6 text-sm text-content-muted">
         This project is not in your local list — refresh the Projects page.
       </p>
     );
-  if (!detail) return <p className="p-6 text-content-muted">Loading…</p>;
+  if (!detail || !id) return <p className="p-6 text-content-muted">Loading…</p>;
 
   const c = detail.card;
   const portalPath = c.coordinator ? `/p/${c.slug}/admin` : `/p/${c.slug}`;
@@ -432,35 +238,88 @@ export default function ProjectDetail() {
   const canModerate = c.coordinator && c.requireApproval;
   const needsApproval = c.requireApproval && !c.coordinator;
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
-  const publishable = gate?.publishable ?? 0;
-  const publishTooltip = publishable === 0 ? 'No passing frames to publish yet' : undefined;
-  const own = frames?.filter((f) => f.own) ?? [];
   // The project's published volume, client-side from the rows already listed.
   const publishedBytes =
-    frames === null ? null : own.filter((f) => f.state === 'published').reduce((sum, f) => sum + f.byteSize, 0);
-  const canRepublish = own.length > 0;
+    frames === null
+      ? null
+      : frames.filter((f) => f.own && f.state === 'published').reduce((sum, f) => sum + f.byteSize, 0);
+  const ownRows = own ?? [];
+  const readyCount = ownRows.filter((r) => r.segment === 'ready').length;
+  const publishedRows = ownRows.filter((r) => r.segment === 'published');
+  const canRepublish = publishedRows.length > 0;
 
   const tabs: Tab[] = [
-    'contribute',
-    ...(canReceive ? (['receive'] as const) : []),
-    ...(canModerate ? (['moderation'] as const) : []),
     'overview',
+    'mine',
+    ...(canReceive ? (['library'] as const) : []),
+    'members',
+    'exchange',
+    ...(canModerate ? (['moderation'] as const) : []),
   ];
-  const activeTab = tabs.includes(tab) ? tab : 'contribute';
+  const requested = resolveTab(storedTab) ?? 'overview';
+  const activeTab: Tab = tabs.includes(requested) ? requested : 'overview';
+  const badge: Partial<Record<Tab, { n: number; cls: string }>> = {
+    mine: { n: own === null ? 0 : readyCount, cls: 'bg-accent/20 text-accent' },
+    library: { n: toCome, cls: 'bg-accent/20 text-accent' },
+    moderation: { n: c.pendingFrames, cls: 'bg-warning/20 text-warning' },
+  };
+
+  // The republish guard's figures: "all" = the published frames not excluded.
+  let guard: { all: boolean; count: number; sourceBytes: number } | null = null;
+  if (republishReq) {
+    if (republishReq.ids === null) {
+      const targets = publishedRows.filter((r) => r.accepted !== false);
+      guard = { all: true, count: targets.length, sourceBytes: targets.reduce((s, r) => s + r.byteSize, 0) };
+    } else {
+      const wanted = new Set(republishReq.ids);
+      guard = {
+        all: false,
+        count: republishReq.ids.length,
+        sourceBytes: ownRows.filter((r) => wanted.has(r.frameId)).reduce((s, r) => s + r.byteSize, 0),
+      };
+    }
+  }
+
   // The device the switch takes the binding from: the card's (freshest), else
   // the one a refusal named.
-  const switchFrom = c.publishingDevice ? deviceLabel(c.publishingDevice.name) : (refusedBy ?? OTHER_DEVICE);
+  const switchFrom = c.publishingDevice
+    ? deviceLabel(c.publishingDevice.name)
+    : (publishing.refusedBy ?? OTHER_DEVICE);
   const switchButton = (
     <button
       type="button"
       onClick={() => setSwitchConfirm(true)}
-      disabled={switchBusy}
+      disabled={publishing.switchBusy}
       className="inline-flex items-center gap-1 rounded border border-border px-2 py-0.5 text-xs text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
     >
-      {switchBusy && <Loader2 size={11} className="animate-spin" />}
+      {publishing.switchBusy && <Loader2 size={11} className="animate-spin" />}
       Publish from this device
     </button>
   );
+
+  // Shown inside My frames, under its toolbar: a publish error once its
+  // confirm is closed, and the A6 publishing-device refusal.
+  const refusal = (
+    <>
+      {publishing.publishError && publishIds === null && (
+        <p className="text-sm text-error">{publishing.publishError}</p>
+      )}
+      {publishing.refusedBy && !c.publishingHere && (
+        <div
+          data-testid="publishing-refusal"
+          className="flex flex-wrap items-center gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-content"
+        >
+          <span className="break-words">{`${leading(publishing.refusedBy)} publishes new frames to this project.`}</span>
+          {switchButton}
+        </div>
+      )}
+    </>
+  );
+
+  const openTab = (t: string) => {
+    const r = resolveTab(t);
+    if (r) setTab(r);
+  };
 
   return (
     <div className="space-y-4 p-6">
@@ -499,253 +358,147 @@ export default function ProjectDetail() {
         {!c.publishingHere && c.publishingDevice && switchButton}
       </div>
 
-      {updateRequired && <UpdateRequired />}
+      {publishing.updateRequired && <UpdateRequired />}
 
       {/* Auto-replication is role-gated in core (`role_allows_replication`:
-          coordinator or send_receive) exactly like the Receive tab, so the bar
+          coordinator or send_receive) exactly like the Library tab, so the bar
           shows on the same condition — a send-only member has nothing to pull. */}
-      {id && canReceive && (
+      {canReceive && (
         <AutoReplicateBar
           projectId={id}
           autoReplicate={c.autoReplicate}
           publishedBytes={publishedBytes}
-          onToggled={() => void load()}
+          onToggled={() => void loadDetail()}
         />
       )}
 
-      <div className="flex gap-1 border-b border-border">
-        {tabs.map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`inline-flex items-center gap-1.5 px-4 py-2 text-sm capitalize transition-colors ${
-              activeTab === t
-                ? 'border-b-2 border-accent font-medium text-content'
-                : 'text-content-muted hover:text-content-secondary'
-            }`}
-          >
-            {t}
-            {t === 'moderation' && c.pendingFrames > 0 && (
-              <span className="rounded-full bg-warning/20 px-1.5 text-[10px] font-medium text-warning">
-                {c.pendingFrames}
-              </span>
-            )}
-          </button>
-        ))}
+      <div role="tablist" className="flex flex-wrap gap-1 border-b border-border">
+        {tabs.map((t) => {
+          const b = badge[t];
+          return (
+            <button
+              key={t}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === t}
+              onClick={() => setTab(t)}
+              className={`inline-flex items-center gap-1.5 px-4 py-2 text-sm transition-colors ${
+                activeTab === t
+                  ? 'border-b-2 border-accent font-medium text-content'
+                  : 'text-content-muted hover:text-content-secondary'
+              }`}
+            >
+              {TAB_LABEL[t]}
+              {b && b.n > 0 && (
+                <>
+                  {' '}
+                  <span className={`${BADGE} ${b.cls}`}>{b.n}</span>
+                </>
+              )}
+            </button>
+          );
+        })}
       </div>
 
-      {activeTab === 'contribute' && (
-        <div className="space-y-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <span className="text-sm font-medium text-content">Linked objects</span>
-            <button
-              onClick={() => setLinkOpen(true)}
-              className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-content-secondary transition-colors hover:bg-surface-hover"
-            >
-              <Plus size={12} /> Link an object
-            </button>
-            {id && (
-              <AutoPublishSwitch projectId={id} enabled={c.autoPublish} onToggled={() => void load()} />
-            )}
-          </div>
-
-          {detail.links.length === 0 ? (
-            <p className="text-sm text-content-muted">Link an object to start.</p>
-          ) : (
-            <ul className="flex flex-wrap gap-2">
-              {detail.links.map((l) => (
-                <li
-                  key={l.framesSetId}
-                  className="rounded border border-border px-2 py-1 text-xs text-content-secondary"
-                >
-                  <span className="break-words">{l.name ?? `Set #${l.framesSetId}`}</span> ·{' '}
-                  {l.lightCount} lights
-                  {l.withinRadius ? ' · on target' : ''}
-                </li>
-              ))}
-            </ul>
+      {activeTab === 'overview' && (
+        <>
+          {membersError && members === null && (
+            <p className="text-sm text-error">Could not load the members — see console.</p>
           )}
-
-          {gateError ? (
-            <p className="text-sm text-error">Gate evaluation failed — see console.</p>
-          ) : (
-            <>
-              {gate && (
-                <GateBlockers
-                  gate={gate}
-                  solveBusy={solveBusy}
-                  analyzeBusy={analyzeBusy}
-                  onMapFilters={() => setMapOpen(true)}
-                  onOpenCalibration={(setId) => navigate(`/objects/${setId}?tab=calibration`)}
-                  onSolve={async (ids) => {
-                    setSolveBusy(true);
-                    solveStartedHereRef.current = true;
-                    try {
-                      await api.invoke('plate_solve_batch', { frameIds: ids });
-                    } catch (err) {
-                      console.error('[projects] solve failed:', err);
-                      solveStartedHereRef.current = false;
-                      setSolveBusy(false);
-                      const msg = err instanceof Error ? err.message : String(err);
-                      notify({
-                        title: 'Could not start the solve',
-                        detail: msg,
-                        kind: 'project',
-                        tone: 'warning',
-                        hasErrors: true,
-                        link: `/projects/${id}`,
-                        dedupeKey: `solve-failed-${id}-${Date.now()}`,
-                      });
-                    }
-                  }}
-                  onAnalyze={async (setId) => {
-                    setAnalyzeBusy((s) => new Set(s).add(setId));
-                    try {
-                      await api.invoke('analyze_frame_set', { frameSetId: setId });
-                    } catch (err) {
-                      console.error('[projects] analyze failed:', err);
-                      setAnalyzeBusy((s) => {
-                        const n = new Set(s);
-                        n.delete(setId);
-                        return n;
-                      });
-                      const msg = err instanceof Error ? err.message : String(err);
-                      notify({
-                        title: 'Could not start the analysis',
-                        detail: msg,
-                        kind: 'project',
-                        tone: 'warning',
-                        hasErrors: true,
-                        link: `/projects/${id}`,
-                        dedupeKey: `analyze-failed-${id}-${Date.now()}`,
-                      });
-                    }
-                  }}
-                />
-              )}
-              <GateTable gate={gate} />
-            </>
-          )}
-
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="space-y-1">
-              <button
-                onClick={() => {
-                  setPublishError(null);
-                  setPublishConfirm(true);
-                }}
-                disabled={publishable === 0}
-                className="inline-flex items-center gap-1.5 rounded bg-accent px-4 py-2 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-                title={publishTooltip}
-              >
-                <Send size={14} /> Publish {publishable} passing frames
-              </button>
-              {publishError && !publishConfirm && <p className="text-sm text-error">{publishError}</p>}
-            </div>
-
-            {canRepublish && (
-              <button
-                onClick={() => {
-                  setRepublishError(null);
-                  setRepublishConfirm(true);
-                }}
-                className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-2 text-sm text-content-secondary transition-colors hover:bg-surface-hover"
-                title="Regenerate every one of your published frames as a new content version"
-              >
-                <RefreshCw size={14} /> Recalibrate and republish all
-              </button>
-            )}
-          </div>
-          {republishError && !republishConfirm && (
-            <p className="text-sm text-error">{republishError}</p>
-          )}
-          {refusedBy && !c.publishingHere && (
-            <div
-              data-testid="publishing-refusal"
-              className="flex flex-wrap items-center gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-content"
-            >
-              <span className="break-words">{`${leading(refusedBy)} publishes new frames to this project.`}</span>
-              {switchButton}
-            </div>
-          )}
-
-          <PublicationHistory frames={own} error={framesError} loaded={frames !== null} />
-        </div>
+          <OverviewTab
+            projectId={id}
+            goals={detail.goals}
+            members={members}
+            own={own}
+            libraryToCome={canReceive ? toCome : 0}
+            pending={c.pendingFrames}
+            canModerate={canModerate}
+            thresholds={detail.thresholds}
+            thresholdsVersion={detail.thresholdsVersion}
+            onOpenSegment={(s) => {
+              setSegment(s);
+              setTab('mine');
+            }}
+            onOpenTab={openTab}
+          />
+        </>
       )}
 
-      {activeTab === 'receive' && id && (
-        <ReceiveTab projectId={id} projectTitle={c.title} frames={frames} reload={loadFrames} />
-      )}
-
-      {activeTab === 'moderation' && id && (
-        <ModerationQueue
+      {activeTab === 'mine' && (
+        <MyFramesTab
           projectId={id}
-          onDecided={() => {
-            void load();
-            void loadFrames();
+          rows={own}
+          error={ownError}
+          links={detail.links}
+          autoPublish={c.autoPublish}
+          segment={segment}
+          onSegment={setSegment}
+          onReload={() => void loadOwn()}
+          onDetailReload={() => void loadDetail()}
+          onRequestPublish={(ids) => {
+            publishing.clearPublishError();
+            setPublishIds(ids);
+          }}
+          publishBusy={publishing.publishBusy}
+          onRequestRepublish={(ids) => {
+            publishing.clearRepublishError();
+            setRepublishReq({ ids });
+          }}
+          republishBusy={publishing.republishBusy}
+          canRepublish={canRepublish}
+          coordinator={c.coordinator}
+          republishError={republishReq ? null : publishing.republishError}
+          refusal={refusal}
+          onOpen={setDrawer}
+        />
+      )}
+
+      {activeTab === 'library' && (
+        <LibraryTab
+          projectId={id}
+          projectTitle={c.title}
+          frames={frames}
+          error={framesError}
+          reload={() => void loadLibrary()}
+          coordinator={c.coordinator}
+          onOpen={setDrawer}
+        />
+      )}
+
+      {activeTab === 'members' && (
+        <MembersTab
+          projectId={id}
+          onMembers={(m) => {
+            setMembers(m);
+            setMembersError(false);
           }}
         />
       )}
 
-      {activeTab === 'overview' && (
-        <div className="space-y-4 text-sm">
-          <section>
-            <h2 className="mb-1 font-medium text-content">Members</h2>
-            <ul className="text-content-secondary">
-              {detail.members.map((m, i) => (
-                <li key={`${m.displayName}-${i}`} className="break-words">
-                  {m.displayName} — {m.coordinator ? 'coordinator' : m.dataRole}
-                </li>
-              ))}
-            </ul>
-          </section>
+      {activeTab === 'exchange' && <ExchangeTab projectId={id} canReceive={canReceive} members={members} />}
 
-          <section>
-            <h2 className="mb-1 font-medium text-content">
-              Quality thresholds
-              {detail.thresholdsVersion != null ? ` (v${detail.thresholdsVersion})` : ''}
-            </h2>
-            {detail.thresholds.length === 0 ? (
-              <p className="text-content-muted">No thresholds set.</p>
-            ) : (
-              <ul className="text-content-secondary">
-                {detail.thresholds.map((r, i) => (
-                  <li key={`${r.metricKey}-${i}`} className="break-words">
-                    {r.op === 'reject_if'
-                      ? r.metricKey === 'not_trailed'
-                        ? 'Reject trailed frames'
-                        : `${r.metricKey} — reject if ${String(r.value)}`
-                      : `${r.metricKey} ${r.op === 'lte' ? '≤' : r.op === 'gte' ? '≥' : r.op} ${String(r.value)}`}
-                  </li>
-                ))}
-              </ul>
-            )}
-            <p className="mt-1 text-xs text-content-muted">
-              Thresholds are set by the coordinator on the portal. Changes are prospective —
-              already-published frames stay published.
-            </p>
-          </section>
-        </div>
-      )}
-
-      {linkOpen && id && (
-        <LinkObjectDialog
+      {activeTab === 'moderation' && (
+        <ModerationTab
           projectId={id}
-          onClose={() => setLinkOpen(false)}
-          onChanged={() => void load()}
+          library={frames}
+          onDecided={() => {
+            void loadDetail();
+            void loadLibrary();
+          }}
+          onOpen={setDrawer}
         />
       )}
 
-      {mapOpen && id && (
-        <FilterMappingDialog
+      {drawer && (
+        <FrameDrawer
+          key={drawer.key}
           projectId={id}
-          onClose={() => setMapOpen(false)}
-          onSaved={(r) => {
-            setGate(r);
-            setMapOpen(false);
-            // I1 (final-review minor 10): a mapping can change which own
-            // frames pass the gate — reload so their chips are not stale.
-            void loadFrames(true);
+          frame={drawer}
+          coordinator={c.coordinator}
+          onClose={() => setDrawer(null)}
+          onChanged={() => {
+            void loadOwn();
+            void loadLibrary();
           }}
         />
       )}
@@ -755,14 +508,17 @@ export default function ProjectDetail() {
         title="Publish from this device?"
         message={`${leading(switchFrom)} will stop publishing new frames to this project; it can still update the frames it already published.`}
         confirmText="Switch"
-        onConfirm={() => void doSwitch()}
+        onConfirm={() => {
+          setSwitchConfirm(false);
+          void publishing.switchHere();
+        }}
         onCancel={() => setSwitchConfirm(false)}
       />
 
-      {publishConfirm && (
+      {publishIds && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-          onClick={() => !publishBusy && setPublishConfirm(false)}
+          onClick={() => !publishing.publishBusy && setPublishIds(null)}
         >
           <div
             className="w-[30rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
@@ -773,11 +529,11 @@ export default function ProjectDetail() {
               <h2 className="font-medium text-content">Publish to {c.title}</h2>
             </div>
             <p className="mb-2 text-sm text-content-secondary">
-              {publishable} passing {publishable === 1 ? 'frame' : 'frames'} will be calibrated and
+              {publishIds.length} passing {publishIds.length === 1 ? 'frame' : 'frames'} will be calibrated and
               announced to the project.
             </p>
             <p className="mb-2 text-xs text-content-muted">
-              Estimated size ≈ {formatBytes(publishable * APPROX_FRAME_BYTES)} — the exact size is
+              Estimated size ≈ {formatBytes(publishIds.length * APPROX_FRAME_BYTES)} — the exact size is
               measured when each frame is generated.
             </p>
             {needsApproval && (
@@ -786,201 +542,40 @@ export default function ProjectDetail() {
                 review.
               </p>
             )}
-            {publishError && <p className="mb-2 text-sm text-error">{publishError}</p>}
+            {publishing.publishError && <p className="mb-2 text-sm text-error">{publishing.publishError}</p>}
             <div className="mt-3 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setPublishConfirm(false)}
-                disabled={publishBusy}
+                onClick={() => setPublishIds(null)}
+                disabled={publishing.publishBusy}
                 className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="button"
-                onClick={() => void doPublish()}
-                disabled={publishBusy}
+                onClick={() => void publishing.publish(publishIds)}
+                disabled={publishing.publishBusy}
                 className="inline-flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {publishBusy && <Loader2 size={12} className="animate-spin" />} Publish
+                {publishing.publishBusy && <Loader2 size={12} className="animate-spin" />} Publish
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {republishConfirm && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-          onClick={() => !republishBusy && setRepublishConfirm(false)}
-        >
-          <div
-            className="w-[30rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="mb-2 flex items-center gap-2">
-              <RefreshCw size={16} className="text-accent" />
-              <h2 className="font-medium text-content">Recalibrate and republish all</h2>
-            </div>
-            <p className="mb-2 text-sm text-content-secondary">
-              Every one of your published frames is regenerated and, where the bytes changed, posted
-              as a new content version.
-            </p>
-            <p className="mb-2 text-xs text-warning">
-              Every processor holding one of your frames re-downloads it once this finishes.
-            </p>
-            {republishError && <p className="mb-2 text-sm text-error">{republishError}</p>}
-            <div className="mt-3 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setRepublishConfirm(false)}
-                disabled={republishBusy}
-                className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void doRepublish()}
-                disabled={republishBusy}
-                className="inline-flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {republishBusy && <Loader2 size={12} className="animate-spin" />} Republish
-              </button>
-            </div>
-          </div>
-        </div>
+      {republishReq && guard && (
+        <RepublishGuardDialog
+          count={guard.count}
+          sourceBytes={guard.sourceBytes}
+          all={guard.all}
+          busy={publishing.republishBusy}
+          error={publishing.republishError}
+          onConfirm={() => void publishing.republish(republishReq.ids)}
+          onCancel={() => setRepublishReq(null)}
+        />
       )}
-    </div>
-  );
-}
-
-/** Own frames with their hub-mirrored state. */
-function PublicationHistory({
-  frames,
-  error,
-  loaded,
-}: {
-  frames: ProjectFrameView[];
-  error: boolean;
-  loaded: boolean;
-}) {
-  if (error)
-    return (
-      <div className="space-y-1">
-        <h2 className="text-sm font-medium text-content">Your publications</h2>
-        <p className="text-sm text-error">Could not load your publications — see console.</p>
-      </div>
-    );
-  if (!loaded) return null;
-  return (
-    <div className="space-y-2">
-      <h2 className="text-sm font-medium text-content">Your publications</h2>
-      {frames.length === 0 ? (
-        <p className="text-sm text-content-muted">Nothing published yet.</p>
-      ) : (
-        <ul className="space-y-1.5">
-          {frames.map((f) => (
-            <li key={f.frameUuid} className="rounded border border-border px-3 py-2 text-sm">
-              <div className="flex flex-wrap items-center gap-2">
-                <span
-                  className="max-w-[16rem] truncate text-xs text-content-secondary"
-                  title={f.fileName}
-                >
-                  {f.fileName}
-                </span>
-                <span className="text-xs text-content-muted">
-                  v{f.contentVersion} · {formatBytes(f.byteSize)}
-                </span>
-                <StateChip state={f.state} rejectReason={f.acceptedReason} />
-                {f.contributorState && (
-                  <span
-                    className="rounded bg-surface-hover px-1.5 text-[10px] text-content-muted"
-                    title={f.contributorReason ?? undefined}
-                  >
-                    {CONTRIBUTOR_STATE_LABEL[f.contributorState] ?? f.contributorState}
-                  </span>
-                )}
-              </div>
-              <p className="mt-0.5 text-[11px] text-content-muted">
-                held by {f.holdersOnline} online / {f.holdersTotal}
-                {f.localState === 'own_missing' ? ' · not on disk' : ''}
-                {f.localState === 'own_changed' ? ' · file changed' : ''}
-                {f.lastError ? ` · ${f.lastError}` : ''}
-              </p>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-/** Hub-mirrored publication state chip. Rejected carries its reason on the title. */
-function StateChip({ state, rejectReason }: { state: string; rejectReason: string | null }) {
-  const map: Record<string, string> = {
-    pending: 'bg-warning/20 text-warning',
-    published: 'bg-success/20 text-success',
-    rejected: 'bg-error/20 text-error',
-  };
-  const cls = map[state] ?? 'bg-surface-hover text-content-muted';
-  return (
-    <span
-      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
-      title={state === 'rejected' && rejectReason ? rejectReason : undefined}
-    >
-      {state}
-    </span>
-  );
-}
-
-/** Candidate frames of the linked sets with their per-rule gate verdict. */
-function GateTable({ gate }: { gate: GateReport | null }) {
-  if (!gate) return null;
-  if (gate.total === 0)
-    return (
-      <p className="text-sm text-content-muted">
-        No candidate frames yet — link an object that has LIGHT frames.
-      </p>
-    );
-
-  return (
-    <div className="overflow-x-auto">
-      <p className="mb-1 text-sm text-content-secondary">
-        {gate.publishable} publishable of {gate.total}
-      </p>
-      <table className="w-full text-left text-xs">
-        <thead className="text-content-muted">
-          <tr>
-            <th className="py-1 pr-3 font-normal">Frame</th>
-            <th className="pr-3 font-normal">FWHM″</th>
-            <th className="pr-3 font-normal">Ecc</th>
-            <th className="pr-3 font-normal">Stars</th>
-            <th className="font-normal">Gate</th>
-          </tr>
-        </thead>
-        <tbody>
-          {gate.rows.map((r: FrameGateRow) => (
-            <tr key={r.frameId} className="border-t border-border/50">
-              <td className="max-w-[16rem] truncate py-1 pr-3 text-content">{r.filename}</td>
-              <td className="pr-3 text-content-secondary">
-                {r.fwhmArcsec != null ? r.fwhmArcsec.toFixed(2) : '—'}
-              </td>
-              <td className="pr-3 text-content-secondary">
-                {r.eccentricity != null ? r.eccentricity.toFixed(2) : '—'}
-              </td>
-              <td className="pr-3 text-content-secondary">{r.starsDetected ?? '—'}</td>
-              <td
-                className={r.publishable ? 'text-success' : 'text-error'}
-                title={r.publishable ? undefined : r.failures.join('; ')}
-              >
-                {r.publishable ? '✓ publishable' : (r.failures[0] ?? 'not publishable')}
-                {!r.publishable && r.failures.length > 1 ? ` (+${r.failures.length - 1})` : ''}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
     </div>
   );
 }

@@ -1,16 +1,17 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { useEffect } from 'react';
 import { render, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
-import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
+import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import { NotificationProvider } from '../contexts/NotificationContext';
-import { SessionStateProvider } from '../contexts/SessionStateContext';
+import { SessionStateProvider, useSessionState } from '../contexts/SessionStateContext';
 import { NavHistoryProvider } from '../contexts/NavHistoryContext';
+import { CollabExchangeProvider } from '../contexts/CollabExchangeContext';
 import { ToastStack } from '../components/Toast';
 import ProjectDetail from './ProjectDetail';
 import { useCollabNotifications } from '../hooks/useCollabNotifications';
 import { api } from '../api';
 import type {
-  FrameGateRow,
-  GateReport,
+  OwnFrameRow,
   ProjectCard,
   ProjectDetail as Detail,
   ProjectFrameView,
@@ -54,49 +55,176 @@ function detailFixture(card: ProjectCard = projectCard()): Detail {
     members: [],
     thresholdsVersion: null,
     thresholds: [],
-    links: [],
+    links: [{ framesSetId: 10, name: 'M42', lightCount: 2, distanceDeg: 0.1, withinRadius: true }],
     portalBase: 'https://hub.example',
     goals: null,
   };
 }
 
-function gateFixture(overrides: Partial<GateReport> = {}): GateReport {
-  return { projectId: 'proj-1', total: 2, publishable: 2, rows: [], blockers: [], ...overrides };
+function ownRow(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
+  return {
+    frameId: 1,
+    frameUuid: null,
+    fileName: 'L_0001.fits',
+    setId: 10,
+    setName: 'M42',
+    night: '2026-09-29',
+    filter: 'Ha',
+    filterMapped: true,
+    camera: 'ASI2600MM Pro',
+    exptimeSec: 300,
+    byteSize: 42_000_000,
+    fwhmArcsec: 2.4,
+    eccentricity: 0.4,
+    starsDetected: 1200,
+    medianSnr: 18,
+    segment: 'ready',
+    contributorState: 'published',
+    contributorReason: null,
+    failures: [],
+    contentVersion: null,
+    pubState: null,
+    acceptedReason: null,
+    holdersOnline: null,
+    holdersTotal: null,
+    localState: null,
+    publishedAt: null,
+    lastError: null,
+    rules: [],
+    path: '/data/L_0001.fits',
+    accepted: null,
+    ...o,
+  };
 }
 
+/** Two frames ready to publish — the default own-frames answer. */
+const twoReady: OwnFrameRow[] = [
+  ownRow({ frameId: 1, fileName: 'L_0001.fits' }),
+  ownRow({ frameId: 2, fileName: 'L_0002.fits' }),
+];
+
+function published(frameId: number, o: Partial<OwnFrameRow> = {}): OwnFrameRow {
+  return ownRow({
+    frameId,
+    frameUuid: `u-${frameId}`,
+    fileName: `P_${String(frameId).padStart(4, '0')}.fits`,
+    segment: 'published',
+    pubState: 'published',
+    contentVersion: 1,
+    localState: 'own_held',
+    holdersOnline: 1,
+    holdersTotal: 1,
+    accepted: true,
+    ...o,
+  });
+}
+
+function heldRow(frameId: number, kind: string, text: string, o: Partial<OwnFrameRow> = {}): OwnFrameRow {
+  return ownRow({
+    frameId,
+    fileName: `H_${String(frameId).padStart(4, '0')}.fits`,
+    segment: 'held',
+    failures: [{ kind, text }],
+    ...o,
+  });
+}
+
+function libraryFrame(o: Partial<ProjectFrameView> = {}): ProjectFrameView {
+  return {
+    frameUuid: 'lib-1',
+    fileName: 'alice_001.fits',
+    publisher: 'Alice',
+    publisherAccountId: 'acc-a',
+    own: false,
+    filter: 'L',
+    exptimeSec: 120,
+    dateObs: null,
+    state: 'published',
+    accepted: true,
+    acceptedReason: null,
+    localState: 'held',
+    onDisk: true,
+    holdersOnline: 2,
+    holdersTotal: 3,
+    waitingForPublisher: false,
+    newVersionWaiting: false,
+    byteSize: 1024,
+    contentVersion: 1,
+    lastError: null,
+    fwhmArcsec: 2.1,
+    eccentricity: 0.3,
+    starsDetected: 500,
+    camera: null,
+    telescope: null,
+    night: null,
+    medianSnr: null,
+    contributorState: null,
+    contributorReason: null,
+    receivedAt: null,
+    receivedFromDevice: null,
+    receivedFromMember: null,
+    ...o,
+  };
+}
+
+const okPublish: PublishResult = {
+  announced: 2,
+  updated: 0,
+  state: 'published',
+  heldBack: [],
+  unchanged: 0,
+} as PublishResult;
+
 let publishedListener: ((res: unknown) => void) | undefined;
-/** Every `api.listen` registration this render made, by event name — lets a
- *  test fire `analysis-complete`/`plate-solve-complete` (or any other event)
- *  without a dedicated capture variable per event. */
+/** Every `api.listen` registration this render made, by event name (a later
+ *  registration of the same event wins) — lets a test fire
+ *  `analysis-complete`/`plate-solve-complete` without a capture per event. */
 const listeners: Record<string, ((payload: unknown) => void) | undefined> = {};
+
+/** The default command answers, with `extra` taking precedence per command. */
+function mockCommands(
+  card: ProjectCard = projectCard(),
+  extra: Record<string, (args?: unknown) => Promise<unknown>> = {},
+) {
+  vi.mocked(api.invoke).mockImplementation(((command: string, args?: unknown) => {
+    if (extra[command]) return extra[command](args);
+    switch (command) {
+      case 'get_collab_project_detail':
+        return Promise.resolve(detailFixture(card));
+      case 'list_project_own_frames':
+        return Promise.resolve(twoReady);
+      case 'list_collab_frames':
+        return Promise.resolve([] as ProjectFrameView[]);
+      case 'get_collab_member_summary':
+        return Promise.resolve([]);
+      case 'get_collab_exchange':
+        return Promise.resolve({ projects: [], names: [] });
+      case 'list_collab_receive_sessions':
+        return Promise.resolve([]);
+      case 'list_collab_moderation':
+        return Promise.resolve([]);
+      case 'list_collab_attention':
+        return Promise.resolve({ changed: [], awaitingChoice: [], notKept: [], otherFiles: [] });
+      case 'get_collaboration_dir':
+        return Promise.resolve('/collab');
+      case 'list_collab_projects':
+        return Promise.resolve([card]);
+      case 'publish_collab_frames':
+        return Promise.resolve(okPublish);
+      case 'republish_collab_frames':
+        return Promise.resolve({ ...okPublish, announced: 0, updated: 2 });
+      default:
+        return Promise.resolve(null);
+    }
+  }) as never);
+}
 
 beforeEach(() => {
   publishedListener = undefined;
   for (const k of Object.keys(listeners)) delete listeners[k];
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    switch (command) {
-      case 'get_collab_project_detail':
-        return Promise.resolve(detailFixture());
-      case 'evaluate_collab_gate':
-        return Promise.resolve(gateFixture());
-      case 'list_collab_frames':
-        return Promise.resolve([] as ProjectFrameView[]);
-      case 'list_collab_projects':
-        return Promise.resolve([projectCard()]);
-      case 'publish_collab_frames':
-        return Promise.resolve({
-          announced: 2,
-          updated: 0,
-          state: 'published',
-          heldBack: [],
-          unchanged: 0,
-        } as PublishResult);
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
+  mockCommands();
   vi.mocked(api.listen).mockImplementation((<T,>(event: string, cb: (p: T) => void) => {
     listeners[event] = cb as unknown as (payload: unknown) => void;
     if (event === 'collab-published') {
@@ -115,25 +243,48 @@ function CollabNotificationsHarness() {
   return null;
 }
 
-/** Renders wherever `onOpenCalibration`'s `navigate` sends the page, so a
- *  test can assert the exact path + query it landed on. */
+/** Renders the current location, so a test can assert the exact path +
+ *  query a navigation landed on (or that `?tab=` was stripped). */
 function LocationDisplay() {
   const location = useLocation();
   return <div data-testid="location">{location.pathname}{location.search}</div>;
 }
 
-function renderProjectDetail() {
+/** Stores a legacy tab value in the session, then opens the project — the
+ *  shape a session that last visited the old four-tab page leaves behind. */
+function SeedLegacyTab({ value }: { value: string }) {
+  const [, setTab] = useSessionState<string>('projectDetail.tab', 'overview');
+  const navigate = useNavigate();
+  useEffect(() => {
+    setTab(value);
+    navigate('/projects/proj-1');
+  }, [navigate, setTab, value]);
+  return null;
+}
+
+function renderProjectDetail(entry = '/projects/proj-1', seed?: string) {
   return render(
-    <MemoryRouter initialEntries={['/projects/proj-1']}>
+    <MemoryRouter initialEntries={[entry]}>
       <NavHistoryProvider>
         <SessionStateProvider>
           <NotificationProvider>
-            <CollabNotificationsHarness />
-            <Routes>
-              <Route path="/projects/:id" element={<ProjectDetail />} />
-              <Route path="/objects/:id" element={<LocationDisplay />} />
-            </Routes>
-            <ToastStack />
+            <CollabExchangeProvider>
+              <CollabNotificationsHarness />
+              <Routes>
+                <Route
+                  path="/projects/:id"
+                  element={
+                    <>
+                      <ProjectDetail />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+                <Route path="/objects/:id" element={<LocationDisplay />} />
+                <Route path="/seed" element={<SeedLegacyTab value={seed ?? 'overview'} />} />
+              </Routes>
+              <ToastStack />
+            </CollabExchangeProvider>
           </NotificationProvider>
         </SessionStateProvider>
       </NavHistoryProvider>
@@ -141,20 +292,32 @@ function renderProjectDetail() {
   );
 }
 
+async function openTab(name: RegExp) {
+  fireEvent.click(await screen.findByRole('tab', { name }));
+}
+
+/** My frames → "Publish all 2" → the confirm's Publish. */
+async function publishViaConfirm() {
+  await openTab(/^My frames/);
+  fireEvent.click(await screen.findByRole('button', { name: 'Publish all 2' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
+}
+
+function invokeCount(command: string): number {
+  return vi.mocked(api.invoke).mock.calls.filter(([c]) => c === command).length;
+}
+
 describe('ProjectDetail manual publish', () => {
   it('raises no inline toast of its own; the live collab-published event produces exactly one', async () => {
     renderProjectDetail();
+    await publishViaConfirm();
 
-    const publishButton = await screen.findByRole('button', { name: /Publish 2 passing frames/ });
-    fireEvent.click(publishButton);
-
-    const confirmButton = await screen.findByRole('button', { name: 'Publish' });
-    fireEvent.click(confirmButton);
-
-    // doPublish resolves, closes the confirm dialog, then reloads frames + detail.
+    // publish resolves, closes the confirm dialog, then reloads own frames + detail.
     await waitFor(() =>
       expect(screen.queryByRole('button', { name: 'Publish' })).not.toBeInTheDocument(),
     );
+    expect(api.invoke).toHaveBeenCalledWith('publish_collab_frames', { projectId: 'proj-1', frameIds: [1, 2] });
+    await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThanOrEqual(2));
 
     expect(publishedListener).toBeDefined();
     // The invoke resolved successfully — ProjectDetail itself raises no toast.
@@ -172,30 +335,23 @@ describe('ProjectDetail manual publish', () => {
     expect(toasts[0]).toHaveTextContent('Published 2 frames in M42 Mosaic');
   });
 
-  it('a failed publish shows an inline error and a toast whose dedupeKey cannot collide with the live one', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      switch (command) {
-        case 'get_collab_project_detail':
-          return Promise.resolve(detailFixture());
-        case 'evaluate_collab_gate':
-          return Promise.resolve(gateFixture());
-        case 'list_collab_frames':
-          return Promise.resolve([] as ProjectFrameView[]);
-        case 'list_collab_projects':
-          return Promise.resolve([projectCard()]);
-        case 'publish_collab_frames':
-          return Promise.reject(new Error('hub unreachable'));
-        default:
-          return Promise.resolve(null);
-      }
-    }) as never);
-
+  it('the confirm counts the requested frames and estimates their size', async () => {
     renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish all 2' }));
+    expect(await screen.findByText('Publish to M42 Mosaic')).toBeInTheDocument();
+    expect(
+      screen.getByText('2 passing frames will be calibrated and announced to the project.'),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Estimated size ≈ 90\.0 MB/)).toBeInTheDocument();
+  });
 
-    const publishButton = await screen.findByRole('button', { name: /Publish 2 passing frames/ });
-    fireEvent.click(publishButton);
-    const confirmButton = await screen.findByRole('button', { name: 'Publish' });
-    fireEvent.click(confirmButton);
+  it('a failed publish shows an inline error and a toast whose dedupeKey cannot collide with the live one', async () => {
+    mockCommands(projectCard(), {
+      publish_collab_frames: () => Promise.reject(new Error('hub unreachable')),
+    });
+    renderProjectDetail();
+    await publishViaConfirm();
 
     expect(await screen.findByText('hub unreachable')).toBeInTheDocument();
 
@@ -205,30 +361,12 @@ describe('ProjectDetail manual publish', () => {
   });
 
   it('a publish refused because another run is in progress reads as "already running", not a failure', async () => {
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      switch (command) {
-        case 'get_collab_project_detail':
-          return Promise.resolve(detailFixture());
-        case 'evaluate_collab_gate':
-          return Promise.resolve(gateFixture());
-        case 'list_collab_frames':
-          return Promise.resolve([] as ProjectFrameView[]);
-        case 'list_collab_projects':
-          return Promise.resolve([projectCard()]);
-        case 'publish_collab_frames':
-          // Both hosts reject with the backend's message as a plain string.
-          return Promise.reject('publication of this project is already running');
-        default:
-          return Promise.resolve(null);
-      }
-    }) as never);
-
+    mockCommands(projectCard(), {
+      // Both hosts reject with the backend's message as a plain string.
+      publish_collab_frames: () => Promise.reject('publication of this project is already running'),
+    });
     renderProjectDetail();
-
-    const publishButton = await screen.findByRole('button', { name: /Publish 2 passing frames/ });
-    fireEvent.click(publishButton);
-    const confirmButton = await screen.findByRole('button', { name: 'Publish' });
-    fireEvent.click(confirmButton);
+    await publishViaConfirm();
 
     expect(
       await screen.findByText(
@@ -242,36 +380,9 @@ describe('ProjectDetail manual publish', () => {
   });
 });
 
-/** The default command answers, with `extra` taking precedence per command. */
-function mockCommands(
-  card: ProjectCard,
-  extra: Record<string, (args?: unknown) => Promise<unknown>> = {},
-) {
-  vi.mocked(api.invoke).mockImplementation(((command: string, args?: unknown) => {
-    if (extra[command]) return extra[command](args);
-    switch (command) {
-      case 'get_collab_project_detail':
-        return Promise.resolve(detailFixture(card));
-      case 'evaluate_collab_gate':
-        return Promise.resolve(gateFixture());
-      case 'list_collab_frames':
-        return Promise.resolve([] as ProjectFrameView[]);
-      case 'list_collab_projects':
-        return Promise.resolve([card]);
-      default:
-        return Promise.resolve(null);
-    }
-  }) as never);
-}
-
 const obsPc = { deviceId: 'dev-obs', name: 'Obs PC' };
 const boundElsewhere = projectCard({ publishingDevice: obsPc, publishingHere: false });
 const boundHere = projectCard({ publishingDevice: { deviceId: 'dev-me', name: 'Laptop' }, publishingHere: true });
-
-async function publishViaConfirm() {
-  fireEvent.click(await screen.findByRole('button', { name: /Publish 2 passing frames/ }));
-  fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
-}
 
 describe('ProjectDetail publishing device (A6)', () => {
   it('names this device when it is the publishing device, with no switch offered', async () => {
@@ -323,7 +434,7 @@ describe('ProjectDetail publishing device (A6)', () => {
     expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
     // No reload was needed: the card came from the command's answer.
-    expect(vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_collab_project_detail')).toHaveLength(1);
+    expect(invokeCount('get_collab_project_detail')).toBe(1);
     expect(screen.queryAllByRole('status')).toHaveLength(0);
   });
 
@@ -393,16 +504,20 @@ describe('ProjectDetail publishing device (A6)', () => {
 
   it('a republish refused the same way shows the same message', async () => {
     mockCommands(boundElsewhere, {
-      list_collab_frames: () => Promise.resolve([ownFrame()]),
+      list_project_own_frames: () => Promise.resolve([published(3)]),
       republish_collab_frames: () => Promise.reject('collab_publishing_device:Obs PC'),
     });
     renderProjectDetail();
+    await openTab(/^My frames/);
     fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Republish' }));
+    fireEvent.change(screen.getByLabelText('Type 1 to confirm'), { target: { value: '1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Republish' }));
     expect(await screen.findByTestId('publishing-refusal')).toHaveTextContent(
       'Obs PC publishes new frames to this project',
     );
     expect(screen.queryByText('Republish failed')).not.toBeInTheDocument();
+    // The guard closed on the refusal.
+    expect(screen.queryByRole('button', { name: 'Republish' })).not.toBeInTheDocument();
   });
 
   it('a run that succeeds with new frames held back for the other device shows the same message', async () => {
@@ -521,10 +636,110 @@ describe('ProjectDetail publishing device (A6)', () => {
   });
 });
 
-describe('ProjectDetail contribute header (F7, dead decision-C hint removed)', () => {
+describe('ProjectDetail republish guard', () => {
+  const fivePublished = [published(11), published(12), published(13), published(14), published(15)];
+
+  it('"Recalibrate and republish all" needs the typed count, then republishes everything (frameIds: null)', async () => {
+    mockCommands(projectCard(), { list_project_own_frames: () => Promise.resolve(fivePublished) });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
+
+    expect(screen.getByRole('heading', { name: 'Recalibrate and republish all' })).toBeInTheDocument();
+    expect(screen.getByText(/^5 frames · 200\.3 MB of source frames will be recalibrated\./)).toBeInTheDocument();
+    const confirm = screen.getByRole('button', { name: 'Republish' });
+    expect(confirm).toBeDisabled();
+
+    const input = screen.getByLabelText('Type 5 to confirm');
+    fireEvent.change(input, { target: { value: '4' } });
+    expect(confirm).toBeDisabled();
+    fireEvent.change(input, { target: { value: ' 5 ' } });
+    expect(confirm).toBeEnabled();
+
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('republish_collab_frames', { projectId: 'proj-1', frameIds: null }),
+    );
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Republish' })).not.toBeInTheDocument());
+  });
+
+  it('"all" counts only the published frames that are not excluded', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () =>
+        Promise.resolve([published(21), published(22), published(23, { accepted: false, acceptedReason: 'trailed' })]),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
+    expect(screen.getByLabelText('Type 2 to confirm')).toBeInTheDocument();
+  });
+
+  it('a 2-frame selection confirms without typing and sends exactly those ids', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () => Promise.resolve([published(31), published(32)]),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /^Published 2/ }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Republish 2' }));
+
+    expect(screen.getByRole('heading', { name: 'Republish 2 frames' })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/to confirm/)).not.toBeInTheDocument();
+    const confirm = screen.getByRole('button', { name: 'Republish' });
+    expect(confirm).toBeEnabled();
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('republish_collab_frames', { projectId: 'proj-1', frameIds: [31, 32] }),
+    );
+  });
+
+  it('a republish refused because another run is in progress reads as "already running" inside the guard', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () => Promise.resolve([published(41)]),
+      republish_collab_frames: () => Promise.reject('publication of this project is already running'),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
+    fireEvent.change(screen.getByLabelText('Type 1 to confirm'), { target: { value: '1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Republish' }));
+
+    expect(
+      await screen.findByText(
+        'Publication of this project is already running — wait for it to finish, then try again.',
+      ),
+    ).toBeInTheDocument();
+    // Still inside the guard (it stays open on a busy refusal).
+    expect(screen.getByRole('button', { name: 'Republish' })).toBeInTheDocument();
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Publication already running');
+    expect(toasts[0]).not.toHaveTextContent('Republish failed');
+  });
+
+  it('a failed republish shows the error inside the guard and one "Republish failed" toast', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () => Promise.resolve([published(51)]),
+      republish_collab_frames: () => Promise.reject(new Error('hub unreachable')),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
+    fireEvent.change(screen.getByLabelText('Type 1 to confirm'), { target: { value: '1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Republish' }));
+    expect(await screen.findByText('hub unreachable')).toBeInTheDocument();
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Republish failed');
+  });
+});
+
+describe('ProjectDetail My frames header (F7, dead decision-C hint removed)', () => {
   it('auto_publish_switch_visible_without_receive', async () => {
     mockCommands(projectCard({ dataRole: 'send' }));
     renderProjectDetail();
+    await openTab(/^My frames/);
 
     const toggle = await screen.findByRole('checkbox', { name: /Auto-publish my frames/ });
     // The fixture's `autoPublish` defaults to true; the click toggles it off.
@@ -537,76 +752,46 @@ describe('ProjectDetail contribute header (F7, dead decision-C hint removed)', (
     );
   });
 
-  it('never shows the dead "not available in this version" hint, even when every candidate fails only on calibration', async () => {
+  it('never shows the dead "not available in this version" hint, even when every frame is held back only on calibration', async () => {
     mockCommands(projectCard(), {
-      evaluate_collab_gate: () =>
-        Promise.resolve(
-          gateFixture({
-            publishable: 0,
-            rows: [
-              {
-                frameId: 1,
-                filename: 'a.fits',
-                fwhmArcsec: null,
-                eccentricity: null,
-                starsDetected: null,
-                trailed: null,
-                publishable: false,
-                failures: ['not calibrated — 3 lights have no calibration links'],
-              } as FrameGateRow,
-            ],
-          }),
-        ),
+      list_project_own_frames: () =>
+        Promise.resolve([heldRow(1, 'linkCalibration', 'not calibrated — 3 lights have no calibration links')]),
     });
     renderProjectDetail();
-
-    await screen.findByRole('button', { name: /Publish 0 passing frames/ });
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /^Held back 1/ }));
+    await screen.findByRole('button', { name: 'Open calibration' });
     expect(screen.queryByText(/not available in this version/)).not.toBeInTheDocument();
   });
 });
 
-describe('ProjectDetail gate blockers (GateBlockers wiring)', () => {
-  it('Analyze sends the blocked set\'s id as analyze_frame_set { frameSetId }', async () => {
+describe('ProjectDetail Held back fixes (My frames wiring)', () => {
+  async function openHeld(count: number) {
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(`^Held back ${count}`) }));
+  }
+
+  it("Analyze sends the held set's id as analyze_frame_set { frameSetId }", async () => {
     mockCommands(projectCard(), {
-      evaluate_collab_gate: () =>
-        Promise.resolve(
-          gateFixture({ blockers: [{ kind: 'analyze', frames: 2, sets: [42], names: [] }] }),
-        ),
+      list_project_own_frames: () => Promise.resolve([heldRow(5, 'analyze', 'no analysis', { setId: 42 })]),
     });
     renderProjectDetail();
+    await openHeld(1);
 
-    const btn = await screen.findByRole('button', { name: 'Analyze' });
-    fireEvent.click(btn);
+    fireEvent.click(await screen.findByRole('button', { name: 'Analyze' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('analyze_frame_set', { frameSetId: 42 }),
     );
   });
 
-  it('Solve sends the failing rows\' ids as plate_solve_batch { frameIds }', async () => {
+  it("Solve sends the held rows' ids as plate_solve_batch { frameIds }", async () => {
     mockCommands(projectCard(), {
-      evaluate_collab_gate: () =>
-        Promise.resolve(
-          gateFixture({
-            blockers: [{ kind: 'solve', frames: 1, sets: [], names: [] }],
-            rows: [
-              {
-                frameId: 7,
-                filename: 'a.fits',
-                fwhmArcsec: null,
-                eccentricity: null,
-                starsDetected: null,
-                trailed: null,
-                publishable: false,
-                failures: ['unknown pixel scale'],
-              } as FrameGateRow,
-            ],
-          }),
-        ),
+      list_project_own_frames: () => Promise.resolve([heldRow(7, 'solve', 'unknown pixel scale')]),
     });
     renderProjectDetail();
+    await openHeld(1);
 
-    const btn = await screen.findByRole('button', { name: /Solve 1 frames?/ });
-    fireEvent.click(btn);
+    fireEvent.click(await screen.findByRole('button', { name: 'Solve 1' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('plate_solve_batch', { frameIds: [7] }),
     );
@@ -614,24 +799,21 @@ describe('ProjectDetail gate blockers (GateBlockers wiring)', () => {
 
   it('"Open calibration" navigates to the set\'s /objects/<id>?tab=calibration', async () => {
     mockCommands(projectCard(), {
-      evaluate_collab_gate: () =>
-        Promise.resolve(
-          gateFixture({ blockers: [{ kind: 'linkCalibration', frames: 3, sets: [99], names: [] }] }),
-        ),
+      list_project_own_frames: () =>
+        Promise.resolve([heldRow(8, 'linkCalibration', 'no calibration linked', { setId: 99 })]),
     });
     renderProjectDetail();
+    await openHeld(1);
 
-    const btn = await screen.findByRole('button', { name: 'Open calibration' });
-    fireEvent.click(btn);
-    const loc = await screen.findByTestId('location');
-    expect(loc.textContent).toBe('/objects/99?tab=calibration');
+    fireEvent.click(await screen.findByRole('button', { name: 'Open calibration' }));
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/objects/99?tab=calibration'));
   });
 
-  it('re-fetches the gate when analysis-complete fires', async () => {
-    mockCommands(projectCard());
+  it('re-fetches own frames when analysis-complete fires', async () => {
     renderProjectDetail();
-    await screen.findByRole('heading', { name: /M42 Mosaic/ });
-    const before = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
+    await openTab(/^My frames/);
+    await screen.findByRole('button', { name: 'Publish all 2' });
+    const before = invokeCount('list_project_own_frames');
     act(() => {
       listeners['analysis-complete']?.({
         frame_set_id: 42,
@@ -642,89 +824,48 @@ describe('ProjectDetail gate blockers (GateBlockers wiring)', () => {
         cancelled: false,
       });
     });
-    await waitFor(() => {
-      const after = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
-      expect(after).toBeGreaterThan(before);
-    });
+    await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThan(before));
   });
 
-  it('re-fetches the gate when plate-solve-complete fires, after this page started a solve', async () => {
+  it('re-fetches own frames when plate-solve-complete fires, after this page started a solve', async () => {
     mockCommands(projectCard(), {
-      evaluate_collab_gate: () =>
-        Promise.resolve(
-          gateFixture({
-            blockers: [{ kind: 'solve', frames: 1, sets: [], names: [] }],
-            rows: [
-              {
-                frameId: 7,
-                filename: 'a.fits',
-                fwhmArcsec: null,
-                eccentricity: null,
-                starsDetected: null,
-                trailed: null,
-                publishable: false,
-                failures: ['unknown pixel scale'],
-              } as FrameGateRow,
-            ],
-          }),
-        ),
+      list_project_own_frames: () => Promise.resolve([heldRow(7, 'solve', 'unknown pixel scale')]),
     });
     renderProjectDetail();
-    const btn = await screen.findByRole('button', { name: /Solve 1 frames?/ });
-    fireEvent.click(btn);
+    await openHeld(1);
+    fireEvent.click(await screen.findByRole('button', { name: 'Solve 1' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('plate_solve_batch', { frameIds: [7] }),
     );
-    const before = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
+    const before = invokeCount('list_project_own_frames');
     act(() => {
       listeners['plate-solve-complete']?.({});
     });
-    await waitFor(() => {
-      const after = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
-      expect(after).toBeGreaterThan(before);
-    });
+    await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThan(before));
   });
 
-  it('final-review minor: plate-solve-complete is a global event — it does not re-fetch this page\'s gate when this page never started a solve', async () => {
-    mockCommands(projectCard());
+  it("final-review minor: plate-solve-complete is a global event — it does not re-fetch this page's frames when this page never started a solve", async () => {
     renderProjectDetail();
-    await screen.findByRole('heading', { name: /M42 Mosaic/ });
-    const before = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
+    await openTab(/^My frames/);
+    await screen.findByRole('button', { name: 'Publish all 2' });
+    const before = invokeCount('list_project_own_frames');
     act(() => {
       listeners['plate-solve-complete']?.({});
     });
     // No `await waitFor` for a positive assertion here — give any (wrongly)
     // scheduled re-fetch a tick to land, then assert it did not.
     await new Promise((r) => setTimeout(r, 0));
-    const after = vi.mocked(api.invoke).mock.calls.filter((c) => c[0] === 'evaluate_collab_gate').length;
-    expect(after).toBe(before);
+    expect(invokeCount('list_project_own_frames')).toBe(before);
   });
 
   it('final-review minor: a failed Solve invoke notifies', async () => {
     mockCommands(projectCard(), {
-      evaluate_collab_gate: () =>
-        Promise.resolve(
-          gateFixture({
-            blockers: [{ kind: 'solve', frames: 1, sets: [], names: [] }],
-            rows: [
-              {
-                frameId: 7,
-                filename: 'a.fits',
-                fwhmArcsec: null,
-                eccentricity: null,
-                starsDetected: null,
-                trailed: null,
-                publishable: false,
-                failures: ['unknown pixel scale'],
-              } as FrameGateRow,
-            ],
-          }),
-        ),
+      list_project_own_frames: () => Promise.resolve([heldRow(7, 'solve', 'unknown pixel scale')]),
       plate_solve_batch: () => Promise.reject(new Error('solver unavailable')),
     });
     renderProjectDetail();
-    const btn = await screen.findByRole('button', { name: /Solve 1 frames?/ });
-    fireEvent.click(btn);
+    await openHeld(1);
+    fireEvent.click(await screen.findByRole('button', { name: 'Solve 1' }));
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
     expect(toasts[0]).toHaveTextContent('Could not start the solve');
@@ -732,38 +873,223 @@ describe('ProjectDetail gate blockers (GateBlockers wiring)', () => {
 
   it('final-review minor: a failed Analyze invoke notifies', async () => {
     mockCommands(projectCard(), {
-      evaluate_collab_gate: () =>
-        Promise.resolve(
-          gateFixture({ blockers: [{ kind: 'analyze', frames: 2, sets: [42], names: [] }] }),
-        ),
+      list_project_own_frames: () => Promise.resolve([heldRow(5, 'analyze', 'no analysis', { setId: 42 })]),
       analyze_frame_set: () => Promise.reject(new Error('analysis unavailable')),
     });
     renderProjectDetail();
-    const btn = await screen.findByRole('button', { name: 'Analyze' });
-    fireEvent.click(btn);
+    await openHeld(1);
+    fireEvent.click(await screen.findByRole('button', { name: 'Analyze' }));
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
     expect(toasts[0]).toHaveTextContent('Could not start the analysis');
   });
 });
 
-function ownFrame(): ProjectFrameView {
-  return {
-    frameUuid: 'f-1',
-    fileName: 'c_L_0001.fits',
-    own: true,
-    state: 'published',
-    contentVersion: 1,
-    byteSize: 1024,
-    holdersOnline: 1,
-    holdersTotal: 1,
-    localState: 'own_held',
-    lastError: null,
-    acceptedReason: null,
-    contributorState: null,
-    contributorReason: null,
-    receivedAt: null,
-    receivedFromDevice: null,
-    receivedFromMember: null,
-  } as ProjectFrameView;
+describe('ProjectDetail tabs', () => {
+  function tabNames(): string[] {
+    return screen.getAllByRole('tab').map((t) => t.textContent ?? '');
+  }
+
+  it('opens on Overview by default, with the six tabs in order for a coordinator of an approval project', async () => {
+    mockCommands(projectCard({ coordinator: true, requireApproval: true }));
+    renderProjectDetail();
+    const overview = await screen.findByRole('tab', { name: 'Overview' });
+    expect(overview).toHaveAttribute('aria-selected', 'true');
+    expect(tabNames()).toEqual(['Overview', 'My frames 2', 'Library', 'Members', 'Exchange', 'Moderation']);
+  });
+
+  it('a contributor (send only, not coordinator) sees no Library tab', async () => {
+    mockCommands(projectCard({ dataRole: 'send', coordinator: false }));
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    expect(screen.queryByRole('tab', { name: /^Library/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: /^My frames/ })).toBeInTheDocument();
+  });
+
+  it('Moderation shows only for a coordinator of a project that requires approval, with the pending badge', async () => {
+    mockCommands(projectCard({ coordinator: true, requireApproval: true, pendingFrames: 3 }));
+    const first = renderProjectDetail();
+    expect(await screen.findByRole('tab', { name: 'Moderation 3' })).toBeInTheDocument();
+    first.unmount();
+
+    mockCommands(projectCard({ coordinator: true, requireApproval: false }));
+    const second = renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    expect(screen.queryByRole('tab', { name: /^Moderation/ })).not.toBeInTheDocument();
+    second.unmount();
+
+    mockCommands(projectCard({ coordinator: false, requireApproval: true }));
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    expect(screen.queryByRole('tab', { name: /^Moderation/ })).not.toBeInTheDocument();
+  });
+
+  it('the My frames badge shows the ready count', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () =>
+        Promise.resolve([...twoReady, ownRow({ frameId: 3, fileName: 'L_0003.fits' }), published(4)]),
+    });
+    renderProjectDetail();
+    expect(await screen.findByRole('tab', { name: 'My frames 3' })).toBeInTheDocument();
+  });
+
+  it('the Library badge counts the library frames still to come on this device', async () => {
+    mockCommands(projectCard(), {
+      list_collab_frames: () =>
+        Promise.resolve([
+          libraryFrame({ frameUuid: 'a', localState: 'wanted' }),
+          libraryFrame({ frameUuid: 'b', localState: 'held' }),
+          libraryFrame({ frameUuid: 'c', localState: 'wanted', own: true }),
+        ]),
+    });
+    renderProjectDetail();
+    expect(await screen.findByRole('tab', { name: 'Library 1' })).toBeInTheDocument();
+  });
+
+  it('?tab=receive opens Library and is removed from the URL', async () => {
+    renderProjectDetail('/projects/proj-1?tab=receive');
+    const library = await screen.findByRole('tab', { name: /^Library/ });
+    await waitFor(() => expect(library).toHaveAttribute('aria-selected', 'true'));
+    expect(await screen.findByText('Received frames')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/projects/proj-1'));
+  });
+
+  it('?tab=contribute opens My frames', async () => {
+    renderProjectDetail('/projects/proj-1?tab=contribute');
+    const mine = await screen.findByRole('tab', { name: /^My frames/ });
+    await waitFor(() => expect(mine).toHaveAttribute('aria-selected', 'true'));
+    expect(await screen.findByRole('button', { name: 'Publish all 2' })).toBeInTheDocument();
+  });
+
+  it('?tab=members and ?tab=exchange open their tabs', async () => {
+    const first = renderProjectDetail('/projects/proj-1?tab=members');
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Members' })).toHaveAttribute('aria-selected', 'true'),
+    );
+    first.unmount();
+    renderProjectDetail('/projects/proj-1?tab=exchange');
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Exchange' })).toHaveAttribute('aria-selected', 'true'),
+    );
+  });
+
+  it('a deep link to a tab this member cannot see falls back to Overview', async () => {
+    mockCommands(projectCard({ dataRole: 'send', coordinator: false }));
+    renderProjectDetail('/projects/proj-1?tab=receive');
+    const overview = await screen.findByRole('tab', { name: 'Overview' });
+    expect(overview).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('a legacy stored tab ("contribute") from the old page maps to My frames', async () => {
+    renderProjectDetail('/seed', 'contribute');
+    const mine = await screen.findByRole('tab', { name: /^My frames/ });
+    await waitFor(() => expect(mine).toHaveAttribute('aria-selected', 'true'));
+  });
+
+  it('an Overview segment button opens My frames on that segment', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () => Promise.resolve([heldRow(7, 'solve', 'unknown pixel scale')]),
+    });
+    renderProjectDetail();
+    fireEvent.click(await screen.findByRole('button', { name: 'Held back 1' }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /^My frames/ })).toHaveAttribute('aria-selected', 'true'),
+    );
+    expect(await screen.findByRole('button', { name: 'Solve 1' })).toBeInTheDocument();
+  });
+
+  it('a project missing from the local list says so', async () => {
+    mockCommands(projectCard(), {
+      get_collab_project_detail: () => Promise.reject(new Error('not found')),
+    });
+    renderProjectDetail();
+    expect(
+      await screen.findByText('This project is not in your local list — refresh the Projects page.'),
+    ).toBeInTheDocument();
+  });
+
+  it('the page no longer evaluates the project gate', async () => {
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    await screen.findByRole('button', { name: 'Publish all 2' });
+    expect(invokeCount('evaluate_collab_gate')).toBe(0);
+    expect(api.invoke).toHaveBeenCalledWith('list_project_own_frames', { projectId: 'proj-1' });
+    expect(api.invoke).toHaveBeenCalledWith('list_collab_frames', { projectId: 'proj-1' });
+  });
+});
+
+function GoToProject2() {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate('/projects/proj-2')}>
+      go to project 2
+    </button>
+  );
 }
+
+describe('ProjectDetail project switch', () => {
+  it("navigating to another project never carries the previous project's frames, drawer or confirm over", async () => {
+    mockCommands(projectCard(), {
+      get_collab_project_detail: (args) =>
+        Promise.resolve(
+          detailFixture(
+            (args as { projectId: string }).projectId === 'proj-2'
+              ? projectCard({ projectId: 'proj-2', title: 'M31 Deep' })
+              : projectCard(),
+          ),
+        ),
+      list_project_own_frames: (args) =>
+        Promise.resolve(
+          (args as { projectId: string }).projectId === 'proj-2'
+            ? [ownRow({ frameId: 9, fileName: 'M31_0009.fits' })]
+            : twoReady,
+        ),
+    });
+    render(
+      <MemoryRouter initialEntries={['/projects/proj-1']}>
+        <NavHistoryProvider>
+          <SessionStateProvider>
+            <NotificationProvider>
+              <CollabExchangeProvider>
+                <Routes>
+                  <Route
+                    path="/projects/:id"
+                    element={
+                      <>
+                        <GoToProject2 />
+                        <ProjectDetail />
+                      </>
+                    }
+                  />
+                </Routes>
+              </CollabExchangeProvider>
+            </NotificationProvider>
+          </SessionStateProvider>
+        </NavHistoryProvider>
+      </MemoryRouter>,
+    );
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByText('L_0001.fits'));
+    expect(await screen.findByRole('complementary')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'go to project 2' }));
+    expect(await screen.findByRole('heading', { name: 'M31 Deep' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Publish all 1' })).toBeInTheDocument();
+    expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
+    expect(screen.queryByText('L_0001.fits')).not.toBeInTheDocument();
+  });
+});
+
+describe('ProjectDetail frame drawer', () => {
+  it('clicking a row opens the drawer and Escape closes it', async () => {
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByText('L_0001.fits'));
+
+    const drawer = await screen.findByRole('complementary');
+    expect(within(drawer).getByRole('heading', { name: 'L_0001.fits' })).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('complementary')).not.toBeInTheDocument());
+  });
+});

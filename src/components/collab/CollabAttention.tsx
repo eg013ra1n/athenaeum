@@ -115,7 +115,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
       kind: 'project',
       tone: 'warning',
       hasErrors: true,
-      link: `/projects/${projectId}?tab=receive`,
+      link: `/projects/${projectId}?tab=library`,
     });
   };
 
@@ -215,7 +215,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
         detail: row.path,
         kind: 'project',
         tone: 'success',
-        link: `/projects/${projectId}?tab=receive`,
+        link: `/projects/${projectId}?tab=library`,
       });
     });
 
@@ -238,7 +238,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
               detail: 'It is listed under Not kept — "Keep again" fetches it once more.',
               kind: 'project',
               tone: 'success',
-              link: `/projects/${projectId}?tab=receive`,
+              link: `/projects/${projectId}?tab=library`,
             });
           }),
       ),

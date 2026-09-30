@@ -14,9 +14,9 @@ import type { MemberSummary, OwnFrameRow, ThresholdRuleView } from '../../../typ
  * wave 2, mockup `overviewView`). Five parts: integration per canonical
  * filter drawn as member-coloured bars against the coordinator's goals, "my
  * three numbers", Needs attention, a live Exchange-now one-liner, and the
- * quality-thresholds section moved verbatim from the old Overview tab
- * (`ProjectDetail.tsx`, now duplicated here — Task 16 rewires the page and
- * drops the old copy).
+ * quality-thresholds section moved verbatim from the old Overview tab of
+ * `ProjectDetail.tsx`. While `own` is still loading (`null`), My frames and
+ * Needs attention read `Loading…` rather than zero counts.
  */
 
 export interface OverviewTabProps {
@@ -232,22 +232,30 @@ export default function OverviewTab({
         <div className="space-y-4">
           <div className={CARD}>
             <h2 className={HEADER}>My frames</h2>
-            <div className="mt-1 flex flex-wrap gap-2">
-              <button type="button" onClick={() => onOpenSegment('ready')} className={READY_BTN}>
-                Ready {readyCount}
-              </button>
-              <button type="button" onClick={() => onOpenSegment('published')} className={PUBLISHED_BTN}>
-                Published {publishedCount}
-              </button>
-              <button type="button" onClick={() => onOpenSegment('held')} className={HELD_BTN}>
-                Held back {heldCount}
-              </button>
-            </div>
+            {/* While own frames load, never zero counts (they would read as
+                "you have nothing"). */}
+            {own === null ? (
+              <p className={EMPTY}>Loading…</p>
+            ) : (
+              <div className="mt-1 flex flex-wrap gap-2">
+                <button type="button" onClick={() => onOpenSegment('ready')} className={READY_BTN}>
+                  Ready {readyCount}
+                </button>
+                <button type="button" onClick={() => onOpenSegment('published')} className={PUBLISHED_BTN}>
+                  Published {publishedCount}
+                </button>
+                <button type="button" onClick={() => onOpenSegment('held')} className={HELD_BTN}>
+                  Held back {heldCount}
+                </button>
+              </div>
+            )}
           </div>
 
           <div className={CARD}>
             <h2 className={HEADER}>Needs attention</h2>
-            {attentionItems.length === 0 ? (
+            {own === null ? (
+              <p className={EMPTY}>Loading…</p>
+            ) : attentionItems.length === 0 ? (
               <p className={EMPTY}>Nothing needs attention.</p>
             ) : (
               <div className="mt-1 space-y-1">

@@ -15,7 +15,7 @@ const REASON_MAX = 500;
  *  call). Benign: the frame is decided either way, so the loop counts it and
  *  moves on instead of stopping. Stable core text from `decide_err` in
  *  `crates/athenaeum-core/src/api/collab.rs`; same string-match convention as
- *  `PUBLISH_BUSY` in `src/pages/ProjectDetail.tsx`. */
+ *  `PUBLISH_BUSY` in `./usePublishing.ts`. */
 const ALREADY_DECIDED = 'This frame was already decided';
 
 function isAlreadyDecided(msg: string): boolean {
@@ -33,11 +33,10 @@ function byUuid(library: ProjectFrameView[] | null): ReadonlyMap<string, Project
 /**
  * Moderation tab — the coordinator's queue of pending first publications, as
  * one `ProjectFrameTable` (Task 12, spec 2026-09-30 "Moderation"). Replaces
- * `ModerationQueue`'s per-row list with batch Approve/Reject; `ModerationQueue`
- * itself is untouched here (Task 16 deletes it once the redesigned page is
- * wired up). The "Trust this publisher" checkbox moves from per-row (the old
- * queue) to one table-wide toggle in the toolbar, default on, applied to
- * every frame a batch Approve covers.
+ * the retired per-row moderation queue with batch Approve/Reject. The "Trust
+ * this publisher" checkbox moves from per-row (the old queue) to one
+ * table-wide toggle in the toolbar, default on, applied to every frame a
+ * batch Approve covers.
  */
 export default function ModerationTab({
   projectId,
@@ -203,7 +202,7 @@ export default function ModerationTab({
   );
 }
 
-/** Required-reason reject dialog (≤500 chars), moved from `ModerationQueue.tsx`
+/** Required-reason reject dialog (≤500 chars), moved from the retired moderation queue
  *  and generalized to a batch of frames — same rule and copy, one reason
  *  applied to every target. */
 function RejectDialog({

@@ -42,7 +42,7 @@ export default function FrameSetProjectBlock({ framesSetId, status, onChanged }:
         <div key={l.projectId} className="flex flex-wrap items-center gap-2 text-content-secondary">
           <Users size={14} className="text-content-muted" />
           <span><span className="text-content">Project {l.title}</span> · {summary(l)}</span>
-          <Link to={`/projects/${l.projectId}?tab=contribute`} className="rounded border border-border px-2 py-0.5 text-xs hover:bg-surface-hover">Open project</Link>
+          <Link to={`/projects/${l.projectId}?tab=mine`} className="rounded border border-border px-2 py-0.5 text-xs hover:bg-surface-hover">Open project</Link>
         </div>
       ))}
       {status.links.length === 0 && status.candidates.map((c) => (

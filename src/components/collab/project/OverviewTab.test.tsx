@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { CollabExchangeProvider } from '../../../contexts/CollabExchangeContext';
 import { api } from '../../../api';
 import OverviewTab, { type OverviewTabProps } from './OverviewTab';
@@ -123,7 +123,7 @@ function renderTab(overrides: Partial<OverviewTabProps> = {}) {
 
 describe('OverviewTab — integration', () => {
   it('members === null shows Loading…', async () => {
-    renderTab({ members: null, goals: { Ha: 36000 } });
+    renderTab({ members: null, goals: { Ha: 36000 }, own: [] });
     expect(await screen.findByText('Loading…')).toBeInTheDocument();
   });
 
@@ -242,7 +242,7 @@ describe('OverviewTab — needs attention', () => {
 
   it('library-to-come and pending-review items route through onOpenTab', async () => {
     const onOpenTab = vi.fn();
-    renderTab({ libraryToCome: 4, pending: 2, canModerate: true, onOpenTab });
+    renderTab({ own: [], libraryToCome: 4, pending: 2, canModerate: true, onOpenTab });
 
     fireEvent.click(await screen.findByText('4 library frames still to come'));
     expect(onOpenTab).toHaveBeenCalledWith('library');
@@ -254,6 +254,17 @@ describe('OverviewTab — needs attention', () => {
   it('pending review is hidden when canModerate is false', async () => {
     renderTab({ pending: 2, canModerate: false });
     expect(screen.queryByText(/frames wait for your review/)).not.toBeInTheDocument();
+  });
+
+  it('while own frames are still loading, My frames and Needs attention read Loading…, never zero counts or "Nothing needs attention."', async () => {
+    renderTab({ own: null, members: [], libraryToCome: 0, pending: 0, canModerate: false });
+    const myFrames = (await screen.findByRole('heading', { name: 'My frames' })).parentElement!;
+    expect(within(myFrames).getByText('Loading…')).toBeInTheDocument();
+    expect(within(myFrames).queryByRole('button')).not.toBeInTheDocument();
+    const attention = screen.getByRole('heading', { name: 'Needs attention' }).parentElement!;
+    expect(within(attention).getByText('Loading…')).toBeInTheDocument();
+    expect(screen.queryByText('Nothing needs attention.')).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Ready \d/)).not.toBeInTheDocument();
   });
 
   it('reads "Nothing needs attention." when nothing qualifies', async () => {

@@ -23,7 +23,7 @@ describe('FrameSetProjectBlock', () => {
     render(<MemoryRouter><FrameSetProjectBlock framesSetId={5} status={status} onChanged={vi.fn()} /></MemoryRouter>);
     expect(screen.getByText(/Project M 101/)).toBeInTheDocument();
     expect(screen.getByText(/812 published · 79 fail gate · 3 update pending/)).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Open project' })).toHaveAttribute('href', '/projects/p1?tab=contribute');
+    expect(screen.getByRole('link', { name: 'Open project' })).toHaveAttribute('href', '/projects/p1?tab=mine');
   });
 
   it('offers Link to project for a candidate and links on click', async () => {

@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { FolderOpen, FolderOutput } from 'lucide-react';
 import { api } from '../../../api';
 import { useCollabExchange } from '../../../contexts/CollabExchangeContext';
+import type { ExchangeState } from '../exchange/state';
 import ProjectExportDialog from '../ProjectExportDialog';
 import CollabAttention from '../CollabAttention';
 import ExcludeDialog from './ExcludeDialog';
@@ -16,11 +17,10 @@ import type {
 
 /**
  * Library tab — other members' published frames and their state on this
- * device (Task 11, spec 2026-09-30 "Library"). Replaces `ReceiveTab`'s
- * grouped-by-publisher table with `ProjectFrameTable`; the Collaboration-
- * folder banner, `Export for WBPP`, `CollabAttention` and the per-project
- * reload listeners move here VERBATIM from `ReceiveTab` — `ReceiveTab` itself
- * is untouched (Task 16 deletes it once the redesigned page is wired up).
+ * device (Task 11, spec 2026-09-30 "Library"). One `ProjectFrameTable`
+ * grouped by publisher; the Collaboration-folder banner, `Export for WBPP`,
+ * `CollabAttention` and the per-project reload listeners moved here verbatim
+ * from the retired four-tab page's receive tab.
  *
  * The device column (`fromLibrary`) reads this device's replication state
  * off the stored `localState` (never optimistic, S6); `downloading` and its
@@ -100,16 +100,7 @@ export default function LibraryTab({
 
   // This project's receiving flows' in-flight items, keyed by frame uuid —
   // `fromLibrary`'s only source for `downloading` + its percent.
-  const inFlight = useMemo(() => {
-    const map = new Map<string, { done: number; size: number }>();
-    const recv = state.projects[projectId]?.recv ?? [];
-    for (const flow of recv) {
-      for (const item of flow.inFlight) {
-        map.set(item.frameUuid, { done: item.done, size: item.size });
-      }
-    }
-    return map;
-  }, [state.projects, projectId]);
+  const inFlight = useMemo(() => libraryInFlight(state.projects, projectId), [state.projects, projectId]);
 
   // Own frames are the Contribute/My-frames tabs' business; a frame still
   // pending moderation belongs to the Moderation tab, not here.
@@ -224,6 +215,24 @@ export default function LibraryTab({
       )}
     </div>
   );
+}
+
+/** This project's receiving flows' in-flight items, keyed by frame uuid —
+ * the ONE builder of the map `fromLibrary` reads for `downloading` + its
+ * percent; the tab and the page's Library badge (`libraryToCome`) both use
+ * it, so the two can never disagree. */
+export function libraryInFlight(
+  projects: ExchangeState['projects'],
+  projectId: string,
+): Map<string, { done: number; size: number }> {
+  const map = new Map<string, { done: number; size: number }>();
+  const recv = projects[projectId]?.recv ?? [];
+  for (const flow of recv) {
+    for (const item of flow.inFlight) {
+      map.set(item.frameUuid, { done: item.done, size: item.size });
+    }
+  }
+  return map;
 }
 
 /** The Library tab's badge count: frames whose device state (`fromLibrary`)

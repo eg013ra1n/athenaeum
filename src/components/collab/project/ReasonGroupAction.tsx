@@ -36,9 +36,9 @@ function setsOf(rows: FrameVM[]): SetEntry[] {
 /**
  * Held back's per-Reason-group fix button (Task 10, spec 2026-09-30). Sits
  * on a Reason group's header (`ProjectFrameTable`'s `groupAction`) and
- * replaces `GateBlockers`' project-wide line for the same cause — same
+ * replaces the retired project-wide blocker line for the same cause — same
  * set-picker menu behaviour (Escape / outside-click close), reused verbatim
- * from there, but fed the group's OWN rows so the count and the offered
+ * from it, but fed the group's OWN rows so the count and the offered
  * sets are exactly this group's, not the whole project's gate.
  */
 export default function ReasonGroupAction({
@@ -49,7 +49,7 @@ export default function ReasonGroupAction({
 
   // Escape or a click outside the open menu closes it — the ONE open menu at
   // a time `menuFor` tracks, so one ref (attached only to whichever
-  // `setPicker` call is currently open) is enough (GateBlockers' pattern).
+  // `setPicker` call is currently open) is enough (the retired blocker line's pattern).
   useEffect(() => {
     if (!menuFor) return;
     const onKeyDown = (e: KeyboardEvent) => {

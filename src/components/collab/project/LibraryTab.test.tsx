@@ -146,7 +146,7 @@ function rowOf(fileName: string): HTMLElement {
   return row as HTMLElement;
 }
 
-describe('LibraryTab — ported from ReceiveTab', () => {
+describe('LibraryTab — ported from the retired receive tab', () => {
   it('shows the Collaboration-folder banner when unset, and hides it once set', async () => {
     vi.mocked(api.invoke).mockImplementation(((command: string) => {
       if (command === 'get_collaboration_dir') return Promise.resolve(null);

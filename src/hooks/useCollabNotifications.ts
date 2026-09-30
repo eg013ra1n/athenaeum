@@ -107,7 +107,7 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
  * reaches `notify()` regardless of which page or tab is open, and a
  * background auto-publish or a manifest change arriving on the hub's event
  * feed surfaces a toast even when nobody is on the Projects page. Per-page
- * hooks/components (`useProjects`, `ReceiveTab`, `CollabAttention`) keep
+ * hooks/components (`useProjects`, the project page's `LibraryTab`, `CollabAttention`) keep
  * their own state/UI concerns only — no `notify()` calls of their own for
  * these events, so there is exactly one place that can toast for each.
  */
@@ -151,7 +151,7 @@ export function useCollabNotifications() {
           kind: 'project',
           tone: 'warning',
           hasErrors: true,
-          link: p.projectIds.length === 1 ? `/projects/${p.projectIds[0]}?tab=receive` : '/projects',
+          link: p.projectIds.length === 1 ? `/projects/${p.projectIds[0]}?tab=library` : '/projects',
           dedupeKey: p.dedupeKey,
         });
       })
@@ -185,7 +185,7 @@ export function useCollabNotifications() {
                 kind: 'project',
                 tone: 'warning',
                 hasErrors: true,
-                link: `/projects/${p.projectId}?tab=receive`,
+                link: `/projects/${p.projectId}?tab=library`,
               }
             : {
                 title: `${p.fileName} is lost everywhere — restore it from the Trash`,
@@ -193,7 +193,7 @@ export function useCollabNotifications() {
                 kind: 'project',
                 tone: 'warning',
                 hasErrors: true,
-                link: `/projects/${p.projectId}?tab=receive`,
+                link: `/projects/${p.projectId}?tab=library`,
               },
         );
       })
@@ -221,7 +221,7 @@ export function useCollabNotifications() {
           detail: `${titleFor(p.projectId)}: it is no longer served — re-fetch the original or delete it under Changed files.`,
           kind: 'project',
           tone: 'warning',
-          link: `/projects/${p.projectId}?tab=receive`,
+          link: `/projects/${p.projectId}?tab=library`,
         });
       })
       .then((fn) => {
@@ -305,7 +305,7 @@ export function useCollabNotifications() {
         if (cancelled) return;
         if (l.landed === 0 && l.failed === 0) return;
         const title = titleFor(l.projectId);
-        const link = `/projects/${l.projectId}?tab=receive`;
+        const link = `/projects/${l.projectId}?tab=library`;
         const landedPlural = l.landed === 1 ? 'frame' : 'frames';
         notify({
           title:
