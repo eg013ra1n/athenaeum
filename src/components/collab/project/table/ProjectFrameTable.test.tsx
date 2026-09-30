@@ -142,3 +142,68 @@ it('a null metric sorts after real values', () => {
   const names = screen.getAllByRole('row').map((r) => r.textContent ?? '').filter((t) => t.includes('.fits'));
   expect(names.map((t) => t.match(/f\d+\.fits/)![0])).toEqual(['f3.fits', 'f2.fits', 'f1.fits']);
 });
+
+/* ── Fix round 1 (task review, 2026-09-30) ─────────────────────────────── */
+
+it('the windowing observer re-attaches when the table mounts later with rows (fix 1)', () => {
+  // jsdom has no ResizeObserver at all — install a spy-backed stub for this
+  // test only, so we can assert `observe` is called against the scroll
+  // element once it exists, not just once on the very first mount.
+  const observe = vi.fn();
+  class MockResizeObserver {
+    constructor(_cb: ResizeObserverCallback) {}
+    observe = observe;
+    unobserve = vi.fn();
+    disconnect = vi.fn();
+  }
+  const original = (globalThis as { ResizeObserver?: unknown }).ResizeObserver;
+  (globalThis as { ResizeObserver?: unknown }).ResizeObserver = MockResizeObserver;
+  try {
+    const { rerender } = renderTable({ rows: [] });
+    expect(observe).not.toHaveBeenCalled(); // no scroll container exists yet — the <p> sentence only
+
+    rerender(
+      <SessionStateProvider>
+        <ProjectFrameTable
+          tableId="ready" scope="p1" actions={[]} onOpen={vi.fn()} emptyText="Nothing ready." today="2026-09-30"
+          rows={[ready('1')]}
+        />
+      </SessionStateProvider>,
+    );
+
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observe.mock.calls[0][0]).toBeInstanceOf(HTMLElement);
+  } finally {
+    (globalThis as { ResizeObserver?: unknown }).ResizeObserver = original;
+  }
+});
+
+it('initial expansion is not consumed by an empty tree (fix 2)', () => {
+  const { rerender } = renderTable({ rows: [] }); // tree is empty on this first render
+  rerender(
+    <SessionStateProvider>
+      <ProjectFrameTable
+        tableId="ready" scope="p1" actions={[]} onOpen={vi.fn()} emptyText="Nothing ready." today="2026-09-30"
+        rows={[ready('1', { night: '2026-09-29', filter: 'L' })]}
+      />
+    </SessionStateProvider>,
+  );
+  // Had the empty tree's `[]` latched in as "already initialised", this
+  // group would still be collapsed and the frame invisible.
+  expect(screen.getByText('f1.fits')).toBeInTheDocument();
+});
+
+it('a selection fully hidden by a facet still lets the primary action cover the view, and the strip says so (fix 3)', () => {
+  const run = vi.fn();
+  const rows = [ready('1', { filter: 'L' }), ready('2', { filter: 'Ha' })];
+  renderTable({ rows, actions: [{ id: 'pub', verb: 'Publish', eligible: () => true, primary: true, run }] });
+
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Select f1.fits' })); // select the L frame
+  fireEvent.click(screen.getByRole('button', { name: /^Ha/ })); // filter down to Ha only — hides the selection
+
+  expect(screen.getByRole('button', { name: 'Publish all 1' })).toBeEnabled(); // covers the filtered view, not "0"
+  expect(screen.getByText('1 selected · 1 hidden')).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Publish all 1' }));
+  expect(run).toHaveBeenCalledWith([rows[1]]);
+});

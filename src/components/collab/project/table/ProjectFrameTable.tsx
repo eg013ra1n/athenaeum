@@ -95,7 +95,14 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [columnsOpen, setColumnsOpen] = useState(false);
 
-  const scrollRef = useRef<HTMLDivElement>(null);
+  // A callback ref (not a plain `useRef`) so measurement re-attaches whenever
+  // the scroll element itself changes — including "doesn't exist yet" (the
+  // table is behind the `rows.length === 0` early return below) → "exists"
+  // once rows arrive, and detach → reattach if rows empty out and refill.
+  // A `useRef` object never changes identity, so an effect keyed on `[]`
+  // would only ever see the FIRST element (or none), and never re-run.
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const scrollRef = (node: HTMLDivElement | null) => setScrollEl(node);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(0);
 
@@ -116,16 +123,15 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
   }, [rows]);
 
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return undefined;
-    setViewportH(el.clientHeight);
+    if (!scrollEl) return undefined;
+    setViewportH(scrollEl.clientHeight);
     if (typeof ResizeObserver === 'undefined') return undefined;
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) setViewportH(entry.contentRect.height);
     });
-    ro.observe(el);
+    ro.observe(scrollEl);
     return () => ro.disconnect();
-  }, []);
+  }, [scrollEl]);
 
   const counts = useMemo(() => facetCounts(rows, facets, FRAME_ACCESS, today), [rows, facets, today]);
   const filtered = useMemo(() => applyFacets(rows, facets, FRAME_ACCESS, today), [rows, facets, today]);
@@ -168,6 +174,11 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
   useEffect(() => {
     if (levelDefs.length === 0) return;
     if (expanded !== null) return;
+    // An empty tree (no rows yet, or the facets currently hide everything) has
+    // no "first group" to open — leave `expanded` at `null` so this effect
+    // runs again once real groups exist, instead of latching `[]` in as
+    // "already initialised" for the rest of the session.
+    if (tree.length === 0) return;
     setExpanded(initialExpanded(tree));
   }, [levelDefs.length, expanded, tree, setExpanded]);
 
@@ -262,7 +273,14 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
     return <p className="text-sm text-content-muted">{emptyText}</p>;
   }
 
-  const selectedInView = filtered.reduce((n, r) => (selected.has(rowKey(r)) ? n + 1 : n), 0);
+  // A selection entirely hidden by the current facets counts as NO selection
+  // for the actions (controller ruling, fix round 1 #3): `actionTargets` gets
+  // only the in-view part of `selected`, so when that part is empty it takes
+  // its own `selected.size === 0` branch and the primary action falls back
+  // to covering the whole filtered view, instead of reporting "0 of 0"
+  // against frames the user can no longer see or reach.
+  const inViewSelected = new Set(filtered.filter((r) => selected.has(rowKey(r))).map(rowKey));
+  const hiddenSelected = selected.size - inViewSelected.size;
   const totalExp = sum(filtered.map((r) => r.exptimeSec));
   const totalBytes = sum(filtered.map((r) => r.byteSize));
   const medFwhm = median(filtered.map((r) => r.fwhm));
@@ -433,9 +451,12 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
         <span>Σ {formatDuration(totalExp)}</span>
         <span>{formatBytes(totalBytes)}</span>
         <span>FWHM x̃ {medFwhm === null ? '—' : medFwhm.toFixed(2)}</span>
-        {selectedInView > 0 && (
-          <span className="text-accent">
-            {selectedInView} selected ·{' '}
+        {selected.size > 0 && (
+          <span className="flex items-center gap-1 text-accent">
+            <span>
+              {selected.size} selected{hiddenSelected > 0 ? ` · ${hiddenSelected} hidden` : ''}
+            </span>
+            <span>·</span>
             <button type="button" onClick={() => setSelected(new Set())} className="hover:underline">
               Clear
             </button>
@@ -443,7 +464,7 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
         )}
         <span className="flex-1" />
         {actions.map((a) => {
-          const { targets, selectedCount } = actionTargets(filtered, selected, rowKey, a.eligible);
+          const { targets, selectedCount } = actionTargets(filtered, inViewSelected, rowKey, a.eligible);
           const disabled = targets.length === 0 || !!a.busy;
           return (
             <button
