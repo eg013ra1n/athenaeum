@@ -75,9 +75,15 @@ function qualityKey(q: CameraQuality, i: number): string {
 export default function MembersTab({
   projectId,
   onMembers,
+  refreshToken = 0,
 }: {
   projectId: string;
   onMembers?: (m: MemberSummary[]) => void;
+  /** Bumped by the page shell on a trailing `collab-peers-changed` reload
+   *  (Task 5). Re-invokes the load below WITHOUT resetting `sort`/`openId` —
+   *  those are independent session state — and without clearing `members`
+   *  first, so a presence-triggered refresh never flashes "Loading…". */
+  refreshToken?: number;
 }): JSX.Element {
   const [members, setMembers] = useState<MemberSummary[] | null>(null);
   const [error, setError] = useState(false);
@@ -87,15 +93,28 @@ export default function MembersTab({
   const onMembersRef = useRef(onMembers);
   onMembersRef.current = onMembers;
 
+  // `firstLoadRef` distinguishes the initial mount / `projectId` change (show
+  // "Loading…" while nothing is on screen yet) from a `refreshToken` bump
+  // (keep the current rows visible while the re-read is in flight).
+  const firstLoadRef = useRef(true);
+  useEffect(() => {
+    firstLoadRef.current = true;
+  }, [projectId]);
+
   useEffect(() => {
     let cancelled = false;
-    setMembers(null);
-    setError(false);
+    const isFirstLoad = firstLoadRef.current;
+    firstLoadRef.current = false;
+    if (isFirstLoad) {
+      setMembers(null);
+      setError(false);
+    }
     api
       .invoke<MemberSummary[]>('get_collab_member_summary', { projectId })
       .then((list) => {
         if (cancelled) return;
         setMembers(list);
+        setError(false);
         onMembersRef.current?.(list);
       })
       .catch((err) => {
@@ -106,7 +125,7 @@ export default function MembersTab({
     return () => {
       cancelled = true;
     };
-  }, [projectId]);
+  }, [projectId, refreshToken]);
 
   const presentFilters = useMemo(() => {
     const set = new Set<string>();

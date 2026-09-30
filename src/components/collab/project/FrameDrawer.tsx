@@ -1,11 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Copy, Loader2, X } from 'lucide-react';
 import { api } from '../../../api';
 import { formatTimestamp } from '../../../utils/dateFormatting';
 import { getFilterColor } from '../../../utils/filterColors';
 import { formatBytes } from '../format';
-import type { FrameHolderView } from '../../../types/models';
+import type { CollabPeersChanged, FrameHolderView } from '../../../types/models';
 import type { FrameVM } from './frames';
 import ExcludeDialog from './ExcludeDialog';
 
@@ -70,6 +70,51 @@ export default function FrameDrawer({
       cancelled = true;
     };
   }, [projectId, frame.frameUuid]);
+
+  // Live presence/holder changes (core: `collab-peers-changed`, throttled to
+  // one per project per second) re-read holders for the still-open frame.
+  // Refs let the listener subscribe once (StrictMode-safe, CLAUDE.md
+  // pattern) while always reading the latest project/frame; `holders` is
+  // only replaced once the new rows arrive, so this never flashes back
+  // through "Loading holders…".
+  const projectIdRef = useRef(projectId);
+  projectIdRef.current = projectId;
+  const frameUuidRef = useRef(frame.frameUuid);
+  frameUuidRef.current = frame.frameUuid;
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<CollabPeersChanged>('collab-peers-changed', (p) => {
+        if (cancelled || p.projectId !== projectIdRef.current) return;
+        const frameUuid = frameUuidRef.current;
+        if (!frameUuid) return;
+        api
+          .invoke<FrameHolderView[]>('get_collab_frame_holders', {
+            projectId: projectIdRef.current,
+            frameUuid,
+          })
+          .then((rows) => {
+            if (!cancelled) setHolders(rows);
+          })
+          .catch((err) => {
+            // Never swallow — log, but keep the currently-shown rows rather
+            // than replacing them with an error state on a transient refresh
+            // failure (the initial load's own failure still sets 'error').
+            console.error('[drawer] holders refresh failed:', err);
+          });
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[drawer] collab-peers-changed listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const doRestore = async () => {
     const frameUuid = frame.frameUuid;

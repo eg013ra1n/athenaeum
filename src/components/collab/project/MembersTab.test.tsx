@@ -233,6 +233,64 @@ describe('MembersTab — Holds', () => {
   });
 });
 
+describe('MembersTab — refreshToken', () => {
+  it('re-invokes get_collab_member_summary when refreshToken changes, keeps showing rows while it re-reads, and keeps the sort', async () => {
+    const list1 = [
+      member({ accountId: 'a1', displayName: 'Alice', publishedFrames: 5 }),
+      member({ accountId: 'a2', displayName: 'Bob', publishedFrames: 50 }),
+    ];
+    mockMembers(list1);
+    const { rerender } = render(
+      <SessionStateProvider>
+        <MembersTab projectId="proj-1" refreshToken={0} />
+      </SessionStateProvider>,
+    );
+    await screen.findByText('Alice');
+    expect(nameOrder()).toEqual(['Bob', 'Alice']); // default: published desc
+
+    fireEvent.click(screen.getByText('Member'));
+    expect(nameOrder()).toEqual(['Alice', 'Bob']); // now: name asc
+
+    const before = vi
+      .mocked(api.invoke)
+      .mock.calls.filter(([c]) => c === 'get_collab_member_summary').length;
+
+    let resolveSecond!: (rows: MemberSummary[]) => void;
+    const second = new Promise<MemberSummary[]>((resolve) => {
+      resolveSecond = resolve;
+    });
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'get_collab_member_summary') return second;
+      return Promise.resolve(null);
+    }) as never);
+
+    rerender(
+      <SessionStateProvider>
+        <MembersTab projectId="proj-1" refreshToken={1} />
+      </SessionStateProvider>,
+    );
+
+    // Re-invoked immediately …
+    expect(
+      vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_collab_member_summary').length,
+    ).toBeGreaterThan(before);
+    // … but the table keeps the OLD rows while the read is in flight — no
+    // "Loading…" flash on a presence-triggered refresh.
+    expect(screen.getByText('Alice')).toBeInTheDocument();
+    expect(screen.queryByText('Loading…')).not.toBeInTheDocument();
+
+    resolveSecond([
+      member({ accountId: 'a1', displayName: 'Alice', publishedFrames: 5 }),
+      member({ accountId: 'a2', displayName: 'Bob', publishedFrames: 50 }),
+      member({ accountId: 'a3', displayName: 'Carol', publishedFrames: 1 }),
+    ]);
+
+    await screen.findByText('Carol');
+    // The sort survived the refresh — still name asc.
+    expect(nameOrder()).toEqual(['Alice', 'Bob', 'Carol']);
+  });
+});
+
 describe('MembersTab — expanded row', () => {
   it('is collapsed by default and expands on row click', async () => {
     mockMembers([

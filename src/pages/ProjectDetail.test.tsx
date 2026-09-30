@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { useEffect } from 'react';
 import { render, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
@@ -234,6 +234,13 @@ beforeEach(() => {
     (listeners[event] ??= []).push(cb as unknown as (payload: unknown) => void);
     return Promise.resolve(() => {});
   }) as never);
+});
+
+afterEach(() => {
+  // Safety net: a test that enables fake timers and then fails before
+  // reaching its own `vi.useRealTimers()` would otherwise leave every
+  // following test's `findByText`/`waitFor` (real-timer pollers) hanging.
+  vi.useRealTimers();
 });
 
 /** Mounts the same live listener `Layout.tsx` mounts once at the app root
@@ -1202,6 +1209,101 @@ describe('ProjectDetail project switch', () => {
     expect(await screen.findByRole('button', { name: 'Publish all 1' })).toBeInTheDocument();
     expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
     expect(screen.queryByText('L_0001.fits')).not.toBeInTheDocument();
+  });
+});
+
+describe('ProjectDetail presence (collab-peers-changed)', () => {
+  it('a burst of events collapses to one library/member reload after 1s, and one own-frames reload after 5s', async () => {
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    await waitFor(() => expect(listeners['collab-peers-changed']?.length ?? 0).toBeGreaterThan(0));
+
+    const lib0 = invokeCount('list_collab_frames');
+    const mem0 = invokeCount('get_collab_member_summary');
+    const own0 = invokeCount('list_project_own_frames');
+
+    vi.useFakeTimers();
+    try {
+      // Three events, all within 300ms of each other (here: the same instant,
+      // which is well within the window) — the debounce must collapse them.
+      fire('collab-peers-changed', { projectId: 'proj-1' });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      fire('collab-peers-changed', { projectId: 'proj-1' });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      fire('collab-peers-changed', { projectId: 'proj-1' });
+
+      // Just under 1s since the LAST event: nothing yet.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(999);
+      });
+      expect(invokeCount('list_collab_frames')).toBe(lib0);
+      expect(invokeCount('get_collab_member_summary')).toBe(mem0);
+      expect(invokeCount('list_project_own_frames')).toBe(own0);
+
+      // 1s since the last event: the library + member reload fires exactly once.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(invokeCount('list_collab_frames')).toBe(lib0 + 1);
+      expect(invokeCount('get_collab_member_summary')).toBe(mem0 + 1);
+      expect(invokeCount('list_project_own_frames')).toBe(own0);
+
+      // 5s since the last event: the own-frames gate read fires exactly once,
+      // and the earlier reload did not fire again.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(invokeCount('list_project_own_frames')).toBe(own0 + 1);
+      expect(invokeCount('list_collab_frames')).toBe(lib0 + 1);
+      expect(invokeCount('get_collab_member_summary')).toBe(mem0 + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an event for another project reloads nothing', async () => {
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    const lib0 = invokeCount('list_collab_frames');
+    const mem0 = invokeCount('get_collab_member_summary');
+    const own0 = invokeCount('list_project_own_frames');
+
+    vi.useFakeTimers();
+    try {
+      fire('collab-peers-changed', { projectId: 'proj-other' });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(invokeCount('list_collab_frames')).toBe(lib0);
+      expect(invokeCount('get_collab_member_summary')).toBe(mem0);
+      expect(invokeCount('list_project_own_frames')).toBe(own0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears its timers on unmount — no reload fires afterward', async () => {
+    const { unmount } = renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    const lib0 = invokeCount('list_collab_frames');
+    const own0 = invokeCount('list_project_own_frames');
+
+    vi.useFakeTimers();
+    try {
+      fire('collab-peers-changed', { projectId: 'proj-1' });
+      unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(invokeCount('list_collab_frames')).toBe(lib0);
+      expect(invokeCount('list_project_own_frames')).toBe(own0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

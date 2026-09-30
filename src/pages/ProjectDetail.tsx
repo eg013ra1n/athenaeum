@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { ExternalLink, Loader2, Monitor, Send, Target } from 'lucide-react';
 import { api } from '../api';
@@ -24,6 +24,7 @@ import RepublishGuardDialog from '../components/collab/project/RepublishGuardDia
 import { deviceLabel, leading, OTHER_DEVICE, usePublishing } from '../components/collab/project/usePublishing';
 import { fromLibrary, fromOwn, ownFrameKey, type FrameVM } from '../components/collab/project/frames';
 import type {
+  CollabPeersChanged,
   MemberSummary,
   OwnFrameRow,
   ProjectDetail as Detail,
@@ -69,6 +70,14 @@ const APPROX_FRAME_BYTES = 45 * 1024 * 1024;
 
 const BADGE = 'rounded-full px-1.5 text-[10px] font-medium';
 
+// `collab-peers-changed` fires per event, throttled core-side to one per
+// project per second (`LANDED_BURST`, `runtime.rs`). These mirror that on the
+// frontend so a fast run of events collapses to one trailing reload each; a
+// new event restarts the window. `loadOwn` is the expensive gate read, so it
+// gets its own, longer window.
+const PEERS_RELOAD_MS = 1000;
+const OWN_RELOAD_MS = 5000;
+
 /**
  * A collab project: the header (title, target, publishing device, live
  * status, portal link, auto-replication) and six tabs — Overview, My frames,
@@ -102,6 +111,9 @@ function ProjectPage({ id }: { id: string | undefined }) {
   /** The republish guard's request (`ids: null` = "all"); `null` = closed. */
   const [republishReq, setRepublishReq] = useState<{ ids: number[] | null } | null>(null);
   const [switchConfirm, setSwitchConfirm] = useState(false);
+  // Bumped on a trailing `collab-peers-changed` reload; passed to `MembersTab`
+  // as `refreshToken` so it re-reads without losing its sort/expansion state.
+  const [membersRefresh, setMembersRefresh] = useState(0);
 
   // Session-scoped so stepping into a linked object and back returns to the
   // tab and segment you were on. A value stored by the old four-tab page
@@ -200,22 +212,69 @@ function ProjectPage({ id }: { id: string | undefined }) {
   }, [id, loadOwn, loadLibrary, loadDetail]);
 
   // Loaded once here for the Overview and Exchange tabs; the Members tab
-  // refreshes it through `onMembers` whenever it mounts.
+  // refreshes it through `onMembers` whenever it mounts, and a trailing
+  // `collab-peers-changed` reload calls this directly (below).
+  const loadMembers = useCallback(async () => {
+    if (!id) return;
+    setMembersError(false);
+    try {
+      setMembers(await api.invoke<MemberSummary[]>('get_collab_member_summary', { projectId: id }));
+    } catch (err) {
+      console.error('[projects] member summary failed:', err);
+      setMembersError(true);
+    }
+  }, [id]);
+
+  useEffect(() => {
+    void loadMembers();
+  }, [loadMembers]);
+
+  // Presence/holder changes (core: `collab-peers-changed`, throttled to one
+  // per project per second). Loaders are read through refs so the listener
+  // can subscribe once per project (StrictMode-safe, CLAUDE.md pattern) with
+  // `id` as the effect's only real dependency — it never changes across this
+  // component's life (`ProjectDetail` keys `ProjectPage` on it). Each event
+  // restarts both trailing windows, so a burst collapses to one reload each:
+  // `loadLibrary` + `loadMembers` (+ the `MembersTab` refresh token) after
+  // `PEERS_RELOAD_MS`, and the expensive `loadOwn` gate read after the
+  // longer `OWN_RELOAD_MS`.
+  const loadLibraryRef = useRef(loadLibrary);
+  loadLibraryRef.current = loadLibrary;
+  const loadMembersRef = useRef(loadMembers);
+  loadMembersRef.current = loadMembers;
+  const loadOwnRef = useRef(loadOwn);
+  loadOwnRef.current = loadOwn;
+
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
-    setMembersError(false);
+    let unlisten: (() => void) | undefined;
+    let peersTimer: ReturnType<typeof setTimeout> | undefined;
+    let ownTimer: ReturnType<typeof setTimeout> | undefined;
     api
-      .invoke<MemberSummary[]>('get_collab_member_summary', { projectId: id })
-      .then((list) => {
-        if (!cancelled) setMembers(list);
+      .listen<CollabPeersChanged>('collab-peers-changed', (p) => {
+        if (cancelled || p.projectId !== id) return;
+        if (peersTimer !== undefined) clearTimeout(peersTimer);
+        peersTimer = setTimeout(() => {
+          void loadLibraryRef.current();
+          void loadMembersRef.current();
+          setMembersRefresh((n) => n + 1);
+        }, PEERS_RELOAD_MS);
+        if (ownTimer !== undefined) clearTimeout(ownTimer);
+        ownTimer = setTimeout(() => {
+          void loadOwnRef.current();
+        }, OWN_RELOAD_MS);
       })
-      .catch((err) => {
-        console.error('[projects] member summary failed:', err);
-        if (!cancelled) setMembersError(true);
-      });
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[projects] collab-peers-changed listen failed:', err));
     return () => {
       cancelled = true;
+      unlisten?.();
+      if (peersTimer !== undefined) clearTimeout(peersTimer);
+      if (ownTimer !== undefined) clearTimeout(ownTimer);
     };
   }, [id]);
 
@@ -526,6 +585,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
       {activeTab === 'members' && (
         <MembersTab
           projectId={id}
+          refreshToken={membersRefresh}
           onMembers={(m) => {
             setMembers(m);
             setMembersError(false);

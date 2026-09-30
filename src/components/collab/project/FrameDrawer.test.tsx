@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import FrameDrawer from './FrameDrawer';
 import { api } from '../../../api';
@@ -142,12 +142,28 @@ function renderDrawer(
   );
 }
 
+/** Every `api.listen` registration a render made, by event name. `fire`
+ *  delivers a payload to every listener registered for that event. */
+const listeners: Record<string, ((payload: unknown) => void)[]> = {};
+
+function fire(event: string, payload: unknown) {
+  act(() => {
+    for (const cb of listeners[event] ?? []) cb(payload);
+  });
+}
+
 beforeEach(() => {
+  for (const k of Object.keys(listeners)) delete listeners[k];
   vi.mocked(api.invoke).mockReset();
   vi.mocked(api.invoke).mockImplementation(((command: string) => {
     if (command === 'get_collab_frame_holders') return Promise.resolve([] as FrameHolderView[]);
     return Promise.reject(new Error(`unexpected ${command}`));
   }) as typeof api.invoke);
+  vi.mocked(api.listen).mockReset();
+  vi.mocked(api.listen).mockImplementation((<T,>(event: string, cb: (p: T) => void) => {
+    (listeners[event] ??= []).push(cb as unknown as (payload: unknown) => void);
+    return Promise.resolve(() => {});
+  }) as never);
 });
 
 describe('FrameDrawer', () => {
@@ -315,5 +331,94 @@ describe('FrameDrawer', () => {
     renderDrawer(frame, { canModerate: false });
     expect(screen.getByText(/Excluded — trailed/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
+  });
+
+  it('(i) collab-peers-changed for this project re-reads holders and swaps in the new answer without flashing "Loading holders…"', async () => {
+    const first: FrameHolderView[] = [
+      {
+        memberName: 'Kostya',
+        deviceName: 'kostya-obs',
+        device: 'abcdef0123456789',
+        deviceShort: 'abcdef01',
+        online: true,
+        isPublisher: true,
+        contentVersion: 1,
+      },
+    ];
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'get_collab_frame_holders') return Promise.resolve(first);
+      return Promise.reject(new Error(`unexpected ${command}`));
+    }) as typeof api.invoke);
+
+    renderDrawer(baseFrame());
+    await waitFor(() => expect(screen.getByText('Kostya')).toBeInTheDocument());
+
+    let resolveSecond!: (rows: FrameHolderView[]) => void;
+    const second = new Promise<FrameHolderView[]>((resolve) => {
+      resolveSecond = resolve;
+    });
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'get_collab_frame_holders') return second;
+      return Promise.reject(new Error(`unexpected ${command}`));
+    }) as typeof api.invoke);
+
+    fire('collab-peers-changed', { projectId: 'p' });
+
+    // The re-read is in flight — the OLD holder stays, no loading flash.
+    expect(screen.getByText('Kostya')).toBeInTheDocument();
+    expect(screen.queryByText('Loading holders…')).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveSecond([
+        {
+          memberName: 'Olga',
+          deviceName: 'olga-mac',
+          device: 'deadbeefcafebabe',
+          deviceShort: 'deadbeef',
+          online: true,
+          isPublisher: false,
+          contentVersion: 2,
+        },
+      ]);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(screen.getByText('Olga')).toBeInTheDocument());
+    expect(screen.queryByText('Kostya')).not.toBeInTheDocument();
+    expect(api.invoke).toHaveBeenCalledWith('get_collab_frame_holders', {
+      projectId: 'p',
+      frameUuid: 'uuid-1',
+    });
+  });
+
+  it('(j) collab-peers-changed for another project re-reads nothing', async () => {
+    const first: FrameHolderView[] = [
+      {
+        memberName: 'Kostya',
+        deviceName: 'kostya-obs',
+        device: 'abcdef0123456789',
+        deviceShort: 'abcdef01',
+        online: true,
+        isPublisher: true,
+        contentVersion: 1,
+      },
+    ];
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'get_collab_frame_holders') return Promise.resolve(first);
+      return Promise.reject(new Error(`unexpected ${command}`));
+    }) as typeof api.invoke);
+    renderDrawer(baseFrame());
+    await waitFor(() => expect(screen.getByText('Kostya')).toBeInTheDocument());
+    const before = vi
+      .mocked(api.invoke)
+      .mock.calls.filter(([c]) => c === 'get_collab_frame_holders').length;
+
+    fire('collab-peers-changed', { projectId: 'another-project' });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const after = vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_collab_frame_holders').length;
+    expect(after).toBe(before);
   });
 });
