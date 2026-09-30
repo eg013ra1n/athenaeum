@@ -40,6 +40,17 @@ pub struct ListCollabFramesArgs {
     with_contributor_state: bool,
 }
 
+/// Wave 2 (plan 2026-09-30 Task 1): `frameIds` absent or `null` publishes
+/// (or republishes) every gate-passing candidate, as before; present, it
+/// restricts the run to those gate rows.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishArgs {
+    pub project_id: String,
+    #[serde(default)]
+    pub frame_ids: Option<Vec<i64>>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLinkArgs {
@@ -287,27 +298,37 @@ pub async fn get_frame_set_project_status(
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn publish_collab_frames(
     State(state): State<WebAppState>,
-    Json(args): Json<ProjectIdArgs>,
+    Json(args): Json<PublishArgs>,
 ) -> Result<Json<api::PublishResult>, (axum::http::StatusCode, String)> {
     let emitter: Arc<dyn ProgressEmitter> =
         Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    api::publish_collab_frames(&state.ctx, &args.project_id, Some(emitter))
-        .await
-        .map(Json)
-        .map_err(api_err)
+    api::publish_collab_frames(
+        &state.ctx,
+        &args.project_id,
+        args.frame_ids.as_deref(),
+        Some(emitter),
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
 }
 
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn republish_collab_frames(
     State(state): State<WebAppState>,
-    Json(args): Json<ProjectIdArgs>,
+    Json(args): Json<PublishArgs>,
 ) -> Result<Json<api::PublishResult>, (axum::http::StatusCode, String)> {
     let emitter: Arc<dyn ProgressEmitter> =
         Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    api::republish_collab_frames(&state.ctx, &args.project_id, Some(emitter))
-        .await
-        .map(Json)
-        .map_err(api_err)
+    api::republish_collab_frames(
+        &state.ctx,
+        &args.project_id,
+        args.frame_ids.as_deref(),
+        Some(emitter),
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
 }
 
 /// Every cached frame of a project (cache-only — no hub call), with its local
@@ -848,5 +869,19 @@ mod args_serde_tests {
         let args: OptionalProjectArgs = serde_json::from_str(r#"{"projectId":"p"}"#)
             .expect("OptionalProjectArgs should deserialize camelCase body");
         assert_eq!(args.project_id.as_deref(), Some("p"));
+    }
+
+    /// Wave 2 (plan 2026-09-30 Task 1): `frameIds` reads camelCase and
+    /// defaults to `None` when absent, so a plain publish/republish body
+    /// keeps working.
+    #[test]
+    fn publish_args_read_camel_case_frame_ids() {
+        let a: PublishArgs = serde_json::from_str(r#"{"projectId":"p","frameIds":[3,5]}"#).unwrap();
+        assert_eq!(
+            (a.project_id.as_str(), a.frame_ids),
+            ("p", Some(vec![3, 5]))
+        );
+        let b: PublishArgs = serde_json::from_str(r#"{"projectId":"p"}"#).unwrap();
+        assert_eq!(b.frame_ids, None);
     }
 }

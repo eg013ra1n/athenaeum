@@ -126,9 +126,10 @@ pub async fn publish_collab_frames(
     state: State<'_, AppState>,
     app: AppHandle,
     project_id: String,
+    frame_ids: Option<Vec<i64>>,
 ) -> Result<PublishResult, String> {
     let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
-    api::publish_collab_frames(&state.ctx, &project_id, Some(emitter))
+    api::publish_collab_frames(&state.ctx, &project_id, frame_ids.as_deref(), Some(emitter))
         .await
         .map_err(|e| e.to_string())
 }
@@ -141,9 +142,10 @@ pub async fn republish_collab_frames(
     state: State<'_, AppState>,
     app: AppHandle,
     project_id: String,
+    frame_ids: Option<Vec<i64>>,
 ) -> Result<PublishResult, String> {
     let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
-    api::republish_collab_frames(&state.ctx, &project_id, Some(emitter))
+    api::republish_collab_frames(&state.ctx, &project_id, frame_ids.as_deref(), Some(emitter))
         .await
         .map_err(|e| e.to_string())
 }

@@ -900,7 +900,7 @@ async fn unmapped_filter_then_mapped_and_an_attested_set() {
     };
     crate::api::collab::link_frame_set(&w.a.ctx, ts::PID, set_id).unwrap();
 
-    let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None)
+    let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None, None)
         .await
         .unwrap();
     assert_eq!(res.announced, 0, "{:?}", res.held_back);
@@ -915,8 +915,12 @@ async fn unmapped_filter_then_mapped_and_an_attested_set() {
 
     {
         let conn = crate::api::db(&w.a.ctx).unwrap().conn();
-        crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_EMAIL, "alice@example.com")
-            .unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::ACCOUNT_EMAIL,
+            "alice@example.com",
+        )
+        .unwrap();
     }
     crate::api::collab::set_filter_mappings(
         &w.a.ctx,
@@ -929,13 +933,12 @@ async fn unmapped_filter_then_mapped_and_an_attested_set() {
     )
     .unwrap();
 
-    let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None)
+    let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None, None)
         .await
         .unwrap();
     assert_eq!(res.announced, 1, "{:?}", res.held_back);
 
-    w.b
-        .wait_state(&uuid, LocalState::Held, Duration::from_secs(30))
+    w.b.wait_state(&uuid, LocalState::Held, Duration::from_secs(30))
         .await;
     assert_eq!(
         w.b.row(&uuid).unwrap().filter_canonical,
@@ -962,13 +965,12 @@ async fn unmapped_filter_then_mapped_and_an_attested_set() {
     }
     crate::api::collab::link_frame_set(&w.a.ctx, ts::PID, set2_id).unwrap();
 
-    let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None)
+    let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None, None)
         .await
         .unwrap();
     assert_eq!(res.announced, 1, "{:?}", res.held_back);
 
-    w.b
-        .wait_state(&uuid2, LocalState::Held, Duration::from_secs(30))
+    w.b.wait_state(&uuid2, LocalState::Held, Duration::from_secs(30))
         .await;
     let landed2 = std::path::PathBuf::from(w.b.row(&uuid2).unwrap().landed_path.unwrap());
     assert_eq!(

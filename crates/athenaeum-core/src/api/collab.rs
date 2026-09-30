@@ -3965,14 +3965,21 @@ async fn retag_under_hub_version(
 /// `Conflict(`[`PUBLISH_BUSY_MSG`]`)`, never queued or waited for. Two
 /// overlapping runs would each compare against the row as it was before the
 /// other posted, and post the same bytes as a second version.
+///
+/// `frame_ids` (wave 2, plan 2026-09-30 Task 1): `Some(ids)` restricts the
+/// run to gate rows whose `frame_id` is in `ids` — a row outside the
+/// selection is neither a candidate nor `heldBack`, and an id that is not a
+/// gate row of the project is ignored. `None` publishes every gate-passing
+/// candidate, as before.
 pub async fn publish_collab_frames(
     ctx: &ServiceContext,
     project_id: &str,
+    frame_ids: Option<&[i64]>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<PublishResult, ApiError> {
     let lock = publish_lock(ctx, project_id)?;
     let _run = claim_publish(&lock, project_id)?;
-    run_publish(ctx, project_id, emitter, false, None).await
+    run_publish(ctx, project_id, emitter, false, frame_ids, None).await
 }
 
 /// The refusal a publish (manual, republish or auto) gets while another
@@ -3992,7 +3999,7 @@ pub(crate) async fn auto_publish_collab_frames(
 ) -> Result<PublishResult, ApiError> {
     let lock = publish_lock(ctx, project_id)?;
     let _run = claim_publish(&lock, project_id)?;
-    run_publish(ctx, project_id, emitter, false, None).await
+    run_publish(ctx, project_id, emitter, false, None, None).await
 }
 
 /// Take the project's publish lock without waiting, or refuse with
@@ -4035,14 +4042,20 @@ pub(crate) fn publish_lock(
 /// changed get a new content version. The remedy after an app release that
 /// changed the calibration engine or its defaults. Refused while a publish
 /// run of the same project is in progress, like [`publish_collab_frames`].
+///
+/// `frame_ids`: the same selection semantics as [`publish_collab_frames`] —
+/// `Some(ids)` walks only those gate candidates (an own row among them
+/// regenerates as an `Update`), so a republish restricted to a selection
+/// never touches, and never announces, an unselected ready frame.
 pub async fn republish_collab_frames(
     ctx: &ServiceContext,
     project_id: &str,
+    frame_ids: Option<&[i64]>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<PublishResult, ApiError> {
     let lock = publish_lock(ctx, project_id)?;
     let _run = claim_publish(&lock, project_id)?;
-    run_publish(ctx, project_id, emitter, true, None).await
+    run_publish(ctx, project_id, emitter, true, frame_ids, None).await
 }
 
 /// The refusal a publish gets while the Collaboration folder's store cannot
@@ -4059,6 +4072,7 @@ async fn run_publish(
     project_id: &str,
     emitter: Option<Arc<dyn ProgressEmitter>>,
     force: bool,
+    only: Option<&[i64]>,
     after_split: AfterSplit<'_>,
 ) -> Result<PublishResult, ApiError> {
     use crate::account::AccountClientError as E;
@@ -4077,6 +4091,24 @@ async fn run_publish(
                 internal(e)
             })?;
         (project, gated, binding)
+    };
+    // Wave 2 (plan 2026-09-30 Task 1): a selection restricts the run to the
+    // chosen gate rows; the rest are neither candidates nor held back.
+    let gated: Vec<_> = match only {
+        None => gated,
+        Some(ids) => {
+            let keep: HashSet<i64> = ids.iter().copied().collect();
+            let kept: Vec<_> = gated
+                .into_iter()
+                .filter(|(_, row)| keep.contains(&row.frame_id))
+                .collect();
+            tracing::info!(
+                project_id,
+                count = kept.len(),
+                "publish: restricted to a selection"
+            );
+            kept
+        }
     };
     let mut held_back: Vec<HeldBackFrame> = Vec::new();
     let mut candidates: Vec<PublishCandidate> = Vec::new();
@@ -7719,7 +7751,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let res = publish_collab_frames(&ctx, "p-1", None)
+        let res = publish_collab_frames(&ctx, "p-1", None, None)
             .await
             .expect("an unlinked set is held back, not an error");
         assert_eq!((res.announced, res.updated, res.unchanged), (0, 0, 0));
@@ -7879,7 +7911,9 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let res = publish_collab_frames(&ctx, "p-1", None).await.unwrap();
+        let res = publish_collab_frames(&ctx, "p-1", None, None)
+            .await
+            .unwrap();
         assert_eq!((res.announced, res.updated, res.unchanged), (0, 0, 0));
         assert!(res.held_back.is_empty());
         assert_eq!(res.state, None);
@@ -9100,7 +9134,9 @@ pub(crate) mod tests {
             let store_dir = fx.collab.join(".athenaeum").join("blobs");
             let store_before = dir_bytes(&store_dir);
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 (res.announced, res.updated, res.unchanged),
                 (2, 0, 0),
@@ -9185,12 +9221,74 @@ pub(crate) mod tests {
             drop(fx.tmp);
         }
 
+        /// Wave 2 (plan 2026-09-30 Task 1): a selection publishes exactly the
+        /// chosen frames; the rest stay unpublished and are not reported as
+        /// held back, and a later plain publish picks them up.
+        #[tokio::test]
+        async fn publish_with_frame_ids_announces_only_the_selected_frames() {
+            let fx = fixture(3).await;
+            mount_hub(&fx.server, "published").await;
+
+            let pick = [fx.frame_ids[1]];
+            let res = publish_collab_frames(&fx.ctx, PID, Some(&pick), None)
+                .await
+                .unwrap();
+            assert_eq!((res.announced, res.updated), (1, 0), "{res:?}");
+            assert!(res.held_back.is_empty(), "{:?}", res.held_back);
+            let mut names: Vec<String> = std::fs::read_dir(own_dir(&fx))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["c_L_0001.fits"]);
+
+            let rest = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(rest.announced, 2, "{rest:?}");
+        }
+
+        #[tokio::test]
+        async fn publish_with_an_empty_selection_publishes_nothing() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            let res = publish_collab_frames(&fx.ctx, PID, Some(&[]), None)
+                .await
+                .unwrap();
+            assert_eq!((res.announced, res.updated), (0, 0), "{res:?}");
+            assert!(res.held_back.is_empty(), "{:?}", res.held_back);
+        }
+
+        /// A republish of a selection regenerates only the selected published
+        /// frame and never announces an unselected, still-ready one.
+        #[tokio::test]
+        async fn republish_with_frame_ids_touches_only_the_selection() {
+            let fx = fixture(3).await;
+            mount_hub(&fx.server, "published").await;
+            let first = [fx.frame_ids[0], fx.frame_ids[1]];
+            publish_collab_frames(&fx.ctx, PID, Some(&first), None)
+                .await
+                .unwrap();
+
+            let pick = [fx.frame_ids[0]];
+            let res = republish_collab_frames(&fx.ctx, PID, Some(&pick), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                res.announced, 0,
+                "the ready frame 2 must not be announced: {res:?}"
+            );
+            assert_eq!(res.updated + res.unchanged, 1, "{res:?}");
+        }
+
         /// The hub's `pending` (require-approval project) is reported as is.
         #[tokio::test]
         async fn pending_state_is_returned_as_is() {
             let fx = fixture(1).await;
             mount_hub(&fx.server, "pending").await;
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.state.as_deref(), Some("pending"));
             assert_eq!(own_row(&fx, &fx.uuids[0]).unwrap().state, "pending");
         }
@@ -9207,7 +9305,7 @@ pub(crate) mod tests {
                 )
                 .mount(&fx.server)
                 .await;
-            let err = publish_collab_frames(&fx.ctx, PID, None)
+            let err = publish_collab_frames(&fx.ctx, PID, None, None)
                 .await
                 .expect_err("nothing was announced");
             assert!(matches!(err, ApiError::Internal(_)), "{err:?}");
@@ -9221,7 +9319,9 @@ pub(crate) mod tests {
             // The retry reuses the same files instead of piling up copies.
             fx.server.reset().await;
             mount_hub(&fx.server, "published").await;
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 2);
             assert_eq!(std::fs::read_dir(own_dir(&fx)).unwrap().count(), 2);
         }
@@ -9249,7 +9349,9 @@ pub(crate) mod tests {
                 .await;
             mount_hub(&fx.server, "published").await;
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{res:?}");
             let bodies = announce_bodies(&fx.server).await;
             assert_eq!(bodies.len(), 2, "one refused, one retried");
@@ -9288,11 +9390,15 @@ pub(crate) mod tests {
         async fn touched_source_with_identical_output_sends_no_version() {
             let fx = fixture(1).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let before = own_row(&fx, &fx.uuids[0]).unwrap();
 
             set_mtime(&fx.lights[0], 120);
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 (res.announced, res.updated, res.unchanged),
                 (0, 0, 1),
@@ -9322,7 +9428,9 @@ pub(crate) mod tests {
             use crate::collab::serve::ServeOracle as _;
             let fx = fixture(1).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let staged = |fx: &PubFx| -> bool {
                 crate::api::db(&fx.ctx)
                     .unwrap()
@@ -9349,7 +9457,9 @@ pub(crate) mod tests {
             assert!(oracle.lookup(&row.blake3).is_none(), "staged: refused");
 
             set_mtime(&fx.lights[0], 120);
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.unchanged, 1, "{res:?}");
             assert!(!staged(&fx), "the identical regeneration confirmed it");
             assert!(oracle.lookup(&row.blake3).is_some(), "served again");
@@ -9377,16 +9487,22 @@ pub(crate) mod tests {
         async fn republish_forces_regeneration_but_respects_identical_output() {
             let fx = fixture(2).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             {
                 let conn = crate::api::db(&fx.ctx).unwrap().conn();
                 seed_plate_solve(&conn, fx.frame_ids[0], 0.776, 10.68, 41.27);
             }
-            let plain = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let plain = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(plain.unchanged, 2, "a plate solve is not in the recipe");
             assert!(version_calls(&fx.server).await.is_empty());
 
-            let res = republish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = republish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 (res.announced, res.updated, res.unchanged),
                 (0, 1, 1),
@@ -9414,12 +9530,16 @@ pub(crate) mod tests {
         async fn changed_master_publishes_a_new_version() {
             let fx = fixture(1).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let before = own_row(&fx, &fx.uuids[0]).unwrap();
 
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 (res.announced, res.updated, res.unchanged),
                 (0, 1, 0),
@@ -9452,7 +9572,9 @@ pub(crate) mod tests {
         async fn unchanged_frames_are_not_regenerated() {
             let fx = fixture(2).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let landed: Vec<PathBuf> = fx
                 .uuids
                 .iter()
@@ -9461,7 +9583,9 @@ pub(crate) mod tests {
             let mtimes: Vec<_> = landed.iter().map(|p| mtime(p)).collect();
             let hub_calls = requests(&fx.server).await.len();
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 (res.announced, res.updated, res.unchanged),
                 (0, 0, 2),
@@ -9481,7 +9605,7 @@ pub(crate) mod tests {
                 let conn = crate::api::db(&ctx).unwrap().conn();
                 seed_publish_project(&conn, "p-1", "[]");
             }
-            match publish_collab_frames(&ctx, "p-1", None).await {
+            match publish_collab_frames(&ctx, "p-1", None, None).await {
                 Err(ApiError::Invalid(m)) => assert_eq!(m, COLLABORATION_ROOT_REQUIRED),
                 other => panic!("expected the P25 refusal, got {other:?}"),
             }
@@ -9504,7 +9628,9 @@ pub(crate) mod tests {
                 .await;
             mount_hub(&fx.server, "published").await;
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 2, "{res:?}");
             assert!(res.held_back.is_empty(), "{:?}", res.held_back);
             let bodies = announce_bodies(&fx.server).await;
@@ -9521,7 +9647,9 @@ pub(crate) mod tests {
             assert_eq!(own_row(&fx, &fx.uuids[1]).unwrap().state, "published");
 
             // The adopted frame is now an ordinary own frame: nothing to do.
-            let again = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let again = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!((again.announced, again.updated, again.unchanged), (0, 0, 2));
         }
 
@@ -9540,7 +9668,9 @@ pub(crate) mod tests {
                 ))
                 .unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{res:?}");
             assert_eq!(res.held_back.len(), 1);
             assert_eq!(res.held_back[0].frame_id, fx.frame_ids[1]);
@@ -9561,7 +9691,9 @@ pub(crate) mod tests {
         async fn unchanged_run_takes_no_compute_permit() {
             let fx = fixture(2).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
 
             let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (permit, _) = fx
@@ -9575,7 +9707,7 @@ pub(crate) mod tests {
                 .unwrap();
             let run = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
-                publish_collab_frames(&fx.ctx, PID, None),
+                publish_collab_frames(&fx.ctx, PID, None, None),
             )
             .await;
             drop(permit);
@@ -9592,7 +9724,9 @@ pub(crate) mod tests {
         async fn write_backs_keep_hub_state_written_mid_run() {
             let fx = fixture(1).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let hook = |conn: &Connection| {
                 conn.execute(
                     "UPDATE project_frames_local SET state = 'hub-truth', manifest_version = 42",
@@ -9603,7 +9737,7 @@ pub(crate) mod tests {
 
             // Identical output: only the recipe moves.
             set_mtime(&fx.lights[0], 120);
-            let res = run_publish(&fx.ctx, PID, None, false, Some(&hook))
+            let res = run_publish(&fx.ctx, PID, None, false, None, Some(&hook))
                 .await
                 .unwrap();
             assert_eq!(res.unchanged, 1, "{res:?}");
@@ -9621,7 +9755,7 @@ pub(crate) mod tests {
             }
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 240);
-            let res = run_publish(&fx.ctx, PID, None, false, Some(&hook))
+            let res = run_publish(&fx.ctx, PID, None, false, None, Some(&hook))
                 .await
                 .unwrap();
             assert_eq!(res.updated, 1, "{res:?}");
@@ -9643,7 +9777,9 @@ pub(crate) mod tests {
         async fn manifest_delivered_own_row_is_bound_not_reannounced() {
             let fx = fixture(1).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let before = own_row(&fx, &fx.uuids[0]).unwrap();
             {
                 let conn = crate::api::db(&fx.ctx).unwrap().conn();
@@ -9654,7 +9790,9 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 (res.announced, res.updated, res.unchanged),
                 (0, 0, 1),
@@ -9685,7 +9823,9 @@ pub(crate) mod tests {
             let fx = fixture(2).await;
             mount_hub(&fx.server, "published").await;
             std::fs::write(&fx.lights[1], b"not a FITS file at all").unwrap();
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{res:?}");
             assert_eq!(res.held_back.len(), 1);
             assert_eq!(res.held_back[0].frame_id, fx.frame_ids[1]);
@@ -9749,7 +9889,7 @@ pub(crate) mod tests {
                 )
                 .mount(&fx.server)
                 .await;
-            match publish_collab_frames(&fx.ctx, PID, None).await {
+            match publish_collab_frames(&fx.ctx, PID, None, None).await {
                 Err(ApiError::Conflict(m)) => {
                     assert!(m.starts_with("collab_api_outdated"), "{m}");
                     assert_eq!(m, COLLAB_API_OUTDATED_MSG);
@@ -9771,13 +9911,15 @@ pub(crate) mod tests {
         async fn overlapping_publish_runs_post_one_version_per_changed_frame() {
             let fx = fixture(2).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
 
             let (a, b) = tokio::join!(
-                republish_collab_frames(&fx.ctx, PID, None),
-                publish_collab_frames(&fx.ctx, PID, None)
+                republish_collab_frames(&fx.ctx, PID, None, None),
+                publish_collab_frames(&fx.ctx, PID, None, None)
             );
             let (ran, refused) = match (a, b) {
                 (Ok(r), Err(e)) | (Err(e), Ok(r)) => (r, e),
@@ -9799,7 +9941,9 @@ pub(crate) mod tests {
             assert_eq!(calls, expected, "one …/version per changed frame");
 
             // The next run finds nothing to do: no second version, ever.
-            let again = republish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let again = republish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!((again.updated, again.unchanged), (0, 2), "{again:?}");
             assert_eq!(version_calls(&fx.server).await.len(), 2);
         }
@@ -9815,8 +9959,8 @@ pub(crate) mod tests {
             let lock = publish_lock(&fx.ctx, PID).unwrap();
             let held = lock.lock().await;
             for result in [
-                publish_collab_frames(&fx.ctx, PID, None).await,
-                republish_collab_frames(&fx.ctx, PID, None).await,
+                publish_collab_frames(&fx.ctx, PID, None, None).await,
+                republish_collab_frames(&fx.ctx, PID, None, None).await,
                 auto_publish_collab_frames(&fx.ctx, PID, None).await,
             ] {
                 match result {
@@ -9829,7 +9973,9 @@ pub(crate) mod tests {
             assert!(requests(&fx.server).await.is_empty(), "no hub call");
             assert!(!own_dir(&fx).exists(), "nothing generated");
             drop(held);
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "released: the next run goes through");
         }
 
@@ -9842,11 +9988,15 @@ pub(crate) mod tests {
         async fn a_version_the_hub_already_has_is_not_posted_again() {
             let fx = fixture(1).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let v1 = own_row(&fx, &fx.uuids[0]).unwrap();
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let v2 = own_row(&fx, &fx.uuids[0]).unwrap();
             assert_eq!(v2.content_version, 2);
             assert_eq!(version_calls(&fx.server).await.len(), 1);
@@ -9871,7 +10021,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             };
-            let res = run_publish(&fx.ctx, PID, None, false, Some(&hook))
+            let res = run_publish(&fx.ctx, PID, None, false, None, Some(&hook))
                 .await
                 .unwrap();
             assert_eq!((res.updated, res.unchanged), (0, 1), "{res:?}");
@@ -9908,7 +10058,9 @@ pub(crate) mod tests {
                 .unwrap();
             };
             set_exptime(None);
-            let first = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let first = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 (first.announced, first.held_back.len()),
                 (1, 1),
@@ -9929,7 +10081,9 @@ pub(crate) mod tests {
                 .unwrap();
             }
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert!(res.held_back.is_empty(), "{:?}", res.held_back);
             assert_eq!((res.announced, res.unchanged), (1, 1), "{res:?}");
             let adopted = own_row(&fx, &fx.uuids[0]).unwrap();
@@ -9969,7 +10123,9 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{res:?}");
             assert_eq!(res.held_back.len(), 1, "{:?}", res.held_back);
             assert_eq!(res.held_back[0].frame_id, fx.frame_ids[1]);
@@ -10059,7 +10215,9 @@ pub(crate) mod tests {
                 .mount(&fx.server)
                 .await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
 
@@ -10079,7 +10237,7 @@ pub(crate) mod tests {
                 (events, row, tag_present(&fx, &fx.uuids[0], 2).await)
             };
             let (res, (events, mid_row, mid_tag)) =
-                tokio::join!(publish_collab_frames(&fx.ctx, PID, None), mid_sweep);
+                tokio::join!(publish_collab_frames(&fx.ctx, PID, None, None), mid_sweep);
             let res = res.unwrap();
             assert_eq!(res.updated, 1, "{res:?}");
             assert!(
@@ -10120,12 +10278,14 @@ pub(crate) mod tests {
                 .mount(&fx.server)
                 .await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let v1 = own_row(&fx, &fx.uuids[0]).unwrap();
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
 
-            let err = publish_collab_frames(&fx.ctx, PID, None).await;
+            let err = publish_collab_frames(&fx.ctx, PID, None, None).await;
             assert!(err.is_err(), "{err:?}");
             let row = own_row(&fx, &fx.uuids[0]).unwrap();
             assert_eq!(
@@ -10148,7 +10308,9 @@ pub(crate) mod tests {
             assert!(!own_row(&fx, &fx.uuids[0]).unwrap().on_disk);
             drop(conn);
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 1, "{res:?}");
             let row = own_row(&fx, &fx.uuids[0]).unwrap();
             assert_eq!(row.content_version, 2);
@@ -10186,12 +10348,16 @@ pub(crate) mod tests {
                 .mount(&fx.server)
                 .await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(claims(&fx), vec![(fx.uuids[0].clone(), 1)]);
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 0, "{res:?}");
             assert_eq!(res.held_back.len(), 1);
             assert_eq!(
@@ -10252,11 +10418,15 @@ pub(crate) mod tests {
                 .mount(&fx.server)
                 .await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!((res.updated, res.held_back.len()), (1, 0), "{res:?}");
             let row = own_row(&fx, &fx.uuids[0]).unwrap();
             assert_eq!(row.content_version, 2);
@@ -10291,11 +10461,15 @@ pub(crate) mod tests {
                 .mount(&fx.server)
                 .await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!((res.updated, res.held_back.len()), (0, 1), "{res:?}");
             assert_eq!(
                 res.held_back[0].reasons,
@@ -10318,7 +10492,9 @@ pub(crate) mod tests {
         async fn the_outbox_is_flushed_before_the_version_batch() {
             let fx = fixture(2).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             {
                 // an unsent claim change, as a landing would leave it
                 let conn = crate::api::db(&fx.ctx).unwrap().conn();
@@ -10332,7 +10508,9 @@ pub(crate) mod tests {
             }
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 2, "{res:?}");
             let reqs = requests(&fx.server).await;
             let put = reqs
@@ -10374,7 +10552,9 @@ pub(crate) mod tests {
                 .mount(&fx.server)
                 .await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let v1 = own_row(&fx, &fx.uuids[0]).unwrap();
             {
                 let conn = crate::api::db(&fx.ctx).unwrap().conn();
@@ -10398,7 +10578,7 @@ pub(crate) mod tests {
                 }
             };
             tokio::select! {
-                res = republish_collab_frames(&fx.ctx, PID, None) => {
+                res = republish_collab_frames(&fx.ctx, PID, None, None) => {
                     panic!("the republish finished before it was interrupted: {res:?}")
                 }
                 () = staged => {}
@@ -10410,7 +10590,9 @@ pub(crate) mod tests {
                 "a staged file is not a confirmed recipe"
             );
 
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!((res.updated, res.unchanged), (1, 0), "{res:?}");
             let row = own_row(&fx, &fx.uuids[0]).unwrap();
             assert_eq!(row.content_version, 2);
@@ -10433,7 +10615,7 @@ pub(crate) mod tests {
             let store_dir = fx.collab.join(".athenaeum");
             std::fs::remove_dir_all(&store_dir).unwrap();
             std::fs::write(&store_dir, b"not a folder").unwrap();
-            match publish_collab_frames(&fx.ctx, PID, None).await {
+            match publish_collab_frames(&fx.ctx, PID, None, None).await {
                 Err(ApiError::Conflict(m)) => assert_eq!(m, COLLAB_STORE_UNMOUNTED),
                 other => panic!("expected the unmounted refusal, got {other:?}"),
             }
@@ -10507,7 +10689,7 @@ pub(crate) mod tests {
             assert_eq!(x1.origin, crate::db::collab_frames::FrameOrigin::Replica);
             assert_eq!(x1.local_state, crate::db::collab_frames::LocalState::Wanted);
 
-            match publish_collab_frames(&fx.ctx, PID, None).await {
+            match publish_collab_frames(&fx.ctx, PID, None, None).await {
                 Err(ApiError::Conflict(m)) => assert_eq!(m, "collab_publishing_device:Obs PC"),
                 other => panic!("expected the typed refusal, got {other:?}"),
             }
@@ -10552,7 +10734,9 @@ pub(crate) mod tests {
                 hub.publishing_device(PID, "acc-Me Myself").as_deref(),
                 Some(me.as_str())
             );
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 2, "{res:?}");
             let mut names: Vec<String> = fx
                 .uuids
@@ -10621,7 +10805,9 @@ pub(crate) mod tests {
             wire_hub(&fx.ctx, &hub.uri());
             // The old install (the old key) published the frame.
             crate::api::account::store_token_for_test(&fx.ctx, "tok-old").unwrap();
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1);
             let uuid = fx.uuids[0].clone();
             assert_eq!(
@@ -10652,7 +10838,9 @@ pub(crate) mod tests {
             // A recalibration: a new version from this device, accepted and adopted.
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 1, "{res:?}");
             let hub_row = hub.frame(PID, &uuid).unwrap();
             assert_eq!(hub_row.content_version, 2);
@@ -10694,7 +10882,9 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{res:?}");
             assert!(res.held_back.iter().all(|h| h.publishing_device.is_none()));
         }
@@ -10717,7 +10907,9 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{res:?}");
             assert!(
                 res.held_back.iter().all(|h| h.publishing_device.is_none()),
@@ -10745,7 +10937,9 @@ pub(crate) mod tests {
             }
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 1, "the version still goes out: {res:?}");
             let refused: Vec<&HeldBackFrame> = res
                 .held_back
@@ -10768,7 +10962,9 @@ pub(crate) mod tests {
         async fn versions_are_posted_only_for_this_devices_frames() {
             let fx = fixture(1).await;
             mount_hub(&fx.server, "published").await;
-            publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             let uuid = fx.uuids[0].clone();
             // The hub answers every version with not_publishing_device.
             fx.server.reset().await;
@@ -10789,7 +10985,7 @@ pub(crate) mod tests {
                 .await;
             write_dark(&fx.master, 310.0);
             set_mtime(&fx.master, 120);
-            let res = publish_collab_frames(&fx.ctx, PID, None).await;
+            let res = publish_collab_frames(&fx.ctx, PID, None, None).await;
             let row = own_row(&fx, &uuid).unwrap();
             assert_eq!(row.content_version, 1, "{res:?}");
             assert!(
@@ -10801,7 +10997,7 @@ pub(crate) mod tests {
             );
             assert_eq!(version_calls(&fx.server).await.len(), 1);
             // Not retried while the manifest row stays as it is.
-            let res = publish_collab_frames(&fx.ctx, PID, None).await;
+            let res = publish_collab_frames(&fx.ctx, PID, None, None).await;
             assert_eq!(version_calls(&fx.server).await.len(), 1, "{res:?}");
 
             // A manifest row naming ANOTHER device: never versioned here.
@@ -10817,7 +11013,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             }
-            let _ = publish_collab_frames(&fx.ctx, PID, None).await;
+            let _ = publish_collab_frames(&fx.ctx, PID, None, None).await;
             assert_eq!(
                 version_calls(&fx.server).await.len(),
                 1,
@@ -10855,7 +11051,9 @@ pub(crate) mod tests {
                 conn.execute("DELETE FROM calibration_set_to_frames", [])
                     .unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 2, "{:?}", res.held_back);
             let bodies = announce_bodies(&fx.server).await;
             assert_eq!(bodies.len(), 1);
@@ -10920,14 +11118,14 @@ pub(crate) mod tests {
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
             }
             assert_eq!(
-                publish_collab_frames(&fx.ctx, PID, None)
+                publish_collab_frames(&fx.ctx, PID, None, None)
                     .await
                     .unwrap()
                     .announced,
                 1
             );
             assert_eq!(
-                publish_collab_frames(&fx.ctx, PID, None)
+                publish_collab_frames(&fx.ctx, PID, None, None)
                     .await
                     .unwrap()
                     .unchanged,
@@ -10945,7 +11143,9 @@ pub(crate) mod tests {
                 .unwrap();
             }
             std::fs::write(&fx.lights[0], b"new bytes that differ").unwrap();
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 1, "{:?}", res.held_back);
             // I4: the own row describes the (drifted) original, and the
             // publish itself never further touches the file beyond the
@@ -10992,7 +11192,9 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 0, "{:?}", res.held_back);
             assert_eq!(res.held_back.len(), 1);
             assert!(
@@ -11018,7 +11220,9 @@ pub(crate) mod tests {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             assert_eq!(
                 own_row(&fx, &fx.uuids[0]).unwrap().landed_path.as_deref(),
@@ -11035,7 +11239,9 @@ pub(crate) mod tests {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, false).unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 1, "{:?}", res.held_back);
 
             // C1: the original is byte-for-byte and mtime untouched.
@@ -11076,7 +11282,9 @@ pub(crate) mod tests {
         async fn attesting_after_a_generated_publish_moves_landed_path_and_removes_the_old_file() {
             let fx = fixture(1).await;
             mount_hub(&fx.server, "published").await;
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             let old_landed = own_row(&fx, &fx.uuids[0]).unwrap().landed_path.unwrap();
             let old_path = PathBuf::from(&old_landed);
@@ -11096,7 +11304,9 @@ pub(crate) mod tests {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 1, "{:?}", res.held_back);
 
             let row = own_row(&fx, &fx.uuids[0]).unwrap();
@@ -11162,7 +11372,9 @@ pub(crate) mod tests {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             assert_eq!(
                 own_row(&fx, &fx.uuids[0]).unwrap().landed_path.as_deref(),
@@ -11179,7 +11391,9 @@ pub(crate) mod tests {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, false).unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 1, "{:?}", res.held_back);
 
             // C1: the original, still cataloged under the Collaboration
@@ -11250,7 +11464,9 @@ pub(crate) mod tests {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             assert_eq!(
                 own_row(&fx, &fx.uuids[0]).unwrap().landed_path.as_deref(),
@@ -11267,7 +11483,9 @@ pub(crate) mod tests {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, false).unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.updated, 1, "{:?}", res.held_back);
 
             // C1: the original, still sitting right where the user put it
@@ -11323,7 +11541,9 @@ pub(crate) mod tests {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             let before = own_row(&fx, &fx.uuids[0]).unwrap();
             assert_eq!(
@@ -11347,7 +11567,9 @@ pub(crate) mod tests {
             }
             let original_bytes = std::fs::read(&new_path).unwrap();
 
-            let res = republish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = republish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(
                 (res.announced, res.updated, res.unchanged),
                 (0, 0, 1),
@@ -11465,7 +11687,9 @@ pub(crate) mod tests {
             second_project(&fx, &hub, "p2", "p2proj").await;
 
             // B publishes GENERATED first, while the set is not attested.
-            let res_b1 = publish_collab_frames(&fx.ctx, "p2", None).await.unwrap();
+            let res_b1 = publish_collab_frames(&fx.ctx, "p2", None, None)
+                .await
+                .unwrap();
             assert_eq!(res_b1.announced, 1, "{:?}", res_b1.held_back);
             let b_old_landed = crate::db::collab_frames::get(&fx.conn(), "p2", &fx.uuids[0])
                 .unwrap()
@@ -11480,7 +11704,9 @@ pub(crate) mod tests {
                 let conn = fx.conn();
                 crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
             }
-            let res_a = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res_a = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res_a.announced, 1, "{:?}", res_a.held_back);
             assert_eq!(
                 hub.frame(PID, &fx.uuids[0]).unwrap().file_name,
@@ -11489,7 +11715,9 @@ pub(crate) mod tests {
 
             // B publishes again: now attested too (same set), it crosses
             // toward the SAME original — colliding with A's row.
-            let _res_b2 = publish_collab_frames(&fx.ctx, "p2", None).await.unwrap();
+            let _res_b2 = publish_collab_frames(&fx.ctx, "p2", None, None)
+                .await
+                .unwrap();
             let b_row = crate::db::collab_frames::get(&fx.conn(), "p2", &fx.uuids[0])
                 .unwrap()
                 .unwrap();
@@ -11528,12 +11756,16 @@ pub(crate) mod tests {
             }
 
             // A publishes first and lands the original.
-            let res_a = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res_a = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res_a.announced, 1, "{:?}", res_a.held_back);
 
             // B, same set, also attested, never published before: New —
             // held back instead of racing the hub for an orphaned announce.
-            let res_b = publish_collab_frames(&fx.ctx, "p2", None).await.unwrap();
+            let res_b = publish_collab_frames(&fx.ctx, "p2", None, None)
+                .await
+                .unwrap();
             assert_eq!(res_b.announced, 0, "{:?}", res_b.held_back);
             assert_eq!(res_b.held_back.len(), 1, "{:?}", res_b.held_back);
             assert!(
@@ -11578,7 +11810,9 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             assert_eq!(res.held_back.len(), 1, "{:?}", res.held_back);
             assert!(
@@ -11686,7 +11920,9 @@ pub(crate) mod tests {
                 drop(conn);
                 link_frame_set(&fx.ctx, PID, set2_id).unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             assert_eq!(res.held_back.len(), 1, "{:?}", res.held_back);
             assert!(
@@ -11717,7 +11953,9 @@ pub(crate) mod tests {
         async fn generated_lights_report_their_masters_in_meta() {
             let fx = fixture(1).await;
             mount_hub(&fx.server, "published").await;
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             let bodies = announce_bodies(&fx.server).await;
             let f = &bodies[0]["frames"].as_array().unwrap()[0];
@@ -11766,7 +12004,9 @@ pub(crate) mod tests {
                 crate::db::collab::upsert_filter_mapping(&conn, "a@x.io", "ASI2600MM", "", "None")
                     .unwrap();
             }
-            let res = publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             assert_eq!(res.announced, 1, "{:?}", res.held_back);
             let f = hub.frame(PID, &fx.uuids[0]).expect("announced");
             assert_eq!(f.filter_raw, "");
