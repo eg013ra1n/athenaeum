@@ -7,10 +7,12 @@ import { SessionStateProvider, useSessionState } from '../contexts/SessionStateC
 import { NavHistoryProvider } from '../contexts/NavHistoryContext';
 import { CollabExchangeProvider } from '../contexts/CollabExchangeContext';
 import { ToastStack } from '../components/Toast';
-import ProjectDetail from './ProjectDetail';
+import ProjectDetail, { resolveSelfAccount } from './ProjectDetail';
 import { useCollabNotifications } from '../hooks/useCollabNotifications';
 import { api } from '../api';
 import type {
+  AccountStatus,
+  MemberSummary,
   OwnFrameRow,
   ProjectCard,
   ProjectDetail as Detail,
@@ -168,6 +170,14 @@ function libraryFrame(o: Partial<ProjectFrameView> = {}): ProjectFrameView {
   };
 }
 
+const accountStatus: AccountStatus = {
+  signedIn: true,
+  email: 'me@example.org',
+  deviceId: 'dev-me',
+  capability: 'athenaeum',
+  hubUrl: 'https://hub.example',
+};
+
 const okPublish: PublishResult = {
   announced: 2,
   updated: 0,
@@ -219,6 +229,8 @@ function mockCommands(
         return Promise.resolve(okPublish);
       case 'republish_collab_frames':
         return Promise.resolve({ ...okPublish, announced: 0, updated: 2 });
+      case 'account_status':
+        return Promise.resolve(accountStatus);
       default:
         return Promise.resolve(null);
     }
@@ -414,14 +426,14 @@ describe('ProjectDetail publishing device (A6)', () => {
     mockCommands(boundHere);
     renderProjectDetail();
     expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish from here' })).not.toBeInTheDocument();
   });
 
-  it('names the other device and offers "Publish from this device"', async () => {
+  it('names the other device and offers "Publish from here" in the meta line', async () => {
     mockCommands(boundElsewhere);
     renderProjectDetail();
     expect(await screen.findByText('Publishing from Obs PC')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Publish from this device' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Publish from here' })).toBeInTheDocument();
   });
 
   it('an unnamed bound device reads as another device of this account', async () => {
@@ -435,7 +447,7 @@ describe('ProjectDetail publishing device (A6)', () => {
     renderProjectDetail();
     expect(await screen.findByText('Nobody is publishing to this project yet')).toBeInTheDocument();
     expect(screen.queryByText('Publishing from this device')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish from here' })).not.toBeInTheDocument();
   });
 
   it('the switch is confirmed, sends the project id and updates the card from the answer', async () => {
@@ -444,7 +456,7 @@ describe('ProjectDetail publishing device (A6)', () => {
     mockCommands(boundElsewhere, { set_collab_publishing_device: setDevice });
     renderProjectDetail();
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish from this device' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish from here' }));
     expect(
       await screen.findByText(
         'Obs PC will stop publishing new frames to this project; it can still update the frames it already published.',
@@ -457,7 +469,7 @@ describe('ProjectDetail publishing device (A6)', () => {
       expect(api.invoke).toHaveBeenCalledWith('set_collab_publishing_device', { projectId: 'proj-1' }),
     );
     expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish from here' })).not.toBeInTheDocument();
     // No reload was needed: the card came from the command's answer.
     expect(invokeCount('get_collab_project_detail')).toBe(1);
     expect(screen.queryAllByRole('status')).toHaveLength(0);
@@ -467,7 +479,7 @@ describe('ProjectDetail publishing device (A6)', () => {
     const setDevice = vi.fn(() => Promise.resolve(boundHere));
     mockCommands(boundElsewhere, { set_collab_publishing_device: setDevice });
     renderProjectDetail();
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish from this device' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish from here' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
     expect(screen.queryByText(/will stop publishing new frames/)).not.toBeInTheDocument();
     expect(setDevice).not.toHaveBeenCalled();
@@ -479,7 +491,7 @@ describe('ProjectDetail publishing device (A6)', () => {
       set_collab_publishing_device: () => Promise.reject("The account's role may not perform this action."),
     });
     renderProjectDetail();
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish from this device' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish from here' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Switch' }));
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
@@ -942,7 +954,7 @@ describe('ProjectDetail tabs', () => {
     renderProjectDetail();
     const overview = await screen.findByRole('tab', { name: 'Overview' });
     expect(overview).toHaveAttribute('aria-selected', 'true');
-    expect(tabNames()).toEqual(['Overview', 'My frames 2', 'Library', 'Members', 'Exchange', 'Moderation']);
+    expect(tabNames()).toEqual(['Overview', 'My frames 2 ready', 'Library', 'Members', 'Exchange', 'Moderation']);
   });
 
   it('a contributor (send only, not coordinator) sees no Library tab', async () => {
@@ -1014,7 +1026,7 @@ describe('ProjectDetail tabs', () => {
         Promise.resolve([...twoReady, ownRow({ frameId: 3, fileName: 'L_0003.fits' }), published(4)]),
     });
     renderProjectDetail();
-    expect(await screen.findByRole('tab', { name: 'My frames 3' })).toBeInTheDocument();
+    expect(await screen.findByRole('tab', { name: 'My frames 3 ready' })).toBeInTheDocument();
   });
 
   it('the Library badge counts the library frames still to come on this device', async () => {
@@ -1027,7 +1039,7 @@ describe('ProjectDetail tabs', () => {
         ]),
     });
     renderProjectDetail();
-    expect(await screen.findByRole('tab', { name: 'Library 1' })).toBeInTheDocument();
+    expect(await screen.findByRole('tab', { name: 'Library 1 to go' })).toBeInTheDocument();
   });
 
   it('?tab=receive opens Library and is removed from the URL', async () => {
@@ -1409,5 +1421,227 @@ describe('ProjectDetail frame drawer', () => {
     await waitFor(() => expect(within(drawer).queryByText(/Excluded — trailed/)).not.toBeInTheDocument());
     expect(within(drawer).getByRole('button', { name: 'Exclude…' })).toBeInTheDocument();
     expect(calls).toBe(2);
+  });
+});
+
+function memberSummary(o: Partial<MemberSummary> & { accountId: string; displayName: string }): MemberSummary {
+  return {
+    dataRole: 'send_receive',
+    coordinator: false,
+    devices: [],
+    online: true,
+    lastSeenAt: null,
+    publishedFrames: 0,
+    secondsByFilter: {},
+    qualityByCamera: [],
+    holdsFrames: 0,
+    holdsBytes: 0,
+    holdsShare: 0,
+    ...o,
+  };
+}
+
+describe('resolveSelfAccount', () => {
+  const members = [
+    memberSummary({ accountId: 'acc-a', displayName: 'Alice', devices: [{ device: 'dev-a', name: 'alice-pc', online: true }] }),
+    memberSummary({ accountId: 'acc-me', displayName: 'Me', devices: [{ device: 'dev-me', name: 'laptop', online: true }] }),
+  ];
+
+  it("a published own frame's publisher wins", () => {
+    const frames = [libraryFrame({ own: false }), libraryFrame({ frameUuid: 'o', own: true, publisherAccountId: 'acc-own' })];
+    expect(resolveSelfAccount(frames, members, 'dev-a')).toBe('acc-own');
+  });
+
+  it('else the member whose devices include this device', () => {
+    expect(resolveSelfAccount([libraryFrame({ own: false })], members, 'dev-me')).toBe('acc-me');
+    expect(resolveSelfAccount(null, members, 'dev-me')).toBe('acc-me');
+  });
+
+  it('unknown without a device id, without members, or when no member holds the device', () => {
+    expect(resolveSelfAccount(null, members, null)).toBeNull();
+    expect(resolveSelfAccount(null, null, 'dev-me')).toBeNull();
+    expect(resolveSelfAccount([], members, 'dev-zz')).toBeNull();
+  });
+});
+
+describe('ProjectDetail page shell (wave 5.5)', () => {
+  /** The mockup's project: coordinator of an approval project, two members,
+   *  one ready frame, three pending contributions, one library frame to go. */
+  function renderPage(
+    patch: Partial<ProjectCard> = {},
+    extra: Record<string, (args?: unknown) => Promise<unknown>> = {},
+  ) {
+    const card = projectCard({
+      title: 'M31 Deep Field 2026',
+      slug: 'm31-deep-field-2026',
+      targetName: 'M31',
+      targetRadiusDeg: 1.5,
+      coordinator: true,
+      canModerate: true,
+      requireApproval: true,
+      pendingFrames: 3,
+      publishingHere: true,
+      publishingDevice: { deviceId: 'dev-me', name: 'Laptop' },
+      ...patch,
+    });
+    mockCommands(card, {
+      get_collab_project_detail: () =>
+        Promise.resolve({
+          ...detailFixture(card),
+          members: [
+            { displayName: 'Me', dataRole: 'send_receive', coordinator: true },
+            { displayName: 'Alice', dataRole: 'send_receive', coordinator: false },
+          ],
+        }),
+      list_project_own_frames: () => Promise.resolve([ownRow({ frameId: 1, fileName: 'L_0001.fits' })]),
+      list_collab_frames: () =>
+        Promise.resolve([
+          libraryFrame({ frameUuid: 'lib-1', fileName: 'light_001.fits', publisher: 'Alice', publisherAccountId: 'acc-a', localState: 'wanted' }),
+        ]),
+      get_collab_member_summary: () =>
+        Promise.resolve([
+          memberSummary({ accountId: 'acc-me', displayName: 'Me', coordinator: true, devices: [{ device: 'dev-me', name: 'Laptop', online: true }] }),
+          memberSummary({ accountId: 'acc-a', displayName: 'Alice', devices: [{ device: 'dev-a', name: 'alice-pc', online: true }] }),
+        ]),
+      get_collab_frame_holders: () => Promise.resolve([]),
+      ...extra,
+    });
+    return renderProjectDetail();
+  }
+
+  it('header follows the app pattern: HistoryNav, 24px bold title, muted subtitle, role chip, live pill, portal link', async () => {
+    renderPage();
+    const h = await screen.findByRole('heading', { level: 2, name: /M31 Deep Field 2026/ });
+    expect(h.className).toContain('text-2xl');
+    expect(h.className).toContain('font-bold');
+    expect(screen.getByText(/M31 · r 1\.5° · 2 members/)).toBeInTheDocument();
+    expect(screen.getByText(/M31 · r 1\.5° · 2 members/).className).toContain('text-content-muted');
+    expect(screen.getByText('coordinator')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Manage on portal/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Back' })).toBeInTheDocument();
+    expect(screen.queryByText('Auto-download contributions')).toBeNull();
+  });
+
+  it('the live pill sits in the header, right of the title, and runs Sync', async () => {
+    renderPage(
+      {},
+      {
+        get_collab_live_status: () =>
+          Promise.resolve({
+            state: 'connecting',
+            retryInSecs: null,
+            since: '2026-09-29T10:00:00Z',
+            storage: 'available',
+            storageReason: null,
+            watcherDegraded: false,
+            networkVolume: false,
+          }),
+      },
+    );
+    const pill = await screen.findByRole('button', { name: 'Connecting…' });
+    expect(pill.className).toContain('rounded-full');
+    const title = screen.getByRole('heading', { level: 2, name: /M31 Deep Field 2026/ });
+    expect(title.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // No separate "Sync now" button: the pill is it.
+    expect(screen.queryByRole('button', { name: 'Sync now' })).toBeNull();
+    fireEvent.click(pill);
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('collab_sync_now'));
+  });
+
+  it('a long project title truncates on one line (review focus 1)', async () => {
+    renderPage({ title: 'M31 Deep Field 2026 — autumn campaign with the extended team and guests' });
+    const h = await screen.findByRole('heading', { level: 2, name: /autumn campaign/ });
+    expect(h.className).toContain('truncate');
+    expect(h.className).toContain('min-w-0');
+    // The row never wraps, so the pill and the portal link stay on row 1.
+    expect(h.parentElement!.className).not.toContain('flex-wrap');
+  });
+
+  it('the meta line carries the publishing device and both toggles', async () => {
+    renderPage();
+    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Auto-publish on' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Auto-replicate on' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('set_project_auto_replicate', { projectId: 'proj-1', enabled: false }),
+    );
+    // The page re-reads the card after the write.
+    await waitFor(() => expect(invokeCount('get_collab_project_detail')).toBe(2));
+  });
+
+  it('a send-only member gets no auto-replicate toggle', async () => {
+    renderPage({ dataRole: 'send', coordinator: false, canModerate: false });
+    expect(await screen.findByRole('button', { name: 'Auto-publish on' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Auto-replicate/ })).toBeNull();
+  });
+
+  it('tab counts read "136 ready" / "N to go" / pending, as pills', async () => {
+    renderPage();
+    expect(await screen.findByRole('tab', { name: /My frames 1 ready/ })).toBeInTheDocument();
+    expect(await screen.findByRole('tab', { name: /Library 1 to go/ })).toBeInTheDocument();
+    const moderation = screen.getByRole('tab', { name: /Moderation 3/ });
+    const pill = within(moderation).getByText('3');
+    expect(pill.className).toContain('rounded-full');
+    expect(pill.className).toContain('text-[10.5px]');
+    expect(pill.className).toContain('text-warning');
+    expect(within(screen.getByRole('tab', { name: /My frames/ })).getByText('1 ready').className).toContain(
+      'text-content-muted',
+    );
+  });
+
+  it('the active tab is underlined in accent and semibold', async () => {
+    renderPage();
+    const overview = await screen.findByRole('tab', { name: 'Overview' });
+    expect(overview).toHaveAttribute('aria-selected', 'true');
+    expect(overview.className).toContain('border-accent');
+    expect(overview.className).toContain('font-semibold');
+    // No negative margin: inside the bar's overflow box it would clip the
+    // 2 px underline to 1 px and scroll the bar by a pixel (mockup: none).
+    expect(overview.className).not.toContain('-mb-px');
+    expect(screen.getByRole('tab', { name: /^Members/ }).className).toContain('border-transparent');
+  });
+
+  it('closes the frame panel on a tab change', async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole('tab', { name: /Library/ }));
+    fireEvent.click(await screen.findByText('light_001.fits'));
+    expect(screen.getByRole('complementary', { name: 'Frame details' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: /Members/ }));
+    expect(screen.queryByRole('complementary', { name: 'Frame details' })).toBeNull();
+    // Going back does not bring the old card back.
+    fireEvent.click(screen.getByRole('tab', { name: /Library/ }));
+    await screen.findByText('light_001.fits');
+    expect(screen.queryByRole('complementary', { name: 'Frame details' })).toBeNull();
+  });
+
+  it('the open frame is the active row, inside the docked panel layout', async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole('tab', { name: /Library/ }));
+    fireEvent.click(await screen.findByText('light_001.fits'));
+    const panel = screen.getByRole('complementary', { name: 'Frame details' });
+    // PanelLayout: the tab body and the panel share the two-column grid.
+    expect(panel.parentElement!.className).toContain('grid-cols-[minmax(0,1fr)_400px]');
+    // The panel repeats the file name; the row is the one inside the table.
+    const row = screen
+      .getAllByText('light_001.fits')
+      .map((e) => e.closest('tr'))
+      .find((tr) => tr !== null)!;
+    expect(row.className).toContain('bg-accent/[0.16]');
+  });
+
+  it('colours members with this account resolved from its device (accent for self)', async () => {
+    const { container } = renderPage();
+    fireEvent.click(await screen.findByRole('tab', { name: /Library/ }));
+    await screen.findByText('light_001.fits');
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('account_status'));
+    // Alice is the only other member: with self = acc-me she takes palette
+    // slot 1 (#a3be8c), never slot 0 (the accent, reserved for self).
+    await waitFor(() => {
+      const dots = [...container.querySelectorAll<HTMLElement>('span[aria-hidden][style]')].map(
+        (d) => d.style.backgroundColor,
+      );
+      expect(dots).toContain('rgb(163, 190, 140)');
+      expect(dots).not.toContain('rgb(136, 192, 208)');
+    });
   });
 });

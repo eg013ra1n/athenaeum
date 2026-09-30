@@ -3,6 +3,7 @@ import { Loader2, RefreshCw, Wifi, WifiOff } from 'lucide-react';
 import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useDeviceReplace } from './DeviceReplaceDialog';
+import { Button, Pill, StatusDot } from '../ui';
 import type { CollabLiveStatus as Status } from '../../types/models';
 
 /**
@@ -12,6 +13,10 @@ import type { CollabLiveStatus as Status } from '../../types/models';
  * reconciles at once. Follows `collab-live-status`; never reads or classifies
  * the storage itself (that is `DeviceReplaceDialog`'s job, through the
  * "Replace a device…" link).
+ *
+ * `variant="pill"` (the project page header, spec 2026-09-30 §8) folds all of
+ * it into ONE pill: a status dot, then the label ("Live · synced N s ago"
+ * while live with storage available); clicking the pill IS Sync now.
  */
 
 /** Storage reasons (`CollabLiveStatus.storageReason`, core's stable
@@ -53,6 +58,25 @@ export function liveStatusLabel(s: Status, elapsedSecs: number): string {
 
 const PERIODIC_ONLY = 'Changes are seen by periodic check only';
 
+/** The pill's dot (pure): live, a read-only store warns, an unavailable store
+ *  or an unreachable hub is an error, everything else is offline. */
+export function dotState(s: Status): 'live' | 'warn' | 'error' | 'offline' {
+  if (s.state === 'live') return s.storage === 'unavailable' ? 'error' : s.storage === 'readOnly' ? 'warn' : 'live';
+  return s.state === 'unreachable' ? 'error' : 'offline';
+}
+
+/** The pill's label (pure): "Live · synced N s ago" (minutes from 60 s) while
+ *  live with storage available and a known sync time, else the one live
+ *  status label. An unparsable `syncedAt` reads as unknown — never "NaN s". */
+export function pillLabel(s: Status, elapsed: number, syncedAt: string | null, now: number): string {
+  const synced = syncedAt ? Date.parse(syncedAt) : NaN;
+  if (s.state === 'live' && s.storage === 'available' && Number.isFinite(synced)) {
+    const secs = Math.max(0, Math.round((now - synced) / 1000));
+    return `Live · synced ${secs < 60 ? `${secs} s` : `${Math.round(secs / 60)} m`} ago`;
+  }
+  return liveStatusLabel(s, elapsed);
+}
+
 function toneOf(s: Status): string {
   if (s.state === 'live') {
     if (s.storage === 'unavailable') return 'text-error';
@@ -64,12 +88,22 @@ function toneOf(s: Status): string {
   return 'text-content-muted';
 }
 
-export default function CollabLiveStatus({ compact = false }: { compact?: boolean }) {
+export default function CollabLiveStatus({
+  compact = false,
+  variant = 'default',
+  syncedAt = null,
+}: {
+  compact?: boolean;
+  variant?: 'default' | 'pill';
+  /** The pill's "synced N s ago" origin (the project card's `fetchedAt`). */
+  syncedAt?: string | null;
+}) {
   const { notify } = useNotifications();
   const { available: canReplace, pending, requestOpen } = useDeviceReplace();
   const [status, setStatus] = useState<Status | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [syncing, setSyncing] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
   // An event that arrived before the initial read resolves is newer: keep it.
   const gotEvent = useRef(false);
 
@@ -115,6 +149,13 @@ export default function CollabLiveStatus({ compact = false }: { compact?: boolea
     return () => clearInterval(t);
   }, [reconnecting, status?.since, status?.retryInSecs]);
 
+  // The pill's "synced N s ago" — a display tick, not a poll.
+  useEffect(() => {
+    if (variant !== 'pill') return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [variant]);
+
   const syncNow = async () => {
     setSyncing(true);
     try {
@@ -138,6 +179,35 @@ export default function CollabLiveStatus({ compact = false }: { compact?: boolea
   const periodicOnly = status.watcherDegraded || status.networkVolume;
   const showOwnerLink = canReplace && (pending !== null || status.storageReason === 'other_device');
   const off = status.state === 'off';
+
+  if (variant === 'pill') {
+    return (
+      <span className="inline-flex items-center gap-2">
+        <Pill
+          as="button"
+          className="whitespace-nowrap"
+          onClick={() => void syncNow()}
+          disabled={syncing || off}
+          title={[
+            periodicOnly ? PERIODIC_ONLY : null,
+            off
+              ? 'Collaboration is off — sign in and set a Collaboration folder first'
+              : 'Sync now: reconnect to the hub and check every project',
+          ]
+            .filter(Boolean)
+            .join(' · ')}
+          dot={<StatusDot state={dotState(status)} />}
+        >
+          {syncing ? 'Syncing…' : pillLabel(status, elapsed, syncedAt, now)}
+        </Pill>
+        {showOwnerLink && (
+          <Button variant="link" size="sm" onClick={requestOpen}>
+            {pending === 'replace' ? 'Replace a device…' : 'Resolve the folder owner…'}
+          </Button>
+        )}
+      </span>
+    );
+  }
 
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">

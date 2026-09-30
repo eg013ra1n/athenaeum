@@ -36,6 +36,7 @@ export default function LibraryTab({
   reload,
   canModerate,
   onOpen,
+  activeKey = null,
 }: {
   projectId: string;
   projectTitle: string;
@@ -44,6 +45,8 @@ export default function LibraryTab({
   reload: () => void;
   canModerate: boolean;
   onOpen: (vm: FrameVM) => void;
+  /** The frame whose side panel is open — its row takes the active state. */
+  activeKey?: string | null;
 }): JSX.Element {
   const { state } = useCollabExchange();
 
@@ -194,6 +197,7 @@ export default function LibraryTab({
           rows={rows}
           actions={actions}
           onOpen={onOpen}
+          activeKey={activeKey}
           emptyText="No frames in this project yet — published contributions appear here."
         />
       )}

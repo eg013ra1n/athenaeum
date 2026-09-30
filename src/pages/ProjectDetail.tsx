@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
-import { ExternalLink, Loader2, Monitor, Send, Target } from 'lucide-react';
+import { Loader2, Send } from 'lucide-react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
 import { useSessionState } from '../contexts/SessionStateContext';
@@ -8,11 +8,13 @@ import { useCollabExchange } from '../contexts/CollabExchangeContext';
 import { openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
-import AutoReplicateBar from '../components/collab/AutoReplicateBar';
 import UpdateRequired from '../components/collab/UpdateRequired';
 import CollabLiveStatus from '../components/collab/CollabLiveStatus';
 import { formatBytes } from '../components/collab/format';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { Button, Chip, PanelLayout } from '../components/ui';
+import MetaLine from '../components/collab/project/MetaLine';
+import { MemberColorsProvider } from '../components/collab/project/MemberColorsContext';
 import OverviewTab from '../components/collab/project/OverviewTab';
 import MyFramesTab, { type Segment } from '../components/collab/project/MyFramesTab';
 import LibraryTab, { libraryInFlight, libraryToCome } from '../components/collab/project/LibraryTab';
@@ -24,6 +26,7 @@ import RepublishGuardDialog from '../components/collab/project/RepublishGuardDia
 import { deviceLabel, leading, OTHER_DEVICE, usePublishing } from '../components/collab/project/usePublishing';
 import { fromLibrary, fromOwn, ownFrameKey, type FrameVM } from '../components/collab/project/frames';
 import type {
+  AccountStatus,
   CollabPeersChanged,
   MemberSummary,
   OwnFrameRow,
@@ -68,8 +71,6 @@ function resolveTab(v: string | null | undefined): Tab | null {
 // an authoritative stored value (S6).
 const APPROX_FRAME_BYTES = 45 * 1024 * 1024;
 
-const BADGE = 'rounded-full px-1.5 text-[10px] font-medium';
-
 // `collab-peers-changed` fires per event, throttled core-side to one per
 // project per second (`LANDED_BURST`, `runtime.rs`). These mirror that on the
 // frontend as a schedule-if-none-pending throttle: the FIRST event schedules
@@ -79,13 +80,35 @@ const BADGE = 'rounded-full px-1.5 text-[10px] font-medium';
 const PEERS_RELOAD_MS = 1000;
 const OWN_RELOAD_MS = 5000;
 
+/** The colour provider's members while the summary loads — one stable array,
+ *  so the lookup (and every dot on the page) is not rebuilt each render. */
+const NO_MEMBERS: MemberSummary[] = [];
+
+/** This account: a published own frame's publisher, else the member whose
+ *  devices include this device. `null` while unknown — every member then
+ *  takes the palette from slot 0 (`memberColor`). */
+export function resolveSelfAccount(
+  frames: ProjectFrameView[] | null,
+  members: MemberSummary[] | null,
+  deviceId: string | null,
+): string | null {
+  const own = frames?.find((f) => f.own)?.publisherAccountId;
+  if (own) return own;
+  if (!deviceId || !members) return null;
+  return members.find((m) => m.devices.some((d) => d.device === deviceId))?.accountId ?? null;
+}
+
 /**
- * A collab project: the header (title, target, publishing device, live
- * status, portal link, auto-replication) and six tabs — Overview, My frames,
- * Library, Members, Exchange, Moderation. The shell owns the loads shared by
- * several tabs, the tab/segment state and deep links, the frame drawer, and
- * the publish confirm + republish guard (orchestration in `usePublishing`).
- * Every tab body is its own component under `components/collab/project/`.
+ * A collab project (spec 2026-09-30 §8): the header on the app's page pattern
+ * (back/forward, title, target subtitle, role chip, the live pill that also
+ * runs Sync, the portal link), the meta line (publishing device, auto-publish
+ * and auto-replicate toggles — `MetaLine`) and six tabs — Overview, My
+ * frames, Library, Members, Exchange, Moderation. The shell owns the loads
+ * shared by several tabs, the tab/segment state and deep links, the frame
+ * panel (docked beside the frame tables, `PanelLayout`), the member colours
+ * (`MemberColorsProvider`), and the publish confirm + republish guard
+ * (orchestration in `usePublishing`). Every tab body is its own component
+ * under `components/collab/project/`.
  */
 export default function ProjectDetail() {
   const { id } = useParams();
@@ -129,6 +152,8 @@ function ProjectPage({ id }: { id: string | undefined }) {
   useEffect(() => {
     const t = resolveTab(searchParams.get('tab'));
     if (!t) return;
+    // A tab change closes the frame panel (spec §6.1).
+    setDrawer(null);
     setTab(t);
     const next = new URLSearchParams(searchParams);
     next.delete('tab');
@@ -159,8 +184,8 @@ function ProjectPage({ id }: { id: string | undefined }) {
     }
   }, [id]);
 
-  // The project's manifest mirror: the Library and Moderation tabs' rows and
-  // the published volume the auto-replication bar shows.
+  // The project's manifest mirror: the Library and Moderation tabs' rows, the
+  // Library count pill and the member-colour self lookup.
   const loadLibrary = useCallback(async () => {
     if (!id) return;
     setFramesError(false);
@@ -181,7 +206,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   }, [loadOwn]);
 
   // Re-read on every tab change, as the old page did — cheap, and it keeps
-  // the Library badge and the replication bar's volume current.
+  // the Library count pill current.
   useEffect(() => {
     void loadLibrary();
   }, [loadLibrary, storedTab]);
@@ -189,7 +214,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   // Core emits `collab-published` at the end of EVERY publish run of a
   // project — manual, republish and the background auto-publish — so this is
   // the one place that keeps own frames (Ready counts, `Publish all N`), the
-  // library (the replication bar's published volume) and the card current
+  // library (the Library count pill) and the card current
   // after a run nobody clicked. StrictMode-safe listener pattern (CLAUDE.md);
   // the loaders are stable per project (the page is keyed on `id`).
   useEffect(() => {
@@ -230,6 +255,23 @@ function ProjectPage({ id }: { id: string | undefined }) {
   useEffect(() => {
     void loadMembers();
   }, [loadMembers]);
+
+  // This device's id, for `resolveSelfAccount` — this account's member colour
+  // is the accent everywhere on the page (spec §4.4).
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .invoke<AccountStatus>('account_status')
+      .then((s) => {
+        if (!cancelled) setDeviceId(s?.deviceId ?? null);
+      })
+      .catch((err) => console.error('[projects] account_status failed:', err));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const selfAccountId = useMemo(() => resolveSelfAccount(frames, members, deviceId), [frames, members, deviceId]);
 
   // Presence/holder changes (core: `collab-peers-changed`). Loaders are read
   // through refs so the listener can subscribe once per project
@@ -345,7 +387,18 @@ function ProjectPage({ id }: { id: string | undefined }) {
       });
       return;
     }
-    await openUrl(safe);
+    try {
+      await openUrl(safe);
+    } catch (err) {
+      console.error('[projects] open portal failed:', err);
+      notify({
+        title: 'Could not open the portal',
+        detail: err instanceof Error ? err.message : String(err),
+        kind: 'project',
+        tone: 'warning',
+        hasErrors: true,
+      });
+    }
   };
 
   if (missing)
@@ -362,11 +415,6 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const canModerate = c.canModerate;
   const needsApproval = c.requireApproval && !c.canModerate;
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
-  // The project's published volume, client-side from the rows already listed.
-  const publishedBytes =
-    frames === null
-      ? null
-      : frames.filter((f) => f.own && f.state === 'published').reduce((sum, f) => sum + f.byteSize, 0);
   const ownRows = own ?? [];
   const readyCount = ownRows.filter((r) => r.segment === 'ready').length;
   const publishedRows = ownRows.filter((r) => r.segment === 'published');
@@ -383,10 +431,11 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const requested = resolveTab(storedTab) ?? 'overview';
   const activeTab: Tab = tabs.includes(requested) ? requested : 'overview';
   activeTabRef.current = activeTab;
-  const badge: Partial<Record<Tab, { n: number; cls: string }>> = {
-    mine: { n: own === null ? 0 : readyCount, cls: 'bg-accent/20 text-accent' },
-    library: { n: toCome, cls: 'bg-accent/20 text-accent' },
-    moderation: { n: c.pendingFrames, cls: 'bg-warning/20 text-warning' },
+  // Tab count pills (spec §8): "136 ready", "278 to go", the pending count.
+  const badge: Partial<Record<Tab, { n: number; text: string; warn?: boolean }>> = {
+    mine: { n: readyCount, text: `${readyCount} ready` },
+    library: { n: toCome, text: `${toCome} to go` },
+    moderation: { n: c.pendingFrames, text: String(c.pendingFrames), warn: true },
   };
 
   // The republish guard's figures and the ids it sends. "All" = the
@@ -450,273 +499,289 @@ function ProjectPage({ id }: { id: string | undefined }) {
     </>
   );
 
+  // Every tab change closes the frame panel (spec §6.1).
+  const selectTab = (t: Tab) => {
+    setDrawer(null);
+    setTab(t);
+  };
   const openTab = (t: string) => {
     const r = resolveTab(t);
-    if (r) setTab(r);
+    if (r) selectTab(r);
   };
 
+  // The frame panel, docked beside the My frames / Library / Moderation
+  // tables. Interim: the existing drawer until the frame card (Task 8).
+  const framePanel = drawerFrame ? (
+    <FrameDrawer
+      key={drawerFrame.key}
+      projectId={id}
+      frame={drawerFrame}
+      canModerate={canModerate}
+      onClose={() => setDrawer(null)}
+      onChanged={() => {
+        void loadOwn();
+        void loadLibrary();
+      }}
+    />
+  ) : null;
+  const activeKey = drawerFrame?.key ?? null;
+
   return (
-    <div className="space-y-4 p-6">
-      <div className="flex flex-wrap items-center gap-3">
-        <HistoryNav fallback="/projects" />
-        <h1 className="truncate text-lg font-semibold text-content">{c.title}</h1>
-        <span className="flex items-center gap-1 text-xs text-content-muted">
-          <Target size={12} /> {c.targetName} · r {c.targetRadiusDeg.toFixed(1)}°
-        </span>
-        {c.coordinator && (
-          <span className="rounded bg-accent/20 px-1.5 py-0.5 text-xs text-accent">coordinator</span>
-        )}
-        <div className="ml-auto">
-          <CollabLiveStatus />
+    <MemberColorsProvider members={members ?? NO_MEMBERS} selfAccountId={selfAccountId}>
+      <div className="space-y-0 p-6 text-[13px] leading-[1.4] [font-variant-numeric:tabular-nums]">
+        {/* Row 1 (spec §8, U5): the app's page-header pattern. The row never
+            wraps: the title is the one item that shrinks (ellipsis), so a long
+            title can never push the pill and the portal link to a second row. */}
+        <div className="flex items-center gap-x-3.5">
+          <HistoryNav fallback="/projects" />
+          <h2 className="min-w-0 truncate text-2xl font-bold text-content">{c.title}</h2>
+          <span className="shrink-0 whitespace-nowrap text-sm font-normal text-content-muted">
+            ◎ {c.targetName} · r {c.targetRadiusDeg.toFixed(1)}° · {detail.members.length}{' '}
+            {detail.members.length === 1 ? 'member' : 'members'}
+          </span>
+          {c.coordinator && (
+            <Chip tone="info" className="shrink-0">
+              coordinator
+            </Chip>
+          )}
+          <span className="ml-auto flex shrink-0 items-center gap-3.5">
+            <CollabLiveStatus variant="pill" syncedAt={c.fetchedAt} />
+            <Button variant="link" onClick={() => void openPortal(portalPath)}>
+              Manage on portal ↗
+            </Button>
+          </span>
         </div>
-        <button
-          onClick={() => void openPortal(portalPath)}
-          className="inline-flex items-center gap-1 text-sm text-content-secondary transition-colors hover:text-content"
-        >
-          Manage on portal <ExternalLink size={13} />
-        </button>
-      </div>
-
-      {/* A6: one device of this account announces new frames here. `null`
-          = nobody yet (the next device that publishes becomes it) — never
-          "this device". */}
-      <div className="flex flex-wrap items-center gap-2 text-xs text-content-muted">
-        <Monitor size={12} className="shrink-0" />
-        <span className="break-words">
-          {c.publishingHere
-            ? 'Publishing from this device'
-            : c.publishingDevice
-              ? `Publishing from ${deviceLabel(c.publishingDevice.name)}`
-              : 'Nobody is publishing to this project yet'}
-        </span>
-        {!c.publishingHere && c.publishingDevice && switchButton}
-      </div>
-
-      {publishing.updateRequired && <UpdateRequired />}
-
-      {/* Auto-replication is role-gated in core (`role_allows_replication`:
-          coordinator or send_receive) exactly like the Library tab, so the bar
-          shows on the same condition — a send-only member has nothing to pull. */}
-      {canReceive && (
-        <AutoReplicateBar
-          projectId={id}
-          autoReplicate={c.autoReplicate}
-          publishedBytes={publishedBytes}
-          onToggled={() => void loadDetail()}
+        {/* Row 2: the publishing device (A6) and the two preferences. */}
+        <MetaLine
+          card={c}
+          canReceive={canReceive}
+          onChanged={() => void loadDetail()}
+          onSwitchHere={() => setSwitchConfirm(true)}
+          switchBusy={publishing.switchBusy}
         />
-      )}
 
-      <div role="tablist" className="flex flex-wrap gap-1 border-b border-border">
-        {tabs.map((t) => {
-          const b = badge[t];
-          return (
-            <button
-              key={t}
-              type="button"
-              role="tab"
-              aria-selected={activeTab === t}
-              onClick={() => setTab(t)}
-              className={`inline-flex items-center gap-1.5 px-4 py-2 text-sm transition-colors ${
-                activeTab === t
-                  ? 'border-b-2 border-accent font-medium text-content'
-                  : 'text-content-muted hover:text-content-secondary'
-              }`}
-            >
-              {TAB_LABEL[t]}
-              {b && b.n > 0 && (
-                <>
-                  {' '}
-                  <span className={`${BADGE} ${b.cls}`}>{b.n}</span>
-                </>
+        {publishing.updateRequired && (
+          <div className="mt-3">
+            <UpdateRequired />
+          </div>
+        )}
+
+        <div role="tablist" className="mt-3.5 flex gap-0.5 overflow-x-auto border-b border-border">
+          {tabs.map((t) => {
+            const b = badge[t];
+            return (
+              <button
+                key={t}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === t}
+                onClick={() => selectTab(t)}
+                className={`inline-flex items-center gap-1.5 whitespace-nowrap border-b-2 px-3.5 py-2 ${
+                  activeTab === t
+                    ? 'border-accent font-semibold text-content'
+                    : 'border-transparent text-content-faint hover:text-content-secondary'
+                }`}
+              >
+                {TAB_LABEL[t]}
+                {b && b.n > 0 && (
+                  <>
+                    {/* A space for the accessible name ("My frames 1 ready");
+                        whitespace in a flex row renders nothing. */}{' '}
+                    <span
+                      className={`rounded-full px-[5px] text-[10.5px] font-medium ${
+                        b.warn ? 'bg-warning-muted text-warning' : 'bg-surface-hover text-content-muted'
+                      }`}
+                    >
+                      {b.text}
+                    </span>
+                  </>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="pt-3.5">
+          {activeTab === 'overview' && (
+            <div className="space-y-4">
+              {ownError && own === null && (
+                <p className="text-sm text-error">Could not load your frames — see console.</p>
               )}
-            </button>
-          );
-        })}
-      </div>
-
-      {activeTab === 'overview' && (
-        <>
-          {ownError && own === null && (
-            <p className="text-sm text-error">Could not load your frames — see console.</p>
-          )}
-          {membersError && members === null && (
-            <p className="text-sm text-error">Could not load the members — see console.</p>
-          )}
-          <OverviewTab
-            projectId={id}
-            goals={detail.goals}
-            members={members}
-            own={own}
-            ownError={ownError}
-            libraryToCome={canReceive ? toCome : 0}
-            pending={c.pendingFrames}
-            canModerate={canModerate}
-            thresholds={detail.thresholds}
-            thresholdsVersion={detail.thresholdsVersion}
-            onOpenSegment={(s) => {
-              setSegment(s);
-              setTab('mine');
-            }}
-            onOpenTab={openTab}
-          />
-        </>
-      )}
-
-      {activeTab === 'mine' && (
-        <MyFramesTab
-          projectId={id}
-          rows={own}
-          error={ownError}
-          links={detail.links}
-          autoPublish={c.autoPublish}
-          segment={segment}
-          onSegment={setSegment}
-          onReload={() => void loadOwn()}
-          onDetailReload={() => void loadDetail()}
-          onRequestPublish={(ids) => {
-            publishing.clearPublishError();
-            setPublishIds(ids);
-          }}
-          publishBusy={publishing.publishBusy}
-          onRequestRepublish={(ids) => {
-            publishing.clearRepublishError();
-            setRepublishReq({ ids });
-          }}
-          republishBusy={publishing.republishBusy}
-          canRepublish={canRepublish}
-          canModerate={canModerate}
-          republishError={republishReq ? null : publishing.republishError}
-          refusal={refusal}
-          onOpen={setDrawer}
-        />
-      )}
-
-      {activeTab === 'library' && (
-        <LibraryTab
-          projectId={id}
-          projectTitle={c.title}
-          frames={frames}
-          error={framesError}
-          reload={() => void loadLibrary()}
-          canModerate={canModerate}
-          onOpen={setDrawer}
-        />
-      )}
-
-      {activeTab === 'members' && (
-        <MembersTab
-          projectId={id}
-          refreshToken={membersRefresh}
-          onMembers={(m) => {
-            setMembers(m);
-            setMembersError(false);
-          }}
-        />
-      )}
-
-      {activeTab === 'exchange' && <ExchangeTab projectId={id} canReceive={canReceive} members={members} />}
-
-      {activeTab === 'moderation' && (
-        <ModerationTab
-          projectId={id}
-          requireApproval={c.requireApproval}
-          library={frames}
-          libraryError={framesError}
-          onDecided={() => {
-            void loadDetail();
-            void loadLibrary();
-          }}
-          onOpen={setDrawer}
-        />
-      )}
-
-      {drawerFrame && (
-        <FrameDrawer
-          key={drawerFrame.key}
-          projectId={id}
-          frame={drawerFrame}
-          canModerate={canModerate}
-          onClose={() => setDrawer(null)}
-          onChanged={() => {
-            void loadOwn();
-            void loadLibrary();
-          }}
-        />
-      )}
-
-      <ConfirmDialog
-        isOpen={switchConfirm}
-        title="Publish from this device?"
-        message={`${leading(switchFrom)} will stop publishing new frames to this project; it can still update the frames it already published.`}
-        confirmText="Switch"
-        onConfirm={() => {
-          setSwitchConfirm(false);
-          void publishing.switchHere();
-        }}
-        onCancel={() => setSwitchConfirm(false)}
-      />
-
-      {publishIds && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-          onClick={() => !publishing.publishBusy && setPublishIds(null)}
-        >
-          <div
-            className="w-[30rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="mb-2 flex items-center gap-2">
-              <Send size={16} className="text-accent" />
-              <h2 className="font-medium text-content">Publish to {c.title}</h2>
+              {membersError && members === null && (
+                <p className="text-sm text-error">Could not load the members — see console.</p>
+              )}
+              <OverviewTab
+                projectId={id}
+                goals={detail.goals}
+                members={members}
+                own={own}
+                ownError={ownError}
+                libraryToCome={canReceive ? toCome : 0}
+                pending={c.pendingFrames}
+                canModerate={canModerate}
+                thresholds={detail.thresholds}
+                thresholdsVersion={detail.thresholdsVersion}
+                onOpenSegment={(s) => {
+                  setSegment(s);
+                  selectTab('mine');
+                }}
+                onOpenTab={openTab}
+              />
             </div>
-            <p className="mb-2 text-sm text-content-secondary">
-              {publishIds.length} passing {publishIds.length === 1 ? 'frame' : 'frames'} will be calibrated and
-              announced to the project.
-            </p>
-            <p className="mb-2 text-xs text-content-muted">
-              Estimated size ≈ {formatBytes(publishIds.length * APPROX_FRAME_BYTES)} — the exact size is
-              measured when each frame is generated.
-            </p>
-            {needsApproval && (
-              <p className="mb-2 text-xs text-warning">
-                This project requires approval — your contribution goes to {coordinatorName} for
-                review.
+          )}
+
+          {activeTab === 'mine' && (
+            <PanelLayout panel={framePanel}>
+              <MyFramesTab
+                projectId={id}
+                rows={own}
+                error={ownError}
+                links={detail.links}
+                autoPublish={c.autoPublish}
+                segment={segment}
+                onSegment={setSegment}
+                onReload={() => void loadOwn()}
+                onDetailReload={() => void loadDetail()}
+                onRequestPublish={(ids) => {
+                  publishing.clearPublishError();
+                  setPublishIds(ids);
+                }}
+                publishBusy={publishing.publishBusy}
+                onRequestRepublish={(ids) => {
+                  publishing.clearRepublishError();
+                  setRepublishReq({ ids });
+                }}
+                republishBusy={publishing.republishBusy}
+                canRepublish={canRepublish}
+                canModerate={canModerate}
+                republishError={republishReq ? null : publishing.republishError}
+                refusal={refusal}
+                onOpen={setDrawer}
+                activeKey={activeKey}
+              />
+            </PanelLayout>
+          )}
+
+          {activeTab === 'library' && (
+            <PanelLayout panel={framePanel}>
+              <LibraryTab
+                projectId={id}
+                projectTitle={c.title}
+                frames={frames}
+                error={framesError}
+                reload={() => void loadLibrary()}
+                canModerate={canModerate}
+                onOpen={setDrawer}
+                activeKey={activeKey}
+              />
+            </PanelLayout>
+          )}
+
+          {activeTab === 'members' && (
+            <MembersTab
+              projectId={id}
+              refreshToken={membersRefresh}
+              onMembers={(m) => {
+                setMembers(m);
+                setMembersError(false);
+              }}
+            />
+          )}
+
+          {activeTab === 'exchange' && <ExchangeTab projectId={id} canReceive={canReceive} members={members} />}
+
+          {activeTab === 'moderation' && (
+            <PanelLayout panel={framePanel}>
+              <ModerationTab
+                projectId={id}
+                requireApproval={c.requireApproval}
+                library={frames}
+                libraryError={framesError}
+                onDecided={() => {
+                  void loadDetail();
+                  void loadLibrary();
+                }}
+                onOpen={setDrawer}
+                activeKey={activeKey}
+              />
+            </PanelLayout>
+          )}
+        </div>
+
+        <ConfirmDialog
+          isOpen={switchConfirm}
+          title="Publish from this device?"
+          message={`${leading(switchFrom)} will stop publishing new frames to this project; it can still update the frames it already published.`}
+          confirmText="Switch"
+          onConfirm={() => {
+            setSwitchConfirm(false);
+            void publishing.switchHere();
+          }}
+          onCancel={() => setSwitchConfirm(false)}
+        />
+
+        {publishIds && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+            onClick={() => !publishing.publishBusy && setPublishIds(null)}
+          >
+            <div
+              className="w-[30rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="mb-2 flex items-center gap-2">
+                <Send size={16} className="text-accent" />
+                <h2 className="font-medium text-content">Publish to {c.title}</h2>
+              </div>
+              <p className="mb-2 text-sm text-content-secondary">
+                {publishIds.length} passing {publishIds.length === 1 ? 'frame' : 'frames'} will be calibrated and
+                announced to the project.
               </p>
-            )}
-            {publishing.publishError && <p className="mb-2 text-sm text-error">{publishing.publishError}</p>}
-            <div className="mt-3 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setPublishIds(null)}
-                disabled={publishing.publishBusy}
-                className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void publishing.publish(publishIds)}
-                disabled={publishing.publishBusy}
-                className="inline-flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {publishing.publishBusy && <Loader2 size={12} className="animate-spin" />} Publish
-              </button>
+              <p className="mb-2 text-xs text-content-muted">
+                Estimated size ≈ {formatBytes(publishIds.length * APPROX_FRAME_BYTES)} — the exact size is
+                measured when each frame is generated.
+              </p>
+              {needsApproval && (
+                <p className="mb-2 text-xs text-warning">
+                  This project requires approval — your contribution goes to {coordinatorName} for
+                  review.
+                </p>
+              )}
+              {publishing.publishError && <p className="mb-2 text-sm text-error">{publishing.publishError}</p>}
+              <div className="mt-3 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPublishIds(null)}
+                  disabled={publishing.publishBusy}
+                  className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void publishing.publish(publishIds)}
+                  disabled={publishing.publishBusy}
+                  className="inline-flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {publishing.publishBusy && <Loader2 size={12} className="animate-spin" />} Publish
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {republishReq && guard && (
-        <RepublishGuardDialog
-          count={guard.count}
-          sourceBytes={guard.sourceBytes}
-          all={guard.all}
-          busy={publishing.republishBusy}
-          error={publishing.republishError}
-          onConfirm={() => void publishing.republish(guard.ids)}
-          onCancel={() => setRepublishReq(null)}
-        />
-      )}
-    </div>
+        {republishReq && guard && (
+          <RepublishGuardDialog
+            count={guard.count}
+            sourceBytes={guard.sourceBytes}
+            all={guard.all}
+            busy={publishing.republishBusy}
+            error={publishing.republishError}
+            onConfirm={() => void publishing.republish(guard.ids)}
+            onCancel={() => setRepublishReq(null)}
+          />
+        )}
+      </div>
+    </MemberColorsProvider>
   );
 }

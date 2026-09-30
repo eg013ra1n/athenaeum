@@ -54,6 +54,7 @@ export default function ModerationTab({
   libraryError,
   onDecided,
   onOpen,
+  activeKey = null,
 }: {
   projectId: string;
   requireApproval: boolean;
@@ -61,6 +62,8 @@ export default function ModerationTab({
   libraryError: boolean;
   onDecided: () => void;
   onOpen: (vm: FrameVM) => void;
+  /** The frame whose side panel is open — its row takes the active state. */
+  activeKey?: string | null;
 }): JSX.Element {
   const [items, setItems] = useState<ModerationFrameView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -243,6 +246,7 @@ export default function ModerationTab({
             rows={rows}
             actions={actions}
             onOpen={onOpen}
+            activeKey={activeKey}
             emptyText="Nothing waiting for review."
             toolbarExtra={
               <Checkbox checked={trust} onChange={setTrust} label="Trust these publishers" size="sm" />
@@ -275,6 +279,7 @@ export default function ModerationTab({
             rows={excludedRows}
             actions={restoreActions}
             onOpen={onOpen}
+            activeKey={activeKey}
             emptyText="No frames are excluded."
           />
         )}

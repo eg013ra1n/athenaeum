@@ -35,6 +35,8 @@ export interface MyFramesTabProps {
   republishError: string | null;
   refusal: ReactNode; // the shell's publishing-device refusal box, or null
   onOpen: (vm: FrameVM) => void;
+  /** The frame whose side panel is open — its row takes the active state. */
+  activeKey?: string | null;
 }
 
 const SEG_BTN = 'rounded border px-3 py-1.5 text-sm transition-colors';
@@ -55,7 +57,7 @@ const OUTLINE_BTN =
 export default function MyFramesTab({
   projectId, rows, error, links, autoPublish, segment, onSegment, onReload, onDetailReload,
   onRequestPublish, publishBusy, onRequestRepublish, republishBusy, canRepublish, canModerate,
-  republishError, refusal, onOpen,
+  republishError, refusal, onOpen, activeKey = null,
 }: MyFramesTabProps): JSX.Element {
   const navigate = useNavigate();
   const { notify } = useNotifications();
@@ -343,6 +345,7 @@ export default function MyFramesTab({
               rows={readyRows}
               actions={readyActions}
               onOpen={onOpen}
+              activeKey={activeKey}
               emptyText={readyEmptyText}
             />
           )}
@@ -354,6 +357,7 @@ export default function MyFramesTab({
               rows={heldRows}
               actions={heldActions}
               onOpen={onOpen}
+              activeKey={activeKey}
               emptyText="Nothing held back."
               groupAction={(node: GroupNode<FrameVM>) =>
                 node.def.id === 'reason' ? (
@@ -379,6 +383,7 @@ export default function MyFramesTab({
               rows={publishedRows}
               actions={publishedActions}
               onOpen={onOpen}
+              activeKey={activeKey}
               emptyText="Nothing published yet."
             />
           )}

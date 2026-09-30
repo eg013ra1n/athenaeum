@@ -3,7 +3,7 @@ import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom';
 import { NotificationProvider } from '../../contexts/NotificationContext';
 import { ToastStack } from '../Toast';
-import CollabLiveStatus, { liveStatusLabel } from './CollabLiveStatus';
+import CollabLiveStatus, { dotState, liveStatusLabel, pillLabel } from './CollabLiveStatus';
 import DeviceReplaceDialog, { DeviceReplaceProvider } from './DeviceReplaceDialog';
 import { api } from '../../api';
 import type { CollabLiveStatus as Status, CollabStorageStatus } from '../../types/models';
@@ -188,5 +188,167 @@ describe('CollabLiveStatus', () => {
     // …but the link opens the same dialog.
     fireEvent.click(link);
     expect(await screen.findByText('This device replaces Old laptop')).toBeInTheDocument();
+  });
+});
+
+const NOW = '2026-09-29T10:00:00Z';
+
+/** Sets `get_collab_live_status`'s answer; every other command answers null. */
+function mockStatus(s: Status) {
+  vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
+    cmd === 'get_collab_live_status' ? Promise.resolve(s) : Promise.resolve(null)) as never);
+}
+
+/** The pill in the providers the component needs (notifications for a
+ *  failed Sync; the router for the toast stack). */
+const renderPill = (syncedAt: string | null = NOW) =>
+  render(
+    <MemoryRouter>
+      <NotificationProvider>
+        <CollabLiveStatus variant="pill" syncedAt={syncedAt} />
+        <ToastStack />
+      </NotificationProvider>
+    </MemoryRouter>,
+  );
+
+/** `StatusDot` state → its fill class (ui/Dots.tsx). */
+const DOT_CLASS = { live: 'bg-success', offline: 'bg-border', warn: 'bg-warning', error: 'bg-error' } as const;
+
+describe('CollabLiveStatus pill variant', () => {
+  it.each([
+    [{ state: 'connecting' }, 'Connecting…', 'offline'],
+    [{ state: 'reconnecting', retryInSecs: 12 }, 'Reconnecting in 12 s', 'offline'],
+    [{ state: 'unreachable' }, 'Hub unreachable — retrying', 'error'],
+    [{ state: 'signedOut' }, 'Signed out', 'offline'],
+    [{ state: 'live', storage: 'unavailable', storageReason: 'path_missing' }, 'Online · storage unavailable (the Collaboration folder is missing)', 'error'],
+  ] as [Partial<Status>, string, keyof typeof DOT_CLASS][])('pill variant shows %o as one pill (review focus 5)', async (patch, label, dot) => {
+    mockStatus({ state: 'live', retryInSecs: null, since: NOW, storage: 'available', storageReason: null, watcherDegraded: false, networkVolume: false, ...patch });
+    renderPill();
+    const pill = await screen.findByRole('button', { name: new RegExp(label.replace(/[()]/g, '\\$&')) });
+    expect(pill.className).toContain('rounded-full');
+    expect(pill).toHaveTextContent(label);
+    // One pill: the dot is its first child, and there is no second button.
+    expect(pill.firstElementChild?.className).toContain(DOT_CLASS[dot]);
+    expect(screen.getAllByRole('button')).toHaveLength(1);
+  });
+
+  it('pill variant reads "Live · synced N s ago" and runs Sync on click', async () => {
+    vi.useFakeTimers({ now: new Date('2026-09-29T10:00:04Z') });
+    try {
+      mockStatus({ state: 'live', retryInSecs: null, since: NOW, storage: 'available', storageReason: null, watcherDegraded: false, networkVolume: false });
+      renderPill('2026-09-29T10:00:00Z');
+      await advance(0);
+      const pill = screen.getByRole('button', { name: 'Live · synced 4 s ago' });
+      expect(pill.firstElementChild?.className).toContain(DOT_CLASS.live);
+      fireEvent.click(pill);
+      expect(api.invoke).toHaveBeenCalledWith('collab_sync_now');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the synced age ticks every second and turns into minutes from 60 s', async () => {
+    vi.useFakeTimers({ now: new Date('2026-09-29T10:00:04Z') });
+    try {
+      mockStatus({ ...base, since: NOW });
+      renderPill('2026-09-29T10:00:00Z');
+      await advance(0);
+      expect(screen.getByRole('button', { name: 'Live · synced 4 s ago' })).toBeInTheDocument();
+      await advance(1000);
+      expect(screen.getByRole('button', { name: 'Live · synced 5 s ago' })).toBeInTheDocument();
+      await advance(55_000);
+      expect(screen.getByRole('button', { name: 'Live · synced 1 m ago' })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads "Syncing…" while the sync runs, then its label again', async () => {
+    let finish: (() => void) | undefined;
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
+      if (cmd === 'get_collab_live_status') return Promise.resolve({ ...base, state: 'connecting' });
+      if (cmd === 'collab_sync_now') return new Promise<void>((r) => { finish = r; });
+      return Promise.resolve(null);
+    }) as never);
+    renderPill();
+    fireEvent.click(await screen.findByRole('button', { name: 'Connecting…' }));
+    expect(await screen.findByRole('button', { name: 'Syncing…' })).toBeDisabled();
+    await act(async () => finish?.());
+    expect(await screen.findByRole('button', { name: 'Connecting…' })).toBeEnabled();
+  });
+
+  it('pill is disabled when collaboration is off', async () => {
+    mockStatus({ state: 'off', retryInSecs: null, since: NOW, storage: 'notSet', storageReason: null, watcherDegraded: false, networkVolume: false });
+    renderPill();
+    expect(await screen.findByRole('button', { name: 'Collaboration is off' })).toBeDisabled();
+  });
+
+  it('a failed Sync from the pill is a warning notification', async () => {
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
+      if (cmd === 'get_collab_live_status') return Promise.resolve(base);
+      if (cmd === 'collab_sync_now') return Promise.reject('The live exchange is not running');
+      return Promise.resolve(null);
+    }) as never);
+    renderPill();
+    fireEvent.click(await screen.findByRole('button', { name: /^Live · synced/ }));
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Sync now failed');
+  });
+
+  it('periodic-only goes to the pill title, not beside it', async () => {
+    mockStatus({ ...base, networkVolume: true });
+    renderPill();
+    const pill = await screen.findByRole('button', { name: /^Live · synced/ });
+    expect(pill.getAttribute('title')).toContain('Changes are seen by periodic check only');
+    expect(screen.queryByText('Changes are seen by periodic check only')).not.toBeInTheDocument();
+  });
+
+  it('keeps the folder-owner link after the pill, as a link button', async () => {
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
+      if (cmd === 'get_collab_live_status')
+        return Promise.resolve({ ...base, storage: 'unavailable', storageReason: 'other_device' });
+      if (cmd === 'get_collab_storage_status')
+        return Promise.resolve({ ...storageOk, state: 'unavailable', reason: 'other_device' });
+      return Promise.resolve(null);
+    }) as never);
+    render(
+      <MemoryRouter>
+        <NotificationProvider>
+          <DeviceReplaceProvider>
+            <CollabLiveStatus variant="pill" syncedAt={NOW} />
+          </DeviceReplaceProvider>
+        </NotificationProvider>
+      </MemoryRouter>,
+    );
+    const pill = await screen.findByRole('button', { name: /storage unavailable/ });
+    const link = await screen.findByRole('button', { name: 'Resolve the folder owner…' });
+    expect(link.className).toContain('text-accent');
+    expect(pill.compareDocumentPosition(link) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe('pill helpers', () => {
+  it('dotState maps each state to its dot', () => {
+    expect(dotState(base)).toBe('live');
+    expect(dotState({ ...base, storage: 'readOnly' })).toBe('warn');
+    expect(dotState({ ...base, storage: 'unavailable' })).toBe('error');
+    expect(dotState({ ...base, state: 'unreachable' })).toBe('error');
+    for (const state of ['connecting', 'reconnecting', 'signedOut', 'outdated', 'off'] as const) {
+      expect(dotState({ ...base, state })).toBe('offline');
+    }
+  });
+
+  it('pillLabel shows the synced age only while live with storage available', () => {
+    const t = Date.parse(NOW);
+    expect(pillLabel(base, 0, NOW, t + 59_000)).toBe('Live · synced 59 s ago');
+    expect(pillLabel(base, 0, NOW, t + 60_000)).toBe('Live · synced 1 m ago');
+    expect(pillLabel(base, 0, NOW, t - 5_000)).toBe('Live · synced 0 s ago');
+    expect(pillLabel(base, 0, null, t)).toBe('Live');
+    expect(pillLabel(base, 0, 'not a date', t)).toBe('Live');
+    expect(pillLabel({ ...base, storage: 'readOnly' }, 0, NOW, t)).toBe(
+      'Online · read-only storage (serving, not downloading)',
+    );
+    expect(pillLabel({ ...base, state: 'reconnecting', retryInSecs: 12 }, 2, NOW, t)).toBe('Reconnecting in 10 s');
   });
 });

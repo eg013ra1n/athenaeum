@@ -151,7 +151,7 @@ export default function FrameDrawer({
   const showExclusionSection = frame.excluded || (canModerate && frame.pubState === 'published');
 
   return (
-    <aside className="fixed inset-y-0 right-0 z-40 w-[26rem] max-w-[90vw] overflow-y-auto border-l border-border bg-surface-elevated p-4">
+    <aside aria-label="Frame details" className="fixed inset-y-0 right-0 z-40 w-[26rem] max-w-[90vw] overflow-y-auto border-l border-border bg-surface-elevated p-4">
       <div className="flex items-start justify-between gap-2">
         <h2 className="break-all font-mono text-sm text-content">{frame.fileName}</h2>
         <button

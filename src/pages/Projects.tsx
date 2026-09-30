@@ -1,4 +1,4 @@
-import { RefreshCw, Target, Users } from 'lucide-react';
+import { RefreshCw, Target } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useProjects } from '../hooks/useProjects';
 import { HistoryNav } from '../components/HistoryNav';
@@ -14,8 +14,7 @@ export default function Projects() {
     <div className="p-6 space-y-4">
       <div className="flex items-center gap-3">
         <HistoryNav />
-        <Users size={20} className="text-content-secondary" />
-        <h1 className="text-lg font-semibold text-content">Projects</h1>
+        <h2 className="text-2xl font-bold">Projects</h2>
         <div className="ml-auto">
           <CollabLiveStatus compact />
         </div>

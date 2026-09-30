@@ -8,8 +8,10 @@ import { Checkbox } from '../settings/Checkbox';
  * and auto-publishes this device's own passing frames on scan/analysis/
  * solve/link/threshold changes (`set_project_auto_publish`; the hub never
  * learns of it). Rendered for EVERY member in the Contribute tab header —
- * unlike `AutoReplicateBar`'s auto-download switch, it is not gated on
- * `canReceive` (a send-only member still publishes).
+ * unlike the auto-replicate toggle (`project/MetaLine`), it is not gated on
+ * `canReceive` (a send-only member still publishes). On the project page the
+ * header's `MetaLine` owns this preference too; this switch leaves the My
+ * frames header with the wave 5.5 My-frames rework.
  *
  * Saved then re-read — the parent's `onToggled` reloads the detail from the
  * catalog, so the rendered state is the stored one (S6), never optimistic.
