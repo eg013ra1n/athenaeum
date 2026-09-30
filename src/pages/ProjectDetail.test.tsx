@@ -762,5 +762,8 @@ function ownFrame(): ProjectFrameView {
     acceptedReason: null,
     contributorState: null,
     contributorReason: null,
+    receivedAt: null,
+    receivedFromDevice: null,
+    receivedFromMember: null,
   } as ProjectFrameView;
 }

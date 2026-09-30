@@ -1724,7 +1724,26 @@ night: string | null,
  * frame bound yet has no local frame to hang a chip off of — it never
  * gets one, by construction, not by an explicit "no chip" branch.
  */
-contributorState: string | null, contributorReason: string | null, };
+contributorState: string | null, contributorReason: string | null, 
+/**
+ * Non-own rows only (wave 2 Task 2, spec §7.2) — `finished_at` of the
+ * newest collab landing row for this frame (`sync_history` with
+ * `project = <this project> AND package_id IS NULL AND direction =
+ * 'received'`). `None` for an own row or one that never landed here.
+ */
+receivedAt: string | null, 
+/**
+ * That row's `peer_device` — a base64 device id, or `"local"` for a
+ * frame linked from content already on disk (no fetch).
+ */
+receivedFromDevice: string | null, 
+/**
+ * The member display name owning `received_from_device`, via the same
+ * device → member lookup `api::collab_live::surface::get_collab_frame_holders`
+ * uses. `None` for `"local"` and for a device this project's cached
+ * membership snapshot doesn't list.
+ */
+receivedFromMember: string | null, };
 
 export type FramesChangeKind = "newFrames" | "pendingFrames" | "approved" | "rejected" | "excluded" | "newVersions";
 

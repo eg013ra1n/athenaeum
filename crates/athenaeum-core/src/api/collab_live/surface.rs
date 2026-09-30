@@ -18,7 +18,7 @@ use crate::collab::live::holders::{
 };
 use crate::collab::live::meter::{FlowDirection, FlowView};
 use crate::collab::live::presence::PresenceBook;
-use crate::collab::snapshot::SnapshotMember;
+use crate::collab::snapshot::{member_of_device, SnapshotMember};
 use crate::collab::storage::deletions;
 use crate::collab::storage::marker::{
     check_store, offer_flags, read_marker, CheckOutcome, StoreMarker, StoreState, UnavailableReason,
@@ -527,17 +527,6 @@ pub fn list_collab_attention(
         not_kept,
         other_files,
     })
-}
-
-/// The project member whose `nodes` lists `device` — plain string
-/// membership: device ids are the base64 pubkeys, the same string in
-/// `SnapshotMember.nodes`, `collab_holder_devices.device` and presence.
-/// Reused by Tasks 8, 12 and 13.
-pub(crate) fn member_of_device<'a>(
-    members: &'a [SnapshotMember],
-    device: &str,
-) -> Option<&'a SnapshotMember> {
-    members.iter().find(|m| m.nodes.iter().any(|n| n == device))
 }
 
 /// Who holds one frame (spec 2026-09-29 §5.3) — the project page's frame

@@ -41,6 +41,9 @@ function frame(overrides: Partial<ProjectFrameView>): ProjectFrameView {
     medianSnr: null,
     contributorState: null,
     contributorReason: null,
+    receivedAt: null,
+    receivedFromDevice: null,
+    receivedFromMember: null,
     ...overrides,
   };
 }

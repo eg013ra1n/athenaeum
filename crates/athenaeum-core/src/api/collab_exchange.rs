@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::account::keys::{device_key_path, DeviceKey};
 use crate::api::{db, ApiError};
 use crate::collab::hub_client::CollabClient;
-use crate::collab::snapshot::{own_display_name, SnapshotMember};
+use crate::collab::snapshot::{member_of_device, own_display_name, SnapshotMember};
 use crate::db::collab_frames::{FrameOrigin, LocalFrameRow};
 use crate::events::ProgressEmitter;
 use crate::export::models::WbppExportConfig;
@@ -792,6 +792,19 @@ pub struct ProjectFrameView {
     /// gets one, by construction, not by an explicit "no chip" branch.
     pub contributor_state: Option<String>,
     pub contributor_reason: Option<String>,
+    /// Non-own rows only (wave 2 Task 2, spec §7.2) — `finished_at` of the
+    /// newest collab landing row for this frame (`sync_history` with
+    /// `project = <this project> AND package_id IS NULL AND direction =
+    /// 'received'`). `None` for an own row or one that never landed here.
+    pub received_at: Option<String>,
+    /// That row's `peer_device` — a base64 device id, or `"local"` for a
+    /// frame linked from content already on disk (no fetch).
+    pub received_from_device: Option<String>,
+    /// The member display name owning `received_from_device`, via the same
+    /// device → member lookup `api::collab_live::surface::get_collab_frame_holders`
+    /// uses. `None` for `"local"` and for a device this project's cached
+    /// membership snapshot doesn't list.
+    pub received_from_member: Option<String>,
 }
 
 /// What the live exchange knows about a frame beyond its catalog row: other
@@ -813,7 +826,12 @@ impl ProjectFrameView {
     /// this cache only ever writes it via `serde_json::to_string` of a
     /// decoded [`FrameViewWire`]) still returns a view, with those fields
     /// empty and a `warn!` — never a lost frame from the list.
-    fn from_local_row(row: LocalFrameRow, live: FrameLiveInfo, new_version_waiting: bool) -> Self {
+    fn from_local_row(
+        row: LocalFrameRow,
+        live: FrameLiveInfo,
+        new_version_waiting: bool,
+        received: Option<(String, String, Option<String>)>,
+    ) -> Self {
         let wire = parse_manifest_wire(
             &row.project_id,
             &row.frame_uuid,
@@ -856,6 +874,10 @@ impl ProjectFrameView {
             ),
             None => (0.0, None, None, None, None, None, None, None, None, None),
         };
+        let (received_at, received_from_device, received_from_member) = match received {
+            Some((at, dev, member)) => (Some(at), Some(dev), member),
+            None => (None, None, None),
+        };
         ProjectFrameView {
             frame_uuid: row.frame_uuid,
             file_name: row.file_name,
@@ -886,6 +908,9 @@ impl ProjectFrameView {
             night,
             contributor_state: None,
             contributor_reason: None,
+            received_at,
+            received_from_device,
+            received_from_member,
         }
     }
 }
@@ -909,7 +934,7 @@ pub fn list_project_frames_with(
     project_id: &str,
     live: impl Fn(&LocalFrameRow) -> FrameLiveInfo,
 ) -> Result<Vec<ProjectFrameView>, ApiError> {
-    let (rows, quarantined) = {
+    let (rows, quarantined, landed, members) = {
         let db = db(ctx)?;
         let conn = db.conn();
         let rows = crate::db::collab_frames::list_for_project(&conn, project_id)?;
@@ -918,7 +943,41 @@ pub fn list_project_frames_with(
                 .into_iter()
                 .map(|q| (q.frame_uuid, q.quarantined_version))
                 .collect();
-        (rows, quarantined)
+        // Wave 2 Task 2 (spec §7.2): the newest collab landing per frame —
+        // one query per list, never per row. `package_id IS NULL AND
+        // direction = 'received'` is what makes a `sync_history` row a
+        // collab landing rather than a personal-sync transfer.
+        let mut landed: HashMap<String, (String, String)> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT frame_uuid, finished_at, peer_device FROM sync_history
+                 WHERE project = ?1 AND package_id IS NULL AND direction = 'received'
+                   AND frame_uuid IS NOT NULL AND finished_at IS NOT NULL
+                 ORDER BY finished_at ASC",
+            )?;
+            let it = stmt.query_map([project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in it {
+                let (uuid, at, dev) = row?;
+                landed.insert(uuid, (at, dev)); // ASC order: the newest wins
+            }
+        }
+        // The device → member-name map, from the same cached membership
+        // snapshot `get_collab_frame_holders` reads (`member_of_device`).
+        let members: Vec<SnapshotMember> = crate::db::collab::get_project(&conn, project_id)?
+            .map(|p| {
+                serde_json::from_str(&p.members_json).unwrap_or_else(|e| {
+                    tracing::warn!(project_id, error = %e, "members_json unreadable; received-from names skipped");
+                    Vec::new()
+                })
+            })
+            .unwrap_or_default();
+        (rows, quarantined, landed, members)
     };
     Ok(rows
         .into_iter()
@@ -929,7 +988,21 @@ pub fn list_project_frames_with(
                 && quarantined
                     .get(&row.frame_uuid)
                     .is_some_and(|v| row.content_version > *v);
-            ProjectFrameView::from_local_row(row, info, new_version_waiting)
+            // "Received from" is a replica-only fact (spec §7.2) — an own
+            // row was produced locally, never landed.
+            let received = if row.origin == FrameOrigin::Own {
+                None
+            } else {
+                landed.get(&row.frame_uuid).map(|(at, dev)| {
+                    let member = if dev == "local" {
+                        None
+                    } else {
+                        member_of_device(&members, dev).map(|m| m.display_name.clone())
+                    };
+                    (at.clone(), dev.clone(), member)
+                })
+            };
+            ProjectFrameView::from_local_row(row, info, new_version_waiting, received)
         })
         .collect())
 }
@@ -2222,6 +2295,144 @@ mod tests {
             "UTC date of dateObs - 12h"
         );
         assert_eq!(f.publisher_account_id, "acc-alice");
+    }
+
+    /// Wave 2 Task 2 (spec §7.2): `received_at`/`received_from_device`/
+    /// `received_from_member` read the newest collab landing
+    /// (`sync_history` with `project = <p> AND package_id IS NULL AND
+    /// direction = 'received'`) for a non-own frame, resolving the device to
+    /// a member name through the same lookup `get_collab_frame_holders`
+    /// uses. A personal-sync row for the same uuid (`package_id` set) is
+    /// ignored even though it is newer; a `"local"` landing (no fetch) gives
+    /// a device but no member; a frame with no landing row, or an own row
+    /// with one anyway, gives all three fields `None`.
+    #[test]
+    fn list_project_frames_reads_received_from_landing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let device_sr = B64.encode(NODE_SR); // "SendRecv" per members_json()
+
+        let wire = |uuid: &str, own: bool| -> crate::collab::hub_client::FrameViewWire {
+            serde_json::from_value(serde_json::json!({
+                "frameUuid": uuid, "publisherAccountId": "acc-alice", "publisherDisplayName": "Alice",
+                "own": own, "fileName": format!("{uuid}.fits"), "contentVersion": 1, "blake3": "b".repeat(64),
+                "byteSize": 1, "xxh3": "0123456789abcdef", "filterRaw": "L", "filterCanonical": "L",
+                "channel": "mono", "exptimeSec": 300.0,
+                "gateVersion": 0, "accepted": true, "state": "published", "manifestVersion": 1,
+                "createdAt": "2026-07-13T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let landing = |uuid: &str,
+                       device: &str,
+                       project: Option<&str>,
+                       package_id: Option<&str>,
+                       finished_at: &str| {
+            crate::sync::HistoryRow {
+                frame_uuid: uuid.to_string(),
+                filename: format!("{uuid}.fits"),
+                object: None,
+                peer_device: device.to_string(),
+                direction: crate::sync::Direction::Received,
+                bytes: 1,
+                started_at: "2026-09-30T09:00:00Z".to_string(),
+                finished_at: Some(finished_at.to_string()),
+                outcome: "ingested".to_string(),
+                project: project.map(str::to_string),
+                package_id: package_id.map(str::to_string),
+                batch_name: None,
+            }
+        };
+
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            seed_project(&conn, "p-1", &members_json());
+            crate::db::collab_frames::upsert_from_manifest(&conn, "p-1", &wire("u-landed", false))
+                .unwrap();
+            crate::db::collab_frames::upsert_from_manifest(&conn, "p-1", &wire("u-local", false))
+                .unwrap();
+            crate::db::collab_frames::upsert_from_manifest(&conn, "p-1", &wire("u-never", false))
+                .unwrap();
+            crate::db::collab_frames::upsert_from_manifest(&conn, "p-1", &wire("u-own", true))
+                .unwrap();
+
+            // The collab landing `list_project_frames_with` must read.
+            crate::sync::store::insert_history_row(
+                &conn,
+                &landing(
+                    "u-landed",
+                    &device_sr,
+                    Some("p-1"),
+                    None,
+                    "2026-09-30T10:00:00Z",
+                ),
+            )
+            .unwrap();
+            // A personal-sync row for the same uuid — newer, but `package_id`
+            // is set, so it must be ignored.
+            crate::sync::store::insert_history_row(
+                &conn,
+                &landing(
+                    "u-landed",
+                    "some-other-device",
+                    None,
+                    Some("pkg"),
+                    "2026-09-30T11:00:00Z",
+                ),
+            )
+            .unwrap();
+            // A "local" landing (linked from disk already holding the
+            // content, no fetch): a device but never a member.
+            crate::sync::store::insert_history_row(
+                &conn,
+                &landing(
+                    "u-local",
+                    "local",
+                    Some("p-1"),
+                    None,
+                    "2026-09-30T09:01:00Z",
+                ),
+            )
+            .unwrap();
+            // An own row with a (spurious) landing row anyway must still
+            // read back `None` for all three fields.
+            crate::sync::store::insert_history_row(
+                &conn,
+                &landing(
+                    "u-own",
+                    &device_sr,
+                    Some("p-1"),
+                    None,
+                    "2026-09-30T10:00:00Z",
+                ),
+            )
+            .unwrap();
+        }
+
+        let views = list_project_frames(&ctx, "p-1").unwrap();
+        let by_uuid = |uuid: &str| views.iter().find(|v| v.frame_uuid == uuid).unwrap();
+
+        let v = by_uuid("u-landed");
+        assert_eq!(v.received_at.as_deref(), Some("2026-09-30T10:00:00Z"));
+        assert_eq!(v.received_from_device.as_deref(), Some(device_sr.as_str()));
+        assert_eq!(v.received_from_member.as_deref(), Some("SendRecv"));
+
+        let local = by_uuid("u-local");
+        assert_eq!(local.received_at.as_deref(), Some("2026-09-30T09:01:00Z"));
+        assert_eq!(local.received_from_device.as_deref(), Some("local"));
+        assert_eq!(local.received_from_member, None);
+
+        let never = by_uuid("u-never");
+        assert_eq!(never.received_at, None);
+        assert_eq!(never.received_from_device, None);
+        assert_eq!(never.received_from_member, None);
+
+        let own = by_uuid("u-own");
+        assert!(own.own);
+        assert_eq!(own.received_at, None);
+        assert_eq!(own.received_from_device, None);
+        assert_eq!(own.received_from_member, None);
     }
 
     /// The UTC date of `dateObs − 12 h` — the night boundary for a frame we

@@ -80,6 +80,24 @@ pub(crate) fn own_display_name(members: &[SnapshotMember], own_node: &NodeId) ->
         .unwrap_or_default()
 }
 
+/// The project member whose `nodes` lists `device` — plain string
+/// membership: device ids are the base64 pubkeys, the same string in
+/// `SnapshotMember.nodes`, `collab_holder_devices.device` and presence (no
+/// base64 decode, unlike [`member_node_ids`]).
+///
+/// Lives here (rather than in the render-gated `api::collab_live::surface`
+/// where it began) so the ungated per-frame views
+/// (`api::collab_exchange::list_project_frames_with`, wave 2 Task 2) can
+/// resolve a landing's device to a member name in the headless build too.
+/// Reused by `get_collab_frame_holders`, `get_collab_exchange` and
+/// `list_collab_receive_sessions`.
+pub(crate) fn member_of_device<'a>(
+    members: &'a [SnapshotMember],
+    device: &str,
+) -> Option<&'a SnapshotMember> {
+    members.iter().find(|m| m.nodes.iter().any(|n| n == device))
+}
+
 /// Verify the wire snapshot against the pinned hub pubkey and parse it.
 /// Every failure is a hard error — a snapshot that does not verify is never
 /// partially used.
