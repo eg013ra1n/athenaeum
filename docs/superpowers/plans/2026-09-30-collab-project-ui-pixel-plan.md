@@ -2748,7 +2748,7 @@ Expected: FAIL.
 - The trust checkbox moves into the table's `toolbarExtra` as `<Checkbox checked={trust} onChange={setTrust} label="Trust these publishers" size="sm" />`. Approve keeps `primary: true`, Reject is a default button.
 - `RejectDialog` renders
   `<DialogShell title={`Reject ${frames.length} ${frames.length === 1 ? 'frame' : 'frames'}`} onClose={onCancel} busy={busy} footer={<><Button onClick={onCancel} disabled={busy}>Cancel</Button><Button variant="dangerPrimary" disabled={!valid || busy} onClick={() => onReject(trimmed)}>{busy && <Loader2 size={12} className="animate-spin" />}Reject</Button></>}>`.
-  The body is a `<textarea>` with the field classes (`rounded border border-border bg-surface px-1.5 py-[3px] text-[12px]`, 4 rows, full width), the counter `text-[11px] text-content-faint` (red when over), and the too-long / empty messages as today. Its own Escape listener goes (`DialogShell` owns Escape and `busy`).
+  The body is a `<textarea data-autofocus>` (initial focus goes to the reason, never to the destructive Reject — ruling R12) with the field classes (`rounded border border-border bg-surface px-1.5 py-[3px] text-[12px]`, 4 rows, full width), the counter `text-[11px] text-content-faint` (red when over), and the too-long / empty messages as today. Its own Escape listener goes (`DialogShell` owns Escape and `busy`).
 - Result lines `text-[12.5px]`; errors `text-error`.
 
 - [ ] **Step 4: Run the tests and the typecheck**
@@ -2996,7 +2996,7 @@ For every one of them:
 - replace buttons with `Button` (Cancel/Close → default; the main action → `primary`; destructive → `dangerPrimary`), selects and text inputs with `Select` / `TextInput`, checkboxes with `Checkbox`;
 - set body text to 12.5 px `content-muted` (inherited), notes to `text-[11.5px] text-content-faint`, errors to `text-[12.5px] text-error`.
 
-Keep every behaviour: the busy locks (`busy` prop), `ExcludeDialog`'s outcome line, `DeviceReplaceDialog`'s `escapeClosesAsNotNow`, and `ProjectExportDialog`'s cancel-export wiring. For `DeviceReplaceDialog`, pass `onClose={() => close(escapeClosesAsNotNow)}` so Escape keeps its meaning.
+Initial focus (ruling R12): a dialog with a text field puts `data-autofocus` on that field (Exclude's reason, Filter mapping's first select, Link's search); a destructive primary (`dangerPrimary`) never carries `data-autofocus` — with no field, it goes on Cancel. Keep every behaviour: the busy locks (`busy` prop), `ExcludeDialog`'s outcome line, `DeviceReplaceDialog`'s `escapeClosesAsNotNow`, and `ProjectExportDialog`'s cancel-export wiring. For `DeviceReplaceDialog`, pass `onClose={() => close(escapeClosesAsNotNow)}` so Escape keeps its meaning.
 
 `PublishConfirmDialog` body:
 
