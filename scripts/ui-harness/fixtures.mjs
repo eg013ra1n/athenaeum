@@ -61,10 +61,10 @@ export function buildFixtures(scenario = 'default') {
     members: MEMBERS.map((m) => ({ displayName: m.name, dataRole: (m.data || m.role) === 'Contributor' ? 'send' : 'send_receive', coordinator: m.role === 'Coordinator' })),
     thresholdsVersion: 3,
     thresholds: [
-      { metricKey: 'fwhm', op: 'lte', value: 3.0 },
+      { metricKey: 'fwhm_arcsec', op: 'lte', value: 3.0 },
       { metricKey: 'eccentricity', op: 'lte', value: 0.55 },
-      { metricKey: 'stars', op: 'gte', value: 150 },
-      { metricKey: 'trailed', op: 'reject_if', value: true },
+      { metricKey: 'stars_detected', op: 'gte', value: 150 },
+      { metricKey: 'not_trailed', op: 'reject_if', value: true },
     ],
     links: [{ framesSetId: 1, name: 'M31 · 2026 autumn', lightCount: FRAMES.filter((f) => f.own).length, distanceDeg: 0.12, withinRadius: true }],
     portalBase: 'https://portal.example',
@@ -90,10 +90,10 @@ export function buildFixtures(scenario = 'default') {
     receivedFromMember: !f.own && f.mine === 'have' ? MBY[f.publisher].name : null,
   });
   const rulesOf = (f) => [
-    { metricKey: 'fwhm', label: 'FWHM', value: `${f.fwhm.toFixed(2)}″`, needs: '≤ 3.00″', pass: f.fwhm <= 3 },
+    { metricKey: 'fwhm_arcsec', label: 'FWHM', value: `${f.fwhm.toFixed(2)}″`, needs: '≤ 3.00″', pass: f.fwhm <= 3 },
     { metricKey: 'eccentricity', label: 'eccentricity', value: f.ecc.toFixed(2), needs: '≤ 0.55', pass: f.ecc <= 0.55 },
-    { metricKey: 'stars', label: 'stars', value: String(f.stars), needs: '≥ 150', pass: f.stars >= 150 },
-    { metricKey: 'trailed', label: 'trailed', value: 'no', needs: 'not trailed', pass: true },
+    { metricKey: 'stars_detected', label: 'stars', value: String(f.stars), needs: '≥ 150', pass: f.stars >= 150 },
+    { metricKey: 'not_trailed', label: 'trailed', value: 'no', needs: 'not trailed', pass: true },
   ];
   const ownRow = (f) => ({
     frameId: f.id, frameUuid: uuid(f), fileName: f.name, setId: 1, setName: f.set, night: f.night, filter: f.filter,
