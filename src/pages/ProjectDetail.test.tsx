@@ -1213,7 +1213,7 @@ describe('ProjectDetail project switch', () => {
 });
 
 describe('ProjectDetail presence (collab-peers-changed)', () => {
-  it('a burst of events collapses to one library/member reload after 1s, and one own-frames reload after 5s', async () => {
+  it('a burst of events schedules from the FIRST event (schedule-if-none-pending, not a debounce that restarts)', async () => {
     renderProjectDetail();
     await screen.findByRole('tab', { name: 'Overview' });
     await waitFor(() => expect(listeners['collab-peers-changed']?.length ?? 0).toBeGreaterThan(0));
@@ -1224,8 +1224,10 @@ describe('ProjectDetail presence (collab-peers-changed)', () => {
 
     vi.useFakeTimers();
     try {
-      // Three events, all within 300ms of each other (here: the same instant,
-      // which is well within the window) — the debounce must collapse them.
+      // Three events within 300ms. Fix round 1 (Important): while a timer is
+      // pending, further events are ABSORBED — they must not reset it, or a
+      // steady stream (the core's `PeerBurst` while a transfer keeps landing
+      // frames) would never let it fire.
       fire('collab-peers-changed', { projectId: 'proj-1' });
       await act(async () => {
         await vi.advanceTimersByTimeAsync(100);
@@ -1236,15 +1238,16 @@ describe('ProjectDetail presence (collab-peers-changed)', () => {
       });
       fire('collab-peers-changed', { projectId: 'proj-1' });
 
-      // Just under 1s since the LAST event: nothing yet.
+      // Just under 1s since the FIRST event (200ms elapsed so far + 799ms):
+      // nothing yet — the later two events did not push the timer out.
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(999);
+        await vi.advanceTimersByTimeAsync(799);
       });
       expect(invokeCount('list_collab_frames')).toBe(lib0);
       expect(invokeCount('get_collab_member_summary')).toBe(mem0);
       expect(invokeCount('list_project_own_frames')).toBe(own0);
 
-      // 1s since the last event: the library + member reload fires exactly once.
+      // 1s since the FIRST event: the library + member reload fires exactly once.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1);
       });
@@ -1252,13 +1255,64 @@ describe('ProjectDetail presence (collab-peers-changed)', () => {
       expect(invokeCount('get_collab_member_summary')).toBe(mem0 + 1);
       expect(invokeCount('list_project_own_frames')).toBe(own0);
 
-      // 5s since the last event: the own-frames gate read fires exactly once,
-      // and the earlier reload did not fire again.
+      // 5s since the FIRST event: the own-frames gate read fires exactly
+      // once, and the earlier reload did not fire again.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(4000);
       });
       expect(invokeCount('list_project_own_frames')).toBe(own0 + 1);
       expect(invokeCount('list_collab_frames')).toBe(lib0 + 1);
+      expect(invokeCount('get_collab_member_summary')).toBe(mem0 + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fix round 1 (Important): a steady ~1Hz stream (as during a transfer) does not freeze — library reloads keep landing and own-frames lands near 5s and 10s', async () => {
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    await waitFor(() => expect(listeners['collab-peers-changed']?.length ?? 0).toBeGreaterThan(0));
+
+    const lib0 = invokeCount('list_collab_frames');
+    const own0 = invokeCount('list_project_own_frames');
+
+    vi.useFakeTimers();
+    try {
+      // 12 events, one every 1000ms, each landing right after the previous
+      // second's due timers have fired — the core's PeerBurst shape while a
+      // transfer keeps landing frames at a peer. Under the OLD trailing
+      // debounce (restarts on every event) neither timer would ever fire.
+      // Under the schedule-if-none-pending throttle: the 1s timer re-arms
+      // every second (12 reloads in 12s), and the 5s timer re-arms once it
+      // fires, landing at t=5000 and t=10000 — twice in 12s, not zero times.
+      for (let i = 0; i < 12; i++) {
+        fire('collab-peers-changed', { projectId: 'proj-1' });
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1000);
+        });
+      }
+
+      expect(invokeCount('list_collab_frames')).toBe(lib0 + 12);
+      expect(invokeCount('list_project_own_frames')).toBe(own0 + 2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fix round 1 (minor): with the Members tab active, one event calls get_collab_member_summary exactly once — not once from the shell and once from MembersTab', async () => {
+    renderProjectDetail();
+    await openTab(/^Members/);
+    await screen.findByText('No members yet.');
+    await waitFor(() => expect(listeners['collab-peers-changed']?.length ?? 0).toBeGreaterThan(0));
+
+    const mem0 = invokeCount('get_collab_member_summary');
+
+    vi.useFakeTimers();
+    try {
+      fire('collab-peers-changed', { projectId: 'proj-1' });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
       expect(invokeCount('get_collab_member_summary')).toBe(mem0 + 1);
     } finally {
       vi.useRealTimers();

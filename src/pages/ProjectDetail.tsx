@@ -229,21 +229,35 @@ function ProjectPage({ id }: { id: string | undefined }) {
     void loadMembers();
   }, [loadMembers]);
 
-  // Presence/holder changes (core: `collab-peers-changed`, throttled to one
-  // per project per second). Loaders are read through refs so the listener
-  // can subscribe once per project (StrictMode-safe, CLAUDE.md pattern) with
-  // `id` as the effect's only real dependency — it never changes across this
-  // component's life (`ProjectDetail` keys `ProjectPage` on it). Each event
-  // restarts both trailing windows, so a burst collapses to one reload each:
-  // `loadLibrary` + `loadMembers` (+ the `MembersTab` refresh token) after
-  // `PEERS_RELOAD_MS`, and the expensive `loadOwn` gate read after the
-  // longer `OWN_RELOAD_MS`.
+  // Presence/holder changes (core: `collab-peers-changed`). Loaders are read
+  // through refs so the listener can subscribe once per project
+  // (StrictMode-safe, CLAUDE.md pattern) with `id` as the effect's only real
+  // dependency — it never changes across this component's life
+  // (`ProjectDetail` keys `ProjectPage` on it).
+  //
+  // Fix round 1 (Important, controller-ruled): this used to be a trailing
+  // debounce that RESTARTED on every event. The core's `PeerBurst` sends one
+  // of these per project roughly every second for as long as a transfer
+  // keeps landing frames at a peer (every landed frame is a new holder) — a
+  // restarting debounce would never let the 5s `ownTimer` fire at all for
+  // the whole length of a transfer, freezing My frames, and the 1s
+  // `peersTimer` would race the next event forever. Both are now
+  // schedule-if-none-pending throttles, the same shape as the core's
+  // `PeerBurst`: an event schedules a timer only when none is already
+  // pending; further events while one is pending are absorbed (they do NOT
+  // reset it); a fired timer clears its own pending marker so the next event
+  // schedules again. A burst still collapses to one reload each.
   const loadLibraryRef = useRef(loadLibrary);
   loadLibraryRef.current = loadLibrary;
   const loadMembersRef = useRef(loadMembers);
   loadMembersRef.current = loadMembers;
   const loadOwnRef = useRef(loadOwn);
   loadOwnRef.current = loadOwn;
+  // Latest `activeTab` (set below, after it's computed) — fix round 1 minor:
+  // when the Members tab is mounted it already reloads itself off the
+  // `refreshToken` bump via its own `onMembers`, so calling `loadMembers`
+  // here too would double the `get_collab_member_summary` call.
+  const activeTabRef = useRef<Tab>('overview');
 
   useEffect(() => {
     if (!id) return;
@@ -254,16 +268,20 @@ function ProjectPage({ id }: { id: string | undefined }) {
     api
       .listen<CollabPeersChanged>('collab-peers-changed', (p) => {
         if (cancelled || p.projectId !== id) return;
-        if (peersTimer !== undefined) clearTimeout(peersTimer);
-        peersTimer = setTimeout(() => {
-          void loadLibraryRef.current();
-          void loadMembersRef.current();
-          setMembersRefresh((n) => n + 1);
-        }, PEERS_RELOAD_MS);
-        if (ownTimer !== undefined) clearTimeout(ownTimer);
-        ownTimer = setTimeout(() => {
-          void loadOwnRef.current();
-        }, OWN_RELOAD_MS);
+        if (peersTimer === undefined) {
+          peersTimer = setTimeout(() => {
+            peersTimer = undefined;
+            void loadLibraryRef.current();
+            if (activeTabRef.current !== 'members') void loadMembersRef.current();
+            setMembersRefresh((n) => n + 1);
+          }, PEERS_RELOAD_MS);
+        }
+        if (ownTimer === undefined) {
+          ownTimer = setTimeout(() => {
+            ownTimer = undefined;
+            void loadOwnRef.current();
+          }, OWN_RELOAD_MS);
+        }
       })
       .then((fn) => {
         if (cancelled) fn();
@@ -362,6 +380,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   ];
   const requested = resolveTab(storedTab) ?? 'overview';
   const activeTab: Tab = tabs.includes(requested) ? requested : 'overview';
+  activeTabRef.current = activeTab;
   const badge: Partial<Record<Tab, { n: number; cls: string }>> = {
     mine: { n: own === null ? 0 : readyCount, cls: 'bg-accent/20 text-accent' },
     library: { n: toCome, cls: 'bg-accent/20 text-accent' },
