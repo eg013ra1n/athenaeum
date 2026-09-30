@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { Loader2 } from 'lucide-react';
 import { api } from '../../../api';
 import { useNotifications } from '../../../contexts/NotificationContext';
 import type { AnalysisCompleteEvent } from '../../../types/helpers';
 import type { LinkedSetView, OwnFrameRow } from '../../../types/models';
-import { Button, SegmentTiles } from '../../ui';
+import { Button, EmptyState, SegmentTiles } from '../../ui';
 import FilterMappingDialog from '../FilterMappingDialog';
 import LinkObjectDialog from '../LinkObjectDialog';
 import ExcludeDialog from './ExcludeDialog';
@@ -36,6 +37,9 @@ export interface MyFramesTabProps {
   /** The frame whose side panel is open — its row takes the active state. */
   activeKey?: string | null;
 }
+
+/** The mockup's tile-row button box: 33 px tall, min 150, 7x14 padding, radius 6. */
+const ROW_BTN = 'h-[33px] min-w-[150px] justify-center !rounded-md !px-3.5 !py-[7px]';
 
 /**
  * My frames — the three Ready/Published/Held back tables of the redesigned
@@ -257,35 +261,39 @@ export default function MyFramesTab({
   ];
 
   return (
-    <div className="space-y-4">
-      {error && <p className="text-[12.5px] text-error">Could not load your frames — see console.</p>}
+    <div>
+      {error && <p className="mb-2.5 text-[12.5px] text-error">Could not load your frames — see console.</p>}
+
+      <div className="mb-2.5 flex flex-wrap items-center gap-2">
+        {rows !== null && (
+          <SegmentTiles
+            tiles={[
+              { value: 'ready', n: readyRows.length, label: 'Ready to publish', tone: 'accent' },
+              { value: 'published', n: publishedRows.length, label: 'Published', tone: 'success' },
+              { value: 'held', n: heldRows.length, label: 'Held back', tone: 'warning' },
+            ]}
+            value={segment}
+            onChange={onSegment}
+          />
+        )}
+        <span className="flex-1" />
+        <Button className={ROW_BTN} onClick={() => setLinkOpen(true)}>+ Link an object</Button>
+        <Button
+          className={ROW_BTN}
+          onClick={() => onRequestRepublish(null)}
+          disabled={!canRepublish || republishBusy}
+          title="Regenerate every one of your published frames as a new content version"
+        >
+          {republishBusy && <Loader2 size={12} className="animate-spin" />}
+          Recalibrate and republish all
+        </Button>
+      </div>
 
       {rows === null ? (
-        <p className="text-sm text-content-muted">Loading…</p>
+        <EmptyState>Loading…</EmptyState>
       ) : (
         <>
-          <div className="mb-2.5 flex flex-wrap items-start gap-2">
-            <SegmentTiles
-              tiles={[
-                { value: 'ready', n: readyRows.length, label: 'Ready to publish', tone: 'accent' },
-                { value: 'published', n: publishedRows.length, label: 'Published', tone: 'success' },
-                { value: 'held', n: heldRows.length, label: 'Held back', tone: 'warning' },
-              ]}
-              value={segment}
-              onChange={onSegment}
-            />
-            <span className="flex-1" />
-            <Button onClick={() => setLinkOpen(true)}>+ Link an object</Button>
-            <Button
-              onClick={() => onRequestRepublish(null)}
-              disabled={!canRepublish || republishBusy}
-              title="Regenerate every one of your published frames as a new content version"
-            >
-              Recalibrate and republish all
-            </Button>
-          </div>
-
-          {republishError && <p className="text-[12.5px] text-error">{republishError}</p>}
+          {republishError && <p className="mb-2.5 text-[12.5px] text-error">{republishError}</p>}
           {refusal}
 
           {segment === 'ready' && (

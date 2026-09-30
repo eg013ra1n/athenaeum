@@ -141,6 +141,40 @@ describe('MyFramesTab — segments', () => {
     expect(screen.getByRole('button', { name: 'Publish all 2' }).className).toContain('bg-accent');
   });
 
+  it('Recalibrate and republish all is disabled without published frames, spins while busy', () => {
+    const { unmount } = renderTab({ canRepublish: false });
+    expect(screen.getByRole('button', { name: 'Recalibrate and republish all' })).toBeDisabled();
+    unmount();
+    renderTab({ canRepublish: true, republishBusy: true });
+    const b = screen.getByRole('button', { name: 'Recalibrate and republish all' });
+    expect(b).toBeDisabled();
+    expect(b.querySelector('.animate-spin')).not.toBeNull();
+  });
+
+  it('while loading, no tiles but the Link button stays; both buttons use the 33 px box', () => {
+    renderTab({ rows: null });
+    expect(screen.queryByRole('button', { name: /Ready to publish/ })).toBeNull();
+    expect(screen.getByText('Loading…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '+ Link an object' }).className).toContain('h-[33px]');
+  });
+
+  it('the link dialog lists a linked set once, and Unlink sends linked:false', async () => {
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
+      Promise.resolve(
+        cmd === 'list_collab_link_suggestions'
+          ? [{ framesSetId: 1, name: 'M31', lightCount: 40, withinRadius: true, distanceDeg: 0, alreadyLinked: true }]
+          : null,
+      )) as never);
+    renderTab({ links: [{ framesSetId: 1, name: 'M31', lightCount: 40, withinRadius: true }] as never });
+    fireEvent.click(screen.getByRole('button', { name: '+ Link an object' }));
+    await screen.findByRole('button', { name: 'Unlink' });
+    expect(screen.getAllByText('M31')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Unlink' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('set_collab_link', { projectId: 'proj-1', framesSetId: 1, linked: false }),
+    );
+  });
+
   it('the link dialog lists the linked objects with their target state', async () => {
     vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
       Promise.resolve(cmd === 'list_collab_link_suggestions' ? [] : null)) as never);

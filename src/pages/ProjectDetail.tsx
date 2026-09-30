@@ -492,12 +492,12 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const refusal = (
     <>
       {publishing.publishError && publishIds === null && (
-        <p className="text-sm text-error">{publishing.publishError}</p>
+        <p className="mb-2.5 text-[12.5px] text-error">{publishing.publishError}</p>
       )}
       {publishing.refusedBy && !c.publishingHere && (
         <div
           data-testid="publishing-refusal"
-          className="flex flex-wrap items-center gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-content"
+          className="mb-2.5 flex flex-wrap items-center gap-2 rounded border border-warning/40 bg-warning-muted px-2.5 py-2 text-[12px] text-content"
         >
           <span className="break-words">{`${leading(publishing.refusedBy)} publishes new frames to this project.`}</span>
           {switchButton}

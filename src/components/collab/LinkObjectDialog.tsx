@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, Link2, X } from 'lucide-react';
+import { Link2, X } from 'lucide-react';
 import { api } from '../../api';
-import { Chip } from '../ui';
+import { Button, Chip } from '../ui';
 import type { LinkSuggestion, LinkedSetView } from '../../types/models';
 
 /**
@@ -11,14 +11,14 @@ import type { LinkSuggestion, LinkedSetView } from '../../types/models';
  */
 export default function LinkObjectDialog({
   projectId,
-  links = [],
+  links,
   onClose,
   onChanged,
 }: {
   projectId: string;
   /** The project's current links — listed read-only above the suggestions
-   *  (unlinking stays on each suggestion's Linked button). */
-  links?: LinkedSetView[];
+   *  (each row carries Unlink). */
+  links: LinkedSetView[];
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -39,14 +39,10 @@ export default function LinkObjectDialog({
     void load();
   }, [load]);
 
-  const toggle = async (s: LinkSuggestion) => {
-    setBusy(s.framesSetId);
+  const setLinked = async (framesSetId: number, linked: boolean) => {
+    setBusy(framesSetId);
     try {
-      await api.invoke('set_collab_link', {
-        projectId,
-        framesSetId: s.framesSetId,
-        linked: !s.alreadyLinked,
-      });
+      await api.invoke('set_collab_link', { projectId, framesSetId, linked });
       await load();
       onChanged();
     } catch (err) {
@@ -96,13 +92,22 @@ export default function LinkObjectDialog({
                   ) : (
                     <Chip tone="warn">outside the target</Chip>
                   )}
+                  <Button
+                    variant="link"
+                    size="sm"
+                    className="ml-auto"
+                    disabled={busy === l.framesSetId}
+                    onClick={() => void setLinked(l.framesSetId, false)}
+                  >
+                    Unlink
+                  </Button>
                 </li>
               ))}
             </ul>
           </div>
         )}
         <ul className="space-y-1">
-          {suggestions.map((s) => (
+          {suggestions.filter((s) => !s.alreadyLinked).map((s) => (
             <li
               key={s.framesSetId}
               className="flex items-center gap-2 rounded border border-border px-3 py-2 text-sm"
@@ -123,25 +128,15 @@ export default function LinkObjectDialog({
                 <span className="flex-shrink-0 text-xs text-content-muted">no center</span>
               )}
               <button
-                onClick={() => void toggle(s)}
+                onClick={() => void setLinked(s.framesSetId, true)}
                 disabled={busy === s.framesSetId}
-                className={`ml-auto flex-shrink-0 inline-flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors disabled:opacity-50 ${
-                  s.alreadyLinked
-                    ? 'border border-border text-content-secondary hover:bg-surface-hover'
-                    : 'bg-accent text-surface hover:bg-accent-hover'
-                }`}
+                className="ml-auto flex-shrink-0 inline-flex items-center gap-1 rounded bg-accent px-2 py-1 text-xs text-surface transition-colors hover:bg-accent-hover disabled:opacity-50"
               >
-                {s.alreadyLinked ? (
-                  <>
-                    <Check size={12} /> Linked
-                  </>
-                ) : (
-                  'Link'
-                )}
+                Link
               </button>
             </li>
           ))}
-          {suggestions.length === 0 && (
+          {suggestions.every((s) => s.alreadyLinked) && (
             <li className="py-2 text-sm text-content-muted">No frame sets to link yet.</li>
           )}
         </ul>
