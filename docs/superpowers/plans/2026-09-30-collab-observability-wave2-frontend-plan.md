@@ -16,36 +16,48 @@ indicator all read that provider. `ProjectDetail.tsx` shrinks to a shell: header
 orchestration. Each tab is its own component under `src/components/collab/project/`.
 
 **Tech Stack:** React 18 + TypeScript, Tailwind design tokens, `lucide-react`, vitest + Testing Library. Rust
-(`athenaeum-core`, Tauri command, Axum route) for Tasks 1–2 only.
+(`athenaeum-core`, Tauri command, Axum route) for Tasks 1–4 only.
 
 **Spec:** `docs/superpowers/specs/2026-09-29-collab-project-observability-design.md` (§4, §5.5, §6.4, §7.3, §8, §10
 frontend, §13 amendments). **Visual reference:** `docs/superpowers/research/2026-09-29-collab-project-layout-mockup.html`
 (open it in a browser; its `COLS`, `GROUPS`, `TABLES`, `peerRow`, `liveHtml` and the Overview/Members renderers are
-the layout contract). Where the mockup shows ZP, Download, Stop keeping, Exclude or Ask to exclude, this plan wins
+the layout contract). Where the mockup shows ZP, Download, Stop keeping or Ask to exclude, this plan wins
 (see Scope rulings).
 
-## Scope rulings (owner, 2026-09-30, before this plan)
+## Scope rulings (owner, 2026-09-30, two rounds before execution)
 
 - **Publish acts on the selection.** `publish_collab_frames` gains an optional `frameIds` (Task 1, both hosts). With
   no selection, the primary action publishes the whole *filtered view*, and those ids are always sent explicitly.
-- **Not built this cycle** (no backend exists; exclusion needs the hub): **Exclude** (coordinator), **Ask to
-  exclude**, **Download**, **Stop keeping** for held frames. They are not rendered, not even disabled. They are
-  recorded in `docs/superpowers/open-items.md` (Task 16).
-- **Republish stays project-wide** ("Recalibrate and republish all", existing command, unchanged). The Published
-  table therefore has no selection actions.
-- **Library actions:** **Keep again** on `not_kept` frames (`keep_collab_frames_again`, existing). `CollabAttention`
-  stays above the Library table. It owns changed files, deletion choices and last-copy warnings.
+- **Republish acts on the selection too** (`republish_collab_frames { projectId, frameIds? }`, Task 1). "Recalibrate
+  and republish all" stays. **Every republish goes through a guard dialog, so nobody re-announces 100 TB with one
+  click** (Task 16): the dialog states the frame count and the total size of what will be regenerated. For "all", or
+  a selection above `REPUBLISH_TYPED_CONFIRM_ABOVE = 100` frames, the Republish button stays disabled until the user
+  types the exact frame count.
+- **Exclude and Restore (coordinator) are built.** The hub already has `PATCH /projects/{id}/frames/{uuid}`
+  (`accepted=false` + reason 1..=500 chars / `accepted=true`, cap `data.moderate`). Task 3 adds the core client and
+  the `exclude_collab_frame` / `restore_collab_frame` commands on both hosts. UI: an `Exclude` action (reason
+  required) in Published and Library for a coordinator, and Exclude/Restore in the drawer.
+- **Not built this cycle:**
+  - **Ask to exclude** (contributor request) needs a hub mechanism.
+  - **Download** and **Stop keeping** per frame need a new core model: a per-frame want/unwant override on top of the
+    replication policy, plus replica deletion.
+
+  Neither is rendered, not even disabled. Both are recorded in `docs/superpowers/open-items.md` (Task 18) with a
+  short design note.
+- **Library actions:** **Keep again** on `not_kept` frames (`keep_collab_frames_again`, existing), plus **Exclude** for
+  a coordinator. `CollabAttention` stays above the Library table. It owns changed files, deletion choices and
+  last-copy warnings.
 - **Moderation actions:** **Approve** (primary, with the existing "Trust this publisher" choice) and **Reject** (one
   reason for all selected), looping the existing per-frame commands.
 - **No ZP column anywhere** (spec §13.3).
 - **The page no longer calls `evaluate_collab_gate`.** Held back's per-Reason actions work from the group's own rows
   (`OwnFrameRow.failures[].kind`, `setId`, `setName`), which is more precise than project-wide blockers. The frame
   set's Project block still uses the gate (untouched). Spec §5.1's "evaluate_collab_gate stays" still holds for that
-  consumer; recorded as an amendment in Task 16.
-- **Drawer gate section** lists the frame's failures (✕ text, from `failures[]`). A passing frame reads
-  "✓ passes all N rules". There is no client-side re-evaluation of thresholds (one derivation, in the core). The
-  drawer shows no local path for own frames: `OwnFrameRow` carries none. It shows the object (set) name with an
-  "Open object" link instead. Both are amendments, recorded in Task 16.
+  consumer; recorded as an amendment in Task 18.
+- **Drawer gate section is rule-by-rule, as the spec says** (`rule · value · needs · ✓/✕`). The verdicts come from the
+  core (Task 4 adds `rules[]` to `FrameGateRow`, produced inside `evaluate_frame` itself, one derivation, and carried
+  on `OwnFrameRow`). Precondition failures (no analysis, no coordinates, not calibrated…) are listed above the rules.
+  **The drawer shows the frame's local path** (Task 4 adds `path` to `OwnFrameRow`).
 - **"Received <date> from <member>"** needs data the frontend cannot read today (`list_sync_history` now excludes
   collab landings). Task 2 adds three read-only fields to `ProjectFrameView`.
 
@@ -78,23 +90,23 @@ the layout contract). Where the mockup shows ZP, Download, Stop keeping, Exclude
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and
   `Claude-Session: https://claude.ai/code/session_015RRpMcroNShaEgp8Q33fR3`.
 - Frontend gate per task: `npx tsc --noEmit` clean + `npx vitest run <the task's test files>` green. Final gate
-  (Task 16): `npm test` (the whole vitest suite), `npx tsc --noEmit`, `cargo check --workspace`,
+  (Task 18): `npm test` (the whole vitest suite), `npx tsc --noEmit`, `cargo check --workspace`,
   `cargo test -p athenaeum-core` (all targets; run `collab_live` live tests alone with `--test-threads=2` if they
   flake under load — known machine note).
 
 ## Review Focus
 
 1. **Empty project** (no linked sets, or zero rows in a segment). Every tab and segment shows its empty-state
-   sentence, not a header-only table, and every action is disabled (`Publish all 0` is disabled). Pinned in Task 8
-   and Task 5.
+   sentence, not a header-only table, and every action is disabled (`Publish all 0` is disabled). Pinned in Task 10
+   and Task 7.
 2. **Missing values** (`night` null, `camera` `""`/null, null metrics). They group under "Unknown night" / "Unknown
-   camera", sort after real values in both directions, and are ignored by medians. Pinned in Task 3 and Task 4.
+   camera", sort after real values in both directions, and are ignored by medians. Pinned in Task 5 and Task 6.
 3. **Selection outliving its rows.** After a publish, the published rows leave Ready. The selection is pruned to the
-   keys that still exist, and the action label never counts vanished rows. Pinned in Task 5.
+   keys that still exist, and the action label never counts vanished rows. Pinned in Task 7.
 4. **Exchange events naming a device the snapshot never named.** The row shows the short device id immediately. The
-   snapshot is refetched once (not per event) and the name then appears. Pinned in Task 6.
+   snapshot is refetched once (not per event) and the name then appears. Pinned in Task 8.
 5. **Stale deep links** persisted in notification history (`?tab=receive`, `?tab=contribute`). They land on Library /
-   My frames rather than silently falling back to Overview. Pinned in Task 14.
+   My frames rather than silently falling back to Overview. Pinned in Task 16.
 
 ---
 
@@ -102,8 +114,10 @@ the layout contract). Where the mockup shows ZP, Download, Stop keeping, Exclude
 
 | File | Responsibility |
 | ---- | ---- |
-| `crates/athenaeum-core/src/api/collab.rs` (modify) | `publish_collab_frames` takes `frame_ids: Option<&[i64]>`; `run_publish` filters the gate rows to it. |
-| `crates/athenaeum-tauri/src/commands/collab.rs`, `crates/athenaeum-web/src/routes/collab.rs` (modify) | `frameIds` arg on both hosts. |
+| `crates/athenaeum-core/src/api/collab.rs` (modify) | `publish_collab_frames` / `republish_collab_frames` take `frame_ids: Option<&[i64]>`; `run_publish` filters the gate rows to it; `exclude_collab_frame` / `restore_collab_frame`; `OwnFrameRow.rules/path/accepted`. |
+| `crates/athenaeum-core/src/collab/hub_client.rs` (modify) | `set_frame_acceptance` (`PATCH /projects/{id}/frames/{uuid}`). |
+| `crates/athenaeum-core/src/collab/gate.rs` (modify) | `RuleVerdict`; `FrameGateRow.rules` produced by `evaluate_frame`. |
+| `crates/athenaeum-tauri/src/{commands/collab.rs,lib.rs}`, `crates/athenaeum-web/src/routes/{collab.rs,mod.rs}` (modify) | `frameIds` on publish/republish; exclude/restore commands registered on both hosts. |
 | `crates/athenaeum-core/src/api/collab_exchange.rs` (modify) | `ProjectFrameView.receivedAt / receivedFromDevice / receivedFromMember`. |
 | `src/types/models.ts` (regenerated) | ts-rs output for the two Rust changes. |
 | `src/components/collab/format.ts` (modify) | + `formatDuration`, `formatRate`, `formatRelative`. |
@@ -112,7 +126,9 @@ the layout contract). Where the mockup shows ZP, Download, Stop keeping, Exclude
 | `src/components/collab/project/table/ProjectFrameTable.tsx` (new) | The one table component (facet row, group row, totals strip, windowed body, selection). |
 | `src/components/collab/exchange/state.ts` (new) | Pure exchange reducer (snapshot/progress/clear, names, rate history, totals). |
 | `src/contexts/CollabExchangeContext.tsx` (new) | App-root provider + `useCollabExchange()`. Mounted in `Layout.tsx`. |
-| `src/components/collab/project/FrameDrawer.tsx` (new) | Right-side drawer: identity, metrics, gate, holders, provenance. |
+| `src/components/collab/project/FrameDrawer.tsx` (new) | Right-side drawer: identity + path, metrics, rule-by-rule gate, exclusion, holders, provenance. |
+| `src/components/collab/project/ExcludeDialog.tsx` (new) | Reason-required exclusion of one or more frames (coordinator). |
+| `src/components/collab/project/RepublishGuardDialog.tsx` (new) | Scale-stating republish confirm; typed count for "all" or > 100 frames. |
 | `src/components/collab/project/ReasonGroupAction.tsx` (new, replaces `GateBlockers.tsx`) | The per-Reason fix button on Held back group headers. |
 | `src/components/collab/project/MyFramesTab.tsx` (new) | Segments Ready / Published / Held back + linked objects + solve/analyze/map orchestration. |
 | `src/components/collab/project/LibraryTab.tsx` (new, replaces `ReceiveTab.tsx`) | Other members' frames; attention, export, keep-again. |
@@ -128,19 +144,22 @@ the layout contract). Where the mockup shows ZP, Download, Stop keeping, Exclude
 
 ---
 
-### Task 1: Core — publish a selection (`frameIds`), both hosts
+### Task 1: Core — publish and republish a selection (`frameIds`), both hosts
 
 **Files:**
 - Modify: `crates/athenaeum-core/src/api/collab.rs` (`publish_collab_frames` ≈3968, `run_publish` ≈4057, tests module ≈9097)
 - Modify: `crates/athenaeum-tauri/src/commands/collab.rs:125-137`
-- Modify: `crates/athenaeum-web/src/routes/collab.rs:288-298`
-- Modify: every other caller of `publish_collab_frames(` (grep the workspace; tests pass `None`)
+- Modify: `crates/athenaeum-web/src/routes/collab.rs:288-310` (publish + republish routes)
+- Modify: every other caller of `publish_collab_frames(` / `republish_collab_frames(` (grep the workspace; tests pass `None`)
 
 **Interfaces:**
 - Produces: `pub async fn publish_collab_frames(ctx: &ServiceContext, project_id: &str, frame_ids: Option<&[i64]>, emitter: Option<Arc<dyn ProgressEmitter>>) -> Result<PublishResult, ApiError>`. Frontend: `api.invoke<PublishResult>('publish_collab_frames', { projectId, frameIds })`, where `frameIds: number[] | null`.
+- Produces: `pub async fn republish_collab_frames(ctx, project_id: &str, frame_ids: Option<&[i64]>, emitter) -> Result<PublishResult, ApiError>`. Frontend: `api.invoke<PublishResult>('republish_collab_frames', { projectId, frameIds })`.
 - Semantics: `Some(ids)` restricts the run to gate rows whose `frame_id` is in `ids`. Rows outside the selection
   are neither candidates nor `heldBack`. An id that is not a gate row of the project is ignored. `None` keeps
-  today's behaviour. Republish and auto-publish always pass `None`.
+  today's behaviour. Auto-publish always passes `None`. Republish walks the same gate candidates (`force = true`
+  turns an own row into an `Update`), so one filter serves both commands. One consequence must be pinned by a test:
+  a republish restricted to published frames never announces an unselected ready frame.
 
 - [ ] **Step 1: Write the failing test** (in the `mod` that holds `publish_writes_once_into_the_collab_folder_and_seeds_by_reference`, same fixture helpers):
 
@@ -178,7 +197,27 @@ the layout contract). Where the mockup shows ZP, Download, Stop keeping, Exclude
             assert_eq!((res.announced, res.updated), (0, 0), "{res:?}");
             assert!(res.held_back.is_empty(), "{:?}", res.held_back);
         }
+
+        /// A republish of a selection regenerates only the selected published
+        /// frame and never announces an unselected, still-ready one.
+        #[tokio::test]
+        async fn republish_with_frame_ids_touches_only_the_selection() {
+            let fx = fixture(3).await;
+            mount_hub(&fx.server, "published").await;
+            let first = [fx.frame_ids[0], fx.frame_ids[1]];
+            publish_collab_frames(&fx.ctx, PID, Some(&first), None).await.unwrap();
+
+            let pick = [fx.frame_ids[0]];
+            let res = republish_collab_frames(&fx.ctx, PID, Some(&pick), None)
+                .await
+                .unwrap();
+            assert_eq!(res.announced, 0, "the ready frame 2 must not be announced: {res:?}");
+            assert_eq!(res.updated + res.unchanged, 1, "{res:?}");
+        }
 ```
+
+  (`republish_forces_regeneration_but_respects_identical_output` shows how the hub mock answers a version post; mount
+  the same mocks here if the update path needs them.)
 
 - [ ] **Step 2: Run it and watch it fail to compile** (arity):
   `cargo test -p athenaeum-core --lib publish_with_frame_ids -- --nocapture` → error `this function takes 3 arguments but 4 were supplied`.
@@ -198,7 +237,9 @@ pub async fn publish_collab_frames(
 }
 ```
 
-  `auto_publish_collab_frames` and `republish_collab_frames` pass `None` for the new argument. Change
+  `republish_collab_frames` gets the same new `frame_ids: Option<&[i64]>` parameter (after `project_id`) and passes it
+  through as `run_publish(ctx, project_id, emitter, true, frame_ids, None)`. `auto_publish_collab_frames` passes
+  `None`. Change
   `run_publish`'s signature to `(ctx, project_id, emitter, force: bool, only: Option<&[i64]>, after_split:
   AfterSplit<'_>)`, and update the three test call sites (`run_publish(&fx.ctx, PID, None, false, None,
   Some(&hook))`). Right after the gate block (`let (project, gated, binding) = { … };`), insert:
@@ -257,8 +298,8 @@ pub struct PublishArgs {
 }
 ```
 
-  and use `Json(args): Json<PublishArgs>` with `api::publish_collab_frames(&state.ctx, &args.project_id,
-  args.frame_ids.as_deref(), Some(emitter))`. Add a web deserialization unit test beside the existing route tests
+  and use `Json(args): Json<PublishArgs>` in both the publish and the republish route, passing
+  `args.frame_ids.as_deref()`. The Tauri `republish_collab_frames` gains `frame_ids: Option<Vec<i64>>` the same way. Add a web deserialization unit test beside the existing route tests
   (or at the bottom of the file under `#[cfg(test)]`):
 
 ```rust
@@ -272,9 +313,9 @@ fn publish_args_read_camel_case_frame_ids() {
 }
 ```
 
-- [ ] **Step 4: Run.** `cargo test -p athenaeum-core --lib publish_with -- --nocapture` → both PASS.
+- [ ] **Step 4: Run.** `cargo test -p athenaeum-core --lib with_frame_ids -- --nocapture` and `… --lib empty_selection` → all PASS.
   `cargo test -p athenaeum-web publish_args` → PASS. `cargo check --workspace` → clean.
-- [ ] **Step 5: Commit** `feat(collab): publish a selection of frames (frameIds) on both hosts`.
+- [ ] **Step 5: Commit** `feat(collab): publish and republish a selection of frames (frameIds) on both hosts`.
 
 ---
 
@@ -351,7 +392,178 @@ fn publish_args_read_camel_case_frame_ids() {
 
 ---
 
-### Task 3: Pure table model
+### Task 3: Core — Exclude and Restore a frame (coordinator), both hosts
+
+**Files:**
+- Modify: `crates/athenaeum-core/src/collab/hub_client.rs` (beside `reject_frame` ≈652)
+- Modify: `crates/athenaeum-core/src/api/collab.rs` (beside `reject_collab_frame` ≈5812; tests beside `approve_then_sync_marks_published` ≈8039)
+- Modify: `crates/athenaeum-core/src/api/mod.rs` if `api::` re-exports the collab commands by name
+- Modify: `crates/athenaeum-tauri/src/commands/collab.rs`, `crates/athenaeum-tauri/src/lib.rs` (`invoke_handler![]`)
+- Modify: `crates/athenaeum-web/src/routes/collab.rs`, `crates/athenaeum-web/src/routes/mod.rs` (`build_router`)
+
+**Interfaces:**
+- Produces (core): `CollabClient::set_frame_acceptance(&self, token: &str, project_id: &str, frame_uuid: &str, accepted: bool, reason: Option<&str>) -> Result<(), AccountClientError>`, which sends `PATCH /projects/{id}/frames/{uuid}` with body `{"accepted": false, "acceptedReason": "<reason>"}` or `{"accepted": true}` and accepts 200 or 204; `pub async fn exclude_collab_frame(ctx: &ServiceContext, project_id: &str, frame_uuid: &str, reason: String) -> Result<(), ApiError>`; `pub async fn restore_collab_frame(ctx: &ServiceContext, project_id: &str, frame_uuid: &str) -> Result<(), ApiError>`.
+- Produces (frontend): `api.invoke('exclude_collab_frame', { projectId, frameUuid, reason })`, `api.invoke('restore_collab_frame', { projectId, frameUuid })`.
+- Rules: the reason is trimmed and must be 1..=500 **characters** (`chars().count()`, the hub's own rule, which
+  differs from reject's byte rule), validated before any hub call → `ApiError::Invalid("an exclusion reason of 1 to
+  500 characters is required")`. Signed out → `ApiError::SignedOut("Sign in to moderate frames.")`. The project must
+  be live (`collab_exchange::live_project`). Hub errors map through the existing `client_err` (a 403 surfaces as the
+  hub's text). After success: `tracing::info!(project_id, frame_uuid, "excluded frame")` / `"restored frame"`, then a
+  best-effort `sync_manifest` exactly like approve/reject (a failure is a `warn!`, not the command's error).
+
+- [ ] **Step 1: Write the failing tests** (wiremock, the `approve_then_sync_marks_published` pattern):
+
+```rust
+    #[tokio::test]
+    async fn exclude_sends_the_patch_then_syncs_the_manifest() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("PATCH"))
+            .and(wm_path("/api/v1/projects/p-1/frames/u1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "accepted": false, "acceptedReason": "wrong target"
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/projects/p-1/manifest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projectVersion": 3, "rows": [], "hasMore": false, "next": null
+            })))
+            .mount(&server)
+            .await;
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+        }
+        exclude_collab_frame(&ctx, "p-1", "u1", "  wrong target  ".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_sends_accepted_true_without_a_reason() {
+        // same shape: body_json({"accepted": true}), 200, expect(1)
+    }
+
+    #[tokio::test]
+    async fn exclude_refuses_an_empty_or_overlong_reason_before_the_hub() {
+        let (_tmp, ctx) = test_ctx();
+        let empty = exclude_collab_frame(&ctx, "p-1", "u1", "   ".into()).await.unwrap_err();
+        assert!(matches!(empty, ApiError::Invalid(_)), "{empty:?}");
+        let long = exclude_collab_frame(&ctx, "p-1", "u1", "é".repeat(501)).await.unwrap_err();
+        assert!(matches!(long, ApiError::Invalid(_)), "{long:?}");
+        // 500 multi-byte characters are allowed (character rule, not bytes):
+        // assert through a mounted hub that "é".repeat(500) reaches the PATCH.
+    }
+```
+
+  Write the restore test out in full, same shape as the exclude test. For the 500-character case, mount a PATCH mock
+  with `.expect(1)` and assert `Ok`.
+- [ ] **Step 2: Run** `cargo test -p athenaeum-core --lib exclude_ restore_sends` → compile failure.
+- [ ] **Step 3: Implement** the client method (mirror `reject_frame`: `self.http.patch(...)`, `bearer_auth`,
+  `json`, `classify` on any other status), the two api functions, the two Tauri commands
+  (`#[tauri::command] #[tracing::instrument(skip_all, err)] pub async fn exclude_collab_frame(state, project_id:
+  String, frame_uuid: String, reason: String)` / `restore_collab_frame(state, project_id, frame_uuid)`,
+  `.map_err(|e| e.to_string())` like their neighbours), register both in `invoke_handler![]`, and mirror both as Axum
+  routes with `#[derive(Deserialize)] #[serde(rename_all = "camelCase")]` arg structs (`ExcludeArgs { project_id,
+  frame_uuid, reason }`, reuse the existing frame-uuid args struct for restore if there is one), registered in
+  `build_router` beside `approve_collab_frame`. Add a web deserialization unit test for `ExcludeArgs` reading
+  `{"projectId":"p","frameUuid":"u","reason":"r"}`.
+- [ ] **Step 4: Run** the three core tests → PASS; `cargo test -p athenaeum-web exclude_args` → PASS;
+  `cargo check --workspace` → clean.
+- [ ] **Step 5: Commit** `feat(collab): coordinator excludes and restores a frame on both hosts`.
+
+---
+
+### Task 4: Core — rule-by-rule gate verdicts, frame path and acceptance on `OwnFrameRow`
+
+**Files:**
+- Modify: `crates/athenaeum-core/src/collab/gate.rs` (`FrameGateRow` ≈123, `evaluate_frame` ≈146, its tests)
+- Modify: `crates/athenaeum-core/src/api/collab.rs` (`OwnFrameRow` ≈1531 and `list_project_own_frames`' builder)
+- Modify: `crates/athenaeum-core/src/ts_export.rs` (register `RuleVerdict`)
+- Regenerate: `src/types/models.ts`
+
+**Interfaces:**
+- Produces:
+
+```rust
+/// One threshold rule's verdict for one frame (spec 2026-09-29 §4.1 drawer:
+/// rule · value · needs · ✓/✕). Produced inside `evaluate_frame`, in the same
+/// loop that writes the failure texts — never a second evaluation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleVerdict {
+    pub metric_key: String,
+    /// "FWHM", "eccentricity", "stars", "trailed", else the metric key.
+    pub label: String,
+    /// The frame's value, formatted like the failure text ("3.42″", "500",
+    /// "no"/"yes" for trailed); `None` when the input is missing.
+    pub value: Option<String>,
+    /// "≤ 3.00″", "≥ 200", "not trailed".
+    pub needs: String,
+    /// `None` = not evaluated (missing input — the precondition failure
+    /// already blocks the frame).
+    pub pass: Option<bool>,
+}
+```
+
+  `FrameGateRow` gains `pub rules: Vec<RuleVerdict>` (one entry per rule `evaluate_frame` understood; an unknown
+  metric, op or non-numeric value is still skipped with its existing `warn!` and gets no entry). `OwnFrameRow` gains
+  `pub rules: Vec<RuleVerdict>` (copied from its gate row), `pub path: Option<String>` (the source light's catalog
+  file path, the `files` row the frame belongs to, read in the same batch query that fills `night`/`camera`) and
+  `pub accepted: Option<bool>` (announced frames only: the manifest row's `accepted`; `Some(false)` = excluded).
+  TS: `RuleVerdict`, `FrameGateRow.rules`, `OwnFrameRow.rules/path/accepted`.
+- Formatting follows the failure texts: an `lte` rule value/needs with 2 decimals and the unit (`3.42″`, `≤ 3.00″`),
+  a `gte` rule with 0 decimals (`500`, `≥ 200`). `not_trailed` gives value `yes`/`no` and needs `not trailed`.
+
+- [ ] **Step 1: Write the failing tests** in `gate.rs`'s test module (use its existing input/rule builders):
+
+```rust
+    #[test]
+    fn evaluate_frame_reports_a_verdict_per_rule() {
+        let rules = vec![rule("fwhm_arcsec", "lte", json!(3.0)), rule("stars_detected", "gte", json!(200)), rule("not_trailed", "reject_if", json!(true))];
+        let row = evaluate_frame(&input_with(/* fwhm 3.42″ after scale, 500 stars, not trailed */), &target(), &rules);
+        assert_eq!(row.rules.len(), 3);
+        assert_eq!((row.rules[0].label.as_str(), row.rules[0].value.as_deref(), row.rules[0].needs.as_str(), row.rules[0].pass), ("FWHM", Some("3.42″"), "≤ 3.00″", Some(false)));
+        assert_eq!((row.rules[1].value.as_deref(), row.rules[1].needs.as_str(), row.rules[1].pass), (Some("500"), "≥ 200", Some(true)));
+        assert_eq!((row.rules[2].value.as_deref(), row.rules[2].needs.as_str(), row.rules[2].pass), (Some("no"), "not trailed", Some(true)));
+        assert_eq!(row.failures, vec!["FWHM 3.42″ > 3.00″".to_string()]); // texts unchanged
+    }
+
+    #[test]
+    fn a_rule_without_its_input_is_listed_but_not_evaluated() {
+        let rules = vec![rule("fwhm_arcsec", "lte", json!(3.0))];
+        let row = evaluate_frame(&input_without_analysis(), &target(), &rules);
+        assert_eq!((row.rules[0].value.as_deref(), row.rules[0].pass), (None, None));
+    }
+
+    #[test]
+    fn an_unknown_metric_gets_no_verdict() {
+        let rules = vec![rule("zero_point", "gte", json!(20))];
+        assert!(evaluate_frame(&input_with(/* any */), &target(), &rules).rules.is_empty());
+    }
+```
+
+  Adapt the builder names to the ones the module already has. Add missing tiny helpers in the test module. In
+  `collab.rs` tests, extend the existing `list_project_own_frames` test to assert that a ready frame carries
+  `path == Some(<the seeded light's path>)` and `rules.len() == <the project's rule count>`, and that an announced own
+  row carries `accepted == Some(true)`.
+- [ ] **Step 2: Run** `cargo test -p athenaeum-core --lib collab::gate` → FAIL.
+- [ ] **Step 3: Implement.** In `evaluate_frame`, push a `RuleVerdict` in each rule branch where the failure text is
+  decided today. `pass = Some(!failed)` when the metric exists, else `None` with `value: None`. Keep every failure
+  string byte-identical (other tests pin them). Fix every `FrameGateRow { … }` literal the compiler flags (add
+  `rules: vec![]`). Fill the three `OwnFrameRow` fields in `list_project_own_frames`.
+- [ ] **Step 4: Regenerate TS and run.** `TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract`, then
+  `cargo test -p athenaeum-core --lib collab::gate list_project_own_frames` → PASS, `cargo test -p athenaeum-core
+  --test ts_contract` → PASS, `npx tsc --noEmit` → fix any TS literal of `FrameGateRow`/`OwnFrameRow` in tests
+  (`rules: []`, `path: null`, `accepted: null`).
+- [ ] **Step 5: Commit** `feat(collab): gate verdict per rule, frame path and acceptance on own frames`.
+
+---
+
+### Task 5: Pure table model
 
 **Files:**
 - Create: `src/components/collab/project/table/model.ts`
@@ -832,7 +1044,7 @@ export function windowSlice(scrollTop: number, viewportH: number, total: number,
 
 ---
 
-### Task 4: Frame view-model, columns, groups, table configs + formatters
+### Task 6: Frame view-model, columns, groups, table configs + formatters
 
 **Files:**
 - Modify: `src/components/collab/format.ts` (+ `formatDuration`, `formatRate`, `formatRelative`)
@@ -840,7 +1052,7 @@ export function windowSlice(scrollTop: number, viewportH: number, total: number,
 - Test: `src/components/collab/project/frames.test.tsx`, `src/components/collab/format.test.ts` (create if absent)
 
 **Interfaces:**
-- Consumes: Task 3 types; `OwnFrameRow`, `ProjectFrameView`, `ModerationFrameView`, `InFlightView` from `models.ts`.
+- Consumes: Task 5 types; `OwnFrameRow`, `ProjectFrameView`, `ModerationFrameView`, `InFlightView` from `models.ts`.
 - Produces:
 
 ```ts
@@ -865,6 +1077,7 @@ export interface FrameVM {
   failures: { kind: string; text: string }[];
   contentVersion: number | null;
   pubState: string | null;        // pending | published | rejected
+  excluded: boolean;              // accepted === false (coordinator exclusion)
   acceptedReason: string | null;
   holdersOnline: number | null;
   holdersTotal: number | null;    // OTHER member devices (core doc) — see copies()
@@ -897,8 +1110,11 @@ export function formatRelative(iso: string, now: number): string; // 'just now' 
 ```
 
 Rules the mappers implement (and the tests pin):
+- `excluded`: own → `accepted === false`; library → `!accepted`; moderation → `false`. The Status column and the
+  `status` group read `excluded` (reason on the chip's `title`) before `pubState`. Every table's name cell appends a
+  muted `excluded` chip to an excluded frame.
 - `fromOwn`: `disk` from `localState`: `own_held` → `on`, `own_missing` → `missing`, `own_changed` → `changed`, else
-  `null`. `states` by segment: held → the distinct `failures[].kind` values; published → `[pubState ?? 'published']`
+  `null`. `states` by segment: held → the distinct `failures[].kind` values; published → `[excluded ? 'excluded' : pubState ?? 'published']`
   plus `'single'` when `copies === 1` plus `'disk'` when `disk` is `missing`/`changed`; ready → `[]`. `camera` null →
   `''`.
 - `fromLibrary`: `device` from `localState`: `held` → `have`; `wanted` → `downloading` if the frame uuid is in
@@ -941,7 +1157,7 @@ Columns (ids → label, width, numeric; `cell` / `renderAggregate` follow the mo
 Groups (`GROUPS`): `night` (key `night ?? ''`, label = date + weekday `2026-09-29 · Tue`, `''` → `Unknown night`, order
 `nightOrderDesc`), `filter` (dot + name, `filterOrder`), `camera` (`''` → `Unknown camera`, alpha), `object` (key
 `setName ?? ''`, `''` → `No object`, alpha), `reason` (key `failures[0]?.kind ?? ''`, label `REASON_LABEL[k]`,
-`reasonOrder`), `status` (key `pubState ?? 'published'`, alpha), `publisher` (key `publisher ?? ''`, alpha), `none`
+`reasonOrder`), `status` (key `excluded ? 'excluded' : pubState ?? 'published'`, alpha), `publisher` (key `publisher ?? ''`, alpha), `none`
 (label `None`; never passed to `buildTree`: it means "no level").
 
 `REASON_LABEL`: analyze "No analysis", solve "No coordinates or pixel scale", linkCalibration "Not calibrated — no
@@ -955,7 +1171,7 @@ the target".
 export const TABLES: Record<TableId, TableConfig> = {
   ready: { id: 'ready', columns: ['name', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'size'], defaultColumns: ['name', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'size'], groupings: ['night', 'filter', 'camera', 'object', 'none'], defaultGrouping: ['night', 'filter'], stateFacet: null, publisherFacet: false },
   held: { id: 'held', columns: ['name', 'reason', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'size'], defaultColumns: ['name', 'reason', 'night', 'filter', 'exp', 'fwhm', 'ecc', 'stars'], groupings: ['reason', 'night', 'filter', 'camera', 'object', 'none'], defaultGrouping: ['reason', 'night'], stateFacet: { label: 'Reason', options: BLOCKER_ORDER.map((k) => [k, REASON_LABEL[k]]) }, publisherFacet: false },
-  published: { id: 'published', columns: ['name', 'night', 'filter', 'camera', 'exp', 'version', 'status', 'holders', 'disk', 'publishedAt', 'fwhm', 'ecc', 'size'], defaultColumns: ['name', 'filter', 'exp', 'version', 'status', 'holders', 'disk', 'publishedAt', 'size'], groupings: ['night', 'filter', 'status', 'camera', 'none'], defaultGrouping: ['night', 'filter'], stateFacet: { label: 'Status', options: [['published', 'Published'], ['pending', 'Pending approval'], ['rejected', 'Rejected'], ['single', 'Only one copy'], ['disk', 'Not on disk / changed']] }, publisherFacet: false },
+  published: { id: 'published', columns: ['name', 'night', 'filter', 'camera', 'exp', 'version', 'status', 'holders', 'disk', 'publishedAt', 'fwhm', 'ecc', 'size'], defaultColumns: ['name', 'filter', 'exp', 'version', 'status', 'holders', 'disk', 'publishedAt', 'size'], groupings: ['night', 'filter', 'status', 'camera', 'none'], defaultGrouping: ['night', 'filter'], stateFacet: { label: 'Status', options: [['published', 'Published'], ['pending', 'Pending approval'], ['rejected', 'Rejected'], ['excluded', 'Excluded'], ['single', 'Only one copy'], ['disk', 'Not on disk / changed']] }, publisherFacet: false },
   library: { id: 'library', columns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'holders', 'device', 'size'], defaultColumns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'holders', 'device', 'size'], groupings: ['publisher', 'filter', 'camera', 'night', 'none'], defaultGrouping: ['publisher', 'filter'], stateFacet: { label: 'On this device', options: (['have', 'downloading', 'queued', 'missing', 'notKept', 'needsChoice', 'changed', 'notReplicated'] as DeviceState[]).map((k) => [k, DEVICE_LABEL[k]]) }, publisherFacet: true },
   moderation: { id: 'moderation', columns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'size', 'submitted'], defaultColumns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr'], groupings: ['publisher', 'night', 'filter', 'camera', 'none'], defaultGrouping: ['publisher', 'night'], stateFacet: null, publisherFacet: true },
 };
@@ -1004,6 +1220,12 @@ it('fromModeration fills manifest-only metrics when the mirror has the frame', (
   const vm = fromModeration(m, new Map([['u9', lib({ frameUuid: 'u9', night: '2026-09-29', camera: 'QHY268M', eccentricity: 0.4 })]]));
   expect([vm.night, vm.camera, vm.ecc, vm.submittedAt]).toEqual(['2026-09-29', 'QHY268M', 0.4, '2026-09-30T08:00:00Z']);
 });
+it('an excluded own frame reads as excluded in Status and in the state facet', () => {
+  const vm = fromOwn(own({ segment: 'published', pubState: 'published', accepted: false, acceptedReason: 'wrong target', localState: 'own_held', holdersTotal: 2 }));
+  expect(vm.excluded).toBe(true);
+  expect(vm.states).toContain('excluded');
+  expect(GROUPS.status.key(vm)).toBe('excluded');
+});
 it('no table offers a ZP column', () => {
   for (const t of Object.values(TABLES)) expect(t.columns).not.toContain('zp');
 });
@@ -1023,14 +1245,14 @@ it('no table offers a ZP column', () => {
 
 ---
 
-### Task 5: `ProjectFrameTable` component
+### Task 7: `ProjectFrameTable` component
 
 **Files:**
 - Create: `src/components/collab/project/table/ProjectFrameTable.tsx`
 - Test: `src/components/collab/project/table/ProjectFrameTable.test.tsx`
 
 **Interfaces:**
-- Consumes: Task 3 model, Task 4 `FrameVM`, `COLUMNS`, `GROUPS`, `FRAME_ACCESS`, `TABLES`, `TableId`.
+- Consumes: Task 5 model, Task 6 `FrameVM`, `COLUMNS`, `GROUPS`, `FRAME_ACCESS`, `TABLES`, `TableId`.
 - Produces:
 
 ```ts
@@ -1179,7 +1401,7 @@ it('a null metric sorts after real values', () => {
 
 ---
 
-### Task 6: Exchange state + app-root provider
+### Task 8: Exchange state + app-root provider
 
 **Files:**
 - Create: `src/components/collab/exchange/state.ts`, `src/contexts/CollabExchangeContext.tsx`
@@ -1287,55 +1509,86 @@ it('totals sum rates by direction', () => {
 
 ---
 
-### Task 7: Frame drawer
+### Task 9: Frame drawer + `ExcludeDialog`
 
 **Files:**
-- Create: `src/components/collab/project/FrameDrawer.tsx`
-- Test: `src/components/collab/project/FrameDrawer.test.tsx`
+- Create: `src/components/collab/project/FrameDrawer.tsx`, `src/components/collab/project/ExcludeDialog.tsx`
+- Test: `src/components/collab/project/FrameDrawer.test.tsx`, `src/components/collab/project/ExcludeDialog.test.tsx`
 
 **Interfaces:**
-- Consumes: `FrameVM` (Task 4), `FrameHolderView`, `ThresholdRuleView`, `formatTimestamp`, `formatBytes`.
-- Produces: `export default function FrameDrawer({ projectId, frame, ruleCount, onClose }: { projectId: string; frame: FrameVM; ruleCount: number; onClose: () => void }): JSX.Element`.
+- Consumes: `FrameVM` (Task 6), `FrameHolderView`, `RuleVerdict` (Task 4), `formatTimestamp`, `formatBytes`; the
+  commands of Task 3.
+- Produces:
+  - `export default function FrameDrawer({ projectId, frame, coordinator, onClose, onChanged }: { projectId: string; frame: FrameVM; coordinator: boolean; onClose: () => void; onChanged: () => void }): JSX.Element`
+  - `export default function ExcludeDialog({ projectId, frames, onClose, onDone }: { projectId: string; frames: FrameVM[]; onClose: () => void; onDone: (excluded: number) => void }): JSX.Element`,
+    which Tasks 10 and 11 reuse for the table action.
 
-Content (a fixed right panel `w-[26rem] max-w-[90vw] border-l border-border bg-surface-elevated`, over the page, a
-close button with `aria-label="Close"`; Escape closes via a `keydown` listener on `document`):
+`ExcludeDialog`: a modal (the page's existing modal markup) titled `Exclude N frames from the project`. It has a
+required reason `<textarea>` (trimmed, 1..=500 characters, a live `N / 500` counter; Exclude disabled outside the
+range) and the note `Excluded frames stop counting toward the project and are no longer exchanged. You can restore
+them from the frame's panel.` Exclude invokes `exclude_collab_frame { projectId, frameUuid, reason }` for each frame
+in turn. On the first failure it stops, logs `console.error('[exclude] failed:', err)` and shows `Excluded K of N —
+<message>` inline, then calls `onDone(K)`. All succeeding calls `onDone(N)`, then `onClose()`.
+
+Drawer content (a fixed right panel `w-[26rem] max-w-[90vw] border-l border-border bg-surface-elevated`, over the
+page, a close button with `aria-label="Close"`; Escape closes via a `keydown` listener on `document`):
 1. **Identity:** file name, filter dot + filter (`(unmapped)` suffix when `!filterMapped`), camera (`Unknown camera`
    for `''`), night, exposure, size, publisher (library/moderation), object (own) with a `Link` "Open object" to
-   `/objects/${setId}` when `setId`.
+   `/objects/${setId}` when `setId`, and for own frames the **local path** (`own.path`, monospace, `break-all`, with
+   a copy button that uses `navigator.clipboard.writeText` inside try/catch + `console.error`).
 2. **Metrics:** FWHM″, Ecc, Stars, SNR (`—` when null).
-3. **Gate** (own frames): `failures.length === 0` → `✓ passes all ${ruleCount} rules` (`text-success`), else each
-   failure `✕ {text}` (`text-error`) in order. Own published frames also show version `v{contentVersion}`,
-   `Published {formatTimestamp(publishedAt)}` and `lastError` in `text-error` when present.
-4. **Who holds it** (when `frameUuid`): invoke `get_collab_frame_holders { projectId, frameUuid }` on open and on
-   `frameUuid` change (a cancelled flag guards the late answer). Loading → `Loading holders…`; error →
-   `console.error('[drawer] holders failed:', err)` + `Could not load holders.` in `text-error`; empty → `Nobody else
-   holds it yet.`; rows → online dot (`bg-success` / `bg-border`), `memberName ?? 'Unknown member'`, `deviceName ??
-   deviceShort`, `publisher` chip when `isPublisher`, `v{contentVersion}` muted.
-5. **Provenance** (library frames with `lib.receivedAt`): `Received {formatTimestamp(receivedAt)} from {X}` where X =
-   `receivedFromMember`, else `this device's files` when `receivedFromDevice === 'local'`, else the device's first
+3. **Gate** (own frames):
+   - first the precondition failures: the `failures` whose `kind !== 'threshold'`, each `✕ {text}` in `text-error`;
+   - then a rules table from `own.rules`, with columns `Rule · Value · Needs · ✓/✕`: `pass === true` → `✓` in
+     `text-success`, `false` → `✕` in `text-error`, `null` → `—` muted with the title `not evaluated — see above`;
+   - no rules → `No quality rules set.`
+   - Own published frames also show version `v{contentVersion}`, `Published {formatTimestamp(publishedAt)}` and
+     `lastError` in `text-error` when present.
+4. **Exclusion** (announced frames): when `excluded`, a warning box `Excluded — {acceptedReason}`. When
+   `coordinator`, a `Restore` button there (invokes `restore_collab_frame`, then `onChanged()`; a failure goes to
+   `console.error` and inline `text-error`). When `coordinator && !excluded && pubState === 'published'`, an
+   `Exclude…` button opens `ExcludeDialog` for this one frame, whose `onDone` calls `onChanged()`.
+5. **Who holds it** (when `frameUuid`): invoke `get_collab_frame_holders { projectId, frameUuid }` on open and on
+   `frameUuid` change (a cancelled flag guards the late answer).
+   - Loading → `Loading holders…`.
+   - Error → `console.error('[drawer] holders failed:', err)` + `Could not load holders.` in `text-error`.
+   - Empty → `Nobody else holds it yet.`
+   - Rows → online dot (`bg-success` / `bg-border`), `memberName ?? 'Unknown member'`, `deviceName ?? deviceShort`,
+     a `publisher` chip when `isPublisher`, `v{contentVersion}` muted.
+6. **Provenance** (library frames with `lib.receivedAt`): `Received {formatTimestamp(receivedAt)} from {X}`, where X
+   is `receivedFromMember`, else `this device's files` when `receivedFromDevice === 'local'`, else the device's first
    8 chars.
 
-- [ ] **Step 1: Write the failing tests:** (a) an own held frame lists both failure texts and no "passes";
-  (b) an own ready frame reads `✓ passes all 3 rules`; (c) holders load and show `Kostya`, `kostya-obs`, a
-  `publisher` chip; an unknown member reads `Unknown member` with the short id; (d) a failed holders call shows
-  `Could not load holders.`; (e) Escape calls `onClose`; (f) a received library frame reads `Received 2026-09-30
-  10:00:00 from Olga` (use the `formatTimestamp` output format of the repo; assert with `getByText(/Received .* from
-  Olga/)`).
+- [ ] **Step 1: Write the failing tests:**
+  - (a) An own held frame lists its precondition failure (`no analysis`) and a rules table where FWHM reads `3.42″ ·
+    ≤ 3.00″ · ✕` and stars read `500 · ≥ 200 · ✓`.
+  - (b) A rule with `pass: null` shows `—`.
+  - (c) An own frame shows its path.
+  - (d) Holders load and show `Kostya`, `kostya-obs` and a `publisher` chip; an unknown member reads `Unknown member`
+    with the short id.
+  - (e) A failed holders call shows `Could not load holders.`
+  - (f) Escape calls `onClose`.
+  - (g) A received library frame matches `getByText(/Received .* from Olga/)`.
+  - (h) A coordinator on an excluded frame sees `Restore`, which invokes `restore_collab_frame` and then calls
+    `onChanged`; a non-coordinator sees the reason but no button.
+  - (i) `ExcludeDialog`: Exclude is disabled for a blank reason and for 501 characters. With two frames it invokes
+    `exclude_collab_frame` twice with the trimmed reason. A failure on the second reads `Excluded 1 of 2` and calls
+    `onDone(1)`.
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS, `tsc` clean.
-- [ ] **Step 5: Commit** `feat(collab): frame drawer with gate, holders and provenance`.
+- [ ] **Step 5: Commit** `feat(collab): frame drawer with rule-by-rule gate, holders, provenance, exclusion`.
 
 ---
 
-### Task 8: My frames tab (Ready · Published · Held back) + `ReasonGroupAction`
+### Task 10: My frames tab (Ready · Published · Held back) + `ReasonGroupAction`
 
 **Files:**
 - Create: `src/components/collab/project/MyFramesTab.tsx`, `src/components/collab/project/ReasonGroupAction.tsx`
 - Test: `src/components/collab/project/MyFramesTab.test.tsx`, `src/components/collab/project/ReasonGroupAction.test.tsx`
-- Delete in Task 14 (not here): `GateBlockers.tsx` + test (still imported by the old page until then)
+- Delete in Task 16 (not here): `GateBlockers.tsx` + test (still imported by the old page until then)
 
 **Interfaces:**
 - Consumes: `ProjectFrameTable`, `TableAction`, `fromOwn`, `FrameVM`, `OwnFrameRow`, `LinkedSetView`,
-  `AutoPublishSwitch`, `LinkObjectDialog`, `FilterMappingDialog`.
+  `AutoPublishSwitch`, `LinkObjectDialog`, `FilterMappingDialog`, `ExcludeDialog` (Task 9).
 - Produces:
 
 ```ts
@@ -1352,8 +1605,10 @@ export interface MyFramesTabProps {
   onDetailReload: () => void;          // re-read get_collab_project_detail (links, card)
   onRequestPublish: (frameIds: number[]) => void;   // the shell confirms, then publishes
   publishBusy: boolean;
-  onRequestRepublish: () => void;
+  onRequestRepublish: (frameIds: number[] | null) => void;  // null = "all"; the shell's guard dialog confirms
+  republishBusy: boolean;
   canRepublish: boolean;
+  coordinator: boolean;
   republishError: string | null;
   refusal: ReactNode;                  // the shell's publishing-device refusal box, or null
   onOpen: (vm: FrameVM) => void;
@@ -1385,7 +1640,14 @@ back N`; `aria-pressed` on the active one). On the right, `Recalibrate and repub
   rows={node.rows} … /> : null`. Actions `Solve` (eligible: failures include `solve`; run →
   `onSolveIds(ids)`) and `Analyze` (eligible: failures include `analyze`; run → `analyze_frame_set` for each distinct
   `setId`). Empty text: `Nothing held back.`
-- **Published:** no actions. Empty text: `Nothing published yet.`
+- **Published:**
+  - `Republish`: `{ id: 'republish', verb: 'Republish', eligible: (v) => !v.excluded, busy: republishBusy, run:
+    (t) => onRequestRepublish(t.map((v) => v.frameId!)) }`.
+  - For a coordinator, also `Exclude`: `{ id: 'exclude', verb: 'Exclude', eligible: (v) => !v.excluded && v.pubState
+    === 'published' && v.frameUuid !== null, run: (t) => setExcluding(t) }`, which opens `ExcludeDialog` and then
+    calls `onReload()`.
+  - `Recalibrate and republish all` (above the segments) calls `onRequestRepublish(null)`.
+  - Empty text: `Nothing published yet.`
 
 Solve/Analyze orchestration moves here from the page, unchanged in behaviour:
 `plate_solve_batch { frameIds }` with the `solveStartedHereRef` guard;
@@ -1413,7 +1675,11 @@ frames themselves`; `uuid` → muted `re-scan the folder`; `outsideTarget` → m
      started here calls nothing;
   5. `Analyze` on a group with two sets opens a menu naming both sets by `setName`; picking one invokes
      `analyze_frame_set { frameSetId }`; `analysis-complete` for it calls `onReload`;
-  6. a failed `plate_solve_batch` raises a warning notification titled `Could not start the solve`.
+  6. a failed `plate_solve_batch` raises a warning notification titled `Could not start the solve`;
+  7. in Published, selecting two frames and clicking `Republish 2` calls `onRequestRepublish([id1, id2])`, and
+     `Recalibrate and republish all` calls `onRequestRepublish(null)`;
+  8. `Exclude` shows only when `coordinator`; with one excluded frame among three selected, it reads
+     `Exclude 2 of 3` and opens the dialog listing 2 frames.
   `ReasonGroupAction.test.tsx`: the `threshold` kind renders the quality text and no button; `mapFilter` calls
   `onMapFilters`; `attest` offers `Attest as calibrated…` which calls `onOpenCalibration(setId)`.
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement.** **Step 4: Run** → PASS, `tsc` clean.
@@ -1421,7 +1687,7 @@ frames themselves`; `uuid` → muted `re-scan the folder`; `outsideTarget` → m
 
 ---
 
-### Task 9: Library tab
+### Task 11: Library tab
 
 **Files:**
 - Create: `src/components/collab/project/LibraryTab.tsx`
@@ -1430,14 +1696,16 @@ frames themselves`; `uuid` → muted `re-scan the folder`; `outsideTarget` → m
 **Interfaces:**
 - Consumes: `ProjectFrameTable`, `fromLibrary`, `useCollabExchange` (in-flight map), `CollabAttention`,
   `ProjectExportDialog`.
-- Produces: `export default function LibraryTab({ projectId, projectTitle, frames, error, reload, onOpen }: { projectId: string; projectTitle: string; frames: ProjectFrameView[] | null; error: boolean; reload: () => void; onOpen: (vm: FrameVM) => void }): JSX.Element` and `export function libraryToCome(frames: ProjectFrameView[] | null, inFlight: ReadonlyMap<string, unknown>): number` (the tab badge: frames that map to device `downloading`, `queued` or `missing`).
+- Produces: `export default function LibraryTab({ projectId, projectTitle, frames, error, reload, coordinator, onOpen }: { projectId: string; projectTitle: string; frames: ProjectFrameView[] | null; error: boolean; reload: () => void; coordinator: boolean; onOpen: (vm: FrameVM) => void }): JSX.Element` and `export function libraryToCome(frames: ProjectFrameView[] | null, inFlight: ReadonlyMap<string, unknown>): number` (the tab badge: frames that map to device `downloading`, `queued` or `missing`).
 
 Behaviour: everything `ReceiveTab` does today moves here unchanged: the Collaboration-folder banner, `Export for
 WBPP`, `CollabAttention`, and the reload on `collab-attention-changed` / `collab-frames-landed` for this project.
 Then the table over `frames.filter((f) => !f.own && f.state !== 'pending')` mapped with `fromLibrary(f, inFlight)`,
 where `inFlight` is built from `state.projects[projectId]?.recv.flatMap((fl) => fl.inFlight)` keyed by `frameUuid`
-(`{ done, size }`). One action: `{ id: 'keep', verb: 'Keep again', eligible: (v) => v.device === 'notKept', run:
-(t) => keep_collab_frames_again({ projectId, frameUuids }) then reload }`. A failure → `console.error` + inline
+(`{ done, size }`). Actions: `{ id: 'keep', verb: 'Keep again', eligible: (v) => v.device === 'notKept', run:
+(t) => keep_collab_frames_again({ projectId, frameUuids }) then reload }`, and for a coordinator `{ id: 'exclude',
+verb: 'Exclude', eligible: (v) => !v.excluded && v.pubState === 'published', run: (t) => open ExcludeDialog(t) }`,
+followed by `reload()` when the dialog is done. A failure → `console.error` + inline
 `text-error`. Empty text: `No frames from other members yet — published contributions appear here.` Loading →
 `Loading…`. `error` → `Could not load the library — see console.`
 
@@ -1445,14 +1713,15 @@ where `inFlight` is built from `state.projects[projectId]?.recv.flatMap((fl) => 
   a frame in the exchange's in-flight list renders `downloading` with its percent; a `wanted` frame with
   `waitingForPublisher` reads `missing` + `publisher offline`; `Keep again` is disabled with no `not_kept` frame and,
   with one, invokes `keep_collab_frames_again { projectId, frameUuids: ['u2'] }`; `libraryToCome` counts downloading
-  + queued + missing and not `notKept`/`have`. Wrap renders in a test `CollabExchangeProvider` whose mocked
+  + queued + missing and not `notKept`/`have`; `Exclude` is absent for a non-coordinator and, for a coordinator,
+  opens the dialog with the eligible frames. Wrap renders in a test `CollabExchangeProvider` whose mocked
   `get_collab_exchange` returns the in-flight fixture.
 - [ ] **Step 2–4:** Run → FAIL, implement, run → PASS, `tsc` clean.
 - [ ] **Step 5: Commit** `feat(collab): Library tab — other members' frames and their state here`.
 
 ---
 
-### Task 10: Moderation tab
+### Task 12: Moderation tab
 
 **Files:**
 - Create: `src/components/collab/project/ModerationTab.tsx`
@@ -1479,7 +1748,7 @@ text: `Nothing waiting for review.`
 
 ---
 
-### Task 11: Members tab
+### Task 13: Members tab
 
 **Files:**
 - Create: `src/components/collab/project/MembersTab.tsx`, `src/components/collab/project/memberColors.ts`
@@ -1508,11 +1777,11 @@ Integration (`formatDuration(Σ secondsByFilter)`), one column per filter presen
 
 ---
 
-### Task 12: Exchange tab
+### Task 14: Exchange tab
 
 **Files:**
 - Create: `src/components/collab/project/ExchangeTab.tsx`, `src/components/collab/exchange/PeerFlowRow.tsx`
-  (shared with Transfers in Task 15)
+  (shared with Transfers in Task 17)
 - Test: `src/components/collab/project/ExchangeTab.test.tsx`
 
 **Interfaces:**
@@ -1548,7 +1817,7 @@ Behaviour (mockup `liveHtml` / `peerRow`):
 
 ---
 
-### Task 13: Overview tab
+### Task 15: Overview tab
 
 **Files:**
 - Create: `src/components/collab/project/OverviewTab.tsx`
@@ -1584,11 +1853,12 @@ Content (mockup Overview):
 
 ---
 
-### Task 14: The page shell, removals, deep links, test migration
+### Task 16: The page shell, removals, deep links, test migration
 
 **Files:**
 - Rewrite: `src/pages/ProjectDetail.tsx`
-- Create: `src/components/collab/project/usePublishing.ts`
+- Create: `src/components/collab/project/usePublishing.ts`, `src/components/collab/project/RepublishGuardDialog.tsx`
+  (+ `RepublishGuardDialog.test.tsx`)
 - Modify: `src/hooks/useCollabNotifications.ts`, `src/components/collab/CollabAttention.tsx` (`?tab=receive` →
   `?tab=library`), `src/components/collab/FrameSetProjectBlock.tsx` (`?tab=contribute` → `?tab=mine`)
 - Delete: `src/components/collab/ReceiveTab.tsx`, `ReceiveTab.test.tsx`, `ModerationQueue.tsx`, `GateBlockers.tsx`,
@@ -1596,8 +1866,10 @@ Content (mockup Overview):
 - Rewrite tests: `src/pages/ProjectDetail.test.tsx`
 
 **Interfaces:**
-- Consumes: every tab from Tasks 7–13; Task 1's `frameIds`.
-- Produces: `usePublishing(projectId, { reloadDetail, reloadOwn })` → `{ publish(frameIds: number[]): Promise<void>; republish(): Promise<void>; switchHere(): Promise<void>; publishBusy; publishError; republishBusy; republishError; switchBusy; refusedBy; updateRequired; clearPublishError(); clearRepublishError() }`. It holds today's `doPublish`/`doRepublish`/`doSwitch` bodies verbatim (same notifications, dedupe keys, busy/outdated/publishing-device handling). The one change: `publish_collab_frames` is invoked with `{ projectId, frameIds }`.
+- Consumes: every tab from Tasks 9–15; Task 1's `frameIds` on both publish and republish.
+- Produces: `usePublishing(projectId, { reloadDetail, reloadOwn })` → `{ publish(frameIds: number[]): Promise<void>; republish(frameIds: number[] | null): Promise<void>; switchHere(): Promise<void>; publishBusy; publishError; republishBusy; republishError; switchBusy; refusedBy; updateRequired; clearPublishError(); clearRepublishError() }`. It holds today's `doPublish`/`doRepublish`/`doSwitch` bodies verbatim (same notifications, dedupe keys, busy/outdated/publishing-device handling). The one change: `publish_collab_frames` and `republish_collab_frames` are invoked with `{ projectId, frameIds }`
+  (`frameIds: null` for "republish all"). `RepublishGuardDialog({ count, sourceBytes, all, busy, error, onConfirm,
+  onCancel })` is exported with `REPUBLISH_TYPED_CONFIRM_ABOVE = 100`.
 
 Shell responsibilities:
 - Loads `get_collab_project_detail` (missing → today's "not in your local list" text),
@@ -1614,11 +1886,27 @@ Shell responsibilities:
 - Deep links: `?tab=` accepts the six ids plus the aliases `receive` → `library` and `contribute` → `mine`, then is
   removed from the URL (`replace`).
 - Drawer: `const [drawer, setDrawer] = useState<FrameVM | null>(null)`; `<FrameDrawer projectId frame={drawer}
-  ruleCount={detail.thresholds.length} onClose={() => setDrawer(null)} />` when set.
+  coordinator={c.coordinator} onClose={() => setDrawer(null)} onChanged={() => { reloadOwn(); reloadLibrary(); }} />`
+  when set. `coordinator={c.coordinator}` also goes to `MyFramesTab` and `LibraryTab`.
 - Publish confirm dialog: today's dialog, with the count = the requested ids' length and the estimate `ids.length ×
   APPROX_FRAME_BYTES`. The dialog keeps the requested ids in state; Publish calls `publishing.publish(ids)`, which
   then reloads own frames + detail.
-- Republish confirm: unchanged.
+- **Republish guard (owner ruling: nobody re-announces 100 TB with one click).** `onRequestRepublish(ids)` opens
+  `RepublishGuardDialog` with:
+  - `all = ids === null`;
+  - `count` = `ids.length`, or for "all" the number of own rows in segment `published` that are not excluded;
+  - `sourceBytes` = Σ `byteSize` of those rows.
+
+  The dialog reads:
+  - title `Recalibrate and republish all` for "all", else `Republish N frames`;
+  - `N frames · {formatBytes(sourceBytes)} of source frames will be recalibrated. Every frame whose bytes change is
+    posted as a new version, and every processor holding it downloads it again.`;
+  - the existing warning line.
+
+  When `all || count > REPUBLISH_TYPED_CONFIRM_ABOVE`, a text input labelled `Type {count} to confirm` appears, and
+  Republish stays disabled until its trimmed value equals `String(count)`. Below the threshold, a plain confirm is
+  enough. Confirm calls `publishing.republish(ids)`; busy and error show inside the dialog, as the old dialog did.
+  `count === 0` → Republish is disabled with `Nothing to republish.`
 
 - [ ] **Step 1: Migrate the tests.** Rewrite `ProjectDetail.test.tsx` around the new structure, keeping every
   behaviour the old file pinned:
@@ -1629,12 +1917,18 @@ Shell responsibilities:
     now open **My frames**, click `Publish all N`, confirm, and assert `publish_collab_frames` was called with
     `{ projectId: 'proj-1', frameIds: [...] }`;
   - the analyze/solve/listener/notification tests move to My frames' Held back segment;
+  - the republish tests (busy, refusal, publishing-device) go through the guard: "all" needs the typed count
+    (Republish disabled until `5` is typed for 5 published frames), then `republish_collab_frames` is called with
+    `{ projectId: 'proj-1', frameIds: null }`; a 2-frame selection confirms without typing and sends `frameIds: [a,
+    b]`;
+  - `RepublishGuardDialog.test.tsx`: a 101-frame selection requires typing `101`, and `100` does not; a wrong number
+    keeps the button disabled; `count 0` disables it with `Nothing to republish.`;
   - new: `?tab=receive` opens Library, `?tab=contribute` opens My frames; a contributor
     (`dataRole: 'send'`, not coordinator) sees no Library tab; Moderation shows only for `coordinator &&
     requireApproval`; the My frames badge shows the ready count; clicking a row opens the drawer and Escape closes
     it.
   Delete the tests of removed components (`ReceiveTab.test.tsx`, `GateBlockers.test.tsx`). Their cases were ported
-  in Tasks 8–9.
+  in Tasks 10–11.
 - [ ] **Step 2: Run** `npx vitest run src/pages/ProjectDetail.test.tsx` → FAIL (old page).
 - [ ] **Step 3: Implement** the shell and `usePublishing`, delete the removed files, update the three link sites.
   `grep -rn "GateBlockers\|ReceiveTab\|ModerationQueue\|PublicationHistory\|GateTable" src` must return nothing.
@@ -1643,7 +1937,7 @@ Shell responsibilities:
 
 ---
 
-### Task 15: Transfers — collab groups, sessions in history, panel, sidebar indicator
+### Task 17: Transfers — collab groups, sessions in history, panel, sidebar indicator
 
 **Files:**
 - Create: `src/components/transfers/CollabTrafficGroups.tsx`
@@ -1653,7 +1947,7 @@ Shell responsibilities:
   `src/components/transfers/TransferIndicator.test.tsx` (extend or create)
 
 **Interfaces:**
-- Consumes: `useCollabExchange`, `exchangeTotals`, `peerLabel`, `PeerFlowRow` (Task 12), `ReceiveSessionView`.
+- Consumes: `useCollabExchange`, `exchangeTotals`, `peerLabel`, `PeerFlowRow` (Task 14), `ReceiveSessionView`.
 - Produces: `export function CollabTrafficGroups({ projectTitles }: { projectTitles: Record<string, string> }): JSX.Element | null` (one expandable group per project with flows; header `{title} · ↓ {rate} · ↑ {rate} · {n} peers`; body = `PeerFlowRow`s; link `Open in project →` to `/projects/${id}?tab=exchange`); `UnifiedRow` gains `| { kind: 'session'; selKey: string; session: ReceiveSessionView }`; `export function mergeHistory<T extends { at: string }>(a: T[], b: T[]): T[]` in `src/components/transfers/historyGrouping.ts` (newest first, stable).
 
 Behaviour:
@@ -1682,28 +1976,47 @@ Behaviour:
 
 ---
 
-### Task 16: Docs, open items, spec amendments, final gates
+### Task 18: Docs, open items, spec amendments, final gates
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-09-29-collab-project-observability-design.md` (add §14 "Amendments (wave 2,
   2026-09-30)")
 - Modify: `docs/superpowers/open-items.md`
 - Modify: `docs/transfers/README.md` (Collab section: the project page tabs, Transfers groups/sessions, indicator)
-- Modify: `CLAUDE.md` only if a rule, a command surface or a path changed. It did: `publish_collab_frames` takes
-  `frameIds`, and the collab frontend moved to `src/components/collab/project/`. Add one clause to the Transfers /
-  collab summary line. The command count is unchanged (no new command).
+- Modify: `CLAUDE.md`. A rule, a command surface and a path changed:
+  - `publish_collab_frames` / `republish_collab_frames` take `frameIds`;
+  - two new commands `exclude_collab_frame` / `restore_collab_frame` move the Tauri command count from 286 to 288.
+    Recount with the strict grep CLAUDE.md names and write the new number, date and two names in its parenthetical;
+  - the collab frontend moved to `src/components/collab/project/`.
 
-- [ ] **Step 1: Spec §14 amendments** — one numbered line each: (1) publish takes an optional `frameIds`; the
-  primary action always sends the ids it shows; (2) Exclude, Ask to exclude, Download and Stop keeping (held) not
-  built, pending a hub + core cycle; (3) Republish stays project-wide; the Published table has no selection actions;
-  (4) the project page no longer calls `evaluate_collab_gate`: Held back's Reason actions work from the group's rows;
-  (5) the drawer lists failures instead of a rule-by-rule table and shows the object instead of a local path;
-  (6) `ProjectFrameView` gained `receivedAt` / `receivedFromDevice` / `receivedFromMember`; (7) "Only one copy" =
-  `holdersTotal + (this device holds it)` = 1, because `holdersTotal` counts other devices only.
-- [ ] **Step 2: open-items.md**, following that file's own format: the owner smoke (spec §10's three-instance
-  scenario plus: select three Ready frames and publish exactly those; Held back Solve/Analyze from the group header;
-  Library `Keep again`; Transfers shows a project group and a session with both sources; the sidebar indicator
-  lights on collab-only traffic), and the deferred actions of (2) above as one backlog line.
+  Add one clause to the Transfers / collab summary line.
+
+- [ ] **Step 1: Spec §14 amendments.** One numbered line each:
+  1. Publish and republish take an optional `frameIds`. The primary action always sends the ids it shows. Every
+     republish goes through a guard dialog, which asks for the typed frame count for "all" or for more than 100
+     frames.
+  2. Exclude/Restore (coordinator) are built on the hub's existing `PATCH …/frames/{uuid}`. Ask to exclude,
+     Download and Stop keeping (held) are not built (hub mechanism / new core model).
+  3. The project page no longer calls `evaluate_collab_gate`. Held back's Reason actions work from the group's rows.
+  4. `FrameGateRow` / `OwnFrameRow` carry `rules[]` (`RuleVerdict`) from `evaluate_frame`, and `OwnFrameRow` carries
+     `path` and `accepted`. The drawer is rule-by-rule, as §4.1 says.
+  5. `ProjectFrameView` gained `receivedAt` / `receivedFromDevice` / `receivedFromMember`.
+  6. "Only one copy" means `holdersTotal + (this device holds it)` = 1, because `holdersTotal` counts other devices
+     only.
+- [ ] **Step 2: open-items.md**, following that file's own format:
+  - the owner smoke: spec §10's three-instance scenario, plus
+    - select three Ready frames and publish exactly those;
+    - republish two selected frames;
+    - "Recalibrate and republish all" asks for the typed count;
+    - the coordinator excludes a frame with a reason and it shows `excluded` on the publisher's Published tab, then
+      restores it;
+    - the drawer shows the rules table and the path;
+    - Held back Solve/Analyze from the group header;
+    - Library `Keep again`;
+    - Transfers shows a project group and a session with both sources;
+    - the sidebar indicator lights on collab-only traffic;
+  - one backlog line for Ask to exclude (hub) and per-frame Download / Stop keeping (core want/unwant override on top
+    of the policy + replica deletion with the last-copy warning).
 - [ ] **Step 3: docs/transfers/README.md** + CLAUDE.md edits as scoped above.
 - [ ] **Step 4: Final gates**, all of them, reporting output honestly:
   `npm test` (full vitest) → all green; `npx tsc --noEmit` → clean; `cargo check --workspace` → clean;
@@ -1717,25 +2030,35 @@ Behaviour:
 ## Self-review notes
 
 - **Spec coverage:**
-  - §4 page and tabs: Tasks 8–14.
-  - §4.1 table: Tasks 3–5.
-  - §4.2 configs: Task 4.
-  - Held back specifics: Task 8.
-  - Library specifics: Tasks 4 and 9.
-  - §5.5 goals: Task 13.
-  - §6.4 surface consumption: Task 6.
-  - §7.2 drawer provenance: Tasks 2 and 7.
-  - §7.3 Transfers and indicator: Task 15.
+  - §4 page and tabs: Tasks 10–16.
+  - §4.1 table: Tasks 5–7.
+  - §4.1 drawer (rule-by-rule, path, holders): Tasks 4 and 9.
+  - §4.2 configs: Task 6.
+  - §4.2 actions, per the owner's rulings:
+    - Publish and Republish on the selection: Tasks 1, 10 and 16;
+    - Exclude: Tasks 3, 9, 10 and 11;
+    - Keep again: Task 11;
+    - Approve / Reject: Task 12.
+  - Held back specifics: Task 10.
+  - Library specifics: Tasks 6 and 11.
+  - §5.5 goals: Task 15.
+  - §6.4 surface consumption: Task 8.
+  - §7.2 drawer provenance: Tasks 2 and 9.
+  - §7.3 Transfers and indicator: Task 17.
   - §7.4 no notifications added: nothing to build.
-  - §8 removals and split: Task 14.
+  - §8 removals and split: Task 16.
   - §10 frontend test list:
-    - grouping and aggregates, facet counts, sort, `(N of M)`, windowing: Task 3 (and Task 5);
-    - Transfers merge order and indicator: Task 15;
-    - role-dependent tabs: Task 14.
-  - Items deliberately not built are listed under Scope rulings and land in open items (Task 16).
+    - grouping and aggregates, facet counts, sort, `(N of M)`, windowing: Task 5 (and Task 7);
+    - Transfers merge order and indicator: Task 17;
+    - role-dependent tabs: Task 16.
+  - Items deliberately not built (Ask to exclude, Download, Stop keeping) are listed under Scope rulings and land in
+    open items (Task 18).
 - **Type names used across tasks:**
-  - `FrameVM`, `TableId`, `TableAction`, `Segment`, `ExchangeState`, `peerLabel`, `exchangeTotals`, `memberTone`,
-    `PeerFlowRow`, `libraryToCome`, `usePublishing` are defined in the task that produces them and consumed with the
-    same names.
-  - `publish_collab_frames { projectId, frameIds }` matches Task 1's Tauri arg `frame_ids` (Tauri camelCases args)
-    and the web `PublishArgs`.
+  - `FrameVM` (with `excluded`), `TableId`, `TableAction`, `Segment`, `ExchangeState`, `peerLabel`,
+    `exchangeTotals`, `memberTone`, `PeerFlowRow`, `libraryToCome`, `ExcludeDialog`, `RepublishGuardDialog`,
+    `REPUBLISH_TYPED_CONFIRM_ABOVE`, `usePublishing`, `RuleVerdict` are defined in the task that produces them and
+    consumed with the same names.
+  - `publish_collab_frames` / `republish_collab_frames { projectId, frameIds }` match Task 1's Tauri arg `frame_ids`
+    (Tauri camelCases args) and the web `PublishArgs`.
+  - `exclude_collab_frame { projectId, frameUuid, reason }` / `restore_collab_frame { projectId, frameUuid }` match
+    Task 3.
