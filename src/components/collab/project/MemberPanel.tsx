@@ -2,10 +2,11 @@ import type { JSX } from 'react';
 import { Chip, EmptyState, FilterDot, KV, MemberDot, SidePanel, StatusDot } from '../../ui';
 import { formatSize } from '../format';
 import { filterOrder } from './table/model';
+import { PANEL_H3 } from './panelStyle';
 import { useMemberColor } from './MemberColorsContext';
 import type { CameraQuality, MemberSummary } from '../../../types/models';
 
-function roleLabel(dataRole: string): string {
+export function roleLabel(dataRole: string): string {
   if (dataRole === 'send_receive') return 'Processor';
   if (dataRole === 'send') return 'Contributor';
   return dataRole;
@@ -27,7 +28,6 @@ function groupByCamera(quality: CameraQuality[]): [string, CameraQuality[]][] {
     .map(([camera, list]) => [camera, [...list].sort((a, b) => filterOrder(a.filter, b.filter))]);
 }
 
-const H = 'mb-1 mt-3.5 text-[11.5px] font-medium uppercase tracking-wide text-content-faint';
 
 /** Docked member card (wave 5.5 Task 13): cameras, devices and holdings. */
 export default function MemberPanel({ member, onClose }: { member: MemberSummary; onClose: () => void }): JSX.Element {
@@ -48,7 +48,7 @@ export default function MemberPanel({ member, onClose }: { member: MemberSummary
         </div>
       }
     >
-      <h4 className={H}>Cameras</h4>
+      <h4 className={PANEL_H3}>Cameras</h4>
       {cameras.length === 0 ? (
         <EmptyState>Nothing published yet.</EmptyState>
       ) : (
@@ -69,7 +69,7 @@ export default function MemberPanel({ member, onClose }: { member: MemberSummary
         </div>
       )}
 
-      <h4 className={H}>Devices</h4>
+      <h4 className={PANEL_H3}>Devices</h4>
       {member.devices.length === 0 ? (
         <EmptyState>No devices.</EmptyState>
       ) : (
@@ -84,7 +84,7 @@ export default function MemberPanel({ member, onClose }: { member: MemberSummary
         />
       )}
 
-      <h4 className={H}>Holds</h4>
+      <h4 className={PANEL_H3}>Holds</h4>
       <p className="text-content-secondary">
         {`${member.holdsFrames.toLocaleString('en-US')} fr · ${formatSize(member.holdsBytes)} · ${Math.round(member.holdsShare * 100)} % of the project`}
       </p>

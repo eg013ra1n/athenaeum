@@ -1344,6 +1344,24 @@ describe('ProjectDetail presence (collab-peers-changed)', () => {
     }
   });
 
+  it('a failed member summary shows the inline error and logs it', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockCommands(projectCard(), { get_collab_member_summary: () => Promise.reject(new Error('boom')) });
+    renderProjectDetail();
+    expect(await screen.findByText('Could not load the members — see console.')).toBeInTheDocument();
+    expect(spy).toHaveBeenCalledWith('[projects] member summary failed:', expect.any(Error));
+    spy.mockRestore();
+  });
+
+  it('collab-published also reloads the members', async () => {
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    await waitFor(() => expect(listeners['collab-published']?.length ?? 0).toBeGreaterThan(0));
+    const mem0 = invokeCount('get_collab_member_summary');
+    fire('collab-published', { projectId: 'proj-1' });
+    await waitFor(() => expect(invokeCount('get_collab_member_summary')).toBe(mem0 + 1));
+  });
+
   it('an event for another project reloads nothing', async () => {
     renderProjectDetail();
     await screen.findByRole('tab', { name: 'Overview' });

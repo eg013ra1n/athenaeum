@@ -10,6 +10,7 @@ import { COLUMNS, REASON_LABEL, WEEKDAY, effectiveStatus, statusTone, type Frame
 import { BLOCKER_ORDER } from './table/model';
 import { useMemberColor } from './MemberColorsContext';
 import ExcludeDialog from './ExcludeDialog';
+import { PANEL_H3 } from './panelStyle';
 
 type Holders = 'loading' | 'error' | FrameHolderView[];
 
@@ -145,7 +146,7 @@ export default function FramePanel({
   const showExclusionSection = frame.excluded || (canModerate && frame.pubState === 'published');
 
   const colorOf = useMemberColor();
-  const H3 = 'mb-1.5 mt-4 text-[13px] font-semibold text-content';
+  const H3 = PANEL_H3;
   const status = frame.own
     ? frame.own.segment === 'held' ? <Chip tone="warn">held back</Chip>
       : frame.own.segment === 'ready' ? <Chip tone="info">ready</Chip>

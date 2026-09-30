@@ -3,7 +3,7 @@ import { PanelLayout, EmptyState, FilterDot, MemberDot, StatusDot } from '../../
 import { formatDurationPadded, formatRelative, formatSize } from '../format';
 import { filterOrder } from './table/model';
 import { useMemberColor } from './MemberColorsContext';
-import MemberPanel from './MemberPanel';
+import MemberPanel, { roleLabel } from './MemberPanel';
 import type { MemberSummary } from '../../../types/models';
 
 /**
@@ -13,7 +13,7 @@ import type { MemberSummary } from '../../../types/models';
  */
 
 type FilterKey = `filter:${string}`;
-type SortKey = 'name' | 'role' | 'lastSeen' | 'published' | 'integration' | 'holds' | FilterKey;
+type SortKey = 'name' | 'role' | 'devices' | 'lastSeen' | 'published' | 'integration' | 'fwhm' | 'holds' | FilterKey;
 interface SortState {
   key: SortKey;
   dir: 1 | -1;
@@ -25,10 +25,9 @@ const DEFAULT_SORT: SortState = { key: 'published', dir: -1 };
  *  mirrors the design mockup's own `memberSort` click handler. */
 const ASC_BY_DEFAULT: SortKey[] = ['name', 'role'];
 
-function roleLabel(dataRole: string): string {
-  if (dataRole === 'send_receive') return 'Processor';
-  if (dataRole === 'send') return 'Contributor';
-  return dataRole;
+/** The role exactly as the Role cell reads (also its sort value). */
+function roleText(m: MemberSummary): string {
+  return m.coordinator ? 'Coordinator' : roleLabel(m.dataRole);
 }
 
 function totalSeconds(m: MemberSummary): number {
@@ -51,7 +50,9 @@ function lastSeenRank(m: MemberSummary): number {
 
 function valueFor(key: SortKey, m: MemberSummary): number | string {
   if (key === 'name') return m.displayName;
-  if (key === 'role') return roleLabel(m.dataRole);
+  if (key === 'role') return roleText(m);
+  if (key === 'devices') return m.devices.filter((d) => d.online).length;
+  if (key === 'fwhm') return weightedFwhm(m) ?? 0;
   if (key === 'lastSeen') return lastSeenRank(m);
   if (key === 'published') return m.publishedFrames;
   if (key === 'integration') return totalSeconds(m);
@@ -59,9 +60,9 @@ function valueFor(key: SortKey, m: MemberSummary): number | string {
   return m.secondsByFilter[key.slice('filter:'.length)] ?? 0;
 }
 
-/** Filters with any integration across the members, in `filterOrder`, `None` ("No filter") last. */
-export function filterColumns(members: MemberSummary[]): string[] {
-  const set = new Set<string>();
+/** Filters with integration or a goal, in `filterOrder`, `None` ("No filter") last. */
+export function filterColumns(members: MemberSummary[], goals: Record<string, number> | null): string[] {
+  const set = new Set<string>(Object.keys(goals ?? {}));
   for (const m of members) for (const [f, s] of Object.entries(m.secondsByFilter)) if (s > 0) set.add(f);
   const list = [...set].sort(filterOrder);
   return list.includes('None') ? [...list.filter((f) => f !== 'None'), 'None'] : list;
@@ -92,21 +93,30 @@ function Ghost(): JSX.Element {
 export default function MembersTab({
   members,
   error,
-  projectId,
+  goals,
 }: {
   members: MemberSummary[] | null;
   error: boolean;
-  projectId: string;
+  goals: Record<string, number> | null;
 }): JSX.Element {
   const colorOf = useMemberColor();
   const [sort, setSort] = useState<SortState>(DEFAULT_SORT);
   const [openId, setOpenId] = useState<string | null>(null);
 
-  const filters = useMemo(() => filterColumns(members ?? []), [members]);
+  const filters = useMemo(() => filterColumns(members ?? [], goals), [members, goals]);
 
   const sorted = useMemo(() => {
     const list = members ?? [];
     return [...list].sort((a, b) => {
+      if (sort.key === 'fwhm') {
+        // A member without FWHM data sorts last in both directions.
+        const fa = weightedFwhm(a);
+        const fb = weightedFwhm(b);
+        if (fa === null || fb === null) {
+          if (fa === fb) return a.displayName.localeCompare(b.displayName);
+          return fa === null ? 1 : -1;
+        }
+      }
       const x = valueFor(sort.key, a);
       const y = valueFor(sort.key, b);
       let c: number;
@@ -145,9 +155,9 @@ export default function MembersTab({
 
   return (
     <PanelLayout panel={open ? <MemberPanel member={open} onClose={() => setOpenId(null)} /> : null}>
-      <div data-project-id={projectId} className="space-y-3">
-        {error && <p className="text-sm text-error">Could not load members — see console.</p>}
-        {members === null && !error && <p className="text-sm text-content-muted">Loading…</p>}
+      <div className="space-y-3">
+        {error && <p className="text-[12.5px] text-error">Could not load members — see console.</p>}
+        {members === null && !error && <EmptyState>Loading…</EmptyState>}
         {members !== null && sorted.length === 0 && <EmptyState>No members yet.</EmptyState>}
         {members !== null && sorted.length > 0 && (
           <div data-testid="members-scroll" className="overflow-x-auto rounded-md border border-line">
@@ -156,7 +166,7 @@ export default function MembersTab({
                 <tr>
                   {head('name', 'Member', false)}
                   {head('role', 'Role', false)}
-                  {head(null, 'Devices', false)}
+                  {head('devices', 'Devices', false)}
                   {head('published', 'Published', true)}
                   {filters.map((f) =>
                     head(
@@ -169,7 +179,7 @@ export default function MembersTab({
                     ),
                   )}
                   {head('integration', 'Σ', true)}
-                  {head(null, 'FWHM x̃', true)}
+                  {head('fwhm', 'FWHM x̃', true)}
                   {head('holds', 'Holds', true)}
                   {head('lastSeen', 'Last seen', false)}
                 </tr>
@@ -188,13 +198,17 @@ export default function MembersTab({
                       <td className={TD}>
                         <span className="inline-flex items-center gap-[5px]">
                           <MemberDot color={colorOf(m.accountId)} />
-                          <b data-testid="member-name" className="font-semibold text-content">
+                          <b
+                            data-testid="member-name"
+                            title={m.displayName}
+                            className="max-w-[16rem] truncate font-semibold text-content"
+                          >
                             {m.displayName}
                           </b>
                         </span>
                       </td>
                       <td className={TD}>
-                        {m.coordinator ? 'Coordinator' : roleLabel(m.dataRole)}
+                        {roleText(m)}
                         {m.coordinator && m.dataRole === 'send_receive' && (
                           <span className="text-content-faint"> (Processor data)</span>
                         )}
@@ -203,15 +217,13 @@ export default function MembersTab({
                         )}
                       </td>
                       <td className={TD}>
-                        {m.devices.map((d) => (
-                          <span
-                            key={d.device}
-                            title={d.name ?? d.device.slice(0, 8)}
-                            className="mr-0.5 inline-block"
-                          >
-                            <StatusDot state={d.online ? 'online' : 'offline'} />
-                          </span>
-                        ))}
+                        <span className="inline-flex items-center gap-0.5 align-middle">
+                          {m.devices.map((d) => (
+                            <span key={d.device} title={d.name ?? d.device.slice(0, 8)} className="inline-flex">
+                              <StatusDot state={d.online ? 'online' : 'offline'} />
+                            </span>
+                          ))}
+                        </span>
                       </td>
                       <td className={`${TD} text-right`}>{m.publishedFrames.toLocaleString('en-US')}</td>
                       {filters.map((f) => {
@@ -223,7 +235,7 @@ export default function MembersTab({
                         );
                       })}
                       <td className={`${TD} text-right`}>
-                        <b className="font-semibold text-content">{formatDurationPadded(totalSeconds(m))}</b>
+                        {totalSeconds(m) > 0 ? <b className="font-semibold text-content">{formatDurationPadded(totalSeconds(m))}</b> : <Ghost />}
                       </td>
                       <td className={`${TD} text-right text-content-secondary`}>
                         {fwhm !== null ? `${fwhm.toFixed(2)}″` : <Ghost />}

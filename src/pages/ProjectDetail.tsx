@@ -229,6 +229,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
         void loadOwn();
         void loadLibrary();
         void loadDetail();
+        void loadMembersRef.current();
       })
       .then((fn) => {
         if (cancelled) fn();
@@ -693,7 +694,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
           )}
 
           {activeTab === 'members' && (
-            <MembersTab projectId={id} members={members} error={membersError} />
+            <MembersTab members={members} error={membersError} goals={detail.goals} />
           )}
 
           {activeTab === 'exchange' && <ExchangeTab projectId={id} canReceive={canReceive} members={members} />}
