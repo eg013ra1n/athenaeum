@@ -482,4 +482,42 @@ describe('FramePanel', () => {
     expect(screen.getByText('publisher')).toBeInTheDocument();
     expect(screen.getByText('andrei-pc').className).toContain('ml-auto');
   });
+
+  it('Gate lists each blocker text with a failing row', () => {
+    renderPanel(baseFrame({ own: own({ failures: [
+      { kind: 'linkCalibration', text: 'No master flat for B, bin 1' },
+      { kind: 'attest', text: 'Not calibrated' },
+    ] }) }));
+    expect(screen.getByText('No master flat for B, bin 1')).toBeInTheDocument();
+    expect(screen.getAllByText('Not calibrated').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('✕')).toHaveLength(2);
+  });
+
+  it('a failing precondition shows its failure text in the Value cell', () => {
+    renderPanel(baseFrame({ own: own({ failures: [{ kind: 'solve', text: 'unknown pixel scale' }] }) }));
+    expect(screen.getByText('unknown pixel scale')).toBeInTheDocument();
+    expect(screen.getAllByText('✕')).toHaveLength(1);
+  });
+
+  it('a long holder device name truncates and carries a title', async () => {
+    const long = 'd'.repeat(40);
+    holdersAnswer([{ memberName: 'Andrei', deviceName: long, device: 'd1', deviceShort: 'd1', online: true, isPublisher: false, contentVersion: 1 }]);
+    renderPanel(baseFrame({ lib: lib(), contentVersion: 1 }));
+    const el = await screen.findByText(long);
+    expect(el.className).toContain('truncate');
+    expect(el).toHaveAttribute('title', long);
+  });
+
+  it('no version chip on holders when the frame has no content version', async () => {
+    holdersAnswer([{ memberName: 'Andrei', deviceName: 'pc', device: 'd1', deviceShort: 'd1', online: true, isPublisher: false, contentVersion: 2 }]);
+    renderPanel(baseFrame({ contentVersion: null }));
+    await screen.findByText('Andrei');
+    expect(screen.queryByText('v2')).toBeNull();
+  });
+
+  it('a moderation frame shows only the status chip in the title row', () => {
+    renderPanel(baseFrame({ own: null, lib: null, device: null, pubState: 'pending' }));
+    expect(screen.getByText('pending')).toBeInTheDocument();
+    expect(screen.queryByText('—')).toBeNull();
+  });
 });

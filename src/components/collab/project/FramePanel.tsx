@@ -6,7 +6,8 @@ import { formatTimestamp } from '../../../utils/dateFormatting';
 import { Button, Chip, EmptyState, FilterDot, KV, MemberDot, SidePanel, StatusDot } from '../../ui';
 import { formatSize } from '../format';
 import type { CollabPeersChanged, FrameHolderView } from '../../../types/models';
-import { COLUMNS, WEEKDAY, effectiveStatus, statusTone, type FrameVM } from './frames';
+import { COLUMNS, REASON_LABEL, WEEKDAY, effectiveStatus, statusTone, type FrameVM } from './frames';
+import { BLOCKER_ORDER } from './table/model';
 import { useMemberColor } from './MemberColorsContext';
 import ExcludeDialog from './ExcludeDialog';
 
@@ -73,7 +74,7 @@ export default function FramePanel({
   // Refs let the listener subscribe once (StrictMode-safe, CLAUDE.md
   // pattern) while always reading the latest project/frame; `holders` is
   // only replaced once the new rows arrive, so this never flashes back
-  // through "Loading holders…".
+  // through "Loading…".
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
   const frameUuidRef = useRef(holdersFor);
@@ -149,12 +150,22 @@ export default function FramePanel({
     ? frame.own.segment === 'held' ? <Chip tone="warn">held back</Chip>
       : frame.own.segment === 'ready' ? <Chip tone="info">ready</Chip>
       : <Chip tone={statusTone(effectiveStatus(frame))}>{effectiveStatus(frame)}</Chip>
-    : <><Chip tone={statusTone(effectiveStatus(frame))}>{effectiveStatus(frame)}</Chip> {COLUMNS.device.cell(frame)}</>;
-  const preconditions: [string, boolean][] = frame.own ? [
-    ['Plate-solved', !frame.own.failures.some((f) => f.kind === 'solve')],
-    ['Analyzed', !frame.own.failures.some((f) => f.kind === 'analyze')],
-    ['Filter mapped', frame.filterMapped],
+    : <><Chip tone={statusTone(effectiveStatus(frame))}>{effectiveStatus(frame)}</Chip>{frame.device !== null && <> {COLUMNS.device.cell(frame)}</>}</>;
+  const failText = (kind: string) => frame.own?.failures.find((f) => f.kind === kind)?.text;
+  // [label, pass, value shown when failing]
+  const preconditions: [string, boolean, string][] = frame.own ? [
+    ['Plate-solved', failText('solve') === undefined, failText('solve') ?? 'no'],
+    ['Analyzed', failText('analyze') === undefined, failText('analyze') ?? 'no'],
+    ['Filter mapped', frame.filterMapped, failText('mapFilter') ?? 'no'],
   ] : [];
+  const PRECOND_KINDS = ['threshold', 'solve', 'analyze', 'mapFilter'];
+  const blockers = (frame.own?.failures ?? [])
+    .filter((f) => !PRECOND_KINDS.includes(f.kind))
+    .sort((x, y) => {
+      const ix = BLOCKER_ORDER.indexOf(x.kind);
+      const iy = BLOCKER_ORDER.indexOf(y.kind);
+      return (ix < 0 ? 99 : ix) - (iy < 0 ? 99 : iy);
+    });
 
   return (
     <SidePanel
@@ -198,12 +209,20 @@ export default function FramePanel({
               <span className={r.pass === true ? 'text-success' : r.pass === false ? 'text-error' : 'text-content-faint'}>{r.pass === true ? '✓' : r.pass === false ? '✕' : '—'}</span>
             </Fragment>
           ))}
-          {preconditions.map(([label, ok]) => (
+          {preconditions.map(([label, ok, why]) => (
             <Fragment key={label}>
               <span className="text-content-secondary">{label}</span>
-              <span className="text-content-secondary">{ok ? 'yes' : 'no'}</span>
+              <span className="break-words text-content-secondary">{ok ? 'yes' : why}</span>
               <span className="text-content-faint">required</span>
               <span className={ok ? 'text-success' : 'text-error'}>{ok ? '✓' : '✕'}</span>
+            </Fragment>
+          ))}
+          {blockers.map((f, i) => (
+            <Fragment key={`${f.kind}-${i}`}>
+              <span className="text-content-secondary">{REASON_LABEL[f.kind] ?? f.kind}</span>
+              <span className="break-words text-content-secondary">{f.text}</span>
+              <span className="text-content-faint">required</span>
+              <span className="text-error">✕</span>
             </Fragment>
           ))}
         </div>
@@ -216,13 +235,13 @@ export default function FramePanel({
         {holders === 'error' && <p className="text-[12.5px] text-error">Could not load holders — see console.</p>}
         {Array.isArray(holders) && holders.length === 0 && <EmptyState>Nobody else holds it yet.</EmptyState>}
         {Array.isArray(holders) && holders.map((h, i) => (
-          <div key={i} className="flex items-center gap-2 py-0.5 text-[12.5px]">
+          <div key={i} className="flex min-w-0 items-center gap-2 py-0.5 text-[12.5px]">
             <StatusDot state={h.online ? 'online' : 'offline'} />
             <MemberDot color={colorOf(h.memberName)} />
-            <span className="text-content-secondary">{h.memberName ?? 'Unknown member'}</span>
+            <span className="truncate text-content-secondary" title={h.memberName ?? undefined}>{h.memberName ?? 'Unknown member'}</span>
             {h.isPublisher && <Chip tone="mute">publisher</Chip>}
-            {h.contentVersion !== frame.contentVersion && <Chip tone="warn">v{h.contentVersion}</Chip>}
-            <span className="ml-auto text-content-faint">{h.deviceName ?? h.deviceShort}</span>
+            {frame.contentVersion !== null && h.contentVersion !== frame.contentVersion && <Chip tone="warn">v{h.contentVersion}</Chip>}
+            <span className="ml-auto min-w-0 truncate text-content-faint" title={h.deviceName ?? h.deviceShort}>{h.deviceName ?? h.deviceShort}</span>
           </div>
         ))}
       </>)}
