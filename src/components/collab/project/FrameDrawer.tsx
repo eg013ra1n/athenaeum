@@ -37,11 +37,15 @@ export default function FrameDrawer({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key !== 'Escape') return;
+      // The dialog owns Escape while it is open (its own reason and its own
+      // partial-failure message would otherwise vanish with the drawer).
+      if (excludeOpen) return;
+      onClose();
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, [onClose, excludeOpen]);
 
   useEffect(() => {
     const frameUuid = frame.frameUuid;

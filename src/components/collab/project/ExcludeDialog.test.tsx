@@ -80,6 +80,47 @@ describe('ExcludeDialog', () => {
     expect(btn).toBeDisabled();
   });
 
+  it('fix round 1: counts Unicode scalar values, not UTF-16 code units, against the 500 limit', () => {
+    render(<ExcludeDialog projectId="p" frames={[frame()]} onClose={vi.fn()} onDone={vi.fn()} />);
+    const textarea = screen.getByRole('textbox');
+    const btn = screen.getByRole('button', { name: 'Exclude' });
+
+    fireEvent.change(textarea, { target: { value: '😀'.repeat(500) } });
+    expect(screen.getByText('500 / 500')).toBeInTheDocument();
+    expect(btn).not.toBeDisabled();
+
+    fireEvent.change(textarea, { target: { value: '😀'.repeat(501) } });
+    expect(screen.getByText('501 / 500')).toBeInTheDocument();
+    expect(btn).toBeDisabled();
+  });
+
+  it('fix round 1: Escape does not close the dialog while a request is in flight', async () => {
+    let resolveInvoke: (() => void) | null = null;
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'exclude_collab_frame') {
+        return new Promise<void>((resolve) => {
+          resolveInvoke = () => resolve();
+        });
+      }
+      return Promise.reject(new Error(`unexpected ${command}`));
+    }) as typeof api.invoke);
+    const onClose = vi.fn();
+
+    render(<ExcludeDialog projectId="p" frames={[frame()]} onClose={onClose} onDone={vi.fn()} />);
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'reason' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude' }));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Exclude' })).toBeDisabled());
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Once the in-flight call settles (success path here), the dialog closes
+    // on its own — proving the Escape guard only withheld it during the
+    // request, not permanently.
+    resolveInvoke!();
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+
   it('excludes each frame with the trimmed reason, in turn; a failure stops and reports "Excluded K of N"', async () => {
     let calls = 0;
     vi.mocked(api.invoke).mockImplementation(((command: string) => {

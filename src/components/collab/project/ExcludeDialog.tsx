@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Ban, Loader2, X } from 'lucide-react';
 import { api } from '../../../api';
 import type { FrameVM } from './frames';
@@ -29,8 +29,22 @@ export default function ExcludeDialog({
   const [result, setResult] = useState<string | null>(null);
 
   const trimmed = reason.trim();
-  const valid = trimmed.length >= 1 && trimmed.length <= REASON_MAX;
-  const tooLong = reason.length > REASON_MAX;
+  // Unicode scalar values, not UTF-16 code units — matches the core's
+  // `chars().count()` and the hub's count (an emoji is 1 char, not 2).
+  const trimmedLength = [...trimmed].length;
+  const valid = trimmedLength >= 1 && trimmedLength <= REASON_MAX;
+  const tooLong = trimmedLength > REASON_MAX;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // Owns Escape while open (see FrameDrawer's onKey, which defers to
+      // this dialog) — but never while a request is in flight, so a
+      // mid-loop Escape can't hide the "Excluded K of N — …" outcome.
+      if (e.key === 'Escape' && !busy) onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose, busy]);
 
   const doExclude = async () => {
     setBusy(true);
@@ -95,7 +109,7 @@ export default function ExcludeDialog({
         />
         <div className="mt-1 flex items-center justify-between text-xs">
           <span className={tooLong ? 'text-error' : 'text-content-muted'}>
-            {reason.length} / {REASON_MAX}
+            {trimmedLength} / {REASON_MAX}
           </span>
         </div>
         {result && <p className="mt-2 text-sm text-error">{result}</p>}

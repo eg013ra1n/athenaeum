@@ -251,6 +251,20 @@ describe('FrameDrawer', () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  it('fix round 1: Escape closes only the ExcludeDialog when it is open, not the drawer underneath', () => {
+    const onClose = vi.fn();
+    const frame = baseFrame({ excluded: false, pubState: 'published' });
+    renderDrawer(frame, { coordinator: true, onClose });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude…' }));
+    expect(screen.getByText('Exclude 1 frames from the project')).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(screen.queryByText('Exclude 1 frames from the project')).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it('(g) shows the provenance line for a received library frame', () => {
     const lib = baseLib({
       receivedAt: '2026-09-20T10:00:00Z',
