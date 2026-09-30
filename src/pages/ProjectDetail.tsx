@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
-import { Loader2, Send } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
 import { useSessionState } from '../contexts/SessionStateContext';
@@ -10,7 +10,6 @@ import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
 import UpdateRequired from '../components/collab/UpdateRequired';
 import CollabLiveStatus from '../components/collab/CollabLiveStatus';
-import { formatBytes } from '../components/collab/format';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { Button, Chip, PanelLayout } from '../components/ui';
 import MetaLine from '../components/collab/project/MetaLine';
@@ -24,6 +23,7 @@ import MembersTab from '../components/collab/project/MembersTab';
 import ExchangeTab from '../components/collab/project/ExchangeTab';
 import ModerationTab from '../components/collab/project/ModerationTab';
 import FramePanel from '../components/collab/project/FramePanel';
+import PublishConfirmDialog from '../components/collab/project/PublishConfirmDialog';
 import RepublishGuardDialog from '../components/collab/project/RepublishGuardDialog';
 import { deviceLabel, leading, OTHER_DEVICE, usePublishing } from '../components/collab/project/usePublishing';
 import { fromLibrary, fromOwn, ownFrameKey, type FrameVM } from '../components/collab/project/frames';
@@ -730,53 +730,17 @@ function ProjectPage({ id }: { id: string | undefined }) {
         />
 
         {publishIds && (
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-            onClick={() => !publishing.publishBusy && setPublishIds(null)}
-          >
-            <div
-              className="w-[30rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="mb-2 flex items-center gap-2">
-                <Send size={16} className="text-accent" />
-                <h2 className="font-medium text-content">Publish to {c.title}</h2>
-              </div>
-              <p className="mb-2 text-sm text-content-secondary">
-                {publishIds.length} passing {publishIds.length === 1 ? 'frame' : 'frames'} will be calibrated and
-                announced to the project.
-              </p>
-              <p className="mb-2 text-xs text-content-muted">
-                Estimated size ≈ {formatBytes(publishIds.length * APPROX_FRAME_BYTES)} — the exact size is
-                measured when each frame is generated.
-              </p>
-              {needsApproval && (
-                <p className="mb-2 text-xs text-warning">
-                  This project requires approval — your contribution goes to {coordinatorName} for
-                  review.
-                </p>
-              )}
-              {publishing.publishError && <p className="mb-2 text-sm text-error">{publishing.publishError}</p>}
-              <div className="mt-3 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setPublishIds(null)}
-                  disabled={publishing.publishBusy}
-                  className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void publishing.publish(publishIds)}
-                  disabled={publishing.publishBusy}
-                  className="inline-flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {publishing.publishBusy && <Loader2 size={12} className="animate-spin" />} Publish
-                </button>
-              </div>
-            </div>
-          </div>
+          <PublishConfirmDialog
+            title={c.title}
+            count={publishIds.length}
+            estimatedBytes={publishIds.length * APPROX_FRAME_BYTES}
+            needsApproval={needsApproval}
+            coordinatorName={coordinatorName}
+            busy={publishing.publishBusy}
+            error={publishing.publishError}
+            onConfirm={() => void publishing.publish(publishIds)}
+            onCancel={() => setPublishIds(null)}
+          />
         )}
 
         {republishReq && guard && (

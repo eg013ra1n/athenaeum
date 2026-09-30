@@ -1,5 +1,6 @@
 import { useState, type JSX } from 'react';
-import { Loader2, RefreshCw } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
+import { Button, DialogShell, TextInput } from '../../ui';
 import { formatBytes } from '../format';
 
 /** Above this many frames a selection needs the typed count (owner ruling:
@@ -41,73 +42,48 @@ export default function RepublishGuardDialog({
   const inputId = 'republish-guard-count';
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={() => !busy && onCancel()}
+    <DialogShell
+      title={all ? 'Recalibrate and republish all' : `Republish ${frames(count)}`}
+      onClose={onCancel}
+      busy={busy}
+      footer={<>
+        <Button onClick={onCancel} disabled={busy}>Cancel</Button>
+        <Button variant="primary" onClick={onConfirm} disabled={!canConfirm} data-autofocus={needsTyping ? undefined : true}>
+          {busy && <Loader2 size={12} className="animate-spin" />}Republish
+        </Button>
+      </>}
     >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="republish-guard-title"
-        className="w-[30rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-2 flex items-center gap-2">
-          <RefreshCw size={16} className="text-accent" />
-          <h2 id="republish-guard-title" className="font-medium text-content">
-            {all ? 'Recalibrate and republish all' : `Republish ${frames(count)}`}
-          </h2>
-        </div>
-        {count === 0 ? (
-          <p className="mb-2 text-sm text-content-muted">Nothing to republish.</p>
-        ) : (
-          <p className="mb-2 text-sm text-content-secondary">
-            {`${frames(count)} · ${formatBytes(sourceBytes)} of source frames will be recalibrated. Every frame whose bytes change is posted as a new version, and every processor holding it downloads it again.`}
-          </p>
-        )}
-        <p className="mb-2 text-xs text-warning">
-          Every processor holding one of your frames re-downloads it once this finishes.
+      {count === 0 ? (
+        <p>Nothing to republish.</p>
+      ) : (
+        <p>
+          {`${frames(count)} · ${formatBytes(sourceBytes)} of source frames will be recalibrated. Every frame whose bytes change is posted as a new version, and every processor holding it downloads it again.`}
         </p>
-        {needsTyping && (
-          <div className="mb-2 space-y-1">
-            <label htmlFor={inputId} className="block text-xs text-content-secondary">
-              Type {count} to confirm
-            </label>
-            <input
-              id={inputId}
-              type="text"
-              inputMode="numeric"
-              autoComplete="off"
-              value={typed}
-              disabled={busy}
-              onChange={(e) => setTyped(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && canConfirm) onConfirm();
-              }}
-              className="w-full rounded border border-border bg-surface-elevated px-2 py-1 text-sm text-content focus:border-accent focus:outline-none"
-            />
-          </div>
-        )}
-        {error && <p className="mb-2 text-sm text-error">{error}</p>}
-        <div className="mt-3 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
+      )}
+      <p className="mt-1.5 text-[12px] text-warning">
+        Every processor holding one of your frames re-downloads it once this finishes.
+      </p>
+      {needsTyping && (
+        <div className="mt-2 space-y-1">
+          <label htmlFor={inputId} className="block text-[11.5px] text-content-faint">
+            Type {count} to confirm
+          </label>
+          <TextInput
+            id={inputId}
+            inputMode="numeric"
+            autoComplete="off"
+            value={typed}
             disabled={busy}
-            className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={onConfirm}
-            disabled={!canConfirm}
-            className="inline-flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {busy && <Loader2 size={12} className="animate-spin" />} Republish
-          </button>
+            data-autofocus
+            onChange={(e) => setTyped(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && canConfirm) onConfirm();
+            }}
+            className="w-full focus:border-accent focus:outline-none"
+          />
         </div>
-      </div>
-    </div>
+      )}
+      {error && <p className="mt-1.5 text-[12.5px] text-error">{error}</p>}
+    </DialogShell>
   );
 }

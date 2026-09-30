@@ -115,4 +115,33 @@ describe('FilterMappingDialog', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalled();
   });
+
+  it('renders through the shared dialog shell', async () => {
+    render(<FilterMappingDialog projectId="p" onClose={vi.fn()} onSaved={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByRole('combobox')).toHaveLength(4));
+    const d = screen.getByRole('dialog', { name: /Filter mapping/ });
+    expect(d.className).toContain('rounded-lg');
+    expect(d.className).toMatch(/w-\[560px\]/);
+  });
+
+  it('focuses the first select once the sheet has loaded', async () => {
+    render(<FilterMappingDialog projectId="p" onClose={vi.fn()} onSaved={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByRole('combobox')).toHaveLength(4));
+    expect(screen.getAllByRole('combobox')[0]).toHaveFocus();
+  });
+
+  it('Escape does not close while a save is running', async () => {
+    let release: (r: GateReport) => void = () => {};
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'get_collab_filter_mapping_sheet') return Promise.resolve(sheet);
+      return new Promise<GateReport>((res) => { release = res; });
+    }) as typeof api.invoke);
+    const onClose = vi.fn();
+    render(<FilterMappingDialog projectId="p" onClose={onClose} onSaved={vi.fn()} />);
+    await waitFor(() => expect(screen.getAllByRole('combobox')).toHaveLength(4));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
+    release(report);
+  });
 });

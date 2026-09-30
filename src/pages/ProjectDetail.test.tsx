@@ -362,7 +362,7 @@ describe('ProjectDetail manual publish', () => {
     expect(
       screen.getByText('2 passing frames will be calibrated and announced to the project.'),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Estimated size ≈ 90\.0 MB/)).toBeInTheDocument();
+    expect(screen.getByText(/Estimated size ≈ 94 MB/)).toBeInTheDocument();
   });
 
   it('the confirm shows no approval notice for a non-coordinator with canModerate: true', async () => {

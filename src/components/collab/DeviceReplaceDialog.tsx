@@ -3,8 +3,6 @@ import {
   useCallback,
   useContext,
   useEffect,
-  useId,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -14,6 +12,7 @@ import { HardDrive, Loader2, RefreshCw, ShieldAlert } from 'lucide-react';
 import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { ConfirmDialog } from '../ConfirmDialog';
+import { Button, DialogShell } from '../ui';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   CollabLiveStatus,
@@ -106,18 +105,10 @@ function shortId(id: string): string {
   return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-6)}` : id;
 }
 
-const BTN =
-  'inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50';
-const BTN_PRIMARY =
-  'inline-flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50';
-const BTN_DANGER =
-  'inline-flex items-center gap-1.5 rounded border border-error/50 px-3 py-1.5 text-sm text-error transition-colors hover:bg-error/10 disabled:cursor-not-allowed disabled:opacity-50';
-
 export default function DeviceReplaceDialog() {
   const { notify } = useNotifications();
   const ctx = useContext(DeviceReplaceContext);
   const { publish, openSeq } = ctx;
-  const titleId = useId();
 
   const [status, setStatus] = useState<CollabStorageStatus | null>(null);
   const [open, setOpen] = useState(false);
@@ -198,23 +189,11 @@ export default function DeviceReplaceDialog() {
     setOpen(false);
   }, []);
 
-  // Escape closes the dialog (a window listener, so it works for the prompt
-  // that opened on its own before anything in it had focus). While the
-  // take-over confirm or an action is running it does nothing — the confirm
-  // has its own Cancel. Closing the replace prompt this way counts as
-  // "Not now". A layout effect, so the listener is attached in the same
-  // commit that puts the dialog on screen: a passive effect runs a task
-  // later, and an Escape pressed in between (a visible dialog, no listener
-  // yet) was lost — seen as a flaky test under CPU load.
+  // `DialogShell` owns Escape, the scrim and the close button: all three call
+  // `onClose`, which for the replace prompt means "Not now". The shell ignores
+  // them while an action runs (`busy`), and only its top dialog answers Escape,
+  // so the take-over confirm (itself a shell) keeps its own Cancel.
   const escapeClosesAsNotNow = status?.replace != null && !status.replace.markerMismatch;
-  useLayoutEffect(() => {
-    if (!open || confirmTakeOver || busy !== null) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close(escapeClosesAsNotNow);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [open, confirmTakeOver, busy, close, escapeClosesAsNotNow]);
 
   const checkAgain = async (root: string | null) => {
     setBusy('check');
@@ -315,10 +294,10 @@ export default function DeviceReplaceDialog() {
   const otherFolder =
     status.root && status.reason === 'other_device' && viewPath && viewPath !== status.root ? status.root : null;
   const checkButton = (root: string | null, label = 'Check again') => (
-    <button type="button" className={BTN} disabled={busy !== null} onClick={() => void checkAgain(root)}>
-      {busy === 'check' ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+    <Button disabled={busy !== null} onClick={() => void checkAgain(root)}>
+      {busy === 'check' ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
       {label}
-    </button>
+    </Button>
   );
 
   let title: string;
@@ -327,15 +306,13 @@ export default function DeviceReplaceDialog() {
   if (mismatch && viewPath) {
     title = 'Another disk is mounted here';
     body = (
-      <p className="text-sm text-content-secondary">
+      <p>
         {`The Collaboration folder's marker does not match the one recorded for it: another disk is mounted at ${viewPath}. Mount the disk this folder was set up on, or choose a different Collaboration folder — a replace or take-over would be refused.`}
       </p>
     );
     actions = (
       <>
-        <button type="button" className={BTN} onClick={() => close(false)}>
-          Close
-        </button>
+        <Button onClick={() => close(false)} data-autofocus>Close</Button>
         {checkButton(viewPath)}
       </>
     );
@@ -344,85 +321,78 @@ export default function DeviceReplaceDialog() {
     title = `This device replaces ${name}`;
     body = (
       <>
-        <p className="text-sm text-content-secondary">
+        <p>
           {replace.offlineDays !== null
             ? `${name} has been offline for ${replace.offlineDays} days. Replacing it retires that device and adopts the files already in this folder — nothing is downloaded again.`
             : `Replacing ${name} retires that device and adopts the files already in this folder — nothing is downloaded again.`}
         </p>
         {replace.proposeRetire && (
-          <p className="text-sm text-warning">{`${name} can be retired (offline for more than 30 days).`}</p>
+          <p className="mt-1.5 text-[12.5px] text-warning">{`${name} can be retired (offline for more than 30 days).`}</p>
         )}
-        <p className="text-xs text-content-muted">
+        <p className="mt-1.5 text-[11.5px] text-content-faint">
           {replace.lastSeenAt
             ? `Last seen ${formatTimestamp(replace.lastSeenAt)}, ${asOfCheck(replace.checkedAt)} — check again if ${name} may have been used since.`
             : `Never seen online, ${asOfCheck(replace.checkedAt)}.`}
         </p>
-        <p className="break-all text-xs text-content-muted">Folder: {replace.path}</p>
+        <p className="mt-1.5 break-all text-[11.5px] text-content-faint">Folder: {replace.path}</p>
       </>
     );
     actions = (
       <>
-        <button type="button" className={BTN} onClick={() => close(true)}>
-          Not now
-        </button>
+        <Button onClick={() => close(true)}>Not now</Button>
         {checkButton(replace.path)}
-        <button
-          type="button"
-          className={BTN_PRIMARY}
+        <Button
+          variant="primary"
           disabled={busy !== null}
           onClick={() => void replaceDevice(replace.deviceId, name, replace.path)}
+          data-autofocus
         >
-          {busy === 'replace' && <Loader2 size={14} className="animate-spin" />}
+          {busy === 'replace' && <Loader2 size={12} className="animate-spin" />}
           {`Replace ${name}`}
-        </button>
+        </Button>
       </>
     );
   } else if (unknown) {
     title = 'This folder belongs to another device';
     body = (
       <>
-        <p className="text-sm text-content-secondary">
+        <p>
           {`The marker in ${unknown.path} names a device this account does not list (${shortId(unknown.deviceId)}) — another account's device, a revoked device, or a disk from elsewhere.`}
         </p>
         {unknown.recordedOffline && (
-          <p className="text-sm text-warning">
+          <p className="mt-1.5 text-[12.5px] text-warning">
             Recorded while offline — the device may belong to this account. Check again once online.
           </p>
         )}
         {unknown.checkedAt && (
-          <p className="text-xs text-content-muted">{`Last checked ${formatTimestamp(unknown.checkedAt)}.`}</p>
+          <p className="mt-1.5 text-[11.5px] text-content-faint">{`Last checked ${formatTimestamp(unknown.checkedAt)}.`}</p>
         )}
       </>
     );
     actions = (
       <>
-        <button type="button" className={BTN} onClick={() => close(false)}>
-          Close
-        </button>
+        <Button onClick={() => close(false)} data-autofocus>Close</Button>
         {checkButton(unknown.path)}
-        <button
-          type="button"
-          className={BTN_DANGER}
+        <Button
+          variant="dangerPrimary"
           disabled={busy !== null}
           onClick={() => setConfirmTakeOver(true)}
         >
-          {busy === 'takeOver' && <Loader2 size={14} className="animate-spin" />}
+          {busy === 'takeOver' && <Loader2 size={12} className="animate-spin" />}
           Take over this folder…
-        </button>
+        </Button>
       </>
     );
   } else {
     title = 'This folder belongs to another device';
     body = (
-      <p className="text-sm text-content-secondary">
+      <p>
         {`The Collaboration folder's marker names another device${status.root ? ` (${status.root})` : ''}. Check again to ask the hub whether it is one of this account's devices.`}
       </p>
     );
     actions = (
       <>
-        <button type="button" className={BTN} onClick={() => close(false)}>
-          Close
-        </button>
+        <Button onClick={() => close(false)} data-autofocus>Close</Button>
         {checkButton(status.root)}
       </>
     );
@@ -430,40 +400,32 @@ export default function DeviceReplaceDialog() {
 
   return (
     <>
-      <div
-        className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-        aria-hidden={confirmTakeOver ? true : undefined}
-        onClick={() => busy === null && close(kind === 'replace')}
-      >
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby={titleId}
-          className="w-[32rem] max-w-[90vw] space-y-3 rounded-lg border border-border bg-surface-elevated p-4"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="flex items-center gap-2">
+      <DialogShell
+        title={
+          <span className="inline-flex items-center gap-2">
             {mismatch ? (
-              <HardDrive size={16} className="shrink-0 text-warning" />
+              <HardDrive size={14} className="shrink-0 text-warning" />
             ) : (
-              <ShieldAlert size={16} className="shrink-0 text-accent" />
+              <ShieldAlert size={14} className="shrink-0 text-accent" />
             )}
-            <h2 id={titleId} className="font-medium text-content">
-              {title}
-            </h2>
+            {title}
+          </span>
+        }
+        size="sm"
+        onClose={() => close(escapeClosesAsNotNow)}
+        busy={busy !== null}
+        footer={<div className="flex min-w-0 flex-1 flex-wrap justify-end gap-2">{actions}</div>}
+      >
+        {body}
+        {otherFolder && (
+          <div className="mt-2 space-y-2 rounded border border-border px-3 py-2">
+            <p className="text-[11.5px] text-content-faint">
+              {`The Collaboration folder ${otherFolder} names another device too. Checking ${otherFolder} replaces the pending offer for ${viewPath} — the app keeps one folder check at a time.`}
+            </p>
+            {checkButton(otherFolder, `Check ${otherFolder}`)}
           </div>
-          {body}
-          {otherFolder && (
-            <div className="space-y-2 rounded border border-border px-3 py-2">
-              <p className="text-xs text-content-muted">
-                {`The Collaboration folder ${otherFolder} names another device too. Checking ${otherFolder} replaces the pending offer for ${viewPath} — the app keeps one folder check at a time.`}
-              </p>
-              {checkButton(otherFolder, `Check ${otherFolder}`)}
-            </div>
-          )}
-          <div className="flex flex-wrap justify-end gap-2 pt-1">{actions}</div>
-        </div>
-      </div>
+        )}
+      </DialogShell>
       {unknown && (
         <ConfirmDialog
           isOpen={confirmTakeOver}

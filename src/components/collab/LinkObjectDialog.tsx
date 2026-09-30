@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Link2, X } from 'lucide-react';
+import { Link2 } from 'lucide-react';
 import { api } from '../../api';
-import { Button, Chip } from '../ui';
+import { useNotifications } from '../../contexts/NotificationContext';
+import { Button, Chip, DialogShell } from '../ui';
 import type { LinkSuggestion, LinkedSetView } from '../../types/models';
 
 /**
@@ -22,13 +23,14 @@ export default function LinkObjectDialog({
   onClose: () => void;
   onChanged: () => void;
 }) {
+  const { notify } = useNotifications();
   const [suggestions, setSuggestions] = useState<LinkSuggestion[]>([]);
   const [busy, setBusy] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     try {
       setSuggestions(
-        await api.invoke<LinkSuggestion[]>('list_collab_link_suggestions', { projectId }),
+        (await api.invoke<LinkSuggestion[] | null>('list_collab_link_suggestions', { projectId })) ?? [],
       );
     } catch (err) {
       console.error('[projects] link suggestions failed:', err);
@@ -47,46 +49,41 @@ export default function LinkObjectDialog({
       onChanged();
     } catch (err) {
       console.error('[projects] link toggle failed:', err);
+      notify({
+        title: linked ? 'Could not link the frame set' : 'Could not unlink the frame set',
+        detail: err instanceof Error ? err.message : String(err),
+        kind: 'project',
+        tone: 'warning',
+        hasErrors: true,
+      });
     } finally {
       setBusy(null);
     }
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={onClose}
+    <DialogShell
+      title={<span className="inline-flex items-center gap-2"><Link2 size={14} className="text-content-secondary" />Link an object</span>}
+      size="md"
+      onClose={onClose}
+      footer={<Button onClick={onClose} data-autofocus>Close</Button>}
     >
-      <div
-        className="max-h-[80vh] w-[34rem] overflow-auto rounded-lg border border-border bg-surface p-4"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-3 flex items-center gap-2">
-          <Link2 size={16} className="text-content-secondary" />
-          <h2 className="font-medium text-content">Link an object</h2>
-          <button
-            onClick={onClose}
-            className="ml-auto text-content-muted transition-colors hover:text-content"
-            aria-label="Close"
-          >
-            <X size={16} />
-          </button>
-        </div>
-        <p className="mb-3 text-xs text-content-muted">
-          Frame sets nearest the project target come first. Linking is a catalog-only
-          choice — each frame is still checked against the project&apos;s quality gate.
-        </p>
+      <p className="mb-3 text-[11.5px] text-content-faint">
+        Frame sets nearest the project target come first. Linking is a catalog-only
+        choice — each frame is still checked against the project&apos;s quality gate.
+      </p>
+      <div className="max-h-[60vh] overflow-auto">
         {links.length > 0 && (
           <div className="mb-3">
-            <div className="mb-1 text-xs font-medium text-content-secondary">Linked objects</div>
+            <div className="mb-1 font-medium text-content-secondary">Linked objects</div>
             <ul className="space-y-1">
               {links.map((l) => (
                 <li
                   key={l.framesSetId}
-                  className="flex items-center gap-2 rounded border border-border px-3 py-2 text-sm"
+                  className="flex items-center gap-2 rounded border border-border px-3 py-2"
                 >
                   <span className="truncate text-content">{l.name ?? `Set #${l.framesSetId}`}</span>
-                  <span className="flex-shrink-0 text-xs text-content-muted">· {l.lightCount} lights</span>
+                  <span className="flex-shrink-0 text-[11.5px] text-content-faint">· {l.lightCount} lights</span>
                   {l.withinRadius ? (
                     <Chip tone="ok">on target</Chip>
                   ) : (
@@ -110,37 +107,37 @@ export default function LinkObjectDialog({
           {suggestions.filter((s) => !s.alreadyLinked).map((s) => (
             <li
               key={s.framesSetId}
-              className="flex items-center gap-2 rounded border border-border px-3 py-2 text-sm"
+              className="flex items-center gap-2 rounded border border-border px-3 py-2"
             >
               <span className="truncate text-content">{s.name ?? `Set #${s.framesSetId}`}</span>
-              <span className="flex-shrink-0 text-xs text-content-muted">
+              <span className="flex-shrink-0 text-[11.5px] text-content-faint">
                 {s.lightCount} lights
               </span>
               {s.withinRadius ? (
-                <span className="flex-shrink-0 rounded bg-accent/20 px-1.5 py-0.5 text-xs text-accent">
-                  on target
-                </span>
+                <Chip tone="ok">on target</Chip>
               ) : s.distanceDeg != null ? (
-                <span className="flex-shrink-0 text-xs text-content-muted">
+                <span className="flex-shrink-0 text-[11.5px] text-content-faint">
                   {s.distanceDeg.toFixed(1)}° away
                 </span>
               ) : (
-                <span className="flex-shrink-0 text-xs text-content-muted">no center</span>
+                <span className="flex-shrink-0 text-[11.5px] text-content-faint">no center</span>
               )}
-              <button
+              <Button
+                variant="primary"
+                size="sm"
+                className="ml-auto flex-shrink-0"
                 onClick={() => void setLinked(s.framesSetId, true)}
                 disabled={busy === s.framesSetId}
-                className="ml-auto flex-shrink-0 inline-flex items-center gap-1 rounded bg-accent px-2 py-1 text-xs text-surface transition-colors hover:bg-accent-hover disabled:opacity-50"
               >
                 Link
-              </button>
+              </Button>
             </li>
           ))}
           {suggestions.every((s) => s.alreadyLinked) && (
-            <li className="py-2 text-sm text-content-muted">No frame sets to link yet.</li>
+            <li className="py-2 text-content-faint">No frame sets to link yet.</li>
           )}
         </ul>
       </div>
-    </div>
+    </DialogShell>
   );
 }

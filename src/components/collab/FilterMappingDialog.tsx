@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Loader2, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Loader2 } from 'lucide-react';
 import { api } from '../../api';
+import { Button, DialogShell, Select } from '../ui';
 import { useNotifications } from '../../contexts/NotificationContext';
 import type { FilterMappingEdit, FilterMappingRowView, FilterMappingSheet, GateReport } from '../../types/models';
 
@@ -41,11 +42,12 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
+  // The shell focuses `[data-autofocus]` on mount, when the sheet has not
+  // loaded yet — focus the first select once its rows exist.
+  const bodyRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
+    if (sheet) bodyRef.current?.querySelector<HTMLElement>('[data-autofocus]')?.focus();
+  }, [sheet]);
 
   const edits = useMemo<FilterMappingEdit[]>(() => {
     if (!sheet) return [];
@@ -95,13 +97,15 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
   const unresolved = sheet?.rows.filter((r) => r.resolution === 'unmapped' || r.resolution === 'mappedToMissing') ?? [];
   const resolved = sheet?.rows.filter((r) => r.resolution === 'mapped' || r.resolution === 'matched') ?? [];
 
+  const firstKey = [...unresolved, ...resolved][0] ? key([...unresolved, ...resolved][0]) : null;
+
   const row = (r: FilterMappingRowView) => (
     <li key={key(r)} className="flex flex-wrap items-center gap-2 py-1">
-      <span className="min-w-[18rem] text-sm text-content">{label(r)}</span>
-      {r.resolution === 'mappedToMissing' && <span className="text-xs text-warning">mapped to &quot;{r.canonical}&quot;, not in this project</span>}
-      <select
+      <span className="min-w-[18rem] text-content">{label(r)}</span>
+      {r.resolution === 'mappedToMissing' && <span className="text-[11.5px] text-warning">mapped to &quot;{r.canonical}&quot;, not in this project</span>}
+      <Select
         aria-label={`Canonical for ${label(r)}`}
-        className="rounded border border-border bg-surface px-2 py-1 text-sm text-content"
+        data-autofocus={key(r) === firstKey ? true : undefined}
         value={choice[key(r)] ?? ''}
         onChange={(e) => setChoice({ ...choice, [key(r)]: e.target.value })}
       >
@@ -113,44 +117,41 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
         {sheet!.dictionary.map((d) => (
           <option key={d.canonical} value={d.canonical}>{d.canonical} · {d.kind}</option>
         ))}
-      </select>
+      </Select>
     </li>
   );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="Filter mapping"
-        className="max-h-[80vh] w-[40rem] overflow-auto rounded-lg border border-border bg-surface p-4"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-2 flex items-center justify-between">
-          <h2 className="text-base font-semibold text-content">Filter mapping</h2>
-          <button type="button" onClick={onClose} aria-label="Close" className="text-content-muted hover:text-content"><X size={16} /></button>
-        </div>
-        <p className="mb-3 text-xs text-content-muted">Pick the project&apos;s canonical filter for each raw name. Remembered for your account and asked once.</p>
-        {error && <p className="mb-2 text-sm text-error">{error}</p>}
+    <DialogShell
+      title="Filter mapping"
+      size="md"
+      onClose={onClose}
+      busy={busy}
+      footer={sheet ? (
+        <>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button variant="primary" onClick={() => void save()} disabled={busy || edits.length === 0}>
+            {busy && <Loader2 size={12} className="animate-spin" />}Save
+          </Button>
+        </>
+      ) : undefined}
+    >
+      <div ref={bodyRef} className="max-h-[60vh] overflow-auto">
+        <p className="mb-3 text-[11.5px] text-content-faint">Pick the project&apos;s canonical filter for each raw name. Remembered for your account and asked once.</p>
+        {error && <p className="mb-2 text-[12.5px] text-error">{error}</p>}
         {!sheet && !error && <Loader2 size={16} className="animate-spin text-content-muted" />}
         {sheet && (
           <>
             <ul>{unresolved.map(row)}</ul>
             {resolved.length > 0 && (
               <>
-                <p className="mt-3 border-t border-border pt-2 text-xs text-content-muted">Already resolved</p>
+                <p className="mt-3 border-t border-border pt-2 text-[11.5px] text-content-faint">Already resolved</p>
                 <ul>{resolved.map(row)}</ul>
               </>
             )}
-            <div className="mt-3 flex items-center gap-2">
-              <button type="button" onClick={() => void save()} disabled={busy || edits.length === 0} className="inline-flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-sm text-surface hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50">
-                {busy && <Loader2 size={12} className="animate-spin" />} Save
-              </button>
-              <button type="button" onClick={onClose} className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary hover:bg-surface-hover">Cancel</button>
-            </div>
           </>
         )}
       </div>
-    </div>
+    </DialogShell>
   );
 }

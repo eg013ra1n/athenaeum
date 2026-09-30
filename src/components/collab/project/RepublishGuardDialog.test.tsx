@@ -106,4 +106,30 @@ describe('RepublishGuardDialog', () => {
     expect(screen.getByRole('heading', { name: 'Republish 1 frame' })).toBeInTheDocument();
     expect(screen.getByText(/^1 frame · 1\.0 KB of source frames/)).toBeInTheDocument();
   });
+
+  it('renders through the shared dialog shell', () => {
+    renderGuard();
+    const d = screen.getByRole('dialog', { name: /Republish 2 frames/ });
+    expect(d.className).toContain('rounded-lg');
+    expect(d.className).toMatch(/w-\[440px\]/);
+  });
+
+  it('focuses the count field when typing is required, else Republish', () => {
+    cleanup();
+    renderGuard({ count: 2, all: true });
+    expect(screen.getByLabelText('Type 2 to confirm')).toHaveFocus();
+    cleanup();
+    renderGuard({ count: 2 });
+    expect(confirmButton()).toHaveFocus();
+  });
+
+  it('Escape cancels unless busy', () => {
+    const props = renderGuard();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(props.onCancel).toHaveBeenCalledTimes(1);
+    cleanup();
+    const busy = renderGuard({ busy: true });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(busy.onCancel).not.toHaveBeenCalled();
+  });
 });

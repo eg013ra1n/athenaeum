@@ -153,7 +153,27 @@ describe('DeviceReplaceDialog — replace (another device of this account)', () 
     await screen.findByText('This device replaces Old laptop');
     // The listener is attached in the commit that shows the dialog, so the
     // Escape is handled at once — no waiting that could hide a late listener.
-    fireEvent.keyDown(window, { key: 'Escape' });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByText('This device replaces Old laptop')).not.toBeInTheDocument();
+  });
+
+  it('renders through the shared dialog shell, Replace focused first', async () => {
+    mockCommands(storage({ replace: offer }));
+    renderWithProvider();
+    const d = await screen.findByRole('dialog', { name: /This device replaces Old laptop/ });
+    expect(d.className).toContain('rounded-lg');
+    expect(d.className).toMatch(/w-\[440px\]/);
+    expect(screen.getByRole('button', { name: 'Replace Old laptop' })).toHaveFocus();
+  });
+
+  it('the shell close button means "Not now" for the replace prompt', async () => {
+    mockCommands(storage({ replace: offer }));
+    renderWithProvider();
+    await screen.findByText('This device replaces Old laptop');
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    expect(screen.queryByText('This device replaces Old laptop')).not.toBeInTheDocument();
+    // dismissed for this start: a status change does not reopen it
+    await act(async () => { emitLive?.(live); });
     expect(screen.queryByText('This device replaces Old laptop')).not.toBeInTheDocument();
   });
 
@@ -215,6 +235,18 @@ describe('DeviceReplaceDialog — take-over (a device this account does not list
     );
     const toasts = await screen.findAllByRole('status');
     expect(toasts[0]).toHaveTextContent('Adopted 3 of 4 files');
+  });
+
+  it('the take-over dialog focuses Close, never the destructive button', async () => {
+    mockCommands(storage({ unknownDevice: unknown }));
+    renderWithProvider();
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('get_collab_storage_status'));
+    fireEvent.click(screen.getByRole('button', { name: 'open folder owner' }));
+    await screen.findByRole('dialog', { name: /This folder belongs to another device/ });
+    const closes = screen.getAllByRole('button', { name: 'Close' });
+    expect(screen.getByRole('button', { name: 'Take over this folder…' })).not.toHaveFocus();
+    expect(document.activeElement?.textContent).toBe('Close');
+    expect(closes.length).toBeGreaterThan(0);
   });
 
   it('labels a classification recorded while offline, in the dialog and in the take-over confirm', async () => {

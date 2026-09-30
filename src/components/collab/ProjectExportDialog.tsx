@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Folder, FolderOutput, Loader2, X } from 'lucide-react';
+import { Folder, FolderOutput, Loader2 } from 'lucide-react';
 import { api, type UnlistenFn } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { FolderBrowserModal } from '../FolderBrowserModal';
+import { Button, DialogShell, TextInput } from '../ui';
+import { Checkbox } from '../settings/Checkbox';
 import type { ExportProgressEvent, ExportResult } from '../../types/export';
 
 /** The Д3 sentinel `frame_set_id` the project export runner emits under — the
@@ -170,87 +172,79 @@ export default function ProjectExportDialog({
   const barPercent = progress ? Math.min(100, Math.max(0, progress.percent)) : 0;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={() => !busy && onClose()}
-    >
-      <div
-        className="w-[32rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
-        onClick={(e) => e.stopPropagation()}
+    <>
+      <DialogShell
+        title={<span className="inline-flex items-center gap-2"><FolderOutput size={14} className="text-accent" />{`Export ${projectTitle ? `“${projectTitle}”` : 'project'} for WBPP`}</span>}
+        size="md"
+        onClose={onClose}
+        busy={busy}
+        footer={busy ? (
+          <Button onClick={() => void handleCancel()} disabled={cancelling}>
+            {cancelling && <Loader2 size={12} className="animate-spin" />}
+            {cancelling ? 'Cancelling…' : 'Cancel'}
+          </Button>
+        ) : (
+          <>
+            <Button onClick={onClose}>Close</Button>
+            <Button
+              variant="primary"
+              onClick={() => void handleExport()}
+              disabled={!canExport}
+              title={outputDir ? undefined : 'Select an output folder first'}
+            >
+              <FolderOutput size={12} /> Export
+            </Button>
+          </>
+        )}
       >
-        <div className="mb-3 flex items-center gap-2">
-          <FolderOutput size={16} className="text-accent" />
-          <h2 className="flex-1 truncate font-medium text-content">
-            Export {projectTitle ? `“${projectTitle}”` : 'project'} for WBPP
-          </h2>
-          <button
-            type="button"
-            onClick={() => !busy && onClose()}
-            disabled={busy}
-            className="text-content-muted transition-colors hover:text-content disabled:opacity-40"
-            title="Close"
-          >
-            <X size={16} />
-          </button>
-        </div>
-
-        <p className="mb-3 text-xs text-content-muted">
+        <p className="mb-3 text-[11.5px] text-content-faint">
           Organizes every contributor’s frames into a PixInsight WBPP folder tree — one subtree per
           publisher under the project title.
         </p>
 
         {/* Output directory */}
-        <label htmlFor="collab-export-dir" className="mb-1 block text-sm text-content-muted">
+        <label htmlFor="collab-export-dir" className="mb-1 block">
           Output Directory
         </label>
         <div className="flex gap-2">
-          <input
+          <TextInput
             id="collab-export-dir"
-            type="text"
             value={outputDir}
             readOnly
             placeholder="Select output folder…"
             title={outputDir || undefined}
-            className="flex-1 truncate rounded-lg border border-border bg-surface-hover px-3 py-2 text-content placeholder-content-muted"
+            className="min-w-0 flex-1 truncate"
           />
-          <button
-            type="button"
+          <Button
             onClick={() => void handleSelectFolder()}
             disabled={busy}
             title="Pick the destination folder"
-            className={`flex items-center gap-2 rounded-lg px-4 py-2 transition-colors disabled:opacity-50 ${
-              outputDir
-                ? 'border border-border bg-surface-hover hover:brightness-110'
-                : 'border border-accent/40 bg-accent/10 text-accent hover:bg-accent/20'
-            }`}
+            data-autofocus
           >
-            <Folder size={16} />
+            <Folder size={12} />
             Browse
-          </button>
+          </Button>
         </div>
 
         {/* Symlinks toggle (macOS / Linux Tauri only) — hidden states explained. */}
         <div className="mt-3">
           {symlinksAvailable ? (
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={useSymlinks}
-                disabled={busy}
-                onChange={(e) => setUseSymlinks(e.target.checked)}
-                className="h-4 w-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
-              />
-              <span className="text-content-secondary">Use symbolic links instead of copying files</span>
-            </label>
+            <Checkbox
+              checked={useSymlinks}
+              disabled={busy}
+              onChange={setUseSymlinks}
+              size="sm"
+              label="Use symbolic links instead of copying files"
+            />
           ) : symlinkUnavailableReason ? (
-            <p className="text-xs text-content-muted">{symlinkUnavailableReason}</p>
+            <p className="text-[11.5px] text-content-faint">{symlinkUnavailableReason}</p>
           ) : null}
         </div>
 
         {/* Progress — dialog-local, per publisher (the bar restarts each subtree). */}
         {busy && (
           <div className="mt-4 space-y-1.5">
-            <div className="flex items-center justify-between text-xs text-content-secondary">
+            <div className="flex items-center justify-between">
               <span>
                 {progress?.phase === 'copying'
                   ? `Copying — publisher ${progress.publisher} · file ${progress.current} of ${progress.total}`
@@ -265,7 +259,7 @@ export default function ProjectExportDialog({
               />
             </div>
             {progress?.currentFile && (
-              <p className="truncate text-[11px] text-content-muted" title={progress.currentFile}>
+              <p className="truncate text-[11.5px] text-content-faint" title={progress.currentFile}>
                 {progress.currentFile}
               </p>
             )}
@@ -274,14 +268,14 @@ export default function ProjectExportDialog({
 
         {/* Success */}
         {result && result.success && (
-          <div className="mt-4 rounded-lg border border-success/30 bg-success/10 p-3 text-sm">
+          <div className="mt-4 rounded-lg border border-success/30 bg-success/10 p-3">
             <p className="font-medium text-success">
               Export complete — {result.filesOrganized}{' '}
               {result.filesOrganized === 1 ? 'file' : 'files'} organized
             </p>
-            <p className="mt-0.5 break-all text-xs text-content-muted">{result.outputDir}</p>
+            <p className="mt-0.5 break-all text-[11.5px] text-content-faint">{result.outputDir}</p>
             {result.warnings.length > 0 && (
-              <p className="mt-1 text-xs text-warning">
+              <p className="mt-1 text-[11.5px] text-warning">
                 {result.warnings.length} warning{result.warnings.length === 1 ? '' : 's'} — see the
                 notification history.
               </p>
@@ -290,42 +284,8 @@ export default function ProjectExportDialog({
         )}
 
         {/* Inline error (bad path, nothing to export, cancelled, per-publisher abort). */}
-        {error && <p className="mt-4 text-sm text-error">{error}</p>}
-
-        {/* Actions */}
-        <div className="mt-4 flex justify-end gap-2">
-          {busy ? (
-            <button
-              type="button"
-              onClick={() => void handleCancel()}
-              disabled={cancelling}
-              className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-            >
-              {cancelling && <Loader2 size={12} className="animate-spin" />}
-              {cancelling ? 'Cancelling…' : 'Cancel'}
-            </button>
-          ) : (
-            <>
-              <button
-                type="button"
-                onClick={onClose}
-                className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover"
-              >
-                Close
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleExport()}
-                disabled={!canExport}
-                title={outputDir ? undefined : 'Select an output folder first'}
-                className="inline-flex items-center gap-1.5 rounded bg-accent px-4 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <FolderOutput size={14} /> Export
-              </button>
-            </>
-          )}
-        </div>
-      </div>
+        {error && <p className="mt-4 text-[12.5px] text-error">{error}</p>}
+      </DialogShell>
 
       {/* Web mode: folder browser for the export directory. */}
       <FolderBrowserModal
@@ -337,6 +297,6 @@ export default function ProjectExportDialog({
         }}
         onClose={() => setShowFolderBrowser(false)}
       />
-    </div>
+    </>
   );
 }
