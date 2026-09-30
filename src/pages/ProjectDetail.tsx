@@ -172,6 +172,33 @@ function ProjectPage({ id }: { id: string | undefined }) {
     void loadLibrary();
   }, [loadLibrary, storedTab]);
 
+  // Core emits `collab-published` at the end of EVERY publish run of a
+  // project — manual, republish and the background auto-publish — so this is
+  // the one place that keeps own frames (Ready counts, `Publish all N`), the
+  // library (the replication bar's published volume) and the card current
+  // after a run nobody clicked. StrictMode-safe listener pattern (CLAUDE.md);
+  // the loaders are stable per project (the page is keyed on `id`).
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<{ projectId: string }>('collab-published', (p) => {
+        if (cancelled || p.projectId !== id) return;
+        void loadOwn();
+        void loadLibrary();
+        void loadDetail();
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[projects] collab-published listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [id, loadOwn, loadLibrary, loadDetail]);
+
   // Loaded once here for the Overview and Exchange tabs; the Members tab
   // refreshes it through `onMembers` whenever it mounts.
   useEffect(() => {
@@ -264,18 +291,27 @@ function ProjectPage({ id }: { id: string | undefined }) {
     moderation: { n: c.pendingFrames, cls: 'bg-warning/20 text-warning' },
   };
 
-  // The republish guard's figures: "all" = the published frames not excluded.
-  let guard: { all: boolean; count: number; sourceBytes: number } | null = null;
+  // The republish guard's figures and the ids it sends. "All" = the
+  // published frames not excluded — sent EXPLICITLY, never as `null`: a null
+  // republish runs over every gate candidate and would announce Ready frames
+  // that were never published (controller ruling, fix round 1).
+  let guard: { all: boolean; count: number; sourceBytes: number; ids: number[] } | null = null;
   if (republishReq) {
     if (republishReq.ids === null) {
       const targets = publishedRows.filter((r) => r.accepted !== false);
-      guard = { all: true, count: targets.length, sourceBytes: targets.reduce((s, r) => s + r.byteSize, 0) };
+      guard = {
+        all: true,
+        count: targets.length,
+        sourceBytes: targets.reduce((s, r) => s + r.byteSize, 0),
+        ids: targets.map((r) => r.frameId),
+      };
     } else {
       const wanted = new Set(republishReq.ids);
       guard = {
         all: false,
         count: republishReq.ids.length,
         sourceBytes: ownRows.filter((r) => wanted.has(r.frameId)).reduce((s, r) => s + r.byteSize, 0),
+        ids: republishReq.ids,
       };
     }
   }
@@ -402,6 +438,9 @@ function ProjectPage({ id }: { id: string | undefined }) {
 
       {activeTab === 'overview' && (
         <>
+          {ownError && own === null && (
+            <p className="text-sm text-error">Could not load your frames — see console.</p>
+          )}
           {membersError && members === null && (
             <p className="text-sm text-error">Could not load the members — see console.</p>
           )}
@@ -410,6 +449,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
             goals={detail.goals}
             members={members}
             own={own}
+            ownError={ownError}
             libraryToCome={canReceive ? toCome : 0}
             pending={c.pendingFrames}
             canModerate={canModerate}
@@ -572,7 +612,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
           all={guard.all}
           busy={publishing.republishBusy}
           error={publishing.republishError}
-          onConfirm={() => void publishing.republish(republishReq.ids)}
+          onConfirm={() => void publishing.republish(guard.ids)}
           onCancel={() => setRepublishReq(null)}
         />
       )}

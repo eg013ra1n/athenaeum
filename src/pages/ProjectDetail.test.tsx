@@ -175,11 +175,16 @@ const okPublish: PublishResult = {
   unchanged: 0,
 } as PublishResult;
 
-let publishedListener: ((res: unknown) => void) | undefined;
-/** Every `api.listen` registration this render made, by event name (a later
- *  registration of the same event wins) — lets a test fire
- *  `analysis-complete`/`plate-solve-complete` without a capture per event. */
-const listeners: Record<string, ((payload: unknown) => void) | undefined> = {};
+/** Every `api.listen` registration this render made, by event name — ALL of
+ *  them: the page and the app-root `useCollabNotifications` both listen to
+ *  `collab-published`. `fire` delivers a payload to every one. */
+const listeners: Record<string, ((payload: unknown) => void)[]> = {};
+
+function fire(event: string, payload: unknown) {
+  act(() => {
+    for (const cb of listeners[event] ?? []) cb(payload);
+  });
+}
 
 /** The default command answers, with `extra` taking precedence per command. */
 function mockCommands(
@@ -220,16 +225,12 @@ function mockCommands(
 }
 
 beforeEach(() => {
-  publishedListener = undefined;
   for (const k of Object.keys(listeners)) delete listeners[k];
   localStorage.clear();
   vi.mocked(api.invoke).mockReset();
   mockCommands();
   vi.mocked(api.listen).mockImplementation((<T,>(event: string, cb: (p: T) => void) => {
-    listeners[event] = cb as unknown as (payload: unknown) => void;
-    if (event === 'collab-published') {
-      publishedListener = cb as unknown as (res: unknown) => void;
-    }
+    (listeners[event] ??= []).push(cb as unknown as (payload: unknown) => void);
     return Promise.resolve(() => {});
   }) as never);
 });
@@ -319,16 +320,14 @@ describe('ProjectDetail manual publish', () => {
     expect(api.invoke).toHaveBeenCalledWith('publish_collab_frames', { projectId: 'proj-1', frameIds: [1, 2] });
     await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThanOrEqual(2));
 
-    expect(publishedListener).toBeDefined();
+    expect(listeners['collab-published']?.length ?? 0).toBeGreaterThan(0);
     // The invoke resolved successfully — ProjectDetail itself raises no toast.
     expect(screen.queryAllByRole('status')).toHaveLength(0);
 
     // The backend always emits `collab-published` on a successful publish;
     // the live listener (`useCollabNotifications`) is the one place that
     // turns it into a toast.
-    act(() => {
-      publishedListener?.({ projectId: 'proj-1', announced: 2, updated: 0, heldBack: 0 });
-    });
+    fire('collab-published', { projectId: 'proj-1', announced: 2, updated: 0, heldBack: 0 });
 
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
@@ -639,7 +638,7 @@ describe('ProjectDetail publishing device (A6)', () => {
 describe('ProjectDetail republish guard', () => {
   const fivePublished = [published(11), published(12), published(13), published(14), published(15)];
 
-  it('"Recalibrate and republish all" needs the typed count, then republishes everything (frameIds: null)', async () => {
+  it('"Recalibrate and republish all" needs the typed count, then sends the published ids explicitly (never null)', async () => {
     mockCommands(projectCard(), { list_project_own_frames: () => Promise.resolve(fivePublished) });
     renderProjectDetail();
     await openTab(/^My frames/);
@@ -658,7 +657,10 @@ describe('ProjectDetail republish guard', () => {
 
     fireEvent.click(confirm);
     await waitFor(() =>
-      expect(api.invoke).toHaveBeenCalledWith('republish_collab_frames', { projectId: 'proj-1', frameIds: null }),
+      expect(api.invoke).toHaveBeenCalledWith('republish_collab_frames', {
+        projectId: 'proj-1',
+        frameIds: [11, 12, 13, 14, 15],
+      }),
     );
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Republish' })).not.toBeInTheDocument());
   });
@@ -671,7 +673,32 @@ describe('ProjectDetail republish guard', () => {
     renderProjectDetail();
     await openTab(/^My frames/);
     fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
-    expect(screen.getByLabelText('Type 2 to confirm')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Type 2 to confirm'), { target: { value: '2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Republish' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('republish_collab_frames', { projectId: 'proj-1', frameIds: [21, 22] }),
+    );
+  });
+
+  it('"all" never announces Ready frames: with 2 published and 1 ready it sends only the 2 published ids', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () =>
+        Promise.resolve([published(61), published(62), ownRow({ frameId: 63, fileName: 'L_0063.fits' })]),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
+    expect(screen.getByRole('heading', { name: 'Recalibrate and republish all' })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Type 2 to confirm'), { target: { value: '2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Republish' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('republish_collab_frames', { projectId: 'proj-1', frameIds: [61, 62] }),
+    );
+    expect(
+      vi.mocked(api.invoke).mock.calls.filter(
+        ([c, a]) => c === 'republish_collab_frames' && (a as { frameIds: unknown }).frameIds === null,
+      ),
+    ).toHaveLength(0);
   });
 
   it('a 2-frame selection confirms without typing and sends exactly those ids', async () => {
@@ -814,15 +841,13 @@ describe('ProjectDetail Held back fixes (My frames wiring)', () => {
     await openTab(/^My frames/);
     await screen.findByRole('button', { name: 'Publish all 2' });
     const before = invokeCount('list_project_own_frames');
-    act(() => {
-      listeners['analysis-complete']?.({
-        frame_set_id: 42,
-        analyzed: 2,
-        skipped: 0,
-        failed: 0,
-        errors: [],
-        cancelled: false,
-      });
+    fire('analysis-complete', {
+      frame_set_id: 42,
+      analyzed: 2,
+      skipped: 0,
+      failed: 0,
+      errors: [],
+      cancelled: false,
     });
     await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThan(before));
   });
@@ -838,9 +863,7 @@ describe('ProjectDetail Held back fixes (My frames wiring)', () => {
       expect(api.invoke).toHaveBeenCalledWith('plate_solve_batch', { frameIds: [7] }),
     );
     const before = invokeCount('list_project_own_frames');
-    act(() => {
-      listeners['plate-solve-complete']?.({});
-    });
+    fire('plate-solve-complete', {});
     await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThan(before));
   });
 
@@ -849,9 +872,7 @@ describe('ProjectDetail Held back fixes (My frames wiring)', () => {
     await openTab(/^My frames/);
     await screen.findByRole('button', { name: 'Publish all 2' });
     const before = invokeCount('list_project_own_frames');
-    act(() => {
-      listeners['plate-solve-complete']?.({});
-    });
+    fire('plate-solve-complete', {});
     // No `await waitFor` for a positive assertion here — give any (wrongly)
     // scheduled re-fetch a tick to land, then assert it did not.
     await new Promise((r) => setTimeout(r, 0));
@@ -1015,6 +1036,54 @@ describe('ProjectDetail tabs', () => {
     expect(invokeCount('evaluate_collab_gate')).toBe(0);
     expect(api.invoke).toHaveBeenCalledWith('list_project_own_frames', { projectId: 'proj-1' });
     expect(api.invoke).toHaveBeenCalledWith('list_collab_frames', { projectId: 'proj-1' });
+  });
+});
+
+describe('ProjectDetail fix round 1', () => {
+  it('collab-published for this project (e.g. an auto-publish) re-reads own frames, the library and the detail', async () => {
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    await screen.findByRole('button', { name: 'Publish all 2' });
+    await waitFor(() => expect(listeners['collab-published']?.length ?? 0).toBeGreaterThanOrEqual(2));
+    const own = invokeCount('list_project_own_frames');
+    const lib = invokeCount('list_collab_frames');
+    const det = invokeCount('get_collab_project_detail');
+
+    fire('collab-published', { projectId: 'proj-1', announced: 3, updated: 0, heldBack: 0 });
+    await waitFor(() => {
+      expect(invokeCount('list_project_own_frames')).toBeGreaterThan(own);
+      expect(invokeCount('list_collab_frames')).toBeGreaterThan(lib);
+      expect(invokeCount('get_collab_project_detail')).toBeGreaterThan(det);
+    });
+  });
+
+  it('collab-published for another project re-reads nothing', async () => {
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    await screen.findByRole('button', { name: 'Publish all 2' });
+    await waitFor(() => expect(listeners['collab-published']?.length ?? 0).toBeGreaterThanOrEqual(2));
+    const own = invokeCount('list_project_own_frames');
+    const lib = invokeCount('list_collab_frames');
+    const det = invokeCount('get_collab_project_detail');
+
+    fire('collab-published', { projectId: 'proj-other', announced: 3, updated: 0, heldBack: 0 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(invokeCount('list_project_own_frames')).toBe(own);
+    expect(invokeCount('list_collab_frames')).toBe(lib);
+    expect(invokeCount('get_collab_project_detail')).toBe(det);
+  });
+
+  it('an own-frames failure on Overview shows the error, and My frames / Needs attention stop saying Loading…', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () => Promise.reject(new Error('catalog locked')),
+    });
+    renderProjectDetail();
+    expect(await screen.findByText('Could not load your frames — see console.')).toBeInTheDocument();
+    const myFrames = screen.getByRole('heading', { name: 'My frames' }).parentElement!;
+    expect(within(myFrames).queryByText('Loading…')).not.toBeInTheDocument();
+    const attention = screen.getByRole('heading', { name: 'Needs attention' }).parentElement!;
+    expect(within(attention).queryByText('Loading…')).not.toBeInTheDocument();
+    expect(within(attention).queryByText('Nothing needs attention.')).not.toBeInTheDocument();
   });
 });
 

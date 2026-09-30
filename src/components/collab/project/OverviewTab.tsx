@@ -16,7 +16,8 @@ import type { MemberSummary, OwnFrameRow, ThresholdRuleView } from '../../../typ
  * three numbers", Needs attention, a live Exchange-now one-liner, and the
  * quality-thresholds section moved verbatim from the old Overview tab of
  * `ProjectDetail.tsx`. While `own` is still loading (`null`), My frames and
- * Needs attention read `Loading…` rather than zero counts.
+ * Needs attention read `Loading…` rather than zero counts (`Not available.`
+ * once `ownError` says the load failed).
  */
 
 export interface OverviewTabProps {
@@ -24,6 +25,9 @@ export interface OverviewTabProps {
   goals: Record<string, number> | null;
   members: MemberSummary[] | null;
   own: OwnFrameRow[] | null;
+  /** `own` failed to load: the cards say so instead of `Loading…` (the
+   *  shell shows the error line above the tab). */
+  ownError?: boolean;
   libraryToCome: number;
   pending: number;
   canModerate: boolean;
@@ -74,6 +78,7 @@ export default function OverviewTab({
   goals,
   members,
   own,
+  ownError = false,
   libraryToCome,
   pending,
   canModerate,
@@ -235,7 +240,7 @@ export default function OverviewTab({
             {/* While own frames load, never zero counts (they would read as
                 "you have nothing"). */}
             {own === null ? (
-              <p className={EMPTY}>Loading…</p>
+              <p className={EMPTY}>{ownError ? 'Not available.' : 'Loading…'}</p>
             ) : (
               <div className="mt-1 flex flex-wrap gap-2">
                 <button type="button" onClick={() => onOpenSegment('ready')} className={READY_BTN}>
@@ -254,7 +259,7 @@ export default function OverviewTab({
           <div className={CARD}>
             <h2 className={HEADER}>Needs attention</h2>
             {own === null ? (
-              <p className={EMPTY}>Loading…</p>
+              <p className={EMPTY}>{ownError ? 'Not available.' : 'Loading…'}</p>
             ) : attentionItems.length === 0 ? (
               <p className={EMPTY}>Nothing needs attention.</p>
             ) : (

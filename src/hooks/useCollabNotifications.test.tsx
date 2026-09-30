@@ -98,7 +98,7 @@ describe('useCollabNotifications', () => {
     expect(listeners['collab-replication-paused']).toBeUndefined();
   });
 
-  it('collab-deletion-choice is one warning linking the Receive tab, deduplicated per occurrence', async () => {
+  it('collab-deletion-choice is one warning linking the Library tab, deduplicated per occurrence', async () => {
     renderHarness();
     await settle();
     const choice: CollabDeletionChoice = {
@@ -111,6 +111,10 @@ describe('useCollabNotifications', () => {
     expect(toasts).toHaveLength(1);
     expect(toasts[0]).toHaveTextContent('15 replicas were deleted — choose what to do');
     expect(screen.getByRole('button', { name: '15 replicas were deleted — choose what to do' })).toBeInTheDocument();
+    // The detail names the Library tab (the retired page called it Receive).
+    const history = localStorage.getItem('athenaeum.notifications.v1') ?? '';
+    expect(history).toContain('re-fetch or stop keeping on the Library tab');
+    expect(history).not.toContain('Receive tab');
 
     // A replay of the same batch (same key) is not shown again…
     emit('collab-deletion-choice', choice);

@@ -147,7 +147,7 @@ export function useCollabNotifications() {
         const n = p.count;
         notify({
           title: `${n} ${n === 1 ? 'replica was' : 'replicas were'} deleted — choose what to do`,
-          detail: `${p.projectIds.map(titleFor).join(', ')}: re-fetch or stop keeping on the Receive tab. Nothing else is paused.`,
+          detail: `${p.projectIds.map(titleFor).join(', ')}: re-fetch or stop keeping on the Library tab. Nothing else is paused.`,
           kind: 'project',
           tone: 'warning',
           hasErrors: true,

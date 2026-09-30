@@ -95,7 +95,11 @@ export interface Publishing {
  * orchestration, moved from `ProjectDetail` with the bodies unchanged: the
  * same notifications, dedupe keys and busy / outdated / publishing-device
  * handling. The one change: `publish_collab_frames` and
- * `republish_collab_frames` carry `frameIds` (`null` = republish all).
+ * `republish_collab_frames` carry `frameIds`. `republish` still accepts
+ * `null` (the command's "all"), but the project page never passes it: its
+ * guard sends the published, non-excluded ids it counted, because a null
+ * republish runs over every gate candidate and would announce never-published
+ * Ready frames.
  *
  * R29 fix round 2: the backend always emits `collab-published` on a
  * successful publish/republish (manual or auto), and the app-root

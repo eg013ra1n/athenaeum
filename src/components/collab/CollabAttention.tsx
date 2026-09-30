@@ -14,7 +14,7 @@ import type {
 
 /**
  * The project's replicas that need the user (spec §9.4, L4–L6), above the
- * Receive tab's frame list; each list is hidden while empty:
+ * Library tab's frame list; each list is hidden while empty:
  *
  * - **Changed files** (L5) — a replica edited in place, set aside and no
  *   longer served: "Re-fetch original" (the edited file goes to the system

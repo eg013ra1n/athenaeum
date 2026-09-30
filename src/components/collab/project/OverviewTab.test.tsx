@@ -267,6 +267,18 @@ describe('OverviewTab — needs attention', () => {
     expect(screen.queryByText(/^Ready \d/)).not.toBeInTheDocument();
   });
 
+  it('own frames that failed to load (ownError) show neither Loading… nor zero counts in My frames and Needs attention', async () => {
+    renderTab({ own: null, ownError: true, members: [], libraryToCome: 0, pending: 0, canModerate: false });
+    const myFrames = (await screen.findByRole('heading', { name: 'My frames' })).parentElement!;
+    expect(within(myFrames).queryByText('Loading…')).not.toBeInTheDocument();
+    expect(within(myFrames).getByText('Not available.')).toBeInTheDocument();
+    expect(within(myFrames).queryByRole('button')).not.toBeInTheDocument();
+    const attention = screen.getByRole('heading', { name: 'Needs attention' }).parentElement!;
+    expect(within(attention).queryByText('Loading…')).not.toBeInTheDocument();
+    expect(within(attention).getByText('Not available.')).toBeInTheDocument();
+    expect(screen.queryByText('Nothing needs attention.')).not.toBeInTheDocument();
+  });
+
   it('reads "Nothing needs attention." when nothing qualifies', async () => {
     renderTab({ own: [], libraryToCome: 0, pending: 0, canModerate: false });
     expect(await screen.findByText('Nothing needs attention.')).toBeInTheDocument();
