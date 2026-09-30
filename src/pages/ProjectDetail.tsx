@@ -22,7 +22,7 @@ import ModerationTab from '../components/collab/project/ModerationTab';
 import FrameDrawer from '../components/collab/project/FrameDrawer';
 import RepublishGuardDialog from '../components/collab/project/RepublishGuardDialog';
 import { deviceLabel, leading, OTHER_DEVICE, usePublishing } from '../components/collab/project/usePublishing';
-import type { FrameVM } from '../components/collab/project/frames';
+import { fromLibrary, fromOwn, ownFrameKey, type FrameVM } from '../components/collab/project/frames';
 import type {
   MemberSummary,
   OwnFrameRow,
@@ -233,6 +233,24 @@ function ProjectPage({ id }: { id: string | undefined }) {
     () => libraryToCome(frames, libraryInFlight(exchange.projects, id ?? '')),
     [frames, exchange.projects, id],
   );
+
+  // The drawer renders a FRESH view of its open frame, never the possibly
+  // stale snapshot `onOpen` captured: an own frame's key found in the latest
+  // `own` wins (so its own Restore/Exclude reads back immediately — a
+  // `FrameDrawer` kept mounted across the reload never sees old props
+  // otherwise), then a library frame's key found in the latest `frames`
+  // (`fromLibrary`, the same builder the Library badge's `toCome` uses).
+  // Only when the row can't be found this render — a moderation row (no
+  // `own`/`lib` mirror to re-derive from) or a row that vanished entirely —
+  // does the original snapshot render as a fallback.
+  const drawerFrame: FrameVM | null = useMemo(() => {
+    if (!drawer) return null;
+    const ownRow = own?.find((r) => ownFrameKey(r) === drawer.key);
+    if (ownRow) return fromOwn(ownRow);
+    const libRow = frames?.find((f) => f.frameUuid === drawer.key);
+    if (libRow) return fromLibrary(libRow, libraryInFlight(exchange.projects, id ?? ''));
+    return drawer;
+  }, [drawer, own, frames, exchange.projects, id]);
 
   const openPortal = async (path: string) => {
     if (!detail) return;
@@ -529,11 +547,11 @@ function ProjectPage({ id }: { id: string | undefined }) {
         />
       )}
 
-      {drawer && (
+      {drawerFrame && (
         <FrameDrawer
-          key={drawer.key}
+          key={drawerFrame.key}
           projectId={id}
-          frame={drawer}
+          frame={drawerFrame}
           coordinator={c.coordinator}
           onClose={() => setDrawer(null)}
           onChanged={() => {

@@ -44,13 +44,20 @@ export interface FrameVM {
   disk: 'on' | 'missing' | 'changed' | null; // own published only
   publishedAt: string | null;
   device: DeviceState | null; // library only
-  missingWhy: 'holder offline' | 'publisher offline' | null;
+  missingWhy: 'holder offline' | 'publisher offline' | 'gone from disk' | null;
   progress: number | null; // 0..100 while downloading
   submittedAt: string | null; // moderation only
   states: string[]; // this table's state-facet values
   own: OwnFrameRow | null;
   lib: ProjectFrameView | null;
   mod: ModerationFrameView | null;
+}
+
+/** The `FrameVM.key` for an own-frame row — the single source of truth for
+ * `fromOwn`'s own key and for callers that need to match a stale VM back to
+ * its fresh row (e.g. re-deriving an open drawer's frame after a reload). */
+export function ownFrameKey(r: Pick<OwnFrameRow, 'frameUuid' | 'frameId'>): string {
+  return r.frameUuid ?? `id:${r.frameId}`;
 }
 
 /** Own frame → view-model. `disk` and the segment-dependent `states` are
@@ -65,7 +72,7 @@ export function fromOwn(r: OwnFrameRow): FrameVM {
   const excluded = r.accepted === false;
 
   const vm: FrameVM = {
-    key: r.frameUuid ?? `id:${r.frameId}`,
+    key: ownFrameKey(r),
     frameId: r.frameId,
     frameUuid: r.frameUuid,
     setId: r.setId,
@@ -118,6 +125,12 @@ export function fromOwn(r: OwnFrameRow): FrameVM {
 export function fromLibrary(r: ProjectFrameView, inFlight: ReadonlyMap<string, { done: number; size: number }>): FrameVM {
   let device: DeviceState | null;
   let progress: number | null = null;
+  // Holder-offline / publisher-offline are reasons for the `wanted` route
+  // ONLY — core's `LocalState::Missing` means "was on disk, isn't any more"
+  // (GC'd, deleted, disk truth found it gone), a different fact from "we
+  // want it but nobody online has it", so it never borrows that route's
+  // reasons.
+  let missingWhy: FrameVM['missingWhy'] = null;
   switch (r.localState) {
     case 'held':
       device = 'have';
@@ -126,9 +139,10 @@ export function fromLibrary(r: ProjectFrameView, inFlight: ReadonlyMap<string, {
       const fl = inFlight.get(r.frameUuid);
       if (fl) {
         device = 'downloading';
-        progress = Math.min(100, Math.max(0, Math.round((fl.done / fl.size) * 100)));
+        progress = fl.size > 0 ? Math.min(100, Math.max(0, Math.round((fl.done / fl.size) * 100))) : 0;
       } else if (r.waitingForPublisher || r.holdersOnline === 0) {
         device = 'missing';
+        missingWhy = r.waitingForPublisher ? 'publisher offline' : 'holder offline';
       } else {
         device = 'queued';
       }
@@ -136,6 +150,7 @@ export function fromLibrary(r: ProjectFrameView, inFlight: ReadonlyMap<string, {
     }
     case 'missing':
       device = 'missing';
+      missingWhy = 'gone from disk';
       break;
     case 'not_kept':
       device = 'notKept';
@@ -151,11 +166,6 @@ export function fromLibrary(r: ProjectFrameView, inFlight: ReadonlyMap<string, {
       break;
     default:
       device = null; // own_held / own_missing / own_changed
-  }
-
-  let missingWhy: FrameVM['missingWhy'] = null;
-  if (device === 'missing') {
-    missingWhy = r.waitingForPublisher ? 'publisher offline' : (r.holdersOnline === 0 ? 'holder offline' : null);
   }
 
   return {

@@ -1,3 +1,9 @@
+/** `n === 1 ? singular : plural` — the one pluralization rule shared across
+ * the collab UI (defaults `plural` to `singular + 's'`). */
+export function pluralize(n: number, singular: string, plural: string = `${singular}s`): string {
+  return n === 1 ? singular : plural;
+}
+
 /** Human byte size, shared by the Stage-II collab exchange UI. */
 export function formatBytes(n: number): string {
   if (!isFinite(n) || n < 0) return '—';

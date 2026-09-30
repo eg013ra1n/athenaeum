@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type JSX } from 'react';
 import { api } from '../../../api';
 import { useCollabExchange } from '../../../contexts/CollabExchangeContext';
 import { formatTimestamp } from '../../../utils/dateFormatting';
-import { formatBytes, formatRate } from '../format';
+import { formatBytes, formatRate, pluralize } from '../format';
 import { flowKey, peerLabel } from '../exchange/state';
 import { PeerFlowRow } from '../exchange/PeerFlowRow';
 import { memberTone } from './memberColors';
@@ -24,6 +24,13 @@ const EMPTY = 'py-1.5 text-xs text-content-muted';
 
 function sumRate(flows: FlowView[]): number {
   return flows.reduce((a, f) => a + f.rateBps, 0);
+}
+
+/** Distinct MEMBERS behind a direction's flows, not flow (device) count — two
+ * devices of the same member (`peerLabel(...).member`) count once; an
+ * unnamed device falls back to its own id so it still counts as one peer. */
+function distinctMembers(flows: FlowView[], label: (device: string) => { member: string | null }): number {
+  return new Set(flows.map((f) => label(f.device).member ?? f.device)).size;
 }
 
 function toneFor(member: string | null, members: MemberSummary[] | null): string | undefined {
@@ -112,13 +119,17 @@ export default function ExchangeTab({
   const toGo = summary?.toGo ?? 0;
   const waitingForPublisher = summary?.waitingForPublisher ?? null;
 
+  const peerLabelHere = (device: string) => peerLabel(state, projectId, device);
+  const recvMembers = distinctMembers(recv, peerLabelHere);
+  const sendMembers = distinctMembers(send, peerLabelHere);
+
   const recvSub = canReceive
-    ? `${formatRate(sumRate(recv))} from ${recv.length} members · ${toGo} frames to go${
+    ? `${formatRate(sumRate(recv))} from ${recvMembers} ${pluralize(recvMembers, 'member')} · ${toGo} frames to go${
         waitingForPublisher ? ` · waiting for publisher: ${waitingForPublisher}` : ''
       }`
     : 'Your role does not receive project data';
 
-  const sendSub = `${formatRate(sumRate(send))} to ${send.length} members`;
+  const sendSub = `${formatRate(sumRate(send))} to ${sendMembers} ${pluralize(sendMembers, 'member')}`;
 
   const renderRows = (flows: FlowView[]) => (
     <div>

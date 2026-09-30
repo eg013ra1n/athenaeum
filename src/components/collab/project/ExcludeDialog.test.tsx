@@ -50,6 +50,25 @@ function frame(overrides: Partial<FrameVM> = {}): FrameVM {
 }
 
 describe('ExcludeDialog', () => {
+  it('titles the dialog "Exclude 1 frame" (singular) for one frame, "Exclude N frames" (plural) for several', () => {
+    const { unmount } = render(
+      <ExcludeDialog projectId="p" frames={[frame()]} onClose={vi.fn()} onDone={vi.fn()} />,
+    );
+    expect(screen.getByText('Exclude 1 frame from the project')).toBeInTheDocument();
+    expect(screen.queryByText('Exclude 1 frames from the project')).not.toBeInTheDocument();
+    unmount();
+
+    render(
+      <ExcludeDialog
+        projectId="p"
+        frames={[frame(), frame({ key: 'uuid-2', frameUuid: 'uuid-2' })]}
+        onClose={vi.fn()}
+        onDone={vi.fn()}
+      />,
+    );
+    expect(screen.getByText('Exclude 2 frames from the project')).toBeInTheDocument();
+  });
+
   it('titles the dialog with the frame count and disables Exclude for a blank or over-limit reason', () => {
     render(
       <ExcludeDialog

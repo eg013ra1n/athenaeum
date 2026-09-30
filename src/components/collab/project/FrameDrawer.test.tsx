@@ -257,11 +257,11 @@ describe('FrameDrawer', () => {
     renderDrawer(frame, { coordinator: true, onClose });
 
     fireEvent.click(screen.getByRole('button', { name: 'Exclude…' }));
-    expect(screen.getByText('Exclude 1 frames from the project')).toBeInTheDocument();
+    expect(screen.getByText('Exclude 1 frame from the project')).toBeInTheDocument();
 
     fireEvent.keyDown(document, { key: 'Escape' });
 
-    expect(screen.queryByText('Exclude 1 frames from the project')).not.toBeInTheDocument();
+    expect(screen.queryByText('Exclude 1 frame from the project')).not.toBeInTheDocument();
     expect(onClose).not.toHaveBeenCalled();
   });
 

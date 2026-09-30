@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type JSX, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Loader2, Plus, RefreshCw } from 'lucide-react';
 import { api } from '../../../api';
@@ -182,10 +182,22 @@ export default function MyFramesTab({
     navigate(`/objects/${setId}?tab=calibration`);
   };
 
-  const raw = rows ?? [];
-  const readyRows: FrameVM[] = raw.filter((r) => r.segment === 'ready').map(fromOwn);
-  const publishedRows: FrameVM[] = raw.filter((r) => r.segment === 'published').map(fromOwn);
-  const heldRows: FrameVM[] = raw.filter((r) => r.segment === 'held').map(fromOwn);
+  // Memoized on `rows` alone: `ProjectPage` re-renders on every 1 Hz exchange
+  // event, and without this each of the three tables would re-derive its
+  // whole `FrameVM[]` on every one of those renders even though `rows` (from
+  // `list_project_own_frames`) hasn't changed.
+  const readyRows: FrameVM[] = useMemo(
+    () => (rows ?? []).filter((r) => r.segment === 'ready').map(fromOwn),
+    [rows],
+  );
+  const publishedRows: FrameVM[] = useMemo(
+    () => (rows ?? []).filter((r) => r.segment === 'published').map(fromOwn),
+    [rows],
+  );
+  const heldRows: FrameVM[] = useMemo(
+    () => (rows ?? []).filter((r) => r.segment === 'held').map(fromOwn),
+    [rows],
+  );
 
   const readyActions: TableAction[] = [
     {

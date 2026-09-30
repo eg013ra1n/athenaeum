@@ -92,6 +92,19 @@ it('fromLibrary: wanted with no online holder is missing (holder offline); with 
   expect(fromLibrary(lib({ localState: 'wanted', holdersOnline: 2 }), new Map()).device).toBe('queued');
 });
 
+it('fromLibrary: localState "missing" (gone from disk) reads that reason even with holdersOnline: 0 — never borrows the wanted route\'s reasons', () => {
+  const vm = fromLibrary(lib({ localState: 'missing', holdersOnline: 0, waitingForPublisher: false }), new Map());
+  expect([vm.device, vm.missingWhy]).toEqual(['missing', 'gone from disk']);
+});
+
+it('fromLibrary: a zero-size in-flight item never divides into NaN — progress is 0', () => {
+  const vm = fromLibrary(
+    lib({ frameUuid: 'u1', localState: 'wanted' }),
+    new Map([['u1', { done: 0, size: 0 }]]),
+  );
+  expect([vm.device, vm.progress]).toEqual(['downloading', 0]);
+});
+
 it('copies counts this device when it holds the frame', () => {
   expect(copies(fromOwn(own({ segment: 'published', localState: 'own_held', holdersTotal: 0 })))).toBe(1);
   expect(copies(fromLibrary(lib({ localState: 'held', holdersTotal: 1 }), new Map()))).toBe(2);

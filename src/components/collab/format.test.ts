@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { formatDuration, formatRate, formatRelative } from './format';
+import { formatDuration, formatRate, formatRelative, pluralize } from './format';
+
+describe('pluralize', () => {
+  it('picks the singular at exactly 1, the plural (default +s) otherwise', () => {
+    expect(pluralize(1, 'member')).toBe('member');
+    expect(pluralize(0, 'member')).toBe('members');
+    expect(pluralize(2, 'member')).toBe('members');
+  });
+  it('accepts an explicit irregular plural', () => {
+    expect(pluralize(1, 'copy', 'copies')).toBe('copy');
+    expect(pluralize(3, 'copy', 'copies')).toBe('copies');
+  });
+});
 
 describe('formatDuration', () => {
   it('0 seconds is 0m (not 0s)', () => {

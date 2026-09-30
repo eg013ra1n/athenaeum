@@ -85,7 +85,7 @@ export default function ExcludeDialog({
       >
         <div className="mb-2 flex items-center gap-2">
           <Ban size={16} className="text-error" />
-          <h2 className="font-medium text-content">Exclude {frames.length} frames from the project</h2>
+          <h2 className="font-medium text-content">Exclude {frames.length} {frames.length === 1 ? 'frame' : 'frames'} from the project</h2>
           <button
             onClick={onClose}
             disabled={busy}

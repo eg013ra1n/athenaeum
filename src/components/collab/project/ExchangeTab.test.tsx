@@ -212,6 +212,28 @@ describe('ExchangeTab — live rows', () => {
     expect(button).toHaveAttribute('aria-expanded', 'true');
     expect(await screen.findByText('light_003.fits')).toBeInTheDocument();
   });
+
+  it('counts distinct MEMBERS, not flows: two recv flows from two devices of one member read "from 1 member" (singular)', async () => {
+    exchangeSnapshot = {
+      projects: [
+        projectFlows({
+          recv: [
+            flow({ device: 'devA', direction: 'recv', rateBps: 100 }),
+            flow({ device: 'devB', direction: 'recv', rateBps: 100 }),
+          ],
+        }),
+      ],
+      names: [
+        { projectId: 'proj-1', device: 'devA', memberName: 'Kostya', deviceName: 'kostya-laptop' },
+        { projectId: 'proj-1', device: 'devB', memberName: 'Kostya', deviceName: 'kostya-obs' },
+      ],
+    };
+
+    renderTab();
+
+    expect(await screen.findByText(/from 1 member ·/)).toBeInTheDocument();
+    expect(screen.queryByText(/from 2 members ·/)).not.toBeInTheDocument();
+  });
 });
 
 describe('ExchangeTab — receive history', () => {

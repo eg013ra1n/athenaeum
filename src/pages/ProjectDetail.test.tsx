@@ -1161,4 +1161,41 @@ describe('ProjectDetail frame drawer', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     await waitFor(() => expect(screen.queryByRole('complementary')).not.toBeInTheDocument());
   });
+
+  it("a coordinator's own Restore refreshes the still-open drawer — no stale Excluded box, offers Exclude…", async () => {
+    let calls = 0;
+    mockCommands(projectCard({ coordinator: true }), {
+      list_project_own_frames: () => {
+        calls += 1;
+        return Promise.resolve([
+          published(
+            23,
+            calls === 1 ? { accepted: false, acceptedReason: 'trailed' } : { accepted: true, acceptedReason: null },
+          ),
+        ]);
+      },
+      get_collab_frame_holders: () => Promise.resolve([]),
+      restore_collab_frame: () => Promise.resolve(undefined),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /^Published 1/ }));
+    fireEvent.click(await screen.findByText('P_0023.fits'));
+
+    const drawer = await screen.findByRole('complementary');
+    expect(within(drawer).getByText(/Excluded — trailed/)).toBeInTheDocument();
+    expect(within(drawer).queryByRole('button', { name: 'Exclude…' })).not.toBeInTheDocument();
+
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Restore' }));
+
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('restore_collab_frame', { projectId: 'proj-1', frameUuid: 'u-23' }),
+    );
+    // The reload answers `accepted: true` — the drawer, kept open on the same
+    // frame (same key, no remount), must reflect it: the Excluded box is
+    // gone and the coordinator now sees Exclude… instead.
+    await waitFor(() => expect(within(drawer).queryByText(/Excluded — trailed/)).not.toBeInTheDocument());
+    expect(within(drawer).getByRole('button', { name: 'Exclude…' })).toBeInTheDocument();
+    expect(calls).toBe(2);
+  });
 });
