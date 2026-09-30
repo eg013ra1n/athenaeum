@@ -1,6 +1,6 @@
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { formatBytes, shortPeer } from './presentation';
-import type { UnifiedRow } from './types';
+import type { DetailRow, UnifiedRow } from './types';
 
 /** The `Sender` detail line (Perseus UI v2) — `<device name or short hex> ·
  *  Perseus agent` / `· Athenaeum` for a RECEIVED transfer whose sender kind is
@@ -18,7 +18,7 @@ function senderRow(deviceLabel: string, kind: string | null): { label: string; v
  * is the ONLY place hex is shown), direction, timings, attempts, raw state, and
  * byte size. Diagnostic surface, not the everyday view.
  */
-export function TransferDetails({ item }: { item: UnifiedRow }) {
+export function TransferDetails({ item }: { item: DetailRow }) {
   const rows: Array<{ label: string; value: string; mono?: boolean }> =
     item.kind === 'live' ? liveRows(item) : historyRows(item);
 

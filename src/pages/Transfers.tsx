@@ -3,14 +3,22 @@ import { ArrowLeftRight } from 'lucide-react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
 import { AppDataWarningStrip } from '../components/transfers/AppDataWarningStrip';
+import { CollabTrafficGroups } from '../components/transfers/CollabTrafficGroups';
 import { TransferRow } from '../components/transfers/TransferRow';
 import { TransferDetail } from '../components/transfers/TransferDetail';
-import { groupHasCancel, groupHasFailure, groupHasRealSuccess } from '../components/transfers/historyGrouping';
+import {
+  groupHasCancel,
+  groupHasFailure,
+  groupHasRealSuccess,
+  mergeHistory,
+} from '../components/transfers/historyGrouping';
 import type { DeleteKey, TransferFilter, UnifiedRow } from '../components/transfers/types';
-import type { Direction } from '../types/models';
+import type { CollabFramesLanded, Direction, ReceiveSessionView } from '../types/models';
 import type { TransferRow as TransferRowModel } from '../hooks/useTransferQueue';
 import { useTransferQueue } from '../hooks/useTransferQueue';
 import { useTransferHistory } from '../hooks/useTransferHistory';
+
+const SESSIONS_LIMIT = 200;
 
 /**
  * `/transfers` — the torrent-style master-detail Transfers view (Transfers
@@ -30,14 +38,58 @@ export default function Transfers() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
+  // Collab receive sessions (Task 17) — merged into the unified list's
+  // history by time, alongside the personal-sync groups. Global (`projectId:
+  // null`): every project's sessions show up here, same as every project's
+  // live traffic shows up in `CollabTrafficGroups` below.
+  const [sessions, setSessions] = useState<ReceiveSessionView[]>([]);
+  const fetchSessions = useCallback(() => {
+    api
+      .invoke<ReceiveSessionView[]>('list_collab_receive_sessions', {
+        projectId: null,
+        limit: SESSIONS_LIMIT,
+      })
+      .then((rows) => setSessions(rows))
+      .catch((err) => console.error('[Transfers] list_collab_receive_sessions failed:', err));
+  }, []);
+
+  useEffect(() => {
+    fetchSessions();
+  }, [fetchSessions]);
+
+  // Re-read sessions the moment a burst of landings lands, for any project —
+  // StrictMode-safe listener pattern (CLAUDE.md).
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<CollabFramesLanded>('collab-frames-landed', () => {
+        if (!cancelled) fetchSessions();
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[Transfers] collab-frames-landed listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [fetchSessions]);
+
   // Re-read history the moment a transfer finishes (cheap; the hook also polls).
-  // Live rows already react via the shared `useSyncStatus` snapshot.
+  // Live rows already react via the shared `useSyncStatus` snapshot. Also
+  // re-reads collab sessions on the same tick (Task 17) — one discrete-outcome
+  // signal, two cheap refetches.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     api
       .listen<unknown>('sync-finished', () => {
-        if (!cancelled) refetch();
+        if (!cancelled) {
+          refetch();
+          fetchSessions();
+        }
       })
       .then((fn) => {
         if (cancelled) fn();
@@ -48,7 +100,7 @@ export default function Transfers() {
       cancelled = true;
       unlisten?.();
     };
-  }, [refetch]);
+  }, [refetch, fetchSessions]);
 
   // Merge live rows + history groups into one unified list (§D8). The batch model
   // guarantees ONE durable row per transfer per direction — the sender reuses its
@@ -121,8 +173,29 @@ export default function Transfers() {
         deleteKey: g.packageId ? { direction: g.direction, packageKey: g.packageId } : null,
       });
     }
-    return [...liveUnified, ...historyUnified];
-  }, [rows, groups, deviceNames, deviceKinds, projectNames]);
+    // Collab receive sessions (Task 17) merge in with the history groups by
+    // time — `finishedAt` for a session, `finishedAt ?? startedAt` for a
+    // group — so the two interleave instead of one stacking wholesale above
+    // the other. Both inputs are already newest-first (the backend returns
+    // sessions that way; `groups` inherits it from `list_sync_history`), so
+    // `mergeHistory` does one linear pass, no re-sort.
+    const sessionUnified: UnifiedRow[] = sessions.map((s) => ({
+      kind: 'session',
+      selKey: `session:${s.id}`,
+      session: s,
+    }));
+    const sessionTimed = sessionUnified.map((row) => ({
+      at: (row as Extract<UnifiedRow, { kind: 'session' }>).session.finishedAt,
+      row,
+    }));
+    const historyTimed = historyUnified.map((row) => {
+      const group = (row as Extract<UnifiedRow, { kind: 'history' }>).group;
+      return { at: group.finishedAt ?? group.startedAt, row };
+    });
+    const mergedHistory = mergeHistory(sessionTimed, historyTimed).map((e) => e.row);
+
+    return [...liveUnified, ...mergedHistory];
+  }, [rows, groups, deviceNames, deviceKinds, projectNames, sessions]);
 
   // Filter membership (§D8). A row can match more than one bucket (a mixed
   // history group is both Completed and Failed); counts reflect that honestly.
@@ -152,6 +225,12 @@ export default function Transfers() {
         else if (r.displayState === 'cancelled') s.add('cancelled');
         else s.add('completed');
       } else s.add(r.kind === 'outbound' ? 'sending' : 'receiving');
+    } else if (u.kind === 'session') {
+      // A collab receive session is always a settled fact (Task 17) — it
+      // belongs in Completed, and ALSO in Failed when any frame in the burst
+      // failed (mirrors a mixed history group being in both buckets).
+      s.add('completed');
+      if (u.session.failed > 0) s.add('failed');
     } else {
       const success = groupHasRealSuccess(u.group);
       const failure = groupHasFailure(u.group);
@@ -189,7 +268,10 @@ export default function Transfers() {
   // Resolve the selected row from the FILTERED list, not the full one: a row the
   // active filter no longer includes must drop out of the detail pane (it comes
   // back if the filter widens again — `selectedKey` is preserved, not cleared).
-  const selected = selectedKey ? (filtered.find((u) => u.selKey === selectedKey) ?? null) : null;
+  // A `session` row (Task 17) still highlights via `selected` on `TransferRow`
+  // — it just never opens the bottom pane, so it resolves to `null` here.
+  const selectedRow = selectedKey ? (filtered.find((u) => u.selKey === selectedKey) ?? null) : null;
+  const selected = selectedRow && selectedRow.kind !== 'session' ? selectedRow : null;
 
   // Trash a settled batch (UX wave 2, §problem 5): fire the durable delete, then
   // — only on success (the backend refuses `Invalid` if any attempt is active) —
@@ -266,6 +348,15 @@ export default function Transfers() {
           );
         })}
       </div>
+
+      {/* Collab traffic groups (Task 17) — visible under the filters that show
+          in-progress traffic (`all`/`sending`/`receiving`); hidden under the
+          settled-outcome filters (`waiting`/`completed`/`cancelled`/`failed`),
+          where live flows have nothing to add. The component itself already
+          renders nothing when no project has a live flow. */}
+      {(filter === 'all' || filter === 'sending' || filter === 'receiving') && (
+        <CollabTrafficGroups projectTitles={projectNames} />
+      )}
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-border">
         <div className="min-h-0 flex-1 overflow-y-auto">

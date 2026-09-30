@@ -1,5 +1,8 @@
-import { ArrowUp, ArrowDown, RefreshCw } from 'lucide-react';
+import { ArrowUp, ArrowDown, RefreshCw, Users } from 'lucide-react';
 import { useTransfers } from '../../contexts/TransfersContext';
+import { useCollabExchange } from '../../contexts/CollabExchangeContext';
+import { exchangeTotals } from '../collab/exchange/state';
+import { formatRate } from '../collab/format';
 import { transportHealthView } from './transportHealth';
 
 interface TransferIndicatorProps {
@@ -14,16 +17,25 @@ interface TransferIndicatorProps {
  * 3.3); clicking opens the `TransfersPanel`.
  *
  * The snapshot behind it is polled by the single shared `useSyncStatus` in
- * `TransfersProvider` — this component is presentational only.
+ * `TransfersProvider` — this component is presentational only. Task 17 adds
+ * collab traffic to the icon: it lights up on collab-only traffic too, reading
+ * the SAME app-root `CollabExchangeProvider` the Transfers page and the
+ * project Exchange tab already read (one source of live state, never a
+ * second poller). The `visible` gate itself is untouched — it already means
+ * "signed in with a role", which collab traffic needs too.
  */
 export function TransferIndicator({ collapsed }: TransferIndicatorProps) {
   const { status, visible, openPanel } = useTransfers();
+  const { recvBps, sendBps, active } = exchangeTotals(useCollabExchange().state);
   if (!visible || !status) return null;
 
   const up = status.sender.queued + status.sender.transferring;
   const down = status.receiver.receivedTotal;
   const health = transportHealthView(status.transport);
-  const title = `Transfers — ${up} sending, ${down} received\n${health.detail}`;
+  const lit = up > 0 || active;
+  const title =
+    `Transfers — ${up} sending, ${down} received\n${health.detail}` +
+    (active ? `\nCollaboration — ↓ ${formatRate(recvBps)} · ↑ ${formatRate(sendBps)}` : '');
 
   if (collapsed) {
     return (
@@ -34,7 +46,7 @@ export function TransferIndicator({ collapsed }: TransferIndicatorProps) {
           title={title}
           className="relative flex w-full items-center justify-center py-3 text-content-secondary transition-colors hover:text-content"
         >
-          <RefreshCw size={20} className={up > 0 ? 'text-accent' : 'text-content-muted'} />
+          <RefreshCw size={20} className={lit ? 'text-accent' : 'text-content-muted'} />
           {up > 0 && (
             <span className="absolute -top-0.5 -right-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-accent text-[9px] font-bold text-surface">
               {up}
@@ -61,7 +73,7 @@ export function TransferIndicator({ collapsed }: TransferIndicatorProps) {
       >
         <div className="flex items-center gap-1.5 min-w-0">
           <span className="relative flex shrink-0">
-            <RefreshCw size={14} className={up > 0 ? 'text-accent' : 'text-content-muted'} />
+            <RefreshCw size={14} className={lit ? 'text-accent' : 'text-content-muted'} />
             {/* Transport-health dot (Task 3.3) tucked on the transfers icon. */}
             <span
               className={`absolute -bottom-1 -right-1 h-2 w-2 rounded-full ring-2 ring-surface ${health.dot}`}
@@ -85,6 +97,15 @@ export function TransferIndicator({ collapsed }: TransferIndicatorProps) {
             <ArrowDown size={12} />
             {down}
           </span>
+          {active && (
+            <span
+              className="flex items-center gap-0.5 text-accent"
+              title={`Collaboration — ↓ ${formatRate(recvBps)} · ↑ ${formatRate(sendBps)}`}
+            >
+              <Users size={12} />
+              {formatRate(recvBps + sendBps)}
+            </span>
+          )}
         </div>
       </button>
     </div>

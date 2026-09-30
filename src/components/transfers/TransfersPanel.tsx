@@ -3,7 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import { X, Search, ArrowUp, ArrowDown, ArrowUpRight, Inbox, Users } from 'lucide-react';
 import { api } from '../../api';
 import { useTransfers } from '../../contexts/TransfersContext';
+import { useCollabExchange } from '../../contexts/CollabExchangeContext';
 import { plainTransferError, displayStateChip, displayStateSubline, formatBytes } from './presentation';
+import { formatRate } from '../collab/format';
 import { transportHealthView } from './transportHealth';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
@@ -100,6 +102,7 @@ function isDelivered(r: HistoryRow): boolean {
  */
 export function TransfersPanel() {
   const { open, closePanel, status, active, refresh } = useTransfers();
+  const { state: exchangeState } = useCollabExchange();
   const navigate = useNavigate();
   const incoming = status?.receiver.active ?? [];
   // Variant B: announces parked in a sending peer's lane with no `sync_inbound`
@@ -311,6 +314,29 @@ export function TransfersPanel() {
     );
   }, [history, search, deviceNames, projectNames]);
 
+  // Collab projects with a live flow (Task 17) — the Active tab's own line per
+  // project, reading the SAME app-root `CollabExchangeProvider` the Transfers
+  // page and the project Exchange tab already read. Titles come from this
+  // panel's own `projectNames` map (already fetched for the History tab).
+  const collabTraffic = useMemo(
+    () =>
+      Object.entries(exchangeState.projects).map(([projectId, flows]) => ({
+        projectId,
+        title: projectNames[projectId] ?? projectId.slice(0, 8),
+        recvBps: flows.recv.reduce((a, f) => a + f.rateBps, 0),
+        sendBps: flows.send.reduce((a, f) => a + f.rateBps, 0),
+      })),
+    [exchangeState.projects, projectNames],
+  );
+
+  const openCollabProject = useCallback(
+    (projectId: string) => {
+      closePanel();
+      navigate(`/projects/${projectId}?tab=exchange`);
+    },
+    [closePanel, navigate],
+  );
+
   return (
     <>
       {open && (
@@ -402,6 +428,8 @@ export function TransfersPanel() {
               incoming={incoming}
               incomingQueued={incomingQueued}
               preparingBytes={preparingBytes}
+              collabTraffic={collabTraffic}
+              onOpenCollabProject={openCollabProject}
             />
           ) : (
             <HistoryTab
@@ -421,11 +449,22 @@ export function TransfersPanel() {
   );
 }
 
+/** One collab project with a live flow (Task 17) — the Active tab's per-project
+ *  summary line, sibling of the personal outbound/inbound rows. */
+interface CollabTrafficLine {
+  projectId: string;
+  title: string;
+  recvBps: number;
+  sendBps: number;
+}
+
 function ActiveTab({
   active,
   incoming,
   incomingQueued,
   preparingBytes,
+  collabTraffic,
+  onOpenCollabProject,
 }: {
   active: OutboundSummary[];
   incoming: InboundSummary[];
@@ -434,8 +473,16 @@ function ActiveTab({
   /** Live pre-transfer bytes per outbound row id (spec §7.1), empty for every
    *  package that is not currently staging. */
   preparingBytes: Map<number, PreparingBytes>;
+  /** Collab projects currently moving data (Task 17), under the personal rows. */
+  collabTraffic: CollabTrafficLine[];
+  onOpenCollabProject: (projectId: string) => void;
 }) {
-  if (active.length === 0 && incoming.length === 0 && incomingQueued.length === 0) {
+  if (
+    active.length === 0 &&
+    incoming.length === 0 &&
+    incomingQueued.length === 0 &&
+    collabTraffic.length === 0
+  ) {
     return (
       <p className="px-4 py-10 text-center text-sm text-content-muted">No active transfers</p>
     );
@@ -594,6 +641,24 @@ function ActiveTab({
           </li>
         );
       })}
+      {/* Collab traffic (Task 17) — one line per project with a live flow,
+          under the personal rows. Links to that project's Exchange tab and
+          closes the panel, same as "Open full screen" above. */}
+      {collabTraffic.map((p) => (
+        <li key={`collab-${p.projectId}`}>
+          <button
+            type="button"
+            onClick={() => onOpenCollabProject(p.projectId)}
+            className="flex w-full items-center gap-2 px-4 py-3 text-left transition-colors hover:bg-surface-hover"
+          >
+            <Users size={12} className="shrink-0 text-accent" />
+            <span className="min-w-0 flex-1 truncate text-xs font-medium text-content">{p.title}</span>
+            <span className="shrink-0 text-[10px] text-content-muted">
+              {`↓ ${formatRate(p.recvBps)} · ↑ ${formatRate(p.sendBps)}`}
+            </span>
+          </button>
+        </li>
+      ))}
     </ul>
   );
 }

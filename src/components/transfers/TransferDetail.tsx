@@ -4,13 +4,15 @@ import { FileTree } from './FileTree';
 import { TransferLog } from './TransferLog';
 import { TransferDetails } from './TransferDetails';
 import { outcomeChipClass, outcomeLabel } from './presentation';
-import type { UnifiedRow } from './types';
+import type { DetailRow } from './types';
 import type { Direction, TransferEventEntry, TransferFileEntry } from '../../types/models';
 
 type DetailTab = 'files' | 'log' | 'details';
 
 interface TransferDetailProps {
-  item: UnifiedRow;
+  /** Never a `session` row (Task 17) — the page resolves a selected session
+   *  to no selection at all before this component ever mounts. */
+  item: DetailRow;
   /** Live per-file overlay, keyed packageKey → relPath → bytes (from the page hook). */
   liveFiles: Map<string, Map<string, { bytesDone: number; bytesTotal: number }>>;
   onClose: () => void;
@@ -171,7 +173,7 @@ export function TransferDetail({ item, liveFiles, onClose }: TransferDetailProps
 
 /** Files tab for a merged-history group with no live row id: the group's
  *  per-frame outcome list (history data — basenames + settled verdicts). */
-function HistoryFileList({ item }: { item: Extract<UnifiedRow, { kind: 'history' }> }) {
+function HistoryFileList({ item }: { item: Extract<DetailRow, { kind: 'history' }> }) {
   const rows = item.group.rows;
   if (rows.length === 0) {
     return <p className="px-1 py-3 text-xs text-content-muted">No file detail.</p>;

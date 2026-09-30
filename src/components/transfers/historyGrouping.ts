@@ -180,3 +180,29 @@ export function groupHasRealSuccess(g: HistoryGroup): boolean {
 export function groupHasCancel(g: HistoryGroup): boolean {
   return (g.outcomeCounts.cancelled ?? 0) > 0;
 }
+
+/**
+ * Merge two lists already sorted newest-first (by `at`, an ISO-8601 string —
+ * plain string comparison sorts it correctly, the same convention
+ * `groupHistory` itself uses for `finishedAt`/`startedAt`) into one
+ * newest-first list, in one pass, without re-sorting either input.
+ *
+ * Used to fold collab receive sessions (Task 17) in with personal-sync
+ * history groups on `/transfers`, so a session and a group interleave by
+ * time instead of one list stacking wholesale above the other. Stable on
+ * ties: when `a[i].at === b[j].at`, `a`'s element is taken first, and equal
+ * elements within the SAME input keep their original relative order (the
+ * merge only ever compares the two current heads, never reorders past that).
+ */
+export function mergeHistory<T extends { at: string }>(a: T[], b: T[]): T[] {
+  const result: T[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i].at >= b[j].at) result.push(a[i++]);
+    else result.push(b[j++]);
+  }
+  while (i < a.length) result.push(a[i++]);
+  while (j < b.length) result.push(b[j++]);
+  return result;
+}

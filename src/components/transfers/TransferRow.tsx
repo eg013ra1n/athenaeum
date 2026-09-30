@@ -13,9 +13,10 @@ import {
   shortPeer,
   shortProject,
 } from './presentation';
+import { formatRate } from '../collab/format';
 import { summarizeOutcomeChips } from './historyGrouping';
 import type { DeleteKey, UnifiedRow } from './types';
-import type { Direction } from '../../types/models';
+import type { Direction, ReceiveSessionView } from '../../types/models';
 import type { TransferRow as TransferRowModel } from '../../hooks/useTransferQueue';
 
 interface TransferRowProps {
@@ -79,6 +80,8 @@ export function TransferRow({
           onResend={onResend}
           onDelete={onDelete}
         />
+      ) : item.kind === 'session' ? (
+        <SessionRowBody session={item.session} />
       ) : (
         <HistoryRowBody item={item} busy={busy} onDelete={onDelete} />
       )}
@@ -557,6 +560,64 @@ function HistoryRowBody({
             </span>
           </div>
           {deleteKey && <DeleteButton deleteKey={deleteKey} busy={busy} onDelete={onDelete} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A collab receive session (Task 17) — a burst of landings collapsed into one
+ * row, merged into the unified list by time alongside personal-sync history
+ * groups. One line, no actions: `{projectTitle} chip · {frames} frames ·
+ * from {sources joined} · {bytes} · {rate}`. Selecting it opens no detail
+ * pane (the page's selector returns `null` for a session before it ever
+ * reaches `TransferDetail`).
+ */
+function SessionRowBody({ session }: { session: ReceiveSessionView }) {
+  const spanSecs = (Date.parse(session.finishedAt) - Date.parse(session.startedAt)) / 1000;
+  const rate = formatRate(session.bytes / spanSecs);
+  const sources = session.sources
+    .map((src) => src.memberName ?? src.deviceName ?? src.device.slice(0, 8))
+    .join(', ');
+
+  return (
+    <div className="px-3 py-2">
+      <div className="flex items-start gap-3">
+        <span className="mt-0.5 shrink-0" title="Received">
+          <ArrowDown size={15} className="text-content-muted" />
+        </span>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span
+              className="inline-flex shrink-0 items-center gap-0.5 rounded bg-accent/15 px-1 py-0.5 text-[9px] text-accent"
+              title={session.projectTitle}
+            >
+              <Users size={9} />
+              <span className="max-w-[10rem] truncate">{session.projectTitle}</span>
+            </span>
+          </div>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] text-content-muted">
+            <span className="tabular-nums">{session.frames} frames</span>
+            <span aria-hidden="true">·</span>
+            <span className="truncate" title={sources}>
+              from {sources}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="tabular-nums">{formatBytes(session.bytes)}</span>
+            <span aria-hidden="true">·</span>
+            <span className="tabular-nums">{rate}</span>
+          </div>
+        </div>
+
+        <div className="flex shrink-0 flex-col items-end gap-0.5">
+          {session.failed > 0 && (
+            <span className="text-[10px] font-medium text-error">{session.failed} failed</span>
+          )}
+          <span className="text-[10px] text-content-muted tabular-nums">
+            {formatTimestamp(session.finishedAt)}
+          </span>
         </div>
       </div>
     </div>

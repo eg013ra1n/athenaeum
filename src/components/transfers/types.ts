@@ -4,7 +4,7 @@
 // `useTransferHistory`) — "Completed is a filter over the same list", so both
 // sources flow through one row model and one selection key.
 
-import type { Direction } from '../../types/models';
+import type { Direction, ReceiveSessionView } from '../../types/models';
 import type { TransferRow } from '../../hooks/useTransferQueue';
 import type { HistoryGroup } from './historyGrouping';
 
@@ -60,4 +60,18 @@ export type UnifiedRow =
       /** Batch delete key (trash action), or `null` for a legacy null-key
        *  "Earlier transfers" bucket that has no single package key. */
       deleteKey: DeleteKey | null;
+    }
+  | {
+      /** A collab receive session (Task 17) — a burst of collab landings
+       *  collapsed into one row, merged into the unified list by time
+       *  alongside `history` groups. No delete key, no live id: it has no
+       *  actions and opens no detail pane. */
+      kind: 'session';
+      selKey: string;
+      session: ReceiveSessionView;
     };
+
+/** The two `UnifiedRow` kinds that open the bottom detail pane (`TransferDetail`).
+ *  A `session` row (Task 17) never reaches it — the page's selection logic
+ *  resolves a selected session to `null` before it gets this far. */
+export type DetailRow = Extract<UnifiedRow, { kind: 'live' } | { kind: 'history' }>;
