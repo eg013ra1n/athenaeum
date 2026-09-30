@@ -109,6 +109,7 @@ pub async fn get_my_setting(State(state): State<AppState>) -> impl IntoResponse 
 - Tailwind + design tokens (above). Icons from `lucide-react`. Charts from `recharts`.
 - Custom hooks prefixed `use…`; pages mostly presentational, logic in hooks.
 - TS interfaces in `src/types/models.ts` mirror Rust models; `src/types/calibration-config.ts` mirrors the calibration config.
+- Shared compact UI primitives live in `src/components/ui/` (they mirror the collab mockup's CSS: `Button`, `Chip`, `Card`, `KV`, `DialogShell`, `SidePanel`, …); a new or reworked modal uses `DialogShell` (the collab dialogs and `ConfirmDialog`/`AlertDialog` do; the rest move in wave 5.6). `npm run ui:harness` renders the project page on the mockup's data for side-by-side checks.
 
 **Settings page** (`docs/settings/README.md` is the contract — read it before adding a setting).
 Seven tabs in a fixed order — General · Blink · Analysis · Plate Solving · Calibration · Stacking ·

@@ -177,8 +177,9 @@ follows the rule rather than the mockup's hand-picked order.
 - **Header.** Sticky, 30 px, `table-head`, 11.5 px weight 500 `content-faint`, padding `0 8px`,
   bottom border `border`. Numeric headers are right-aligned. A sortable header turns `content` on
   hover; the sorted header is `accent` with ` ↑` / ` ↓`.
-- **Data row.** Cell height 28 px, a 1 px `line-soft` separator (29 px pitch, the windowing constant
-  stays 29), 13 px `content-secondary`, padding `0 8px`, no wrap, ellipsis. File name: mono 12 px.
+- **Data row.** Cell height 28 px including its 1 px `line-soft` separator (border-box, 28 px pitch —
+  measured in the mockup and the app; the windowing constant `ROW_H` is 28, §21 R17), 13 px
+  `content-secondary`, padding `0 8px`, no wrap, ellipsis. File name: mono 12 px.
 - **Row states.** Hover `rgba(67,76,94,.55)`. Selected (checkbox) `rgba(136,192,208,.08)`. Active
   (its side panel is open) `rgba(136,192,208,.16)`.
 - **Group rows.** `table-group` (level 0) and `table-group-l1` (level 1), weight 500 `content`,
@@ -506,7 +507,7 @@ Every column sorts. A row click opens the member card (§6.3). Durations everywh
 | "N queued" per peer flow | `FlowView` has no per-peer queue | "N in flight" only |
 | "upload streams 3 of 4" in Sending | the upload cap is not in any view | omitted |
 | per-flow landed-vs-queued bar | as above | `Bar` = byte progress of the in-flight items |
-| rate history | not in the model | `Sparkline` from a frontend ring buffer (last 60 samples per flow) filled by the existing 1 Hz `collab-exchange-progress` events; empty after a reload |
+| rate history | not in the model | `Sparkline` over the existing 40-sample `state.rates` history per flow (`RATE_HISTORY_MAX`), filled by the 1 Hz `collab-exchange-progress` events; empty after a reload |
 
 ## 17. Harness and verification
 
@@ -589,3 +590,41 @@ The inputs most likely to break the layout; each has a test or a harness check i
 5. **Live states** — connecting, reconnecting, offline, signed out, and publishing from another
    device. Expected: the pill and the meta line show each state in the same geometry; Sync is
    disabled while it cannot run.
+
+## 21. Implementation notes (execution rulings, 2026-09-30 – 2026-10-01)
+
+Decisions taken while the plan ran. Each one either sharpens this spec or records where the build
+departs from it. The full record, with the cost of each if wrong, is in the plan's execution ledger.
+
+| # | Ruling |
+| ---- | ---- |
+| R1 | Interim only: the old drawer got `aria-label="Frame details"` one task before `FramePanel` replaced it. |
+| R2 | Harness threshold keys are the gate registry's (`fwhm_arcsec`, `eccentricity`, `stars_detected`, `not_trailed`); the Overview thresholds card keys on them. |
+| R3 | The harness answers commands it does not model with `null`, or `[]` for `list_*`; an object-shaped `list_*` (`list_terminal_transfers`) needs its own fixture. |
+| R4 | `formatDurationPadded` rounds total minutes first ("2h 00m", never the mockup's "1h 60m"). |
+| R5 | `SegmentTiles` keeps a space between number and label so the accessible name reads "136 Ready to publish". |
+| R6 | `Pill` accepts `disabled` and dims (opacity .45, no hover). |
+| R7 | The live dot's glow is a token ring (`ring-success/[0.18]`), not a raw shadow. |
+| R8–R9 | One module-level overlay stack (dialog, popover, panel; panels at the bottom). Only the top overlay handles Escape and calls `preventDefault`; only the top dialog traps Tab; `data-autofocus` wins initial focus; a scrim closes only when press and release both land on it; `DialogShell` portals to `document.body`. |
+| R10 | The settings switch folds into `Checkbox`; `AlertDialog` closes with the shell's ×. |
+| R11 | `Checkbox`'s label is `relative`, so the hidden input stays inside the scroller. |
+| R12 | Initial focus: a field if the dialog has one; never a destructive button; with no field and a destructive action, Cancel. |
+| R13 | The checkbox box sits 3.5 px down to centre on a 20 px line. |
+| R14 | The member-colour context lives in `MemberColorsContext.tsx` (a case-only clash with `memberColors.ts` breaks imports on a case-insensitive disk). |
+| R15, R19 | Where the plan's pixel values disagreed with the mockup, the mockup won: row indent 8 + 18·depth (+14 for a frame row), bars fill their cell, "Clear filters" 12 px, search 170 px, caret 13 px; the table's min-width sits on a wrapper `div`. |
+| R16 | Checkbox column 34 px (§5.1's 32 was a transcription error). |
+| R17 | `ROW_H` = 28 (§5.1 amended). |
+| R18 | `useFillHeight` also refits from a `ResizeObserver` on its parent and on `document.body`. |
+| R20 | Header row 1 never wraps: a long title truncates, and the pill and portal link stay on the row (§20.3 "never overlapping" is met by truncation). |
+| R21 | Tabs have no `-mb-px` (it clipped the underline); header gap 14 px, meta-line margin 6 px. |
+| R22 | A zone-less `fetchedAt` is parsed as UTC; the pill's age rolls s → m → h → d and resets after its own Sync; form controls inherit `font-variant-numeric` (base rule in `index.css`). |
+| R23 | `ExcludeDialog` moved onto `DialogShell` together with `FramePanel`, which opens it. |
+| R24 | The panel's Gate grid keeps every blocker's explanation, one row per cause. |
+| R25 | Overview attention counts come from the same predicates the opened table filters on; the missing-frames row shows only when this member receives; Map opens the filter-mapping dialog; "not analyzed" navigates to Held back instead of running analysis from Overview. |
+| R26 | My frames: the row buttons take the tile box (150 × 33); the Link dialog lists linked objects with Unlink, then the remaining suggestions; `AutoPublishSwitch` removed. |
+| R27 | Export for WBPP lives on the Library group row, so an empty Library has none. |
+| R28 | Each Library attention list shows its note as a visible faint line, not a tooltip only. |
+| R29 | Moderation's "Excluded frames" keeps its 20 px top margin; `TextArea` joins the field primitives. |
+| R30 | Members: FWHM x̃ and Devices sortable; filter columns = filters with data or a goal; a member with no data shows a ghost "—"; names truncate at 16 rem; the member card lists one filter per line under each camera (a deliberate deviation). The member-name cell is `align-top`: the truncating name made the baseline-aligned row 1.25 px taller than the mockup's 30.5. |
+| R31 | Exchange: the Received table's Started shows seconds through an opt-in `formatTimestamp(iso, { seconds: true })` (every other caller keeps HH:MM); the From cell is plain inline dot + name. |
+| R32 | `PeerFlowRow` sets its own 13 px / 1.4 so it renders the same on Transfers; the in-flight size column is a fixed 110 px on one line (the mockup's 80 px column wraps it). |

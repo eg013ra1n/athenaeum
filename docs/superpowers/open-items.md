@@ -201,6 +201,17 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Collab project page — wave 5.5 pixel pass (2026-10-01)
+
+The project page, its dialogs and the shared `src/components/ui/` primitives were matched to the
+mockup in the dev harness (`npm run ui:harness`, spec
+`docs/superpowers/specs/2026-09-30-collab-project-ui-pixel-design.md`, plan
+`docs/superpowers/plans/2026-09-30-collab-project-ui-pixel-plan.md`), in Chrome. Owed:
+
+- Wave 5.5 — real-window (Tauri/WebKit) check of the project page: owed until the terminal has
+  Screen Recording permission. On the owner's data: all six tabs, the frame panel, the member panel
+  and one dialog, compared with the harness for font rendering and layout.
+
 ### Collab observability wave 1 + 2 (2026-09-30)
 
 Backend (wave 1: the exchange meter, sessions, member summary) and frontend (wave 2: the six-tab project
