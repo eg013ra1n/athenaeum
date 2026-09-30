@@ -928,22 +928,59 @@ describe('ProjectDetail tabs', () => {
     expect(screen.getByRole('tab', { name: /^My frames/ })).toBeInTheDocument();
   });
 
-  it('Moderation shows only for a coordinator of a project that requires approval, with the pending badge', async () => {
-    mockCommands(projectCard({ coordinator: true, canModerate: true, requireApproval: true, pendingFrames: 3 }));
-    const first = renderProjectDetail();
-    expect(await screen.findByRole('tab', { name: 'Moderation 3' })).toBeInTheDocument();
-    first.unmount();
+  it('a non-coordinator with canModerate: true sees the Moderation tab, the Exclude action in Library, and Restore in the drawer', async () => {
+    const eligible = libraryFrame({ frameUuid: 'lib-1', fileName: 'alice_001.fits', accepted: true });
+    const excluded = libraryFrame({
+      frameUuid: 'lib-2',
+      fileName: 'alice_002.fits',
+      accepted: false,
+      acceptedReason: 'trailed',
+    });
+    mockCommands(projectCard({ coordinator: false, canModerate: true, requireApproval: true, pendingFrames: 2 }), {
+      list_collab_frames: () => Promise.resolve([eligible, excluded]),
+      get_collab_frame_holders: () => Promise.resolve([]),
+    });
+    renderProjectDetail();
+    expect(await screen.findByRole('tab', { name: 'Moderation 2' })).toBeInTheDocument();
 
-    mockCommands(projectCard({ coordinator: true, canModerate: true, requireApproval: false }));
-    const second = renderProjectDetail();
-    await screen.findByRole('tab', { name: 'Overview' });
-    expect(screen.queryByRole('tab', { name: /^Moderation/ })).not.toBeInTheDocument();
-    second.unmount();
+    await openTab(/^Library/);
+    expect(await screen.findByRole('button', { name: /^Exclude/ })).toBeInTheDocument();
 
-    mockCommands(projectCard({ coordinator: false, requireApproval: true }));
+    fireEvent.click(screen.getByText('alice_002.fits'));
+    const drawer = await screen.findByRole('complementary');
+    expect(within(drawer).getByRole('button', { name: 'Restore' })).toBeInTheDocument();
+  });
+
+  it('a member with canModerate: false sees none of these', async () => {
+    const eligible = libraryFrame({ frameUuid: 'lib-1', fileName: 'alice_001.fits', accepted: true });
+    const excluded = libraryFrame({
+      frameUuid: 'lib-2',
+      fileName: 'alice_002.fits',
+      accepted: false,
+      acceptedReason: 'trailed',
+    });
+    mockCommands(projectCard({ coordinator: false, canModerate: false, requireApproval: true, pendingFrames: 2 }), {
+      list_collab_frames: () => Promise.resolve([eligible, excluded]),
+      get_collab_frame_holders: () => Promise.resolve([]),
+    });
     renderProjectDetail();
     await screen.findByRole('tab', { name: 'Overview' });
     expect(screen.queryByRole('tab', { name: /^Moderation/ })).not.toBeInTheDocument();
+
+    await openTab(/^Library/);
+    await screen.findByText('alice_001.fits');
+    expect(screen.queryByRole('button', { name: /^Exclude/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('alice_002.fits'));
+    const drawer = await screen.findByRole('complementary');
+    expect(within(drawer).queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
+  });
+
+  it('coordinator: true, canModerate: true, requireApproval: false still sees the Moderation tab', async () => {
+    mockCommands(projectCard({ coordinator: true, canModerate: true, requireApproval: false }));
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    expect(screen.getByRole('tab', { name: /^Moderation/ })).toBeInTheDocument();
   });
 
   it('the My frames badge shows the ready count', async () => {

@@ -280,7 +280,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const c = detail.card;
   const portalPath = c.coordinator ? `/p/${c.slug}/admin` : `/p/${c.slug}`;
   const canReceive = c.dataRole === 'send_receive' || c.coordinator;
-  const canModerate = c.coordinator && c.requireApproval;
+  const canModerate = c.canModerate;
   const needsApproval = c.requireApproval && !c.coordinator;
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
   // The project's published volume, client-side from the rows already listed.
@@ -504,7 +504,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
           }}
           republishBusy={publishing.republishBusy}
           canRepublish={canRepublish}
-          coordinator={c.coordinator}
+          canModerate={canModerate}
           republishError={republishReq ? null : publishing.republishError}
           refusal={refusal}
           onOpen={setDrawer}
@@ -518,7 +518,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
           frames={frames}
           error={framesError}
           reload={() => void loadLibrary()}
-          coordinator={c.coordinator}
+          canModerate={canModerate}
           onOpen={setDrawer}
         />
       )}
@@ -552,7 +552,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
           key={drawerFrame.key}
           projectId={id}
           frame={drawerFrame}
-          coordinator={c.coordinator}
+          canModerate={canModerate}
           onClose={() => setDrawer(null)}
           onChanged={() => {
             void loadOwn();

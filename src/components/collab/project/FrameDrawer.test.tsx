@@ -127,14 +127,14 @@ function baseFrame(overrides: Partial<FrameVM> = {}): FrameVM {
 
 function renderDrawer(
   frame: FrameVM,
-  props: Partial<{ coordinator: boolean; onClose: () => void; onChanged: () => void }> = {},
+  props: Partial<{ canModerate: boolean; onClose: () => void; onChanged: () => void }> = {},
 ) {
   return render(
     <MemoryRouter>
       <FrameDrawer
         projectId="p"
         frame={frame}
-        coordinator={props.coordinator ?? false}
+        canModerate={props.canModerate ?? false}
         onClose={props.onClose ?? vi.fn()}
         onChanged={props.onChanged ?? vi.fn()}
       />
@@ -254,7 +254,7 @@ describe('FrameDrawer', () => {
   it('fix round 1: Escape closes only the ExcludeDialog when it is open, not the drawer underneath', () => {
     const onClose = vi.fn();
     const frame = baseFrame({ excluded: false, pubState: 'published' });
-    renderDrawer(frame, { coordinator: true, onClose });
+    renderDrawer(frame, { canModerate: true, onClose });
 
     fireEvent.click(screen.getByRole('button', { name: 'Exclude…' }));
     expect(screen.getByText('Exclude 1 frame from the project')).toBeInTheDocument();
@@ -294,7 +294,7 @@ describe('FrameDrawer', () => {
     expect(screen.getByText(/Received .* from abcdef01/)).toBeInTheDocument();
   });
 
-  it('(h) a coordinator sees Restore on an excluded frame, which restores and calls onChanged; a non-coordinator sees no button', async () => {
+  it('(h) canModerate sees Restore on an excluded frame, which restores and calls onChanged; without canModerate there is no button', async () => {
     const onChanged = vi.fn();
     vi.mocked(api.invoke).mockImplementation(((command: string) => {
       if (command === 'get_collab_frame_holders') return Promise.resolve([]);
@@ -303,7 +303,7 @@ describe('FrameDrawer', () => {
     }) as typeof api.invoke);
     const frame = baseFrame({ excluded: true, acceptedReason: 'trailed', pubState: 'published' });
 
-    const { unmount } = renderDrawer(frame, { coordinator: true, onChanged });
+    const { unmount } = renderDrawer(frame, { canModerate: true, onChanged });
     expect(screen.getByText(/Excluded — trailed/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Restore' }));
     await waitFor(() =>
@@ -312,7 +312,7 @@ describe('FrameDrawer', () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
     unmount();
 
-    renderDrawer(frame, { coordinator: false });
+    renderDrawer(frame, { canModerate: false });
     expect(screen.getByText(/Excluded — trailed/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
   });

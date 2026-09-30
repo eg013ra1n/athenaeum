@@ -33,7 +33,7 @@ export default function LibraryTab({
   frames,
   error,
   reload,
-  coordinator,
+  canModerate,
   onOpen,
 }: {
   projectId: string;
@@ -41,7 +41,7 @@ export default function LibraryTab({
   frames: ProjectFrameView[] | null;
   error: boolean;
   reload: () => void;
-  coordinator: boolean;
+  canModerate: boolean;
   onOpen: (vm: FrameVM) => void;
 }): JSX.Element {
   const { state } = useCollabExchange();
@@ -135,7 +135,7 @@ export default function LibraryTab({
         void handleKeepAgain(frameUuids);
       },
     },
-    ...(coordinator
+    ...(canModerate
       ? [
           {
             id: 'exclude',

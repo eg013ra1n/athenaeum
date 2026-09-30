@@ -81,7 +81,7 @@ function defaultProps(overrides: Partial<MyFramesTabProps> = {}): MyFramesTabPro
     onRequestRepublish: vi.fn(),
     republishBusy: false,
     canRepublish: false,
-    coordinator: false,
+    canModerate: false,
     republishError: null,
     refusal: null,
     onOpen: vi.fn(),
@@ -309,13 +309,13 @@ describe('MyFramesTab — Published', () => {
     }),
   ];
 
-  it('8a. Exclude is not offered to a non-coordinator', () => {
-    renderTab({ rows: exclusionFixture, segment: 'published', coordinator: false });
+  it('8a. Exclude is not offered without canModerate', () => {
+    renderTab({ rows: exclusionFixture, segment: 'published', canModerate: false });
     expect(screen.queryByRole('button', { name: /Exclude/ })).toBeNull();
   });
 
-  it('8b. a coordinator sees "Exclude 2 of 3" (one of the three selected is already excluded) and it opens the dialog with just those two', () => {
-    renderTab({ rows: exclusionFixture, segment: 'published', coordinator: true });
+  it('8b. canModerate sees "Exclude 2 of 3" (one of the three selected is already excluded) and it opens the dialog with just those two', () => {
+    renderTab({ rows: exclusionFixture, segment: 'published', canModerate: true });
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
     fireEvent.click(screen.getByRole('button', { name: 'Exclude 2 of 3' }));
     expect(screen.getByText('Exclude 2 frames from the project')).toBeInTheDocument();

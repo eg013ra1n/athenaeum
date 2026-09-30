@@ -114,7 +114,7 @@ beforeEach(() => {
 
 function renderTab(
   frames: ProjectFrameView[] | null,
-  overrides: { error?: boolean; coordinator?: boolean; onOpen?: (vm: FrameVM) => void } = {},
+  overrides: { error?: boolean; canModerate?: boolean; onOpen?: (vm: FrameVM) => void } = {},
 ) {
   const reload = vi.fn();
   const onOpen = overrides.onOpen ?? vi.fn();
@@ -129,7 +129,7 @@ function renderTab(
               frames={frames}
               error={overrides.error ?? false}
               reload={reload}
-              coordinator={overrides.coordinator ?? false}
+              canModerate={overrides.canModerate ?? false}
               onOpen={onOpen}
             />
           </NotificationProvider>
@@ -267,7 +267,7 @@ describe('libraryToCome', () => {
   });
 });
 
-describe('LibraryTab — Exclude (coordinator)', () => {
+describe('LibraryTab — Exclude (canModerate)', () => {
   const exclusionFixture: ProjectFrameView[] = [
     frame({ frameUuid: 'p1', fileName: 'p1.fits', state: 'published', accepted: true }),
     frame({ frameUuid: 'p2', fileName: 'p2.fits', state: 'published', accepted: true }),
@@ -280,14 +280,14 @@ describe('LibraryTab — Exclude (coordinator)', () => {
     }),
   ];
 
-  it('is not offered to a non-coordinator', async () => {
-    renderTab(exclusionFixture, { coordinator: false });
+  it('is not offered without canModerate', async () => {
+    renderTab(exclusionFixture, { canModerate: false });
     await screen.findByText('p1.fits');
     expect(screen.queryByRole('button', { name: /Exclude/ })).toBeNull();
   });
 
-  it('for a coordinator, opens the dialog with just the eligible frames', async () => {
-    renderTab(exclusionFixture, { coordinator: true });
+  it('with canModerate, opens the dialog with just the eligible frames', async () => {
+    renderTab(exclusionFixture, { canModerate: true });
     await screen.findByText('p1.fits');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
     fireEvent.click(screen.getByRole('button', { name: 'Exclude 2 of 3' }));

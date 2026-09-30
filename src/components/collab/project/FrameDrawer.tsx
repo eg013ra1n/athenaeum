@@ -14,19 +14,20 @@ type Holders = 'loading' | 'error' | FrameHolderView[];
 /**
  * Right-side frame detail panel (spec 2026-09-30 Task 9). Opens from a
  * clicked row of any collab project table (Tasks 10, 11). Read-only except
- * for the coordinator's Restore/Exclude actions and the local-path copy
+ * for the Restore/Exclude actions gated on `canModerate` (coordinator, or an
+ * account with the hub's `data.moderate` capability) and the local-path copy
  * button — everything else is a straight `FrameVM` read.
  */
 export default function FrameDrawer({
   projectId,
   frame,
-  coordinator,
+  canModerate,
   onClose,
   onChanged,
 }: {
   projectId: string;
   frame: FrameVM;
-  coordinator: boolean;
+  canModerate: boolean;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -98,7 +99,7 @@ export default function FrameDrawer({
     }
   };
 
-  const showExclusionSection = frame.excluded || (coordinator && frame.pubState === 'published');
+  const showExclusionSection = frame.excluded || (canModerate && frame.pubState === 'published');
 
   return (
     <aside className="fixed inset-y-0 right-0 z-40 w-[26rem] max-w-[90vw] overflow-y-auto border-l border-border bg-surface-elevated p-4">
@@ -231,7 +232,7 @@ export default function FrameDrawer({
           {frame.excluded ? (
             <div className="rounded border border-warning/40 bg-warning/10 p-2 text-sm text-warning">
               Excluded — {frame.acceptedReason}
-              {coordinator && (
+              {canModerate && (
                 <div className="mt-1.5">
                   <button
                     type="button"

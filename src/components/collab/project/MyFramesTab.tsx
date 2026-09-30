@@ -31,7 +31,7 @@ export interface MyFramesTabProps {
   onRequestRepublish: (frameIds: number[] | null) => void; // null = "all"; the shell's guard dialog confirms
   republishBusy: boolean;
   canRepublish: boolean;
-  coordinator: boolean;
+  canModerate: boolean;
   republishError: string | null;
   refusal: ReactNode; // the shell's publishing-device refusal box, or null
   onOpen: (vm: FrameVM) => void;
@@ -54,7 +54,7 @@ const OUTLINE_BTN =
  */
 export default function MyFramesTab({
   projectId, rows, error, links, autoPublish, segment, onSegment, onReload, onDetailReload,
-  onRequestPublish, publishBusy, onRequestRepublish, republishBusy, canRepublish, coordinator,
+  onRequestPublish, publishBusy, onRequestRepublish, republishBusy, canRepublish, canModerate,
   republishError, refusal, onOpen,
 }: MyFramesTabProps): JSX.Element {
   const navigate = useNavigate();
@@ -250,7 +250,7 @@ export default function MyFramesTab({
       busy: republishBusy,
       run: (targets) => onRequestRepublish(targets.map((v) => v.frameId!)),
     },
-    ...(coordinator
+    ...(canModerate
       ? [
           {
             id: 'exclude',
