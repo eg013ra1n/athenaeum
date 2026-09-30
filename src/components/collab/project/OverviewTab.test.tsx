@@ -104,13 +104,14 @@ const BASE_PROPS: OverviewTabProps = {
   goals: null,
   members: null,
   own: null,
-  libraryToCome: 0,
+  library: null,
   pending: 0,
   canModerate: false,
   thresholds: [],
   thresholdsVersion: null,
   onOpenSegment: vi.fn(),
   onOpenTab: vi.fn(),
+  onAttention: vi.fn(),
 };
 
 function renderTab(overrides: Partial<OverviewTabProps> = {}) {
@@ -136,9 +137,9 @@ describe('OverviewTab — integration', () => {
       ],
     });
 
-    expect(await screen.findByText('7h to go')).toBeInTheDocument();
-    expect(screen.getByTitle('Alice · 2h')).toBeInTheDocument();
-    expect(screen.getByTitle('Bob · 1h')).toBeInTheDocument();
+    expect(await screen.findByText('7h 00m to go')).toBeInTheDocument();
+    expect(screen.getByTitle('Alice · 2h 00m')).toBeInTheDocument();
+    expect(screen.getByTitle('Bob · 1h 00m')).toBeInTheDocument();
   });
 
   it('a goal for SII with no frames still renders an SII row', async () => {
@@ -157,7 +158,7 @@ describe('OverviewTab — integration', () => {
     });
 
     expect(await screen.findByText('L')).toBeInTheDocument();
-    expect(screen.getByText('1h')).toBeInTheDocument();
+    expect(screen.getByText('1h 00m')).toBeInTheDocument();
     expect(screen.queryByText(/to go/)).not.toBeInTheDocument();
     expect(screen.queryByText('goal met')).not.toBeInTheDocument();
   });
@@ -177,15 +178,15 @@ describe('OverviewTab — integration', () => {
   });
 });
 
-describe('OverviewTab — my frames', () => {
-  it('clicking "Ready 2" calls onOpenSegment("ready")', async () => {
+describe('OverviewTab — my contribution', () => {
+  it('clicking the ready tile calls onOpenSegment("ready")', async () => {
     const onOpenSegment = vi.fn();
     renderTab({
       own: [ownRow({ frameId: 1, segment: 'ready' }), ownRow({ frameId: 2, segment: 'ready' })],
       onOpenSegment,
     });
 
-    fireEvent.click(await screen.findByText('Ready 2'));
+    fireEvent.click(await screen.findByRole('button', { name: /2 ready to publish/ }));
     expect(onOpenSegment).toHaveBeenCalledWith('ready');
   });
 
@@ -197,98 +198,87 @@ describe('OverviewTab — my frames', () => {
       ],
     });
 
-    expect(await screen.findByText('Published 1')).toBeInTheDocument();
-    expect(screen.getByText('Held back 1')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /1 published/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /1 held back/ })).toBeInTheDocument();
   });
 });
 
 describe('OverviewTab — needs attention', () => {
-  it('lists the held-back item naming the commonest first kind', async () => {
-    const onOpenSegment = vi.fn();
+  it('an attention row calls onAttention with its target', () => {
+    const onAttention = vi.fn();
+    renderTab({ onAttention, own: [ownRow({ segment: 'held', failures: [{ kind: 'solve', text: 'No coordinates or pixel scale' }] })] });
+    fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    expect(onAttention).toHaveBeenCalledWith({ kind: 'segment', segment: 'held', state: 'solve' });
+  });
+
+  it('one row per held-back cause instead of a single "mostly" line', () => {
     renderTab({
       own: [
-        ownRow({ frameId: 1, segment: 'held', failures: [{ kind: 'solve', text: 'No coordinates or pixel scale' }] }),
-        ownRow({ frameId: 2, segment: 'held', failures: [{ kind: 'solve', text: 'No coordinates or pixel scale' }] }),
-        ownRow({ frameId: 3, segment: 'held', failures: [{ kind: 'analyze', text: 'No analysis' }] }),
+        ownRow({ frameId: 1, segment: 'held', failures: [{ kind: 'solve', text: 's' }] }),
+        ownRow({ frameId: 2, segment: 'held', failures: [{ kind: 'analyze', text: 'a' }] }),
       ],
-      onOpenSegment,
     });
-
-    const item = await screen.findByText(/held back — mostly No coordinates or pixel scale/);
-    expect(item).toBeInTheDocument();
-    fireEvent.click(item);
-    expect(onOpenSegment).toHaveBeenCalledWith('held');
+    expect(screen.getByText(/1 frame from 2026-09-29 is not plate-solved/)).toBeInTheDocument();
+    expect(screen.getByText(/1 frame is not analyzed/)).toBeInTheDocument();
   });
 
-  it('own published frames in one copy only surface as an attention item to the published segment', async () => {
-    const onOpenSegment = vi.fn();
+  it('own published frames in one copy only open the published segment with state single', () => {
+    const onAttention = vi.fn();
     renderTab({
-      own: [
-        ownRow({
-          frameId: 1,
-          segment: 'published',
-          pubState: 'published',
-          localState: 'own_held',
-          holdersTotal: 0,
-        }),
-      ],
-      onOpenSegment,
+      own: [ownRow({ segment: 'published', pubState: 'published', localState: 'own_held', holdersTotal: 0 })],
+      onAttention,
     });
-
-    const item = await screen.findByText('1 of your frames exist in one copy only');
-    fireEvent.click(item);
-    expect(onOpenSegment).toHaveBeenCalledWith('published');
+    expect(screen.getByText(/1 published frame exists in one copy only/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show' }));
+    expect(onAttention).toHaveBeenCalledWith({ kind: 'segment', segment: 'published', state: 'single' });
   });
 
-  it('library-to-come and pending-review items route through onOpenTab', async () => {
-    const onOpenTab = vi.fn();
-    renderTab({ own: [], libraryToCome: 4, pending: 2, canModerate: true, onOpenTab });
-
-    fireEvent.click(await screen.findByText('4 library frames still to come'));
-    expect(onOpenTab).toHaveBeenCalledWith('library');
-
-    fireEvent.click(screen.getByText('2 frames wait for your review'));
-    expect(onOpenTab).toHaveBeenCalledWith('moderation');
+  it('the approval row routes to moderation for a moderator', () => {
+    const onAttention = vi.fn();
+    renderTab({ own: [], pending: 2, canModerate: true, onAttention });
+    expect(screen.getByText(/2 frames wait for your approval/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Moderate' }));
+    expect(onAttention).toHaveBeenCalledWith({ kind: 'tab', tab: 'moderation' });
   });
 
-  it('pending review is hidden when canModerate is false', async () => {
-    renderTab({ pending: 2, canModerate: false });
-    expect(screen.queryByText(/frames wait for your review/)).not.toBeInTheDocument();
+  it('pending approval is hidden when canModerate is false', async () => {
+    renderTab({ own: [], pending: 2, canModerate: false });
+    expect(screen.queryByText(/wait for your approval/)).not.toBeInTheDocument();
   });
 
-  it('while own frames are still loading, My frames and Needs attention read Loading…, never zero counts or "Nothing needs attention."', async () => {
-    renderTab({ own: null, members: [], libraryToCome: 0, pending: 0, canModerate: false });
-    const myFrames = (await screen.findByRole('heading', { name: 'My frames' })).parentElement!;
+  it('while own frames are still loading, My contribution and Needs attention read Loading…, never zero counts or "Nothing needs your attention."', async () => {
+    renderTab({ own: null, members: [], library: [], pending: 0, canModerate: false });
+    const myFrames = (await screen.findByRole('heading', { name: 'My contribution' })).parentElement!;
     expect(within(myFrames).getByText('Loading…')).toBeInTheDocument();
     expect(within(myFrames).queryByRole('button')).not.toBeInTheDocument();
     const attention = screen.getByRole('heading', { name: 'Needs attention' }).parentElement!;
     expect(within(attention).getByText('Loading…')).toBeInTheDocument();
-    expect(screen.queryByText('Nothing needs attention.')).not.toBeInTheDocument();
-    expect(screen.queryByText(/^Ready \d/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Nothing needs your attention.')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /ready to publish/ })).not.toBeInTheDocument();
   });
 
-  it('own frames that failed to load (ownError) show neither Loading… nor zero counts in My frames and Needs attention', async () => {
-    renderTab({ own: null, ownError: true, members: [], libraryToCome: 0, pending: 0, canModerate: false });
-    const myFrames = (await screen.findByRole('heading', { name: 'My frames' })).parentElement!;
+  it('own frames that failed to load (ownError) show neither Loading… nor zero counts in My contribution and Needs attention', async () => {
+    renderTab({ own: null, ownError: true, members: [], library: [], pending: 0, canModerate: false });
+    const myFrames = (await screen.findByRole('heading', { name: 'My contribution' })).parentElement!;
     expect(within(myFrames).queryByText('Loading…')).not.toBeInTheDocument();
     expect(within(myFrames).getByText('Not available.')).toBeInTheDocument();
     expect(within(myFrames).queryByRole('button')).not.toBeInTheDocument();
     const attention = screen.getByRole('heading', { name: 'Needs attention' }).parentElement!;
     expect(within(attention).queryByText('Loading…')).not.toBeInTheDocument();
     expect(within(attention).getByText('Not available.')).toBeInTheDocument();
-    expect(screen.queryByText('Nothing needs attention.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Nothing needs your attention.')).not.toBeInTheDocument();
   });
 
-  it('reads "Nothing needs attention." when nothing qualifies', async () => {
-    renderTab({ own: [], libraryToCome: 0, pending: 0, canModerate: false });
-    expect(await screen.findByText('Nothing needs attention.')).toBeInTheDocument();
+  it('reads "Nothing needs your attention." when nothing qualifies', async () => {
+    renderTab({ own: [], library: [], pending: 0, canModerate: false });
+    expect(await screen.findByText('Nothing needs your attention.')).toBeInTheDocument();
   });
 });
 
 describe('OverviewTab — exchange now', () => {
-  it('reads "Quiet." when nothing is moving', async () => {
+  it('reads "Nothing is moving." when nothing is moving', async () => {
     renderTab();
-    expect(await screen.findByText('Quiet.')).toBeInTheDocument();
+    expect(await screen.findByText('Nothing is moving.')).toBeInTheDocument();
   });
 
   it('shows the recv rate and member name, and Open Exchange routes through onOpenTab', async () => {
@@ -299,33 +289,56 @@ describe('OverviewTab — exchange now', () => {
     const onOpenTab = vi.fn();
     renderTab({ onOpenTab });
 
-    expect(await screen.findByText('↓ 1 KB/s from Alice')).toBeInTheDocument();
+    await screen.findByText('1 KB/s');
+    expect(document.body.textContent).toContain('↓ 1 KB/s from Alice');
     fireEvent.click(screen.getByText('Open Exchange →'));
     expect(onOpenTab).toHaveBeenCalledWith('exchange');
   });
 });
 
 describe('OverviewTab — quality thresholds', () => {
-  it('renders thresholds verbatim with version and the portal note', async () => {
+  it('renders thresholds with the mockup wording and version', async () => {
     const thresholds: ThresholdRuleView[] = [
-      { metricKey: 'fwhm', op: 'lte', value: 3 },
+      { metricKey: 'fwhm_arcsec', op: 'lte', value: 3 },
       { metricKey: 'not_trailed', op: 'reject_if', value: true },
     ];
     renderTab({ thresholds, thresholdsVersion: 3 });
 
-    expect(await screen.findByText('Quality thresholds (v3)')).toBeInTheDocument();
-    expect(screen.getByText('fwhm ≤ 3')).toBeInTheDocument();
+    expect(await screen.findByText('FWHM ≤ 3.00″')).toBeInTheDocument();
     expect(screen.getByText('Reject trailed frames')).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        'Thresholds are set by the coordinator on the portal. Changes are prospective — already-published frames stay published.',
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByText('v3 · set by the coordinator')).toBeInTheDocument();
   });
 
-  it('shows "No thresholds set." when empty', async () => {
+  it('shows "No quality rules set." when empty', async () => {
     renderTab({ thresholds: [], thresholdsVersion: null });
-    expect(await screen.findByText('No thresholds set.')).toBeInTheDocument();
+    expect(await screen.findByText('No quality rules set.')).toBeInTheDocument();
     expect(screen.getByText('Quality thresholds')).toBeInTheDocument();
+  });
+});
+
+describe('OverviewTab — mockup cards', () => {
+  it('renders the four cards like the mockup', async () => {
+    renderTab({
+      goals: { Ha: 144000 },
+      members: [member({ secondsByFilter: { Ha: 29_760 } })],
+      own: Array.from({ length: 136 }, (_, i) => ownRow({ frameId: i + 1, segment: 'ready' })),
+      thresholds: [
+        { metricKey: 'fwhm_arcsec', op: 'lte', value: 3 },
+        { metricKey: 'not_trailed', op: 'reject_if', value: true },
+      ],
+    });
+    expect(screen.getByRole('heading', { name: /Integration toward goal published, accepted frames · by member/ })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'My contribution' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /136 ready to publish/ })).toBeInTheDocument();
+    expect(screen.getByText(/8h 16m/)).toBeInTheDocument();
+    expect(screen.getByText('FWHM ≤ 3.00″')).toBeInTheDocument();
+    expect(screen.getByText('Reject trailed frames')).toBeInTheDocument();
+  });
+
+  it('an empty project shows empty states, never NaN', () => {
+    renderTab({ own: [], members: [], library: [], goals: null });
+    expect(screen.getByText('No integration yet.')).toBeInTheDocument();
+    expect(screen.getByText('Nothing needs your attention.')).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/NaN/);
   });
 });

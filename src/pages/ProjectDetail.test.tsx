@@ -1087,7 +1087,7 @@ describe('ProjectDetail tabs', () => {
       list_project_own_frames: () => Promise.resolve([heldRow(7, 'solve', 'unknown pixel scale')]),
     });
     renderProjectDetail();
-    fireEvent.click(await screen.findByRole('button', { name: 'Held back 1' }));
+    fireEvent.click(await screen.findByRole('button', { name: /1 held back/ }));
     await waitFor(() =>
       expect(screen.getByRole('tab', { name: /^My frames/ })).toHaveAttribute('aria-selected', 'true'),
     );
@@ -1154,11 +1154,11 @@ describe('ProjectDetail fix round 1', () => {
     });
     renderProjectDetail();
     expect(await screen.findByText('Could not load your frames — see console.')).toBeInTheDocument();
-    const myFrames = screen.getByRole('heading', { name: 'My frames' }).parentElement!;
+    const myFrames = screen.getByRole('heading', { name: 'My contribution' }).parentElement!;
     expect(within(myFrames).queryByText('Loading…')).not.toBeInTheDocument();
     const attention = screen.getByRole('heading', { name: 'Needs attention' }).parentElement!;
     expect(within(attention).queryByText('Loading…')).not.toBeInTheDocument();
-    expect(within(attention).queryByText('Nothing needs attention.')).not.toBeInTheDocument();
+    expect(within(attention).queryByText('Nothing needs your attention.')).not.toBeInTheDocument();
   });
 });
 

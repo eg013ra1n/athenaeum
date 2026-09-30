@@ -16,6 +16,8 @@ import { Button, Chip, PanelLayout } from '../components/ui';
 import MetaLine from '../components/collab/project/MetaLine';
 import { MemberColorsProvider } from '../components/collab/project/MemberColorsContext';
 import OverviewTab from '../components/collab/project/OverviewTab';
+import type { AttentionTarget } from '../components/collab/project/attention';
+import { EMPTY_FACETS, type Facets } from '../components/collab/project/table/model';
 import MyFramesTab, { type Segment } from '../components/collab/project/MyFramesTab';
 import LibraryTab, { libraryInFlight, libraryToCome } from '../components/collab/project/LibraryTab';
 import MembersTab from '../components/collab/project/MembersTab';
@@ -145,6 +147,11 @@ function ProjectPage({ id }: { id: string | undefined }) {
   // resolves through the same alias table as a deep link.
   const [storedTab, setTab] = useSessionState<string>('projectDetail.tab', 'overview');
   const [segment, setSegment] = useSessionState<Segment>('projectDetail.segment', 'ready');
+  // Write-only handles on the tables' facet session keys (`collab.<project>.<tableId>.facets`).
+  const [, setReadyFacets] = useSessionState<Facets>(`collab.${id}.ready.facets`, EMPTY_FACETS);
+  const [, setHeldFacets] = useSessionState<Facets>(`collab.${id}.held.facets`, EMPTY_FACETS);
+  const [, setPublishedFacets] = useSessionState<Facets>(`collab.${id}.published.facets`, EMPTY_FACETS);
+  const [, setLibraryFacets] = useSessionState<Facets>(`collab.${id}.library.facets`, EMPTY_FACETS);
 
   // `?tab=…` (a collab notification's link, `CollabAttention`, the frame
   // set's Project block) jumps to that tab on arrival, then cleans the URL.
@@ -508,6 +515,19 @@ function ProjectPage({ id }: { id: string | undefined }) {
     const r = resolveTab(t);
     if (r) selectTab(r);
   };
+  // A Needs-attention action: pre-set the target table's state facet (the
+  // same session keys `ProjectFrameTable` reads), then open it.
+  const openAttention = (t: AttentionTarget) => {
+    const facets: Facets = { ...EMPTY_FACETS, state: t.state ?? null };
+    if (t.kind === 'segment') {
+      ({ ready: setReadyFacets, held: setHeldFacets, published: setPublishedFacets })[t.segment](facets);
+      setSegment(t.segment);
+      selectTab('mine');
+    } else {
+      if (t.tab === 'library') setLibraryFacets(facets);
+      selectTab(t.tab);
+    }
+  };
 
   // The frame panel, docked beside the My frames / Library / Moderation
   // tables.
@@ -618,7 +638,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 members={members}
                 own={own}
                 ownError={ownError}
-                libraryToCome={canReceive ? toCome : 0}
+                library={frames}
                 pending={c.pendingFrames}
                 canModerate={canModerate}
                 thresholds={detail.thresholds}
@@ -628,6 +648,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
                   selectTab('mine');
                 }}
                 onOpenTab={openTab}
+                onAttention={openAttention}
               />
             </div>
           )}

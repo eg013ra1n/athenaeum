@@ -246,3 +246,24 @@ export function exchangeTotals(s: ExchangeState): { recvBps: number; sendBps: nu
   }
   return { recvBps, sendBps, active };
 }
+
+/** Σ `rateBps` over a direction's flows. */
+export function sumRate(flows: FlowView[]): number {
+  return flows.reduce((a, f) => a + f.rateBps, 0);
+}
+
+/** Distinct peer names behind a direction's flows: the member name when
+ * known, else the device label. Two devices of one member count once. */
+export function distinctNames(flows: FlowView[], label: (device: string) => { member: string | null; device: string }): string[] {
+  return [...new Set(flows.map((f) => {
+    const l = label(f.device);
+    return l.member ?? l.device;
+  }))];
+}
+
+/** Distinct MEMBERS behind a direction's flows, not flow (device) count — two
+ * devices of the same member (`peerLabel(...).member`) count once; an
+ * unnamed device falls back to its own id so it still counts as one peer. */
+export function distinctMembers(flows: FlowView[], label: (device: string) => { member: string | null }): number {
+  return new Set(flows.map((f) => label(f.device).member ?? f.device)).size;
+}

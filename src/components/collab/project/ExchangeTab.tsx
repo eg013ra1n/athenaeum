@@ -3,7 +3,7 @@ import { api } from '../../../api';
 import { useCollabExchange } from '../../../contexts/CollabExchangeContext';
 import { formatTimestamp } from '../../../utils/dateFormatting';
 import { formatBytes, formatRate, pluralize } from '../format';
-import { flowKey, peerLabel } from '../exchange/state';
+import { distinctMembers, flowKey, peerLabel, sumRate } from '../exchange/state';
 import { PeerFlowRow } from '../exchange/PeerFlowRow';
 import { memberColor } from './memberColors';
 import type { CollabFramesLanded, FlowView, MemberSummary, ReceiveSessionView } from '../../../types/models';
@@ -21,17 +21,6 @@ const CARD = 'rounded-lg border border-border bg-surface-elevated p-3';
 const HEADER = 'flex flex-wrap items-baseline gap-x-1.5 text-sm font-semibold text-content';
 const SUB = 'font-normal text-xs text-content-muted';
 const EMPTY = 'py-1.5 text-xs text-content-muted';
-
-function sumRate(flows: FlowView[]): number {
-  return flows.reduce((a, f) => a + f.rateBps, 0);
-}
-
-/** Distinct MEMBERS behind a direction's flows, not flow (device) count — two
- * devices of the same member (`peerLabel(...).member`) count once; an
- * unnamed device falls back to its own id so it still counts as one peer. */
-function distinctMembers(flows: FlowView[], label: (device: string) => { member: string | null }): number {
-  return new Set(flows.map((f) => label(f.device).member ?? f.device)).size;
-}
 
 function toneFor(member: string | null, members: MemberSummary[] | null): string | undefined {
   if (!member || !members) return undefined;
