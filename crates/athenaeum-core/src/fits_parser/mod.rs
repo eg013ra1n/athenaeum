@@ -2,12 +2,13 @@
 
 pub mod calibrated_light;
 pub(crate) mod fits_header_reader;
+pub(crate) mod ra_units;
 pub mod stored_header;
 
 use crate::models::{Frame, ImageType};
 use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDateTime, Utc};
 pub use calibrated_light::{calibrated_light_identity, CalibratedIdentity, MasterRef};
+use chrono::{DateTime, NaiveDateTime, Utc};
 pub use fits_header_reader::FitsHeader; // Task 14: reachable for round-trip tests (fits_header_reader itself stays pub(crate))
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -40,82 +41,6 @@ fn read_xisf_header(path: &Path) -> Result<Vec<u8>> {
     let mut content = vec![0u8; header_length];
     buf_reader.read_exact(&mut content)?;
     Ok(content)
-}
-
-/// Detects if RA is in hours (0-24) or degrees (0-360) and normalizes to degrees
-///
-/// IMPROVED ALGORITHM: Uses OBJCTRA for verification when available to handle edge cases.
-///
-/// The FITS standard allows RA in both hours [0, 24) and degrees [0, 360).
-/// For values in [0, 24), this is ambiguous without additional context.
-///
-/// This function uses these strategies:
-/// 1. If OBJCTRA is available, parse it and compare with numeric RA to determine units
-/// 2. If numeric RA matches OBJCTRA (within 0.1°), it's already in degrees
-/// 3. If numeric RA * 15 matches OBJCTRA (within 0.1°), it's in hours → convert
-/// 4. If no OBJCTRA, use heuristics: RA < 24 with valid DEC → assume hours
-///
-/// # Arguments
-/// * `ra` - Raw RA value from FITS header
-/// * `dec` - Optional DEC value for validation
-/// * `objctra` - Optional OBJCTRA string for verification
-///
-/// # Returns
-/// RA in decimal degrees, normalized to [0, 360)
-///
-/// # Edge Cases
-/// - RA=0 works correctly in both hours and degrees (0h = 0°)
-/// - RA in [1, 24) is verified against OBJCTRA if available
-/// - Without OBJCTRA, assumes hours (common in astronomical FITS)
-fn normalize_ra_from_fits(ra: f64, dec: Option<f64>, objctra: Option<&str>) -> f64 {
-    // Handle RA >= 24: must be degrees
-    if ra >= 24.0 {
-        return crate::coordinates::normalize_ra(ra);
-    }
-
-    // Handle RA < 0: must be degrees, needs normalization
-    if ra < 0.0 {
-        return crate::coordinates::normalize_ra(ra);
-    }
-
-    // RA is in [0, 24): AMBIGUOUS - could be hours or degrees
-    // Use OBJCTRA for verification if available
-    if let Some(ra_str) = objctra {
-        if let Ok(ra_from_objctra) = crate::coordinates::parse_ra_sexagesimal(ra_str) {
-            // Compare numeric RA with parsed OBJCTRA
-            let diff_as_degrees = (ra - ra_from_objctra).abs();
-            let diff_as_hours = ((ra * 15.0) - ra_from_objctra).abs();
-
-            // If numeric RA already matches OBJCTRA (within 0.1°), it's in degrees
-            if diff_as_degrees < 0.1 {
-                tracing::debug!(ra, "RA already in degrees (verified against OBJCTRA)");
-                return crate::coordinates::normalize_ra(ra);
-            }
-
-            // If numeric RA * 15 matches OBJCTRA (within 0.1°), it's in hours
-            if diff_as_hours < 0.1 {
-                tracing::debug!(ra_hours = ra, ra_degrees = ra * 15.0, "RA detected in hours (verified against OBJCTRA)");
-                return crate::coordinates::normalize_ra(ra * 15.0);
-            }
-
-            // Neither match well - use OBJCTRA as ground truth
-            tracing::warn!(ra, ra_from_objctra, "RA does not match OBJCTRA; using OBJCTRA value");
-            return ra_from_objctra;
-        }
-    }
-
-    // No OBJCTRA available, use heuristics
-    if let Some(d) = dec {
-        if d >= -90.0 && d <= 90.0 {
-            // Valid DEC suggests these are coordinates, assume hours
-            tracing::warn!(ra, ra_degrees = ra * 15.0, "RA ambiguous with no OBJCTRA; assuming hours based on valid DEC");
-            return crate::coordinates::normalize_ra(ra * 15.0);
-        }
-    }
-
-    // No context available, default to hours (astronomical convention)
-    tracing::warn!(ra, "RA ambiguous with no verification available; assuming hours");
-    crate::coordinates::normalize_ra(ra * 15.0)
 }
 
 /// Validates and normalizes DEC to [-90, 90] range
@@ -207,7 +132,13 @@ pub fn extract_xisf_header(path: &Path) -> Result<String> {
                 }
 
                 if !name.is_empty() {
-                    header_text.push_str(&format!("{} = {}\n", name, value));
+                    if name == "RA" {
+                        // Keep explicit RA units in the stored text snapshot too.
+                        let comment = ra_units::comment(&xml_str);
+                        header_text.push_str(&format!("{} = {} / {}\n", name, value, comment));
+                    } else {
+                        header_text.push_str(&format!("{} = {}\n", name, value));
+                    }
                 }
             }
             Ok(Event::Eof) => break,
@@ -453,23 +384,36 @@ pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &
     let objctdec = header.get_str("OBJCTDEC");
 
     // Apply unit detection and validation
-    // Pass objctra for verification (handles RA=0 and [0,24) ambiguity correctly)
-    let ra = ra_raw.map(|r| normalize_ra_from_fits(r, dec_raw, objctra.as_deref()));
+    // Respect explicit units; an ambiguous small numeric RA needs independent evidence.
+    let ra_unit = header
+        .get_str("RAUNIT")
+        .unwrap_or_else(|| ra_units::comment(&header.to_header_text()));
+    let wcs_ra = header
+        .get_str("CTYPE1")
+        .filter(|s| s.to_uppercase().starts_with("RA"))
+        .and_then(|_| header.get_f64("CRVAL1"));
+    let ra = ra_raw.and_then(|r| ra_units::resolve(r, &ra_unit, objctra.as_deref(), wcs_ra));
     let dec = dec_raw.and_then(|d| validate_dec(d).ok());
 
     // Fallback: parse OBJCTRA/OBJCTDEC if numeric RA/DEC missing
     let ra = ra.or_else(|| {
-        objctra.as_deref().and_then(|s| crate::coordinates::parse_ra_sexagesimal(s).ok())
+        objctra
+            .as_deref()
+            .and_then(|s| crate::coordinates::parse_ra_sexagesimal(s).ok())
     });
     let dec = dec.or_else(|| {
-        objctdec.as_deref().and_then(|s| crate::coordinates::parse_dec_sexagesimal(s).ok())
+        objctdec
+            .as_deref()
+            .and_then(|s| crate::coordinates::parse_dec_sexagesimal(s).ok())
     });
 
     // WCS fallback: CRVAL1/CRVAL2 when CTYPE indicates RA/DEC
     let ra = ra.or_else(|| {
         let ctype1 = header.get_str("CTYPE1")?;
         if ctype1.to_uppercase().starts_with("RA") {
-            header.get_f64("CRVAL1").map(|r| crate::coordinates::normalize_ra(r))
+            header
+                .get_f64("CRVAL1")
+                .map(|r| crate::coordinates::normalize_ra(r))
         } else {
             None
         }
@@ -763,59 +707,92 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     // Absent keywords stay None; 0 is a real phase, not a default.
     let parse_offset = |s: &String| -> Option<i64> {
         let s = s.trim();
-        s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+        s.parse::<i64>()
+            .ok()
+            .or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
     };
     let xbayroff = fits_keywords.get("XBAYROFF").and_then(parse_offset);
     let ybayroff = fits_keywords.get("YBAYROFF").and_then(parse_offset);
-    let roworder = fits_keywords.get("ROWORDER")
+    let roworder = fits_keywords
+        .get("ROWORDER")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let xpixsz = fits_keywords.get("XPIXSZ")
+    let xpixsz = fits_keywords
+        .get("XPIXSZ")
         .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| fits_keywords.get("PIXSIZE1").and_then(|s| s.parse::<f64>().ok()))
-        .or_else(|| xisf_properties.get("Instrument:Sensor:XPixelSize")
-            .and_then(|s| s.parse::<f64>().ok()));
-    let ypixsz = fits_keywords.get("YPIXSZ")
+        .or_else(|| {
+            fits_keywords
+                .get("PIXSIZE1")
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .or_else(|| {
+            xisf_properties
+                .get("Instrument:Sensor:XPixelSize")
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+    let ypixsz = fits_keywords
+        .get("YPIXSZ")
         .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| fits_keywords.get("PIXSIZE2").and_then(|s| s.parse::<f64>().ok()))
-        .or_else(|| xisf_properties.get("Instrument:Sensor:YPixelSize")
-            .and_then(|s| s.parse::<f64>().ok()));
+        .or_else(|| {
+            fits_keywords
+                .get("PIXSIZE2")
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .or_else(|| {
+            xisf_properties
+                .get("Instrument:Sensor:YPixelSize")
+                .and_then(|s| s.parse::<f64>().ok())
+        });
 
     // Image dimensions (with <Image geometry="w:h:c"> fallback)
-    let naxis1 = fits_keywords.get("NAXIS1")
+    let naxis1 = fits_keywords
+        .get("NAXIS1")
         .and_then(|s| s.parse::<i32>().ok())
         .or_else(|| xisf_geometry.map(|(w, _)| w));
-    let naxis2 = fits_keywords.get("NAXIS2")
+    let naxis2 = fits_keywords
+        .get("NAXIS2")
         .and_then(|s| s.parse::<i32>().ok())
         .or_else(|| xisf_geometry.map(|(_, h)| h));
 
     // Astronomical coordinates
     // Read raw values first
-    let ra_raw = fits_keywords.get("RA")
-        .and_then(|s| s.parse::<f64>().ok());
-    let dec_raw = fits_keywords.get("DEC")
-        .and_then(|s| s.parse::<f64>().ok());
+    let ra_raw = fits_keywords.get("RA").and_then(|s| s.parse::<f64>().ok());
+    let dec_raw = fits_keywords.get("DEC").and_then(|s| s.parse::<f64>().ok());
     let objctra = fits_keywords.get("OBJCTRA").cloned();
     let objctdec = fits_keywords.get("OBJCTDEC").cloned();
 
     // Apply unit detection and validation
-    // Pass objctra for verification (handles RA=0 and [0,24) ambiguity correctly)
-    let ra = ra_raw.map(|r| normalize_ra_from_fits(r, dec_raw, objctra.as_deref()));
+    // Respect explicit units; an ambiguous small numeric RA needs independent evidence.
+    let ra_unit = fits_keywords
+        .get("RAUNIT")
+        .cloned()
+        .unwrap_or_else(|| ra_units::comment(&xml_str));
+    let wcs_ra = fits_keywords
+        .get("CTYPE1")
+        .filter(|s| s.to_uppercase().starts_with("RA"))
+        .and_then(|_| fits_keywords.get("CRVAL1"))
+        .and_then(|s| s.parse().ok());
+    let ra = ra_raw.and_then(|r| ra_units::resolve(r, &ra_unit, objctra.as_deref(), wcs_ra));
     let dec = dec_raw.and_then(|d| validate_dec(d).ok());
 
     // Fallback: parse OBJCTRA/OBJCTDEC if numeric RA/DEC missing
     let ra = ra.or_else(|| {
-        objctra.as_ref().and_then(|s| crate::coordinates::parse_ra_sexagesimal(s).ok())
+        objctra
+            .as_ref()
+            .and_then(|s| crate::coordinates::parse_ra_sexagesimal(s).ok())
     });
     let dec = dec.or_else(|| {
-        objctdec.as_ref().and_then(|s| crate::coordinates::parse_dec_sexagesimal(s).ok())
+        objctdec
+            .as_ref()
+            .and_then(|s| crate::coordinates::parse_dec_sexagesimal(s).ok())
     });
 
     // WCS fallback: CRVAL1/CRVAL2 when CTYPE indicates RA/DEC
     let ra = ra.or_else(|| {
         let ctype1 = fits_keywords.get("CTYPE1")?;
         if ctype1.to_uppercase().starts_with("RA") {
-            fits_keywords.get("CRVAL1")
+            fits_keywords
+                .get("CRVAL1")
                 .and_then(|s| s.parse::<f64>().ok())
                 .map(|r| crate::coordinates::normalize_ra(r))
         } else {
@@ -1060,6 +1037,30 @@ mod tests {
         let path = std::path::Path::new("/tmp/test.fits");
         let frame = build_frame_from_header(&header, 1, path).unwrap();
         assert_eq!(frame.exptime, Some(60.0));
+    }
+
+    #[test]
+    fn explicit_ra_units_match_fits_xisf_and_stored_snapshots() {
+        let header = header_with_cards(&[
+            "RA      =            10.487505 / Object Right Ascension in degrees",
+            "DEC     =            40.815833 / Object Declination in degrees",
+        ]);
+        let fits = build_frame_from_header(&header, 1, Path::new("fixture.fits")).unwrap();
+        assert_eq!(fits.ra, Some(10.487505));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.xisf");
+        write_xisf_with_image_body(&path, "<FITSKeyword name=\"RA\" value=\"10.487505\" comment=\"Object Right Ascension in degrees\"/><FITSKeyword name=\"DEC\" value=\"40.815833\"/>");
+        assert_eq!(parse_xisf(&path, 1).unwrap().ra, fits.ra);
+        for (format, text) in [
+            (crate::models::FileFormat::FITS, header.to_header_text()),
+            (
+                crate::models::FileFormat::XISF,
+                extract_xisf_header(&path).unwrap(),
+            ),
+        ] {
+            let keys = stored_header::parse_stored_header_keys(format, &text);
+            assert_eq!(stored_header::snapshot_from_keys(1, &keys).ra, fits.ra);
+        }
     }
 
     /// Build a one-block FITS header out of already-formatted 80-column cards.
