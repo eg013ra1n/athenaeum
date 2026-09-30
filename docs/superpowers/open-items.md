@@ -228,6 +228,15 @@ owed, on the test hub, spec §10's three-instance scenario plus the wave-2 surfa
 - the project page refreshes on its own after a background auto-publish (`collab-published`), with no
   manual reload.
 
+Added by the smoke-fixes cycle (2026-09-30, `docs/superpowers/plans/2026-09-30-collab-smoke-fixes-names-moderation-presence-plan.md`):
+
+- device names in the drawer and in Members read the device's own name;
+- a moderator who is not coordinator sees Moderation, Exclude and Restore, and no false approval line;
+- a member coming online shows within about 2 s without reopening the page.
+
+The hub fix (`holder-device-names`, commit `b485578`) is deployed to the TEST hub only — not merged to hub
+`main`.
+
 Deferred, not built this cycle: Ask to exclude (hub mechanism, publisher side) and per-frame Download /
 Stop keeping in the Library tab (core want/unwant override on top of the replication policy, plus replica
 deletion with the last-copy warning).

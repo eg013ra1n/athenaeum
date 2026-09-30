@@ -518,3 +518,32 @@ controller made five further rulings that change a documented contract; both are
 11. **§6.3 device → person.** `member_of_device` moved from `api::collab_live::surface` (render-gated) to
     `collab::snapshot` (ungated), required so the headless build still compiles it; behaviour-preserving
     (controller ruling, Task 2).
+
+## 15. Amendments (smoke fixes, 2026-09-30)
+
+The owner's first smoke of the wave-2 project page found three defects, fixed the same cycle. Plan
+`docs/superpowers/plans/2026-09-30-collab-smoke-fixes-names-moderation-presence-plan.md`.
+
+1. **§5.3 holder snapshot — device names.** The hub's holder-snapshot query sent the member's own display
+   name for every one of their devices (`pm.display_name`, not `d.name`), so the app stored the member's name
+   as every device's `displayName`. Fixed at the hub (`COALESCE(d.name, '')`, hub commit `b485578` on branch
+   `holder-device-names`); the app needed no change — its existing empty-name-falls-back-to-short-id rule
+   already covers a device with no name.
+2. **§5.1 `ProjectCard` — `canModerate`.** Gained a `canModerate` field (`coordinator || data.moderate`, from
+   the same cached `gov_caps_json` the card already carries). Moderation, Exclude and Restore, and the
+   publish-confirm approval line, all gate on `canModerate` rather than `coordinator` alone —
+   `needsApproval` is `requireApproval && !canModerate` (controller ruling: a `data.moderate` holder's own
+   publish must never show a false "needs approval" line, matching the hub, which already authorizes
+   decide/exclude/restore on `data.moderate`, not on `coordinator`).
+3. **§4 Moderation tab.** Now two sections rather than one, visible to `canModerate`: "Waiting for review" —
+   the existing pending queue, or the single line "This project publishes without review." when the project
+   does not require approval; and "Excluded frames" — every frame with `accepted === false`, derived from
+   the already-loaded library (no separate fetch), with a batch Restore action.
+4. **New event `collab-peers-changed { projectId }`.** Raised by the collab-live runtime on presence, holder,
+   membership (`FeedEffect::MembersChanged`) and epoch (`FeedEffect::EpochChanged`) changes — the brief scoped
+   only holder/presence, but the owner's goal ("online, or the roster, shows without reopening the page")
+   covers a member joining or leaving too (controller ruling, Task 2). Throttled to at most one per project
+   per second (`PeerBurst`, the same `LANDED_BURST` window as the landed-frames burst). The project page
+   re-reads the library and members after a trailing 1 s, and the more expensive own-frames gate read after a
+   trailing 5 s; an open frame drawer re-reads that frame's holders on the same 1 s-throttled event. No new
+   command — the event goes through the existing emitter, and the web host forwards it over SSE unchanged.

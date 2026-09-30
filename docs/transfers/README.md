@@ -236,7 +236,7 @@ shell) now composes six tabs under `src/components/collab/project/` — `GateTab
 | Library | `send_receive` or coordinator | Other members' published frames and their state on this device |
 | Members | everyone | People, last seen, contribution and holdings |
 | Exchange | everyone | Live per-member rows both directions, then receive history |
-| Moderation | coordinator, `requireApproval` | Pending first publications, batch approve/reject |
+| Moderation | `canModerate` | Waiting for review (pending first publications, batch approve/reject, or a note when review is off), and Excluded frames with Restore |
 
 - **`ProjectFrameTable`** (`src/components/collab/project/table/`, plus `frames.ts`'s view-model/column
   configs) is the one grouped table every tab's list runs on: facet row (filter/camera/night/publisher/state/
@@ -261,3 +261,11 @@ shell) now composes six tabs under `src/components/collab/project/` — `GateTab
   provider (never a second poller).
 - **The sidebar `TransferIndicator`** lights on collab-only traffic too (`exchangeTotals().active` — some flow
   actually moving, not merely a nonzero rate), reading the same `CollabExchangeProvider` state.
+- **`collab-peers-changed { projectId }`** (smoke fixes, 2026-09-30): the collab-live runtime raises it on
+  presence, holder, membership and epoch changes, throttled to at most one per project per second; the project
+  page re-reads the library and members after a trailing 1 s, own frames after a trailing 5 s, and an open
+  frame drawer re-reads that frame's holders — so a member coming online or a frame changing hands shows
+  without reopening the page.
+- **Moderation** (smoke fixes, 2026-09-30) gates on `canModerate` (coordinator or `data.moderate`), not
+  `coordinator` alone, and the same rule governs Exclude/Restore and the publish-confirm approval line. Below
+  the pending queue, an Excluded-frames table lists every `accepted === false` frame with a batch Restore.
