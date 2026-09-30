@@ -163,6 +163,13 @@ describe('LibraryTab — ported from the retired receive tab', () => {
     expect(screen.getByRole('button', { name: /Export for WBPP/ })).toBeInTheDocument();
   });
 
+  it('has no "Project frames" heading and puts Export for WBPP on the group row', async () => {
+    renderTab([frame({})]);
+    expect(screen.queryByText('Project frames')).toBeNull();
+    const exportBtn = await screen.findByRole('button', { name: /Export for WBPP/ });
+    expect(exportBtn.closest('div')!.textContent).toContain('Columns');
+  });
+
   it('does not show the banner once a Collaboration folder is set', async () => {
     renderTab([frame({})]);
     await screen.findByText('light_001.fits');

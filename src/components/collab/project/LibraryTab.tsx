@@ -4,6 +4,7 @@ import { FolderOpen, FolderOutput } from 'lucide-react';
 import { api } from '../../../api';
 import { useCollabExchange } from '../../../contexts/CollabExchangeContext';
 import type { ExchangeState } from '../exchange/state';
+import { Button } from '../../ui';
 import ProjectExportDialog from '../ProjectExportDialog';
 import CollabAttention from '../CollabAttention';
 import ExcludeDialog from './ExcludeDialog';
@@ -155,37 +156,20 @@ export default function LibraryTab({
 
   return (
     <div className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-sm font-medium text-content">Project frames</span>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setExportOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover"
-            title="Organize the project's frames into a PixInsight WBPP folder tree"
-          >
-            <FolderOutput size={14} /> Export for WBPP
-          </button>
-        </div>
-      </div>
-
       {dirUnset && (
-        <div className="flex flex-wrap items-center gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-content-secondary">
+        <div className="flex items-center gap-2 rounded border border-warning/40 bg-warning-muted px-2.5 py-2 text-[12px] text-content-secondary">
           <FolderOpen size={14} className="shrink-0 text-warning" />
           <span>Set a Collaboration folder first — synced frames land there.</span>
-          <Link
-            to="/files"
-            className="ml-auto rounded border border-border px-2 py-0.5 text-xs text-content-secondary transition-colors hover:bg-surface-hover"
-          >
-            Open File Manager
+          <Link to="/files" className="ml-auto">
+            <Button size="sm">Open File Manager</Button>
           </Link>
         </div>
       )}
 
       <CollabAttention projectId={projectId} />
 
-      {error && <p className="text-sm text-error">Could not load the library — see console.</p>}
-      {keepError && <p className="text-sm text-error">{keepError}</p>}
+      {error && <p className="text-[12.5px] text-error">Could not load the library — see console.</p>}
+      {keepError && <p className="text-[12.5px] text-error">{keepError}</p>}
 
       {frames === null ? (
         <p className="text-sm text-content-muted">Loading…</p>
@@ -198,6 +182,15 @@ export default function LibraryTab({
           actions={actions}
           onOpen={onOpen}
           activeKey={activeKey}
+          groupRowExtra={
+            <Button
+              onClick={() => setExportOpen(true)}
+              title="Organize the project's frames into a PixInsight WBPP folder tree"
+            >
+              <FolderOutput size={12} />
+              Export for WBPP
+            </Button>
+          }
           emptyText="No frames in this project yet — published contributions appear here."
         />
       )}

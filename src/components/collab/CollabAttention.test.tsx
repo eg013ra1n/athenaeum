@@ -67,10 +67,13 @@ const attentionReads = () =>
 describe('CollabAttention', () => {
   it('lists the four kinds', async () => {
     renderIt();
-    expect(await screen.findByText('Changed files')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: /Needs your attention/ })).toBeInTheDocument();
+    expect(screen.getAllByRole('heading')).toHaveLength(1);
+    expect(screen.getByText('Changed files')).toBeInTheDocument();
     expect(screen.getByText('A new version is waiting')).toBeInTheDocument();
     expect(screen.getByText('Waiting for your choice')).toBeInTheDocument();
-    expect(screen.getByText(/Nothing else is paused/)).toBeInTheDocument();
+    // The per-list note is the label's tooltip now.
+    expect(screen.getByTitle(/Nothing else is paused/)).toBeInTheDocument();
     expect(screen.getByText('Not kept')).toBeInTheDocument();
     // "Other files" is one collapsed line with a count; the paths open on demand.
     const other = screen.getByRole('button', { name: /1 other file in the Collaboration folder/ });

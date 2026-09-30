@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, ChevronDown, ChevronRight, FileQuestion, FileWarning, Trash2 } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronRight, FileQuestion } from 'lucide-react';
 import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
+import { Button, Card, Chip } from '../ui';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
@@ -50,11 +51,6 @@ interface Confirmation {
   confirmText: string;
   onConfirm: () => void;
 }
-
-const SMALL_BTN =
-  'rounded border border-border px-2 py-0.5 text-xs text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50';
-const SMALL_BTN_DANGER =
-  'rounded border border-error/50 px-2 py-0.5 text-xs text-error transition-colors hover:bg-error/10 disabled:cursor-not-allowed disabled:opacity-50';
 
 export default function CollabAttention({ projectId }: { projectId: string }) {
   const { notify } = useNotifications();
@@ -260,152 +256,132 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
   if (changed.length + awaitingChoice.length + notKept.length + otherFiles.length === 0) return null;
 
   return (
-    <div className="space-y-3">
-      <div className="space-y-3" aria-hidden={confirm ? true : undefined}>
-        {changed.length > 0 && (
-          <Section
-            title="Changed files"
-            icon={<FileWarning size={14} className="text-warning" />}
-            note="Edited in place and set aside: these files are not served and nothing is written over them until you choose."
-            tone="warning"
-          >
-            <ul className="space-y-1.5">
+    <div>
+      <div aria-hidden={confirm ? true : undefined}>
+        <Card title="Needs your attention">
+          {changed.length > 0 && (
+            <Group
+              label="Changed files"
+              note="Edited in place and set aside: these files are not served and nothing is written over them until you choose."
+            >
               {changed.map((row) => (
-                <li key={row.frameUuid} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                  <span className="max-w-[16rem] truncate text-content" title={row.fileName}>
+                <Row key={row.frameUuid}>
+                  <span className="max-w-[16rem] truncate font-mono text-[12px] text-content" title={row.fileName}>
                     {row.fileName}
                   </span>
-                  <span className="min-w-0 flex-1 truncate text-content-muted" title={row.path}>
+                  <span className="min-w-0 flex-1 truncate text-[11.5px] text-content-faint" title={row.path}>
                     {row.path}
                   </span>
-                  <span className="text-content-muted">{formatTimestamp(row.detectedAt)}</span>
-                  {row.newVersionWaiting && (
-                    <span className="rounded bg-accent/20 px-1.5 py-0.5 text-[10px] text-accent">A new version is waiting</span>
-                  )}
-                  <span className="ml-auto flex gap-1.5">
-                    <button
-                      type="button"
-                      className={SMALL_BTN}
-                      disabled={busy}
-                      aria-label={`Re-fetch original ${row.fileName}`}
-                      onClick={() => void refetchOriginal(row, false)}
-                    >
-                      Re-fetch original
-                    </button>
-                    <button
-                      type="button"
-                      className={SMALL_BTN_DANGER}
-                      disabled={busy}
-                      aria-label={`Delete ${row.fileName}`}
-                      onClick={() => deleteChanged(row)}
-                    >
-                      Delete
-                    </button>
-                  </span>
-                </li>
+                  <span className="text-[11.5px] text-content-faint">{formatTimestamp(row.detectedAt)}</span>
+                  {row.newVersionWaiting && <Chip tone="info">A new version is waiting</Chip>}
+                  <Button
+                    size="sm"
+                    disabled={busy}
+                    aria-label={`Re-fetch original ${row.fileName}`}
+                    onClick={() => void refetchOriginal(row, false)}
+                  >
+                    Re-fetch original
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    disabled={busy}
+                    aria-label={`Delete ${row.fileName}`}
+                    onClick={() => deleteChanged(row)}
+                  >
+                    Delete
+                  </Button>
+                </Row>
               ))}
-            </ul>
-          </Section>
-        )}
+            </Group>
+          )}
 
-        {awaitingChoice.length > 0 && (
-          <Section
-            title="Waiting for your choice"
-            icon={<Trash2 size={14} className="text-warning" />}
-            note={`${awaitingChoice.length} ${awaitingChoice.length === 1 ? 'frame was' : 'frames were'} deleted from the Collaboration folder. Re-fetch them, or stop keeping them. Nothing else is paused.`}
-            tone="warning"
-            actions={
-              <>
-                <button type="button" className={SMALL_BTN} disabled={busy} onClick={() => void refetch(null)}>
-                  Re-fetch all
-                </button>
-                <button
-                  type="button"
-                  className={SMALL_BTN_DANGER}
-                  disabled={busy}
-                  onClick={() => void stopKeeping(awaitingChoice.map((r) => r.frameUuid))}
-                >
-                  Stop keeping all
-                </button>
-              </>
-            }
-          >
-            <ul className="space-y-1.5">
+          {awaitingChoice.length > 0 && (
+            <Group
+              label="Waiting for your choice"
+              note={`${awaitingChoice.length} ${awaitingChoice.length === 1 ? 'frame was' : 'frames were'} deleted from the Collaboration folder. Re-fetch them, or stop keeping them. Nothing else is paused.`}
+              actions={
+                <>
+                  <Button size="sm" disabled={busy} onClick={() => void refetch(null)}>
+                    Re-fetch all
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    disabled={busy}
+                    onClick={() => void stopKeeping(awaitingChoice.map((r) => r.frameUuid))}
+                  >
+                    Stop keeping all
+                  </Button>
+                </>
+              }
+            >
               {awaitingChoice.map((row) => (
-                <li key={row.frameUuid} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                  <span className="max-w-[16rem] truncate text-content" title={row.fileName}>
+                <Row key={row.frameUuid}>
+                  <span className="max-w-[16rem] truncate font-mono text-[12px] text-content" title={row.fileName}>
                     {row.fileName}
                   </span>
-                  <span className="text-content-muted">
+                  <span className="min-w-0 flex-1 text-[11.5px] text-content-faint">
                     Holders: {row.holdersOnline} online / {row.holdersTotal}
                   </span>
                   {row.atRisk && (
-                    <span className="inline-flex items-center gap-1 text-warning">
+                    <span className="inline-flex items-center gap-1 text-[11.5px] text-warning">
                       <AlertTriangle size={11} /> Last holders
                     </span>
                   )}
-                  <span className="ml-auto flex gap-1.5">
-                    <button
-                      type="button"
-                      className={SMALL_BTN}
-                      disabled={busy}
-                      aria-label={`Re-fetch ${row.fileName}`}
-                      onClick={() => void refetch([row.frameUuid])}
-                    >
-                      Re-fetch
-                    </button>
-                    <button
-                      type="button"
-                      className={SMALL_BTN_DANGER}
-                      disabled={busy}
-                      aria-label={`Stop keeping ${row.fileName}`}
-                      onClick={() => void stopKeeping([row.frameUuid])}
-                    >
-                      Stop keeping
-                    </button>
-                  </span>
-                </li>
+                  <Button
+                    size="sm"
+                    disabled={busy}
+                    aria-label={`Re-fetch ${row.fileName}`}
+                    onClick={() => void refetch([row.frameUuid])}
+                  >
+                    Re-fetch
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    disabled={busy}
+                    aria-label={`Stop keeping ${row.fileName}`}
+                    onClick={() => void stopKeeping([row.frameUuid])}
+                  >
+                    Stop keeping
+                  </Button>
+                </Row>
               ))}
-            </ul>
-          </Section>
-        )}
+            </Group>
+          )}
 
-        {notKept.length > 0 && (
-          <Section
-            title="Not kept"
-            icon={<Trash2 size={14} className="text-content-muted" />}
-            note="Frames this device no longer keeps. Keep again fetches them once more."
-            actions={
-              <button type="button" className={SMALL_BTN} disabled={busy} onClick={() => void keepAgain(null)}>
-                Keep all again
-              </button>
-            }
-          >
-            <ul className="space-y-1.5">
+          {notKept.length > 0 && (
+            <Group
+              label="Not kept"
+              note="Frames this device no longer keeps. Keep again fetches them once more."
+              actions={
+                <Button size="sm" disabled={busy} onClick={() => void keepAgain(null)}>
+                  Keep all again
+                </Button>
+              }
+            >
               {notKept.map((row) => (
-                <li key={row.frameUuid} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                  <span className="max-w-[16rem] truncate text-content" title={row.fileName}>
+                <Row key={row.frameUuid}>
+                  <span className="max-w-[16rem] truncate font-mono text-[12px] text-content" title={row.fileName}>
                     {row.fileName}
                   </span>
-                  <span className="text-content-muted">v{row.contentVersion}</span>
-                  <span className="ml-auto">
-                    <button
-                      type="button"
-                      className={SMALL_BTN}
-                      disabled={busy}
-                      aria-label={`Keep again ${row.fileName}`}
-                      onClick={() => void keepAgain([row.frameUuid])}
-                    >
-                      Keep again
-                    </button>
-                  </span>
-                </li>
+                  <span className="min-w-0 flex-1 text-[11.5px] text-content-faint">v{row.contentVersion}</span>
+                  <Button
+                    size="sm"
+                    disabled={busy}
+                    aria-label={`Keep again ${row.fileName}`}
+                    onClick={() => void keepAgain([row.frameUuid])}
+                  >
+                    Keep again
+                  </Button>
+                </Row>
               ))}
-            </ul>
-          </Section>
-        )}
+            </Group>
+          )}
 
-        {otherFiles.length > 0 && <OtherFiles files={otherFiles} />}
+          {otherFiles.length > 0 && <OtherFiles files={otherFiles} />}
+        </Card>
       </div>
 
       <ConfirmDialog
@@ -421,37 +397,36 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
   );
 }
 
-function Section({
-  title,
-  icon,
+const ROW_CLS = 'flex items-center gap-2.5 border-t border-line py-[7px] text-[12.5px] first-of-type:border-t-0';
+
+/** One compact attention row (mockup `.att`). */
+function Row({ children }: { children: ReactNode }) {
+  return <div className={ROW_CLS}>{children}</div>;
+}
+
+/** A list inside the card: 12 px faint label (the note is its tooltip), bulk
+ *  buttons to its right, then the rows. */
+function Group({
+  label,
   note,
-  tone,
   actions,
   children,
 }: {
-  title: string;
-  icon: ReactNode;
+  label: string;
   note: string;
-  tone?: 'warning';
   actions?: ReactNode;
   children: ReactNode;
 }) {
-  const headingId = useId();
   return (
-    <section
-      aria-labelledby={headingId}
-      className={`space-y-2 rounded border px-3 py-2 ${tone === 'warning' ? 'border-warning/40 bg-warning/5' : 'border-border bg-surface'}`}
-    >
-      <div className="flex flex-wrap items-center gap-2">
-        {icon}
-        <h3 id={headingId} className="text-sm font-medium text-content">
-          {title}
-        </h3>
-        {actions && <span className="ml-auto flex gap-1.5">{actions}</span>}
+    <div className="mb-2 last:mb-0">
+      <div className="flex items-center gap-2 pb-1">
+        <span className="text-[12px] text-content-faint" title={note}>
+          {label}
+        </span>
+        {actions && <span className="ml-auto flex items-center gap-1.5">{actions}</span>}
       </div>
-      <p className="text-xs text-content-muted">{note}</p>
-      {children}
-    </section>
+      <div>{children}</div>
+    </div>
   );
 }
 
@@ -468,35 +443,38 @@ function OtherFiles({ files }: { files: ForeignFileView[] }) {
   const listId = useId();
   const Chevron = open ? ChevronDown : ChevronRight;
   return (
-    <section className="rounded border border-border bg-surface px-3 py-1.5">
+    <div className="mb-2 last:mb-0">
+      <div className="pb-1 text-[12px] text-content-faint" title="Files in the Collaboration folder that no frame references; the app never deletes them.">
+        Other files
+      </div>
       <button
         type="button"
-        className="flex w-full items-center gap-2 text-left text-xs text-content-secondary hover:text-content"
+        className={`${ROW_CLS} w-full text-left text-content-secondary hover:text-content`}
         aria-expanded={open}
         aria-controls={listId}
         onClick={() => setOpen((o) => !o)}
       >
         <Chevron size={14} className="text-content-muted" />
         <FileQuestion size={14} className="text-content-muted" />
-        <span className="font-medium">
+        <span>
           {files.length} other {files.length === 1 ? 'file' : 'files'} in the Collaboration folder
         </span>
-        <span className="truncate text-content-muted">— belong to no project frame; the app never deletes them</span>
+        <span className="truncate text-[11.5px] text-content-faint">— belong to no project frame; the app never deletes them</span>
       </button>
       {open && (
-        <ul id={listId} className="mt-1.5 max-h-48 space-y-0.5 overflow-y-auto pr-1">
+        <ul id={listId} className="max-h-48 space-y-0.5 overflow-y-auto pr-1">
           {files.map((f) => {
             const { name, dir } = splitPath(f.path);
             return (
-              <li key={f.path} className="flex items-center gap-x-3 text-xs" title={f.path}>
-                <span className="max-w-[18rem] shrink-0 truncate text-content">{name}</span>
-                <span className="min-w-0 flex-1 truncate text-content-muted">{dir}</span>
-                <span className="shrink-0 text-content-muted">{formatTimestamp(f.seenAt)}</span>
+              <li key={f.path} className="flex items-center gap-x-3 text-[12px]" title={f.path}>
+                <span className="max-w-[18rem] shrink-0 truncate font-mono text-content">{name}</span>
+                <span className="min-w-0 flex-1 truncate text-[11.5px] text-content-faint">{dir}</span>
+                <span className="shrink-0 text-[11.5px] text-content-faint">{formatTimestamp(f.seenAt)}</span>
               </li>
             );
           })}
         </ul>
       )}
-    </section>
+    </div>
   );
 }
