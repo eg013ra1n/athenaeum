@@ -71,8 +71,19 @@ export default function MyFramesTab({
   // this tab's batch done.
   const solveStartedHereRef = useRef(false);
 
+  // Fix round 1, finding 2: a latest-value ref, not a dep, so the two
+  // listener effects below subscribe exactly ONCE for the life of the tab.
+  // An inline `onReload` from the parent (a new function identity every
+  // render) would otherwise re-subscribe on every render; each
+  // unsubscribe → resubscribe pair opens an async gap in which a
+  // `plate-solve-complete` fired in between is missed entirely, leaving
+  // `solveBusy` stuck forever.
+  const onReloadRef = useRef(onReload);
+  onReloadRef.current = onReload;
+
   // StrictMode-safe listener pattern (CLAUDE.md) — moved verbatim from
-  // ProjectDetail, `loadGate()` replaced by `onReload()`.
+  // ProjectDetail, `loadGate()` replaced by `onReloadRef.current()`. Deps
+  // `[]`: subscribed once, reads the latest `onReload` through the ref.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
@@ -86,7 +97,7 @@ export default function MyFramesTab({
           next.delete(payload.frame_set_id);
           return next;
         });
-        onReload();
+        onReloadRef.current();
       })
       .then((fn) => {
         if (cancelled) fn();
@@ -97,7 +108,7 @@ export default function MyFramesTab({
       cancelled = true;
       unlisten?.();
     };
-  }, [onReload]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -108,7 +119,7 @@ export default function MyFramesTab({
         if (!solveStartedHereRef.current) return;
         solveStartedHereRef.current = false;
         setSolveBusy(false);
-        onReload();
+        onReloadRef.current();
       })
       .then((fn) => {
         if (cancelled) fn();
@@ -119,7 +130,7 @@ export default function MyFramesTab({
       cancelled = true;
       unlisten?.();
     };
-  }, [onReload]);
+  }, []);
 
   const handleSolve = async (frameIds: number[]): Promise<void> => {
     setSolveBusy(true);
@@ -202,7 +213,16 @@ export default function MyFramesTab({
     {
       id: 'analyze',
       verb: 'Analyze',
-      eligible: (v) => v.failures.some((f) => f.kind === 'analyze'),
+      // Fix round 1, finding 1: a set already running is ineligible, not
+      // just "already counted" — `analyze_frame_set` is awaited for the
+      // whole run and the backend refuses a second one on the same set
+      // (`Conflict`). Without this, the group's own Analyze button and this
+      // toolbar action can race: the second call's catch would delete
+      // `setId` from `analyzeBusy` while the first run is still going,
+      // re-enabling the group's button and raising a false failure toast.
+      // Excluding busy sets here needs no separate `busy:` field — the
+      // button naturally reads `N of M` and disables at zero.
+      eligible: (v) => v.setId !== null && !analyzeBusy.has(v.setId) && v.failures.some((f) => f.kind === 'analyze'),
       run: (targets) => {
         const setIds = new Set(targets.map((v) => v.setId).filter((id): id is number => id !== null));
         for (const setId of setIds) void handleAnalyze(setId);

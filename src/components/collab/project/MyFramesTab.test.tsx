@@ -89,9 +89,11 @@ function defaultProps(overrides: Partial<MyFramesTabProps> = {}): MyFramesTabPro
   };
 }
 
-function renderTab(overrides: Partial<MyFramesTabProps> = {}) {
-  const props = defaultProps(overrides);
-  const utils = render(
+/** Shared element tree — also used directly by the rerender test below, so a
+ *  rerender updates the SAME mounted `MyFramesTab` instance (same position,
+ *  same component type at every level) instead of remounting it. */
+function tree(props: MyFramesTabProps) {
+  return (
     <MemoryRouter>
       <SessionStateProvider>
         <NotificationProvider>
@@ -99,8 +101,13 @@ function renderTab(overrides: Partial<MyFramesTabProps> = {}) {
           <ToastStack />
         </NotificationProvider>
       </SessionStateProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderTab(overrides: Partial<MyFramesTabProps> = {}) {
+  const props = defaultProps(overrides);
+  const utils = render(tree(props));
   return { ...utils, props };
 }
 
@@ -312,5 +319,102 @@ describe('MyFramesTab — Published', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
     fireEvent.click(screen.getByRole('button', { name: 'Exclude 2 of 3' }));
     expect(screen.getByText('Exclude 2 frames from the project')).toBeInTheDocument();
+  });
+});
+
+describe('MyFramesTab — fix round 1, finding 1: the toolbar Analyze excludes an already-running set', () => {
+  it('after the group Analyze starts a set, the toolbar Analyze drops it (disabled, 0 eligible) and never re-invokes analyze_frame_set for it', async () => {
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      // Never resolves — simulates the backend's real run-for-the-whole-call
+      // shape (`analyze_frame_set` is awaited for the whole analysis), so
+      // the set stays "busy" for the rest of this test.
+      if (command === 'analyze_frame_set') return new Promise(() => {});
+      return Promise.resolve(null);
+    }) as never);
+
+    renderTab({
+      rows: [
+        own({
+          frameId: 5,
+          fileName: 'a1.fits',
+          segment: 'held',
+          setId: 10,
+          setName: 'M31',
+          failures: [{ kind: 'analyze', text: 'no analysis' }],
+        }),
+      ],
+      segment: 'held',
+    });
+
+    // A single set: the group header's ReasonGroupAction is a plain button
+    // (no menu), distinct from the toolbar's "Analyze all N".
+    const groupBtn = await screen.findByRole('button', { name: 'Analyze' });
+    fireEvent.click(groupBtn);
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('analyze_frame_set', { frameSetId: 10 }));
+
+    // The toolbar action's `eligible` now excludes set 10 — 0 of the 1 held
+    // frame is eligible, and the button disables at zero (never hidden).
+    const toolbarBtn = screen.getByRole('button', { name: 'Analyze all 0' });
+    expect(toolbarBtn).toBeDisabled();
+
+    // A click on a disabled button fires no handler — belt-and-braces check
+    // that it truly never re-invokes the command for the busy set.
+    fireEvent.click(toolbarBtn);
+    expect(
+      vi.mocked(api.invoke).mock.calls.filter(
+        ([c, a]) => c === 'analyze_frame_set' && (a as { frameSetId: number })?.frameSetId === 10,
+      ),
+    ).toHaveLength(1);
+  });
+});
+
+describe('MyFramesTab — fix round 1, finding 2: listeners subscribe once, not per render', () => {
+  it('a rerender with a new inline onReload does not re-subscribe api.listen, and the LATEST onReload runs on completion', async () => {
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'plate_solve_batch') return Promise.resolve(undefined);
+      return Promise.resolve(null);
+    }) as never);
+
+    const onReload1 = vi.fn();
+    const props = defaultProps({
+      rows: [
+        own({
+          frameId: 4,
+          fileName: 'h1.fits',
+          segment: 'held',
+          setId: 10,
+          setName: 'M31',
+          failures: [{ kind: 'solve', text: 'no coordinates or pixel scale' }],
+        }),
+      ],
+      segment: 'held',
+      onReload: onReload1,
+    });
+    const { rerender } = render(tree(props));
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Solve 1' }));
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('plate_solve_batch', { frameIds: [4] }));
+
+    const listenCallsBefore = vi
+      .mocked(api.listen)
+      .mock.calls.filter(([event]) => event === 'plate-solve-complete').length;
+    expect(listenCallsBefore).toBe(1);
+
+    // A brand-new inline `onReload` — exactly the shape a shell page that
+    // does not memoize its callback would pass on every render.
+    const onReload2 = vi.fn();
+    rerender(tree({ ...props, onReload: onReload2 }));
+
+    const listenCallsAfter = vi
+      .mocked(api.listen)
+      .mock.calls.filter(([event]) => event === 'plate-solve-complete').length;
+    expect(listenCallsAfter).toBe(1); // still exactly one subscription — not re-subscribed
+
+    act(() => {
+      listeners['plate-solve-complete']?.({});
+    });
+
+    expect(onReload2).toHaveBeenCalledTimes(1);
+    expect(onReload1).not.toHaveBeenCalled();
   });
 });
