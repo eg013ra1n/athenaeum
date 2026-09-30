@@ -48,27 +48,42 @@ async fn a_publish_is_fetched_without_any_poll() {
     }
 }
 
-/// A new holder (B landing A's publish) raises at least one
+/// A new holder (B landing A's publish) raises at least one NEW
 /// `collab-peers-changed` for the project on A's side — the live-connected
 /// publisher — so its project page can refresh "online" without being
 /// reopened. The exact throttle numbers (coalescing, window-end flush) are
 /// covered by `PeerBurst`'s own pure unit tests in `runtime.rs`; this only
 /// wires it to a real holder change end to end.
+///
+/// The baseline is taken right after `two_instances()` and before the
+/// publish: connecting a project's live exchange already raises its own
+/// `ProvidersChanged` (the initial holders snapshot fetch), so a bare
+/// "at least one, ever" check would pass even with the trigger under test
+/// removed — this counts strictly NEW events past that connect-time one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_holder_raises_collab_peers_changed() {
     let w = ts::two_instances().await;
+    // Let the connect-time settling (each side's initial holders-snapshot
+    // ProvidersChanged) finish before taking the baseline — confirmed by a
+    // throwaway diagnostic to land within ~1s and never recur on its own.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before =
+        w.a.events
+            .payloads(crate::api::collab_exchange::COLLAB_PEERS_CHANGED_EVENT)
+            .len();
     let uuids = w.a_publishes(1).await;
     for u in &uuids {
         w.b.wait_state(u, LocalState::Held, Duration::from_secs(20))
             .await;
     }
     ts::wait_until(
-        "collab-peers-changed after a new holder",
+        "a new collab-peers-changed after a new holder",
         Duration::from_secs(10),
         || {
-            !w.a.events
+            w.a.events
                 .payloads(crate::api::collab_exchange::COLLAB_PEERS_CHANGED_EVENT)
-                .is_empty()
+                .len()
+                > before
         },
     )
     .await;
@@ -81,21 +96,34 @@ async fn a_new_holder_raises_collab_peers_changed() {
 }
 
 /// Fix round 1: a member added to the project (a `ChangeKind::Members`
-/// project event, no publish or land involved) also raises
+/// project event, no publish or land involved) also raises a NEW
 /// `collab-peers-changed` — the Members tab must refresh even though nothing
 /// was published or landed. Covers the `FeedEffect::MembersChanged` arm,
 /// distinct from the holder-change coverage above.
+///
+/// Same connect-time-noise caveat as the holder test above: the baseline is
+/// taken before `add_member` so the assertion is strictly about a NEW event,
+/// not just "any event, ever" (which would also pass from the initial
+/// holders-snapshot `ProvidersChanged` at connect time, with no fix at all —
+/// caught by running this exact test against the pre-fix runtime.rs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_member_change_raises_collab_peers_changed() {
     let w = ts::two_instances().await;
+    // See the holder test above: let connect-time settling finish first.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before =
+        w.a.events
+            .payloads(crate::api::collab_exchange::COLLAB_PEERS_CHANGED_EVENT)
+            .len();
     w.hub.add_member(ts::PID, "acc-c", "send", false);
     ts::wait_until(
-        "collab-peers-changed after a member change",
+        "a new collab-peers-changed after a member change",
         Duration::from_secs(10),
         || {
-            !w.a.events
+            w.a.events
                 .payloads(crate::api::collab_exchange::COLLAB_PEERS_CHANGED_EVENT)
-                .is_empty()
+                .len()
+                > before
         },
     )
     .await;
