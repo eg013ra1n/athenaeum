@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import type { ModerationFrameView, OwnFrameRow, ProjectFrameView } from '../../../types/models';
-import { copies, fromLibrary, fromModeration, fromOwn, GROUPS, TABLES } from './frames';
+import { COLUMNS, copies, fromLibrary, fromModeration, fromOwn, GROUPS, TABLES } from './frames';
 
 function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
   return {
@@ -160,4 +160,32 @@ it('a ready own frame has no states', () => {
 
 it('no table offers a ZP column', () => {
   for (const t of Object.values(TABLES)) expect(t.columns).not.toContain('zp');
+});
+
+it('TABLES.excluded is the Moderation tab\'s excluded-frames layout', () => {
+  expect(TABLES.excluded).toEqual({
+    id: 'excluded',
+    columns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'exclusion', 'fwhm', 'ecc', 'size'],
+    defaultColumns: ['name', 'publisher', 'night', 'filter', 'exp', 'exclusion'],
+    groupings: ['publisher', 'night', 'filter', 'camera', 'none'],
+    defaultGrouping: ['publisher', 'none'],
+    stateFacet: null,
+    publisherFacet: true,
+  });
+});
+
+it('COLUMNS.exclusion reads acceptedReason, dashing a null reason', () => {
+  const withReason = fromLibrary(lib({ accepted: false, acceptedReason: 'wrong target' }), new Map());
+  const withoutReason = fromLibrary(lib({ accepted: false, acceptedReason: null }), new Map());
+  expect(COLUMNS.exclusion.value(withReason)).toBe('wrong target');
+  expect(COLUMNS.exclusion.value(withoutReason)).toBeNull();
+
+  render(
+    <>
+      <span data-testid="with-reason">{COLUMNS.exclusion.cell(withReason)}</span>
+      <span data-testid="without-reason">{COLUMNS.exclusion.cell(withoutReason)}</span>
+    </>,
+  );
+  expect(screen.getByTestId('with-reason')).toHaveTextContent('wrong target');
+  expect(screen.getByTestId('without-reason')).toHaveTextContent('—');
 });

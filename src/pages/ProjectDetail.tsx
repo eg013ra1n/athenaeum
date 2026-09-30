@@ -538,6 +538,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
       {activeTab === 'moderation' && (
         <ModerationTab
           projectId={id}
+          requireApproval={c.requireApproval}
           library={frames}
           onDecided={() => {
             void loadDetail();

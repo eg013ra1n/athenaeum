@@ -10,7 +10,7 @@ import {
 
 /* ── View-model ─────────────────────────────────────────────────────────── */
 
-export type TableId = 'ready' | 'held' | 'published' | 'library' | 'moderation';
+export type TableId = 'ready' | 'held' | 'published' | 'library' | 'moderation' | 'excluded';
 
 export type DeviceState =
   | 'have' | 'downloading' | 'queued' | 'missing' | 'notKept' | 'needsChoice' | 'changed' | 'notReplicated';
@@ -640,6 +640,13 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     value: (v) => v.submittedAt,
     cell: (v) => (v.submittedAt === null ? dash() : <span className="text-content-muted">{formatTimestamp(v.submittedAt)}</span>),
   },
+  exclusion: {
+    id: 'exclusion',
+    label: 'Why excluded',
+    width: 240,
+    value: (v) => v.acceptedReason,
+    cell: (v) => v.acceptedReason ?? dash(),
+  },
 };
 
 /* ── Groups ─────────────────────────────────────────────────────────────── */
@@ -785,6 +792,15 @@ export const TABLES: Record<TableId, TableConfig> = {
     defaultColumns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr'],
     groupings: ['publisher', 'night', 'filter', 'camera', 'none'],
     defaultGrouping: ['publisher', 'night'],
+    stateFacet: null,
+    publisherFacet: true,
+  },
+  excluded: {
+    id: 'excluded',
+    columns: ['name', 'publisher', 'night', 'filter', 'camera', 'exp', 'exclusion', 'fwhm', 'ecc', 'size'],
+    defaultColumns: ['name', 'publisher', 'night', 'filter', 'exp', 'exclusion'],
+    groupings: ['publisher', 'night', 'filter', 'camera', 'none'],
+    defaultGrouping: ['publisher', 'none'],
     stateFacet: null,
     publisherFacet: true,
   },

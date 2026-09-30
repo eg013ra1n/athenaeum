@@ -3,10 +3,11 @@ import { Loader2, X } from 'lucide-react';
 import { api } from '../../../api';
 import { Checkbox } from '../../settings/Checkbox';
 import ProjectFrameTable, { type TableAction } from './table/ProjectFrameTable';
-import { fromModeration, type FrameVM } from './frames';
+import { fromLibrary, fromModeration, type FrameVM } from './frames';
 import type { ModerationFrameView, ProjectFrameView } from '../../../types/models';
 
 const REASON_MAX = 500;
+const HEADER = 'text-sm font-semibold text-content';
 
 /** The hub's stable 409 text for "this frame is no longer pending" — already
  *  approved/rejected by another moderator, or swept up by THIS SAME batch's
@@ -31,20 +32,27 @@ function byUuid(library: ProjectFrameView[] | null): ReadonlyMap<string, Project
 }
 
 /**
- * Moderation tab — the coordinator's queue of pending first publications, as
- * one `ProjectFrameTable` (Task 12, spec 2026-09-30 "Moderation"). Replaces
- * the retired per-row moderation queue with batch Approve/Reject. The "Trust
- * this publisher" checkbox moves from per-row (the old queue) to one
- * table-wide toggle in the toolbar, default on, applied to every frame a
- * batch Approve covers.
+ * Moderation tab — two sections (Task 4, 2026-09-30 collab-smoke-fixes plan).
+ * "Waiting for review" is the coordinator's queue of pending first
+ * publications, as one `ProjectFrameTable` (Task 12, spec 2026-09-30
+ * "Moderation"). Batch Approve/Reject; the "Trust this publisher" checkbox
+ * is one table-wide toggle in the toolbar, default on, applied to every
+ * frame a batch Approve covers. When the project publishes without review
+ * (`requireApproval: false`) this section is a muted sentence instead, and
+ * `list_collab_moderation` is never called.
+ * "Excluded frames" lists every frame the coordinator excluded
+ * (`accepted === false`), derived straight from the `library` prop (no
+ * separate fetch), with a batch Restore action.
  */
 export default function ModerationTab({
   projectId,
+  requireApproval,
   library,
   onDecided,
   onOpen,
 }: {
   projectId: string;
+  requireApproval: boolean;
   library: ProjectFrameView[] | null;
   onDecided: () => void;
   onOpen: (vm: FrameVM) => void;
@@ -55,6 +63,8 @@ export default function ModerationTab({
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [rejecting, setRejecting] = useState<FrameVM[] | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  const [restoreResult, setRestoreResult] = useState<string | null>(null);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -76,8 +86,9 @@ export default function ModerationTab({
   }, [projectId]);
 
   useEffect(() => {
+    if (!requireApproval) return;
     void load();
-  }, [load]);
+  }, [load, requireApproval]);
 
   const mirror = byUuid(library);
   const rows: FrameVM[] = (items ?? []).map((m) => fromModeration(m, mirror));
@@ -168,36 +179,95 @@ export default function ModerationTab({
     },
   ];
 
+  const excludedRows: FrameVM[] = (library ?? [])
+    .filter((f) => !f.accepted)
+    .map((f) => fromLibrary(f, new Map()));
+
+  const restoreAll = useCallback(
+    async (targets: FrameVM[]): Promise<void> => {
+      setRestoring(true);
+      setRestoreResult(null);
+      let done = 0;
+      for (const t of targets) {
+        try {
+          await api.invoke('restore_collab_frame', { projectId, frameUuid: t.frameUuid });
+          done += 1;
+        } catch (err) {
+          // Never swallow: log first, then stop and report exactly how far the batch got.
+          console.error('[moderation] restore_collab_frame failed:', err);
+          const msg = err instanceof Error ? err.message : String(err);
+          if (mounted.current) setRestoreResult(`Restored ${done} of ${targets.length} — ${msg}`);
+          setRestoring(false);
+          onDecided();
+          return;
+        }
+      }
+      setRestoring(false);
+      onDecided();
+    },
+    [projectId, onDecided],
+  );
+
+  const restoreActions: TableAction[] = [
+    {
+      id: 'restore',
+      verb: 'Restore',
+      eligible: () => true,
+      primary: true,
+      busy: restoring,
+      run: (targets) => void restoreAll(targets),
+    },
+  ];
+
   return (
-    <div className="space-y-3">
-      {error && <p className="text-sm text-error">{error}</p>}
-      {result && <p className="text-sm text-error">{result}</p>}
+    <div className="space-y-6">
+      <div className="space-y-3">
+        <h2 className={HEADER}>Waiting for review</h2>
+        {error && <p className="text-sm text-error">{error}</p>}
+        {result && <p className="text-sm text-error">{result}</p>}
 
-      {items === null ? (
-        <p className="text-sm text-content-muted">Loading…</p>
-      ) : (
+        {!requireApproval ? (
+          <p className="text-sm text-content-muted">This project publishes without review.</p>
+        ) : items === null ? (
+          <p className="text-sm text-content-muted">Loading…</p>
+        ) : (
+          <ProjectFrameTable
+            key={`${projectId}.moderation`}
+            tableId="moderation"
+            scope={projectId}
+            rows={rows}
+            actions={actions}
+            onOpen={onOpen}
+            emptyText="Nothing waiting for review."
+            toolbarExtra={
+              <Checkbox checked={trust} onChange={setTrust} label="Trust these publishers" size="sm" />
+            }
+          />
+        )}
+
+        {rejecting && (
+          <RejectDialog
+            frames={rejecting}
+            busy={busy}
+            onCancel={() => setRejecting(null)}
+            onReject={(reason) => void rejectAll(rejecting, reason)}
+          />
+        )}
+      </div>
+
+      <div className="space-y-3">
+        <h2 className={HEADER}>Excluded frames</h2>
+        {restoreResult && <p className="text-sm text-error">{restoreResult}</p>}
         <ProjectFrameTable
-          key={`${projectId}.moderation`}
-          tableId="moderation"
+          key={`${projectId}.excluded`}
+          tableId="excluded"
           scope={projectId}
-          rows={rows}
-          actions={actions}
+          rows={excludedRows}
+          actions={restoreActions}
           onOpen={onOpen}
-          emptyText="Nothing waiting for review."
-          toolbarExtra={
-            <Checkbox checked={trust} onChange={setTrust} label="Trust these publishers" size="sm" />
-          }
+          emptyText="No frames are excluded."
         />
-      )}
-
-      {rejecting && (
-        <RejectDialog
-          frames={rejecting}
-          busy={busy}
-          onCancel={() => setRejecting(null)}
-          onReject={(reason) => void rejectAll(rejecting, reason)}
-        />
-      )}
+      </div>
     </div>
   );
 }

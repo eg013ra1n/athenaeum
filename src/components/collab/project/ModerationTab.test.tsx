@@ -79,13 +79,20 @@ beforeEach(() => {
 
 function renderTab(
   library: ProjectFrameView[] | null = null,
-  overrides: { onDecided?: () => void; onOpen?: (vm: FrameVM) => void } = {},
+  overrides: { onDecided?: () => void; onOpen?: (vm: FrameVM) => void; requireApproval?: boolean } = {},
 ) {
   const onDecided = overrides.onDecided ?? vi.fn();
   const onOpen = overrides.onOpen ?? vi.fn();
+  const requireApproval = overrides.requireApproval ?? true;
   const utils = render(
     <SessionStateProvider>
-      <ModerationTab projectId="proj-1" library={library} onDecided={onDecided} onOpen={onOpen} />
+      <ModerationTab
+        projectId="proj-1"
+        requireApproval={requireApproval}
+        library={library}
+        onDecided={onDecided}
+        onOpen={onOpen}
+      />
     </SessionStateProvider>,
   );
   return { onDecided, onOpen, ...utils };
@@ -103,6 +110,13 @@ function rejectCalls(): { projectId: string; frameUuid: string; reason: string }
     .mocked(api.invoke)
     .mock.calls.filter(([cmd]) => cmd === 'reject_collab_frame')
     .map(([, args]) => args as { projectId: string; frameUuid: string; reason: string });
+}
+
+function restoreCalls(): { projectId: string; frameUuid: string }[] {
+  return vi
+    .mocked(api.invoke)
+    .mock.calls.filter(([cmd]) => cmd === 'restore_collab_frame')
+    .map(([, args]) => args as { projectId: string; frameUuid: string });
 }
 
 describe('ModerationTab — empty and load', () => {
@@ -285,5 +299,80 @@ describe('ModerationTab — manifest mirror', () => {
     // name, publisher, night, filter, … — index 3 (0 = the row checkbox).
     const cells = within(row as HTMLElement).getAllByRole('cell');
     expect(cells[3]).toHaveTextContent('—');
+  });
+});
+
+describe('ModerationTab — Waiting for review, approval off', () => {
+  it('shows the muted line and never calls list_collab_moderation', async () => {
+    renderTab(null, { requireApproval: false });
+
+    expect(await screen.findByText('This project publishes without review.')).toBeInTheDocument();
+    expect(screen.queryByText('Nothing waiting for review.')).not.toBeInTheDocument();
+    expect(vi.mocked(api.invoke).mock.calls.some(([cmd]) => cmd === 'list_collab_moderation')).toBe(false);
+  });
+});
+
+describe('ModerationTab — Excluded frames', () => {
+  function excludedFrame(overrides: Partial<ProjectFrameView> = {}): ProjectFrameView {
+    return libraryFrame({ accepted: false, acceptedReason: 'wrong target', ...overrides });
+  }
+
+  it('shows the empty text when nothing is excluded', async () => {
+    renderTab([libraryFrame({ frameUuid: 'u-1', accepted: true })], { requireApproval: false });
+    expect(await screen.findByText('No frames are excluded.')).toBeInTheDocument();
+  });
+
+  it('lists every excluded frame with its reason; an accepted frame does not appear', async () => {
+    const normal = libraryFrame({ frameUuid: 'n-1', fileName: 'ok.fits', accepted: true });
+    const excludedA = excludedFrame({ frameUuid: 'e-1', fileName: 'bad1.fits', acceptedReason: 'trailed' });
+    const excludedB = excludedFrame({ frameUuid: 'e-2', fileName: 'bad2.fits', acceptedReason: 'wrong target' });
+    renderTab([normal, excludedA, excludedB], { requireApproval: false });
+
+    await screen.findByText('bad1.fits');
+    expect(screen.getByText('bad2.fits')).toBeInTheDocument();
+    expect(screen.queryByText('ok.fits')).not.toBeInTheDocument();
+    expect(screen.getByText('trailed')).toBeInTheDocument();
+    expect(screen.getByText('wrong target')).toBeInTheDocument();
+  });
+
+  it('Restore 2 invokes restore_collab_frame for each selected frame, then onDecided', async () => {
+    const excludedA = excludedFrame({ frameUuid: 'e-1', fileName: 'bad1.fits' });
+    const excludedB = excludedFrame({ frameUuid: 'e-2', fileName: 'bad2.fits' });
+    const { onDecided } = renderTab([excludedA, excludedB], { requireApproval: false });
+
+    await screen.findByText('bad1.fits');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Restore 2' }));
+
+    await waitFor(() => expect(restoreCalls()).toHaveLength(2));
+    expect(restoreCalls()).toEqual([
+      { projectId: 'proj-1', frameUuid: 'e-1' },
+      { projectId: 'proj-1', frameUuid: 'e-2' },
+    ]);
+    await waitFor(() => expect(onDecided).toHaveBeenCalledTimes(1));
+  });
+
+  it('a failure on the second of two stops the batch and reads "Restored 1 of 2 — …"', async () => {
+    const excludedA = excludedFrame({ frameUuid: 'e-1', fileName: 'bad1.fits' });
+    const excludedB = excludedFrame({ frameUuid: 'e-2', fileName: 'bad2.fits' });
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'list_collab_moderation') return Promise.resolve(moderationItems);
+      if (command === 'restore_collab_frame') {
+        const n = restoreCalls().length;
+        if (n === 2) return Promise.reject(new Error('offline'));
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    }) as never);
+
+    const { onDecided } = renderTab([excludedA, excludedB], { requireApproval: false });
+    await screen.findByText('bad1.fits');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Restore 2' }));
+
+    expect(await screen.findByText(/Restored 1 of 2 — offline/)).toBeInTheDocument();
+    expect(restoreCalls()).toHaveLength(2);
+    expect(restoreCalls().map((c) => c.frameUuid)).toEqual(['e-1', 'e-2']);
+    await waitFor(() => expect(onDecided).toHaveBeenCalledTimes(1));
   });
 });
