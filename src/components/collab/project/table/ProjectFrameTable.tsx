@@ -38,10 +38,13 @@ export interface ProjectFrameTableProps {
   today?: string; // test seam; default localToday()
 }
 
+/** The checkbox column's width — the mockup measures 34 px. */
+const CHECK_COL_W = 34;
+
 /** Checkbox column + Frame at its 220 px minimum + every other column's
  *  fixed width (spec §5.1): below this the table scrolls horizontally. */
 export function tableMinWidth(columns: ColumnDef<FrameVM>[]): number {
-  return 32 + 220 + columns.filter((c) => c.id !== 'name').reduce((a, c) => a + c.width, 0);
+  return CHECK_COL_W + 220 + columns.filter((c) => c.id !== 'name').reduce((a, c) => a + c.width, 0);
 }
 
 /* ── Small helpers ──────────────────────────────────────────────────────── */
@@ -87,11 +90,15 @@ function saveColumns(tableId: TableId, cols: string[]): void {
 
 /** Mockup `table.ft th` — sticky 30 px header on `table-head`. */
 const TH = 'sticky top-0 z-[2] h-[30px] select-none overflow-hidden text-ellipsis whitespace-nowrap border-b border-border bg-table-head px-2 text-[11.5px] font-medium';
-/** Mockup `table.ft td` — 28 px cell + 1 px `line-soft` separator (the 29 px
- *  `ROW_H` pitch), never wraps, truncates with an ellipsis. */
+/** Mockup `table.ft td` — a 28 px border-box cell whose 1 px `line-soft`
+ *  separator sits inside it, so the row pitch is 28 px (`ROW_H`); never
+ *  wraps, truncates with an ellipsis. */
 const TD = 'h-7 overflow-hidden text-ellipsis whitespace-nowrap border-b border-line-soft px-2';
 
-/** Spec §5.2 item 4 — the table box reaches the window bottom, minimum `min`px. */
+/** Spec §5.2 item 4 — the table box reaches the window bottom, minimum `min`px.
+ *  Refits on a window resize and whenever the table's own block or the page
+ *  body changes size (the filter row wraps once the side panel opens, the
+ *  totals bar wraps, a card appears above), not only once at mount. */
 function useFillHeight(el: HTMLElement | null, min: number): number | undefined {
   const [h, setH] = useState<number | undefined>(undefined);
   useLayoutEffect(() => {
@@ -99,7 +106,16 @@ function useFillHeight(el: HTMLElement | null, min: number): number | undefined 
     const fit = () => setH(Math.max(min, Math.floor(window.innerHeight - el.getBoundingClientRect().top - 24)));
     fit();
     window.addEventListener('resize', fit);
-    return () => window.removeEventListener('resize', fit);
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => fit());
+      if (el.parentElement) ro.observe(el.parentElement);
+      ro.observe(document.body);
+    }
+    return () => {
+      window.removeEventListener('resize', fit);
+      ro?.disconnect();
+    };
   }, [el, min]);
   return h;
 }
@@ -380,14 +396,14 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
         )}
 
         <TextInput
-          placeholder="Search frames"
-          aria-label="Search frames"
+          placeholder="Search file name"
+          aria-label="Search file name"
           value={facets.search}
           onChange={(e) => setFacets((prev) => ({ ...prev, search: e.target.value }))}
-          className="w-[150px]"
+          className="w-[170px]"
         />
 
-        <Button variant="link" size="sm" disabled={active === 0} onClick={clearFacets}>
+        <Button variant="link" disabled={active === 0} onClick={clearFacets}>
           Clear filters
         </Button>
       </div>
@@ -404,7 +420,7 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
         </Select>
         {group[0] !== 'none' && (
           <>
-            <span className="text-[11.5px] text-content-faint">▸</span>
+            <span className="text-[13px] text-content-faint">▸</span>
             <Select aria-label="Then group by" value={group[1]} onChange={(e) => setGroup1(e.target.value)}>
               {config.groupings.filter((id) => id !== group[0]).map((id) => (
                 <option key={id} value={id}>
@@ -485,84 +501,89 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
         style={{ height: fillHeight }}
         className="overflow-auto rounded-b-md border border-line bg-surface"
       >
-        <table className="w-full table-fixed border-separate border-spacing-0" style={{ minWidth: tableMinWidth(columns) }}>
-          {/* Widths come only from the column definitions, never from the
-              rendered rows, so windowing can never move a column (spec §5.1). */}
-          <colgroup>
-            <col style={{ width: 32 }} />
-            {columns.map((c) => (
-              <col key={c.id} style={c.id === 'name' ? undefined : { width: c.width }} />
-            ))}
-          </colgroup>
-          <thead>
-            <tr>
-              <th scope="col" className={`${TH} text-left text-content-faint`}>
-                <CbBox state={headerState} onChange={toggleSelectAllShown} label="Select all shown" />
-              </th>
-              {columns.map((col) => (
-                <th
-                  key={col.id}
-                  scope="col"
-                  onClick={() => onSortClick(col.id)}
-                  className={`${TH} cursor-pointer hover:text-content ${col.numeric ? 'text-right' : 'text-left'} ${sort.col === col.id ? 'text-accent' : 'text-content-faint'}`}
-                >
-                  {col.label}
-                  {sort.col === col.id ? (sort.dir === 1 ? ' ↑' : ' ↓') : ''}
-                </th>
+        {/* min-width on a wrapper, not the <table> (undefined on tables in
+            CSS 2.1; WebKit may ignore it): Frame never drops below 220 px,
+            then the box scrolls horizontally. The table fills this div. */}
+        <div style={{ minWidth: tableMinWidth(columns) }}>
+          <table className="w-full table-fixed border-separate border-spacing-0">
+            {/* Widths come only from the column definitions, never from the
+                rendered rows, so windowing can never move a column (spec §5.1). */}
+            <colgroup>
+              <col style={{ width: CHECK_COL_W }} />
+              {columns.map((c) => (
+                <col key={c.id} style={c.id === 'name' ? undefined : { width: c.width }} />
               ))}
-            </tr>
-          </thead>
-          <tbody>
-            {visibleRows.length === 0 ? (
+            </colgroup>
+            <thead>
               <tr>
-                <td colSpan={colSpan} className="px-3 py-[18px] text-[12.5px] text-content-faint">
-                  No frames match these filters ·{' '}
-                  <Button variant="link" onClick={clearFacets}>
-                    Clear filters
-                  </Button>
-                </td>
+                <th scope="col" className={`${TH} text-left text-content-faint`}>
+                  <CbBox state={headerState} onChange={toggleSelectAllShown} label="Select all shown" />
+                </th>
+                {columns.map((col) => (
+                  <th
+                    key={col.id}
+                    scope="col"
+                    onClick={() => onSortClick(col.id)}
+                    className={`${TH} cursor-pointer hover:text-content ${col.numeric ? 'text-right' : 'text-left'} ${sort.col === col.id ? 'text-accent' : 'text-content-faint'}`}
+                  >
+                    {col.label}
+                    {sort.col === col.id ? (sort.dir === 1 ? ' ↑' : ' ↓') : ''}
+                  </th>
+                ))}
               </tr>
-            ) : (
-              <>
-                {padTop > 0 && (
-                  <tr style={{ height: padTop }}>
-                    <td colSpan={colSpan} style={{ padding: 0, border: 0, height: padTop }} />
-                  </tr>
-                )}
-                {windowed.map((vr) =>
-                  vr.kind === 'group' ? (
-                    <GroupRow
-                      key={vr.node.id}
-                      node={vr.node}
-                      columns={columns}
-                      selected={selected}
-                      expandedIds={expanded ?? []}
-                      groupAction={groupAction}
-                      onToggleSelect={toggleGroupSelection}
-                      onToggleExpand={toggleExpand}
-                    />
-                  ) : (
-                    <FrameRow
-                      key={vr.row.key}
-                      row={vr.row}
-                      depth={vr.depth}
-                      columns={columns}
-                      selected={selected.has(vr.row.key)}
-                      active={activeKey !== null && activeKey === vr.row.key}
-                      onToggleSelect={toggleFrameSelection}
-                      onOpen={onOpen}
-                    />
-                  ),
-                )}
-                {padBottom > 0 && (
-                  <tr style={{ height: padBottom }}>
-                    <td colSpan={colSpan} style={{ padding: 0, border: 0, height: padBottom }} />
-                  </tr>
-                )}
-              </>
-            )}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {visibleRows.length === 0 ? (
+                <tr>
+                  <td colSpan={colSpan} className="px-3 py-[18px] text-[12.5px] text-content-faint">
+                    No frames match these filters ·{' '}
+                    <Button variant="link" onClick={clearFacets}>
+                      Clear filters
+                    </Button>
+                  </td>
+                </tr>
+              ) : (
+                <>
+                  {padTop > 0 && (
+                    <tr style={{ height: padTop }}>
+                      <td colSpan={colSpan} style={{ padding: 0, border: 0, height: padTop }} />
+                    </tr>
+                  )}
+                  {windowed.map((vr) =>
+                    vr.kind === 'group' ? (
+                      <GroupRow
+                        key={vr.node.id}
+                        node={vr.node}
+                        columns={columns}
+                        selected={selected}
+                        expandedIds={expanded ?? []}
+                        groupAction={groupAction}
+                        onToggleSelect={toggleGroupSelection}
+                        onToggleExpand={toggleExpand}
+                      />
+                    ) : (
+                      <FrameRow
+                        key={vr.row.key}
+                        row={vr.row}
+                        depth={vr.depth}
+                        columns={columns}
+                        selected={selected.has(vr.row.key)}
+                        active={activeKey !== null && activeKey === vr.row.key}
+                        onToggleSelect={toggleFrameSelection}
+                        onOpen={onOpen}
+                      />
+                    ),
+                  )}
+                  {padBottom > 0 && (
+                    <tr style={{ height: padBottom }}>
+                      <td colSpan={colSpan} style={{ padding: 0, border: 0, height: padBottom }} />
+                    </tr>
+                  )}
+                </>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
@@ -647,8 +668,8 @@ function GroupRow({
       {columns.map((col, i) => {
         if (i === 0) {
           return (
-            <td key={col.id} style={{ paddingLeft: 8 + node.depth * 16 }} className={`${TD} font-medium text-content`}>
-              <span className="inline-block w-3.5 text-content-faint">{isOpen ? '▾' : '▸'}</span>
+            <td key={col.id} style={{ paddingLeft: 8 + node.depth * 18 }} className={`${TD} font-medium text-content`}>
+              <span className="inline-block w-3.5 text-[13px] text-content-faint">{isOpen ? '▾' : '▸'}</span>
               {node.def.renderLabel(node.key)}
               <span className="ml-1.5 text-[11px] font-normal text-content-faint">{node.rows.length} fr</span>
               {groupAction && (
@@ -704,7 +725,8 @@ function FrameRow({
       {columns.map((col, i) => (
         <td
           key={col.id}
-          style={i === 0 ? { paddingLeft: 8 + depth * 16 } : undefined}
+          // Mockup: 8 + 18 per level + the 14 px caret column of its group.
+          style={i === 0 ? { paddingLeft: 8 + depth * 18 + 14 } : undefined}
           title={col.id === 'name' ? row.fileName : undefined}
           className={`${TD} text-content-secondary ${col.numeric ? 'text-right' : ''}`}
         >

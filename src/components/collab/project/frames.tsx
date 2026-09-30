@@ -3,9 +3,7 @@ import type { ModerationFrameView, OwnFrameRow, ProjectFrameView } from '../../.
 import { formatTimestamp } from '../../../utils/dateFormatting';
 import { Bar, Chip, FilterDot, MemberDot, ProgressBar, StatusDot, type ChipTone } from '../../ui';
 import { formatDurationPadded, formatSize } from '../format';
-// Explicit extension: on a case-insensitive file system (macOS, Windows)
-// an extensionless './MemberColors' resolves to the sibling memberColors.ts.
-import { useMemberColor } from './MemberColors.tsx';
+import { useMemberColor } from './MemberColorsContext';
 import {
   alphaOrder, BLOCKER_ORDER, filterOrder, median, nightOrderDesc, reasonOrder, sum,
   type ColumnDef, type FacetAccess, type GroupDef,
@@ -496,7 +494,7 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
       return (
         <span>
           <Chip tone={tone}>{first.text}</Chip>
-          {v.failures.length > 1 && <span className="ml-1.5 text-[11px] text-content-muted">+{v.failures.length - 1}</span>}
+          {v.failures.length > 1 && <span className="ml-1.5 text-[11px] text-content-faint">+{v.failures.length - 1}</span>}
         </span>
       );
     },
@@ -597,8 +595,8 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
         case 'downloading':
           return (
             <span className="inline-flex w-full items-center gap-1.5">
-              <ProgressBar percent={v.progress ?? 0} className="w-[60px]" />
-              <span className="text-[11px] text-accent">{v.progress ?? 0}%</span>
+              <ProgressBar percent={v.progress ?? 0} className="flex-1" />
+              <span className="text-accent">{v.progress ?? 0}%</span>
             </span>
           );
         case 'queued':
@@ -611,7 +609,7 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
             </span>
           );
         case 'notKept':
-          return <span className="text-content-faint">not kept</span>;
+          return <span className="text-content-ghost">not kept</span>;
         case 'needsChoice':
           return <span className="text-warning">needs your choice</span>;
         case 'changed':
@@ -631,9 +629,7 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
       else text = <span className="text-content-faint">{counts.have}/{rows.length}</span>;
       return (
         <span className="inline-flex w-full items-center gap-1.5">
-          {/* 80 px fixed (the plan's value). `max-w`, not `w`: Bar's own `w-full`
-              is emitted after an arbitrary `w-[80px]` and would win. */}
-          <Bar className="max-w-[80px]" segments={[
+          <Bar className="flex-1" segments={[
             { value: counts.have, className: 'bg-success', title: `${counts.have} have` },
             { value: counts.downloading, className: 'bg-accent', title: `${counts.downloading} downloading` },
             { value: counts.queued, className: 'bg-accent-muted', title: `${counts.queued} queued` },
@@ -716,7 +712,7 @@ export const GROUPS: Record<string, GroupDef<FrameVM>> = {
     id: 'publisher',
     label: 'Publisher',
     key: (v) => v.publisher ?? '',
-    renderLabel: (k) => <PublisherName accountId={null} name={k || null} />,
+    renderLabel: (k) => (k === '' ? <span>Unknown publisher</span> : <PublisherName accountId={null} name={k} />),
     order: alphaOrder,
   },
   none: {

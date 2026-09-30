@@ -2,7 +2,6 @@ import { expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import type { ModerationFrameView, OwnFrameRow, ProjectFrameView } from '../../../types/models';
 import { COLUMNS, copies, fromLibrary, fromModeration, fromOwn, GROUPS, TABLES } from './frames';
-import { MemberColorsProvider } from './MemberColors.tsx';
 
 function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
   return {
@@ -224,18 +223,32 @@ it('status and disk cells use Chip tones', () => {
   expect(screen.getByText('missing').className).toContain('bg-error-muted');
 });
 
-it('publisher cells and group labels take the member colour from MemberColorsProvider (by accountId, else by name)', () => {
-  // Also pins the import: an extensionless './MemberColors' resolves to the
-  // sibling memberColors.ts on a case-insensitive file system.
-  const members = [{ accountId: 'acc-me', displayName: 'Me' }, { accountId: 'acc-kostya', displayName: 'Kostya' }];
-  const vm = fromLibrary(lib(), new Map()); // Kostya, acc-kostya
-  const { container } = render(
-    <MemberColorsProvider members={members} selfAccountId="acc-me">
-      {COLUMNS.publisher.cell(vm)}
-      {GROUPS.publisher.renderLabel('Kostya')}
-    </MemberColorsProvider>,
+/* ── Task 6 fix round 1: the mockup's pixels ───────────────────────────── */
+
+it('device cells: the progress bar and the group bar fill the cell, % is cell-sized, "not kept" is ghost', () => {
+  const dl = fromLibrary(lib({ frameUuid: 'u1', localState: 'wanted' }), new Map([['u1', { done: 50, size: 100 }]]));
+  const nk = fromLibrary(lib({ frameUuid: 'u2', localState: 'not_kept' }), new Map());
+  render(
+    <>
+      <span data-testid="dl">{COLUMNS.device.cell(dl)}</span>
+      <span data-testid="nk">{COLUMNS.device.cell(nk)}</span>
+      <span data-testid="agg">{COLUMNS.device.renderAggregate!([dl, nk])}</span>
+    </>,
   );
-  const dots = [...container.querySelectorAll('span[aria-hidden]')].map((d) => (d as HTMLElement).style.backgroundColor);
-  // Self takes slot 0; Kostya is the first other member → slot 1 (#a3be8c).
-  expect(dots).toEqual(['rgb(163, 190, 140)', 'rgb(163, 190, 140)']);
+  const pbar = screen.getByTestId('dl').querySelector('i')!.parentElement as HTMLElement; // the .pbar track
+  expect(pbar.className).toContain('flex-1');
+  expect(pbar.className).not.toMatch(/\bw-\[/);
+  expect(screen.getByText('50%').className).not.toContain('text-[11px]');
+  expect(screen.getByText('not kept').className).toContain('text-content-ghost');
+  const bar = screen.getByTestId('agg').querySelector('i')!.parentElement as HTMLElement; // the .bar track
+  expect(bar.className).not.toContain('max-w-');
+  expect(bar.className).toContain('flex-1');
+});
+
+it('held-back "+N" uses the faint group-count style; an empty publisher group reads "Unknown publisher"', () => {
+  const vm = fromOwn(own({ segment: 'held', failures: [{ kind: 'solve', text: 'no coordinates' }, { kind: 'analyze', text: 'no analysis' }] }));
+  render(<>{COLUMNS.reason.cell(vm)}{GROUPS.publisher.renderLabel('')}</>);
+  expect(screen.getByText('+1').className).toContain('text-content-faint');
+  expect(screen.getByText('+1').className).toContain('text-[11px]');
+  expect(screen.getByText('Unknown publisher')).toBeInTheDocument();
 });

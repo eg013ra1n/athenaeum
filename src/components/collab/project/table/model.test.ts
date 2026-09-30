@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   EMPTY_FACETS, actionLabel, actionTargets, applyFacets, buildTree, checkState, facetCounts, filterOrder,
-  flatten, initialExpanded, median, nightWithin, reasonOrder, sortRows, sum, windowSlice,
+  flatten, initialExpanded, median, nightWithin, reasonOrder, ROW_H, sortRows, sum, windowSlice,
   type ColumnDef, type FacetAccess, type GroupDef,
 } from './model';
 
@@ -110,26 +110,29 @@ describe('selection and actions', () => {
 });
 
 describe('windowSlice', () => {
+  it('the row pitch is the rendered 28 px: a 28 px border-box cell holds its own 1 px separator (fix round 1)', () => {
+    expect(ROW_H).toBe(28);
+  });
   it('slices around the viewport with overscan and pads the rest', () => {
-    expect(windowSlice(29 * 100, 29 * 20, 5000, 29, 10)).toEqual({ start: 90, end: 130, padTop: 90 * 29, padBottom: (5000 - 130) * 29 });
+    expect(windowSlice(ROW_H * 100, ROW_H * 20, 5000, ROW_H, 10)).toEqual({ start: 90, end: 130, padTop: 90 * ROW_H, padBottom: (5000 - 130) * ROW_H });
   });
   it('an unmeasured viewport (jsdom) renders the first 60 rows', () => {
     expect(windowSlice(0, 0, 5000)).toMatchObject({ start: 0, end: 60 });
     expect(windowSlice(0, 0, 3)).toMatchObject({ start: 0, end: 3, padBottom: 0 });
   });
   it('a stale scrollTop past a shrunk row count clamps to a valid, non-empty slice', () => {
-    const s = windowSlice(20000, 290, 10, 29, 10);
+    const s = windowSlice(20000, ROW_H * 10, 10, ROW_H, 10);
     expect(s.start).toBeLessThanOrEqual(s.end);
     expect(s.end).toBeGreaterThan(s.start);
-    expect(s.padTop + (s.end - s.start) * 29 + s.padBottom).toBe(10 * 29);
+    expect(s.padTop + (s.end - s.start) * ROW_H + s.padBottom).toBe(10 * ROW_H);
   });
   it('padTop + visible*rowH + padBottom always accounts for the whole row count', () => {
-    const rowH = 29;
+    const rowH = ROW_H;
     const cases: Array<[number, number]> = [
-      [0, 5000], [2900, 5000], [1_000_000, 5000], [0, 0], [10_000, 1], [29 * 3, 1],
+      [0, 5000], [rowH * 100, 5000], [1_000_000, 5000], [0, 0], [10_000, 1], [rowH * 3, 1],
     ];
     for (const [scrollTop, total] of cases) {
-      const s = windowSlice(scrollTop, 290, total, rowH, 10);
+      const s = windowSlice(scrollTop, rowH * 10, total, rowH, 10);
       expect(s.start).toBeLessThanOrEqual(s.end);
       expect(s.padTop + (s.end - s.start) * rowH + s.padBottom).toBe(total * rowH);
     }

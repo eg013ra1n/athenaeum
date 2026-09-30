@@ -74,7 +74,10 @@ export interface GroupNode<R> {
 
 export type VisibleRow<R> = { kind: 'group'; node: GroupNode<R> } | { kind: 'frame'; row: R; depth: number };
 
-export const ROW_H = 29;
+/** The frame table's row pitch: a 28 px border-box cell (`h-7`) whose 1 px
+ *  `line-soft` separator sits inside it. The windowing math depends on it
+ *  matching the rendered pitch exactly. */
+export const ROW_H = 28;
 
 /* ── Natural orders ─────────────────────────────────────────────────────── */
 

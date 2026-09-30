@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { SessionStateProvider } from '../../../../contexts/SessionStateContext';
 import type { OwnFrameRow, ProjectFrameView } from '../../../../types/models';
 import { fromLibrary, fromOwn } from '../frames';
@@ -217,8 +217,11 @@ it('the windowing observer re-attaches when the table mounts later with rows (fi
       </SessionStateProvider>,
     );
 
-    expect(observe).toHaveBeenCalledTimes(1);
-    expect(observe.mock.calls[0][0]).toBeInstanceOf(HTMLElement);
+    // The windowing observer watches the scroll element itself (the fill-height
+    // observer also watches its parent and <body> — fix round 1 #2).
+    const scroller = document.querySelector('[data-testid="frame-table-scroll"]');
+    expect(scroller).toBeInstanceOf(HTMLElement);
+    expect(observe.mock.calls.map((c) => c[0])).toContain(scroller);
   } finally {
     (globalThis as { ResizeObserver?: unknown }).ResizeObserver = original;
   }
@@ -261,7 +264,7 @@ it('lays out with a fixed colgroup from the column definitions, independent of t
   const table = container.querySelector('table')!;
   expect(table.className).toContain('table-fixed');
   const cols = [...container.querySelectorAll('col')].map((c) => (c as HTMLElement).style.width);
-  expect(cols[0]).toBe('32px');
+  expect(cols[0]).toBe('34px'); // the mockup's checkbox column
   expect(cols[1]).toBe(''); // Frame takes the rest
   expect(cols).toContain('108px'); // Publisher
   const scroller = container.querySelector('[data-testid="frame-table-scroll"]')!;
@@ -269,11 +272,15 @@ it('lays out with a fixed colgroup from the column definitions, independent of t
   expect([...container.querySelectorAll('col')].map((c) => (c as HTMLElement).style.width)).toEqual(cols);
 });
 
-it('sets the table min-width so Frame never drops below 220px (review focus 3)', () => {
+it('sets the min-width on a wrapper around the table so Frame never drops below 220px (review focus 3)', () => {
   const { container } = renderTable({ tableId: 'library', rows: rows(3) });
   const table = container.querySelector('table') as HTMLElement;
-  const expected = 32 + 220 + [108, 98, 70, 122, 82, 66, 60, 88, 168, 78].reduce((a, b) => a + b, 0);
-  expect(table.style.minWidth).toBe(`${expected}px`);
+  const wrapper = table.parentElement as HTMLElement;
+  const expected = 34 + 220 + [108, 98, 70, 122, 82, 66, 60, 88, 168, 78].reduce((a, b) => a + b, 0);
+  // On the wrapper, not the <table>: min-width on a table is undefined in CSS 2.1.
+  expect(wrapper.style.minWidth).toBe(`${expected}px`);
+  expect(wrapper.parentElement!.dataset.testid).toBe('frame-table-scroll');
+  expect(table.style.minWidth).toBe('');
 });
 
 it('right-aligns numeric headers and truncates cells instead of wrapping (review focus 1)', () => {
@@ -294,4 +301,67 @@ it('marks the active row', () => {
 it('renders groupRowExtra next to Columns', () => {
   renderTable({ tableId: 'library', rows: rows(2), groupRowExtra: <button>Export for WBPP</button> });
   expect(screen.getByRole('button', { name: 'Export for WBPP' })).toBeInTheDocument();
+});
+
+/* ── Task 6 fix round 1 ────────────────────────────────────────────────── */
+
+it('toggling a column keeps <col>, <th> and every row\'s <td> in lockstep', () => {
+  const r = rows(2);
+  const { container } = renderTable({ tableId: 'library', rows: r });
+  fireEvent.click(screen.getByRole('button', { name: 'Columns ⚙' }));
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Size' }));
+  const colCount = container.querySelectorAll('col').length;
+  expect(colCount).toBe(container.querySelectorAll('th').length);
+  expect(screen.getByText(r[0].fileName).closest('tr')!.querySelectorAll('td').length).toBe(colCount);
+  expect(screen.queryByRole('columnheader', { name: /Size/ })).toBeNull();
+});
+
+it('indents like the mockup: group rows 8 + 18·depth, frame rows 8 + 18·depth + 14', () => {
+  // ready: Night ▸ Filter — group depth 0 and 1, frames at depth 2.
+  renderTable({ rows: [ready('1', { night: '2026-09-29', filter: 'L' })] });
+  const groupLabelCells = screen
+    .getAllByRole('checkbox', { name: 'Select group' })
+    .map((cb) => cb.closest('tr')!.querySelectorAll('td')[1] as HTMLElement);
+  expect(groupLabelCells.map((td) => td.style.paddingLeft)).toEqual(['8px', '26px']);
+  expect((screen.getByText('f1.fits').closest('td') as HTMLElement).style.paddingLeft).toBe('58px');
+
+  // One grouping level → the frame sits at depth 1.
+  fireEvent.change(screen.getByLabelText('Then group by'), { target: { value: 'none' } });
+  expect((screen.getByText('f1.fits').closest('td') as HTMLElement).style.paddingLeft).toBe('40px');
+});
+
+it('refits the table height when the content around it resizes, and disconnects on unmount', () => {
+  const instances: { cb: ResizeObserverCallback; targets: Element[]; disconnect: ReturnType<typeof vi.fn> }[] = [];
+  class MockResizeObserver {
+    cb: ResizeObserverCallback;
+    targets: Element[] = [];
+    disconnect = vi.fn();
+    constructor(cb: ResizeObserverCallback) {
+      this.cb = cb;
+      instances.push(this);
+    }
+    observe = (t: Element) => { this.targets.push(t); };
+    unobserve = vi.fn();
+  }
+  const original = (globalThis as { ResizeObserver?: unknown }).ResizeObserver;
+  (globalThis as { ResizeObserver?: unknown }).ResizeObserver = MockResizeObserver;
+  try {
+    const { unmount } = renderTable({ rows: rows(3), tableId: 'library' });
+    const scroller = document.querySelector('[data-testid="frame-table-scroll"]') as HTMLElement;
+    expect(scroller.style.height).toBe(`${window.innerHeight - 24}px`); // top 0 in jsdom
+
+    const watched = instances.flatMap((i) => i.targets);
+    expect(watched).toContain(scroller.parentElement);
+    expect(watched).toContain(document.body);
+
+    // The filter row wraps (the side panel opened) → the table box moves down 300 px.
+    scroller.getBoundingClientRect = () => ({ top: 300, left: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 300, toJSON: () => ({}) });
+    act(() => { for (const i of instances) i.cb([], i as unknown as ResizeObserver); });
+    expect(scroller.style.height).toBe(`${Math.max(360, window.innerHeight - 300 - 24)}px`);
+
+    unmount();
+    for (const i of instances) expect(i.disconnect).toHaveBeenCalled();
+  } finally {
+    (globalThis as { ResizeObserver?: unknown }).ResizeObserver = original;
+  }
 });
