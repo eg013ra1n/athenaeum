@@ -5874,6 +5874,71 @@ pub async fn reject_collab_frame(
     Ok(())
 }
 
+/// Exclude a published frame (coordinator only — enforced by the hub via the
+/// `data.moderate` capability). `reason` is required, trimmed, and must be
+/// 1..=500 CHARACTERS (`chars().count()`, the hub's own rule — this differs
+/// from reject's byte rule) — validated BEFORE any hub call. A best-effort
+/// manifest sync follows a successful exclude, same as approve/reject.
+pub async fn exclude_collab_frame(
+    ctx: &ServiceContext,
+    project_id: &str,
+    frame_uuid: &str,
+    reason: String,
+) -> Result<(), ApiError> {
+    let trimmed = reason.trim().to_string();
+    if !(1..=500).contains(&trimmed.chars().count()) {
+        return Err(ApiError::Invalid(
+            "an exclusion reason of 1 to 500 characters is required".into(),
+        ));
+    }
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        return Err(ApiError::SignedOut("Sign in to moderate frames.".into()));
+    };
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::api::collab_exchange::live_project(&conn, project_id)?;
+    }
+    let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    client
+        .set_frame_acceptance(&token, project_id, frame_uuid, false, Some(&trimmed))
+        .await
+        .map_err(client_err)?;
+    tracing::info!(project_id, frame_uuid, "excluded frame");
+    if let Err(e) = crate::api::collab_exchange::sync_manifest(ctx, project_id, None, None).await {
+        tracing::warn!(project_id, frame_uuid, error = %e, "manifest sync after exclude failed; the next project event syncs it");
+    }
+    Ok(())
+}
+
+/// Restore a previously excluded frame (coordinator only — enforced by the
+/// hub via the `data.moderate` capability). Sends `accepted: true` with no
+/// reason. A best-effort manifest sync follows, same as exclude.
+pub async fn restore_collab_frame(
+    ctx: &ServiceContext,
+    project_id: &str,
+    frame_uuid: &str,
+) -> Result<(), ApiError> {
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        return Err(ApiError::SignedOut("Sign in to moderate frames.".into()));
+    };
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::api::collab_exchange::live_project(&conn, project_id)?;
+    }
+    let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    client
+        .set_frame_acceptance(&token, project_id, frame_uuid, true, None)
+        .await
+        .map_err(client_err)?;
+    tracing::info!(project_id, frame_uuid, "restored frame");
+    if let Err(e) = crate::api::collab_exchange::sync_manifest(ctx, project_id, None, None).await {
+        tracing::warn!(project_id, frame_uuid, error = %e, "manifest sync after restore failed; the next project event syncs it");
+    }
+    Ok(())
+}
+
 // The Collaboration-root guard (P25) lives beside the replication pass, which
 // compiles headless; publish uses it through this re-export.
 #[cfg(test)]
@@ -8296,6 +8361,115 @@ pub(crate) mod tests {
                 "{uuid}: unchanged until the next poll"
             );
         }
+    }
+
+    // ── Moderation (wave 2 Task 3): exclude/restore a published frame ────────
+
+    /// Exclude sends the trimmed reason via `PATCH .../frames/{uuid}` as
+    /// `{"accepted": false, "acceptedReason": "..."}` and, on a 204, runs the
+    /// same follow-up manifest sync as approve/reject.
+    #[tokio::test]
+    async fn exclude_sends_the_patch_then_syncs_the_manifest() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("PATCH"))
+            .and(wm_path("/api/v1/projects/p-1/frames/u1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "accepted": false, "acceptedReason": "wrong target"
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/projects/p-1/manifest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projectVersion": 3, "rows": [], "hasMore": false, "next": null
+            })))
+            .mount(&server)
+            .await;
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+        }
+        exclude_collab_frame(&ctx, "p-1", "u1", "  wrong target  ".into())
+            .await
+            .unwrap();
+    }
+
+    /// Restore sends `{"accepted": true}` with no reason field, same shape
+    /// and same follow-up sync as exclude.
+    #[tokio::test]
+    async fn restore_sends_accepted_true_without_a_reason() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("PATCH"))
+            .and(wm_path("/api/v1/projects/p-1/frames/u1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "accepted": true
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/projects/p-1/manifest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projectVersion": 3, "rows": [], "hasMore": false, "next": null
+            })))
+            .mount(&server)
+            .await;
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+        }
+        restore_collab_frame(&ctx, "p-1", "u1").await.unwrap();
+    }
+
+    /// A reason that is empty, whitespace-only or over 500 CHARACTERS is
+    /// `Invalid` BEFORE any hub call. Exactly 500 multi-byte characters
+    /// (`é`, 2 bytes each — over 500 bytes) is still allowed, because the
+    /// hub's rule counts characters, not bytes.
+    #[tokio::test]
+    async fn exclude_refuses_an_empty_or_overlong_reason_before_the_hub() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("PATCH"))
+            .and(wm_path("/api/v1/projects/p-1/frames/u1"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "accepted": false, "acceptedReason": "é".repeat(500)
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/projects/p-1/manifest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projectVersion": 3, "rows": [], "hasMore": false, "next": null
+            })))
+            .mount(&server)
+            .await;
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+        }
+
+        let empty = exclude_collab_frame(&ctx, "p-1", "u1", "   ".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(empty, ApiError::Invalid(_)), "{empty:?}");
+        let long = exclude_collab_frame(&ctx, "p-1", "u1", "é".repeat(501))
+            .await
+            .unwrap_err();
+        assert!(matches!(long, ApiError::Invalid(_)), "{long:?}");
+        // 500 multi-byte characters are allowed (character rule, not bytes):
+        exclude_collab_frame(&ctx, "p-1", "u1", "é".repeat(500))
+            .await
+            .unwrap();
     }
 
     /// Fix round 1, item 10, against the fake hub: the manifest read finds

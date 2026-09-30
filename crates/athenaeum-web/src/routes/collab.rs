@@ -111,6 +111,14 @@ pub struct RejectFrameArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ExcludeFrameArgs {
+    project_id: String,
+    frame_uuid: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExportProjectArgs {
     project_id: String,
     output_dir: String,
@@ -527,6 +535,32 @@ pub async fn reject_collab_frame(
         .map_err(api_err)
 }
 
+/// Exclude a published frame (coordinator only — enforced by the hub);
+/// `reason` required (1..=500 characters), hub `PATCH`, then a manifest sync.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn exclude_collab_frame(
+    State(state): State<WebAppState>,
+    Json(args): Json<ExcludeFrameArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    api::exclude_collab_frame(&state.ctx, &args.project_id, &args.frame_uuid, args.reason)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// Restore a previously excluded frame (coordinator only — enforced by the
+/// hub); hub `PATCH` with `accepted: true`, then a manifest sync.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn restore_collab_frame(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    api::restore_collab_frame(&state.ctx, &args.project_id, &args.frame_uuid)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
 // ── Project-scoped WBPP export (slice 5, "processor payoff") ─────────────────
 
 /// Web mirror of `export_collab_project`. Validates `output_dir` is within the
@@ -862,6 +896,18 @@ mod args_serde_tests {
             .expect("FrameArgs should deserialize camelCase body");
         assert_eq!(args.project_id, "p");
         assert_eq!(args.frame_uuid, "u");
+    }
+
+    /// Wave 2 Task 3: `ExcludeFrameArgs` must carry `camelCase` too — the
+    /// missing-attribute bug this whole test module pins against.
+    #[test]
+    fn exclude_args_reads_camel_case_fields() {
+        let args: ExcludeFrameArgs =
+            serde_json::from_str(r#"{"projectId":"p","frameUuid":"u","reason":"r"}"#)
+                .expect("ExcludeFrameArgs should deserialize camelCase body");
+        assert_eq!(args.project_id, "p");
+        assert_eq!(args.frame_uuid, "u");
+        assert_eq!(args.reason, "r");
     }
 
     #[test]

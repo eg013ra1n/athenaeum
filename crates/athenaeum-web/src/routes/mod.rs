@@ -354,6 +354,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/list_collab_moderation", post(collab::list_collab_moderation))
         .route("/api/approve_collab_frame", post(collab::approve_collab_frame))
         .route("/api/reject_collab_frame", post(collab::reject_collab_frame))
+        .route("/api/exclude_collab_frame", post(collab::exclude_collab_frame))
+        .route("/api/restore_collab_frame", post(collab::restore_collab_frame))
         .route("/api/export_collab_project", post(collab::export_collab_project))
         .route("/api/collab_sync_now", post(collab::collab_sync_now))
         .route("/api/get_collab_live_status", post(collab::get_collab_live_status))

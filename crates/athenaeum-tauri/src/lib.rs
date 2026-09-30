@@ -521,6 +521,8 @@ pub fn run() {
             commands::list_collab_moderation,
             commands::approve_collab_frame,
             commands::reject_collab_frame,
+            commands::exclude_collab_frame,
+            commands::restore_collab_frame,
             commands::export_collab_project,
             commands::collab_sync_now,
             commands::get_collab_live_status,

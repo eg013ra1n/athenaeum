@@ -352,6 +352,35 @@ pub async fn reject_collab_frame(
         .map_err(|e| e.to_string())
 }
 
+/// Exclude a published frame (coordinator only — enforced by the hub);
+/// `reason` required (1..=500 characters), hub `PATCH`, then a manifest sync.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn exclude_collab_frame(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame_uuid: String,
+    reason: String,
+) -> Result<(), String> {
+    api::exclude_collab_frame(&state.ctx, &project_id, &frame_uuid, reason)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Restore a previously excluded frame (coordinator only — enforced by the
+/// hub); hub `PATCH` with `accepted: true`, then a manifest sync.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn restore_collab_frame(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame_uuid: String,
+) -> Result<(), String> {
+    api::restore_collab_frame(&state.ctx, &project_id, &frame_uuid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Project-scoped WBPP export (slice 5, "processor payoff") ─────────────────
 
 /// Organize the project's frames (own and replica, from `project_frames_local`)

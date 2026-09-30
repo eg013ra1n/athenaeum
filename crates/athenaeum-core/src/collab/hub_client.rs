@@ -676,6 +676,40 @@ impl CollabClient {
         Err(classify(status, resp, "reject frame").await)
     }
 
+    /// `PATCH /projects/{id}/frames/{uuid}` — set a published frame's
+    /// moderation acceptance (coordinator "Exclude"/"Restore", requires the
+    /// `data.moderate` capability). `accepted: false` (exclude) carries
+    /// `acceptedReason`; `accepted: true` (restore) sends no reason field at
+    /// all. The hub requires a trimmed reason of 1..=500 CHARACTERS on
+    /// exclude — validated by the caller before this call. Accepts 200 or
+    /// 204.
+    pub async fn set_frame_acceptance(
+        &self,
+        token: &str,
+        project_id: &str,
+        frame_uuid: &str,
+        accepted: bool,
+        reason: Option<&str>,
+    ) -> Result<(), AccountClientError> {
+        let mut body = serde_json::json!({ "accepted": accepted });
+        if let Some(reason) = reason {
+            body["acceptedReason"] = serde_json::Value::String(reason.to_string());
+        }
+        let resp = self
+            .http
+            .patch(self.url(&format!("/projects/{project_id}/frames/{frame_uuid}")))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(net)?;
+        let status = resp.status();
+        if status == StatusCode::OK || status == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        Err(classify(status, resp, "set frame acceptance").await)
+    }
+
     /// `GET /projects/{id}/dictionary` — the project's current filter/channel
     /// dictionary (canonical names + aliases the gate and the manifest both
     /// validate against).
