@@ -339,13 +339,12 @@ export default function DeviceReplaceDialog() {
     );
     actions = (
       <>
-        <Button onClick={() => close(true)}>Not now</Button>
+        <Button onClick={() => close(true)} data-autofocus>Not now</Button>
         {checkButton(replace.path)}
         <Button
           variant="primary"
           disabled={busy !== null}
           onClick={() => void replaceDevice(replace.deviceId, name, replace.path)}
-          data-autofocus
         >
           {busy === 'replace' && <Loader2 size={12} className="animate-spin" />}
           {`Replace ${name}`}

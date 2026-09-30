@@ -66,7 +66,7 @@ export default function LinkObjectDialog({
       title={<span className="inline-flex items-center gap-2"><Link2 size={14} className="text-content-secondary" />Link an object</span>}
       size="md"
       onClose={onClose}
-      footer={<Button onClick={onClose} data-autofocus>Close</Button>}
+      footer={<Button onClick={onClose} data-autofocus>Done</Button>}
     >
       <p className="mb-3 text-[11.5px] text-content-faint">
         Frame sets nearest the project target come first. Linking is a catalog-only

@@ -157,13 +157,14 @@ describe('DeviceReplaceDialog — replace (another device of this account)', () 
     expect(screen.queryByText('This device replaces Old laptop')).not.toBeInTheDocument();
   });
 
-  it('renders through the shared dialog shell, Replace focused first', async () => {
+  it('renders through the shared dialog shell, Not now focused first (never the irreversible Replace)', async () => {
     mockCommands(storage({ replace: offer }));
     renderWithProvider();
     const d = await screen.findByRole('dialog', { name: /This device replaces Old laptop/ });
     expect(d.className).toContain('rounded-lg');
     expect(d.className).toMatch(/w-\[440px\]/);
-    expect(screen.getByRole('button', { name: 'Replace Old laptop' })).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Not now' })).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Replace Old laptop' })).not.toHaveFocus();
   });
 
   it('the shell close button means "Not now" for the replace prompt', async () => {
@@ -207,6 +208,7 @@ describe('DeviceReplaceDialog — replace (another device of this account)', () 
     fireEvent.click(await screen.findByRole('button', { name: 'open folder owner' }));
     expect(await screen.findByText(/another disk is mounted at \/c/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Replace Old laptop' })).not.toBeInTheDocument();
+    expect(screen.getByText('Close', { selector: 'button' })).toHaveFocus();
   });
 });
 
@@ -243,10 +245,8 @@ describe('DeviceReplaceDialog — take-over (a device this account does not list
     await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('get_collab_storage_status'));
     fireEvent.click(screen.getByRole('button', { name: 'open folder owner' }));
     await screen.findByRole('dialog', { name: /This folder belongs to another device/ });
-    const closes = screen.getAllByRole('button', { name: 'Close' });
     expect(screen.getByRole('button', { name: 'Take over this folder…' })).not.toHaveFocus();
-    expect(document.activeElement?.textContent).toBe('Close');
-    expect(closes.length).toBeGreaterThan(0);
+    expect(screen.getByText('Close', { selector: 'button' })).toHaveFocus();
   });
 
   it('labels a classification recorded while offline, in the dialog and in the take-over confirm', async () => {
@@ -292,6 +292,7 @@ describe('DeviceReplaceDialog — Check again', () => {
     renderWithProvider();
     fireEvent.click(await screen.findByRole('button', { name: 'open folder owner' }));
     expect(await screen.findByText(/marker names another device/)).toBeInTheDocument();
+    expect(screen.getByText('Close', { selector: 'button' })).toHaveFocus();
     fireEvent.click(screen.getByRole('button', { name: 'Check again' }));
     await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('check_collab_folder_owner', { root: '/c' }));
     expect(await screen.findByText('This device replaces Old laptop')).toBeInTheDocument();

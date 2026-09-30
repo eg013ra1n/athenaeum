@@ -129,7 +129,7 @@ export default function FilterMappingDialog({ projectId, onClose, onSaved }: { p
       busy={busy}
       footer={sheet ? (
         <>
-          <Button onClick={onClose}>Cancel</Button>
+          <Button onClick={onClose} disabled={busy}>Cancel</Button>
           <Button variant="primary" onClick={() => void save()} disabled={busy || edits.length === 0}>
             {busy && <Loader2 size={12} className="animate-spin" />}Save
           </Button>

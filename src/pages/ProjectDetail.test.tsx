@@ -683,7 +683,7 @@ describe('ProjectDetail republish guard', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
 
     expect(screen.getByRole('heading', { name: 'Recalibrate and republish all' })).toBeInTheDocument();
-    expect(screen.getByText(/^5 frames · 200\.3 MB of source frames will be recalibrated\./)).toBeInTheDocument();
+    expect(screen.getByText(/^5 frames · 210 MB of source frames will be recalibrated\./)).toBeInTheDocument();
     const confirm = screen.getByRole('button', { name: 'Republish' });
     expect(confirm).toBeDisabled();
 

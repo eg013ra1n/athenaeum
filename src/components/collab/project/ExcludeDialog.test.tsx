@@ -213,6 +213,8 @@ describe('ExcludeDialog', () => {
     expect(dlg).toBeInTheDocument();
     expect(screen.getByRole('textbox')).toHaveFocus();
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+    expect(dlg.className).toContain('rounded-lg');
+    expect(dlg.className).toMatch(/w-\[440px\]/);
   });
 
   it('Escape over a FramePanel closes only the dialog, never the panel', () => {

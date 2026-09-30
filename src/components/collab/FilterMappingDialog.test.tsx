@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import FilterMappingDialog from './FilterMappingDialog';
 import { api } from '../../api';
 import type { FilterMappingSheet, GateReport } from '../../types/models';
@@ -142,6 +142,7 @@ describe('FilterMappingDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).not.toHaveBeenCalled();
-    release(report);
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await act(async () => { release(report); });
   });
 });

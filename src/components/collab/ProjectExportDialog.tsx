@@ -172,11 +172,10 @@ export default function ProjectExportDialog({
   const barPercent = progress ? Math.min(100, Math.max(0, progress.percent)) : 0;
 
   return (
-    <>
-      <DialogShell
+    <DialogShell
         title={<span className="inline-flex items-center gap-2"><FolderOutput size={14} className="text-accent" />{`Export ${projectTitle ? `“${projectTitle}”` : 'project'} for WBPP`}</span>}
         size="md"
-        onClose={onClose}
+        onClose={() => (showFolderBrowser ? setShowFolderBrowser(false) : onClose())}
         busy={busy}
         footer={busy ? (
           <Button onClick={() => void handleCancel()} disabled={cancelling}>
@@ -285,18 +284,17 @@ export default function ProjectExportDialog({
 
         {/* Inline error (bad path, nothing to export, cancelled, per-publisher abort). */}
         {error && <p className="mt-4 text-[12.5px] text-error">{error}</p>}
-      </DialogShell>
 
-      {/* Web mode: folder browser for the export directory. */}
-      <FolderBrowserModal
-        isOpen={showFolderBrowser}
-        scope="export"
-        onSelect={(path) => {
-          setOutputDir(path);
-          setShowFolderBrowser(false);
-        }}
-        onClose={() => setShowFolderBrowser(false)}
-      />
-    </>
+        {/* Web mode: folder browser, inside the shell so it shares its portal and stacking context. */}
+        <FolderBrowserModal
+          isOpen={showFolderBrowser}
+          scope="export"
+          onSelect={(path) => {
+            setOutputDir(path);
+            setShowFolderBrowser(false);
+          }}
+          onClose={() => setShowFolderBrowser(false)}
+        />
+      </DialogShell>
   );
 }

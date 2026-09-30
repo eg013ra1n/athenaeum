@@ -33,7 +33,7 @@ describe('RepublishGuardDialog', () => {
     expect(screen.getByRole('heading', { name: 'Republish 2 frames' })).toBeInTheDocument();
     expect(
       screen.getByText(
-        '2 frames · 2.0 MB of source frames will be recalibrated. Every frame whose bytes change is posted as a new version, and every processor holding it downloads it again.',
+        '2 frames · 2 MB of source frames will be recalibrated. Every frame whose bytes change is posted as a new version, and every processor holding it downloads it again.',
       ),
     ).toBeInTheDocument();
     expect(
@@ -104,7 +104,7 @@ describe('RepublishGuardDialog', () => {
   it('a single frame reads in the singular', () => {
     renderGuard({ count: 1, sourceBytes: 1024 });
     expect(screen.getByRole('heading', { name: 'Republish 1 frame' })).toBeInTheDocument();
-    expect(screen.getByText(/^1 frame · 1\.0 KB of source frames/)).toBeInTheDocument();
+    expect(screen.getByText(/^1 frame · 1 KB of source frames/)).toBeInTheDocument();
   });
 
   it('renders through the shared dialog shell', () => {
@@ -121,6 +121,12 @@ describe('RepublishGuardDialog', () => {
     cleanup();
     renderGuard({ count: 2 });
     expect(confirmButton()).toHaveFocus();
+  });
+
+  it('with nothing to republish, Cancel takes focus (Republish is disabled)', () => {
+    renderGuard({ count: 0 });
+    expect(confirmButton()).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
   });
 
   it('Escape cancels unless busy', () => {

@@ -40,11 +40,11 @@ describe('LinkObjectDialog', () => {
     await screen.findByText('M31 set');
   });
 
-  it('puts initial focus on Close (no field, no primary)', async () => {
+  it('puts initial focus on Done (no field, no primary)', async () => {
     mock([suggestion()]);
     renderDialog();
     await screen.findByText('M31 set');
-    expect(document.activeElement?.textContent).toBe('Close');
+    expect(screen.getByRole('button', { name: 'Done' })).toHaveFocus();
   });
 
   it('survives a null suggestion list', async () => {

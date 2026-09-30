@@ -1,7 +1,7 @@
 import { useState, type JSX } from 'react';
 import { Loader2 } from 'lucide-react';
 import { Button, DialogShell, TextInput } from '../../ui';
-import { formatBytes } from '../format';
+import { formatSize } from '../format';
 
 /** Above this many frames a selection needs the typed count (owner ruling:
  *  nobody re-announces 100 TB with one click). "All" always needs it. */
@@ -47,8 +47,8 @@ export default function RepublishGuardDialog({
       onClose={onCancel}
       busy={busy}
       footer={<>
-        <Button onClick={onCancel} disabled={busy}>Cancel</Button>
-        <Button variant="primary" onClick={onConfirm} disabled={!canConfirm} data-autofocus={needsTyping ? undefined : true}>
+        <Button onClick={onCancel} disabled={busy} data-autofocus={count === 0 ? true : undefined}>Cancel</Button>
+        <Button variant="primary" onClick={onConfirm} disabled={!canConfirm} data-autofocus={needsTyping || count === 0 ? undefined : true}>
           {busy && <Loader2 size={12} className="animate-spin" />}Republish
         </Button>
       </>}
@@ -57,7 +57,7 @@ export default function RepublishGuardDialog({
         <p>Nothing to republish.</p>
       ) : (
         <p>
-          {`${frames(count)} · ${formatBytes(sourceBytes)} of source frames will be recalibrated. Every frame whose bytes change is posted as a new version, and every processor holding it downloads it again.`}
+          {`${frames(count)} · ${formatSize(sourceBytes)} of source frames will be recalibrated. Every frame whose bytes change is posted as a new version, and every processor holding it downloads it again.`}
         </p>
       )}
       <p className="mt-1.5 text-[12px] text-warning">
@@ -79,7 +79,7 @@ export default function RepublishGuardDialog({
             onKeyDown={(e) => {
               if (e.key === 'Enter' && canConfirm) onConfirm();
             }}
-            className="w-full focus:border-accent focus:outline-none"
+            className="w-full"
           />
         </div>
       )}
