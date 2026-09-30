@@ -74,12 +74,19 @@ describe('MembersTab — load', () => {
     expect(api.invoke).toHaveBeenCalledWith('get_collab_member_summary', { projectId: 'proj-1' });
   });
 
-  it('logs and shows inline text on a failed load', async () => {
+  it('logs and shows inline text on a failed load, never a stuck "Loading…"', async () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     mockMembers(new Error('boom'));
     renderTab();
     expect(await screen.findByText('Could not load members — see console.')).toBeInTheDocument();
     expect(spy).toHaveBeenCalledWith('[members] get_collab_member_summary failed:', expect.any(Error));
+    // Regression: `members` stays `null` forever after a failed fetch, so the
+    // loading paragraph must be gated on `!error` too, or it renders under
+    // the error message permanently.
+    expect(screen.queryByText('Loading…')).not.toBeInTheDocument();
+    // Also never an empty table — that would misread as "no members" rather
+    // than "the load failed".
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
     spy.mockRestore();
   });
 

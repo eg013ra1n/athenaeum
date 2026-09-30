@@ -155,9 +155,15 @@ export default function MembersTab({
 
       {error && <p className="text-sm text-error">Could not load members — see console.</p>}
 
-      {members === null ? (
-        <p className="text-sm text-content-muted">Loading…</p>
-      ) : (
+      {/* Gated on `!error` too: without it, a failed fetch left `members`
+       *  null forever and this paragraph rendered underneath the error
+       *  message, permanently — S6 (never a stuck "Loading…"). Deliberately
+       *  not "set members to [] in the catch" instead: that would render an
+       *  empty table with its own "No members yet." row, which misreads as
+       *  a real, empty project rather than a failed load. */}
+      {members === null && !error && <p className="text-sm text-content-muted">Loading…</p>}
+
+      {members !== null && (
         <div className="overflow-auto rounded border border-border">
           <table className="w-full border-collapse text-sm">
             <thead>
