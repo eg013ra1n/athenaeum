@@ -43,7 +43,7 @@ export function PeerFlowRow({
         type="button"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
-        className="grid w-full grid-cols-[28px_minmax(140px,1.2fr)_minmax(160px,2fr)_90px_128px_70px] items-center gap-2.5 border-t border-line px-1 py-[9px] text-left first:border-t-0 hover:bg-[rgba(67,76,94,0.3)] max-[640px]:grid-cols-[28px_1fr_80px]"
+        className="grid w-full grid-cols-[28px_minmax(140px,1.2fr)_minmax(160px,2fr)_90px_128px_70px] items-center gap-2.5 border-t border-line px-1 py-[9px] text-left text-[13px] leading-[1.4] first:border-t-0 hover:bg-[rgba(67,76,94,0.3)] max-[640px]:grid-cols-[28px_1fr_80px]"
       >
         <span
           className={`grid h-[26px] w-[26px] place-items-center rounded-full text-[11px] font-bold ${color ? 'text-surface' : 'bg-surface-hover text-content'}`}
@@ -74,15 +74,15 @@ export function PeerFlowRow({
         </span>
       </button>
       {open && (
-        <div className="grid gap-[5px] pb-2 pl-[42px] pt-0.5">
+        <div className="grid gap-[5px] pb-2 pl-[42px] pt-0.5 leading-[1.4]">
           {flow.inFlight.map((item) => (
             <div
               key={item.frameUuid}
-              className="grid grid-cols-[minmax(0,1fr)_160px_80px] items-center gap-2.5 text-[12px] text-content-muted"
+              className="grid grid-cols-[minmax(0,1fr)_160px_110px] items-center gap-2.5 text-[12px] text-content-muted"
             >
               <span className="truncate font-mono">{item.fileName}</span>
               <ProgressBar percent={item.size > 0 ? (100 * item.done) / item.size : 0} color={barColor} />
-              <span className="text-right">
+              <span className="whitespace-nowrap text-right">
                 {formatSize(item.done)} / {formatSize(item.size)}
               </span>
             </div>

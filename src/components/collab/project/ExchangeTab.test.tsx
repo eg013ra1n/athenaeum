@@ -315,6 +315,8 @@ describe('ExchangeTab — mockup layout', () => {
     renderTab();
     const row = await screen.findByRole('button', { name: /from Kostya/ });
     expect(row.className).toContain('grid-cols-[28px_minmax(140px,1.2fr)_minmax(160px,2fr)_90px_128px_70px]');
+    // Own font size: the Transfers page inherits a larger one than the project page.
+    expect(row.className).toContain('text-[13px]');
     expect(within(row).getByText(/37 landed this session · 4\.8 GB/)).toBeInTheDocument();
     expect(within(row).getByText('ETA 9m')).toBeInTheDocument();
     // One more sample from a progress event gives the rates buffer 2 points.

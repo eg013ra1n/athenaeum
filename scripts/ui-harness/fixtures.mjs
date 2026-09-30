@@ -172,6 +172,8 @@ export function buildFixtures(scenario = 'default') {
     get_collab_storage_status: () => ({ state: 'available', reason: null, root: '/Volumes/Astro/Collaboration', watcherDegraded: false, networkVolume: false, replace: null, unknownDevice: null }),
     list_collab_receive_sessions: () => sessions,
     list_collab_link_suggestions: () => [],
+    // An object, not a list: the server's `list_*` → [] default would crash the Transfers page.
+    list_terminal_transfers: () => ({ sent: [], received: [] }),
     get_export_dir: () => '/Volumes/Astro/Exports',
     get_collab_frame_holders: (args) => holdersFor(args.frameUuid),
     account_status: () => ({ signedIn: true, email: 'you@example.org', deviceId: devId('you', 0), capability: 'full', hubUrl: 'https://hub.example' }),
