@@ -5,7 +5,7 @@ import { formatTimestamp } from '../../../utils/dateFormatting';
 import { formatBytes, formatRate, pluralize } from '../format';
 import { flowKey, peerLabel } from '../exchange/state';
 import { PeerFlowRow } from '../exchange/PeerFlowRow';
-import { memberTone } from './memberColors';
+import { memberColor } from './memberColors';
 import type { CollabFramesLanded, FlowView, MemberSummary, ReceiveSessionView } from '../../../types/models';
 
 /**
@@ -36,7 +36,7 @@ function distinctMembers(flows: FlowView[], label: (device: string) => { member:
 function toneFor(member: string | null, members: MemberSummary[] | null): string | undefined {
   if (!member || !members) return undefined;
   const m = members.find((mm) => mm.displayName === member);
-  return m ? memberTone(m.accountId, members) : undefined;
+  return m ? memberColor(m.accountId, members, null) : undefined;
 }
 
 export default function ExchangeTab({
@@ -141,7 +141,7 @@ export default function ExchangeTab({
             flow={flow}
             label={label}
             rates={state.rates[flowKey(flow)] ?? []}
-            tone={toneFor(label.member, members)}
+            toneColor={toneFor(label.member, members)}
           />
         );
       })}

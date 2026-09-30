@@ -171,7 +171,7 @@ export default function Layout() {
           {/* Main Content */}
           <main className="flex-1 overflow-auto flex flex-col">
             <ArchiveResumeBanner />
-            <div ref={contentRef} className="flex-1 overflow-auto">
+            <div ref={contentRef} className="flex-1 overflow-auto [scrollbar-gutter:stable]">
               <Outlet />
             </div>
           </main>

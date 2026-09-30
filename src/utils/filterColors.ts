@@ -9,16 +9,17 @@ const KNOWN_FILTER_COLORS: Record<string, string> = {};
 function initKnownColors() {
   // Narrowband
   const narrowband: [string[], string][] = [
-    [['ha', 'h-alpha'], '#DC2626'],  // red
-    [['oiii', 'o3'], '#06B6D4'],     // cyan
-    [['sii', 's2'], '#7C3AED'],      // purple
+    [['ha', 'h-alpha'], '#d08770'],  // red
+    [['oiii', 'o3'], '#88c0d0'],     // cyan
+    [['sii', 's2'], '#b48ead'],      // purple
   ];
   // Broadband
   const broadband: [string[], string][] = [
-    [['r', 'red'], '#EF4444'],
-    [['g', 'green'], '#22C55E'],
-    [['b', 'blue'], '#3B82F6'],
-    [['l', 'lum', 'luminance'], '#9CA3AF'],
+    [['r', 'red'], '#bf616a'],
+    [['g', 'green'], '#a3be8c'],
+    [['b', 'blue'], '#5e81ac'],
+    [['l', 'lum', 'luminance'], '#e5e9f0'],
+    [['osc', 'rgb', 'color'], '#ebcb8b'],
   ];
   for (const [keys, color] of [...narrowband, ...broadband]) {
     for (const k of keys) {
@@ -49,14 +50,14 @@ let nextUnknownIdx = 0;
  * Unknown filters get a persistent random color from a palette.
  */
 export function getFilterColor(filter: string | null): string {
-  if (!filter) return '#9CA3AF'; // gray for luminance / no filter
+  if (!filter) return '#e5e9f0'; // luminance / no filter
 
   const f = filter.toLowerCase();
 
   // Check narrowband with includes (Ha can appear as "Ha 7nm", etc.)
-  if (f.includes('ha') || f === 'h-alpha') return '#DC2626';
-  if (f.includes('oiii') || f === 'o3') return '#06B6D4';
-  if (f.includes('sii') || f === 's2') return '#7C3AED';
+  if (f.includes('ha') || f === 'h-alpha') return '#d08770';
+  if (f.includes('oiii') || f === 'o3') return '#88c0d0';
+  if (f.includes('sii') || f === 's2') return '#b48ead';
 
   // Check broadband exact match
   const known = KNOWN_FILTER_COLORS[f];

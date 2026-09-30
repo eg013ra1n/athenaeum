@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 :root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   line-height: 1.5;
   font-weight: 400;
 
@@ -149,4 +149,13 @@ select:focus {
 select option {
   background-color: #434c5e;
   color: #eceff4;
+}
+
+@layer base {
+  button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible, [role='tab']:focus-visible {
+    @apply outline outline-2 outline-offset-1 outline-accent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
 }

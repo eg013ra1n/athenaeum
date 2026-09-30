@@ -47,3 +47,22 @@ export function formatRelative(iso: string, now: number): string {
   const days = Math.floor(diffSec / 86400);
   return `${days} day${days === 1 ? '' : 's'} ago`;
 }
+
+/** The mockup's `fmtB` — decimal units, as the project page shows sizes
+ *  ("122 MB", "4.9 GB", "1.25 TB"). The binary `formatBytes` above keeps its
+ *  non-project callers (spec §15). */
+export function formatSize(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n >= 1e12) return `${(n / 1e12).toFixed(2)} TB`;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(0)} MB`;
+  return `${(n / 1e3).toFixed(0)} KB`;
+}
+
+/** The mockup's `fmtDur` — minutes zero-padded after hours ("3h 02m", "18m"). */
+export function formatDurationPadded(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0m';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.round((seconds % 3600) / 60);
+  return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
+}

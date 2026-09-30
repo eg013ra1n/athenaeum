@@ -5,7 +5,7 @@ import { getFilterColor } from '../../../utils/filterColors';
 import { formatDuration, formatRate } from '../format';
 import { filterOrder } from './table/model';
 import { copies, fromOwn, REASON_LABEL } from './frames';
-import { memberTone } from './memberColors';
+import { memberColor } from './memberColors';
 import type { Segment } from './MyFramesTab';
 import type { MemberSummary, OwnFrameRow, ThresholdRuleView } from '../../../types/models';
 
@@ -194,8 +194,8 @@ export default function OverviewTab({
                               <span
                                 key={m.accountId}
                                 title={`${m.displayName} · ${formatDuration(secs)}`}
-                                className={`h-full ${memberTone(m.accountId, members)}`}
-                                style={{ width: `${(secs / scale) * 100}%` }}
+                                className="h-full"
+                                style={{ width: `${(secs / scale) * 100}%`, backgroundColor: memberColor(m.accountId, members, null) }}
                               />
                             );
                           })}
@@ -225,7 +225,7 @@ export default function OverviewTab({
               <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-content-muted">
                 {(members ?? []).map((m) => (
                   <span key={m.accountId} className="inline-flex items-center gap-1">
-                    <span className={`inline-block h-2 w-2 rounded-full ${memberTone(m.accountId, members ?? [])}`} />
+                    <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: memberColor(m.accountId, members ?? [], null) }} />
                     {m.displayName}
                   </span>
                 ))}

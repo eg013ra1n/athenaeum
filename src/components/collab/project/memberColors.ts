@@ -1,35 +1,32 @@
 /**
- * Stable member → colour-tone mapping (Task 13, wave 2 "Members" design).
- * The Members tab renders the tone dot; the Overview and Exchange tabs reuse
- * this module so the same member shows the same colour everywhere on the
- * project page.
- *
- * Design tokens only (global constraints — no raw hex, ever). The tone is
- * the member's rank in the FULL member list, sorted by `displayName` then
- * `accountId` for a deterministic order that never depends on API/array
- * ordering, taken modulo the palette length so it stays stable as members
- * are added (existing members keep their tone unless the sort order shifts
- * around them — acceptable for a cosmetic dot, never load-bearing).
+ * Stable member → colour mapping (hex palette per spec §4.4; this account is
+ * always accent). The Members, Overview and Exchange tabs share this module so
+ * the same member shows the same colour everywhere on the project page.
+ * Raw hex is allowed here by design: colours are applied via inline style.
  */
-export const MEMBER_TONES = [
-  'bg-accent',
-  'bg-success',
-  'bg-purple',
-  'bg-warning',
-  'bg-orange',
-  'bg-error',
-  'bg-info',
-  'bg-accent-muted',
-];
 
-export function memberTone(
+/** Spec §4.4 — the mockup's member colours, in order. */
+export const MEMBER_PALETTE = [
+  '#88c0d0', '#a3be8c', '#b48ead', '#ebcb8b', '#d08770', '#81a1c1', '#8fbcbb', '#bf616a',
+] as const;
+
+/**
+ * A member's colour: this account (`selfAccountId`) is always the accent; the
+ * others take the remaining palette in displayName-then-accountId order,
+ * cycling. With no known self, everyone takes the palette from slot 0.
+ */
+export function memberColor(
   accountId: string,
   all: { accountId: string; displayName: string }[],
+  selfAccountId: string | null,
 ): string {
-  const sorted = [...all].sort(
-    (a, b) => a.displayName.localeCompare(b.displayName) || a.accountId.localeCompare(b.accountId),
-  );
-  const idx = sorted.findIndex((m) => m.accountId === accountId);
-  if (idx === -1) return MEMBER_TONES[0];
-  return MEMBER_TONES[idx % MEMBER_TONES.length];
+  if (selfAccountId !== null && accountId === selfAccountId) return MEMBER_PALETTE[0];
+  const others = [...all]
+    .filter((m) => m.accountId !== selfAccountId)
+    .sort((a, b) => a.displayName.localeCompare(b.displayName) || a.accountId.localeCompare(b.accountId));
+  const idx = others.findIndex((m) => m.accountId === accountId);
+  if (idx === -1) return MEMBER_PALETTE[0];
+  const offset = selfAccountId !== null ? 1 : 0;
+  const span = MEMBER_PALETTE.length - offset;
+  return MEMBER_PALETTE[offset + (idx % span)];
 }

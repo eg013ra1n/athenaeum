@@ -34,11 +34,14 @@ export function PeerFlowRow({
   label,
   rates,
   tone = 'bg-surface-hover',
+  toneColor,
 }: {
   flow: FlowView;
   label: { member: string | null; device: string };
   rates: number[];
   tone?: string;
+  /** Hex colour from `memberColor`; overrides the `tone` class when set. */
+  toneColor?: string;
 }): JSX.Element {
   const [open, setOpen] = useState(false);
   const isRecv = flow.direction === 'recv';
@@ -47,7 +50,7 @@ export function PeerFlowRow({
   const arrow = isRecv ? '↓' : '↑';
   const verb = isRecv ? 'from' : 'to';
   const completedWord = isRecv ? 'landed' : 'served';
-  const toneText = tone === 'bg-surface-hover' ? 'text-content' : 'text-surface';
+  const toneText = tone === 'bg-surface-hover' && !toneColor ? 'text-content' : 'text-surface';
   const sparkColor = isRecv ? 'text-accent' : 'text-success';
   const points = sparklinePoints(rates);
 
@@ -61,6 +64,7 @@ export function PeerFlowRow({
       >
         <span
           className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-medium ${tone} ${toneText}`}
+          style={toneColor ? { backgroundColor: toneColor } : undefined}
         >
           {initial}
         </span>

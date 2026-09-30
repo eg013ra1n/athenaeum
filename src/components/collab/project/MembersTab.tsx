@@ -4,7 +4,7 @@ import { useSessionState } from '../../../contexts/SessionStateContext';
 import { formatTimestamp } from '../../../utils/dateFormatting';
 import { formatBytes, formatDuration, formatRelative } from '../format';
 import { filterOrder } from './table/model';
-import { memberTone } from './memberColors';
+import { memberColor } from './memberColors';
 import type { CameraQuality, MemberSummary } from '../../../types/models';
 
 /**
@@ -214,7 +214,7 @@ export default function MembersTab({
               ) : (
                 sorted.map((m) => {
                   const open = openId === m.accountId;
-                  const tone = memberTone(m.accountId, sorted);
+                  const tone = memberColor(m.accountId, sorted, null);
                   return (
                     <Fragment key={m.accountId}>
                       <tr
@@ -222,7 +222,7 @@ export default function MembersTab({
                         className="cursor-pointer border-b border-border transition-colors hover:bg-surface-hover"
                       >
                         <td className="px-2 py-1.5">
-                          <span className={`mr-1.5 inline-block h-2 w-2 rounded-full ${tone}`} />
+                          <span className="mr-1.5 inline-block h-2 w-2 rounded-full" style={{ backgroundColor: tone }} />
                           <span data-testid="member-name">{m.displayName}</span>
                           {m.coordinator && <span className={`ml-1.5 ${CHIP}`}>Coordinator</span>}
                         </td>

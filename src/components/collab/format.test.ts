@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatDuration, formatRate, formatRelative, pluralize } from './format';
+import { formatDuration, formatDurationPadded, formatRate, formatRelative, formatSize, pluralize } from './format';
 
 describe('pluralize', () => {
   it('picks the singular at exactly 1, the plural (default +s) otherwise', () => {
@@ -55,5 +55,20 @@ describe('formatRelative', () => {
   });
   it('an unparseable iso renders an em dash', () => {
     expect(formatRelative('not-a-date', now)).toBe('—');
+  });
+});
+
+describe('mockup formatters', () => {
+  it('formatSize uses decimal units like the mockup', () => {
+    expect(formatSize(121_920_698)).toBe('122 MB');
+    expect(formatSize(4_900_000_000)).toBe('4.9 GB');
+    expect(formatSize(1_250_000_000_000)).toBe('1.25 TB');
+    expect(formatSize(950_000)).toBe('950 KB');
+  });
+  it('formatDurationPadded pads minutes after hours', () => {
+    expect(formatDurationPadded(3 * 3600 + 2 * 60)).toBe('3h 02m');
+    expect(formatDurationPadded(18 * 60)).toBe('18m');
+    expect(formatDurationPadded(45 * 3600 + 57 * 60)).toBe('45h 57m');
+    expect(formatDurationPadded(0)).toBe('0m');
   });
 });
