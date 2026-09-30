@@ -48,8 +48,12 @@ export default function FrameDrawer({
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose, excludeOpen]);
 
+  // Holders exist only for a frame in this device's project mirror: an own
+  // frame not yet published has a uuid but nothing to ask about.
+  const holdersFor = frame.hasProjectRow ? frame.frameUuid : null;
+
   useEffect(() => {
-    const frameUuid = frame.frameUuid;
+    const frameUuid = holdersFor;
     if (!frameUuid) {
       setHolders([]);
       return;
@@ -69,7 +73,7 @@ export default function FrameDrawer({
     return () => {
       cancelled = true;
     };
-  }, [projectId, frame.frameUuid]);
+  }, [projectId, holdersFor]);
 
   // Live presence/holder changes (core: `collab-peers-changed`, throttled to
   // one per project per second) re-read holders for the still-open frame.
@@ -79,8 +83,8 @@ export default function FrameDrawer({
   // through "Loading holders…".
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
-  const frameUuidRef = useRef(frame.frameUuid);
-  frameUuidRef.current = frame.frameUuid;
+  const frameUuidRef = useRef(holdersFor);
+  frameUuidRef.current = holdersFor;
 
   useEffect(() => {
     let cancelled = false;
@@ -304,7 +308,7 @@ export default function FrameDrawer({
       )}
 
       {/* Who holds it */}
-      {frame.frameUuid && (
+      {holdersFor && (
         <section className="mt-4">
           <h3 className="mb-1 text-xs font-semibold uppercase text-content-muted">Who holds it</h3>
           {holders === 'loading' && <p className="text-sm text-content-muted">Loading holders…</p>}

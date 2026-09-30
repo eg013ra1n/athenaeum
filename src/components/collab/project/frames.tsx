@@ -19,6 +19,10 @@ export interface FrameVM {
   key: string; // frameUuid, else `id:<frameId>`
   frameId: number | null;
   frameUuid: string | null;
+  /** This device's project mirror has the frame (a `project_frames_local`
+   *  row), so its holders can be read. An own frame not yet published has a
+   *  `frameUuid` (its catalog uuid) but no row. */
+  hasProjectRow: boolean;
   setId: number | null;
   setName: string | null;
   fileName: string;
@@ -75,6 +79,7 @@ export function fromOwn(r: OwnFrameRow): FrameVM {
     key: ownFrameKey(r),
     frameId: r.frameId,
     frameUuid: r.frameUuid,
+    hasProjectRow: r.pubState !== null,
     setId: r.setId,
     setName: r.setName,
     fileName: r.fileName,
@@ -184,6 +189,7 @@ export function fromLibrary(r: ProjectFrameView, inFlight: ReadonlyMap<string, {
     key: r.frameUuid,
     frameId: null,
     frameUuid: r.frameUuid,
+    hasProjectRow: true,
     setId: null,
     setName: null,
     fileName: r.fileName,
@@ -228,6 +234,7 @@ export function fromModeration(m: ModerationFrameView, byUuid: ReadonlyMap<strin
     key: m.frameUuid,
     frameId: null,
     frameUuid: m.frameUuid,
+    hasProjectRow: mirror !== null,
     setId: null,
     setName: null,
     fileName: m.fileName,

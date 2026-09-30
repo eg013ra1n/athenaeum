@@ -147,6 +147,15 @@ it('fromModeration has no manifest mirror falls back to null/empty', () => {
   expect([vm.night, vm.camera, vm.ecc, vm.stars, vm.snr, vm.byteSize]).toEqual([null, '', null, null, null, null]);
 });
 
+it('hasProjectRow: an own frame has one only once published; a library frame always; a moderation row only with a mirror', () => {
+  expect(fromOwn(own({ segment: 'ready', frameUuid: 'cat-uuid', pubState: null })).hasProjectRow).toBe(false);
+  expect(fromOwn(own({ segment: 'published', pubState: 'published' })).hasProjectRow).toBe(true);
+  expect(fromLibrary(lib(), new Map()).hasProjectRow).toBe(true);
+  const m: ModerationFrameView = { frameUuid: 'u11', fileName: 'c.fits', publisher: 'Olga', publisherAccountId: 'acc-o', filter: 'Ha', exptimeSec: 300, fwhmArcsec: null, createdAt: '2026-09-30T08:00:00Z' };
+  expect(fromModeration(m, new Map()).hasProjectRow).toBe(false);
+  expect(fromModeration(m, new Map([['u11', lib({ frameUuid: 'u11' })]])).hasProjectRow).toBe(true);
+});
+
 it('an excluded own frame reads as excluded in Status and in the state facet', () => {
   const vm = fromOwn(own({ segment: 'published', pubState: 'published', accepted: false, acceptedReason: 'wrong target', localState: 'own_held', holdersTotal: 2 }));
   expect(vm.excluded).toBe(true);

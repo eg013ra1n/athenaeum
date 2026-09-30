@@ -13,6 +13,7 @@ function frame(overrides: Partial<FrameVM> = {}): FrameVM {
     key: 'uuid-1',
     frameId: null,
     frameUuid: 'uuid-1',
+    hasProjectRow: true,
     setId: null,
     setName: null,
     fileName: 'light_001.fits',

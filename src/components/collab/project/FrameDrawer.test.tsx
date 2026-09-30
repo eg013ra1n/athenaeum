@@ -89,6 +89,7 @@ function baseFrame(overrides: Partial<FrameVM> = {}): FrameVM {
     key: 'uuid-1',
     frameId: 1,
     frameUuid: 'uuid-1',
+    hasProjectRow: true,
     setId: null,
     setName: null,
     fileName: 'light_001.fits',
@@ -258,6 +259,13 @@ describe('FrameDrawer', () => {
     await waitFor(() => expect(screen.getByText('Could not load holders.')).toBeInTheDocument());
     expect(errSpy).toHaveBeenCalledWith('[drawer] holders failed:', expect.any(Error));
     errSpy.mockRestore();
+  });
+
+  it('(e2) an own frame not yet published (uuid, no project row) asks for no holders and shows no holders section', () => {
+    renderDrawer(baseFrame({ hasProjectRow: false, pubState: null }));
+
+    expect(api.invoke).not.toHaveBeenCalledWith('get_collab_frame_holders', expect.anything());
+    expect(screen.queryByText('Who holds it')).toBeNull();
   });
 
   it('(f) Escape calls onClose', () => {
