@@ -8,6 +8,20 @@ import type { ModerationFrameView, ProjectFrameView } from '../../../types/model
 
 const REASON_MAX = 500;
 
+/** The hub's stable 409 text for "this frame is no longer pending" — already
+ *  approved/rejected by another moderator, or swept up by THIS SAME batch's
+ *  own `trust: true` cascade (`approve_collab_frame` can retroactively
+ *  publish every other pending frame from the same publisher in one hub
+ *  call). Benign: the frame is decided either way, so the loop counts it and
+ *  moves on instead of stopping. Stable core text from `decide_err` in
+ *  `crates/athenaeum-core/src/api/collab.rs`; same string-match convention as
+ *  `PUBLISH_BUSY` in `src/pages/ProjectDetail.tsx`. */
+const ALREADY_DECIDED = 'This frame was already decided';
+
+function isAlreadyDecided(msg: string): boolean {
+  return msg.includes(ALREADY_DECIDED);
+}
+
 /** Keys the library (manifest mirror) by frame uuid, for `fromModeration`'s
  *  night/camera/metric fill-in when the frame has already landed. */
 function byUuid(library: ProjectFrameView[] | null): ReadonlyMap<string, ProjectFrameView> {
@@ -79,9 +93,16 @@ export default function ModerationTab({
           await api.invoke('approve_collab_frame', { projectId, frameUuid: t.frameUuid, trust });
           done += 1;
         } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (isAlreadyDecided(msg)) {
+            // Benign — already decided (another moderator, or this batch's
+            // own trust cascade). Not an error: count it and keep going.
+            console.info('[moderation] approve_collab_frame: already decided, continuing:', t.frameUuid);
+            done += 1;
+            continue;
+          }
           // Never swallow: log first, then stop and report exactly how far the batch got.
           console.error('[moderation] approve_collab_frame failed:', err);
-          const msg = err instanceof Error ? err.message : String(err);
           if (mounted.current) setResult(`Approved ${done} of ${targets.length} — ${msg}`);
           setBusy(false);
           await load();
@@ -106,8 +127,14 @@ export default function ModerationTab({
           await api.invoke('reject_collab_frame', { projectId, frameUuid: t.frameUuid, reason });
           done += 1;
         } catch (err) {
-          console.error('[moderation] reject_collab_frame failed:', err);
           const msg = err instanceof Error ? err.message : String(err);
+          if (isAlreadyDecided(msg)) {
+            // Benign — see approveAll's matching branch.
+            console.info('[moderation] reject_collab_frame: already decided, continuing:', t.frameUuid);
+            done += 1;
+            continue;
+          }
+          console.error('[moderation] reject_collab_frame failed:', err);
           if (mounted.current) setResult(`Rejected ${done} of ${targets.length} — ${msg}`);
           setBusy(false);
           setRejecting(null);

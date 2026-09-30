@@ -175,6 +175,35 @@ describe('ModerationTab — Approve', () => {
     expect(approveCalls().map((c) => c.frameUuid)).toEqual(['u1', 'u2']);
     expect(onDecided).toHaveBeenCalledTimes(1);
   });
+
+  it('an "already decided" error (trust cascade or another moderator) is benign and the batch continues', async () => {
+    moderationItems = [
+      mod({ frameUuid: 'u1', fileName: 'a.fits' }),
+      mod({ frameUuid: 'u2', fileName: 'b.fits' }),
+      mod({ frameUuid: 'u3', fileName: 'c.fits' }),
+    ];
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'list_collab_moderation') return Promise.resolve(moderationItems);
+      if (command === 'approve_collab_frame') {
+        const n = approveCalls().length;
+        // The first frame's own approve succeeds; trust:true's cascade on the
+        // hub has already decided the other two by the time this batch
+        // reaches them.
+        if (n >= 2) return Promise.reject(new Error('This frame was already decided — refresh the queue.'));
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    }) as never);
+
+    const { onDecided } = renderTab();
+    const btn = await screen.findByRole('button', { name: 'Approve all 3' });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(approveCalls()).toHaveLength(3));
+    expect(approveCalls().map((c) => c.frameUuid)).toEqual(['u1', 'u2', 'u3']);
+    await waitFor(() => expect(onDecided).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/^Approved/)).not.toBeInTheDocument();
+  });
 });
 
 describe('ModerationTab — Reject', () => {
@@ -204,6 +233,36 @@ describe('ModerationTab — Reject', () => {
       { projectId: 'proj-1', frameUuid: 'u1', reason: 'blurry' },
       { projectId: 'proj-1', frameUuid: 'u2', reason: 'blurry' },
     ]);
+  });
+
+  it('an "already decided" error is benign and the reject batch continues', async () => {
+    moderationItems = [
+      mod({ frameUuid: 'u1', fileName: 'a.fits' }),
+      mod({ frameUuid: 'u2', fileName: 'b.fits' }),
+    ];
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'list_collab_moderation') return Promise.resolve(moderationItems);
+      if (command === 'reject_collab_frame') {
+        if (rejectCalls().length >= 1) {
+          return Promise.reject(new Error('This frame was already decided — refresh the queue.'));
+        }
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    }) as never);
+
+    const { onDecided } = renderTab();
+    await screen.findByText('a.fits');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Reject 2' }));
+    fireEvent.change(screen.getByPlaceholderText('Why is this frame rejected?'), {
+      target: { value: 'blurry' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
+
+    await waitFor(() => expect(rejectCalls()).toHaveLength(2));
+    await waitFor(() => expect(onDecided).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/^Rejected/)).not.toBeInTheDocument();
   });
 });
 
