@@ -2522,13 +2522,15 @@ export function deriveAttention({ own, library, members, canModerate, pending, n
 `thresholdLine(r)`:
 
 ```ts
+// Keys are the gate's METRIC_REGISTRY (crates/athenaeum-core/src/collab/gate.rs).
 function thresholdLine(r: ThresholdRuleView): string {
   const v = typeof r.value === 'number' ? r.value : null;
-  if (r.op === 'reject_if' && r.metricKey === 'trailed') return 'Reject trailed frames';
+  if (r.op === 'reject_if') return r.metricKey === 'not_trailed' ? 'Reject trailed frames' : `${r.metricKey} — reject if ${String(r.value)}`;
   const op = r.op === 'lte' ? '≤' : r.op === 'gte' ? '≥' : r.op;
-  if (r.metricKey === 'fwhm' && v !== null) return `FWHM ${op} ${v.toFixed(2)}″`;
+  if (r.metricKey === 'fwhm_arcsec' && v !== null) return `FWHM ${op} ${v.toFixed(2)}″`;
   if (r.metricKey === 'eccentricity' && v !== null) return `Eccentricity ${op} ${v.toFixed(2)}`;
-  if (r.metricKey === 'stars' && v !== null) return `Stars ${op} ${v}`;
+  if (r.metricKey === 'stars_detected' && v !== null) return `Stars ${op} ${v}`;
+  if (r.metricKey === 'median_snr' && v !== null) return `SNR ${op} ${v}`;
   return `${r.metricKey} ${op} ${String(r.value)}`;
 }
 ```
