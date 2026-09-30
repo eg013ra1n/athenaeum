@@ -2,10 +2,12 @@ import { useEffect, useRef, useState, type JSX } from 'react';
 import { api } from '../../../api';
 import { useCollabExchange } from '../../../contexts/CollabExchangeContext';
 import { formatTimestamp } from '../../../utils/dateFormatting';
-import { formatBytes, formatRate, pluralize } from '../format';
+import { formatDurationPadded, formatRate, formatSize, pluralize } from '../format';
 import { distinctMembers, flowKey, peerLabel, sumRate } from '../exchange/state';
 import { PeerFlowRow } from '../exchange/PeerFlowRow';
-import { memberColor } from './memberColors';
+import { useMemberColor } from './MemberColorsContext';
+import { TD, TH } from './tableStyle';
+import { Card, Chip, EmptyState, MemberDot } from '../../ui';
 import type { CollabFramesLanded, FlowView, MemberSummary, ReceiveSessionView } from '../../../types/models';
 
 /**
@@ -17,26 +19,16 @@ import type { CollabFramesLanded, FlowView, MemberSummary, ReceiveSessionView } 
  * `[]` when the project has nothing live right now.
  */
 
-const CARD = 'rounded-lg border border-border bg-surface-elevated p-3';
-const HEADER = 'flex flex-wrap items-baseline gap-x-1.5 text-sm font-semibold text-content';
-const SUB = 'font-normal text-xs text-content-muted';
-const EMPTY = 'py-1.5 text-xs text-content-muted';
-
-function toneFor(member: string | null, members: MemberSummary[] | null): string | undefined {
-  if (!member || !members) return undefined;
-  const m = members.find((mm) => mm.displayName === member);
-  return m ? memberColor(m.accountId, members, null) : undefined;
-}
-
 export default function ExchangeTab({
   projectId,
   canReceive,
-  members,
 }: {
   projectId: string;
   canReceive: boolean;
-  members: MemberSummary[] | null;
+  /** Kept for the caller's signature; colours come from `MemberColorsContext`. */
+  members?: MemberSummary[] | null;
 }): JSX.Element {
+  const colorOf = useMemberColor();
   const { state, refreshProject } = useCollabExchange();
   const [sessions, setSessions] = useState<ReceiveSessionView[] | null>(null);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
@@ -130,7 +122,7 @@ export default function ExchangeTab({
             flow={flow}
             label={label}
             rates={state.rates[flowKey(flow)] ?? []}
-            toneColor={toneFor(label.member, members)}
+            color={colorOf(label.member)}
           />
         );
       })}
@@ -138,98 +130,86 @@ export default function ExchangeTab({
   );
 
   return (
-    <div className="space-y-3">
-      <div className={CARD}>
-        <h2 className={HEADER}>
-          Receiving <span className={SUB}>{recvSub}</span>
-        </h2>
+    <div className="flex flex-col gap-3.5">
+      <Card title="Receiving" subtitle={recvSub}>
         {canReceive ? (
           recv.length === 0 ? (
-            <p className={EMPTY}>Nothing arriving right now.</p>
+            <EmptyState>Nothing is being received.</EmptyState>
           ) : (
             renderRows(recv)
           )
         ) : (
-          <p className={EMPTY}>
+          <EmptyState>
             Contributors only send. Ask the coordinator for the Processor role to receive the project.
-          </p>
+          </EmptyState>
         )}
-      </div>
+      </Card>
 
-      <div className={CARD}>
-        <h2 className={HEADER}>
-          Sending <span className={SUB}>{sendSub}</span>
-        </h2>
-        {send.length === 0 ? <p className={EMPTY}>Nothing being served right now.</p> : renderRows(send)}
-      </div>
+      <Card title="Sending" subtitle={sendSub}>
+        {send.length === 0 ? <EmptyState>Nothing is being sent.</EmptyState> : renderRows(send)}
+      </Card>
 
       {canReceive && (
-        <div className={CARD}>
-          <h2 className={HEADER}>
-            Received <span className={SUB}>sessions</span>
-          </h2>
+        <Card title="Received" subtitle="sessions · a session ends after 5 min without a landing">
           {sessionsError && (
-            <p className="mt-1 text-xs text-error">Could not load receive sessions — see console.</p>
+            <p className="text-[12.5px] text-error">Could not load receive sessions — see console.</p>
           )}
-          {sessions === null && !sessionsError && <p className={EMPTY}>Loading…</p>}
-          {sessions !== null && (
-            <div className="mt-2 overflow-auto rounded border border-border">
-              <table className="w-full border-collapse text-sm">
+          {sessions === null && !sessionsError && <EmptyState>Loading…</EmptyState>}
+          {sessions !== null && sessions.length === 0 && <EmptyState>No sessions yet.</EmptyState>}
+          {sessions !== null && sessions.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-[12.5px]">
                 <thead>
-                  <tr className="bg-surface">
-                    <th className="border-b border-border px-2 py-1.5 text-left font-medium text-content-muted">
-                      Started
-                    </th>
-                    <th className="border-b border-border px-2 py-1.5 text-right font-medium text-content-muted">
-                      Frames
-                    </th>
-                    <th className="border-b border-border px-2 py-1.5 text-right font-medium text-content-muted">
-                      Size
-                    </th>
-                    <th className="border-b border-border px-2 py-1.5 text-left font-medium text-content-muted">
-                      Sources
-                    </th>
-                    <th className="border-b border-border px-2 py-1.5 text-right font-medium text-content-muted">
-                      Rate
-                    </th>
-                    <th className="border-b border-border px-2 py-1.5 text-right font-medium text-content-muted">
-                      Failed
-                    </th>
+                  <tr>
+                    <th className={`${TH} text-left`}>Started</th>
+                    <th className={`${TH} text-left`}>From</th>
+                    <th className={`${TH} text-right`}>Frames</th>
+                    <th className={`${TH} text-right`}>Size</th>
+                    <th className={`${TH} text-right`}>Duration</th>
+                    <th className={`${TH} text-right`}>Avg rate</th>
+                    <th className={`${TH} text-left`}>Outcome</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {sessions.length === 0 ? (
-                    <tr>
-                      <td colSpan={6} className="px-2 py-2 text-xs text-content-muted">
-                        No receive sessions yet.
-                      </td>
-                    </tr>
-                  ) : (
-                    sessions.map((s) => {
-                      const spanSecs = (Date.parse(s.finishedAt) - Date.parse(s.startedAt)) / 1000;
-                      const rate = spanSecs > 0 ? formatRate(s.bytes / spanSecs) : '—';
-                      const sources = s.sources
-                        .map((src) => src.memberName ?? src.deviceName ?? src.device.slice(0, 8))
-                        .join(', ');
-                      return (
-                        <tr key={s.id} className="border-b border-border last:border-b-0">
-                          <td className="px-2 py-1.5 text-content-muted">{formatTimestamp(s.startedAt)}</td>
-                          <td className="px-2 py-1.5 text-right">{s.frames}</td>
-                          <td className="px-2 py-1.5 text-right">{formatBytes(s.bytes)}</td>
-                          <td className="px-2 py-1.5">{sources}</td>
-                          <td className="px-2 py-1.5 text-right">{rate}</td>
-                          <td className={`px-2 py-1.5 text-right ${s.failed > 0 ? 'text-error' : ''}`}>
-                            {s.failed}
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
+                  {sessions.map((s) => {
+                    const spanSecs = (Date.parse(s.finishedAt) - Date.parse(s.startedAt)) / 1000;
+                    const rate = spanSecs > 0 ? formatRate(s.bytes / spanSecs) : '—';
+                    return (
+                      <tr key={s.id}>
+                        <td className={`${TD} text-content-muted`}>{formatTimestamp(s.startedAt)}</td>
+                        <td className={TD}>
+                          {s.sources.map((src, i) => {
+                            const name = src.memberName ?? src.deviceName ?? src.device.slice(0, 8);
+                            return (
+                              <span key={src.device}>
+                                {i > 0 && ', '}
+                                <span className="inline-flex items-center gap-1.5">
+                                  <MemberDot color={colorOf(src.memberName)} />
+                                  <span>{name}</span>
+                                </span>
+                              </span>
+                            );
+                          })}
+                        </td>
+                        <td className={`${TD} text-right`}>{s.frames}</td>
+                        <td className={`${TD} text-right`}>{formatSize(s.bytes)}</td>
+                        <td className={`${TD} text-right`}>{formatDurationPadded(spanSecs)}</td>
+                        <td className={`${TD} text-right`}>{rate}</td>
+                        <td className={TD}>
+                          {s.failed > 0 ? (
+                            <Chip tone="warn">partial · {s.failed} failed</Chip>
+                          ) : (
+                            <Chip tone="ok">landed</Chip>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
           )}
-        </div>
+        </Card>
       )}
     </div>
   );

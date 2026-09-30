@@ -66,7 +66,7 @@ export function CollabTrafficGroups({
               </Link>
             </div>
             {isOpen && (
-              <div className="divide-y divide-border border-t border-border">
+              <div className="border-t border-border">
                 {allFlows.map((flow) => {
                   const label = peerLabel(state, projectId, flow.device);
                   return (

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { CollabExchangeProvider } from '../../../contexts/CollabExchangeContext';
 import { api } from '../../../api';
 import ExchangeTab from './ExchangeTab';
@@ -237,7 +237,7 @@ describe('ExchangeTab — live rows', () => {
 });
 
 describe('ExchangeTab — receive history', () => {
-  it('lists "Kostya, Olga" for two sources', async () => {
+  it('lists both sources, comma-separated', async () => {
     receiveSessions = [
       receiveSession({
         sources: [
@@ -249,13 +249,14 @@ describe('ExchangeTab — receive history', () => {
 
     renderTab();
 
-    expect(await screen.findByText('Kostya, Olga')).toBeInTheDocument();
+    expect(await screen.findByText('Kostya')).toBeInTheDocument();
+    expect(screen.getByText('Olga')).toBeInTheDocument();
   });
 
-  it('shows "No receive sessions yet." when the history is empty', async () => {
+  it('shows "No sessions yet." when the history is empty', async () => {
     receiveSessions = [];
     renderTab();
-    expect(await screen.findByText('No receive sessions yet.')).toBeInTheDocument();
+    expect(await screen.findByText('No sessions yet.')).toBeInTheDocument();
   });
 
   it('clears a stale error once a reload triggered by collab-frames-landed succeeds', async () => {
@@ -319,5 +320,59 @@ describe('ExchangeTab — member tone', () => {
     renderTab({ members: [member({ accountId: 'acc-1', displayName: 'Kostya' })] });
 
     expect(await screen.findByText('↓ from Kostya')).toBeInTheDocument();
+  });
+});
+
+describe('ExchangeTab — mockup layout', () => {
+  it('flow rows use the mockup grid: avatar, who, bar + caption, rate, sparkline, ETA', async () => {
+    exchangeSnapshot = {
+      projects: [
+        projectFlows({
+          recv: [flow({ device: 'devA', direction: 'recv', completed: 37, bytesSession: 4.8e9, rateBps: 1e6, etaSecs: 540 })],
+        }),
+      ],
+      names: [{ projectId: 'proj-1', device: 'devA', memberName: 'Kostya', deviceName: 'kostya-obs' }],
+    };
+    renderTab();
+    const row = await screen.findByRole('button', { name: /from Kostya/ });
+    expect(row.className).toContain('grid-cols-[28px_minmax(140px,1.2fr)_minmax(160px,2fr)_90px_128px_70px]');
+    expect(within(row).getByText(/37 landed this session · 4\.8 GB/)).toBeInTheDocument();
+    expect(within(row).getByText('ETA 9m')).toBeInTheDocument();
+  });
+
+  it('Received sessions: Started, From, Frames, Size, Duration, Avg rate, Outcome', async () => {
+    receiveSessions = [
+      receiveSession({
+        id: 1,
+        frames: 90,
+        bytes: 7.9e9,
+        failed: 0,
+        startedAt: '2026-09-28T22:48:00Z',
+        finishedAt: '2026-09-28T22:54:56Z',
+        sources: [sessionSource({ device: 'd1', memberName: 'Kostya' })],
+      }),
+      receiveSession({
+        id: 2,
+        frames: 68,
+        bytes: 4.1e9,
+        failed: 2,
+        startedAt: '2026-09-28T10:54:00Z',
+        finishedAt: '2026-09-28T10:56:13Z',
+      }),
+    ];
+    renderTab();
+    expect((await screen.findAllByRole('columnheader')).map((h) => h.textContent)).toEqual([
+      'Started', 'From', 'Frames', 'Size', 'Duration', 'Avg rate', 'Outcome',
+    ]);
+    expect(screen.getByText('landed').className).toContain('bg-success-muted');
+    expect(screen.getByText('partial · 2 failed').className).toContain('bg-warning-muted');
+    expect(screen.getByText('7m')).toBeInTheDocument();
+  });
+
+  it('idle project: the three empty states', async () => {
+    renderTab();
+    expect(await screen.findByText('Nothing is being received.')).toBeInTheDocument();
+    expect(screen.getByText('Nothing is being sent.')).toBeInTheDocument();
+    expect(await screen.findByText('No sessions yet.')).toBeInTheDocument();
   });
 });

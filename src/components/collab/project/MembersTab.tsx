@@ -5,6 +5,7 @@ import { filterOrder } from './table/model';
 import { useMemberColor } from './MemberColorsContext';
 import MemberPanel, { roleLabel } from './MemberPanel';
 import type { MemberSummary } from '../../../types/models';
+import { TD, TH } from './tableStyle';
 
 /**
  * Members tab (wave 5.5 Task 13) — the mockup's plain table. Data comes from
@@ -83,8 +84,6 @@ function weightedFwhm(m: MemberSummary): number | null {
   return null;
 }
 
-const TH = 'whitespace-nowrap border-b border-border px-2 py-1.5 text-[11.5px] font-medium';
-const TD = 'whitespace-nowrap border-b border-line-plain px-2 py-1.5';
 
 function Ghost(): JSX.Element {
   return <span className="text-content-ghost">—</span>;
