@@ -48,6 +48,38 @@ async fn a_publish_is_fetched_without_any_poll() {
     }
 }
 
+/// A new holder (B landing A's publish) raises at least one
+/// `collab-peers-changed` for the project on A's side — the live-connected
+/// publisher — so its project page can refresh "online" without being
+/// reopened. The exact throttle numbers (coalescing, window-end flush) are
+/// covered by `PeerBurst`'s own pure unit tests in `runtime.rs`; this only
+/// wires it to a real holder change end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_holder_raises_collab_peers_changed() {
+    let w = ts::two_instances().await;
+    let uuids = w.a_publishes(1).await;
+    for u in &uuids {
+        w.b.wait_state(u, LocalState::Held, Duration::from_secs(20))
+            .await;
+    }
+    ts::wait_until(
+        "collab-peers-changed after a new holder",
+        Duration::from_secs(10),
+        || {
+            !w.a.events
+                .payloads(crate::api::collab_exchange::COLLAB_PEERS_CHANGED_EVENT)
+                .is_empty()
+        },
+    )
+    .await;
+    for payload in
+        w.a.events
+            .payloads(crate::api::collab_exchange::COLLAB_PEERS_CHANGED_EVENT)
+    {
+        assert_eq!(payload["projectId"].as_str(), Some(ts::PID));
+    }
+}
+
 /// P28: a clean exit leaves presence at once; a restart resumes from the
 /// persisted holder map and claim digest — nothing is reported again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

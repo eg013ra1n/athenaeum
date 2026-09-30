@@ -29,6 +29,7 @@ function projectCard(overrides: Partial<ProjectCard> = {}): ProjectCard {
     title: 'M42 Mosaic',
     dataRole: 'send_receive',
     coordinator: false,
+    canModerate: false,
     requireApproval: false,
     pendingFrames: 0,
     projectStatus: 'open',
@@ -912,7 +913,7 @@ describe('ProjectDetail tabs', () => {
   }
 
   it('opens on Overview by default, with the six tabs in order for a coordinator of an approval project', async () => {
-    mockCommands(projectCard({ coordinator: true, requireApproval: true }));
+    mockCommands(projectCard({ coordinator: true, canModerate: true, requireApproval: true }));
     renderProjectDetail();
     const overview = await screen.findByRole('tab', { name: 'Overview' });
     expect(overview).toHaveAttribute('aria-selected', 'true');
@@ -928,12 +929,12 @@ describe('ProjectDetail tabs', () => {
   });
 
   it('Moderation shows only for a coordinator of a project that requires approval, with the pending badge', async () => {
-    mockCommands(projectCard({ coordinator: true, requireApproval: true, pendingFrames: 3 }));
+    mockCommands(projectCard({ coordinator: true, canModerate: true, requireApproval: true, pendingFrames: 3 }));
     const first = renderProjectDetail();
     expect(await screen.findByRole('tab', { name: 'Moderation 3' })).toBeInTheDocument();
     first.unmount();
 
-    mockCommands(projectCard({ coordinator: true, requireApproval: false }));
+    mockCommands(projectCard({ coordinator: true, canModerate: true, requireApproval: false }));
     const second = renderProjectDetail();
     await screen.findByRole('tab', { name: 'Overview' });
     expect(screen.queryByRole('tab', { name: /^Moderation/ })).not.toBeInTheDocument();
@@ -1164,7 +1165,7 @@ describe('ProjectDetail frame drawer', () => {
 
   it("a coordinator's own Restore refreshes the still-open drawer — no stale Excluded box, offers Exclude…", async () => {
     let calls = 0;
-    mockCommands(projectCard({ coordinator: true }), {
+    mockCommands(projectCard({ coordinator: true, canModerate: true }), {
       list_project_own_frames: () => {
         calls += 1;
         return Promise.resolve([

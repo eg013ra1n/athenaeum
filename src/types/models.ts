@@ -1543,7 +1543,13 @@ deviceId: string,
  */
 name: string | null, };
 
-export type ProjectCard = { projectId: string, slug: string, title: string, dataRole: string, coordinator: boolean, requireApproval: boolean, pendingFrames: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
+export type ProjectCard = { projectId: string, slug: string, title: string, dataRole: string, coordinator: boolean, 
+/**
+ * True for the coordinator, or for an account holding the hub's
+ * `data.moderate` capability ([`can_moderate`]) — the moderation
+ * surface (exclude/restore/reject) checks this, not `coordinator`.
+ */
+canModerate: boolean, requireApproval: boolean, pendingFrames: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
 /**
  * D3 §3.3: this device auto-downloads the project's published contributions
  * (default ON). Local preference — `set_project_auto_replicate` writes it.
@@ -1789,6 +1795,8 @@ alreadyHeld: number,
 toFetch: number, toFetchBytes: number, };
 
 export type CollabFramesLanded = { projectId: string, landed: number, failed: number, awaitingGc: number, };
+
+export type CollabPeersChanged = { projectId: string, };
 
 export type LiveState = "off" | "connecting" | "live" | "reconnecting" | "unreachable" | "signedOut" | "outdated";
 

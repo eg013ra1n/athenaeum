@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::api::collab_exchange::{CollabFramesLanded, COLLAB_FRAMES_LANDED_EVENT};
+use crate::api::collab_exchange::{
+    CollabFramesLanded, CollabPeersChanged, COLLAB_FRAMES_LANDED_EVENT, COLLAB_PEERS_CHANGED_EVENT,
+};
 use crate::api::collab_live::executor::{Derive, ExecEnv, Executor, Note};
 use crate::api::collab_live::feed::FeedEffect;
 use crate::api::collab_live::holdings::{member_devices, HolderMaps};
@@ -983,6 +985,61 @@ struct Burst {
     last: HashMap<String, Instant>,
 }
 
+/// Per-project throttle for [`COLLAB_PEERS_CHANGED_EVENT`]: at most one
+/// emission per project per [`LANDED_BURST`], mirroring [`Burst`] — a
+/// project noted inside the window is not dropped, it flushes once the
+/// window ends. Unlike `Burst` there is nothing to accumulate (the payload
+/// is just the project id), so a note only schedules a due time; a note that
+/// arrives while one is already scheduled changes nothing — it still fires
+/// once, at the already-scheduled time.
+#[derive(Default)]
+struct PeerBurst {
+    /// Project → when its next `collab-peers-changed` may fire.
+    due_at: HashMap<String, Instant>,
+    /// Project → when it last fired (the throttle anchor).
+    last: HashMap<String, Instant>,
+}
+
+impl PeerBurst {
+    /// Note a providers change (presence or holders) for `project_id` at
+    /// `now`. The first note since the last emission schedules one —
+    /// immediately if outside the throttle window, otherwise at the
+    /// window's end.
+    fn note(&mut self, project_id: &str, now: Instant) {
+        if self.due_at.contains_key(project_id) {
+            return;
+        }
+        let earliest = self
+            .last
+            .get(project_id)
+            .map(|t| *t + LANDED_BURST)
+            .filter(|t| *t > now)
+            .unwrap_or(now);
+        self.due_at.insert(project_id.to_string(), earliest);
+    }
+
+    /// Projects whose scheduled emission is due at `now` — removed from the
+    /// schedule and stamped as last-fired.
+    fn due(&mut self, now: Instant) -> Vec<String> {
+        let ready: Vec<String> = self
+            .due_at
+            .iter()
+            .filter(|(_, at)| now >= **at)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in &ready {
+            self.due_at.remove(p);
+            self.last.insert(p.clone(), now);
+        }
+        ready
+    }
+
+    /// The earliest scheduled emission, for the loop's `deadline()`.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.due_at.values().min().copied()
+    }
+}
+
 /// How a runtime's loop ended.
 enum Exit {
     /// `shutdown` / `on_sign_out` (or the handle dropped: `None`).
@@ -1038,6 +1095,8 @@ struct Runtime {
     next_gc_probe: Instant,
     gc_probe: Duration,
     burst: Burst,
+    /// Throttles `collab-peers-changed` (presence or holders changed).
+    peer_burst: PeerBurst,
     serving_dirty: bool,
     attention: BTreeSet<String>,
     /// Projects whose replication scope (`apply_policy`) is re-derived at
@@ -1243,6 +1302,7 @@ impl Runtime {
             next_gc_probe: Instant::now() + cfg.gc_probe,
             gc_probe: cfg.gc_probe,
             burst: Burst::default(),
+            peer_burst: PeerBurst::default(),
             serving_dirty: true,
             attention: BTreeSet::new(),
             policy_dirty: BTreeSet::new(),
@@ -1338,6 +1398,9 @@ impl Runtime {
             if let Some(last) = self.burst.last.get(pid) {
                 d = d.min(*last + LANDED_BURST);
             }
+        }
+        if let Some(next) = self.peer_burst.next_deadline() {
+            d = d.min(next);
         }
         // Something in flight or moving, or a quiet payload owed: the
         // progress gate is polled once a period (a flow that starts moving
@@ -1694,6 +1757,9 @@ impl Runtime {
             }
             FeedEffect::ProvidersChanged(p) => {
                 self.with_derive(|exec, d| exec.refresh_providers(&p, d));
+                let now = Instant::now();
+                self.peer_burst.note(&p, now);
+                self.flush_peer_bursts(now);
             }
             FeedEffect::MembersChanged(p) => {
                 // I11: a device that may no longer connect is closed on both
@@ -1973,6 +2039,17 @@ impl Runtime {
         }
     }
 
+    /// Emit each project's due `collab-peers-changed` (at most one per
+    /// project per [`LANDED_BURST`] — see [`PeerBurst`]).
+    fn flush_peer_bursts(&mut self, now: Instant) {
+        for p in self.peer_burst.due(now) {
+            self.emit(
+                COLLAB_PEERS_CHANGED_EVENT,
+                &CollabPeersChanged { project_id: p },
+            );
+        }
+    }
+
     // ── timers and reconciliation ───────────────────────────────────────
 
     /// The loop's own due work: the GC probe, the core's `Tick`, the
@@ -2001,6 +2078,7 @@ impl Runtime {
             self.exec.step(Input::Tick);
         }
         self.flush_bursts(now);
+        self.flush_peer_bursts(now);
         self.flush_exchange(now);
     }
 
@@ -2085,5 +2163,76 @@ mod tests {
         shared.set_session_for(new, "s-new".into());
         shared.set_session_for(old, "s-stale".into());
         assert_eq!(shared.session_signal().borrow().as_deref(), Some("s-new"));
+    }
+
+    /// Three `ProvidersChanged` for one project within 200ms produce exactly
+    /// one immediate emission; the two coalesced inside the window are never
+    /// dropped — polling again ~1.2s after the first (as `on_timers` would)
+    /// flushes them as a second, distinct emission.
+    #[test]
+    fn peer_burst_coalesces_rapid_changes_and_flushes_at_window_end() {
+        let mut b = PeerBurst::default();
+        let t0 = Instant::now();
+        // Three ProvidersChanged for one project within 200ms, each followed
+        // by an immediate flush attempt (mirrors the runtime's
+        // on_effect → flush_peer_bursts pattern).
+        b.note("p1", t0);
+        assert_eq!(
+            b.due(t0),
+            vec!["p1".to_string()],
+            "the first change fires immediately"
+        );
+        b.note("p1", t0 + Duration::from_millis(50));
+        assert!(
+            b.due(t0 + Duration::from_millis(50)).is_empty(),
+            "coalesced inside the throttle window"
+        );
+        b.note("p1", t0 + Duration::from_millis(200));
+        assert!(
+            b.due(t0 + Duration::from_millis(200)).is_empty(),
+            "still inside the throttle window — exactly one event so far"
+        );
+        // A second change ~1.2s later: the coalesced note is never dropped —
+        // it flushes as a second event once the window ends.
+        let t1 = t0 + Duration::from_millis(1200);
+        assert_eq!(
+            b.due(t1),
+            vec!["p1".to_string()],
+            "the coalesced change flushed as a second event"
+        );
+        assert!(b.due(t1).is_empty(), "nothing left pending after the flush");
+    }
+
+    /// After a quiet period well past the throttle window, a genuinely new
+    /// change fires immediately again — the throttle never gets stuck.
+    #[test]
+    fn peer_burst_fires_again_after_a_quiet_period() {
+        let mut b = PeerBurst::default();
+        let t0 = Instant::now();
+        b.note("p1", t0);
+        assert_eq!(b.due(t0), vec!["p1".to_string()]);
+        let t1 = t0 + Duration::from_secs(3);
+        b.note("p1", t1);
+        assert_eq!(b.due(t1), vec!["p1".to_string()]);
+    }
+
+    /// Two different projects are throttled independently: a change on one
+    /// mid-window never holds back a first change on the other.
+    #[test]
+    fn peer_burst_tracks_projects_independently() {
+        let mut b = PeerBurst::default();
+        let t0 = Instant::now();
+        b.note("p1", t0);
+        assert_eq!(b.due(t0), vec!["p1".to_string()]);
+        // p1 is now inside its throttle window...
+        b.note("p1", t0 + Duration::from_millis(50));
+        assert!(b.due(t0 + Duration::from_millis(50)).is_empty());
+        // ...but p2's own first-ever change fires immediately regardless.
+        b.note("p2", t0 + Duration::from_millis(50));
+        assert_eq!(
+            b.due(t0 + Duration::from_millis(50)),
+            vec!["p2".to_string()],
+            "p2's own first change is not held back by p1's window"
+        );
     }
 }

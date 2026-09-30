@@ -1187,6 +1187,19 @@ pub struct CollabFramesLanded {
     pub awaiting_gc: usize,
 }
 
+/// Emitted at most once per second per project while a project's providers
+/// (presence or holders) change — so a project page can refresh "online"
+/// without being reopened. A change inside the window is emitted when the
+/// window ends, never dropped.
+pub const COLLAB_PEERS_CHANGED_EVENT: &str = "collab-peers-changed";
+
+/// Payload of [`COLLAB_PEERS_CHANGED_EVENT`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabPeersChanged {
+    pub project_id: String,
+}
+
 /// `"size:mtime_secs"` — the same spelling publish records.
 pub(crate) fn size_mtime_from(meta: &std::fs::Metadata) -> String {
     let secs = meta

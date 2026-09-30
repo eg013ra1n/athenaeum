@@ -139,6 +139,10 @@ pub struct ProjectCard {
     pub title: String,
     pub data_role: String,
     pub coordinator: bool,
+    /// True for the coordinator, or for an account holding the hub's
+    /// `data.moderate` capability ([`can_moderate`]) — the moderation
+    /// surface (exclude/restore/reject) checks this, not `coordinator`.
+    pub can_moderate: bool,
     pub require_approval: bool,
     pub pending_frames: i64,
     pub project_status: String,
@@ -1853,6 +1857,25 @@ fn device_for_cards(ctx: &ServiceContext) -> Option<String> {
     }
 }
 
+/// True for the coordinator, or for a member whose cached `gov_caps_json`
+/// (the hub's governance caps, wholesale-refreshed by `upsert_project`)
+/// contains `"data.moderate"`. A `gov_caps_json` that fails to parse is
+/// `warn!`-logged and read as no caps — never moderator through a malformed
+/// cache row.
+fn can_moderate(is_coordinator: bool, gov_caps_json: &str) -> bool {
+    if is_coordinator {
+        return true;
+    }
+    let caps: Vec<String> = match serde_json::from_str(gov_caps_json) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, gov_caps_json, "project card: gov_caps_json did not parse; treated as no caps");
+            Vec::new()
+        }
+    };
+    caps.iter().any(|c| c == "data.moderate")
+}
+
 /// Build a [`ProjectCard`] from a cached row, computing the live counts.
 /// `card_from_row` never holds a DB connection across the gate call. `me`
 /// is this device's key (`publishing_here`).
@@ -1875,6 +1898,7 @@ fn card_from_row(
         (Some(p), Some(me)) => p.device_id == me,
         _ => false,
     };
+    let can_moderate = can_moderate(row.is_coordinator, &row.gov_caps_json);
     let gate = evaluate_project_gate(ctx, &row.project_id)?;
     Ok(ProjectCard {
         project_id: row.project_id,
@@ -1882,6 +1906,7 @@ fn card_from_row(
         title: row.title,
         data_role: row.data_role,
         coordinator: row.is_coordinator,
+        can_moderate,
         require_approval: row.require_approval,
         pending_frames: row.pending_frames,
         project_status: row.project_status,
@@ -6040,6 +6065,102 @@ pub(crate) mod tests {
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
         (tmp, ctx)
+    }
+
+    /// A minimal cached-project row for [`can_moderate`]/`card_from_row`
+    /// tests: no linked sets, so the gate is trivially empty regardless of
+    /// `is_coordinator`/`gov_caps_json` — only those two are exercised.
+    fn moderation_test_row(
+        project_id: &str,
+        is_coordinator: bool,
+        gov_caps_json: &str,
+    ) -> CollabProjectRow {
+        CollabProjectRow {
+            project_id: project_id.into(),
+            slug: "mod-test".into(),
+            title: "Moderation test".into(),
+            data_role: "send_receive".into(),
+            is_coordinator,
+            require_approval: false,
+            pending_frames: 0,
+            project_status: "active".into(),
+            target_name: "Target".into(),
+            target_ra_deg: 0.0,
+            target_dec_deg: 0.0,
+            target_radius_deg: 1.0,
+            membership_version: 1,
+            snapshot_payload_b64: "e30=".into(),
+            snapshot_signature_b64: "e30=".into(),
+            members_json: "[]".into(),
+            thresholds_version: None,
+            thresholds_rules_json: None,
+            gov_caps_json: gov_caps_json.into(),
+            auto_replicate: true,
+            synced_caps_json: "[]".into(),
+            hub_version: 0,
+            manifest_cursor: 0,
+            dictionary_version: None,
+            dictionary_json: None,
+            policy_json: r#"{"mode":"all"}"#.into(),
+            replication_paused: false,
+            auto_publish: true,
+            fetched_at: String::new(), // filled by SQL
+            feed_epoch: None,
+            holder_seq: -1,
+        }
+    }
+
+    /// A non-coordinator holding `data.moderate` can moderate.
+    #[test]
+    fn can_moderate_true_for_a_capability_holder() {
+        let (_tmp, ctx) = test_ctx();
+        let row = moderation_test_row("p-mod-1", false, r#"["data.moderate"]"#);
+        {
+            let db = db(&ctx).unwrap();
+            crate::db::collab::upsert_project(&db.conn(), &row).unwrap();
+        }
+        let card = card_from_row(&ctx, row, None).unwrap();
+        assert!(card.can_moderate);
+    }
+
+    /// A non-coordinator with no caps cannot moderate.
+    #[test]
+    fn can_moderate_false_without_the_capability() {
+        let (_tmp, ctx) = test_ctx();
+        let row = moderation_test_row("p-mod-2", false, "[]");
+        {
+            let db = db(&ctx).unwrap();
+            crate::db::collab::upsert_project(&db.conn(), &row).unwrap();
+        }
+        let card = card_from_row(&ctx, row, None).unwrap();
+        assert!(!card.can_moderate);
+    }
+
+    /// The coordinator can moderate even with an empty caps list.
+    #[test]
+    fn can_moderate_true_for_the_coordinator_with_no_caps() {
+        let (_tmp, ctx) = test_ctx();
+        let row = moderation_test_row("p-mod-3", true, "[]");
+        {
+            let db = db(&ctx).unwrap();
+            crate::db::collab::upsert_project(&db.conn(), &row).unwrap();
+        }
+        let card = card_from_row(&ctx, row, None).unwrap();
+        assert!(card.can_moderate);
+    }
+
+    /// A `gov_caps_json` that fails to parse is read as no caps, not a panic
+    /// or a moderator grant.
+    #[test]
+    fn can_moderate_false_for_malformed_gov_caps_json() {
+        let (_tmp, ctx) = test_ctx();
+        let row = moderation_test_row("p-mod-4", false, "not json");
+        {
+            let db = db(&ctx).unwrap();
+            crate::db::collab::upsert_project(&db.conn(), &row).unwrap();
+        }
+        let card = card_from_row(&ctx, row, None).unwrap();
+        assert!(!card.can_moderate);
     }
 
     /// Cached project fixture: target M101 (210.8, +54.35), radius 1.5°, one

@@ -230,6 +230,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::collab_exchange::ReplicationPolicy,
             crate::api::collab_exchange::PolicyPreview,
             crate::api::collab_exchange::CollabFramesLanded,
+            crate::api::collab_exchange::CollabPeersChanged,
             crate::api::collab_live::LiveState,
             crate::api::collab_live::StorageStateView,
             crate::api::collab_live::CollabLiveStatus,

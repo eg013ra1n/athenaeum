@@ -31,6 +31,7 @@ function projectCard(overrides: Partial<ProjectCard>): ProjectCard {
     title: 'M42 Mosaic',
     dataRole: 'send_receive',
     coordinator: false,
+    canModerate: false,
     requireApproval: false,
     pendingFrames: 0,
     projectStatus: 'open',
