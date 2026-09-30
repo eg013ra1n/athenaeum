@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import ExcludeDialog from './ExcludeDialog';
+import FramePanel from './FramePanel';
+import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../../api';
 import type { FrameVM } from './frames';
 
@@ -203,5 +205,33 @@ describe('ExcludeDialog', () => {
       frameUuid: 'uuid-1',
       reason: 'trailed frame',
     });
+  });
+
+  it('renders as a dialog named by its title, reason field focused first', () => {
+    render(<ExcludeDialog projectId="p" frames={[frame()]} onClose={vi.fn()} onDone={vi.fn()} />);
+    const dlg = screen.getByRole('dialog', { name: 'Exclude 1 frame from the project' });
+    expect(dlg).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+  });
+
+  it('Escape over a FramePanel closes only the dialog, never the panel', () => {
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'get_collab_frame_holders') return Promise.resolve([]);
+      return Promise.reject(new Error(`unexpected ${command}`));
+    }) as typeof api.invoke);
+    vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
+    const onClose = vi.fn();
+    render(
+      <MemoryRouter>
+        <FramePanel projectId="p" frame={frame()} canModerate onClose={onClose} onChanged={vi.fn()} thresholdsVersion={null} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude…' }));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole('complementary', { name: 'Frame details' })).toBeInTheDocument();
   });
 });

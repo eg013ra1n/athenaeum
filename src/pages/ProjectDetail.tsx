@@ -21,7 +21,7 @@ import LibraryTab, { libraryInFlight, libraryToCome } from '../components/collab
 import MembersTab from '../components/collab/project/MembersTab';
 import ExchangeTab from '../components/collab/project/ExchangeTab';
 import ModerationTab from '../components/collab/project/ModerationTab';
-import FrameDrawer from '../components/collab/project/FrameDrawer';
+import FramePanel from '../components/collab/project/FramePanel';
 import RepublishGuardDialog from '../components/collab/project/RepublishGuardDialog';
 import { deviceLabel, leading, OTHER_DEVICE, usePublishing } from '../components/collab/project/usePublishing';
 import { fromLibrary, fromOwn, ownFrameKey, type FrameVM } from '../components/collab/project/frames';
@@ -358,7 +358,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   // The drawer renders a FRESH view of its open frame, never the possibly
   // stale snapshot `onOpen` captured: an own frame's key found in the latest
   // `own` wins (so its own Restore/Exclude reads back immediately — a
-  // `FrameDrawer` kept mounted across the reload never sees old props
+  // `FramePanel` kept mounted across the reload never sees old props
   // otherwise), then a library frame's key found in the latest `frames`
   // (`fromLibrary`, the same builder the Library badge's `toCome` uses).
   // Only when the row can't be found this render — a moderation row (no
@@ -510,13 +510,14 @@ function ProjectPage({ id }: { id: string | undefined }) {
   };
 
   // The frame panel, docked beside the My frames / Library / Moderation
-  // tables. Interim: the existing drawer until the frame card (Task 8).
+  // tables.
   const framePanel = drawerFrame ? (
-    <FrameDrawer
+    <FramePanel
       key={drawerFrame.key}
       projectId={id}
       frame={drawerFrame}
       canModerate={canModerate}
+      thresholdsVersion={detail.thresholdsVersion}
       onClose={() => setDrawer(null)}
       onChanged={() => {
         void loadOwn();
@@ -524,6 +525,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
       }}
     />
   ) : null;
+  const toggleDrawer = (vm: FrameVM) => setDrawer((d) => (d?.key === vm.key ? null : vm));
   const activeKey = drawerFrame?.key ?? null;
 
   return (
@@ -656,7 +658,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 canModerate={canModerate}
                 republishError={republishReq ? null : publishing.republishError}
                 refusal={refusal}
-                onOpen={setDrawer}
+                onOpen={toggleDrawer}
                 activeKey={activeKey}
               />
             </PanelLayout>
@@ -671,7 +673,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 error={framesError}
                 reload={() => void loadLibrary()}
                 canModerate={canModerate}
-                onOpen={setDrawer}
+                onOpen={toggleDrawer}
                 activeKey={activeKey}
               />
             </PanelLayout>
@@ -701,7 +703,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
                   void loadDetail();
                   void loadLibrary();
                 }}
-                onOpen={setDrawer}
+                onOpen={toggleDrawer}
                 activeKey={activeKey}
               />
             </PanelLayout>

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import FrameDrawer from './FrameDrawer';
+import FramePanel from './FramePanel';
 import { api } from '../../../api';
 import type { FrameHolderView, OwnFrameRow, ProjectFrameView } from '../../../types/models';
 import type { FrameVM } from './frames';
@@ -126,18 +126,19 @@ function baseFrame(overrides: Partial<FrameVM> = {}): FrameVM {
   };
 }
 
-function renderDrawer(
+function renderPanel(
   frame: FrameVM,
-  props: Partial<{ canModerate: boolean; onClose: () => void; onChanged: () => void }> = {},
+  props: Partial<{ canModerate: boolean; onClose: () => void; onChanged: () => void; thresholdsVersion: number | null }> = {},
 ) {
   return render(
     <MemoryRouter>
-      <FrameDrawer
+      <FramePanel
         projectId="p"
         frame={frame}
         canModerate={props.canModerate ?? false}
         onClose={props.onClose ?? vi.fn()}
         onChanged={props.onChanged ?? vi.fn()}
+        thresholdsVersion={props.thresholdsVersion ?? null}
       />
     </MemoryRouter>,
   );
@@ -167,7 +168,7 @@ beforeEach(() => {
   }) as never);
 });
 
-describe('FrameDrawer', () => {
+describe('FramePanel', () => {
   it('(a) lists the precondition failure and the rule verdicts for an own held frame', async () => {
     const own = baseOwn({
       failures: [{ kind: 'solve', text: 'unknown pixel scale' }],
@@ -176,39 +177,36 @@ describe('FrameDrawer', () => {
         { metricKey: 'stars', label: 'Stars', value: '500', needs: '≥ 200', pass: true },
       ],
     });
-    renderDrawer(baseFrame({ own, failures: own.failures }));
+    renderPanel(baseFrame({ own, failures: own.failures }));
 
-    expect(screen.getByText('✕ unknown pixel scale')).toBeInTheDocument();
-
-    const table = screen.getByRole('table');
-    const fwhmRow = within(table).getByText('FWHM').closest('tr')!;
-    expect(within(fwhmRow).getByText('3.42″')).toBeInTheDocument();
-    expect(within(fwhmRow).getByText('≤ 3.00″')).toBeInTheDocument();
-    expect(within(fwhmRow).getByText('✕')).toBeInTheDocument();
-
-    const starsRow = within(table).getByText('Stars').closest('tr')!;
-    expect(within(starsRow).getByText('500')).toBeInTheDocument();
-    expect(within(starsRow).getByText('≥ 200')).toBeInTheDocument();
-    expect(within(starsRow).getByText('✓')).toBeInTheDocument();
+    expect(screen.getByText('Plate-solved')).toBeInTheDocument();
+    const fwhmLabel = screen.getByText('FWHM', { selector: 'span' });
+    expect(fwhmLabel).toBeInTheDocument();
+    expect(screen.getByText('3.42″', { selector: 'span' })).toBeInTheDocument();
+    expect(screen.getByText('≤ 3.00″')).toBeInTheDocument();
+    expect(screen.getByText('≥ 200')).toBeInTheDocument();
+    // Stars rule + Analyzed + Filter mapped pass; FWHM rule + Plate-solved fail.
+    expect(screen.getAllByText('✓')).toHaveLength(3);
+    expect(screen.getAllByText('✕')).toHaveLength(2);
 
     await waitFor(() => expect(screen.getByText('Nobody else holds it yet.')).toBeInTheDocument());
   });
 
-  it('(b) shows — for a rule that was not evaluated', () => {
+  it('(b) shows a dash and no verdict for a rule that was not evaluated', () => {
     const own = baseOwn({
       rules: [{ metricKey: 'ecc', label: 'Eccentricity', value: null, needs: '≤ 0.55', pass: null }],
     });
-    renderDrawer(baseFrame({ own }));
+    renderPanel(baseFrame({ own }));
 
-    const table = screen.getByRole('table');
-    const row = within(table).getByText('Eccentricity').closest('tr')!;
-    expect(within(row).getByTitle('not evaluated — see above')).toBeInTheDocument();
-    expect(within(row).getByTitle('not evaluated — see above')).toHaveTextContent('—');
+    expect(screen.getByText('Eccentricity', { selector: 'span' })).toBeInTheDocument();
+    expect(screen.getByText('≤ 0.55')).toBeInTheDocument();
+    // Three precondition rows pass; the un-evaluated rule adds no verdict.
+    expect(screen.getAllByText('✓')).toHaveLength(3);
   });
 
   it('(c) shows the own frame\'s local path', () => {
     const own = baseOwn({ path: '/Volumes/Astro/M31/2026-09-20/light_001.fits' });
-    renderDrawer(baseFrame({ own }));
+    renderPanel(baseFrame({ own }));
     expect(screen.getByText('/Volumes/Astro/M31/2026-09-20/light_001.fits')).toBeInTheDocument();
   });
 
@@ -238,7 +236,7 @@ describe('FrameDrawer', () => {
       return Promise.reject(new Error(`unexpected ${command}`));
     }) as typeof api.invoke);
 
-    renderDrawer(baseFrame());
+    renderPanel(baseFrame());
 
     await waitFor(() => expect(screen.getByText('Kostya')).toBeInTheDocument());
     expect(screen.getByText('kostya-obs')).toBeInTheDocument();
@@ -254,15 +252,15 @@ describe('FrameDrawer', () => {
       return Promise.reject(new Error(`unexpected ${command}`));
     }) as typeof api.invoke);
 
-    renderDrawer(baseFrame());
+    renderPanel(baseFrame());
 
-    await waitFor(() => expect(screen.getByText('Could not load holders.')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Could not load holders — see console.')).toBeInTheDocument());
     expect(errSpy).toHaveBeenCalledWith('[drawer] holders failed:', expect.any(Error));
     errSpy.mockRestore();
   });
 
   it('(e2) an own frame not yet published (uuid, no project row) asks for no holders and shows no holders section', () => {
-    renderDrawer(baseFrame({ hasProjectRow: false, pubState: null }));
+    renderPanel(baseFrame({ hasProjectRow: false, pubState: null }));
 
     expect(api.invoke).not.toHaveBeenCalledWith('get_collab_frame_holders', expect.anything());
     expect(screen.queryByText('Who holds it')).toBeNull();
@@ -270,7 +268,7 @@ describe('FrameDrawer', () => {
 
   it('(f) Escape calls onClose', () => {
     const onClose = vi.fn();
-    renderDrawer(baseFrame(), { onClose });
+    renderPanel(baseFrame(), { onClose });
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalled();
   });
@@ -278,7 +276,7 @@ describe('FrameDrawer', () => {
   it('fix round 1: Escape closes only the ExcludeDialog when it is open, not the drawer underneath', () => {
     const onClose = vi.fn();
     const frame = baseFrame({ excluded: false, pubState: 'published' });
-    renderDrawer(frame, { canModerate: true, onClose });
+    renderPanel(frame, { canModerate: true, onClose });
 
     fireEvent.click(screen.getByRole('button', { name: 'Exclude…' }));
     expect(screen.getByText('Exclude 1 frame from the project')).toBeInTheDocument();
@@ -295,7 +293,7 @@ describe('FrameDrawer', () => {
       receivedFromDevice: 'somehexdeviceid',
       receivedFromMember: 'Olga',
     });
-    renderDrawer(baseFrame({ lib }));
+    renderPanel(baseFrame({ lib }));
     expect(screen.getByText(/Received .* from Olga/)).toBeInTheDocument();
   });
 
@@ -305,7 +303,7 @@ describe('FrameDrawer', () => {
       receivedFromDevice: 'local',
       receivedFromMember: null,
     });
-    const { unmount } = renderDrawer(baseFrame({ lib: localLib }));
+    const { unmount } = renderPanel(baseFrame({ lib: localLib }));
     expect(screen.getByText(/Received .* from this device's files/)).toBeInTheDocument();
     unmount();
 
@@ -314,7 +312,7 @@ describe('FrameDrawer', () => {
       receivedFromDevice: 'abcdef0123456789',
       receivedFromMember: null,
     });
-    renderDrawer(baseFrame({ lib: deviceLib }));
+    renderPanel(baseFrame({ lib: deviceLib }));
     expect(screen.getByText(/Received .* from abcdef01/)).toBeInTheDocument();
   });
 
@@ -327,7 +325,7 @@ describe('FrameDrawer', () => {
     }) as typeof api.invoke);
     const frame = baseFrame({ excluded: true, acceptedReason: 'trailed', pubState: 'published' });
 
-    const { unmount } = renderDrawer(frame, { canModerate: true, onChanged });
+    const { unmount } = renderPanel(frame, { canModerate: true, onChanged });
     expect(screen.getByText(/Excluded — trailed/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Restore' }));
     await waitFor(() =>
@@ -336,7 +334,7 @@ describe('FrameDrawer', () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
     unmount();
 
-    renderDrawer(frame, { canModerate: false });
+    renderPanel(frame, { canModerate: false });
     expect(screen.getByText(/Excluded — trailed/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
   });
@@ -358,7 +356,7 @@ describe('FrameDrawer', () => {
       return Promise.reject(new Error(`unexpected ${command}`));
     }) as typeof api.invoke);
 
-    renderDrawer(baseFrame());
+    renderPanel(baseFrame());
     await waitFor(() => expect(screen.getByText('Kostya')).toBeInTheDocument());
 
     let resolveSecond!: (rows: FrameHolderView[]) => void;
@@ -374,7 +372,7 @@ describe('FrameDrawer', () => {
 
     // The re-read is in flight — the OLD holder stays, no loading flash.
     expect(screen.getByText('Kostya')).toBeInTheDocument();
-    expect(screen.queryByText('Loading holders…')).not.toBeInTheDocument();
+    expect(screen.queryByText('Loading…')).not.toBeInTheDocument();
 
     await act(async () => {
       resolveSecond([
@@ -415,7 +413,7 @@ describe('FrameDrawer', () => {
       if (command === 'get_collab_frame_holders') return Promise.resolve(first);
       return Promise.reject(new Error(`unexpected ${command}`));
     }) as typeof api.invoke);
-    renderDrawer(baseFrame());
+    renderPanel(baseFrame());
     await waitFor(() => expect(screen.getByText('Kostya')).toBeInTheDocument());
     const before = vi
       .mocked(api.invoke)
@@ -428,5 +426,60 @@ describe('FrameDrawer', () => {
 
     const after = vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_collab_frame_holders').length;
     expect(after).toBe(before);
+  });
+
+  function lib() { return baseLib(); }
+  function own(overrides: Partial<OwnFrameRow> = {}) { return baseOwn(overrides); }
+  function holdersAnswer(rows: FrameHolderView[]) {
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'get_collab_frame_holders') return Promise.resolve(rows);
+      return Promise.reject(new Error(`unexpected ${command}`));
+    }) as typeof api.invoke);
+  }
+
+  it('title block: mono file name and status chips', () => {
+    renderPanel(baseFrame({ own: null, lib: lib(), pubState: 'published', device: 'have' }));
+    expect(screen.getByText('light_001.fits').className).toContain('font-mono');
+    expect(screen.getByText('published').className).toContain('bg-success-muted');
+    expect(screen.getByText('have')).toBeInTheDocument();
+  });
+
+  it('Frame section is a KV with the mockup labels', () => {
+    renderPanel(baseFrame({ night: '2026-08-31', exptimeSec: 180, byteSize: 121_920_698, contentVersion: 2, publisher: 'Olga' }));
+    for (const label of ['Publisher', 'Night', 'Filter', 'Camera', 'Exposure', 'Size', 'Version']) {
+      expect(screen.getByText(label).tagName).toBe('DT');
+    }
+    expect(screen.getByText('2026-08-31 · Mon')).toBeInTheDocument();
+    expect(screen.getByText('180 s')).toBeInTheDocument();
+    expect(screen.getByText('122 MB')).toBeInTheDocument();
+    expect(screen.getByText('v2 · v1 superseded')).toBeInTheDocument();
+  });
+
+  it('Metrics: SNR to one decimal, no Zero point row', () => {
+    renderPanel(baseFrame({ snr: 23.054622650146484 }));
+    expect(screen.getByText('23.1')).toBeInTheDocument();
+    expect(screen.queryByText('Zero point')).toBeNull();
+  });
+
+  it('Gate is a 4-column grid with the thresholds version and precondition rows', () => {
+    renderPanel(
+      baseFrame({ own: own({ failures: [{ kind: 'solve', text: 'No WCS' }], rules: [{ metricKey: 'fwhm', label: 'FWHM', value: '3.42″', needs: '≤ 3.00″', pass: false }] }) }),
+      { thresholdsVersion: 3 },
+    );
+    expect(screen.getByRole('heading', { name: /Gate thresholds v3/ })).toBeInTheDocument();
+    expect(screen.getByText('Plate-solved')).toBeInTheDocument();
+    expect(screen.getByText('3.42″', { selector: 'span' })).toBeInTheDocument();
+    expect(screen.getAllByText('✕').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('Who holds it: "N online of M", publisher chip, device on the right', async () => {
+    holdersAnswer([
+      { memberName: 'Andrei', deviceName: 'andrei-pc', device: 'd1', deviceShort: 'd1', online: true, isPublisher: true, contentVersion: 1 },
+      { memberName: 'Olga', deviceName: 'olga-home', device: 'd2', deviceShort: 'd2', online: false, isPublisher: false, contentVersion: 1 },
+    ]);
+    renderPanel(baseFrame({ lib: lib() }));
+    expect(await screen.findByRole('heading', { name: /Who holds it 1 online of 2/ })).toBeInTheDocument();
+    expect(screen.getByText('publisher')).toBeInTheDocument();
+    expect(screen.getByText('andrei-pc').className).toContain('ml-auto');
   });
 });

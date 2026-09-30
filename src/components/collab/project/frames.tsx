@@ -316,7 +316,7 @@ function num(text: string): ReactNode {
   return <span className="tabular-nums">{text}</span>;
 }
 
-function statusTone(s: string): ChipTone {
+export function statusTone(s: string): ChipTone {
   switch (s) {
     case 'published': return 'ok';
     case 'rejected': return 'err';
@@ -337,7 +337,7 @@ function PublisherName({ accountId, name }: { accountId: string | null; name: st
 }
 
 /** The Status column and the `status` group read `excluded` before `pubState`. */
-function effectiveStatus(v: FrameVM): string {
+export function effectiveStatus(v: FrameVM): string {
   return v.excluded ? 'excluded' : (v.pubState ?? 'published');
 }
 
@@ -659,7 +659,7 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
 
 /* ── Groups ─────────────────────────────────────────────────────────────── */
 
-const WEEKDAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+export const WEEKDAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 export const GROUPS: Record<string, GroupDef<FrameVM>> = {
   night: {

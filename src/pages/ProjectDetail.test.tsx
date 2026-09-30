@@ -1380,10 +1380,21 @@ describe('ProjectDetail frame drawer', () => {
     fireEvent.click(await screen.findByText('L_0001.fits'));
 
     const drawer = await screen.findByRole('complementary');
-    expect(within(drawer).getByRole('heading', { name: 'L_0001.fits' })).toBeInTheDocument();
+    // The panel title is a mono block, no longer an h2.
+    expect(within(drawer).getByText('L_0001.fits').className).toContain('font-mono');
 
     fireEvent.keyDown(document, { key: 'Escape' });
     await waitFor(() => expect(screen.queryByRole('complementary')).not.toBeInTheDocument());
+  });
+
+  it('a second click on the active row closes the panel', async () => {
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByText('L_0001.fits'));
+    await screen.findByRole('complementary', { name: 'Frame details' });
+
+    fireEvent.click(screen.getAllByText('L_0001.fits')[0]);
+    await waitFor(() => expect(screen.queryByRole('complementary', { name: 'Frame details' })).not.toBeInTheDocument());
   });
 
   it("a coordinator's own Restore refreshes the still-open drawer — no stale Excluded box, offers Exclude…", async () => {
