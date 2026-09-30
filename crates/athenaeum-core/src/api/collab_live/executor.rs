@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use iroh::{EndpointAddr, EndpointId};
 use iroh_blobs::api::Store;
 use iroh_blobs::Hash;
@@ -1657,16 +1658,32 @@ async fn land(
     if matches!(landed, Landed::Failed(_)) {
         match crate::api::db(&env.ctx) {
             Ok(db) => {
-                if let Err(e) = crate::db::collab_sessions::record_failure(
-                    &db.conn(),
-                    &row.project_id,
-                    &crate::sync::now_iso(),
-                ) {
-                    tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "receive session failure not recorded");
+                // A bare read-then-write on an autocommit connection would
+                // race a concurrent landing's already-IMMEDIATE transaction
+                // of the same project (its SELECT could read stale
+                // `sources_json`, then overwrite the landing's write with a
+                // now-stale UPDATE, or both INSERT and split the session).
+                // One IMMEDIATE transaction here serializes against it.
+                let record = (|| -> anyhow::Result<()> {
+                    let mut conn = db.conn();
+                    let tx = conn
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .context("begin receive-session failure tx")?;
+                    crate::db::collab_sessions::record_failure(
+                        &tx,
+                        &row.project_id,
+                        &crate::sync::now_iso(),
+                    )
+                    .context("record receive session failure")?;
+                    tx.commit().context("commit receive-session failure tx")?;
+                    Ok(())
+                })();
+                if let Err(e) = record {
+                    tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %format!("{e:#}"), "receive session failure not recorded");
                 }
             }
             Err(e) => {
-                tracing::warn!(project_id = %row.project_id, error = %e, "receive session failure not recorded")
+                tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %format!("{e:#}"), "receive session failure not recorded")
             }
         }
     }

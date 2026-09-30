@@ -82,16 +82,32 @@ fn bump(
         .context("read last receive session")?;
     match last.filter(|(_, fin, _)| continues(fin, now)) {
         Some((id, _, json)) => {
-            let mut map: BTreeMap<String, i64> = serde_json::from_str(&json).unwrap_or_default();
-            for (d, b) in sources {
-                *map.entry(d.clone()).or_default() += *b as i64;
+            if sources.is_empty() {
+                // No sources to merge (a failure record): the column is left
+                // untouched entirely, so this bump can't clobber a
+                // concurrent bump's write to the same `sources_json` with a
+                // stale re-serialization of what THIS bump read.
+                conn.execute(
+                    "UPDATE collab_receive_sessions SET finished_at = ?2, frames = frames + ?3, \
+                     bytes = bytes + ?4, failed = failed + ?5 WHERE id = ?1",
+                    rusqlite::params![id, now, frames, bytes, failed],
+                )
+                .context("extend receive session")?;
+            } else {
+                let mut map: BTreeMap<String, i64> = serde_json::from_str(&json).unwrap_or_else(|e| {
+                    tracing::warn!(project_id, session_id = id, error = %e, "receive session sources unreadable; reset");
+                    BTreeMap::new()
+                });
+                for (d, b) in sources {
+                    *map.entry(d.clone()).or_default() += *b as i64;
+                }
+                conn.execute(
+                    "UPDATE collab_receive_sessions SET finished_at = ?2, frames = frames + ?3, \
+                     bytes = bytes + ?4, failed = failed + ?5, sources_json = ?6 WHERE id = ?1",
+                    rusqlite::params![id, now, frames, bytes, failed, serde_json::to_string(&map)?],
+                )
+                .context("extend receive session")?;
             }
-            conn.execute(
-                "UPDATE collab_receive_sessions SET finished_at = ?2, frames = frames + ?3, \
-                 bytes = bytes + ?4, failed = failed + ?5, sources_json = ?6 WHERE id = ?1",
-                rusqlite::params![id, now, frames, bytes, failed, serde_json::to_string(&map)?],
-            )
-            .context("extend receive session")?;
         }
         None => {
             let map: BTreeMap<String, i64> = sources
@@ -150,16 +166,22 @@ pub fn list(conn: &Connection, project_id: Option<&str>, limit: i64) -> Result<V
          ORDER BY finished_at DESC, id DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![project_id, limit], |r| {
+        let id: i64 = r.get(0)?;
+        let row_project_id: String = r.get(1)?;
         let json: String = r.get(7)?;
+        let sources = serde_json::from_str(&json).unwrap_or_else(|e| {
+            tracing::warn!(project_id = %row_project_id, session_id = id, error = %e, "receive session sources unreadable; reset");
+            BTreeMap::new()
+        });
         Ok(SessionRow {
-            id: r.get(0)?,
-            project_id: r.get(1)?,
+            id,
+            project_id: row_project_id,
             started_at: r.get(2)?,
             finished_at: r.get(3)?,
             frames: r.get(4)?,
             bytes: r.get(5)?,
             failed: r.get(6)?,
-            sources: serde_json::from_str(&json).unwrap_or_default(),
+            sources,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -256,5 +278,70 @@ mod tests {
         assert!(!continues("garbage", "2026-09-29T10:00:00Z"));
         assert!(continues("2026-09-29T10:00:00Z", "2026-09-29T10:05:00Z"));
         assert!(!continues("2026-09-29T10:00:00Z", "2026-09-29T10:05:01Z"));
+    }
+
+    /// Fix round 1, finding 2: a corrupted `sources_json` must never panic
+    /// `bump`'s merge — it resets to an empty map (losing the unreadable
+    /// accumulated totals, which is the best available outcome) and the new
+    /// landing's sources are still recorded.
+    #[test]
+    fn a_corrupted_sources_json_is_reset_when_a_new_landing_extends_the_session() {
+        let c = conn();
+        record_landing(&c, "p", "2026-09-29T10:00:00.000Z", 10, &[("A=".into(), 5)]).unwrap();
+        c.execute(
+            "UPDATE collab_receive_sessions SET sources_json = 'not json' WHERE project_id = 'p'",
+            [],
+        )
+        .unwrap();
+        record_landing(&c, "p", "2026-09-29T10:01:00.000Z", 20, &[("B=".into(), 7)]).unwrap();
+        let s = list(&c, Some("p"), 10).unwrap();
+        assert_eq!(
+            s.len(),
+            1,
+            "still one session (the gap is inside the window)"
+        );
+        assert_eq!(
+            s[0].sources,
+            [("B=".to_string(), 7)].into_iter().collect(),
+            "the corrupted map was reset, not merged into; the new landing's sources still land"
+        );
+    }
+
+    /// Fix round 1, finding 2 (`list` half): a row whose `sources_json` is
+    /// unreadable (and never gets touched by another `bump`) must still be
+    /// listed, with an empty source map, never a panic.
+    #[test]
+    fn list_recovers_from_a_permanently_corrupted_sources_json() {
+        let c = conn();
+        record_landing(&c, "p", "2026-09-29T10:00:00.000Z", 10, &[("A=".into(), 5)]).unwrap();
+        c.execute(
+            "UPDATE collab_receive_sessions SET sources_json = '{not json' WHERE project_id = 'p'",
+            [],
+        )
+        .unwrap();
+        let s = list(&c, Some("p"), 10).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].sources, BTreeMap::new());
+    }
+
+    /// Fix round 1, finding 1 companion: a failure record (empty `sources`)
+    /// must never touch `sources_json` at all, so it can't clobber a
+    /// concurrent landing's write to the same session (the actual race is
+    /// fixed by wrapping `record_failure`'s caller in a `BEGIN IMMEDIATE`
+    /// transaction in `executor.rs`; this pins the DB-layer half: a
+    /// zero-source bump is a no-op on the sources column).
+    #[test]
+    fn a_failure_in_the_same_window_as_a_landing_leaves_its_sources_intact() {
+        let c = conn();
+        record_landing(&c, "p", "2026-09-29T10:00:00.000Z", 10, &[("A=".into(), 5)]).unwrap();
+        record_failure(&c, "p", "2026-09-29T10:01:00.000Z").unwrap();
+        let s = list(&c, Some("p"), 10).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].frames, s[0].failed), (1, 1));
+        assert_eq!(
+            s[0].sources,
+            [("A=".to_string(), 5)].into_iter().collect(),
+            "the failure (no sources) never rewrites the landing's sources_json"
+        );
     }
 }
