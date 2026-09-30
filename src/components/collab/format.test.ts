@@ -71,4 +71,11 @@ describe('mockup formatters', () => {
     expect(formatDurationPadded(45 * 3600 + 57 * 60)).toBe('45h 57m');
     expect(formatDurationPadded(0)).toBe('0m');
   });
+  it('rounds to total minutes before splitting (never prints 60m)', () => {
+    expect(formatDurationPadded(7170)).toBe('2h 00m');
+    expect(formatDurationPadded(3599)).toBe('1h 00m');
+    expect(formatDurationPadded(3 * 3600 + 3590)).toBe('4h 00m');
+    expect(formatDurationPadded(29)).toBe('0m');
+    expect(formatDurationPadded(30)).toBe('1m');
+  });
 });
