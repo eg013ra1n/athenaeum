@@ -1670,9 +1670,7 @@ Behaviour:
   `projectNames` map.
 - **TransferIndicator:** `const { recvBps, sendBps, active } = exchangeTotals(useCollabExchange().state)`. The icon
   goes `text-accent` when personal `up > 0` **or** collab `active`. The title gains `\nCollaboration — ↓ {rate} · ↑
-  {rate}` when active. The expanded form shows a third item `{formatRate(recvBps + sendBps)}` when active. The
-  indicator must render when collab traffic moves even if `visible` is false? **No.** `visible` already means
-  "signed in with a role", which collab needs too, so the gate is unchanged.
+  {rate}` when active. The expanded form shows a third item `{formatRate(recvBps + sendBps)}` when active. The `visible` gate stays unchanged: it already means "signed in with a role", which collab needs too.
 
 - [ ] **Step 1: Write the failing tests:** `mergeHistory` orders by time and keeps equal-time order; a session row
   renders `from Kostya, Olga` and `48 frames`; a failed session counts under Failed; `CollabTrafficGroups` renders
