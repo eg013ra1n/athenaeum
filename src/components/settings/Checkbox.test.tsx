@@ -3,11 +3,9 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { Checkbox } from './Checkbox';
 
 describe('Checkbox', () => {
-  it('renders the accent-tinted native input reflecting the checked prop', () => {
+  it('renders a real input reflecting the checked prop', () => {
     render(<Checkbox checked={false} onChange={() => {}} label="Auto check" />);
-    const input = screen.getByRole('checkbox', { name: 'Auto check' });
-    expect(input).not.toBeChecked();
-    expect(input.className).toContain('accent-accent');
+    expect(screen.getByRole('checkbox', { name: 'Auto check' })).not.toBeChecked();
   });
 
   it('calls onChange with the new value when clicked', () => {
@@ -18,19 +16,20 @@ describe('Checkbox', () => {
     expect(onChange).toHaveBeenCalledWith(true);
   });
 
-  it('renders as a switch and at the sm size when asked', () => {
+  it('renders as a switch at the sm size without changing the box', () => {
     render(<Checkbox checked role="switch" size="sm" onChange={() => {}} label="Watch for new files" />);
-    const input = screen.getByRole('switch', { name: 'Watch for new files' });
-    expect(input).toBeChecked();
-    expect(input.className).toContain('w-3.5');
-    expect(input.className).toContain('h-3.5');
+    expect(screen.getByRole('switch', { name: 'Watch for new files' })).toBeChecked();
+    expect(screen.getByTestId('cb-box').className).toContain('h-[13px]');
   });
 
-  it('defaults to the md size', () => {
-    render(<Checkbox checked={false} onChange={() => {}} label="Auto check" />);
-    const input = screen.getByRole('checkbox', { name: 'Auto check' });
-    expect(input.className).toContain('w-4');
-    expect(input.className).toContain('h-4');
+  it('draws the 13px box and a tick only when checked', () => {
+    const { rerender } = render(<Checkbox checked={false} onChange={() => {}} label="Auto check" />);
+    const box = screen.getByTestId('cb-box');
+    expect(box.className).toContain('h-[13px]');
+    expect(box.className).toContain('w-[13px]');
+    expect(box.querySelector('svg')).toBeNull();
+    rerender(<Checkbox checked onChange={() => {}} label="Auto check" />);
+    expect(screen.getByTestId('cb-box').querySelector('svg')).not.toBeNull();
   });
 
   it('renders the description under the label', () => {
