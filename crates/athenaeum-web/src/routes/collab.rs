@@ -371,6 +371,27 @@ pub async fn get_collab_exchange(
         .map_err(api_err)
 }
 
+/// Collab observability wave 1 (Task 13): the project's (or every project's)
+/// receive sessions, newest first — the Transfers/project page's collapsed
+/// view of a burst of landings, real sources named.
+#[derive(serde::Deserialize)]
+pub struct SessionsArgs {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn list_collab_receive_sessions(
+    State(state): State<WebAppState>,
+    Json(args): Json<SessionsArgs>,
+) -> Result<Json<Vec<surface::ReceiveSessionView>>, (axum::http::StatusCode, String)> {
+    surface::list_collab_receive_sessions(&state.ctx, args.project_id.as_deref(), args.limit)
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
 /// the hub never learns of it). The live exchange re-reads the project's need
 /// set at once.

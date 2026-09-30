@@ -13,6 +13,7 @@ pub mod master_unregister;
 pub mod collab;
 pub mod collab_frames;
 pub mod collab_live;
+pub mod collab_sessions;
 pub mod stacking;
 
 pub use schema::*;

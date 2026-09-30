@@ -2690,7 +2690,23 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             PRIMARY KEY (project_id, frame_uuid),
             FOREIGN KEY (project_id, frame_uuid) REFERENCES project_frames_local(project_id, frame_uuid) ON DELETE CASCADE
          );
-         CREATE INDEX IF NOT EXISTS idx_collab_quarantine_frame_uuid ON collab_quarantine(frame_uuid);",
+         CREATE INDEX IF NOT EXISTS idx_collab_quarantine_frame_uuid ON collab_quarantine(frame_uuid);
+         -- Receive sessions (collab observability wave 1, Task 13): one row
+         -- per project session — consecutive landings closer than
+         -- `collab_sessions::SESSION_GAP_SECS` apart, a wider gap opens a new
+         -- one. Written inside the landing transaction (`db::collab_sessions`).
+         CREATE TABLE IF NOT EXISTS collab_receive_sessions (
+            id INTEGER PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            frames INTEGER NOT NULL DEFAULT 0,
+            bytes INTEGER NOT NULL DEFAULT 0,
+            failed INTEGER NOT NULL DEFAULT 0,
+            sources_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY (project_id) REFERENCES collab_projects(project_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_collab_receive_sessions_project ON collab_receive_sessions(project_id, id);",
     )?;
 
     // Local project↔frame-set links. NEVER sent to the hub (spec §7).

@@ -216,6 +216,20 @@ pub async fn get_collab_exchange(
     surface::get_collab_exchange(&state.ctx, project_id.as_deref()).map_err(|e| e.to_string())
 }
 
+/// Collab observability wave 1 (Task 13): the project's (or every project's)
+/// receive sessions, newest first — the Transfers/project page's collapsed
+/// view of a burst of landings, real sources named.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_collab_receive_sessions(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<surface::ReceiveSessionView>, String> {
+    surface::list_collab_receive_sessions(&state.ctx, project_id.as_deref(), limit)
+        .map_err(|e| e.to_string())
+}
+
 /// D3 §3.3: turn this project's auto-replication on or off (local preference —
 /// the hub never learns of it). The live exchange re-reads the project's need
 /// set at once.

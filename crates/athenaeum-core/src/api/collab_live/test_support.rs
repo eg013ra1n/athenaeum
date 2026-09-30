@@ -1114,6 +1114,17 @@ impl FetchRig {
         &self,
         i: usize,
     ) -> Result<PathBuf, crate::api::collab_live::landing::Landed> {
+        self.land_with_sources(i, &[]).await
+    }
+
+    /// [`land`](Self::land) with the fetch's per-device byte totals threaded
+    /// through as the frame's sources (Task 13: the receive-session and
+    /// `sync_history` provenance writers read these off `LandingEnv`).
+    pub(crate) async fn land_with_sources(
+        &self,
+        i: usize,
+        sources: &[(String, u64)],
+    ) -> Result<PathBuf, crate::api::collab_live::landing::Landed> {
         use crate::api::collab_live::landing::{land_frame, Landed, LandingEnv};
         let row = self.in_flight.lock().unwrap()[i]
             .clone()
@@ -1134,7 +1145,7 @@ impl FetchRig {
             guard: &self.guard,
             started_at: &started_at,
             hooks: &self.hooks,
-            sources: &[],
+            sources,
         };
         match land_frame(&env, &row, hash).await {
             Landed::Yes(p) => Ok(p),

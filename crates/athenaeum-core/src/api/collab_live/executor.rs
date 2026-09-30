@@ -1653,7 +1653,24 @@ async fn land(
         hooks: &hooks,
         sources,
     };
-    land_frame(&landing, row, hash).await
+    let landed = land_frame(&landing, row, hash).await;
+    if matches!(landed, Landed::Failed(_)) {
+        match crate::api::db(&env.ctx) {
+            Ok(db) => {
+                if let Err(e) = crate::db::collab_sessions::record_failure(
+                    &db.conn(),
+                    &row.project_id,
+                    &crate::sync::now_iso(),
+                ) {
+                    tracing::warn!(project_id = %row.project_id, frame_uuid = %row.frame_uuid, error = %e, "receive session failure not recorded");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(project_id = %row.project_id, error = %e, "receive session failure not recorded")
+            }
+        }
+    }
+    landed
 }
 
 /// Test hooks (Task 15 fix round 1, I2): the next landing under a root

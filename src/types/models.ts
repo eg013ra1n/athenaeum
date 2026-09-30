@@ -1958,6 +1958,10 @@ export type DeviceNameView = { projectId: string, device: string, memberName: st
 
 export type ExchangeSnapshot = { projects: Array<ProjectFlows>, names: Array<DeviceNameView>, };
 
+export type SessionSourceView = { device: string, memberName: string | null, deviceName: string | null, bytes: number, };
+
+export type ReceiveSessionView = { id: number, projectId: string, projectTitle: string, startedAt: string, finishedAt: string, frames: number, bytes: number, failed: number, sources: Array<SessionSourceView>, };
+
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**
  * Human-readable failure reasons, empty when publishable (e.g.

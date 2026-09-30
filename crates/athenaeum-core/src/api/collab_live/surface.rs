@@ -1064,6 +1064,102 @@ pub fn get_collab_exchange(
     })
 }
 
+/// One receive session's per-device byte total, named exactly as
+/// [`get_collab_exchange`]'s peers are — sorted by bytes descending (the top
+/// source first).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSourceView {
+    pub device: String,
+    pub member_name: Option<String>,
+    pub device_name: Option<String>,
+    pub bytes: i64,
+}
+
+/// One project receive session (collab observability wave 1, Task 13): a
+/// burst of landings collapsed into one row, in place of one `sync_history`
+/// row per frame crowding the Transfers history.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveSessionView {
+    pub id: i64,
+    pub project_id: String,
+    pub project_title: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub frames: i64,
+    pub bytes: i64,
+    pub failed: i64,
+    pub sources: Vec<SessionSourceView>,
+}
+
+/// The project's (or every project's) receive sessions, newest first, peers
+/// named the same way `get_collab_exchange` names its flows. Answers from the
+/// catalog alone — no live runtime needed (review focus 5): a signed-out or
+/// just-started app still shows its receive history.
+pub fn list_collab_receive_sessions(
+    ctx: &ServiceContext,
+    project_id: Option<&str>,
+    limit: Option<i64>,
+) -> Result<Vec<ReceiveSessionView>, ApiError> {
+    let limit = limit.unwrap_or(200).clamp(1, 1000);
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let rows = crate::db::collab_sessions::list(&conn, project_id, limit)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let project = crate::db::collab::get_project(&conn, &row.project_id)?;
+        let title = project
+            .as_ref()
+            .map(|p| p.title.clone())
+            .unwrap_or_default();
+        if project.is_none() {
+            tracing::debug!(project_id = %row.project_id, "receive session for a project not cached; sources unnamed");
+        }
+        let members: Vec<SnapshotMember> = project
+            .as_ref()
+            .map(|p| {
+                serde_json::from_str(&p.members_json).unwrap_or_else(|e| {
+                    tracing::warn!(project_id = %row.project_id, error = %e, "members_json unreadable; receive session sources named by device only");
+                    Vec::new()
+                })
+            })
+            .unwrap_or_default();
+        let devices = if project.is_some() {
+            live_db::load_holders(&conn, &row.project_id)?.0
+        } else {
+            Vec::new()
+        };
+        let mut sources: Vec<SessionSourceView> = row
+            .sources
+            .into_iter()
+            .map(|(device, bytes)| SessionSourceView {
+                member_name: member_of_device(&members, &device).map(|m| m.display_name.clone()),
+                device_name: devices
+                    .iter()
+                    .find(|d| d.device == device)
+                    .map(|d| d.display_name.clone())
+                    .filter(|n| !n.is_empty()),
+                device,
+                bytes,
+            })
+            .collect();
+        sources.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        out.push(ReceiveSessionView {
+            id: row.id,
+            project_id: row.project_id,
+            project_title: title,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+            frames: row.frames,
+            bytes: row.bytes,
+            failed: row.failed,
+            sources,
+        });
+    }
+    Ok(out)
+}
+
 // ── live status, Sync now, stream limits ───────────────────────────────────
 
 /// The live status (P27); `off` when no live exchange runs.
@@ -2416,6 +2512,60 @@ mod tests {
                 projects: vec![],
                 names: vec![]
             }
+        );
+    }
+
+    /// Review focus 5 (`list_collab_receive_sessions` half): no live runtime
+    /// is needed — the sessions come straight from the catalog, named the
+    /// way `get_collab_exchange`'s peers are, sources sorted top-source-first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receive_sessions_name_sources_and_sort_them_by_bytes_descending() {
+        let (_d, ctx, _hub) = ts::signed_in_rig().await;
+        let pid = ts::PID;
+        {
+            let db = crate::api::db(&ctx).unwrap();
+            let conn = db.conn();
+            seed_project_with_members(&conn, pid, &[("acc-anna", "Anna", &["AAA="])]);
+            let devices = vec![live_db::HolderDeviceRow {
+                device: "BBB=".into(),
+                display_name: "bo-mac".into(),
+                relay_url: None,
+            }];
+            live_db::replace_holders(&conn, pid, &devices, &[]).unwrap();
+            crate::db::collab_sessions::record_landing(
+                &conn,
+                pid,
+                "2026-09-29T10:00:00.000Z",
+                100,
+                &[("AAA=".to_string(), 30), ("BBB=".to_string(), 70)],
+            )
+            .unwrap();
+        }
+        let sessions = list_collab_receive_sessions(&ctx, Some(pid), None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.project_id, pid);
+        assert_eq!(s.project_title, "M31");
+        assert_eq!((s.frames, s.bytes, s.failed), (1, 100, 0));
+        assert_eq!(
+            s.sources.iter().map(|v| v.bytes).collect::<Vec<_>>(),
+            vec![70, 30],
+            "the top source (BBB=, a device with no member) sorts first"
+        );
+        assert_eq!(
+            (
+                s.sources[0].device.as_str(),
+                s.sources[0].member_name.as_deref(),
+                s.sources[0].device_name.as_deref()
+            ),
+            ("BBB=", None, Some("bo-mac"))
+        );
+        assert_eq!(
+            (
+                s.sources[1].device.as_str(),
+                s.sources[1].member_name.as_deref()
+            ),
+            ("AAA=", Some("Anna"))
         );
     }
 

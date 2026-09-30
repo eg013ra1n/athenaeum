@@ -747,18 +747,33 @@ fn record_landing(env: &LandingEnv<'_>, row: &LocalFrameRow, dest: &Path) -> Res
     }
     frames_db::set_local_state(&tx, &row.project_id, &row.frame_uuid, to)
         .context("move frame to held")?;
+    let now = crate::sync::now_iso();
+    crate::db::collab_sessions::record_landing(
+        &tx,
+        &row.project_id,
+        &now,
+        row.byte_size.max(0),
+        env.sources,
+    )
+    .context("record receive session")?;
     crate::sync::store::insert_history_row(
         &tx,
         &crate::sync::HistoryRow {
             frame_uuid: row.frame_uuid.clone(),
             filename: row.file_name.clone(),
             object: None,
-            // A swarm fetch has no single serving device.
-            peer_device: "swarm".to_string(),
+            // The device that delivered the most bytes; `local` for a copy
+            // linked from content already on disk (`link_identical`, no
+            // fetch — `env.sources` is empty).
+            peer_device: env
+                .sources
+                .first()
+                .map(|(d, _)| d.clone())
+                .unwrap_or_else(|| "local".to_string()),
             direction: crate::sync::Direction::Received,
             bytes: row.byte_size.max(0) as u64,
             started_at: env.started_at.to_string(),
-            finished_at: Some(crate::sync::now_iso()),
+            finished_at: Some(now.clone()),
             outcome: "ingested".to_string(),
             project: Some(row.project_id.clone()),
             package_id: None,
@@ -1065,6 +1080,43 @@ mod tests {
             rig.node.project_frame_tags(&pid, &uuid).await.unwrap(),
             vec![(2, rig.v2_hash(0))],
             "v1 unseeded, v2 seeded"
+        );
+    }
+
+    /// Task 13: a landed frame's sources (the fetch's per-device byte
+    /// totals) join the project's receive session and name the
+    /// `sync_history` row's real top source — no more the placeholder
+    /// `"swarm"`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_landed_frames_sources_join_its_receive_session_and_name_its_history_row() {
+        let rig = ts::fetch_rig(1).await;
+        let (pid, uuid) = rig.frame(0);
+        rig.land_with_sources(0, &[("SRC=".into(), 42)])
+            .await
+            .expect("v1 lands");
+
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        let sessions = crate::db::collab_sessions::list(&conn, Some(&pid), 10).unwrap();
+        assert_eq!(sessions.len(), 1, "one receive session for the landing");
+        assert_eq!(sessions[0].frames, 1);
+        assert_eq!(sessions[0].sources.get("SRC=").copied(), Some(42));
+
+        let rows = crate::sync::store::search_history_rows(
+            &conn,
+            &crate::sync::HistoryQuery {
+                project: Some(pid.clone()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.frame_uuid == uuid)
+            .expect("a sync_history row for the landed frame");
+        assert_eq!(
+            row.peer_device, "SRC=",
+            "the history row names the real top source, not the swarm placeholder"
         );
     }
 
