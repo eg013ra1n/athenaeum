@@ -71,7 +71,6 @@ function defaultProps(overrides: Partial<MyFramesTabProps> = {}): MyFramesTabPro
     rows: [],
     error: false,
     links: [],
-    autoPublish: true,
     segment: 'ready',
     onSegment: vi.fn(),
     onReload: vi.fn(),
@@ -126,11 +125,43 @@ const fourRows: OwnFrameRow[] = [
 ];
 
 describe('MyFramesTab — segments', () => {
+  it('segment tiles and the two buttons sit on one row like the mockup', () => {
+    renderTab({ rows: fourRows.slice(0, 1).concat(fourRows.slice(2)) });
+    expect(screen.getByRole('button', { name: /1 Ready to publish/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /1 Published/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /1 Held back/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '+ Link an object' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Recalibrate and republish all' })).toBeInTheDocument();
+    expect(screen.queryByText('Linked objects')).toBeNull();
+    expect(screen.queryByText('Auto-publish my frames')).toBeNull();
+  });
+
+  it('Ready shows "Publish all N" as the primary action', () => {
+    renderTab({ rows: fourRows });
+    expect(screen.getByRole('button', { name: 'Publish all 2' }).className).toContain('bg-accent');
+  });
+
+  it('the link dialog lists the linked objects with their target state', async () => {
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
+      Promise.resolve(cmd === 'list_collab_link_suggestions' ? [] : null)) as never);
+    renderTab({
+      links: [
+        { framesSetId: 1, name: 'M31', lightCount: 40, withinRadius: true },
+        { framesSetId: 2, name: 'M33', lightCount: 12, withinRadius: false },
+      ] as never,
+    });
+    fireEvent.click(screen.getByRole('button', { name: '+ Link an object' }));
+    expect(await screen.findByText('M31')).toBeInTheDocument();
+    expect(screen.getByText('on target')).toBeInTheDocument();
+    expect(screen.getByText('outside the target')).toBeInTheDocument();
+    expect(screen.getByText('· 40 lights')).toBeInTheDocument();
+  });
+
   it('1. the segment buttons read the count of each segment', () => {
     renderTab({ rows: fourRows, segment: 'ready' });
-    expect(screen.getByRole('button', { name: 'Ready to publish 2' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Published 1' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Held back 1' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /2 Ready to publish/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /1 Published/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /1 Held back/ })).toBeInTheDocument();
   });
 
   it('2. with no selection, "Publish all 2" calls onRequestPublish with the two ready ids', () => {

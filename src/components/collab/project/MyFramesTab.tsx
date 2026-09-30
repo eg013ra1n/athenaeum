@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Loader2, Plus, RefreshCw } from 'lucide-react';
 import { api } from '../../../api';
 import { useNotifications } from '../../../contexts/NotificationContext';
 import type { AnalysisCompleteEvent } from '../../../types/helpers';
 import type { LinkedSetView, OwnFrameRow } from '../../../types/models';
-import AutoPublishSwitch from '../AutoPublishSwitch';
+import { Button, SegmentTiles } from '../../ui';
 import FilterMappingDialog from '../FilterMappingDialog';
 import LinkObjectDialog from '../LinkObjectDialog';
 import ExcludeDialog from './ExcludeDialog';
@@ -21,7 +20,6 @@ export interface MyFramesTabProps {
   rows: OwnFrameRow[] | null; // null = loading
   error: boolean;
   links: LinkedSetView[];
-  autoPublish: boolean;
   segment: Segment;
   onSegment: (s: Segment) => void;
   onReload: () => void; // re-read list_project_own_frames
@@ -39,12 +37,6 @@ export interface MyFramesTabProps {
   activeKey?: string | null;
 }
 
-const SEG_BTN = 'rounded border px-3 py-1.5 text-sm transition-colors';
-const SEG_BTN_ON = 'border-accent bg-accent/10 text-content';
-const SEG_BTN_OFF = 'border-border text-content-secondary hover:bg-surface-hover';
-const OUTLINE_BTN =
-  'inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50';
-
 /**
  * My frames — the three Ready/Published/Held back tables of the redesigned
  * collab project page (Task 10, spec 2026-09-30 §"My frames"). Carries the
@@ -55,7 +47,7 @@ const OUTLINE_BTN =
  * still uses the gate; untouched here).
  */
 export default function MyFramesTab({
-  projectId, rows, error, links, autoPublish, segment, onSegment, onReload, onDetailReload,
+  projectId, rows, error, links, segment, onSegment, onReload, onDetailReload,
   onRequestPublish, publishBusy, onRequestRepublish, republishBusy, canRepublish, canModerate,
   republishError, refusal, onOpen, activeKey = null,
 }: MyFramesTabProps): JSX.Element {
@@ -266,75 +258,34 @@ export default function MyFramesTab({
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-3">
-        <span className="text-sm font-medium text-content">Linked objects</span>
-        {links.length > 0 && (
-          <ul className="flex flex-wrap gap-2">
-            {links.map((l) => (
-              <li key={l.framesSetId} className="rounded border border-border px-2 py-1 text-xs text-content-secondary">
-                <span className="break-words">{l.name ?? `Set #${l.framesSetId}`}</span> · {l.lightCount} lights
-                {l.withinRadius ? ' · on target' : ''}
-              </li>
-            ))}
-          </ul>
-        )}
-        <button
-          type="button"
-          onClick={() => setLinkOpen(true)}
-          className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-content-secondary transition-colors hover:bg-surface-hover"
-        >
-          <Plus size={12} /> Link an object
-        </button>
-        <AutoPublishSwitch projectId={projectId} enabled={autoPublish} onToggled={onDetailReload} />
-      </div>
-
-      {error && <p className="text-sm text-error">Could not load your frames — see console.</p>}
+      {error && <p className="text-[12.5px] text-error">Could not load your frames — see console.</p>}
 
       {rows === null ? (
         <p className="text-sm text-content-muted">Loading…</p>
       ) : (
         <>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              aria-pressed={segment === 'ready'}
-              onClick={() => onSegment('ready')}
-              className={`${SEG_BTN} ${segment === 'ready' ? SEG_BTN_ON : SEG_BTN_OFF}`}
-            >
-              Ready to publish {readyRows.length}
-            </button>
-            <button
-              type="button"
-              aria-pressed={segment === 'published'}
-              onClick={() => onSegment('published')}
-              className={`${SEG_BTN} ${segment === 'published' ? SEG_BTN_ON : SEG_BTN_OFF}`}
-            >
-              Published {publishedRows.length}
-            </button>
-            <button
-              type="button"
-              aria-pressed={segment === 'held'}
-              onClick={() => onSegment('held')}
-              className={`${SEG_BTN} ${segment === 'held' ? SEG_BTN_ON : SEG_BTN_OFF}`}
-            >
-              Held back {heldRows.length}
-            </button>
+          <div className="mb-2.5 flex flex-wrap items-start gap-2">
+            <SegmentTiles
+              tiles={[
+                { value: 'ready', n: readyRows.length, label: 'Ready to publish', tone: 'accent' },
+                { value: 'published', n: publishedRows.length, label: 'Published', tone: 'success' },
+                { value: 'held', n: heldRows.length, label: 'Held back', tone: 'warning' },
+              ]}
+              value={segment}
+              onChange={onSegment}
+            />
             <span className="flex-1" />
-            {canRepublish && (
-              <button
-                type="button"
-                onClick={() => onRequestRepublish(null)}
-                disabled={republishBusy}
-                className={OUTLINE_BTN}
-                title="Regenerate every one of your published frames as a new content version"
-              >
-                {republishBusy && <Loader2 size={14} className="animate-spin" />}
-                <RefreshCw size={14} /> Recalibrate and republish all
-              </button>
-            )}
+            <Button onClick={() => setLinkOpen(true)}>+ Link an object</Button>
+            <Button
+              onClick={() => onRequestRepublish(null)}
+              disabled={!canRepublish || republishBusy}
+              title="Regenerate every one of your published frames as a new content version"
+            >
+              Recalibrate and republish all
+            </Button>
           </div>
 
-          {republishError && <p className="text-sm text-error">{republishError}</p>}
+          {republishError && <p className="text-[12.5px] text-error">{republishError}</p>}
           {refusal}
 
           {segment === 'ready' && (
@@ -393,6 +344,7 @@ export default function MyFramesTab({
       {linkOpen && (
         <LinkObjectDialog
           projectId={projectId}
+          links={links}
           onClose={() => setLinkOpen(false)}
           onChanged={() => {
             onDetailReload();

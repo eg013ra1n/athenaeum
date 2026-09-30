@@ -665,7 +665,6 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 rows={own}
                 error={ownError}
                 links={detail.links}
-                autoPublish={c.autoPublish}
                 segment={segment}
                 onSegment={setSegment}
                 onReload={() => void loadOwn()}

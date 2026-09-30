@@ -745,7 +745,7 @@ describe('ProjectDetail republish guard', () => {
     });
     renderProjectDetail();
     await openTab(/^My frames/);
-    fireEvent.click(await screen.findByRole('button', { name: /^Published 2/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /^2 Published/ }));
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all shown' }));
     fireEvent.click(screen.getByRole('button', { name: 'Republish 2' }));
 
@@ -806,7 +806,8 @@ describe('ProjectDetail My frames header (F7, dead decision-C hint removed)', ()
     renderProjectDetail();
     await openTab(/^My frames/);
 
-    const toggle = await screen.findByRole('checkbox', { name: /Auto-publish my frames/ });
+    // The page header's meta line owns the switch now.
+    const toggle = await screen.findByRole('button', { name: 'Auto-publish on' });
     // The fixture's `autoPublish` defaults to true; the click toggles it off.
     fireEvent.click(toggle);
     await waitFor(() =>
@@ -824,7 +825,7 @@ describe('ProjectDetail My frames header (F7, dead decision-C hint removed)', ()
     });
     renderProjectDetail();
     await openTab(/^My frames/);
-    fireEvent.click(await screen.findByRole('button', { name: /^Held back 1/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /^1 Held back/ }));
     await screen.findByRole('button', { name: 'Open calibration' });
     expect(screen.queryByText(/not available in this version/)).not.toBeInTheDocument();
   });
@@ -833,7 +834,7 @@ describe('ProjectDetail My frames header (F7, dead decision-C hint removed)', ()
 describe('ProjectDetail Held back fixes (My frames wiring)', () => {
   async function openHeld(count: number) {
     await openTab(/^My frames/);
-    fireEvent.click(await screen.findByRole('button', { name: new RegExp(`^Held back ${count}`) }));
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(`^${count} Held back`) }));
   }
 
   it("Analyze sends the held set's id as analyze_frame_set { frameSetId }", async () => {
@@ -1426,7 +1427,7 @@ describe('ProjectDetail frame drawer', () => {
     });
     renderProjectDetail();
     await openTab(/^My frames/);
-    fireEvent.click(await screen.findByRole('button', { name: /^Published 1/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /^1 Published/ }));
     fireEvent.click(await screen.findByText('P_0023.fits'));
 
     const drawer = await screen.findByRole('complementary');

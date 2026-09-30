@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Check, Link2, X } from 'lucide-react';
 import { api } from '../../api';
-import type { LinkSuggestion } from '../../types/models';
+import { Chip } from '../ui';
+import type { LinkSuggestion, LinkedSetView } from '../../types/models';
 
 /**
  * Link/unlink frame sets to a project (spec §7 — linking is explicit, never
@@ -10,10 +11,14 @@ import type { LinkSuggestion } from '../../types/models';
  */
 export default function LinkObjectDialog({
   projectId,
+  links = [],
   onClose,
   onChanged,
 }: {
   projectId: string;
+  /** The project's current links — listed read-only above the suggestions
+   *  (unlinking stays on each suggestion's Linked button). */
+  links?: LinkedSetView[];
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -75,6 +80,27 @@ export default function LinkObjectDialog({
           Frame sets nearest the project target come first. Linking is a catalog-only
           choice — each frame is still checked against the project&apos;s quality gate.
         </p>
+        {links.length > 0 && (
+          <div className="mb-3">
+            <div className="mb-1 text-xs font-medium text-content-secondary">Linked objects</div>
+            <ul className="space-y-1">
+              {links.map((l) => (
+                <li
+                  key={l.framesSetId}
+                  className="flex items-center gap-2 rounded border border-border px-3 py-2 text-sm"
+                >
+                  <span className="truncate text-content">{l.name ?? `Set #${l.framesSetId}`}</span>
+                  <span className="flex-shrink-0 text-xs text-content-muted">· {l.lightCount} lights</span>
+                  {l.withinRadius ? (
+                    <Chip tone="ok">on target</Chip>
+                  ) : (
+                    <Chip tone="warn">outside the target</Chip>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <ul className="space-y-1">
           {suggestions.map((s) => (
             <li
