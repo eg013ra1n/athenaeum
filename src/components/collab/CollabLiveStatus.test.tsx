@@ -61,7 +61,7 @@ describe('liveStatusLabel', () => {
     expect(liveStatusLabel({ ...base, state: 'connecting' }, 0)).toBe('Connecting…');
     expect(liveStatusLabel({ ...base, state: 'reconnecting', retryInSecs: 12 }, 0)).toBe('Reconnecting in 12 s');
     expect(liveStatusLabel({ ...base, state: 'reconnecting', retryInSecs: 12 }, 5)).toBe('Reconnecting in 7 s');
-    expect(liveStatusLabel({ ...base, state: 'reconnecting', retryInSecs: 3 }, 9)).toBe('Reconnecting in 0 s');
+    expect(liveStatusLabel({ ...base, state: 'reconnecting', retryInSecs: 3 }, 9)).toBe('Reconnecting…');
     expect(liveStatusLabel({ ...base, state: 'unreachable' }, 0)).toBe('Hub unreachable — retrying');
     expect(liveStatusLabel({ ...base, state: 'signedOut' }, 0)).toBe('Signed out');
     expect(liveStatusLabel({ ...base, state: 'outdated' }, 0)).toBe('Update required');

@@ -242,8 +242,14 @@ export default function MembersTab({
                         {fwhm !== null ? `${fwhm.toFixed(2)}″` : <Ghost />}
                       </td>
                       <td className={`${TD} text-right`}>
-                        {`${m.holdsFrames.toLocaleString('en-US')} fr · ${formatSize(m.holdsBytes)} `}
-                        <span className="text-content-faint">{Math.round(m.holdsShare * 100)}%</span>
+                        {m.holdsFrames > 0 ? (
+                          <>
+                            {`${m.holdsFrames.toLocaleString('en-US')} fr · ${formatSize(m.holdsBytes)} `}
+                            <span className="text-content-faint">{Math.round(m.holdsShare * 100)}%</span>
+                          </>
+                        ) : (
+                          <Ghost />
+                        )}
                       </td>
                       <td className={TD}>
                         {m.online ? (

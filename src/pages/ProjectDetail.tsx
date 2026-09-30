@@ -545,7 +545,9 @@ function ProjectPage({ id }: { id: string | undefined }) {
             title can never push the pill and the portal link to a second row. */}
         <div className="flex items-center gap-x-3.5">
           <HistoryNav fallback="/projects" />
-          <h2 className="min-w-0 truncate text-2xl font-bold text-content">{c.title}</h2>
+          <h2 className="min-w-0 truncate text-2xl font-bold text-content" title={c.title}>
+            {c.title}
+          </h2>
           <span className="shrink-0 whitespace-nowrap text-sm font-normal text-content-muted">
             ◎ {c.targetName} · r {c.targetRadiusDeg.toFixed(1)}° · {detail.members.length}{' '}
             {detail.members.length === 1 ? 'member' : 'members'}

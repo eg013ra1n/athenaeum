@@ -167,6 +167,9 @@ describe('MembersTab — mockup table', () => {
     expect(within(row).getByText('26%').className).toContain('text-content-faint');
     expect(within(row).getByText('now').className).toContain('text-success');
     expect(screen.getByText(formatRelative(iso, Date.now()))).toBeInTheDocument();
+    // A member holding nothing reads a ghost dash, not "0 fr · 0 KB 0%" (like Σ).
+    const bob = screen.getByText('Bob').closest('tr') as HTMLElement;
+    expect(within(bob).queryByText(/0 fr/)).toBeNull();
   });
 
   it('sorting: Published desc by default, a header click flips, Last seen puts online first', () => {

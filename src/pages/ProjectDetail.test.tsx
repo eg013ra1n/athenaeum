@@ -1599,6 +1599,8 @@ describe('ProjectDetail page shell (wave 5.5)', () => {
     const h = await screen.findByRole('heading', { level: 2, name: /autumn campaign/ });
     expect(h.className).toContain('truncate');
     expect(h.className).toContain('min-w-0');
+    // The whole title stays readable on hover.
+    expect(h).toHaveAttribute('title', 'M31 Deep Field 2026 — autumn campaign with the extended team and guests');
     // The row never wraps, so the pill and the portal link stay on row 1.
     expect(h.parentElement!.className).not.toContain('flex-wrap');
   });

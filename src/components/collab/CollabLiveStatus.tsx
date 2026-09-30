@@ -42,8 +42,11 @@ export function liveStatusLabel(s: Status, elapsedSecs: number): string {
       return 'Live';
     case 'connecting':
       return 'Connecting…';
-    case 'reconnecting':
-      return `Reconnecting in ${Math.max(0, (s.retryInSecs ?? 0) - elapsedSecs)} s`;
+    case 'reconnecting': {
+      // At zero the attempt is in flight; a slow one must not read "in 0 s".
+      const left = (s.retryInSecs ?? 0) - elapsedSecs;
+      return left > 0 ? `Reconnecting in ${left} s` : 'Reconnecting…';
+    }
     case 'unreachable':
       return 'Hub unreachable — retrying';
     case 'signedOut':
