@@ -1772,6 +1772,13 @@ impl Runtime {
                 self.policy_dirty.insert(p.clone());
                 self.exec.dirty.insert(p.clone());
                 self.with_derive(|exec, d| exec.refresh_providers(&p, d));
+                // A member add/remove is a providers change too (the
+                // Members tab's roster): a member added while offline, or
+                // removed, would otherwise never nudge an open tab. Same
+                // throttle as ProvidersChanged.
+                let now = Instant::now();
+                self.peer_burst.note(&p, now);
+                self.flush_peer_bursts(now);
                 self.attention.insert(p);
             }
             FeedEffect::ProjectGone(p) => {
@@ -1795,6 +1802,14 @@ impl Runtime {
                         exec.refresh_need(p, fetching, *refused, d, true);
                     }
                 });
+                // Every provider list was refreshed above — a reused epoch
+                // affects every live project, not just one, so every one of
+                // them is noted (same throttle as ProvidersChanged).
+                let now = Instant::now();
+                for (p, _) in &projects {
+                    self.peer_burst.note(p, now);
+                }
+                self.flush_peer_bursts(now);
                 self.serving_dirty = true;
             }
         }
@@ -2186,6 +2201,14 @@ mod tests {
         assert!(
             b.due(t0 + Duration::from_millis(50)).is_empty(),
             "coalesced inside the throttle window"
+        );
+        // Cheap pin: the coalesced note schedules exactly the window's end —
+        // this is what `Runtime::deadline()` folds in via `next_deadline()`
+        // to actually wake the loop and flush it.
+        assert_eq!(
+            b.next_deadline(),
+            Some(t0 + LANDED_BURST),
+            "the coalesced change is scheduled for exactly the window's end"
         );
         b.note("p1", t0 + Duration::from_millis(200));
         assert!(

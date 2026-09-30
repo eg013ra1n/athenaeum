@@ -80,6 +80,33 @@ async fn a_new_holder_raises_collab_peers_changed() {
     }
 }
 
+/// Fix round 1: a member added to the project (a `ChangeKind::Members`
+/// project event, no publish or land involved) also raises
+/// `collab-peers-changed` — the Members tab must refresh even though nothing
+/// was published or landed. Covers the `FeedEffect::MembersChanged` arm,
+/// distinct from the holder-change coverage above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_change_raises_collab_peers_changed() {
+    let w = ts::two_instances().await;
+    w.hub.add_member(ts::PID, "acc-c", "send", false);
+    ts::wait_until(
+        "collab-peers-changed after a member change",
+        Duration::from_secs(10),
+        || {
+            !w.a.events
+                .payloads(crate::api::collab_exchange::COLLAB_PEERS_CHANGED_EVENT)
+                .is_empty()
+        },
+    )
+    .await;
+    for payload in
+        w.a.events
+            .payloads(crate::api::collab_exchange::COLLAB_PEERS_CHANGED_EVENT)
+    {
+        assert_eq!(payload["projectId"].as_str(), Some(ts::PID));
+    }
+}
+
 /// P28: a clean exit leaves presence at once; a restart resumes from the
 /// persisted holder map and claim digest — nothing is reported again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
