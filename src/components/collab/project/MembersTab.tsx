@@ -196,7 +196,10 @@ export default function MembersTab({
                       }`}
                     >
                       <td className={TD}>
-                        <span className="inline-flex items-center gap-[5px]">
+                        {/* align-top: the truncating name is a scroll container, which moves
+                            a baseline-aligned inline-flex's baseline to its bottom edge and
+                            stretches the row past the mockup's 30.5px */}
+                        <span className="inline-flex items-center gap-[5px] align-top">
                           <MemberDot color={colorOf(m.accountId)} />
                           <b
                             data-testid="member-name"
