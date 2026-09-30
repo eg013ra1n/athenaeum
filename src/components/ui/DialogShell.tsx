@@ -1,6 +1,8 @@
-import { useEffect, useId, useRef, type ReactNode } from 'react';
+import { useId, useLayoutEffect, useRef, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 import { Button } from './Button';
+import { isTopOverlay, popOverlay, pushOverlay } from './overlayStack';
 
 const FOCUSABLE = 'button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
@@ -20,11 +22,15 @@ export function DialogShell({ title, size = 'sm', onClose, busy = false, footer,
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
 
-  useEffect(() => {
+  const pressOnScrim = useRef(false);
+
+  useLayoutEffect(() => {
+    const overlayId = pushOverlay();
     const opener = document.activeElement as HTMLElement | null;
-    const first = ref.current?.querySelector<HTMLElement>(`[data-autofocus],${FOCUSABLE}`);
+    const first = ref.current?.querySelector<HTMLElement>('[data-autofocus]') ?? ref.current?.querySelector<HTMLElement>(FOCUSABLE);
     (first ?? ref.current)?.focus();
     const onKey = (e: KeyboardEvent) => {
+      if (!isTopOverlay(overlayId)) return;
       if (e.key === 'Escape') {
         if (!busyRef.current) closeRef.current();
         return;
@@ -39,15 +45,21 @@ export function DialogShell({ title, size = 'sm', onClose, busy = false, footer,
     document.addEventListener('keydown', onKey);
     return () => {
       document.removeEventListener('keydown', onKey);
+      popOverlay(overlayId);
       opener?.focus?.();
     };
   }, []);
 
-  return (
+  return createPortal(
     <div
       data-testid="dialog-scrim"
       className="fixed inset-0 z-50 flex items-center justify-center bg-[rgba(46,52,64,0.6)]"
-      onClick={() => { if (!busyRef.current) onClose(); }}
+      onMouseDown={(e) => { pressOnScrim.current = e.target === e.currentTarget; }}
+      onClick={(e) => {
+        const fromScrim = pressOnScrim.current && e.target === e.currentTarget;
+        pressOnScrim.current = false;
+        if (fromScrim && !busyRef.current) onClose();
+      }}
     >
       <div
         ref={ref}
@@ -65,6 +77,7 @@ export function DialogShell({ title, size = 'sm', onClose, busy = false, footer,
         <div>{children}</div>
         {footer !== undefined && <div className="mt-3.5 flex justify-end gap-2">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

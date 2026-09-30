@@ -1,13 +1,15 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useLayoutEffect, useRef, type ReactNode } from 'react';
+import { isTopOverlay, popOverlay, pushOverlay } from './overlayStack';
 
 /** Mockup `.pop` — absolutely positioned under its `relative` parent. */
 export function Popover({ open, onClose, children, className = '' }: { open: boolean; onClose: () => void; children: ReactNode; className?: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return undefined;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeRef.current(); };
+    const overlayId = pushOverlay();
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && isTopOverlay(overlayId)) closeRef.current(); };
     const onDown = (e: MouseEvent) => {
       if (ref.current && !ref.current.parentElement?.contains(e.target as Node)) closeRef.current();
     };
@@ -16,6 +18,7 @@ export function Popover({ open, onClose, children, className = '' }: { open: boo
     return () => {
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('mousedown', onDown);
+      popOverlay(overlayId);
     };
   }, [open]);
   if (!open) return null;

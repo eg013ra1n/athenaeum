@@ -1,6 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { X } from 'lucide-react';
 import { Button } from './Button';
+import { isTopOverlay, popOverlay, pushOverlay } from './overlayStack';
 
 /** Spec §6.1 — a tab body that grows a 400px docked panel column while `panel` is set. */
 export function PanelLayout({ panel, children }: { panel: ReactNode | null; children: ReactNode }) {
@@ -19,23 +20,38 @@ export function SidePanel({ title, label, onClose, children }: { title: ReactNod
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   useLayoutEffect(() => {
+    let raf = 0;
     const fit = () => {
       if (!ref.current) return;
       const top = Math.max(0, ref.current.getBoundingClientRect().top);
       setHeight(Math.max(240, window.innerHeight - top - 16));
     };
+    const schedule = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = 0; fit(); });
+    };
     fit();
     window.addEventListener('resize', fit);
-    return () => window.removeEventListener('resize', fit);
+    window.addEventListener('scroll', schedule, { capture: true, passive: true });
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(schedule) : null;
+    ro?.observe(document.body);
+    return () => {
+      window.removeEventListener('resize', fit);
+      window.removeEventListener('scroll', schedule, { capture: true });
+      ro?.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
   }, []);
-  useEffect(() => {
+  useLayoutEffect(() => {
+    const overlayId = pushOverlay();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || e.defaultPrevented) return;
-      if (document.querySelector('[role="dialog"]')) return; // an open dialog owns Escape
-      closeRef.current();
+      if (e.key === 'Escape' && isTopOverlay(overlayId)) closeRef.current();
     };
     document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      popOverlay(overlayId);
+    };
   }, []);
   return (
     <aside
