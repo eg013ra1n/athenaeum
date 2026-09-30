@@ -935,6 +935,11 @@ pub fn record_own(conn: &Connection, row: &LocalFrameRow) -> Result<()> {
             announced_at,
         ],
     )?;
+    // The publish wrote this file before this row existed, so the watcher may
+    // have listed it as foreign in between; the row claims the path now.
+    if let Some(path) = row.landed_path.as_deref() {
+        forget_foreign_file(conn, path)?;
+    }
     Ok(())
 }
 
@@ -1713,10 +1718,17 @@ pub fn record_foreign_file(
 /// The foreign files listed for a project — those whose `ATH_PRJ` stamp
 /// names it, plus the unstamped ones (they belong to no project, so every
 /// project's "Other files" list shows them). `(path, seen_at)` by path.
+///
+/// A path some frame row has since landed at is never listed: a publish
+/// writes the file before its own row exists, so the watcher can list it
+/// first, and the list must not outlive the row that claims the path —
+/// whichever of the six `landed_path` writers claimed it.
 pub fn list_foreign_files(conn: &Connection, project_id: &str) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT path, seen_at FROM collab_foreign_files
-         WHERE project_id = ?1 OR project_id IS NULL ORDER BY path",
+        "SELECT f.path, f.seen_at FROM collab_foreign_files f
+         WHERE (f.project_id = ?1 OR f.project_id IS NULL)
+           AND NOT EXISTS (SELECT 1 FROM project_frames_local l WHERE l.landed_path = f.path)
+         ORDER BY f.path",
     )?;
     let rows = stmt
         .query_map(params![project_id], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1826,6 +1838,36 @@ mod tests {
             })
             .collect();
         assert_eq!(paths, vec!["/collab/a.fits", "/collab/b.fits"]);
+    }
+
+    /// The publish race: the watcher lists the freshly written file before
+    /// its own row exists. Recording the own row drops the entry, and a path
+    /// any row has landed at is never listed even if an entry survives.
+    #[test]
+    fn a_path_a_frame_row_landed_at_is_not_an_other_file() {
+        let c = conn();
+        record_foreign_file(&c, "/c/u1.fits", None, None).unwrap();
+        record_foreign_file(&c, "/c/u2.fits", Some("p1"), None).unwrap();
+        record_foreign_file(&c, "/c/stray.fits", None, None).unwrap();
+        own_manifest_row(&c, "u1");
+        let mut row = get(&c, "p1", "u1").unwrap().unwrap();
+        row.on_disk = true;
+        row.landed_path = Some("/c/u1.fits".into());
+        record_own(&c, &row).unwrap();
+        assert_eq!(foreign_file_size_mtime(&c, "/c/u1.fits").unwrap(), None);
+        // An entry left behind by an older build: hidden by the landed path.
+        own_manifest_row(&c, "u2");
+        c.execute(
+            "UPDATE project_frames_local SET landed_path = '/c/u2.fits' WHERE frame_uuid = 'u2'",
+            [],
+        )
+        .unwrap();
+        let paths: Vec<String> = list_foreign_files(&c, "p1")
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(paths, vec!["/c/stray.fits"]);
     }
 
     // ── Amendment A6: own per device ─────────────────────────────────────

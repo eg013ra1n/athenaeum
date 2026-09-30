@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, FileQuestion, FileWarning, Trash2 } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronRight, FileQuestion, FileWarning, Trash2 } from 'lucide-react';
 import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { ConfirmDialog } from '../ConfirmDialog';
@@ -9,6 +9,7 @@ import type {
   ChangedFileView,
   CollabAttention as Attention,
   CollabAttentionChanged,
+  ForeignFileView,
   LastCopyView,
 } from '../../types/models';
 
@@ -23,8 +24,8 @@ import type {
  *   or "Stop keeping", per frame and for all. "Stop keeping" shows the
  *   last-copy warning first when a frame has fewer than 2 other holders.
  * - **Not kept** (L6) — reversible: "Keep again", per frame and for all.
- * - **Other files** — files in the folder that no frame references; listed,
- *   never deleted.
+ * - **Other files** — files in the folder that no frame references; never
+ *   deleted. Informational, so it stays one collapsed line with a count.
  *
  * Reloads on mount and on `collab-attention-changed` for this project.
  * Per-row buttons are named with their file ("Re-fetch c_b.fits"), bulk
@@ -404,24 +405,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
           </Section>
         )}
 
-        {otherFiles.length > 0 && (
-          <Section
-            title="Other files"
-            icon={<FileQuestion size={14} className="text-content-muted" />}
-            note="Files in the Collaboration folder that belong to no project frame. The app never deletes them."
-          >
-            <ul className="space-y-1">
-              {otherFiles.map((f) => (
-                <li key={f.path} className="flex flex-wrap items-center gap-x-3 text-xs">
-                  <span className="min-w-0 flex-1 truncate text-content-secondary" title={f.path}>
-                    {f.path}
-                  </span>
-                  <span className="text-content-muted">{formatTimestamp(f.seenAt)}</span>
-                </li>
-              ))}
-            </ul>
-          </Section>
-        )}
+        {otherFiles.length > 0 && <OtherFiles files={otherFiles} />}
       </div>
 
       <ConfirmDialog
@@ -467,6 +451,52 @@ function Section({
       </div>
       <p className="text-xs text-content-muted">{note}</p>
       {children}
+    </section>
+  );
+}
+
+/** File name and its folder, split at the last separator (either kind). */
+function splitPath(path: string): { name: string; dir: string } {
+  const i = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  return i < 0 ? { name: path, dir: '' } : { name: path.slice(i + 1), dir: path.slice(0, i) };
+}
+
+/** "Other files": nothing to act on, so a collapsed line until opened; the
+ *  open list scrolls inside a bounded box instead of pushing the table down. */
+function OtherFiles({ files }: { files: ForeignFileView[] }) {
+  const [open, setOpen] = useState(false);
+  const listId = useId();
+  const Chevron = open ? ChevronDown : ChevronRight;
+  return (
+    <section className="rounded border border-border bg-surface px-3 py-1.5">
+      <button
+        type="button"
+        className="flex w-full items-center gap-2 text-left text-xs text-content-secondary hover:text-content"
+        aria-expanded={open}
+        aria-controls={listId}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <Chevron size={14} className="text-content-muted" />
+        <FileQuestion size={14} className="text-content-muted" />
+        <span className="font-medium">
+          {files.length} other {files.length === 1 ? 'file' : 'files'} in the Collaboration folder
+        </span>
+        <span className="truncate text-content-muted">— belong to no project frame; the app never deletes them</span>
+      </button>
+      {open && (
+        <ul id={listId} className="mt-1.5 max-h-48 space-y-0.5 overflow-y-auto pr-1">
+          {files.map((f) => {
+            const { name, dir } = splitPath(f.path);
+            return (
+              <li key={f.path} className="flex items-center gap-x-3 text-xs" title={f.path}>
+                <span className="max-w-[18rem] shrink-0 truncate text-content">{name}</span>
+                <span className="min-w-0 flex-1 truncate text-content-muted">{dir}</span>
+                <span className="shrink-0 text-content-muted">{formatTimestamp(f.seenAt)}</span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </section>
   );
 }

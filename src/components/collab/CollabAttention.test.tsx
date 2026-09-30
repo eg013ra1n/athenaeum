@@ -72,9 +72,15 @@ describe('CollabAttention', () => {
     expect(screen.getByText('Waiting for your choice')).toBeInTheDocument();
     expect(screen.getByText(/Nothing else is paused/)).toBeInTheDocument();
     expect(screen.getByText('Not kept')).toBeInTheDocument();
-    expect(screen.getByText('Other files')).toBeInTheDocument();
-    expect(screen.getByText(/The app never deletes them/)).toBeInTheDocument();
-    expect(screen.getByText('/c/m31/stray.fits')).toBeInTheDocument();
+    // "Other files" is one collapsed line with a count; the paths open on demand.
+    const other = screen.getByRole('button', { name: /1 other file in the Collaboration folder/ });
+    expect(other).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByText(/the app never deletes them/)).toBeInTheDocument();
+    expect(screen.queryByText('stray.fits')).toBeNull();
+    fireEvent.click(other);
+    expect(other).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('stray.fits')).toBeInTheDocument();
+    expect(screen.getByText('/c/m31')).toBeInTheDocument();
     expect(api.invoke).toHaveBeenCalledWith('list_collab_attention', { projectId: 'p1' });
   });
 
