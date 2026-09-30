@@ -221,3 +221,43 @@ commands and one meter close that gap without touching the iroh wire.
   drawer's "received <date> from <member>"), with `peer_device` now the top source's base64 device id (the
   same string as `SnapshotMember.nodes`), or `"local"` for content linked from disk with no fetch;
   personal-sync rows are unaffected and keep their hex node ids.
+
+## Collab project page (wave 2, 2026-09-30)
+
+Spec `docs/superpowers/specs/2026-09-29-collab-project-observability-design.md` (amendments §14), plan
+`docs/superpowers/plans/2026-09-30-collab-observability-wave2-frontend-plan.md`. `ProjectDetail.tsx` (the page
+shell) now composes six tabs under `src/components/collab/project/` — `GateTable`/`PublicationHistory`,
+`ReceiveTab.tsx` and the old four-tab switch are gone:
+
+| Tab | Visible to | Content |
+| ---- | ---- | ---- |
+| Overview | everyone | Integration vs goals, my three numbers (ready/published/held back), Needs attention, Exchange now |
+| My frames | everyone | Ready / Published / Held back segments, `+ Link an object`, `Recalibrate and republish all` |
+| Library | `send_receive` or coordinator | Other members' published frames and their state on this device |
+| Members | everyone | People, last seen, contribution and holdings |
+| Exchange | everyone | Live per-member rows both directions, then receive history |
+| Moderation | coordinator, `requireApproval` | Pending first publications, batch approve/reject |
+
+- **`ProjectFrameTable`** (`src/components/collab/project/table/`, plus `frames.ts`'s view-model/column
+  configs) is the one grouped table every tab's list runs on: facet row (filter/camera/night/publisher/state/
+  name search, counts against the other active facets), group row (two levels, expand/collapse, per-tab column
+  visibility), a totals strip over the filtered set with `(N of M)` actions, windowed rows (start clamped to
+  `[0, max(0, total*rowH − viewportH)]` so a shrunk total never blanks the view), and a frame drawer with the
+  rule-by-rule gate (`RuleVerdict[]` from `evaluate_frame`), holders and, for a received frame, provenance
+  ("received <date> from <member>"). Grouping/aggregate/windowing logic is pure and lives beside the table, not
+  in the tab components.
+- **`CollabExchangeProvider`** (`src/contexts/CollabExchangeContext.tsx`), mounted once in `Layout.tsx`, is the
+  ONE poller/listener pair behind the project Exchange tab, the Transfers page and the sidebar indicator: the
+  initial `get_collab_exchange` snapshot, the `collab-exchange-progress` event stream (an unnamed device
+  triggers at most one in-flight global refetch), and a `collab-live-status` listener that clears live flows on
+  any transition away from `'live'` (the runtime sends no quiet payload on stop). Its pure reducer
+  (`components/collab/exchange/state.ts`) keeps a per-project `summary` (`toGo`, `waitingForPublisher`)
+  separate from the live-flow map — the meter's 60 s "just finished" ghost is filtered out of `projects`, but
+  `summary` is written for every project a snapshot names and is never deleted by a quiet event or by
+  `clearFlows`; it is not flow data.
+- **Transfers** (`src/pages/Transfers.tsx`) merges `list_collab_receive_sessions` into the unified history by
+  time alongside the personal-sync groups, and renders `CollabTrafficGroups` above the list — one expandable
+  group per project with a live flow, the same per-peer rows as the project's Exchange tab, fed by the same
+  provider (never a second poller).
+- **The sidebar `TransferIndicator`** lights on collab-only traffic too (`exchangeTotals().active` — some flow
+  actually moving, not merely a nonzero rate), reading the same `CollabExchangeProvider` state.

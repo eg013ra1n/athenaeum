@@ -201,9 +201,36 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
-### Collab observability wave 1 (2026-09-30)
+### Collab observability wave 1 + 2 (2026-09-30)
 
-Collab observability wave 1 — owner smoke owed: two instances on the test hub, live rows both ways, sessions with sources, Members holds/last seen.
+Backend (wave 1: the exchange meter, sessions, member summary) and frontend (wave 2: the six-tab project
+page, `ProjectFrameTable`, Exchange tab, Transfers groups/sessions, the sidebar indicator) are both
+code-complete with green gates. Spec
+`docs/superpowers/specs/2026-09-29-collab-project-observability-design.md` (amendments §13, §14), plans
+`docs/superpowers/plans/2026-09-30-collab-observability-wave{0-hub,1-core,2-frontend}-plan.md`. Owner smoke
+owed, on the test hub, spec §10's three-instance scenario plus the wave-2 surface it now exercises:
+
+- the coordinator sets goals on the portal and the app's Overview draws them;
+- a member who quit an hour ago shows that time in Members;
+- A publishes, B receives from A and C; both ends show live rows with names, rate and ETA;
+- B's Transfers shows the project group and a session in history with both sources;
+- A's Published shows B as holder in the drawer; Members holds match;
+- select three Ready frames and publish exactly those;
+- republish two selected frames;
+- "Recalibrate and republish all" opens the typed-count guard, refuses a wrong count and republishes only
+  the guard's own published, non-excluded frames on the right one;
+- the coordinator excludes a frame with a reason and it shows `excluded` on the publisher's Published tab,
+  then restores it;
+- the drawer shows the rules table and the path;
+- Held back Solve/Analyze from the group header;
+- Library `Keep again`;
+- the sidebar indicator lights on collab-only traffic;
+- the project page refreshes on its own after a background auto-publish (`collab-published`), with no
+  manual reload.
+
+Deferred, not built this cycle: Ask to exclude (hub mechanism, publisher side) and per-frame Download /
+Stop keeping in the Library tab (core want/unwant override on top of the replication policy, plus replica
+deletion with the last-copy warning).
 
 ### Collab v3 wave 3 — owner smoke (2026-09-28)
 

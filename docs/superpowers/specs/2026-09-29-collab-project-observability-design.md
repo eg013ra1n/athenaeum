@@ -479,3 +479,42 @@ each is fixed inline above and listed here for the record.
 7. **§7.2 provenance.** `sync_history.peer_device` for a collab landing is the top source's base64 device id
    (the same string as `SnapshotMember.nodes`), or `"local"` for content linked from disk with no fetch;
    personal-sync rows are unaffected and keep their hex node ids.
+
+## 14. Amendments (wave 2, 2026-09-30)
+
+Wave 2 (frontend) implementation found six places where the built shape differs from this design, and the
+controller made five further rulings that change a documented contract; both are listed here for the record.
+
+1. **§4.2 actions — publish and republish.** Publish and republish take an optional `frameIds`. The primary
+   action always sends the ids it shows. Every republish goes through a guard dialog, which asks for the typed
+   frame count for "all" or for more than 100 frames.
+2. **§4.2 actions — Exclude / Restore.** Exclude/Restore (coordinator) are built on the hub's existing
+   `PATCH …/frames/{uuid}`. Ask to exclude, Download and Stop keeping (held) are not built (hub mechanism /
+   new core model).
+3. **§4 page.** The project page no longer calls `evaluate_collab_gate`. Held back's Reason actions work from
+   the group's rows.
+4. **§4.1 drawer.** `FrameGateRow` / `OwnFrameRow` carry `rules[]` (`RuleVerdict`) from `evaluate_frame`, and
+   `OwnFrameRow` carries `path` and `accepted`. The drawer is rule-by-rule, as §4.1 says.
+5. **§5.2 `ProjectFrameView`.** Gained `receivedAt` / `receivedFromDevice` / `receivedFromMember`.
+6. **§4.2 Published table.** "Only one copy" means `holdersTotal + (this device holds it)` = 1, because
+   `holdersTotal` counts other devices only.
+7. **§4.2 My frames — "Recalibrate and republish all".** Sends the guard's own target ids (own published,
+   non-excluded `frameIds`), never `frameIds: null` — a null republish runs force over every gate candidate
+   and would announce never-published Ready frames, contradicting "publish sends the ids it shows" and "no
+   100 TB by one click". The typed-count rule still keys on "all" (controller ruling, Task 16).
+8. **§4.2 Moderation — batch approve/reject.** An approve-with-trust cascade can answer a later frame of the
+   same publisher with Conflict "This frame was already decided — refresh the queue." (detected by that
+   stable core message prefix). The batch loop treats that one refusal as benign — the frame is no longer
+   pending, so it counts as decided and the loop continues; any other error still stops it (controller ruling,
+   Task 12).
+9. **§6.4 / §8 `ExchangeState`.** Keeps a per-project `summary` (`toGo`, `waitingForPublisher`) separate from
+   the live-flow map: the meter keeps a finished flow for 60 s reporting `moving: false, rateBps: 0`, so both
+   `applySnapshot` and `applyProgress` filter that ghost out of `projects` — but `summary` is written for
+   every project named in a snapshot's answer and is never deleted by a quiet event or by `clearFlows`; it is
+   not flow data (controller ruling, Task 8).
+10. **§4.2 Library — Exclude dialog reason.** The reason-length check counts Unicode characters
+    (`[...reason.trim()].length`), matching the core/hub count, not UTF-16 code units (controller ruling,
+    Task 9).
+11. **§6.3 device → person.** `member_of_device` moved from `api::collab_live::surface` (render-gated) to
+    `collab::snapshot` (ungated), required so the headless build still compiles it; behaviour-preserving
+    (controller ruling, Task 2).
