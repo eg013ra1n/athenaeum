@@ -1,10 +1,11 @@
-import { useMemo, type JSX } from 'react';
+import { useMemo, useState, type JSX } from 'react';
 import { useCollabExchange } from '../../../contexts/CollabExchangeContext';
 import { distinctNames, peerLabel, sumRate } from '../exchange/state';
 import { formatDurationPadded, formatRate } from '../format';
 import { Button, Card, Chip, EmptyState, FilterDot, MemberDot } from '../../ui';
 import { filterOrder } from './table/model';
-import { deriveAttention, type AttentionTarget } from './attention';
+import { deriveAttention, type AttentionTarget, type NavTarget } from './attention';
+import FilterMappingDialog from '../FilterMappingDialog';
 import { useMemberColor } from './MemberColorsContext';
 import type { Segment } from './MyFramesTab';
 import type { MemberSummary, OwnFrameRow, ProjectFrameView, ThresholdRuleView } from '../../../types/models';
@@ -35,7 +36,11 @@ export interface OverviewTabProps {
   thresholdsVersion: number | null;
   onOpenSegment: (s: Segment) => void;
   onOpenTab: (t: string) => void;
-  onAttention: (target: AttentionTarget) => void;
+  /** This member receives (has the Library tab). */
+  canReceive: boolean;
+  /** Reload own frames after the filter mapping is saved. */
+  onReloadOwn: () => void;
+  onAttention: (target: NavTarget) => void;
 }
 
 // Keys are the gate's METRIC_REGISTRY (crates/athenaeum-core/src/collab/gate.rs).
@@ -63,10 +68,14 @@ export default function OverviewTab({
   thresholdsVersion,
   onOpenSegment,
   onOpenTab,
+  canReceive,
+  onReloadOwn,
   onAttention,
 }: OverviewTabProps): JSX.Element {
   const { state } = useCollabExchange();
   const colorOf = useMemberColor();
+  const [mapOpen, setMapOpen] = useState(false);
+  const act = (t: AttentionTarget) => (t.kind === 'map' ? setMapOpen(true) : onAttention(t));
 
   const rows = own ?? [];
   const readyCount = rows.filter((r) => r.segment === 'ready').length;
@@ -74,8 +83,8 @@ export default function OverviewTab({
   const heldCount = rows.filter((r) => r.segment === 'held').length;
 
   const items = useMemo(
-    () => deriveAttention({ own: own ?? [], library: library ?? [], members: members ?? [], canModerate, pending, now: Date.now() }),
-    [own, library, members, canModerate, pending],
+    () => deriveAttention({ own: own ?? [], library: library ?? [], members: members ?? [], canModerate, canReceive, pending, now: Date.now() }),
+    [own, library, members, canModerate, canReceive, pending],
   );
 
   // Integration: the union of every canonical filter with a goal or at
@@ -98,6 +107,7 @@ export default function OverviewTab({
   ] as const;
 
   return (
+    <>
     <div className="grid grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)] items-start gap-3.5 max-[900px]:grid-cols-1">
       <Card title="Integration toward goal" subtitle="published, accepted frames · by member">
         {members === null ? (
@@ -189,13 +199,13 @@ export default function OverviewTab({
             <EmptyState>Nothing needs your attention.</EmptyState>
           ) : (
             items.map((it) => (
-              <div key={it.key} className="flex items-start gap-2.5 border-t border-line py-[7px] text-[12.5px] first:border-t-0">
+              <div key={it.key} className="flex items-start gap-2.5 border-t border-line py-[7px] text-[12.5px] first-of-type:border-t-0">
                 <Chip tone={it.tone}>{it.count.toLocaleString('en-US')}</Chip>
                 <span className="flex-1 text-content-secondary">
                   {it.title}
                   {it.detail && <small className="block text-[11.5px] text-content-faint">{it.detail}</small>}
                 </span>
-                <Button size="sm" onClick={() => onAttention(it.target)}>{it.action}</Button>
+                <Button size="sm" onClick={() => act(it.target)}>{it.action}</Button>
               </div>
             ))
           )}
@@ -227,5 +237,16 @@ export default function OverviewTab({
         </Card>
       </div>
     </div>
+    {mapOpen && (
+      <FilterMappingDialog
+        projectId={projectId}
+        onClose={() => setMapOpen(false)}
+        onSaved={() => {
+          setMapOpen(false);
+          onReloadOwn();
+        }}
+      />
+    )}
+    </>
   );
 }

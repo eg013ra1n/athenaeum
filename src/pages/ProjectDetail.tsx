@@ -16,7 +16,7 @@ import { Button, Chip, PanelLayout } from '../components/ui';
 import MetaLine from '../components/collab/project/MetaLine';
 import { MemberColorsProvider } from '../components/collab/project/MemberColorsContext';
 import OverviewTab from '../components/collab/project/OverviewTab';
-import type { AttentionTarget } from '../components/collab/project/attention';
+import type { NavTarget } from '../components/collab/project/attention';
 import { EMPTY_FACETS, type Facets } from '../components/collab/project/table/model';
 import MyFramesTab, { type Segment } from '../components/collab/project/MyFramesTab';
 import LibraryTab, { libraryInFlight, libraryToCome } from '../components/collab/project/LibraryTab';
@@ -517,7 +517,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   };
   // A Needs-attention action: pre-set the target table's state facet (the
   // same session keys `ProjectFrameTable` reads), then open it.
-  const openAttention = (t: AttentionTarget) => {
+  const openAttention = (t: NavTarget) => {
     const facets: Facets = { ...EMPTY_FACETS, state: t.state ?? null };
     if (t.kind === 'segment') {
       ({ ready: setReadyFacets, held: setHeldFacets, published: setPublishedFacets })[t.segment](facets);
@@ -638,16 +638,21 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 members={members}
                 own={own}
                 ownError={ownError}
-                library={frames}
+                library={canReceive ? frames : []}
                 pending={c.pendingFrames}
                 canModerate={canModerate}
                 thresholds={detail.thresholds}
                 thresholdsVersion={detail.thresholdsVersion}
                 onOpenSegment={(s) => {
+                  // A tile opens the whole segment: clear its state facet.
+                  const clear = (f: Facets): Facets => ({ ...f, state: null });
+                  ({ ready: setReadyFacets, held: setHeldFacets, published: setPublishedFacets })[s](clear);
                   setSegment(s);
                   selectTab('mine');
                 }}
                 onOpenTab={openTab}
+                canReceive={canReceive}
+                onReloadOwn={() => void loadOwn()}
                 onAttention={openAttention}
               />
             </div>
@@ -718,7 +723,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
               <ModerationTab
                 projectId={id}
                 requireApproval={c.requireApproval}
-                library={frames}
+                library={canReceive ? frames : []}
                 libraryError={framesError}
                 onDecided={() => {
                   void loadDetail();

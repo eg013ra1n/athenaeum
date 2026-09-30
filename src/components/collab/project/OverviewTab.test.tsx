@@ -5,6 +5,7 @@ import { api } from '../../../api';
 import OverviewTab, { type OverviewTabProps } from './OverviewTab';
 import type { ExchangeSnapshot, FlowView, MemberSummary, OwnFrameRow, ProjectFlows, ThresholdRuleView } from '../../../types/models';
 
+vi.mock('../../../contexts/NotificationContext', () => ({ useNotifications: () => ({ notify: vi.fn() }) }));
 vi.mock('../../../api', () => ({
   api: { invoke: vi.fn(), listen: vi.fn() },
 }));
@@ -111,6 +112,8 @@ const BASE_PROPS: OverviewTabProps = {
   thresholdsVersion: null,
   onOpenSegment: vi.fn(),
   onOpenTab: vi.fn(),
+  canReceive: true,
+  onReloadOwn: vi.fn(),
   onAttention: vi.fn(),
 };
 
@@ -313,6 +316,20 @@ describe('OverviewTab — quality thresholds', () => {
     renderTab({ thresholds: [], thresholdsVersion: null });
     expect(await screen.findByText('No quality rules set.')).toBeInTheDocument();
     expect(screen.getByText('Quality thresholds')).toBeInTheDocument();
+  });
+});
+
+describe('OverviewTab — actions', () => {
+  it('Map opens the filter-mapping dialog instead of navigating', async () => {
+    const onAttention = vi.fn();
+    renderTab({ onAttention, own: [ownRow({ segment: 'held', filter: 'S2', failures: [{ kind: 'mapFilter', text: 'm' }] })] });
+    fireEvent.click(screen.getByRole('button', { name: 'Map' }));
+    expect(onAttention).not.toHaveBeenCalled();
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+  });
+  it('attention rows carry no stray top border on the first row', () => {
+    renderTab({ own: [ownRow({ segment: 'held', failures: [{ kind: 'solve', text: 's' }] })] });
+    expect(screen.getByRole('button', { name: 'Review' }).parentElement!.className).toContain('first-of-type:border-t-0');
   });
 });
 

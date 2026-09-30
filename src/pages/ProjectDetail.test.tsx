@@ -1094,6 +1094,18 @@ describe('ProjectDetail tabs', () => {
     expect(await screen.findByRole('button', { name: 'Solve 1' })).toBeInTheDocument();
   });
 
+  it('an attention Review opens My frames on Held back with that Reason selected', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () => Promise.resolve([heldRow(7, 'solve', 'unknown pixel scale')]),
+    });
+    renderProjectDetail();
+    fireEvent.click(await screen.findByRole('button', { name: 'Review' }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /^My frames/ })).toHaveAttribute('aria-selected', 'true'),
+    );
+    expect(await screen.findByRole('combobox', { name: 'Reason' })).toHaveValue('solve');
+  });
+
   it('a project missing from the local list says so', async () => {
     mockCommands(projectCard(), {
       get_collab_project_detail: () => Promise.reject(new Error('not found')),
