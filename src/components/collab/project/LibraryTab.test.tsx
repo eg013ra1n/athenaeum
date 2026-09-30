@@ -112,6 +112,12 @@ beforeEach(() => {
   }) as never);
 });
 
+const navigateMock = vi.fn();
+vi.mock('react-router-dom', async (orig) => ({
+  ...(await orig<typeof import('react-router-dom')>()),
+  useNavigate: () => navigateMock,
+}));
+
 function renderTab(
   frames: ProjectFrameView[] | null,
   overrides: { error?: boolean; canModerate?: boolean; onOpen?: (vm: FrameVM) => void } = {},
@@ -161,6 +167,8 @@ describe('LibraryTab — ported from the retired receive tab', () => {
 
     expect(await screen.findByText('Set a Collaboration folder first — synced frames land there.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Export for WBPP/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Open File Manager' }));
+    expect(navigateMock).toHaveBeenCalledWith('/files');
   });
 
   it('has no "Project frames" heading and puts Export for WBPP on the group row', async () => {

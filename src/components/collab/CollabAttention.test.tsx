@@ -72,8 +72,10 @@ describe('CollabAttention', () => {
     expect(screen.getByText('Changed files')).toBeInTheDocument();
     expect(screen.getByText('A new version is waiting')).toBeInTheDocument();
     expect(screen.getByText('Waiting for your choice')).toBeInTheDocument();
-    // The per-list note is the label's tooltip now.
-    expect(screen.getByTitle(/Nothing else is paused/)).toBeInTheDocument();
+    expect(screen.getByText(/Edited in place and set aside/)).toBeInTheDocument();
+    expect(screen.getByText('Other files')).toBeInTheDocument();
+    expect(screen.getAllByRole('group')).toHaveLength(4);
+    expect(screen.getByText(/Nothing else is paused/)).toBeInTheDocument();
     expect(screen.getByText('Not kept')).toBeInTheDocument();
     // "Other files" is one collapsed line with a count; the paths open on demand.
     const other = screen.getByRole('button', { name: /1 other file in the Collaboration folder/ });

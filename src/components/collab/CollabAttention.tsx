@@ -321,7 +321,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
                   <span className="max-w-[16rem] truncate font-mono text-[12px] text-content" title={row.fileName}>
                     {row.fileName}
                   </span>
-                  <span className="min-w-0 flex-1 text-[11.5px] text-content-faint">
+                  <span className="min-w-0 flex-1 truncate text-[11.5px] text-content-faint">
                     Holders: {row.holdersOnline} online / {row.holdersTotal}
                   </span>
                   {row.atRisk && (
@@ -366,7 +366,7 @@ export default function CollabAttention({ projectId }: { projectId: string }) {
                   <span className="max-w-[16rem] truncate font-mono text-[12px] text-content" title={row.fileName}>
                     {row.fileName}
                   </span>
-                  <span className="min-w-0 flex-1 text-[11.5px] text-content-faint">v{row.contentVersion}</span>
+                  <span className="min-w-0 flex-1 truncate text-[11.5px] text-content-faint">v{row.contentVersion}</span>
                   <Button
                     size="sm"
                     disabled={busy}
@@ -418,10 +418,11 @@ function Group({
   children: ReactNode;
 }) {
   return (
-    <div className="mb-2 last:mb-0">
+    <div role="group" aria-label={label} className="mb-2 last:mb-0">
       <div className="flex items-center gap-2 pb-1">
-        <span className="text-[12px] text-content-faint" title={note}>
-          {label}
+        <span className="text-[12px] text-content-faint">{label}</span>
+        <span className="min-w-0 truncate text-[11.5px] text-content-faint" title={note}>
+          {note}
         </span>
         {actions && <span className="ml-auto flex items-center gap-1.5">{actions}</span>}
       </div>
@@ -443,8 +444,8 @@ function OtherFiles({ files }: { files: ForeignFileView[] }) {
   const listId = useId();
   const Chevron = open ? ChevronDown : ChevronRight;
   return (
-    <div className="mb-2 last:mb-0">
-      <div className="pb-1 text-[12px] text-content-faint" title="Files in the Collaboration folder that no frame references; the app never deletes them.">
+    <div role="group" aria-label="Other files" className="mb-2 last:mb-0">
+      <div className="pb-1 text-[12px] text-content-faint">
         Other files
       </div>
       <button

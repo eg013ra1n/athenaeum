@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type JSX } from 'react';
-import { Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { FolderOpen, FolderOutput } from 'lucide-react';
 import { api } from '../../../api';
 import { useCollabExchange } from '../../../contexts/CollabExchangeContext';
@@ -50,6 +50,7 @@ export default function LibraryTab({
   activeKey?: string | null;
 }): JSX.Element {
   const { state } = useCollabExchange();
+  const navigate = useNavigate();
 
   // `undefined` = still loading the folder setting; `null` = unset (banner).
   const [collabDir, setCollabDir] = useState<string | null | undefined>(undefined);
@@ -160,9 +161,9 @@ export default function LibraryTab({
         <div className="flex items-center gap-2 rounded border border-warning/40 bg-warning-muted px-2.5 py-2 text-[12px] text-content-secondary">
           <FolderOpen size={14} className="shrink-0 text-warning" />
           <span>Set a Collaboration folder first — synced frames land there.</span>
-          <Link to="/files" className="ml-auto">
-            <Button size="sm">Open File Manager</Button>
-          </Link>
+          <Button size="sm" className="ml-auto" onClick={() => navigate('/files')}>
+            Open File Manager
+          </Button>
         </div>
       )}
 
