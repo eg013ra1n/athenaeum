@@ -43,9 +43,11 @@ export function SidePanel({ title, label, onClose, children }: { title: ReactNod
     };
   }, []);
   useLayoutEffect(() => {
-    const overlayId = pushOverlay();
+    const overlayId = pushOverlay('panel');
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && isTopOverlay(overlayId)) closeRef.current();
+      if (e.key !== 'Escape' || e.defaultPrevented || !isTopOverlay(overlayId)) return;
+      e.preventDefault();
+      closeRef.current();
     };
     document.addEventListener('keydown', onKey);
     return () => {

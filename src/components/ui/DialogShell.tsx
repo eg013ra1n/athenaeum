@@ -2,7 +2,7 @@ import { useId, useLayoutEffect, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 import { Button } from './Button';
-import { isTopOverlay, popOverlay, pushOverlay } from './overlayStack';
+import { isTopDialog, isTopOverlay, popOverlay, pushOverlay } from './overlayStack';
 
 const FOCUSABLE = 'button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
@@ -25,17 +25,19 @@ export function DialogShell({ title, size = 'sm', onClose, busy = false, footer,
   const pressOnScrim = useRef(false);
 
   useLayoutEffect(() => {
-    const overlayId = pushOverlay();
+    const overlayId = pushOverlay('dialog');
     const opener = document.activeElement as HTMLElement | null;
     const first = ref.current?.querySelector<HTMLElement>('[data-autofocus]') ?? ref.current?.querySelector<HTMLElement>(FOCUSABLE);
     (first ?? ref.current)?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (!isTopOverlay(overlayId)) return;
+      if (e.defaultPrevented) return;
       if (e.key === 'Escape') {
+        if (!isTopOverlay(overlayId)) return;
+        e.preventDefault();
         if (!busyRef.current) closeRef.current();
         return;
       }
-      if (e.key !== 'Tab' || !ref.current) return;
+      if (e.key !== 'Tab' || !ref.current || !isTopDialog(overlayId)) return;
       const items = [...ref.current.querySelectorAll<HTMLElement>(FOCUSABLE)];
       if (items.length === 0) return;
       const i = items.indexOf(document.activeElement as HTMLElement);

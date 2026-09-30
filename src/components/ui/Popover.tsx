@@ -8,9 +8,14 @@ export function Popover({ open, onClose, children, className = '' }: { open: boo
   closeRef.current = onClose;
   useLayoutEffect(() => {
     if (!open) return undefined;
-    const overlayId = pushOverlay();
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && isTopOverlay(overlayId)) closeRef.current(); };
+    const overlayId = pushOverlay('popover');
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented || !isTopOverlay(overlayId)) return;
+      e.preventDefault();
+      closeRef.current();
+    };
     const onDown = (e: MouseEvent) => {
+      if (!isTopOverlay(overlayId)) return;
       if (ref.current && !ref.current.parentElement?.contains(e.target as Node)) closeRef.current();
     };
     document.addEventListener('keydown', onKey);

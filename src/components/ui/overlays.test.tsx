@@ -136,13 +136,72 @@ describe('overlay ownership and fixes', () => {
     vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => { cb(0); return 1; });
     let top = 100;
     const spy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(() => ({ top } as DOMRect));
-    render(<SidePanel title="t" label="P" onClose={() => {}}>x</SidePanel>);
-    const aside = screen.getByRole('complementary', { name: 'P' });
-    const before = aside.style.height;
-    top = 40;
-    act(() => { fireEvent.scroll(window); });
-    expect(aside.style.height).not.toBe(before);
-    spy.mockRestore();
-    vi.unstubAllGlobals();
+    try {
+      render(<SidePanel title="t" label="P" onClose={() => {}}>x</SidePanel>);
+      const aside = screen.getByRole('complementary', { name: 'P' });
+      const before = aside.style.height;
+      top = 40;
+      act(() => { fireEvent.scroll(window); });
+      expect(aside.style.height).not.toBe(before);
+    } finally {
+      spy.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+  it('a popover inside a dialog keeps the Tab trap; Esc closes only the popover', () => {
+    const dlg = vi.fn(); const pop = vi.fn();
+    const ui = (open: boolean) => (
+      <DialogShell title="D" onClose={dlg} footer={<button>Last</button>}>
+        <div className="relative"><Popover open={open} onClose={pop}><button>in-pop</button></Popover></div>
+      </DialogShell>
+    );
+    const { rerender } = render(ui(false));
+    rerender(ui(true));
+    screen.getByText('Last').focus();
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Close' }));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(pop).toHaveBeenCalledTimes(1);
+    expect(dlg).not.toHaveBeenCalled();
+  });
+  it('a side panel mounted after a dialog does not steal Esc', () => {
+    const panel = vi.fn(); const dlg = vi.fn();
+    const ui = (withPanel: boolean) => (
+      <>
+        <DialogShell title="D" onClose={dlg}>b</DialogShell>
+        {withPanel && <SidePanel title="t" label="P" onClose={panel}>x</SidePanel>}
+      </>
+    );
+    const { rerender } = render(ui(false));
+    rerender(ui(true));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(dlg).toHaveBeenCalledTimes(1);
+    expect(panel).not.toHaveBeenCalled();
+  });
+  it('mousedown in a dialog opened from an open popover does not close the popover', () => {
+    const pop = vi.fn();
+    const ui = (dialog: boolean) => (
+      <div className="relative">
+        <Popover open onClose={pop}>
+          {dialog && <DialogShell title="D" onClose={() => {}}><p>inside</p></DialogShell>}
+        </Popover>
+      </div>
+    );
+    const { rerender } = render(ui(false));
+    rerender(ui(true));
+    fireEvent.mouseDown(screen.getByText('inside'));
+    expect(pop).not.toHaveBeenCalled();
+  });
+  it('an Escape already handled elsewhere does not close the side panel', () => {
+    const onClose = vi.fn();
+    render(<SidePanel title="t" label="P" onClose={onClose}>x</SidePanel>);
+    const pre = (e: Event) => e.preventDefault();
+    document.addEventListener('keydown', pre, true);
+    try {
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    } finally {
+      document.removeEventListener('keydown', pre, true);
+    }
+    expect(onClose).not.toHaveBeenCalled();
   });
 });
