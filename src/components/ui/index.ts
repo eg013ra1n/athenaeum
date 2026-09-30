@@ -11,3 +11,6 @@ export * from './Sparkline';
 export * from './FilterChip';
 export * from './EmptyState';
 export * from './Field';
+export * from './DialogShell';
+export * from './Popover';
+export * from './SidePanel';
