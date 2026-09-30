@@ -137,10 +137,6 @@ function ProjectPage({ id }: { id: string | undefined }) {
   /** The republish guard's request (`ids: null` = "all"); `null` = closed. */
   const [republishReq, setRepublishReq] = useState<{ ids: number[] | null } | null>(null);
   const [switchConfirm, setSwitchConfirm] = useState(false);
-  // Bumped by the throttled `collab-peers-changed` reload; passed to
-  // `MembersTab` as `refreshToken` so it re-reads without losing its
-  // sort/expansion state.
-  const [membersRefresh, setMembersRefresh] = useState(0);
 
   // Session-scoped so stepping into a linked object and back returns to the
   // tab and segment you were on. A value stored by the old four-tab page
@@ -245,9 +241,8 @@ function ProjectPage({ id }: { id: string | undefined }) {
     };
   }, [id, loadOwn, loadLibrary, loadDetail]);
 
-  // Loaded once here for the Overview and Exchange tabs; the Members tab
-  // refreshes it through `onMembers` whenever it mounts, and the throttled
-  // `collab-peers-changed` reload calls this directly (below).
+  // Loaded once here for the Overview, Members and Exchange tabs; the
+  // throttled `collab-peers-changed` reload calls this directly (below).
   const loadMembers = useCallback(async () => {
     if (!id) return;
     setMembersError(false);
@@ -304,11 +299,6 @@ function ProjectPage({ id }: { id: string | undefined }) {
   loadMembersRef.current = loadMembers;
   const loadOwnRef = useRef(loadOwn);
   loadOwnRef.current = loadOwn;
-  // Latest `activeTab` (set below, after it's computed) — fix round 1 minor:
-  // when the Members tab is mounted it already reloads itself off the
-  // `refreshToken` bump via its own `onMembers`, so calling `loadMembers`
-  // here too would double the `get_collab_member_summary` call.
-  const activeTabRef = useRef<Tab>('overview');
 
   useEffect(() => {
     if (!id) return;
@@ -323,8 +313,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
           peersTimer = setTimeout(() => {
             peersTimer = undefined;
             void loadLibraryRef.current();
-            if (activeTabRef.current !== 'members') void loadMembersRef.current();
-            setMembersRefresh((n) => n + 1);
+            void loadMembersRef.current();
           }, PEERS_RELOAD_MS);
         }
         if (ownTimer === undefined) {
@@ -437,7 +426,6 @@ function ProjectPage({ id }: { id: string | undefined }) {
   ];
   const requested = resolveTab(storedTab) ?? 'overview';
   const activeTab: Tab = tabs.includes(requested) ? requested : 'overview';
-  activeTabRef.current = activeTab;
   // Tab count pills (spec §8): "136 ready", "278 to go", the pending count.
   const badge: Partial<Record<Tab, { n: number; text: string; warn?: boolean }>> = {
     mine: { n: readyCount, text: `${readyCount} ready` },
@@ -705,14 +693,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
           )}
 
           {activeTab === 'members' && (
-            <MembersTab
-              projectId={id}
-              refreshToken={membersRefresh}
-              onMembers={(m) => {
-                setMembers(m);
-                setMembersError(false);
-              }}
-            />
+            <MembersTab projectId={id} members={members} error={membersError} />
           )}
 
           {activeTab === 'exchange' && <ExchangeTab projectId={id} canReceive={canReceive} members={members} />}

@@ -1,339 +1,208 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
-import { SessionStateProvider } from '../../../contexts/SessionStateContext';
-import { api } from '../../../api';
 import { formatRelative } from '../format';
-import { formatTimestamp } from '../../../utils/dateFormatting';
-import MembersTab from './MembersTab';
+import MembersTab, { filterColumns } from './MembersTab';
 import type { MemberSummary } from '../../../types/models';
-
-vi.mock('../../../api', () => ({
-  api: { invoke: vi.fn(), listen: vi.fn() },
-}));
 
 afterEach(() => {
   cleanup();
-  // Safety net: a test that enables fake timers and then times out before
-  // reaching its own `vi.useRealTimers()` would otherwise leave every
-  // following test's `findByText`/`waitFor` (which poll on real timers)
-  // hanging too.
   vi.useRealTimers();
 });
 
-function member(overrides: Partial<MemberSummary> = {}): MemberSummary {
+let seq = 0;
+/** Builds a `MemberSummary` from a name, seconds per filter and a patch. */
+function m(name: string, secondsByFilter: Record<string, number> = {}, patch: Partial<MemberSummary> = {}): MemberSummary {
+  seq += 1;
   return {
-    accountId: 'acc-1',
-    displayName: 'Alice',
+    accountId: `acc-${name}-${seq}`,
+    displayName: name,
     dataRole: 'send_receive',
     coordinator: false,
     devices: [],
     online: false,
     lastSeenAt: null,
     publishedFrames: 0,
-    secondsByFilter: {},
+    secondsByFilter,
     qualityByCamera: [],
     holdsFrames: 0,
     holdsBytes: 0,
     holdsShare: 0,
-    ...overrides,
+    ...patch,
   };
 }
 
-beforeEach(() => {
-  vi.mocked(api.invoke).mockReset();
-  vi.mocked(api.listen).mockReset();
-  vi.mocked(api.listen).mockImplementation((() => Promise.resolve(() => {})) as never);
-});
-
-function mockMembers(list: MemberSummary[] | Error) {
-  vi.mocked(api.invoke).mockImplementation(((command: string) => {
-    if (command === 'get_collab_member_summary') {
-      return list instanceof Error ? Promise.reject(list) : Promise.resolve(list);
-    }
-    return Promise.resolve(null);
-  }) as never);
-}
-
-function renderTab(onMembers?: (m: MemberSummary[]) => void) {
-  return render(
-    <SessionStateProvider>
-      <MembersTab projectId="proj-1" onMembers={onMembers} />
-    </SessionStateProvider>,
-  );
-}
-
-function nameOrder(): string[] {
+function names(): string[] {
   return screen.getAllByTestId('member-name').map((el) => el.textContent ?? '');
 }
 
-describe('MembersTab — load', () => {
-  it('calls get_collab_member_summary with the project id on mount', async () => {
-    mockMembers([member({ accountId: 'a1', displayName: 'Alice' })]);
-    renderTab();
-    await screen.findByText('Alice');
-    expect(api.invoke).toHaveBeenCalledWith('get_collab_member_summary', { projectId: 'proj-1' });
+describe('MembersTab — mockup table', () => {
+  it('columns in the mockup order, numeric headers right-aligned', () => {
+    render(<MembersTab projectId="p" members={[m('Kostya', { L: 7200 })]} error={false} />);
+    const heads = screen.getAllByRole('columnheader').map((h) => h.textContent?.trim());
+    expect(heads).toEqual(['Member', 'Role', 'Devices', 'Published ↓', 'L', 'Σ', 'FWHM x̃', 'Holds', 'Last seen']);
+    expect(screen.getByRole('columnheader', { name: 'Σ' }).className).toContain('text-right');
   });
 
-  it('logs and shows inline text on a failed load, never a stuck "Loading…"', async () => {
+  it('filter cells read "2h 00m" or a ghost dash; None becomes "No filter" last', () => {
+    render(<MembersTab projectId="p" members={[m('A', { L: 7200, None: 600 }), m('B', {})]} error={false} />);
+    expect(screen.getByRole('columnheader', { name: 'No filter' })).toBeInTheDocument();
+    expect(screen.getAllByText('2h 00m')[0]).toBeInTheDocument();
+    expect(screen.getAllByText('—')[0].className).toContain('text-content-ghost');
+    const heads = screen.getAllByRole('columnheader').map((h) => h.textContent?.trim());
+    expect(heads.indexOf('No filter')).toBe(heads.indexOf('Σ') - 1);
+  });
+
+  it('12 filters scroll horizontally inside the table box (review focus 2)', () => {
+    const secs = Object.fromEntries(
+      ['L', 'R', 'G', 'B', 'Ha', 'OIII', 'SII', 'OSC', 'CLS', 'S2 6nm', 'O3 3nm', 'L-eXtreme'].map((f) => [f, 600]),
+    );
+    const { container } = render(<MembersTab projectId="p" members={[m('A', secs)]} error={false} />);
+    expect(container.querySelector('[data-testid="members-scroll"]')!.className).toContain('overflow-x-auto');
+    expect(screen.getAllByRole('columnheader')).toHaveLength(9 + 11);
+  });
+
+  it('a row click opens the member panel with cameras and devices', () => {
+    render(
+      <MembersTab
+        projectId="p"
+        members={[
+          m('Kostya', { L: 7200 }, {
+            devices: [{ device: 'deviceabcdef12', name: 'Mac mini', online: true }],
+            qualityByCamera: [{ camera: 'ASI6200MM Pro', filter: 'L', frames: 60, medianFwhm: 2.3, medianEcc: 0.4 }],
+          }),
+        ]}
+        error={false}
+      />,
+    );
+    fireEvent.click(screen.getByText('Kostya'));
+    const panel = screen.getByRole('complementary', { name: 'Member details' });
+    expect(within(panel).getByText('ASI6200MM Pro')).toBeInTheDocument();
+    expect(within(panel).getByText(/60 fr · x̃ FWHM 2\.30″ · x̃ ecc 0\.40/)).toBeInTheDocument();
+    expect(within(panel).getByText('Mac mini')).toBeInTheDocument();
+    fireEvent.click(within(panel).getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
+  });
+
+  it('no members → an empty state (review focus 4)', () => {
+    render(<MembersTab projectId="p" members={[]} error={false} />);
+    expect(screen.getByText('No members yet.')).toBeInTheDocument();
+  });
+
+  it('members === null shows Loading…, an error shows the inline message and no table', () => {
+    const { rerender } = render(<MembersTab projectId="p" members={null} error={false} />);
+    expect(screen.getByText('Loading…')).toBeInTheDocument();
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    mockMembers(new Error('boom'));
-    renderTab();
-    expect(await screen.findByText('Could not load members — see console.')).toBeInTheDocument();
-    expect(spy).toHaveBeenCalledWith('[members] get_collab_member_summary failed:', expect.any(Error));
-    // Regression: `members` stays `null` forever after a failed fetch, so the
-    // loading paragraph must be gated on `!error` too, or it renders under
-    // the error message permanently.
+    rerender(<MembersTab projectId="p" members={null} error />);
+    expect(screen.getByText('Could not load members — see console.')).toBeInTheDocument();
     expect(screen.queryByText('Loading…')).not.toBeInTheDocument();
-    // Also never an empty table — that would misread as "no members" rather
-    // than "the load failed".
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
     spy.mockRestore();
   });
 
-  it('calls onMembers with the loaded list', async () => {
-    const onMembers = vi.fn();
-    const list = [member({ accountId: 'a1', displayName: 'Alice' })];
-    mockMembers(list);
-    renderTab(onMembers);
-    await screen.findByText('Alice');
-    expect(onMembers).toHaveBeenCalledWith(list);
+  it('filterColumns: filters with seconds, filterOrder, None last', () => {
+    expect(filterColumns([m('A', { Ha: 1, None: 5, L: 2, B: 0 }), m('B', { R: 3 })])).toEqual(['L', 'R', 'Ha', 'None']);
   });
-});
 
-describe('MembersTab — Role', () => {
-  it('maps send_receive to Processor and send to Contributor, else shows the raw value', async () => {
-    mockMembers([
-      member({ accountId: 'a1', displayName: 'Alice', dataRole: 'send_receive' }),
-      member({ accountId: 'a2', displayName: 'Bob', dataRole: 'send' }),
-      member({ accountId: 'a3', displayName: 'Carol', dataRole: 'receive' }),
-    ]);
-    renderTab();
-    await screen.findByText('Alice');
-    expect(screen.getByText('Processor')).toBeInTheDocument();
+  it('Role: Processor/Contributor/raw; a coordinator carries the data role faintly', () => {
+    render(
+      <MembersTab
+        projectId="p"
+        members={[
+          m('Alice', {}, { dataRole: 'send' }),
+          m('Bob', {}, { dataRole: 'receive' }),
+          m('Carol', {}, { coordinator: true, dataRole: 'send_receive' }),
+        ]}
+        error={false}
+      />,
+    );
     expect(screen.getByText('Contributor')).toBeInTheDocument();
     expect(screen.getByText('receive')).toBeInTheDocument();
-  });
-});
-
-describe('MembersTab — Member column', () => {
-  it('shows a coordinator chip only for a coordinator', async () => {
-    mockMembers([
-      member({ accountId: 'a1', displayName: 'Alice', coordinator: true }),
-      member({ accountId: 'a2', displayName: 'Bob', coordinator: false }),
-    ]);
-    renderTab();
-    await screen.findByText('Alice');
-    const aliceRow = screen.getByText('Alice').closest('tr') as HTMLElement;
-    const bobRow = screen.getByText('Bob').closest('tr') as HTMLElement;
-    expect(within(aliceRow).getByText('Coordinator')).toBeInTheDocument();
-    expect(within(bobRow).queryByText('Coordinator')).toBeNull();
-  });
-});
-
-describe('MembersTab — Last seen', () => {
-  it('an online member reads "online now"', async () => {
-    mockMembers([member({ accountId: 'a1', displayName: 'Alice', online: true, lastSeenAt: '2026-09-29T10:00:00Z' })]);
-    renderTab();
-    const el = await screen.findByText('online now');
-    expect(el).toHaveClass('text-success');
+    expect(screen.getByText('(Processor data)').className).toContain('text-content-faint');
   });
 
-  it('an offline member with lastSeenAt shows its timestamp and a relative time', async () => {
-    // Fake only `Date` — RTL's `findByText`/`waitFor` poll on real timers,
-    // and faking those too would hang every following test as well.
+  it('device dots carry the device name as a title', () => {
+    const { container } = render(
+      <MembersTab projectId="p" members={[m('A', {}, { devices: [{ device: 'deviceabcdef12', name: null, online: false }] })]} error={false} />,
+    );
+    expect(container.querySelector('[title="deviceab"]')).not.toBeNull();
+  });
+
+  it('FWHM x̃ is the frame-weighted median over cameras; a ghost dash without data', () => {
+    render(
+      <MembersTab
+        projectId="p"
+        members={[
+          m('A', {}, {
+            qualityByCamera: [
+              { camera: 'c1', filter: 'L', frames: 10, medianFwhm: 2.0, medianEcc: null },
+              { camera: 'c2', filter: 'L', frames: 1, medianFwhm: 4.0, medianEcc: null },
+              { camera: 'c3', filter: 'R', frames: 10, medianFwhm: 3.0, medianEcc: null },
+            ],
+          }),
+          m('B'),
+        ]}
+        error={false}
+      />,
+    );
+    expect(screen.getByText('3.00″')).toBeInTheDocument();
+  });
+
+  it('Holds and Last seen', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-09-29T12:00:00Z'));
     const iso = '2026-09-29T11:00:00Z';
-    mockMembers([member({ accountId: 'a1', displayName: 'Alice', online: false, lastSeenAt: iso })]);
-    renderTab();
-    await screen.findByText('Alice');
-    expect(screen.getByText(formatTimestamp(iso))).toBeInTheDocument();
+    render(
+      <MembersTab
+        projectId="p"
+        members={[
+          m('Alice', {}, { holdsFrames: 42, holdsBytes: 1024 * 1024, holdsShare: 0.256, online: true }),
+          m('Bob', {}, { lastSeenAt: iso }),
+        ]}
+        error={false}
+      />,
+    );
+    const row = screen.getByText('Alice').closest('tr') as HTMLElement;
+    expect(within(row).getByText(/42 fr · 1 MB/)).toBeInTheDocument();
+    expect(within(row).getByText('26%').className).toContain('text-content-faint');
+    expect(within(row).getByText('now').className).toContain('text-success');
     expect(screen.getByText(formatRelative(iso, Date.now()))).toBeInTheDocument();
-    vi.useRealTimers();
   });
 
-  it('a member with no lastSeenAt reads "never"', async () => {
-    mockMembers([member({ accountId: 'a1', displayName: 'Alice', online: false, lastSeenAt: null })]);
-    renderTab();
-    await screen.findByText('Alice');
-    expect(screen.getByText('never')).toBeInTheDocument();
-  });
-});
-
-describe('MembersTab — sorting', () => {
-  it('defaults to Published desc', async () => {
-    mockMembers([
-      member({ accountId: 'a1', displayName: 'Alice', publishedFrames: 5 }),
-      member({ accountId: 'a2', displayName: 'Bob', publishedFrames: 50 }),
-      member({ accountId: 'a3', displayName: 'Carol', publishedFrames: 20 }),
-    ]);
-    renderTab();
-    await screen.findByText('Alice');
-    expect(nameOrder()).toEqual(['Bob', 'Carol', 'Alice']);
-  });
-
-  it('sorting by Last seen puts online first, then by lastSeenAt desc, then never last', async () => {
-    mockMembers([
-      member({ accountId: 'a1', displayName: 'Alice', online: false, lastSeenAt: '2026-09-20T10:00:00Z' }),
-      member({ accountId: 'a2', displayName: 'Bob', online: true, lastSeenAt: '2026-09-01T10:00:00Z' }),
-      member({ accountId: 'a3', displayName: 'Carol', online: false, lastSeenAt: null }),
-      member({ accountId: 'a4', displayName: 'Dana', online: false, lastSeenAt: '2026-09-25T10:00:00Z' }),
-    ]);
-    renderTab();
-    await screen.findByText('Alice');
-    fireEvent.click(screen.getByText('Last seen'));
-    expect(nameOrder()).toEqual(['Bob', 'Dana', 'Alice', 'Carol']);
-  });
-
-  it('clicking the same header again flips direction', async () => {
-    mockMembers([
-      member({ accountId: 'a1', displayName: 'Alice', publishedFrames: 5 }),
-      member({ accountId: 'a2', displayName: 'Bob', publishedFrames: 50 }),
-    ]);
-    renderTab();
-    await screen.findByText('Alice');
-    expect(nameOrder()).toEqual(['Bob', 'Alice']); // desc default
+  it('sorting: Published desc by default, a header click flips, Last seen puts online first', () => {
+    render(
+      <MembersTab
+        projectId="p"
+        members={[
+          m('Alice', {}, { publishedFrames: 5, lastSeenAt: '2026-09-20T10:00:00Z' }),
+          m('Bob', {}, { publishedFrames: 50, online: true, lastSeenAt: '2026-09-01T10:00:00Z' }),
+          m('Carol', {}, { publishedFrames: 20 }),
+          m('Dana', {}, { publishedFrames: 1, lastSeenAt: '2026-09-25T10:00:00Z' }),
+        ]}
+        error={false}
+      />,
+    );
+    expect(names()).toEqual(['Bob', 'Carol', 'Alice', 'Dana']);
     fireEvent.click(screen.getByText(/^Published/));
-    expect(nameOrder()).toEqual(['Alice', 'Bob']); // flipped to asc
+    expect(names()).toEqual(['Dana', 'Alice', 'Carol', 'Bob']);
+    fireEvent.click(screen.getByText('Last seen'));
+    expect(names()).toEqual(['Bob', 'Dana', 'Alice', 'Carol']);
   });
-});
 
-describe('MembersTab — filter columns', () => {
-  it('shows one column per filter present in any member, ordered by filterOrder, with formatted hours', async () => {
-    mockMembers([
-      member({ accountId: 'a1', displayName: 'Alice', secondsByFilter: { Ha: 7200, B: 3600 } }),
-      member({ accountId: 'a2', displayName: 'Bob', secondsByFilter: { L: 1800 } }),
-    ]);
-    renderTab();
-    await screen.findByText('Alice');
-    const headers = screen.getAllByRole('columnheader').map((h) => h.textContent);
-    const lIdx = headers.findIndex((h) => h?.startsWith('L'));
-    const bIdx = headers.findIndex((h) => h?.startsWith('B'));
-    const haIdx = headers.findIndex((h) => h?.startsWith('Ha'));
-    expect(lIdx).toBeGreaterThanOrEqual(0);
-    expect(lIdx).toBeLessThan(bIdx);
-    expect(bIdx).toBeLessThan(haIdx);
-
-    const aliceRow = screen.getByText('Alice').closest('tr') as HTMLElement;
-    expect(within(aliceRow).getByText('2h')).toBeInTheDocument(); // Ha 7200s
-    expect(within(aliceRow).getByText('1h')).toBeInTheDocument(); // B 3600s
-  });
-});
-
-describe('MembersTab — Holds', () => {
-  it('renders frames, bytes and share percent', async () => {
-    mockMembers([
-      member({ accountId: 'a1', displayName: 'Alice', holdsFrames: 42, holdsBytes: 1024 * 1024, holdsShare: 0.256 }),
-    ]);
-    renderTab();
-    const row = (await screen.findByText('Alice')).closest('tr') as HTMLElement;
-    expect(within(row).getByText(/42 fr/)).toBeInTheDocument();
-    expect(within(row).getByText(/1\.0 MB/)).toBeInTheDocument();
-    expect(within(row).getByText(/26%/)).toBeInTheDocument();
-  });
-});
-
-describe('MembersTab — refreshToken', () => {
-  it('re-invokes get_collab_member_summary when refreshToken changes, keeps showing rows while it re-reads, and keeps the sort', async () => {
-    const list1 = [
-      member({ accountId: 'a1', displayName: 'Alice', publishedFrames: 5 }),
-      member({ accountId: 'a2', displayName: 'Bob', publishedFrames: 50 }),
-    ];
-    mockMembers(list1);
-    const { rerender } = render(
-      <SessionStateProvider>
-        <MembersTab projectId="proj-1" refreshToken={0} />
-      </SessionStateProvider>,
+  it('labels an empty camera "Unknown camera" in the panel', () => {
+    render(
+      <MembersTab
+        projectId="p"
+        members={[m('A', {}, { qualityByCamera: [{ camera: '', filter: 'L', frames: 4, medianFwhm: 2.1, medianEcc: 0.2 }] })]}
+        error={false}
+      />,
     );
-    await screen.findByText('Alice');
-    expect(nameOrder()).toEqual(['Bob', 'Alice']); // default: published desc
-
-    fireEvent.click(screen.getByText('Member'));
-    expect(nameOrder()).toEqual(['Alice', 'Bob']); // now: name asc
-
-    const before = vi
-      .mocked(api.invoke)
-      .mock.calls.filter(([c]) => c === 'get_collab_member_summary').length;
-
-    let resolveSecond!: (rows: MemberSummary[]) => void;
-    const second = new Promise<MemberSummary[]>((resolve) => {
-      resolveSecond = resolve;
-    });
-    vi.mocked(api.invoke).mockImplementation(((command: string) => {
-      if (command === 'get_collab_member_summary') return second;
-      return Promise.resolve(null);
-    }) as never);
-
-    rerender(
-      <SessionStateProvider>
-        <MembersTab projectId="proj-1" refreshToken={1} />
-      </SessionStateProvider>,
-    );
-
-    // Re-invoked immediately …
-    expect(
-      vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_collab_member_summary').length,
-    ).toBeGreaterThan(before);
-    // … but the table keeps the OLD rows while the read is in flight — no
-    // "Loading…" flash on a presence-triggered refresh.
-    expect(screen.getByText('Alice')).toBeInTheDocument();
-    expect(screen.queryByText('Loading…')).not.toBeInTheDocument();
-
-    resolveSecond([
-      member({ accountId: 'a1', displayName: 'Alice', publishedFrames: 5 }),
-      member({ accountId: 'a2', displayName: 'Bob', publishedFrames: 50 }),
-      member({ accountId: 'a3', displayName: 'Carol', publishedFrames: 1 }),
-    ]);
-
-    await screen.findByText('Carol');
-    // The sort survived the refresh — still name asc.
-    expect(nameOrder()).toEqual(['Alice', 'Bob', 'Carol']);
-  });
-});
-
-describe('MembersTab — expanded row', () => {
-  it('is collapsed by default and expands on row click', async () => {
-    mockMembers([
-      member({
-        accountId: 'a1',
-        displayName: 'Alice',
-        devices: [{ device: 'deviceabcdef12', name: 'Mac mini', online: true }],
-        qualityByCamera: [{ camera: 'ZWO ASI2600MM', filter: 'L', frames: 10, medianFwhm: 2.5, medianEcc: 0.3 }],
-      }),
-    ]);
-    renderTab();
-    const row = (await screen.findByText('Alice')).closest('tr') as HTMLElement;
-    expect(screen.queryByText('Mac mini')).not.toBeInTheDocument();
-    fireEvent.click(row);
-    expect(await screen.findByText('Mac mini')).toBeInTheDocument();
-    expect(screen.getByText('ZWO ASI2600MM')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('A'));
+    expect(screen.getByText('Unknown camera')).toBeInTheDocument();
   });
 
-  it('lists a device by its id prefix when it has no name', async () => {
-    mockMembers([
-      member({
-        accountId: 'a1',
-        displayName: 'Alice',
-        devices: [{ device: 'deviceabcdef12', name: null, online: false }],
-      }),
-    ]);
-    renderTab();
-    const row = (await screen.findByText('Alice')).closest('tr') as HTMLElement;
-    fireEvent.click(row);
-    expect(await screen.findByText('deviceab')).toBeInTheDocument();
-  });
-
-  it('labels an empty camera as "Unknown camera"', async () => {
-    mockMembers([
-      member({
-        accountId: 'a1',
-        displayName: 'Alice',
-        qualityByCamera: [{ camera: '', filter: 'L', frames: 4, medianFwhm: 2.1, medianEcc: 0.2 }],
-      }),
-    ]);
-    renderTab();
-    const row = (await screen.findByText('Alice')).closest('tr') as HTMLElement;
-    fireEvent.click(row);
-    expect(await screen.findByText('Unknown camera')).toBeInTheDocument();
+  it('a panel without published frames says so', () => {
+    render(<MembersTab projectId="p" members={[m('A')]} error={false} />);
+    fireEvent.click(screen.getByText('A'));
+    expect(screen.getByText('Nothing published yet.')).toBeInTheDocument();
   });
 });
