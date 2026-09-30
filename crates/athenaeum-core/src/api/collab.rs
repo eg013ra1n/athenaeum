@@ -39,7 +39,7 @@ use crate::api::{db, ApiError};
 use crate::collab::filters::DictionaryEntry;
 use crate::collab::gate::{
     evaluate_frame, header_pixel_scale_arcsec, FrameGateRow, GateFrameInput, ProjectTarget,
-    ThresholdRuleView,
+    RuleVerdict, ThresholdRuleView,
 };
 use crate::collab::hub_client::CollabClient;
 use crate::collab::snapshot::{member_node_ids, SnapshotMember};
@@ -1557,6 +1557,17 @@ pub struct OwnFrameRow {
     pub local_state: Option<String>,
     pub published_at: Option<String>,
     pub last_error: Option<String>,
+    /// One entry per threshold rule the gate understood, for the drawer's
+    /// rule-by-rule section (Task 4, spec 2026-09-29 §4.1) — copied verbatim
+    /// off the same [`FrameGateRow`] this row's other gate facts come from.
+    pub rules: Vec<RuleVerdict>,
+    /// The source light's catalog file path (the `files` row this frame
+    /// belongs to), for the drawer's "local path" line.
+    pub path: Option<String>,
+    /// Announced frames only: the manifest/own row's acceptance —
+    /// `Some(false)` = excluded by the coordinator. `None` for a frame this
+    /// account has never published.
+    pub accepted: Option<bool>,
 }
 
 /// The "My frames" tab segment a [`crate::collab::contributor_state::ContributorState`]
@@ -1582,6 +1593,8 @@ struct FrameFacts {
     /// `session_members → sessions → imaging_nights`, else
     /// `DATE(frames.date_obs, '-12 hours')` (global-constraints night rule).
     night: Option<String>,
+    /// The `files` row's catalog path (Task 4 — the drawer's local-path line).
+    path: String,
 }
 
 fn frame_facts(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, FrameFacts>, ApiError> {
@@ -1599,7 +1612,8 @@ fn frame_facts(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, FrameFacts
                          JOIN sessions s ON s.id = sm.session_id \
                          JOIN imaging_nights n ON n.id = s.imaging_night_id \
                         WHERE sm.frame_id = f.id ORDER BY n.start_time LIMIT 1), \
-                      DATE(f.date_obs, '-12 hours')) \
+                      DATE(f.date_obs, '-12 hours')), \
+                    fi.path \
              FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id IN ({marks})"
         );
         let mut stmt = conn
@@ -1614,6 +1628,7 @@ fn frame_facts(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, FrameFacts
                         size: r.get(2)?,
                         median_snr: r.get(3)?,
                         night: r.get(4)?,
+                        path: r.get(5)?,
                     },
                 ))
             })
@@ -1718,6 +1733,7 @@ pub fn list_project_own_frames(
             set_id: identity.set_id,
             set_name: identity.set_id.and_then(|s| set_names.get(&s).cloned()),
             night: f.and_then(|f| f.night.clone()),
+            path: f.map(|f| f.path.clone()),
             filter: identity
                 .filter_canonical
                 .clone()
@@ -1740,9 +1756,11 @@ pub fn list_project_own_frames(
                     text,
                 })
                 .collect(),
+            rules: row.rules.clone(),
             content_version: own_row.map(|o| o.content_version),
             pub_state: own_row.map(|o| o.state.clone()),
             accepted_reason: wire.as_ref().and_then(|w| w.accepted_reason.clone()),
+            accepted: own_row.map(|o| o.accepted),
             holders_online: live.as_ref().map(|l| l.holders_online as i64),
             holders_total: live.as_ref().map(|l| l.holders_total as i64),
             local_state: own_row.map(|o| o.local_state.as_db_str().to_string()),
@@ -7177,6 +7195,17 @@ pub(crate) mod tests {
         assert_eq!(published.segment, "published");
         assert_eq!(published.pub_state.as_deref(), Some("published"));
         assert!(published.published_at.is_some());
+        // Task 4: an announced own row carries the manifest's acceptance.
+        assert_eq!(published.accepted, Some(true));
+        // Task 4: a ready (unpublished) frame carries its source light's
+        // catalog path and one verdict per the project's threshold rule
+        // (`cached_project`'s thresholds_rules_json has exactly one: not_trailed).
+        let ready = rows
+            .iter()
+            .find(|r| r.segment == "ready")
+            .expect("a ready row");
+        assert_eq!(ready.path.as_deref(), Some("/data/M101 set/L_0000.fits"));
+        assert_eq!(ready.rules.len(), 1, "{:?}", ready.rules);
     }
 
     #[test]

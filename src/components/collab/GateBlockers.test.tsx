@@ -7,8 +7,8 @@ afterEach(cleanup);
 
 const gate: GateReport = {
   projectId: 'p', total: 10, publishable: 1, rows: [
-    { frameId: 1, filename: 'a.fits', fwhmArcsec: null, eccentricity: null, starsDetected: null, trailed: null, publishable: false, failures: ['no analysis'] },
-    { frameId: 2, filename: 'b.fits', fwhmArcsec: null, eccentricity: null, starsDetected: null, trailed: null, publishable: false, failures: ['no coordinates'] },
+    { frameId: 1, filename: 'a.fits', fwhmArcsec: null, eccentricity: null, starsDetected: null, trailed: null, publishable: false, failures: ['no analysis'], rules: [] },
+    { frameId: 2, filename: 'b.fits', fwhmArcsec: null, eccentricity: null, starsDetected: null, trailed: null, publishable: false, failures: ['no coordinates'], rules: [] },
   ],
   blockers: [
     { kind: 'analyze', frames: 79, sets: [10], names: [] },

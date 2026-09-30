@@ -262,6 +262,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::collab_live::surface::SessionSourceView,
             crate::api::collab_live::surface::ReceiveSessionView,
             crate::collab::gate::FrameGateRow,
+            crate::collab::gate::RuleVerdict,
             crate::collab::gate::ThresholdRuleView,
             crate::collab::gate::GateBlocker,
             crate::collab::gate::UnmappedFilter,

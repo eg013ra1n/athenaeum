@@ -114,6 +114,25 @@ pub struct GateFrameInput {
     pub uuid: String,
 }
 
+/// One threshold rule's verdict for one frame (spec 2026-09-29 §4.1 drawer:
+/// rule · value · needs · ✓/✕). Produced inside `evaluate_frame`, in the same
+/// loop that writes the failure texts — never a second evaluation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleVerdict {
+    pub metric_key: String,
+    /// "FWHM", "eccentricity", "stars", "trailed", else the metric key.
+    pub label: String,
+    /// The frame's value, formatted like the failure text ("3.42″", "500",
+    /// "no"/"yes" for trailed); `None` when the input is missing.
+    pub value: Option<String>,
+    /// "≤ 3.00″", "≥ 200", "not trailed".
+    pub needs: String,
+    /// `None` = not evaluated (missing input — the precondition failure
+    /// already blocks the frame).
+    pub pass: Option<bool>,
+}
+
 /// The gate's verdict for one frame: echoed metrics, the publishable flag, and
 /// every human-readable failure reason.
 ///
@@ -136,6 +155,9 @@ pub struct FrameGateRow {
     /// dictionary`, `no analysis`, `unknown pixel scale`,
     /// `outside target radius (2.1° > 1.5°)`).
     pub failures: Vec<String>,
+    /// One entry per rule this function understood (an unknown metric, op or
+    /// non-numeric value gets no entry — see [`RuleVerdict`]).
+    pub rules: Vec<RuleVerdict>,
 }
 
 /// Evaluate one frame against the project target and threshold rules (spec §4).
@@ -208,10 +230,18 @@ pub fn evaluate_frame(
     let stars_detected = analysis.map(|a| a.stars_detected);
     let trailed = analysis.map(|a| a.possibly_trailed);
 
+    let mut rule_verdicts: Vec<RuleVerdict> = Vec::new();
     for rule in rules {
         match rule.metric_key.as_str() {
             "not_trailed" => {
                 if rule.op == "reject_if" && rule.value == serde_json::json!(true) {
+                    rule_verdicts.push(RuleVerdict {
+                        metric_key: rule.metric_key.clone(),
+                        label: "trailed".to_string(),
+                        value: trailed.map(|t| if t { "yes" } else { "no" }.to_string()),
+                        needs: "not trailed".to_string(),
+                        pass: trailed.map(|t| !t),
+                    });
                     if trailed == Some(true) {
                         failures.push("frame appears trailed".to_string());
                     }
@@ -236,23 +266,55 @@ pub fn evaluate_frame(
                     tracing::warn!(metric_key = %rule.metric_key, "non-numeric gate rule value skipped");
                     continue;
                 };
-                let Some(metric) = metric else { continue }; // layer-1 already recorded the blocker
                 let (label, unit) = match key {
                     "fwhm_arcsec" => ("FWHM", "″"),
                     "eccentricity" => ("eccentricity", ""),
                     "stars_detected" => ("stars", ""),
                     other => (other, ""),
                 };
-                match rule.op.as_str() {
-                    "lte" if metric > limit => {
-                        failures.push(format!("{label} {metric:.2}{unit} > {limit:.2}{unit}"))
-                    }
-                    "gte" if metric < limit => {
-                        failures.push(format!("{label} {metric:.0} < {limit:.0}"))
-                    }
-                    "lte" | "gte" => {}
+                // "needs" is derived from the op alone, so it exists even when
+                // the metric input is missing below — validating the op here
+                // (rather than after the metric-presence check, as the
+                // original single-pass version did) means an unknown op is
+                // still skipped with its warn regardless of whether the input
+                // happens to be present too.
+                let needs = match rule.op.as_str() {
+                    "lte" => format!("≤ {limit:.2}{unit}"),
+                    "gte" => format!("≥ {limit:.0}"),
                     other => {
-                        tracing::warn!(metric_key = %rule.metric_key, op = %other, "unknown gate op skipped")
+                        tracing::warn!(metric_key = %rule.metric_key, op = %other, "unknown gate op skipped");
+                        continue;
+                    }
+                };
+                let Some(metric) = metric else {
+                    rule_verdicts.push(RuleVerdict {
+                        metric_key: rule.metric_key.clone(),
+                        label: label.to_string(),
+                        value: None,
+                        needs,
+                        pass: None,
+                    });
+                    continue; // layer-1 already recorded the blocker
+                };
+                let (value, failed) = match rule.op.as_str() {
+                    "lte" => (format!("{metric:.2}{unit}"), metric > limit),
+                    "gte" => (format!("{metric:.0}"), metric < limit),
+                    _ => unreachable!("op validated above"),
+                };
+                rule_verdicts.push(RuleVerdict {
+                    metric_key: rule.metric_key.clone(),
+                    label: label.to_string(),
+                    value: Some(value),
+                    needs,
+                    pass: Some(!failed),
+                });
+                if failed {
+                    match rule.op.as_str() {
+                        "lte" => {
+                            failures.push(format!("{label} {metric:.2}{unit} > {limit:.2}{unit}"))
+                        }
+                        "gte" => failures.push(format!("{label} {metric:.0} < {limit:.0}")),
+                        _ => unreachable!("op validated above"),
                     }
                 }
             }
@@ -268,6 +330,7 @@ pub fn evaluate_frame(
         trailed,
         publishable: failures.is_empty(),
         failures,
+        rules: rule_verdicts,
     }
 }
 
@@ -1006,6 +1069,79 @@ mod tests {
             "unknown metric must not block: {:?}",
             row.failures
         );
+    }
+
+    /// Tiny helper the test module didn't have yet: build one
+    /// `ThresholdRuleView` from its three wire fields.
+    fn rule(metric_key: &str, op: &str, value: serde_json::Value) -> ThresholdRuleView {
+        serde_json::from_value(
+            serde_json::json!({"metricKey": metric_key, "op": op, "value": value}),
+        )
+        .unwrap()
+    }
+
+    /// Task 4: a verdict per rule, in rule order, formatted exactly like the
+    /// failure texts. fwhm: 1.71px × 2.0″/px (`input()`'s pixel scale) = 3.42″.
+    #[test]
+    fn evaluate_frame_reports_a_verdict_per_rule() {
+        let rules = vec![
+            rule("fwhm_arcsec", "lte", serde_json::json!(3.0)),
+            rule("stars_detected", "gte", serde_json::json!(200)),
+            rule("not_trailed", "reject_if", serde_json::json!(true)),
+        ];
+        let row = evaluate_frame(
+            &input(Some(analysis(1.71, 0.4, 500, false))),
+            &target(),
+            &rules,
+        );
+        assert_eq!(row.rules.len(), 3);
+        assert_eq!(
+            (
+                row.rules[0].label.as_str(),
+                row.rules[0].value.as_deref(),
+                row.rules[0].needs.as_str(),
+                row.rules[0].pass
+            ),
+            ("FWHM", Some("3.42″"), "≤ 3.00″", Some(false))
+        );
+        assert_eq!(
+            (
+                row.rules[1].value.as_deref(),
+                row.rules[1].needs.as_str(),
+                row.rules[1].pass
+            ),
+            (Some("500"), "≥ 200", Some(true))
+        );
+        assert_eq!(
+            (
+                row.rules[2].value.as_deref(),
+                row.rules[2].needs.as_str(),
+                row.rules[2].pass
+            ),
+            (Some("no"), "not trailed", Some(true))
+        );
+        assert_eq!(row.failures, vec!["FWHM 3.42″ > 3.00″".to_string()]); // texts unchanged
+    }
+
+    #[test]
+    fn a_rule_without_its_input_is_listed_but_not_evaluated() {
+        let rules = vec![rule("fwhm_arcsec", "lte", serde_json::json!(3.0))];
+        let row = evaluate_frame(&input(None), &target(), &rules);
+        assert_eq!(
+            (row.rules[0].value.as_deref(), row.rules[0].pass),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn an_unknown_metric_gets_no_verdict() {
+        let rules = vec![rule("zero_point", "gte", serde_json::json!(20))];
+        let row = evaluate_frame(
+            &input(Some(analysis(1.2, 0.4, 400, false))),
+            &target(),
+            &rules,
+        );
+        assert!(row.rules.is_empty());
     }
 
     #[test]

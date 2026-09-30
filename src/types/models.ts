@@ -1991,7 +1991,32 @@ export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: numb
  * dictionary`, `no analysis`, `unknown pixel scale`,
  * `outside target radius (2.1° > 1.5°)`).
  */
-failures: Array<string>, };
+failures: Array<string>, 
+/**
+ * One entry per rule this function understood (an unknown metric, op or
+ * non-numeric value gets no entry — see [`RuleVerdict`]).
+ */
+rules: Array<RuleVerdict>, };
+
+export type RuleVerdict = { metricKey: string, 
+/**
+ * "FWHM", "eccentricity", "stars", "trailed", else the metric key.
+ */
+label: string, 
+/**
+ * The frame's value, formatted like the failure text ("3.42″", "500",
+ * "no"/"yes" for trailed); `None` when the input is missing.
+ */
+value: string | null, 
+/**
+ * "≤ 3.00″", "≥ 200", "not trailed".
+ */
+needs: string, 
+/**
+ * `None` = not evaluated (missing input — the precondition failure
+ * already blocks the frame).
+ */
+pass: boolean | null, };
 
 export type ThresholdRuleView = { metricKey: string, op: string, 
 /**
@@ -2052,7 +2077,24 @@ export type OwnFrameRow = { frameId: number, frameUuid: string | null, fileName:
 /**
  * "ready" | "published" | "held"
  */
-segment: string, contributorState: string, contributorReason: string | null, failures: Array<GateFailure>, contentVersion: number | null, pubState: string | null, acceptedReason: string | null, holdersOnline: number | null, holdersTotal: number | null, localState: string | null, publishedAt: string | null, lastError: string | null, };
+segment: string, contributorState: string, contributorReason: string | null, failures: Array<GateFailure>, contentVersion: number | null, pubState: string | null, acceptedReason: string | null, holdersOnline: number | null, holdersTotal: number | null, localState: string | null, publishedAt: string | null, lastError: string | null, 
+/**
+ * One entry per threshold rule the gate understood, for the drawer's
+ * rule-by-rule section (Task 4, spec 2026-09-29 §4.1) — copied verbatim
+ * off the same [`FrameGateRow`] this row's other gate facts come from.
+ */
+rules: Array<RuleVerdict>, 
+/**
+ * The source light's catalog file path (the `files` row this frame
+ * belongs to), for the drawer's "local path" line.
+ */
+path: string | null, 
+/**
+ * Announced frames only: the manifest/own row's acceptance —
+ * `Some(false)` = excluded by the coordinator. `None` for a frame this
+ * account has never published.
+ */
+accepted: boolean | null, };
 
 export type Channel = "stable" | "beta";
 
