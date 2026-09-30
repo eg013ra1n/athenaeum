@@ -43,4 +43,15 @@ describe('Checkbox', () => {
     expect(input).toBeDisabled();
     expect(input.closest('label')?.className).toContain('opacity-50');
   });
+
+  it('positions the label, toggles from the box, and does not double-dim when disabled', () => {
+    const onChange = vi.fn();
+    const { rerender } = render(<Checkbox checked={false} onChange={onChange} label="Auto check" />);
+    expect(screen.getByRole('checkbox').closest('label')?.className.split(' ')).toContain('relative');
+    fireEvent.click(screen.getByTestId('cb-box'));
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith(true);
+    rerender(<Checkbox checked={false} onChange={onChange} label="Auto check" disabled />);
+    expect(screen.getByTestId('cb-box').className).not.toContain('opacity-45');
+  });
 });

@@ -22,8 +22,8 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
       onClose={onCancel}
       footer={
         <>
-          <Button onClick={onCancel}>{cancelText}</Button>
-          <Button variant={confirmDanger ? 'dangerPrimary' : 'primary'} onClick={onConfirm} data-autofocus>{confirmText}</Button>
+          <Button onClick={onCancel} data-autofocus={confirmDanger ? true : undefined}>{cancelText}</Button>
+          <Button variant={confirmDanger ? 'dangerPrimary' : 'primary'} onClick={onConfirm} data-autofocus={confirmDanger ? undefined : true}>{confirmText}</Button>
         </>
       }
     >

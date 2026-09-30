@@ -20,4 +20,11 @@ describe('ConfirmDialog on DialogShell', () => {
     render(<ConfirmDialog isOpen={false} title="t" message="m" onConfirm={() => {}} onCancel={() => {}} />);
     expect(screen.queryByRole('dialog')).toBeNull();
   });
+  it('focuses Cancel for a danger confirm and the confirm button otherwise', () => {
+    const { unmount } = render(<ConfirmDialog isOpen title="t" message="m" confirmText="Delete" confirmDanger onConfirm={() => {}} onCancel={() => {}} />);
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Cancel' }));
+    unmount();
+    render(<ConfirmDialog isOpen title="t" message="m" confirmText="Go" onConfirm={() => {}} onCancel={() => {}} />);
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Go' }));
+  });
 });
