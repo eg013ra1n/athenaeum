@@ -7,7 +7,6 @@ import type {
   ExchangeSnapshot,
   FlowView,
   InFlightView,
-  MemberSummary,
   ProjectFlows,
   ReceiveSessionView,
   SessionSourceView,
@@ -68,25 +67,6 @@ function receiveSession(overrides: Partial<ReceiveSessionView> = {}): ReceiveSes
   };
 }
 
-function member(overrides: Partial<MemberSummary> = {}): MemberSummary {
-  return {
-    accountId: 'acc-1',
-    displayName: 'Kostya',
-    dataRole: 'send_receive',
-    coordinator: false,
-    devices: [],
-    online: true,
-    lastSeenAt: null,
-    publishedFrames: 0,
-    secondsByFilter: {},
-    qualityByCamera: [],
-    holdsFrames: 0,
-    holdsBytes: 0,
-    holdsShare: 0,
-    ...overrides,
-  };
-}
-
 const EMPTY_SNAPSHOT: ExchangeSnapshot = { projects: [], names: [] };
 
 /** Every registered listener per event. */
@@ -118,14 +98,13 @@ beforeEach(() => {
 });
 
 function renderTab(
-  overrides: { canReceive?: boolean; members?: MemberSummary[] | null; projectId?: string } = {},
+  overrides: { canReceive?: boolean; projectId?: string } = {},
 ) {
   return render(
     <CollabExchangeProvider>
       <ExchangeTab
         projectId={overrides.projectId ?? 'proj-1'}
         canReceive={overrides.canReceive ?? true}
-        members={overrides.members ?? null}
       />
     </CollabExchangeProvider>,
   );
@@ -249,8 +228,8 @@ describe('ExchangeTab — receive history', () => {
 
     renderTab();
 
-    expect(await screen.findByText('Kostya')).toBeInTheDocument();
-    expect(screen.getByText('Olga')).toBeInTheDocument();
+    const from = (await screen.findByText(/Kostya/)).closest('td') as HTMLElement;
+    expect(from.textContent).toBe(' Kostya,  Olga');
   });
 
   it('shows "No sessions yet." when the history is empty', async () => {
@@ -317,7 +296,7 @@ describe('ExchangeTab — member tone', () => {
       names: [{ projectId: 'proj-1', device: 'devA', memberName: 'Kostya', deviceName: 'kostya-obs' }],
     };
 
-    renderTab({ members: [member({ accountId: 'acc-1', displayName: 'Kostya' })] });
+    renderTab();
 
     expect(await screen.findByText('↓ from Kostya')).toBeInTheDocument();
   });
@@ -338,6 +317,20 @@ describe('ExchangeTab — mockup layout', () => {
     expect(row.className).toContain('grid-cols-[28px_minmax(140px,1.2fr)_minmax(160px,2fr)_90px_128px_70px]');
     expect(within(row).getByText(/37 landed this session · 4\.8 GB/)).toBeInTheDocument();
     expect(within(row).getByText('ETA 9m')).toBeInTheDocument();
+    // One more sample from a progress event gives the rates buffer 2 points.
+    await waitFor(() => expect(listeners['collab-exchange-progress']).toBeDefined());
+    act(() => {
+      (listeners['collab-exchange-progress'] ?? []).forEach((h) =>
+        h({
+          projects: [
+            projectFlows({
+              recv: [flow({ device: 'devA', direction: 'recv', completed: 37, bytesSession: 4.8e9, rateBps: 2e6, etaSecs: 540 })],
+            }),
+          ],
+        }),
+      );
+    });
+    await waitFor(() => expect(row.querySelector('svg polyline')).not.toBeNull());
   });
 
   it('Received sessions: Started, From, Frames, Size, Duration, Avg rate, Outcome', async () => {

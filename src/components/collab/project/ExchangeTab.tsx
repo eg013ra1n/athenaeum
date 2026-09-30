@@ -8,7 +8,7 @@ import { PeerFlowRow } from '../exchange/PeerFlowRow';
 import { useMemberColor } from './MemberColorsContext';
 import { TD, TH } from './tableStyle';
 import { Card, Chip, EmptyState, MemberDot } from '../../ui';
-import type { CollabFramesLanded, FlowView, MemberSummary, ReceiveSessionView } from '../../../types/models';
+import type { CollabFramesLanded, FlowView, ReceiveSessionView } from '../../../types/models';
 
 /**
  * Exchange tab — live per-peer rows in both directions, plus the receive
@@ -25,8 +25,6 @@ export default function ExchangeTab({
 }: {
   projectId: string;
   canReceive: boolean;
-  /** Kept for the caller's signature; colours come from `MemberColorsContext`. */
-  members?: MemberSummary[] | null;
 }): JSX.Element {
   const colorOf = useMemberColor();
   const { state, refreshProject } = useCollabExchange();
@@ -161,13 +159,13 @@ export default function ExchangeTab({
               <table className="w-full border-collapse text-[12.5px]">
                 <thead>
                   <tr>
-                    <th className={`${TH} text-left`}>Started</th>
-                    <th className={`${TH} text-left`}>From</th>
-                    <th className={`${TH} text-right`}>Frames</th>
-                    <th className={`${TH} text-right`}>Size</th>
-                    <th className={`${TH} text-right`}>Duration</th>
-                    <th className={`${TH} text-right`}>Avg rate</th>
-                    <th className={`${TH} text-left`}>Outcome</th>
+                    <th className={`${TH} text-left text-content-faint`}>Started</th>
+                    <th className={`${TH} text-left text-content-faint`}>From</th>
+                    <th className={`${TH} text-right text-content-faint`}>Frames</th>
+                    <th className={`${TH} text-right text-content-faint`}>Size</th>
+                    <th className={`${TH} text-right text-content-faint`}>Duration</th>
+                    <th className={`${TH} text-right text-content-faint`}>Avg rate</th>
+                    <th className={`${TH} text-left text-content-faint`}>Outcome</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -176,17 +174,14 @@ export default function ExchangeTab({
                     const rate = spanSecs > 0 ? formatRate(s.bytes / spanSecs) : '—';
                     return (
                       <tr key={s.id}>
-                        <td className={`${TD} text-content-muted`}>{formatTimestamp(s.startedAt)}</td>
+                        <td className={`${TD} text-content-muted`}>{formatTimestamp(s.startedAt, { seconds: true })}</td>
                         <td className={TD}>
                           {s.sources.map((src, i) => {
                             const name = src.memberName ?? src.deviceName ?? src.device.slice(0, 8);
                             return (
                               <span key={src.device}>
                                 {i > 0 && ', '}
-                                <span className="inline-flex items-center gap-1.5">
-                                  <MemberDot color={colorOf(src.memberName)} />
-                                  <span>{name}</span>
-                                </span>
+                                <MemberDot color={colorOf(src.memberName)} /> {name}
                               </span>
                             );
                           })}

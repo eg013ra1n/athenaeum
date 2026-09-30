@@ -55,7 +55,7 @@ export function PeerFlowRow({
           <b className="block truncate font-semibold text-content">
             {isRecv ? '↓ from' : '↑ to'} {who}
           </b>
-          <small className="block truncate text-[11.5px] text-content-faint">
+          <small className="block truncate text-[11.5px] leading-[18.2px] text-content-faint">
             {label.device} · {flow.inFlight.length} in flight
           </small>
         </span>

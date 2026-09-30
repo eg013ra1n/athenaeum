@@ -84,7 +84,6 @@ function weightedFwhm(m: MemberSummary): number | null {
   return null;
 }
 
-
 function Ghost(): JSX.Element {
   return <span className="text-content-ghost">—</span>;
 }

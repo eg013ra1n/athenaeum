@@ -697,7 +697,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
             <MembersTab members={members} error={membersError} goals={detail.goals} />
           )}
 
-          {activeTab === 'exchange' && <ExchangeTab projectId={id} canReceive={canReceive} members={members} />}
+          {activeTab === 'exchange' && <ExchangeTab projectId={id} canReceive={canReceive} />}
 
           {activeTab === 'moderation' && (
             <PanelLayout panel={framePanel}>
