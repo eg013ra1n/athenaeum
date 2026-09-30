@@ -201,6 +201,10 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Collab observability wave 1 (2026-09-30)
+
+Collab observability wave 1 — owner smoke owed: two instances on the test hub, live rows both ways, sessions with sources, Members holds/last seen.
+
 ### Collab v3 wave 3 — owner smoke (2026-09-28)
 
 The owner's first hands-on pass over wave 3 (app on local `main`, portal +

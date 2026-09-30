@@ -170,3 +170,54 @@ column — four new commands (`get_collab_filter_mapping_sheet`,
   unlinked, nearby candidate projects (`find_matching_projects`, within
   target radius, not yet linked); signed out returns both empty, never an
   error.
+
+## Exchange observability (wave 1, 2026-09-30)
+
+Spec `docs/superpowers/specs/2026-09-29-collab-project-observability-design.md` (amendments §13). Before this
+wave a receive showed only landed files (no source, no rate) and serving showed nothing at all; five new
+commands and one meter close that gap without touching the iroh wire.
+
+- **The meter.** `ExchangeMeter` (`collab/live/meter.rs`) is node-owned (`SharedIrohNode::exchange_meter()`,
+  created at bind, not owned by the live runtime — serving happens on connections the node accepts whether or
+  not a live exchange runtime is running for that project) and keyed by `(project_id, peer_device,
+  direction)`: bytes this session, an EMA rate, ETA, completed count and the frames currently in flight
+  (`frameUuid`, `fileName`, `size`, `done`, clamped to `size` so a hedge or a retried delivery never reads
+  over 100%). It is in-memory only and never a correctness input — a dropped or stale flow only degrades what
+  the UI shows.
+- **Feeds.** Receive: a `DeliveredSink` byte callback threaded through `LiveRunOptions`/`AssignmentOptions`
+  into `transfer_once` (`sharing/iroh/assign.rs`) — not a `ProviderEvent` variant, since `ProviderEvent` is
+  `Copy` and the item key the meter needs isn't in scope where the stream's bytes are read. Serve: the collab
+  provider-event loop tracks per-blob progress the way the personal path's upload accumulator already does.
+  **Meter ≥ report, never reconcile**: the meter's own byte sum can exceed the landing's
+  `AssignmentReport::total_bytes` (hedge losers, cancelled primaries, yielded items) — the meter is the
+  per-peer truth, and nothing ever corrects it against the report.
+- **The event.** `collab-exchange-progress` carries device ids only (no catalog read on the runtime's emit
+  path) — at most once per second, only while something moves, then exactly one all-zero event per project
+  when it goes quiet (`ProgressGate`, the same throttle discipline as `FanOutTicker`). The runtime does not
+  poll on a fixed timer: it wakes on a `flow_started` signal and keeps emitting while `needs_progress` is
+  true.
+- **The snapshot.** `get_collab_exchange { projectId? }` (both hosts, `level = "debug"` — the UI calls it on
+  mount and on an unknown device) answers the same per-project flows plus a `names` list
+  (`{ projectId, device, memberName?, deviceName? }`) resolved once against the catalog, and
+  `waitingForPublisher` (a catalog read the event path skips). No `projectId` returns the projects that
+  currently have flows, not every project the account belongs to.
+- **Frame holders and member summary.** `get_collab_frame_holders { projectId, frameUuid }` lists who holds one
+  frame's current content version (publisher first, then by name, then device; unknown devices are listed by
+  short id, never dropped). `get_collab_member_summary { projectId }` is the project page's Members tab: one
+  row per member with devices online, published contribution (`secondsByFilter`, `f64` seconds) and quality
+  by camera (`camera == ""` for a frame with no `INSTRUME`, shown as "Unknown camera"), and this member's share
+  of the project's held frames. `list_project_own_frames { projectId }` is the "My frames" tab, joining the
+  gate verdict, the contributor state and the local own row per light frame — no `zeroPoint` anywhere (the app
+  does not compute one; v3 R9 is unbuilt).
+- **Receive sessions.** `collab_receive_sessions` groups a burst of landings (a gap over five minutes opens a
+  new session) into one row — frame count, bytes, a `failed` count and per-device source bytes — instead of
+  one `sync_history` row per landed frame. `list_collab_receive_sessions { projectId?, limit }` answers from
+  the catalog alone, no live runtime needed, so a signed-out or just-started app still shows its receive
+  history; sources are named the same way `get_collab_exchange`'s peers are, sorted top-source-first.
+- **History exclusion.** `HistoryQuery.exclude_collab_landings` (set by `api::sync::list_history`, the
+  Transfers page's read) drops per-frame collab landing rows (`project IS NOT NULL AND package_id IS NULL`) so
+  a large project's frame-by-frame landings no longer crowd personal transfers out of the history cap —
+  receive sessions show that traffic instead. The frame-level `sync_history` row still exists (the frame
+  drawer's "received <date> from <member>"), with `peer_device` now the top source's base64 device id (the
+  same string as `SnapshotMember.nodes`), or `"local"` for content linked from disk with no fetch;
+  personal-sync rows are unaffected and keep their hex node ids.

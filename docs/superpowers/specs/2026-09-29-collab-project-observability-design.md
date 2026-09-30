@@ -138,7 +138,7 @@ OwnFrameRow {
   night,                // catalog night (noon-to-noon), YYYY-MM-DD
   filter, filterMapped, // canonical name when mapped, else the raw FILTER with filterMapped = false
   camera?, exptimeSec?, byteSize,
-  fwhmArcsec?, eccentricity?, starsDetected?, medianSnr?, zeroPoint?,
+  fwhmArcsec?, eccentricity?, starsDetected?, medianSnr?,   // no zeroPoint — amended, see §13.3
   segment,              // "ready" | "published" | "held"
   contributorState,     // ContributorState::key()
   failures: [{ kind, text }],   // kind ∈ BLOCKER_ORDER keys; sorted by that order
@@ -160,7 +160,7 @@ OwnFrameRow {
 ### 5.2 Library — extend `ProjectFrameView`
 
 New fields, read from `project_frames_local.manifest_json`: `camera` (`instrume`), `telescope`, `night`,
-`medianSnr`, `zeroPoint`, `publisherAccountId`.
+`medianSnr`, `publisherAccountId`. No `zeroPoint` (amended, see §13.3).
 
 - `night` for another member's frame = the UTC date of `dateObs − 12 h`. We do not know the publisher's
   longitude; for Europe/Russia this equals the local night, for the Americas it can differ. Computed in the
@@ -183,11 +183,14 @@ id with `memberName = null` — never dropped. Called only when the drawer opens
 MemberSummary {
   accountId, displayName, dataRole, coordinator,
   devices: [{ name, online }],
-  publishedFrames, secondsByFilter: { <canonical>: i64 },
+  publishedFrames, secondsByFilter: { <canonical>: f64 },   // seconds, amended: f64 not i64, see §13.5
   qualityByCamera: [{ camera, filter, frames, medianFwhm, medianEcc }],
   holdsFrames, holdsBytes, holdsShare,   // share of all published frames
 }
 ```
+
+`CameraQuality.camera` (amended, see §13.5) is `""` when a frame had no `INSTRUME`; the UI labels that row
+"Unknown camera" rather than the app inventing a placeholder string.
 
 - Published counts and seconds come from the local manifest mirror (published, accepted rows).
 - Holds = holder claims on the frame's current content version, mapped to the account through its devices,
@@ -260,21 +263,30 @@ shown) and the members-list line.
 
 ### 6.1 Shape
 
-One `ExchangeMeter` per process, owned by the `collab_live` runtime. Keyed by
-`(project_id, peer_device, direction)`; each entry holds bytes this session, frames in flight
-(`frame_uuid`, file name, size, bytes done), completed count, an EMA rate over a ~10 s window, `started_at`,
-`last_moved_at`. Writes are synchronous (atomics plus a short `std::sync::Mutex`, never held across an
-`await`), so the runtime rule "the loop never awaits" holds. An entry idle for 60 s is dropped; its bytes are
-already in the session history (§7) for receives.
+One `ExchangeMeter` per process. Amended (wave 1, see §13.6): node-owned (`SharedIrohNode::exchange_meter()`),
+created at bind rather than owned by the `collab_live` runtime, since the serve feed (§6.2) fires from
+connections the node accepts independently of any running runtime. Keyed by `(project_id, peer_device,
+direction)`; each entry holds bytes this session, frames in flight (`frame_uuid`, file name, size, bytes
+done), completed count, an EMA rate over a ~10 s window, `started_at`, `last_moved_at`. Writes are synchronous
+(atomics plus a short `std::sync::Mutex`, never held across an `await`), so the runtime rule "the loop never
+awaits" holds. An entry idle for 60 s is dropped; its bytes are already in the session history (§7) for
+receives.
+
+The runtime does not poll the meter on a fixed timer: it wakes on a `flow_started` signal (a new flow, or one
+resumed after a pause) and then keeps emitting while `needs_progress` is true (bytes in flight, or a flow
+moved within the last `MOVING` window) — see §13.6. A flow quiet longer than `MOVING` re-seeds its rate on the
+next delivery instead of reading a stale average across the gap. An in-flight item's reported `done` is
+clamped to its known `size` (a hedge or a retry re-delivering past 100% must not read over it).
 
 ### 6.2 Feeds
 
 - **Receive.** `assign.rs`'s live child loop already consumes each provider's `Progress(u64)` stream itself
   (not the stock downloader's buffered channel, so the "telemetry is a sample" caveat on
-  `ProviderTelemetrySink` does not apply to this path). `ProviderEvent` gains
-  `Delivered { provider, item, bytes }`, emitted from that loop as deltas. The executor passes a sink that
-  writes the meter instead of `noop_provider_telemetry()`. At landing the executor keeps the
-  `AssignmentReport` for §7.
+  `ProviderTelemetrySink` does not apply to this path). Amended (wave 1, see §13.1): not a `ProviderEvent`
+  variant — a separate `DeliveredSink` byte callback threaded through `LiveRunOptions`/`AssignmentOptions`
+  into `transfer_once`, emitting deltas as bytes arrive. At landing the executor keeps the `AssignmentReport`
+  for §7; the meter's own sum can exceed `AssignmentReport::total_bytes` (hedge losers, cancelled primaries,
+  yielded items) — the meter is the per-peer truth, never reconciled against the report.
 - **Serve.** The collab provider-event loop replaces the bare drain with a match on
   `RequestUpdate::Progress / Completed / Aborted`, tracking per-blob `end_offset` the way the personal path's
   `UploadAccumulator` already does. Project and frame come from the `ServeRecord` found at admission; the peer
@@ -289,13 +301,19 @@ Same mapping as §5.3. An unknown device shows its short id; the row is never dr
 
 ### 6.4 Surface (both hosts)
 
-- `get_collab_exchange { projectId? }` → `ExchangeSnapshot { projects: [ProjectExchange] }`;
-  `ProjectExchange { projectId, title, recv: [PeerFlow], send: [PeerFlow], toGo, waitingForPublisher }`;
-  `PeerFlow { device, deviceName, memberName?, bytesSession, rateBps, etaSecs?, completed, queued,
-  inFlight: [{ frameUuid, fileName, size, done }] }`. No `projectId` = every project (Transfers).
-- Event `collab-exchange-progress`: the same shape, changed projects only, at most once per second, only while
-  something moves, then exactly one all-zero event per project when it goes quiet. Throttling follows
-  `FanOutTicker`.
+- `get_collab_exchange { projectId? }` → `ExchangeSnapshot { projects: [ProjectExchange], names }` (amended,
+  see §13.4). `ProjectExchange { projectId, recv: [PeerFlow], send: [PeerFlow], toGo, waitingForPublisher }` —
+  no `title` (the caller already has it) and no per-peer `queued` (the queue is per project, `toGo`, read from
+  the scheduler's want set and kept current by the executor, not stored per event). `PeerFlow { device,
+  bytesSession, rateBps, etaSecs?, completed, inFlight: [{ frameUuid, fileName, size, done }] }` — device ids
+  only; names are a separate top-level list, `names: [{ projectId, device, memberName?, deviceName? }]`,
+  resolved once against the catalog in the command, never per event. `waitingForPublisher` is populated only
+  in this command's answer (it needs a catalog read); it is `null` in every `collab-exchange-progress` event.
+  No `projectId` = every project that currently has flows (not every project the account belongs to).
+- Event `collab-exchange-progress`: the same per-project/per-peer shape minus `names` and
+  `waitingForPublisher` (device ids only, no catalog read on the emit path) — changed projects only, at most
+  once per second, only while something moves, then exactly one all-zero event per project when it goes
+  quiet. Throttling follows `FanOutTicker`.
 - Rate and ETA are computed in the core. Personal sync keeps its frontend-computed rate; this cycle does not
   touch it.
 - A contributor's snapshot has an empty `recv` (role does not receive).
@@ -311,7 +329,7 @@ Send journal (D2); per-peer relay/direct split; any wire change.
 ```
 collab_receive_sessions (
   id INTEGER PRIMARY KEY, project_id TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
-  frames INTEGER NOT NULL, bytes INTEGER NOT NULL, retried INTEGER NOT NULL DEFAULT 0,
+  frames INTEGER NOT NULL, bytes INTEGER NOT NULL, failed INTEGER NOT NULL DEFAULT 0,
   sources_json TEXT NOT NULL DEFAULT '{}'   -- { device: bytes }
 )
 ```
@@ -319,16 +337,20 @@ collab_receive_sessions (
 - A landing extends the project's newest session when its `finished_at` is ≤ 5 min ago, else opens one.
   Written inside the existing landing transaction (`BEGIN IMMEDIATE`, the collab read-then-write rule).
 - `sources_json` sums the landing's `AssignmentReport.per_provider` bytes by device.
-- `retried` counts frames whose fetch switched provider after a failure (today such failures are not recorded).
+- Amended (wave 1, see §13.2): the column is `failed`, counting landings that failed outright — a provider
+  switch mid-fetch is not observable per frame, so `retried` was dropped.
 - Keep the newest 500 sessions per project; prune on insert.
 - Command `list_collab_receive_sessions { projectId?, limit }` on both hosts.
 
 ### 7.2 Per-frame provenance
 
 The landing's `sync_history` row keeps being written, with `peer_device` = the provider that delivered the
-most bytes instead of `"swarm"`. The drawer reads it as "received <date> from <member>".
-`api::sync::list_history` excludes collab landings (`project IS NOT NULL AND package_id IS NULL`) so they no
-longer crowd out personal transfers; sessions replace them in the Transfers history.
+most bytes instead of `"swarm"` — amended (wave 1, see §13.7): concretely, the top source's base64 device id
+(the same string as `SnapshotMember.nodes`), or `"local"` for content linked from disk with no fetch
+(`link_identical`); personal-sync rows are unaffected and keep their hex node ids. The drawer reads it as
+"received <date> from <member>". `api::sync::list_history` excludes collab landings (`project IS NOT NULL AND
+package_id IS NULL`) so they no longer crowd out personal transfers; sessions replace them in the Transfers
+history.
 
 ### 7.3 Transfers page
 
@@ -420,3 +442,40 @@ Three waves, one plan each, in order:
 - Relay/direct per peer.
 - Project Stacking and Export tabs (v3 §8.1).
 - Night of another member's frame using the publisher's longitude.
+
+## 13. Amendments (wave 1, 2026-09-30)
+
+Wave 1 (core and commands) implementation found seven places where the built shape differs from this design;
+each is fixed inline above and listed here for the record.
+
+1. **§6.2 receive feed.** Not a `ProviderEvent::Delivered` variant — `ProviderEvent` is `Copy` and the stream
+   is sampled, and the item key the meter needs is not in scope where bytes are actually read. The feed is a
+   separate `DeliveredSink` byte callback (`sharing/iroh/assign.rs`) threaded through
+   `LiveRunOptions`/`AssignmentOptions` into `transfer_once`. Its sum can exceed the fetch report's
+   `total_bytes` (hedge losers, cancelled primaries, yielded items) — **the meter is the per-peer truth; it is
+   never reconciled against the report.**
+2. **§7.1 sessions column.** `failed` (landings that failed outright), not `retried` — a provider switch
+   mid-fetch is not observable per frame.
+3. **§5.1 / §5.2 — no `zeroPoint`.** Dropped from `OwnFrameRow` and the `ProjectFrameView` extension: the app
+   does not compute a zero point anywhere (v3 R9 is unbuilt); the mockup's ZP column is dropped in wave 2.
+4. **§6.4 surface shape.**
+   - The progress event carries device ids only; names come from `get_collab_exchange`'s own separate
+     `names: [{ projectId, device, memberName?, deviceName? }]` list, resolved once against the catalog in the
+     command, never per event.
+   - `ProjectExchange.title` and per-peer `queued` are dropped — the queue is per project (`toGo`, from the
+     scheduler's want set, kept current by the executor, never stored per event).
+   - `get_collab_exchange` with no `projectId` returns the projects that currently have flows, not every
+     project the account belongs to.
+   - `waitingForPublisher` is populated only in the command's snapshot (it needs a catalog read); it is `null`
+     in every `collab-exchange-progress` event.
+5. **§5.4 member summary.** `secondsByFilter` values are `f64` seconds, not `i64`. `CameraQuality.camera` is
+   `""` when a frame had no `INSTRUME` header (the UI labels that row "Unknown camera").
+6. **§6.1 / §6.4 meter.** The meter is node-owned (`SharedIrohNode::exchange_meter()`), created at bind, not
+   owned by the `collab_live` runtime — the serve feed fires from connections the node accepts independently
+   of any running runtime. The runtime wakes on a `flow_started` signal and then keeps emitting while
+   `needs_progress` is true, rather than polling on a fixed timer. A flow quiet longer than `MOVING` re-seeds
+   its rate on resume instead of reading a stale average across the gap. An in-flight item's reported `done`
+   is clamped to its known size.
+7. **§7.2 provenance.** `sync_history.peer_device` for a collab landing is the top source's base64 device id
+   (the same string as `SnapshotMember.nodes`), or `"local"` for content linked from disk with no fetch;
+   personal-sync rows are unaffected and keep their hex node ids.
