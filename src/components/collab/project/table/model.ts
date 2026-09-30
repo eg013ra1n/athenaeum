@@ -283,7 +283,11 @@ export function windowSlice(scrollTop: number, viewportH: number, total: number,
     const end = Math.min(total, 60);
     return { start: 0, end, padTop: 0, padBottom: (total - end) * rowH };
   }
-  const start = Math.max(0, Math.floor(scrollTop / rowH) - overscan);
-  const end = Math.min(total, Math.ceil((scrollTop + viewportH) / rowH) + overscan);
+  // Clamp against the current row count first: a facet/grouping change can shrink `total`
+  // while a stale, larger `scrollTop` is still in state, which would otherwise put `start`
+  // past `end` and break the padTop + visible*rowH + padBottom === total*rowH invariant.
+  const clampedScrollTop = Math.min(Math.max(scrollTop, 0), Math.max(0, total * rowH - viewportH));
+  const start = Math.max(0, Math.floor(clampedScrollTop / rowH) - overscan);
+  const end = Math.min(total, Math.ceil((clampedScrollTop + viewportH) / rowH) + overscan);
   return { start, end, padTop: start * rowH, padBottom: (total - end) * rowH };
 }

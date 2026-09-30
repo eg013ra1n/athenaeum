@@ -117,6 +117,23 @@ describe('windowSlice', () => {
     expect(windowSlice(0, 0, 5000)).toMatchObject({ start: 0, end: 60 });
     expect(windowSlice(0, 0, 3)).toMatchObject({ start: 0, end: 3, padBottom: 0 });
   });
+  it('a stale scrollTop past a shrunk row count clamps to a valid, non-empty slice', () => {
+    const s = windowSlice(20000, 290, 10, 29, 10);
+    expect(s.start).toBeLessThanOrEqual(s.end);
+    expect(s.end).toBeGreaterThan(s.start);
+    expect(s.padTop + (s.end - s.start) * 29 + s.padBottom).toBe(10 * 29);
+  });
+  it('padTop + visible*rowH + padBottom always accounts for the whole row count', () => {
+    const rowH = 29;
+    const cases: Array<[number, number]> = [
+      [0, 5000], [2900, 5000], [1_000_000, 5000], [0, 0], [10_000, 1], [29 * 3, 1],
+    ];
+    for (const [scrollTop, total] of cases) {
+      const s = windowSlice(scrollTop, 290, total, rowH, 10);
+      expect(s.start).toBeLessThanOrEqual(s.end);
+      expect(s.padTop + (s.end - s.start) * rowH + s.padBottom).toBe(total * rowH);
+    }
+  });
 });
 
 describe('orders', () => {
