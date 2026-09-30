@@ -1438,7 +1438,7 @@ git commit -m "feat(ui): Checkbox, ConfirmDialog and AlertDialog on the mockup s
 **Files:**
 - Modify: `src/components/collab/project/table/ProjectFrameTable.tsx` (markup and layout; the facet/group/sort/selection/windowing logic stays as is)
 - Modify: `src/components/collab/project/frames.tsx` (cell and group renderers only, `COLUMNS`/`GROUPS` data unchanged)
-- Create: `src/components/collab/project/MemberColors.tsx`
+- Create: `src/components/collab/project/MemberColorsContext.tsx`
 - Modify: `src/components/collab/project/table/ProjectFrameTable.test.tsx`, `src/components/collab/project/frames.test.tsx`
 
 **Interfaces:**
@@ -1522,7 +1522,7 @@ it('status and disk cells use Chip tones', () => {
 Run: `npx vitest run src/components/collab/project/table/ProjectFrameTable.test.tsx src/components/collab/project/frames.test.tsx`
 Expected: FAIL — there is no `table-fixed`, no `<col>`, and cells read "180s" and binary sizes.
 
-- [ ] **Step 3: `MemberColors.tsx`**
+- [ ] **Step 3: `MemberColorsContext.tsx`**
 
 ```tsx
 import { createContext, useCallback, useContext, useMemo, type ReactNode } from 'react';
