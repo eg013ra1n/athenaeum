@@ -23,6 +23,7 @@ import { NotificationBell } from './NotificationBell';
 import { ToastStack } from './Toast';
 import { NotificationPanel } from './NotificationPanel';
 import { TransfersProvider } from '../contexts/TransfersContext';
+import { CollabExchangeProvider } from '../contexts/CollabExchangeContext';
 import { TransferIndicator } from './transfers/TransferIndicator';
 import { TransfersPanel } from './transfers/TransfersPanel';
 import { UpdatesProvider } from '../contexts/UpdatesContext';
@@ -99,6 +100,7 @@ export default function Layout() {
     <SessionStateProvider>
     <NotificationProvider>
     <TransfersProvider>
+    <CollabExchangeProvider>
     <UpdatesProvider>
     <ScanProgressProvider>
       <ExportProgressProvider>
@@ -199,6 +201,7 @@ export default function Layout() {
       </ExportProgressProvider>
     </ScanProgressProvider>
     </UpdatesProvider>
+    </CollabExchangeProvider>
     </TransfersProvider>
     </NotificationProvider>
     </SessionStateProvider>
