@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX, type ReactNode } from 'react';
 import { Loader2 } from 'lucide-react';
 import { useSessionState } from '../../../../contexts/SessionStateContext';
-import { getFilterColor } from '../../../../utils/filterColors';
-import { formatBytes, formatDuration } from '../../format';
+import { Button, EmptyState, FilterChip, Popover, Select, TextInput } from '../../../ui';
+import { formatDurationPadded, formatSize } from '../../format';
 import { COLUMNS, FRAME_ACCESS, GROUPS, TABLES, type FrameVM, type TableId } from '../frames';
 import {
   activeFacetCount, allGroupIds, applyFacets, buildTree, checkState, EMPTY_FACETS, facetCounts, filterOrder,
@@ -31,7 +31,17 @@ export interface ProjectFrameTableProps {
   emptyText: string; // shown when rows is empty (not when facets hide everything)
   groupAction?: (node: GroupNode<FrameVM>) => ReactNode; // Held back Reason headers
   toolbarExtra?: ReactNode; // e.g. the moderation trust checkbox
+  /** The row whose side panel is open — it gets the active background. */
+  activeKey?: string | null;
+  /** Rendered left of "Columns ⚙" on the group row (Library: Export for WBPP). */
+  groupRowExtra?: ReactNode;
   today?: string; // test seam; default localToday()
+}
+
+/** Checkbox column + Frame at its 220 px minimum + every other column's
+ *  fixed width (spec §5.1): below this the table scrolls horizontally. */
+export function tableMinWidth(columns: ColumnDef<FrameVM>[]): number {
+  return 32 + 220 + columns.filter((c) => c.id !== 'name').reduce((a, c) => a + c.width, 0);
 }
 
 /* ── Small helpers ──────────────────────────────────────────────────────── */
@@ -75,14 +85,29 @@ function saveColumns(tableId: TableId, cols: string[]): void {
   }
 }
 
-const linkBtn = 'text-[11px] text-accent hover:underline disabled:text-content-muted disabled:no-underline disabled:cursor-not-allowed';
-const outlineBtn = 'inline-flex items-center gap-1 rounded border border-border px-2.5 py-1 text-xs text-content-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50';
-const primaryBtn = 'inline-flex items-center gap-1 rounded bg-accent px-2.5 py-1 text-xs text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50';
+/** Mockup `table.ft th` — sticky 30 px header on `table-head`. */
+const TH = 'sticky top-0 z-[2] h-[30px] select-none overflow-hidden text-ellipsis whitespace-nowrap border-b border-border bg-table-head px-2 text-[11.5px] font-medium';
+/** Mockup `table.ft td` — 28 px cell + 1 px `line-soft` separator (the 29 px
+ *  `ROW_H` pitch), never wraps, truncates with an ellipsis. */
+const TD = 'h-7 overflow-hidden text-ellipsis whitespace-nowrap border-b border-line-soft px-2';
+
+/** Spec §5.2 item 4 — the table box reaches the window bottom, minimum `min`px. */
+function useFillHeight(el: HTMLElement | null, min: number): number | undefined {
+  const [h, setH] = useState<number | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (!el) return undefined;
+    const fit = () => setH(Math.max(min, Math.floor(window.innerHeight - el.getBoundingClientRect().top - 24)));
+    fit();
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+  }, [el, min]);
+  return h;
+}
 
 /* ── Component ──────────────────────────────────────────────────────────── */
 
 export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.Element {
-  const { tableId, scope, rows, actions, onOpen, emptyText, groupAction, toolbarExtra } = props;
+  const { tableId, scope, rows, actions, onOpen, emptyText, groupAction, toolbarExtra, activeKey = null, groupRowExtra } = props;
   const today = props.today ?? localToday();
   const config = TABLES[tableId];
 
@@ -105,6 +130,7 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
   const scrollRef = (node: HTMLDivElement | null) => setScrollEl(node);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(0);
+  const fillHeight = useFillHeight(scrollEl, 360);
 
   // Prune the selection whenever the underlying rows change (a frame that left
   // the table — republished, excluded, downloaded — stops being selectable).
@@ -270,7 +296,7 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
 
   // Empty states (spec §4.1 item 7): no rows at all → just the sentence.
   if (rows.length === 0) {
-    return <p className="text-sm text-content-muted">{emptyText}</p>;
+    return <EmptyState>{emptyText}</EmptyState>;
   }
 
   // A selection entirely hidden by the current facets counts as NO selection
@@ -288,37 +314,20 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
   const active = activeFacetCount(facets);
 
   return (
-    <div className="flex flex-col gap-2 text-xs">
-      {/* ── Facet row ──────────────────────────────────────────────────── */}
-      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
-        <span className="text-content-muted">Filter</span>
-        {presentFilters.map((f) => {
-          const on = facets.filters.includes(f);
-          const c = counts.filters.get(f) ?? 0;
-          return (
-            <button
-              key={f}
-              type="button"
-              onClick={() => toggleFilterChip(f)}
-              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 ${
-                on ? 'border-accent bg-accent/10 text-content' : 'border-border text-content-secondary'
-              } ${c === 0 ? 'opacity-40' : ''}`}
-            >
-              <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: getFilterColor(f) }} />
-              {f}
-              {' '}
-              <span className="text-[10px] text-content-muted">{c}</span>
-            </button>
-          );
-        })}
+    <div className="flex flex-col text-[13px] leading-[1.4]">
+      {/* ── Filter row — mockup .toolbar ───────────────────────────────── */}
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 py-2">
+        <span className="-mr-1 text-[11.5px] text-content-faint">Filter</span>
+        {presentFilters.map((f) => (
+          <FilterChip key={f} filter={f} count={counts.filters.get(f) ?? 0} on={facets.filters.includes(f)} onClick={() => toggleFilterChip(f)} />
+        ))}
 
-        <span className="mx-1 h-4 w-px bg-border" />
+        <span aria-hidden className="h-[18px] w-px bg-line" />
 
-        <select
+        <Select
           aria-label="Camera"
           value={facets.camera ?? ALL}
           onChange={(e) => setFacets((prev) => ({ ...prev, camera: e.target.value === ALL ? null : e.target.value }))}
-          className="h-6 rounded border border-border bg-surface-elevated px-1.5 text-content"
         >
           <option value={ALL}>All cameras</option>
           {presentCameras.map((c) => (
@@ -326,27 +335,25 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
               {c === '' ? 'Unknown camera' : c} ({counts.cameras.get(c) ?? 0})
             </option>
           ))}
-        </select>
+        </Select>
 
-        <select
+        <Select
           aria-label="Night"
           value={facets.night}
           onChange={(e) => setFacets((prev) => ({ ...prev, night: e.target.value as NightWindow }))}
-          className="h-6 rounded border border-border bg-surface-elevated px-1.5 text-content"
         >
           {NIGHT_WINDOWS.map((w) => (
             <option key={w} value={w}>
               {NIGHT_LABEL[w]} ({counts.nights[w]})
             </option>
           ))}
-        </select>
+        </Select>
 
         {config.publisherFacet && (
-          <select
+          <Select
             aria-label="Publisher"
             value={facets.publisher ?? ALL}
             onChange={(e) => setFacets((prev) => ({ ...prev, publisher: e.target.value === ALL ? null : e.target.value }))}
-            className="h-6 rounded border border-border bg-surface-elevated px-1.5 text-content"
           >
             <option value={ALL}>All publishers</option>
             {presentPublishers.map((p) => (
@@ -354,15 +361,14 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
                 {p} ({counts.publishers.get(p) ?? 0})
               </option>
             ))}
-          </select>
+          </Select>
         )}
 
         {config.stateFacet && (
-          <select
+          <Select
             aria-label={config.stateFacet.label}
             value={facets.state ?? ALL}
             onChange={(e) => setFacets((prev) => ({ ...prev, state: e.target.value === ALL ? null : e.target.value }))}
-            className="h-6 rounded border border-border bg-surface-elevated px-1.5 text-content"
           >
             <option value={ALL}>{config.stateFacet.label}: any</option>
             {config.stateFacet.options.map(([v, l]) => (
@@ -370,96 +376,91 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
                 {l} ({counts.states.get(v) ?? 0})
               </option>
             ))}
-          </select>
+          </Select>
         )}
 
-        <input
-          type="text"
+        <TextInput
           placeholder="Search frames"
           aria-label="Search frames"
           value={facets.search}
           onChange={(e) => setFacets((prev) => ({ ...prev, search: e.target.value }))}
-          className="h-6 w-40 rounded border border-border bg-surface-elevated px-1.5 text-content placeholder:text-content-muted"
+          className="w-[150px]"
         />
 
-        <button type="button" disabled={active === 0} onClick={clearFacets} className={linkBtn}>
+        <Button variant="link" size="sm" disabled={active === 0} onClick={clearFacets}>
           Clear filters
-        </button>
+        </Button>
       </div>
 
       {/* ── Group row ──────────────────────────────────────────────────── */}
-      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
-        <span className="text-content-muted">Group by</span>
-        <select
-          aria-label="Group by"
-          value={group[0]}
-          onChange={(e) => setGroup0(e.target.value)}
-          className="h-6 rounded border border-border bg-surface-elevated px-1.5 text-content"
-        >
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 pb-2">
+        <span className="-mr-1 text-[11.5px] text-content-faint">Group by</span>
+        <Select aria-label="Group by" value={group[0]} onChange={(e) => setGroup0(e.target.value)}>
           {config.groupings.map((id) => (
             <option key={id} value={id}>
               {GROUPS[id].label}
             </option>
           ))}
-        </select>
+        </Select>
         {group[0] !== 'none' && (
           <>
-            <span className="text-content-muted">▸</span>
-            <select
-              aria-label="Then group by"
-              value={group[1]}
-              onChange={(e) => setGroup1(e.target.value)}
-              className="h-6 rounded border border-border bg-surface-elevated px-1.5 text-content"
-            >
+            <span className="text-[11.5px] text-content-faint">▸</span>
+            <Select aria-label="Then group by" value={group[1]} onChange={(e) => setGroup1(e.target.value)}>
               {config.groupings.filter((id) => id !== group[0]).map((id) => (
                 <option key={id} value={id}>
                   {GROUPS[id].label}
                 </option>
               ))}
-            </select>
+            </Select>
           </>
         )}
-        <button type="button" disabled={levelDefs.length === 0} onClick={() => setExpanded(allGroupIds(tree))} className={linkBtn}>
+        <Button variant="link" disabled={levelDefs.length === 0} onClick={() => setExpanded(allGroupIds(tree))}>
           Expand all
-        </button>
-        <button type="button" disabled={levelDefs.length === 0} onClick={() => setExpanded([])} className={linkBtn}>
+        </Button>
+        <Button variant="link" disabled={levelDefs.length === 0} onClick={() => setExpanded([])}>
           Collapse all
-        </button>
+        </Button>
         <span className="flex-1" />
+        {groupRowExtra}
         <div className="relative">
-          <button type="button" onClick={() => setColumnsOpen((o) => !o)} className={outlineBtn}>
-            Columns
-          </button>
-          {columnsOpen && (
-            <div className="absolute right-0 top-full z-20 mt-1 grid gap-1 rounded border border-border bg-surface-elevated p-2 shadow-lg">
-              {config.columns.filter((id) => id !== 'name').map((id) => (
-                <label key={id} className="flex items-center gap-1.5 whitespace-nowrap text-content-secondary">
-                  <input type="checkbox" checked={visibleColIds.includes(id)} onChange={() => toggleColumn(id)} />
-                  {COLUMNS[id].label}
-                </label>
-              ))}
-            </div>
-          )}
+          <Button onClick={() => setColumnsOpen((o) => !o)}>Columns ⚙</Button>
+          <Popover open={columnsOpen} onClose={() => setColumnsOpen(false)}>
+            {config.columns.filter((id) => id !== 'name').map((id) => (
+              <CbBox
+                key={id}
+                checked={visibleColIds.includes(id)}
+                onChange={() => toggleColumn(id)}
+                label={COLUMNS[id].label}
+                className="flex items-center gap-2 whitespace-nowrap text-[12px] text-content-muted"
+              >
+                {COLUMNS[id].label}
+              </CbBox>
+            ))}
+          </Popover>
         </div>
       </div>
 
-      {/* ── Totals strip ───────────────────────────────────────────────── */}
-      <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 rounded-t border border-b-0 border-border bg-surface-elevated px-2.5 py-1.5 text-content-secondary">
+      {/* ── Totals — mockup .totals ────────────────────────────────────── */}
+      <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 rounded-t-md border border-b-0 border-line bg-surface-elevated px-2.5 py-[7px] text-[12px] text-content-muted">
         <span>
-          {filtered.length.toLocaleString('en-US')} of {rows.length.toLocaleString('en-US')} frames
+          Showing <strong className="font-semibold text-content">{filtered.length.toLocaleString('en-US')}</strong> of {rows.length.toLocaleString('en-US')} frames
         </span>
-        <span>Σ {formatDuration(totalExp)}</span>
-        <span>{formatBytes(totalBytes)}</span>
-        <span>FWHM x̃ {medFwhm === null ? '—' : medFwhm.toFixed(2)}</span>
+        <span>
+          Σ <strong className="font-semibold text-content">{formatDurationPadded(totalExp)}</strong>
+        </span>
+        <strong className="font-semibold text-content">{formatSize(totalBytes)}</strong>
+        <span>
+          FWHM x̃ <strong className="font-semibold text-content">{medFwhm === null ? '—' : `${medFwhm.toFixed(2)}″`}</strong>
+        </span>
         {selected.size > 0 && (
-          <span className="flex items-center gap-1 text-accent">
+          <span className="flex items-center gap-1 text-[12px] text-accent">
             <span>
               {selected.size} selected{hiddenSelected > 0 ? ` · ${hiddenSelected} hidden` : ''}
             </span>
             <span>·</span>
-            <button type="button" onClick={() => setSelected(new Set())} className="hover:underline">
+            <Button variant="link" size="sm" onClick={() => setSelected(new Set())}>
               Clear
-            </button>
+            </Button>
           </span>
         )}
         <span className="flex-1" />
@@ -467,58 +468,58 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
           const { targets, selectedCount } = actionTargets(filtered, inViewSelected, rowKey, a.eligible);
           const disabled = targets.length === 0 || !!a.busy;
           return (
-            <button
-              key={a.id}
-              type="button"
-              disabled={disabled}
-              onClick={() => a.run(targets)}
-              className={a.primary ? primaryBtn : outlineBtn}
-            >
+            <Button key={a.id} variant={a.primary ? 'primary' : 'default'} disabled={disabled} onClick={() => a.run(targets)}>
               {a.busy && <Loader2 size={12} className="animate-spin" />}
               {actionLabel(a.verb, targets.length, selectedCount)}
-            </button>
+            </Button>
           );
         })}
         {toolbarExtra}
       </div>
 
-      {/* ── Table ──────────────────────────────────────────────────────── */}
+      {/* ── Table box — mockup .tscroll ────────────────────────────────── */}
       <div
         ref={scrollRef}
+        data-testid="frame-table-scroll"
         onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
-        className="max-h-[calc(100vh-22rem)] overflow-auto rounded-b border border-border"
+        style={{ height: fillHeight }}
+        className="overflow-auto rounded-b-md border border-line bg-surface"
       >
-        <table className="w-full border-collapse">
+        <table className="w-full table-fixed border-separate border-spacing-0" style={{ minWidth: tableMinWidth(columns) }}>
+          {/* Widths come only from the column definitions, never from the
+              rendered rows, so windowing can never move a column (spec §5.1). */}
+          <colgroup>
+            <col style={{ width: 32 }} />
+            {columns.map((c) => (
+              <col key={c.id} style={c.id === 'name' ? undefined : { width: c.width }} />
+            ))}
+          </colgroup>
           <thead>
-            <tr className="sticky top-0 z-10 bg-surface">
-              <th className="w-7 border-b border-border px-2 py-1.5">
-                <HeaderCheckbox state={headerState} onChange={toggleSelectAllShown} />
+            <tr>
+              <th scope="col" className={`${TH} text-left text-content-faint`}>
+                <CbBox state={headerState} onChange={toggleSelectAllShown} label="Select all shown" />
               </th>
-              {columns.map((col) => {
-                const sorted = sort.col === col.id;
-                return (
-                  <th
-                    key={col.id}
-                    onClick={() => onSortClick(col.id)}
-                    className={`cursor-pointer select-none whitespace-nowrap border-b border-border px-2 py-1.5 text-left font-medium text-content-muted hover:text-content ${
-                      col.numeric ? 'text-right' : ''
-                    } ${sorted ? 'text-accent' : ''}`}
-                  >
-                    {col.label}
-                    {sorted ? (sort.dir === 1 ? ' ↑' : ' ↓') : ''}
-                  </th>
-                );
-              })}
+              {columns.map((col) => (
+                <th
+                  key={col.id}
+                  scope="col"
+                  onClick={() => onSortClick(col.id)}
+                  className={`${TH} cursor-pointer hover:text-content ${col.numeric ? 'text-right' : 'text-left'} ${sort.col === col.id ? 'text-accent' : 'text-content-faint'}`}
+                >
+                  {col.label}
+                  {sort.col === col.id ? (sort.dir === 1 ? ' ↑' : ' ↓') : ''}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
             {visibleRows.length === 0 ? (
               <tr>
-                <td colSpan={colSpan} className="p-3 text-content-muted">
+                <td colSpan={colSpan} className="px-3 py-[18px] text-[12.5px] text-content-faint">
                   No frames match these filters ·{' '}
-                  <button type="button" onClick={clearFacets} className="text-accent hover:underline">
+                  <Button variant="link" onClick={clearFacets}>
                     Clear filters
-                  </button>
+                  </Button>
                 </td>
               </tr>
             ) : (
@@ -547,6 +548,7 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
                       depth={vr.depth}
                       columns={columns}
                       selected={selected.has(vr.row.key)}
+                      active={activeKey !== null && activeKey === vr.row.key}
                       onToggleSelect={toggleFrameSelection}
                       onOpen={onOpen}
                     />
@@ -568,12 +570,50 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
 
 /* ── Row components ─────────────────────────────────────────────────────── */
 
-function HeaderCheckbox({ state, onChange }: { state: 'none' | 'some' | 'all'; onChange: () => void }) {
+type CheckState = 'none' | 'some' | 'all';
+
+/** Mockup `.cb` / `.cb.on` / `.cb.mid` over a real, visually hidden checkbox
+ *  (keyboard, label and a11y stay native). The table's own box — the app's
+ *  `Checkbox` does not expose the indeterminate state. `children` render
+ *  inside the same `<label>` (the Columns popover rows), so labels never nest. */
+function CbBox({
+  state,
+  checked,
+  onChange,
+  label,
+  className = '',
+  children,
+}: {
+  state?: CheckState;
+  checked?: boolean;
+  onChange: () => void;
+  label: string;
+  className?: string;
+  children?: ReactNode;
+}) {
+  const s: CheckState = state ?? (checked ? 'all' : 'none');
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => {
-    if (ref.current) ref.current.indeterminate = state === 'some';
-  }, [state]);
-  return <input ref={ref} type="checkbox" checked={state === 'all'} onChange={onChange} aria-label="Select all shown" />;
+    if (ref.current) ref.current.indeterminate = s === 'some';
+  }, [s]);
+  const tone = s === 'all' ? 'border-accent bg-accent' : s === 'some' ? 'border-accent-muted bg-accent-muted' : 'border-border bg-surface';
+  return (
+    <label className={`relative cursor-pointer ${className}`}>
+      <input ref={ref} type="checkbox" className="peer sr-only" checked={s === 'all'} onChange={onChange} aria-label={label} />
+      <span
+        aria-hidden
+        className={`relative inline-block h-[13px] w-[13px] shrink-0 rounded-[3px] border align-[-2px] peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-accent ${tone}`}
+      >
+        {s === 'all' && (
+          <svg width="9" height="9" viewBox="0 0 9 9" className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-surface">
+            <path d="M1.5 4.5 3.5 6.5 7.5 2" stroke="currentColor" strokeWidth="2" fill="none" />
+          </svg>
+        )}
+        {s === 'some' && <span className="absolute left-[2px] top-[5px] h-[2px] w-[7px] bg-content" />}
+      </span>
+      {children}
+    </label>
+  );
 }
 
 function GroupRow({
@@ -594,27 +634,23 @@ function GroupRow({
   onToggleExpand: (node: GroupNode<FrameVM>) => void;
 }) {
   const state = checkState(node.rows, selected, rowKey);
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (ref.current) ref.current.indeterminate = state === 'some';
-  }, [state]);
   const isOpen = expandedIds.includes(node.id);
 
   return (
     <tr
-      className="h-[29px] cursor-pointer border-b border-border/40 bg-surface-elevated hover:bg-surface-hover"
+      className={`cursor-pointer ${node.depth === 0 ? 'bg-table-group' : 'bg-table-group-l1'} hover:bg-table-group-hover`}
       onClick={() => onToggleExpand(node)}
     >
-      <td className="px-2" onClick={(e) => e.stopPropagation()}>
-        <input ref={ref} type="checkbox" checked={state === 'all'} onChange={() => onToggleSelect(node)} aria-label="Select group" />
+      <td className={TD} onClick={(e) => e.stopPropagation()}>
+        <CbBox state={state} onChange={() => onToggleSelect(node)} label="Select group" />
       </td>
       {columns.map((col, i) => {
         if (i === 0) {
           return (
-            <td key={col.id} style={{ paddingLeft: node.depth * 16 }} className="whitespace-nowrap px-2 font-medium text-content">
-              <span className="mr-1 inline-block w-3 text-content-muted">{isOpen ? '▾' : '▸'}</span>
+            <td key={col.id} style={{ paddingLeft: 8 + node.depth * 16 }} className={`${TD} font-medium text-content`}>
+              <span className="inline-block w-3.5 text-content-faint">{isOpen ? '▾' : '▸'}</span>
               {node.def.renderLabel(node.key)}
-              <span className="ml-1.5 text-[11px] font-normal text-content-muted">{node.rows.length}</span>
+              <span className="ml-1.5 text-[11px] font-normal text-content-faint">{node.rows.length} fr</span>
               {groupAction && (
                 <span onClick={(e) => e.stopPropagation()} className="ml-2 inline-block align-middle">
                   {groupAction(node)}
@@ -623,9 +659,14 @@ function GroupRow({
             </td>
           );
         }
-        if (col.id === node.def.id) return <td key={col.id} className="px-2" />;
+        if (col.id === node.def.id) return <td key={col.id} className={TD} />;
+        // Spec §5.1: a group row is weight 500 `content`; its numeric cells
+        // (x̃ 2.42, Σ 18h 42m, size sums) are `content-muted` weight 400.
         return (
-          <td key={col.id} className={`px-2 font-normal text-content-secondary ${col.numeric ? 'text-right tabular-nums' : ''}`}>
+          <td
+            key={col.id}
+            className={`${TD} ${col.numeric ? 'text-right font-normal text-content-muted' : 'font-medium text-content'}`}
+          >
             {col.renderAggregate?.(node.rows) ?? null}
           </td>
         );
@@ -639,6 +680,7 @@ function FrameRow({
   depth,
   columns,
   selected,
+  active,
   onToggleSelect,
   onOpen,
 }: {
@@ -646,22 +688,25 @@ function FrameRow({
   depth: number;
   columns: ColumnDef<FrameVM>[];
   selected: boolean;
+  active: boolean;
   onToggleSelect: (row: FrameVM) => void;
   onOpen: (row: FrameVM) => void;
 }) {
   return (
     <tr
-      className={`h-[29px] cursor-pointer border-b border-border/40 hover:bg-surface-hover ${selected ? 'bg-accent/5' : ''}`}
+      // Mockup order: the active and selected backgrounds win over hover.
+      className={`cursor-pointer ${active ? 'bg-accent/[0.16]' : selected ? 'bg-accent/[0.08]' : 'hover:bg-[rgba(67,76,94,0.55)]'}`}
       onClick={() => onOpen(row)}
     >
-      <td className="px-2" onClick={(e) => e.stopPropagation()}>
-        <input type="checkbox" checked={selected} onChange={() => onToggleSelect(row)} aria-label={`Select ${row.fileName}`} />
+      <td className={TD} onClick={(e) => e.stopPropagation()}>
+        <CbBox checked={selected} onChange={() => onToggleSelect(row)} label={`Select ${row.fileName}`} />
       </td>
       {columns.map((col, i) => (
         <td
           key={col.id}
-          style={i === 0 ? { paddingLeft: depth * 16 } : undefined}
-          className={`px-2 text-content-secondary ${col.numeric ? 'text-right tabular-nums' : ''}`}
+          style={i === 0 ? { paddingLeft: 8 + depth * 16 } : undefined}
+          title={col.id === 'name' ? row.fileName : undefined}
+          className={`${TD} text-content-secondary ${col.numeric ? 'text-right' : ''}`}
         >
           {col.cell(row)}
         </td>

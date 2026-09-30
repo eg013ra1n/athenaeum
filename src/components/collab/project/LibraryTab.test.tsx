@@ -236,7 +236,7 @@ describe('LibraryTab — every project frame', () => {
     ]);
 
     expect(await screen.findByText('mine.fits')).toBeInTheDocument();
-    expect(within(rowOf('mine.fits')).getByText('● have')).toBeInTheDocument();
+    expect(within(rowOf('mine.fits')).getByText('have')).toBeInTheDocument(); // the ● glyph is now a StatusDot
     expect(screen.getByText('Zoe')).toBeInTheDocument();
     expect(within(rowOf('gone.fits')).getByText('missing')).toBeInTheDocument();
     expect(within(rowOf('gone.fits')).getByText('gone from disk')).toBeInTheDocument();

@@ -1,8 +1,11 @@
 import type { ReactNode } from 'react';
 import type { ModerationFrameView, OwnFrameRow, ProjectFrameView } from '../../../types/models';
 import { formatTimestamp } from '../../../utils/dateFormatting';
-import { getFilterColor } from '../../../utils/filterColors';
-import { formatBytes, formatDuration } from '../format';
+import { Bar, Chip, FilterDot, MemberDot, ProgressBar, StatusDot, type ChipTone } from '../../ui';
+import { formatDurationPadded, formatSize } from '../format';
+// Explicit extension: on a case-insensitive file system (macOS, Windows)
+// an extensionless './MemberColors' resolves to the sibling memberColors.ts.
+import { useMemberColor } from './MemberColors.tsx';
 import {
   alphaOrder, BLOCKER_ORDER, filterOrder, median, nightOrderDesc, reasonOrder, sum,
   type ColumnDef, type FacetAccess, type GroupDef,
@@ -306,40 +309,33 @@ export const DEVICE_LABEL: Record<DeviceState, string> = {
 
 /* ── Small rendering helpers ────────────────────────────────────────────── */
 
-type Tone = 'success' | 'warning' | 'error' | 'muted';
-
-/** One chip-class helper for every colored chip in these tables — status,
- * holders, disk, device-missing, the held-back reason. */
-function chip(tone: Tone): string {
-  const tones: Record<Tone, string> = {
-    success: 'bg-success/20 text-success',
-    warning: 'bg-warning/20 text-warning',
-    error: 'bg-error/20 text-error',
-    muted: 'bg-surface-hover text-content-muted',
-  };
-  return `rounded px-1.5 py-0.5 text-[10px] font-medium ${tones[tone]}`;
-}
-
+/** Mockup `--ghost` "—" for an empty cell. */
 function dash(): ReactNode {
-  return <span className="text-content-muted">—</span>;
+  return <span className="text-content-ghost">—</span>;
 }
 
 function num(text: string): ReactNode {
   return <span className="tabular-nums">{text}</span>;
 }
 
-function filterDot(f: string): ReactNode {
-  return <span className="mr-1 inline-block h-2 w-2 rounded-full" style={{ backgroundColor: getFilterColor(f) }} />;
+function statusTone(s: string): ChipTone {
+  switch (s) {
+    case 'published': return 'ok';
+    case 'rejected': return 'err';
+    case 'excluded': return 'mute';
+    case 'pending':
+    default: return 'warn';
+  }
 }
 
-function statusTone(s: string): Tone {
-  switch (s) {
-    case 'published': return 'success';
-    case 'rejected': return 'error';
-    case 'excluded': return 'muted';
-    case 'pending':
-    default: return 'warning';
-  }
+/** Mockup `mdot(p) name` — the member's colour dot, then the display name
+ *  (spec §4.4; the colour lookup falls back from accountId to name). Inline
+ *  flow, as in the mockup, so the cell's ellipsis truncates a long name; an
+ *  `inline-flex` box is atomic and would be dropped whole for a lone "…". */
+function PublisherName({ accountId, name }: { accountId: string | null; name: string | null }) {
+  const colorOf = useMemberColor();
+  if (!name) return <span className="text-content-ghost">—</span>;
+  return <span><MemberDot color={colorOf(accountId ?? name)} /> {name}</span>;
 }
 
 /** The Status column and the `status` group read `excluded` before `pubState`. */
@@ -356,9 +352,9 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     width: 260,
     value: (v) => v.fileName,
     cell: (v) => (
-      <span className="font-mono text-xs">
+      <span className="font-mono text-[12px]">
         {v.fileName}
-        {v.excluded && <span title={v.acceptedReason ?? undefined} className={`ml-1.5 ${chip('muted')}`}>excluded</span>}
+        {v.excluded && <Chip tone="mute" title={v.acceptedReason ?? undefined} className="ml-1.5">excluded</Chip>}
       </span>
     ),
   },
@@ -367,10 +363,10 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     label: 'Publisher',
     width: 108,
     value: (v) => v.publisher,
-    cell: (v) => v.publisher ?? dash(),
+    cell: (v) => <PublisherName accountId={v.publisherAccountId} name={v.publisher} />,
     renderAggregate: (rows) => {
       const names = new Set(rows.map((r) => r.publisher ?? ''));
-      if (names.size <= 1) return rows[0]?.publisher ?? dash();
+      if (names.size <= 1) return rows[0] ? <PublisherName accountId={rows[0].publisherAccountId} name={rows[0].publisher} /> : dash();
       return `${names.size} members`;
     },
   },
@@ -391,12 +387,12 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     label: 'Filter',
     width: 70,
     value: (v) => v.filter,
-    cell: (v) => <span>{filterDot(v.filter)}{v.filter}</span>,
+    cell: (v) => <span><FilterDot filter={v.filter} />{v.filter}</span>,
     renderAggregate: (rows) => {
       const filters = Array.from(new Set(rows.map((r) => r.filter)));
       if (filters.length <= 1) {
         const f = filters[0] ?? '';
-        return <span>{filterDot(f)}{f}</span>;
+        return <span><FilterDot filter={f} />{f}</span>;
       }
       return `${filters.length} filters`;
     },
@@ -422,9 +418,9 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     width: 82,
     numeric: true,
     value: (v) => v.exptimeSec,
-    cell: (v) => (v.exptimeSec === null ? dash() : num(`${v.exptimeSec}s`)),
+    cell: (v) => (v.exptimeSec === null ? dash() : num(`${v.exptimeSec} s`)),
     aggregate: (rows) => sum(rows.map((r) => r.exptimeSec)),
-    renderAggregate: (rows) => num(formatDuration(sum(rows.map((r) => r.exptimeSec)))),
+    renderAggregate: (rows) => num(formatDurationPadded(sum(rows.map((r) => r.exptimeSec)))),
   },
   fwhm: {
     id: 'fwhm',
@@ -484,9 +480,9 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     width: 78,
     numeric: true,
     value: (v) => v.byteSize,
-    cell: (v) => (v.byteSize === null ? dash() : num(formatBytes(v.byteSize))),
+    cell: (v) => (v.byteSize === null ? dash() : num(formatSize(v.byteSize))),
     aggregate: (rows) => sum(rows.map((r) => r.byteSize)),
-    renderAggregate: (rows) => num(formatBytes(sum(rows.map((r) => r.byteSize)))),
+    renderAggregate: (rows) => num(formatSize(sum(rows.map((r) => r.byteSize)))),
   },
   reason: {
     id: 'reason',
@@ -496,10 +492,10 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     cell: (v) => {
       const first = v.failures[0];
       if (!first) return dash();
-      const tone: Tone = first.kind === 'threshold' ? 'error' : 'warning';
+      const tone: ChipTone = first.kind === 'threshold' ? 'err' : 'warn';
       return (
         <span>
-          <span className={chip(tone)}>{first.text}</span>
+          <Chip tone={tone}>{first.text}</Chip>
           {v.failures.length > 1 && <span className="ml-1.5 text-[11px] text-content-muted">+{v.failures.length - 1}</span>}
         </span>
       );
@@ -524,7 +520,7 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     value: (v) => effectiveStatus(v),
     cell: (v) => {
       const s = effectiveStatus(v);
-      return <span title={v.excluded ? (v.acceptedReason ?? undefined) : undefined} className={chip(statusTone(s))}>{s}</span>;
+      return <Chip tone={statusTone(s)} title={v.excluded ? (v.acceptedReason ?? undefined) : undefined}>{s}</Chip>;
     },
     renderAggregate: (rows) => {
       const counts = new Map<string, number>();
@@ -534,11 +530,11 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
       }
       const nonPublished = [...counts.entries()].filter(([k]) => k !== 'published');
       if (nonPublished.length === 0) {
-        return <span className={chip('success')}>{counts.get('published') ?? 0} published</span>;
+        return <Chip tone="ok">{counts.get('published') ?? 0} published</Chip>;
       }
       return (
         <span className="inline-flex gap-1">
-          {nonPublished.map(([k, n]) => <span key={k} className={chip(statusTone(k))}>{n} {k}</span>)}
+          {nonPublished.map(([k, n]) => <Chip key={k} tone={statusTone(k)}>{n} {k}</Chip>)}
         </span>
       );
     },
@@ -552,7 +548,7 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     cell: (v) => {
       const c = copies(v);
       if (c === null) return dash();
-      if (c === 1) return <span title="Only one copy in the project" className={chip('warning')}>1 copy</span>;
+      if (c === 1) return <Chip tone="warn" title="Only one copy in the project">1 copy</Chip>;
       return num(`${v.holdersOnline ?? 0} on / ${c}`);
     },
     aggregate: (rows) => {
@@ -561,7 +557,7 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     },
     renderAggregate: (rows) => {
       const singles = rows.filter((r) => copies(r) === 1).length;
-      if (singles > 0) return <span className={chip('warning')}>{singles} single</span>;
+      if (singles > 0) return <Chip tone="warn">{singles} single</Chip>;
       const vals = rows.map(copies).filter((x): x is number => x !== null);
       return vals.length ? num(`min ${Math.min(...vals)}`) : dash();
     },
@@ -572,14 +568,14 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     width: 84,
     value: (v) => v.disk,
     cell: (v) => {
-      if (v.disk === 'on') return <span className="text-content-muted">yes</span>;
-      if (v.disk === 'missing') return <span className={chip('error')}>missing</span>;
-      if (v.disk === 'changed') return <span className={chip('warning')}>changed</span>;
+      if (v.disk === 'on') return <span className="text-content-faint">yes</span>;
+      if (v.disk === 'missing') return <Chip tone="err">missing</Chip>;
+      if (v.disk === 'changed') return <Chip tone="warn">changed</Chip>;
       return dash();
     },
     renderAggregate: (rows) => {
       const n = rows.filter((r) => r.disk === 'missing' || r.disk === 'changed').length;
-      return n > 0 ? <span className={chip('error')}>{n}</span> : null;
+      return n > 0 ? <Chip tone="err">{n}</Chip> : null;
     },
   },
   publishedAt: {
@@ -587,7 +583,7 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     label: 'Published',
     width: 142,
     value: (v) => v.publishedAt,
-    cell: (v) => (v.publishedAt === null ? dash() : <span className="text-content-muted">{formatTimestamp(v.publishedAt)}</span>),
+    cell: (v) => (v.publishedAt === null ? dash() : <span className="text-content-faint">{formatTimestamp(v.publishedAt)}</span>),
   },
   device: {
     id: 'device',
@@ -597,33 +593,31 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     cell: (v) => {
       switch (v.device) {
         case 'have':
-          return <span className="text-success">● have</span>;
+          return <span className="inline-flex items-center gap-[5px] text-success"><StatusDot state="online" />have</span>;
         case 'downloading':
           return (
             <span className="inline-flex w-full items-center gap-1.5">
-              <span className="h-1 flex-1 overflow-hidden rounded bg-surface-hover">
-                <span className="block h-full bg-accent" style={{ width: `${v.progress ?? 0}%` }} />
-              </span>
-              <span className="text-accent">{v.progress ?? 0}%</span>
+              <ProgressBar percent={v.progress ?? 0} className="w-[60px]" />
+              <span className="text-[11px] text-accent">{v.progress ?? 0}%</span>
             </span>
           );
         case 'queued':
-          return <span className="text-content-muted">○ queued</span>;
+          return <span className="text-content-faint">○ queued</span>;
         case 'missing':
           return (
             <span>
-              <span title={v.missingWhy ?? undefined} className={chip('error')}>missing</span>
-              {v.missingWhy && <span className="ml-1.5 text-[11px] text-content-muted">{v.missingWhy}</span>}
+              <Chip tone="err" title={v.missingWhy ?? undefined}>missing</Chip>
+              {v.missingWhy && <span className="ml-1.5 text-[11px] text-content-faint">{v.missingWhy}</span>}
             </span>
           );
         case 'notKept':
-          return <span className="text-content-muted">not kept</span>;
+          return <span className="text-content-faint">not kept</span>;
         case 'needsChoice':
           return <span className="text-warning">needs your choice</span>;
         case 'changed':
           return <span className="text-warning">changed</span>;
         case 'notReplicated':
-          return <span className="text-content-muted">not replicated</span>;
+          return <span className="text-content-faint">not replicated</span>;
         default:
           return dash();
       }
@@ -631,22 +625,21 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     renderAggregate: (rows) => {
       const counts: Record<string, number> = { have: 0, downloading: 0, queued: 0, missing: 0, notKept: 0 };
       for (const r of rows) if (r.device && r.device in counts) counts[r.device] += 1;
-      const total = rows.length || 1;
-      const seg = (n: number, cls: string, key: string) =>
-        n > 0 ? <i key={key} className={`block h-full ${cls}`} style={{ width: `${(n / total) * 100}%` }} /> : null;
       let text: ReactNode;
       if (counts.missing > 0) text = <span className="text-error">{counts.missing} missing</span>;
       else if (counts.downloading + counts.queued > 0) text = <span className="text-accent">{counts.downloading + counts.queued} to go</span>;
-      else text = <span className="text-content-muted">{counts.have}/{rows.length}</span>;
+      else text = <span className="text-content-faint">{counts.have}/{rows.length}</span>;
       return (
         <span className="inline-flex w-full items-center gap-1.5">
-          <span className="flex h-1.5 flex-1 overflow-hidden rounded bg-surface-hover">
-            {seg(counts.have, 'bg-success', 'have')}
-            {seg(counts.downloading, 'bg-accent', 'downloading')}
-            {seg(counts.queued, 'bg-accent-muted', 'queued')}
-            {seg(counts.missing, 'bg-error', 'missing')}
-            {seg(counts.notKept, 'border border-border', 'notKept')}
-          </span>
+          {/* 80 px fixed (the plan's value). `max-w`, not `w`: Bar's own `w-full`
+              is emitted after an arbitrary `w-[80px]` and would win. */}
+          <Bar className="max-w-[80px]" segments={[
+            { value: counts.have, className: 'bg-success', title: `${counts.have} have` },
+            { value: counts.downloading, className: 'bg-accent', title: `${counts.downloading} downloading` },
+            { value: counts.queued, className: 'bg-accent-muted', title: `${counts.queued} queued` },
+            { value: counts.missing, className: 'bg-error', title: `${counts.missing} missing` },
+            { value: counts.notKept, className: 'bg-border', title: `${counts.notKept} not kept` },
+          ]} total={rows.length} />
           <span className="text-[11px]">{text}</span>
         </span>
       );
@@ -657,7 +650,7 @@ export const COLUMNS: Record<string, ColumnDef<FrameVM>> = {
     label: 'Submitted',
     width: 142,
     value: (v) => v.submittedAt,
-    cell: (v) => (v.submittedAt === null ? dash() : <span className="text-content-muted">{formatTimestamp(v.submittedAt)}</span>),
+    cell: (v) => (v.submittedAt === null ? dash() : <span className="text-content-faint">{formatTimestamp(v.submittedAt)}</span>),
   },
   exclusion: {
     id: 'exclusion',
@@ -688,7 +681,7 @@ export const GROUPS: Record<string, GroupDef<FrameVM>> = {
     id: 'filter',
     label: 'Filter',
     key: (v) => v.filter,
-    renderLabel: (k) => <span>{filterDot(k)}{k}</span>,
+    renderLabel: (k) => <span className="inline-flex items-center"><FilterDot filter={k} />{k}</span>,
     order: filterOrder,
   },
   camera: {
@@ -716,14 +709,14 @@ export const GROUPS: Record<string, GroupDef<FrameVM>> = {
     id: 'status',
     label: 'Status',
     key: (v) => effectiveStatus(v),
-    renderLabel: (k) => <span className={chip(statusTone(k))}>{k}</span>,
+    renderLabel: (k) => <Chip tone={statusTone(k)}>{k}</Chip>,
     order: alphaOrder,
   },
   publisher: {
     id: 'publisher',
     label: 'Publisher',
     key: (v) => v.publisher ?? '',
-    renderLabel: (k) => <span>{k === '' ? 'Unknown publisher' : k}</span>,
+    renderLabel: (k) => <PublisherName accountId={null} name={k || null} />,
     order: alphaOrder,
   },
   none: {

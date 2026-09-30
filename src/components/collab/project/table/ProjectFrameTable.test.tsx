@@ -1,8 +1,8 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { SessionStateProvider } from '../../../../contexts/SessionStateContext';
-import type { OwnFrameRow } from '../../../../types/models';
-import { fromOwn } from '../frames';
+import type { OwnFrameRow, ProjectFrameView } from '../../../../types/models';
+import { fromLibrary, fromOwn } from '../frames';
 import type { FrameVM } from '../frames';
 import ProjectFrameTable, { type ProjectFrameTableProps } from './ProjectFrameTable';
 
@@ -56,6 +56,52 @@ function ready(id: string, o: { filter?: string; night?: string | null; fwhm?: n
       ...(fwhm !== undefined ? { fwhmArcsec: fwhm } : {}),
       ...rest,
     }),
+  );
+}
+
+function lib(o: Partial<ProjectFrameView> = {}): ProjectFrameView {
+  return {
+    frameUuid: 'u-lib-1',
+    fileName: 'Light_Ha_300s_0002.fits',
+    publisher: 'Kostya',
+    publisherAccountId: 'acc-kostya',
+    own: false,
+    filter: 'Ha',
+    exptimeSec: 300,
+    dateObs: '2026-09-29T22:00:00Z',
+    state: 'published',
+    accepted: true,
+    acceptedReason: null,
+    localState: 'held',
+    onDisk: true,
+    holdersOnline: 1,
+    holdersTotal: 1,
+    waitingForPublisher: false,
+    newVersionWaiting: false,
+    byteSize: 42_000_000,
+    contentVersion: 1,
+    lastError: null,
+    fwhmArcsec: 2.4,
+    eccentricity: 0.4,
+    starsDetected: 1200,
+    camera: 'ASI2600MM Pro',
+    telescope: null,
+    medianSnr: 18,
+    night: '2026-09-29',
+    contributorState: null,
+    contributorReason: null,
+    receivedAt: null,
+    receivedFromDevice: null,
+    receivedFromMember: null,
+    ...o,
+  };
+}
+
+/** `n` library `FrameVM` rows — one publisher, one filter, so the default
+ *  Publisher ▸ Filter grouping opens them all in its first group. */
+function rows(n: number): FrameVM[] {
+  return Array.from({ length: n }, (_, i) =>
+    fromLibrary(lib({ frameUuid: `u-lib-${i + 1}`, fileName: `Light_Ha_300s_${String(i + 1).padStart(4, '0')}.fits` }), new Map()),
   );
 }
 
@@ -206,4 +252,46 @@ it('a selection fully hidden by a facet still lets the primary action cover the 
 
   fireEvent.click(screen.getByRole('button', { name: 'Publish all 1' }));
   expect(run).toHaveBeenCalledWith([rows[1]]);
+});
+
+/* ── Wave 5.5 Task 6: the mockup's fixed-layout geometry ───────────────── */
+
+it('lays out with a fixed colgroup from the column definitions, independent of the rendered rows', () => {
+  const { container } = renderTable({ tableId: 'library', rows: rows(400) });
+  const table = container.querySelector('table')!;
+  expect(table.className).toContain('table-fixed');
+  const cols = [...container.querySelectorAll('col')].map((c) => (c as HTMLElement).style.width);
+  expect(cols[0]).toBe('32px');
+  expect(cols[1]).toBe(''); // Frame takes the rest
+  expect(cols).toContain('108px'); // Publisher
+  const scroller = container.querySelector('[data-testid="frame-table-scroll"]')!;
+  fireEvent.scroll(scroller, { target: { scrollTop: 5000 } });
+  expect([...container.querySelectorAll('col')].map((c) => (c as HTMLElement).style.width)).toEqual(cols);
+});
+
+it('sets the table min-width so Frame never drops below 220px (review focus 3)', () => {
+  const { container } = renderTable({ tableId: 'library', rows: rows(3) });
+  const table = container.querySelector('table') as HTMLElement;
+  const expected = 32 + 220 + [108, 98, 70, 122, 82, 66, 60, 88, 168, 78].reduce((a, b) => a + b, 0);
+  expect(table.style.minWidth).toBe(`${expected}px`);
+});
+
+it('right-aligns numeric headers and truncates cells instead of wrapping (review focus 1)', () => {
+  const long = rows(1).map((r) => ({ ...r, fileName: `${'Light_M31_Ha_300s_'.repeat(4)}0001.fits` }));
+  renderTable({ tableId: 'library', rows: long });
+  expect(screen.getByRole('columnheader', { name: /Size/ }).className).toContain('text-right');
+  const cell = screen.getByText(/0001\.fits/).closest('td')!;
+  expect(cell.className).toContain('whitespace-nowrap');
+  expect(cell.className).toContain('text-ellipsis');
+});
+
+it('marks the active row', () => {
+  const r = rows(2);
+  renderTable({ tableId: 'library', rows: r, activeKey: r[1].key });
+  expect(screen.getByText(r[1].fileName).closest('tr')!.className).toContain('bg-accent/[0.16]');
+});
+
+it('renders groupRowExtra next to Columns', () => {
+  renderTable({ tableId: 'library', rows: rows(2), groupRowExtra: <button>Export for WBPP</button> });
+  expect(screen.getByRole('button', { name: 'Export for WBPP' })).toBeInTheDocument();
 });

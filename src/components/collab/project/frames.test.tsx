@@ -2,6 +2,7 @@ import { expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import type { ModerationFrameView, OwnFrameRow, ProjectFrameView } from '../../../types/models';
 import { COLUMNS, copies, fromLibrary, fromModeration, fromOwn, GROUPS, TABLES } from './frames';
+import { MemberColorsProvider } from './MemberColors.tsx';
 
 function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
   return {
@@ -204,4 +205,37 @@ it('COLUMNS.exclusion reads acceptedReason, dashing a null reason', () => {
   );
   expect(screen.getByTestId('with-reason')).toHaveTextContent('wrong target');
   expect(screen.getByTestId('without-reason')).toHaveTextContent('—');
+});
+
+/* ── Wave 5.5 Task 6: the mockup's cell formats ────────────────────────── */
+
+it('formats cells like the mockup: "180 s", decimal sizes, padded group durations', () => {
+  const vm = fromLibrary(lib({ exptimeSec: 180, byteSize: 121_920_698 }), new Map());
+  render(<>{COLUMNS.exp.cell(vm)}|{COLUMNS.size.cell(vm)}|{COLUMNS.exp.renderAggregate!([vm, vm, vm])}</>);
+  expect(screen.getByText(/180 s/)).toBeInTheDocument();
+  expect(screen.getByText(/122 MB/)).toBeInTheDocument();
+  expect(screen.getByText(/9m/)).toBeInTheDocument();
+});
+
+it('status and disk cells use Chip tones', () => {
+  const vm = fromOwn(own({ segment: 'published', pubState: 'pending', localState: 'own_missing', holdersTotal: 1 }));
+  render(<>{COLUMNS.status.cell(vm)}{COLUMNS.disk.cell(vm)}</>);
+  expect(screen.getByText('pending').className).toContain('bg-warning-muted');
+  expect(screen.getByText('missing').className).toContain('bg-error-muted');
+});
+
+it('publisher cells and group labels take the member colour from MemberColorsProvider (by accountId, else by name)', () => {
+  // Also pins the import: an extensionless './MemberColors' resolves to the
+  // sibling memberColors.ts on a case-insensitive file system.
+  const members = [{ accountId: 'acc-me', displayName: 'Me' }, { accountId: 'acc-kostya', displayName: 'Kostya' }];
+  const vm = fromLibrary(lib(), new Map()); // Kostya, acc-kostya
+  const { container } = render(
+    <MemberColorsProvider members={members} selfAccountId="acc-me">
+      {COLUMNS.publisher.cell(vm)}
+      {GROUPS.publisher.renderLabel('Kostya')}
+    </MemberColorsProvider>,
+  );
+  const dots = [...container.querySelectorAll('span[aria-hidden]')].map((d) => (d as HTMLElement).style.backgroundColor);
+  // Self takes slot 0; Kostya is the first other member → slot 1 (#a3be8c).
+  expect(dots).toEqual(['rgb(163, 190, 140)', 'rgb(163, 190, 140)']);
 });
