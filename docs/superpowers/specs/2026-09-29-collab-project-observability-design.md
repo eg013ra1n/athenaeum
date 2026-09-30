@@ -58,7 +58,7 @@ publishing-device line, `UpdateRequired`, the auto-publish and auto-replicate sw
 | ---- | ---- | ---- |
 | Overview | all | Integration per canonical filter as bars coloured by member (goal marker when goals exist, §5.5); my three numbers (ready / published / held back), each opening its segment; Needs attention; Exchange now (live one-liner); quality thresholds (moved from today's overview). |
 | My frames | all | Segments Ready / Published / Held back with counts, `+ Link an object`, `Recalibrate and republish all`; one `ProjectFrameTable` per segment. |
-| Library | `send_receive` or coordinator (same rule as today's Receive) | Other members' published frames and their state on this device. |
+| Library | `send_receive` or coordinator (same rule as today's Receive) | Every published project frame — mine and other members' — and its state on this device (§16). |
 | Members | all | Table of people (§5.4). |
 | Exchange | all | Live per-member rows both directions, then receive history (§7). A contributor sees only the Sending block and a line saying their role does not receive. |
 | Moderation | coordinator, when `requireApproval` | Pending first publications. |
@@ -548,3 +548,16 @@ The owner's first smoke of the wave-2 project page found three defects, fixed th
    scheduled by the first event; further events in the window are absorbed, never restarting it; an open
    frame drawer re-reads that frame's holders on the same 1 s-throttled event. No new
    command — the event goes through the existing emitter, and the web host forwards it over SSE unchanged.
+
+## 16. Amendments (owner, 2026-09-30)
+
+1. **Library = every project frame.** D3 had narrowed the v3 §8.1 "Lights" tab to other members' frames,
+   which dropped the owner's own published frames out of the one list the project's WBPP export (already
+   own and replica alike, `collect_project_export_data`) and a future project stack work from. The Library
+   now lists every frame not pending moderation, mine included; an own frame's device column reads its own
+   state (`own_held` → have, `own_missing` → missing / gone from disk, `own_changed` → changed). The badge
+   still counts only frames to come, so own frames never count. Heading "Project frames".
+2. **Other files.** The publish writes a frame's file before its own row exists, so the Collaboration-folder
+   watcher could list it as foreign and nothing removed it: every published frame showed under "Other
+   files". `record_own` now forgets the entry, and the list skips any path a frame row has landed at. The
+   panel is one collapsed line with a count; opened, a bounded scrolling list of name + folder.

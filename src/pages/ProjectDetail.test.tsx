@@ -1034,7 +1034,7 @@ describe('ProjectDetail tabs', () => {
     renderProjectDetail('/projects/proj-1?tab=receive');
     const library = await screen.findByRole('tab', { name: /^Library/ });
     await waitFor(() => expect(library).toHaveAttribute('aria-selected', 'true'));
-    expect(await screen.findByText('Received frames')).toBeInTheDocument();
+    expect(await screen.findByText('Project frames')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/projects/proj-1'));
   });
 

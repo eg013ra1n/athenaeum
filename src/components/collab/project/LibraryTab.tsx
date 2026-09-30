@@ -16,8 +16,9 @@ import type {
 } from '../../../types/models';
 
 /**
- * Library tab — other members' published frames and their state on this
- * device (Task 11, spec 2026-09-30 "Library"). One `ProjectFrameTable`
+ * Library tab — every published project frame, mine and other members',
+ * and its state on this device (v3 §8.1 "Lights": the project's frames are
+ * what Export for WBPP organizes, own and replica alike). One `ProjectFrameTable`
  * grouped by publisher; the Collaboration-folder banner, `Export for WBPP`,
  * `CollabAttention` and the per-project reload listeners moved here verbatim
  * from the retired four-tab page's receive tab.
@@ -102,10 +103,10 @@ export default function LibraryTab({
   // `fromLibrary`'s only source for `downloading` + its percent.
   const inFlight = useMemo(() => libraryInFlight(state.projects, projectId), [state.projects, projectId]);
 
-  // Own frames are the Contribute/My-frames tabs' business; a frame still
-  // pending moderation belongs to the Moderation tab, not here.
+  // Every project frame, mine included; a frame still pending moderation is
+  // not part of the project yet (Moderation tab / My frames).
   const libraryFrames = useMemo(
-    () => (frames ?? []).filter((f) => !f.own && f.state !== 'pending'),
+    () => (frames ?? []).filter((f) => f.state !== 'pending'),
     [frames],
   );
   const rows = useMemo(() => libraryFrames.map((f) => fromLibrary(f, inFlight)), [libraryFrames, inFlight]);
@@ -152,7 +153,7 @@ export default function LibraryTab({
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-sm font-medium text-content">Received frames</span>
+        <span className="text-sm font-medium text-content">Project frames</span>
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -193,7 +194,7 @@ export default function LibraryTab({
           rows={rows}
           actions={actions}
           onOpen={onOpen}
-          emptyText="No frames from other members yet — published contributions appear here."
+          emptyText="No frames in this project yet — published contributions appear here."
         />
       )}
 
@@ -237,9 +238,9 @@ export function libraryInFlight(
 
 /** The Library tab's badge count: frames whose device state (`fromLibrary`)
  * is `downloading`, `queued` or `missing` — the ones still "to come" on this
- * device. `notKept` and `have` don't count (spec mockup: "N to go"). Applies
- * the same own/pending exclusion as the tab's own table, so the badge always
- * matches what the table would show. */
+ * device. `notKept` and `have` don't count (spec mockup: "N to go"). Pending
+ * frames are skipped as in the table; my own frames are skipped too — they
+ * are never fetched, so none of them is "to come". */
 export function libraryToCome(frames: ProjectFrameView[] | null, inFlight: ReadonlyMap<string, unknown>): number {
   if (!frames) return 0;
   const typedInFlight = inFlight as ReadonlyMap<string, { done: number; size: number }>;

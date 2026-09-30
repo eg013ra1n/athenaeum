@@ -77,6 +77,13 @@ function lib(o: Partial<ProjectFrameView> = {}): ProjectFrameView {
   };
 }
 
+it('fromLibrary: my own frames read their on-disk state (Library lists every project frame)', () => {
+  expect(fromLibrary(lib({ own: true, localState: 'own_held' }), new Map()).device).toBe('have');
+  const gone = fromLibrary(lib({ own: true, localState: 'own_missing' }), new Map());
+  expect([gone.device, gone.missingWhy]).toEqual(['missing', 'gone from disk']);
+  expect(fromLibrary(lib({ own: true, localState: 'own_changed' }), new Map()).device).toBe('changed');
+});
+
 it('fromLibrary: wanted + in flight is downloading with a clamped percent', () => {
   const vm = fromLibrary(lib({ frameUuid: 'u1', localState: 'wanted' }), new Map([['u1', { done: 150, size: 100 }]]));
   expect([vm.device, vm.progress]).toEqual(['downloading', 100]);

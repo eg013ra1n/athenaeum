@@ -225,6 +225,25 @@ describe('LibraryTab — device state', () => {
   });
 });
 
+describe('LibraryTab — every project frame', () => {
+  it('lists my own published frames beside other members\' — own_held reads Have, own_missing reads missing', async () => {
+    renderTab([
+      // Grouped by publisher, only the first group opens: "Me" sorts before "Zoe".
+      frame({ frameUuid: 'u-z', fileName: 'zoe.fits', publisher: 'Zoe', localState: 'held' }),
+      frame({ frameUuid: 'u-m', fileName: 'mine.fits', publisher: 'Me', own: true, localState: 'own_held' }),
+      frame({ frameUuid: 'u-g', fileName: 'gone.fits', publisher: 'Me', own: true, localState: 'own_missing', onDisk: false }),
+      frame({ frameUuid: 'u-p', fileName: 'pending.fits', publisher: 'Me', own: true, state: 'pending', localState: 'own_held' }),
+    ]);
+
+    expect(await screen.findByText('mine.fits')).toBeInTheDocument();
+    expect(within(rowOf('mine.fits')).getByText('● have')).toBeInTheDocument();
+    expect(screen.getByText('Zoe')).toBeInTheDocument();
+    expect(within(rowOf('gone.fits')).getByText('missing')).toBeInTheDocument();
+    expect(within(rowOf('gone.fits')).getByText('gone from disk')).toBeInTheDocument();
+    expect(screen.queryByText('pending.fits')).toBeNull();
+  });
+});
+
 describe('LibraryTab — Keep again', () => {
   it('is disabled with no not_kept frame in view', async () => {
     renderTab([frame({ frameUuid: 'u1', fileName: 'a.fits', localState: 'held' })]);
@@ -260,6 +279,11 @@ describe('libraryToCome', () => {
     const inFlight = new Map([['dl1', { done: 1, size: 2 }]]);
 
     expect(libraryToCome(frames, inFlight)).toBe(3);
+  });
+
+  it('never counts my own frames, even a missing one', () => {
+    const frames: ProjectFrameView[] = [frame({ frameUuid: 'o1', own: true, localState: 'own_missing' })];
+    expect(libraryToCome(frames, new Map())).toBe(0);
   });
 
   it('returns 0 for a null frame list', () => {

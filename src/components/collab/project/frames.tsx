@@ -164,8 +164,20 @@ export function fromLibrary(r: ProjectFrameView, inFlight: ReadonlyMap<string, {
     case 'idle':
       device = 'notReplicated';
       break;
+    // My own published frames: the Library lists every project frame, so
+    // the device column reads their on-disk state the same way.
+    case 'own_held':
+      device = 'have';
+      break;
+    case 'own_missing':
+      device = 'missing';
+      missingWhy = 'gone from disk';
+      break;
+    case 'own_changed':
+      device = 'changed';
+      break;
     default:
-      device = null; // own_held / own_missing / own_changed
+      device = null;
   }
 
   return {
