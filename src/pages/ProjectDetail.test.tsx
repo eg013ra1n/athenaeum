@@ -1544,8 +1544,12 @@ describe('ProjectDetail page shell (wave 5.5)', () => {
     expect(title.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // No separate "Sync now" button: the pill is it.
     expect(screen.queryByRole('button', { name: 'Sync now' })).toBeNull();
+    const details = invokeCount('get_collab_project_detail');
     fireEvent.click(pill);
     await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('collab_sync_now'));
+    // Fix round 1: a successful Sync re-reads the card, so "synced N s ago"
+    // restarts from the fresh `fetchedAt`.
+    await waitFor(() => expect(invokeCount('get_collab_project_detail')).toBe(details + 1));
   });
 
   it('a long project title truncates on one line (review focus 1)', async () => {

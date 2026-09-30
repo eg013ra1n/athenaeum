@@ -545,7 +545,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
             </Chip>
           )}
           <span className="ml-auto flex shrink-0 items-center gap-3.5">
-            <CollabLiveStatus variant="pill" syncedAt={c.fetchedAt} />
+            <CollabLiveStatus variant="pill" syncedAt={c.fetchedAt} onSynced={() => void loadDetail()} />
             <Button variant="link" onClick={() => void openPortal(portalPath)}>
               Manage on portal ↗
             </Button>

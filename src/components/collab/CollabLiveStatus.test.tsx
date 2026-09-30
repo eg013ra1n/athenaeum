@@ -201,11 +201,11 @@ function mockStatus(s: Status) {
 
 /** The pill in the providers the component needs (notifications for a
  *  failed Sync; the router for the toast stack). */
-const renderPill = (syncedAt: string | null = NOW) =>
+const renderPill = (syncedAt: string | null = NOW, onSynced?: () => void) =>
   render(
     <MemoryRouter>
       <NotificationProvider>
-        <CollabLiveStatus variant="pill" syncedAt={syncedAt} />
+        <CollabLiveStatus variant="pill" syncedAt={syncedAt} onSynced={onSynced} />
         <ToastStack />
       </NotificationProvider>
     </MemoryRouter>,
@@ -350,5 +350,69 @@ describe('pill helpers', () => {
       'Online · read-only storage (serving, not downloading)',
     );
     expect(pillLabel({ ...base, state: 'reconnecting', retryInSecs: 12 }, 2, NOW, t)).toBe('Reconnecting in 10 s');
+  });
+
+  // Fix round 1: the age rolls to larger units — "N s" under 60 s, "N m"
+  // under 60 min, "N h" under 48 h, else "N d" (whole units, rounded down).
+  it('pillLabel rolls the age to minutes, hours and days at each boundary', () => {
+    const t = Date.parse(NOW);
+    const at = (secs: number) => pillLabel(base, 0, NOW, t + secs * 1000);
+    expect(at(59)).toBe('Live · synced 59 s ago');
+    expect(at(60)).toBe('Live · synced 1 m ago');
+    expect(at(59 * 60)).toBe('Live · synced 59 m ago');
+    expect(at(59 * 60 + 59)).toBe('Live · synced 59 m ago');
+    expect(at(60 * 60)).toBe('Live · synced 1 h ago');
+    expect(at(47 * 3600)).toBe('Live · synced 47 h ago');
+    expect(at(48 * 3600 - 1)).toBe('Live · synced 47 h ago');
+    expect(at(48 * 3600)).toBe('Live · synced 2 d ago');
+    expect(at(2187 * 60)).toBe('Live · synced 36 h ago');
+  });
+
+  // Fix round 1: core stamps `fetched_at = datetime('now')` — UTC with no
+  // zone designator. `Date.parse` reads a zone-less date-time as LOCAL time,
+  // so the age was off by the machine's UTC offset.
+  it("pillLabel reads core's zone-less datetime('now') stamp as UTC, whatever the machine's zone", () => {
+    const now = Date.parse('2026-09-29T10:00:04Z');
+    expect(pillLabel(base, 0, '2026-09-29 10:00:00', now)).toBe('Live · synced 4 s ago');
+    expect(pillLabel(base, 0, '2026-09-29T10:00:00', now)).toBe('Live · synced 4 s ago');
+    // A string that carries its zone is left alone.
+    expect(pillLabel(base, 0, '2026-09-29T10:00:00Z', now)).toBe('Live · synced 4 s ago');
+    expect(pillLabel(base, 0, '2026-09-29T13:00:00+03:00', now)).toBe('Live · synced 4 s ago');
+    expect(pillLabel(base, 0, '2026-09-29T07:00:00-03:00', now)).toBe('Live · synced 4 s ago');
+  });
+});
+
+describe('CollabLiveStatus pill — fix round 1', () => {
+  it("the pill reads a datetime('now')-shaped fetchedAt as UTC", async () => {
+    vi.useFakeTimers({ now: new Date('2026-09-29T10:00:04Z') });
+    try {
+      mockStatus({ ...base, since: NOW });
+      renderPill('2026-09-29 10:00:00');
+      await advance(0);
+      expect(screen.getByRole('button', { name: 'Live · synced 4 s ago' })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('onSynced runs once after a successful Sync', async () => {
+    const onSynced = vi.fn();
+    renderPill(NOW, onSynced);
+    fireEvent.click(await screen.findByRole('button', { name: /^Live · synced/ }));
+    await waitFor(() => expect(onSynced).toHaveBeenCalledTimes(1));
+    expect(api.invoke).toHaveBeenCalledWith('collab_sync_now');
+  });
+
+  it('onSynced does not run after a failed Sync', async () => {
+    const onSynced = vi.fn();
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) => {
+      if (cmd === 'get_collab_live_status') return Promise.resolve(base);
+      if (cmd === 'collab_sync_now') return Promise.reject('The live exchange is not running');
+      return Promise.resolve(null);
+    }) as never);
+    renderPill(NOW, onSynced);
+    fireEvent.click(await screen.findByRole('button', { name: /^Live · synced/ }));
+    expect(await screen.findByText('Sync now failed')).toBeInTheDocument();
+    expect(onSynced).not.toHaveBeenCalled();
   });
 });

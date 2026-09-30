@@ -65,14 +65,34 @@ export function dotState(s: Status): 'live' | 'warn' | 'error' | 'offline' {
   return s.state === 'unreachable' ? 'error' : 'offline';
 }
 
-/** The pill's label (pure): "Live · synced N s ago" (minutes from 60 s) while
+/** A sync time in epoch ms. Core stamps `fetched_at = datetime('now')`:
+ *  UTC with no zone designator (`YYYY-MM-DD HH:MM:SS`), which `Date.parse`
+ *  would read as LOCAL time — off by the machine's UTC offset. A zone-less
+ *  date-time is therefore read as UTC; a string carrying `Z` or `±hh:mm`
+ *  keeps its own zone. `NaN` when unparsable. */
+function parseSyncedAt(syncedAt: string): number {
+  const iso = syncedAt.trim().replace(' ', 'T');
+  const zoned = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/i.test(iso);
+  return Date.parse(zoned || !iso.includes('T') ? iso : `${iso}Z`);
+}
+
+/** Whole units, rounded down: "N s" under 60 s, "N m" under 60 min, "N h"
+ *  under 48 h, else "N d". */
+function formatAge(secs: number): string {
+  if (secs < 60) return `${secs} s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)} m`;
+  if (secs < 48 * 3600) return `${Math.floor(secs / 3600)} h`;
+  return `${Math.floor(secs / 86400)} d`;
+}
+
+/** The pill's label (pure): "Live · synced N s ago" (then m / h / d) while
  *  live with storage available and a known sync time, else the one live
  *  status label. An unparsable `syncedAt` reads as unknown — never "NaN s". */
 export function pillLabel(s: Status, elapsed: number, syncedAt: string | null, now: number): string {
-  const synced = syncedAt ? Date.parse(syncedAt) : NaN;
+  const synced = syncedAt ? parseSyncedAt(syncedAt) : NaN;
   if (s.state === 'live' && s.storage === 'available' && Number.isFinite(synced)) {
     const secs = Math.max(0, Math.round((now - synced) / 1000));
-    return `Live · synced ${secs < 60 ? `${secs} s` : `${Math.round(secs / 60)} m`} ago`;
+    return `Live · synced ${formatAge(secs)} ago`;
   }
   return liveStatusLabel(s, elapsed);
 }
@@ -92,11 +112,15 @@ export default function CollabLiveStatus({
   compact = false,
   variant = 'default',
   syncedAt = null,
+  onSynced,
 }: {
   compact?: boolean;
   variant?: 'default' | 'pill';
   /** The pill's "synced N s ago" origin (the project card's `fetchedAt`). */
   syncedAt?: string | null;
+  /** Called after `collab_sync_now` succeeds (never on failure) — the project
+   *  page re-reads its card, so the synced age restarts. */
+  onSynced?: () => void;
 }) {
   const { notify } = useNotifications();
   const { available: canReplace, pending, requestOpen } = useDeviceReplace();
@@ -160,6 +184,7 @@ export default function CollabLiveStatus({
     setSyncing(true);
     try {
       await api.invoke('collab_sync_now');
+      onSynced?.();
     } catch (err) {
       console.error('[collab] collab_sync_now failed:', err);
       notify({
