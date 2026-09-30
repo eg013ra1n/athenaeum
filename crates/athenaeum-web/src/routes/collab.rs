@@ -375,6 +375,7 @@ pub async fn get_collab_exchange(
 /// receive sessions, newest first — the Transfers/project page's collapsed
 /// view of a burst of landings, real sources named.
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionsArgs {
     #[serde(default)]
     project_id: Option<String>,
@@ -814,5 +815,38 @@ mod live_surface_tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST, "{}", err.1);
         assert!(err.1.contains(".."), "{}", err.1);
+    }
+}
+
+/// Whole-branch review finding 1: `SessionsArgs` lacked `camelCase`, so the
+/// frontend's `{"projectId":...}` body deserialized with `project_id: None`
+/// via `#[serde(default)]` — the web build silently returned every
+/// project's sessions instead of the requested one. These pin the camelCase
+/// boundary for every args struct this task touches.
+#[cfg(test)]
+mod args_serde_tests {
+    use super::*;
+
+    #[test]
+    fn sessions_args_reads_camel_case_fields() {
+        let args: SessionsArgs = serde_json::from_str(r#"{"projectId":"p","limit":5}"#)
+            .expect("SessionsArgs should deserialize camelCase body");
+        assert_eq!(args.project_id.as_deref(), Some("p"));
+        assert_eq!(args.limit, Some(5));
+    }
+
+    #[test]
+    fn frame_args_reads_camel_case_fields() {
+        let args: FrameArgs = serde_json::from_str(r#"{"projectId":"p","frameUuid":"u"}"#)
+            .expect("FrameArgs should deserialize camelCase body");
+        assert_eq!(args.project_id, "p");
+        assert_eq!(args.frame_uuid, "u");
+    }
+
+    #[test]
+    fn optional_project_args_reads_camel_case_field() {
+        let args: OptionalProjectArgs = serde_json::from_str(r#"{"projectId":"p"}"#)
+            .expect("OptionalProjectArgs should deserialize camelCase body");
+        assert_eq!(args.project_id.as_deref(), Some("p"));
     }
 }

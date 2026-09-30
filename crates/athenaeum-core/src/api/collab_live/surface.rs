@@ -1042,7 +1042,7 @@ pub fn get_collab_exchange(
                 tracing::warn!(project_id = %pf.project_id, error = %e, "members_json unreadable; exchange peers named by device only");
                 Vec::new()
             });
-        let (devices, _) = live_db::load_holders(&conn, &pf.project_id)?;
+        let devices = live_db::holder_devices(&conn, &pf.project_id)?;
         for f in pf.recv.iter().chain(pf.send.iter()) {
             names.push(DeviceNameView {
                 project_id: pf.project_id.clone(),
@@ -1107,28 +1107,45 @@ pub fn list_collab_receive_sessions(
     let conn = db.conn();
     let rows = crate::db::collab_sessions::list(&conn, project_id, limit)?;
     let mut out = Vec::with_capacity(rows.len());
+    // `(title, members, devices)` per distinct project_id, resolved once per
+    // project rather than once per session row (finding 2, whole-branch
+    // review: `load_holders` alone was already the wrong query for a
+    // names-only lookup — repeating it per row on top of that would mean
+    // one full `collab_holder_claims` scan per row too).
+    let mut project_cache: HashMap<
+        String,
+        (String, Vec<SnapshotMember>, Vec<live_db::HolderDeviceRow>),
+    > = HashMap::new();
     for row in rows {
-        let project = crate::db::collab::get_project(&conn, &row.project_id)?;
-        let title = project
-            .as_ref()
-            .map(|p| p.title.clone())
-            .unwrap_or_default();
-        if project.is_none() {
-            tracing::debug!(project_id = %row.project_id, "receive session for a project not cached; sources unnamed");
-        }
-        let members: Vec<SnapshotMember> = project
-            .as_ref()
-            .map(|p| {
-                serde_json::from_str(&p.members_json).unwrap_or_else(|e| {
-                    tracing::warn!(project_id = %row.project_id, error = %e, "members_json unreadable; receive session sources named by device only");
+        let (title, members, devices) = match project_cache.get(&row.project_id) {
+            Some(cached) => cached.clone(),
+            None => {
+                let project = crate::db::collab::get_project(&conn, &row.project_id)?;
+                let title = project
+                    .as_ref()
+                    .map(|p| p.title.clone())
+                    .unwrap_or_default();
+                if project.is_none() {
+                    tracing::debug!(project_id = %row.project_id, "receive session for a project not cached; sources unnamed");
+                }
+                let members: Vec<SnapshotMember> = project
+                    .as_ref()
+                    .map(|p| {
+                        serde_json::from_str(&p.members_json).unwrap_or_else(|e| {
+                            tracing::warn!(project_id = %row.project_id, error = %e, "members_json unreadable; receive session sources named by device only");
+                            Vec::new()
+                        })
+                    })
+                    .unwrap_or_default();
+                let devices = if project.is_some() {
+                    live_db::holder_devices(&conn, &row.project_id)?
+                } else {
                     Vec::new()
-                })
-            })
-            .unwrap_or_default();
-        let devices = if project.is_some() {
-            live_db::load_holders(&conn, &row.project_id)?.0
-        } else {
-            Vec::new()
+                };
+                let resolved = (title, members, devices);
+                project_cache.insert(row.project_id.clone(), resolved.clone());
+                resolved
+            }
         };
         let mut sources: Vec<SessionSourceView> = row
             .sources

@@ -747,10 +747,12 @@ pub fn apply_holder_delta(
     Ok(())
 }
 
-pub fn load_holders(
-    conn: &Connection,
-    project_id: &str,
-) -> Result<(Vec<HolderDeviceRow>, Vec<(String, i32, i32)>)> {
+/// Device names only (`collab_holder_devices`, one row per device) — for
+/// callers that only need to label a device (a session's sources, the
+/// exchange snapshot's peers) and must not pay for [`load_holders`]'s
+/// `collab_holder_claims` scan, which is one row per (device, frame) and
+/// so grows with project size (up to ~780k rows at 78 members / 10k frames).
+pub fn holder_devices(conn: &Connection, project_id: &str) -> Result<Vec<HolderDeviceRow>> {
     let mut stmt = conn.prepare(
         "SELECT device, display_name, relay_url FROM collab_holder_devices WHERE project_id = ?1 ORDER BY device",
     )?;
@@ -763,6 +765,14 @@ pub fn load_holders(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(devices)
+}
+
+pub fn load_holders(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<(Vec<HolderDeviceRow>, Vec<(String, i32, i32)>)> {
+    let devices = holder_devices(conn, project_id)?;
     let mut stmt = conn.prepare(
         "SELECT device, frame_seq, content_version FROM collab_holder_claims WHERE project_id = ?1 ORDER BY device, frame_seq",
     )?;
@@ -993,6 +1003,27 @@ mod tests {
         // a delta for an unknown device creates a placeholder device row
         apply_holder_delta(&conn, "p1", "BBB=", &[(2, 1)], &[]).unwrap();
         assert_eq!(load_holders(&conn, "p1").unwrap().0.len(), 2);
+    }
+
+    /// Finding 2 (whole-branch review): callers that only need device names
+    /// (Transfers history, the exchange snapshot) must not pull the whole
+    /// `collab_holder_claims` table the way `load_holders` does — at 78
+    /// members / 10k frames that's up to ~780k rows read for nothing.
+    /// `holder_devices` reads names with no claims present at all.
+    #[test]
+    fn holder_devices_reads_names_without_any_claims_present() {
+        let conn = conn_with_project();
+        let dev = HolderDeviceRow {
+            device: "AAA=".into(),
+            display_name: "Anna".into(),
+            relay_url: Some("relay1".into()),
+        };
+        replace_holders(&conn, "p1", &[dev.clone()], &[]).unwrap();
+        assert_eq!(holder_devices(&conn, "p1").unwrap(), vec![dev]);
+        assert!(
+            load_holders(&conn, "p1").unwrap().1.is_empty(),
+            "no claims were ever written"
+        );
     }
 
     #[test]
