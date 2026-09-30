@@ -1100,12 +1100,26 @@ impl Runtime {
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "landing temp sweep task failed"),
         }
-        let engine = StorageEngine::start_with(
-            Arc::clone(&ctx),
-            Arc::clone(&r.node),
-            Arc::clone(&guard),
-            cfg.timings,
-        );
+        // Registering the folder watcher blocks until the OS stream is up
+        // (macOS FSEvents: measured 1.6–3.2 s) — off the async path, so the
+        // start stays an await point `or_stop` can end at once (final fix
+        // A-M2); a stop meanwhile drops the engine when the thread returns.
+        let engine = {
+            let (ctx, node, guard, timings) = (
+                Arc::clone(&ctx),
+                Arc::clone(&r.node),
+                Arc::clone(&guard),
+                cfg.timings,
+            );
+            tokio::task::spawn_blocking(move || {
+                StorageEngine::start_with(ctx, node, guard, timings)
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "collaboration storage engine start panicked");
+                ApiError::Internal(format!("storage engine start failed: {e}"))
+            })?
+        };
         let (degraded, network) = (engine.degraded(), engine.network());
         let maps = HolderMaps::default();
         let holders: Arc<dyn HolderView> = Arc::new(SharedHolders {
