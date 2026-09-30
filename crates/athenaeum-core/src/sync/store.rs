@@ -925,6 +925,9 @@ pub fn search_history_rows(conn: &Connection, q: &HistoryQuery) -> Result<Vec<Hi
         sql.push_str(" AND package_id = ?");
         args.push(Box::new(package_id.clone()));
     }
+    if q.exclude_collab_landings {
+        sql.push_str(" AND NOT (project IS NOT NULL AND package_id IS NULL)");
+    }
     sql.push_str(" ORDER BY started_at DESC, id DESC LIMIT ?");
     args.push(Box::new(q.limit as i64));
 

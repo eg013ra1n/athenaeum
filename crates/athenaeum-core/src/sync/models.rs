@@ -454,6 +454,14 @@ pub struct HistoryQuery {
     /// per-batch detail read ([`list_transfer_files`](crate::api::sync::list_transfer_files))
     /// scopes a package's per-frame rows by [`HistoryRow::package_id`].
     pub package_id: Option<String>,
+    /// When `true`, drop per-frame collab landing rows (`project IS NOT NULL
+    /// AND package_id IS NULL`) — [`list_history`](crate::api::sync::list_history)'s
+    /// Transfers-page read sets this so collab traffic shows up as receive
+    /// sessions (Task 13), not as one row per landed frame crowding out
+    /// personal transfers. Every other caller (per-batch detail reads,
+    /// direct [`SyncStore::search_history`](super::store::SyncStore::search_history)
+    /// callers) leaves this `false` (the `Default`) to keep today's behaviour.
+    pub exclude_collab_landings: bool,
     pub limit: u32,
 }
 

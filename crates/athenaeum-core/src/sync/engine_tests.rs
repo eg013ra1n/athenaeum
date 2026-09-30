@@ -257,6 +257,7 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();
@@ -1442,6 +1443,7 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();
@@ -1861,6 +1863,7 @@ async fn timeouts_back_off_forever_without_failing() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();
@@ -2145,6 +2148,7 @@ async fn missing_package_dir_fails_terminally() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();
@@ -2227,6 +2231,7 @@ async fn peer_offline_backs_off_and_stays_pending() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();
@@ -2373,6 +2378,7 @@ async fn first_attempt_peer_offline_then_online_completes() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();
@@ -2458,6 +2464,7 @@ async fn cancel_moves_to_cancelled_state() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();
@@ -2582,6 +2589,7 @@ async fn all_cancelled_ack_marks_cancelled_by_receiver() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();

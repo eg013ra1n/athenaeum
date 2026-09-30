@@ -768,6 +768,7 @@ async fn engine_suite_over_iroh() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();
@@ -878,6 +879,7 @@ async fn engine_dup_ack_confirms_once_over_iroh() {
             peer: None,
             project: None,
             package_id: None,
+            exclude_collab_landings: false,
             limit: 100,
         })
         .unwrap();

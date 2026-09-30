@@ -2479,6 +2479,11 @@ pub fn list_history(
         // The history log is not scoped by batch; per-batch detail is
         // `list_transfer_files`.
         package_id: None,
+        // Collab landings write one `sync_history` row per frame (`project`
+        // set, no `package_id`); the Transfers page shows collab traffic as
+        // receive sessions (Task 13) instead, so this read drops them to stop
+        // a large project from crowding personal transfers out of the cap.
+        exclude_collab_landings: true,
         limit,
     };
     let db = db(ctx)?;
@@ -9264,6 +9269,59 @@ mod tests {
         let combined = list_history(&ctx, q(Some(Direction::Sent), Some("peerB".into()))).unwrap();
         assert_eq!(combined.len(), 1);
         assert_eq!(combined[0].frame_uuid, "s2");
+    }
+
+    /// Task 14: `list_history` (the Transfers page's history read) excludes
+    /// per-frame collab landing rows (`project IS NOT NULL AND package_id IS
+    /// NULL`) — collab traffic shows up in history as receive sessions
+    /// (Task 13), not as one row per landed frame crowding out personal
+    /// transfers. A personal row (no `project`, a `package_id`) still comes
+    /// back.
+    #[test]
+    fn list_history_leaves_out_collab_landings() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            for (uuid, project, package) in [
+                ("personal", None, Some("pkg-1")),
+                ("collab", Some("p1"), None),
+            ] {
+                crate::sync::store::insert_history_row(
+                    &conn,
+                    &HistoryRow {
+                        frame_uuid: uuid.into(),
+                        filename: format!("{uuid}.fits"),
+                        object: None,
+                        peer_device: "d".into(),
+                        direction: Direction::Received,
+                        bytes: 1,
+                        started_at: "2026-07-06T00:00:00.000Z".into(),
+                        finished_at: Some("2026-07-06T00:00:01.000Z".into()),
+                        outcome: "ingested".into(),
+                        project: project.map(str::to_string),
+                        package_id: package.map(str::to_string),
+                        batch_name: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let q = SyncHistoryQuery {
+            filename: None,
+            object: None,
+            direction: None,
+            peer: None,
+            project: None,
+            limit: 0,
+        };
+        let rows = list_history(&ctx, q).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.frame_uuid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["personal"]
+        );
     }
 
     // ── Per-batch file detail (task 14) ──────────────────────────────────────
