@@ -287,6 +287,31 @@ describe('ModerationTab — Reject', () => {
   });
 });
 
+describe('ModerationTab — mockup layout', () => {
+  it('totals bar: Approve all (primary), Reject all, then the trust checkbox', async () => {
+    moderationItems = [mod({ frameUuid: 'u1', fileName: 'a.fits' })];
+    renderTab();
+    const approve = await screen.findByRole('button', { name: /Approve all/ });
+    expect(approve.className).toContain('bg-accent');
+    expect(screen.getByRole('button', { name: /Reject all/ })).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Trust these publishers' })).toBeInTheDocument();
+  });
+
+  it('reject opens a DialogShell dialog whose reason field takes the initial focus', async () => {
+    moderationItems = [mod({ frameUuid: 'u1', fileName: 'a.fits' })];
+    renderTab();
+    fireEvent.click(await screen.findByRole('button', { name: /Reject all/ }));
+    expect(screen.getByRole('dialog', { name: /Reject/ })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Why is this frame rejected?')).toHaveAttribute('data-autofocus');
+  });
+
+  it('Waiting for review and Excluded frames are 13px section titles', async () => {
+    renderTab([libraryFrame({ accepted: false })]);
+    expect((await screen.findByRole('heading', { name: 'Waiting for review' })).className).toContain('text-[13px]');
+    expect((await screen.findByRole('heading', { name: 'Excluded frames' })).className).toContain('text-[13px]');
+  });
+});
+
 describe('ModerationTab — manifest mirror', () => {
   it('shows night from the library mirror when the frame has already landed', async () => {
     moderationItems = [mod({ frameUuid: 'u-1', fileName: 'landed.fits' })];

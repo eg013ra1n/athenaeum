@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState, type JSX } from 'react';
-import { Loader2, X } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 import { api } from '../../../api';
 import { Checkbox } from '../../settings/Checkbox';
+import { Button, DialogShell } from '../../ui';
 import ProjectFrameTable, { type TableAction } from './table/ProjectFrameTable';
 import { fromLibrary, fromModeration, type FrameVM } from './frames';
 import type { ModerationFrameView, ProjectFrameView } from '../../../types/models';
 
 const REASON_MAX = 500;
-const HEADER = 'text-sm font-semibold text-content';
+const HEADER = 'mb-1.5 mt-5 text-[13px] font-semibold text-content first:mt-0';
 
 /** The hub's stable 409 text for "this frame is no longer pending" — already
  *  approved/rejected by another moderator, or swept up by THIS SAME batch's
@@ -228,16 +229,16 @@ export default function ModerationTab({
   ];
 
   return (
-    <div className="space-y-6">
-      <div className="space-y-3">
-        <h2 className={HEADER}>Waiting for review</h2>
-        {error && <p className="text-sm text-error">{error}</p>}
-        {result && <p className="text-sm text-error">{result}</p>}
+    <div>
+      <div>
+        <h3 className={HEADER}>Waiting for review</h3>
+        {error && <p className="text-[12.5px] text-error">{error}</p>}
+        {result && <p className="text-[12.5px] text-error">{result}</p>}
 
         {!requireApproval ? (
-          <p className="text-sm text-content-muted">This project publishes without review.</p>
+          <p className="text-[12px] text-content-faint">This project publishes without review.</p>
         ) : items === null ? (
-          <p className="text-sm text-content-muted">Loading…</p>
+          <p className="text-[12px] text-content-faint">Loading…</p>
         ) : (
           <ProjectFrameTable
             key={`${projectId}.moderation`}
@@ -264,13 +265,13 @@ export default function ModerationTab({
         )}
       </div>
 
-      <div className="space-y-3">
-        <h2 className={HEADER}>Excluded frames</h2>
-        {restoreResult && <p className="text-sm text-error">{restoreResult}</p>}
+      <div>
+        <h3 className={HEADER}>Excluded frames</h3>
+        {restoreResult && <p className="text-[12.5px] text-error">{restoreResult}</p>}
         {library === null && !libraryError ? (
-          <p className="text-sm text-content-muted">Loading…</p>
+          <p className="text-[12px] text-content-faint">Loading…</p>
         ) : libraryError ? (
-          <p className="text-sm text-error">Could not load the library — see console.</p>
+          <p className="text-[12.5px] text-error">Could not load the library — see console.</p>
         ) : (
           <ProjectFrameTable
             key={`${projectId}.excluded`}
@@ -307,70 +308,37 @@ function RejectDialog({
   const tooLong = reason.length > REASON_MAX;
   const valid = trimmed.length > 0 && !tooLong;
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !busy) onCancel();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onCancel, busy]);
-
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={() => !busy && onCancel()}
-    >
-      <div
-        className="w-[30rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-2 flex items-center gap-2">
-          <X size={16} className="text-error" />
-          <h2 className="font-medium text-content">
-            Reject {frames.length} frame{frames.length === 1 ? '' : 's'}
-          </h2>
-          <button
-            onClick={onCancel}
-            disabled={busy}
-            className="ml-auto text-content-muted transition-colors hover:text-content disabled:opacity-50"
-            aria-label="Close"
-          >
-            <X size={16} />
-          </button>
-        </div>
-        <p className="mb-2 text-xs text-content-muted">The reason is sent to the publisher.</p>
-        <textarea
-          value={reason}
-          onChange={(e) => setReason(e.target.value)}
-          rows={4}
-          autoFocus
-          placeholder="Why is this frame rejected?"
-          className="w-full resize-none rounded border border-border bg-surface-elevated p-2 text-sm text-content placeholder:text-content-muted focus:border-accent focus:outline-none"
-        />
-        <div className="mt-1 flex items-center justify-between text-xs">
-          <span className={tooLong ? 'text-error' : 'text-content-muted'}>
-            {reason.length}/{REASON_MAX}
-          </span>
-        </div>
-        <div className="mt-3 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
-            disabled={busy}
-            className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-          >
+    <DialogShell
+      title={`Reject ${frames.length} ${frames.length === 1 ? 'frame' : 'frames'}`}
+      onClose={onCancel}
+      busy={busy}
+      footer={
+        <>
+          <Button onClick={onCancel} disabled={busy}>
             Cancel
-          </button>
-          <button
-            type="button"
-            onClick={() => onReject(trimmed)}
-            disabled={!valid || busy}
-            className="inline-flex items-center gap-1 rounded bg-error px-3 py-1.5 text-sm text-surface transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {busy && <Loader2 size={12} className="animate-spin" />} Reject
-          </button>
-        </div>
+          </Button>
+          <Button variant="dangerPrimary" disabled={!valid || busy} onClick={() => onReject(trimmed)}>
+            {busy && <Loader2 size={12} className="animate-spin" />}
+            Reject
+          </Button>
+        </>
+      }
+    >
+      <p className="mb-2 text-[12px] text-content-muted">The reason is sent to the publisher.</p>
+      <textarea
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+        rows={4}
+        data-autofocus
+        placeholder="Why is this frame rejected?"
+        className="w-full resize-none rounded border border-border bg-surface px-1.5 py-[3px] text-[12px] text-content placeholder:text-content-faint focus:border-accent focus:outline-none"
+      />
+      <div className="mt-1 text-[11px]">
+        <span className={tooLong ? 'text-error' : 'text-content-faint'}>
+          {reason.length}/{REASON_MAX}
+        </span>
       </div>
-    </div>
+    </DialogShell>
   );
 }
