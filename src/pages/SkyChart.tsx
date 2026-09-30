@@ -1,3 +1,4 @@
+import { initializeSkyFootprint, projectSkyFootprint } from '../utils/skyFootprint';
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
@@ -62,7 +63,7 @@ export default function SkyChart() {
   // filter changes) provides the new closure without registering again.
   const renderMarkersRef = useRef<(() => void) | null>(null);
   // T1-6 — track current selected target inside the redraw callback so we
-  // can know when its FOV gets hidden by zoom/distortion thresholds.
+  // can know when its FOV gets hidden by projection clipping.
   const selectedTargetRef = useRef<string>('');
   const [locations, setLocations] = useState<ImagingLocation[]>([]);
   const [loading, setLoading] = useState(true);
@@ -715,88 +716,11 @@ export default function SkyChart() {
               return [raToGeoJsonLongitude(cornerRA), cornerDec] as [number, number];
             });
 
-            const projectedCorners: [number, number][] = [];
-            let hasInvalidCorner = false;
-            for (const c of corners) {
-              const pt = window.Celestial.map.projection()(c);
-              if (!pt || !isFinite(pt[0]) || !isFinite(pt[1])) {
-                hasInvalidCorner = true;
-                break;
-              }
-              if (!window.Celestial.clip(c)) {
-                hasInvalidCorner = true;
-                break;
-              }
-              projectedCorners.push([pt[0] * scaling.scaleX, pt[1] * scaling.scaleY]);
-            }
-
-            if (hasInvalidCorner || projectedCorners.length !== 4) {
-              g.style('display', 'none');
-              return;
-            }
-
-            const xCoords = projectedCorners.map(p => p[0]);
-            const yCoords = projectedCorners.map(p => p[1]);
-            const xSpan = Math.max(...xCoords) - Math.min(...xCoords);
-            const ySpan = Math.max(...yCoords) - Math.min(...yCoords);
-
-            const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
-            const canvasWidth = canvas ? canvas.getBoundingClientRect().width : 1000;
-            const canvasHeight = canvas ? canvas.getBoundingClientRect().height : 1000;
-
-            if (xSpan > canvasWidth * 0.5 || ySpan > canvasHeight * 0.5) {
-              g.style('display', 'none');
-              return;
-            }
-
-            const absPARad = Math.abs(paRad);
-            const tanW = Math.tan((fovW / 2) * Math.PI / 180) * 2 * (180 / Math.PI);
-            const tanH = Math.tan((fovH / 2) * Math.PI / 180) * 2 * (180 / Math.PI);
-            const expectedBBWidth = tanW * Math.abs(Math.cos(absPARad)) + tanH * Math.abs(Math.sin(absPARad));
-            const expectedBBHeight = tanW * Math.abs(Math.sin(absPARad)) + tanH * Math.abs(Math.cos(absPARad));
-            const originalAspectRatio = expectedBBWidth / Math.max(expectedBBHeight, 0.001);
-            const projectedAspectRatio = xSpan / Math.max(ySpan, 0.001);
-            const distortionRatio = projectedAspectRatio / originalAspectRatio;
-
-            if (distortionRatio > 3 || distortionRatio < 0.33) {
-              g.style('display', 'none');
-              return;
-            }
-
-            const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
-
-            const fillColor = markerColor.replace('#', '');
-            const r = parseInt(fillColor.substring(0, 2), 16);
-            const g_rgb = parseInt(fillColor.substring(2, 4), 16);
-            const b = parseInt(fillColor.substring(4, 6), 16);
-            // T2-15 — bumped from 0.15 → 0.28; was nearly invisible on dark sky.
-            const fillStyle = `rgba(${r}, ${g_rgb}, ${b}, 0.28)`;
-
-            // Whole-box hit area — transparent fill + thick transparent
-            // stroke. pointer-events: all means clicks/dblclicks anywhere
-            // inside or near the border register; wheel events get
-            // explicitly forwarded to the canvas (see g.on('wheel', …)
-            // below) so zoom-over-FOV still works.
-            if (d.properties.frameSetId) {
-              g.append('path')
-                .attr('class', 'fov-hit')
-                .attr('d', pathData)
-                .style('fill', 'transparent')
-                .style('stroke', 'transparent')
-                .style('stroke-width', '14px')
-                .style('pointer-events', 'all')
-                .style('cursor', 'pointer');
-            }
-
-            g.append('path')
-              .attr('class', 'fov-rect')
-              .attr('d', pathData)
-              .style('fill', fillStyle)
-              .style('stroke', markerColor)
-              .style('stroke-width', '2px')
-              // Visible rect doesn't need its own hit testing — the
-              // sibling .fov-hit captures clicks/dblclicks for us.
-              .style('pointer-events', 'none');
+            // Create retained geometry regardless of the initial projection.
+            // Visibility is recalculated below on every redraw.
+            initializeSkyFootprint(g, corners);
+            // Keep the existing palette while making geometry recoverable.
+            g.select('.fov-rect').style('fill', markerColor).style('stroke', markerColor);
 
             // Object-name label — hidden by default, positioned + shown by
             // the placement pass in the redraw callback. The pill bg + text
@@ -824,11 +748,6 @@ export default function SkyChart() {
               .style('font-family', 'Helvetica, Arial, sans-serif')
               .style('fill', '#ffffff')
               .style('user-select', 'none');
-
-            (this as any).__fovCorners = corners;
-            (this as any).__fovWidth = fovW;
-            (this as any).__fovHeight = fovH;
-            (this as any).__rotation = pa;
           } else {
             const pt = window.Celestial.map.projection()(d.geometry.coordinates);
             if (pt) {
@@ -955,82 +874,35 @@ export default function SkyChart() {
         // Update globe clip on every redraw
         updateGlobeClipRef.current?.(svg, 'markers-globe-clip', scaling);
 
-        const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
-        const canvasWidth = canvas ? canvas.getBoundingClientRect().width : 1000;
-        const canvasHeight = canvas ? canvas.getBoundingClientRect().height : 1000;
-
         // T1-6 — tracks whether the user-selected target's FOV ends up
         // hidden in this redraw pass.
         const targetIdNum = selectedTargetRef.current ? Number(selectedTargetRef.current) : null;
         let selectedTargetHidden = false;
         let selectedTargetSeen = false;
 
-        markersGroup.selectAll('.fov-box').each(function(this: any, d: any) {
+        markersGroup.selectAll('.fov-box').each(function (this: any, d: any) {
           const pt = map.projection()(d.geometry.coordinates);
           const corners = (this as any).__fovCorners;
 
           if (corners) {
-            const projectedCorners: [number, number][] = [];
-            let hasInvalidCorner = false;
-            for (const c of corners) {
-              const projPt = map.projection()(c);
-              if (!projPt || !isFinite(projPt[0]) || !isFinite(projPt[1])) {
-                hasInvalidCorner = true;
-                break;
-              }
-              projectedCorners.push([projPt[0] * scaling.scaleX, projPt[1] * scaling.scaleY]);
-            }
-
-            if (hasInvalidCorner || projectedCorners.length !== 4) {
-              d3.select(this).style('display', 'none');
-              return;
-            }
-
-            const xCoords = projectedCorners.map(p => p[0]);
-            const yCoords = projectedCorners.map(p => p[1]);
-            const xSpan = Math.max(...xCoords) - Math.min(...xCoords);
-            const ySpan = Math.max(...yCoords) - Math.min(...yCoords);
-
-            if (xSpan > canvasWidth * 0.5 || ySpan > canvasHeight * 0.5) {
-              d3.select(this).style('display', 'none');
-              return;
-            }
-
-            const storedFovW = (this as any).__fovWidth;
-            const storedFovH = (this as any).__fovHeight;
-            if (storedFovW && storedFovH) {
-              const storedRotation = (this as any).__rotation ?? 0;
-              const absPARad = Math.abs(storedRotation * Math.PI / 180);
-              const tanW = Math.tan((storedFovW / 2) * Math.PI / 180) * 2 * (180 / Math.PI);
-              const tanH = Math.tan((storedFovH / 2) * Math.PI / 180) * 2 * (180 / Math.PI);
-              const expectedBBWidth = tanW * Math.abs(Math.cos(absPARad)) + tanH * Math.abs(Math.sin(absPARad));
-              const expectedBBHeight = tanW * Math.abs(Math.sin(absPARad)) + tanH * Math.abs(Math.cos(absPARad));
-              const originalAspectRatio = expectedBBWidth / Math.max(expectedBBHeight, 0.001);
-              const projectedAspectRatio = xSpan / Math.max(ySpan, 0.001);
-              const distortionRatio = projectedAspectRatio / originalAspectRatio;
-
-              if (distortionRatio > 3 || distortionRatio < 0.33) {
-                d3.select(this).style('display', 'none');
-                return;
-              }
-            }
-
-            const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
-
-            // Update both the visible stroke AND the invisible wide
-            // hit-stroke that gives the rectangle a generous click target.
-            d3.select(this).selectAll('.fov-rect, .fov-hit')
-              .attr('d', pathData);
-
-            d3.select(this).style('display', null);
+            const path = projectSkyFootprint(
+              corners,
+              map.projection(),
+              point => window.Celestial.clip(point),
+              scaling.scaleX,
+              scaling.scaleY,
+            );
+            d3.select(this).style('display', path ? null : 'none');
+            if (path) d3.select(this).selectAll('.fov-rect, .fov-hit').attr('d', path);
           } else if (pt) {
             const scaledX = pt[0] * scaling.scaleX;
             const scaledY = pt[1] * scaling.scaleY;
-            d3.select(this).select('path')
-              .attr('transform', `translate(${scaledX},${scaledY})`);
+            d3.select(this).select('path').attr('transform', `translate(${scaledX},${scaledY})`);
 
             const isVisible = pt && window.Celestial.clip(d.geometry.coordinates);
             d3.select(this).style('display', isVisible ? null : 'none');
+          } else {
+            d3.select(this).style('display', 'none');
           }
 
           // T1-6 — note whether this is the user-selected target and
@@ -1427,10 +1299,10 @@ export default function SkyChart() {
           </div>
         )}
         {/* T1-6 — explain why the selected target's FOV box has vanished
-            (zoom/distortion thresholds in the projection). */}
+            (projection clipping in the projection). */}
         {fovHiddenForTarget && (
           <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 bg-warning-muted border border-warning/50 text-warning text-xs px-3 py-1.5 rounded shadow">
-            FOV overlay hidden at this zoom — zoom out to see it.
+            Footprint crosses the projection boundary — center the target to see it.
           </div>
         )}
 
