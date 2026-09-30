@@ -281,7 +281,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const portalPath = c.coordinator ? `/p/${c.slug}/admin` : `/p/${c.slug}`;
   const canReceive = c.dataRole === 'send_receive' || c.coordinator;
   const canModerate = c.canModerate;
-  const needsApproval = c.requireApproval && !c.coordinator;
+  const needsApproval = c.requireApproval && !c.canModerate;
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
   // The project's published volume, client-side from the rows already listed.
   const publishedBytes =

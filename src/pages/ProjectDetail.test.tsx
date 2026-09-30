@@ -346,6 +346,24 @@ describe('ProjectDetail manual publish', () => {
     expect(screen.getByText(/Estimated size ≈ 90\.0 MB/)).toBeInTheDocument();
   });
 
+  it('the confirm shows no approval notice for a non-coordinator with canModerate: true', async () => {
+    mockCommands(projectCard({ coordinator: false, canModerate: true, requireApproval: true }));
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish all 2' }));
+    expect(await screen.findByText('Publish to M42 Mosaic')).toBeInTheDocument();
+    expect(screen.queryByText(/requires approval/)).not.toBeInTheDocument();
+  });
+
+  it('the confirm still shows the approval notice for a member without canModerate', async () => {
+    mockCommands(projectCard({ coordinator: false, canModerate: false, requireApproval: true }));
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish all 2' }));
+    expect(await screen.findByText('Publish to M42 Mosaic')).toBeInTheDocument();
+    expect(screen.getByText(/requires approval/)).toBeInTheDocument();
+  });
+
   it('a failed publish shows an inline error and a toast whose dedupeKey cannot collide with the live one', async () => {
     mockCommands(projectCard(), {
       publish_collab_frames: () => Promise.reject(new Error('hub unreachable')),
