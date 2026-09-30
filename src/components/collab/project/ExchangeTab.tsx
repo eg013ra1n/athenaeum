@@ -53,14 +53,30 @@ export default function ExchangeTab({
 
   // Held in a ref so the listener effect below subscribes exactly once per
   // `projectId` regardless of how many times this reload function is
-  // recreated (Task 10 listener ruling).
+  // recreated (Task 10 listener ruling). The loader runs both on mount and
+  // on every `collab-frames-landed` for this project, so a stale in-flight
+  // request can resolve after a newer one has already started — a
+  // monotonically increasing request id (fix round 1) guards `sessions`/
+  // `sessionsError` writes to the LATEST call only, the same idea as
+  // MembersTab's `cancelled` flag generalized to more than one call per
+  // mount. `sessionsError` is also reset synchronously at the top of every
+  // load — previously it was only ever set, never cleared, so one transient
+  // failure produced a permanent phantom error banner even after a later
+  // reload succeeded.
+  const requestIdRef = useRef(0);
   const loadSessionsRef = useRef<() => void>(() => {});
   loadSessionsRef.current = () => {
+    const requestId = ++requestIdRef.current;
+    setSessionsError(null);
     api
       .invoke<ReceiveSessionView[]>('list_collab_receive_sessions', { projectId, limit: 50 })
-      .then((rows) => setSessions(rows))
+      .then((rows) => {
+        if (requestId !== requestIdRef.current) return;
+        setSessions(rows);
+      })
       .catch((err) => {
         console.error('[collab-exchange] list_collab_receive_sessions failed:', err);
+        if (requestId !== requestIdRef.current) return;
         setSessionsError(err instanceof Error ? err.message : String(err));
       });
   };

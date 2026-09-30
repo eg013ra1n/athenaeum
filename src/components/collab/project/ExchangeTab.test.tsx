@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { CollabExchangeProvider } from '../../../contexts/CollabExchangeContext';
 import { api } from '../../../api';
 import ExchangeTab from './ExchangeTab';
@@ -234,6 +234,39 @@ describe('ExchangeTab — receive history', () => {
     receiveSessions = [];
     renderTab();
     expect(await screen.findByText('No receive sessions yet.')).toBeInTheDocument();
+  });
+
+  it('clears a stale error once a reload triggered by collab-frames-landed succeeds', async () => {
+    let calls = 0;
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      switch (command) {
+        case 'get_collab_exchange':
+          return Promise.resolve(exchangeSnapshot);
+        case 'list_collab_receive_sessions':
+          calls += 1;
+          if (calls === 1) return Promise.reject(new Error('boom'));
+          return Promise.resolve([receiveSession({ id: 9, frames: 42 })]);
+        default:
+          return Promise.resolve(null);
+      }
+    }) as never);
+
+    renderTab();
+
+    expect(await screen.findByText('Could not load receive sessions — see console.')).toBeInTheDocument();
+
+    await waitFor(() => expect(listeners['collab-frames-landed']).toBeDefined());
+    act(() => {
+      (listeners['collab-frames-landed'] ?? []).forEach((h) =>
+        h({ projectId: 'proj-1', landed: 1, failed: 0, awaitingGc: 0 }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByText('Could not load receive sessions — see console.')).not.toBeInTheDocument(),
+    );
+    expect(await screen.findByText('42')).toBeInTheDocument();
+    expect(calls).toBe(2);
   });
 });
 
