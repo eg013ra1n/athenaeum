@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
-import { Bar, Button, Card, Chip, EmptyState, FilterChip, KV, ProgressBar, Seg, SegmentTiles, Sparkline } from '.';
+import { Bar, Button, Pill, StatusDot, Card, Chip, EmptyState, FilterChip, KV, ProgressBar, Seg, SegmentTiles, Sparkline } from '.';
 
 describe('ui primitives', () => {
   it('Button variants carry the mockup classes', () => {
@@ -60,5 +60,20 @@ describe('ui primitives', () => {
   it('EmptyState uses the faint 12.5px line', () => {
     render(<EmptyState>Nothing is moving.</EmptyState>);
     expect(screen.getByText('Nothing is moving.').className).toContain('text-[12.5px]');
+  });
+  it('disabled Pill button dims and ignores clicks', () => {
+    const onClick = vi.fn();
+    render(<Pill as="button" disabled onClick={onClick}>Live</Pill>);
+    const b = screen.getByRole('button', { name: 'Live' });
+    expect(b).toBeDisabled();
+    expect(b.className).toContain('opacity-45');
+    fireEvent.click(b);
+    expect(onClick).not.toHaveBeenCalled();
+  });
+  it('live StatusDot uses a token ring, no raw rgba', () => {
+    const { container } = render(<StatusDot state="live" />);
+    const cls = (container.firstChild as HTMLElement).className;
+    expect(cls).toContain('ring-success/[0.18]');
+    expect(cls).not.toContain('rgba(');
   });
 });

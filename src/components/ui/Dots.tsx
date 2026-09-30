@@ -11,7 +11,7 @@ export function MemberDot({ color }: { color: string }) {
 const STATE = {
   online: 'bg-success',
   offline: 'bg-border',
-  live: 'bg-success shadow-[0_0_0_3px_rgba(163,190,140,0.18)]',
+  live: 'bg-success ring-[3px] ring-success/[0.18]',
   warn: 'bg-warning',
   error: 'bg-error',
 } as const;
