@@ -113,4 +113,84 @@ describe('collab exchange state', () => {
     expect(s.projects).toEqual({});
     expect(s.rates).toEqual({});
   });
+
+  // ── Fix round 1 (controller ruling): idle flows in a snapshot never
+  // resurrect a project, `summary` carries toGo/waitingForPublisher across a
+  // project going quiet, and rings/active are never reset or lit by a ghost.
+
+  it('a global snapshot containing only an idle flow leaves projects empty and totals inactive', () => {
+    const s = applySnapshot(
+      EMPTY_EXCHANGE,
+      { projects: [proj({ recv: [flow({ moving: false, rateBps: 0, inFlight: [] })] })], names: [] },
+      null,
+    );
+    expect(s.projects).toEqual({});
+    expect(exchangeTotals(s)).toEqual({ recvBps: 0, sendBps: 0, active: false });
+  });
+
+  it('a scoped snapshot of an idle-only project keeps its summary but drops it from projects', () => {
+    const s = applySnapshot(
+      EMPTY_EXCHANGE,
+      {
+        projects: [
+          proj({
+            recv: [flow({ moving: false, rateBps: 0, inFlight: [] })],
+            toGo: 7,
+            waitingForPublisher: 3,
+          }),
+        ],
+        names: [],
+      },
+      'p1',
+    );
+    expect(s.summary.p1).toEqual({ toGo: 7, waitingForPublisher: 3 });
+    expect(s.projects.p1).toBeUndefined();
+  });
+
+  it('a scoped snapshot naming a different project leaves an existing summary untouched', () => {
+    let s = applySnapshot(
+      EMPTY_EXCHANGE,
+      { projects: [proj({ toGo: 7, waitingForPublisher: 3 })], names: [] },
+      'p1',
+    );
+    s = applySnapshot(s, { projects: [], names: [] }, 'p9');
+    expect(s.summary.p1).toEqual({ toGo: 7, waitingForPublisher: 3 });
+  });
+
+  it('a quiet progress event keeps summary; a live one updates toGo and keeps waitingForPublisher', () => {
+    let s = applySnapshot(
+      EMPTY_EXCHANGE,
+      { projects: [proj({ waitingForPublisher: 3 })], names: [] },
+      'p1',
+    );
+    s = applyProgress(s, { projects: [proj({ toGo: 0 })] });
+    expect(s.summary.p1).toEqual({ toGo: 0, waitingForPublisher: 3 });
+    expect(s.projects.p1).toBeUndefined();
+
+    s = applyProgress(s, { projects: [proj({ toGo: 5 })] });
+    expect(s.summary.p1).toEqual({ toGo: 5, waitingForPublisher: 3 });
+  });
+
+  it('a rate ring survives a later global snapshot of the same live flow (no reset)', () => {
+    let s = applySnapshot(EMPTY_EXCHANGE, { projects: [proj({ recv: [flow({})] })], names: [] }, null);
+    s = applyProgress(s, { projects: [proj({ recv: [flow({ rateBps: 2000 })] })] });
+    expect(s.rates['p1|recv|devA']).toEqual([1000, 2000]);
+
+    s = applySnapshot(
+      s,
+      { projects: [proj({ recv: [flow({ rateBps: 3000 })] })], names: [] },
+      null,
+    );
+    expect(s.rates['p1|recv|devA']).toEqual([1000, 2000]);
+  });
+
+  it('clearFlows keeps summary', () => {
+    let s = applySnapshot(
+      EMPTY_EXCHANGE,
+      { projects: [proj({ recv: [flow({})], toGo: 7, waitingForPublisher: 3 })], names: [] },
+      null,
+    );
+    s = clearFlows(s);
+    expect(s.summary.p1).toEqual({ toGo: 7, waitingForPublisher: 3 });
+  });
 });
