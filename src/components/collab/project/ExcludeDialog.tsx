@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Ban, Loader2 } from 'lucide-react';
 import { api } from '../../../api';
-import { Button, DialogShell } from '../../ui';
+import { Button, DialogShell, TextArea } from '../../ui';
 import type { FrameVM } from './frames';
 
 const REASON_MAX = 500;
@@ -81,13 +81,13 @@ export default function ExcludeDialog({
         Excluded frames stop counting toward the project and are no longer exchanged. You can restore
         them from the frame&apos;s panel.
       </p>
-      <textarea
+      <TextArea
         value={reason}
         onChange={(e) => setReason(e.target.value)}
         rows={4}
         data-autofocus
         placeholder="Why are these frames excluded?"
-        className="w-full resize-none rounded border border-border bg-surface px-1.5 py-[3px] text-[12px] text-content placeholder:text-content-faint focus:border-accent focus:outline-none"
+        className="w-full resize-none focus:border-accent focus:outline-none"
       />
       <div className="mt-1 flex items-center justify-between text-[11px]">
         <span className={tooLong ? 'text-error' : 'text-content-faint'}>

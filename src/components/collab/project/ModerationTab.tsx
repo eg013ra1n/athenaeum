@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type JSX } from 'react';
 import { Loader2 } from 'lucide-react';
 import { api } from '../../../api';
 import { Checkbox } from '../../settings/Checkbox';
-import { Button, DialogShell } from '../../ui';
+import { Button, DialogShell, TextArea } from '../../ui';
 import ProjectFrameTable, { type TableAction } from './table/ProjectFrameTable';
 import { fromLibrary, fromModeration, type FrameVM } from './frames';
 import type { ModerationFrameView, ProjectFrameView } from '../../../types/models';
@@ -37,7 +37,7 @@ function byUuid(library: ProjectFrameView[] | null): ReadonlyMap<string, Project
  * "Waiting for review" is the moderator's (`canModerate` — coordinator or
  * `data.moderate`) queue of pending first publications, as one
  * `ProjectFrameTable` (Task 12, spec 2026-09-30 "Moderation"). Batch
- * Approve/Reject; the "Trust this publisher" checkbox is one table-wide
+ * Approve/Reject; the "Trust these publishers" checkbox is one table-wide
  * toggle in the toolbar, default on, applied to every frame a batch Approve
  * covers. When the project publishes without review (`requireApproval:
  * false`) this section is a muted sentence instead, and
@@ -229,8 +229,8 @@ export default function ModerationTab({
   ];
 
   return (
-    <div>
-      <div>
+    <>
+      <>
         <h3 className={HEADER}>Waiting for review</h3>
         {error && <p className="text-[12.5px] text-error">{error}</p>}
         {result && <p className="text-[12.5px] text-error">{result}</p>}
@@ -263,9 +263,9 @@ export default function ModerationTab({
             onReject={(reason) => void rejectAll(rejecting, reason)}
           />
         )}
-      </div>
+      </>
 
-      <div>
+      <>
         <h3 className={HEADER}>Excluded frames</h3>
         {restoreResult && <p className="text-[12.5px] text-error">{restoreResult}</p>}
         {library === null && !libraryError ? (
@@ -284,8 +284,8 @@ export default function ModerationTab({
             emptyText="No frames are excluded."
           />
         )}
-      </div>
-    </div>
+      </>
+    </>
   );
 }
 
@@ -326,13 +326,13 @@ function RejectDialog({
       }
     >
       <p className="mb-2 text-[12px] text-content-muted">The reason is sent to the publisher.</p>
-      <textarea
+      <TextArea
         value={reason}
         onChange={(e) => setReason(e.target.value)}
         rows={4}
         data-autofocus
         placeholder="Why is this frame rejected?"
-        className="w-full resize-none rounded border border-border bg-surface px-1.5 py-[3px] text-[12px] text-content placeholder:text-content-faint focus:border-accent focus:outline-none"
+        className="w-full resize-none focus:border-accent focus:outline-none"
       />
       <div className="mt-1 text-[11px]">
         <span className={tooLong ? 'text-error' : 'text-content-faint'}>

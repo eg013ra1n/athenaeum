@@ -1,8 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
-import { Bar, Button, Pill, StatusDot, Card, Chip, EmptyState, FilterChip, KV, ProgressBar, Seg, SegmentTiles, Sparkline } from '.';
+import { Bar, Button, Pill, StatusDot, Card, Chip, EmptyState, FilterChip, KV, ProgressBar, Seg, SegmentTiles, Sparkline, TextArea } from '.';
+import { createRef } from 'react';
 
 describe('ui primitives', () => {
+  it('TextArea forwards its ref and renders a textarea with the field style', () => {
+    const ref = createRef<HTMLTextAreaElement>();
+    render(<TextArea ref={ref} rows={4} placeholder="why" />);
+    expect(ref.current).toBeInstanceOf(HTMLTextAreaElement);
+    expect(screen.getByPlaceholderText('why').className).toContain('bg-surface-elevated');
+  });
   it('Button variants carry the mockup classes', () => {
     render(<><Button>Plain</Button><Button variant="primary">Go</Button><Button size="sm">Small</Button></>);
     expect(screen.getByText('Plain').className).toContain('text-[12px]');

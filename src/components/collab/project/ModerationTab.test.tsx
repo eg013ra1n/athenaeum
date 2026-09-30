@@ -302,7 +302,32 @@ describe('ModerationTab — mockup layout', () => {
     renderTab();
     fireEvent.click(await screen.findByRole('button', { name: /Reject all/ }));
     expect(screen.getByRole('dialog', { name: /Reject/ })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('Why is this frame rejected?')).toHaveAttribute('data-autofocus');
+    const reason = screen.getByPlaceholderText('Why is this frame rejected?');
+    expect(reason).toHaveAttribute('data-autofocus');
+    expect(reason).toHaveFocus();
+  });
+
+  it('the trust control is the shared Checkbox', async () => {
+    moderationItems = [mod({ frameUuid: 'u1', fileName: 'a.fits' })];
+    renderTab();
+    const cb = await screen.findByRole('checkbox', { name: 'Trust these publishers' });
+    expect(cb.closest('label')!.querySelector('[data-testid="cb-box"]')).not.toBeNull();
+  });
+
+  it('totals bar order is Approve, Reject, then trust', async () => {
+    moderationItems = [mod({ frameUuid: 'u1', fileName: 'a.fits' })];
+    renderTab();
+    const approve = await screen.findByRole('button', { name: /Approve all/ });
+    const reject = screen.getByRole('button', { name: /Reject all/ });
+    const trust = screen.getByRole('checkbox', { name: 'Trust these publishers' });
+    expect(approve.compareDocumentPosition(reject) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(reject.compareDocumentPosition(trust) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('Excluded frames title keeps its top gap (not its parent\'s first child)', async () => {
+    renderTab([libraryFrame({ accepted: false })]);
+    const h = await screen.findByRole('heading', { name: 'Excluded frames' });
+    expect(h.previousElementSibling).not.toBeNull();
   });
 
   it('Waiting for review and Excluded frames are 13px section titles', async () => {
