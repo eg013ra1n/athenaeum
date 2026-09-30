@@ -72,9 +72,10 @@ const BADGE = 'rounded-full px-1.5 text-[10px] font-medium';
 
 // `collab-peers-changed` fires per event, throttled core-side to one per
 // project per second (`LANDED_BURST`, `runtime.rs`). These mirror that on the
-// frontend so a fast run of events collapses to one trailing reload each; a
-// new event restarts the window. `loadOwn` is the expensive gate read, so it
-// gets its own, longer window.
+// frontend as a schedule-if-none-pending throttle: the FIRST event schedules
+// the reload; further events inside the window are absorbed and never
+// restart it. `loadOwn` is the expensive gate read, so it gets its own,
+// longer window.
 const PEERS_RELOAD_MS = 1000;
 const OWN_RELOAD_MS = 5000;
 
@@ -111,8 +112,9 @@ function ProjectPage({ id }: { id: string | undefined }) {
   /** The republish guard's request (`ids: null` = "all"); `null` = closed. */
   const [republishReq, setRepublishReq] = useState<{ ids: number[] | null } | null>(null);
   const [switchConfirm, setSwitchConfirm] = useState(false);
-  // Bumped on a trailing `collab-peers-changed` reload; passed to `MembersTab`
-  // as `refreshToken` so it re-reads without losing its sort/expansion state.
+  // Bumped by the throttled `collab-peers-changed` reload; passed to
+  // `MembersTab` as `refreshToken` so it re-reads without losing its
+  // sort/expansion state.
   const [membersRefresh, setMembersRefresh] = useState(0);
 
   // Session-scoped so stepping into a linked object and back returns to the
@@ -212,7 +214,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   }, [id, loadOwn, loadLibrary, loadDetail]);
 
   // Loaded once here for the Overview and Exchange tabs; the Members tab
-  // refreshes it through `onMembers` whenever it mounts, and a trailing
+  // refreshes it through `onMembers` whenever it mounts, and the throttled
   // `collab-peers-changed` reload calls this directly (below).
   const loadMembers = useCallback(async () => {
     if (!id) return;
@@ -619,6 +621,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
           projectId={id}
           requireApproval={c.requireApproval}
           library={frames}
+          libraryError={framesError}
           onDecided={() => {
             void loadDetail();
             void loadLibrary();

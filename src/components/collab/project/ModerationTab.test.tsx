@@ -79,17 +79,24 @@ beforeEach(() => {
 
 function renderTab(
   library: ProjectFrameView[] | null = null,
-  overrides: { onDecided?: () => void; onOpen?: (vm: FrameVM) => void; requireApproval?: boolean } = {},
+  overrides: {
+    onDecided?: () => void;
+    onOpen?: (vm: FrameVM) => void;
+    requireApproval?: boolean;
+    libraryError?: boolean;
+  } = {},
 ) {
   const onDecided = overrides.onDecided ?? vi.fn();
   const onOpen = overrides.onOpen ?? vi.fn();
   const requireApproval = overrides.requireApproval ?? true;
+  const libraryError = overrides.libraryError ?? false;
   const utils = render(
     <SessionStateProvider>
       <ModerationTab
         projectId="proj-1"
         requireApproval={requireApproval}
         library={library}
+        libraryError={libraryError}
         onDecided={onDecided}
         onOpen={onOpen}
       />
@@ -320,6 +327,19 @@ describe('ModerationTab — Excluded frames', () => {
   it('shows the empty text when nothing is excluded', async () => {
     renderTab([libraryFrame({ frameUuid: 'u-1', accepted: true })], { requireApproval: false });
     expect(await screen.findByText('No frames are excluded.')).toBeInTheDocument();
+  });
+
+  it('shows Loading… while the library is null and has not errored, not the empty text', async () => {
+    renderTab(null, { requireApproval: false });
+    expect(await screen.findByText('Loading…')).toBeInTheDocument();
+    expect(screen.queryByText('No frames are excluded.')).not.toBeInTheDocument();
+  });
+
+  it('shows a load-failed message when libraryError is set', async () => {
+    renderTab(null, { requireApproval: false, libraryError: true });
+    expect(await screen.findByText('Could not load the library — see console.')).toBeInTheDocument();
+    expect(screen.queryByText('No frames are excluded.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Loading…')).not.toBeInTheDocument();
   });
 
   it('lists every excluded frame with its reason; an accepted frame does not appear', async () => {

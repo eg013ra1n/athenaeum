@@ -79,7 +79,7 @@ export default function MembersTab({
 }: {
   projectId: string;
   onMembers?: (m: MemberSummary[]) => void;
-  /** Bumped by the page shell on a trailing `collab-peers-changed` reload
+  /** Bumped by the page shell's throttled `collab-peers-changed` reload
    *  (Task 5). Re-invokes the load below WITHOUT resetting `sort`/`openId` —
    *  those are independent session state — and without clearing `members`
    *  first, so a presence-triggered refresh never flashes "Loading…". */

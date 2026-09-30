@@ -544,6 +544,7 @@ The owner's first smoke of the wave-2 project page found three defects, fixed th
    only holder/presence, but the owner's goal ("online, or the roster, shows without reopening the page")
    covers a member joining or leaving too (controller ruling, Task 2). Throttled to at most one per project
    per second (`PeerBurst`, the same `LANDED_BURST` window as the landed-frames burst). The project page
-   re-reads the library and members after a trailing 1 s, and the more expensive own-frames gate read after a
-   trailing 5 s; an open frame drawer re-reads that frame's holders on the same 1 s-throttled event. No new
+   re-reads at most one reload per 1 s window (library + members) and per 5 s window (own frames),
+   scheduled by the first event; further events in the window are absorbed, never restarting it; an open
+   frame drawer re-reads that frame's holders on the same 1 s-throttled event. No new
    command — the event goes through the existing emitter, and the web host forwards it over SSE unchanged.

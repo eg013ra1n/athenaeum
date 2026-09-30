@@ -263,7 +263,8 @@ shell) now composes six tabs under `src/components/collab/project/` — `GateTab
   actually moving, not merely a nonzero rate), reading the same `CollabExchangeProvider` state.
 - **`collab-peers-changed { projectId }`** (smoke fixes, 2026-09-30): the collab-live runtime raises it on
   presence, holder, membership and epoch changes, throttled to at most one per project per second; the project
-  page re-reads the library and members after a trailing 1 s, own frames after a trailing 5 s, and an open
+  page re-reads at most one reload per 1 s window (library + members) and per 5 s window (own frames),
+  scheduled by the first event — further events in the window are absorbed, never restarting it — and an open
   frame drawer re-reads that frame's holders — so a member coming online or a frame changing hands shows
   without reopening the page.
 - **Moderation** (smoke fixes, 2026-09-30) gates on `canModerate` (coordinator or `data.moderate`), not

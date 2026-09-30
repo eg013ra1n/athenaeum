@@ -33,27 +33,32 @@ function byUuid(library: ProjectFrameView[] | null): ReadonlyMap<string, Project
 
 /**
  * Moderation tab — two sections (Task 4, 2026-09-30 collab-smoke-fixes plan).
- * "Waiting for review" is the coordinator's queue of pending first
- * publications, as one `ProjectFrameTable` (Task 12, spec 2026-09-30
- * "Moderation"). Batch Approve/Reject; the "Trust this publisher" checkbox
- * is one table-wide toggle in the toolbar, default on, applied to every
- * frame a batch Approve covers. When the project publishes without review
- * (`requireApproval: false`) this section is a muted sentence instead, and
+ * "Waiting for review" is the moderator's (`canModerate` — coordinator or
+ * `data.moderate`) queue of pending first publications, as one
+ * `ProjectFrameTable` (Task 12, spec 2026-09-30 "Moderation"). Batch
+ * Approve/Reject; the "Trust this publisher" checkbox is one table-wide
+ * toggle in the toolbar, default on, applied to every frame a batch Approve
+ * covers. When the project publishes without review (`requireApproval:
+ * false`) this section is a muted sentence instead, and
  * `list_collab_moderation` is never called.
- * "Excluded frames" lists every frame the coordinator excluded
+ * "Excluded frames" lists every frame a moderator excluded
  * (`accepted === false`), derived straight from the `library` prop (no
- * separate fetch), with a batch Restore action.
+ * separate fetch), with a batch Restore action. `library === null` (still
+ * loading) and `libraryError` (the load failed) each get their own state
+ * instead of reading as a confident "No frames are excluded."
  */
 export default function ModerationTab({
   projectId,
   requireApproval,
   library,
+  libraryError,
   onDecided,
   onOpen,
 }: {
   projectId: string;
   requireApproval: boolean;
   library: ProjectFrameView[] | null;
+  libraryError: boolean;
   onDecided: () => void;
   onOpen: (vm: FrameVM) => void;
 }): JSX.Element {
@@ -258,15 +263,21 @@ export default function ModerationTab({
       <div className="space-y-3">
         <h2 className={HEADER}>Excluded frames</h2>
         {restoreResult && <p className="text-sm text-error">{restoreResult}</p>}
-        <ProjectFrameTable
-          key={`${projectId}.excluded`}
-          tableId="excluded"
-          scope={projectId}
-          rows={excludedRows}
-          actions={restoreActions}
-          onOpen={onOpen}
-          emptyText="No frames are excluded."
-        />
+        {library === null && !libraryError ? (
+          <p className="text-sm text-content-muted">Loading…</p>
+        ) : libraryError ? (
+          <p className="text-sm text-error">Could not load the library — see console.</p>
+        ) : (
+          <ProjectFrameTable
+            key={`${projectId}.excluded`}
+            tableId="excluded"
+            scope={projectId}
+            rows={excludedRows}
+            actions={restoreActions}
+            onOpen={onOpen}
+            emptyText="No frames are excluded."
+          />
+        )}
       </div>
     </div>
   );
