@@ -2961,7 +2961,7 @@ git commit -m "feat(collab): Exchange flows and received sessions as in the mock
 
 **Files:**
 - Modify: `src/components/collab/ProjectExportDialog.tsx`, `LinkObjectDialog.tsx`, `FilterMappingDialog.tsx`, `DeviceReplaceDialog.tsx`
-- Modify: `src/components/collab/project/ExcludeDialog.tsx`, `RepublishGuardDialog.tsx`
+- Modify: `src/components/collab/project/RepublishGuardDialog.tsx` (`ExcludeDialog` moved to Task 8 — ruling R23)
 - Create: `src/components/collab/project/PublishConfirmDialog.tsx` (moved out of `ProjectDetail.tsx`'s inline block)
 - Modify: `src/pages/ProjectDetail.tsx`
 - Tests: each dialog's existing test file (and `PublishConfirmDialog.test.tsx`, new)
