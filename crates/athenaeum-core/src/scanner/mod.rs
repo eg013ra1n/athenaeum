@@ -694,6 +694,13 @@ fn reconcile_project_file(
         return Ok(());
     }
 
+    // A calibrated file awaiting review (spec 2026-10-01 §4.3) is ours, not foreign.
+    if crate::db::collab_prepare::is_prepared_path(conn, current_path)? {
+        frames_db::forget_foreign_file(conn, current_path)?;
+        tracing::debug!(root_id, path = %current_path, "prepared project frame");
+        return Ok(());
+    }
+
     // R30: a file already listed as foreign whose `size:mtime` has not moved
     // was hashed and classified before — no re-hash, no repeated warn.
     let size_mtime = std::fs::metadata(path).ok().map(|m| size_mtime_of(&m));
@@ -3698,6 +3705,27 @@ mod calibrated_light_scan_tests {
                 vec![(s(&stray), None)],
                 "parallel={parallel}: only the unknown file is listed"
             );
+        }
+    }
+
+    /// A prepared (calibrated, unpublished) file is known: never listed foreign.
+    #[test]
+    fn a_prepared_file_is_known_not_foreign() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let prepared = root.path().join("m31").join("Me").join("c_L_0007.fits");
+            write_plain_light(&prepared, 7);
+            let conn = collab_db(root.path(), 1);
+            crate::db::collab_prepare::upsert_prepared(&conn, &crate::db::collab_prepare::PreparedRow {
+            project_id: "p1".into(), source_frame_id: 1, frame_uuid: "u1".into(),
+            calibrated_path: Some(s(&prepared)), external: false,
+            own_dir: s(prepared.parent().unwrap()), recipe_hash: "r".into(), xxh3: "x".into(),
+            byte_size: 1, size_mtime_seen: None, prepared_at: String::new(), publish_run_id: "r".into(),
+        }).unwrap();
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(catalog_rows(&conn), (0, 0), "parallel={parallel}");
+            assert!(foreign(&conn).is_empty(), "parallel={parallel}: {:?}", foreign(&conn));
         }
     }
 

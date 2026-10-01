@@ -3247,15 +3247,48 @@ fn new_frame_target(
         {
             continue;
         }
-        let referenced =
-            crate::db::collab_frames::find_by_landed_path(conn, &candidate.to_string_lossy())?
-                .is_some();
+        let candidate_str = candidate.to_string_lossy();
+        let referenced = crate::db::collab_frames::find_by_landed_path(conn, &candidate_str)?
+            .is_some()
+            || crate::db::collab_prepare::is_prepared_path(conn, &candidate_str)?;
         if !referenced {
             claimed.insert(candidate.clone());
             return Ok(candidate);
         }
     }
     anyhow::bail!("no free file name for {} in {}", name, dir.display())
+}
+
+/// The own folder: the one own rows already use, else the one a prepared
+/// row pinned, else a new one (spec §4.3 — never drifts once calibrated).
+pub(crate) fn own_folder(
+    conn: &Connection,
+    collab_root: &Path,
+    project: &CollabProjectRow,
+    account_id: &str,
+    display: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    if !account_id.is_empty() {
+        if let Some(d) = crate::db::collab_frames::publisher_dir(
+            conn,
+            &project.project_id,
+            account_id,
+            collab_root,
+        )? {
+            return Ok(d);
+        }
+    }
+    if let Some(d) = crate::db::collab_prepare::own_dir(conn, &project.project_id)? {
+        return Ok(std::path::PathBuf::from(d));
+    }
+    crate::api::collab_exchange::publisher_folder(
+        conn,
+        collab_root,
+        project,
+        account_id,
+        display,
+        "own",
+    )
 }
 
 /// The sibling temp an `update` regenerates into before its BLAKE3 decides
@@ -4535,12 +4568,10 @@ async fn run_publish(
     let own_dir = {
         let db = db(ctx)?;
         let conn = db.conn();
-        publisher_folder(&conn, &collab_root, &project, &account_id, &display, "own").map_err(
-            |e| {
-                tracing::error!(project_id, error = %format!("{e:#}"), "publish: own folder failed");
-                internal(e)
-            },
-        )?
+        own_folder(&conn, &collab_root, &project, &account_id, &display).map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "publish: own folder failed");
+            internal(e)
+        })?
     };
     {
         let db = db(ctx)?;
@@ -6235,9 +6266,9 @@ pub async fn restore_collab_frame(
 
 // The Collaboration-root guard (P25) lives beside the replication pass, which
 // compiles headless; publish uses it through this re-export.
+pub(crate) use crate::api::collab_exchange::require_collaboration_root;
 #[cfg(test)]
 pub(crate) use crate::api::collab_exchange::COLLABORATION_ROOT_REQUIRED;
-pub(crate) use crate::api::collab_exchange::{publisher_folder, require_collaboration_root};
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -6448,6 +6479,90 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn new_frame_target_skips_a_prepared_path() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        let dir = _tmp.path().join("collab/m101/me");
+        let taken = dir.join("c_L_0001.fits");
+        crate::db::collab_prepare::upsert_prepared(
+            &conn,
+            &crate::db::collab_prepare::PreparedRow {
+                project_id: "p-1".into(),
+                source_frame_id: 1,
+                frame_uuid: "u1".into(),
+                calibrated_path: Some(taken.to_string_lossy().into()),
+                external: false,
+                own_dir: dir.to_string_lossy().into(),
+                recipe_hash: "r".into(),
+                xxh3: "x".into(),
+                byte_size: 1,
+                size_mtime_seen: None,
+                prepared_at: String::new(),
+                publish_run_id: "r".into(),
+            },
+        )
+        .unwrap();
+        let mut claimed = std::collections::HashSet::new();
+        let got = new_frame_target(
+            &conn,
+            &dir,
+            "c_L_0001.fits",
+            &mut claimed,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_ne!(got, taken);
+    }
+
+    #[test]
+    fn the_own_folder_is_pinned_by_prepared_rows_and_a_peer_avoids_it() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        let root = _tmp.path().join("collab");
+        let pinned = root.join("m101").join("me-myself");
+        crate::db::collab_prepare::upsert_prepared(
+            &conn,
+            &crate::db::collab_prepare::PreparedRow {
+                project_id: "p-1".into(),
+                source_frame_id: 1,
+                frame_uuid: "u1".into(),
+                calibrated_path: Some(pinned.join("c_a.fits").to_string_lossy().into()),
+                external: false,
+                own_dir: pinned.to_string_lossy().into(),
+                recipe_hash: "r".into(),
+                xxh3: "x".into(),
+                byte_size: 1,
+                size_mtime_seen: None,
+                prepared_at: String::new(),
+                publish_run_id: "r".into(),
+            },
+        )
+        .unwrap();
+        let project = crate::db::collab::get_project(&conn, "p-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            own_folder(&conn, &root, &project, "acc-me", "Me Myself").unwrap(),
+            pinned
+        );
+        let peer = crate::api::collab_exchange::publisher_folder(
+            &conn,
+            &root,
+            &project,
+            "acc-peer",
+            "Me Myself",
+            "peer",
+        )
+        .unwrap();
+        assert_ne!(
+            peer, pinned,
+            "a same-named peer never lands in our pinned folder"
+        );
     }
 
     /// Cached project fixture: target M101 (210.8, +54.35), radius 1.5°, one

@@ -1091,6 +1091,11 @@ pub(crate) fn publisher_folder(
         }
     }
     let project_dir = collab_root.join(crate::sync::ingest::sanitize_slug(&project.slug));
+    let mut pinned: HashSet<PathBuf> =
+        crate::db::collab_prepare::own_dirs(conn, &project.project_id)?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
     let taken: HashSet<PathBuf> = {
         let mut stmt = conn.prepare(
             "SELECT landed_path FROM project_frames_local
@@ -1104,6 +1109,7 @@ pub(crate) fn publisher_folder(
         paths
             .into_iter()
             .filter_map(|p| Path::new(&p).parent().map(Path::to_path_buf))
+            .chain(pinned.drain())
             .collect()
     };
     let base = crate::sync::ingest::sanitize_slug(if display.is_empty() {

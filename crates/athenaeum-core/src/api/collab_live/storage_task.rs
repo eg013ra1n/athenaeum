@@ -2424,6 +2424,43 @@ mod tests {
         assert_eq!(state(&rig.ctx, &pid, &uuid), LocalState::Held);
     }
 
+    /// Task 6: a prepared (calibrated, unpublished) file in the project's own
+    /// folder is not the engine's business — a sweep never touches it or its row.
+    #[tokio::test]
+    async fn a_sweep_never_touches_a_prepared_file() {
+        let rig = ts::landed_rig(1).await;
+        let (pid, _uuid, path) = rig.frames[0].clone();
+        let own = path.parent().unwrap().join("me");
+        std::fs::create_dir_all(&own).unwrap();
+        let prepared = own.join("c_L_0001.fits");
+        std::fs::write(&prepared, b"prepared bytes").unwrap();
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        let prow = crate::db::collab_prepare::PreparedRow {
+            project_id: pid.clone(),
+            source_frame_id: 1,
+            frame_uuid: "u-prep".into(),
+            calibrated_path: Some(prepared.to_string_lossy().into()),
+            external: false,
+            own_dir: own.to_string_lossy().into(),
+            recipe_hash: "r".into(),
+            xxh3: "x".into(),
+            byte_size: 14,
+            size_mtime_seen: None,
+            prepared_at: String::new(),
+            publish_run_id: "r".into(),
+        };
+        crate::db::collab_prepare::upsert_prepared(&conn, &prow).unwrap();
+        let before = crate::db::collab_frames::list_for_project(&conn, &pid).unwrap().len();
+        drop(conn);
+        let mut eng = rig.engine();
+        eng.sweep(&Holders(2)).await;
+        assert_eq!(std::fs::read(&prepared).unwrap(), b"prepared bytes");
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        assert_eq!(crate::db::collab_prepare::list_prepared(&conn, &pid).unwrap().len(), 1);
+        assert!(crate::db::collab_prepare::is_prepared_path(&conn, &prepared.to_string_lossy()).unwrap());
+        assert_eq!(crate::db::collab_frames::list_for_project(&conn, &pid).unwrap().len(), before);
+    }
+
     #[tokio::test]
     async fn an_edited_replica_is_quarantined_at_once_and_stops_serving() {
         let rig = ts::landed_rig(1).await;

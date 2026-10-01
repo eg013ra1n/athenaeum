@@ -1728,6 +1728,7 @@ pub fn list_foreign_files(conn: &Connection, project_id: &str) -> Result<Vec<(St
         "SELECT f.path, f.seen_at FROM collab_foreign_files f
          WHERE (f.project_id = ?1 OR f.project_id IS NULL)
            AND NOT EXISTS (SELECT 1 FROM project_frames_local l WHERE l.landed_path = f.path)
+           AND NOT EXISTS (SELECT 1 FROM collab_prepared_frames p WHERE p.calibrated_path = f.path)
          ORDER BY f.path",
     )?;
     let rows = stmt
@@ -1821,6 +1822,34 @@ mod tests {
             "meta":{},"gateVersion":0,"accepted":true,"state":"published","manifestVersion":mv,
             "createdAt":"2026-09-24T00:00:00Z","holderCount":1}))
         .unwrap()
+    }
+
+    #[test]
+    fn a_prepared_file_is_never_listed_as_foreign() {
+        let c = conn();
+        record_foreign_file(&c, "/c/c_L_0001.fits", Some("p1"), None).unwrap();
+        record_foreign_file(&c, "/c/stray.fits", Some("p1"), None).unwrap();
+        crate::db::collab_prepare::upsert_prepared(
+            &c,
+            &crate::db::collab_prepare::PreparedRow {
+                project_id: "p1".into(),
+                source_frame_id: 1,
+                frame_uuid: "u1".into(),
+                calibrated_path: Some("/c/c_L_0001.fits".into()),
+                external: false,
+                own_dir: "/c".into(),
+                recipe_hash: "r".into(),
+                xxh3: "x".into(),
+                byte_size: 1,
+                size_mtime_seen: None,
+                prepared_at: String::new(),
+                publish_run_id: "r".into(),
+            },
+        )
+        .unwrap();
+        let listed = list_foreign_files(&c, "p1").unwrap();
+        assert!(!listed.iter().any(|f| f.0 == "/c/c_L_0001.fits"));
+        assert!(listed.iter().any(|f| f.0 == "/c/stray.fits"));
     }
 
     #[test]
