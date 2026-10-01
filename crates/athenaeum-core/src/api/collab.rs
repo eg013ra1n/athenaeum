@@ -3683,6 +3683,192 @@ fn remove_temp(project_id: &str, path: &Path) {
     }
 }
 
+/// N40 (spec 2026-10-01 §16.1): the bytes a calibrating run always leaves
+/// free on the landing volume, on top of its own estimate — the disk is never
+/// filled to zero, because the catalog database, the logs and the OS keep
+/// writing after the run.
+pub(crate) const CALIBRATE_SPACE_RESERVE_BYTES: u64 = 1_000_000_000;
+
+/// N40: header bytes added to each frame's pixel estimate — the FITS header
+/// with the stamped publish cards, rounded up generously.
+const CALIBRATED_HEADER_SLACK_BYTES: u64 = 16 * 1024;
+
+/// The stable prefix of a run refused for disk space (N40):
+/// `collab_no_space:<needed>:<free>`, both in bytes.
+pub(crate) const COLLAB_NO_SPACE: &str = "collab_no_space";
+
+/// `collab_no_space:<needed>:<free>` — the typed space refusal (N40).
+pub(crate) fn no_space_msg(needed: u64, free: u64) -> String {
+    format!("{COLLAB_NO_SPACE}:{needed}:{free}")
+}
+
+/// N40: the bytes one calibrated publish file takes. Publish writes float32
+/// with ONE plane (debayer is off, an OSC frame stays a CFA mosaic), so
+/// `naxis1 × naxis2 × 4` plus header slack; without both dimensions, twice
+/// the raw file (16-bit raw → 32-bit float). `0` when neither is known —
+/// the caller logs that frame.
+fn calibrated_frame_estimate(
+    naxis1: Option<i64>,
+    naxis2: Option<i64>,
+    raw_size: Option<i64>,
+) -> u64 {
+    match (naxis1, naxis2) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w as u64)
+            .saturating_mul(h as u64)
+            .saturating_mul(4)
+            .saturating_add(CALIBRATED_HEADER_SLACK_BYTES),
+        _ => match raw_size {
+            Some(s) if s > 0 => (s as u64).saturating_mul(2),
+            _ => 0,
+        },
+    }
+}
+
+/// N40's decision: `Ok` when the free bytes cover `needed` (exactly equal
+/// passes) or are unknown (`None` — a failed probe never refuses a run);
+/// otherwise the refusal message.
+fn space_verdict(needed: u64, free: Option<u64>) -> Result<(), String> {
+    match free {
+        Some(free) if free < needed => Err(no_space_msg(needed, free)),
+        _ => Ok(()),
+    }
+}
+
+/// `(naxis1, naxis2, raw file size)` of one frame, as the catalog has them.
+type SizeFacts = (Option<i64>, Option<i64>, Option<i64>);
+
+/// [`SizeFacts`] of every id, read in batches like [`frame_facts`] (one
+/// statement per 500 ids, never one per frame). A frame the catalog does not
+/// have is simply absent.
+fn frame_size_facts(conn: &Connection, ids: &[i64]) -> anyhow::Result<HashMap<i64, SizeFacts>> {
+    let mut out = HashMap::with_capacity(ids.len());
+    for chunk in ids.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT f.id, f.naxis1, f.naxis2, fi.size FROM frames f \
+             LEFT JOIN files fi ON fi.id = f.file_id WHERE f.id IN ({marks})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+        })?;
+        for row in rows {
+            let (id, facts) = row?;
+            out.insert(id, facts);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+fn free_space_seams() -> &'static std::sync::Mutex<HashMap<String, Option<u64>>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<u64>>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Test seam (N40): every later generation of this project reads `free` as
+/// the landing volume's free bytes (`None` = unknown) instead of probing the
+/// disk. Keyed by database path and project, so parallel tests never see
+/// each other's value.
+#[cfg(test)]
+pub(crate) fn set_free_space_for_test(ctx: &ServiceContext, project_id: &str, free: Option<u64>) {
+    let key = format!("{}|{project_id}", db(ctx).unwrap().path().display());
+    free_space_seams().lock().unwrap().insert(key, free);
+}
+
+/// Free bytes on the volume `dir` lands on, probed at its nearest existing
+/// folder (a new project's own folder is created by the first write). `db`
+/// only keys the test seam.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn landing_free_bytes(db: &crate::db::Database, project_id: &str, dir: &Path) -> Option<u64> {
+    #[cfg(test)]
+    {
+        let key = format!("{}|{project_id}", db.path().display());
+        if let Some(free) = free_space_seams()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+        {
+            return *free;
+        }
+    }
+    match crate::disk::nearest_existing_dir(dir) {
+        Some(probe) => crate::disk::free_bytes(probe),
+        None => {
+            tracing::warn!(project_id, path = %dir.display(), "free space probe: no existing folder at or above the landing folder");
+            None
+        }
+    }
+}
+
+/// N40: refuse the WHOLE run before anything is written when the landing
+/// volume lacks the generated frames' estimate plus
+/// [`CALIBRATE_SPACE_RESERVE_BYTES`]. `generated` is never empty (an
+/// attested-only run writes nothing and is never checked). Every generated
+/// target lies in the own folder by construction (`new_frame_target`,
+/// `is_own_dir_landing`, `adopt_landing`), and an update's temp is its
+/// sibling, so the first target's folder is where every byte lands.
+fn check_landing_space(
+    db: &crate::db::Database,
+    pid: &str,
+    run: &crate::api::collab_publish_run::RunHandle,
+    generated: &[PlannedFrame],
+) -> Result<(), ApiError> {
+    let ids: Vec<i64> = generated.iter().map(|p| p.cand.frame_id).collect();
+    let facts = frame_size_facts(&db.conn(), &ids).map_err(|e| {
+        tracing::error!(project_id = pid, count = ids.len(), error = %format!("{e:#}"), "publish: reading frame sizes for the space check failed");
+        internal(e)
+    })?;
+    let mut needed = CALIBRATE_SPACE_RESERVE_BYTES;
+    for &fid in &ids {
+        let (naxis1, naxis2, raw_size) = facts.get(&fid).copied().unwrap_or((None, None, None));
+        let estimate = calibrated_frame_estimate(naxis1, naxis2, raw_size);
+        if estimate == 0 {
+            tracing::debug!(
+                project_id = pid,
+                frame_id = fid,
+                "publish: no dimensions or raw size for this frame; counted as 0 in the space check"
+            );
+        }
+        needed = needed.saturating_add(estimate);
+    }
+    let dir = generated
+        .first()
+        .and_then(|p| p.target.parent())
+        .unwrap_or_else(|| Path::new(""));
+    let free = landing_free_bytes(db, pid, dir);
+    if let Err(msg) = space_verdict(needed, free) {
+        tracing::error!(
+            project_id = pid,
+            publish_run_id = %run.id(),
+            count = ids.len(),
+            needed_bytes = needed,
+            free_bytes = free.unwrap_or_default(),
+            path = %dir.display(),
+            "publish: not enough free space to calibrate; run refused before any file is written"
+        );
+        return Err(ApiError::Conflict(msg));
+    }
+    match free {
+        Some(free) => tracing::debug!(
+            project_id = pid,
+            count = ids.len(),
+            needed_bytes = needed,
+            free_bytes = free,
+            path = %dir.display(),
+            "publish: space check passed"
+        ),
+        None => tracing::warn!(
+            project_id = pid,
+            count = ids.len(),
+            needed_bytes = needed,
+            path = %dir.display(),
+            "free space unknown, calibrating without the space check"
+        ),
+    }
+    Ok(())
+}
+
 /// The generation phase of a publish run. F5: an attested (external) plan is
 /// handled first and needs no compute at all — hashed and stat'd straight
 /// from its catalog path. Whatever remains runs on a blocking thread under
@@ -3692,7 +3878,8 @@ fn remove_temp(project_id: &str, path: &Path) {
 /// calibrating each exactly once — a new frame straight into its landing
 /// path, an update or adoption into a sibling temp whose BLAKE3 decides
 /// whether anything changed. A failing frame is held back with its reason;
-/// the run goes on.
+/// the run goes on. The one whole-run refusal is N40's space check
+/// ([`check_landing_space`]), made before any of that.
 fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiError> {
     use crate::services::compute_queue::ComputeJobKind;
 
@@ -3706,6 +3893,14 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     // is hashed and stat'd IN PLACE, with no compute permit and no spec.
     let (external_plans, generated_plans): (Vec<PlannedFrame>, Vec<PlannedFrame>) =
         job.plans.into_iter().partition(|p| p.external);
+
+    // N40: a run that writes calibrated files is refused WHOLE when their
+    // volume lacks the room — before any frame (attested ones included) is
+    // recorded, before the compute permit, before any file is written. An
+    // attested-only run writes nothing and is never checked.
+    if !generated_plans.is_empty() {
+        check_landing_space(&job.db, pid, &job.run, &generated_plans)?;
+    }
 
     // Progress: attested frames are hashed with no compute slot, so with any
     // of them the run reads "calibrating" from the start (without, it goes
@@ -5804,7 +5999,9 @@ async fn run_publish(
 
     // ── 4. Generation: one compute permit, only when there is work ───────────
     // Review focus 3: a calibrate interrupted mid-write left a writer temp.
-    // Swept only now, past every refusal: a refused run touches no disk.
+    // Swept only now, past every refusal of the split: a refused run touches
+    // no disk. N40's space check (in the generation) comes after the sweep
+    // on purpose — the leftovers it removes are space the check may count.
     if matches!(scope, RunScope::Calibrate { .. }) {
         crate::api::collab_prepare::sweep_writer_temps(&own_dir);
     }
@@ -10014,6 +10211,50 @@ pub(crate) mod tests {
         let opts = publish_options();
         assert!(!opts.debayer_osc);
         assert_eq!(opts.format, crate::fits_writer::OutputFormat::Fits);
+    }
+
+    /// N40: one float32 plane plus header slack from the dimensions; twice
+    /// the raw file without both; 0 when nothing is known.
+    #[test]
+    fn calibrated_frame_estimate_reads_dims_then_raw_size_then_nothing() {
+        assert_eq!(
+            calibrated_frame_estimate(Some(6248), Some(4176), Some(52_000_000)),
+            6248 * 4176 * 4 + 16 * 1024
+        );
+        assert_eq!(
+            calibrated_frame_estimate(None, Some(4176), Some(52_000_000)),
+            104_000_000
+        );
+        assert_eq!(
+            calibrated_frame_estimate(Some(0), Some(4176), Some(1000)),
+            2000
+        );
+        assert_eq!(
+            calibrated_frame_estimate(Some(6248), Some(-1), Some(1000)),
+            2000
+        );
+        assert_eq!(calibrated_frame_estimate(None, None, None), 0);
+        assert_eq!(calibrated_frame_estimate(Some(-5), None, Some(0)), 0);
+        assert_eq!(
+            calibrated_frame_estimate(Some(i64::MAX), Some(i64::MAX), None),
+            u64::MAX,
+            "saturates, never wraps"
+        );
+    }
+
+    /// N40: exactly enough passes, one byte less refuses with the machine
+    /// message, and an unknown free space never refuses.
+    #[test]
+    fn space_verdict_passes_at_the_boundary_and_when_unknown() {
+        assert_eq!(space_verdict(1_000_004_000, Some(1_000_004_000)), Ok(()));
+        assert_eq!(
+            space_verdict(1_000_004_000, Some(1_000_003_999)),
+            Err("collab_no_space:1000004000:1000003999".to_string())
+        );
+        assert_eq!(space_verdict(1_000_004_000, None), Ok(()));
+        assert!(crate::api::collab_autopublish::is_no_space_refusal(
+            &space_verdict(10, Some(0)).unwrap_err()
+        ));
     }
 
     /// An empty gate (no publishable frames) is an outcome, never an error
@@ -14668,6 +14909,123 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert_eq!(res.calibrated, 0);
+        }
+
+        // ── Free-space check (spec 2026-10-01 §16.1 N40) ─────────────────────
+
+        /// Every file under `dir` (none when it does not exist).
+        fn files_under(dir: &Path) -> Vec<PathBuf> {
+            std::fs::read_dir(dir)
+                .map(|d| d.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        }
+
+        /// N40: a calibrate whose landing volume lacks the estimate plus the
+        /// 1 GB reserve is refused whole — no calibrated file, no prepared
+        /// row — and its one finished event is `refused` with the machine
+        /// message. With exactly the estimate free, the same run calibrates.
+        #[tokio::test]
+        async fn calibrate_without_the_space_is_refused_before_anything_is_written() {
+            let fx = fixture(2).await;
+            // Frame 0 is sized from its dimensions (one float32 plane plus
+            // header slack); frame 1 has none in the catalog and falls back
+            // to twice its 1000-byte raw file.
+            fx.conn()
+                .execute(
+                    "UPDATE frames SET naxis1 = 512, naxis2 = 512 WHERE id = ?1",
+                    [fx.frame_ids[0]],
+                )
+                .unwrap();
+            let needed = CALIBRATE_SPACE_RESERVE_BYTES + (512 * 512 * 4 + 16 * 1024) + 2 * 1000;
+            set_free_space_for_test(&fx.ctx, PID, Some(needed - 1));
+            let rec =
+                std::sync::Arc::new(crate::api::collab_live::test_support::Recorder::default());
+            let err = calibrate_collab_frames(&fx.ctx, PID, None, Some(rec.clone()))
+                .await
+                .unwrap_err();
+            let want = format!("collab_no_space:{needed}:{}", needed - 1);
+            assert!(
+                matches!(&err, ApiError::Conflict(m) if *m == want),
+                "{err:?}"
+            );
+            assert!(prepared(&fx).is_empty(), "no prepared row");
+            assert!(
+                files_under(&own_dir(&fx)).is_empty(),
+                "{:?}",
+                files_under(&own_dir(&fx))
+            );
+            let f = rec.payloads(crate::api::collab_publish_run::COLLAB_PUBLISH_FINISHED_EVENT);
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert_eq!(f[0]["outcome"], "refused");
+            assert_eq!(f[0]["error"], want.as_str());
+
+            set_free_space_for_test(&fx.ctx, PID, Some(needed));
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.calibrated, 2, "{res:?}");
+            assert_eq!(prepared(&fx).len(), 2);
+        }
+
+        /// N40: an attested set writes nothing, so a run of attested frames
+        /// alone is never space-checked — not even with no space at all.
+        #[tokio::test]
+        async fn an_attested_only_calibrate_is_never_space_checked() {
+            let fx = fixture(1).await;
+            fx.conn()
+                .execute(
+                    "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                    [fx.set_id],
+                )
+                .unwrap();
+            set_free_space_for_test(&fx.ctx, PID, Some(0));
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.calibrated, 1, "{res:?}");
+            let rows = prepared(&fx);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].external);
+        }
+
+        /// N40: a probe that cannot read the free space never refuses — the
+        /// run calibrates as before.
+        #[tokio::test]
+        async fn calibrate_with_unknown_free_space_calibrates_normally() {
+            let fx = fixture(2).await;
+            set_free_space_for_test(&fx.ctx, PID, None);
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.calibrated, 2, "{res:?}");
+            assert_eq!(prepared(&fx).len(), 2);
+        }
+
+        /// N40 covers every path that writes calibrated files: a Republish
+        /// without the space regenerates nothing and versions nothing.
+        #[tokio::test]
+        async fn a_republish_without_the_space_is_refused_before_regenerating() {
+            let fx = fixture(1).await;
+            mount_hub(&fx.server, "published").await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let landed = own_row(&fx, &fx.uuids[0]).unwrap().landed_path.unwrap();
+            let before = std::fs::read(&landed).unwrap();
+            set_free_space_for_test(&fx.ctx, PID, Some(0));
+            let err = republish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ApiError::Conflict(m) if crate::api::collab_autopublish::is_no_space_refusal(m)),
+                "{err:?}"
+            );
+            assert!(version_calls(&fx.server).await.is_empty());
+            assert!(!update_temp_path(Path::new(&landed)).exists());
+            assert_eq!(std::fs::read(&landed).unwrap(), before);
         }
 
         /// Spec §4.1 step 5: a prepared frame whose file moved is Ready again —

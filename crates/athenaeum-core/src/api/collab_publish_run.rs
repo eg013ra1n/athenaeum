@@ -449,6 +449,7 @@ fn outcome_of(
         Ok(_) => (PublishOutcome::Done, None),
         Err(ApiError::Conflict(m))
             if crate::api::collab_autopublish::is_publishing_device_refusal(m)
+                || crate::api::collab_autopublish::is_no_space_refusal(m)
                 || m == crate::account::client::COLLAB_API_OUTDATED_MSG =>
         {
             (PublishOutcome::Refused, Some(m.clone()))
@@ -629,6 +630,10 @@ mod tests {
                 )),
                 "refused",
             ),
+            (
+                ApiError::Conflict(crate::api::collab::no_space_msg(2_000_000_000, 5)),
+                "refused",
+            ),
             (ApiError::Internal("disk full".into()), "failed"),
         ] {
             let rec = std::sync::Arc::new(Recorder::default());
@@ -647,6 +652,23 @@ mod tests {
                 want
             );
         }
+    }
+
+    /// N40: a space refusal is `refused` and carries its machine message
+    /// unchanged — the UI reads the two byte counts from it.
+    #[test]
+    fn a_no_space_refusal_is_refused_with_its_message() {
+        let msg = crate::api::collab::no_space_msg(1_000_004_000, 1_000_003_999);
+        assert_eq!(msg, "collab_no_space:1000004000:1000003999");
+        assert_eq!(
+            outcome_of(&Err(ApiError::Conflict(msg.clone())), false),
+            (PublishOutcome::Refused, Some(msg))
+        );
+        // Only the exact prefix: any other conflict is still a failure.
+        assert_eq!(
+            outcome_of(&Err(ApiError::Conflict("collab_no_spacer".into())), false).0,
+            PublishOutcome::Failed
+        );
     }
 
     #[test]
