@@ -3409,6 +3409,9 @@ struct GenerationOutcome {
     written: Vec<WrittenFrame>,
     unchanged: usize,
     held_back: Vec<HeldBackFrame>,
+    /// The run's cancel flag fired: frames written so far are kept, the
+    /// in-flight frame and the rest were not generated.
+    cancelled: bool,
 }
 
 /// Everything the blocking generation phase owns.
@@ -3549,6 +3552,7 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     let mut held_back: Vec<HeldBackFrame> = Vec::new();
     let mut written: Vec<WrittenFrame> = Vec::new();
     let mut unchanged = 0usize;
+    let mut cancelled = false;
 
     // F5/A1: an attested light is never regenerated, renamed or copied — it
     // is hashed and stat'd IN PLACE, with no compute permit and no spec.
@@ -3566,6 +3570,14 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     let mut done = 0usize;
 
     for plan in external_plans {
+        if job.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!(
+                project_id = pid,
+                "publish: cancelled before an attested frame"
+            );
+            cancelled = true;
+            break;
+        }
         done += 1;
         let _done = FrameDone {
             run: &job.run,
@@ -3683,27 +3695,37 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
         }
     }
 
-    if generated_plans.is_empty() {
+    if generated_plans.is_empty() || cancelled {
         return Ok(GenerationOutcome {
             written,
             unchanged,
             held_back,
+            cancelled,
         });
     }
 
     let cancel = Arc::clone(&job.cancel);
     job.run.stage(PublishStage::Queued, total);
-    let (permit, _job_id) = job
-        .queue
-        .acquire(
-            ComputeJobKind::LightCalibration,
-            &job.label,
-            Arc::clone(&cancel),
-        )
-        .map_err(|_| {
-            tracing::error!(project_id = pid, "publish: compute slot wait cancelled");
-            ApiError::Internal("publish: the compute slot wait was cancelled".into())
-        })?;
+    let (permit, _job_id) = match job.queue.acquire(
+        ComputeJobKind::LightCalibration,
+        &job.label,
+        Arc::clone(&cancel),
+    ) {
+        Ok(p) => p,
+        Err(_) => {
+            // W7: a cancel while queued is a clean, empty outcome.
+            tracing::info!(
+                project_id = pid,
+                "publish: cancelled while waiting for a compute slot"
+            );
+            return Ok(GenerationOutcome {
+                written,
+                unchanged,
+                held_back,
+                cancelled: true,
+            });
+        }
+    };
     job.run.stage(PublishStage::Calibrating, total);
     // `stage` resets the count: carry the attested frames over.
     job.run.tick(done, None);
@@ -3717,6 +3739,10 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
         let mut divisors = crate::export::DivisorCache::new();
         let mut master_ok: HashMap<std::path::PathBuf, bool> = HashMap::new();
         for plan in generated_plans {
+            if job.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
             let fid = plan.cand.frame_id;
             let name = plan.cand.filename.clone();
             let mut spec = match crate::export::resolve_generation_cached(
@@ -3778,6 +3804,19 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
         count = prepared.len(),
         "publish: calibrated-light generation planned"
     );
+    if cancelled {
+        tracing::info!(
+            project_id = pid,
+            "publish: cancelled while planning the frames"
+        );
+        drop(permit);
+        return Ok(GenerationOutcome {
+            written,
+            unchanged,
+            held_back,
+            cancelled: true,
+        });
+    }
     // Frames the catalog phase held back are done too.
     done += generated_count - prepared.len();
     job.run.tick(done, None);
@@ -3787,6 +3826,15 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     // (frame_uuid, recipe, verified blake3, regenerated xxh3)
     let mut identical: Vec<(String, String, String, String)> = Vec::new();
     for (plan, spec, recipe) in prepared {
+        if job.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!(
+                project_id = pid,
+                frame_id = plan.cand.frame_id,
+                "publish: cancelled before this frame"
+            );
+            cancelled = true;
+            break;
+        }
         done += 1;
         let _done = FrameDone {
             run: &job.run,
@@ -3820,6 +3868,18 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
         ) {
             Ok(g) => g,
             Err(e) => {
+                if job.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::info!(
+                        project_id = pid,
+                        frame_id = fid,
+                        "publish: the frame in flight was cancelled; it stays Ready"
+                    );
+                    if is_temp {
+                        remove_temp(pid, &staged);
+                    }
+                    cancelled = true;
+                    break;
+                }
                 tracing::error!(project_id = pid, frame_id = fid, dest = %staged.display(), error = %format!("{e:#}"), "publish: calibration failed");
                 held_back.push(held(
                     fid,
@@ -3944,6 +4004,7 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
         written,
         unchanged,
         held_back,
+        cancelled,
     })
 }
 
@@ -5252,6 +5313,7 @@ async fn run_publish(
             written: Vec::new(),
             unchanged: 0,
             held_back: Vec::new(),
+            cancelled: false,
         }
     } else {
         // The generation reports its own stages (queued for the compute
@@ -5280,6 +5342,28 @@ async fn run_publish(
     };
     held_back.extend(outcome.held_back);
     unchanged += outcome.unchanged;
+
+    // W4: a cancel before seeding starts ends the run here. Frames the
+    // Calibrate scope wrote are already prepared; a Publish scope's
+    // regenerated update temps are removed (the hub keeps its version, the
+    // frame is stale again next time).
+    if outcome.cancelled && !matches!(scope, RunScope::Calibrate { .. }) {
+        for w in &outcome.written {
+            if w.staged != w.target {
+                remove_temp(project_id, &w.staged);
+            }
+        }
+        tracing::info!(
+            project_id,
+            outcome = "cancelled",
+            "publish: cancelled before seeding"
+        );
+        return Ok(PublishResult {
+            unchanged,
+            held_back,
+            ..Default::default()
+        });
+    }
 
     // Calibrate stops here: its frames are prepared, waiting for review.
     if matches!(scope, RunScope::Calibrate { .. }) {
@@ -13536,6 +13620,59 @@ pub(crate) mod tests {
                 (f[0]["kind"].as_str(), f[0]["calibrated"].as_u64()),
                 (Some("calibrate"), Some(2))
             );
+        }
+
+        #[tokio::test]
+        async fn cancel_between_frames_keeps_written_frames_prepared_and_the_rest_ready() {
+            let fx = fixture(3).await;
+            crate::api::collab_publish_run::cancel_after_frames_for_test(&fx.ctx, PID, 1);
+            let rec =
+                std::sync::Arc::new(crate::api::collab_live::test_support::Recorder::default());
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, Some(rec.clone()))
+                .await
+                .unwrap();
+            assert_eq!(res.calibrated, 1, "{res:?}");
+            assert!(
+                res.held_back.is_empty(),
+                "no 'calibration failed: cancelled' hold-backs"
+            );
+            let segs: Vec<String> = list_project_own_frames(&fx.ctx, PID)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.segment)
+                .collect();
+            assert_eq!(segs.iter().filter(|s| *s == "review").count(), 1);
+            assert_eq!(segs.iter().filter(|s| *s == "ready").count(), 2);
+            let f = rec.payloads(crate::api::collab_publish_run::COLLAB_PUBLISH_FINISHED_EVENT);
+            assert_eq!(f[0]["outcome"], "cancelled");
+        }
+
+        #[tokio::test]
+        async fn a_queued_calibrate_cancelled_is_ok_and_changes_nothing() {
+            let fx = fixture(1).await;
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (_held, _id) = fx
+                .ctx
+                .compute_queue
+                .acquire(
+                    crate::services::compute_queue::ComputeJobKind::Analysis,
+                    "test",
+                    flag,
+                )
+                .unwrap();
+            let ctx = fx.ctx.clone();
+            let task =
+                tokio::spawn(async move { calibrate_collab_frames(&ctx, PID, None, None).await });
+            for _ in 0..100 {
+                if crate::api::collab_publish_run::is_active(&fx.ctx, PID) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            crate::api::collab_publish_run::cancel_collab_publish(&fx.ctx, PID).unwrap();
+            let res = task.await.unwrap().unwrap();
+            assert_eq!(res.calibrated, 0);
+            assert!(prepared(&fx).is_empty());
         }
     }
 }

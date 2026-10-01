@@ -149,6 +149,20 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<RunState>>> {
     R.get_or_init(Default::default)
 }
 
+#[cfg(test)]
+fn cancel_seams() -> &'static Mutex<HashMap<String, usize>> {
+    static S: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Test seam: every later run of this project cancels itself once a tick
+/// reports `current >= n` (deterministic "cancel after N frames").
+#[cfg(test)]
+pub(crate) fn cancel_after_frames_for_test(ctx: &ServiceContext, project_id: &str, n: usize) {
+    let k = key(ctx, project_id).unwrap();
+    cancel_seams().lock().unwrap().insert(k, n);
+}
+
 fn key(ctx: &ServiceContext, project_id: &str) -> Result<String, ApiError> {
     Ok(format!("{}|{project_id}", db(ctx)?.path().display()))
 }
@@ -312,6 +326,15 @@ impl RunHandle {
                 .unwrap_or_else(|p| p.into_inner());
             p.current = current as u32;
             p.current_file = file.map(str::to_string);
+        }
+        #[cfg(test)]
+        if cancel_seams()
+            .lock()
+            .unwrap()
+            .get(&self.key)
+            .is_some_and(|n| current >= *n)
+        {
+            self.state.cancel.store(true, Ordering::SeqCst);
         }
         self.emit_progress(false);
     }
