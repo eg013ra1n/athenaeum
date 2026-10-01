@@ -336,6 +336,7 @@ export function useCollabNotifications() {
           case 'refused': {
             const space = f.error ? noSpaceRefusal(f.error) : null;
             if (space) {
+              console.warn('[collab] publish run refused for free space:', f.error);
               // Toasts for both triggers (owner ruling): an auto run that
               // stops for space is never silent; once a day per project.
               notify({
