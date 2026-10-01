@@ -501,42 +501,10 @@ fn remove_if_created(path: &Path, existed_before: bool) {
     }
 }
 
-/// Free bytes available on the volume holding `path` (`statvfs`'s
-/// `f_bavail * f_frsize`, the same "available to an unprivileged process"
-/// figure `sync::retention::disk_usage_pct` reads). `None` on any error or on
-/// a non-unix platform — a probe failure must never look like "the disk is
-/// full", so the caller treats `None` as "unknown", not zero. Never silent:
-/// both failure paths (an unrepresentable path, a failed `statvfs` call)
-/// `warn!` before returning `None`.
-#[cfg(unix)]
-pub fn free_bytes(path: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let cpath = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "free space probe failed");
-            return None;
-        }
-    };
-    // SAFETY: `stat` is zero-initialised and only read after a successful
-    // call; `cpath` is a valid NUL-terminated C string living for the call's
-    // duration.
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
-    if rc != 0 {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(path = %path.display(), %error, "free space probe failed");
-        return None;
-    }
-    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
-}
-
-#[cfg(not(unix))]
-pub fn free_bytes(_path: &Path) -> Option<u64> {
-    None
-}
+/// The free-space probe lives in the ungated [`crate::disk`] (the collab
+/// calibrate space check needs it without the render + solver features);
+/// re-exported so this module's callers keep `paths::free_bytes`.
+pub use crate::disk::free_bytes;
 
 /// The flat per-plane byte estimate [`estimate_bytes`] uses for the `fits`
 /// artifact (Tier C Task 1), MEASURED (final fix wave, ruling C-30, the
