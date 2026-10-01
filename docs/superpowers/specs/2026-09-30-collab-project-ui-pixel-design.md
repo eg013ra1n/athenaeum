@@ -601,7 +601,7 @@ The inputs most likely to break the layout; each has a test or a harness check i
 ## 21. Implementation notes (execution rulings, 2026-09-30 – 2026-10-01)
 
 Decisions taken while the plan ran. Each one either sharpens this spec or records where the build
-departs from it. The full record, with the cost of each if wrong, is in the plan's execution ledger.
+departs from it.
 
 | # | Ruling |
 | ---- | ---- |
