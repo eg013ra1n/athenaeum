@@ -464,6 +464,20 @@ pub async fn sync_manifest(
     emitter: Option<&dyn ProgressEmitter>,
     vouched_version: Option<i64>,
 ) -> Result<Vec<CollabFramesChange>, ApiError> {
+    sync_manifest_counted(ctx, project_id, emitter, vouched_version)
+        .await
+        .map(|(changes, _rows)| changes)
+}
+
+/// [`sync_manifest`], also returning how many rows the sync wrote or pruned
+/// ([`ManifestSynced::rows`]) — the live feed's confirmation report counts
+/// these, not the change kinds (a restore or an edit maps to no kind).
+pub(crate) async fn sync_manifest_counted(
+    ctx: &ServiceContext,
+    project_id: &str,
+    emitter: Option<&dyn ProgressEmitter>,
+    vouched_version: Option<i64>,
+) -> Result<(Vec<CollabFramesChange>, usize), ApiError> {
     let result = sync_manifest_inner(ctx, project_id, emitter, vouched_version, false).await;
     if let Err(e) = &result {
         tracing::warn!(
@@ -472,7 +486,7 @@ pub async fn sync_manifest(
             "manifest sync failed; the next sync resumes from the stored cursor"
         );
     }
-    result.map(|(changes, _seen, _project_version)| changes)
+    result.map(|synced| (synced.changes, synced.rows))
 }
 
 /// Refetch the whole manifest from 0 and prune rows the hub no longer lists
@@ -489,9 +503,24 @@ pub(crate) async fn sync_manifest_full(
     emitter: Option<&dyn ProgressEmitter>,
     vouched_version: Option<i64>,
 ) -> Result<(HashSet<String>, i64), ApiError> {
-    let (_changes, seen, project_version) =
-        sync_manifest_inner(ctx, project_id, emitter, vouched_version, true).await?;
-    Ok((seen, project_version))
+    let synced = sync_manifest_inner(ctx, project_id, emitter, vouched_version, true).await?;
+    Ok((synced.seen, synced.project_version))
+}
+
+/// What one [`sync_manifest_inner`] call did. `seen` and `project_version`
+/// are read only by the `render` + `solver` callers (`sync_manifest_full`,
+/// the live feed).
+#[cfg_attr(not(all(feature = "render", feature = "solver")), allow(dead_code))]
+pub(crate) struct ManifestSynced {
+    /// The per-kind changes (one `collab-frames-changed` each).
+    pub changes: Vec<CollabFramesChange>,
+    /// Every uuid the hub listed this call.
+    pub seen: HashSet<String>,
+    /// The manifest's own `projectVersion` as of the last page fetched.
+    pub project_version: i64,
+    /// Rows written (every row the hub returned: a delta returns only the
+    /// rows that changed) plus rows pruned.
+    pub rows: usize,
 }
 
 /// The lock for one project's manifest syncs, keyed by hub + project.
@@ -517,17 +546,18 @@ fn poll_scope(ctx: &ServiceContext, hub_url: &str) -> Result<String, ApiError> {
 /// project's manifest delta (or the whole manifest from 0 when `force_full`,
 /// the wave-3 epoch-reload path) into `project_frames_local`. Returns the
 /// per-kind changes, every uuid the hub listed this call (used by the epoch
-/// path to compare against the own rows still cached, plan P25), and the
+/// path to compare against the own rows still cached, plan P25), the
 /// manifest's own `projectVersion` as of the last page fetched — the
 /// authoritative cursor value for a caller that must not trust an event's
-/// head beyond what the manifest actually confirmed (T5 ruling).
+/// head beyond what the manifest actually confirmed (T5 ruling) — and the
+/// rows written plus pruned.
 pub(crate) async fn sync_manifest_inner(
     ctx: &ServiceContext,
     project_id: &str,
     emitter: Option<&dyn ProgressEmitter>,
     vouched_version: Option<i64>,
     force_full: bool,
-) -> Result<(Vec<CollabFramesChange>, HashSet<String>, i64), ApiError> {
+) -> Result<ManifestSynced, ApiError> {
     use crate::db::collab_frames as frames_db;
 
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
@@ -673,7 +703,12 @@ pub(crate) async fn sync_manifest_inner(
         manifest_cursor = max_mv,
         "manifest synced"
     );
-    Ok((changes, seen, project_version))
+    Ok(ManifestSynced {
+        changes,
+        seen,
+        project_version,
+        rows: applied + pruned,
+    })
 }
 
 /// Decode a cached row's retained manifest JSON back into the

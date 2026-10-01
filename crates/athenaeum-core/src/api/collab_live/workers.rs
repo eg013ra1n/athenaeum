@@ -259,11 +259,12 @@ impl FeedWorker {
             Err(ApiError::Forbidden(e)) => match project {
                 Some(project_id) => {
                     // The refusal is a not-ok report for its project too,
-                    // and the only one: it replaces the applier's own
-                    // report of this event.
+                    // and the only one: it folds into the applier's own
+                    // report of this event, which keeps what was applied
+                    // before the refusal.
                     let refused = refused_report(&project_id, &e);
                     match reports.iter_mut().find(|r| r.project_id == project_id) {
-                        Some(r) => *r = refused,
+                        Some(r) => r.merge(refused),
                         None => reports.push(refused),
                     }
                     self.send(FeedOut::Refused {

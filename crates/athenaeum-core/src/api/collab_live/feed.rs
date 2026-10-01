@@ -72,7 +72,8 @@ pub struct SyncChanges {
     pub manifest_rows: usize,
     pub members: bool,
     pub holders: bool,
-    /// The project snapshot itself changed (joined or gone).
+    /// The project snapshot itself changed: joined or gone, or its title,
+    /// goals, thresholds, dictionary or policy were refreshed.
     pub card: bool,
 }
 
@@ -85,8 +86,9 @@ impl SyncChanges {
 impl SyncReport {
     /// A second outcome for the same project folds into the first: the
     /// project is confirmed only when every step for it succeeded, the
-    /// first error is kept, and the changes add up.
-    fn merge(&mut self, other: SyncReport) {
+    /// first error is kept, and the changes add up (also for a not-ok
+    /// outcome: what was applied before the failure stays applied).
+    pub(crate) fn merge(&mut self, other: SyncReport) {
         self.ok &= other.ok;
         if self.error.is_none() {
             self.error = other.error;
@@ -150,8 +152,11 @@ pub struct FeedApplier {
     /// Confirmation reports not taken yet, at most one per project
     /// ([`Self::report`] merges a second outcome into the first).
     reports: Vec<SyncReport>,
-    /// Manifest rows applied per project since its last report.
+    /// Manifest rows written or pruned per project since its last report.
     manifest_rows: HashMap<String, usize>,
+    /// Projects whose snapshot (meta, thresholds, dictionary) was refreshed
+    /// since their last report.
+    card_changed: HashSet<String>,
 }
 
 impl FeedApplier {
@@ -171,6 +176,7 @@ impl FeedApplier {
             epoch: None,
             reports: Vec::new(),
             manifest_rows: HashMap::new(),
+            card_changed: HashSet::new(),
         }
     }
 
@@ -180,20 +186,23 @@ impl FeedApplier {
         std::mem::take(&mut self.reports)
     }
 
-    /// Record `project_id`'s outcome: ok with what its effects and the
-    /// manifest rows applied since its last report changed, or not ok with
-    /// the error. A project already reported and not taken yet folds this
-    /// outcome into that report ([`SyncReport::merge`]), so a project is
-    /// reported once per apply even when its path reports a swallowed
-    /// failure of its own before the event's own outcome.
+    /// Record `project_id`'s outcome: ok with what its effects, the
+    /// manifest rows and the snapshot refreshes since its last report
+    /// changed, or not ok with the error — still carrying the rows and the
+    /// snapshot refresh applied before the failure. A project already
+    /// reported and not taken yet folds this outcome into that report
+    /// ([`SyncReport::merge`]), so a project is reported once per apply even
+    /// when its path reports a swallowed failure of its own before the
+    /// event's own outcome.
     fn report(&mut self, project_id: &str, result: Result<&[FeedEffect], &ApiError>) {
-        let manifest_rows = self.manifest_rows.remove(project_id).unwrap_or(0);
+        let applied = SyncChanges {
+            manifest_rows: self.manifest_rows.remove(project_id).unwrap_or(0),
+            card: self.card_changed.remove(project_id),
+            ..Default::default()
+        };
         let report = match result {
             Ok(effects) => {
-                let mut changes = SyncChanges {
-                    manifest_rows,
-                    ..Default::default()
-                };
+                let mut changes = applied;
                 for e in effects {
                     match e {
                         FeedEffect::MembersChanged(p) if p == project_id => changes.members = true,
@@ -219,7 +228,7 @@ impl FeedApplier {
                 project_id: project_id.to_string(),
                 ok: false,
                 error: Some(e.to_string()),
-                changes: SyncChanges::default(),
+                changes: applied,
             },
         };
         match self.reports.iter_mut().find(|r| r.project_id == project_id) {
@@ -228,13 +237,30 @@ impl FeedApplier {
         }
     }
 
-    /// Count manifest rows applied for `project_id`; its next report carries
-    /// them.
+    /// Count manifest rows written or pruned for `project_id`; its next
+    /// report carries them.
     fn note_manifest_rows(&mut self, project_id: &str, rows: usize) {
         *self
             .manifest_rows
             .entry(project_id.to_string())
             .or_default() += rows;
+    }
+
+    /// `project_id`'s snapshot was refreshed for a change of `kinds`: a
+    /// meta, thresholds or dictionary kind — or a refresh that saw its
+    /// thresholds or dictionary move (`gate_moved`) — marks its next
+    /// report's `card` (spec 2026-10-01 §6.1; members are reported on their
+    /// own).
+    fn note_card(&mut self, project_id: &str, kinds: &[ChangeKind], gate_moved: bool) {
+        let snapshot_kind = kinds.iter().any(|k| {
+            matches!(
+                k,
+                ChangeKind::Meta | ChangeKind::Thresholds | ChangeKind::Dictionary
+            )
+        });
+        if snapshot_kind || gate_moved {
+            self.card_changed.insert(project_id.to_string());
+        }
     }
 
     fn stored_cursor(&self, project_id: &str) -> Result<Option<FeedCursor>, ApiError> {
@@ -721,6 +747,7 @@ impl FeedApplier {
             for moved in &report.gate_moved {
                 crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
             }
+            self.note_card(&pid, &ev.kinds, report.gate_moved.contains(&pid));
             if ev.kinds.contains(&ChangeKind::Members) {
                 effects.push(FeedEffect::MembersChanged(pid.clone()));
             }
@@ -743,14 +770,14 @@ impl FeedApplier {
             project.gov_caps_json != project.synced_caps_json
         };
         if caps_changed {
-            let changes = crate::api::collab_exchange::sync_manifest(
+            let (_changes, rows) = crate::api::collab_exchange::sync_manifest_counted(
                 &self.ctx,
                 &pid,
                 self.emitter.as_deref(),
                 Some(ev.version),
             )
             .await?;
-            self.note_manifest_rows(&pid, changes.iter().map(|c| c.count).sum());
+            self.note_manifest_rows(&pid, rows);
             effects.push(FeedEffect::NeedSetChanged(pid.clone()));
         } else {
             match (ev.kinds.contains(&ChangeKind::Frames), ev.frames) {
@@ -759,14 +786,14 @@ impl FeedApplier {
                     effects.push(FeedEffect::NeedSetChanged(pid.clone()));
                 }
                 (true, _) => {
-                    let changes = crate::api::collab_exchange::sync_manifest(
+                    let (_changes, rows) = crate::api::collab_exchange::sync_manifest_counted(
                         &self.ctx,
                         &pid,
                         self.emitter.as_deref(),
                         Some(ev.version),
                     )
                     .await?;
-                    self.note_manifest_rows(&pid, changes.iter().map(|c| c.count).sum());
+                    self.note_manifest_rows(&pid, rows);
                     effects.push(FeedEffect::NeedSetChanged(pid.clone()));
                 }
                 (false, _) => {}
@@ -793,6 +820,7 @@ impl FeedApplier {
         mut rows: Vec<crate::collab::hub_client::FrameViewWire>,
     ) -> Result<(), ApiError> {
         use crate::db::collab_frames as frames_db;
+        let written = rows.len();
         let database = db(&self.ctx)?;
         let conn = database.conn();
         let project = crate::api::collab_exchange::live_project(&conn, pid)?;
@@ -825,8 +853,10 @@ impl FeedApplier {
         crate::db::collab::set_feed_version(&tx, pid, epoch, version)?;
         tx.commit()?;
         routes.route();
-        // The field, not `note_manifest_rows`: `conn` still borrows `ctx`.
-        *self.manifest_rows.entry(pid.to_string()).or_default() += counts.values().sum::<usize>();
+        // Every inlined row is written (a restore or an edit maps to no
+        // kind). The field, not `note_manifest_rows`: `conn` still borrows
+        // `ctx`.
+        *self.manifest_rows.entry(pid.to_string()).or_default() += written;
         for (kind, count) in counts {
             let change = crate::api::collab_exchange::CollabFramesChange {
                 project_id: pid.to_string(),
@@ -903,20 +933,20 @@ impl FeedApplier {
         // M3 fix round: a manifest-sync failure is logged here, at the
         // applier boundary, before it propagates — every caller of this
         // function used to fail silently past this point.
-        let (changes, _seen, mut project_version) =
-            crate::api::collab_exchange::sync_manifest_inner(
-                &self.ctx,
-                project_id,
-                self.emitter.as_deref(),
-                None,
-                false,
-            )
-            .await
-            .map_err(|e| {
-                tracing::warn!(project_id, requested_version = ?version, error = %e, "catch-up manifest sync failed; cursor stays put for a retry");
-                e
-            })?;
-        self.note_manifest_rows(project_id, changes.iter().map(|c| c.count).sum());
+        let synced = crate::api::collab_exchange::sync_manifest_inner(
+            &self.ctx,
+            project_id,
+            self.emitter.as_deref(),
+            None,
+            false,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(project_id, requested_version = ?version, error = %e, "catch-up manifest sync failed; cursor stays put for a retry");
+            e
+        })?;
+        let mut project_version = synced.project_version;
+        self.note_manifest_rows(project_id, synced.rows);
 
         if small_docs {
             let only: HashSet<String> = [project_id.to_string()].into_iter().collect();
@@ -936,6 +966,11 @@ impl FeedApplier {
             for moved in &report.gate_moved {
                 crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
             }
+            self.note_card(
+                project_id,
+                kinds,
+                report.gate_moved.iter().any(|m| m == project_id),
+            );
             if kinds.contains(&ChangeKind::Members) {
                 effects.push(FeedEffect::MembersChanged(project_id.to_string()));
             }
@@ -953,7 +988,7 @@ impl FeedApplier {
                 project.gov_caps_json != project.synced_caps_json
             };
             if caps_changed_now {
-                let (c2, _s2, pv2) = crate::api::collab_exchange::sync_manifest_inner(
+                let resynced = crate::api::collab_exchange::sync_manifest_inner(
                     &self.ctx,
                     project_id,
                     self.emitter.as_deref(),
@@ -965,8 +1000,8 @@ impl FeedApplier {
                     tracing::warn!(project_id, error = %e, "catch-up caps-change full resync failed; cursor stays put for a retry");
                     e
                 })?;
-                self.note_manifest_rows(project_id, c2.iter().map(|c| c.count).sum());
-                project_version = pv2;
+                self.note_manifest_rows(project_id, resynced.rows);
+                project_version = resynced.project_version;
             }
         }
 
@@ -1186,6 +1221,12 @@ impl FeedApplier {
     /// version can be perfectly fine), and this skip must agree, or such a
     /// project would be skipped here forever while `EpochChanged` keeps
     /// firing with nothing ever resetting it.
+    ///
+    /// A skipped project whose head is AHEAD of its cursor on either axis
+    /// (spec 2026-10-01 §6.1: never a bare ok for state this device has not
+    /// confirmed) gets the same isolated catch-up `on_versions` runs — after
+    /// the loop, once `self.epoch` is `new_epoch`, so the catch-up stamps the
+    /// new epoch — and reports its outcome.
     pub async fn epoch_change(
         &mut self,
         new_epoch: &str,
@@ -1214,6 +1255,7 @@ impl FeedApplier {
                 .collect()
         };
         let mut effects = vec![FeedEffect::EpochChanged];
+        let mut ahead: Vec<(String, i64, bool, bool)> = Vec::new();
         for (pid, stored) in live {
             let already_on_new_epoch = stored.epoch.as_deref() == Some(new_epoch);
             let head = heads.get(&pid).copied();
@@ -1224,9 +1266,17 @@ impl FeedApplier {
                 head.is_some_and(|(_, h)| stored.holder_seq >= 0 && h < stored.holder_seq);
             if already_on_new_epoch && !version_regressed && !holder_regressed {
                 // Already reloaded into this exact epoch, no further
-                // regression on either axis since — nothing to redo (item 4),
-                // and confirmed as it stands.
-                self.report(&pid, Ok(&[]));
+                // regression on either axis since — nothing to redo (item 4).
+                // Confirmed as it stands unless its head is ahead.
+                let version_ahead = head.is_some_and(|(v, _)| v > stored.version);
+                let holder_ahead =
+                    head.is_some_and(|(_, h)| stored.holder_seq >= 0 && h > stored.holder_seq);
+                match head {
+                    Some((v, _)) if version_ahead || holder_ahead => {
+                        ahead.push((pid, v, version_ahead, holder_ahead));
+                    }
+                    _ => self.report(&pid, Ok(&[])),
+                }
                 continue;
             }
             match self
@@ -1257,6 +1307,36 @@ impl FeedApplier {
             crate::db::collab_live::meta_set(&conn, crate::db::collab_live::META_EPOCH, new_epoch)?;
         }
         self.epoch = Some(new_epoch.to_string());
+        for (pid, head_version, needs_project, needs_holders) in ahead {
+            let mut project_effects = Vec::new();
+            let mut failure: Option<ApiError> = None;
+            if needs_project {
+                match self
+                    .catch_up_project(&pid, Some(head_version), &ALL_KINDS)
+                    .await
+                {
+                    Ok(effs) => project_effects.extend(effs),
+                    Err(e) => {
+                        tracing::error!(project_id = %pid, error = %e, "catch-up of a project ahead of its cursor failed during an epoch change; retried next pass");
+                        failure = Some(e);
+                    }
+                }
+            }
+            if needs_holders {
+                match holders.catch_up(&pid, new_epoch).await {
+                    Ok(effs) => project_effects.extend(effs),
+                    Err(e) => {
+                        tracing::error!(project_id = %pid, error = %e, "holder catch-up of a project ahead of its cursor failed during an epoch change; retried next pass");
+                        failure.get_or_insert(e);
+                    }
+                }
+            }
+            match &failure {
+                Some(e) => self.report(&pid, Err(e)),
+                None => self.report(&pid, Ok(&project_effects)),
+            }
+            effects.extend(project_effects);
+        }
         Ok(effects)
     }
 
@@ -1327,6 +1407,7 @@ impl FeedApplier {
             for moved in &report.gate_moved {
                 crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
             }
+            self.note_card(pid, kinds, report.gate_moved.iter().any(|m| m == pid));
             if kinds.contains(&ChangeKind::Members) {
                 effects.push(FeedEffect::MembersChanged(pid.to_string()));
             }
@@ -3441,5 +3522,153 @@ mod tests {
         let r = f.take_reports();
         let p1 = report_for(&r, PID);
         assert!(!p1.ok && p1.error.is_some(), "{p1:?}");
+    }
+
+    /// Fix round 1, item 1: a coordinator's meta or thresholds edit reaches
+    /// the other members as a `project` event whose snapshot refresh adds
+    /// no effect and no rows; its report still says the card changed.
+    #[tokio::test]
+    async fn a_meta_or_thresholds_event_reports_a_card_change() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+
+        hub.bump(PID);
+        let ev = project_event_from_hub(&hub, PID);
+        assert!(ev.kinds.contains(&ChangeKind::Meta));
+        let effects = f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        assert!(effects.is_empty(), "no effect of its own: {effects:?}");
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(p1.ok && p1.changes.card && p1.changes.any(), "{p1:?}");
+        assert_eq!(p1.changes.manifest_rows, 0, "{p1:?}");
+
+        hub.set_thresholds_version(PID, 3);
+        let ev = project_event_from_hub(&hub, PID);
+        assert!(ev.kinds.contains(&ChangeKind::Thresholds));
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        let r = f.take_reports();
+        assert!(report_for(&r, PID).changes.card, "{r:?}");
+
+        // A frames-only event is not a card change.
+        hub.seed_frames(PID, "acc-o", &["u1"], "published");
+        let ev = project_event_from_hub(&hub, PID);
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        let r = f.take_reports();
+        assert!(!report_for(&r, PID).changes.card, "{r:?}");
+    }
+
+    /// Fix round 1, item 2: a `versions` beat where one project regressed
+    /// (an epoch change) and a sibling, already on the epoch, is AHEAD of
+    /// its cursor: the sibling is caught up and reported with what it
+    /// applied — or not ok when its catch-up fails — never a bare ok.
+    #[tokio::test]
+    async fn an_epoch_change_catches_up_a_sibling_ahead_of_its_cursor() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.add_project("p2", "m42", &[("acc-me", "send_receive", false)], false);
+        hub.seed_frames(PID, "acc-o", &["u0"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        let (_, p1_version) = cursor(&ctx);
+        assert!(p1_version > 0);
+
+        // p2 moves ahead; p1's head reads below its cursor (a regression).
+        hub.seed_frames("p2", "acc-o", &["u-1", "u-2"], "published");
+        let mut vv = VersionsEvent::new();
+        vv.insert(PID.into(), (p1_version - 1, -1));
+        vv.insert("p2".into(), (hub.version("p2"), -1));
+        let effects = f.apply(LiveEvent::Versions(vv), &mut h).await.unwrap();
+        assert!(effects.contains(&FeedEffect::EpochChanged));
+        let r = f.take_reports();
+        let p2 = report_for(&r, "p2");
+        assert!(p2.ok && p2.changes.manifest_rows >= 2, "caught up: {p2:?}");
+        assert_eq!(
+            project_cursor(&ctx, "p2"),
+            (Some("e1".to_string()), hub.version("p2")),
+            "the sibling's cursor reached its head, on the session's epoch"
+        );
+        assert!(
+            report_for(&r, PID).ok,
+            "the regressed project reloaded: {r:?}"
+        );
+
+        // Again, with the sibling's catch-up failing.
+        hub.seed_frames("p2", "acc-o", &["u-3"], "published");
+        hub.set_failing("/projects/p2/manifest", true);
+        let stamped = project_cursor(&ctx, "p2");
+        let (_, p1_version) = cursor(&ctx);
+        let mut vv = VersionsEvent::new();
+        vv.insert(PID.into(), (p1_version - 1, -1));
+        vv.insert("p2".into(), (hub.version("p2"), -1));
+        f.apply(LiveEvent::Versions(vv), &mut h).await.unwrap();
+        let r = f.take_reports();
+        let p2 = report_for(&r, "p2");
+        assert!(!p2.ok && p2.error.is_some(), "{p2:?}");
+        assert_eq!(project_cursor(&ctx, "p2"), stamped, "not stamped");
+    }
+
+    /// Fix round 1, item 3: a moderator's restore (accepted false → true)
+    /// maps to no change kind, yet it is a row the sync wrote — counted, on
+    /// the inline path and on a catch-up.
+    #[tokio::test]
+    async fn a_restore_counts_the_row_it_wrote() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.seed_frames(PID, "acc-o", &["u1"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        hub.set_accepted(PID, "u1", false, Some("trailed"));
+        let ev = project_event_from_hub(&hub, PID);
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        f.take_reports();
+
+        // Inline.
+        hub.set_accepted(PID, "u1", true, None);
+        let ev = project_event_from_hub(&hub, PID);
+        assert!(ev.frames.is_some() && !ev.more, "an inline event");
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(p1.ok && p1.changes.manifest_rows == 1, "{p1:?}");
+
+        // Over REST (a hello catch-up).
+        hub.set_accepted(PID, "u1", false, Some("trailed"));
+        hub.set_accepted(PID, "u1", true, None);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(p1.ok && p1.changes.manifest_rows >= 1, "{p1:?}");
+    }
+
+    /// Fix round 1, item 3: rows a catch-up wrote before a later step of it
+    /// failed stay in its not-ok report (the burst sums changes whatever
+    /// `ok` says).
+    #[tokio::test]
+    async fn a_not_ok_report_keeps_the_rows_written_before_the_failure() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        hub.seed_frames(PID, "acc-o", &["u1", "u2"], "published");
+        // The manifest lands; the snapshot refresh after it fails.
+        hub.set_failing("/me/projects", true);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(!p1.ok && p1.error.is_some(), "{p1:?}");
+        assert_eq!(p1.changes.manifest_rows, 2, "{p1:?}");
     }
 }
