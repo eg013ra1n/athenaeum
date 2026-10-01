@@ -84,6 +84,7 @@ function renderTab(
     onOpen?: (vm: FrameVM) => void;
     requireApproval?: boolean;
     libraryError?: boolean;
+    syncToken?: number;
   } = {},
 ) {
   const onDecided = overrides.onDecided ?? vi.fn();
@@ -97,6 +98,7 @@ function renderTab(
         requireApproval={requireApproval}
         library={library}
         libraryError={libraryError}
+        syncToken={overrides.syncToken}
         onDecided={onDecided}
         onOpen={onOpen}
       />
@@ -446,5 +448,28 @@ describe('ModerationTab — Excluded frames', () => {
     expect(restoreCalls()).toHaveLength(2);
     expect(restoreCalls().map((c) => c.frameUuid)).toEqual(['e-1', 'e-2']);
     await waitFor(() => expect(onDecided).toHaveBeenCalledTimes(1));
+  });
+});
+
+describe('ModerationTab — sync token', () => {
+  it('a new syncToken re-reads the queue', async () => {
+    const calls = () => vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'list_collab_moderation').length;
+    const view = (token: number) => (
+      <SessionStateProvider>
+        <ModerationTab
+          projectId="proj-1"
+          requireApproval
+          library={null}
+          libraryError={false}
+          syncToken={token}
+          onDecided={vi.fn()}
+          onOpen={vi.fn()}
+        />
+      </SessionStateProvider>
+    );
+    const { rerender } = render(view(0));
+    await waitFor(() => expect(calls()).toBe(1));
+    rerender(view(1));
+    await waitFor(() => expect(calls()).toBe(2));
   });
 });

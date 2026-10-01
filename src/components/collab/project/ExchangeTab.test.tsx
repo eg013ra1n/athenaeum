@@ -378,3 +378,21 @@ describe('ExchangeTab — mockup layout', () => {
     expect(await screen.findByText('No sessions yet.')).toBeInTheDocument();
   });
 });
+
+describe('ExchangeTab — sync token', () => {
+  it('a new syncToken re-reads the sessions and the project summary', async () => {
+    const calls = (c: string) => vi.mocked(api.invoke).mock.calls.filter(([x]) => x === c).length;
+    const view = (token: number) => (
+      <CollabExchangeProvider>
+        <ExchangeTab projectId="proj-1" canReceive syncToken={token} />
+      </CollabExchangeProvider>
+    );
+    const { rerender } = render(view(0));
+    await waitFor(() => expect(calls('list_collab_receive_sessions')).toBe(1));
+    const exch0 = calls('get_collab_exchange');
+    expect(exch0).toBeGreaterThan(0);
+    rerender(view(1));
+    await waitFor(() => expect(calls('list_collab_receive_sessions')).toBe(2));
+    await waitFor(() => expect(calls('get_collab_exchange')).toBe(exch0 + 1));
+  });
+});

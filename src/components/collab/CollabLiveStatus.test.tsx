@@ -3,7 +3,7 @@ import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom';
 import { NotificationProvider } from '../../contexts/NotificationContext';
 import { ToastStack } from '../Toast';
-import CollabLiveStatus, { dotState, liveStatusLabel, pillLabel } from './CollabLiveStatus';
+import CollabLiveStatus, { dotState, liveStatusLabel, pillLabel, SYNC_WAIT_MS } from './CollabLiveStatus';
 import DeviceReplaceDialog, { DeviceReplaceProvider } from './DeviceReplaceDialog';
 import { api } from '../../api';
 import type { CollabLiveStatus as Status, CollabStorageStatus } from '../../types/models';
@@ -414,5 +414,124 @@ describe('CollabLiveStatus pill — fix round 1', () => {
     fireEvent.click(await screen.findByRole('button', { name: /^Live · synced/ }));
     expect(await screen.findByText('Sync now failed')).toBeInTheDocument();
     expect(onSynced).not.toHaveBeenCalled();
+  });
+});
+
+describe('CollabLiveStatus pill — waits for the hub (spec §6.4)', () => {
+  const handlers = new Map<string, (p: unknown) => void>();
+  const emitEv = (ev: string, p: unknown) => act(() => handlers.get(ev)?.(p));
+  const synced = (o: Record<string, unknown> = {}) => ({
+    projectId: 'p1',
+    syncedAt: new Date(Date.now() + 5).toISOString(),
+    ok: true,
+    error: null,
+    changed: false,
+    ...o,
+  });
+
+  beforeEach(() => {
+    handlers.clear();
+    vi.mocked(api.listen).mockImplementation((async (ev: string, cb: (p: unknown) => void) => {
+      handlers.set(ev, cb);
+      return () => {
+        handlers.delete(ev);
+      };
+    }) as never);
+  });
+
+  const renderWait = (props: Record<string, unknown>) =>
+    render(
+      <MemoryRouter>
+        <NotificationProvider>
+          <CollabLiveStatus variant="pill" {...props} />
+          <ToastStack />
+        </NotificationProvider>
+      </MemoryRouter>,
+    );
+
+  it("the click waits for this project's synced report, then calls onSynced", async () => {
+    const onSynced = vi.fn();
+    renderWait({ projectId: 'p1', syncedAt: new Date(Date.now() - 50_000).toISOString(), onSynced });
+    fireEvent.click(await screen.findByRole('button', { name: /synced/ }));
+    expect(await screen.findByText('Syncing…')).toBeInTheDocument();
+    await waitFor(() => expect(handlers.has('collab-project-synced')).toBe(true));
+    emitEv('collab-project-synced', synced({ projectId: 'p2', changed: true }));
+    expect(screen.getByText('Syncing…')).toBeInTheDocument();
+    emitEv('collab-project-synced', synced());
+    await waitFor(() => expect(screen.queryByText('Syncing…')).toBeNull());
+    expect(screen.getByRole('button', { name: /synced [0-2] s ago/ })).toBeInTheDocument();
+    expect(onSynced).toHaveBeenCalledTimes(1);
+  });
+
+  it('a_not_ok_report_stops_the_pill_and_notifies', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onSynced = vi.fn();
+    renderWait({ projectId: 'p1', syncedAt: null, onSynced });
+    fireEvent.click(await screen.findByRole('button', { name: /Live/ }));
+    await waitFor(() => expect(handlers.has('collab-project-synced')).toBe(true));
+    emitEv('collab-project-synced', synced({ syncedAt: null, ok: false, error: 'the hub refused the project (403)' }));
+    await waitFor(() => expect(screen.queryByText('Syncing…')).toBeNull());
+    expect(await screen.findByText('Sync did not complete')).toBeInTheDocument();
+    // The toast carries the title; the detail lives in the notification history.
+    await waitFor(() =>
+      expect(localStorage.getItem('athenaeum.notifications.v1') ?? '').toContain('the hub refused the project (403)'),
+    );
+    expect(err).toHaveBeenCalled();
+    expect(onSynced).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it('an ok report stamped before the click does not end the wait', async () => {
+    renderWait({ projectId: 'p1', syncedAt: null });
+    fireEvent.click(await screen.findByRole('button', { name: /Live/ }));
+    await waitFor(() => expect(handlers.has('collab-project-synced')).toBe(true));
+    emitEv('collab-project-synced', synced({ syncedAt: new Date(Date.now() - 5_000).toISOString(), changed: true }));
+    expect(screen.getByText('Syncing…')).toBeInTheDocument();
+  });
+
+  it('thirty seconds without a report stop the pill and say there was no answer', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      renderWait({ projectId: 'p1', syncedAt: null });
+      fireEvent.click(await screen.findByRole('button', { name: /Live/ }));
+      await act(async () => {
+        vi.advanceTimersByTime(SYNC_WAIT_MS);
+      });
+      expect(screen.queryByText('Syncing…')).toBeNull();
+      expect(screen.getByText('Sync did not complete')).toBeInTheDocument();
+      expect(localStorage.getItem('athenaeum.notifications.v1') ?? '').toContain('no answer from the hub');
+    } finally {
+      vi.useRealTimers();
+      err.mockRestore();
+    }
+  });
+
+  it('F5: a synced report restarts the age without a card re-read', async () => {
+    renderWait({ projectId: 'p1', syncedAt: new Date(Date.now() - 50_000).toISOString() });
+    expect(await screen.findByRole('button', { name: /synced 5\d s ago/ })).toBeInTheDocument();
+    await waitFor(() => expect(handlers.has('collab-project-synced')).toBe(true));
+    emitEv('collab-project-synced', synced({ syncedAt: new Date().toISOString() }));
+    expect(await screen.findByRole('button', { name: /synced [0-2] s ago/ })).toBeInTheDocument();
+  });
+
+  it('without projectId the pill keeps calling onSynced right after collab_sync_now', async () => {
+    const onSynced = vi.fn();
+    renderWait({ syncedAt: null, onSynced });
+    fireEvent.click(await screen.findByRole('button', { name: /Live/ }));
+    await waitFor(() => expect(onSynced).toHaveBeenCalledTimes(1));
+  });
+
+  it('a failed collab_sync_now ends the wait and notifies Sync now failed', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
+      if (cmd === 'collab_sync_now') throw new Error('not signed in');
+      return base;
+    }) as never);
+    renderWait({ projectId: 'p1', syncedAt: null });
+    fireEvent.click(await screen.findByRole('button', { name: /Live/ }));
+    expect(await screen.findByText('Sync now failed')).toBeInTheDocument();
+    expect(screen.queryByText('Syncing…')).toBeNull();
+    err.mockRestore();
   });
 });

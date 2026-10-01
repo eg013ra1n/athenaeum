@@ -4,7 +4,7 @@ import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useDeviceReplace } from './DeviceReplaceDialog';
 import { Button, Pill, StatusDot } from '../ui';
-import type { CollabLiveStatus as Status } from '../../types/models';
+import type { CollabLiveStatus as Status, CollabProjectSynced } from '../../types/models';
 
 /**
  * The live-exchange status line (spec §14, L10): "Live", "Reconnecting in N s",
@@ -79,6 +79,20 @@ function parseSyncedAt(syncedAt: string): number {
   return Date.parse(zoned || !iso.includes('T') ? iso : `${iso}Z`);
 }
 
+/** How long the pill waits for the hub's confirmation after a click. */
+export const SYNC_WAIT_MS = 30_000;
+
+/** The newer of two RFC 3339 stamps (plan F5); an unparsable one loses. */
+function newer(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  const pa = parseSyncedAt(a);
+  const pb = parseSyncedAt(b);
+  if (!Number.isFinite(pb)) return a;
+  if (!Number.isFinite(pa)) return b;
+  return pb > pa ? b : a;
+}
+
 /** Whole units, rounded down: "N s" under 60 s, "N m" under 60 min, "N h"
  *  under 48 h, else "N d". */
 function formatAge(secs: number): string {
@@ -116,14 +130,19 @@ export default function CollabLiveStatus({
   variant = 'default',
   syncedAt = null,
   onSynced,
+  projectId,
 }: {
   compact?: boolean;
   variant?: 'default' | 'pill';
-  /** The pill's "synced N s ago" origin (the project card's `fetchedAt`). */
+  /** The pill's "synced N s ago" origin (the project card's `syncedAt` — the last hub confirmation). */
   syncedAt?: string | null;
   /** Called after `collab_sync_now` succeeds (never on failure) — the project
    *  page re-reads its card, so the synced age restarts. */
   onSynced?: () => void;
+  /** With it, a click waits for THIS project's `collab-project-synced`
+   *  report (spec §6.4) before `onSynced`; without it, `onSynced` runs right
+   *  after `collab_sync_now`. */
+  projectId?: string;
 }) {
   const { notify } = useNotifications();
   const { available: canReplace, pending, requestOpen } = useDeviceReplace();
@@ -133,6 +152,10 @@ export default function CollabLiveStatus({
   const [now, setNow] = useState(() => Date.now());
   // An event that arrived before the initial read resolves is newer: keep it.
   const gotEvent = useRef(false);
+  const [heard, setHeard] = useState<string | null>(null);
+  const wait = useRef<{ since: number; timer: ReturnType<typeof setTimeout> } | null>(null);
+  const onSyncedRef = useRef(onSynced);
+  onSyncedRef.current = onSynced;
 
   useEffect(() => {
     let cancelled = false;
@@ -183,11 +206,76 @@ export default function CollabLiveStatus({
     return () => clearInterval(t);
   }, [variant]);
 
+  const endWait = () => {
+    if (wait.current) clearTimeout(wait.current.timer);
+    wait.current = null;
+    setSyncing(false);
+  };
+
+  // Spec §6.4: the click's confirmation is this project's next report.
+  useEffect(() => {
+    if (!projectId) return undefined;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<CollabProjectSynced>('collab-project-synced', (p) => {
+        if (cancelled || p.projectId !== projectId) return;
+        if (p.ok && p.syncedAt) setHeard((h) => newer(h, p.syncedAt));
+        const w = wait.current;
+        if (!w) return;
+        if (!p.ok) {
+          endWait();
+          console.error('[collab] sync report not ok:', p.error);
+          notify({
+            title: 'Sync did not complete',
+            detail: p.error ?? 'the hub did not confirm the project',
+            kind: 'project',
+            tone: 'warning',
+            hasErrors: true,
+          });
+        } else if (p.syncedAt && parseSyncedAt(p.syncedAt) >= w.since) {
+          endWait();
+          onSyncedRef.current?.();
+        }
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[collab] project-synced listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      if (wait.current) clearTimeout(wait.current.timer);
+      wait.current = null;
+    };
+  }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const syncNow = async () => {
     setSyncing(true);
+    if (projectId) {
+      if (wait.current) clearTimeout(wait.current.timer);
+      wait.current = {
+        since: Date.now(),
+        timer: setTimeout(() => {
+          endWait();
+          console.error('[collab] sync confirmation timed out', { projectId });
+          notify({
+            title: 'Sync did not complete',
+            detail: 'no answer from the hub',
+            kind: 'project',
+            tone: 'warning',
+            hasErrors: true,
+          });
+        }, SYNC_WAIT_MS),
+      };
+    }
     try {
       await api.invoke('collab_sync_now');
-      onSynced?.();
+      if (!projectId) {
+        onSynced?.();
+        setSyncing(false);
+      }
     } catch (err) {
       console.error('[collab] collab_sync_now failed:', err);
       notify({
@@ -197,8 +285,7 @@ export default function CollabLiveStatus({
         tone: 'warning',
         hasErrors: true,
       });
-    } finally {
-      setSyncing(false);
+      endWait();
     }
   };
 
@@ -226,7 +313,7 @@ export default function CollabLiveStatus({
             .join(' · ')}
           dot={<StatusDot state={dotState(status)} />}
         >
-          {syncing ? 'Syncing…' : pillLabel(status, elapsed, syncedAt, now)}
+          {syncing && !reconnecting ? 'Syncing…' : pillLabel(status, elapsed, newer(syncedAt, heard), now)}
         </Pill>
         {showOwnerLink && (
           <Button variant="link" size="sm" onClick={requestOpen}>

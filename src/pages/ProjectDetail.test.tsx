@@ -1448,6 +1448,111 @@ describe('ProjectDetail presence (collab-peers-changed)', () => {
   });
 });
 
+const liveStatus = {
+  state: 'live',
+  retryInSecs: null,
+  since: '2026-10-01T10:00:00Z',
+  storage: 'available',
+  storageReason: null,
+  watcherDegraded: false,
+  networkVolume: false,
+};
+
+const syncedReport = (patch: Record<string, unknown> = {}) => ({
+  projectId: 'proj-1',
+  syncedAt: new Date(Date.now() + 5).toISOString(),
+  ok: true,
+  error: null,
+  changed: true,
+  ...patch,
+});
+
+describe('ProjectDetail synced reports (collab-project-synced)', () => {
+  it('a changed synced report reloads detail, library and members after 1 s and own frames after 5 s', async () => {
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    await waitFor(() => expect(listeners['collab-project-synced']?.length ?? 0).toBeGreaterThan(0));
+    const det0 = invokeCount('get_collab_project_detail');
+    const lib0 = invokeCount('list_collab_frames');
+    const mem0 = invokeCount('get_collab_member_summary');
+    const own0 = invokeCount('list_project_own_frames');
+
+    vi.useFakeTimers();
+    try {
+      fire('collab-project-synced', syncedReport());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(999);
+      });
+      expect(invokeCount('get_collab_project_detail')).toBe(det0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(invokeCount('get_collab_project_detail')).toBe(det0 + 1);
+      expect(invokeCount('list_collab_frames')).toBe(lib0 + 1);
+      expect(invokeCount('get_collab_member_summary')).toBe(mem0 + 1);
+      expect(invokeCount('list_project_own_frames')).toBe(own0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(invokeCount('list_project_own_frames')).toBe(own0 + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an unchanged or foreign-project report reloads nothing', async () => {
+    renderProjectDetail();
+    await screen.findByRole('tab', { name: 'Overview' });
+    await waitFor(() => expect(listeners['collab-project-synced']?.length ?? 0).toBeGreaterThan(0));
+    const det0 = invokeCount('get_collab_project_detail');
+    const lib0 = invokeCount('list_collab_frames');
+    const own0 = invokeCount('list_project_own_frames');
+
+    vi.useFakeTimers();
+    try {
+      fire('collab-project-synced', syncedReport({ changed: false }));
+      fire('collab-project-synced', syncedReport({ projectId: 'proj-other' }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000);
+      });
+      expect(invokeCount('get_collab_project_detail')).toBe(det0);
+      expect(invokeCount('list_collab_frames')).toBe(lib0);
+      expect(invokeCount('list_project_own_frames')).toBe(own0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the pill confirmation re-reads detail, own frames, library and members', async () => {
+    mockCommands(projectCard({ syncedAt: new Date(Date.now() - 50_000).toISOString() }), {
+      get_collab_live_status: () => Promise.resolve(liveStatus),
+    });
+    renderProjectDetail();
+    const pill = await screen.findByRole('button', { name: /Live · synced/ });
+    await waitFor(() => expect(listeners['collab-project-synced']?.length ?? 0).toBeGreaterThan(0));
+    const det0 = invokeCount('get_collab_project_detail');
+    const own0 = invokeCount('list_project_own_frames');
+    const lib0 = invokeCount('list_collab_frames');
+    const mem0 = invokeCount('get_collab_member_summary');
+
+    fireEvent.click(pill);
+    await waitFor(() => expect(invokeCount('collab_sync_now')).toBe(1));
+    fire('collab-project-synced', syncedReport({ changed: false }));
+    await waitFor(() => expect(invokeCount('get_collab_project_detail')).toBe(det0 + 1));
+    expect(invokeCount('list_project_own_frames')).toBe(own0 + 1);
+    expect(invokeCount('list_collab_frames')).toBe(lib0 + 1);
+    expect(invokeCount('get_collab_member_summary')).toBe(mem0 + 1);
+  });
+
+  it('the pill reads the card syncedAt, not fetchedAt', async () => {
+    mockCommands(projectCard({ syncedAt: new Date(Date.now() - 12_000).toISOString() }), {
+      get_collab_live_status: () => Promise.resolve(liveStatus),
+    });
+    renderProjectDetail();
+    expect(await screen.findByRole('button', { name: /Live · synced 1\d s ago/ })).toBeInTheDocument();
+  });
+});
+
 describe('ProjectDetail frame drawer', () => {
   it('clicking a row opens the drawer and Escape closes it', async () => {
     renderProjectDetail();
@@ -1633,8 +1738,10 @@ describe('ProjectDetail page shell (wave 5.5)', () => {
     const details = invokeCount('get_collab_project_detail');
     fireEvent.click(pill);
     await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('collab_sync_now'));
-    // Fix round 1: a successful Sync re-reads the card, so "synced N s ago"
-    // restarts from the fresh `fetchedAt`.
+    // Wave 2: the click waits for the hub's report for THIS project, then
+    // re-reads the card, so "synced N s ago" restarts from the fresh `syncedAt`.
+    expect(invokeCount('get_collab_project_detail')).toBe(details);
+    fire('collab-project-synced', syncedReport({ changed: false }));
     await waitFor(() => expect(invokeCount('get_collab_project_detail')).toBe(details + 1));
   });
 

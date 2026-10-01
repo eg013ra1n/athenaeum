@@ -56,6 +56,7 @@ export default function ModerationTab({
   onDecided,
   onOpen,
   activeKey = null,
+  syncToken,
 }: {
   projectId: string;
   requireApproval: boolean;
@@ -65,6 +66,8 @@ export default function ModerationTab({
   onOpen: (vm: FrameVM) => void;
   /** The frame whose side panel is open — its row takes the active state. */
   activeKey?: string | null;
+  /** Bumped when a hub confirmation says the project changed — re-reads the queue. */
+  syncToken?: number;
 }): JSX.Element {
   const [items, setItems] = useState<ModerationFrameView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -97,7 +100,7 @@ export default function ModerationTab({
   useEffect(() => {
     if (!requireApproval) return;
     void load();
-  }, [load, requireApproval]);
+  }, [load, requireApproval, syncToken]);
 
   const mirror = byUuid(library);
   const rows: FrameVM[] = (items ?? []).map((m) => fromModeration(m, mirror));

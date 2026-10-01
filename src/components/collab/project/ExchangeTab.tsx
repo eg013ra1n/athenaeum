@@ -22,9 +22,12 @@ import type { CollabFramesLanded, FlowView, ReceiveSessionView } from '../../../
 export default function ExchangeTab({
   projectId,
   canReceive,
+  syncToken,
 }: {
   projectId: string;
   canReceive: boolean;
+  /** Bumped when a hub confirmation says the project changed — re-reads the sessions and summary. */
+  syncToken?: number;
 }): JSX.Element {
   const colorOf = useMemberColor();
   const { state, refreshProject } = useCollabExchange();
@@ -35,7 +38,7 @@ export default function ExchangeTab({
   // is moving right now — the project-scoped snapshot read.
   useEffect(() => {
     void refreshProject(projectId);
-  }, [projectId, refreshProject]);
+  }, [projectId, refreshProject, syncToken]);
 
   // Held in a ref so the listener effect below subscribes exactly once per
   // `projectId` regardless of how many times this reload function is
@@ -69,7 +72,7 @@ export default function ExchangeTab({
 
   useEffect(() => {
     loadSessionsRef.current();
-  }, [projectId]);
+  }, [projectId, syncToken]);
 
   // StrictMode-safe listener pattern (CLAUDE.md): re-read the sessions list
   // whenever a landing lands for THIS project.

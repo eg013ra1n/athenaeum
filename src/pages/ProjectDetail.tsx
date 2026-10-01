@@ -32,6 +32,7 @@ import { fromLibrary, fromOwn, ownFrameKey, type FrameVM } from '../components/c
 import type {
   AccountStatus,
   CollabPeersChanged,
+  CollabProjectSynced,
   MemberSummary,
   OwnFrameRow,
   ProjectDetail as Detail,
@@ -306,6 +307,60 @@ function ProjectPage({ id }: { id: string | undefined }) {
   loadMembersRef.current = loadMembers;
   const loadOwnRef = useRef(loadOwn);
   loadOwnRef.current = loadOwn;
+  const loadDetailRef = useRef(loadDetail);
+  loadDetailRef.current = loadDetail;
+
+  // The pill's confirmation (and a changed synced report below) re-read every
+  // list; the token makes the Moderation and Exchange tabs re-fetch their own.
+  const [syncToken, setSyncToken] = useState(0);
+  const reloadAll = useCallback(() => {
+    void loadDetail();
+    void loadOwn();
+    void loadLibrary();
+    void loadMembers();
+    setSyncToken((n) => n + 1);
+  }, [loadDetail, loadOwn, loadLibrary, loadMembers]);
+
+  // The hub's per-project confirmation (`collab-project-synced`): when it says
+  // something changed, refresh the page on the same throttles as the peers
+  // listener above (schedule-if-none-pending).
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    let pageTimer: ReturnType<typeof setTimeout> | undefined;
+    let ownTimer: ReturnType<typeof setTimeout> | undefined;
+    api
+      .listen<CollabProjectSynced>('collab-project-synced', (p) => {
+        if (cancelled || p.projectId !== id || !p.changed) return;
+        if (pageTimer === undefined) {
+          pageTimer = setTimeout(() => {
+            pageTimer = undefined;
+            void loadDetailRef.current();
+            void loadLibraryRef.current();
+            void loadMembersRef.current();
+            setSyncToken((n) => n + 1);
+          }, PEERS_RELOAD_MS);
+        }
+        if (ownTimer === undefined) {
+          ownTimer = setTimeout(() => {
+            ownTimer = undefined;
+            void loadOwnRef.current();
+          }, OWN_RELOAD_MS);
+        }
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[projects] collab-project-synced listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      if (pageTimer !== undefined) clearTimeout(pageTimer);
+      if (ownTimer !== undefined) clearTimeout(ownTimer);
+    };
+  }, [id]);
 
   useEffect(() => {
     if (!id) return;
@@ -569,7 +624,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
             </Chip>
           )}
           <span className="ml-auto flex shrink-0 items-center gap-3.5">
-            <CollabLiveStatus variant="pill" syncedAt={c.fetchedAt} onSynced={() => void loadDetail()} />
+            <CollabLiveStatus variant="pill" projectId={id} syncedAt={c.syncedAt} onSynced={reloadAll} />
             <Button variant="link" onClick={() => void openPortal(portalPath)}>
               Manage on portal ↗
             </Button>
@@ -720,12 +775,13 @@ function ProjectPage({ id }: { id: string | undefined }) {
             <MembersTab members={members} error={membersError} goals={detail.goals} />
           )}
 
-          {activeTab === 'exchange' && <ExchangeTab projectId={id} canReceive={canReceive} />}
+          {activeTab === 'exchange' && <ExchangeTab projectId={id} canReceive={canReceive} syncToken={syncToken} />}
 
           {activeTab === 'moderation' && (
             <PanelLayout panel={framePanel}>
               <ModerationTab
                 projectId={id}
+                syncToken={syncToken}
                 requireApproval={c.requireApproval}
                 library={canReceive ? frames : []}
                 libraryError={framesError}
