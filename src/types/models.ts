@@ -1543,6 +1543,8 @@ deviceId: string,
  */
 name: string | null, };
 
+export type PublishMode = "manual" | "autoCalibrate" | "automatic";
+
 export type ProjectCard = { projectId: string, slug: string, title: string, dataRole: string, coordinator: boolean, 
 /**
  * True for the coordinator, or for an account holding the hub's
@@ -1561,7 +1563,7 @@ autoReplicate: boolean,
  * threshold changes (default ON). Local preference —
  * `set_project_auto_publish` writes it.
  */
-autoPublish: boolean, fetchedAt: string, 
+publishMode: PublishMode, fetchedAt: string, 
 /**
  * Amendment A6: the one device of this account that may announce new
  * frames into the project, as the hub last reported it. `None` = no
@@ -2067,7 +2069,7 @@ export type FrameSetProjectLink = { projectId: string, slug: string, title: stri
  * Amendment A6: this device is the account's publishing device for the
  * project.
  */
-publishingHere: boolean, autoPublish: boolean, counts: ContributorCounts, frames: Array<FrameProjectState>, };
+publishingHere: boolean, publishMode: PublishMode, counts: ContributorCounts, frames: Array<FrameProjectState>, };
 
 export type FrameProjectState = { frameId: number, 
 /**

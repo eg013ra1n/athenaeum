@@ -22,7 +22,41 @@ const SELECT_COLS: &str = "project_id, slug, title, data_role, is_coordinator, r
     target_radius_deg, membership_version, snapshot_payload_b64, snapshot_signature_b64, \
     members_json, thresholds_version, thresholds_rules_json, auto_replicate, gov_caps_json, \
     synced_caps_json, hub_version, manifest_cursor, dictionary_version, dictionary_json, \
-    policy_json, replication_paused, auto_publish, fetched_at, feed_epoch, holder_seq";
+    policy_json, replication_paused, publish_mode, fetched_at, feed_epoch, holder_seq";
+
+/// Spec 2026-10-01 P3: what the auto worker does for a project (local only).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, ts_rs::TS,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum PublishMode {
+    #[default]
+    Manual,
+    AutoCalibrate,
+    Automatic,
+}
+
+impl PublishMode {
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::AutoCalibrate => "auto_calibrate",
+            Self::Automatic => "automatic",
+        }
+    }
+
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "manual" => Self::Manual,
+            "auto_calibrate" => Self::AutoCalibrate,
+            "automatic" => Self::Automatic,
+            other => {
+                tracing::warn!(value = other, "unknown publish mode; read as manual");
+                Self::Manual
+            }
+        }
+    }
+}
 
 /// One cached collaboration project (poll snapshot, refreshed wholesale).
 #[derive(Debug, Clone, PartialEq)]
@@ -80,9 +114,9 @@ pub struct CollabProjectRow {
     /// LOCAL loss-guard trip flag (P14). Written only by
     /// [`set_replication_paused`]; [`upsert_project`] leaves it untouched.
     pub replication_paused: bool,
-    /// LOCAL auto-publish preference (P13), default ON. Written only by
-    /// [`set_auto_publish`]; [`upsert_project`] leaves it untouched.
-    pub auto_publish: bool,
+    /// LOCAL publish mode (spec 2026-10-01 P3), default Manual. Written only by
+    /// [`set_publish_mode`]; [`upsert_project`] leaves it untouched.
+    pub publish_mode: PublishMode,
     /// Set by SQL (`datetime('now')`); ignored on write, populated on read.
     pub fetched_at: String,
     /// The live feed's epoch cursor (wave 3, plan P5), paired with
@@ -126,7 +160,7 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
         dictionary_json: row.get(24)?,
         policy_json: row.get(25)?,
         replication_paused: row.get::<_, i64>(26)? != 0,
-        auto_publish: row.get::<_, i64>(27)? != 0,
+        publish_mode: PublishMode::from_db(&row.get::<_, String>(27)?),
         fetched_at: row.get(28)?,
         feed_epoch: row.get(29)?,
         holder_seq: row.get(30)?,
@@ -140,7 +174,7 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
 ///
 /// Eleven columns are deliberately NOT in the list, each written only by
 /// dedicated setters so a wholesale poll refresh can never clobber it:
-/// `auto_replicate`/`policy_json`/`replication_paused`/`auto_publish` are LOCAL
+/// `auto_replicate`/`policy_json`/`replication_paused`/`publish_mode` are LOCAL
 /// preferences; `manifest_cursor`/`synced_caps_json` are the manifest-sync
 /// cursor ([`set_sync_state`], P9); `hub_version` is written by
 /// [`set_sync_state`] AND by the wave-3 feed's [`set_feed_version`] (it is
@@ -452,16 +486,35 @@ pub fn set_replication_paused(conn: &Connection, project_id: &str, paused: bool)
     Ok(())
 }
 
-/// Set the LOCAL auto-publish preference (P13). The ONLY writer of
-/// `auto_publish`. Returns the number of rows updated (0 when the project
-/// isn't cached), same contract as [`set_auto_replicate`] — the api layer's
-/// `set_project_auto_publish` uses it to refuse an unknown project.
-pub fn set_auto_publish(conn: &Connection, project_id: &str, on: bool) -> Result<usize> {
+/// Set the LOCAL publish mode (spec 2026-10-01 P3). The ONLY writer of
+/// `publish_mode`. Returns the number of rows updated (0 when the project
+/// isn't cached), same contract as [`set_auto_replicate`].
+pub fn set_publish_mode(conn: &Connection, project_id: &str, mode: PublishMode) -> Result<usize> {
     let updated = conn.execute(
-        "UPDATE collab_projects SET auto_publish = ?2 WHERE project_id = ?1",
-        params![project_id, on as i64],
+        "UPDATE collab_projects SET publish_mode = ?2 WHERE project_id = ?1",
+        params![project_id, mode.as_db()],
     )?;
     Ok(updated)
+}
+
+/// Persist the last publish run's summary JSON (local only).
+pub fn set_last_publish_run(conn: &Connection, project_id: &str, json: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE collab_projects SET last_publish_run = ?2 WHERE project_id = ?1",
+        params![project_id, json],
+    )?;
+    Ok(())
+}
+
+pub fn last_publish_run(conn: &Connection, project_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT last_publish_run FROM collab_projects WHERE project_id = ?1",
+            [project_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// All cached projects I am still a member of, ordered by title. Projects
@@ -780,7 +833,7 @@ mod tests {
             dictionary_json: None,
             policy_json: r#"{"mode":"all"}"#.into(),
             replication_paused: false,
-            auto_publish: true,
+            publish_mode: crate::db::collab::PublishMode::Automatic,
             fetched_at: String::new(), // set by SQL
             feed_epoch: None,
             holder_seq: -1,
@@ -878,7 +931,7 @@ mod tests {
     }
 
     /// v3 (Task 2): a wholesale poll refresh ([`upsert_project`]) must never
-    /// clobber the LOCAL columns — `auto_publish`, `policy_json` and
+    /// clobber the LOCAL columns — `publish_mode`, `policy_json` and
     /// `replication_paused` — any more than it clobbers `auto_replicate`.
     /// Wave 3 (Task 1): the same holds for the live-feed cursor
     /// (`feed_epoch`/`holder_seq`), set by [`set_feed_version`]/
@@ -960,7 +1013,7 @@ mod tests {
         let conn = test_conn();
         upsert_project(&conn, &sample_row("p-1")).unwrap();
 
-        set_auto_publish(&conn, "p-1", false).unwrap();
+        set_publish_mode(&conn, "p-1", PublishMode::AutoCalibrate).unwrap();
         set_policy(&conn, "p-1", r#"{"mode":"filter","filters":["R"]}"#).unwrap();
         set_replication_paused(&conn, "p-1", true).unwrap();
         set_feed_version(&conn, "p-1", "epoch-1", 9).unwrap();
@@ -973,7 +1026,11 @@ mod tests {
 
         let row = get_project(&conn, "p-1").unwrap().unwrap();
         assert_eq!(row.title, "Refreshed", "the hub-mirrored column DID update");
-        assert!(!row.auto_publish, "auto_publish must survive the poll");
+        assert_eq!(
+            row.publish_mode,
+            PublishMode::AutoCalibrate,
+            "publish_mode must survive the poll"
+        );
         assert_eq!(
             row.policy_json, r#"{"mode":"filter","filters":["R"]}"#,
             "policy_json must survive the poll"

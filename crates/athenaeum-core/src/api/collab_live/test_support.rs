@@ -130,7 +130,7 @@ fn seed_local_project(ctx: &ServiceContext, my_pubkey: &str) {
             dictionary_json: None,
             policy_json: r#"{"mode":"all"}"#.into(),
             replication_paused: false,
-            auto_publish: true,
+            publish_mode: crate::db::collab::PublishMode::Automatic,
             fetched_at: String::new(),
             feed_epoch: None,
             holder_seq: -1,

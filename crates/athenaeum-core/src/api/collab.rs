@@ -161,7 +161,7 @@ pub struct ProjectCard {
     /// auto-publishes its own passing frames on scan/analysis/solve/link/
     /// threshold changes (default ON). Local preference —
     /// `set_project_auto_publish` writes it.
-    pub auto_publish: bool,
+    pub publish_mode: crate::db::collab::PublishMode,
     pub fetched_at: String,
     /// Amendment A6: the one device of this account that may announce new
     /// frames into the project, as the hub last reported it. `None` = no
@@ -713,7 +713,12 @@ pub async fn set_project_auto_publish(
     let db = db(ctx)?;
     let conn = db.conn();
     crate::api::collab_exchange::live_project(&conn, project_id)?;
-    crate::db::collab::set_auto_publish(&conn, project_id, on).map_err(internal)?;
+    let mode = if on {
+        crate::db::collab::PublishMode::Automatic
+    } else {
+        crate::db::collab::PublishMode::Manual
+    };
+    crate::db::collab::set_publish_mode(&conn, project_id, mode).map_err(internal)?;
     tracing::info!(project_id, on, "collab auto-publish toggled");
     Ok(())
 }
@@ -1243,7 +1248,7 @@ pub struct FrameSetProjectLink {
     /// Amendment A6: this device is the account's publishing device for the
     /// project.
     pub publishing_here: bool,
-    pub auto_publish: bool,
+    pub publish_mode: crate::db::collab::PublishMode,
     pub counts: ContributorCounts,
     pub frames: Vec<FrameProjectState>,
 }
@@ -1381,7 +1386,7 @@ pub fn get_frame_set_project_status(
             slug: p.slug.clone(),
             title: p.title.clone(),
             publishing_here,
-            auto_publish: p.auto_publish,
+            publish_mode: p.publish_mode,
             counts,
             frames,
         });
@@ -1919,7 +1924,7 @@ fn card_from_row(
         candidates: gate.total,
         publishable: gate.publishable,
         auto_replicate: row.auto_replicate,
-        auto_publish: row.auto_publish,
+        publish_mode: row.publish_mode,
         fetched_at: row.fetched_at,
         publishing_device: publishing.map(|p| PublishingDeviceView {
             device_id: p.device_id,
@@ -2161,7 +2166,7 @@ async fn fetch_one_project(
         dictionary_json: None,
         policy_json: r#"{"mode":"all"}"#.into(),
         replication_paused: false,
-        auto_publish: true,
+        publish_mode: crate::db::collab::PublishMode::Automatic,
         fetched_at: String::new(), // filled by SQL
         feed_epoch: None,
         holder_seq: -1,
@@ -6103,7 +6108,7 @@ pub(crate) mod tests {
             dictionary_json: None,
             policy_json: r#"{"mode":"all"}"#.into(),
             replication_paused: false,
-            auto_publish: true,
+            publish_mode: crate::db::collab::PublishMode::Automatic,
             fetched_at: String::new(), // filled by SQL
             feed_epoch: None,
             holder_seq: -1,
@@ -6208,7 +6213,7 @@ pub(crate) mod tests {
                 ),
                 policy_json: r#"{"mode":"all"}"#.into(),
                 replication_paused: false,
-                auto_publish: true,
+                publish_mode: crate::db::collab::PublishMode::Automatic,
                 fetched_at: String::new(), // filled by SQL
                 feed_epoch: None,
                 holder_seq: -1,
@@ -7660,7 +7665,7 @@ pub(crate) mod tests {
                 dictionary_json: None,
                 policy_json: r#"{"mode":"all"}"#.into(),
                 replication_paused: false,
-                auto_publish: true,
+                publish_mode: crate::db::collab::PublishMode::Automatic,
                 fetched_at: String::new(),
                 feed_epoch: None,
                 holder_seq: -1,
@@ -9413,7 +9418,7 @@ pub(crate) mod tests {
                         dictionary_json: None,
                         policy_json: r#"{"mode":"all"}"#.into(),
                         replication_paused: false,
-                        auto_publish: true,
+                        publish_mode: crate::db::collab::PublishMode::Automatic,
                         fetched_at: String::new(),
                         feed_epoch: None,
                         holder_seq: -1,
@@ -11971,7 +11976,7 @@ pub(crate) mod tests {
                         dictionary_json: None,
                         policy_json: r#"{"mode":"all"}"#.into(),
                         replication_paused: false,
-                        auto_publish: true,
+                        publish_mode: crate::db::collab::PublishMode::Automatic,
                         fetched_at: String::new(),
                         feed_epoch: None,
                         holder_seq: -1,

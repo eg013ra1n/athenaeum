@@ -2380,6 +2380,21 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // Spec 2026-10-01 P1 / plan W5: every project starts in Manual. The
+    // column default fills every existing row on the first run - that IS
+    // the one-time migration; `auto_publish` is no longer read.
+    if !column_exists(conn, "collab_projects", "publish_mode")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN publish_mode TEXT NOT NULL DEFAULT 'manual'",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "collab_projects", "last_publish_run")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN last_publish_run TEXT",
+            [],
+        )?;
+    }
     // Wave-2 Task 8 (ruling R14): a project the hub no longer lists is marked
     // lost instead of deleted, so my own frame rows (and the files they
     // track) survive the loss. `list_projects` hides lost rows; a re-join
@@ -2437,6 +2452,43 @@ pub fn init_db(conn: &Connection) -> Result<()> {
          ON project_frames_local(source_frame_id)",
         [],
     )?;
+    // Spec 2026-10-01 4.2: calibrated frames waiting for review, and frames
+    // the member withheld. Local only; never sent to the hub.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS collab_prepared_frames (
+            project_id       TEXT NOT NULL,
+            source_frame_id  INTEGER NOT NULL,
+            frame_uuid       TEXT NOT NULL,
+            calibrated_path  TEXT,
+            external         INTEGER NOT NULL DEFAULT 0,
+            own_dir          TEXT NOT NULL,
+            recipe_hash      TEXT NOT NULL,
+            xxh3             TEXT NOT NULL,
+            byte_size        INTEGER NOT NULL,
+            size_mtime_seen  TEXT,
+            prepared_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            publish_run_id   TEXT NOT NULL,
+            PRIMARY KEY (project_id, source_frame_id),
+            UNIQUE (project_id, calibrated_path),
+            FOREIGN KEY (project_id) REFERENCES collab_projects(project_id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_collab_prepared_path ON collab_prepared_frames(calibrated_path)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS collab_withheld_frames (
+            project_id       TEXT NOT NULL,
+            source_frame_id  INTEGER NOT NULL,
+            withheld_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (project_id, source_frame_id),
+            FOREIGN KEY (project_id) REFERENCES collab_projects(project_id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Wave-2 Task 9 fix round (R21): the `size:mtime` of a file at a row's
     // landed path whose content re-admission rejected (a version-bumped
     // replica's old file, an edited one). Disk truth skips the re-hash while

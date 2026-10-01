@@ -2061,7 +2061,7 @@ mod tests {
             dictionary_json: None,
             policy_json: String::new(),
             replication_paused: false,
-            auto_publish: false,
+            publish_mode: crate::db::collab::PublishMode::Manual,
             fetched_at: String::new(),
             feed_epoch: None,
             holder_seq: -1,

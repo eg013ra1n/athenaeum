@@ -183,7 +183,7 @@ fn drain_due_projects(ctx: &ServiceContext) -> Vec<String> {
                 continue;
             }
         };
-        if !project.auto_publish {
+        if project.publish_mode == crate::db::collab::PublishMode::Manual {
             continue;
         }
         // R14: `get_project` still reads a lost project (only `list_projects`
@@ -408,6 +408,8 @@ mod tests {
     /// so they need no lock.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    use crate::db::collab::PublishMode;
+
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -418,7 +420,7 @@ mod tests {
         (tmp, ctx)
     }
 
-    fn sample_project(id: &str, auto_publish: bool) -> crate::db::collab::CollabProjectRow {
+    fn sample_project(id: &str, mode: PublishMode) -> crate::db::collab::CollabProjectRow {
         crate::db::collab::CollabProjectRow {
             project_id: id.to_string(),
             slug: format!("{id}-slug"),
@@ -447,11 +449,18 @@ mod tests {
             dictionary_json: None,
             policy_json: r#"{"mode":"all"}"#.into(),
             replication_paused: false,
-            auto_publish,
+            publish_mode: mode,
             fetched_at: String::new(),
             feed_epoch: None,
             holder_seq: -1,
         }
+    }
+
+    /// `upsert_project` never writes the LOCAL columns, so the mode goes in
+    /// through its own setter, as the real toggle path does.
+    fn insert_project(conn: &rusqlite::Connection, id: &str, mode: PublishMode) {
+        crate::db::collab::upsert_project(conn, &sample_project(id, mode)).unwrap();
+        crate::db::collab::set_publish_mode(conn, id, mode).unwrap();
     }
 
     /// Clears the global dirty state so a test starts from a known-empty
@@ -474,7 +483,7 @@ mod tests {
         let conn = crate::api::db(&ctx).unwrap().conn();
         conn.execute("INSERT INTO frames_set (id, name) VALUES (42, 'S')", [])
             .unwrap();
-        crate::db::collab::upsert_project(&conn, &sample_project("p-set", true)).unwrap();
+        insert_project(&conn, "p-set", PublishMode::Automatic);
         crate::db::collab::link_set(&conn, "p-set", 42).unwrap();
         drop(conn);
 
@@ -495,17 +504,14 @@ mod tests {
         let conn = crate::api::db(&ctx).unwrap().conn();
         conn.execute("INSERT INTO frames_set (id, name) VALUES (7, 'S')", [])
             .unwrap();
-        // `upsert_project` never writes `auto_publish` (it's LOCAL, P13) —
-        // `set_auto_publish` is the only writer, same as the real toggle path.
-        crate::db::collab::upsert_project(&conn, &sample_project("p-off", true)).unwrap();
-        crate::db::collab::set_auto_publish(&conn, "p-off", false).unwrap();
+        insert_project(&conn, "p-off", PublishMode::Manual);
         crate::db::collab::link_set(&conn, "p-off", 7).unwrap();
         drop(conn);
 
         request_auto_publish(Some("p-off"));
         assert!(
             drain_due_projects(&ctx).is_empty(),
-            "auto_publish = 0 is never due"
+            "a Manual project is never due"
         );
     }
 
@@ -517,7 +523,7 @@ mod tests {
         reset_dirty_state();
         let (_tmp, ctx) = test_ctx();
         let conn = crate::api::db(&ctx).unwrap().conn();
-        crate::db::collab::upsert_project(&conn, &sample_project("p-bare", true)).unwrap();
+        insert_project(&conn, "p-bare", PublishMode::Automatic);
         drop(conn);
 
         request_auto_publish(Some("p-bare"));
@@ -538,7 +544,7 @@ mod tests {
         let conn = crate::api::db(&ctx).unwrap().conn();
         conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'S')", [])
             .unwrap();
-        crate::db::collab::upsert_project(&conn, &sample_project("p-thr", true)).unwrap();
+        insert_project(&conn, "p-thr", PublishMode::Automatic);
         crate::db::collab::link_set(&conn, "p-thr", 1).unwrap();
         drop(conn);
 
@@ -562,7 +568,7 @@ mod tests {
         let conn = crate::api::db(&ctx).unwrap().conn();
         conn.execute("INSERT INTO frames_set (id, name) VALUES (99, 'S')", [])
             .unwrap();
-        crate::db::collab::upsert_project(&conn, &sample_project("p-lost", true)).unwrap();
+        insert_project(&conn, "p-lost", PublishMode::Automatic);
         crate::db::collab::link_set(&conn, "p-lost", 99).unwrap();
         assert_eq!(crate::db::collab::mark_lost(&conn, "p-lost").unwrap(), 1);
         drop(conn);
