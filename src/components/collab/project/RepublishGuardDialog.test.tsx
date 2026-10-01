@@ -11,8 +11,6 @@ function renderGuard(o: Partial<Props> = {}) {
     count: 2,
     sourceBytes: 2 * 1024 * 1024,
     all: false,
-    busy: false,
-    error: null,
     onConfirm: vi.fn(),
     onCancel: vi.fn(),
     ...o,
@@ -85,16 +83,6 @@ describe('RepublishGuardDialog', () => {
     expect(screen.queryByLabelText(/to confirm/)).not.toBeInTheDocument();
   });
 
-  it('shows the error inline, and busy disables both buttons', () => {
-    const props = renderGuard({ busy: true, error: 'hub unreachable' });
-    expect(screen.getByText('hub unreachable')).toBeInTheDocument();
-    expect(confirmButton()).toBeDisabled();
-    const cancel = screen.getByRole('button', { name: 'Cancel' });
-    expect(cancel).toBeDisabled();
-    fireEvent.click(cancel);
-    expect(props.onCancel).not.toHaveBeenCalled();
-  });
-
   it('Cancel calls onCancel', () => {
     const props = renderGuard();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
@@ -129,13 +117,19 @@ describe('RepublishGuardDialog', () => {
     expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
   });
 
-  it('Escape cancels unless busy', () => {
+  it('Escape cancels', () => {
     const props = renderGuard();
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(props.onCancel).toHaveBeenCalledTimes(1);
-    cleanup();
-    const busy = renderGuard({ busy: true });
-    fireEvent.keyDown(document, { key: 'Escape' });
-    expect(busy.onCancel).not.toHaveBeenCalled();
+  });
+
+  it('Enter in the count field confirms once the typed count matches', () => {
+    const props = renderGuard({ count: 3, all: true });
+    const input = screen.getByLabelText('Type 3 to confirm');
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(props.onConfirm).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: '3' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(props.onConfirm).toHaveBeenCalledTimes(1);
   });
 });

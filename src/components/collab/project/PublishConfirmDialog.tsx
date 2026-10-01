@@ -1,17 +1,17 @@
 import type { JSX } from 'react';
-import { Loader2 } from 'lucide-react';
 import { Button, DialogShell } from '../../ui';
 import { formatSize } from '../format';
 
-/** The confirm every publish goes through (moved out of `ProjectDetail`). */
+/** The confirm every publish goes through (moved out of `ProjectDetail`). It
+ *  closes the moment the user confirms: the run panel in My frames shows the
+ *  work (with Cancel), and a refusal returned before the run starts shows in
+ *  My frames (final-review ruling, spec §16.1). */
 export default function PublishConfirmDialog({
   title,
   count,
   bytes,
   needsApproval,
   coordinatorName,
-  busy,
-  error,
   onConfirm,
   onCancel,
 }: {
@@ -20,8 +20,6 @@ export default function PublishConfirmDialog({
   bytes: number;
   needsApproval: boolean;
   coordinatorName: string;
-  busy: boolean;
-  error: string | null;
   onConfirm: () => void;
   onCancel: () => void;
 }): JSX.Element {
@@ -29,18 +27,14 @@ export default function PublishConfirmDialog({
     <DialogShell
       title={`Publish to ${title}`}
       onClose={onCancel}
-      busy={busy}
       footer={<>
-        <Button onClick={onCancel} disabled={busy}>Cancel</Button>
-        <Button variant="primary" onClick={onConfirm} disabled={busy} data-autofocus>
-          {busy && <Loader2 size={12} className="animate-spin" />}Publish
-        </Button>
+        <Button onClick={onCancel}>Cancel</Button>
+        <Button variant="primary" onClick={onConfirm} data-autofocus>Publish</Button>
       </>}
     >
-      <p>{count} passing {count === 1 ? 'frame' : 'frames'} will be calibrated and announced to the project.</p>
+      <p>{count} calibrated {count === 1 ? 'frame' : 'frames'} will be announced to the project.</p>
       <p className="mt-1.5 text-[11.5px] text-content-faint">Size {formatSize(bytes)}</p>
       {needsApproval && <p className="mt-1.5 text-[12px] text-warning">This project requires approval — your contribution goes to {coordinatorName} for review.</p>}
-      {error && <p className="mt-1.5 text-[12.5px] text-error">{error}</p>}
     </DialogShell>
   );
 }

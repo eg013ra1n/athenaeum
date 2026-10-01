@@ -21,6 +21,7 @@ import type {
   ProjectFrameView,
   PublishResult,
   CollabPublishFinished,
+  CollabPublishProgress,
 } from '../types/models';
 
 vi.mock('../api', () => ({
@@ -341,15 +342,44 @@ function finished(patch: Partial<CollabPublishFinished> = {}): CollabPublishFini
   };
 }
 
+/** A `collab-publish-progress` payload; defaults to a manual publish seeding. */
+function progress(patch: Partial<CollabPublishProgress> = {}): CollabPublishProgress {
+  return {
+    projectId: 'proj-1', publishRunId: 'run-1', kind: 'publish', trigger: 'manual', mode: null, stage: 'seeding',
+    current: 1, total: 2, currentFile: null, startedAt: new Date().toISOString(), ...patch,
+  };
+}
+
 describe('ProjectDetail manual publish', () => {
+  it('confirming Publish closes the confirm at once; the run panel and its Cancel are reachable while the run is in flight', async () => {
+    let settle: (r: PublishResult) => void = () => {};
+    mockCommands(projectCard(), {
+      publish_collab_frames: () => new Promise<PublishResult>((r) => { settle = r; }),
+    });
+    renderProjectDetail();
+    await publishViaConfirm();
+
+    // Closed on the click itself — publish_collab_frames has not resolved.
+    expect(screen.queryByRole('dialog', { name: /Publish to M42 Mosaic/ })).toBeNull();
+    expect(api.invoke).toHaveBeenCalledWith('publish_collab_frames', { projectId: 'proj-1', frameIds: [3, 4] });
+
+    fire('collab-publish-progress', progress({ stage: 'seeding', current: 1, total: 2 }));
+    const panel = screen.getByRole('region', { name: 'Publish run' });
+    expect(within(panel).getByText('Seeding 1 of 2')).toBeInTheDocument();
+    fireEvent.click(within(panel).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('cancel_collab_publish', { projectId: 'proj-1' }));
+
+    const own = invokeCount('list_project_own_frames');
+    await act(async () => settle(okPublish));
+    await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThan(own));
+  });
+
   it('raises no inline toast of its own; the live collab-publish-finished event produces exactly one', async () => {
     renderProjectDetail();
     await publishViaConfirm();
 
-    // publish resolves, closes the confirm dialog, then reloads own frames + detail.
-    await waitFor(() =>
-      expect(screen.queryByRole('button', { name: 'Publish' })).not.toBeInTheDocument(),
-    );
+    // The confirm closed on the click; publish resolves, then reloads own frames + detail.
+    expect(screen.queryByRole('button', { name: 'Publish' })).not.toBeInTheDocument();
     expect(api.invoke).toHaveBeenCalledWith('publish_collab_frames', { projectId: 'proj-1', frameIds: [3, 4] });
     await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThanOrEqual(2));
 
@@ -374,7 +404,7 @@ describe('ProjectDetail manual publish', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Publish all 2' }));
     expect(await screen.findByText('Publish to M42 Mosaic')).toBeInTheDocument();
     expect(
-      screen.getByText('2 passing frames will be calibrated and announced to the project.'),
+      screen.getByText('2 calibrated frames will be announced to the project.'),
     ).toBeInTheDocument();
     expect(screen.getByText('Size 3 MB')).toBeInTheDocument();
   });
@@ -399,16 +429,21 @@ describe('ProjectDetail manual publish', () => {
     expect(screen.getByText(/requires approval/)).toBeInTheDocument();
   });
 
-  it('a failed publish shows an inline error and no toast (F4: only the finished event notifies)', async () => {
+  it('a failed publish shows the error inline in My frames, the confirm closed, and no toast (F4: only the finished event notifies)', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     mockCommands(projectCard(), {
       publish_collab_frames: () => Promise.reject(new Error('hub unreachable')),
     });
     renderProjectDetail();
     await publishViaConfirm();
 
-    expect(await screen.findByText('hub unreachable')).toBeInTheDocument();
+    const line = await screen.findByText('hub unreachable');
+    expect(line.closest('[role="dialog"]')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(err).toHaveBeenCalled();
 
     expect(screen.queryAllByRole('status')).toHaveLength(0);
+    err.mockRestore();
   });
 
   it('Calibrate in My frames invokes calibrate_collab_frames with the selection', async () => {
@@ -422,7 +457,7 @@ describe('ProjectDetail manual publish', () => {
 
   it('calibrate invokes calibrate_collab_frames with the ids and toasts nothing on failure', async () => {
     const { result } = renderHook(() => usePublishing('proj-1', {
-      reloadDetail: async () => {}, reloadOwn: async () => {}, onCard: () => {}, closeConfirm: () => {},
+      reloadDetail: async () => {}, reloadOwn: async () => {}, onCard: () => {},
     }), { wrapper: NotificationProvider });
     vi.mocked(api.invoke).mockResolvedValueOnce(okPublish as never);
     await act(async () => { await result.current.calibrate([1, 2]); });
@@ -442,11 +477,12 @@ describe('ProjectDetail manual publish', () => {
     renderProjectDetail();
     await publishViaConfirm();
 
-    expect(
-      await screen.findByText(
-        'Publication of this project is already running — wait for it to finish, then try again.',
-      ),
-    ).toBeInTheDocument();
+    const line = await screen.findByText(
+      'Publication of this project is already running — wait for it to finish, then try again.',
+    );
+    // Inline in My frames: the confirm closed on the click.
+    expect(line.closest('[role="dialog"]')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
     expect(toasts[0]).toHaveTextContent('Publication already running');
@@ -796,7 +832,35 @@ describe('ProjectDetail republish guard', () => {
     );
   });
 
-  it('a republish refused because another run is in progress reads as "already running" inside the guard', async () => {
+  it('confirming the guard closes it at once; the run panel shows while the republish is in flight', async () => {
+    let settle: (r: PublishResult) => void = () => {};
+    mockCommands(projectCard(), {
+      list_project_own_frames: () => Promise.resolve([published(71), published(72)]),
+      republish_collab_frames: () => new Promise<PublishResult>((r) => { settle = r; }),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /^2 Published/ }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Republish 2' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Republish' }));
+
+    // Closed on the click itself — republish_collab_frames has not resolved.
+    expect(screen.queryByRole('dialog', { name: /Republish 2 frames/ })).toBeNull();
+    expect(api.invoke).toHaveBeenCalledWith('republish_collab_frames', { projectId: 'proj-1', frameIds: [71, 72] });
+
+    fire('collab-publish-progress', progress({ kind: 'republish', stage: 'calibrating', current: 1, total: 2 }));
+    const panel = screen.getByRole('region', { name: 'Publish run' });
+    expect(within(panel).getByText('Calibrating 1 of 2')).toBeInTheDocument();
+    expect(within(panel).getByRole('button', { name: 'Cancel' })).toBeEnabled();
+
+    const own = invokeCount('list_project_own_frames');
+    await act(async () => settle({ ...okPublish, announced: 0, updated: 2 }));
+    await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThan(own));
+  });
+
+  it('a republish refused because another run is in progress reads as "already running" in My frames, the guard closed', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     mockCommands(projectCard(), {
       list_project_own_frames: () => Promise.resolve([published(41)]),
       republish_collab_frames: () => Promise.reject('publication of this project is already running'),
@@ -807,20 +871,20 @@ describe('ProjectDetail republish guard', () => {
     fireEvent.change(screen.getByLabelText('Type 1 to confirm'), { target: { value: '1' } });
     fireEvent.click(screen.getByRole('button', { name: 'Republish' }));
 
-    expect(
-      await screen.findByText(
-        'Publication of this project is already running — wait for it to finish, then try again.',
-      ),
-    ).toBeInTheDocument();
-    // Still inside the guard (it stays open on a busy refusal).
-    expect(screen.getByRole('button', { name: 'Republish' })).toBeInTheDocument();
+    const line = await screen.findByText(
+      'Publication of this project is already running — wait for it to finish, then try again.',
+    );
+    expect(line.closest('[role="dialog"]')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Republish' })).not.toBeInTheDocument();
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
     expect(toasts[0]).toHaveTextContent('Publication already running');
     expect(toasts[0]).not.toHaveTextContent('Republish failed');
+    err.mockRestore();
   });
 
-  it('a failed republish shows the error inside the guard and no toast (F4)', async () => {
+  it('a failed republish shows the error in My frames, the guard closed, and no toast (F4)', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     mockCommands(projectCard(), {
       list_project_own_frames: () => Promise.resolve([published(51)]),
       republish_collab_frames: () => Promise.reject(new Error('hub unreachable')),
@@ -830,8 +894,11 @@ describe('ProjectDetail republish guard', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Recalibrate and republish all/ }));
     fireEvent.change(screen.getByLabelText('Type 1 to confirm'), { target: { value: '1' } });
     fireEvent.click(screen.getByRole('button', { name: 'Republish' }));
-    expect(await screen.findByText('hub unreachable')).toBeInTheDocument();
+    const line = await screen.findByText('hub unreachable');
+    expect(line.closest('[role="dialog"]')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.queryAllByRole('status')).toHaveLength(0);
+    err.mockRestore();
   });
 });
 

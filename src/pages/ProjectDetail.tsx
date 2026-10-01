@@ -403,10 +403,6 @@ function ProjectPage({ id }: { id: string | undefined }) {
     reloadDetail: loadDetail,
     reloadOwn: loadOwn,
     onCard: (card) => setDetail((d) => (d ? { ...d, card } : d)),
-    closeConfirm: () => {
-      setPublishIds(null);
-      setRepublishReq(null);
-    },
   });
 
   const toCome = useMemo(
@@ -815,9 +811,14 @@ function ProjectPage({ id }: { id: string | undefined }) {
             bytes={publishBytes}
             needsApproval={needsApproval}
             coordinatorName={coordinatorName}
-            busy={publishing.publishBusy}
-            error={publishing.publishError}
-            onConfirm={() => void publishing.publish(publishIds)}
+            onConfirm={() => {
+              // Closed at once (final-review ruling): the run panel and its
+              // Cancel stay reachable for the whole run; a refusal shows in
+              // My frames.
+              const ids = publishIds;
+              setPublishIds(null);
+              void publishing.publish(ids);
+            }}
             onCancel={() => setPublishIds(null)}
           />
         )}
@@ -827,9 +828,11 @@ function ProjectPage({ id }: { id: string | undefined }) {
             count={guard.count}
             sourceBytes={guard.sourceBytes}
             all={guard.all}
-            busy={publishing.republishBusy}
-            error={publishing.republishError}
-            onConfirm={() => void publishing.republish(guard.ids)}
+            onConfirm={() => {
+              const ids = guard.ids;
+              setRepublishReq(null);
+              void publishing.republish(ids);
+            }}
             onCancel={() => setRepublishReq(null)}
           />
         )}

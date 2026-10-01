@@ -68,10 +68,6 @@ export interface PublishingOptions {
   /** The card `set_collab_publishing_device` answered with — applied as is,
    *  no reload needed. */
   onCard: (card: ProjectCard) => void;
-  /** Close whichever confirm (publish, republish guard) started the run —
-   *  on success, an outdated build or a publishing-device refusal. A busy or
-   *  failed run leaves it open with the error inside. */
-  closeConfirm: () => void;
 }
 
 export interface Publishing {
@@ -95,10 +91,8 @@ export interface Publishing {
 }
 
 /**
- * The project page's publish / republish / "Publish from this device"
- * orchestration, moved from `ProjectDetail` with the bodies unchanged: the
- * same notifications, dedupe keys and busy / outdated / publishing-device
- * handling. The one change: `publish_collab_frames` and
+ * The project page's publish / republish / calibrate / "Publish from this
+ * device" orchestration. `publish_collab_frames` and
  * `republish_collab_frames` carry `frameIds`. `republish` still accepts
  * `null` (the command's "all"), but the project page never passes it: its
  * guard sends the published, non-excluded ids it counted, because a null
@@ -107,10 +101,13 @@ export interface Publishing {
  *
  * F4: the app-root `useCollabNotifications` hook is the one place that turns
  * `collab-publish-finished` (the outcome of every STARTED run) into a toast.
- * `publish`/`republish`/`calibrate` do their own local UI work (close the
- * confirm, reload own frames + detail) and show a refusal returned before any
- * run starts inline (error line, `updateRequired`, the A6 box); only a busy
- * refusal also raises an info toast, since no run exists to finish.
+ * `publish`/`republish`/`calibrate` do their own local UI work (reload own
+ * frames + detail) and show a refusal returned before any run starts inline
+ * in My frames (error line, `updateRequired`, the A6 box); only a busy
+ * refusal also raises an info toast, since no run exists to finish. The
+ * shell closes its confirm the moment the user confirms (final-review
+ * ruling, spec §16.1), so the run panel and its Cancel stay reachable for
+ * the whole run — nothing here keeps a dialog open.
  */
 export function usePublishing(projectId: string | undefined, options: PublishingOptions): Publishing {
   const { notify } = useNotifications();
@@ -172,21 +169,20 @@ export function usePublishing(projectId: string | undefined, options: Publishing
     setPublishError(null);
     try {
       const res = await api.invoke<PublishResult>('publish_collab_frames', { projectId, frameIds });
-      opts.current.closeConfirm();
       setRefusedBy(heldForPublishingDevice(res));
       await opts.current.reloadOwn();
       await opts.current.reloadDetail();
     } catch (err) {
-      // S6 — a failed publish surfaces inline AND as a toast, never silently
-      // swallowed (the backend raises no event to notify from otherwise).
+      // F4 — a refusal before any run: logged, then shown inline in My frames
+      // (the error line, the `updateRequired` banner or the A6 box); only a
+      // busy refusal also toasts. A started run's failure is notified once,
+      // from `collab-publish-finished`.
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[projects] publish failed:', err);
       const refused = publishingDeviceRefusal(msg);
       if (isOutdated(msg)) {
-        opts.current.closeConfirm();
         setUpdateRequired(true);
       } else if (refused) {
-        opts.current.closeConfirm();
         showPublishingDeviceRefusal(refused);
       } else if (isPublishBusy(msg)) {
         setPublishError(PUBLISH_BUSY_INLINE);
@@ -214,7 +210,6 @@ export function usePublishing(projectId: string | undefined, options: Publishing
     setRepublishError(null);
     try {
       const res = await api.invoke<PublishResult>('republish_collab_frames', { projectId, frameIds });
-      opts.current.closeConfirm();
       setRefusedBy(heldForPublishingDevice(res));
       await opts.current.reloadOwn();
       await opts.current.reloadDetail();
@@ -223,10 +218,8 @@ export function usePublishing(projectId: string | undefined, options: Publishing
       console.error('[projects] republish failed:', err);
       const refused = publishingDeviceRefusal(msg);
       if (isOutdated(msg)) {
-        opts.current.closeConfirm();
         setUpdateRequired(true);
       } else if (refused) {
-        opts.current.closeConfirm();
         showPublishingDeviceRefusal(refused);
       } else if (isPublishBusy(msg)) {
         setRepublishError(PUBLISH_BUSY_INLINE);

@@ -1,5 +1,4 @@
 import { useState, type JSX } from 'react';
-import { Loader2 } from 'lucide-react';
 import { Button, DialogShell, TextInput } from '../../ui';
 import { formatSize } from '../format';
 
@@ -15,41 +14,38 @@ function frames(n: number): string {
  * The confirm every republish goes through (Task 16). It states how many
  * frames will be regenerated and the size of their source frames. For "all",
  * or for a selection above `REPUBLISH_TYPED_CONFIRM_ABOVE`, Republish stays
- * disabled until the exact count is typed. `busy` and `error` show inside the
- * dialog, as the old republish confirm did.
+ * disabled until the exact count is typed. It closes the moment the user
+ * confirms: the run panel in My frames shows the work (with Cancel), and a
+ * refusal returned before the run starts shows in My frames (final-review
+ * ruling, spec §16.1).
  */
 export default function RepublishGuardDialog({
   count,
   sourceBytes,
   all,
-  busy,
-  error,
   onConfirm,
   onCancel,
 }: {
   count: number;
   sourceBytes: number;
   all: boolean;
-  busy: boolean;
-  error: string | null;
   onConfirm: () => void;
   onCancel: () => void;
 }): JSX.Element {
   const [typed, setTyped] = useState('');
   const needsTyping = count > 0 && (all || count > REPUBLISH_TYPED_CONFIRM_ABOVE);
   const typedOk = !needsTyping || typed.trim() === String(count);
-  const canConfirm = count > 0 && typedOk && !busy;
+  const canConfirm = count > 0 && typedOk;
   const inputId = 'republish-guard-count';
 
   return (
     <DialogShell
       title={all ? 'Recalibrate and republish all' : `Republish ${frames(count)}`}
       onClose={onCancel}
-      busy={busy}
       footer={<>
-        <Button onClick={onCancel} disabled={busy} data-autofocus={count === 0 ? true : undefined}>Cancel</Button>
+        <Button onClick={onCancel} data-autofocus={count === 0 ? true : undefined}>Cancel</Button>
         <Button variant="primary" onClick={onConfirm} disabled={!canConfirm} data-autofocus={needsTyping || count === 0 ? undefined : true}>
-          {busy && <Loader2 size={12} className="animate-spin" />}Republish
+          Republish
         </Button>
       </>}
     >
@@ -73,7 +69,6 @@ export default function RepublishGuardDialog({
             inputMode="numeric"
             autoComplete="off"
             value={typed}
-            disabled={busy}
             data-autofocus
             onChange={(e) => setTyped(e.target.value)}
             onKeyDown={(e) => {
@@ -83,7 +78,6 @@ export default function RepublishGuardDialog({
           />
         </div>
       )}
-      {error && <p className="mt-1.5 text-[12.5px] text-error">{error}</p>}
     </DialogShell>
   );
 }

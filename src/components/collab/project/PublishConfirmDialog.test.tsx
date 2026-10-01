@@ -13,8 +13,6 @@ function renderDialog(o: Partial<Props> = {}) {
     bytes: 142_000_000,
     needsApproval: false,
     coordinatorName: 'Ada',
-    busy: false,
-    error: null,
     onConfirm: vi.fn(),
     onCancel: vi.fn(),
     ...o,
@@ -33,7 +31,7 @@ describe('PublishConfirmDialog', () => {
 
   it('states the count, the exact size and no approval line by default', () => {
     renderDialog();
-    expect(screen.getByText('3 passing frames will be calibrated and announced to the project.')).toBeInTheDocument();
+    expect(screen.getByText('3 calibrated frames will be announced to the project.')).toBeInTheDocument();
     expect(screen.getByText('Size 142 MB')).toBeInTheDocument();
     expect(screen.queryByText(/Estimated|≈/)).toBeNull();
     expect(screen.queryByText(/requires approval/)).toBeNull();
@@ -41,17 +39,12 @@ describe('PublishConfirmDialog', () => {
 
   it('singular frame wording', () => {
     renderDialog({ count: 1 });
-    expect(screen.getByText(/^1 passing frame will be/)).toBeInTheDocument();
+    expect(screen.getByText('1 calibrated frame will be announced to the project.')).toBeInTheDocument();
   });
 
   it('shows the approval line only when needsApproval', () => {
     renderDialog({ needsApproval: true });
     expect(screen.getByText('This project requires approval — your contribution goes to Ada for review.')).toBeInTheDocument();
-  });
-
-  it('shows the error', () => {
-    renderDialog({ error: 'hub said no' });
-    expect(screen.getByText('hub said no')).toBeInTheDocument();
   });
 
   it('Publish calls onConfirm, Cancel calls onCancel; Publish takes initial focus', () => {
@@ -64,11 +57,9 @@ describe('PublishConfirmDialog', () => {
     expect(props.onCancel).toHaveBeenCalled();
   });
 
-  it('busy locks Cancel, Publish and Escape', () => {
-    const props = renderDialog({ busy: true });
-    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+  it('Escape cancels', () => {
+    const props = renderDialog();
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(props.onCancel).not.toHaveBeenCalled();
+    expect(props.onCancel).toHaveBeenCalledTimes(1);
   });
 });
