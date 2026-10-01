@@ -64,8 +64,10 @@ export interface ToolBarProps {
   onBlackhole: () => void;
   onRestore: () => void;
   isBlackholing: boolean;
-  /** Project mode: these buttons replace Restore / Blackhole in the selection block. */
-  projectActions?: { id: string; label: string; tone: 'default' | 'warn' | 'danger'; busy: boolean; onClick: () => void }[];
+  /** Project mode: these buttons replace Restore / Blackhole in the selection block.
+   *  `disabled` is set on every action while any one runs — the running one may
+   *  be hidden by then (its targets left the eligible set). */
+  projectActions?: { id: string; label: string; tone: 'default' | 'warn' | 'danger'; busy: boolean; disabled: boolean; onClick: () => void }[];
 
   // Annotations
   showAnnotations: boolean;

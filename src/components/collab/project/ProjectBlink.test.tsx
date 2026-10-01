@@ -144,6 +144,19 @@ describe('ProjectBlink', () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
   });
 
+  it('an entry whose key matches no requested frame is dropped and logged as a contract break', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(api.invoke).mockResolvedValueOnce([entry('f1', 'calibrated'), entry('f99', 'raw')] as never);
+    render(tree({ table: 'ready', vms: [fromOwn(own({ frameId: 1 }))] }));
+    await waitFor(() => expect(blink).not.toBeNull());
+    expect(blink!.frames.map((f) => f.key)).toEqual(['f1']);
+    expect(spy).toHaveBeenCalledWith(
+      expect.stringContaining('match no requested frame'),
+      expect.objectContaining({ projectId: 'p1', keys: ['f99'] }),
+    );
+    spy.mockRestore();
+  });
+
   it('a failed resolve logs, notifies "Could not open Blink" and closes', async () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const onClose = vi.fn();

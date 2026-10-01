@@ -366,4 +366,25 @@ describe('LibraryTab — Blink', () => {
     }));
     await waitFor(() => expect(blink?.frames.map((f) => f.key)).toEqual(['u1']));
   });
+
+  it('a second Blink while the first resolve is in flight re-resolves the new selection', async () => {
+    const fallback = vi.mocked(api.invoke).getMockImplementation()!;
+    vi.mocked(api.invoke).mockImplementation((async (cmd: string, args?: unknown) => {
+      if (cmd === 'get_collab_blink_frames') return new Promise(() => {}); // still resolving
+      return fallback(cmd, args as never);
+    }) as never);
+    renderTab([
+      frame({ frameUuid: 'u1', fileName: 'a.fits', localState: 'held' }),
+      frame({ frameUuid: 'u3', fileName: 'c.fits', localState: 'held' }),
+    ]);
+    await screen.findByText('a.fits');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select a.fits' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Blink 1' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select a.fits' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select c.fits' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Blink 1' }));
+    const calls = vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_collab_blink_frames');
+    expect(calls).toHaveLength(2);
+    expect(calls[1][1]).toEqual({ projectId: 'proj-1', refs: [{ frameId: null, frameUuid: 'u3' }] });
+  });
 });

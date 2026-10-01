@@ -614,4 +614,21 @@ describe('MyFramesTab — Blink', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
     expect(screen.getByRole('button', { name: 'Blink 1 of 2' })).toBeInTheDocument();
   });
+
+  it('a second Blink from another segment while the first resolve is in flight re-resolves with that table', () => {
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
+      cmd === 'get_collab_blink_frames' ? new Promise(() => {}) : Promise.resolve(null)) as never);
+    const { rerender, props } = renderTab({
+      rows: [
+        own({ frameId: 1, fileName: 'a.fits', segment: 'ready' }),
+        own({ frameId: 2, fileName: 'b.fits', segment: 'review', calibratedPath: '/c/b.fits' }),
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Blink all 1' }));
+    rerender(tree({ ...props, segment: 'review' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Blink all 1' }));
+    const calls = vi.mocked(api.invoke).mock.calls.filter(([c]) => c === 'get_collab_blink_frames');
+    expect(calls).toHaveLength(2);
+    expect(calls[1][1]).toEqual({ projectId: 'proj-1', refs: [{ frameId: 2, frameUuid: null }] });
+  });
 });

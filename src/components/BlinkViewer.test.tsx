@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useState } from 'react';
@@ -104,15 +104,61 @@ describe('BlinkViewer — project mode', () => {
     expect(run).toHaveBeenCalledTimes(1);
   });
 
-  it('a fresh frames array with new badges keeps the position, the selection and the loaded images', async () => {
-    const { rerender } = renderBlink({ actions: [withhold()] });
+  it('while an action runs every project action is disabled — even one that turns eligible mid-run', async () => {
+    let release: () => void = () => {};
+    const run = vi.fn(() => new Promise<void>((r) => { release = r; }));
+    const releaseRun = vi.fn();
+    const releaseAction: BlinkAction = {
+      id: 'release', label: (n) => `Release (${n})`, eligible: (f) => f.badge === 'withheld', tone: 'default', run: releaseRun,
+    };
+    const blink = (frames: BlinkFrame[]) => (
+      <MemoryRouter><BlinkViewer frames={frames} onClose={vi.fn()} actions={[withhold(run), releaseAction]} /></MemoryRouter>
+    );
+    const { rerender } = render(blink([entry(1), entry(2)]));
+    fireEvent.keyDown(window, { key: 's' }); // selects c_1
+    fireEvent.click(await screen.findByRole('button', { name: "Don't publish (1)" }));
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+
+    // The caller's reload lands while the run is still going: c_1 is withheld,
+    // so Don't publish hides and Release appears.
+    rerender(blink([entry(1, { badge: 'withheld' }), entry(2)]));
+    const rel = await screen.findByRole('button', { name: 'Release (1)' });
+    expect(rel).toBeDisabled();
+    fireEvent.click(rel);
+    expect(releaseRun).not.toHaveBeenCalled();
+
+    release();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Release (1)' })).toBeEnabled());
+  });
+
+  it('a fresh frames array — reordered, new badges — keeps the position, the selection and the loaded images', async () => {
+    const ctx = (f: BlinkFrame) => `at ${f.file.filename}`;
+    const blink = (frames: BlinkFrame[]) => (
+      <MemoryRouter><BlinkViewer frames={frames} onClose={vi.fn()} actions={[withhold()]} contextLabel={ctx} /></MemoryRouter>
+    );
+    const { rerender } = render(blink([entry(1), entry(2)]));
     await waitFor(() => expect(invoked('get_collab_frame_image')).toHaveLength(2)); // both cached before measuring
-    fireEvent.keyDown(window, { key: 'ArrowDown' });
-    fireEvent.keyDown(window, { key: 's' });
+    fireEvent.keyDown(window, { key: 'ArrowDown' }); // current: c_2
+    fireEvent.keyDown(window, { key: 's' }); // selects c_2
+    expect(screen.getByText('at c_2.fits')).toBeInTheDocument();
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
     const loads = invoked('get_collab_frame_image').length;
-    rerender(<MemoryRouter><BlinkViewer frames={[entry(1), entry(2, { badge: 'withheld' })]} onClose={vi.fn()} actions={[withhold()]} /></MemoryRouter>);
-    expect(await screen.findAllByText('withheld')).not.toHaveLength(0);
-    expect(screen.queryByRole('button', { name: /Don't publish/ })).toBeNull(); // the selected entry is now withheld
+
+    // The caller's reload: the same keys in another order, c_1 newly withheld.
+    rerender(blink([entry(2), entry(1, { badge: 'withheld' })]));
+    // The badge lands on c_1's row, matched by key, not by index.
+    expect(await within(screen.getByTitle('c_1.fits')).findByText('withheld')).toBeInTheDocument();
+    expect(within(screen.getByTitle('c_2.fits')).queryByText('withheld')).toBeNull();
+    expect(screen.getByText('at c_2.fits')).toBeInTheDocument(); // the strip still shows the current file
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
+    // The selection is still c_2 (eligible), not whatever now sits at its index.
+    expect(screen.getByRole('button', { name: "Don't publish (1)" })).toBeInTheDocument();
+
+    // Another reload: the selected entry itself is now withheld.
+    rerender(blink([entry(2, { badge: 'withheld' }), entry(1)]));
+    expect(await within(screen.getByTitle('c_2.fits')).findByText('withheld')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Don't publish/ })).toBeNull());
+    expect(screen.getByText('at c_2.fits')).toBeInTheDocument();
     expect(invoked('get_collab_frame_image').length).toBe(loads);
   });
 

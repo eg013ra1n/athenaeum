@@ -81,7 +81,10 @@ export default function MyFramesTab({
   const [linkOpen, setLinkOpen] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
   const [excluding, setExcluding] = useState<FrameVM[] | null>(null);
-  const [blinking, setBlinking] = useState<{ table: BlinkTable; vms: FrameVM[] } | null>(null);
+  // `open` counts the Blink clicks: `ProjectBlink` is keyed on it, so a click
+  // while the previous selection still resolves (from this or another segment)
+  // mounts a fresh one with the right table.
+  const [blinking, setBlinking] = useState<{ table: BlinkTable; vms: FrameVM[]; open: number } | null>(null);
   const [solveBusy, setSolveBusy] = useState(false);
   const [analyzeBusy, setAnalyzeBusy] = useState<Set<number>>(new Set());
   // `plate-solve-complete` is a global event — plate solving can be kicked
@@ -234,7 +237,7 @@ export default function MyFramesTab({
     id: 'blink',
     verb: 'Blink',
     eligible: (v) => blinkRef(v, table) !== null,
-    run: (t) => setBlinking({ table, vms: t }),
+    run: (t) => setBlinking((b) => ({ table, vms: t, open: (b?.open ?? 0) + 1 })),
   });
 
   const asTargets = (vs: FrameVM[]) => vs.map((v) => ({ frameId: v.frameId!, prepared: v.own?.calibratedPath != null }));
@@ -493,6 +496,7 @@ export default function MyFramesTab({
 
       {blinking && (
         <ProjectBlink
+          key={blinking.open}
           projectId={projectId}
           table={blinking.table}
           vms={blinking.vms}

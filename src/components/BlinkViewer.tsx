@@ -280,6 +280,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       label: a.label(eligible.length),
       tone: a.tone,
       busy: actionBusy === a.id,
+      disabled: actionBusy !== null,
       onClick: () => {
         if (actionBusyRef.current !== null) return;
         actionBusyRef.current = a.id;

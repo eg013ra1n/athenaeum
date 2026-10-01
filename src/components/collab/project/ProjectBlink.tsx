@@ -41,6 +41,12 @@ export default function ProjectBlink({ projectId, table, vms, lookup, canModerat
       .invoke<CollabBlinkEntry[]>('get_collab_blink_frames', { projectId, refs: picks.map((p) => p.ref) })
       .then((got) => {
         if (cancelled) return;
+        // Core keys every entry by the ref it answers (`frameUuid ?? f<frameId>`);
+        // one that matches no requested ref is a contract break — dropped, logged.
+        const unmatched = got.filter((e) => !byKey.has(e.key)).map((e) => e.key);
+        if (unmatched.length > 0) {
+          console.error('[projects] blink: entries match no requested frame', { projectId, keys: unmatched });
+        }
         const next = got.flatMap((e) => {
           const p = byKey.get(e.key);
           return p ? [{ e, ref: p.ref, vmKey: p.vmKey }] : [];

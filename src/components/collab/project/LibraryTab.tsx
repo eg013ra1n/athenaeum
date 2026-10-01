@@ -58,7 +58,9 @@ export default function LibraryTab({
   const [collabDir, setCollabDir] = useState<string | null | undefined>(undefined);
   const [exportOpen, setExportOpen] = useState(false);
   const [excluding, setExcluding] = useState<FrameVM[] | null>(null);
-  const [blinking, setBlinking] = useState<FrameVM[] | null>(null);
+  // `open` counts the Blink clicks: `ProjectBlink` is keyed on it, so a click
+  // while the previous selection still resolves mounts a fresh one.
+  const [blinking, setBlinking] = useState<{ vms: FrameVM[]; open: number } | null>(null);
   const [keepBusy, setKeepBusy] = useState(false);
   const [keepError, setKeepError] = useState<string | null>(null);
 
@@ -161,7 +163,7 @@ export default function LibraryTab({
       id: 'blink',
       verb: 'Blink',
       eligible: (v) => blinkRef(v, 'library') !== null,
-      run: (targets) => setBlinking(targets),
+      run: (targets) => setBlinking((b) => ({ vms: targets, open: (b?.open ?? 0) + 1 })),
     },
   ];
 
@@ -227,9 +229,10 @@ export default function LibraryTab({
 
       {blinking && (
         <ProjectBlink
+          key={blinking.open}
           projectId={projectId}
           table="library"
-          vms={blinking}
+          vms={blinking.vms}
           lookup={lookup}
           canModerate={canModerate}
           onClose={() => setBlinking(null)}

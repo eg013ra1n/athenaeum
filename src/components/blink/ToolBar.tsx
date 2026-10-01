@@ -185,7 +185,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
           <button
             key={a.id}
             onClick={a.onClick}
-            disabled={projectActions.some((p) => p.busy)}
+            disabled={a.disabled}
             className={`flex items-center gap-1 px-3 py-1.5 text-sm rounded transition-colors hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed ${PROJECT_ACTION_TONE[a.tone]}`}
           >
             {a.busy && <Loader2 size={16} className="animate-spin" />}
