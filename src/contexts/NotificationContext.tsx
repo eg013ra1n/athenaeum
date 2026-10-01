@@ -174,7 +174,9 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
 
   // Persist whenever history changes (captures the current dedupe set too —
   // `seen` only ever grows alongside a notification push or a clear).
+  const notificationsRef = useRef<Notification[]>(notifications);
   useEffect(() => {
+    notificationsRef.current = notifications;
     savePersisted(notifications, Array.from(seenRef.current));
   }, [notifications]);
 
@@ -187,7 +189,14 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
       input: NotifyInput & { dedupeKey?: string; occurredAt?: string },
     ) => {
       if (input.dedupeKey) {
-        if (seenRef.current.has(input.dedupeKey)) return;
+        if (seenRef.current.has(input.dedupeKey)) {
+          // A suppressed key stays recent so the cap never evicts a key that
+          // keeps firing: move it to the newest position and persist.
+          seenRef.current.delete(input.dedupeKey);
+          seenRef.current.add(input.dedupeKey);
+          savePersisted(notificationsRef.current, Array.from(seenRef.current));
+          return;
+        }
         seenRef.current.add(input.dedupeKey);
         if (seenRef.current.size > SEEN_CAP) {
           seenRef.current = new Set(
