@@ -61,3 +61,34 @@ notify({
 - Timestamps: `formatTimestamp` from `src/utils/dateFormatting.ts`
   (`YYYY-MM-DD HH:MM`). Don't re-implement.
 
+## Collab publishing and sync (2026-10-02)
+
+Spec `docs/superpowers/specs/2026-10-01-collab-publish-review-design.md` §5.4 and §16.1.
+`collab-published` is retired; a started publish-family run is notified in **one** place,
+`collab-publish-finished` in `src/hooks/useCollabNotifications.ts`, mounted once at the app root.
+`usePublishing` no longer notifies run outcomes (F4): it keeps its inline error line, the
+`updateRequired` banner, the A6 refusal box and the busy info toast for refusals returned by the
+command before a run starts.
+
+| Outcome of `collab-publish-finished` | Title | Link |
+| ---- | ---- | ---- |
+| `done`, nothing sent, calibrated > 0 (a calibrate run, or an `auto` run in Auto-calibrate mode, F8) | "Calibrated n frames in {title} — review them" (success; `hasErrors` when frames were held back) | `/projects/{id}?tab=mine&segment=review` |
+| `done`, announced + updated > 0 | "Published n frames in {title}" (detail: n new · m updated, plus held back) | `?tab=mine&segment=published` |
+| `done`, nothing sent or calibrated, held back > 0 | "Nothing new to publish in {title}" (warning) | `?tab=mine&segment=held` |
+| `done`, all counts zero | silent | none |
+| `cancelled` | "Stopped in {title}" (info, history only: `toast: false`) | `?tab=mine` |
+| `refused` | "{device} publishes {title}" for an A6 refusal (`collab_publishing_device:<name>`, F8), otherwise "Not published in {title}" with the error; toast only for a manual run, history only for an auto run | `?tab=mine` |
+| `failed` | "Publishing failed in {title}" + the error, `hasErrors` | `?tab=mine` |
+
+The `segment` URL parameter is handled like `tab` (applied, then removed from the URL).
+
+Other collab outcomes notified from the page, each after a `console.error` / `console.warn`:
+
+| Where | Title |
+| ---- | ---- |
+| Live pill, `CollabLiveStatus` (waits for `collab-project-synced`) | "Sync did not complete — {error}" when the hub refuses the project; "Sync did not complete — no answer from the hub" after the wait times out; "Sync now failed" when `collab_sync_now` itself errors |
+| `ProjectBlink` | "Could not open Blink" (the call failed); "Nothing to blink" (none of the selection is on this device) |
+| `useWithhold` (Don't publish / Release) | "Could not withhold the frames" / "Could not release the frames" |
+
+Toasts show titles only, so the failure reason is part of the Live pill's title.
+

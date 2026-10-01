@@ -270,3 +270,12 @@ shell) now composes six tabs under `src/components/collab/project/` — `GateTab
 - **Moderation** (smoke fixes, 2026-09-30) gates on `canModerate` (coordinator or `data.moderate`), not
   `coordinator` alone, and the same rule governs Exclude/Restore and the publish-confirm approval line. Below
   the pending queue, an Excluded-frames table lists every `accepted === false` frame with a batch Restore.
+- **Reviewed publishing, frontend (wave 2, 2026-10-02)** — spec `2026-10-01-collab-publish-review-design.md` §16.1.
+  Overview reads My contribution first, then the **Project settings card** (`ProjectSettingsCard`: publish
+  mode, auto-replicate, the publishing device and the last run). My frames gains the **To review** segment and
+  the **run panel** (`PublishRunPanel`), both fed by `useCollabPublishRun` (the `get_collab_publish_run`
+  snapshot on mount, then `collab-publish-progress` / `collab-publish-finished`, so a run already in progress
+  shows at once). Don't publish / Release are `useWithhold`. The Live pill waits for `collab-project-synced`
+  after **Sync now** (`syncedAt` restarts the age on each confirmation) and the page reloads on a synced change
+  (`syncToken`). **Project Blink** (`ProjectBlink`, from My frames and Library) mounts `BlinkViewer` in project
+  mode with caller-supplied actions: no Black Hole, and `Blink N of M` opens only the frames held on this device.

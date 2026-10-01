@@ -2119,6 +2119,22 @@ Test thread pressure (ruling R4): r2d2 pool reaper threads (up to 30 s) and the 
 
 Known gap: republishing an `own_missing` frame that regenerates identical bytes deletes the temp file and does not restore the landed file.
 
+### Collab publish review, wave 2 (frontend) — owner smoke — 2026-10-02
+
+Real-app list (spec §12) plus the visual pass; delete each line when it passes:
+
+1. A manual calibrate, review in Blink, Don't publish one, then publish.
+2. Auto-calibrate after a scan.
+3. Fully automatic.
+4. Cancel at each stage.
+5. Live click with a change made on another device.
+6. Blink as moderator and as member.
+7. A migrated project shows Manual.
+8. A side-by-side of the Overview, My frames and Blink against the canvas artboards, in a real window at 1440 px and at a phone-narrow width.
+9. Dark and light themes.
+
+Harness: `HARNESS_SCENARIO=review npm run ui:harness`, `/projects/p-m31?tab=mine` (command surface checked over HTTP; the page itself not eyeballed in a browser).
+
 ---
 
 ## Release notes owed at the next tag
@@ -2128,6 +2144,7 @@ the cache limit, the plate-solve gate controls, the master-deletion un-supersede
 scan-error reveal and **Check again** at v0.5.6; the **Lights + calibration sets** raw
 originals and the role-folder missing files at v0.6.0. Nothing is owed after v0.6.2.)
 
+- **Publishing now has a review step: Calibrate → review in Blink → Publish.** Auto-publish is off for every project (migrated to Manual); Auto-calibrate and Fully automatic are opt-in per project.
 - **Scanning: the master-verification step is visible and the content index
   yields.** A scan that ingests masters used to spend minutes under
   "Building duplicate cache…" with no progress — that time was the app

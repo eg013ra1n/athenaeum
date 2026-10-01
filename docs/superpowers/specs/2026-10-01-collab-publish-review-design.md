@@ -784,3 +784,36 @@ Final whole-branch review fixes:
 - W1: a withheld frame the member selected for Publish is reported in `heldBack` with "Withheld by you" (its prepared row and file still go).
 - Pre-seed re-stat: a prepared New frame's file is re-stat'd (`size_mtime_seen`) right before it is seeded; a changed or missing file is stale — row and non-external file dropped, counted in `stale`, never seeded or announced with the calibrate-time `xxh3`/size.
 - Blink: by `frameId`, a prepared file is served only when the frame is not withheld and its raw is not in the Black Hole (§4.1 steps 2–3, as My frames shows it); otherwise the frame resolves raw.
+
+## 16.1 Amendments (wave 2, frontend)
+
+Plan rulings:
+
+| # | Ruling |
+| ---- | ---- |
+| F1 | **Update** (published frames with `contributorState === "updatePending"`) runs `publish_collab_frames` with those ids directly, with no confirm. The frames are already in the project, and the run panel shows the work. |
+| F2 | **Don't publish** asks for confirmation only when the targets include prepared (To review) frames, because their calibrated files are deleted. From Ready it acts at once. |
+| F3 | The run panel's step strip is **monotonic per run**. An `auto` run re-entering `queued` / `calibrating` for its update step (a wave-1 leftover) never moves a finished step back. |
+| F4 | A refusal returned by a command before a run starts (busy; A6 from the cached binding; outdated hub) stays where it is today: inline line, `updateRequired` banner, A6 refusal box, busy info toast. Every outcome of a started run is notified **only** from `collab-publish-finished` (§5.4). `usePublishing` stops toasting run failures. |
+| F5 | The Live pill shows the newest of the card's `syncedAt` and every `collab-project-synced.syncedAt` it hears for its project, so the age restarts on each confirmation without a card re-read. |
+| F6 | Unlinking a set while a run is active returns the busy text from core. `LinkObjectDialog` shows "A publish run is in progress — try again when it ends." for that error. |
+| F7 | Blink's canvas height is measured from the real header (toolbar plus context strip) with a `ResizeObserver`, replacing the hard-coded `window.innerHeight - 48`. |
+| F8 | A run that calibrated frames and sent none (a calibrate run, or an `auto` run in Auto-calibrate mode) notifies "Calibrated n frames in {title} — review them" and links To review. The spec's "calibrate done" row covers both kinds: in Auto-calibrate, the review notice is the one sign that work was done. A `refused` outcome whose error is an A6 refusal (`collab_publishing_device:<name>`) reads "{device} publishes {title}", never the raw code. |
+| F9 | The run panel's step strip follows the run kind: calibrate = Queued · Calibrate; publish = Seed · Announce; republish and auto = Queued · Calibrate · Seed · Announce. `versions` lights Announce. A publish run that regenerates an update (`queued` / `calibrating`) shows no lit step, and its title carries the stage. |
+
+Contract notes and execution deviations:
+
+| # | Note |
+| ---- | ---- |
+| N1 | `BlinkFrame.imageRef.frame` (not `.ref`, W8); `contextLabel` has the signature `(f) => string`; `SegmentTiles` gained a `sub` line. |
+| N2 | Overview Published footer: "N accepted" counts `pubState === 'published' && accepted !== false`. `OwnFrameRow.accepted` is the exclusion flag and is true for pending rows too (core: "published && accepted"); accepted and pending partition the segment. |
+| N3 | Overview Held back footer groups per gate kind (`REASON_LABEL`), not per threshold rule; count ties break by `HELD_KIND_ORDER` (P1). An unset FILTER is labelled as the tables label it (empty), with no invented label. |
+| N4 | The My frames tab badge shows only the non-zero parts: "N ready", "M to review", or both joined by " · ". |
+| N5 | Project settings card: "Paused — collaboration is off" for live state `off` or `signedOut`; this device with no hub name reads just "This device"; the auto-replicate switch's accessible name is its On/Off label. |
+| N6 | Run wording lives in one module, `publishRunText.ts` (`STAGE_TITLE`, `MODE_LABEL`, `describeLastRun`), used by the settings card and the run panel. |
+| N7 | Don't publish and Release are one hook, `useWithhold`, shared by My frames and project Blink. |
+| N8 | The publish confirm shows the exact sum of `calibratedBytes` (fallback `byteSize`), no "≈ estimate"; sizes are decimal (`formatSize`). |
+| N9 | Live pill: "Syncing…" only while live or connecting; any other status (reconnecting, unreachable, outdated, signedOut) shows at once and the wait continues. The failure reason is in the notification title ("Sync did not complete — {error}" / "— no answer from the hub") because toasts show titles only. The pill reads `ProjectCard.syncedAt`, not `fetchedAt`. |
+| N10 | Blink: the snapshot of `frames` is taken only in project mode (`actions !== undefined`); Blink joins the overlay stack for every caller; its key guard skips text-taking inputs only (the toolbar's range slider keeps driving Blink), and an event a handler above already cancelled (`defaultPrevented`) is ignored, so Alt/⌘+←/→ no longer change speed (the app's global navigation cancels those chords). |
+| N11 | Project Blink: `ProjectBlink` mounts `BlinkViewer` in a body portal only after `get_collab_blink_frames` resolves (a fresh mount per open); entries are matched by core's key `frameUuid ?? f<frameId>`; actions read the CURRENT rows by key, so badges and eligibility follow a reload. |
+| N12 | Harness: the `review` scenario (48 calibrated frames, three withheld, a running calibrate at 12 of 48) is served through the `get_collab_publish_run` snapshot because the harness has no event channel. |

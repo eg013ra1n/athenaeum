@@ -53,7 +53,7 @@ export function buildFixtures(scenario = 'default') {
     pendingFrames: FRAMES.filter((f) => !f.own && f.pub === 'pending').length,
     projectStatus: 'active', targetName: 'M31', targetRaDeg: 10.6847, targetDecDeg: 41.2687, targetRadiusDeg: 1.5,
     membershipVersion: 8, linkedSets: 1, candidates: 0, publishable: FRAMES.filter((f) => f.own && f.seg === 'ready').length,
-    autoReplicate: true, autoPublish: true, fetchedAt: NOW,
+    autoReplicate: true, publishMode: 'manual', syncedAt: new Date(Date.now() - 8000).toISOString(), fetchedAt: NOW,
     publishingDevice: { deviceId: devId('you', 0), name: 'This Mac' }, publishingHere: true,
   };
   const detail = {
@@ -107,6 +107,7 @@ export function buildFixtures(scenario = 'default') {
     holdersOnline: f.pub ? others(f).filter(online).length : null, holdersTotal: f.pub ? others(f).length : null,
     localState: f.pub ? localStateOf(f) : null, publishedAt: f.publishedAt ?? null, lastError: null, rules: rulesOf(f),
     path: `/Volumes/Astro/M31/2026-autumn/${f.night}/LIGHT/${f.name}`, accepted: f.pub ? f.pub !== 'excluded' : null,
+    calibratedPath: null, calibratedBytes: null, preparedAt: null, withheld: false,
   });
   const med = (a) => { const s = [...a].sort((x, y) => x - y); const k = s.length >> 1; return s.length ? (s.length % 2 ? s[k] : (s[k - 1] + s[k]) / 2) : null; };
   const memberSummary = MEMBERS.map((m) => {
@@ -130,6 +131,21 @@ export function buildFixtures(scenario = 'default') {
     projectId: PID, device: devId(mid, 0), direction, bytesSession: bytes, rateBps: rate, etaSecs: 540, moving: true, completed,
     inFlight: items.map((f) => ({ frameUuid: uuid(f), fileName: f.name, size: f.size, done: Math.round((f.size * (f.progress || 40)) / 100) })),
   });
+  // `review`: 48 calibrated frames waiting for review, three the member withheld.
+  const reviewRows = () => {
+    const base = FRAMES.filter((f) => f.own).slice(0, 51).map(ownRow);
+    const prepared = Date.now() - 600000;
+    return base.map((r, i) => {
+      const fl = i % 2 ? 'OIII' : 'Hα';
+      const common = { ...r, filter: fl, exptimeSec: 300, pubState: null, publishedAt: null, contentVersion: null, accepted: null };
+      if (i < 48) {
+        return { ...common, segment: 'review', contributorState: 'notPublished', contributorReason: null, failures: [],
+          calibratedPath: `/collab/own/c_${r.fileName}`, calibratedBytes: 44 * 1024 * 1024, preparedAt: new Date(prepared + i * 1000).toISOString(), withheld: false };
+      }
+      return { ...common, segment: 'held', contributorState: 'notPublished', contributorReason: 'Withheld by you',
+        failures: [{ kind: 'withheld', text: 'Withheld by you' }], withheld: true };
+    });
+  };
   const ownPub = FRAMES.filter((f) => f.own && f.pub);
   const exchange = scenario === 'empty' ? { projects: [], names: [] } : {
     projects: [{
@@ -157,12 +173,13 @@ export function buildFixtures(scenario = 'default') {
     { id: 3, projectId: PID, projectTitle: card.title, startedAt: '2026-09-28T22:48:00Z', finishedAt: '2026-09-28T22:54:56Z', frames: 90, bytes: 7.9e9, failed: 0, sources: [{ device: devId('masha', 0), memberName: 'Masha', deviceName: 'Masha MacBook', bytes: 4.1e9 }, { device: devId('olga', 0), memberName: 'Olga', deviceName: 'olga-home', bytes: 3.8e9 }] },
     { id: 2, projectId: PID, projectTitle: card.title, startedAt: '2026-09-28T10:54:00Z', finishedAt: '2026-09-28T10:56:13Z', frames: 68, bytes: 4.1e9, failed: 2, sources: [{ device: devId('masha', 0), memberName: 'Masha', deviceName: 'Masha MacBook', bytes: 4.1e9 }] },
   ];
+  const zeroPublishResult = { announced: 0, updated: 0, state: null, heldBack: [], unchanged: 0, calibrated: 0, stale: 0 };
   const handlers = {
     list_collab_projects: () => [card],
     refresh_collab_projects: () => [card],
     get_collab_project_detail: () => detail,
     list_collab_frames: () => inProject.map(frameView),
-    list_project_own_frames: () => FRAMES.filter((f) => f.own).map(ownRow),
+    list_project_own_frames: () => (scenario === 'review' ? reviewRows() : FRAMES.filter((f) => f.own).map(ownRow)),
     get_collab_member_summary: () => memberSummary,
     get_collab_exchange: () => exchange,
     list_collab_moderation: () => moderation,
@@ -180,6 +197,16 @@ export function buildFixtures(scenario = 'default') {
     get_compute_queue: () => [],
     get_scan_roots: () => [],
     initialize_database: () => null,
+    get_collab_publish_run: () => (scenario === 'review'
+      ? { running: { kind: 'calibrate', trigger: 'manual', mode: null, stage: 'calibrating', current: 12, total: 48, currentFile: 'M42_Ha_300s_0012.fits', publishRunId: 'h1', projectId: PID, startedAt: new Date(Date.now() - 134000).toISOString() }, last: null }
+      : { running: null, last: null }),
+    cancel_collab_publish: () => null,
+    calibrate_collab_frames: () => zeroPublishResult,
+    publish_collab_frames: () => zeroPublishResult,
+    set_collab_frames_withheld: (args) => args.frameIds.length,
+    set_project_publish_mode: () => null,
+    get_collab_blink_frames: () => [],
+    get_collab_frame_image: () => null,
     get_setting: (args) => args.defaultValue ?? null,
   };
   return { handlers, counts: { frames: FRAMES.length, members: MEMBERS.length } };
