@@ -93,6 +93,14 @@ function newer(a: string | null, b: string | null): string | null {
   return pb > pa ? b : a;
 }
 
+/** The click's confirmation: an ok report stamped after the newest server
+ *  stamp known at the click; with none known (or none readable), any stamped
+ *  report. Server stamps only — never this machine's clock. */
+function newerThan(stamp: string, last: string | null): boolean {
+  const known = last ? parseSyncedAt(last) : NaN;
+  return !Number.isFinite(known) || parseSyncedAt(stamp) > known;
+}
+
 /** Whole units, rounded down: "N s" under 60 s, "N m" under 60 min, "N h"
  *  under 48 h, else "N d". */
 function formatAge(secs: number): string {
@@ -153,7 +161,11 @@ export default function CollabLiveStatus({
   // An event that arrived before the initial read resolves is newer: keep it.
   const gotEvent = useRef(false);
   const [heard, setHeard] = useState<string | null>(null);
-  const wait = useRef<{ since: number; timer: ReturnType<typeof setTimeout> } | null>(null);
+  /** A click's wait: `last` is the newest server stamp known at the click
+   *  (the card's or one heard since) — compared with server stamps only,
+   *  never with this machine's clock (a web browser may run ahead of the
+   *  server). */
+  const wait = useRef<{ last: string | null; timer: ReturnType<typeof setTimeout> } | null>(null);
   const onSyncedRef = useRef(onSynced);
   onSyncedRef.current = onSynced;
 
@@ -212,7 +224,9 @@ export default function CollabLiveStatus({
     setSyncing(false);
   };
 
-  // Spec §6.4: the click's confirmation is this project's next report.
+  // Spec §6.4 (+ §16.1): the click's confirmation is this project's first ok
+  // report stamped after the newest stamp known at the click; a not-ok
+  // report stops the wait at once.
   useEffect(() => {
     if (!projectId) return undefined;
     let cancelled = false;
@@ -233,7 +247,7 @@ export default function CollabLiveStatus({
             tone: 'warning',
             hasErrors: true,
           });
-        } else if (p.syncedAt && parseSyncedAt(p.syncedAt) >= w.since) {
+        } else if (p.syncedAt && newerThan(p.syncedAt, w.last)) {
           endWait();
           onSyncedRef.current?.();
         }
@@ -256,7 +270,7 @@ export default function CollabLiveStatus({
     if (projectId) {
       if (wait.current) clearTimeout(wait.current.timer);
       wait.current = {
-        since: Date.now(),
+        last: newer(syncedAt, heard),
         timer: setTimeout(() => {
           endWait();
           console.error('[collab] sync confirmation timed out', { projectId });

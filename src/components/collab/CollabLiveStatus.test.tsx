@@ -479,12 +479,53 @@ describe('CollabLiveStatus pill — waits for the hub (spec §6.4)', () => {
     err.mockRestore();
   });
 
-  it('an ok report stamped before the click does not end the wait', async () => {
-    renderWait({ projectId: 'p1', syncedAt: null });
-    fireEvent.click(await screen.findByRole('button', { name: /Live/ }));
+  it('an ok report not newer than the last known stamp does not end the wait; the first newer one does', async () => {
+    const onSynced = vi.fn();
+    const last = new Date(Date.now() - 50_000).toISOString();
+    renderWait({ projectId: 'p1', syncedAt: last, onSynced });
+    fireEvent.click(await screen.findByRole('button', { name: /synced/ }));
     await waitFor(() => expect(handlers.has('collab-project-synced')).toBe(true));
-    emitEv('collab-project-synced', synced({ syncedAt: new Date(Date.now() - 5_000).toISOString(), changed: true }));
+    emitEv('collab-project-synced', synced({ syncedAt: last, changed: true })); // the same stamp
+    emitEv('collab-project-synced', synced({ syncedAt: new Date(Date.now() - 60_000).toISOString() })); // older
     expect(screen.getByText('Syncing…')).toBeInTheDocument();
+    expect(onSynced).not.toHaveBeenCalled();
+    // Newer than the last known stamp — server stamps only, whatever the
+    // browser clock reads (this one is 40 s before the click).
+    emitEv('collab-project-synced', synced({ syncedAt: new Date(Date.now() - 40_000).toISOString() }));
+    await waitFor(() => expect(screen.queryByText('Syncing…')).toBeNull());
+    expect(onSynced).toHaveBeenCalledTimes(1);
+  });
+
+  it('the last known stamp includes a report heard before the click', async () => {
+    const onSynced = vi.fn();
+    renderWait({ projectId: 'p1', syncedAt: new Date(Date.now() - 50_000).toISOString(), onSynced });
+    await waitFor(() => expect(handlers.has('collab-project-synced')).toBe(true));
+    const heard = new Date(Date.now() - 10_000).toISOString();
+    emitEv('collab-project-synced', synced({ syncedAt: heard }));
+    fireEvent.click(await screen.findByRole('button', { name: /synced/ }));
+    emitEv('collab-project-synced', synced({ syncedAt: heard }));
+    expect(screen.getByText('Syncing…')).toBeInTheDocument();
+    emitEv('collab-project-synced', synced({ syncedAt: new Date(Date.now() - 9_000).toISOString() }));
+    await waitFor(() => expect(onSynced).toHaveBeenCalledTimes(1));
+  });
+
+  it('a browser clock ahead of the server: a newer server stamp still ends the wait', async () => {
+    const realNow = Date.now.bind(Date);
+    const ahead = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 5 * 60_000);
+    try {
+      const onSynced = vi.fn();
+      renderWait({ projectId: 'p1', syncedAt: new Date(realNow() - 50_000).toISOString(), onSynced });
+      fireEvent.click(await screen.findByRole('button', { name: /synced/ }));
+      expect(await screen.findByText('Syncing…')).toBeInTheDocument();
+      await waitFor(() => expect(handlers.has('collab-project-synced')).toBe(true));
+      // The server's stamp is newer than the last one it sent, yet five
+      // minutes behind this browser's clock.
+      emitEv('collab-project-synced', synced({ syncedAt: new Date(realNow()).toISOString() }));
+      await waitFor(() => expect(screen.queryByText('Syncing…')).toBeNull());
+      expect(onSynced).toHaveBeenCalledTimes(1);
+    } finally {
+      ahead.mockRestore();
+    }
   });
 
   it('thirty seconds without a report stop the pill and say there was no answer', async () => {
