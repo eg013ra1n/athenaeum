@@ -3221,6 +3221,22 @@ fn is_own_dir_landing(path: &Path, own_dir: &Path) -> bool {
     path.parent() == Some(own_dir)
 }
 
+/// Where a generated adoption lands (P6, pass 2): its recorded own-dir
+/// landing, else `<own>/<fileName>` when it has none; `None` when its
+/// recorded landing is not this publisher's — pass 3 picks a fresh name.
+fn adopt_landing(
+    row: &crate::db::collab_frames::LocalFrameRow,
+    own_dir: &Path,
+) -> Option<std::path::PathBuf> {
+    match &row.landed_path {
+        Some(p) if is_own_dir_landing(Path::new(p), own_dir) && !was_external_recipe(row) => {
+            Some(std::path::PathBuf::from(p))
+        }
+        Some(_) => None,
+        None => Some(own_dir.join(&row.file_name)),
+    }
+}
+
 /// Belt-and-braces alongside [`is_own_dir_landing`] (fix round 2): a row
 /// whose stored recipe is external-shaped is never trusted as a generation
 /// target either, independent of where its `landed_path` happens to sit —
@@ -4756,6 +4772,14 @@ async fn run_publish(
     // account, node and store checks (section 2): a refused run never
     // touches disk.
     let mut stale_ids: Vec<i64> = Vec::new();
+    // Plan W3: prepared rows of frames withheld before this Publish run —
+    // dropped with the stale ones (never an attested original), not counted
+    // as stale.
+    let mut withheld_prepared: Vec<i64> = Vec::new();
+    // P6: the prepared row of an adopt-class frame. The frame is published
+    // (adopted), so the row is consumed — and its file may be the very
+    // landing the adoption writes to.
+    let mut adopt_prepared: HashMap<i64, crate::db::collab_prepare::PreparedRow> = HashMap::new();
     // Publish scope (spec §4.3): the prepared row behind each New candidate
     // — its reviewed file is what is seeded and announced, never regenerated.
     let mut from_prepared: HashMap<i64, crate::db::collab_prepare::PreparedRow> = HashMap::new();
@@ -4763,13 +4787,8 @@ async fn run_publish(
         let db = db(ctx)?;
         let conn = db.conn();
         let ids: Vec<i64> = gated.iter().map(|(_, row)| row.frame_id).collect();
-        // The section 4.1 local facts: Calibrate and Publish read them;
-        // Republish takes published (and adopt-class) frames only.
-        let mut local = if matches!(scope, RunScope::Republish { .. }) {
-            None
-        } else {
-            Some(ProjectLocal::load(&conn, project_id, &ids)?)
-        };
+        // The section 4.1 local facts.
+        let mut local = ProjectLocal::load(&conn, project_id, &ids)?;
         let own_by_src = frames_db::own_by_source_frame(&conn, project_id).map_err(|e| {
             tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
             internal(e)
@@ -4788,95 +4807,94 @@ async fn run_publish(
                 }
                 continue;
             }
-            match (scope, local.as_mut()) {
-                (RunScope::Calibrate { .. }, Some(local)) => {
+            let fid = row.frame_id;
+            match scope {
+                RunScope::Calibrate { .. } => {
                     // Spec §4.3: only Ready frames are calibrated — never one
                     // already published, withheld, black-holed or prepared
                     // and still current.
-                    if own_by_src.contains_key(&row.frame_id)
-                        || local.withheld.contains(&row.frame_id)
-                        || local.black_holed.contains(&row.frame_id)
+                    if own_by_src.contains_key(&fid)
+                        || local.withheld.contains(&fid)
+                        || local.black_holed.contains(&fid)
                     {
                         continue;
                     }
-                    if let Some(p) = local.prepared.get(&row.frame_id) {
+                    if let Some(p) = local.prepared.get(&fid) {
                         if prepared_is_current(&conn, p, id.attested) {
                             continue;
                         }
-                        stale_ids.push(row.frame_id);
+                        stale_ids.push(fid);
                     }
                 }
-                (RunScope::Publish { include_new, .. }, Some(local))
-                    if !own_by_src.contains_key(&row.frame_id) =>
+                RunScope::Publish { .. } | RunScope::Republish { .. }
+                    if !own_by_src.contains_key(&fid) =>
                 {
                     // P6: a frame the hub already lists as mine with no
                     // local binding (a replaced device's) is adopted as an
                     // update, never reviewed — whatever its prepared state.
-                    let adopt_class = match is_adopt_class(&conn, project_id, &id.uuid) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            tracing::error!(project_id, frame_id = row.frame_id, error = %format!("{e:#}"), "publish: read frame row failed");
-                            held_back.push(held(
-                                row.frame_id,
-                                &row.filename,
-                                format!("cannot read the frame's project row: {e:#}"),
-                            ));
-                            continue;
-                        }
-                    };
-                    if !adopt_class {
-                        // Spec §4.3: a New frame is published only from its
-                        // prepared (calibrated and reviewed) file.
-                        if local.withheld.contains(&row.frame_id)
-                            || local.black_holed.contains(&row.frame_id)
-                        {
-                            continue;
-                        }
-                        match local.prepared.remove(&row.frame_id) {
-                            Some(p) if prepared_is_current(&conn, &p, id.attested) => {
-                                if !include_new {
-                                    continue;
-                                }
-                                from_prepared.insert(row.frame_id, p);
+                    match is_adopt_class(&conn, project_id, &id.uuid) {
+                        Ok(true) => {
+                            if let Some(p) = local.prepared.remove(&fid) {
+                                adopt_prepared.insert(fid, p);
                             }
-                            Some(_) => {
-                                stale_ids.push(row.frame_id);
-                                continue;
-                            }
-                            None => {
+                        }
+                        Ok(false) => {
+                            let RunScope::Publish { include_new, .. } = scope else {
+                                // Ruling R5 (spec P2, P4): Republish never
+                                // produces a New frame — a frame with no own
+                                // row reaches the hub only through Calibrate
+                                // → review → Publish, and never withheld.
                                 if only.is_some() {
                                     held_back.push(held(
-                                        row.frame_id,
+                                        fid,
                                         &row.filename,
-                                        "not calibrated yet — calibrate it first".into(),
+                                        "not published yet — calibrate and publish it first".into(),
                                     ));
                                 }
                                 continue;
+                            };
+                            // Spec §4.3: a New frame is published only from
+                            // its prepared (calibrated and reviewed) file.
+                            if local.withheld.contains(&fid) {
+                                // P4 / plan W3: never announced; its
+                                // prepared row and file go.
+                                if local.prepared.contains_key(&fid) {
+                                    withheld_prepared.push(fid);
+                                }
+                                continue;
                             }
-                        }
-                    }
-                }
-                // Ruling R5 (spec P2, P4): Republish never produces a New
-                // frame — a frame with no own row reaches the hub only
-                // through Calibrate → review → Publish, and never while
-                // withheld. Adopt-class frames stay (P6).
-                (RunScope::Republish { .. }, _) if !own_by_src.contains_key(&row.frame_id) => {
-                    match is_adopt_class(&conn, project_id, &id.uuid) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if only.is_some() {
-                                held_back.push(held(
-                                    row.frame_id,
-                                    &row.filename,
-                                    "not published yet — calibrate and publish it first".into(),
-                                ));
+                            if local.black_holed.contains(&fid) {
+                                // Spec §4.4: skipped; a prepared row stays
+                                // (a restore brings the frame back to Review).
+                                continue;
                             }
-                            continue;
+                            match local.prepared.remove(&fid) {
+                                Some(p) if prepared_is_current(&conn, &p, id.attested) => {
+                                    if !include_new {
+                                        continue;
+                                    }
+                                    from_prepared.insert(fid, p);
+                                }
+                                Some(_) => {
+                                    stale_ids.push(fid);
+                                    continue;
+                                }
+                                None => {
+                                    if only.is_some() {
+                                        held_back.push(held(
+                                            fid,
+                                            &row.filename,
+                                            "not calibrated yet — calibrate it first".into(),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                            }
                         }
                         Err(e) => {
-                            tracing::error!(project_id, frame_id = row.frame_id, error = %format!("{e:#}"), "publish: read frame row failed");
+                            tracing::error!(project_id, frame_id = fid, error = %format!("{e:#}"), "publish: read frame row failed");
                             held_back.push(held(
-                                row.frame_id,
+                                fid,
                                 &row.filename,
                                 format!("cannot read the frame's project row: {e:#}"),
                             ));
@@ -4887,7 +4905,7 @@ async fn run_publish(
                 _ => {}
             }
             candidates.push(PublishCandidate {
-                frame_id: row.frame_id,
+                frame_id: fid,
                 filename: row.filename,
                 uuid: id.uuid,
                 // `publishable` implies a dictionary match (P3).
@@ -4896,7 +4914,7 @@ async fn run_publish(
             });
         }
     }
-    if candidates.is_empty() && stale_ids.is_empty() {
+    if candidates.is_empty() && stale_ids.is_empty() && withheld_prepared.is_empty() {
         tracing::info!(
             project_id,
             held_back = held_back.len(),
@@ -5014,6 +5032,23 @@ async fn run_publish(
         let conn = db.conn();
         drop_stale_prepared(&conn, project_id, &stale_ids)?
     };
+    // Plan W3 / P4: a frame withheld before the run loses its prepared row
+    // and file (never an attested original) — under the same condition.
+    if !withheld_prepared.is_empty() && bound_elsewhere.is_none() {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let gone = crate::db::collab_prepare::delete_prepared(&conn, project_id, &withheld_prepared)
+            .map_err(|e| {
+                tracing::error!(project_id, error = %format!("{e:#}"), "withheld frames' prepared rows not dropped");
+                internal(e)
+            })?;
+        crate::api::collab_prepare::remove_prepared_files(&gone);
+        tracing::info!(
+            project_id,
+            count = gone.len(),
+            "withheld frames' prepared rows dropped"
+        );
+    }
     if candidates.is_empty() {
         tracing::info!(
             project_id,
@@ -5053,6 +5088,10 @@ async fn run_publish(
             tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
             internal(e)
         })?;
+        // Every landing this run reserves: adoption and update targets
+        // (pass 2; a Calibrate's adoptions already in pass 1), then the New
+        // frames' names (pass 3).
+        let mut claimed: HashSet<std::path::PathBuf> = HashSet::new();
         // Pass 1: what each candidate is (new / update / adopt). F5: an
         // attested candidate is branched here, BEFORE any calibration
         // resolution — an attested light is never resolved or calibrated,
@@ -5163,7 +5202,15 @@ async fn run_publish(
             match (scope, &kind) {
                 // Adopt-class frames are updates, never reviewed (P6):
                 // Publish's, and never one of Calibrate's hold-backs.
-                (RunScope::Calibrate { .. }, PublishKind::Adopt(_)) => {
+                (RunScope::Calibrate { .. }, PublishKind::Adopt(row)) => {
+                    // Its landing stays reserved: a calibrate never picks
+                    // the name the adoption will write to (an attested
+                    // adoption lands on its original, never a picked name).
+                    if external.is_none() {
+                        if let Some(t) = adopt_landing(row, &own_dir) {
+                            claimed.insert(t);
+                        }
+                    }
                     tracing::debug!(
                         project_id,
                         frame_id = fid,
@@ -5226,7 +5273,6 @@ async fn run_publish(
         // kind — never the previous own row's `landed_path`, which for a
         // frame attested after an earlier generated publish would still name
         // the old calibrated file, not the original.
-        let mut claimed: HashSet<std::path::PathBuf> = HashSet::new();
         let mut taken_names = if account_id.is_empty() {
             HashSet::new()
         } else {
@@ -5235,6 +5281,24 @@ async fn run_publish(
                 internal(e)
             })?
         };
+        // Every prepared file of the project, by path: an adoption landing
+        // on one would write over another frame's reviewed file and leave
+        // its row naming a published frame's landing.
+        let prepared_at: HashMap<std::path::PathBuf, i64> =
+            crate::db::collab_prepare::list_prepared(&conn, project_id)
+                .map_err(|e| {
+                    tracing::error!(project_id, error = %format!("{e:#}"), "publish: reading the prepared frames failed");
+                    internal(e)
+                })?
+                .into_iter()
+                .filter_map(|r| {
+                    r.calibrated_path
+                        .map(|p| (std::path::PathBuf::from(p), r.source_frame_id))
+                })
+                .collect();
+        // Frames whose prepared name the run cannot use (stale — back to
+        // Ready, the next calibrate picks a free name).
+        let mut name_taken: Vec<i64> = Vec::new();
         let mut targeted: Vec<(
             PublishCandidate,
             PublishKind,
@@ -5276,21 +5340,24 @@ async fn run_publish(
                             continue;
                         }
                     },
-                    PublishKind::Adopt(row) => match &row.landed_path {
-                        Some(p)
-                            if is_own_dir_landing(Path::new(p), &own_dir)
-                                && !was_external_recipe(row) =>
-                        {
-                            Some(std::path::PathBuf::from(p))
+                    PublishKind::Adopt(row) => {
+                        let landing = adopt_landing(row, &own_dir);
+                        if landing.is_none() {
+                            tracing::info!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, path = row.landed_path.as_deref().unwrap_or(""), "publish: own frame's landed path is not this publisher's landing (un-attested or moved); picking a fresh one");
                         }
-                        Some(p) => {
-                            tracing::info!(project_id, frame_id = cand.frame_id, frame_uuid = %row.frame_uuid, path = %p, "publish: own frame's landed path is not this publisher's landing (un-attested or moved); picking a fresh one");
-                            None
-                        }
-                        None => Some(own_dir.join(&row.file_name)),
-                    },
+                        landing
+                    }
                 }
             };
+            if let (PublishKind::Adopt(_), Some(t)) = (&kind, &target) {
+                // Another frame's prepared file sits where this adoption
+                // lands: that frame goes back to Ready (row and file) before
+                // the adoption writes there.
+                if let Some(&other) = prepared_at.get(t).filter(|&&o| o != cand.frame_id) {
+                    tracing::info!(project_id, frame_id = other, path = %t.display(), "publish: a prepared file sits on an adoption's landing; back to ready");
+                    name_taken.push(other);
+                }
+            }
             if let Some(t) = &target {
                 claimed.insert(t.clone());
             }
@@ -5303,7 +5370,6 @@ async fn run_publish(
         // path, and a basename collision within this publisher is held back,
         // never renamed on disk. A prepared frame lands where its calibrate
         // wrote it (spec §4.3) — its name was picked then.
-        let mut name_taken: Vec<i64> = Vec::new();
         for (cand, kind, osc, target, external) in targeted {
             let fid = cand.frame_id;
             if let (PublishKind::New, Some(p)) = (&kind, from_prepared.get(&fid)) {
@@ -5526,9 +5592,6 @@ async fn run_publish(
                 recipe: None,
             });
         }
-        if !name_taken.is_empty() {
-            stale += drop_stale_prepared(&conn, project_id, &name_taken)?;
-        }
         if let Some(hook) = after_split {
             hook(&conn);
         }
@@ -5560,6 +5623,42 @@ async fn run_publish(
             return Err(ApiError::Conflict(
                 crate::account::client::publishing_device_msg(name.as_deref()),
             ));
+        }
+        // Past every refusal: the prepared rows the split could not use.
+        if !name_taken.is_empty() {
+            name_taken.sort_unstable();
+            name_taken.dedup();
+            stale += drop_stale_prepared(&conn, project_id, &name_taken)?;
+        }
+        // P6: an adopted frame is published — its prepared row is consumed,
+        // so no row ever names a published frame's landing. The file stays
+        // when it IS the adoption's landing, or when the adoption is not
+        // planned this run (where it would land is not decided); otherwise
+        // it goes (never an attested original).
+        if !adopt_prepared.is_empty() {
+            let ids: Vec<i64> = adopt_prepared.keys().copied().collect();
+            crate::db::collab_prepare::delete_prepared(&conn, project_id, &ids).map_err(|e| {
+                tracing::error!(project_id, error = %format!("{e:#}"), "publish: adopted frames' prepared rows not dropped");
+                internal(e)
+            })?;
+            let elsewhere: Vec<crate::db::collab_prepare::PreparedRow> = adopt_prepared
+                .into_values()
+                .filter(|p| {
+                    p.calibrated_path.as_deref().is_some_and(|path| {
+                        plans.iter().any(|pl| {
+                            pl.cand.frame_id == p.source_frame_id
+                                && matches!(pl.kind, PublishKind::Adopt(_))
+                                && pl.target != Path::new(path)
+                        })
+                    })
+                })
+                .collect();
+            crate::api::collab_prepare::remove_prepared_files(&elsewhere);
+            tracing::info!(
+                project_id,
+                count = ids.len(),
+                "publish: adopted frames' prepared rows consumed"
+            );
         }
     }
 
@@ -14523,6 +14622,10 @@ pub(crate) mod tests {
         #[tokio::test]
         async fn withheld_frames_are_not_run_hold_backs() {
             let fx = fixture(2).await;
+            // Both prepared, so the withheld one would otherwise go out.
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
             {
                 let conn = crate::api::db(&fx.ctx).unwrap().conn();
                 crate::db::collab_prepare::set_withheld(&conn, PID, &[fx.frame_ids[0]], true)
@@ -14532,6 +14635,7 @@ pub(crate) mod tests {
             let res = publish_collab_frames(&fx.ctx, PID, None, None)
                 .await
                 .unwrap();
+            assert_eq!(res.announced, 1, "{res:?}");
             assert!(res.held_back.is_empty(), "plan W1: {res:?}");
         }
 
@@ -14601,6 +14705,248 @@ pub(crate) mod tests {
             assert!(announce_bodies(&fx.server).await.is_empty());
             assert_eq!(project_tag_count(&fx).await, 0);
             assert_eq!(prepared(&fx).len(), 1, "the prepared frame stays prepared");
+        }
+
+        /// P4 / plan W3 (review fix round 1): a prepared frame withheld
+        /// before the run is never announced and loses its prepared row and
+        /// file; a prepared frame whose raw went to the Black Hole is skipped
+        /// and stays Held back with its prepared row. Neither is a run
+        /// hold-back (plan W1).
+        #[tokio::test]
+        async fn prepared_frames_withheld_or_black_holed_before_the_run_are_not_announced() {
+            let fx = fixture(3).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let path_of = |fid: i64| {
+                PathBuf::from(
+                    prepared(&fx)
+                        .into_iter()
+                        .find(|r| r.source_frame_id == fid)
+                        .unwrap()
+                        .calibrated_path
+                        .unwrap(),
+                )
+            };
+            let (withheld_path, black_holed_path) =
+                (path_of(fx.frame_ids[0]), path_of(fx.frame_ids[1]));
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                crate::db::collab_prepare::set_withheld(&conn, PID, &[fx.frame_ids[0]], true)
+                    .unwrap();
+                let file_id: i64 = conn
+                    .query_row(
+                        "SELECT file_id FROM frames WHERE id = ?1",
+                        [fx.frame_ids[1]],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                crate::db::add_to_black_hole(&conn, file_id, "light", "/x").unwrap();
+            }
+            mount_hub(&fx.server, "published").await;
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.announced, 1, "{res:?}");
+            assert!(res.held_back.is_empty(), "plan W1: {res:?}");
+            let announced: Vec<String> = announce_bodies(&fx.server)
+                .await
+                .iter()
+                .flat_map(|b| b["frames"].as_array().unwrap().clone())
+                .map(|f| f["frameUuid"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(announced, vec![fx.uuids[2].clone()]);
+            assert!(!withheld_path.exists(), "the withheld frame's file is gone");
+            assert!(
+                black_holed_path.exists(),
+                "the black-holed frame's file stays"
+            );
+            let left: Vec<i64> = prepared(&fx).iter().map(|r| r.source_frame_id).collect();
+            assert_eq!(
+                left,
+                vec![fx.frame_ids[1]],
+                "only the black-holed row stays"
+            );
+            let own = list_project_own_frames(&fx.ctx, PID).unwrap();
+            let seg = |fid: i64| {
+                let r = own.iter().find(|r| r.frame_id == fid).unwrap();
+                (
+                    r.segment.clone(),
+                    r.failures.first().map(|f| f.kind.clone()),
+                )
+            };
+            assert_eq!(
+                seg(fx.frame_ids[0]),
+                ("held".into(), Some("withheld".into()))
+            );
+            assert_eq!(
+                seg(fx.frame_ids[1]),
+                ("held".into(), Some("blackHole".into()))
+            );
+        }
+
+        /// Review fix round 1, item 1: an announced frame whose own row was
+        /// never recorded keeps its prepared row; once the manifest delivers
+        /// it as mine with no local binding, the publish adopts it at its
+        /// file — and the prepared row is consumed, never left naming a
+        /// published frame's landing.
+        #[tokio::test]
+        async fn an_adopted_frame_consumes_its_prepared_row_and_keeps_its_landing() {
+            let fx = fixture(1).await;
+            let hub = crate::collab::fake_hub::FakeHub::start().await;
+            let me = crate::api::account::own_device_id(&fx.ctx).unwrap();
+            hub.add_account("tok", "acc-Me Myself", "Me Myself", &me, None);
+            hub.add_project(
+                PID,
+                "m31",
+                &[("acc-Me Myself", "send_receive", false)],
+                false,
+            );
+            wire_hub(&fx.ctx, &hub.uri());
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let path = PathBuf::from(prepared(&fx)[0].calibrated_path.clone().unwrap());
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER fail_one BEFORE INSERT ON project_frames_local \
+                     WHEN NEW.frame_uuid = '{}' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                    fx.uuids[0]
+                ))
+                .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert!(
+                res.held_back[0].reasons[0].contains("recording it locally failed"),
+                "{res:?}"
+            );
+            assert!(hub.frame(PID, &fx.uuids[0]).is_some(), "the hub took it");
+            assert_eq!(prepared(&fx).len(), 1, "the failed record kept the row");
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute_batch("DROP TRIGGER fail_one;").unwrap();
+            }
+            crate::api::collab_exchange::sync_manifest(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let row = own_row(&fx, &fx.uuids[0]).expect("the manifest delivered it");
+            assert_eq!(row.origin, crate::db::collab_frames::FrameOrigin::Own);
+            assert_eq!(row.source_frame_id, None, "no local binding");
+
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.announced, 0, "{res:?}");
+            assert!(res.held_back.is_empty(), "{res:?}");
+            assert!(prepared(&fx).is_empty(), "the adoption consumed the row");
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(row.source_frame_id, Some(fx.frame_ids[0]), "bound");
+            assert_eq!(
+                row.landed_path.as_deref(),
+                Some(path.to_string_lossy().as_ref())
+            );
+            assert!(path.exists(), "the landed file stays");
+            assert_eq!(crate::package::xxh3_full_file(&path).unwrap(), row.xxh3);
+        }
+
+        /// Review fix round 1, item 2: a calibrate never picks the name an
+        /// adoption will land at — reserved in the calibrate's own split,
+        /// not only through this publisher's manifest names (here the row
+        /// carries none: its publisher account is unresolved).
+        #[tokio::test]
+        async fn a_calibrate_never_picks_an_adoption_landing() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            let first = [fx.frame_ids[0]];
+            calibrate_collab_frames(&fx.ctx, PID, Some(&first), None)
+                .await
+                .unwrap();
+            publish_collab_frames(&fx.ctx, PID, Some(&first), None)
+                .await
+                .unwrap();
+            {
+                // Frame 0: the hub knows it as mine under frame 1's natural
+                // name, with no local binding.
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute(
+                    "UPDATE project_frames_local SET source_frame_id = NULL, recipe_hash = NULL, \
+                     landed_path = NULL, on_disk = 0, file_name = 'c_L_0001.fits', \
+                     publisher_account_id = '' WHERE frame_uuid = ?1",
+                    [&fx.uuids[0]],
+                )
+                .unwrap();
+            }
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.calibrated, 1, "{res:?}");
+            let picked = PathBuf::from(prepared(&fx)[0].calibrated_path.clone().unwrap());
+            assert_eq!(picked.file_name().unwrap(), "c_L_0001_2.fits");
+
+            let res = publish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!((res.announced, res.unchanged), (1, 1), "{res:?}");
+            for uuid in &fx.uuids {
+                let row = own_row(&fx, uuid).unwrap();
+                let landed = PathBuf::from(row.landed_path.unwrap());
+                assert_eq!(crate::package::xxh3_full_file(&landed).unwrap(), row.xxh3);
+            }
+        }
+
+        /// Review fix round 1, item 2: a prepared file already sitting where
+        /// an adoption lands goes back to Ready (row and file) before the
+        /// adoption writes there — never a prepared row naming a published
+        /// frame's landing.
+        #[tokio::test]
+        async fn an_adoption_landing_on_a_prepared_file_drops_that_prepared_frame() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let first = [fx.frame_ids[0]];
+            publish_collab_frames(&fx.ctx, PID, Some(&first), None)
+                .await
+                .unwrap();
+            let landing = own_dir(&fx).join("c_L_0001.fits");
+            assert_eq!(
+                prepared(&fx)[0].calibrated_path.as_deref(),
+                Some(landing.to_string_lossy().as_ref()),
+                "frame 1 is prepared at its natural name"
+            );
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute(
+                    "UPDATE project_frames_local SET source_frame_id = NULL, recipe_hash = NULL, \
+                     landed_path = NULL, on_disk = 0, file_name = 'c_L_0001.fits' \
+                     WHERE frame_uuid = ?1",
+                    [&fx.uuids[0]],
+                )
+                .unwrap();
+            }
+            let res = publish_collab_frames(&fx.ctx, PID, Some(&first), None)
+                .await
+                .unwrap();
+            assert_eq!((res.stale, res.unchanged), (1, 1), "{res:?}");
+            assert!(prepared(&fx).is_empty(), "frame 1's prepared row is gone");
+            let row = own_row(&fx, &fx.uuids[0]).unwrap();
+            assert_eq!(
+                row.landed_path.as_deref(),
+                Some(landing.to_string_lossy().as_ref())
+            );
+            assert_eq!(crate::package::xxh3_full_file(&landing).unwrap(), row.xxh3);
+            let own = list_project_own_frames(&fx.ctx, PID).unwrap();
+            assert_eq!(
+                own.iter()
+                    .find(|r| r.frame_id == fx.frame_ids[1])
+                    .unwrap()
+                    .segment,
+                "ready"
+            );
         }
 
         /// Plan W4 (Task 8 carry): a cancel that lands after the last
