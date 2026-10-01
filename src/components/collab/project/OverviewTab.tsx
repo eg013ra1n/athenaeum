@@ -38,6 +38,9 @@ export interface OverviewTabProps {
   onOpenTab: (t: string) => void;
   /** This member receives (has the Library tab). */
   canReceive: boolean;
+  /** This device's live exchange is running (Needs attention words the
+   *  "missing here" row by it). */
+  liveRunning: boolean;
   /** Reload own frames after the filter mapping is saved. */
   onReloadOwn: () => void;
   onAttention: (target: NavTarget) => void;
@@ -69,6 +72,7 @@ export default function OverviewTab({
   onOpenSegment,
   onOpenTab,
   canReceive,
+  liveRunning,
   onReloadOwn,
   onAttention,
 }: OverviewTabProps): JSX.Element {
@@ -83,8 +87,8 @@ export default function OverviewTab({
   const heldCount = rows.filter((r) => r.segment === 'held').length;
 
   const items = useMemo(
-    () => deriveAttention({ own: own ?? [], library: library ?? [], members: members ?? [], canModerate, canReceive, pending, now: Date.now() }),
-    [own, library, members, canModerate, canReceive, pending],
+    () => deriveAttention({ own: own ?? [], library: library ?? [], members: members ?? [], canModerate, canReceive, liveRunning, pending, now: Date.now() }),
+    [own, library, members, canModerate, canReceive, liveRunning, pending],
   );
 
   // Integration: the union of every canonical filter with a goal or at

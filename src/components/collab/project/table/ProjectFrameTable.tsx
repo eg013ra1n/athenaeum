@@ -716,7 +716,7 @@ function FrameRow({
   return (
     <tr
       // Mockup order: the active and selected backgrounds win over hover.
-      className={`cursor-pointer ${active ? 'bg-accent/[0.16]' : selected ? 'bg-accent/[0.08]' : 'hover:bg-[rgba(67,76,94,0.55)]'}`}
+      className={`cursor-pointer ${active ? 'bg-accent/[0.16]' : selected ? 'bg-accent/[0.08]' : 'hover:bg-table-row-hover'}`}
       onClick={() => onOpen(row)}
     >
       <td className={TD} onClick={(e) => e.stopPropagation()}>

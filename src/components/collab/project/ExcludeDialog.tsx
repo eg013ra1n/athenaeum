@@ -87,7 +87,7 @@ export default function ExcludeDialog({
         rows={4}
         data-autofocus
         placeholder="Why are these frames excluded?"
-        className="w-full resize-none focus:border-accent focus:outline-none"
+        className="w-full resize-none"
       />
       <div className="mt-1 flex items-center justify-between text-[11px]">
         <span className={tooLong ? 'text-error' : 'text-content-faint'}>

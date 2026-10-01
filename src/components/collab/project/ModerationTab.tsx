@@ -332,7 +332,7 @@ function RejectDialog({
         rows={4}
         data-autofocus
         placeholder="Why is this frame rejected?"
-        className="w-full resize-none focus:border-accent focus:outline-none"
+        className="w-full resize-none"
       />
       <div className="mt-1 text-[11px]">
         <span className={tooLong ? 'text-error' : 'text-content-faint'}>

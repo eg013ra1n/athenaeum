@@ -212,6 +212,8 @@ describe('ExcludeDialog', () => {
     const dlg = screen.getByRole('dialog', { name: 'Exclude 1 frame from the project' });
     expect(dlg).toBeInTheDocument();
     expect(screen.getByRole('textbox')).toHaveFocus();
+    // The global focus-visible outline owns focus: no re-typed focus classes.
+    expect(screen.getByRole('textbox').className).not.toMatch(/focus:/);
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
     expect(dlg.className).toContain('rounded-lg');
     expect(dlg.className).toMatch(/w-\[440px\]/);

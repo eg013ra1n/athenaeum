@@ -39,7 +39,9 @@ export function DialogShell({ title, size = 'sm', onClose, busy = false, footer,
       }
       if (e.key !== 'Tab' || !ref.current || !isTopDialog(overlayId)) return;
       const items = [...ref.current.querySelectorAll<HTMLElement>(FOCUSABLE)];
-      if (items.length === 0) return;
+      // Busy disables every control (Close included): with nothing to cycle
+      // through, Tab stays on the dialog itself instead of leaving it.
+      if (items.length === 0) { e.preventDefault(); ref.current.focus(); return; }
       const i = items.indexOf(document.activeElement as HTMLElement);
       if (!e.shiftKey && (i === items.length - 1 || i === -1)) { e.preventDefault(); items[0].focus(); }
       else if (e.shiftKey && i <= 0) { e.preventDefault(); items[items.length - 1].focus(); }

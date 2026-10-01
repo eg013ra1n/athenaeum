@@ -5,6 +5,7 @@ import type { OwnFrameRow, ProjectFrameView } from '../../../../types/models';
 import { fromLibrary, fromOwn } from '../frames';
 import type { FrameVM } from '../frames';
 import ProjectFrameTable, { type ProjectFrameTableProps } from './ProjectFrameTable';
+import { ROW_H } from './model';
 
 function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
   return {
@@ -292,10 +293,33 @@ it('right-aligns numeric headers and truncates cells instead of wrapping (review
   expect(cell.className).toContain('text-ellipsis');
 });
 
+it('every row cell is the 28 px border-box box ROW_H assumes (windowing invariant, other side)', () => {
+  // `h-7` = 28 px, border-box, its 1 px `line-soft` separator inside it, no
+  // vertical padding, no wrap: the rendered pitch IS ROW_H. Change one side
+  // and this test or ROW_H's own test fails.
+  expect(ROW_H).toBe(28);
+  renderTable({ tableId: 'library', rows: rows(2) });
+  const frameRow = screen.getByText('Light_Ha_300s_0001.fits').closest('tr')!;
+  const groupRow = screen.getAllByRole('checkbox', { name: 'Select group' })[0].closest('tr')!;
+  for (const tr of [frameRow, groupRow]) {
+    for (const td of Array.from(tr.querySelectorAll('td'))) {
+      const cls = td.className.split(/\s+/);
+      expect(cls).toContain('h-7');
+      expect(cls).toContain('border-b');
+      expect(cls).toContain('whitespace-nowrap');
+      expect(cls.filter((c) => /^(p[ytb]|h)-/.test(c) && c !== 'h-7')).toEqual([]);
+    }
+  }
+});
+
 it('marks the active row', () => {
   const r = rows(2);
   renderTable({ tableId: 'library', rows: r, activeKey: r[1].key });
   expect(screen.getByText(r[1].fileName).closest('tr')!.className).toContain('bg-accent/[0.16]');
+  // An idle row hovers with the frame-table token (spec §5.1), no raw colour.
+  const idle = screen.getByText(r[0].fileName).closest('tr')!.className;
+  expect(idle).toContain('hover:bg-table-row-hover');
+  expect(idle).not.toContain('rgba(');
 });
 
 it('renders groupRowExtra next to Columns', () => {

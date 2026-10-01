@@ -66,8 +66,12 @@ const CAUSE: Record<string, { title: (n: number, rows: OwnFrameRow[]) => string;
   outsideTarget: { title: (n) => `${n} ${plural(n, 'frame is', 'frames are')} outside the target`, detail: null, action: 'Review' },
 };
 
-export function deriveAttention({ own, library, members, canModerate, canReceive, pending, now }: {
-  own: OwnFrameRow[]; library: ProjectFrameView[]; members: MemberSummary[]; canModerate: boolean; canReceive: boolean; pending: number; now: number;
+export function deriveAttention({ own, library, members, canModerate, canReceive, liveRunning, pending, now }: {
+  own: OwnFrameRow[]; library: ProjectFrameView[]; members: MemberSummary[]; canModerate: boolean; canReceive: boolean;
+  /** This device's live exchange is running. When it is not, holder
+   *  presence reads 0 for everyone, so the holders are not to blame. */
+  liveRunning: boolean;
+  pending: number; now: number;
 }): AttentionItem[] {
   const out: AttentionItem[] = [];
   // Counts equal what the button opens: a row is every held frame whose
@@ -100,11 +104,17 @@ export function deriveAttention({ own, library, members, canModerate, canReceive
   }
   const missing = !canReceive ? [] : library.filter((f) => !f.own && f.state === 'published' && f.localState === 'wanted' && f.holdersOnline === 0);
   if (missing.length > 0) {
-    const offline = [...new Set(missing.map((f) => f.publisherAccountId))]
-      .map((id) => members.find((m) => m.accountId === id))
-      .filter((m): m is MemberSummary => !!m && !m.online)
-      .map((m) => `${m.displayName} offline ${offlineFor(m.lastSeenAt, now)}`);
-    out.push({ key: 'missing', tone: 'err', count: missing.length, title: `${missing.length} ${plural(missing.length, 'frame', 'frames')} missing here because ${plural(missing.length, 'its', 'their')} holders are offline`, detail: offline.length ? `${offline.join(', ')}.` : null, action: 'Show', target: { kind: 'tab', tab: 'library', state: 'missing' } });
+    const frames = `${missing.length} ${plural(missing.length, 'frame', 'frames')} missing here`;
+    const target: AttentionTarget = { kind: 'tab', tab: 'library', state: 'missing' };
+    if (!liveRunning) {
+      out.push({ key: 'missing', tone: 'err', count: missing.length, title: frames, detail: 'The live exchange is off on this device — they download once it runs.', action: 'Show', target });
+    } else {
+      const offline = [...new Set(missing.map((f) => f.publisherAccountId))]
+        .map((id) => members.find((m) => m.accountId === id))
+        .filter((m): m is MemberSummary => !!m && !m.online)
+        .map((m) => `${m.displayName} offline ${offlineFor(m.lastSeenAt, now)}`);
+      out.push({ key: 'missing', tone: 'err', count: missing.length, title: `${frames} because ${plural(missing.length, 'its', 'their')} holders are offline`, detail: offline.length ? `${offline.join(', ')}.` : null, action: 'Show', target });
+    }
   }
   if (canModerate && pending > 0) {
     const pubs = [...new Set(library.filter((f) => !f.own && f.state === 'pending').map((f) => f.publisher))];

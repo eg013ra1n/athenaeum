@@ -76,7 +76,12 @@ export type VisibleRow<R> = { kind: 'group'; node: GroupNode<R> } | { kind: 'fra
 
 /** The frame table's row pitch: a 28 px border-box cell (`h-7`) whose 1 px
  *  `line-soft` separator sits inside it. The windowing math depends on it
- *  matching the rendered pitch exactly. */
+ *  matching the rendered pitch exactly. Ceiling: anything placed in a row,
+ *  group rows included, must stay ≤ 27 px tall (the ReasonGroupAction
+ *  buttons are 22 px, chips 18 px) — a taller item grows the row past 28 px
+ *  and the windowed rows drift off their slots. Pinned on both sides by
+ *  `ROW_H === 28` (model.test.ts) and the cell-class test in
+ *  ProjectFrameTable.test.tsx. */
 export const ROW_H = 28;
 
 /* ── Natural orders ─────────────────────────────────────────────────────── */

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { useState } from 'react';
 import ReasonGroupAction, { type ReasonGroupActionProps } from './ReasonGroupAction';
+import { SidePanel } from '../../ui';
 import { fromOwn } from './frames';
 import type { OwnFrameRow } from '../../../types/models';
 
@@ -166,5 +168,49 @@ describe('ReasonGroupAction', () => {
     expect(freeItem).not.toBeDisabled();
     fireEvent.click(freeItem);
     expect(onAnalyze).toHaveBeenCalledWith(10);
+  });
+
+  it('Escape on an open set menu over a docked side panel closes the menu alone (overlay stack)', () => {
+    function Harness() {
+      const [docked, setDocked] = useState(true);
+      return (
+        <>
+          {docked && <SidePanel title="t" label="Frame details" onClose={() => setDocked(false)}>kv</SidePanel>}
+          <ReasonGroupAction
+            {...baseProps({
+              kind: 'analyze',
+              rows: [fromOwn(own({ setId: 10, setName: 'M31' })), fromOwn(own({ setId: 11, setName: 'M42' }))],
+            })}
+          />
+        </>
+      );
+    }
+    render(<Harness />);
+    fireEvent.click(screen.getByRole('button', { name: 'Analyze' }));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(screen.getByRole('complementary', { name: 'Frame details' })).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('complementary', { name: 'Frame details' })).toBeNull();
+  });
+
+  it('an outside mousedown still closes the open menu', () => {
+    render(
+      <div>
+        <span>outside</span>
+        <ReasonGroupAction
+          {...baseProps({
+            kind: 'analyze',
+            rows: [fromOwn(own({ setId: 10, setName: 'M31' })), fromOwn(own({ setId: 11, setName: 'M42' }))],
+          })}
+        />
+      </div>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Analyze' }));
+    fireEvent.mouseDown(screen.getByText('outside'));
+    expect(screen.queryByRole('menu')).toBeNull();
   });
 });

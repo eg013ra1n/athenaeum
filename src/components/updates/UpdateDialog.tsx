@@ -10,6 +10,7 @@ import { formatTimestamp } from '../../utils/dateFormatting';
 import { useUpdates } from '../../contexts/UpdatesContext';
 import { useTransfers } from '../../contexts/TransfersContext';
 import type { ComputeQueueEntry } from '../../types/models';
+import { useOverlayEscape } from '../ui/useOverlayEscape';
 import { ReleaseNotes } from './ReleaseNotes';
 
 const isWindows = typeof navigator !== 'undefined' && /Win/i.test(navigator.platform);
@@ -48,15 +49,9 @@ export function UpdateDialog() {
   // Escape closes the dialog — the download itself is never cancelled (the
   // plugin offers no cancel), but the dialog must never trap the user for
   // its whole duration: reopening from About (or the bell link) restores
-  // live progress from the context.
-  useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [open, close]);
+  // live progress from the context. On the overlay stack while open, so one
+  // Escape closes this dialog alone.
+  useOverlayEscape(open, 'dialog', close);
 
   useEffect(() => {
     return () => {

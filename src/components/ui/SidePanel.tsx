@@ -13,6 +13,10 @@ export function PanelLayout({ panel, children }: { panel: ReactNode | null; chil
   );
 }
 
+/** Where Escape edits or cancels input rather than closing a panel. A checkbox
+ *  or radio is not text entry: Escape on one still closes the panel. */
+const EDITABLE = 'input:not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable]:not([contenteditable="false"])';
+
 /** Spec §6.1 — sticky, own scroll, height = the viewport below its top edge. */
 export function SidePanel({ title, label, onClose, children }: { title: ReactNode; label: string; onClose: () => void; children: ReactNode }) {
   const ref = useRef<HTMLElement>(null);
@@ -46,6 +50,10 @@ export function SidePanel({ title, label, onClose, children }: { title: ReactNod
     const overlayId = pushOverlay('panel');
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.defaultPrevented || !isTopOverlay(overlayId)) return;
+      // The panel is non-modal: an Escape typed into a field beside it (the
+      // table's search, say) belongs to that field, not to the docked card.
+      const t = e.target;
+      if (t instanceof Element && t.closest(EDITABLE) && !ref.current?.contains(t)) return;
       e.preventDefault();
       closeRef.current();
     };

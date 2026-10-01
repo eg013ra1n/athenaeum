@@ -38,9 +38,6 @@ export interface MyFramesTabProps {
   activeKey?: string | null;
 }
 
-/** The mockup's tile-row button box: 33 px tall, min 150, 7x14 padding, radius 6. */
-const ROW_BTN = 'h-[33px] min-w-[150px] !rounded-md !px-3.5 !py-[7px]';
-
 /**
  * My frames — the three Ready/Published/Held back tables of the redesigned
  * collab project page (Task 10, spec 2026-09-30 §"My frames"). Carries the
@@ -277,9 +274,9 @@ export default function MyFramesTab({
           />
         )}
         <span className="flex-1" />
-        <Button className={ROW_BTN} onClick={() => setLinkOpen(true)}>+ Link an object</Button>
+        <Button size="tile" onClick={() => setLinkOpen(true)}>+ Link an object</Button>
         <Button
-          className={ROW_BTN}
+          size="tile"
           onClick={() => onRequestRepublish(null)}
           disabled={!canRepublish || republishBusy}
           title="Regenerate every one of your published frames as a new content version"

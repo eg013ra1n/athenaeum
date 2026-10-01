@@ -68,6 +68,9 @@ export default {
           group: '#323946',
           'group-l1': '#353c4a',
           'group-hover': '#3a4251',
+          'row-hover': 'rgba(67, 76, 94, 0.55)',   // frame-table row hover (spec §5.1)
+          'plain-hover': 'rgba(67, 76, 94, 0.45)', // plain-table clickable row hover (§5.4)
+          'peer-hover': 'rgba(67, 76, 94, 0.30)',  // Exchange peer row hover (§12)
         },
         teal: { DEFAULT: '#8fbcbb' }, // nord7
       }

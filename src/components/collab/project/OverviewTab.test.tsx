@@ -113,6 +113,7 @@ const BASE_PROPS: OverviewTabProps = {
   onOpenSegment: vi.fn(),
   onOpenTab: vi.fn(),
   canReceive: true,
+  liveRunning: true,
   onReloadOwn: vi.fn(),
   onAttention: vi.fn(),
 };
@@ -251,10 +252,10 @@ describe('OverviewTab — needs attention', () => {
 
   it('while own frames are still loading, My contribution and Needs attention read Loading…, never zero counts or "Nothing needs your attention."', async () => {
     renderTab({ own: null, members: [], library: [], pending: 0, canModerate: false });
-    const myFrames = (await screen.findByRole('heading', { name: 'My contribution' })).parentElement!;
+    const myFrames = (await screen.findByRole('heading', { name: 'My contribution' })).closest('section')!;
     expect(within(myFrames).getByText('Loading…')).toBeInTheDocument();
     expect(within(myFrames).queryByRole('button')).not.toBeInTheDocument();
-    const attention = screen.getByRole('heading', { name: 'Needs attention' }).parentElement!;
+    const attention = screen.getByRole('heading', { name: 'Needs attention' }).closest('section')!;
     expect(within(attention).getByText('Loading…')).toBeInTheDocument();
     expect(screen.queryByText('Nothing needs your attention.')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /ready to publish/ })).not.toBeInTheDocument();
@@ -262,11 +263,11 @@ describe('OverviewTab — needs attention', () => {
 
   it('own frames that failed to load (ownError) show neither Loading… nor zero counts in My contribution and Needs attention', async () => {
     renderTab({ own: null, ownError: true, members: [], library: [], pending: 0, canModerate: false });
-    const myFrames = (await screen.findByRole('heading', { name: 'My contribution' })).parentElement!;
+    const myFrames = (await screen.findByRole('heading', { name: 'My contribution' })).closest('section')!;
     expect(within(myFrames).queryByText('Loading…')).not.toBeInTheDocument();
     expect(within(myFrames).getByText('Not available.')).toBeInTheDocument();
     expect(within(myFrames).queryByRole('button')).not.toBeInTheDocument();
-    const attention = screen.getByRole('heading', { name: 'Needs attention' }).parentElement!;
+    const attention = screen.getByRole('heading', { name: 'Needs attention' }).closest('section')!;
     expect(within(attention).queryByText('Loading…')).not.toBeInTheDocument();
     expect(within(attention).getByText('Not available.')).toBeInTheDocument();
     expect(screen.queryByText('Nothing needs your attention.')).not.toBeInTheDocument();
@@ -344,7 +345,9 @@ describe('OverviewTab — mockup cards', () => {
         { metricKey: 'not_trailed', op: 'reject_if', value: true },
       ],
     });
-    expect(screen.getByRole('heading', { name: /Integration toward goal published, accepted frames · by member/ })).toBeInTheDocument();
+    // The heading is named by its title alone; the subtitle sits beside it.
+    const integration = screen.getByRole('heading', { name: 'Integration toward goal' });
+    expect(integration.parentElement).toHaveTextContent('published, accepted frames · by member');
     expect(screen.getByRole('heading', { name: 'My contribution' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /136 ready to publish/ })).toBeInTheDocument();
     expect(screen.getByText(/8h 16m/)).toBeInTheDocument();

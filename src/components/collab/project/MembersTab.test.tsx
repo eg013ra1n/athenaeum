@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { formatRelative } from '../format';
 import MembersTab, { filterColumns } from './MembersTab';
 import type { MemberSummary } from '../../../types/models';
@@ -81,6 +81,13 @@ describe('MembersTab — mockup table', () => {
     expect(within(panel).getByText('Mac mini')).toBeInTheDocument();
     fireEvent.click(within(panel).getByRole('button', { name: 'Close' }));
     expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
+  });
+
+  it('a clickable member row hovers with the plain-table token, no raw colour', () => {
+    render(<MembersTab goals={null} members={[m('Kostya')]} error={false} />);
+    const row = screen.getByText('Kostya').closest('tr')!;
+    expect(row.className).toContain('hover:bg-table-plain-hover');
+    expect(row.className).not.toContain('rgba(');
   });
 
   it('no members → an empty state (review focus 4)', () => {
@@ -170,6 +177,23 @@ describe('MembersTab — mockup table', () => {
     // A member holding nothing reads a ghost dash, not "0 fr · 0 KB 0%" (like Σ).
     const bob = screen.getByText('Bob').closest('tr') as HTMLElement;
     expect(within(bob).queryByText(/0 fr/)).toBeNull();
+  });
+
+  it('Last seen ticks every 60 s while the tab stays open, and the tick stops on unmount', () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    vi.setSystemTime(new Date('2026-09-29T12:00:00Z'));
+    const { unmount } = render(
+      <MembersTab goals={null} members={[m('Bob', {}, { lastSeenAt: '2026-09-29T11:55:00Z' })]} error={false} />,
+    );
+    const bob = screen.getByText('Bob').closest('tr') as HTMLElement;
+    expect(within(bob).getByText('5 min ago')).toBeInTheDocument();
+    act(() => { vi.advanceTimersByTime(59_000); });
+    expect(within(bob).getByText('5 min ago')).toBeInTheDocument();
+    act(() => { vi.advanceTimersByTime(1_000); });
+    expect(within(bob).getByText('6 min ago')).toBeInTheDocument();
+    expect(vi.getTimerCount()).toBe(1);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('sorting: Published desc by default, a header click flips, Last seen puts online first', () => {

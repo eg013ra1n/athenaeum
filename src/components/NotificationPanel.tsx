@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { useNotifications, type NotificationKind } from '../contexts/NotificationContext';
 import { formatTimestamp } from '../utils/dateFormatting';
+import { useOverlayEscape } from './ui/useOverlayEscape';
 
 const KIND_ICON: Record<NotificationKind, LucideIcon> = {
   files: FolderPlus,
@@ -62,14 +63,11 @@ export function NotificationPanel() {
   const closeBtnRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    if (!panelOpen) return;
-    closeBtnRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closePanel();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [panelOpen, closePanel]);
+    if (panelOpen) closeBtnRef.current?.focus();
+  }, [panelOpen]);
+  // On the overlay stack only while open: Escape closes this panel alone,
+  // never a docked side panel or a dialog underneath as well.
+  useOverlayEscape(panelOpen, 'dialog', closePanel);
 
   return (
     <>

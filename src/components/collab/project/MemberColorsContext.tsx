@@ -1,8 +1,11 @@
 import { createContext, useCallback, useContext, useMemo, type ReactNode } from 'react';
-import { MEMBER_PALETTE, memberColor } from './memberColors';
+import { memberColor } from './memberColors';
 
-type Lookup = (accountIdOrName: string | null) => string;
-const Ctx = createContext<Lookup>(() => MEMBER_PALETTE[0]);
+/** A member's colour, or `undefined` for a key that names no known member
+ *  (null, an unnamed device, a departed member): those render neutral, never
+ *  in the palette's slot 0, which is this account's accent. */
+type Lookup = (accountIdOrName: string | null) => string | undefined;
+const Ctx = createContext<Lookup>(() => undefined);
 
 /** Spec §4.4 — one member → colour lookup for the whole project page. */
 export function MemberColorsProvider({ members, selfAccountId, children }: {
@@ -13,9 +16,10 @@ export function MemberColorsProvider({ members, selfAccountId, children }: {
   const byName = useMemo(() => new Map(members.map((m) => [m.displayName, m.accountId])), [members]);
   const lookup = useCallback<Lookup>(
     (key) => {
-      if (!key) return MEMBER_PALETTE[0];
-      const accountId = members.some((m) => m.accountId === key) ? key : byName.get(key);
-      return accountId ? memberColor(accountId, members, selfAccountId) : MEMBER_PALETTE[0];
+      if (!key) return undefined;
+      const known = key === selfAccountId || members.some((m) => m.accountId === key);
+      const accountId = known ? key : byName.get(key);
+      return accountId ? memberColor(accountId, members, selfAccountId) : undefined;
     },
     [members, byName, selfAccountId],
   );

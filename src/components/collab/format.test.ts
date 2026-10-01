@@ -59,6 +59,17 @@ describe('formatRelative', () => {
 });
 
 describe('mockup formatters', () => {
+  it('formatSize promotes to the next unit when rounding reaches 1000', () => {
+    expect(formatSize(999_499)).toBe('999 KB');
+    expect(formatSize(999_500)).toBe('1 MB');
+    expect(formatSize(999_499_999)).toBe('999 MB');
+    expect(formatSize(999_500_000)).toBe('1.0 GB');
+    expect(formatSize(999_940_000_000)).toBe('999.9 GB');
+    expect(formatSize(999_950_000_000)).toBe('1.00 TB');
+    expect(formatSize(1_000_000)).toBe('1 MB');
+    expect(formatSize(1_000_000_000)).toBe('1.0 GB');
+  });
+
   it('formatSize uses decimal units like the mockup', () => {
     expect(formatSize(121_920_698)).toBe('122 MB');
     expect(formatSize(4_900_000_000)).toBe('4.9 GB');

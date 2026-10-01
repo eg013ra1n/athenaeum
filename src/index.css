@@ -140,10 +140,10 @@ select:hover {
   border-color: #88c0d0;
 }
 
+/* No focus ring of its own: the base focus-visible outline (spec §14) is the
+   one focus style for selects. */
 select:focus {
-  outline: none;
   border-color: #88c0d0;
-  box-shadow: 0 0 0 2px rgba(136, 192, 208, 0.3);
 }
 
 select option {
@@ -163,6 +163,8 @@ select option {
     font-variant-numeric: inherit;
   }
 }
+/* Spec §14: no transitions. Animations stay — `animate-spin` is the only busy
+   cue on many buttons, so freezing it would hide that work is running. */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { transition: none !important; animation: none !important; }
+  *, *::before, *::after { transition: none !important; }
 }

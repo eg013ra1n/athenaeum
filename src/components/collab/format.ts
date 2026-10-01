@@ -53,10 +53,15 @@ export function formatRelative(iso: string, now: number): string {
  *  non-project callers (spec §15). */
 export function formatSize(n: number): string {
   if (!Number.isFinite(n) || n < 0) return '—';
-  if (n >= 1e12) return `${(n / 1e12).toFixed(2)} TB`;
-  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(0)} MB`;
-  return `${(n / 1e3).toFixed(0)} KB`;
+  // A value that ROUNDS to 1000 of a unit is shown in the next one
+  // ("1.0 GB", never "1000 MB").
+  const gb = (n / 1e9).toFixed(1);
+  if (n >= 1e12 || Number(gb) >= 1000) return `${(n / 1e12).toFixed(2)} TB`;
+  const mb = (n / 1e6).toFixed(0);
+  if (n >= 1e9 || Number(mb) >= 1000) return `${gb} GB`;
+  const kb = (n / 1e3).toFixed(0);
+  if (n >= 1e6 || Number(kb) >= 1000) return `${mb} MB`;
+  return `${kb} KB`;
 }
 
 /** The mockup's `fmtDur` — minutes zero-padded after hours ("3h 02m", "18m"). */

@@ -1,4 +1,4 @@
-import { useMemo, useState, type JSX } from 'react';
+import { useEffect, useMemo, useState, type JSX } from 'react';
 import { PanelLayout, EmptyState, FilterDot, MemberDot, StatusDot } from '../../ui';
 import { formatDurationPadded, formatRelative, formatSize } from '../format';
 import { filterOrder } from './table/model';
@@ -21,6 +21,8 @@ interface SortState {
 }
 
 const DEFAULT_SORT: SortState = { key: 'published', dir: -1 };
+/** "Last seen" re-reads the clock this often (its finest unit is minutes). */
+const LAST_SEEN_TICK_MS = 60_000;
 /** Columns that default to ascending on first click; every other column
  *  (numeric, or the special Last-seen ordering) defaults to descending —
  *  mirrors the design mockup's own `memberSort` click handler. */
@@ -100,6 +102,13 @@ export default function MembersTab({
   const colorOf = useMemberColor();
   const [sort, setSort] = useState<SortState>(DEFAULT_SORT);
   const [openId, setOpenId] = useState<string | null>(null);
+  // "Last seen" is relative to now: a display tick (not a poll) keeps
+  // "5 min ago" from freezing while the tab stays open.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), LAST_SEEN_TICK_MS);
+    return () => clearInterval(t);
+  }, []);
 
   const filters = useMemo(() => filterColumns(members ?? [], goals), [members, goals]);
 
@@ -189,7 +198,7 @@ export default function MembersTab({
                     <tr
                       key={m.accountId}
                       onClick={() => setOpenId(openId === m.accountId ? null : m.accountId)}
-                      className={`cursor-pointer hover:bg-[rgba(67,76,94,0.45)] ${
+                      className={`cursor-pointer hover:bg-table-plain-hover ${
                         openId === m.accountId ? 'bg-accent/[0.16]' : ''
                       }`}
                     >
@@ -256,7 +265,7 @@ export default function MembersTab({
                           <span className="text-success">now</span>
                         ) : (
                           <span className="text-content-faint">
-                            {m.lastSeenAt ? formatRelative(m.lastSeenAt, Date.now()) : 'never'}
+                            {m.lastSeenAt ? formatRelative(m.lastSeenAt, now) : 'never'}
                           </span>
                         )}
                       </td>

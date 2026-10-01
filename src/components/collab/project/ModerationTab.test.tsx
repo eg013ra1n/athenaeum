@@ -305,6 +305,8 @@ describe('ModerationTab — mockup layout', () => {
     const reason = screen.getByPlaceholderText('Why is this frame rejected?');
     expect(reason).toHaveAttribute('data-autofocus');
     expect(reason).toHaveFocus();
+    // The global focus-visible outline owns focus: no re-typed focus classes.
+    expect(reason.className).not.toMatch(/focus:/);
   });
 
   it('the trust control is the shared Checkbox', async () => {

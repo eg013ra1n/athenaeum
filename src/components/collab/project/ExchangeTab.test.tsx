@@ -140,6 +140,10 @@ describe('ExchangeTab — live rows', () => {
     renderTab();
 
     expect(await screen.findByText('↓ from devB1234')).toBeInTheDocument();
+    // No member behind the device: the neutral avatar, never this account's accent.
+    const avatar = screen.getByRole('button', { name: /from devB1234/ }).querySelector('span')!;
+    expect(avatar.className).toContain('bg-surface-hover');
+    expect(avatar.getAttribute('style')).toBeNull();
   });
 
   it('a contributor (canReceive=false) sees the role sentence and still the Sending card', async () => {
@@ -317,6 +321,9 @@ describe('ExchangeTab — mockup layout', () => {
     expect(row.className).toContain('grid-cols-[28px_minmax(140px,1.2fr)_minmax(160px,2fr)_90px_128px_70px]');
     // Own font size: the Transfers page inherits a larger one than the project page.
     expect(row.className).toContain('text-[13px]');
+    // Hover from the design token, no raw colour at the call site.
+    expect(row.className).toContain('hover:bg-table-peer-hover');
+    expect(row.className).not.toContain('rgba(');
     expect(within(row).getByText(/37 landed this session · 4\.8 GB/)).toBeInTheDocument();
     expect(within(row).getByText('ETA 9m')).toBeInTheDocument();
     // One more sample from a progress event gives the rates buffer 2 points.

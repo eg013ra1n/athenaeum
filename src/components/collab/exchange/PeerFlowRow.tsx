@@ -43,7 +43,7 @@ export function PeerFlowRow({
         type="button"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
-        className="grid w-full grid-cols-[28px_minmax(140px,1.2fr)_minmax(160px,2fr)_90px_128px_70px] items-center gap-2.5 border-t border-line px-1 py-[9px] text-left text-[13px] leading-[1.4] first:border-t-0 hover:bg-[rgba(67,76,94,0.3)] max-[640px]:grid-cols-[28px_1fr_80px]"
+        className="grid w-full grid-cols-[28px_minmax(140px,1.2fr)_minmax(160px,2fr)_90px_128px_70px] items-center gap-2.5 border-t border-line px-1 py-[9px] text-left text-[13px] leading-[1.4] first:border-t-0 hover:bg-table-peer-hover max-[640px]:grid-cols-[28px_1fr_80px]"
       >
         <span
           className={`grid h-[26px] w-[26px] place-items-center rounded-full text-[11px] font-bold ${color ? 'text-surface' : 'bg-surface-hover text-content'}`}

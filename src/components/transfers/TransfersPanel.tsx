@@ -8,6 +8,7 @@ import { plainTransferError, displayStateChip, displayStateSubline, formatBytes 
 import { formatRate } from '../collab/format';
 import { transportHealthView } from './transportHealth';
 import { formatTimestamp } from '../../utils/dateFormatting';
+import { useOverlayEscape } from '../ui/useOverlayEscape';
 import type {
   Direction,
   HistoryRow,
@@ -258,16 +259,13 @@ export function TransfersPanel() {
     };
   }, []);
 
-  // Escape closes the panel (mirrors NotificationPanel), focus the close button.
+  // Opening focuses the close button. Escape closes the panel (mirrors
+  // NotificationPanel) through the overlay stack, on it only while open, so
+  // it never also closes a docked side panel or a dialog underneath.
   useEffect(() => {
-    if (!open) return;
-    closeBtnRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closePanel();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [open, closePanel]);
+    if (open) closeBtnRef.current?.focus();
+  }, [open]);
+  useOverlayEscape(open, 'dialog', closePanel);
 
   // While open: 5s re-poll + refresh on `sync-finished`. Stable via a ref so the
   // Tauri listener is not re-subscribed on every keystroke (StrictMode-safe).

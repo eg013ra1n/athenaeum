@@ -5,6 +5,7 @@ import { api } from '../api';
 import { HistoryNav } from '../components/HistoryNav';
 import { useSessionState } from '../contexts/SessionStateContext';
 import { useCollabExchange } from '../contexts/CollabExchangeContext';
+import { useCollabLiveState } from '../hooks/useCollabLiveState';
 import { openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
@@ -123,6 +124,10 @@ export default function ProjectDetail() {
 function ProjectPage({ id }: { id: string | undefined }) {
   const { notify } = useNotifications();
   const { state: exchange } = useCollabExchange();
+  // Unknown (not read yet, or the read failed) counts as running: the page
+  // never claims the live exchange is off without being told so.
+  const liveState = useCollabLiveState();
+  const liveRunning = liveState === null || liveState === 'live';
   const [detail, setDetail] = useState<Detail | null>(null);
   const [missing, setMissing] = useState(false);
   const [own, setOwn] = useState<OwnFrameRow[] | null>(null);
@@ -643,6 +648,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 }}
                 onOpenTab={openTab}
                 canReceive={canReceive}
+                liveRunning={liveRunning}
                 onReloadOwn={() => void loadOwn()}
                 onAttention={openAttention}
               />

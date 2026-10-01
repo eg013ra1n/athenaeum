@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type JSX } from 'react';
 import { ChevronDown } from 'lucide-react';
 import type { FrameVM } from './frames';
+import { useOverlayEscape } from '../../ui/useOverlayEscape';
 
 export interface ReasonGroupActionProps {
   kind: string; // the Reason group's key (a BLOCKER_ORDER kind or '')
@@ -50,18 +51,16 @@ export default function ReasonGroupAction({
   // Escape or a click outside the open menu closes it — the ONE open menu at
   // a time `menuFor` tracks, so one ref (attached only to whichever
   // `setPicker` call is currently open) is enough (the retired blocker line's pattern).
+  // Escape goes through the overlay stack as a popover: over a docked side
+  // panel it closes the menu alone.
+  useOverlayEscape(menuFor !== null, 'popover', () => setMenuFor(null));
   useEffect(() => {
     if (!menuFor) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMenuFor(null);
-    };
     const onPointerDown = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuFor(null);
     };
-    document.addEventListener('keydown', onKeyDown);
     document.addEventListener('mousedown', onPointerDown);
     return () => {
-      document.removeEventListener('keydown', onKeyDown);
       document.removeEventListener('mousedown', onPointerDown);
     };
   }, [menuFor]);

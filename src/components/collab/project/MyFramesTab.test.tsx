@@ -158,6 +158,16 @@ describe('MyFramesTab — segments', () => {
     expect(screen.getByRole('button', { name: '+ Link an object' }).className).toContain('h-[33px]');
   });
 
+  it('both row buttons are the tile-size Button, with no !important overrides', () => {
+    renderTab({ rows: [] });
+    for (const name of ['+ Link an object', 'Recalibrate and republish all']) {
+      const cls = screen.getByRole('button', { name }).className.split(/\s+/);
+      expect(cls).toEqual(expect.arrayContaining(['h-[33px]', 'min-w-[150px]', 'rounded-md', 'px-3.5', 'py-[7px]', 'text-[12px]']));
+      expect(cls.filter((c) => c.startsWith('!'))).toEqual([]);
+      expect(cls).not.toContain('justify-center');
+    }
+  });
+
   it('the link dialog lists a linked set once, and Unlink sends linked:false', async () => {
     vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
       Promise.resolve(

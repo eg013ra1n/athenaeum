@@ -20,11 +20,25 @@ describe('ui primitives', () => {
     render(<Chip tone="err">missing</Chip>);
     expect(screen.getByText('missing').className).toContain('bg-error-muted');
   });
-  it('Card renders title, subtitle and action in one header', () => {
-    render(<Card title="Receiving" subtitle="43.4 MB/s" action={<button>x</button>}>body</Card>);
-    const h = screen.getByRole('heading', { name: /Receiving/ });
-    expect(h).toHaveTextContent('43.4 MB/s');
+  it('Card renders title, subtitle and action in one header row; the heading is named by the title alone', () => {
+    render(<Card title="Exchange now" subtitle="43.4 MB/s" action={<button>Open Exchange →</button>}>body</Card>);
+    const h = screen.getByRole('heading', { name: 'Exchange now' });
     expect(h.className).toContain('text-[13px]');
+    expect(h).not.toHaveTextContent('43.4 MB/s');
+    const row = h.parentElement!;
+    expect(row.className).toContain('flex');
+    expect(row).toHaveTextContent('43.4 MB/s');
+    expect(row).toContainElement(screen.getByRole('button', { name: 'Open Exchange →' }));
+  });
+  it('Card with a null title renders no empty heading but keeps its action', () => {
+    render(<Card title={null} action={<button>Open</button>}>body</Card>);
+    expect(screen.queryByRole('heading')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Open' })).toBeInTheDocument();
+  });
+  it('Card with no title, subtitle or action renders no header row', () => {
+    const { container } = render(<Card>body</Card>);
+    expect((container.firstChild as HTMLElement).children).toHaveLength(0);
+    expect(container.firstChild).toHaveTextContent('body');
   });
   it('KV renders a definition list with faint terms', () => {
     render(<KV items={[['Night', '2026-08-31 · Mon']]} />);
@@ -60,6 +74,18 @@ describe('ui primitives', () => {
     rerender(<Sparkline values={[1]} color="#88c0d0" />);
     expect(container.querySelector('polyline')).toBeNull();
   });
+  it('Sparkline drops non-finite samples instead of drawing NaN points', () => {
+    const { container, rerender } = render(<Sparkline values={[1, NaN, 3, Infinity, 2]} color="#88c0d0" />);
+    const pts = [...container.querySelectorAll('polyline')].map((p) => p.getAttribute('points') ?? '');
+    expect(pts).toHaveLength(2);
+    for (const p of pts) expect(p).not.toMatch(/NaN|Infinity/);
+    // Three finite samples → three points on the line, spread over the full width.
+    expect(pts[1].split(' ')).toHaveLength(3);
+    expect(pts[1].split(' ')[2].startsWith('120.0,')).toBe(true);
+    // Fewer than two finite samples draws nothing.
+    rerender(<Sparkline values={[NaN, 4, -Infinity]} color="#88c0d0" />);
+    expect(container.querySelector('polyline')).toBeNull();
+  });
   it('FilterChip shows count and dims at zero', () => {
     render(<FilterChip filter="Ha" count={0} on={false} onClick={() => {}} />);
     expect(screen.getByRole('button', { name: /Ha 0/ }).className).toContain('opacity-40');
@@ -82,6 +108,22 @@ describe('ui primitives', () => {
     const cls = (container.firstChild as HTMLElement).className;
     expect(cls).toContain('ring-success/[0.18]');
     expect(cls).not.toContain('rgba(');
+  });
+});
+
+describe('Button tile size', () => {
+  it("is the mockup's segment-tile row box: 33 px tall, min 150, 7x14 padding, radius 6, left-aligned (R34)", () => {
+    render(<Button size="tile">+ Link an object</Button>);
+    const cls = screen.getByRole('button', { name: '+ Link an object' }).className.split(/\s+/);
+    expect(cls).toEqual(expect.arrayContaining(['h-[33px]', 'min-w-[150px]', 'rounded-md', 'px-3.5', 'py-[7px]', 'text-[12px]', 'border']));
+    // One radius only (no base `rounded` to fight), and no centring.
+    expect(cls).not.toContain('rounded');
+    expect(cls).not.toContain('justify-center');
+  });
+  it('md and sm keep their 4 px radius', () => {
+    render(<><Button>Plain</Button><Button size="sm">Small</Button></>);
+    expect(screen.getByText('Plain').className.split(/\s+/)).toContain('rounded');
+    expect(screen.getByText('Small').className.split(/\s+/)).toContain('rounded');
   });
 });
 

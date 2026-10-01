@@ -1167,11 +1167,29 @@ describe('ProjectDetail fix round 1', () => {
     });
     renderProjectDetail();
     expect(await screen.findByText('Could not load your frames — see console.')).toBeInTheDocument();
-    const myFrames = screen.getByRole('heading', { name: 'My contribution' }).parentElement!;
+    const myFrames = screen.getByRole('heading', { name: 'My contribution' }).closest('section')!;
     expect(within(myFrames).queryByText('Loading…')).not.toBeInTheDocument();
-    const attention = screen.getByRole('heading', { name: 'Needs attention' }).parentElement!;
+    const attention = screen.getByRole('heading', { name: 'Needs attention' }).closest('section')!;
     expect(within(attention).queryByText('Loading…')).not.toBeInTheDocument();
     expect(within(attention).queryByText('Nothing needs your attention.')).not.toBeInTheDocument();
+  });
+
+  it("Needs attention follows this device's live state: off says so, live blames the offline holders", async () => {
+    const status = (state: string) => ({
+      state, retryInSecs: null, since: '2026-09-29T10:00:00Z', storage: 'available', storageReason: null, watcherDegraded: false, networkVolume: false,
+    });
+    mockCommands(projectCard(), {
+      get_collab_live_status: () => Promise.resolve(status('off')),
+      list_collab_frames: () => Promise.resolve([libraryFrame({ localState: 'wanted', holdersOnline: 0 })]),
+    });
+    renderProjectDetail();
+    const attention = (await screen.findByRole('heading', { name: 'Needs attention' })).closest('section')!;
+    expect(await within(attention).findByText('1 frame missing here')).toBeInTheDocument();
+    expect(within(attention).getByText(/The live exchange is off on this device/)).toBeInTheDocument();
+    expect(within(attention).queryByText(/holders are offline/)).toBeNull();
+
+    fire('collab-live-status', status('live'));
+    expect(await within(attention).findByText('1 frame missing here because its holders are offline')).toBeInTheDocument();
   });
 });
 
