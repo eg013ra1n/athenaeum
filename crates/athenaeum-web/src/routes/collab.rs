@@ -321,6 +321,26 @@ pub async fn publish_collab_frames(
     .map_err(api_err)
 }
 
+/// Calibrate the project's Ready frames into prepared files for review
+/// (spec 2026-10-01 §4.3): no seeding, no announce, no hub call.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn calibrate_collab_frames(
+    State(state): State<WebAppState>,
+    Json(args): Json<PublishArgs>,
+) -> Result<Json<api::PublishResult>, (axum::http::StatusCode, String)> {
+    let emitter: Arc<dyn ProgressEmitter> =
+        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    api::calibrate_collab_frames(
+        &state.ctx,
+        &args.project_id,
+        args.frame_ids.as_deref(),
+        Some(emitter),
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
+}
+
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn republish_collab_frames(
     State(state): State<WebAppState>,

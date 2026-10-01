@@ -134,6 +134,22 @@ pub async fn publish_collab_frames(
         .map_err(|e| e.to_string())
 }
 
+/// Calibrate the project's Ready frames into prepared files for review
+/// (spec 2026-10-01 §4.3): no seeding, no announce, no hub call.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn calibrate_collab_frames(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+    frame_ids: Option<Vec<i64>>,
+) -> Result<PublishResult, String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    api::calibrate_collab_frames(&state.ctx, &project_id, frame_ids.as_deref(), Some(emitter))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Re-publish every own frame of the project (P19): regenerate each one and
 /// post a new content version only where the bytes changed.
 #[tauri::command]

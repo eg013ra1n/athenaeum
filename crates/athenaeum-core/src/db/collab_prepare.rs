@@ -111,23 +111,42 @@ pub fn get_prepared(
 }
 
 /// Delete these frames' rows; returns the deleted rows so the caller removes
-/// their (non-external) files.
+/// their (non-external) files. One `DELETE … RETURNING` per chunk, so a row
+/// is returned exactly when this call removed it.
 pub fn delete_prepared(
     conn: &Connection,
     project_id: &str,
     source_frame_ids: &[i64],
 ) -> Result<Vec<PreparedRow>> {
     let mut gone = Vec::new();
-    for id in source_frame_ids {
-        if let Some(r) = get_prepared(conn, project_id, *id)? {
-            conn.execute(
-                "DELETE FROM collab_prepared_frames WHERE project_id = ?1 AND source_frame_id = ?2",
-                params![project_id, id],
-            )?;
-            gone.push(r);
-        }
+    for chunk in source_frame_ids.chunks(CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(", ");
+        let mut st = conn.prepare(&format!(
+            "DELETE FROM collab_prepared_frames
+             WHERE project_id = ? AND source_frame_id IN ({marks})
+             RETURNING {COLS}"
+        ))?;
+        let args = std::iter::once(rusqlite::types::Value::from(project_id.to_string()))
+            .chain(chunk.iter().map(|id| rusqlite::types::Value::from(*id)));
+        let rows = st
+            .query_map(params_from_iter(args), from_sql)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        gone.extend(rows);
     }
+    gone.sort_by_key(|r| r.source_frame_id);
     Ok(gone)
+}
+
+/// Whether the member withheld this frame from the project.
+pub fn is_withheld(conn: &Connection, project_id: &str, source_frame_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM collab_withheld_frames WHERE project_id = ?1 AND source_frame_id = ?2",
+            params![project_id, source_frame_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 pub fn delete_project_prepared(conn: &Connection, project_id: &str) -> Result<Vec<PreparedRow>> {
@@ -333,6 +352,10 @@ mod tests {
             gone[0].calibrated_path.as_deref(),
             Some("/collab/m31/me/c_a.fits")
         );
+        assert!(
+            delete_prepared(&conn, "p1", &[1, 99]).unwrap().is_empty(),
+            "a row is returned only by the call that removed it"
+        );
         assert_eq!(delete_project_prepared(&conn, "p1").unwrap().len(), 1);
     }
 
@@ -341,6 +364,9 @@ mod tests {
         let (_t, db) = conn_with_project();
         let conn = db.conn();
         assert_eq!(set_withheld(&conn, "p1", &[5, 6], true).unwrap(), 2);
+        assert!(is_withheld(&conn, "p1", 5).unwrap());
+        assert!(!is_withheld(&conn, "p1", 7).unwrap());
+        assert!(!is_withheld(&conn, "p2", 5).unwrap(), "per project");
         assert_eq!(
             set_withheld(&conn, "p1", &[5], true).unwrap(),
             0,

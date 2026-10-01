@@ -2114,7 +2114,14 @@ segment: string, contributorState: string, contributorReason: string | null, fai
  * The calibrated file awaiting review (a prepared frame) or the one that
  * was published (own row of a calibrated frame); `None` otherwise.
  */
-calibratedPath: string | null, calibratedBytes: number | null, 
+calibratedPath: string | null, 
+/**
+ * The size of the file [`Self::calibrated_path`] names. For an attested
+ * (calibrated-externally) frame in review there is no calibrated copy:
+ * `calibrated_path` is `None` and these bytes are the original's size.
+ * A published attested frame has neither.
+ */
+calibratedBytes: number | null, 
 /**
  * When the frame was prepared; only for a frame in review.
  */

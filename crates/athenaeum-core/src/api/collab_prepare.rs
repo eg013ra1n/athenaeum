@@ -8,6 +8,25 @@ pub(crate) fn drop_withheld_prepared(ctx: &ServiceContext, project_id: &str) {
     let _ = (ctx, project_id);
 }
 
+/// Remove the calibrated files of these prepared rows — never an external
+/// (attested) original. Returns how many are gone.
+pub(crate) fn remove_prepared_files(rows: &[crate::db::collab_prepare::PreparedRow]) -> usize {
+    let mut gone = 0;
+    for r in rows {
+        let (Some(p), false) = (&r.calibrated_path, r.external) else {
+            continue;
+        };
+        match std::fs::remove_file(p) {
+            Ok(()) => gone += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => gone += 1,
+            Err(e) => {
+                tracing::error!(project_id = %r.project_id, path = %p, error = %e, "prepared file not removed")
+            }
+        }
+    }
+    gone
+}
+
 /// The fits writer's temp name (`fits_writer/writer.rs`):
 /// `<path>.fits.tmp.<pid>.<seq>` — a crash mid-write leaves one behind.
 pub(crate) fn is_writer_temp(name: &str) -> bool {
@@ -94,5 +113,45 @@ mod tests {
             0,
             "a missing folder is not an error"
         );
+    }
+
+    #[test]
+    fn removing_prepared_files_never_touches_an_external_original() {
+        let tmp = tempfile::tempdir().unwrap();
+        let calibrated = tmp.path().join("c_a.fits");
+        let original = tmp.path().join("L_b.fits");
+        std::fs::write(&calibrated, b"x").unwrap();
+        std::fs::write(&original, b"x").unwrap();
+        let row = |path: Option<&std::path::Path>, external: bool| {
+            crate::db::collab_prepare::PreparedRow {
+                project_id: "p1".into(),
+                source_frame_id: 1,
+                frame_uuid: "u".into(),
+                calibrated_path: path.map(|p| p.to_string_lossy().into_owned()),
+                external,
+                own_dir: tmp.path().to_string_lossy().into_owned(),
+                recipe_hash: "r".into(),
+                xxh3: "x".into(),
+                byte_size: 1,
+                size_mtime_seen: None,
+                prepared_at: String::new(),
+                publish_run_id: "run".into(),
+            }
+        };
+        let rows = [
+            row(Some(&calibrated), false),
+            // Never a real shape (an external row has no path), but the
+            // original must survive even then.
+            row(Some(&original), true),
+            row(None, true),
+            row(Some(&tmp.path().join("gone.fits")), false),
+        ];
+        assert_eq!(
+            remove_prepared_files(&rows),
+            2,
+            "a missing file counts as removed"
+        );
+        assert!(!calibrated.exists());
+        assert!(original.exists());
     }
 }

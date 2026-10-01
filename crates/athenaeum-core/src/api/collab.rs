@@ -1544,7 +1544,20 @@ pub(crate) fn prepared_is_current(
             None => return false,
         },
     };
-    row.size_mtime_seen.is_some() && size_mtime_seen(&path) == row.size_mtime_seen
+    row.size_mtime_seen.is_some() && size_mtime_seen_quiet(&path) == row.size_mtime_seen
+}
+
+/// [`size_mtime_seen`] for a read that runs on every UI refresh: a missing
+/// or unreadable prepared file is an expected answer here ("not current"),
+/// so it logs at `debug`, never `warn`.
+fn size_mtime_seen_quiet(path: &Path) -> Option<String> {
+    match size_and_mtime(path) {
+        Ok((size, _, secs)) => Some(format!("{size}:{secs}")),
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %format!("{e:#}"), "prepared check: stat failed");
+            None
+        }
+    }
 }
 
 /// The catalog file path of a frame (the original of an attested frame).
@@ -1645,6 +1658,10 @@ pub struct OwnFrameRow {
     /// The calibrated file awaiting review (a prepared frame) or the one that
     /// was published (own row of a calibrated frame); `None` otherwise.
     pub calibrated_path: Option<String>,
+    /// The size of the file [`Self::calibrated_path`] names. For an attested
+    /// (calibrated-externally) frame in review there is no calibrated copy:
+    /// `calibrated_path` is `None` and these bytes are the original's size.
+    /// A published attested frame has neither.
     pub calibrated_bytes: Option<i64>,
     /// When the frame was prepared; only for a frame in review.
     pub prepared_at: Option<String>,
@@ -3404,6 +3421,86 @@ struct GenerationJob {
     plans: Vec<PlannedFrame>,
     /// The run's own cancel flag (the compute queue's X flips it).
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// The run's tracker: the generation reports its stages and frames here.
+    run: crate::api::collab_publish_run::RunHandle,
+    /// Calibrate only: every New frame written is recorded as prepared.
+    prepare: Option<PrepareSink>,
+}
+
+/// Calibrate only: where a written New frame's prepared row goes.
+pub(crate) struct PrepareSink {
+    pub project_id: String,
+    pub own_dir: String,
+    pub publish_run_id: String,
+}
+
+/// Plan W3: a frame withheld while it was being written is not recorded —
+/// its fresh file is removed instead (never an attested original).
+/// `Ok(true)`: the frame stays in the run's output (recorded, or no sink —
+/// a Publish or Republish run records nothing). `Ok(false)`: withheld, left
+/// out quietly. `Err(reason)`: the row could not be written; the caller
+/// holds the frame back with that reason.
+fn record_prepared(
+    db: &crate::db::Database,
+    sink: Option<&PrepareSink>,
+    w: &WrittenFrame,
+    external: bool,
+) -> Result<bool, String> {
+    let Some(sink) = sink else {
+        return Ok(true);
+    };
+    let conn = db.conn();
+    match crate::db::collab_prepare::is_withheld(&conn, &sink.project_id, w.frame_id) {
+        Ok(true) => {
+            if !external {
+                if let Err(e) = std::fs::remove_file(&w.target) {
+                    tracing::error!(project_id = %sink.project_id, frame_id = w.frame_id, path = %w.target.display(), error = %e, "withheld frame's calibrated file not removed");
+                }
+            }
+            tracing::info!(project_id = %sink.project_id, frame_id = w.frame_id, "frame withheld while calibrating; not recorded");
+            return Ok(false);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(project_id = %sink.project_id, frame_id = w.frame_id, error = %format!("{e:#}"), "withheld check failed; recording the frame")
+        }
+    }
+    let row = crate::db::collab_prepare::PreparedRow {
+        project_id: sink.project_id.clone(),
+        source_frame_id: w.frame_id,
+        frame_uuid: w.uuid.clone(),
+        calibrated_path: (!external).then(|| w.target.to_string_lossy().into_owned()),
+        external,
+        own_dir: sink.own_dir.clone(),
+        recipe_hash: w.recipe.clone(),
+        xxh3: w.xxh3.clone(),
+        byte_size: w.byte_size as i64,
+        // For an attested frame `target` is the catalog original — the file
+        // `prepared_is_current` stats for it.
+        size_mtime_seen: size_mtime_seen(&w.target),
+        prepared_at: String::new(),
+        publish_run_id: sink.publish_run_id.clone(),
+    };
+    if let Err(e) = crate::db::collab_prepare::upsert_prepared(&conn, &row) {
+        tracing::error!(project_id = %sink.project_id, frame_id = w.frame_id, error = %format!("{e:#}"), "prepared row not recorded");
+        return Err(format!("cannot record the calibrated frame: {e:#}"));
+    }
+    tracing::debug!(project_id = %sink.project_id, frame_id = w.frame_id, frame_uuid = %w.uuid, "frame prepared");
+    Ok(true)
+}
+
+/// Reports one frame of the generation as done when dropped, however its
+/// iteration ends (written, held back, or skipped by a `continue`).
+struct FrameDone<'a> {
+    run: &'a crate::api::collab_publish_run::RunHandle,
+    done: usize,
+    file: String,
+}
+
+impl Drop for FrameDone<'_> {
+    fn drop(&mut self) {
+        self.run.tick(self.done, Some(&self.file));
+    }
 }
 
 fn held(frame_id: i64, filename: &str, reason: String) -> HeldBackFrame {
@@ -3458,7 +3555,23 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     let (external_plans, generated_plans): (Vec<PlannedFrame>, Vec<PlannedFrame>) =
         job.plans.into_iter().partition(|p| p.external);
 
+    // Progress: attested frames are hashed with no compute slot, so with any
+    // of them the run reads "calibrating" from the start (without, it goes
+    // straight to "queued" for the slot); `done` counts both kinds.
+    use crate::api::collab_publish_run::PublishStage;
+    let total = external_plans.len() + generated_plans.len();
+    if !external_plans.is_empty() {
+        job.run.stage(PublishStage::Calibrating, total);
+    }
+    let mut done = 0usize;
+
     for plan in external_plans {
+        done += 1;
+        let _done = FrameDone {
+            run: &job.run,
+            done,
+            file: plan.cand.filename.clone(),
+        };
         let PlannedFrame {
             cand,
             kind,
@@ -3544,7 +3657,7 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             bytes = byte_size,
             "publish: attested light staged in place"
         );
-        written.push(WrittenFrame {
+        let w = WrittenFrame {
             frame_id: fid,
             filename: cand.filename,
             // An update or adoption keeps the uuid the hub knows the frame by.
@@ -3562,7 +3675,12 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             meta,
             identical: false,
             staged_blake3,
-        });
+        };
+        match record_prepared(&job.db, job.prepare.as_ref(), &w, true) {
+            Ok(true) => written.push(w),
+            Ok(false) => {}
+            Err(reason) => held_back.push(held(fid, &w.filename, reason)),
+        }
     }
 
     if generated_plans.is_empty() {
@@ -3574,6 +3692,7 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     }
 
     let cancel = Arc::clone(&job.cancel);
+    job.run.stage(PublishStage::Queued, total);
     let (permit, _job_id) = job
         .queue
         .acquire(
@@ -3585,9 +3704,13 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             tracing::error!(project_id = pid, "publish: compute slot wait cancelled");
             ApiError::Internal("publish: the compute slot wait was cancelled".into())
         })?;
+    job.run.stage(PublishStage::Calibrating, total);
+    // `stage` resets the count: carry the attested frames over.
+    job.run.tick(done, None);
 
     let opts = publish_options();
     let scratch_dir = std::env::temp_dir();
+    let generated_count = generated_plans.len();
     let mut prepared: Vec<(PlannedFrame, crate::export::GenerationSpec, String)> = Vec::new();
     {
         let conn = job.db.conn();
@@ -3655,12 +3778,21 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
         count = prepared.len(),
         "publish: calibrated-light generation planned"
     );
+    // Frames the catalog phase held back are done too.
+    done += generated_count - prepared.len();
+    job.run.tick(done, None);
 
     // Pixel phase: no catalog connection held.
     let mut hot_maps = HashMap::new();
     // (frame_uuid, recipe, verified blake3, regenerated xxh3)
     let mut identical: Vec<(String, String, String, String)> = Vec::new();
     for (plan, spec, recipe) in prepared {
+        done += 1;
+        let _done = FrameDone {
+            run: &job.run,
+            done,
+            file: plan.cand.filename.clone(),
+        };
         let PlannedFrame {
             cand,
             kind,
@@ -3762,7 +3894,7 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
         if let Some(m) = meta.as_mut() {
             m.meta["calibration"] = calibration_meta(Some(&spec), false);
         }
-        written.push(WrittenFrame {
+        let w = WrittenFrame {
             frame_id: fid,
             filename: cand.filename,
             // An update or adoption keeps the uuid the hub knows the frame by.
@@ -3780,7 +3912,12 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
             meta,
             identical: same_as_hub,
             staged_blake3,
-        });
+        };
+        match record_prepared(&job.db, job.prepare.as_ref(), &w, false) {
+            Ok(true) => written.push(w),
+            Ok(false) => {}
+            Err(reason) => held_back.push(held(fid, &w.filename, reason)),
+        }
     }
     drop(permit);
 
@@ -4343,7 +4480,7 @@ pub(crate) const COLLAB_STORE_UNMOUNTED: &str =
 type AfterSplit<'a> = Option<&'a (dyn Fn(&Connection) + Sync)>;
 
 /// Spec 2026-10-01 §4.3: what one engine pass does.
-// `Calibrate` and `include_new` are consumed by the calibrate/review tasks.
+// `include_new` is consumed by the publish-review task.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RunScope<'a> {
@@ -4396,6 +4533,54 @@ async fn run_family(
     res
 }
 
+/// Spec §4.1 step 5: drop stale prepared rows (and their non-external files)
+/// so the frame is Ready again. Returns how many were dropped.
+fn drop_stale_prepared(
+    conn: &Connection,
+    project_id: &str,
+    ids: &[i64],
+) -> Result<usize, ApiError> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let gone = crate::db::collab_prepare::delete_prepared(conn, project_id, ids).map_err(|e| {
+        tracing::error!(project_id, error = %format!("{e:#}"), "stale prepared frames not dropped");
+        internal(e)
+    })?;
+    crate::api::collab_prepare::remove_prepared_files(&gone);
+    tracing::info!(
+        project_id,
+        count = gone.len(),
+        "stale prepared frames dropped"
+    );
+    Ok(gone.len())
+}
+
+/// Spec 2026-10-01 §4.3: calibrate Ready frames into prepared files — no
+/// seed, no announce, no hub call. Under the project's publish lock and
+/// refused while another publish-family run of it holds that lock, like
+/// [`publish_collab_frames`]; `frame_ids` has the same selection semantics.
+pub async fn calibrate_collab_frames(
+    ctx: &ServiceContext,
+    project_id: &str,
+    frame_ids: Option<&[i64]>,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> Result<PublishResult, ApiError> {
+    let lock = publish_lock(ctx, project_id)?;
+    let _run = claim_publish(&lock, project_id)?;
+    use crate::api::collab_publish_run::{PublishRunKind as K, PublishTrigger as T};
+    run_family(
+        ctx,
+        project_id,
+        K::Calibrate,
+        T::Manual,
+        None,
+        emitter,
+        &[RunScope::Calibrate { only: frame_ids }],
+    )
+    .await
+}
+
 async fn run_publish(
     ctx: &ServiceContext,
     project_id: &str,
@@ -4445,8 +4630,44 @@ async fn run_publish(
     };
     let mut held_back: Vec<HeldBackFrame> = Vec::new();
     let mut candidates: Vec<PublishCandidate> = Vec::new();
-    for (id, row) in gated {
-        if row.publishable {
+    if matches!(scope, RunScope::Calibrate { .. }) {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let ids: Vec<i64> = gated.iter().map(|(_, row)| row.frame_id).collect();
+        let local = ProjectLocal::load(&conn, project_id, &ids)?;
+        let own_by_src = frames_db::own_by_source_frame(&conn, project_id).map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "calibrate: read own frames failed");
+            internal(e)
+        })?;
+        let mut stale: Vec<i64> = Vec::new();
+        for (id, row) in gated {
+            if !row.publishable {
+                // Plan W1: a gate failure is the run's business only when
+                // the member selected the frame.
+                if only.is_some() {
+                    held_back.push(HeldBackFrame {
+                        frame_id: row.frame_id,
+                        filename: row.filename,
+                        reasons: row.failures,
+                        publishing_device: None,
+                    });
+                }
+                continue;
+            }
+            // Spec §4.3: only Ready frames are calibrated — never one already
+            // published, withheld, black-holed or prepared and still current.
+            if own_by_src.contains_key(&row.frame_id)
+                || local.withheld.contains(&row.frame_id)
+                || local.black_holed.contains(&row.frame_id)
+            {
+                continue;
+            }
+            if let Some(p) = local.prepared.get(&row.frame_id) {
+                if prepared_is_current(&conn, p, id.attested) {
+                    continue;
+                }
+                stale.push(row.frame_id);
+            }
             candidates.push(PublishCandidate {
                 frame_id: row.frame_id,
                 filename: row.filename,
@@ -4455,13 +4676,27 @@ async fn run_publish(
                 filter_canonical: id.filter_canonical.unwrap_or_default(),
                 attested: id.attested,
             });
-        } else {
-            held_back.push(HeldBackFrame {
-                frame_id: row.frame_id,
-                filename: row.filename,
-                reasons: row.failures,
-                publishing_device: None,
-            });
+        }
+        drop_stale_prepared(&conn, project_id, &stale)?;
+    } else {
+        for (id, row) in gated {
+            if row.publishable {
+                candidates.push(PublishCandidate {
+                    frame_id: row.frame_id,
+                    filename: row.filename,
+                    uuid: id.uuid,
+                    // `publishable` implies a dictionary match (P3).
+                    filter_canonical: id.filter_canonical.unwrap_or_default(),
+                    attested: id.attested,
+                });
+            } else {
+                held_back.push(HeldBackFrame {
+                    frame_id: row.frame_id,
+                    filename: row.filename,
+                    reasons: row.failures,
+                    publishing_device: None,
+                });
+            }
         }
     }
     if candidates.is_empty() {
@@ -4577,6 +4812,10 @@ async fn run_publish(
             internal(e)
         })?
     };
+    // Review focus 3: a calibrate interrupted mid-write left a writer temp.
+    if matches!(scope, RunScope::Calibrate { .. }) {
+        crate::api::collab_prepare::sweep_writer_temps(&own_dir);
+    }
     {
         let db = db(ctx)?;
         let conn = db.conn();
@@ -4976,6 +5215,21 @@ async fn run_publish(
         if let Some(hook) = after_split {
             hook(&conn);
         }
+        // Adopt-class frames (the hub already lists them as mine, from a
+        // replaced device) are updates, never reviewed (P6): Publish's.
+        // Dropped before the A6 check, so a Calibrate whose every new frame
+        // was refused still reports the refusal.
+        if matches!(scope, RunScope::Calibrate { .. }) {
+            let before = plans.len();
+            plans.retain(|p| matches!(p.kind, PublishKind::New));
+            if plans.len() != before {
+                tracing::debug!(
+                    project_id,
+                    count = before - plans.len(),
+                    "calibrate: adopt-class frames left to Publish"
+                );
+            }
+        }
         if refused_new > 0 && plans.is_empty() {
             // Nothing else to do: refuse at once, before any permit or hub
             // call (auto-publish stays quiet on it until the binding moves).
@@ -5000,10 +5254,8 @@ async fn run_publish(
             held_back: Vec::new(),
         }
     } else {
-        run.stage(
-            crate::api::collab_publish_run::PublishStage::Calibrating,
-            plans.len(),
-        );
+        // The generation reports its own stages (queued for the compute
+        // slot, then calibrating) and one tick per frame.
         let job = GenerationJob {
             db: db(ctx)?.clone(),
             queue: ctx.compute_queue.clone(),
@@ -5012,6 +5264,12 @@ async fn run_publish(
             label: format!("collab publish {}", project.title),
             plans,
             cancel: run.cancel_flag(),
+            run: run.clone(),
+            prepare: matches!(scope, RunScope::Calibrate { .. }).then(|| PrepareSink {
+                project_id: project_id.to_string(),
+                own_dir: own_dir.to_string_lossy().into_owned(),
+                publish_run_id: run.id(),
+            }),
         };
         tokio::task::spawn_blocking(move || run_publish_generation(job))
             .await
@@ -5022,6 +5280,22 @@ async fn run_publish(
     };
     held_back.extend(outcome.held_back);
     unchanged += outcome.unchanged;
+
+    // Calibrate stops here: its frames are prepared, waiting for review.
+    if matches!(scope, RunScope::Calibrate { .. }) {
+        tracing::info!(
+            project_id,
+            count = outcome.written.len(),
+            held_back = held_back.len(),
+            "calibrate: frames prepared for review"
+        );
+        return Ok(PublishResult {
+            calibrated: outcome.written.len(),
+            unchanged,
+            held_back,
+            ..Default::default()
+        });
+    }
 
     // ── Seed by reference ────────────────────────────────────────────────────
     // An update or adoption replaces the landed file, so it runs under the
@@ -7671,6 +7945,88 @@ pub(crate) mod tests {
             r1.segment, "ready",
             "a stale prepared row reads Ready (4.1 step 5)"
         );
+        // Plan W2: the recipe still matches, but the file is no longer the
+        // one that was written (another length) — the frame is Ready again.
+        std::fs::write(dir.join("c_L_0.fits"), vec![0u8; 65]).unwrap();
+        let rows = own_rows(&ctx);
+        let r0 = rows.iter().find(|r| r.frame_id == frame_ids[0]).unwrap();
+        assert_eq!(
+            r0.segment, "ready",
+            "a prepared file whose size moved reads Ready"
+        );
+    }
+
+    /// Plan W3 / review focus 1: a frame withheld while it was being written
+    /// is not recorded; its calibrated file goes, an attested original never.
+    #[test]
+    fn a_frame_withheld_while_calibrating_is_not_recorded() {
+        let (tmp, ctx) = test_ctx();
+        let db = crate::api::db(&ctx).unwrap();
+        {
+            let conn = db.conn();
+            cached_project(&conn);
+            crate::db::collab_prepare::set_withheld(&conn, "p-1", &[1, 2], true).unwrap();
+        }
+        let sink = PrepareSink {
+            project_id: "p-1".into(),
+            own_dir: tmp.path().to_string_lossy().into_owned(),
+            publish_run_id: "run-1".into(),
+        };
+        let written = |frame_id: i64, path: &Path| WrittenFrame {
+            frame_id,
+            filename: format!("L_{frame_id}.fits"),
+            uuid: format!("u-{frame_id}"),
+            filter_canonical: "L".into(),
+            kind: PublishKind::New,
+            target: path.to_path_buf(),
+            staged: path.to_path_buf(),
+            recipe: "r".into(),
+            xxh3: "x".into(),
+            byte_size: 3,
+            meta: None,
+            identical: false,
+            staged_blake3: None,
+        };
+        let calibrated = tmp.path().join("c_L_1.fits");
+        let original = tmp.path().join("L_2.fits");
+        let kept = tmp.path().join("c_L_3.fits");
+        for p in [&calibrated, &original, &kept] {
+            std::fs::write(p, b"abc").unwrap();
+        }
+        assert_eq!(
+            record_prepared(&db, Some(&sink), &written(1, &calibrated), false),
+            Ok(false)
+        );
+        assert!(
+            !calibrated.exists(),
+            "the withheld frame's calibrated file is removed"
+        );
+        assert_eq!(
+            record_prepared(&db, Some(&sink), &written(2, &original), true),
+            Ok(false)
+        );
+        assert!(original.exists(), "an attested original is never removed");
+        assert_eq!(
+            record_prepared(&db, Some(&sink), &written(3, &kept), false),
+            Ok(true)
+        );
+        assert_eq!(
+            record_prepared(&db, None, &written(1, &kept), false),
+            Ok(true),
+            "a Publish run records nothing"
+        );
+        let rows = crate::db::collab_prepare::list_prepared(&db.conn(), "p-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_frame_id, 3);
+        assert_eq!(
+            rows[0].calibrated_path.as_deref(),
+            Some(kept.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            (rows[0].byte_size, rows[0].publish_run_id.as_str()),
+            (3, "run-1")
+        );
+        assert!(rows[0].size_mtime_seen.is_some());
     }
 
     /// A minimal own `LocalFrameRow`, `record_own`'d directly (no live
@@ -12968,6 +13324,218 @@ pub(crate) mod tests {
             let f = hub.frame(PID, &fx.uuids[0]).expect("announced");
             assert_eq!(f.filter_raw, "");
             assert_eq!(f.filter_canonical, "None");
+        }
+
+        // ── Calibrate (spec 2026-10-01 §4.3, plan Task 7) ────────────────────
+
+        fn prepared(fx: &PubFx) -> Vec<crate::db::collab_prepare::PreparedRow> {
+            let conn = crate::api::db(&fx.ctx).unwrap().conn();
+            crate::db::collab_prepare::list_prepared(&conn, PID).unwrap()
+        }
+
+        async fn hub_requests(fx: &PubFx) -> usize {
+            fx.server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .len()
+        }
+
+        #[tokio::test]
+        async fn calibrate_writes_files_and_prepared_rows_and_never_calls_the_hub() {
+            let fx = fixture(2).await;
+            let before = hub_requests(&fx).await;
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!((res.calibrated, res.announced), (2, 0), "{res:?}");
+            assert_eq!(
+                hub_requests(&fx).await,
+                before,
+                "calibrate makes no hub call"
+            );
+            let rows = prepared(&fx);
+            assert_eq!(rows.len(), 2);
+            for r in &rows {
+                let p = PathBuf::from(r.calibrated_path.as_ref().unwrap());
+                assert!(p.exists() && p.starts_with(own_dir(&fx)), "{p:?}");
+                assert!(
+                    !r.external
+                        && !r.xxh3.is_empty()
+                        && r.byte_size > 0
+                        && r.size_mtime_seen.is_some()
+                );
+            }
+            assert_eq!(project_tag_count(&fx).await, 0, "nothing seeded");
+            assert!(own_row(&fx, &fx.uuids[0]).is_none(), "nothing announced");
+            let own = list_project_own_frames(&fx.ctx, PID).unwrap();
+            assert!(
+                own.iter().all(|r| r.segment == "review"),
+                "{:?}",
+                own.iter().map(|r| &r.segment).collect::<Vec<_>>()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_second_calibrate_skips_current_prepared_frames() {
+            let fx = fixture(2).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.calibrated, 0);
+        }
+
+        /// Spec §4.1 step 5: a prepared frame whose file moved is Ready again —
+        /// the next calibrate drops its stale row and file and writes it anew.
+        #[tokio::test]
+        async fn a_stale_prepared_frame_is_calibrated_again() {
+            let fx = fixture(1).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let first = prepared(&fx).remove(0);
+            let path = PathBuf::from(first.calibrated_path.clone().unwrap());
+            std::fs::write(&path, b"edited after review").unwrap();
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.calibrated, 1, "{res:?}");
+            let again = prepared(&fx);
+            assert_eq!(again.len(), 1);
+            assert_eq!(again[0].calibrated_path, first.calibrated_path);
+            assert_eq!(again[0].xxh3, first.xxh3, "the same calibrated bytes");
+            assert!(std::fs::metadata(&path).unwrap().len() > 100);
+        }
+
+        #[tokio::test]
+        async fn calibrate_skips_withheld_and_black_holed_frames() {
+            let fx = fixture(3).await;
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                crate::db::collab_prepare::set_withheld(&conn, PID, &[fx.frame_ids[0]], true)
+                    .unwrap();
+                let file_id: i64 = conn
+                    .query_row(
+                        "SELECT file_id FROM frames WHERE id = ?1",
+                        [fx.frame_ids[1]],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                crate::db::add_to_black_hole(&conn, file_id, "light", "/x").unwrap();
+            }
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.calibrated, 1);
+            assert!(res.held_back.is_empty(), "{:?}", res.held_back);
+            assert_eq!(prepared(&fx)[0].source_frame_id, fx.frame_ids[2]);
+        }
+
+        /// Review focus 1: an attested frame is prepared in place — its row
+        /// names no calibrated file, nothing is written, the original stays.
+        #[tokio::test]
+        async fn calibrate_records_an_external_row_and_writes_nothing() {
+            let fx = fixture(1).await;
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                crate::db::collab::set_frames_set_attestation(&conn, fx.set_id, true).unwrap();
+            }
+            let files_before = std::fs::read_dir(own_dir(&fx))
+                .map(|d| d.count())
+                .unwrap_or(0);
+            let res = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.calibrated, 1, "{res:?}");
+            let rows = prepared(&fx);
+            assert!(rows[0].external && rows[0].calibrated_path.is_none());
+            assert_eq!(
+                std::fs::read_dir(own_dir(&fx))
+                    .map(|d| d.count())
+                    .unwrap_or(0),
+                files_before
+            );
+            assert!(fx.lights[0].exists(), "the original is untouched");
+            let own = list_project_own_frames(&fx.ctx, PID).unwrap();
+            assert_eq!(own[0].segment, "review", "the external row is current");
+        }
+
+        #[tokio::test]
+        async fn calibrate_is_refused_under_a_foreign_cached_binding() {
+            let fx = fixture(1).await;
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                crate::db::collab::set_publishing_device(
+                    &conn,
+                    PID,
+                    Some(&crate::db::collab::PublishingDevice {
+                        device_id: "dev-other".into(),
+                        name: Some("Observatory".into()),
+                    }),
+                )
+                .unwrap();
+            }
+            let err = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ApiError::Conflict(m) if crate::api::collab_autopublish::is_publishing_device_refusal(m)),
+                "{err:?}"
+            );
+            assert!(prepared(&fx).is_empty());
+        }
+
+        /// Review focus 3: an orphan `c_*.fits` with no row (a crash before
+        /// its row was written) is reused for its name and rewritten.
+        #[tokio::test]
+        async fn an_orphan_calibrated_file_is_overwritten_by_its_frame() {
+            let fx = fixture(1).await;
+            let stem = fx.lights[0]
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let orphan = own_dir(&fx).join(format!("c_{stem}.fits"));
+            std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+            std::fs::write(&orphan, b"left by a crash").unwrap();
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let rows = prepared(&fx);
+            assert_eq!(
+                rows[0].calibrated_path.as_deref(),
+                Some(orphan.to_string_lossy().as_ref())
+            );
+            assert!(
+                std::fs::metadata(&orphan).unwrap().len() > 100,
+                "rewritten with the calibrated frame"
+            );
+        }
+
+        #[tokio::test]
+        async fn calibrate_reports_queued_then_calibrating_and_one_finished() {
+            let fx = fixture(2).await;
+            let rec =
+                std::sync::Arc::new(crate::api::collab_live::test_support::Recorder::default());
+            calibrate_collab_frames(&fx.ctx, PID, None, Some(rec.clone()))
+                .await
+                .unwrap();
+            let stages: Vec<String> = rec
+                .payloads(crate::api::collab_publish_run::COLLAB_PUBLISH_PROGRESS_EVENT)
+                .iter()
+                .map(|p| p["stage"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(stages.first().map(String::as_str), Some("queued"));
+            assert!(stages.iter().any(|s| s == "calibrating"), "{stages:?}");
+            let f = rec.payloads(crate::api::collab_publish_run::COLLAB_PUBLISH_FINISHED_EVENT);
+            assert_eq!(f.len(), 1);
+            assert_eq!(
+                (f[0]["kind"].as_str(), f[0]["calibrated"].as_u64()),
+                (Some("calibrate"), Some(2))
+            );
         }
     }
 }
