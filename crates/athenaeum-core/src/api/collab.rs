@@ -685,17 +685,20 @@ pub fn unlink_frame_set(
     project_id: &str,
     frames_set_id: i64,
 ) -> Result<(), ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let removed =
-        crate::db::collab::unlink_set(&conn, project_id, frames_set_id).map_err(internal)?;
-    tracing::info!(
-        project_id,
-        frames_set_id,
-        removed,
-        "unlinked frame set from project"
-    );
-    let gone = drop_unreachable_prepared(&conn, project_id)?;
+    let gone = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let removed =
+            crate::db::collab::unlink_set(&conn, project_id, frames_set_id).map_err(internal)?;
+        tracing::info!(
+            project_id,
+            frames_set_id,
+            removed,
+            "unlinked frame set from project"
+        );
+        drop_unreachable_prepared(&conn, project_id)?
+    };
+    // The catalog guard is released: the file unlinks block nobody.
     if !gone.is_empty() {
         let removed = crate::api::collab_prepare::remove_prepared_files(&gone);
         tracing::info!(
