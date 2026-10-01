@@ -11,6 +11,7 @@ import ProjectDetail, { resolveSelfAccount } from './ProjectDetail';
 import { useCollabNotifications } from '../hooks/useCollabNotifications';
 import { api } from '../api';
 import { usePublishing } from '../components/collab/project/usePublishing';
+import { projectCard } from '../components/collab/project/testFixtures';
 import type {
   AccountStatus,
   MemberSummary,
@@ -26,34 +27,8 @@ vi.mock('../api', () => ({
   api: { invoke: vi.fn(), listen: vi.fn() },
 }));
 
-function projectCard(overrides: Partial<ProjectCard> = {}): ProjectCard {
-  return {
-    projectId: 'proj-1',
-    slug: 'm42-mosaic',
-    title: 'M42 Mosaic',
-    dataRole: 'send_receive',
-    coordinator: false,
-    canModerate: false,
-    requireApproval: false,
-    pendingFrames: 0,
-    projectStatus: 'open',
-    targetName: 'M42',
-    targetRaDeg: 83.8,
-    targetDecDeg: -5.4,
-    targetRadiusDeg: 1.5,
-    membershipVersion: 1,
-    linkedSets: 1,
-    candidates: 2,
-    publishable: 2,
-    autoReplicate: true,
-    publishMode: 'manual',
-    syncedAt: null,
-    fetchedAt: '2026-09-24T00:00:00Z',
-    publishingDevice: null,
-    publishingHere: false,
-    ...overrides,
-  };
-}
+/** The Overview's Project settings card. */
+const settingsCard = () => within(screen.getByRole('region', { name: 'Project settings' }));
 
 function detailFixture(card: ProjectCard = projectCard()): Detail {
   return {
@@ -468,29 +443,31 @@ describe('ProjectDetail publishing device (A6)', () => {
   it('names this device when it is the publishing device, with no switch offered', async () => {
     mockCommands(boundHere);
     renderProjectDetail();
-    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Publish from here' })).not.toBeInTheDocument();
+    expect(await screen.findByText(/This device · Laptop/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
   });
 
-  it('names the other device and offers "Publish from here" in the meta line', async () => {
+  it('names the other device and offers "Publish from this device" in the settings card', async () => {
     mockCommands(boundElsewhere);
     renderProjectDetail();
-    expect(await screen.findByText('Publishing from Obs PC')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Publish from here' })).toBeInTheDocument();
+    await screen.findByRole('region', { name: 'Project settings' });
+    expect(settingsCard().getByText('Obs PC')).toBeInTheDocument();
+    expect(settingsCard().getByRole('button', { name: 'Publish from this device' })).toBeInTheDocument();
   });
 
   it('an unnamed bound device reads as another device of this account', async () => {
     mockCommands(projectCard({ publishingDevice: { deviceId: 'dev-x', name: null }, publishingHere: false }));
     renderProjectDetail();
-    expect(await screen.findByText('Publishing from another device of this account')).toBeInTheDocument();
+    await screen.findByRole('region', { name: 'Project settings' });
+    expect(settingsCard().getByText('another device of this account')).toBeInTheDocument();
   });
 
   it('an unbound project says nobody is publishing yet — never "this device", no switch', async () => {
     mockCommands(projectCard({ publishingDevice: null, publishingHere: false }));
     renderProjectDetail();
     expect(await screen.findByText('Nobody is publishing to this project yet')).toBeInTheDocument();
-    expect(screen.queryByText('Publishing from this device')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Publish from here' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/This device ·/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
   });
 
   it('the switch is confirmed, sends the project id and updates the card from the answer', async () => {
@@ -499,7 +476,7 @@ describe('ProjectDetail publishing device (A6)', () => {
     mockCommands(boundElsewhere, { set_collab_publishing_device: setDevice });
     renderProjectDetail();
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish from here' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish from this device' }));
     expect(
       await screen.findByText(
         'Obs PC will stop publishing new frames to this project; it can still update the frames it already published.',
@@ -511,8 +488,8 @@ describe('ProjectDetail publishing device (A6)', () => {
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('set_collab_publishing_device', { projectId: 'proj-1' }),
     );
-    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Publish from here' })).not.toBeInTheDocument();
+    expect(await screen.findByText(/This device · Laptop/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish from this device' })).not.toBeInTheDocument();
     // No reload was needed: the card came from the command's answer.
     expect(invokeCount('get_collab_project_detail')).toBe(1);
     expect(screen.queryAllByRole('status')).toHaveLength(0);
@@ -522,11 +499,11 @@ describe('ProjectDetail publishing device (A6)', () => {
     const setDevice = vi.fn(() => Promise.resolve(boundHere));
     mockCommands(boundElsewhere, { set_collab_publishing_device: setDevice });
     renderProjectDetail();
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish from here' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish from this device' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
     expect(screen.queryByText(/will stop publishing new frames/)).not.toBeInTheDocument();
     expect(setDevice).not.toHaveBeenCalled();
-    expect(screen.getByText('Publishing from Obs PC')).toBeInTheDocument();
+    expect(settingsCard().getByText('Obs PC')).toBeInTheDocument();
   });
 
   it('a failed switch is one warning with the reason, and the card is unchanged', async () => {
@@ -534,7 +511,7 @@ describe('ProjectDetail publishing device (A6)', () => {
       set_collab_publishing_device: () => Promise.reject("The account's role may not perform this action."),
     });
     renderProjectDetail();
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish from here' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Publish from this device' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Switch' }));
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
@@ -545,7 +522,7 @@ describe('ProjectDetail publishing device (A6)', () => {
         "The account's role may not perform this action.",
       ),
     );
-    expect(screen.getByText('Publishing from Obs PC')).toBeInTheDocument();
+    expect(settingsCard().getByText('Obs PC')).toBeInTheDocument();
   });
 
   it('a publish refused by the publishing device names it and offers the switch — not a generic failure', async () => {
@@ -708,8 +685,9 @@ describe('ProjectDetail publishing device (A6)', () => {
     const refusal = await screen.findByTestId('publishing-refusal');
     fireEvent.click(within(refusal).getByRole('button', { name: 'Publish from this device' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Switch' }));
-    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
-    expect(screen.queryByTestId('publishing-refusal')).not.toBeInTheDocument();
+    // The settings card lives on the Overview; this flow runs on My frames.
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('set_collab_publishing_device', { projectId: 'proj-1' }));
+    await waitFor(() => expect(screen.queryByTestId('publishing-refusal')).not.toBeInTheDocument());
   });
 });
 
@@ -1652,11 +1630,11 @@ describe('ProjectDetail page shell (wave 5.5)', () => {
     expect(h.parentElement!.className).not.toContain('flex-wrap');
   });
 
-  it('the meta line carries the publishing device and the auto-replicate toggle', async () => {
-    renderPage();
-    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Auto-publish/ })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Auto-replicate on' }));
+  it('the header has no meta line; the settings card carries the device and the auto-replicate switch', async () => {
+    renderPage({ publishingHere: true, publishingDevice: { deviceId: 'dev-me', name: 'Laptop' } });
+    expect(await screen.findByText(/This device · Laptop/)).toBeInTheDocument();
+    expect(screen.queryByText(/Publishing from/)).toBeNull();
+    fireEvent.click(settingsCard().getByRole('switch', { name: 'On' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('set_project_auto_replicate', { projectId: 'proj-1', enabled: false }),
     );
@@ -1666,8 +1644,8 @@ describe('ProjectDetail page shell (wave 5.5)', () => {
 
   it('a send-only member gets no auto-replicate toggle', async () => {
     renderPage({ dataRole: 'send', coordinator: false, canModerate: false });
-    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Auto-replicate/ })).toBeNull();
+    await screen.findByRole('region', { name: 'Project settings' });
+    expect(settingsCard().queryByRole('switch')).toBeNull();
   });
 
   it('tab counts read "136 ready" / "N to go" / pending, as pills', async () => {

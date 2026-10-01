@@ -13,7 +13,8 @@ import UpdateRequired from '../components/collab/UpdateRequired';
 import CollabLiveStatus from '../components/collab/CollabLiveStatus';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { Button, Chip, PanelLayout } from '../components/ui';
-import MetaLine from '../components/collab/project/MetaLine';
+import ProjectSettingsCard from '../components/collab/project/ProjectSettingsCard';
+import { useCollabPublishRun } from '../components/collab/project/useCollabPublishRun';
 import { MemberColorsProvider } from '../components/collab/project/MemberColorsContext';
 import OverviewTab from '../components/collab/project/OverviewTab';
 import type { NavTarget } from '../components/collab/project/attention';
@@ -105,9 +106,9 @@ export function resolveSelfAccount(
 /**
  * A collab project (spec 2026-09-30 §8): the header on the app's page pattern
  * (back/forward, title, target subtitle, role chip, the live pill that also
- * runs Sync, the portal link), the meta line (publishing device, auto-publish
- * and auto-replicate toggles — `MetaLine`) and six tabs — Overview, My
- * frames, Library, Members, Exchange, Moderation. The shell owns the loads
+ * runs Sync, the portal link) and six tabs — Overview, My
+ * frames, Library, Members, Exchange, Moderation. The project's local settings
+ * (publishing device, mode, auto-replicate) are the Overview's settings card. The shell owns the loads
  * shared by several tabs, the tab/segment state and deep links, the frame
  * panel (docked beside the frame tables, `PanelLayout`), the member colours
  * (`MemberColorsProvider`), and the publish confirm + republish guard
@@ -348,6 +349,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
     };
   }, [id]);
 
+  const run = useCollabPublishRun(id);
   const publishing = usePublishing(id, {
     reloadDetail: loadDetail,
     reloadOwn: loadOwn,
@@ -576,14 +578,6 @@ function ProjectPage({ id }: { id: string | undefined }) {
             </Button>
           </span>
         </div>
-        {/* Row 2: the publishing device (A6) and the two preferences. */}
-        <MetaLine
-          card={c}
-          canReceive={canReceive}
-          onChanged={() => void loadDetail()}
-          onSwitchHere={() => setSwitchConfirm(true)}
-          switchBusy={publishing.switchBusy}
-        />
 
         {publishing.updateRequired && (
           <div className="mt-3">
@@ -658,6 +652,18 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 liveRunning={liveRunning}
                 onReloadOwn={() => void loadOwn()}
                 onAttention={openAttention}
+                settings={
+                  <ProjectSettingsCard
+                    card={c}
+                    canReceive={canReceive}
+                    run={run}
+                    liveState={liveState}
+                    onChanged={() => void loadDetail()}
+                    onSwitchHere={() => setSwitchConfirm(true)}
+                    switchBusy={publishing.switchBusy}
+                    onOpenMyFrames={() => selectTab('mine')}
+                  />
+                }
               />
             </div>
           )}
