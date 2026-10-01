@@ -272,6 +272,8 @@ Disabled levels cost ~an atomic load per call site (tracing callsite caching); f
 - Submodules: suites green + `corpus_bench` gate (no measurable cost at `info`).
 - MCP: tools against a fixture log directory.
 
+**Dictionary extension (collab publish-review, `api::collab` + `api::collab_publish_run`, 2026-10-01):** `publish_run_id` (string; a UUID — one publish-family run, Calibrate, Publish or Republish, from start to its one finished event; distinct from the stacking `run_id`, which is an integer `stacking_runs.id`). Every run-scoped line of the publish engine and its tracker carries it, alongside `project_id`.
+
 ## Rollout shape
 
 Phased (detail in the implementation plan): (1) infra — deps, subscriber, files, reload, settings plumbing; (2) command boundary both backends; (3) core sweep module-by-module; (4) submodules (usual branch + bump); (5) Settings UI; (6) MCP crate. Next version branch per the version-branch rule. Docker image and uninstall scripts updated where touched.

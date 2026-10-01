@@ -739,3 +739,37 @@ Merging and pushing wait for the owner's word. `wave-5.5-project-ui` must merge 
 | 11 | Leave / unlink hooks | Project loss via `refresh_projects`; unlink only for unreachable frames (§4.2) |
 | 12 | Cancel open question | Untag with `unseed_project_frame`; in-flight hold-back dropped (§4.7) |
 | 13 | Contract nits (`run_id` name, `fetchedAt`, emit points, timers, self-loading tabs, literals, fixture, grid class, `own_changed`, README) | Each fixed in place (§1, §3, §5, §6.5, §7.1, §9.4, §13) |
+
+## 16. Amendments (wave 1, 2026-10-01)
+
+Plan rulings:
+
+| # | Ruling |
+| ---- | ---- |
+| W1 | `CollabPublishFinished` carries `calibrated, announced, updated, stale, heldBack`, with no `failed` field. A run's `heldBack` counts only frames the run attempted, or frames the member selected. A gate failure of an unselected frame is the Held back segment's business, not the run's: in `only = None` runs, gate-failing rows are no longer pushed into `PublishResult.held_back`. |
+| W2 | A prepared row also stores `frame_uuid` (the catalog `frames.uuid`), `xxh3` and `size_mtime_seen`. A prepared frame is current when its recipe equals `current_recipe_for_frame` and its file's `size_mtime_seen` equals the stored one. |
+| W3 | Withholding a frame while a run of its project is active never deletes files. Two places act instead: the run drops withheld frames before each announce batch and when writing; and `RunHandle::finish` deletes prepared rows and files of frames withheld in the meantime. |
+| W4 | Cancel is checked before each calibrated frame, before seeding starts and before each New-frame announce batch. Once the update step (Update/Adopt seeding + versions) has begun, it runs to its end. |
+| W5 | `PublishMode` lives in `db::collab`. The DB values are `manual` / `auto_calibrate` / `automatic`; the wire values are `manual` / `autoCalibrate` / `automatic`. The `ALTER ... DEFAULT 'manual'` fills every existing row, which is P1's one-time migration. |
+| W6 | The web `get_collab_frame_image` route lives in `routes/collab.rs` and calls a `routes/images.rs` helper `render_path_jpeg(state, path, resolution)`, extracted from `get_frame_preview`. |
+| W7 | A queued-then-cancelled run is `Ok` with outcome `cancelled`; it no longer returns `Internal("publish: the compute slot wait was cancelled")`. |
+| W8 | `get_collab_frame_image` takes its frame as `frame` on the wire (`{ projectId, frame, resolution? }`), not `ref`: `ref` is a Rust keyword and would break the Tauri argument mapping. `CollabBlinkEntry` carries `publisherName` but no received-from fields; the Library row (`ProjectFrameView`) already has `receivedFromMember` / `receivedAt` for the Blink hint. |
+| W9 | Calibrate runs the credentials / node / store checks of `run_publish` unchanged, so it needs a signed-in account. None of those checks makes a hub HTTP call. A signed-out member cannot calibrate, just as they cannot publish. |
+
+Controller rulings and accepted review deviations:
+
+- R1: tests touching the auto-publish dirty statics hold `collab_autopublish::test_lock()`.
+- R3: the operation-queue worker exits once every handle is dropped and its queue is drained (production keeps a handle for the app lifetime); this fixes test-context thread leaks that hit the macOS 4096-thread cap.
+- R4: remaining test thread pressure (r2d2 pool reaper threads, up to 30 s; iroh-blobs 0.103 store leaks one permanent thread per store) is not fixed this cycle; the margin was about 500 at the full-suite gate; open-items entry.
+- R5: `RunScope::Republish` never produces a New plan; a selected never-published frame is held "not published yet — calibrate and publish it first"; adopt-class frames are unchanged.
+- R6: an `epoch_changed` Conflict produces no sync report; the reconnect's hello reports every project.
+- Calibrate: `record_prepared` returns `Result<bool, String>` (a failed row write holds the frame back and removes its fresh non-external file); adopt-class frames are never Calibrate's (skipped after pass 1, their landing reserved in `claimed`); the stale drop and the writer-temp sweep run only after every refusal check, so a refused run touches no disk.
+- Publish: a failed withheld read holds that announce batch back (fail-closed) instead of erroring mid-announce; a prepared frame whose file name was taken since its calibrate is dropped as stale; Publish itself drops withheld prepared frames (row and non-external file) as well as the run's end (W3); an adopt-class frame's prepared row is consumed on adoption (its file kept only when it is the adoption landing); another frame's prepared file sitting on an adoption landing is dropped as stale before the adopt writes there.
+- Cancel: a cancel landing after the last regenerated frame is caught before seeding (`outcome.cancelled || run.cancelled()`).
+- Run tracker: an interrupted run (dropped future or panic) emits and persists one `failed` finished event ("run interrupted"), sets the cancel flag and drops withheld prepared frames; `finish` is idempotent and unregisters before emitting.
+- Auto worker: claims the publish lock before reading the mode.
+- Live sync: `SyncChanges.manifest_rows` is the rows written or pruned by the manifest sync (not change kinds, so a moderator restore now counts); `card` is set by any meta/thresholds/dictionary refresh; reports merge per project (one honest report per project per apply; a 403 is merged into it); `epoch_change` catches up a project already on the new epoch whose head is ahead (no bare ok); `FeedWork::DigestAll` is replaced by `DigestAfterHello`; `sync_now` sends `Reconcile` before `reconnect_now` so the digest flag is always queued before the new stream's hello.
+- Blink: the wire arg of `get_collab_frame_image` is `frame` (W8); a frame id outside the project's linked sets refuses the whole `get_collab_blink_frames` call (Forbidden); only "not on this device" (NotFound) drops an entry, other errors propagate; a prepared file is served only when `prepared_is_current`; an own frame reached by uuid shows calibrated (raw when attested); uuid paths must be inside the current Collaboration root (A5).
+- §3 and §6.3 wording: read the after-hello digest wherever `DigestAll` is named.
+- `CollabPublishFinished` fields: calibrated, announced, updated, stale, heldBack (no `failed`, W1).
+- Commands: six added (`calibrate_collab_frames`, `set_collab_frames_withheld`, `get_collab_publish_run`, `cancel_collab_publish`, `get_collab_blink_frames`, `get_collab_frame_image`); `set_project_auto_publish` renamed `set_project_publish_mode`. Events: `collab-published` retired; `collab-publish-progress`, `collab-publish-finished`, `collab-project-synced` added.

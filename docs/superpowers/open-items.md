@@ -2046,6 +2046,24 @@ cycle, so anything from them that matters later belongs here or in a plan.
 
 ---
 
+### Collab publish review, wave 1 — 2026-10-01
+
+Owner smoke list (spec `2026-10-01-collab-publish-review-design.md` §12, "Real app"); delete each line when it passes:
+
+1. A manual calibrate, review in Blink, Don't publish one, then publish.
+2. Auto-calibrate after a scan.
+3. Fully automatic.
+4. Cancel at each stage.
+5. Live click with a change made on another device.
+6. Blink as moderator and as member.
+7. A migrated project shows Manual.
+
+Test thread pressure (ruling R4): r2d2 pool reaper threads (up to 30 s) and the iroh-blobs 0.103 store (one permanent thread per store) are not fixed. Symptom: "failed to spawn" in sync tests when the full core lib suite grows. Options: pool shutdown on drop, or a dependency patch.
+
+Known gap: republishing an `own_missing` frame that regenerates identical bytes deletes the temp file and does not restore the landed file.
+
+---
+
 ## Release notes owed at the next tag
 
 (The v0.5.1–v0.6.1 lines were paid at their own tags — the Blink full-resolution debayer,
