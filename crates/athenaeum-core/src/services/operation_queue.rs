@@ -54,52 +54,94 @@ pub struct QueuedJob {
 }
 
 struct Inner {
-    pending: Mutex<VecDeque<QueuedJob>>,
+    pending: Mutex<Pending>,
     notify: Condvar,
+}
+
+struct Pending {
+    jobs: VecDeque<QueuedJob>,
+    /// Set when the last [`OperationQueue`] handle is dropped: the worker
+    /// drains what is queued, then exits.
+    closed: bool,
+}
+
+/// The one owner every [`OperationQueue`] clone shares; dropping it closes
+/// the queue. Separate from [`Inner`], which the worker holds, so the
+/// worker's own reference never keeps the queue open.
+struct Handle {
+    inner: Arc<Inner>,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // Under the lock, so a worker between its empty check and its wait
+        // cannot miss the wake-up.
+        let mut pending = self.inner.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending.closed = true;
+        self.inner.notify.notify_all();
+    }
 }
 
 #[derive(Clone)]
 pub struct OperationQueue {
-    inner: Arc<Inner>,
+    handle: Arc<Handle>,
 }
 
 impl OperationQueue {
-    /// Construct a queue and spawn its single worker thread. The worker
-    /// runs forever until the process exits.
+    /// Construct a queue and spawn its single worker thread. The worker runs
+    /// for as long as any handle to the queue is alive (the app's own
+    /// `ServiceContext` keeps one for the process lifetime); once the last
+    /// handle is dropped it finishes the queued jobs and exits.
     pub fn start() -> Self {
+        Self::spawn().0
+    }
+
+    fn spawn() -> (Self, thread::JoinHandle<()>) {
         let inner = Arc::new(Inner {
-            pending: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(Pending {
+                jobs: VecDeque::new(),
+                closed: false,
+            }),
             notify: Condvar::new(),
         });
         let queue = OperationQueue {
-            inner: inner.clone(),
+            handle: Arc::new(Handle {
+                inner: inner.clone(),
+            }),
         };
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("athenaeum-op-queue".into())
             .spawn(move || worker_loop(inner))
             .expect("failed to spawn operation queue worker");
-        queue
+        (queue, worker)
     }
 
     /// Push a job onto the back of the queue. Returns immediately.
     pub fn enqueue(&self, job: QueuedJob) {
+        let inner = &self.handle.inner;
         {
-            let mut pending = self.inner.pending.lock().unwrap();
-            pending.push_back(job);
+            let mut pending = inner.pending.lock().unwrap();
+            pending.jobs.push_back(job);
         }
-        self.inner.notify.notify_one();
+        inner.notify.notify_one();
     }
 }
 
 fn worker_loop(inner: Arc<Inner>) {
     loop {
-        // Wait for a job.
+        // Wait for a job; with the queue closed and drained, stop.
         let job = {
             let mut pending = inner.pending.lock().unwrap();
-            while pending.is_empty() {
+            loop {
+                if let Some(job) = pending.jobs.pop_front() {
+                    break job;
+                }
+                if pending.closed {
+                    tracing::debug!("operation queue closed; worker exiting");
+                    return;
+                }
                 pending = inner.notify.wait(pending).unwrap();
             }
-            pending.pop_front().unwrap()
         };
 
         // Run. Catch panics so a misbehaving job doesn't kill the worker.
@@ -189,5 +231,49 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(after.load(Ordering::SeqCst), 1);
+    }
+
+    /// The worker ends once the last handle is dropped — after running every
+    /// job queued before that — and not while any handle is alive.
+    #[test]
+    fn worker_drains_and_exits_after_the_last_handle_drops() {
+        let (queue, worker) = OperationQueue::spawn();
+        let other = queue.clone();
+        drop(other);
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !worker.is_finished(),
+            "an idle worker stays while a handle is alive"
+        );
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        // The first job holds the worker until the queue is closed, so the
+        // second is still queued then.
+        queue.enqueue(QueuedJob {
+            kind: OperationKind::ZipArchive,
+            operation_id: 1,
+            run: Box::new(move || {
+                gate_rx.recv().ok();
+            }),
+        });
+        let ran2 = ran.clone();
+        queue.enqueue(QueuedJob {
+            kind: OperationKind::ZipArchive,
+            operation_id: 2,
+            run: Box::new(move || {
+                ran2.fetch_add(1, Ordering::SeqCst);
+            }),
+        });
+        drop(queue);
+        gate_tx.send(()).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || done_tx.send(worker.join().is_ok()).ok());
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the worker thread ended"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the queued job still ran");
     }
 }
