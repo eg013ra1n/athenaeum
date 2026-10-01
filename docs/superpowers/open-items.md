@@ -14,6 +14,63 @@ that passes is deleted, not ticked — with the date and the measurement, if the
 one, moved into the cycle's own doc. A decision that gets ratified moves from
 "awaiting a call" into "standing".
 
+## Crucial bugs — fix before the next release
+
+A bug here breaks a core flow on real data. Its entry is deleted once the fix lands
+and the reproduction passes on the owner's catalog.
+
+### Calibration matching ignores frame geometry — stacking dies on a cropped dark (2026-10-01)
+
+**Symptom** (prod v0.6.4, frame set 182 "Horsehead C11", 164 ASI6200MM lights at
+9576×6388). Stacking runs 6 and 7 failed in the Masters stage with
+`master build failed for set 558: bad input: pre-calibration master is 6384x4258, flats are 9576x6388`.
+The engine's guard in `integration/engine.rs::integrate_flat_inner` refused it
+correctly; the bug is upstream of it.
+
+**Root cause.** The owner's catalog holds three ASI6200MM dark libraries that tie on
+exposure, gain, offset, sensor temperature and binning and differ only in geometry:
+full frame 9576×6388, plus two subframe (ROI) captures at 6384×4258 and 4784×3194
+(`XORGSUBF`/`YORGSUBF` set in their headers, `XBINNING = 1`).
+
+1. **The matcher has no geometry parameter.** `calibration/config.rs` matches
+   instrume, binning, gain, offset, exptime, focallen, filter and ccd_temp; NAXIS1/NAXIS2
+   are never compared. Among otherwise-equal candidates the newer date wins, and the ROI
+   sets are a day newer. Flat pre-calibration got 1267 (1.0 s, ROI, 2023-07-28) over
+   1269 (full, 07-27) and 1313 (0.5 s, ROI, 07-29) over 1297 (full, 07-28); the lights
+   got 1242/1315 (ROI) over 1246/1285 (full).
+2. **The manual pick shows no geometry either.** 151 of the 164 lights' dark links are
+   manual overrides onto the ROI masters 1843/1844. With the flats fixed, the Calibrate
+   stage would still refuse every light (`calibration_library/light_cal.rs`, the same
+   mixed-dimension guard).
+3. **The plan gate does not compare geometry.** `stacking::plan::build_plan` knows each
+   light's NAXIS1/NAXIS2 but never checks it against the linked masters, so the run is
+   admitted and dies minutes in, after building the darks, instead of being blocked up
+   front.
+
+Run 5 built flat 558 cleanly only because the flats had no pre-calibration link yet.
+Re-running auto-match at 16:14 linked all 16 flat sets of the frame set to the ROI darks.
+
+**Fix direction (to plan).**
+
+- Geometry (NAXIS1×NAXIS2) becomes a hard requirement for every source → calibration
+  pair, in `configurable_matcher` and in the manual-selection candidate list: a
+  different-sized frame can never calibrate. This changes what auto-link picks, so the
+  plan needs the owner's explicit OK on that point.
+- Links that already mismatch: the plan gate blocks under `links`, naming the set ids
+  and both sizes, and the same check covers a flat set against its pre-calibration
+  master.
+- The manual-pick dialog and the calibration hierarchy show each set's geometry.
+- Open: a same-size ROI at a different origin is also wrong, and the catalog does not
+  store `XORGSUBF`/`YORGSUBF` today. Decide whether to.
+- Regression test: two dark sets that tie on every parameter except geometry.
+
+**Workaround until then** (owner's catalog). Re-link by hand: lights 120 s → 1246,
+180 s → 1285; flat pre-calibration 1.0 s → 1269, 0.5 s → 1297, bias → 1328. Pick by set
+id, not by date: 2022-06-30 holds both full-frame and 4784×3194 sets.
+
+**Acceptance:** frame set 182 stacks end to end on the owner's catalog after a fresh
+auto-match, with no manual re-link.
+
 ## Windows: fixed pending the final measurement; non-core surface still unmeasured
 
 `docs/superpowers/specs/2026-09-07-windows-test-failures-design.md` §10 has the
