@@ -8,9 +8,16 @@ import { api } from '../../../api';
 import LibraryTab, { libraryToCome } from './LibraryTab';
 import type { ExchangeSnapshot, FlowView, ProjectFlows, ProjectFrameView } from '../../../types/models';
 import type { FrameVM } from './frames';
+import type { BlinkViewerProps } from '../../blink/types';
+import type { CollabBlinkEntry, FileWithFrame } from '../../../types/models';
 
 vi.mock('../../../api', () => ({
   api: { invoke: vi.fn(), listen: vi.fn() },
+}));
+
+let blink: BlinkViewerProps | null = null;
+vi.mock('../../BlinkViewer', () => ({
+  default: (p: BlinkViewerProps) => { blink = p; return <div data-testid="blink" />; },
 }));
 
 afterEach(cleanup);
@@ -90,6 +97,7 @@ const fire = (event: string, payload: unknown) => act(() => (listeners[event] ??
 let exchangeSnapshot: ExchangeSnapshot = EMPTY_SNAPSHOT;
 
 beforeEach(() => {
+  blink = null;
   listeners = {};
   exchangeSnapshot = EMPTY_SNAPSHOT;
   localStorage.clear();
@@ -331,5 +339,31 @@ describe('LibraryTab — Exclude (canModerate)', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
     fireEvent.click(screen.getByRole('button', { name: 'Exclude 2 of 3' }));
     expect(screen.getByText('Exclude 2 frames from the project')).toBeInTheDocument();
+  });
+});
+
+describe('LibraryTab — Blink', () => {
+  it('blink_opens_only_frames_held_here', async () => {
+    const blinkEntry = (key: string): CollabBlinkEntry => ({
+      key, source: 'replica', entry: { file: { id: 1, path: '/x.fits' }, frame: null } as unknown as FileWithFrame,
+      frameUuid: key, sourceFrameId: null, publisherName: null,
+    });
+    const fallback = vi.mocked(api.invoke).getMockImplementation()!;
+    vi.mocked(api.invoke).mockImplementation((async (cmd: string, args?: unknown) => {
+      if (cmd === 'get_collab_blink_frames') return [blinkEntry('u1')]; // u3 dropped by the backend
+      return fallback(cmd, args as never);
+    }) as never);
+    renderTab([
+      frame({ frameUuid: 'u1', fileName: 'a.fits', localState: 'held' }),
+      frame({ frameUuid: 'u2', fileName: 'b.fits', localState: 'wanted' }),
+      frame({ frameUuid: 'u3', fileName: 'c.fits', localState: 'own_held', own: true }),
+    ]);
+    await screen.findByText('a.fits');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Blink 2 of 3' }));
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('get_collab_blink_frames', {
+      projectId: 'proj-1', refs: [{ frameId: null, frameUuid: 'u1' }, { frameId: null, frameUuid: 'u3' }],
+    }));
+    await waitFor(() => expect(blink?.frames.map((f) => f.key)).toEqual(['u1']));
   });
 });

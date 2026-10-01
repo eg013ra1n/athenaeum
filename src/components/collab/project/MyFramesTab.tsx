@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Loader2 } from 'lucide-react';
 import { api } from '../../../api';
@@ -10,10 +10,12 @@ import { formatDurationPadded, formatSize } from '../format';
 import FilterMappingDialog from '../FilterMappingDialog';
 import LinkObjectDialog from '../LinkObjectDialog';
 import ExcludeDialog from './ExcludeDialog';
+import ProjectBlink from './ProjectBlink';
+import { blinkRef, type BlinkTable } from './blinkEligibility';
 import ReasonGroupAction from './ReasonGroupAction';
 import ProjectFrameTable, { type TableAction } from './table/ProjectFrameTable';
 import type { GroupNode } from './table/model';
-import { fromOwn, type FrameVM } from './frames';
+import { fromOwn, ownFrameKey, type FrameVM } from './frames';
 import { contributionTiles } from './contribution';
 import PublishRunPanel from './PublishRunPanel';
 import { useWithhold } from './useWithhold';
@@ -79,6 +81,7 @@ export default function MyFramesTab({
   const [linkOpen, setLinkOpen] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
   const [excluding, setExcluding] = useState<FrameVM[] | null>(null);
+  const [blinking, setBlinking] = useState<{ table: BlinkTable; vms: FrameVM[] } | null>(null);
   const [solveBusy, setSolveBusy] = useState(false);
   const [analyzeBusy, setAnalyzeBusy] = useState<Set<number>>(new Set());
   // `plate-solve-complete` is a global event — plate solving can be kicked
@@ -220,6 +223,20 @@ export default function MyFramesTab({
     [rows],
   );
 
+  // Every segment, so an action that moves a frame (Don't publish → Held back)
+  // still finds its fresh row while Blink stays open.
+  const ownByKey = useMemo(
+    () => new Map((rows ?? []).map((r) => [ownFrameKey(r), fromOwn(r)] as const)),
+    [rows],
+  );
+  const lookup = useCallback((k: string) => ownByKey.get(k), [ownByKey]);
+  const blinkAction = (table: BlinkTable): TableAction => ({
+    id: 'blink',
+    verb: 'Blink',
+    eligible: (v) => blinkRef(v, table) !== null,
+    run: (t) => setBlinking({ table, vms: t }),
+  });
+
   const asTargets = (vs: FrameVM[]) => vs.map((v) => ({ frameId: v.frameId!, prepared: v.own?.calibratedPath != null }));
   const readyActions: TableAction[] = [
     {
@@ -237,6 +254,7 @@ export default function MyFramesTab({
       busy: withhold.busy,
       run: (targets) => void withhold.dontPublish(asTargets(targets)),
     },
+    blinkAction('ready'),
   ];
   const reviewActions: TableAction[] = [
     {
@@ -254,6 +272,7 @@ export default function MyFramesTab({
       busy: withhold.busy,
       run: (targets) => void withhold.dontPublish(asTargets(targets)),
     },
+    blinkAction('review'),
   ];
   const readyEmptyText =
     links.length === 0
@@ -294,6 +313,7 @@ export default function MyFramesTab({
         for (const setId of setIds) void handleAnalyze(setId);
       },
     },
+    blinkAction('held'),
   ];
 
   const publishedActions: TableAction[] = [
@@ -321,6 +341,7 @@ export default function MyFramesTab({
           } satisfies TableAction,
         ]
       : []),
+    blinkAction('published'),
   ];
 
   const summary = rows === null ? null : tiles.find((t) => t.segment === segment) ?? null;
@@ -467,6 +488,18 @@ export default function MyFramesTab({
           frames={excluding}
           onClose={() => setExcluding(null)}
           onDone={() => onReload()}
+        />
+      )}
+
+      {blinking && (
+        <ProjectBlink
+          projectId={projectId}
+          table={blinking.table}
+          vms={blinking.vms}
+          lookup={lookup}
+          canModerate={canModerate}
+          onClose={() => setBlinking(null)}
+          onChanged={onReload}
         />
       )}
     </div>

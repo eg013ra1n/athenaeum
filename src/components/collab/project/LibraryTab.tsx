@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type JSX } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { FolderOpen, FolderOutput } from 'lucide-react';
 import { api } from '../../../api';
@@ -8,6 +8,8 @@ import { Button } from '../../ui';
 import ProjectExportDialog from '../ProjectExportDialog';
 import CollabAttention from '../CollabAttention';
 import ExcludeDialog from './ExcludeDialog';
+import ProjectBlink from './ProjectBlink';
+import { blinkRef } from './blinkEligibility';
 import ProjectFrameTable, { type TableAction } from './table/ProjectFrameTable';
 import { fromLibrary, type FrameVM } from './frames';
 import type {
@@ -56,6 +58,7 @@ export default function LibraryTab({
   const [collabDir, setCollabDir] = useState<string | null | undefined>(undefined);
   const [exportOpen, setExportOpen] = useState(false);
   const [excluding, setExcluding] = useState<FrameVM[] | null>(null);
+  const [blinking, setBlinking] = useState<FrameVM[] | null>(null);
   const [keepBusy, setKeepBusy] = useState(false);
   const [keepError, setKeepError] = useState<string | null>(null);
 
@@ -116,6 +119,9 @@ export default function LibraryTab({
   );
   const rows = useMemo(() => libraryFrames.map((f) => fromLibrary(f, inFlight)), [libraryFrames, inFlight]);
 
+  const rowsByKey = useMemo(() => new Map(rows.map((r) => [r.key, r] as const)), [rows]);
+  const lookup = useCallback((k: string) => rowsByKey.get(k), [rowsByKey]);
+
   const handleKeepAgain = async (frameUuids: string[]): Promise<void> => {
     setKeepBusy(true);
     setKeepError(null);
@@ -151,6 +157,12 @@ export default function LibraryTab({
           } satisfies TableAction,
         ]
       : []),
+    {
+      id: 'blink',
+      verb: 'Blink',
+      eligible: (v) => blinkRef(v, 'library') !== null,
+      run: (targets) => setBlinking(targets),
+    },
   ];
 
   const dirUnset = collabDir === null;
@@ -210,6 +222,18 @@ export default function LibraryTab({
           frames={excluding}
           onClose={() => setExcluding(null)}
           onDone={() => reload()}
+        />
+      )}
+
+      {blinking && (
+        <ProjectBlink
+          projectId={projectId}
+          table="library"
+          vms={blinking}
+          lookup={lookup}
+          canModerate={canModerate}
+          onClose={() => setBlinking(null)}
+          onChanged={reload}
         />
       )}
     </div>

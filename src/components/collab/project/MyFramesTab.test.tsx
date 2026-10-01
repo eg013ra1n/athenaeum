@@ -602,3 +602,16 @@ describe('MyFramesTab — fix round 1, finding 2: listeners subscribe once, not 
     expect(onReload1).not.toHaveBeenCalled();
   });
 });
+
+describe('MyFramesTab — Blink', () => {
+  it('each segment offers Blink with the eligible-subset label', () => {
+    renderTab({
+      rows: [
+        own({ frameId: 1, fileName: 'a.fits', segment: 'ready' }),
+        own({ frameId: 2, fileName: 'b.fits', segment: 'ready', path: null }),
+      ],
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    expect(screen.getByRole('button', { name: 'Blink 1 of 2' })).toBeInTheDocument();
+  });
+});
