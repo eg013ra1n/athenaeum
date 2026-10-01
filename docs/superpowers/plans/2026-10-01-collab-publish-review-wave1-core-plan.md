@@ -54,6 +54,7 @@
 | W5 | `PublishMode` lives in `db::collab`. The DB values are `manual` / `auto_calibrate` / `automatic`; the wire values are `manual` / `autoCalibrate` / `automatic`. The `ALTER … DEFAULT 'manual'` fills every existing row, which is P1's one-time migration. |
 | W6 | The web `get_collab_frame_image` route lives in `routes/collab.rs` and calls a `routes/images.rs` helper `render_path_jpeg(state, path, resolution)`, extracted from `get_frame_preview`. |
 | W7 | A queued-then-cancelled run is `Ok` with outcome `cancelled`; it no longer returns `Internal("publish: the compute slot wait was cancelled")`. |
+| W9 | Calibrate runs the credentials / node / store checks of `run_publish` unchanged, so it needs a signed-in account. None of those checks makes a hub HTTP call. A signed-out member cannot calibrate, just as they cannot publish. |
 | W8 | `get_collab_frame_image` takes its frame as `frame` on the wire (`{ projectId, frame, resolution? }`), not `ref`: `ref` is a Rust keyword and would break the Tauri argument mapping. `CollabBlinkEntry` carries `publisherName` but no received-from fields; the Library row (`ProjectFrameView`) already has `receivedFromMember` / `receivedAt` for the Blink hint. |
 
 ## Review Focus
@@ -98,6 +99,14 @@
   - `api/collab.rs` ≈2128, ≈6078, ≈6178, ≈7634, ≈9388, ≈11946
   - `api/collab_live/holdings.rs` ≈2019, ≈2036
   - `export/project_collector.rs` ≈318
+- Modify (read sites, so the crate compiles at the end of THIS task):
+  - `api/collab.rs` `ProjectCard` (≈134-174) / `card_from_row` (≈1922): `auto_publish: bool` → `publish_mode: PublishMode`;
+  - `FrameSetProjectLink` (≈1237-1249) and its builder (≈1381): same;
+  - `api/collab_autopublish.rs` ≈186: the drain filter;
+  - `ts_export.rs`: add `crate::db::collab::PublishMode,` before `crate::api::collab::ProjectCard,`.
+- Modify `api/collab_autopublish.rs` tests:
+  - add `fn insert_project(conn: &Connection, id: &str, mode: PublishMode)` (= `upsert_project(&sample_project(id, mode))` + `set_publish_mode(conn, id, mode)`), because `upsert_project` never writes local columns;
+  - every test that expects a drain (≈`sets_map_to_their_linked_projects`, `unlinked_project_is_skipped`, `two_gate_moves…`, `a_lost_project_is_never_due…`, `failure_does_not_stop_the_worker`, `signed_out_*`, `a_busy_project…`, `requests_during_a_run_rearm_once`; `grep -n "upsert_project(&conn, &sample_project" crates/athenaeum-core/src/api/collab_autopublish.rs`) uses `insert_project(&conn, id, PublishMode::Automatic)`. The old schema default `auto_publish = 1` was what made them due.
 
 **Interfaces:**
 - Produces:
@@ -568,8 +577,17 @@ pub fn black_holed_frame_ids(conn: &Connection, frame_ids: &[i64]) -> Result<Has
 
 Add `pub mod collab_prepare;` to `db/mod.rs`. Update every `CollabProjectRow` literal listed under **Files**.
 
+The read sites, in this task so the crate compiles:
+- `ProjectCard` and `FrameSetProjectLink`: replace `pub auto_publish: bool` with `pub publish_mode: crate::db::collab::PublishMode`.
+- `card_from_row` sets `publish_mode: row.publish_mode`, and the `FrameSetProjectLink` builder sets `publish_mode: p.publish_mode`.
+- In `collab_autopublish.rs` ≈186, `if !project.auto_publish { continue; }` becomes `if project.publish_mode == crate::db::collab::PublishMode::Manual { continue; }`.
+- Add `crate::db::collab::PublishMode,` to `ts_export.rs` before `crate::api::collab::ProjectCard,`.
+- Add the `insert_project` test helper in `collab_autopublish.rs` and switch the drain-expecting tests to it (see **Files**).
+
 - [ ] **Step 4: Run to see them pass**
-  `cargo test -p athenaeum-core --lib db::collab_prepare && cargo test -p athenaeum-core --lib db::collab && cargo test -p athenaeum-core --lib collab_autopublish` → expect all green. The autopublish tests still compile with `sample_project(id, mode)`.
+  `cargo test -p athenaeum-core --lib db::collab_prepare && cargo test -p athenaeum-core --lib db::collab && cargo test -p athenaeum-core --lib collab_autopublish && cargo check -p athenaeum-tauri -p athenaeum-web` → expect all green.
+  - The autopublish drain tests pass because they now insert `Automatic` projects.
+  - Tauri and web still compile: `set_project_auto_publish` still exists, and Task 2 replaces it.
 
 - [ ] **Step 5: Commit**
 
@@ -587,15 +605,10 @@ Claude-Session: https://claude.ai/code/session_015RRpMcroNShaEgp8Q33fR3"
 ### Task 2: Publish mode on the card, the set link and the worker; `set_project_publish_mode`
 
 **Files:**
-- Modify: `crates/athenaeum-core/src/api/collab.rs`:
-  - `ProjectCard` ≈134-174: `auto_publish` → `publish_mode`
-  - `card_from_row` ≈1882
-  - `FrameSetProjectLink` ≈1237-1249 + its builder ≈1379-1387
-  - `set_project_auto_publish` ≈708-719 → `set_project_publish_mode`
+- Modify: `crates/athenaeum-core/src/api/collab.rs` (`set_project_auto_publish` ≈708-719 → `set_project_publish_mode`). The `ProjectCard` / `FrameSetProjectLink` fields and the drain filter were already changed in Task 1.
 - Modify: `crates/athenaeum-core/src/api/collab_autopublish.rs` (`drain_due_projects` ≈186; `is_publishing_device_refusal` ≈333 becomes `pub(crate)`)
 - Modify: `crates/athenaeum-tauri/src/commands/collab.rs` ≈250-261, `crates/athenaeum-tauri/src/lib.rs` ≈516
 - Modify: `crates/athenaeum-web/src/routes/collab.rs` ≈82-87 + ≈439-449, `crates/athenaeum-web/src/routes/mod.rs` ≈349
-- Modify: `crates/athenaeum-core/src/ts_export.rs` (add `crate::db::collab::PublishMode` beside `ProjectCard` ≈215)
 
 **Interfaces:**
 - Consumes: Task 1 `PublishMode`, `set_publish_mode`.
@@ -649,8 +662,7 @@ fn manual_projects_are_never_due_and_auto_modes_are() {
         ("p-cal", PublishMode::AutoCalibrate),
         ("p-auto", PublishMode::Automatic),
     ] {
-        crate::db::collab::upsert_project(&conn, &sample_project(id, mode)).unwrap();
-        crate::db::collab::set_publish_mode(&conn, id, mode).unwrap();
+        insert_project(&conn, id, mode);
         crate::db::collab::link_set(&conn, id, 7).unwrap();
     }
     drop(conn);
@@ -690,11 +702,7 @@ pub async fn set_project_publish_mode(
 }
 ```
 
-Make these changes in `api/collab.rs`:
-- `ProjectCard`: replace `pub auto_publish: bool` with `pub publish_mode: crate::db::collab::PublishMode`. Set it in `card_from_row` from `row.publish_mode`.
-- `FrameSetProjectLink`: the same replacement; its builder sets `publish_mode: p.publish_mode`.
-- `collab_autopublish.rs` ≈186: `if !project.auto_publish { continue; }` becomes `if project.publish_mode == crate::db::collab::PublishMode::Manual { continue; }`.
-- Make `is_publishing_device_refusal` `pub(crate)`.
+`ProjectCard.publish_mode`, `FrameSetProjectLink.publish_mode`, the drain filter and the `PublishMode` ts export were already done in Task 1. Here, also make `is_publishing_device_refusal` `pub(crate)`.
 
 Tauri, in `commands/collab.rs`, replacing the old wrapper:
 
@@ -737,8 +745,6 @@ pub async fn set_project_publish_mode(
 ```
 
 In `routes/mod.rs` ≈349: `.route("/api/set_project_publish_mode", post(collab::set_project_publish_mode))`.
-
-In `ts_export.rs`, add `crate::db::collab::PublishMode,` before `crate::api::collab::ProjectCard,`.
 
 - [ ] **Step 4: Run.**
   `cargo test -p athenaeum-core --lib set_project_publish_mode && cargo test -p athenaeum-core --lib collab_autopublish && cargo check -p athenaeum-tauri -p athenaeum-web` → green.
@@ -912,7 +918,7 @@ async fn withheld_and_black_holed_frames_are_held_back_with_their_kind() {
         sign_in_as(&conn, "me@example.org");
         let (set_id, ids) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 3);
         drop(conn);
-        link_frame_set(&ctx, "p-1", set_id).await.unwrap();
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
         ids
     };
     {
@@ -942,7 +948,7 @@ async fn a_black_holed_raw_keeps_its_published_frame() {
         sign_in_as(&conn, "me@example.org");
         let (set_id, ids) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 1);
         drop(conn);
-        link_frame_set(&ctx, "p-1", set_id).await.unwrap();
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
         ids
     };
     {
@@ -965,10 +971,11 @@ async fn a_current_prepared_frame_is_in_review_and_a_stale_one_is_ready() {
         let conn = crate::api::db(&ctx).unwrap().conn();
         cached_project(&conn);
         sign_in_as(&conn, "me@example.org");
-        let (set_id, ids) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 2);
+        // seed_set marks index 1 trailed (it fails the gate): use 0 and 2.
+        let (set_id, ids) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 3);
         drop(conn);
-        link_frame_set(&ctx, "p-1", set_id).await.unwrap();
-        (ids, _tmp.path().join("collab/m101/me"))
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        (vec![ids[0], ids[2]], _tmp.path().join("collab/m101/me"))
     };
     std::fs::create_dir_all(&dir).unwrap();
     let conn = crate::api::db(&ctx).unwrap().conn();
@@ -1152,7 +1159,8 @@ mod tests {
     fn ctx_with_project() -> (tempfile::TempDir, crate::services::ServiceContext) {
         let (tmp, ctx) = crate::api::collab_exchange::test_support::test_ctx();
         let conn = crate::api::db(&ctx).unwrap().conn();
-        crate::api::collab_exchange::test_support::seed_project(&conn, "p1");
+        // `db/collab.rs`'s test `sample_row` (≈754), made `pub(crate)` for this.
+        crate::db::collab::upsert_project(&conn, &crate::db::collab::tests::sample_row("p1")).unwrap();
         drop(conn);
         (tmp, ctx)
     }
@@ -1222,7 +1230,7 @@ mod tests {
 
 These names must be resolved before writing the tests:
 - **`Recorder`** (`api/collab_live/test_support.rs` ≈1201): if it has no `Default`, construct it with its tuple field.
-- **`seed_project`** (`collab_exchange.rs` ≈2125): it lives in `tests` scope. If it is not reachable from `test_support`, insert the project row with `crate::db::collab::upsert_project(&conn, &<a CollabProjectRow literal>)`, mirroring `collab_autopublish.rs`' `sample_project`.
+- **The project row.** `collab_exchange`'s `seed_project` is private and takes three arguments, so it is not used. Make `db::collab::tests` and its `sample_row` `pub(crate)` (≈754), and pass the project id it expects. If `sample_row` takes no id, set `.project_id = "p1".into()` on the returned row.
 - **The publishing-device prefix constant:** use whatever `is_publishing_device_refusal` matches (`COLLAB_PUBLISHING_DEVICE`).
 
 Add one run-level test in `api/collab.rs` `tests::publish`, using `fixture`, `mount_hub` and `PID` (≈9358/9041):
@@ -1234,7 +1242,9 @@ async fn every_publish_exit_emits_exactly_one_finished() {
     let fx = fixture(1).await;
     {
         let conn = crate::api::db(&fx.ctx).unwrap().conn();
-        conn.execute("DELETE FROM settings WHERE key LIKE 'account.%'", []).unwrap();
+        // The token is a file keyed by the hub host (api/account.rs ≈53):
+        // pointing the hub URL elsewhere makes `hub_credentials` return None.
+        crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_HUB_URL, "https://nobody.invalid").unwrap();
     }
     let rec = std::sync::Arc::new(crate::api::collab_live::test_support::Recorder::default());
     let res = publish_collab_frames(&fx.ctx, PID, None, Some(rec.clone())).await;
@@ -1245,7 +1255,7 @@ async fn every_publish_exit_emits_exactly_one_finished() {
 }
 ```
 
-How the fixture stores credentials (read `wire_hub` ≈7866 and `hub_credentials`) decides the right way to sign out. Use whatever makes `hub_credentials` return `None`, and keep the asserted outcome.
+Use the real path of the hub-URL setting key that `hub_credentials` / `api/account.rs` read (`grep -rn "ACCOUNT_HUB_URL" crates/athenaeum-core/src | head -3`) and the real `set_setting` signature.
 
 - [ ] **Step 2: Run to see them fail.**
   `cargo test -p athenaeum-core --lib collab_publish_run && cargo test -p athenaeum-core --lib every_publish_exit_emits` → compile errors.
@@ -1496,7 +1506,7 @@ fn outcome_of(res: &Result<PublishResult, ApiError>, cancelled: bool) -> (Publis
         Ok(_) => (PublishOutcome::Done, None),
         Err(ApiError::Conflict(m))
             if crate::api::collab_autopublish::is_publishing_device_refusal(m)
-                || m == crate::api::collab_autopublish::OUTDATED_MSG_FOR_RUNS =>
+                || m == crate::account::client::COLLAB_API_OUTDATED_MSG =>
         {
             (PublishOutcome::Refused, Some(m.clone()))
         }
@@ -1544,7 +1554,6 @@ pub fn cancel_collab_publish(ctx: &ServiceContext, project_id: &str) -> Result<(
 ```
 
 Notes for the implementer:
-- **`OUTDATED_MSG_FOR_RUNS`.** Do not invent a constant. Use the existing symbol `run_publish_pass` compares against for the outdated hub (`collab_autopublish.rs` ≈312), via its real path.
 - **`crate::api::collab::internal`.** It is the module's existing `fn internal`; make it `pub(crate)` if needed.
 - **`drop_withheld_prepared`.** Task 10 defines it. Add a stub with exactly the signature `pub(crate) fn drop_withheld_prepared(ctx: &ServiceContext, project_id: &str)` in a new `api/collab_prepare.rs`, with the body `let _ = (ctx, project_id);`, and declare it under the render+solver cfg. Task 10 fills it.
 - **`uuid` and `chrono`.** Both are already core dependencies; check `crates/athenaeum-core/Cargo.toml`.
@@ -1622,7 +1631,7 @@ In `run_publish`:
 
 - **Event.** Remove the `collab-published` emit (≈5719-5737) and the `COLLAB_PUBLISHED_EVENT` constant. `grep -rn "COLLAB_PUBLISHED_EVENT\|collab-published" crates/ src/` lists every user; the frontend ones change in wave 2.
 - **Cancel flag.** Pass `run.cancel_flag()` into `GenerationJob` as a new field `cancel: Arc<AtomicBool>`, and let `run_publish_generation` use it instead of creating its own (≈3380). The compute-queue X now flips the run's flag.
-- **The direct test caller.** `write_backs_keep_hub_state_written_mid_run` (≈10048) calls `run_publish` directly. Wrap it in `RunHandle::begin(...)` and pass `RunScope::Publish { only: None, include_new: true }`.
+- **The direct test callers.** `write_backs_keep_hub_state_written_mid_run` (≈10048) calls `run_publish` directly **twice**, and a third direct call sits at ≈10348 (`grep -n "run_publish(&fx.ctx" crates/athenaeum-core/src/api/collab.rs`). Wrap each in `RunHandle::begin(...)`, pass `RunScope::Publish { only: None, include_new: true }`, and `finish` it after.
 
 Commands, Tauri (in `commands/collab.rs`):
 
@@ -1770,7 +1779,7 @@ fn a_prepared_file_is_never_listed_as_foreign() {
 }
 ```
 
-Write that test fully against the module's helpers (`record_foreign_file(conn, path, project, size_mtime)` ≈ in this file, plus `crate::db::collab_prepare::upsert_prepared`). Assert `!list_foreign_files(&conn, "p1").unwrap().iter().any(|f| f.path == P)`.
+Write that test fully against the module's helpers (`record_foreign_file(conn, path, project, size_mtime)` ≈ in this file, plus `crate::db::collab_prepare::upsert_prepared`). `list_foreign_files` returns `Vec<(String, String)>` (path, seen_at): assert `!list_foreign_files(&conn, "p1").unwrap().iter().any(|f| f.0 == P)`.
 
 In `api/collab_live/storage_task.rs` tests, copy the nearest sweep test (it sets up a mounted Collaboration root). Before the sweep, place a prepared row and its file in the project's own folder. Then assert that the file still exists after `engine.sweep(..)` and that no `project_frames_local` / `collab_prepared_frames` row changed (`a_sweep_never_touches_a_prepared_file`).
 
@@ -1909,7 +1918,7 @@ async fn calibrate_writes_files_and_prepared_rows_and_never_calls_the_hub() {
         assert!(p.exists() && p.starts_with(own_dir(&fx)), "{p:?}");
         assert!(!r.external && !r.xxh3.is_empty() && r.byte_size > 0 && r.size_mtime_seen.is_some());
     }
-    assert_eq!(project_tag_count(&fx), 0, "nothing seeded");
+    assert_eq!(project_tag_count(&fx).await, 0, "nothing seeded");
     assert!(own_row(&fx, &fx.uuids[0]).is_none(), "nothing announced");
     let own = list_project_own_frames(&fx.ctx, PID).unwrap();
     assert!(own.iter().all(|r| r.segment == "review"), "{:?}", own.iter().map(|r| &r.segment).collect::<Vec<_>>());
@@ -1959,7 +1968,12 @@ async fn calibrate_is_refused_under_a_foreign_cached_binding() {
     {
         let conn = crate::api::db(&fx.ctx).unwrap().conn();
         // db/collab.rs ≈207: cache another device as this project's publisher.
-        crate::db::collab::set_publishing_device(&conn, PID, "dev-other", Some("Observatory")).unwrap();
+        crate::db::collab::set_publishing_device(
+            &conn,
+            PID,
+            Some(&crate::db::collab::PublishingDevice { device_id: "dev-other".into(), name: Some("Observatory".into()) }),
+        )
+        .unwrap();
     }
     let err = calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap_err();
     assert!(matches!(&err, ApiError::Conflict(m) if crate::api::collab_autopublish::is_publishing_device_refusal(m)), "{err:?}");
@@ -1997,9 +2011,7 @@ async fn calibrate_reports_queued_then_calibrating_and_one_finished() {
 }
 ```
 
-Check two things against the code:
-- The real signature of the cached-binding setter (`db/collab.rs` ≈207-260: `set_publishing_device` / `replace_publishing_device`). Call it with a device id that is not this device's and name `"Observatory"`.
-- Whether attestation needs more than `frames_set.calibrated_externally = 1` to pass the gate. Look at `set_frame_set_attestation` (`api/frame_sets.rs` ≈455) and use it instead if it exists.
+Check against the code whether attestation needs more than `frames_set.calibrated_externally = 1` to pass the gate. Look at `set_frame_set_attestation` (`api/frame_sets.rs` ≈455) and use it instead if it exists.
 
 - [ ] **Step 2: Run to see them fail.**
   `cargo test -p athenaeum-core --lib tests::publish::calibrate tests::publish::a_second_calibrate tests::publish::an_orphan` → compile errors.
@@ -2051,6 +2063,34 @@ own_by_src.get(&row.frame_id).is_none()
 ```
 
 Rows that do not qualify are skipped and never pushed to `held_back`. Publish/Republish candidate building is unchanged in this task (Task 9 changes it).
+
+Two more rules for Calibrate:
+- **A prepared-but-stale frame** (a prepared row exists, `prepared_is_current` is false) IS a candidate. Its stale row and file are dropped before the split, through a helper both scopes share:
+
+```rust
+/// Spec §4.1 step 5: drop stale prepared rows (and their non-external files)
+/// so the frame is Ready again. Returns how many were dropped.
+fn drop_stale_prepared(conn: &Connection, project_id: &str, ids: &[i64]) -> Result<usize, ApiError> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let gone = crate::db::collab_prepare::delete_prepared(conn, project_id, ids).map_err(internal)?;
+    crate::api::collab_prepare::remove_prepared_files(&gone);
+    tracing::info!(project_id, count = gone.len(), "stale prepared frames dropped");
+    Ok(gone.len())
+}
+```
+
+  `remove_prepared_files` belongs to Task 9 by its interface list, but it is defined HERE, in `api/collab_prepare.rs`, with the body given in Task 9 Step 3, because Calibrate needs it first.
+- **Adopt-class frames are not Calibrate's.** Pass 1 classifies a candidate with no own row by source as `PublishKind::Adopt` when the hub manifest has it as own with `source_frame_id = NULL` (a replaced device's frame). Such a frame is an update (P6, no review). Before building `GenerationJob` in the Calibrate scope:
+
+```rust
+        let before = plans.len();
+        plans.retain(|p| matches!(p.kind, PublishKind::New));
+        if plans.len() != before {
+            tracing::debug!(project_id, count = before - plans.len(), "calibrate: adopt-class frames left to Publish");
+        }
+```
 
 3. **Own folder and temp sweep.** Right after `own_folder(...)` resolves `own_dir`, and only in Calibrate:
 
@@ -2128,10 +2168,10 @@ When it returns `false`, drop the frame from `written`. Two notes:
 - `w.uuid` may be an `Option`-wrapped or differently named field on `WrittenFrame` (≈3172). Use the real one.
 - The recipe stored here must be the same string `current_recipe_for_frame` produces for the frame. Own rows already rely on that equality: `UpdatePending` compares `recipe_hash` with `current_recipe_for_frame`. If `current_recipe_for_frame` returns `None` where the run computed a recipe, read both functions and make `prepared_is_current` use the same derivation the run uses.
 
-**Progress in generation:**
-- After the compute-queue acquire succeeds: `job.run.stage(PublishStage::Calibrating, generated_plans.len() + externals.len())`.
-- After each frame, attested or generated: `job.run.tick(done, Some(&cand.filename))`.
-- When only attested frames exist (no acquire), call `stage(Calibrating, externals.len())` before hashing them.
+**Progress in generation.** Attested plans are hashed BEFORE the compute acquire (≈3262), so the stages are set like this:
+- Let `total = generated_plans.len() + externals.len()`. Call `job.run.stage(PublishStage::Calibrating, total)` before the attested loop. Externals are hashed with no slot.
+- If `generated_plans` is non-empty, call `job.run.stage(PublishStage::Queued, total)` right before the acquire, then `job.run.stage(PublishStage::Calibrating, total)` right after it succeeds. Then call `job.run.tick(done, None)` once, to carry the externals' count over: `stage` resets `current`.
+- After each frame, attested or generated, call `job.run.tick(done, Some(&cand.filename))`, where `done` counts both kinds.
 
 5. **Calibrate returns after generation** (≈4730):
 
@@ -2303,7 +2343,7 @@ In `run_publish_generation`:
 **Interfaces:**
 - Consumes: Tasks 4, 5, 7 and 8.
 - Produces:
-  - `pub(crate) fn remove_prepared_files(rows: &[crate::db::collab_prepare::PreparedRow]) -> usize`. It removes every non-external `calibrated_path` and returns how many were removed. `NotFound` counts as removed; any other error is logged at `error`.
+  - `pub(crate) fn remove_prepared_files(rows: &[crate::db::collab_prepare::PreparedRow]) -> usize`. It is already added in Task 7 with exactly this body; if it is there, keep it. It removes every non-external `calibrated_path` and returns how many were removed. `NotFound` counts as removed; any other error is logged at `error`.
   - `PublishResult.stale` is filled.
   - A selected Ready frame that is not prepared is held with the reason `"not calibrated yet — calibrate it first"`.
 
@@ -2397,7 +2437,7 @@ async fn a_frame_withheld_mid_run_is_not_announced_and_its_file_is_removed() {
     assert_eq!(announced, 1);
     assert!(!std::path::Path::new(&withheld_path).exists());
     assert!(prepared(&fx).is_empty());
-    assert_eq!(project_tag_count(&fx), 1, "the withheld frame is untagged");
+    assert_eq!(project_tag_count(&fx).await, 1, "the withheld frame is untagged");
 }
 
 #[tokio::test]
@@ -2409,7 +2449,7 @@ async fn cancel_before_an_announce_batch_untags_and_keeps_frames_prepared() {
     let res = publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
     assert_eq!(res.announced, 0);
     assert_eq!(prepared(&fx).len(), 2);
-    assert_eq!(project_tag_count(&fx), 0);
+    assert_eq!(project_tag_count(&fx).await, 0);
 }
 
 #[tokio::test]
@@ -2434,7 +2474,7 @@ Add `use std::io::Write;` to the test module if it is missing.
 
 - [ ] **Step 3: Implement.**
 
-`api/collab_prepare.rs`:
+`api/collab_prepare.rs` (already present from Task 7; shown for reference):
 
 ```rust
 /// Remove the calibrated files of these prepared rows — never an external
@@ -2463,17 +2503,16 @@ In `run_publish`:
    - **Prepared but stale:** collect it into `stale_rows`.
    - **Not prepared:** when `only` contains it, push `held(fid, &filename, "not calibrated yet — calibrate it first".into())`; otherwise skip it.
 
+   - **Adopt-class:** the hub manifest has it as own with `source_frame_id = NULL` (`frames_db::get(&conn, project_id, &uuid)` → `Own` with no `source_frame_id`). It stays a candidate whatever its prepared state, as today (P6), so pass 1 adopts it. `a_replaced_devices_frames_are_versioned_here_and_adopted` (≈11115) must keep passing WITHOUT a prior calibrate.
+
    After the loop:
 
 ```rust
-    if !stale_rows.is_empty() {
-        let ids: Vec<i64> = stale_rows.iter().map(|r| r.source_frame_id).collect();
-        let gone = crate::db::collab_prepare::delete_prepared(&conn, project_id, &ids).map_err(internal)?;
-        crate::api::collab_prepare::remove_prepared_files(&gone);
-        tracing::info!(project_id, count = gone.len(), "stale prepared frames returned to Ready");
-        stale = gone.len();
-    }
+    let stale_ids: Vec<i64> = stale_rows.iter().map(|r| r.source_frame_id).collect();
+    let stale = drop_stale_prepared(&conn, project_id, &stale_ids)?;
 ```
+
+   `drop_stale_prepared` is the shared helper from Task 7.
 
    Rows with an own row keep today's Update / Adopt / unchanged handling.
 
@@ -2519,12 +2558,20 @@ In `run_publish`:
 ```rust
     run.stage(crate::api::collab_publish_run::PublishStage::Seeding, outcome.written.len());
     if run.cancelled() {
-        // Nothing seeded yet: staged updates are unstaged exactly as the
-        // outdated-hub path does; prepared frames simply stay prepared.
-        unstage_updates(/* the written Update/Adopt frames, as the existing callers pass them */);
+        // Nothing is seeded or staged in the DB yet; regenerated Update/Adopt
+        // outputs exist only as `.athpub` temps on disk. Remove those, keep
+        // the rest: prepared frames simply stay prepared.
+        for w in &outcome.written {
+            if w.staged != w.target {
+                remove_temp(project_id, &w.staged);
+            }
+        }
+        tracing::info!(project_id, "publish cancelled before seeding");
         return Ok(PublishResult { stale, held_back, ..Default::default() });
     }
 ```
+
+   `remove_temp` is the existing helper the failure paths use to delete an `.athpub` (`grep -n "fn remove_temp" crates/athenaeum-core/src/api/collab.rs`). Use its real name and arguments. Do NOT call `unstage_updates` here: it takes `SeededFrame`s and reverts rows that `stage_own_file` has not touched yet.
 
    Call `run.tick(i + 1, Some(&w.filename))` after each frame is seeded, New and Update alike.
 
@@ -2557,7 +2604,7 @@ In `run_publish`:
 7. **Own rows.** In the IMMEDIATE transaction that records an announced New frame (`record_own`) or a `hub_adopted` one, also run:
 
 ```rust
-            crate::db::collab_prepare::delete_prepared(c, project_id, &[f.written.frame_id]).map_err(internal)?;
+            crate::db::collab_prepare::delete_prepared(c, project_id, &[f.written.frame_id])?; // inside `in_tx`: anyhow
 ```
 
    The file stays: it is now the published `landed_path`.
@@ -2565,7 +2612,7 @@ In `run_publish`:
 8. **Result.** Return `stale` in `PublishResult`.
 
 - [ ] **Step 4: Run.**
-  `cargo test -p athenaeum-core --lib tests::publish && cargo test -p athenaeum-core --test '*' collab 2>&1 | tail -5` → green. `api/collab_v3_live_e2e_tests.rs` (≈903-968) calls `publish_collab_frames`: add a `calibrate_collab_frames` call before each, as for the unit tests.
+  `cargo test -p athenaeum-core --lib tests::publish && cargo test -p athenaeum-core --lib collab_v3_live_e2e -- --test-threads=2` → green. `api/collab_v3_live_e2e_tests.rs` is a `--lib` module (≈903-968) that calls `publish_collab_frames`: add a `calibrate_collab_frames` call before each, as for the unit tests.
 
 - [ ] **Step 5: Commit** `feat(collab): Publish announces prepared frames, drops stale and withheld ones, honours cancel`.
 
@@ -2736,6 +2783,8 @@ pub(crate) fn drop_withheld_prepared(ctx: &ServiceContext, project_id: &str) {
 
 Use the module's real `ServiceContext` / `ApiError` imports. If `api::collab::internal` is private, make it `pub(crate)`.
 
+Known narrow race, accepted: a withhold reads `is_active == false`, then a run starts before the withhold's transaction commits. The run's seed then fails on the deleted file ("seeding failed"), and that frame is held back for this run only. Leave a one-line comment at the `is_active` read.
+
 **Hosts.** Tauri (`commands/collab.rs`):
 
 ```rust
@@ -2819,8 +2868,8 @@ async fn unlink_drops_unreachable_prepared_but_never_an_original() {
         let (a, a_ids) = seed_set(&conn, "A", "14 03 12", "+54 20 56", 210.8, 54.35, 2);
         let (b, b_ids) = seed_set(&conn, "B", "14 03 12", "+54 20 56", 210.8, 54.35, 1);
         drop(conn);
-        link_frame_set(&ctx, "p-1", a).await.unwrap();
-        link_frame_set(&ctx, "p-1", b).await.unwrap();
+        link_frame_set(&ctx, "p-1", a).unwrap();
+        link_frame_set(&ctx, "p-1", b).unwrap();
         (a_ids, b_ids)
     };
     let fa = tmp.path().join("c_a0.fits");
@@ -2837,7 +2886,7 @@ async fn unlink_drops_unreachable_prepared_but_never_an_original() {
         let conn = crate::api::db(&ctx).unwrap().conn();
         conn.query_row("SELECT id FROM frames_set WHERE name = 'A'", [], |r| r.get(0)).unwrap()
     };
-    unlink_frame_set(&ctx, "p-1", set_a).await.unwrap();
+    unlink_frame_set(&ctx, "p-1", set_a).unwrap();
     assert!(!fa.exists(), "A's calibrated file is gone");
     assert!(fb.exists(), "B is still linked");
     let conn = crate::api::db(&ctx).unwrap().conn();
@@ -2888,11 +2937,11 @@ In `api/collab.rs`:
 /// Spec §4.2: prepared rows whose frame no linked set reaches any more —
 /// rows deleted, (non-external) files removed by the caller.
 fn drop_unreachable_prepared(conn: &Connection, project_id: &str) -> Result<Vec<crate::db::collab_prepare::PreparedRow>, ApiError> {
-    let sets = linked_set_ids(conn, project_id)?;
+    let sets = crate::db::collab::linked_set_ids(conn, project_id).map_err(internal)?;
     let reachable: HashSet<i64> = if sets.is_empty() {
         HashSet::new()
     } else {
-        union_light_frames(conn, &sets)?.into_iter().map(|(id, _)| id).collect()
+        union_light_frames(conn, &sets).map_err(internal)?.into_iter().map(|(id, _)| id).collect()
     };
     let orphaned: Vec<i64> = crate::db::collab_prepare::list_prepared(conn, project_id)
         .map_err(internal)?
@@ -2911,7 +2960,7 @@ pub(crate) fn forget_lost_project_local(conn: &Connection, project_id: &str) -> 
 }
 ```
 
-Match the real signatures of `linked_set_ids` and `union_light_frames`; the latter takes the set ids and returns `Vec<(i64, String)>`.
+`linked_set_ids` lives in `crate::db::collab` and returns `anyhow::Result<Vec<i64>>`. `union_light_frames` (≈311) is a private `anyhow` fn: make it `pub(crate)` (Task 15 uses it too).
 
 - **`unlink_frame_set`.** After `unlink_set` (≈691):
 
@@ -3022,7 +3071,11 @@ async fn auto_calibrate_still_updates_a_published_frame() {
     mount_hub(&fx.server, "published").await;
     mount_holders_and_version(&fx.server).await;
     publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
-    set_mtime(&fx.lights[0], 1_700_000_000); // the raw changed → the recipe moved
+    // A new master dark changes the output bytes (a raw-mtime change would only
+    // move the recipe and regenerate identical bytes → `unchanged`, see
+    // `write_backs_keep_hub_state_written_mid_run`).
+    write_dark(&fx.master, 310.0);
+    set_mtime(&fx.master, 240);
     set_mode(&fx, crate::db::collab::PublishMode::AutoCalibrate).await;
     let res = auto_publish_collab_frames(&fx.ctx, PID, None).await.unwrap();
     assert_eq!(res.updated, 1, "{res:?}");
@@ -3247,21 +3300,26 @@ The report points (each project exactly once per apply):
             }
 ```
 
-  Do the same for `Holders` (using `h.project_id`), `Resync` (`r.project_id`) and `Account` (`a.project_id`). `Presence` and `Unknown` produce no report.
+  `LiveEvent::Holders` is inline logic with three return points (≈158-190). Extract its body unchanged into `async fn on_holders(&mut self, h: HoldersEvent, holders: &mut dyn HolderSide) -> Result<Vec<FeedEffect>, ApiError>`, then wrap the call like `Project` (using `h.project_id`, cloned before the call). Wrap `Resync` (`r.project_id`) and `Account` (`a.project_id`) the same way; if `Resync` is inline too, extract it into `on_resync` first. `Presence` and `Unknown` produce no report.
 
 The two error types differ: `report` takes `Result<&[FeedEffect], &ApiError>`, so `r.as_ref().map(|v| v.as_slice())` fits.
 
 In `workers.rs`:
 - **`FeedOut`** gains `Synced(crate::api::collab_live::feed::SyncReport)`.
-- **`on_event`.** After `let applied = feed.apply(ev, holdings).await;` and before matching it:
+- **`on_event`.** `feed` and `holdings` are `&mut` borrows of `self.feed` / `self.holdings` that stay live into the `Ok` arm, so `self.send(..)` (a `&self` call) cannot go between `apply` and the match (E0502). Take the reports right after `apply`:
 
 ```rust
-        for r in feed.take_reports() {
+        let applied = feed.apply(ev, holdings).await;
+        let mut reports = feed.take_reports();
+```
+
+  In the `Err(ApiError::Forbidden(e))` arm, when `project` is `Some`, push a `SyncReport { project_id: project_id.clone(), ok: false, error: Some(e.clone()), changes: Default::default() }` onto `reports`, still before `Refused` is sent. After the whole `match applied { … }` block, where no borrow of `self.feed` / `self.holdings` is live any more:
+
+```rust
+        for r in reports {
             self.send(FeedOut::Synced(r));
         }
 ```
-
-  In the `Err(ApiError::Forbidden(e))` arm, when `project` is `Some`, also send `FeedOut::Synced(SyncReport { project_id: project_id.clone(), ok: false, error: Some(e.clone()), changes: Default::default() })` before `Refused`.
 
 In `runtime.rs` `on_feed_out`, add a temporary arm that Task 14 replaces:
 
@@ -3519,7 +3577,7 @@ In `workers.rs`:
 - **`FeedWork`** gains `DigestAfterHello(Vec<String>)`, and `FeedWorker` gains `digest_after_hello: Option<Vec<String>>`, initialised to `None`.
 - **`handle`:** `FeedWork::DigestAfterHello(p) => self.digest_after_hello = Some(p),`.
 - **Digest fn.** Factor the existing `DigestAll` body into `async fn digest(&mut self, projects: &[String])`. `DigestAll` stays and calls it.
-- **`on_event`.** After the reports are sent for a `hello`:
+- **`on_event`.** After the reports are sent for a `hello`, at the very end of `on_event` (no borrows live):
 
 ```rust
         if hello {
@@ -3552,7 +3610,7 @@ In `api/collab.rs`, `ProjectCard` gains `pub synced_at: Option<String>`, and `ca
   - `frames_db::{get, own_by_source_frame}` (`db/collab_frames.rs` ≈782, ≈1321).
   - `crate::db::get_frames_with_files_by_ids`.
   - `collab_exchange::parse_manifest_wire` (≈688).
-  - `api::collab::{linked_set_ids, union_light_frames}`, made `pub(crate)` if they are private.
+  - `crate::db::collab::linked_set_ids` and `api::collab::union_light_frames` (`pub(crate)` since Task 11). Both are `anyhow`, and `?` converts through `From<anyhow::Error> for ApiError`.
 - Produces:
   - `#[derive(Deserialize, Serialize, ts_rs::TS, Clone, Debug)] #[serde(rename_all = "camelCase")] pub struct CollabFrameRef { pub frame_id: Option<i64>, pub frame_uuid: Option<String> }`.
   - `pub enum BlinkSource { Raw, Calibrated, Replica }` (camelCase).
@@ -3609,21 +3667,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_held_replica_resolves_by_uuid() {
-        let fx = fixture(1).await;
-        let landed = own_dir(&fx).parent().unwrap().join("peer").join("c_peer.fits");
-        std::fs::create_dir_all(landed.parent().unwrap()).unwrap();
-        std::fs::copy(&fx.lights[0], &landed).unwrap();
-        // Insert a replica row: origin 'replica', local_state 'held',
-        // landed_path = landed, a minimal manifest_json — reuse the
-        // collab_frames test helper that builds a LocalFrameRow for a replica.
-        let r = CollabFrameRef { frame_id: None, frame_uuid: Some("u-peer".into()) };
-        let (p, s) = resolve_collab_frame_path(&fx.ctx, PID, &r).unwrap();
-        assert_eq!((s, p), (BlinkSource::Replica, landed));
+        // test_support::landed_rig: frames[i] = (project_id, uuid, landed_path), state Held.
+        let rig = crate::api::collab_live::test_support::landed_rig(1).await;
+        let (pid, uuid, landed) = rig.frames[0].clone();
+        let r = CollabFrameRef { frame_id: None, frame_uuid: Some(uuid) };
+        let (p, s) = resolve_collab_frame_path(&rig.ctx, &pid, &r).unwrap();
+        assert_eq!(s, BlinkSource::Replica);
+        assert_eq!(p, std::path::PathBuf::from(landed));
     }
 }
 ```
 
-`tests::publish` items are `pub(super)`. Make `fixture`, `own_dir`, `PID` and `PubFx` `pub(crate)` under `#[cfg(test)]` so this module can use them. In `a_held_replica_resolves_by_uuid`, insert the replica row with the same helper the `collab_frames` tests use to record a replica (`grep -n "origin: FrameOrigin::Replica" crates/athenaeum-core/src/db/collab_frames.rs`), with `local_state` held and `landed_path` = `landed`.
+`tests::publish` items are `pub(super)`. Make `fixture`, `own_dir`, `PID` and `PubFx` `pub(crate)` under `#[cfg(test)]` so this module can use them. In `landed_rig`, check the real field types (`rig.ctx` may be an `Arc`, and the `frames` tuple may hold a `PathBuf`), and adapt the two lines.
 
 - [ ] **Step 2: Run to see them fail.**
   `cargo test -p athenaeum-core --lib collab_blink` → compile errors.
@@ -3669,7 +3724,7 @@ pub fn resolve_collab_frame_path(ctx: &ServiceContext, project_id: &str, r: &Col
     let conn = d.conn();
     crate::api::collab_exchange::live_project(&conn, project_id)?;
     if let Some(fid) = r.frame_id {
-        let sets = crate::api::collab::linked_set_ids(&conn, project_id)?;
+        let sets = crate::db::collab::linked_set_ids(&conn, project_id)?;
         let in_project = !sets.is_empty()
             && crate::api::collab::union_light_frames(&conn, &sets)?.iter().any(|(id, _)| *id == fid);
         if !in_project {
@@ -3755,20 +3810,24 @@ pub fn get_collab_blink_frames(ctx: &ServiceContext, project_id: &str, refs: &[C
         let d = db(ctx)?;
         let conn = d.conn();
         let (entry, publisher_name) = if let Some(fid) = r.frame_id {
-            let mut fwf = crate::db::get_frames_with_files_by_ids(&conn, &[fid])?
+            // db/operations.rs ≈3169: Vec<(frame_id, File, Frame)>.
+            let (_, catalog_file, frame) = crate::db::get_frames_with_files_by_ids(&conn, &[fid])?
                 .into_iter()
                 .next()
                 .ok_or_else(|| ApiError::NotFound(format!("frame {fid}")))?;
-            if source == BlinkSource::Calibrated {
+            let file = if source == BlinkSource::Calibrated {
+                // Keep the catalog Frame (metadata, star metrics); swap the File.
                 match synthetic_file(&path) {
-                    Some(f) => fwf.0 = f, // see note: keep the catalog Frame, swap the File
+                    Some(f) => f,
                     None => {
                         dropped += 1;
                         continue;
                     }
                 }
-            }
-            (FileWithFrame { file: fwf.0, frame: Some(fwf.1) }, None)
+            } else {
+                catalog_file
+            };
+            (FileWithFrame { file, frame: Some(frame) }, None)
         } else {
             let uuid = r.frame_uuid.as_deref().unwrap_or_default();
             let row = crate::db::collab_frames::get(&conn, project_id, uuid)?.ok_or_else(|| ApiError::NotFound(uuid.into()))?;
@@ -3776,12 +3835,12 @@ pub fn get_collab_blink_frames(ctx: &ServiceContext, project_id: &str, refs: &[C
             let meta = |k: &str| wire.as_ref().and_then(|w| w.meta.get(k)).and_then(|v| v.as_str()).map(str::to_string);
             let frame = Frame {
                 filter: Some(row.filter_canonical.clone()),
-                exptime: wire.as_ref().and_then(|w| w.exptime_sec),
+                exptime: wire.as_ref().map(|w| w.exptime_sec),
                 date_obs: wire.as_ref().and_then(|w| w.date_obs.as_deref()).and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|t| t.with_timezone(&chrono::Utc)),
                 instrume: meta("instrume"),
                 telescop: meta("telescope"),
                 bayerpat: meta("bayerpat"),
-                imagetyp: Some("Light".into()),
+                imagetyp: Some(crate::models::ImageType::Light),
                 ..Default::default()
             };
             let Some(file) = synthetic_file(&path) else {
@@ -3807,7 +3866,6 @@ pub fn get_collab_blink_frames(ctx: &ServiceContext, project_id: &str, refs: &[C
 ```
 
 Adapt these to the real types. The code above is written against the research notes:
-- **`get_frames_with_files_by_ids`.** Check what it returns (a `Vec` of `(File, Frame)` or of a struct). Build `FileWithFrame { file, frame: Some(frame) }` from it, and swap `file` for `synthetic_file(&path)` when the source is `Calibrated`.
 - **Model fields.** Take the exact field types of `File` (`models.rs` ≈5-22) from the source: `updated_at` may not be an `Option`, `size` may be `u64`. Do the same for the `LocalFrameRow` fields `local_state` (an enum, so use its db-string method), `filter_canonical` and `publisher_display`, and the `FrameViewWire` fields (`meta` type, `date_obs` format — `night_of_date_obs` ≈711 shows both accepted formats).
 
 **Web helper.** In `routes/images.rs`, extract `pub(crate) async fn render_path_jpeg(state: &WebAppState, file_path: String, resolution: Option<String>) -> Result<Response, (StatusCode, String)>`:
