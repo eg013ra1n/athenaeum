@@ -10793,7 +10793,7 @@ pub(crate) mod tests {
         }
 
         /// Hub routes every run touches: announce, holder report, versions.
-        async fn mount_hub(server: &MockServer, state: &str) {
+        pub(crate) async fn mount_hub(server: &MockServer, state: &str) {
             Mock::given(wm_method("POST"))
                 .and(wm_path(format!("/api/v1/projects/{PID}/frames")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

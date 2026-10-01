@@ -1315,6 +1315,25 @@ pub fn file_names_of_publisher(
     Ok(names)
 }
 
+/// The own row published from one source frame, by targeted lookup (the
+/// per-frame readers; [`own_by_source_frame`] loads every own row).
+pub fn own_row_for_source_frame(
+    conn: &Connection,
+    project_id: &str,
+    source_frame_id: i64,
+) -> Result<Option<LocalFrameRow>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {SELECT_COLS} FROM project_frames_local \
+                 WHERE project_id = ?1 AND origin = 'own' AND source_frame_id = ?2 LIMIT 1"
+            ),
+            params![project_id, source_frame_id],
+            row_from_sql,
+        )
+        .optional()?)
+}
+
 /// Every own-frame row of a project, keyed by its `source_frame_id` — the
 /// publish run's "what have I already published for this local frame" index
 /// (P19's recipe-hash comparison).
