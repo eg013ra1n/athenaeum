@@ -3559,6 +3559,8 @@ struct GenerationJob {
     queue: crate::services::compute_queue::ComputeQueue,
     pool: Arc<rayon::ThreadPool>,
     project_id: String,
+    /// The Collaboration root: the free-space probe never looks above it.
+    collab_root: std::path::PathBuf,
     label: String,
     plans: Vec<PlannedFrame>,
     /// The run's own cancel flag (the compute queue's X flips it).
@@ -3777,10 +3779,16 @@ pub(crate) fn set_free_space_for_test(ctx: &ServiceContext, project_id: &str, fr
 }
 
 /// Free bytes on the volume `dir` lands on, probed at its nearest existing
-/// folder (a new project's own folder is created by the first write). `db`
-/// only keys the test seam.
-#[cfg_attr(not(test), allow(unused_variables))]
-fn landing_free_bytes(db: &crate::db::Database, project_id: &str, dir: &Path) -> Option<u64> {
+/// folder (a new project's own folder is created by the first write) but
+/// never above the Collaboration root `root`. A root that is missing or not
+/// a folder is unknown (`None`), never another volume's figure. `db` only
+/// keys the test seam.
+fn landing_free_bytes(
+    db: &crate::db::Database,
+    project_id: &str,
+    dir: &Path,
+    root: &Path,
+) -> Option<u64> {
     #[cfg(test)]
     {
         let key = format!("{}|{project_id}", db.path().display());
@@ -3792,10 +3800,12 @@ fn landing_free_bytes(db: &crate::db::Database, project_id: &str, dir: &Path) ->
             return *free;
         }
     }
-    match crate::disk::nearest_existing_dir(dir) {
+    #[cfg(not(test))]
+    let _ = db;
+    match crate::disk::nearest_existing_dir(dir, root) {
         Some(probe) => crate::disk::free_bytes(probe),
         None => {
-            tracing::warn!(project_id, path = %dir.display(), "free space probe: no existing folder at or above the landing folder");
+            tracing::warn!(project_id, path = %dir.display(), root = %root.display(), "free space probe: the Collaboration root is missing or does not contain the landing folder");
             None
         }
     }
@@ -3813,6 +3823,7 @@ fn check_landing_space(
     pid: &str,
     run: &crate::api::collab_publish_run::RunHandle,
     generated: &[PlannedFrame],
+    collab_root: &Path,
 ) -> Result<(), ApiError> {
     let ids: Vec<i64> = generated.iter().map(|p| p.cand.frame_id).collect();
     let facts = frame_size_facts(&db.conn(), &ids).map_err(|e| {
@@ -3836,7 +3847,7 @@ fn check_landing_space(
         .first()
         .and_then(|p| p.target.parent())
         .unwrap_or_else(|| Path::new(""));
-    let free = landing_free_bytes(db, pid, dir);
+    let free = landing_free_bytes(db, pid, dir, collab_root);
     if let Err(msg) = space_verdict(needed, free) {
         tracing::error!(
             project_id = pid,
@@ -3899,7 +3910,7 @@ fn run_publish_generation(job: GenerationJob) -> Result<GenerationOutcome, ApiEr
     // recorded, before the compute permit, before any file is written. An
     // attested-only run writes nothing and is never checked.
     if !generated_plans.is_empty() {
-        check_landing_space(&job.db, pid, &job.run, &generated_plans)?;
+        check_landing_space(&job.db, pid, &job.run, &generated_plans, &job.collab_root)?;
     }
 
     // Progress: attested frames are hashed with no compute slot, so with any
@@ -6026,6 +6037,7 @@ async fn run_publish(
             queue: ctx.compute_queue.clone(),
             pool: Arc::clone(&ctx.image_pool),
             project_id: project_id.to_string(),
+            collab_root: collab_root.clone(),
             label: format!("collab publish {}", project.title),
             plans,
             cancel: run.cancel_flag(),
@@ -14912,6 +14924,9 @@ pub(crate) mod tests {
         }
 
         // ── Free-space check (spec 2026-10-01 §16.1 N40) ─────────────────────
+        // Calibrate tests that do not set the space seam need the estimate
+        // plus 1 GB free on the temp volume; a `collab_no_space` failure in
+        // one of them means the machine's disk, not the code.
 
         /// Every file under `dir` (none when it does not exist).
         fn files_under(dir: &Path) -> Vec<PathBuf> {
@@ -14986,6 +15001,72 @@ pub(crate) mod tests {
             let rows = prepared(&fx);
             assert_eq!(rows.len(), 1);
             assert!(rows[0].external);
+        }
+
+        /// N40: a mixed run (one attested frame, one generated) with too
+        /// little room is refused whole — the attested frame's prepared row
+        /// is not written either, and nothing lands on disk.
+        #[tokio::test]
+        async fn a_mixed_run_without_the_space_writes_no_row_for_the_attested_frame() {
+            let fx = fixture(2).await;
+            {
+                let conn = fx.conn();
+                conn.execute(
+                    "INSERT INTO frames_set (name, objctra, objctdec, calibrated_externally) \
+                     VALUES ('Attested', '00:42:44', '+41:16:09', 1)",
+                    [],
+                )
+                .unwrap();
+                let set2 = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
+                     VALUES (?1, '2026-07-01T20:00:00Z', '2026-07-02T03:00:00Z')",
+                    [set2],
+                )
+                .unwrap();
+                let night = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'ASI2600MM')",
+                    [night],
+                )
+                .unwrap();
+                let session = conn.last_insert_rowid();
+                conn.execute(
+                    "UPDATE session_members SET session_id = ?1 WHERE frame_id = ?2",
+                    rusqlite::params![session, fx.frame_ids[1]],
+                )
+                .unwrap();
+                drop(conn);
+                link_frame_set(&fx.ctx, PID, set2).unwrap();
+            }
+            set_free_space_for_test(&fx.ctx, PID, Some(0));
+            let err = calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ApiError::Conflict(m) if crate::api::collab_autopublish::is_no_space_refusal(m)),
+                "{err:?}"
+            );
+            assert!(prepared(&fx).is_empty(), "no row, attested frame included");
+            assert!(files_under(&own_dir(&fx)).is_empty());
+        }
+
+        /// N40: the probe never measures above the Collaboration root — a
+        /// root that does not exist is unknown (not the parent volume's
+        /// figure), and a project folder not created yet probes the root.
+        #[test]
+        fn landing_free_bytes_is_bounded_by_the_collaboration_root() {
+            let (tmp, ctx) = test_ctx();
+            let database = db(&ctx).unwrap();
+            let root = tmp.path().join("Collab");
+            let dir = root.join("m31").join("me-myself");
+            assert_eq!(landing_free_bytes(database, "no-seam", &dir, &root), None);
+            std::fs::create_dir_all(&root).unwrap();
+            assert_eq!(
+                landing_free_bytes(database, "no-seam", &dir, &root),
+                crate::disk::free_bytes(&root)
+            );
+            assert!(landing_free_bytes(database, "no-seam", &dir, &root).is_some());
         }
 
         /// N40: a probe that cannot read the free space never refuses — the

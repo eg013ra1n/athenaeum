@@ -87,12 +87,26 @@ pub fn free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
-/// The deepest existing directory at or above `path` — the probe target for
-/// a folder a run has not created yet (both platform calls need an existing
-/// path, and the folder's own volume is its nearest existing ancestor's).
-/// `None` when nothing at or above `path` exists.
-pub fn nearest_existing_dir(path: &Path) -> Option<&Path> {
-    path.ancestors().find(|p| p.is_dir())
+/// The deepest existing directory at or above `path`, never above `root` —
+/// the probe target for a folder a run has not created yet (both platform
+/// calls need an existing path, and the folder's own volume is its nearest
+/// existing ancestor's). The walk stops at `root` (inclusive) so it never
+/// measures another volume than the one the tree lives on. `None` when
+/// `root` is not an existing directory, `path` is not under `root`, or
+/// nothing from `path` up to `root` exists.
+pub fn nearest_existing_dir<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
+    if !root.is_dir() || !path.starts_with(root) {
+        return None;
+    }
+    for p in path.ancestors() {
+        if p.is_dir() {
+            return Some(p);
+        }
+        if p == root {
+            return None;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -109,13 +123,29 @@ mod tests {
     #[test]
     fn nearest_existing_dir_walks_up_to_a_folder_that_exists() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(nearest_existing_dir(tmp.path()), Some(tmp.path()));
-        let missing = tmp.path().join("project").join("me");
-        assert_eq!(nearest_existing_dir(&missing), Some(tmp.path()));
+        let root = tmp.path();
+        assert_eq!(nearest_existing_dir(root, root), Some(root));
+        let missing = root.join("project").join("me");
+        assert_eq!(nearest_existing_dir(&missing, root), Some(root));
         // A file is not a folder: the walk goes past it.
-        let file = tmp.path().join("f.fits");
+        let file = root.join("f.fits");
         std::fs::write(&file, b"x").unwrap();
-        assert_eq!(nearest_existing_dir(&file.join("x")), Some(tmp.path()));
-        assert_eq!(nearest_existing_dir(Path::new("no-such-dir/below")), None);
+        assert_eq!(nearest_existing_dir(&file.join("x"), root), Some(root));
+    }
+
+    #[test]
+    fn nearest_existing_dir_never_goes_above_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The root itself is missing: unknown, not the parent volume.
+        let root = tmp.path().join("Collab");
+        let target = root.join("project").join("me");
+        assert_eq!(nearest_existing_dir(&target, &root), None);
+        // The root is a file, not a directory.
+        let file = tmp.path().join("afile");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(nearest_existing_dir(&file.join("p"), &file), None);
+        // A target outside the root is never probed.
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(nearest_existing_dir(&tmp.path().join("other"), &root), None);
     }
 }
