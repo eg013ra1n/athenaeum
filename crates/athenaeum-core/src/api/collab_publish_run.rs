@@ -100,6 +100,48 @@ struct RunState {
     cancel: Arc<AtomicBool>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
     last_emit: Mutex<Option<Instant>>,
+    /// Set by the first exit (`finish` or the guard's drop); everything after
+    /// it is a no-op, so exactly one `collab-publish-finished` ever goes out.
+    finished: AtomicBool,
+    /// The catalog the last run is persisted into (a clone of the context's
+    /// handle, so the guard can persist without a `ServiceContext`).
+    db: crate::db::Database,
+}
+
+impl RunState {
+    /// Persist, unregister (only this run's own entry), then emit — in that
+    /// order, so a listener re-reading the run on the event sees it gone.
+    fn conclude(&self, key: &str, finished: &CollabPublishFinished) {
+        let project_id = finished.project_id.as_str();
+        match serde_json::to_string(finished) {
+            Ok(json) => {
+                if let Err(e) =
+                    crate::db::collab::set_last_publish_run(&self.db.conn(), project_id, &json)
+                {
+                    tracing::error!(project_id, error = %e, "last publish run not stored");
+                }
+            }
+            Err(e) => {
+                tracing::error!(project_id, error = %e, "last publish run not serialized")
+            }
+        }
+        unregister(key, self);
+        if let Some(em) = self.emitter.as_ref() {
+            crate::events::emit_event(em.as_ref(), COLLAB_PUBLISH_FINISHED_EVENT, finished);
+        }
+    }
+}
+
+/// Remove `key` from the registry, but only when it still holds `state` (a
+/// newer run of the same project must never be unregistered by an older one).
+fn unregister(key: &str, state: &RunState) {
+    let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    if reg
+        .get(key)
+        .is_some_and(|s| std::ptr::eq(Arc::as_ptr(s), state))
+    {
+        reg.remove(key);
+    }
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<RunState>>> {
@@ -122,14 +164,54 @@ pub(crate) struct RunHandle {
 /// Unregisters the run when dropped (a panic never leaves a ghost run).
 pub(crate) struct RunGuard {
     key: String,
+    state: Arc<RunState>,
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        registry()
+        if self.state.finished.swap(true, Ordering::SeqCst) {
+            unregister(&self.key, &self.state);
+            return;
+        }
+        // Never finished: the future was dropped (a cancelled web handler) or
+        // a panic unwound. The run still ends with exactly one event.
+        let p = self
+            .state
+            .progress
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.key);
+            .clone();
+        tracing::warn!(project_id = %p.project_id, publish_run_id = %p.publish_run_id, "publish run interrupted");
+        let finished = finished_of(
+            &p,
+            PublishOutcome::Failed,
+            Some("run interrupted".into()),
+            None,
+        );
+        self.state.conclude(&self.key, &finished);
+    }
+}
+
+fn finished_of(
+    p: &CollabPublishProgress,
+    outcome: PublishOutcome,
+    error: Option<String>,
+    r: Option<&PublishResult>,
+) -> CollabPublishFinished {
+    CollabPublishFinished {
+        project_id: p.project_id.clone(),
+        publish_run_id: p.publish_run_id.clone(),
+        kind: p.kind,
+        trigger: p.trigger,
+        outcome,
+        calibrated: r.map_or(0, |r| r.calibrated as u32),
+        announced: r.map_or(0, |r| r.announced as u32),
+        updated: r.map_or(0, |r| r.updated as u32),
+        stale: r.map_or(0, |r| r.stale as u32),
+        held_back: r.map_or(0, |r| r.held_back.len() as u32),
+        error,
+        started_at: p.started_at.clone(),
+        finished_at: chrono::Utc::now().to_rfc3339(),
     }
 }
 
@@ -160,6 +242,8 @@ impl RunHandle {
             cancel: Arc::new(AtomicBool::new(false)),
             emitter,
             last_emit: Mutex::new(None),
+            finished: AtomicBool::new(false),
+            db: db(ctx)?.clone(),
         });
         registry()
             .lock()
@@ -171,7 +255,11 @@ impl RunHandle {
         };
         tracing::info!(project_id, publish_run_id = %run.id(), kind = ?kind, trigger = ?trigger, "publish run started");
         run.emit_progress(true);
-        Ok((run, RunGuard { key }))
+        let guard = RunGuard {
+            key,
+            state: Arc::clone(&run.state),
+        };
+        Ok((run, guard))
     }
 
     pub(crate) fn id(&self) -> String {
@@ -192,6 +280,9 @@ impl RunHandle {
     }
 
     pub(crate) fn stage(&self, stage: PublishStage, total: usize) {
+        if self.state.finished.load(Ordering::SeqCst) {
+            return;
+        }
         {
             let mut p = self
                 .state
@@ -208,6 +299,9 @@ impl RunHandle {
     }
 
     pub(crate) fn tick(&self, current: usize, file: Option<&str>) {
+        if self.state.finished.load(Ordering::SeqCst) {
+            return;
+        }
         {
             let mut p = self
                 .state
@@ -221,6 +315,9 @@ impl RunHandle {
     }
 
     fn emit_progress(&self, force: bool) {
+        if self.state.finished.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(em) = self.state.emitter.as_ref() else {
             return;
         };
@@ -246,6 +343,9 @@ impl RunHandle {
     /// The single exit: emit `collab-publish-finished`, persist it, drop withheld
     /// prepared frames left by a mid-run withhold (plan W3), unregister.
     pub(crate) fn finish(self, ctx: &ServiceContext, res: &Result<PublishResult, ApiError>) {
+        if self.state.finished.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let p = self
             .state
             .progress
@@ -253,49 +353,13 @@ impl RunHandle {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let (outcome, error) = outcome_of(res, self.cancelled());
-        let r = res.as_ref().ok();
-        let finished = CollabPublishFinished {
-            project_id: p.project_id.clone(),
-            publish_run_id: p.publish_run_id.clone(),
-            kind: p.kind,
-            trigger: p.trigger,
-            outcome,
-            calibrated: r.map_or(0, |r| r.calibrated as u32),
-            announced: r.map_or(0, |r| r.announced as u32),
-            updated: r.map_or(0, |r| r.updated as u32),
-            stale: r.map_or(0, |r| r.stale as u32),
-            held_back: r.map_or(0, |r| r.held_back.len() as u32),
-            error,
-            started_at: p.started_at.clone(),
-            finished_at: chrono::Utc::now().to_rfc3339(),
-        };
+        let finished = finished_of(&p, outcome, error, res.as_ref().ok());
         crate::api::collab_prepare::drop_withheld_prepared(ctx, &p.project_id);
-        match (db(ctx), serde_json::to_string(&finished)) {
-            (Ok(d), Ok(json)) => {
-                if let Err(e) =
-                    crate::db::collab::set_last_publish_run(&d.conn(), &p.project_id, &json)
-                {
-                    tracing::error!(project_id = %p.project_id, error = %e, "last publish run not stored");
-                }
-            }
-            (Err(e), _) => {
-                tracing::error!(project_id = %p.project_id, error = %e, "last publish run not stored")
-            }
-            (_, Err(e)) => {
-                tracing::error!(project_id = %p.project_id, error = %e, "last publish run not serialized")
-            }
-        }
         tracing::info!(
             project_id = %p.project_id, publish_run_id = %p.publish_run_id, outcome = ?outcome,
             count = finished.announced + finished.calibrated + finished.updated, "publish run finished"
         );
-        if let Some(em) = self.state.emitter.as_ref() {
-            crate::events::emit_event(em.as_ref(), COLLAB_PUBLISH_FINISHED_EVENT, &finished);
-        }
-        registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.key);
+        self.state.conclude(&self.key, &finished);
     }
 }
 
@@ -365,7 +429,7 @@ pub fn cancel_collab_publish(ctx: &ServiceContext, project_id: &str) -> Result<(
     {
         Some(s) => {
             s.cancel.store(true, Ordering::SeqCst);
-            tracing::info!(project_id, "publish run cancel requested");
+            tracing::info!(project_id, publish_run_id = %s.progress.lock().unwrap_or_else(|p| p.into_inner()).publish_run_id, "publish run cancel requested");
         }
         None => tracing::debug!(project_id, "publish cancel: no run"),
     }
@@ -508,5 +572,102 @@ mod tests {
                 want
             );
         }
+    }
+
+    #[test]
+    fn a_guard_dropped_without_finish_emits_one_failed_and_persists_it() {
+        let (_t, ctx) = ctx_with_project();
+        let rec = std::sync::Arc::new(Recorder::default());
+        let (run, guard) = RunHandle::begin(
+            &ctx,
+            "p1",
+            PublishRunKind::Publish,
+            PublishTrigger::Manual,
+            None,
+            Some(rec.clone()),
+        )
+        .unwrap();
+        drop(run);
+        drop(guard);
+        let f = rec.payloads(COLLAB_PUBLISH_FINISHED_EVENT);
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            (f[0]["outcome"].as_str(), f[0]["error"].as_str()),
+            (Some("failed"), Some("run interrupted"))
+        );
+        let view = get_collab_publish_run(&ctx, "p1").unwrap();
+        assert!(view.running.is_none());
+        assert_eq!(view.last.unwrap().outcome, PublishOutcome::Failed);
+    }
+
+    #[test]
+    fn finish_twice_emits_once_and_a_tick_after_finish_emits_nothing() {
+        let (_t, ctx) = ctx_with_project();
+        let rec = std::sync::Arc::new(Recorder::default());
+        let (run, guard) = RunHandle::begin(
+            &ctx,
+            "p1",
+            PublishRunKind::Publish,
+            PublishTrigger::Manual,
+            None,
+            Some(rec.clone()),
+        )
+        .unwrap();
+        let again = run.clone();
+        run.finish(&ctx, &Ok(Default::default()));
+        let progress_before = rec.payloads(COLLAB_PUBLISH_PROGRESS_EVENT).len();
+        again.stage(PublishStage::Announcing, 5);
+        again.tick(3, Some("x"));
+        again.finish(&ctx, &Err(ApiError::Internal("late".into())));
+        drop(guard);
+        assert_eq!(rec.payloads(COLLAB_PUBLISH_FINISHED_EVENT).len(), 1);
+        assert_eq!(
+            rec.payloads(COLLAB_PUBLISH_PROGRESS_EVENT).len(),
+            progress_before
+        );
+        assert_eq!(
+            get_collab_publish_run(&ctx, "p1")
+                .unwrap()
+                .last
+                .unwrap()
+                .outcome,
+            PublishOutcome::Done
+        );
+    }
+
+    #[test]
+    fn the_run_is_unregistered_before_the_finished_event() {
+        struct Probe {
+            key: String,
+            seen: Mutex<Option<bool>>,
+        }
+        impl ProgressEmitter for Probe {
+            fn emit_json(&self, event: &str, _payload: serde_json::Value) {
+                if event == COLLAB_PUBLISH_FINISHED_EVENT {
+                    let registered = registry().lock().unwrap().contains_key(&self.key);
+                    *self.seen.lock().unwrap() = Some(registered);
+                }
+            }
+        }
+        let (_t, ctx) = ctx_with_project();
+        let probe = Arc::new(Probe {
+            key: key(&ctx, "p1").unwrap(),
+            seen: Mutex::new(None),
+        });
+        let (run, _g) = RunHandle::begin(
+            &ctx,
+            "p1",
+            PublishRunKind::Publish,
+            PublishTrigger::Manual,
+            None,
+            Some(probe.clone()),
+        )
+        .unwrap();
+        run.finish(&ctx, &Ok(Default::default()));
+        assert_eq!(
+            *probe.seen.lock().unwrap(),
+            Some(false),
+            "gone when the event fires"
+        );
     }
 }
