@@ -773,3 +773,14 @@ Controller rulings and accepted review deviations:
 - §3 and §6.3 wording: read the after-hello digest wherever `DigestAll` is named.
 - `CollabPublishFinished` fields: calibrated, announced, updated, stale, heldBack (no `failed`, W1).
 - Commands: six added (`calibrate_collab_frames`, `set_collab_frames_withheld`, `get_collab_publish_run`, `cancel_collab_publish`, `get_collab_blink_frames`, `get_collab_frame_image`); `set_project_auto_publish` renamed `set_project_publish_mode`. Events: `collab-published` retired; `collab-publish-progress`, `collab-publish-finished`, `collab-project-synced` added.
+
+Final whole-branch review fixes:
+
+- Unlink: `unlink_frame_set` is refused with `Conflict(PUBLISH_BUSY_MSG)` while a publish-family run of the project is registered or holds the publish lock (warn, `outcome = "publish_busy"`); it holds the lock for the whole unlink, so a prepared file a run already seeded is never deleted under it.
+- Gate count: `GateReport.publishable` (→ `ProjectCard.publishable`) leaves out a withheld frame and one whose raw is in the Black Hole unless an own row exists (§4.1 steps 1–3); `total` and `rows[].publishable` stay the unfiltered gate (§4.4).
+- Run end order: `RunState::conclude` is unregister → drop withheld prepared frames → persist → emit, for `finish` and the interrupted-run guard alike; `set_collab_frames_withheld` reads the run registry inside its `BEGIN IMMEDIATE`, so a withhold that saw the run registered has committed its row before the end-of-run `DELETE`.
+- No double panic: `Database::try_conn()` returns the pool error instead of panicking; the run's end (persist and the withheld drop) uses it and logs at `error`, so the guard can drop during a panic unwind without aborting.
+- Withhold scope: withholding refuses ids that are not a LIGHT of a set linked to the project (`Invalid`, "N of these frames are not in this project's linked frame sets"), checked inside the transaction; Release is not restricted (it only deletes this project's rows).
+- W1: a withheld frame the member selected for Publish is reported in `heldBack` with "Withheld by you" (its prepared row and file still go).
+- Pre-seed re-stat: a prepared New frame's file is re-stat'd (`size_mtime_seen`) right before it is seeded; a changed or missing file is stale — row and non-external file dropped, counted in `stale`, never seeded or announced with the calibrate-time `xxh3`/size.
+- Blink: by `frameId`, a prepared file is served only when the frame is not withheld and its raw is not in the Black Hole (§4.1 steps 2–3, as My frames shows it); otherwise the frame resolves raw.

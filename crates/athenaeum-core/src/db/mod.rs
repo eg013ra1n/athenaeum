@@ -125,10 +125,29 @@ pub struct Database {
 impl Database {
     /// Create a new database connection pool and initialise the schema.
     pub fn new(path: PathBuf) -> Result<Self> {
+        Self::with_pool(path, Pool::builder().max_size(8))
+    }
+
+    /// A catalog whose pool is small and gives up fast — how a test drives
+    /// [`Database::try_conn`] into its exhausted-pool error.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_pool(
+        path: PathBuf,
+        max_size: u32,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        Self::with_pool(
+            path,
+            Pool::builder()
+                .max_size(max_size)
+                .connection_timeout(timeout),
+        )
+    }
+
+    fn with_pool(path: PathBuf, builder: r2d2::Builder<SqliteConnectionManager>) -> Result<Self> {
         let manager = SqliteConnectionManager::new(&path);
 
-        let pool = Pool::builder()
-            .max_size(8)
+        let pool = builder
             .build(manager)
             .map_err(|e| rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
@@ -156,17 +175,25 @@ impl Database {
     /// later commands. We log when we find one so the underlying call site
     /// is fixable.
     pub fn conn(&self) -> PooledConnection<SqliteConnectionManager> {
-        let conn = self
-            .pool
-            .get()
-            .expect("Failed to get DB connection from pool");
+        self.try_conn()
+            .expect("Failed to get DB connection from pool")
+    }
+
+    /// [`Database::conn`] that reports an exhausted pool (checkout timeout)
+    /// as an error instead of panicking. For code that must never panic —
+    /// a `Drop` that may run while a panic unwinds, where a second panic
+    /// aborts the process.
+    pub fn try_conn(
+        &self,
+    ) -> std::result::Result<PooledConnection<SqliteConnectionManager>, r2d2::Error> {
+        let conn = self.pool.get()?;
         if !conn.is_autocommit() {
             tracing::warn!("pooled connection had an open transaction on checkout, rolling back");
             if let Err(e) = conn.execute("ROLLBACK", []) {
                 tracing::error!(error = %e, "defensive rollback failed");
             }
         }
-        conn
+        Ok(conn)
     }
 
     /// Get the database file path.
@@ -205,5 +232,22 @@ mod tests {
             [],
         );
         assert!(err.is_err(), "FK violation must be rejected, got {err:?}");
+    }
+
+    /// An exhausted pool is an `Err` from `try_conn`, never a panic; the
+    /// next checkout after a release succeeds.
+    #[test]
+    fn try_conn_reports_an_exhausted_pool_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new_for_test_with_pool(
+            dir.path().join("pool.db"),
+            1,
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        let held = db.try_conn().expect("the one connection");
+        assert!(db.try_conn().is_err(), "the pool is exhausted");
+        drop(held);
+        assert!(db.try_conn().is_ok());
     }
 }

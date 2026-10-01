@@ -10,10 +10,15 @@ pub async fn set_collab_frames_withheld(
     withheld: bool,
 ) -> Result<u32, crate::api::ApiError> {
     use crate::api::ApiError;
-    // Known narrow race, accepted: a run may start after this read and before
-    // the transaction commits; its seed then fails on the deleted file and the
-    // frame is held back for that run only.
-    let run_active = crate::api::collab_publish_run::is_active(ctx, project_id);
+    // Plan W3: under an active run of the project the delete is deferred to
+    // the run's end. The registry is read INSIDE the `BEGIN IMMEDIATE`: the
+    // run unregisters before its end-of-run `DELETE`, which needs the write
+    // lock this transaction holds — so a withhold that sees the run active
+    // has committed its row before that `DELETE` reads, and one that sees it
+    // gone deletes on its own. Known narrow race, accepted: a run may START
+    // after this read and before the commit; its pre-seed re-stat then finds
+    // the file gone and the frame is not announced by that run.
+    let mut run_active = false;
     let (changed, gone) = {
         let d = crate::api::db(ctx)?;
         let conn = d.conn();
@@ -22,6 +27,22 @@ pub async fn set_collab_frames_withheld(
             .map_err(|e| crate::api::collab::internal(e.into()))?;
         let res = (|| -> Result<(usize, Vec<crate::db::collab_prepare::PreparedRow>), ApiError> {
             if withheld {
+                // A withheld row is meaningful only for a LIGHT of a set
+                // linked to the project; anything else would be an inert row.
+                let sets = crate::db::collab::linked_set_ids(&conn, project_id)
+                    .map_err(crate::api::collab::internal)?;
+                let linked: std::collections::HashSet<i64> =
+                    crate::api::collab::union_light_frames(&conn, &sets)
+                        .map_err(crate::api::collab::internal)?
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                let foreign = frame_ids.iter().filter(|id| !linked.contains(id)).count();
+                if foreign > 0 {
+                    return Err(ApiError::Invalid(format!(
+                        "{foreign} of these frames are not in this project's linked frame sets"
+                    )));
+                }
                 let own = crate::db::collab_frames::own_by_source_frame(&conn, project_id)
                     .map_err(crate::api::collab::internal)?;
                 let in_project = frame_ids.iter().filter(|id| own.contains_key(id)).count();
@@ -31,6 +52,7 @@ pub async fn set_collab_frames_withheld(
                     )));
                 }
             }
+            run_active = crate::api::collab_publish_run::is_active(ctx, project_id);
             let n = crate::db::collab_prepare::set_withheld(&conn, project_id, frame_ids, withheld)
                 .map_err(crate::api::collab::internal)?;
             let gone = if withheld && !run_active {
@@ -76,20 +98,13 @@ pub async fn set_collab_frames_withheld(
     Ok(changed as u32)
 }
 
-/// Plan W3 — at a run's end: prepared rows of frames withheld meanwhile go,
-/// with their (non-external) files. Logs, never fails the run.
-pub(crate) fn drop_withheld_prepared(ctx: &ServiceContext, project_id: &str) {
-    match crate::api::db(ctx) {
-        Ok(d) => drop_withheld_prepared_db(d, project_id),
-        Err(e) => tracing::error!(project_id, error = %e, "withheld prepared frames not dropped"),
-    }
-}
-
-/// The DB-level core of [`drop_withheld_prepared`]; the interrupted-run guard
-/// (which holds no `ServiceContext`) calls it too.
+/// Plan W3 — at a run's end (finished or interrupted, after it unregistered):
+/// prepared rows of frames withheld meanwhile go, with their (non-external)
+/// files. Logs, never fails the run and never panics (it runs from a `Drop`
+/// that may be unwinding a panic, so the checkout is fallible).
 pub(crate) fn drop_withheld_prepared_db(db: &crate::db::Database, project_id: &str) {
     let gone = (|| -> anyhow::Result<Vec<crate::db::collab_prepare::PreparedRow>> {
-        let conn = db.conn();
+        let conn = db.try_conn()?;
         crate::db::collab_prepare::delete_withheld_prepared(&conn, project_id)
     })();
     match gone {

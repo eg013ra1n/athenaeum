@@ -109,23 +109,47 @@ struct RunState {
 }
 
 impl RunState {
-    /// Persist, unregister (only this run's own entry), then emit — in that
-    /// order, so a listener re-reading the run on the event sees it gone.
+    /// Unregister (only this run's own entry), drop the prepared frames
+    /// withheld meanwhile (plan W3), persist, then emit — in that order:
+    /// - a withhold that still saw the run registered deferred its delete,
+    ///   and committed its row before the drop's `DELETE` (it reads the
+    ///   registry inside its `BEGIN IMMEDIATE`), so the drop takes it; one
+    ///   landing after the unregister deletes on its own;
+    /// - a listener re-reading the run on the event sees it gone.
+    ///
+    /// Never panics: it also runs from [`RunGuard`]'s drop, possibly while a
+    /// panic unwinds, so the catalog checkout is fallible and logged.
     fn conclude(&self, key: &str, finished: &CollabPublishFinished) {
         let project_id = finished.project_id.as_str();
-        match serde_json::to_string(finished) {
-            Ok(json) => {
-                if let Err(e) =
-                    crate::db::collab::set_last_publish_run(&self.db.conn(), project_id, &json)
-                {
-                    tracing::error!(project_id, error = %e, "last publish run not stored");
-                }
+        #[cfg(test)]
+        {
+            let seam = before_unregister_seams()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(key);
+            if let Some(f) = seam {
+                f();
             }
+        }
+        unregister(key, self);
+        crate::api::collab_prepare::drop_withheld_prepared_db(&self.db, project_id);
+        match serde_json::to_string(finished) {
+            Ok(json) => match self.db.try_conn() {
+                Ok(conn) => {
+                    if let Err(e) =
+                        crate::db::collab::set_last_publish_run(&conn, project_id, &json)
+                    {
+                        tracing::error!(project_id, error = %e, "last publish run not stored");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(project_id, error = %e, "last publish run not stored: no catalog connection")
+                }
+            },
             Err(e) => {
                 tracing::error!(project_id, error = %e, "last publish run not serialized")
             }
         }
-        unregister(key, self);
         if let Some(em) = self.emitter.as_ref() {
             crate::events::emit_event(em.as_ref(), COLLAB_PUBLISH_FINISHED_EVENT, finished);
         }
@@ -147,6 +171,31 @@ fn unregister(key: &str, state: &RunState) {
 fn registry() -> &'static Mutex<HashMap<String, Arc<RunState>>> {
     static R: OnceLock<Mutex<HashMap<String, Arc<RunState>>>> = OnceLock::new();
     R.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+type BeforeUnregister = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+fn before_unregister_seams() -> &'static Mutex<HashMap<String, BeforeUnregister>> {
+    static S: OnceLock<Mutex<HashMap<String, BeforeUnregister>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Test seam: the next run of this project to conclude calls `f` at the last
+/// instant it is still registered (right before its unregister) — where a
+/// withhold still defers to the run (plan W3).
+#[cfg(test)]
+pub(crate) fn before_unregister_for_test(
+    ctx: &ServiceContext,
+    project_id: &str,
+    f: impl FnOnce() + Send + 'static,
+) {
+    let k = key(ctx, project_id).unwrap();
+    before_unregister_seams()
+        .lock()
+        .unwrap()
+        .insert(k, Box::new(f));
 }
 
 #[cfg(test)]
@@ -204,7 +253,7 @@ impl Drop for RunGuard {
             Some("run interrupted".into()),
             None,
         );
-        crate::api::collab_prepare::drop_withheld_prepared_db(&self.state.db, &p.project_id);
+        // Drops the frames withheld meanwhile too (after the unregister).
         self.state.conclude(&self.key, &finished);
     }
 }
@@ -366,9 +415,10 @@ impl RunHandle {
         crate::events::emit_event(em.as_ref(), COLLAB_PUBLISH_PROGRESS_EVENT, &snapshot);
     }
 
-    /// The single exit: emit `collab-publish-finished`, persist it, drop withheld
-    /// prepared frames left by a mid-run withhold (plan W3), unregister.
-    pub(crate) fn finish(self, ctx: &ServiceContext, res: &Result<PublishResult, ApiError>) {
+    /// The single exit: unregister, drop withheld prepared frames left by a
+    /// mid-run withhold (plan W3), persist, then emit
+    /// `collab-publish-finished` ([`RunState::conclude`]).
+    pub(crate) fn finish(self, _ctx: &ServiceContext, res: &Result<PublishResult, ApiError>) {
         if self.state.finished.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -380,7 +430,6 @@ impl RunHandle {
             .clone();
         let (outcome, error) = outcome_of(res, self.cancelled());
         let finished = finished_of(&p, outcome, error, res.as_ref().ok());
-        crate::api::collab_prepare::drop_withheld_prepared(ctx, &p.project_id);
         tracing::info!(
             project_id = %p.project_id, publish_run_id = %p.publish_run_id, outcome = ?outcome,
             count = finished.announced + finished.calibrated + finished.updated, "publish run finished"
@@ -664,6 +713,51 @@ mod tests {
                 .outcome,
             PublishOutcome::Done
         );
+    }
+
+    /// Final review: an interrupted run's guard (which may drop while a
+    /// panic unwinds) never panics on an exhausted catalog pool — it logs
+    /// the drop and the persist it could not do and still emits its one
+    /// finished event.
+    #[test]
+    fn a_guard_dropped_with_an_exhausted_pool_logs_and_still_emits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = crate::db::Database::new_for_test_with_pool(
+            tmp.path().join("pool.db"),
+            1,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let rec = Arc::new(Recorder::default());
+        let progress = CollabPublishProgress {
+            project_id: "p1".into(),
+            publish_run_id: "run-1".into(),
+            kind: PublishRunKind::Publish,
+            trigger: PublishTrigger::Manual,
+            mode: None,
+            stage: PublishStage::Seeding,
+            current: 0,
+            total: 0,
+            current_file: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let guard = RunGuard {
+            key: "pool-test|p1".into(),
+            state: Arc::new(RunState {
+                progress: Mutex::new(progress),
+                cancel: Arc::new(AtomicBool::new(false)),
+                emitter: Some(rec.clone()),
+                last_emit: Mutex::new(None),
+                finished: AtomicBool::new(false),
+                db: catalog.clone(),
+            }),
+        };
+        let held = catalog.try_conn().unwrap();
+        drop(guard);
+        drop(held);
+        let f = rec.payloads(COLLAB_PUBLISH_FINISHED_EVENT);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0]["error"], "run interrupted");
     }
 
     #[test]

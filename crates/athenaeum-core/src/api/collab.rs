@@ -93,6 +93,9 @@ pub struct LinkedSetView {
 pub struct GateReport {
     pub project_id: String,
     pub total: i64,
+    /// Gate-passing frames a run can take: a withheld frame and one whose
+    /// raw is in the Black Hole are left out unless already published.
+    /// `rows[].publishable` stays the bare gate verdict.
     pub publishable: i64,
     pub rows: Vec<FrameGateRow>,
     /// Spec §7.1 — the same rows, grouped into causes with a batch action.
@@ -685,11 +688,30 @@ pub fn link_frame_set(
 
 /// Unlink a frame set from a project (idempotent — removing an absent link is a
 /// no-op).
+///
+/// Refused with `Conflict(`[`PUBLISH_BUSY_MSG`]`)` while a publish-family run
+/// of the project is active: a run may already have seeded a prepared file by
+/// reference, and deleting it under the run would announce a frame whose
+/// file is gone. The publish lock is held for the whole unlink, so no run
+/// starts half-way through it either.
 pub fn unlink_frame_set(
     ctx: &ServiceContext,
     project_id: &str,
     frames_set_id: i64,
 ) -> Result<(), ApiError> {
+    let lock = publish_lock(ctx, project_id)?;
+    let _no_run = match lock.try_lock() {
+        Ok(guard) if !crate::api::collab_publish_run::is_active(ctx, project_id) => guard,
+        _ => {
+            tracing::warn!(
+                project_id,
+                frames_set_id,
+                outcome = "publish_busy",
+                "unlink refused: a publication of this project is running"
+            );
+            return Err(ApiError::Conflict(PUBLISH_BUSY_MSG.into()));
+        }
+    };
     let gone = {
         let db = db(ctx)?;
         let conn = db.conn();
@@ -861,7 +883,26 @@ pub fn evaluate_project_gate(
         .collect();
     let blockers = crate::collab::gate::derive_blockers(&blocker_rows);
     let rows: Vec<FrameGateRow> = gated.into_iter().map(|(_, row)| row).collect();
-    let publishable = rows.iter().filter(|r| r.publishable).count() as i64;
+    // Spec §4.4 keeps the gate QUERY unfiltered (My frames still lists a
+    // published frame whose raw is in the Black Hole); the count is not:
+    // a withheld frame and a black-holed one are Held back (§4.1 steps 2–3)
+    // unless an own row exists (step 1, where neither applies).
+    let publishable = {
+        let ids: Vec<i64> = rows.iter().map(|r| r.frame_id).collect();
+        let withheld =
+            crate::db::collab_prepare::withheld_ids(&conn, project_id).map_err(internal)?;
+        let black_holed =
+            crate::db::collab_prepare::black_holed_frame_ids(&conn, &ids).map_err(internal)?;
+        let own =
+            crate::db::collab_frames::own_by_source_frame(&conn, project_id).map_err(internal)?;
+        rows.iter()
+            .filter(|r| {
+                r.publishable
+                    && (own.contains_key(&r.frame_id)
+                        || !(withheld.contains(&r.frame_id) || black_holed.contains(&r.frame_id)))
+            })
+            .count() as i64
+    };
     tracing::info!(
         project_id,
         total = rows.len() as i64,
@@ -4952,6 +4993,14 @@ async fn run_publish(
                                 if local.prepared.contains_key(&fid) {
                                     withheld_prepared.push(fid);
                                 }
+                                // Plan W1: a selected frame is reported.
+                                if only.is_some() {
+                                    held_back.push(held(
+                                        fid,
+                                        &row.filename,
+                                        crate::collab::contributor_state::WITHHELD_REASON.into(),
+                                    ));
+                                }
                                 continue;
                             }
                             if local.black_holed.contains(&fid) {
@@ -5901,6 +5950,33 @@ async fn run_publish(
             file: w.filename.clone(),
         };
         if w.kind.row().is_none() {
+            // A reviewed file is announced with its calibrate-time xxh3 and
+            // size, so it is seeded only while it is still that file: the
+            // section-1 currency check may be long past (other frames'
+            // generation and seeding ran since). Changed or gone → stale:
+            // back to Ready (row and non-external file), never announced.
+            if let Some(p) = from_prepared.get(&w.frame_id) {
+                if p.size_mtime_seen.is_none()
+                    || size_mtime_seen_quiet(&w.target) != p.size_mtime_seen
+                {
+                    tracing::info!(project_id, frame_id = w.frame_id, path = %w.target.display(), "publish: prepared file changed since its review; back to ready");
+                    let dropped = {
+                        let db = db(ctx)?;
+                        let conn = db.conn();
+                        drop_stale_prepared(&conn, project_id, &[w.frame_id])
+                    };
+                    match dropped {
+                        Ok(n) => stale += n,
+                        // Logged at `error` by `drop_stale_prepared`.
+                        Err(e) => held_back.push(held(
+                            w.frame_id,
+                            &w.filename,
+                            format!("the calibrated file changed since its review: {e}"),
+                        )),
+                    }
+                    continue;
+                }
+            }
             match node
                 .seed_project_frame(project_id, &w.uuid, 1, &w.target)
                 .await
@@ -7901,6 +7977,75 @@ pub(crate) mod tests {
         assert_eq!(left, vec![b_ids[0]]);
     }
 
+    /// Final review: a run may already have seeded a prepared file by
+    /// reference — an unlink under it would announce a frame whose file is
+    /// gone. Refused while a run is registered or holds the publish lock;
+    /// nothing is touched; it works once the run is over.
+    #[tokio::test]
+    async fn unlink_is_refused_while_a_publish_run_of_the_project_is_active() {
+        let (tmp, ctx) = test_ctx();
+        let (set_a, a_ids) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "me@example.org");
+            let (a, a_ids) = seed_set(&conn, "A", "14 03 12", "+54 20 56", 210.8, 54.35, 1);
+            drop(conn);
+            link_frame_set(&ctx, "p-1", a).unwrap();
+            (a, a_ids)
+        };
+        let fa = tmp.path().join("c_a0.fits");
+        std::fs::write(&fa, b"x").unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab_prepare::upsert_prepared(
+                &conn,
+                &prep_row("p-1", a_ids[0], Some(fa.clone())),
+            )
+            .unwrap();
+        }
+        let untouched = |ctx: &ServiceContext| {
+            let conn = crate::api::db(ctx).unwrap().conn();
+            assert!(fa.exists(), "the prepared file is untouched");
+            assert_eq!(
+                crate::db::collab_prepare::list_prepared(&conn, "p-1")
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(crate::db::collab::is_set_linked(&conn, "p-1", set_a).unwrap());
+        };
+
+        let (run, guard) = crate::api::collab_publish_run::RunHandle::begin(
+            &ctx,
+            "p-1",
+            crate::api::collab_publish_run::PublishRunKind::Publish,
+            crate::api::collab_publish_run::PublishTrigger::Manual,
+            None,
+            None,
+        )
+        .unwrap();
+        match unlink_frame_set(&ctx, "p-1", set_a) {
+            Err(ApiError::Conflict(m)) => assert_eq!(m, PUBLISH_BUSY_MSG),
+            other => panic!("expected the busy refusal, got {other:?}"),
+        }
+        untouched(&ctx);
+        run.finish(&ctx, &Ok(Default::default()));
+        drop(guard);
+
+        // A run that claimed the lock but has not registered yet.
+        let lock = publish_lock(&ctx, "p-1").unwrap();
+        let claimed = lock.try_lock().unwrap();
+        assert!(matches!(
+            unlink_frame_set(&ctx, "p-1", set_a),
+            Err(ApiError::Conflict(_))
+        ));
+        untouched(&ctx);
+        drop(claimed);
+
+        unlink_frame_set(&ctx, "p-1", set_a).unwrap();
+        assert!(!fa.exists(), "after the run the unlink drops it");
+    }
+
     #[test]
     fn a_lost_project_forgets_its_prepared_and_withheld_rows() {
         let (_tmp, ctx) = test_ctx();
@@ -8620,6 +8765,71 @@ pub(crate) mod tests {
         let rows = own_rows(&ctx);
         assert_eq!(rows.len(), 1, "the published frame is still listed");
         assert_eq!(rows[0].segment, "published");
+    }
+
+    /// Final review: "N publishable" on the Projects card counts what a run
+    /// can take — a withheld and a black-holed passing frame lower it, a
+    /// published frame whose raw went to the Black Hole does not (§4.1 step
+    /// 1); the gate rows and `total` stay unfiltered (§4.4).
+    #[tokio::test]
+    async fn withheld_and_black_holed_frames_are_not_counted_publishable() {
+        let (_tmp, ctx) = test_ctx();
+        let frame_ids = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "me@example.org");
+            // Index 1 is trailed (fails the gate); attested, so the others
+            // pass without calibration links.
+            let (set_id, ids) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 5);
+            crate::db::collab::set_frames_set_attestation(&conn, set_id, true).unwrap();
+            drop(conn);
+            link_frame_set(&ctx, "p-1", set_id).unwrap();
+            ids
+        };
+        let before = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert_eq!(
+            (before.total, before.publishable),
+            (5, 4),
+            "{:?}",
+            before.rows
+        );
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let black_hole = |fid: i64| {
+                let file_id: i64 = conn
+                    .query_row("SELECT file_id FROM frames WHERE id = ?1", [fid], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                crate::db::add_to_black_hole(&conn, file_id, "light", "/x").unwrap();
+            };
+            crate::db::collab_prepare::set_withheld(&conn, "p-1", &[frame_ids[0]], true).unwrap();
+            black_hole(frame_ids[2]);
+            seed_own_row(
+                &conn,
+                "p-1",
+                "u-pub",
+                frame_ids[3],
+                "published",
+                Some("r1"),
+                true,
+            );
+            black_hole(frame_ids[3]);
+        }
+        let after = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert_eq!(after.total, 5, "the gate query is not filtered");
+        assert_eq!(after.publishable, 2, "{:?}", after.rows);
+        assert_eq!(
+            after.rows.iter().filter(|r| r.publishable).count(),
+            4,
+            "the rows keep the bare gate verdict"
+        );
+        let card = list_projects(&ctx)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.project_id == "p-1")
+            .unwrap();
+        assert_eq!(card.publishable, 2);
     }
 
     #[tokio::test]
@@ -15074,6 +15284,173 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(res.announced, 1, "{res:?}");
             assert!(res.held_back.is_empty(), "plan W1: {res:?}");
+        }
+
+        /// Final review (plan W1): a withheld frame the member SELECTED is
+        /// reported held back with the "Withheld by you" reason; its
+        /// prepared row and file still go (plan W3).
+        #[tokio::test]
+        async fn a_selected_withheld_frame_is_a_run_hold_back() {
+            let fx = fixture(2).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let path0 = prepared(&fx)
+                .into_iter()
+                .find(|r| r.source_frame_id == fx.frame_ids[0])
+                .unwrap()
+                .calibrated_path
+                .unwrap();
+            {
+                // DB-level, as a withhold deferred by a run leaves it: the
+                // prepared row is still there.
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                crate::db::collab_prepare::set_withheld(&conn, PID, &[fx.frame_ids[0]], true)
+                    .unwrap();
+            }
+            mount_hub(&fx.server, "published").await;
+            let res = publish_collab_frames(&fx.ctx, PID, Some(fx.frame_ids.as_slice()), None)
+                .await
+                .unwrap();
+            assert_eq!(res.announced, 1, "{res:?}");
+            assert_eq!(res.held_back.len(), 1, "{res:?}");
+            assert_eq!(res.held_back[0].frame_id, fx.frame_ids[0]);
+            assert_eq!(
+                res.held_back[0].reasons,
+                vec![crate::collab::contributor_state::WITHHELD_REASON.to_string()]
+            );
+            assert!(!std::path::Path::new(&path0).exists());
+            assert!(prepared(&fx).is_empty());
+        }
+
+        /// Final review: a reviewed file changed after the run's section-1
+        /// currency check (here: right after the split) is stale at its seed
+        /// — back to Ready, its file gone, never seeded or announced with
+        /// the calibrate-time xxh3/size.
+        #[tokio::test]
+        async fn a_prepared_file_changed_after_the_split_is_stale_and_not_announced() {
+            use std::io::Write as _;
+            let fx = fixture(2).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let path0 = prepared(&fx)
+                .into_iter()
+                .find(|r| r.source_frame_id == fx.frame_ids[0])
+                .unwrap()
+                .calibrated_path
+                .unwrap();
+            mount_hub(&fx.server, "published").await;
+            let edited = path0.clone();
+            let hook = move |_c: &Connection| {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&edited)
+                    .unwrap()
+                    .write_all(b"edited")
+                    .unwrap();
+            };
+            let res = run_publish_for_test(&fx, &hook).await.unwrap();
+            assert_eq!((res.announced, res.stale), (1, 1), "{res:?}");
+            assert!(res.held_back.is_empty(), "{res:?}");
+            assert!(!std::path::Path::new(&path0).exists());
+            assert!(prepared(&fx).is_empty());
+            let bodies = announce_bodies(&fx.server).await;
+            let uuids: Vec<String> = bodies
+                .iter()
+                .flat_map(|b| b["frames"].as_array().unwrap().clone())
+                .map(|f| f["frameUuid"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(uuids, vec![fx.uuids[1].clone()]);
+            assert_eq!(project_tag_count(&fx).await, 1, "never seeded");
+            let own = list_project_own_frames(&fx.ctx, PID).unwrap();
+            assert_eq!(
+                own.iter()
+                    .find(|r| r.frame_id == fx.frame_ids[0])
+                    .unwrap()
+                    .segment,
+                "ready"
+            );
+        }
+
+        /// Final review (plan W3): the run unregisters before its end-of-run
+        /// drop, so a withhold that still saw it registered — and deferred
+        /// its delete — is dropped by that same run end.
+        #[tokio::test]
+        async fn a_withhold_deferred_at_the_last_registered_instant_is_still_dropped() {
+            let fx = fixture(1).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            let path = prepared(&fx)[0].calibrated_path.clone().unwrap();
+            let catalog = crate::api::db(&fx.ctx).unwrap().clone();
+            let ctx = Arc::clone(&fx.ctx);
+            let id0 = fx.frame_ids[0];
+            crate::api::collab_publish_run::before_unregister_for_test(&fx.ctx, PID, move || {
+                assert!(
+                    crate::api::collab_publish_run::is_active(&ctx, PID),
+                    "the seam runs while the run is still registered"
+                );
+                crate::db::collab_prepare::set_withheld(&catalog.conn(), PID, &[id0], true)
+                    .unwrap();
+            });
+            let (run, _g) = crate::api::collab_publish_run::RunHandle::begin(
+                &fx.ctx,
+                PID,
+                crate::api::collab_publish_run::PublishRunKind::Publish,
+                crate::api::collab_publish_run::PublishTrigger::Manual,
+                None,
+                None,
+            )
+            .unwrap();
+            run.finish(&fx.ctx, &Ok(Default::default()));
+            assert!(!std::path::Path::new(&path).exists());
+            assert!(prepared(&fx).is_empty());
+        }
+
+        /// Final review: a withheld row is accepted only for a LIGHT of a set
+        /// linked to the project — an unknown id or an unlinked set's frame
+        /// is refused (the whole call, nothing written).
+        #[tokio::test]
+        async fn withholding_a_frame_outside_the_linked_sets_is_refused() {
+            let fx = fixture(2).await;
+            let withheld =
+                |fx: &PubFx| crate::db::collab_prepare::withheld_ids(&fx.conn(), PID).unwrap();
+            match crate::api::collab_prepare::set_collab_frames_withheld(
+                &fx.ctx,
+                PID,
+                &[fx.frame_ids[0], 987_654],
+                true,
+            )
+            .await
+            {
+                Err(ApiError::Invalid(m)) => assert!(m.starts_with("1 of these frames"), "{m}"),
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+            assert!(withheld(&fx).is_empty(), "nothing written");
+            assert_eq!(
+                crate::api::collab_prepare::set_collab_frames_withheld(
+                    &fx.ctx,
+                    PID,
+                    &[fx.frame_ids[0]],
+                    true
+                )
+                .await
+                .unwrap(),
+                1
+            );
+            unlink_frame_set(&fx.ctx, PID, fx.set_id).unwrap();
+            assert!(matches!(
+                crate::api::collab_prepare::set_collab_frames_withheld(
+                    &fx.ctx,
+                    PID,
+                    &[fx.frame_ids[1]],
+                    true
+                )
+                .await,
+                Err(ApiError::Invalid(_))
+            ));
+            assert_eq!(withheld(&fx), [fx.frame_ids[0]].into_iter().collect());
         }
 
         /// Ruling R5 (spec P2, P4): a republish of every frame never

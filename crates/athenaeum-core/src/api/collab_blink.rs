@@ -113,6 +113,15 @@ fn raw_path_of(conn: &Connection, fid: i64) -> Result<PathBuf, ApiError> {
     Ok(raw)
 }
 
+/// Spec §4.1 steps 2–3 for a frame with no own row: withheld, or its raw in
+/// the Black Hole.
+fn held_back_locally(conn: &Connection, project_id: &str, fid: i64) -> Result<bool, ApiError> {
+    Ok(
+        crate::db::collab_prepare::is_withheld(conn, project_id, fid)?
+            || !crate::db::collab_prepare::black_holed_frame_ids(conn, &[fid])?.is_empty(),
+    )
+}
+
 fn is_external(row: &LocalFrameRow) -> bool {
     row.recipe_hash
         .as_deref()
@@ -136,10 +145,16 @@ fn resolve_with(
                 "this frame is not part of the project".into(),
             ));
         };
-        // A prepared file wins only while it is current (plan W2) — the same
-        // rule the My frames list shows it by.
+        // A prepared file wins only while it is current (plan W2) and the
+        // frame is not Held back by a local fact (spec §4.1 steps 2–3) — the
+        // same rule the My frames list shows it by (no `calibratedPath`
+        // there). A withheld frame keeps its row while a run defers the
+        // delete; a black-holed one keeps it until restored.
         if let Some(p) = crate::db::collab_prepare::get_prepared(conn, project_id, fid)? {
-            if !p.external && crate::api::collab::prepared_is_current(conn, &p, attested) {
+            if !p.external
+                && crate::api::collab::prepared_is_current(conn, &p, attested)
+                && !held_back_locally(conn, project_id, fid)?
+            {
                 if let Some(path) = p.calibrated_path.as_deref().map(PathBuf::from) {
                     if path.exists() {
                         return Ok(Resolved {
@@ -510,6 +525,57 @@ mod tests {
         }
         let (p, s) = resolve_collab_frame_path(&fx.ctx, PID, &r).unwrap();
         assert_eq!((s, p), (BlinkSource::Raw, fx.lights[0].clone()));
+    }
+
+    /// Final review: by id, a prepared frame Held back by a local fact —
+    /// its raw in the Black Hole, or withheld while a run defers the delete
+    /// — is not served calibrated (My frames shows no `calibratedPath` for
+    /// it): it resolves raw.
+    #[tokio::test]
+    async fn a_held_back_prepared_frame_resolves_raw_by_id() {
+        let fx = fixture(2).await;
+        crate::api::collab::calibrate_collab_frames(&fx.ctx, PID, None, None)
+            .await
+            .unwrap();
+        let by_id = |i: usize| CollabFrameRef {
+            frame_id: Some(fx.frame_ids[i]),
+            frame_uuid: None,
+        };
+        for i in 0..2 {
+            assert_eq!(
+                resolve_collab_frame_path(&fx.ctx, PID, &by_id(i))
+                    .unwrap()
+                    .1,
+                BlinkSource::Calibrated
+            );
+        }
+        {
+            let conn = crate::api::db(&fx.ctx).unwrap().conn();
+            let file_id: i64 = conn
+                .query_row(
+                    "SELECT file_id FROM frames WHERE id = ?1",
+                    [fx.frame_ids[0]],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::db::add_to_black_hole(&conn, file_id, "light", "/x").unwrap();
+            crate::db::collab_prepare::set_withheld(&conn, PID, &[fx.frame_ids[1]], true).unwrap();
+            assert_eq!(
+                crate::db::collab_prepare::list_prepared(&conn, PID)
+                    .unwrap()
+                    .len(),
+                2,
+                "both prepared rows are still there"
+            );
+        }
+        for i in 0..2 {
+            let (p, s) = resolve_collab_frame_path(&fx.ctx, PID, &by_id(i)).unwrap();
+            assert_eq!(
+                (s, p),
+                (BlinkSource::Raw, fx.lights[i].clone()),
+                "frame {i}"
+            );
+        }
     }
 
     #[tokio::test]

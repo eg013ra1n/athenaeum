@@ -1602,7 +1602,13 @@ export type LinkSuggestion = { framesSetId: number, name: string | null, lightCo
  */
 distanceDeg: number | null, withinRadius: boolean, alreadyLinked: boolean, };
 
-export type GateReport = { projectId: string, total: number, publishable: number, rows: Array<FrameGateRow>, 
+export type GateReport = { projectId: string, total: number, 
+/**
+ * Gate-passing frames a run can take: a withheld frame and one whose
+ * raw is in the Black Hole are left out unless already published.
+ * `rows[].publishable` stays the bare gate verdict.
+ */
+publishable: number, rows: Array<FrameGateRow>, 
 /**
  * Spec §7.1 — the same rows, grouped into causes with a batch action.
  */
