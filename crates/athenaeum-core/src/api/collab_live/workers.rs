@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use crate::api::collab_live::feed::{FeedApplier, FeedEffect};
+use crate::api::collab_live::feed::{FeedApplier, FeedEffect, SyncChanges, SyncReport};
 use crate::api::collab_live::holdings::{HolderMaps, Holdings};
 use crate::api::collab_live::runtime::Shared;
 use crate::api::collab_live::storage_task::{HolderView, StorageEngine, StorageEvent};
@@ -62,6 +62,10 @@ pub(crate) enum FeedOut {
         project_id: String,
         error: String,
     },
+    /// One project confirmed against the hub, or not (spec 2026-10-01
+    /// §6.1): the applier's reports after each event, and a not-ok report
+    /// after every refusal.
+    Synced(SyncReport),
 }
 
 pub(crate) struct FeedWorker {
@@ -228,6 +232,9 @@ impl FeedWorker {
             return;
         };
         let applied = feed.apply(ev, holdings).await;
+        // Taken now: `feed` borrows `self.feed` into the arms below, and the
+        // reports go out after them (spec 2026-10-01 §6.1).
+        let mut reports = feed.take_reports();
         // The loop derives providers from this copy: it is current before
         // the effects reach it.
         self.shared.set_presence(&feed.presence);
@@ -250,15 +257,28 @@ impl FeedWorker {
                 self.shared.reconnect_now();
             }
             Err(ApiError::Forbidden(e)) => match project {
-                Some(project_id) => self.send(FeedOut::Refused {
-                    project_id,
-                    error: e,
-                }),
+                Some(project_id) => {
+                    // The refusal is a not-ok report for its project too,
+                    // and the only one: it replaces the applier's own
+                    // report of this event.
+                    let refused = refused_report(&project_id, &e);
+                    match reports.iter_mut().find(|r| r.project_id == project_id) {
+                        Some(r) => *r = refused,
+                        None => reports.push(refused),
+                    }
+                    self.send(FeedOut::Refused {
+                        project_id,
+                        error: e,
+                    });
+                }
                 None => tracing::error!(error = %e, "feed event refused by the hub"),
             },
             Err(e) => {
                 tracing::warn!(error = %e, "feed event could not be applied; the next event or the versions vector catches up")
             }
+        }
+        for r in reports {
+            self.send(FeedOut::Synced(r));
         }
     }
 
@@ -277,8 +297,20 @@ impl FeedWorker {
         }
         h.hourly_digest_checks(now).await;
         for (project_id, error) in refused {
+            let report = refused_report(&project_id, &error);
             self.send(FeedOut::Refused { project_id, error });
+            self.send(FeedOut::Synced(report));
         }
+    }
+}
+
+/// The not-ok confirmation report a hub refusal (403) of `project_id` is.
+fn refused_report(project_id: &str, error: &str) -> SyncReport {
+    SyncReport {
+        project_id: project_id.to_string(),
+        ok: false,
+        error: Some(error.to_string()),
+        changes: SyncChanges::default(),
     }
 }
 
@@ -407,5 +439,89 @@ impl HolderView for SharedHolders {
                 Default::default()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collab::fake_hub::FakeHub;
+    use crate::collab::live::wire::{HelloEvent, ResyncEvent, ResyncWhat};
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<FeedOut>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(o) = rx.try_recv() {
+            out.push(match o {
+                FeedOut::Effects(_) => "effects".to_string(),
+                FeedOut::NewSession => "new_session".to_string(),
+                FeedOut::Refused { project_id, .. } => format!("refused {project_id}"),
+                FeedOut::Synced(r) => format!(
+                    "synced {} ok={} error={}",
+                    r.project_id,
+                    r.ok,
+                    r.error.is_some()
+                ),
+            });
+        }
+        out
+    }
+
+    /// Spec 2026-10-01 §6.1: the feed worker forwards the applier's
+    /// per-project reports — one per project after a `hello` — and a 403 on
+    /// an event is forwarded as the refusal AND as exactly one not-ok report
+    /// for that project, after the refusal.
+    #[tokio::test]
+    async fn the_worker_forwards_reports_and_one_not_ok_report_after_a_refusal() {
+        let (_tmp, ctx) = crate::api::collab_exchange::test_support::test_ctx();
+        let ctx = Arc::new(ctx);
+        let hub = FakeHub::start().await;
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        hub.add_account("tok", "acc-me", "Me", &me, None);
+        hub.add_project("p1", "m31", &[("acc-me", "send_receive", false)], false);
+        crate::api::collab_exchange::test_support::wire_hub(&ctx, &hub.uri(), "tok");
+        crate::api::collab::refresh_projects(&ctx).await.unwrap();
+        let shared = Arc::new(Shared::new_for_test(Arc::clone(&ctx)));
+        shared.set_credentials(Some((hub.uri().to_string(), "tok".to_string())));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut worker = FeedWorker::new(
+            shared,
+            me,
+            HolderMaps::default(),
+            tx,
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let hello: HelloEvent = serde_json::from_value(hub.hello_for("tok")).unwrap();
+        worker.on_event(LiveEvent::Hello(hello)).await;
+        let outs = drain(&mut rx);
+        assert!(
+            outs.contains(&"synced p1 ok=true error=false".to_string()),
+            "{outs:?}"
+        );
+
+        hub.remove_member("p1", "acc-me");
+        worker
+            .on_event(LiveEvent::Resync(ResyncEvent {
+                project_id: "p1".into(),
+                what: ResyncWhat::Project,
+            }))
+            .await;
+        let outs = drain(&mut rx);
+        let refused = outs
+            .iter()
+            .position(|o| o == "refused p1")
+            .unwrap_or_else(|| panic!("the refusal is forwarded: {outs:?}"));
+        let synced: Vec<usize> = outs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.starts_with("synced p1"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(synced.len(), 1, "exactly one report for p1: {outs:?}");
+        assert_eq!(outs[synced[0]], "synced p1 ok=false error=true", "{outs:?}");
+        assert!(
+            synced[0] > refused,
+            "the report follows the refusal: {outs:?}"
+        );
     }
 }

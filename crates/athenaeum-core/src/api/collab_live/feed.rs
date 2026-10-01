@@ -8,7 +8,7 @@
 //! ([`HolderSide`]) is a trait so Task 6 can implement it for `Holdings`
 //! without this module depending on that one.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::api::{db, ApiError};
@@ -19,7 +19,7 @@ use crate::collab::live::cursor::{
 use crate::collab::live::presence::PresenceBook;
 use crate::collab::live::wire::{
     AccountEvent, AccountKind, ChangeKind, HelloEvent, HelloProject, HoldersEvent, LiveEvent,
-    ProjectEvent, ResyncWhat, VersionsEvent,
+    ProjectEvent, ResyncEvent, ResyncWhat, VersionsEvent,
 };
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
@@ -47,6 +47,55 @@ pub enum FeedEffect {
     ProjectJoined(String),
     ProjectGone(String),
     EpochChanged,
+}
+
+/// One project confirmed against the hub (or not) — spec 2026-10-01 §6.1.
+/// The applier collects one per project per applied event (a `hello` or a
+/// `versions` beat: one per project it confirmed or failed to; a `project`,
+/// `holders`, `resync` or `account` event: one for its project); the feed
+/// worker drains them ([`FeedApplier::take_reports`]) and forwards each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncReport {
+    pub project_id: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub changes: SyncChanges,
+}
+
+/// What a confirmation applied (spec 2026-10-01 §6.1). Presence is never
+/// counted: it stays on `collab-peers-changed`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncChanges {
+    /// Manifest rows the sync classified as a change (the counts the
+    /// manifest apply already computes; a full reload, whose counts are not
+    /// known, counts 1).
+    pub manifest_rows: usize,
+    pub members: bool,
+    pub holders: bool,
+    /// The project snapshot itself changed (joined or gone).
+    pub card: bool,
+}
+
+impl SyncChanges {
+    pub fn any(&self) -> bool {
+        self.manifest_rows > 0 || self.members || self.holders || self.card
+    }
+}
+
+impl SyncReport {
+    /// A second outcome for the same project folds into the first: the
+    /// project is confirmed only when every step for it succeeded, the
+    /// first error is kept, and the changes add up.
+    fn merge(&mut self, other: SyncReport) {
+        self.ok &= other.ok;
+        if self.error.is_none() {
+            self.error = other.error;
+        }
+        self.changes.manifest_rows += other.changes.manifest_rows;
+        self.changes.members |= other.changes.members;
+        self.changes.holders |= other.changes.holders;
+        self.changes.card |= other.changes.card;
+    }
 }
 
 /// The holder side of the feed (Task 6 implements it for `Holdings`). Kept
@@ -98,6 +147,11 @@ pub struct FeedApplier {
     /// The hub epoch this session last confirmed, learned from `hello.epoch`
     /// (and updated by [`FeedApplier::epoch_change`]).
     pub epoch: Option<String>,
+    /// Confirmation reports not taken yet, at most one per project
+    /// ([`Self::report`] merges a second outcome into the first).
+    reports: Vec<SyncReport>,
+    /// Manifest rows applied per project since its last report.
+    manifest_rows: HashMap<String, usize>,
 }
 
 impl FeedApplier {
@@ -115,7 +169,72 @@ impl FeedApplier {
             presence: PresenceBook::default(),
             account_id: None,
             epoch: None,
+            reports: Vec::new(),
+            manifest_rows: HashMap::new(),
         }
+    }
+
+    /// The confirmation reports collected since the last take (spec
+    /// 2026-10-01 §6.1), at most one per project.
+    pub fn take_reports(&mut self) -> Vec<SyncReport> {
+        std::mem::take(&mut self.reports)
+    }
+
+    /// Record `project_id`'s outcome: ok with what its effects and the
+    /// manifest rows applied since its last report changed, or not ok with
+    /// the error. A project already reported and not taken yet folds this
+    /// outcome into that report ([`SyncReport::merge`]), so a project is
+    /// reported once per apply even when its path reports a swallowed
+    /// failure of its own before the event's own outcome.
+    fn report(&mut self, project_id: &str, result: Result<&[FeedEffect], &ApiError>) {
+        let manifest_rows = self.manifest_rows.remove(project_id).unwrap_or(0);
+        let report = match result {
+            Ok(effects) => {
+                let mut changes = SyncChanges {
+                    manifest_rows,
+                    ..Default::default()
+                };
+                for e in effects {
+                    match e {
+                        FeedEffect::MembersChanged(p) if p == project_id => changes.members = true,
+                        FeedEffect::ProvidersChanged(p) if p == project_id => {
+                            changes.holders = true
+                        }
+                        FeedEffect::ProjectJoined(p) | FeedEffect::ProjectGone(p)
+                            if p == project_id =>
+                        {
+                            changes.card = true
+                        }
+                        _ => {}
+                    }
+                }
+                SyncReport {
+                    project_id: project_id.to_string(),
+                    ok: true,
+                    error: None,
+                    changes,
+                }
+            }
+            Err(e) => SyncReport {
+                project_id: project_id.to_string(),
+                ok: false,
+                error: Some(e.to_string()),
+                changes: SyncChanges::default(),
+            },
+        };
+        match self.reports.iter_mut().find(|r| r.project_id == project_id) {
+            Some(prev) => prev.merge(report),
+            None => self.reports.push(report),
+        }
+    }
+
+    /// Count manifest rows applied for `project_id`; its next report carries
+    /// them.
+    fn note_manifest_rows(&mut self, project_id: &str, rows: usize) {
+        *self
+            .manifest_rows
+            .entry(project_id.to_string())
+            .or_default() += rows;
     }
 
     fn stored_cursor(&self, project_id: &str) -> Result<Option<FeedCursor>, ApiError> {
@@ -152,40 +271,30 @@ impl FeedApplier {
         holders: &mut dyn HolderSide,
     ) -> Result<Vec<FeedEffect>, ApiError> {
         match ev {
-            LiveEvent::Hello(h) => self.on_hello(h, holders).await,
-            LiveEvent::Project(p) => self.on_project(p, holders).await,
-            LiveEvent::Holders(h) => {
-                // M7 fix round: never stamp an empty epoch. In real operation
-                // `hello` always precedes every other event; this guard is
-                // defensive (and load-bearing for a test that feeds events
-                // out of order).
-                let Some(epoch) = self.epoch.clone() else {
-                    tracing::debug!(project_id = %h.project_id, "holders event received before the first hello; skipped");
-                    return Ok(vec![]);
-                };
-                let stored = self.stored_cursor(&h.project_id)?.unwrap_or(FeedCursor {
-                    epoch: None,
-                    version: 0,
-                    holder_seq: -1,
-                });
-                // Item 1 fix round 2: this project is stuck on a different
-                // epoch than the session's confirmed one (its own reload
-                // failed at some point) — a holders delta against its stale
-                // holder map is meaningless; reload it fully instead.
-                if self.project_needs_epoch_reload(&stored) {
-                    tracing::warn!(project_id = %h.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "holders event for a project stuck on a different epoch; reloading it fully instead");
-                    return match self
-                        .reload_one_project(&h.project_id, &epoch, None, &ALL_KINDS, holders)
-                        .await
-                    {
-                        Ok(effs) => Ok(effs),
-                        Err(e) => {
-                            tracing::error!(project_id = %h.project_id, error = %e, "per-project epoch reload failed (holders event); retried next event");
-                            Ok(vec![])
-                        }
-                    };
+            LiveEvent::Hello(h) => {
+                let pids: Vec<String> = h.projects.keys().cloned().collect();
+                let r = self.on_hello(h, holders).await;
+                if let Err(e) = &r {
+                    // The hello failed as a whole (a catalog read or write
+                    // outside the per-project passes): no project it named is
+                    // confirmed. A project already reported folds this in.
+                    for pid in &pids {
+                        self.report(pid, Err(e));
+                    }
                 }
-                holders.on_holders_event(&h, &epoch).await
+                r
+            }
+            LiveEvent::Project(p) => {
+                let pid = p.project_id.clone();
+                let r = self.on_project(p, holders).await;
+                self.report(&pid, r.as_ref().map(|v| v.as_slice()));
+                r
+            }
+            LiveEvent::Holders(h) => {
+                let pid = h.project_id.clone();
+                let r = self.on_holders(h, holders).await;
+                self.report(&pid, r.as_ref().map(|v| v.as_slice()));
+                r
             }
             LiveEvent::Presence(p) => {
                 let changed = self.presence.apply_event(&p);
@@ -195,73 +304,143 @@ impl FeedApplier {
                     vec![FeedEffect::ProvidersChanged(p.project_id)]
                 })
             }
-            LiveEvent::Account(a) => self.on_account(a, holders).await,
-            // Item 1 fix round 3: `resync` names ONE side of ONE project to
-            // catch up over REST — exactly the shape `on_project`/`on_versions`
-            // already guard. Without this, a project stuck on a stale epoch
-            // would delta-fetch from its pre-restore `manifest_cursor` (or run
-            // a holders catch-up against its stale map) and `set_feed_version`
-            // would stamp the CURRENT (new) epoch anyway — losing that
-            // project's reload for good, not just delaying it.
-            LiveEvent::Resync(r) => match r.what {
-                ResyncWhat::Project => {
-                    let Some(epoch) = self.epoch.clone() else {
-                        tracing::debug!(project_id = %r.project_id, "resync(project) received before the first hello; skipped");
-                        return Ok(vec![]);
-                    };
-                    let stored = self.stored_cursor(&r.project_id)?.unwrap_or(FeedCursor {
-                        epoch: None,
-                        version: 0,
-                        holder_seq: -1,
-                    });
-                    if self.project_needs_epoch_reload(&stored) {
-                        tracing::warn!(project_id = %r.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "resync(project) for a project stuck on a different epoch; reloading it fully instead of a delta");
-                        return match self
-                            .reload_one_project(&r.project_id, &epoch, None, &ALL_KINDS, holders)
-                            .await
-                        {
-                            Ok(effs) => Ok(effs),
-                            Err(e) => {
-                                tracing::error!(project_id = %r.project_id, error = %e, "per-project epoch reload failed (resync); retried next event");
-                                Ok(vec![])
-                            }
-                        };
+            LiveEvent::Account(a) => {
+                let pid = a.project_id.clone();
+                let r = self.on_account(a, holders).await;
+                self.report(&pid, r.as_ref().map(|v| v.as_slice()));
+                r
+            }
+            LiveEvent::Resync(r) => {
+                let pid = r.project_id.clone();
+                let res = self.on_resync(r, holders).await;
+                self.report(&pid, res.as_ref().map(|v| v.as_slice()));
+                res
+            }
+            LiveEvent::Versions(v) => {
+                let pids: Vec<String> = v.keys().cloned().collect();
+                let r = self.on_versions(v, holders).await;
+                if let Err(e) = &r {
+                    // As for a failed hello: the beat confirmed nothing.
+                    for pid in &pids {
+                        self.report(pid, Err(e));
                     }
-                    self.catch_up_project(&r.project_id, None, &ALL_KINDS).await
                 }
-                ResyncWhat::Holders => {
-                    let Some(epoch) = self.epoch.clone() else {
-                        tracing::debug!(project_id = %r.project_id, "resync(holders) received before the first hello; skipped");
-                        return Ok(vec![]);
-                    };
-                    let stored = self.stored_cursor(&r.project_id)?.unwrap_or(FeedCursor {
-                        epoch: None,
-                        version: 0,
-                        holder_seq: -1,
-                    });
-                    if self.project_needs_epoch_reload(&stored) {
-                        tracing::warn!(project_id = %r.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "resync(holders) for a project stuck on a different epoch; reloading it fully instead of a stale-map catch-up");
-                        return match self
-                            .reload_one_project(&r.project_id, &epoch, None, &ALL_KINDS, holders)
-                            .await
-                        {
-                            Ok(effs) => Ok(effs),
-                            Err(e) => {
-                                tracing::error!(project_id = %r.project_id, error = %e, "per-project epoch reload failed (resync); retried next event");
-                                Ok(vec![])
-                            }
-                        };
-                    }
-                    holders.catch_up(&r.project_id, &epoch).await
-                }
-                ResyncWhat::Unknown => {
-                    tracing::warn!(project_id = %r.project_id, "resync event names a side this build doesn't know; ignored");
-                    Ok(vec![])
-                }
-            },
-            LiveEvent::Versions(v) => self.on_versions(v, holders).await,
+                r
+            }
             LiveEvent::Unknown(name) => {
                 tracing::debug!(event = %name, "unknown live event kind; ignored (forward compatibility)");
+                Ok(vec![])
+            }
+        }
+    }
+
+    /// A `holders` delta event for one project.
+    async fn on_holders(
+        &mut self,
+        h: HoldersEvent,
+        holders: &mut dyn HolderSide,
+    ) -> Result<Vec<FeedEffect>, ApiError> {
+        // M7 fix round: never stamp an empty epoch. In real operation
+        // `hello` always precedes every other event; this guard is
+        // defensive (and load-bearing for a test that feeds events
+        // out of order).
+        let Some(epoch) = self.epoch.clone() else {
+            tracing::debug!(project_id = %h.project_id, "holders event received before the first hello; skipped");
+            return Ok(vec![]);
+        };
+        let stored = self.stored_cursor(&h.project_id)?.unwrap_or(FeedCursor {
+            epoch: None,
+            version: 0,
+            holder_seq: -1,
+        });
+        // Item 1 fix round 2: this project is stuck on a different
+        // epoch than the session's confirmed one (its own reload
+        // failed at some point) — a holders delta against its stale
+        // holder map is meaningless; reload it fully instead.
+        if self.project_needs_epoch_reload(&stored) {
+            tracing::warn!(project_id = %h.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "holders event for a project stuck on a different epoch; reloading it fully instead");
+            return match self
+                .reload_one_project(&h.project_id, &epoch, None, &ALL_KINDS, holders)
+                .await
+            {
+                Ok(effs) => Ok(effs),
+                Err(e) => {
+                    tracing::error!(project_id = %h.project_id, error = %e, "per-project epoch reload failed (holders event); retried next event");
+                    self.report(&h.project_id, Err(&e));
+                    Ok(vec![])
+                }
+            };
+        }
+        holders.on_holders_event(&h, &epoch).await
+    }
+
+    /// Item 1 fix round 3: `resync` names ONE side of ONE project to
+    /// catch up over REST — exactly the shape `on_project`/`on_versions`
+    /// already guard. Without this, a project stuck on a stale epoch
+    /// would delta-fetch from its pre-restore `manifest_cursor` (or run
+    /// a holders catch-up against its stale map) and `set_feed_version`
+    /// would stamp the CURRENT (new) epoch anyway — losing that
+    /// project's reload for good, not just delaying it.
+    async fn on_resync(
+        &mut self,
+        r: ResyncEvent,
+        holders: &mut dyn HolderSide,
+    ) -> Result<Vec<FeedEffect>, ApiError> {
+        match r.what {
+            ResyncWhat::Project => {
+                let Some(epoch) = self.epoch.clone() else {
+                    tracing::debug!(project_id = %r.project_id, "resync(project) received before the first hello; skipped");
+                    return Ok(vec![]);
+                };
+                let stored = self.stored_cursor(&r.project_id)?.unwrap_or(FeedCursor {
+                    epoch: None,
+                    version: 0,
+                    holder_seq: -1,
+                });
+                if self.project_needs_epoch_reload(&stored) {
+                    tracing::warn!(project_id = %r.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "resync(project) for a project stuck on a different epoch; reloading it fully instead of a delta");
+                    return match self
+                        .reload_one_project(&r.project_id, &epoch, None, &ALL_KINDS, holders)
+                        .await
+                    {
+                        Ok(effs) => Ok(effs),
+                        Err(e) => {
+                            tracing::error!(project_id = %r.project_id, error = %e, "per-project epoch reload failed (resync); retried next event");
+                            self.report(&r.project_id, Err(&e));
+                            Ok(vec![])
+                        }
+                    };
+                }
+                self.catch_up_project(&r.project_id, None, &ALL_KINDS).await
+            }
+            ResyncWhat::Holders => {
+                let Some(epoch) = self.epoch.clone() else {
+                    tracing::debug!(project_id = %r.project_id, "resync(holders) received before the first hello; skipped");
+                    return Ok(vec![]);
+                };
+                let stored = self.stored_cursor(&r.project_id)?.unwrap_or(FeedCursor {
+                    epoch: None,
+                    version: 0,
+                    holder_seq: -1,
+                });
+                if self.project_needs_epoch_reload(&stored) {
+                    tracing::warn!(project_id = %r.project_id, stored_epoch = ?stored.epoch, session_epoch = %epoch, "resync(holders) for a project stuck on a different epoch; reloading it fully instead of a stale-map catch-up");
+                    return match self
+                        .reload_one_project(&r.project_id, &epoch, None, &ALL_KINDS, holders)
+                        .await
+                    {
+                        Ok(effs) => Ok(effs),
+                        Err(e) => {
+                            tracing::error!(project_id = %r.project_id, error = %e, "per-project epoch reload failed (resync); retried next event");
+                            self.report(&r.project_id, Err(&e));
+                            Ok(vec![])
+                        }
+                    };
+                }
+                holders.catch_up(&r.project_id, &epoch).await
+            }
+            ResyncWhat::Unknown => {
+                tracing::warn!(project_id = %r.project_id, "resync event names a side this build doesn't know; ignored");
                 Ok(vec![])
             }
         }
@@ -320,9 +499,13 @@ impl FeedApplier {
                     )
                     .await
                 {
-                    Ok(effs) => effects.extend(effs),
+                    Ok(effs) => {
+                        self.report(pid, Ok(&effs));
+                        effects.extend(effs);
+                    }
                     Err(e) => {
                         tracing::error!(project_id = %pid, error = %e, "processing this project's departure failed; retried on the next hello");
+                        self.report(pid, Err(&e));
                     }
                 }
             }
@@ -337,13 +520,20 @@ impl FeedApplier {
         // ordinary per-project plan). I2 fix round: a refresh failure here is
         // isolated per project — it never aborts the rest of this hello, and
         // the project (still uncached) is simply retried on the next one.
+        // Its report starts here (the join is a card change); the project's
+        // own pass below folds its outcome into it.
         for (pid, _) in &hello.projects {
             if self.stored_cursor(pid)?.is_none() {
                 let only: HashSet<String> = [pid.clone()].into_iter().collect();
                 match crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await {
-                    Ok(_) => effects.push(FeedEffect::ProjectJoined(pid.clone())),
+                    Ok(_) => {
+                        let joined = FeedEffect::ProjectJoined(pid.clone());
+                        self.report(pid, Ok(std::slice::from_ref(&joined)));
+                        effects.push(joined);
+                    }
                     Err(e) => {
                         tracing::error!(project_id = %pid, error = %e, "could not refresh a newly seen project; retried on the next hello");
+                        self.report(pid, Err(&e));
                     }
                 }
             }
@@ -392,16 +582,22 @@ impl FeedApplier {
         // must not abort every other project's — and must not repeat forever
         // on every future hello either. Isolate per project, log, continue;
         // a project whose catch-up failed simply keeps its old cursor, so
-        // the next `project`/`versions` event (or hello) retries it.
+        // the next `project`/`versions` event (or hello) retries it. Each
+        // project is reported once: ok when it was in sync or both its
+        // catch-up and its holder hello-sync succeeded, else the first
+        // error (spec 2026-10-01 §6.1).
         for (pid, hp, plan, stored) in plans {
+            let mut project_effects = Vec::new();
+            let mut failure: Option<ApiError> = None;
             if plan.catch_up_project {
                 match self
                     .catch_up_project(&pid, Some(hp.version), &ALL_KINDS)
                     .await
                 {
-                    Ok(effs) => effects.extend(effs),
+                    Ok(effs) => project_effects.extend(effs),
                     Err(e) => {
                         tracing::error!(project_id = %pid, error = %e, "hello catch-up failed for this project; retried on the next hello");
+                        failure = Some(e);
                     }
                 }
             } else if stored.epoch.is_none() {
@@ -425,11 +621,17 @@ impl FeedApplier {
                 .on_hello_project(&pid, &hp, plan.holders, &hello.epoch)
                 .await
             {
-                Ok(effs) => effects.extend(effs),
+                Ok(effs) => project_effects.extend(effs),
                 Err(e) => {
                     tracing::error!(project_id = %pid, error = %e, "holder hello-sync failed for this project");
+                    failure.get_or_insert(e);
                 }
             }
+            match &failure {
+                Some(e) => self.report(&pid, Err(e)),
+                None => self.report(&pid, Ok(&project_effects)),
+            }
+            effects.extend(project_effects);
         }
 
         {
@@ -477,6 +679,7 @@ impl FeedApplier {
                 Ok(effs) => Ok(effs),
                 Err(e) => {
                     tracing::error!(project_id = %ev.project_id, error = %e, "per-project epoch reload failed (project event); retried next event");
+                    self.report(&ev.project_id, Err(&e));
                     Ok(vec![])
                 }
             };
@@ -540,13 +743,14 @@ impl FeedApplier {
             project.gov_caps_json != project.synced_caps_json
         };
         if caps_changed {
-            crate::api::collab_exchange::sync_manifest(
+            let changes = crate::api::collab_exchange::sync_manifest(
                 &self.ctx,
                 &pid,
                 self.emitter.as_deref(),
                 Some(ev.version),
             )
             .await?;
+            self.note_manifest_rows(&pid, changes.iter().map(|c| c.count).sum());
             effects.push(FeedEffect::NeedSetChanged(pid.clone()));
         } else {
             match (ev.kinds.contains(&ChangeKind::Frames), ev.frames) {
@@ -555,13 +759,14 @@ impl FeedApplier {
                     effects.push(FeedEffect::NeedSetChanged(pid.clone()));
                 }
                 (true, _) => {
-                    crate::api::collab_exchange::sync_manifest(
+                    let changes = crate::api::collab_exchange::sync_manifest(
                         &self.ctx,
                         &pid,
                         self.emitter.as_deref(),
                         Some(ev.version),
                     )
                     .await?;
+                    self.note_manifest_rows(&pid, changes.iter().map(|c| c.count).sum());
                     effects.push(FeedEffect::NeedSetChanged(pid.clone()));
                 }
                 (false, _) => {}
@@ -581,7 +786,7 @@ impl FeedApplier {
     /// project's caps are already in sync (see [`Self::apply_contiguous`]'s
     /// `caps_changed` gate, I4 fix round).
     fn apply_inline(
-        &self,
+        &mut self,
         pid: &str,
         version: i64,
         epoch: &str,
@@ -620,6 +825,8 @@ impl FeedApplier {
         crate::db::collab::set_feed_version(&tx, pid, epoch, version)?;
         tx.commit()?;
         routes.route();
+        // The field, not `note_manifest_rows`: `conn` still borrows `ctx`.
+        *self.manifest_rows.entry(pid.to_string()).or_default() += counts.values().sum::<usize>();
         for (kind, count) in counts {
             let change = crate::api::collab_exchange::CollabFramesChange {
                 project_id: pid.to_string(),
@@ -696,7 +903,7 @@ impl FeedApplier {
         // M3 fix round: a manifest-sync failure is logged here, at the
         // applier boundary, before it propagates — every caller of this
         // function used to fail silently past this point.
-        let (_changes, _seen, mut project_version) =
+        let (changes, _seen, mut project_version) =
             crate::api::collab_exchange::sync_manifest_inner(
                 &self.ctx,
                 project_id,
@@ -709,6 +916,7 @@ impl FeedApplier {
                 tracing::warn!(project_id, requested_version = ?version, error = %e, "catch-up manifest sync failed; cursor stays put for a retry");
                 e
             })?;
+        self.note_manifest_rows(project_id, changes.iter().map(|c| c.count).sum());
 
         if small_docs {
             let only: HashSet<String> = [project_id.to_string()].into_iter().collect();
@@ -745,7 +953,7 @@ impl FeedApplier {
                 project.gov_caps_json != project.synced_caps_json
             };
             if caps_changed_now {
-                let (_c2, _s2, pv2) = crate::api::collab_exchange::sync_manifest_inner(
+                let (c2, _s2, pv2) = crate::api::collab_exchange::sync_manifest_inner(
                     &self.ctx,
                     project_id,
                     self.emitter.as_deref(),
@@ -757,6 +965,7 @@ impl FeedApplier {
                     tracing::warn!(project_id, error = %e, "catch-up caps-change full resync failed; cursor stays put for a retry");
                     e
                 })?;
+                self.note_manifest_rows(project_id, c2.iter().map(|c| c.count).sum());
                 project_version = pv2;
             }
         }
@@ -810,7 +1019,9 @@ impl FeedApplier {
                 continue;
             }
             match plan_versions(&stored, *head_version, *head_holder_seq) {
-                VersionsPlan::InSync => {}
+                // Confirmed as it stands (an epoch change below folds its
+                // own outcome for this project into this report).
+                VersionsPlan::InSync => self.report(pid, Ok(&[])),
                 VersionsPlan::CatchUp { project, holders } => {
                     catchups.push((pid.clone(), *head_version, project, holders));
                 }
@@ -827,9 +1038,13 @@ impl FeedApplier {
                 .reload_one_project(&pid, &epoch, Some(head_version), &ALL_KINDS, holders)
                 .await
             {
-                Ok(effs) => effects.extend(effs),
+                Ok(effs) => {
+                    self.report(&pid, Ok(&effs));
+                    effects.extend(effs);
+                }
                 Err(e) => {
                     tracing::error!(project_id = %pid, error = %e, "per-project epoch reload failed (versions tick); retried next tick");
+                    self.report(&pid, Err(&e));
                 }
             }
         }
@@ -844,25 +1059,34 @@ impl FeedApplier {
         // Item 5 fix round 2: isolate each catch-up — one project's failure
         // must not skip every other project's still in this same tick.
         for (pid, head_version, needs_project, needs_holders) in catchups {
+            let mut project_effects = Vec::new();
+            let mut failure: Option<ApiError> = None;
             if needs_project {
                 match self
                     .catch_up_project(&pid, Some(head_version), &ALL_KINDS)
                     .await
                 {
-                    Ok(effs) => effects.extend(effs),
+                    Ok(effs) => project_effects.extend(effs),
                     Err(e) => {
                         tracing::error!(project_id = %pid, error = %e, "versions catch-up failed for this project; retried next tick");
+                        failure = Some(e);
                     }
                 }
             }
             if needs_holders {
                 match holders.catch_up(&pid, &epoch).await {
-                    Ok(effs) => effects.extend(effs),
+                    Ok(effs) => project_effects.extend(effs),
                     Err(e) => {
                         tracing::error!(project_id = %pid, error = %e, "versions holder catch-up failed for this project; retried next tick");
+                        failure.get_or_insert(e);
                     }
                 }
             }
+            match &failure {
+                Some(e) => self.report(&pid, Err(e)),
+                None => self.report(&pid, Ok(&project_effects)),
+            }
+            effects.extend(project_effects);
         }
         Ok(effects)
     }
@@ -1000,14 +1224,19 @@ impl FeedApplier {
                 head.is_some_and(|(_, h)| stored.holder_seq >= 0 && h < stored.holder_seq);
             if already_on_new_epoch && !version_regressed && !holder_regressed {
                 // Already reloaded into this exact epoch, no further
-                // regression on either axis since — nothing to redo (item 4).
+                // regression on either axis since — nothing to redo (item 4),
+                // and confirmed as it stands.
+                self.report(&pid, Ok(&[]));
                 continue;
             }
             match self
                 .reload_one_project(&pid, new_epoch, head.map(|(v, _)| v), &ALL_KINDS, holders)
                 .await
             {
-                Ok(effs) => effects.extend(effs),
+                Ok(effs) => {
+                    self.report(&pid, Ok(&effs));
+                    effects.extend(effs);
+                }
                 Err(e) => {
                     tracing::error!(
                         project_id = %pid,
@@ -1015,6 +1244,7 @@ impl FeedApplier {
                         error = %e,
                         "epoch reload failed for this project; its cursor stays on the old epoch so the next pass retries it"
                     );
+                    self.report(&pid, Err(&e));
                 }
             }
         }
@@ -1145,6 +1375,8 @@ impl FeedApplier {
             let conn = database.conn();
             crate::db::collab::set_feed_version(&conn, pid, new_epoch, cursor_version)?;
         }
+        // A full reload's row counts are not known: count it as one change.
+        self.note_manifest_rows(pid, 1);
         effects.push(FeedEffect::NeedSetChanged(pid.to_string()));
         Ok(effects)
     }
@@ -2878,5 +3110,336 @@ mod tests {
             "the epoch change was detected for this quiet row and reloaded it"
         );
         assert_eq!(cursor(&ctx).0.as_deref(), Some(e2.as_str()));
+    }
+
+    // ── per-project confirmation reports (spec 2026-10-01 §6.1) ──────────
+
+    fn report_for<'a>(reports: &'a [SyncReport], project_id: &str) -> &'a SyncReport {
+        let mine: Vec<&SyncReport> = reports
+            .iter()
+            .filter(|r| r.project_id == project_id)
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "exactly one report for {project_id}: {reports:?}"
+        );
+        mine[0]
+    }
+
+    #[tokio::test]
+    async fn a_hello_reports_every_project_ok() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.add_project("p2", "m42", &[("acc-me", "send_receive", false)], false);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        let mut reports = f.take_reports();
+        reports.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        assert!(reports.len() >= 2, "{reports:?}");
+        assert!(reports.iter().all(|r| r.ok), "{reports:?}");
+        assert!(f.take_reports().is_empty(), "take drains");
+        // One report per project, the fresh join counted as a card change.
+        assert!(report_for(&reports, "p2").changes.card, "{reports:?}");
+        report_for(&reports, PID);
+    }
+
+    #[tokio::test]
+    async fn a_failed_catch_up_reports_not_ok_and_does_not_stamp() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.add_project("p2", "m42", &[("acc-me", "send_receive", false)], false);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        let stamped = project_cursor(&ctx, "p2");
+        hub.seed_frames("p2", "acc-other", &["u-1"], "published"); // p2's head moves
+        hub.set_failing("/projects/p2/manifest", true);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        let r = f.take_reports();
+        let p2 = r
+            .iter()
+            .find(|r| r.project_id == "p2")
+            .expect("p2 reported");
+        assert!(!p2.ok && p2.error.is_some(), "{p2:?}");
+        assert_eq!(p2.changes, SyncChanges::default(), "{p2:?}");
+        assert_eq!(
+            project_cursor(&ctx, "p2"),
+            stamped,
+            "the failed catch-up never moved p2's cursor"
+        );
+        assert!(
+            report_for(&r, PID).ok,
+            "a healthy sibling still reports ok: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manifest_change_reports_its_rows() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.add_project("p2", "m42", &[("acc-me", "send_receive", false)], false);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        hub.seed_frames("p2", "acc-other", &["u-1", "u-2"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        let r = f.take_reports();
+        let p2 = r.iter().find(|r| r.project_id == "p2").unwrap();
+        assert!(p2.ok && p2.changes.manifest_rows >= 2, "{p2:?}");
+        assert!(p2.changes.any());
+        let p1 = report_for(&r, PID);
+        assert!(
+            p1.ok && !p1.changes.any(),
+            "an in-sync sibling changed nothing: {p1:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn presence_alone_reports_nothing() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        f.apply(
+            LiveEvent::Presence(PresenceEvent {
+                project_id: PID.into(),
+                replace: false,
+                changes: vec![],
+            }),
+            &mut h,
+        )
+        .await
+        .unwrap();
+        assert!(f.take_reports().is_empty());
+    }
+
+    /// An inline `project` event: one ok report for its project, with the
+    /// rows the inline apply wrote.
+    #[tokio::test]
+    async fn a_project_event_reports_its_project_once_with_its_rows() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        hub.seed_frames(PID, "acc-o", &["u1"], "published");
+        let ev = project_event_from_hub(&hub, PID);
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        let r = f.take_reports();
+        assert_eq!(r.len(), 1, "{r:?}");
+        let p1 = report_for(&r, PID);
+        assert!(p1.ok && p1.changes.manifest_rows == 1, "{p1:?}");
+        assert!(!p1.changes.members && !p1.changes.card, "{p1:?}");
+    }
+
+    #[tokio::test]
+    async fn a_members_event_reports_members() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        hub.add_member(PID, "acc-x", "send_receive", false);
+        let ev = project_event_from_hub(&hub, PID);
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(p1.ok && p1.changes.members && p1.changes.any(), "{p1:?}");
+    }
+
+    /// A project stuck on an old epoch whose own reload fails again: the
+    /// event path logs and returns `Ok` (the feed goes on), but the report
+    /// is honest — not ok, exactly once.
+    #[tokio::test]
+    async fn a_swallowed_per_project_reload_failure_reports_not_ok_once() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        hub.set_failing("/manifest", true);
+        let e2 = hub.rotate_epoch();
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor(&ctx).0.as_deref(),
+            Some("e1"),
+            "stuck on the old epoch"
+        );
+        let r = f.take_reports();
+        assert!(!report_for(&r, PID).ok, "the failed epoch reload: {r:?}");
+
+        hub.seed_frames(PID, "acc-o", &["u1"], "published");
+        let ev = project_event_from_hub(&hub, PID);
+        let effects = f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        assert!(effects.is_empty(), "the event path swallows the failure");
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(!p1.ok && p1.error.is_some(), "{p1:?}");
+
+        f.apply(
+            LiveEvent::Holders(HoldersEvent {
+                project_id: PID.into(),
+                prev: 0,
+                seq: 1,
+                deltas: vec![],
+            }),
+            &mut h,
+        )
+        .await
+        .unwrap();
+        let r = f.take_reports();
+        assert!(!report_for(&r, PID).ok, "{r:?}");
+
+        f.apply(
+            LiveEvent::Resync(crate::collab::live::wire::ResyncEvent {
+                project_id: PID.into(),
+                what: ResyncWhat::Holders,
+            }),
+            &mut h,
+        )
+        .await
+        .unwrap();
+        let r = f.take_reports();
+        assert!(!report_for(&r, PID).ok, "{r:?}");
+    }
+
+    /// A `holders` delta event: one ok report for its project.
+    #[tokio::test]
+    async fn a_holders_event_reports_its_project() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        f.apply(
+            LiveEvent::Holders(HoldersEvent {
+                project_id: PID.into(),
+                prev: 0,
+                seq: 1,
+                deltas: vec![],
+            }),
+            &mut h,
+        )
+        .await
+        .unwrap();
+        assert!(h.0.contains(&"holders 1".to_string()));
+        let r = f.take_reports();
+        assert!(report_for(&r, PID).ok, "{r:?}");
+    }
+
+    /// `versions`: an in-sync project reports ok, a project with no cursor
+    /// is skipped, a failed catch-up reports not ok.
+    #[tokio::test]
+    async fn versions_reports_cursored_projects_and_skips_the_rest() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        let (_, v) = cursor(&ctx);
+        let mut vv = VersionsEvent::new();
+        vv.insert(PID.into(), (v, -1));
+        vv.insert("p-unknown".into(), (5, -1));
+        f.apply(LiveEvent::Versions(vv), &mut h).await.unwrap();
+        let r = f.take_reports();
+        assert_eq!(
+            r.len(),
+            1,
+            "no report for a project without a cursor: {r:?}"
+        );
+        let p1 = report_for(&r, PID);
+        assert!(p1.ok && !p1.changes.any(), "{p1:?}");
+
+        hub.seed_frames(PID, "acc-o", &["u5"], "published");
+        hub.set_failing("/manifest", true);
+        let mut vv = VersionsEvent::new();
+        vv.insert(PID.into(), (hub.version(PID), -1));
+        f.apply(LiveEvent::Versions(vv), &mut h).await.unwrap();
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(!p1.ok && p1.error.is_some(), "{p1:?}");
+        assert_eq!(cursor(&ctx).1, v, "not stamped");
+    }
+
+    /// An epoch change reports each project: reloaded (ok), failed (not
+    /// ok), and — on the repeat pass — skipped as already on the new epoch
+    /// (ok).
+    #[tokio::test]
+    async fn an_epoch_change_reports_each_project() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.add_project("p2", "m42", &[("acc-me", "send_receive", false)], false);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        hub.set_failing("/projects/p2/manifest", true);
+        let e2 = hub.rotate_epoch();
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(p1.ok && p1.changes.manifest_rows > 0, "reloaded: {p1:?}");
+        let p2 = report_for(&r, "p2");
+        assert!(!p2.ok && p2.error.is_some(), "{p2:?}");
+
+        let before = manifest_requests_for(&hub, PID).await;
+        f.apply(LiveEvent::Hello(hello(&hub, &e2)), &mut h)
+            .await
+            .unwrap();
+        assert_eq!(manifest_requests_for(&hub, PID).await, before, "p1 skipped");
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(
+            p1.ok && !p1.changes.any(),
+            "skipped, still confirmed: {p1:?}"
+        );
+        assert!(!report_for(&r, "p2").ok, "{r:?}");
+    }
+
+    /// A 403 surfaced by an event's own path is a not-ok report for that
+    /// project (the feed worker forwards it after the refusal).
+    #[tokio::test]
+    async fn a_forbidden_event_reports_not_ok() {
+        let (_t, _ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        hub.remove_member(PID, "acc-me");
+        let applied = f
+            .apply(
+                LiveEvent::Resync(crate::collab::live::wire::ResyncEvent {
+                    project_id: PID.into(),
+                    what: ResyncWhat::Project,
+                }),
+                &mut h,
+            )
+            .await;
+        assert!(
+            matches!(applied, Err(ApiError::Forbidden(_))),
+            "{applied:?}"
+        );
+        let r = f.take_reports();
+        let p1 = report_for(&r, PID);
+        assert!(!p1.ok && p1.error.is_some(), "{p1:?}");
     }
 }

@@ -154,6 +154,12 @@ impl Shared {
         }
     }
 
+    /// Test only: a bare shared state with no emitter, for a worker test.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(ctx: Arc<ServiceContext>) -> Self {
+        Self::new(ctx, None)
+    }
+
     fn update_status(&self, f: impl FnOnce(&mut CollabLiveStatus) -> bool) {
         let changed = self.status.send_if_modified(f);
         if changed {
@@ -1715,6 +1721,10 @@ impl Runtime {
                 }
             }
             FeedOut::Refused { project_id, error } => self.refuse(project_id, &error),
+            // Task 14 records these in `Shared` and emits them.
+            FeedOut::Synced(r) => {
+                tracing::trace!(project_id = %r.project_id, ok = r.ok, "sync report")
+            }
         }
     }
 
