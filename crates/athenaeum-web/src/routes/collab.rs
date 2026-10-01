@@ -359,6 +359,30 @@ pub async fn republish_collab_frames(
     .map_err(api_err)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WithheldArgs {
+    project_id: String,
+    frame_ids: Vec<i64>,
+    withheld: bool,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_collab_frames_withheld(
+    State(state): State<WebAppState>,
+    Json(args): Json<WithheldArgs>,
+) -> Result<Json<u32>, (axum::http::StatusCode, String)> {
+    athenaeum_core::api::collab_prepare::set_collab_frames_withheld(
+        &state.ctx,
+        &args.project_id,
+        &args.frame_ids,
+        args.withheld,
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
+}
+
 /// Every cached frame of a project (cache-only — no hub call), with its local
 /// state and the live holder counts.
 #[tracing::instrument(skip_all, err(Debug))]

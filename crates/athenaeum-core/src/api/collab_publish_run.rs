@@ -204,6 +204,7 @@ impl Drop for RunGuard {
             Some("run interrupted".into()),
             None,
         );
+        crate::api::collab_prepare::drop_withheld_prepared_db(&self.state.db, &p.project_id);
         self.state.conclude(&self.key, &finished);
     }
 }

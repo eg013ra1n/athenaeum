@@ -14597,6 +14597,87 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
+        async fn withholding_a_prepared_frame_deletes_its_file_and_row() {
+            let fx = fixture(2).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            let p0 = prepared(&fx).into_iter().find(|r| r.source_frame_id == fx.frame_ids[0]).unwrap();
+            let n = crate::api::collab_prepare::set_collab_frames_withheld(&fx.ctx, PID, &[fx.frame_ids[0]], true).await.unwrap();
+            assert_eq!(n, 1);
+            assert!(!std::path::Path::new(p0.calibrated_path.as_ref().unwrap()).exists());
+            assert_eq!(prepared(&fx).len(), 1);
+            let own = list_project_own_frames(&fx.ctx, PID).unwrap();
+            assert_eq!(own.iter().find(|r| r.frame_id == fx.frame_ids[0]).unwrap().contributor_state, "withheld");
+        }
+
+        #[tokio::test]
+        async fn withholding_an_external_prepared_frame_keeps_the_original() {
+            let fx = fixture(1).await;
+            {
+                let conn = crate::api::db(&fx.ctx).unwrap().conn();
+                conn.execute("UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1", [fx.set_id]).unwrap();
+            }
+            calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            crate::api::collab_prepare::set_collab_frames_withheld(&fx.ctx, PID, &[fx.frame_ids[0]], true).await.unwrap();
+            assert!(fx.lights[0].exists());
+            assert!(prepared(&fx).is_empty());
+        }
+
+        #[tokio::test]
+        async fn withholding_a_published_frame_is_refused() {
+            let fx = fixture(1).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            mount_hub(&fx.server, "published").await;
+            publish_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            let err = crate::api::collab_prepare::set_collab_frames_withheld(&fx.ctx, PID, &[fx.frame_ids[0]], true).await.unwrap_err();
+            assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+        }
+
+        #[tokio::test]
+        async fn release_returns_the_frame_to_ready_and_dirties_the_project() {
+            let _lock = crate::api::collab_autopublish::test_lock();
+            let fx = fixture(1).await;
+            crate::api::collab_prepare::set_collab_frames_withheld(&fx.ctx, PID, &[fx.frame_ids[0]], true).await.unwrap();
+            crate::api::collab_autopublish::reset_dirty_state_for_test();
+            let n = crate::api::collab_prepare::set_collab_frames_withheld(&fx.ctx, PID, &[fx.frame_ids[0]], false).await.unwrap();
+            assert_eq!(n, 1);
+            assert!(crate::api::collab_autopublish::is_dirty_for_test(PID));
+            assert_eq!(list_project_own_frames(&fx.ctx, PID).unwrap()[0].segment, "ready");
+        }
+
+        #[tokio::test]
+        async fn withholding_during_an_active_run_keeps_files_until_the_run_ends() {
+            let fx = fixture(1).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            let path = prepared(&fx)[0].calibrated_path.clone().unwrap();
+            let (run, _g) = crate::api::collab_publish_run::RunHandle::begin(
+                &fx.ctx, PID, crate::api::collab_publish_run::PublishRunKind::Publish,
+                crate::api::collab_publish_run::PublishTrigger::Manual, None, None,
+            ).unwrap();
+            crate::api::collab_prepare::set_collab_frames_withheld(&fx.ctx, PID, &[fx.frame_ids[0]], true).await.unwrap();
+            assert!(std::path::Path::new(&path).exists(), "plan W3: no deletion under an active run");
+            run.finish(&fx.ctx, &Ok(Default::default()));
+            assert!(!std::path::Path::new(&path).exists(), "the run's end drops it");
+            assert!(prepared(&fx).is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_interrupted_run_still_drops_frames_withheld_meanwhile() {
+            let fx = fixture(1).await;
+            calibrate_collab_frames(&fx.ctx, PID, None, None).await.unwrap();
+            let path = prepared(&fx)[0].calibrated_path.clone().unwrap();
+            let (run, guard) = crate::api::collab_publish_run::RunHandle::begin(
+                &fx.ctx, PID, crate::api::collab_publish_run::PublishRunKind::Publish,
+                crate::api::collab_publish_run::PublishTrigger::Manual, None, None,
+            ).unwrap();
+            crate::api::collab_prepare::set_collab_frames_withheld(&fx.ctx, PID, &[fx.frame_ids[0]], true).await.unwrap();
+            assert!(std::path::Path::new(&path).exists());
+            drop(run);
+            drop(guard);
+            assert!(!std::path::Path::new(&path).exists(), "the guard's end drops it");
+            assert!(prepared(&fx).is_empty());
+        }
+
+        #[tokio::test]
         async fn cancel_before_an_announce_batch_untags_and_keeps_frames_prepared() {
             let fx = fixture(2).await;
             calibrate_collab_frames(&fx.ctx, PID, None, None)

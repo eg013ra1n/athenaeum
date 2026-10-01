@@ -166,6 +166,25 @@ pub async fn republish_collab_frames(
         .map_err(|e| e.to_string())
 }
 
+/// Don't publish (`withheld = true`) / Release for local frames of a project.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_collab_frames_withheld(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame_ids: Vec<i64>,
+    withheld: bool,
+) -> Result<u32, String> {
+    athenaeum_core::api::collab_prepare::set_collab_frames_withheld(
+        &state.ctx,
+        &project_id,
+        &frame_ids,
+        withheld,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Every cached frame of a project (cache-only — no hub call), with its local
 /// state and the live holder counts. `with_contributor_state` (I1, default
 /// `false`) opts into the own-row contributor chip, which runs the full

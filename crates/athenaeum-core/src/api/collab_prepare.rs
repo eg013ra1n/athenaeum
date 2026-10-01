@@ -2,10 +2,107 @@
 
 use crate::services::ServiceContext;
 
-/// Delete prepared rows and files of frames withheld while a run was active
-/// (plan W3). Filled in by the withhold task; a no-op until then.
+/// Spec 2026-10-01 §4.5 — Don't publish (`withheld = true`) / Release.
+pub async fn set_collab_frames_withheld(
+    ctx: &ServiceContext,
+    project_id: &str,
+    frame_ids: &[i64],
+    withheld: bool,
+) -> Result<u32, crate::api::ApiError> {
+    use crate::api::ApiError;
+    // Known narrow race, accepted: a run may start after this read and before
+    // the transaction commits; its seed then fails on the deleted file and the
+    // frame is held back for that run only.
+    let run_active = crate::api::collab_publish_run::is_active(ctx, project_id);
+    let (changed, gone) = {
+        let d = crate::api::db(ctx)?;
+        let conn = d.conn();
+        crate::api::collab_exchange::live_project(&conn, project_id)?;
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| crate::api::collab::internal(e.into()))?;
+        let res = (|| -> Result<(usize, Vec<crate::db::collab_prepare::PreparedRow>), ApiError> {
+            if withheld {
+                let own = crate::db::collab_frames::own_by_source_frame(&conn, project_id)
+                    .map_err(crate::api::collab::internal)?;
+                let in_project = frame_ids.iter().filter(|id| own.contains_key(id)).count();
+                if in_project > 0 {
+                    return Err(ApiError::Invalid(format!(
+                        "{in_project} of these frames are already in the project and cannot be withheld"
+                    )));
+                }
+            }
+            let n = crate::db::collab_prepare::set_withheld(&conn, project_id, frame_ids, withheld)
+                .map_err(crate::api::collab::internal)?;
+            let gone = if withheld && !run_active {
+                crate::db::collab_prepare::delete_prepared(&conn, project_id, frame_ids)
+                    .map_err(crate::api::collab::internal)?
+            } else {
+                Vec::new()
+            };
+            Ok((n, gone))
+        })();
+        match res {
+            Ok(v) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| crate::api::collab::internal(e.into()))?;
+                v
+            }
+            Err(e) => {
+                if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                    tracing::error!(project_id, error = %rb, "withhold rollback failed");
+                }
+                tracing::warn!(project_id, error = %e, "withhold refused");
+                return Err(e);
+            }
+        }
+    };
+    let removed = remove_prepared_files(&gone);
+    tracing::info!(
+        project_id,
+        withheld,
+        count = changed,
+        removed,
+        deferred = run_active,
+        "collab frames withheld or released"
+    );
+    if !withheld && changed > 0 {
+        crate::api::collab_autopublish::request_auto_publish(Some(project_id));
+    }
+    Ok(changed as u32)
+}
+
+/// Plan W3 — at a run's end: prepared rows of frames withheld meanwhile go,
+/// with their (non-external) files. Logs, never fails the run.
 pub(crate) fn drop_withheld_prepared(ctx: &ServiceContext, project_id: &str) {
-    let _ = (ctx, project_id);
+    match crate::api::db(ctx) {
+        Ok(d) => drop_withheld_prepared_db(d, project_id),
+        Err(e) => tracing::error!(project_id, error = %e, "withheld prepared frames not dropped"),
+    }
+}
+
+/// The DB-level core of [`drop_withheld_prepared`]; the interrupted-run guard
+/// (which holds no `ServiceContext`) calls it too.
+pub(crate) fn drop_withheld_prepared_db(db: &crate::db::Database, project_id: &str) {
+    let gone = (|| -> anyhow::Result<Vec<crate::db::collab_prepare::PreparedRow>> {
+        let conn = db.conn();
+        let withheld: Vec<i64> = crate::db::collab_prepare::withheld_ids(&conn, project_id)?
+            .into_iter()
+            .collect();
+        crate::db::collab_prepare::delete_prepared(&conn, project_id, &withheld)
+    })();
+    match gone {
+        Ok(rows) if !rows.is_empty() => {
+            let removed = remove_prepared_files(&rows);
+            tracing::info!(
+                project_id,
+                count = rows.len(),
+                removed,
+                "withheld prepared frames dropped after the run"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!(project_id, error = %e, "withheld prepared frames not dropped"),
+    }
 }
 
 /// Remove the calibrated files of these prepared rows — never an external

@@ -507,6 +507,7 @@ pub fn run() {
             commands::publish_collab_frames,
             commands::calibrate_collab_frames,
             commands::republish_collab_frames,
+            commands::set_collab_frames_withheld,
             commands::list_collab_frames,
             commands::list_project_own_frames,
             commands::get_collab_frame_holders,
