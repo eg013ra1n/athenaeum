@@ -792,7 +792,7 @@ pub fn frames_set_attested(conn: &Connection, frames_set_id: i64) -> Result<bool
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rusqlite::Connection;
 
@@ -803,7 +803,7 @@ mod tests {
         conn
     }
 
-    fn sample_row(id: &str) -> CollabProjectRow {
+    pub(crate) fn sample_row(id: &str) -> CollabProjectRow {
         CollabProjectRow {
             project_id: id.to_string(),
             slug: format!("{id}-slug"),

@@ -511,6 +511,8 @@ pub fn run() {
             commands::get_collab_frame_holders,
             commands::get_collab_member_summary,
             commands::get_collab_exchange,
+            commands::get_collab_publish_run,
+            commands::cancel_collab_publish,
             commands::list_collab_receive_sessions,
             commands::set_project_auto_replicate,
             commands::set_project_publish_mode,

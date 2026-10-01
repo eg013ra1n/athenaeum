@@ -85,6 +85,12 @@ pub mod collab_live;
 // `api::collab` (render+solver) — it drives `publish_collab_frames`.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab_autopublish;
+// One tracker for every collab publish-family run (progress, one finished
+// event, last run, snapshot, cancel) and the prepared-frame bookkeeping.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod collab_prepare;
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod collab_publish_run;
 // Trigger-only shim: `on_batch_finished` marks every auto-publish project
 // dirty after a plate-solve batch completes (Task 10). Gated the same as
 // `collab_autopublish`, which it calls.

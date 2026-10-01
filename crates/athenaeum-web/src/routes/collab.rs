@@ -931,3 +931,26 @@ mod args_serde_tests {
         assert_eq!(b.frame_ids, None);
     }
 }
+
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn get_collab_publish_run(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<
+    Json<athenaeum_core::api::collab_publish_run::CollabPublishRunView>,
+    (axum::http::StatusCode, String),
+> {
+    athenaeum_core::api::collab_publish_run::get_collab_publish_run(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn cancel_collab_publish(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    athenaeum_core::api::collab_publish_run::cancel_collab_publish(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}

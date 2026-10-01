@@ -622,6 +622,7 @@ mod tests {
             state: None,
             held_back: Vec::new(),
             unchanged: 0,
+            ..Default::default()
         };
         run_publish_pass(
             &ctx,
@@ -668,6 +669,7 @@ mod tests {
                         state: None,
                         held_back: Vec::new(),
                         unchanged: 0,
+                        ..Default::default()
                     })
                 }
             },
@@ -701,6 +703,7 @@ mod tests {
                     state: None,
                     held_back: Vec::new(),
                     unchanged: 0,
+                    ..Default::default()
                 })
             },
         )

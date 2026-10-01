@@ -577,3 +577,23 @@ pub async fn set_collab_max_receive_streams(
     surface::set_collab_max_receive_streams(&state.ctx, max_receive_streams)
         .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_collab_publish_run(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<athenaeum_core::api::collab_publish_run::CollabPublishRunView, String> {
+    athenaeum_core::api::collab_publish_run::get_collab_publish_run(&state.ctx, &project_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn cancel_collab_publish(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
+    athenaeum_core::api::collab_publish_run::cancel_collab_publish(&state.ctx, &project_id)
+        .map_err(|e| e.to_string())
+}
