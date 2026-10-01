@@ -271,11 +271,13 @@ describe('useCollabNotifications', () => {
       expect(history()[0].title).toBe('Another device of this account publishes M42 Mosaic');
     });
 
-    it('a refused run on an outdated hub says to update, never the raw code', async () => {
+    it('a refused run on an outdated hub says to update in its title, never the raw code', async () => {
       await fire({ outcome: 'refused', error: 'collab_api_outdated: the hub requires collab API 4' });
       const [n] = history();
-      expect(n.title).toBe('Not published in M42 Mosaic');
+      // Toasts show titles only: the reason is in the title.
+      expect(n.title).toBe('Not published in M42 Mosaic — this hub needs a newer Athenaeum');
       expect(n.detail).toBe('This hub needs a newer Athenaeum — update to publish.');
+      expect(screen.getByRole('status')).toHaveTextContent('Not published in M42 Mosaic — this hub needs a newer Athenaeum');
     });
 
     it('one frame reads in the singular', async () => {

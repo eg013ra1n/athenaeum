@@ -21,8 +21,12 @@ describe('describeLastRun', () => {
     [fin({ outcome: 'refused', trigger: 'auto', error: 'collab_publishing_device:Obs PC' }),
       'Not run — Obs PC publishes this project', null, 'warn'],
     [fin({ outcome: 'failed', error: 'disk full' }), 'Failed — disk full', null, 'error'],
+    // A line, not a sentence: the card puts " · {time}" after it.
     [fin({ outcome: 'refused', error: 'collab_api_outdated: the hub requires collab API 4' }),
-      'This hub needs a newer Athenaeum — update to publish.', null, 'warn'],
+      'This hub needs a newer Athenaeum — update to publish', null, 'warn'],
+    // Only frames sent back to Ready: what the stale-only toast says.
+    [fin({ stale: 2 }), '2 frames back to Ready — changed since calibration', 'ready', 'warn'],
+    [fin({ kind: 'calibrate', stale: 1 }), '1 frame back to Ready — changed since calibration', 'ready', 'warn'],
   ])('%#', (last, text, segment, tone) => {
     expect(describeLastRun(last)).toEqual({ text, segment, tone });
   });

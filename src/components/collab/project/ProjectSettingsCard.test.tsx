@@ -4,6 +4,7 @@ import { api } from '../../../api';
 import { NotificationProvider } from '../../../contexts/NotificationContext';
 import ProjectSettingsCard from './ProjectSettingsCard';
 import { projectCard } from './testFixtures';
+import { formatTimestamp } from '../../../utils/dateFormatting';
 import type { ProjectCard } from '../../../types/models';
 import type { PublishRunState } from './useCollabPublishRun';
 
@@ -71,6 +72,18 @@ describe('ProjectSettingsCard', () => {
       calibrated: 46, announced: 0, updated: 0, stale: 0, heldBack: 2, error: null, startedAt: '2026-10-02T10:00:00Z',
       finishedAt: '2026-10-02T10:03:22Z' } } });
     expect(screen.getByText(/Calibrated 46/)).toBeInTheDocument();
+  });
+
+  it('the outdated-hub last-run line has no stray period before the time', () => {
+    const finishedAt = '2026-10-02T10:03:22Z';
+    renderCard({ run: { ...idle, last: { projectId: 'p1', publishRunId: 'r', kind: 'publish', trigger: 'manual', outcome: 'refused',
+      calibrated: 0, announced: 0, updated: 0, stale: 0, heldBack: 0, error: 'collab_api_outdated: the hub requires collab API 4',
+      startedAt: '2026-10-02T10:03:20Z', finishedAt } } });
+    const line = screen.getByText(/^Last run/);
+    expect(line.textContent).toBe(
+      `Last run · This hub needs a newer Athenaeum — update to publish · ${formatTimestamp(finishedAt, { seconds: true })} · manual`,
+    );
+    expect(line.textContent).not.toContain('. ·');
   });
 
   it('a queued run reads "Waiting for a compute slot" with no counts', () => {

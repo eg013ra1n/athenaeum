@@ -319,11 +319,17 @@ export function useCollabNotifications() {
             break;
           case 'refused': {
             const device = f.error ? publishingDeviceRefusal(f.error) : null;
+            const outdated = !device && !!f.error && isOutdated(f.error);
             notify({
-              title: device ? `${leading(device)} publishes ${title}` : `Not published in ${title}`,
+              // Toasts show titles only, so the reason rides in the title.
+              title: device
+                ? `${leading(device)} publishes ${title}`
+                : outdated
+                  ? `Not published in ${title} — this hub needs a newer Athenaeum`
+                  : `Not published in ${title}`,
               detail: device
                 ? 'Use Publish from this device in Project settings to take over.'
-                : f.error && isOutdated(f.error)
+                : outdated
                   ? HUB_OUTDATED_TEXT
                   : (f.error ?? ''),
               kind: 'project',
