@@ -40,7 +40,9 @@ function newerFinished(a: CollabPublishFinished | null, b: CollabPublishFinished
  * Both listeners are registered BEFORE the snapshot is read, so no event can
  * fall between the read and the subscription. The reply can still be older
  * than an event heard while it was in flight: a `running` whose run already
- * finished is ignored, and `last` keeps the newer of the two.
+ * finished is ignored, a `running: null` keeps a run whose progress was heard
+ * and has not finished (it was queued after the reply was computed), and
+ * `last` keeps the newer of the two.
  */
 export function useCollabPublishRun(projectId: string | undefined): PublishRunState {
   const { notify } = useNotifications();
@@ -64,6 +66,8 @@ export function useCollabPublishRun(projectId: string | undefined): PublishRunSt
 
   // The last run id heard in a `collab-publish-finished` (this subscription).
   const finishedRunRef = useRef<string | null>(null);
+  // The last run id heard in a `collab-publish-progress` (this subscription).
+  const progressRunRef = useRef<string | null>(null);
 
   const applyProgress = useCallback((p: CollabPublishProgress) => {
     setRunning(p);
@@ -77,6 +81,7 @@ export function useCollabPublishRun(projectId: string | undefined): PublishRunSt
     if (!projectId) return undefined;
     let cancelled = false;
     finishedRunRef.current = null;
+    progressRunRef.current = null;
     const offs: Array<() => void> = [];
     // Never rejects: a failed listen is logged and the snapshot still reads.
     const sub = <T,>(name: string, handle: (p: T) => void): Promise<void> =>
@@ -91,7 +96,9 @@ export function useCollabPublishRun(projectId: string | undefined): PublishRunSt
         .catch((err) => console.error(`[publish-run] listen ${name} failed:`, err));
     const subs = [
       sub<CollabPublishProgress>('collab-publish-progress', (p) => {
-        if (p.projectId === projectId) applyProgress(p);
+        if (p.projectId !== projectId) return;
+        progressRunRef.current = p.publishRunId;
+        applyProgress(p);
       }),
       sub<CollabPublishFinished>('collab-publish-finished', (f) => {
         if (f.projectId !== projectId) return;
@@ -107,8 +114,13 @@ export function useCollabPublishRun(projectId: string | undefined): PublishRunSt
         return api.invoke<CollabPublishRunView>('get_collab_publish_run', { projectId }).then((v) => {
           if (cancelled || !v) return;
           if (!v.running) {
-            setRunning(null);
-            setReach(IDLE_REACH);
+            // A run heard while the read was in flight and not finished since
+            // started after the reply was computed: it stays.
+            const heard = progressRunRef.current;
+            if (heard === null || heard === finishedRunRef.current) {
+              setRunning(null);
+              setReach(IDLE_REACH);
+            }
           } else if (v.running.publishRunId !== finishedRunRef.current) {
             applyProgress(v.running);
           }

@@ -83,13 +83,39 @@ describe('useCollabPublishRun', () => {
     expect(result.current.last?.publishRunId).toBe('r1');
   });
 
-  it('a snapshot with running: null resets running and the reached step', async () => {
+  it('a running: null reply keeps a run whose progress was heard while the read was pending', async () => {
+    const snap = deferred<CollabPublishRunView>();
+    vi.mocked(api.invoke).mockReturnValueOnce(snap.promise as never);
+    const { result } = renderHook(() => useCollabPublishRun('p1'), { wrapper });
+    await waitFor(() => expect(snapshotCalls()).toHaveLength(1));
+    // r1 ends, then r2 is queued — after the reply was computed.
+    act(() => listeners['collab-publish-progress'](progress({ stage: 'seeding' })));
+    act(() => listeners['collab-publish-finished'](finished()));
+    act(() => listeners['collab-publish-progress'](progress({ publishRunId: 'r2', stage: 'announcing' })));
+    await act(async () => { snap.resolve({ running: null, last: null }); });
+    expect(result.current.running?.publishRunId).toBe('r2');
+    expect(result.current.reached).toBe(3);
+  });
+
+  it('a running: null reply resets when no unfinished run was heard', async () => {
+    const snap = deferred<CollabPublishRunView>();
+    vi.mocked(api.invoke).mockReturnValueOnce(snap.promise as never);
+    const { result } = renderHook(() => useCollabPublishRun('p1'), { wrapper });
+    await waitFor(() => expect(snapshotCalls()).toHaveLength(1));
+    // Another project's progress is never recorded for this one.
+    act(() => listeners['collab-publish-progress'](progress({ projectId: 'other' })));
+    await act(async () => { snap.resolve({ running: null, last: null }); });
+    expect(result.current.running).toBeNull();
+    expect(result.current.reached).toBe(-1);
+  });
+
+  it('a running: null reply resets when the run heard has already finished', async () => {
     const snap = deferred<CollabPublishRunView>();
     vi.mocked(api.invoke).mockReturnValueOnce(snap.promise as never);
     const { result } = renderHook(() => useCollabPublishRun('p1'), { wrapper });
     await waitFor(() => expect(snapshotCalls()).toHaveLength(1));
     act(() => listeners['collab-publish-progress'](progress({ stage: 'announcing' })));
-    expect(result.current.reached).toBe(3);
+    act(() => listeners['collab-publish-finished'](finished()));
     await act(async () => { snap.resolve({ running: null, last: null }); });
     expect(result.current.running).toBeNull();
     expect(result.current.reached).toBe(-1);
