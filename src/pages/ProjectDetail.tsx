@@ -221,12 +221,18 @@ function ProjectPage({ id }: { id: string | undefined }) {
     void loadLibrary();
   }, [loadLibrary, storedTab]);
 
+  // Bumped to make the Moderation and Exchange tabs re-fetch their own lists:
+  // by the pill's confirmation, a changed synced report and a finished run.
+  const [syncToken, setSyncToken] = useState(0);
+
   // Core emits `collab-publish-finished` at the end of EVERY publish run of a
   // project — manual, republish and the background auto-publish — so this is
   // the one place that keeps own frames (Ready counts, `Publish all N`), the
-  // library (the Library count pill) and the card current
-  // after a run nobody clicked. StrictMode-safe listener pattern (CLAUDE.md);
-  // the loaders are stable per project (the page is keyed on `id`).
+  // library (the Library count pill), the card, the members and the
+  // Moderation / Exchange tabs (`syncToken`) current after a run nobody
+  // clicked (spec §6.5: the finished event reloads everything).
+  // StrictMode-safe listener pattern (CLAUDE.md); the loaders are stable per
+  // project (the page is keyed on `id`).
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
@@ -237,6 +243,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
         void loadLibrary();
         void loadDetail();
         void loadMembersRef.current();
+        setSyncToken((n) => n + 1);
       })
       .then((fn) => {
         if (cancelled) fn();
@@ -312,7 +319,6 @@ function ProjectPage({ id }: { id: string | undefined }) {
 
   // The pill's confirmation (and a changed synced report below) re-read every
   // list; the token makes the Moderation and Exchange tabs re-fetch their own.
-  const [syncToken, setSyncToken] = useState(0);
   const reloadAll = useCallback(() => {
     void loadDetail();
     void loadOwn();

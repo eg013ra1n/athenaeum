@@ -1238,6 +1238,29 @@ describe('ProjectDetail fix round 1', () => {
     });
   });
 
+  it('collab-publish-finished re-reads everything (spec §6.5): the Exchange tab refetches its sessions', async () => {
+    renderProjectDetail();
+    await openTab(/^Exchange/);
+    await waitFor(() => expect(invokeCount('list_collab_receive_sessions')).toBeGreaterThan(0));
+    await waitFor(() => expect(listeners['collab-publish-finished']?.length ?? 0).toBeGreaterThanOrEqual(2));
+    const sessions = invokeCount('list_collab_receive_sessions');
+
+    fire('collab-publish-finished', finished({ announced: 1 }));
+    await waitFor(() => expect(invokeCount('list_collab_receive_sessions')).toBeGreaterThan(sessions));
+  });
+
+  it('collab-publish-finished re-reads the Moderation queue too', async () => {
+    mockCommands(projectCard({ coordinator: true, canModerate: true, requireApproval: true }));
+    renderProjectDetail();
+    await openTab(/^Moderation/);
+    await waitFor(() => expect(invokeCount('list_collab_moderation')).toBeGreaterThan(0));
+    await waitFor(() => expect(listeners['collab-publish-finished']?.length ?? 0).toBeGreaterThanOrEqual(2));
+    const queue = invokeCount('list_collab_moderation');
+
+    fire('collab-publish-finished', finished({ announced: 1 }));
+    await waitFor(() => expect(invokeCount('list_collab_moderation')).toBeGreaterThan(queue));
+  });
+
   it('collab-publish-finished for another project re-reads nothing', async () => {
     renderProjectDetail();
     await openTab(/^My frames/);
