@@ -1123,17 +1123,24 @@ async fn sync_now_raises_a_confirmed_collab_project_synced() {
         },
     )
     .await;
-    let recorded = crate::api::collab_live::live_synced_at(&w.a.ctx, ts::PID)
-        .expect("the runtime recorded the confirmation");
+    // Card first, then the runtime's value: another ok report between the two
+    // reads can only make the runtime's time newer, never older.
     let card = crate::api::collab::list_projects(&w.a.ctx)
         .unwrap()
         .into_iter()
         .find(|c| c.project_id == ts::PID)
         .expect("the project's card");
-    assert_eq!(
-        card.synced_at.as_deref(),
-        Some(recorded.as_str()),
-        "the card reads the runtime's confirmation time"
+    let recorded = crate::api::collab_live::live_synced_at(&w.a.ctx, ts::PID)
+        .expect("the runtime recorded the confirmation");
+    let card_at = chrono::DateTime::parse_from_rfc3339(
+        card.synced_at.as_deref().expect("the card carries a time"),
+    )
+    .expect("the card time is RFC 3339");
+    let recorded_at =
+        chrono::DateTime::parse_from_rfc3339(&recorded).expect("the runtime time is RFC 3339");
+    assert!(
+        recorded_at >= card_at,
+        "the card reads the runtime's confirmation time (card {card_at}, runtime {recorded_at})"
     );
 }
 

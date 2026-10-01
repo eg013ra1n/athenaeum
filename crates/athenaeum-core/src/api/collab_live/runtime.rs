@@ -568,8 +568,8 @@ pub fn status(ctx: &ServiceContext) -> CollabLiveStatus {
 }
 
 /// Sync now (L10, P26): every back-off cleared, the stream dropped and
-/// reopened at once, then reconciliation (a digest check per project, a
-/// stat sweep). Armed but not running yet (waiting for its folder, its
+/// reopened at once, then reconciliation (a stat sweep, and a holder digest
+/// per project that runs after the reconnect's hello — DigestAfterHello). Armed but not running yet (waiting for its folder, its
 /// node, or restarting): queued, applied when the runtime starts (final
 /// fix A-M4) — never a silent no-op.
 pub fn sync_now(ctx: &ServiceContext) -> Result<(), ApiError> {
@@ -1840,7 +1840,7 @@ impl Runtime {
                         .unwrap_or_else(|p| p.into_inner())
                         .insert(r.project_id.clone(), at);
                 } else {
-                    tracing::warn!(project_id = %r.project_id, error = ?r.error, "project not confirmed against the hub");
+                    tracing::debug!(project_id = %r.project_id, error = r.error.as_deref().unwrap_or_default(), "project not confirmed against the hub");
                 }
                 let now = Instant::now();
                 self.sync_burst.note(r, at, now);

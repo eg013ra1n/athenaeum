@@ -11841,9 +11841,6 @@ pub(crate) mod tests {
             assert_eq!(res.unchanged, 2);
         }
 
-        /// R10: the identical-output and the new-version write-backs are
-        /// column-targeted — a hub state a manifest sync wrote between the
-        /// split and the write-back survives both.
         async fn set_mode(fx: &PubFx, mode: crate::db::collab::PublishMode) {
             let conn = crate::api::db(&fx.ctx).unwrap().conn();
             crate::db::collab::set_publish_mode(&conn, PID, mode).unwrap();
@@ -11924,6 +11921,9 @@ pub(crate) mod tests {
                 .is_empty());
         }
 
+        /// R10: the identical-output and the new-version write-backs are
+        /// column-targeted — a hub state a manifest sync wrote between the
+        /// split and the write-back survives both.
         #[tokio::test]
         async fn write_backs_keep_hub_state_written_mid_run() {
             let fx = fixture(1).await;

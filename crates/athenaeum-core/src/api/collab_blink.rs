@@ -78,7 +78,7 @@ fn member_attested(
              JOIN frames f ON f.id = sm.frame_id \
              WHERE sm.frame_id = ?1 AND f.imagetyp = 'Light' \
                AND ino.frames_set_id IN (SELECT frames_set_id FROM project_links WHERE project_id = ?2) \
-             LIMIT 1",
+             ORDER BY ino.frames_set_id LIMIT 1",
             rusqlite::params![fid, project_id],
             |r| r.get(0),
         )
