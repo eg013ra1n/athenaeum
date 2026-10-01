@@ -70,12 +70,6 @@ function resolveTab(v: string | null | undefined): Tab | null {
   return v ? (TAB_ALIASES.get(v) ?? null) : null;
 }
 
-// Rough per-frame size for the PRE-publish confirm estimate only (a calibrated
-// 32-bit-float light frame). The exact size is measured when each frame is
-// calibrated; the dialog labels this figure "estimated" so it never reads as
-// an authoritative stored value (S6).
-const APPROX_FRAME_BYTES = 45 * 1024 * 1024;
-
 // `collab-peers-changed` fires per event, throttled core-side to one per
 // project per second (`LANDED_BURST`, `runtime.rs`). These mirror that on the
 // frontend as a schedule-if-none-pending throttle: the FIRST event schedules
@@ -426,6 +420,9 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const needsApproval = c.requireApproval && !c.canModerate;
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
   const ownRows = own ?? [];
+  const publishBytes = ownRows
+    .filter((r) => publishIds?.includes(r.frameId))
+    .reduce((sum, r) => sum + (r.calibratedBytes ?? r.byteSize), 0);
   const readyCount = ownRows.filter((r) => r.segment === 'ready').length;
   const reviewCount = ownRows.filter((r) => r.segment === 'review').length;
   const publishedRows = ownRows.filter((r) => r.segment === 'published');
@@ -695,6 +692,11 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 refusal={refusal}
                 onOpen={toggleDrawer}
                 activeKey={activeKey}
+                run={run}
+                onCalibrate={(ids) => void publishing.calibrate(ids)}
+                calibrateBusy={publishing.calibrateBusy}
+                calibrateError={publishing.calibrateError}
+                onUpdate={(ids) => void publishing.publish(ids)}
               />
             </PanelLayout>
           )}
@@ -754,7 +756,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
           <PublishConfirmDialog
             title={c.title}
             count={publishIds.length}
-            estimatedBytes={publishIds.length * APPROX_FRAME_BYTES}
+            bytes={publishBytes}
             needsApproval={needsApproval}
             coordinatorName={coordinatorName}
             busy={publishing.publishBusy}

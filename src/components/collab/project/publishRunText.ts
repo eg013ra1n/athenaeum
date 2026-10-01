@@ -1,4 +1,4 @@
-import type { CollabPublishFinished, PublishStage } from '../../../types/models';
+import type { CollabPublishFinished, PublishMode, PublishStage } from '../../../types/models';
 import type { Segment } from './MyFramesTab';
 import { publishingDeviceRefusal } from './usePublishing';
 
@@ -9,6 +9,13 @@ export const STAGE_TITLE: Record<PublishStage, string> = {
   seeding: 'Seeding',
   announcing: 'Announcing',
   versions: 'Posting new versions',
+};
+
+/** The one wording of a project's publish mode. */
+export const MODE_LABEL: Record<PublishMode, string> = {
+  manual: 'Manual',
+  autoCalibrate: 'Auto-calibrate',
+  automatic: 'Fully automatic',
 };
 
 /** One line for a finished run, and the My frames segment it points at (spec §7.3, §8.1). */

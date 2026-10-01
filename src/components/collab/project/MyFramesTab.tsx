@@ -6,6 +6,7 @@ import { useNotifications } from '../../../contexts/NotificationContext';
 import type { AnalysisCompleteEvent } from '../../../types/helpers';
 import type { LinkedSetView, OwnFrameRow } from '../../../types/models';
 import { Button, EmptyState, SegmentTiles } from '../../ui';
+import { formatDurationPadded, formatSize } from '../format';
 import FilterMappingDialog from '../FilterMappingDialog';
 import LinkObjectDialog from '../LinkObjectDialog';
 import ExcludeDialog from './ExcludeDialog';
@@ -13,6 +14,10 @@ import ReasonGroupAction from './ReasonGroupAction';
 import ProjectFrameTable, { type TableAction } from './table/ProjectFrameTable';
 import type { GroupNode } from './table/model';
 import { fromOwn, type FrameVM } from './frames';
+import { contributionTiles } from './contribution';
+import PublishRunPanel from './PublishRunPanel';
+import { useWithhold } from './useWithhold';
+import type { PublishRunState } from './useCollabPublishRun';
 
 export type Segment = 'ready' | 'review' | 'published' | 'held';
 
@@ -36,7 +41,22 @@ export interface MyFramesTabProps {
   onOpen: (vm: FrameVM) => void;
   /** The frame whose side panel is open — its row takes the active state. */
   activeKey?: string | null;
+  /** The project's publish run (the shell's one `useCollabPublishRun`). */
+  run: PublishRunState;
+  onCalibrate: (frameIds: number[]) => void;
+  calibrateBusy: boolean;
+  calibrateError: string | null;
+  /** Plan F1: publish these already-published frames' update with no confirm. */
+  onUpdate: (frameIds: number[]) => void;
 }
+
+const TILE_LABEL: Record<Segment, string> = {
+  ready: 'Ready to calibrate',
+  review: 'To review',
+  published: 'Published',
+  held: 'Held back',
+};
+const TILE_TONE = { ready: 'accent', review: 'purple', published: 'success', held: 'warning' } as const;
 
 /**
  * My frames — the three Ready/Published/Held back tables of the redesigned
@@ -50,11 +70,12 @@ export interface MyFramesTabProps {
 export default function MyFramesTab({
   projectId, rows, error, links, segment, onSegment, onReload, onDetailReload,
   onRequestPublish, publishBusy, onRequestRepublish, republishBusy, canRepublish, canModerate,
-  republishError, refusal, onOpen, activeKey = null,
+  republishError, refusal, onOpen, activeKey = null, run, onCalibrate, calibrateBusy, calibrateError, onUpdate,
 }: MyFramesTabProps): JSX.Element {
   const navigate = useNavigate();
   const { notify } = useNotifications();
 
+  const withhold = useWithhold(projectId, onReload);
   const [linkOpen, setLinkOpen] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
   const [excluding, setExcluding] = useState<FrameVM[] | null>(null);
@@ -185,6 +206,11 @@ export default function MyFramesTab({
     () => (rows ?? []).filter((r) => r.segment === 'ready').map(fromOwn),
     [rows],
   );
+  const reviewRows: FrameVM[] = useMemo(
+    () => (rows ?? []).filter((r) => r.segment === 'review').map(fromOwn),
+    [rows],
+  );
+  const tiles = useMemo(() => contributionTiles(rows ?? []), [rows]);
   const publishedRows: FrameVM[] = useMemo(
     () => (rows ?? []).filter((r) => r.segment === 'published').map(fromOwn),
     [rows],
@@ -194,7 +220,25 @@ export default function MyFramesTab({
     [rows],
   );
 
+  const asTargets = (vs: FrameVM[]) => vs.map((v) => ({ frameId: v.frameId!, prepared: v.own?.calibratedPath != null }));
   const readyActions: TableAction[] = [
+    {
+      id: 'calibrate',
+      verb: 'Calibrate',
+      eligible: () => true,
+      primary: true,
+      busy: calibrateBusy,
+      run: (targets) => onCalibrate(targets.map((v) => v.frameId!)),
+    },
+    {
+      id: 'withhold',
+      verb: "Don't publish",
+      eligible: () => true,
+      busy: withhold.busy,
+      run: (targets) => void withhold.dontPublish(asTargets(targets)),
+    },
+  ];
+  const reviewActions: TableAction[] = [
     {
       id: 'publish',
       verb: 'Publish',
@@ -203,13 +247,28 @@ export default function MyFramesTab({
       busy: publishBusy,
       run: (targets) => onRequestPublish(targets.map((v) => v.frameId!)),
     },
+    {
+      id: 'withhold',
+      verb: "Don't publish",
+      eligible: () => true,
+      busy: withhold.busy,
+      run: (targets) => void withhold.dontPublish(asTargets(targets)),
+    },
   ];
   const readyEmptyText =
     links.length === 0
       ? 'Link an object to start.'
-      : 'Nothing ready to publish — new frames appear here once they pass the gate.';
+      : 'Nothing ready — new frames appear here once they pass the gate.';
 
   const heldActions: TableAction[] = [
+    {
+      id: 'release',
+      verb: 'Release',
+      eligible: (v) => v.own?.withheld === true,
+      primary: true,
+      busy: withhold.busy,
+      run: (targets) => void withhold.release(targets.map((v) => v.frameId!)),
+    },
     {
       id: 'solve',
       verb: 'Solve',
@@ -239,6 +298,13 @@ export default function MyFramesTab({
 
   const publishedActions: TableAction[] = [
     {
+      id: 'update',
+      verb: 'Update',
+      eligible: (v) => v.own?.contributorState === 'updatePending',
+      busy: publishBusy,
+      run: (targets) => onUpdate(targets.map((v) => v.frameId!)),
+    },
+    {
       id: 'republish',
       verb: 'Republish',
       eligible: (v) => !v.excluded,
@@ -257,18 +323,24 @@ export default function MyFramesTab({
       : []),
   ];
 
+  const summary = rows === null ? null : tiles.find((t) => t.segment === segment) ?? null;
+
   return (
     <div>
       {error && <p className="mb-2.5 text-[12.5px] text-error">Could not load your frames — see console.</p>}
 
+      <PublishRunPanel run={run} onOpenSegment={onSegment} />
+
       <div className="mb-2.5 flex flex-wrap items-center gap-2">
         {rows !== null && (
           <SegmentTiles
-            tiles={[
-              { value: 'ready', n: readyRows.length, label: 'Ready to publish', tone: 'accent' },
-              { value: 'published', n: publishedRows.length, label: 'Published', tone: 'success' },
-              { value: 'held', n: heldRows.length, label: 'Held back', tone: 'warning' },
-            ]}
+            tiles={tiles.map((t) => ({
+              value: t.segment,
+              n: t.count,
+              label: TILE_LABEL[t.segment],
+              tone: TILE_TONE[t.segment],
+              sub: `${formatDurationPadded(t.seconds)} · ${t.nights} ${t.nights === 1 ? 'night' : 'nights'}`,
+            }))}
             value={segment}
             onChange={onSegment}
           />
@@ -290,6 +362,12 @@ export default function MyFramesTab({
         <EmptyState>Loading…</EmptyState>
       ) : (
         <>
+          {summary && (
+            <p className="mb-2 text-[12px] text-content-faint">
+              {`${summary.count} ${summary.count === 1 ? 'frame' : 'frames'} · ${formatDurationPadded(summary.seconds)} · ${formatSize(summary.bytes)}`}
+            </p>
+          )}
+          {calibrateError && <p className="mb-2.5 text-[12.5px] text-error">{calibrateError}</p>}
           {republishError && <p className="mb-2.5 text-[12.5px] text-error">{republishError}</p>}
           {refusal}
 
@@ -303,6 +381,18 @@ export default function MyFramesTab({
               onOpen={onOpen}
               activeKey={activeKey}
               emptyText={readyEmptyText}
+            />
+          )}
+          {segment === 'review' && (
+            <ProjectFrameTable
+              key={`${projectId}.review`}
+              tableId="review"
+              scope={projectId}
+              rows={reviewRows}
+              actions={reviewActions}
+              onOpen={onOpen}
+              activeKey={activeKey}
+              emptyText="Nothing to review — calibrated frames wait here until you publish them."
             />
           )}
           {segment === 'held' && (
@@ -345,6 +435,8 @@ export default function MyFramesTab({
           )}
         </>
       )}
+
+      {withhold.dialog}
 
       {linkOpen && (
         <LinkObjectDialog

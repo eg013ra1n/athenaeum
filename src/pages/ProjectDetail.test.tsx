@@ -88,6 +88,12 @@ const twoReady: OwnFrameRow[] = [
   ownRow({ frameId: 2, fileName: 'L_0002.fits' }),
 ];
 
+/** Two calibrated frames waiting in To review (1 MiB and 2 MiB calibrated). */
+const twoReview: OwnFrameRow[] = [
+  ownRow({ frameId: 3, fileName: 'L_0003.fits', segment: 'review', calibratedPath: '/c/3.fits', calibratedBytes: 1_048_576 }),
+  ownRow({ frameId: 4, fileName: 'L_0004.fits', segment: 'review', calibratedPath: '/c/4.fits', calibratedBytes: 2_097_152 }),
+];
+
 function published(frameId: number, o: Partial<OwnFrameRow> = {}): OwnFrameRow {
   return ownRow({
     frameId,
@@ -192,7 +198,7 @@ function mockCommands(
       case 'get_collab_project_detail':
         return Promise.resolve(detailFixture(card));
       case 'list_project_own_frames':
-        return Promise.resolve(twoReady);
+        return Promise.resolve([...twoReady, ...twoReview]);
       case 'list_collab_frames':
         return Promise.resolve([] as ProjectFrameView[]);
       case 'get_collab_member_summary':
@@ -314,9 +320,10 @@ async function openTab(name: RegExp) {
   fireEvent.click(await screen.findByRole('tab', { name }));
 }
 
-/** My frames → "Publish all 2" → the confirm's Publish. */
+/** My frames → To review → "Publish all 2" → the confirm's Publish. */
 async function publishViaConfirm() {
   await openTab(/^My frames/);
+  fireEvent.click(await screen.findByRole('button', { name: /To review/ }));
   fireEvent.click(await screen.findByRole('button', { name: 'Publish all 2' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
 }
@@ -343,7 +350,7 @@ describe('ProjectDetail manual publish', () => {
     await waitFor(() =>
       expect(screen.queryByRole('button', { name: 'Publish' })).not.toBeInTheDocument(),
     );
-    expect(api.invoke).toHaveBeenCalledWith('publish_collab_frames', { projectId: 'proj-1', frameIds: [1, 2] });
+    expect(api.invoke).toHaveBeenCalledWith('publish_collab_frames', { projectId: 'proj-1', frameIds: [3, 4] });
     await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThanOrEqual(2));
 
     expect(listeners['collab-publish-finished']?.length ?? 0).toBeGreaterThan(0);
@@ -360,21 +367,23 @@ describe('ProjectDetail manual publish', () => {
     expect(toasts[0]).toHaveTextContent('Published 2 frames in M42 Mosaic');
   });
 
-  it('the confirm counts the requested frames and estimates their size', async () => {
+  it('the publish confirm shows the exact Σ calibratedBytes of the chosen frames', async () => {
     renderProjectDetail();
     await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /To review/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Publish all 2' }));
     expect(await screen.findByText('Publish to M42 Mosaic')).toBeInTheDocument();
     expect(
       screen.getByText('2 passing frames will be calibrated and announced to the project.'),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Estimated size ≈ 94 MB/)).toBeInTheDocument();
+    expect(screen.getByText('Size 3 MB')).toBeInTheDocument();
   });
 
   it('the confirm shows no approval notice for a non-coordinator with canModerate: true', async () => {
     mockCommands(projectCard({ coordinator: false, canModerate: true, requireApproval: true }));
     renderProjectDetail();
     await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /To review/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Publish all 2' }));
     expect(await screen.findByText('Publish to M42 Mosaic')).toBeInTheDocument();
     expect(screen.queryByText(/requires approval/)).not.toBeInTheDocument();
@@ -384,6 +393,7 @@ describe('ProjectDetail manual publish', () => {
     mockCommands(projectCard({ coordinator: false, canModerate: false, requireApproval: true }));
     renderProjectDetail();
     await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /To review/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Publish all 2' }));
     expect(await screen.findByText('Publish to M42 Mosaic')).toBeInTheDocument();
     expect(screen.getByText(/requires approval/)).toBeInTheDocument();
@@ -399,6 +409,15 @@ describe('ProjectDetail manual publish', () => {
     expect(await screen.findByText('hub unreachable')).toBeInTheDocument();
 
     expect(screen.queryAllByRole('status')).toHaveLength(0);
+  });
+
+  it('Calibrate in My frames invokes calibrate_collab_frames with the selection', async () => {
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: 'Calibrate all 2' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('calibrate_collab_frames', { projectId: 'proj-1', frameIds: [1, 2] }),
+    );
   });
 
   it('calibrate invokes calibrate_collab_frames with the ids and toasts nothing on failure', async () => {
@@ -877,7 +896,7 @@ describe('ProjectDetail Held back fixes (My frames wiring)', () => {
   it('re-fetches own frames when analysis-complete fires', async () => {
     renderProjectDetail();
     await openTab(/^My frames/);
-    await screen.findByRole('button', { name: 'Publish all 2' });
+    await screen.findByRole('button', { name: 'Calibrate all 2' });
     const before = invokeCount('list_project_own_frames');
     fire('analysis-complete', {
       frame_set_id: 42,
@@ -908,7 +927,7 @@ describe('ProjectDetail Held back fixes (My frames wiring)', () => {
   it("final-review minor: plate-solve-complete is a global event — it does not re-fetch this page's frames when this page never started a solve", async () => {
     renderProjectDetail();
     await openTab(/^My frames/);
-    await screen.findByRole('button', { name: 'Publish all 2' });
+    await screen.findByRole('button', { name: 'Calibrate all 2' });
     const before = invokeCount('list_project_own_frames');
     fire('plate-solve-complete', {});
     // No `await waitFor` for a positive assertion here — give any (wrongly)
@@ -954,7 +973,7 @@ describe('ProjectDetail tabs', () => {
     renderProjectDetail();
     const overview = await screen.findByRole('tab', { name: 'Overview' });
     expect(overview).toHaveAttribute('aria-selected', 'true');
-    expect(tabNames()).toEqual(['Overview', 'My frames 2 ready', 'Library', 'Members', 'Exchange', 'Moderation']);
+    expect(tabNames()).toEqual(['Overview', 'My frames 2 ready · 2 to review', 'Library', 'Members', 'Exchange', 'Moderation']);
   });
 
   it('a contributor (send only, not coordinator) sees no Library tab', async () => {
@@ -1062,7 +1081,7 @@ describe('ProjectDetail tabs', () => {
     renderProjectDetail('/projects/proj-1?tab=contribute');
     const mine = await screen.findByRole('tab', { name: /^My frames/ });
     await waitFor(() => expect(mine).toHaveAttribute('aria-selected', 'true'));
-    expect(await screen.findByRole('button', { name: 'Publish all 2' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Calibrate all 2' })).toBeInTheDocument();
   });
 
   it('?tab=members and ?tab=exchange open their tabs', async () => {
@@ -1127,7 +1146,7 @@ describe('ProjectDetail tabs', () => {
   it('the page no longer evaluates the project gate', async () => {
     renderProjectDetail();
     await openTab(/^My frames/);
-    await screen.findByRole('button', { name: 'Publish all 2' });
+    await screen.findByRole('button', { name: 'Calibrate all 2' });
     expect(invokeCount('evaluate_collab_gate')).toBe(0);
     expect(api.invoke).toHaveBeenCalledWith('list_project_own_frames', { projectId: 'proj-1' });
     expect(api.invoke).toHaveBeenCalledWith('list_collab_frames', { projectId: 'proj-1' });
@@ -1138,7 +1157,7 @@ describe('ProjectDetail fix round 1', () => {
   it('collab-publish-finished for this project (e.g. an auto-publish) re-reads own frames, the library and the detail', async () => {
     renderProjectDetail();
     await openTab(/^My frames/);
-    await screen.findByRole('button', { name: 'Publish all 2' });
+    await screen.findByRole('button', { name: 'Calibrate all 2' });
     await waitFor(() => expect(listeners['collab-publish-finished']?.length ?? 0).toBeGreaterThanOrEqual(2));
     const own = invokeCount('list_project_own_frames');
     const lib = invokeCount('list_collab_frames');
@@ -1155,7 +1174,7 @@ describe('ProjectDetail fix round 1', () => {
   it('collab-publish-finished for another project re-reads nothing', async () => {
     renderProjectDetail();
     await openTab(/^My frames/);
-    await screen.findByRole('button', { name: 'Publish all 2' });
+    await screen.findByRole('button', { name: 'Calibrate all 2' });
     await waitFor(() => expect(listeners['collab-publish-finished']?.length ?? 0).toBeGreaterThanOrEqual(2));
     const own = invokeCount('list_project_own_frames');
     const lib = invokeCount('list_collab_frames');
@@ -1256,7 +1275,7 @@ describe('ProjectDetail project switch', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'go to project 2' }));
     expect(await screen.findByRole('heading', { name: 'M31 Deep' })).toBeInTheDocument();
-    expect(await screen.findByRole('button', { name: 'Publish all 1' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Calibrate all 1' })).toBeInTheDocument();
     expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
     expect(screen.queryByText('L_0001.fits')).not.toBeInTheDocument();
   });

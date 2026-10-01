@@ -68,6 +68,16 @@ describe('LinkObjectDialog', () => {
     await waitFor(() => expect(notify).toHaveBeenCalledWith(expect.objectContaining({ detail: 'nope', hasErrors: true })));
   });
 
+  it('F6: an unlink refused by a running publish says so', async () => {
+    mock([], () => Promise.reject('publication of this project is already running'));
+    renderDialog([{ framesSetId: 3, name: 'Old', lightCount: 2, withinRadius: true } as LinkedSetView]);
+    fireEvent.click(await screen.findByRole('button', { name: 'Unlink' }));
+    await waitFor(() => expect(notify).toHaveBeenCalledWith(expect.objectContaining({
+      detail: 'A publish run is in progress — try again when it ends.', hasErrors: true,
+    })));
+    expect(console.error).toHaveBeenCalled();
+  });
+
   it('Escape closes', async () => {
     mock([]);
     const onClose = vi.fn();

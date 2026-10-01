@@ -1,7 +1,9 @@
+import type { ReactNode } from 'react';
+
 /** Mockup `.segs button` — My-frames segment tiles (number 18px, label 12px). */
-const TONE = { accent: 'text-accent', success: 'text-success', warning: 'text-warning', content: 'text-content' } as const;
+const TONE = { accent: 'text-accent', success: 'text-success', warning: 'text-warning', purple: 'text-purple', content: 'text-content' } as const;
 export function SegmentTiles<T extends string>({ tiles, value, onChange }: {
-  tiles: { value: T; n: number | string; label: string; tone: keyof typeof TONE }[];
+  tiles: { value: T; n: number | string; label: string; tone: keyof typeof TONE; sub?: ReactNode }[];
   value: T;
   onChange: (v: T) => void;
 }) {
@@ -19,6 +21,7 @@ export function SegmentTiles<T extends string>({ tiles, value, onChange }: {
           >
             <span className={`text-[18px] font-semibold ${TONE[t.tone]}`}>{typeof t.n === 'number' ? t.n.toLocaleString('en-US') : t.n}</span>{' '}
             <span className={`text-[12px] ${on ? 'text-accent' : 'text-content-faint'}`}>{t.label}</span>
+            {t.sub != null && <span className="text-[11.5px] text-content-faint">{t.sub}</span>}
           </button>
         );
       })}

@@ -10,7 +10,7 @@ function renderDialog(o: Partial<Props> = {}) {
   const props: Props = {
     title: 'M31 Project',
     count: 3,
-    estimatedBytes: 3 * 45 * 1024 * 1024,
+    bytes: 142_000_000,
     needsApproval: false,
     coordinatorName: 'Ada',
     busy: false,
@@ -31,10 +31,11 @@ describe('PublishConfirmDialog', () => {
     expect(d.className).toMatch(/w-\[440px\]/);
   });
 
-  it('states the count, the estimated size and no approval line by default', () => {
+  it('states the count, the exact size and no approval line by default', () => {
     renderDialog();
     expect(screen.getByText('3 passing frames will be calibrated and announced to the project.')).toBeInTheDocument();
-    expect(screen.getByText(/Estimated size ≈ 142 MB — the exact size is measured/)).toBeInTheDocument();
+    expect(screen.getByText('Size 142 MB')).toBeInTheDocument();
+    expect(screen.queryByText(/Estimated|≈/)).toBeNull();
     expect(screen.queryByText(/requires approval/)).toBeNull();
   });
 

@@ -5,20 +5,20 @@ import { Button, Card, Chip, ProgressBar, Seg, StatusDot } from '../../ui';
 import { Checkbox } from '../../settings/Checkbox';
 import { formatTimestamp } from '../../../utils/dateFormatting';
 import { deviceLabel } from './usePublishing';
-import { describeLastRun, STAGE_TITLE } from './publishRunText';
+import { describeLastRun, MODE_LABEL, STAGE_TITLE } from './publishRunText';
 import type { PublishRunState } from './useCollabPublishRun';
 import type { ProjectCard, PublishMode } from '../../../types/models';
 
 const MODES: { value: PublishMode; label: string; help: string }[] = [
-  { value: 'manual', label: 'Manual', help: 'Nothing runs on its own. You calibrate, review and publish from My frames.' },
+  { value: 'manual', label: MODE_LABEL.manual, help: 'Nothing runs on its own. You calibrate, review and publish from My frames.' },
   {
     value: 'autoCalibrate',
-    label: 'Auto-calibrate',
+    label: MODE_LABEL.autoCalibrate,
     help: 'New passing frames are calibrated after scans, analysis or new masters, then wait in To review until you publish them. Runs while Athenaeum is open and signed in to the hub.',
   },
   {
     value: 'automatic',
-    label: 'Fully automatic',
+    label: MODE_LABEL.automatic,
     help: 'New passing frames are calibrated and published with no review. For a remote rig nobody watches. Runs while Athenaeum is open and signed in to the hub.',
   },
 ];

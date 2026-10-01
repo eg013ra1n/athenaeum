@@ -88,6 +88,11 @@ function defaultProps(overrides: Partial<MyFramesTabProps> = {}): MyFramesTabPro
     republishError: null,
     refusal: null,
     onOpen: vi.fn(),
+    run: { running: null, last: null, reached: -1, cancel: vi.fn(async () => {}), cancelBusy: false },
+    onCalibrate: vi.fn(),
+    calibrateBusy: false,
+    calibrateError: null,
+    onUpdate: vi.fn(),
     ...overrides,
   };
 }
@@ -131,7 +136,7 @@ const fourRows: OwnFrameRow[] = [
 describe('MyFramesTab — segments', () => {
   it('segment tiles and the two buttons sit on one row like the mockup', () => {
     renderTab({ rows: fourRows.slice(0, 1).concat(fourRows.slice(2)) });
-    expect(screen.getByRole('button', { name: /1 Ready to publish/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /1 Ready to calibrate/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: /1 Published/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /1 Held back/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '+ Link an object' })).toBeInTheDocument();
@@ -140,9 +145,9 @@ describe('MyFramesTab — segments', () => {
     expect(screen.queryByText('Auto-publish my frames')).toBeNull();
   });
 
-  it('Ready shows "Publish all N" as the primary action', () => {
+  it('Ready shows "Calibrate all N" as the primary action', () => {
     renderTab({ rows: fourRows });
-    expect(screen.getByRole('button', { name: 'Publish all 2' }).className).toContain('bg-accent');
+    expect(screen.getByRole('button', { name: 'Calibrate all 2' }).className).toContain('bg-accent');
   });
 
   it('Recalibrate and republish all is disabled without published frames, spins while busy', () => {
@@ -157,7 +162,7 @@ describe('MyFramesTab — segments', () => {
 
   it('while loading, no tiles but the Link button stays; both buttons use the 33 px box', () => {
     renderTab({ rows: null });
-    expect(screen.queryByRole('button', { name: /Ready to publish/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Ready to calibrate/ })).toBeNull();
     expect(screen.getByText('Loading…')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '+ Link an object' }).className).toContain('h-[33px]');
   });
@@ -207,28 +212,128 @@ describe('MyFramesTab — segments', () => {
 
   it('1. the segment buttons read the count of each segment', () => {
     renderTab({ rows: fourRows, segment: 'ready' });
-    expect(screen.getByRole('button', { name: /2 Ready to publish/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /2 Ready to calibrate/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /1 Published/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /1 Held back/ })).toBeInTheDocument();
   });
 
-  it('2. with no selection, "Publish all 2" calls onRequestPublish with the two ready ids', () => {
-    const onRequestPublish = vi.fn();
-    renderTab({ rows: fourRows, segment: 'ready', onRequestPublish });
-    fireEvent.click(screen.getByRole('button', { name: 'Publish all 2' }));
-    expect(onRequestPublish).toHaveBeenCalledWith([1, 2]);
+  it('2. with no selection, "Calibrate all 2" calls onCalibrate with the two ready ids', () => {
+    const onCalibrate = vi.fn();
+    renderTab({ rows: fourRows, segment: 'ready', onCalibrate });
+    fireEvent.click(screen.getByRole('button', { name: 'Calibrate all 2' }));
+    expect(onCalibrate).toHaveBeenCalledWith([1, 2]);
   });
 
-  it('3. an empty Ready segment with no links shows the link prompt and no Publish button', () => {
+  it('3. an empty Ready segment with no links shows the link prompt and no Calibrate button', () => {
     renderTab({
       rows: [own({ frameId: 9, fileName: 'h.fits', segment: 'held' })],
       segment: 'ready',
       links: [],
     });
     expect(screen.getByText('Link an object to start.')).toBeInTheDocument();
-    // `/^Publish /` (not `/Publish/`) — the segment switch's own "Published 0"
-    // button legitimately matches a loose "Publish" search.
-    expect(screen.queryByRole('button', { name: /^Publish / })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Calibrate / })).toBeNull();
+  });
+});
+
+const reviewRows: OwnFrameRow[] = [
+  own({ frameId: 31, fileName: 'v1.fits', segment: 'review', calibratedPath: '/c/v1.fits', calibratedBytes: 1_048_576, night: '2026-09-29', exptimeSec: 1800 }),
+  own({ frameId: 32, fileName: 'v2.fits', segment: 'review', calibratedPath: '/c/v2.fits', calibratedBytes: 2_097_152, night: '2026-09-29', exptimeSec: 1800 }),
+];
+
+describe('MyFramesTab — publish review', () => {
+  it('four segment tiles read count, hours and nights', () => {
+    renderTab({
+      rows: [
+        own({ frameId: 1, segment: 'ready', exptimeSec: 3600, night: '2026-09-29' }),
+        ...reviewRows,
+        own({ frameId: 3, frameUuid: 'u3', segment: 'published', pubState: 'published' }),
+        own({ frameId: 4, segment: 'held', failures: [{ kind: 'solve', text: 'x' }] }),
+      ],
+    });
+    expect(screen.getByRole('button', { name: /Ready to calibrate/ })).toHaveTextContent('1h 00m · 1 night');
+    expect(screen.getByRole('button', { name: /To review/ })).toHaveTextContent('2');
+    expect(screen.getByRole('button', { name: /Published/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Held back/ })).toBeInTheDocument();
+  });
+
+  it('Ready: Don\'t publish withholds at once, with no dialog', async () => {
+    const onReload = vi.fn();
+    renderTab({ rows: fourRows, segment: 'ready', onReload });
+    fireEvent.click(screen.getByRole('button', { name: "Don't publish all 2" }));
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('set_collab_frames_withheld', { projectId: 'proj-1', frameIds: [1, 2], withheld: true }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    await waitFor(() => expect(onReload).toHaveBeenCalled());
+  });
+
+  it('dont_publish_on_review_frames_confirms_and_names_the_files', async () => {
+    const onReload = vi.fn();
+    renderTab({ rows: reviewRows, segment: 'review', onReload });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: "Don't publish 2" }));
+    expect(await screen.findByText(/2 calibrated files will be deleted/)).toBeInTheDocument();
+    expect(api.invoke).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: "Don't publish" }));
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('set_collab_frames_withheld', { projectId: 'proj-1', frameIds: [31, 32], withheld: true }));
+    await waitFor(() => expect(onReload).toHaveBeenCalled());
+  });
+
+  it('To review: "Publish all 2" calls onRequestPublish', () => {
+    const onRequestPublish = vi.fn();
+    renderTab({ rows: reviewRows, segment: 'review', onRequestPublish });
+    fireEvent.click(screen.getByRole('button', { name: 'Publish all 2' }));
+    expect(onRequestPublish).toHaveBeenCalledWith([31, 32]);
+  });
+
+  it('Published: Update is offered only for update-pending frames and calls onUpdate with no confirm (F1)', () => {
+    const onUpdate = vi.fn();
+    renderTab({
+      segment: 'published',
+      onUpdate,
+      rows: [
+        own({ frameId: 41, frameUuid: 'u41', segment: 'published', pubState: 'published', contributorState: 'updatePending' }),
+        own({ frameId: 42, frameUuid: 'u42', segment: 'published', pubState: 'published' }),
+      ],
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Update 1 of 2' }));
+    expect(onUpdate).toHaveBeenCalledWith([41]);
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('Held back: Release is offered only for withheld frames', async () => {
+    renderTab({
+      segment: 'held',
+      rows: [
+        own({ frameId: 51, segment: 'held', withheld: true, failures: [] }),
+        own({ frameId: 52, segment: 'held', failures: [{ kind: 'threshold', text: 'fwhm' }] }),
+      ],
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Release 1 of 2' }));
+    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('set_collab_frames_withheld', { projectId: 'proj-1', frameIds: [51], withheld: false }));
+  });
+
+  it('the run panel sits above the segment tiles while a run is active', () => {
+    renderTab({
+      rows: reviewRows,
+      run: {
+        running: { projectId: 'proj-1', publishRunId: 'r', kind: 'calibrate', trigger: 'manual', mode: null, stage: 'calibrating', current: 1, total: 2, currentFile: null, startedAt: new Date().toISOString() },
+        last: null, reached: 1, cancel: vi.fn(async () => {}), cancelBusy: false,
+      },
+    });
+    const panel = screen.getByRole('region', { name: 'Publish run' });
+    const tiles = screen.getByRole('button', { name: /To review/ });
+    expect(panel.compareDocumentPosition(tiles) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('the segment summary line reads frames, hours and size', () => {
+    renderTab({ rows: reviewRows, segment: 'review' });
+    expect(screen.getByText('2 frames · 1h 00m · 3 MB')).toBeInTheDocument();
+  });
+
+  it('calibrateError renders on its own line', () => {
+    renderTab({ rows: fourRows, calibrateError: 'calibrate boom' });
+    expect(screen.getByText('calibrate boom')).toBeInTheDocument();
   });
 });
 

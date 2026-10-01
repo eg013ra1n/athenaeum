@@ -49,9 +49,10 @@ export default function LinkObjectDialog({
       onChanged();
     } catch (err) {
       console.error('[projects] link toggle failed:', err);
+      const raw = err instanceof Error ? err.message : String(err);
       notify({
         title: linked ? 'Could not link the frame set' : 'Could not unlink the frame set',
-        detail: err instanceof Error ? err.message : String(err),
+        detail: raw.includes('already running') ? 'A publish run is in progress — try again when it ends.' : raw,
         kind: 'project',
         tone: 'warning',
         hasErrors: true,

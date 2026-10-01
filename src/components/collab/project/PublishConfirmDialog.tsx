@@ -7,7 +7,7 @@ import { formatSize } from '../format';
 export default function PublishConfirmDialog({
   title,
   count,
-  estimatedBytes,
+  bytes,
   needsApproval,
   coordinatorName,
   busy,
@@ -17,7 +17,7 @@ export default function PublishConfirmDialog({
 }: {
   title: string;
   count: number;
-  estimatedBytes: number;
+  bytes: number;
   needsApproval: boolean;
   coordinatorName: string;
   busy: boolean;
@@ -38,7 +38,7 @@ export default function PublishConfirmDialog({
       </>}
     >
       <p>{count} passing {count === 1 ? 'frame' : 'frames'} will be calibrated and announced to the project.</p>
-      <p className="mt-1.5 text-[11.5px] text-content-faint">Estimated size ≈ {formatSize(estimatedBytes)} — the exact size is measured when each frame is generated.</p>
+      <p className="mt-1.5 text-[11.5px] text-content-faint">Size {formatSize(bytes)}</p>
       {needsApproval && <p className="mt-1.5 text-[12px] text-warning">This project requires approval — your contribution goes to {coordinatorName} for review.</p>}
       {error && <p className="mt-1.5 text-[12.5px] text-error">{error}</p>}
     </DialogShell>

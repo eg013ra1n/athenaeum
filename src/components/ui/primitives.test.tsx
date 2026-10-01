@@ -58,6 +58,15 @@ describe('ui primitives', () => {
     expect(onTile).toHaveBeenCalledWith('held');
     expect(screen.getByRole('button', { name: /136 Ready to publish/ })).toHaveAttribute('aria-pressed', 'true');
   });
+  it('SegmentTiles renders a tile sub-label under its label', () => {
+    render(<SegmentTiles tiles={[{ value: 'review', n: 2, label: 'To review', tone: 'purple', sub: '1h 00m · 1 night' }]} value="review" onChange={vi.fn()} />);
+    expect(screen.getByText('1h 00m · 1 night')).toBeInTheDocument();
+    expect(screen.getByText('2').className).toContain('text-purple');
+  });
+  it('Chip pur tone uses the purple token', () => {
+    render(<Chip tone="pur">auto</Chip>);
+    expect(screen.getByText('auto').className).toContain('text-purple');
+  });
   it('Bar sizes its segments as shares of the total', () => {
     const { container } = render(<Bar segments={[{ value: 3, color: '#a3be8c' }, { value: 1, color: '#bf616a' }]} />);
     const segs = container.querySelectorAll('i');
