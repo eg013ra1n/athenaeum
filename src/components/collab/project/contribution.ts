@@ -60,16 +60,25 @@ function footerOf(segment: Segment, rows: OwnFrameRow[]): string {
     }
     case 'held': {
       if (rows.length === 0) return 'Nothing held back';
-      const byKind = new Map<string, number>();
+      // One reason per frame, its first failure. A threshold failure is
+      // named by its first failing rule ("FWHM", "trailed" — spec §7.2);
+      // with no failing rule entry it keeps the kind label.
+      const byReason = new Map<string, { kind: string; label: string; n: number }>();
       for (const r of rows) {
-        const k = r.failures[0]?.kind ?? 'threshold';
-        byKind.set(k, (byKind.get(k) ?? 0) + 1);
+        const kind = r.failures[0]?.kind ?? 'threshold';
+        const rule = kind === 'threshold' ? r.rules.find((v) => v.pass === false) : undefined;
+        const label = rule ? rule.label : lowerFirst(REASON_LABEL[kind] ?? kind);
+        const key = `${kind}\u0000${label}`;
+        const hit = byReason.get(key);
+        if (hit) hit.n += 1;
+        else byReason.set(key, { kind, label, n: 1 });
       }
-      // Count descending; ties by the held-kind order, unknown kinds last (ledger P1).
-      return [...byKind.entries()]
-        .sort((a, b) => b[1] - a[1] || kindRank(a[0]) - kindRank(b[0]))
+      // Count descending; ties by the held-kind order (unknown kinds last,
+      // ledger P1), then by label.
+      return [...byReason.values()]
+        .sort((a, b) => b.n - a.n || kindRank(a.kind) - kindRank(b.kind) || a.label.localeCompare(b.label))
         .slice(0, 3)
-        .map(([k, n]) => `${n} ${lowerFirst(REASON_LABEL[k] ?? k)}`)
+        .map(({ label, n }) => `${n} ${label}`)
         .join(' · ');
     }
   }

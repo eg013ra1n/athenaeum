@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { OwnFrameRow } from '../../../types/models';
+import type { OwnFrameRow, RuleVerdict } from '../../../types/models';
 import { contributionTiles } from './contribution';
 
 const row = (o: Partial<OwnFrameRow>): OwnFrameRow => ({
@@ -39,6 +39,42 @@ describe('contributionTiles', () => {
       row({ segment: 'held', failures: [{ kind: 'blackHole', text: 'In the Black Hole' }] }),
     ]);
     expect(t[3].footer).toBe('2 quality thresholds · 1 no analysis · 1 withheld by you');
+  });
+
+  const rule = (metricKey: string, label: string, pass: boolean | null): RuleVerdict =>
+    ({ metricKey, label, value: null, needs: '', pass });
+  const threshold = (rules: RuleVerdict[]) =>
+    row({ segment: 'held', failures: [{ kind: 'threshold', text: 'fails' }], rules });
+
+  it('a threshold frame is named by its first failing rule (spec §7.2 example)', () => {
+    const t = contributionTiles([
+      ...Array.from({ length: 3 }, () => threshold([rule('fwhm_arcsec', 'FWHM', false), rule('not_trailed', 'trailed', false)])),
+      ...Array.from({ length: 2 }, () => threshold([rule('fwhm_arcsec', 'FWHM', true), rule('not_trailed', 'trailed', false)])),
+      row({ segment: 'held', failures: [{ kind: 'withheld', text: 'Withheld by you' }] }),
+    ]);
+    expect(t[3].footer).toBe('3 FWHM · 2 trailed · 1 withheld by you');
+  });
+
+  it('a threshold frame with no failing rule entry falls back to the kind label', () => {
+    const t = contributionTiles([threshold([rule('fwhm_arcsec', 'FWHM', true), rule('stars_detected', 'stars', null)])]);
+    expect(t[3].footer).toBe('1 quality thresholds');
+  });
+
+  it('count ties break by the held-kind order, then by label', () => {
+    const t = contributionTiles([
+      row({ segment: 'held', failures: [{ kind: 'withheld', text: 'Withheld by you' }] }),
+      threshold([rule('fwhm_arcsec', 'FWHM', false)]),
+      threshold([rule('eccentricity', 'eccentricity', false)]),
+    ]);
+    expect(t[3].footer).toBe('1 eccentricity · 1 FWHM · 1 withheld by you');
+  });
+
+  it('an unknown held kind sorts after the known ones', () => {
+    const t = contributionTiles([
+      row({ segment: 'held', failures: [{ kind: 'mystery', text: '?' }] }),
+      row({ segment: 'held', failures: [{ kind: 'blackHole', text: 'In the Black Hole' }] }),
+    ]);
+    expect(t[3].footer).toBe('1 in the Black Hole · 1 mystery');
   });
 
   it('a Black Hole reason keeps its proper name in the held back footer', () => {

@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { CollabExchangeProvider } from '../../../contexts/CollabExchangeContext';
 import { api } from '../../../api';
 import OverviewTab, { type OverviewTabProps } from './OverviewTab';
+import { formatSize } from '../format';
 import type { ExchangeSnapshot, FlowView, MemberSummary, OwnFrameRow, ProjectFlows, ThresholdRuleView } from '../../../types/models';
 
 vi.mock('../../../contexts/NotificationContext', () => ({ useNotifications: () => ({ notify: vi.fn() }) }));
@@ -226,9 +227,14 @@ describe('OverviewTab — my contribution', () => {
   it('each contribution tile shows hours, nights, size and per-filter hours', () => {
     renderTab({ own: [ownRow({ segment: 'ready', exptimeSec: 3600, filter: 'L' })] });
     const tile = screen.getByRole('button', { name: /ready to calibrate/i });
-    expect(tile).toHaveTextContent('1h 00m');
-    expect(tile).toHaveTextContent('1 night');
+    expect(within(tile).getByText(`1h 00m · 1 night · ${formatSize(42_000_000)}`)).toBeInTheDocument();
     expect(tile).toHaveTextContent('L');
+  });
+
+  it('a tile is named by its count as shown, and described by its meta line and footer', () => {
+    renderTab({ own: Array.from({ length: 1234 }, (_, i) => ownRow({ frameId: i + 1, segment: 'ready', exptimeSec: 60 })) });
+    const tile = screen.getByRole('button', { name: '1,234 ready to calibrate' });
+    expect(tile).toHaveAccessibleDescription(`20h 34m · 1 night · ${formatSize(1234 * 42_000_000)} Calibrate →`);
   });
 
   it('the To review tile opens the review segment', () => {
