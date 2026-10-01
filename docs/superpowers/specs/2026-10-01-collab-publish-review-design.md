@@ -24,7 +24,8 @@ After wave 5.5 the owner found five problems on the project page:
    not look like a button. It sits right under the title, and its explanation is only in a tooltip.
 4. **Live does not refresh.** `collab_sync_now` queues a reconcile and returns at once. The page then
    re-reads only the card, before the reconcile has finished. "synced N ago" is the card's
-   `fetchedAt`, which moves only when the hub had a change. My frames, Library and Members are not
+   `fetchedAt`, which moves only when the project is re-fetched (a hub change or a manual Projects
+   refresh), never when the hub confirms that nothing changed. My frames, Library and Members are not
    re-read at all. Manifest changes from the hub (`collab-frames-changed`) are not heard by the
    page. The member has to leave the page and come back.
 5. **Frames cannot be inspected from the project.** Blink is not reachable from My frames or
@@ -76,24 +77,51 @@ The cycle is done when:
   6. Announce (batches of ≤500).
   7. Content versions.
   8. Own rows.
-  9. **One** `collab-published` event.
+  9. `collab-published`. It is emitted at the end and before the outdated-hub / first-error returns
+     (`collab.rs` ~5720-5745). It is **not** emitted on the early returns: signed out, store
+     unmounted, A6 refusal.
 
   No progress events are emitted.
+- **Attested sets** (`frames_set.calibrated_externally`) are never calibrated. The **original** catalog
+  file is stat'd/hashed and seeded in place, with recipe = `external_recipe(size, mtime)`
+  (`collab.rs` ~3261-3350, ~4310-4335).
 - **Cancel exists only as the compute-queue X.** After that, every remaining frame is still opened and then held back as "calibration failed: cancelled", and already generated frames are still seeded and announced. A cancel while queued fails the whole run.
 - **The calibrated light lives at** `<Collaboration root>/<project slug>/<member or "own">[_n]/c_<stem>.fits`.
   - It is written in place for a new frame; an update goes through `.athpub` + rename.
   - It is seeded by reference and never catalogued.
   - The own row (`project_frames_local`) records `landed_path`, `source_frame_id` and `recipe_hash`.
-  - `project_frames_local` mirrors the hub manifest: rows absent from it are pruned (`delete_not_in`). A not-yet-announced frame therefore cannot live there.
+  - `delete_not_in` prunes **replica** rows only; own rows are never pruned (R12). A not-yet-announced
+    frame still gets its own table (§4.2), because an own row feeds the New/Update split, `ensure_seeded`,
+    the outbox claims and `taken_names`.
+  - The own folder (`publisher_dir`, `collab_exchange.rs` ~1075-1129) is recomputed on every run until
+    an own row exists.
+  - Landing-name allocation (`new_frame_target`, `collab.rs` ~3048-3102) checks the DB, never the
+    filesystem.
+  - A file under the Collaboration root that no row names is recorded as foreign by the scanner
+    (`reconcile_project_file`) and listed under "Other files" (`list_foreign_files`). Nothing deletes
+    it.
 - **Black Hole** only inserts a `black_hole` row. No collab code reads it.
 - **Sync now** (`api/collab_live/runtime.rs::sync_now`):
   - `reset_all` back-offs, `reconnect_now`, `LiveCommand::Reconcile`, which queues `FeedWork::DigestAll` + `StorageWork::Sweep`. It returns before any of it runs.
+  - `DigestAll` is a holder-claim digest (`PUT …/holders/self` per project, `holdings.rs` ~437-478), not
+    a version check. Its results are discarded, and it lands on the serial feed worker **ahead of** the
+    reconnect's `hello`.
   - The reconnect produces a `hello`. `FeedApplier::on_hello` catches up only the projects whose version moved.
   - The hub broadcasts `versions` every 60 s (`HEADS_EVERY`), handled by `FeedApplier::on_versions`.
+    The first one after a connect comes 0–60 s after the hello.
+  - `FeedApplier` holds an emitter but not the runtime's `Shared`; only `FeedWorker` does
+    (`workers.rs`).
+  - `on_hello` / `on_versions` log and skip per-project failures. A 403 there never becomes
+    `FeedOut::Refused`.
+  - `catch_up_project` discards the manifest change list and always reports `NeedSetChanged`.
 - **Blink** (`BlinkViewer`, `src/components/blink/`):
   - It takes `FileWithFrame[]`. The Black Hole / Restore buttons are built in and cannot be hidden.
   - Images come from `read_fits_image_rustafits {path}` (desktop) or `get_frame_preview {frameId: file.id}` (web), as JPEG bytes.
   - Star metrics come from `get_frame_star_metrics {frameId}`.
+  - Per-frame state (images, selection, metrics) is keyed by **array index** (`BlinkViewer.tsx`,
+    `useBlinkCache.ts`). The list key is `file.id ?? index`.
+  - A `window` keydown handler takes `s a 0 - + = Enter Space`, the arrows and Escape. Blink is not on
+    the wave 5.5 overlay stack.
   - Library rows (`ProjectFrameView`) carry no catalog id and no path.
 
 ## 4. Publish model
@@ -115,6 +143,29 @@ My frames has four segments. Each own frame is in exactly one:
 
 `derive` is shared with the frame set's Project block (§11), so both read the same.
 
+**Derivation order.** One function decides, `own_contributor_state` + `derive`, which gain the
+prepared and withheld inputs. The first match wins:
+
+1. **An own row exists** → today's own-row states (Published, PendingApproval, UpdatePending,
+   Rejected, PublishedNotOnDisk, PublishedNowFailsGate). Withhold and the Black Hole never apply.
+2. **Withheld** → `Withheld` (Held back, kind `withheld`, "Withheld by you").
+3. **Source in the Black Hole** → `FailsGate` with kind `blackHole` ("In the Black Hole").
+4. **The gate fails** → `FailsGate`. A prepared row, if any, is kept: `publish` re-gates, skips the
+   frame and reports it held back. Withhold deletes the row; a later pass that clears the gate
+   restores Review.
+5. **Prepared**, with the recipe current and the file present at its recorded size → `Prepared`
+   (To review). A prepared row that is stale → Ready; the next calibrate or publish drops the row.
+6. Otherwise → `NotPublished` (Ready).
+
+`current_recipe` must be computed for prepared rows too. Today it is computed only when an own row
+exists (`collab.rs` ~1490).
+
+**Touch list** (every exhaustive match or mirror of states, kinds and segments):
+- Rust: `segment_of`, `ContributorState::key()` / `short_label()`, `ContributorCounts::bump`, `gate.rs::failure_kinds` (an unknown kind maps to `threshold` today).
+- `derive_blockers`: `withheld` and `blackHole` are frame states, never set blockers.
+- TS: `contributorState.ts` `SHORT`, `BLOCKER_ORDER` + its mirror in `table/model.ts`, `REASON_LABEL`, `attention.ts` `CAUSE` (else `console.error`), and in `ProjectDetail.tsx` the `Segment` / `AttentionTarget` / facet setter maps.
+- The My frames tab badge becomes "N ready · M to review".
+
 **Withheld rows.** In Held back they group under the reason "Withheld by you" through the existing
 `failures[0].kind` grouping.
 
@@ -134,46 +185,61 @@ My frames has four segments. Each own frame is in exactly one:
 - **`collab_projects.last_publish_run`** `TEXT NULL`: JSON of the last finished run (§5.2 payload).
 - **`collab_prepared_frames`**, primary key `(project_id, source_frame_id)`, holds:
   - `project_id`, `source_frame_id`;
-  - `calibrated_path` (UNIQUE), `recipe_hash`, `byte_size`;
-  - `prepared_at`, `run_id`.
+  - `calibrated_path`: NULL for an attested frame; unique per `(project_id, calibrated_path)` when set;
+  - `external INTEGER NOT NULL DEFAULT 0`: 1 for an attested frame, whose file is the catalog original;
+  - `own_dir`: the own folder this frame landed in, pinned (§4.3);
+  - `recipe_hash`, `byte_size`;
+  - `prepared_at`, `publish_run_id`.
 - **`collab_withheld_frames`**, primary key `(project_id, source_frame_id)`, holds `project_id`, `source_frame_id` and `withheld_at`.
-- **Leaving a project or unlinking a set** deletes that project's or set's prepared rows and their files. It also deletes its withheld rows.
+- **No file of an `external = 1` row is ever deleted** by withhold, the stale re-check or any cleanup. Those paths delete the row only.
+- **Project lost.** `refresh_projects` detects the loss and keeps own rows and files by design. It now also deletes the project's prepared rows with their (non-external) files, and its withheld rows.
+- **Set unlinked** (`unlink_frame_set`). Prepared rows of frames no longer reachable through any other linked set of the project are deleted, with their files. Withheld rows are kept, so relinking keeps the member's decision.
 
 ### 4.3 Runs
 
 All four run kinds go through the existing `publish_lock` / `claim_publish`: one run per project, a
-second is refused. Each run gets a `run_id`.
+second is refused. Each run gets a `publish_run_id`, a UUID string. The tracing field is
+`publish_run_id`, a new entry in the logging spec's field dictionary: its `run_id` is the stacking
+run's integer id.
 
 | Kind | Takes | Does |
 | ---- | ---- | ---- |
-| `calibrate` | gate-passing own frames that are not published, not prepared with a current recipe, not withheld, not in the Black Hole (optionally a `frameIds` selection) | gate → A6 check → landing names → generation → write `c_*.fits` → insert `collab_prepared_frames`. **No seed, no announce, no hub call except the A6 check.** |
-| `publish` | prepared frames, **plus** update-pending published frames — the `frameIds` selection, or every one of both when `frameIds` is absent | re-check each prepared frame (recipe current, file present with the recorded size; else drop the prepared row and its file → the frame is Ready again, reported as `stale`) → seed by reference → announce → content versions → own rows → delete the consumed prepared rows. Update-pending frames regenerate as today (P6). |
+| `calibrate` | Ready frames (§4.1 order: no own row, not withheld, not in the Black Hole, gate passes, not prepared with a current recipe), optionally a `frameIds` selection | gate → A6 check (cached binding) → landing names → generation → write `c_*.fits` → insert `collab_prepared_frames` **right after each file's atomic rename**. **No seed, no announce, no hub call.** For an **attested** frame, "calibrate" is the stat/hash step only: the row gets `external = 1`, `calibrated_path NULL`, and the original's size and recipe. Nothing is written, and the member reviews the original. |
+| `publish` | prepared frames, **plus** update-pending published frames — the `frameIds` selection, or every one of both when `frameIds` is absent | **re-gate**: a prepared frame that now fails is held back and keeps its row. **Re-check** each prepared frame: recipe current, file present at the recorded size. A stale frame loses its row (and, if not external, its file), returns to Ready and is reported as `stale`. Then seed by reference → announce → content versions → own rows → delete the consumed prepared rows. Update-pending frames regenerate as today (P6). |
 | `republish` | as today (`frameIds`, guard dialog) | unchanged |
 | `auto` | the worker's run for a project in a non-manual mode | `auto_calibrate`: `calibrate` over all candidates, then the update step for update-pending frames. `automatic`: `calibrate`, then `publish` over every prepared frame (also ones prepared earlier by hand), then updates. |
 
-**Landing names.** Name allocation (`collab.rs` collision handling) must treat `collab_prepared_frames.calibrated_path` as taken, alongside own rows. Two candidates can then never land on the same `c_<stem>.fits`.
-
-**A6.** `calibrate` is refused exactly like `publish` when another device publishes this project
-(`Conflict(collab_publishing_device:…)`). The My frames refusal line and the "Publish from this
-device" button cover it.
+**Landing names and the own folder.**
+- `new_frame_target` treats every `collab_prepared_frames.calibrated_path` as taken, alongside own rows and `taken_names`. Two candidates can then never land on the same `c_<stem>.fits`.
+- **The own folder is pinned.** `publisher_dir` reads `own_dir` from the project's prepared rows, as it reads own rows. Without this, a peer with the same sanitized display name landing first would move "own" to `<name>_2` and orphan the prepared files.
 
 **Known files.** A prepared file is a known file of the Collaboration root:
-- the scanner's `reconcile_collaboration_root` and the live storage engine (sweep, local checks) must never treat it as stray;
-- nothing deletes it except Don't publish, the stale re-check, a re-calibrate that overwrites it, or leaving / unlinking.
+- `list_foreign_files` and the scanner's `reconcile_project_file` exclude prepared paths, as they exclude `landed_path`s. A prepared file is never "Other files" and never recorded as foreign.
+- Nothing deletes it except Don't publish, the stale re-check, a re-calibrate that overwrites it, or project loss / unlink (§4.2). The storage engine deletes only quarantined rows, so it needs no change; a test pins that.
 
-The plan's first core task audits both paths and pins this with tests.
+**Crash windows.**
+- A crash between the rename and the row insert leaves a `c_*.fits` with no row. It shows under Other files until the next calibrate that allocates that name overwrites it. This is the same frame or a same-stem frame, and either way no row points at the old file.
+- A crash during the write leaves a fits-writer temp file (`<name>.fits.tmp.<pid>.<seq>`). **The calibrate run deletes such temp files in the pinned own folder when it starts**, matching that exact pattern only. `.athtmp` is swept at mount and is not used here.
+- A prepared row whose file is gone reads as stale (§4.1 step 5).
+
+**A6.** `calibrate` checks the **cached** binding (`db::collab::publishing_device`), exactly as the
+publish pre-check does today. It is refused with `Conflict(collab_publishing_device:…)` when the cache
+names another device; the My frames refusal line and "Publish from this device" cover it. When the
+cache is stale, the hub refuses at announce: the frames stay prepared and the refusal shows as today.
 
 ### 4.4 Gate changes
 
-- **Black Hole** (P5): the gate's frame query excludes any light whose `files.id` has a `black_hole` row. A restore re-dirties the projects of its sets (`request_auto_publish_for_sets`).
-- **Withheld**: `project_gate` reports a withheld frame as held back with failure kind `withheld` and the message "Withheld by you". `calibrate` and `publish` skip it.
+- **The gate's frame query is not filtered.** `project_gate` also feeds `list_project_own_frames` and `get_frame_set_project_status`. A filter would make published frames whose raw went to the Black Hole vanish from My frames and the counts.
+- **Black Hole** (P5): an unpublished frame whose source file has a `black_hole` row is held back with failure kind `blackHole` (§4.1 step 3). It is never a `calibrate` candidate, and a prepared one is skipped by `publish`. A published frame is unaffected. A Black Hole add or restore re-dirties the projects of the frame's sets (`request_auto_publish_for_sets`).
+- **Withheld**: reported as held back with kind `withheld` (§4.1 step 2). `calibrate` and `publish` skip it.
 - **Already prepared**, recipe current: not a `calibrate` candidate.
 
 ### 4.5 Withhold and release — `set_collab_frames_withheld { projectId, frameIds, withheld }`
 
 - **Withholding** (`withheld = true`):
-  - It inserts withheld rows. For a prepared frame, it deletes the prepared row and the calibrated file in the same step; a delete failure logs at `error` and is returned.
-  - It refuses frames that are published (`Invalid`, naming the count).
+  - It inserts withheld rows.
+  - For a prepared frame, it deletes the prepared row and, if not external, the calibrated file in the same step. A delete failure logs at `error` and is returned.
+  - It refuses frames that have an own row: published, pending, update pending or excluded (`Invalid`, naming the count).
 - **Releasing** (`withheld = false`) deletes the rows and re-dirties the project for the worker.
 
 Both log at `info` with `count`.
@@ -186,16 +252,20 @@ Both log at `info` with `count`.
   - `run_publish_pass` runs kind `auto` with the mode.
   - Triggers are unchanged. A Black Hole restore and a Release are added.
 - **Switching to a non-manual mode** dirties the project, so the worker runs after its debounce.
+- **The worker runs only with the live exchange.** It is armed from `spawn_collab_live` (`runtime.rs` ~499-511). Signed out, or with no Collaboration folder, Auto-calibrate and Fully automatic do nothing.
+  - The help line of both modes says: "Runs while Athenaeum is open and signed in to the hub."
+  - The Project settings status box shows "Paused — collaboration is off" when the live state is `off` or `signedOut`.
 
 ### 4.7 Cancel — `cancel_collab_publish { projectId }`
 
 - Cancelling sets the run's cancel flag. The compute-queue X sets the same flag.
 - **While queued** for the compute slot: the run ends with outcome `cancelled`, not an error, and nothing changes.
-- **While generating:** `run_publish_generation` checks the flag **between frames and breaks**. The frame being generated fails cooperatively, as today; its partial file is never left behind (atomic write).
+- **While generating:** `run_publish_generation` checks the flag **between frames and breaks**. Today it checks only at the slot wait and inside the band loop.
+  - The frame being generated fails cooperatively, as today. Its partial file is never left behind (atomic write), and its "calibration failed: cancelled" hold-back is **dropped**: it stays Ready.
   - Frames already written stay prepared (To review).
   - Untouched frames stay Ready.
   - No held-back entries are produced for the cancel.
-- **During seed/announce:** the current batch completes, then the run stops. Announced frames are published; the rest stay prepared. A frame seeded but not announced stays prepared and is seeded again by the next publish; the plan verifies that re-seeding the same file is idempotent, or untags it on cancel.
+- **During seed/announce:** the current batch completes, then the run stops. Announced frames are published; the rest stay prepared. A frame that was seeded but not announced is **untagged** with `unseed_project_frame` (`node.rs` ~3402-3431, as `unseed_all` does) before the run ends. Re-seeding the same bytes later is idempotent.
 - The resolve phase also checks the flag.
 
 ## 5. Progress, outcome, snapshot
@@ -206,7 +276,7 @@ Both log at `info` with `count`.
 #[derive(Serialize)] #[serde(rename_all = "camelCase")]
 pub struct CollabPublishProgress {
     pub project_id: String,
-    pub run_id: String,
+    pub publish_run_id: String,
     pub kind: PublishRunKind,        // calibrate | publish | republish | auto
     pub trigger: PublishTrigger,     // manual | auto
     pub mode: Option<String>,        // auto runs: the mode
@@ -219,19 +289,21 @@ pub struct CollabPublishProgress {
 ```
 
 - Throttled to one per 300 ms per run. A stage change is sent at once.
-- Logs are separate. Stage transitions log at `info` (`project_id`, `run_id`, `stage`, `total`); per-frame logs stay at `debug`.
+- Logs are separate. Stage transitions log at `info` (`project_id`, `publish_run_id`, `stage`, `total`); per-frame logs stay at `debug`.
 - It is a UI event, not a notification source (CLAUDE.md: never notify on `*-progress`).
 
 ### 5.2 `collab-publish-finished` (event, replaces `collab-published`)
 
-It is emitted exactly once per run from a single exit path, including refusals after the lock was
-taken and cancels:
+It is emitted exactly once per run from a single exit path. This includes every early return after
+the lock was taken (signed out, store unmounted, A6, outdated hub), which today skip the event, and
+cancels. `refused` covers A6 and the outdated hub; `failed` covers everything else that ends the run
+with an error.
 
 ```rust
 pub struct CollabPublishFinished {
-    pub project_id: String, pub run_id: String,
+    pub project_id: String, pub publish_run_id: String,
     pub kind: PublishRunKind, pub trigger: PublishTrigger,
-    pub outcome: PublishOutcome,     // done | cancelled | failed
+    pub outcome: PublishOutcome,     // done | cancelled | refused | failed
     pub calibrated: u32, pub announced: u32, pub updated: u32,
     pub failed: u32, pub stale: u32, pub held_back: u32,
     pub error: Option<String>,
@@ -240,7 +312,7 @@ pub struct CollabPublishFinished {
 ```
 
 - The same JSON is stored in `collab_projects.last_publish_run`.
-- `collab-published` is retired. Its two listeners move to this event: `ProjectDetail` reloads, and `useCollabNotifications` notifies.
+- `collab-published` is retired. Its two listeners move to this event: `ProjectDetail` reloads, and `useCollabNotifications` notifies. `docs/transfers/README.md` (events bullet) is updated.
 
 ### 5.3 Snapshot and cancel commands (both hosts)
 
@@ -249,61 +321,97 @@ pub struct CollabPublishFinished {
 
 ### 5.4 Notifications (`useCollabNotifications`, on `collab-publish-finished` only)
 
+**One source.** A run's outcome is notified only from this event.
+- `usePublishing` stops calling `notify()` for run outcomes and keeps its inline error line in My frames.
+- A refusal returned by the command before a run starts (busy, A6 from the cache) stays inline, as today.
+- The auto worker's A6 refusals stay quiet, as today: outcome `refused` with `trigger: auto` is history-only.
+
 | Outcome | Title | Link |
 | ---- | ---- | ---- |
 | calibrate done, n > 0 | "Calibrated n frames in {title} — review them" | `/projects/{id}?tab=mine&segment=review` |
 | publish/auto done, announced + updated > 0 | "Published n frames in {title}" | `?tab=mine&segment=published` |
 | any, failed > 0 | detail "m failed — see Held back", `hasErrors` | `?tab=mine&segment=held` |
+| publish/auto done, nothing sent, held back > 0 | "Nothing new to publish in {title}" (warning, as today) | `?tab=mine&segment=held` |
 | cancelled | "Stopped in {title}" (info, history only: `toast: false`) | `?tab=mine` |
-| failed | "Publishing failed in {title}" + error | `?tab=mine` |
+| refused, manual | "{device} publishes this project" (warning) | `?tab=mine` |
+| refused, auto | same, history only (`toast: false`) | `?tab=mine` |
+| failed | "Publishing failed in {title}" + error, `hasErrors` | `?tab=mine` |
 
 A run where nothing happened (all zero, outcome `done`) stays silent, as now. The deep link gains a
 `segment` parameter, handled like `tab` (applied, then removed from the URL).
 
 ## 6. Live sync
 
-### 6.1 Confirmation points (core)
+### 6.1 Confirmation reports (core)
 
-`FeedApplier` keeps `synced_at: HashMap<project_id, DateTime<Utc>>` in the runtime's `Shared`. It is
-in memory only, with no DB write per beat. A project is stamped after:
+Stamping lives where `Shared` lives. `FeedApplier` reports, `FeedWorker` forwards, and the runtime
+loop records.
 
-- `on_hello`: each project in the hello, once it is in sync or its catch-up succeeded;
-- `on_versions`: each project that is `InSync` or whose catch-up succeeded;
-- a successfully applied `project`, `holders`, `resync` or `account` event for that project.
+- **`FeedApplier::apply` returns a per-project report** alongside its effects: `ok`, `error`, and
+  `SyncChanges`. `FeedWorker` sends it as a new
+  `FeedOut::Synced { project_id, ok, error: Option<String>, changes: SyncChanges }`:
+  - **after a `hello`:** one report per project in the hello.
+    - `ok` when the project was in sync, or when both its catch-up and its holder hello-sync succeeded.
+    - `ok: false` with the error when either failed. Today these are only logged.
+    - The epoch-change branch reports each project it reloaded (ok) or could not reload (error).
+  - **after a `versions`:** one report per project with a cursor that is in sync or caught up (ok), or whose catch-up failed (error). Projects without a cursor (not joined yet) are skipped, as today.
+  - **after an applied `project` / `holders` / `resync` / `account` event:** ok for that project.
+  - **a `FeedOut::Refused`** (403) also produces a `Synced { ok: false, error }` for that project.
+- **`SyncChanges` counts what was applied:**
+  - `manifestRows`: the row counts the manifest sync already computes (`collab_exchange.rs` ~627-645, `apply_inline` in `feed.rs` ~623-642), now returned instead of discarded;
+  - `card`: the project snapshot changed (title, goals, thresholds, policy);
+  - `members`;
+  - `holders`.
 
-A failed catch-up does not stamp.
+  Presence is not counted; it stays on `collab-peers-changed`.
+- **The runtime loop records `synced_at`** (UTC, in `Shared`, in memory only, no DB write) for every
+  `ok` report.
+- **`ProjectCard.syncedAt: string | null`** (RFC 3339) reads it through a `Shared` accessor, as
+  `card_from_row` already reads live presence on both hosts. It is `null` when no live exchange runs;
+  the pill then shows the status label. `fetchedAt` stays for its other uses.
 
-**Card.** `ProjectCard.syncedAt: string | null` (RFC 3339) reads this map while the live exchange
-runs, else `null`. The pill then shows the status label. `fetchedAt` stays for other uses.
+### 6.2 `collab-project-synced { projectId, syncedAt, ok, error, changed }`
 
-### 6.2 `collab-project-synced { projectId, syncedAt, changed }`
+- The runtime loop emits it for each report, coalesced per project to at most one per second.
+  - A new `SyncBurst` accumulator (shaped like `PeerBurst`, with a trailing flush) sums `SyncChanges`, keeps the last `ok` / `error`, and the newest `syncedAt` of an ok report.
+  - `changed` = any count > 0.
+- An `ok: false` report is never coalesced away: a window that saw a failure flushes with `ok: false`.
 
-- It is emitted at each stamp. `changed = true` when the stamp applied something: a manifest, card, member, holder or change, i.e. any non-empty `FeedEffect` list for the project other than a presence-only `ProvidersChanged`, or a catch-up that fetched rows. Presence stays on `collab-peers-changed`.
-- Bursts are coalesced per project to at most one per second, with the `PeerBurst` shape and a trailing flush. `changed` is OR-ed across the coalesced stamps.
+### 6.3 Sync now
 
-### 6.3 The pill (`CollabLiveStatus variant="pill"`)
+- `sync_now` keeps `reset_all` + `reconnect_now` + the storage `Sweep`.
+- **`DigestAll` moves behind the hello.** `Reconcile` now sets a `digest_after_hello` flag, and the feed worker runs `DigestAll` right after it applies the next `hello`. Holder claims are still checked, but the confirmation no longer waits behind one hub call per project.
+- The confirmation a click waits for is the reconnect's `hello` report for this project.
 
-- **Label.** "Live · synced N s ago" counts from `syncedAt`. While the live exchange runs this never exceeds about 60 s.
+### 6.4 The pill (`CollabLiveStatus variant="pill"`)
+
+- **Label.** "Live · synced N s ago" counts from `syncedAt`. While connected it is normally at most
+  about 60 s (the `versions` beat). It grows longer only while the feed worker is busy or retrying,
+  which is the truth.
 - **Click.**
-  1. `collab_sync_now`, then **Syncing…** until a `collab-project-synced` for this project arrives with `syncedAt` ≥ the click time.
-  2. Then the age restarts from that `syncedAt`, and `onSynced` asks the page to re-read **detail, own frames, library and members**, unconditionally.
+  1. `collab_sync_now`, then **Syncing…** until a `collab-project-synced` for this project arrives
+     after the click.
+  2. **`ok: true`:** the age restarts from its `syncedAt`, and `onSynced` asks the page to re-read
+     **detail, own frames, library and members**, unconditionally, and to bump `syncToken` (§6.5).
+  3. **`ok: false`:** the pill stops at once and notifies "Sync did not complete — {error}"
+     (`tone: 'warning'`).
 - **If the status leaves `live`** (reconnecting, unreachable), the pill shows that status at once.
-- **30 s without a confirmation:** the pill stops spinning and notifies "Sync did not complete — {status}" with `tone: 'warning'`.
+- **30 s with no report:** the pill stops and notifies "Sync did not complete — no answer from the hub".
 
-### 6.4 Page reloads without a click
+### 6.5 Page reloads without a click
 
-`ProjectDetail` listens to `collab-project-synced`. On `changed`, it reuses the existing
-schedule-if-none-pending throttles:
-- 1 s for detail + library + members (detail is added to the existing set);
-- 5 s for own frames.
-
-`collab-peers-changed` stays as is. `collab-publish-finished` reloads everything at once.
+- `ProjectDetail` listens to `collab-project-synced`. On `changed`, its **own**
+  schedule-if-none-pending timers run: 1 s for detail + library + members, 5 s for own frames. They
+  are separate from the `collab-peers-changed` timers, which keep their current set.
+- It also bumps a `syncToken`. `ModerationTab` and `ExchangeTab` load their own data, take the token
+  as a prop, and re-fetch when it changes.
+- `collab-peers-changed` is unchanged. `collab-publish-finished` reloads everything at once.
 
 ## 7. Overview
 
 ### 7.1 Layout (P9)
 
-The `grid-cols-[1.5fr_1fr]` grid stays:
+The `grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)]` grid stays:
 
 - **Left column:** **My contribution**, then **Integration toward goal**.
 - **Right column:**
@@ -361,7 +469,7 @@ listener pattern).
   - Chip `manual`/`auto`, the title ("Calibrating 12 of 48", "Fully automatic · seeding 31 of 48"), and the trigger ("you clicked Calibrate", "started after a scan").
   - The steps of this run kind with the current one highlighted: calibrate = Queued · Calibrate; publish = Seed · Announce; auto = Queued · Calibrate · Seed · Announce.
   - A bar, `current_file`, the elapsed time, and **Cancel**.
-- **Finished:** one line from `last` (done / cancelled / failed, counts, timestamp with seconds, trigger) with a link to the segment the result points at. It stays until the next run starts.
+- **Finished:** one line from `last` (done / cancelled / refused / failed, counts, timestamp with seconds, trigger) with a link to the segment the result points at. It stays until the next run starts.
 
 ### 8.2 Segments and actions
 
@@ -388,8 +496,11 @@ the "Verb N of M" eligible-subset convention.
 | Opened from | Entry shows | File | Frame |
 | ---- | ---- | ---- | ---- |
 | My frames · Ready / Held back | **raw** | catalog `files` row (`get_files_with_frames_by_ids`) | catalog `frames` row |
-| My frames · To review / Published | **calibrated** | prepared `calibrated_path` / own `landed_path` | the source frame's catalog row (metadata + star metrics; calibration moves no pixel, debayer is off for publish) |
+| My frames · To review / Published | **calibrated** (an attested frame: its original, shown as `raw`) | prepared `calibrated_path` / own `landed_path` | the source frame's catalog row (metadata + star metrics; calibration moves no pixel, debayer is off for publish) |
 | Library · held here (`localState` `held` / `own_held`) | **replica** (own frames: calibrated) | `project_frames_local.landed_path` | none from the catalog; a frame built from the manifest fields (filter, exptime, date-obs, camera, telescope) with `id: null` |
+
+An OSC calibrated file keeps `BAYERPAT` (`calibrated_generator.rs` ~620-631), so Blink shows it in
+colour through the same VNG path as a raw OSC light.
 
 **New command `get_collab_blink_frames { projectId, refs: CollabFrameRef[] } -> CollabBlinkEntry[]`**
 (both hosts):
@@ -399,20 +510,38 @@ the "Verb N of M" eligible-subset convention.
 
 **New command `get_collab_frame_image { projectId, ref: CollabFrameRef, resolution? } -> JPEG bytes`**
 (both hosts):
-- Core resolves the path the same way. The desktop wrapper calls the existing `read_fits_image_bytes` (its cache and semaphore); the web wrapper calls the code `get_frame_preview` uses.
+- Core resolves the path the same way.
+- The desktop wrapper calls the existing `read_fits_image_bytes` (its cache and semaphore) and returns `tauri::ipc::Response`, as `get_master_light_preview` does (`commands/stacking.rs` ~265-300).
+- The web route needs `routes/images.rs` (~49-165, inline today) refactored first into a `(state, path, resolution)` helper that both `get_frame_preview` and the new route call.
 - Instrumented at `level = "debug"` (hot path).
 - Blink uses it for every `calibrated` and `replica` entry. `raw` entries keep today's path.
 
 ### 9.2 `BlinkViewer` changes
 
-- **New optional prop `actions?: BlinkAction[]`**, the same shape as `TableAction`: `{ id, label: (n) => string, eligible: (entry) => boolean, tone: 'default' | 'warn' | 'danger', run: (entries) => Promise<void> | void }`.
-  - When given, the Black Hole and Restore buttons, their confirm and `get_blackholed_file_ids` are not used at all.
-  - Each action renders with its eligible count of the selection ("Don't publish (2)"). An action with zero eligible entries is hidden.
-- **New optional per-entry image source** `imageRef?: { projectId, ref }`: when set, images load through `get_collab_frame_image`.
-- **New optional `contextLabel`** for the strip under the toolbar: source chip (`raw` / `calibrated` / `replica`), file name, hint (e.g. "exactly the file that will be published", "received from {member} · {time}"), role hint.
-- **New optional `viewOnly`** renders the "View only" chip.
+`BlinkViewer` keeps its `frames: FileWithFrame[]` prop for every existing caller. A project caller
+passes entries that carry a little more, plus actions.
 
-Every existing caller is unchanged: no `actions` means the Black Hole as today.
+- **`BlinkFrame = FileWithFrame & { key?: string; imageRef?: { projectId: string; ref: CollabFrameRef }; source?: 'raw' | 'calibrated' | 'replica'; badge?: string }`.**
+  - Blink snapshots the array when it opens. Project actions never remove entries, so indexes stay stable while it is open. Index-keyed caches stay as they are.
+  - The list key becomes `key ?? file.id ?? index`, which fixes the `id: null` collision.
+  - **Both** image load sites (the preview load and the full-res load) switch on `imageRef`: when it is set, they call `get_collab_frame_image`.
+- **`actions?: BlinkAction[]`**, its own type, not `TableAction`:
+  `{ id: string; label: (n: number) => string; eligible: (f: BlinkFrame) => boolean; tone: 'default' | 'warn' | 'danger'; run: (frames: BlinkFrame[]) => Promise<void> | void }`.
+  - When given, the Black Hole / Restore buttons, their confirm and `get_blackholed_file_ids` are not used at all.
+  - "Locate in file browser" is hidden: Collaboration-root paths are not browsable there.
+  - Each action shows its eligible count of the selection ("Don't publish (2)"). An action with zero eligible entries is hidden.
+  - After an action, the caller passes a fresh `frames` array with the same keys and updated `badge`s (e.g. `withheld`, `excluded`). Blink matches them by `key` and keeps its position, selection and caches.
+- **`contextLabel?`** fills the strip under the toolbar:
+  - the source chip;
+  - the file name;
+  - a hint ("exactly the file that will be published", "received from {member} · {time}");
+  - a role hint.
+- **`viewOnly?`** renders the "View only" chip.
+- **Overlays.**
+  - Blink joins the wave 5.5 overlay stack (rule R35), so a dialog opened above it owns Escape and focus.
+  - Its `window` keydown handler ignores events whose target is an input, textarea or contenteditable, and every key while an overlay above it is open.
+
+Every existing caller is unchanged: no `actions` means the Black Hole, as today.
 
 ### 9.3 Actions by context and role
 
@@ -425,8 +554,9 @@ Every existing caller is unchanged: no `actions` means the Black Hole as today.
 | Library, moderator | **Exclude from project (n)** for published, non-excluded frames |
 | Library, member | none (view only) |
 
-**Exclude** opens the existing `ExcludeDialog` (reason 1..500 chars) on the overlay stack above Blink
-(wave 5.5 overlay rule). On success, Blink marks the entries excluded and the page reloads.
+**Exclude** opens the existing `ExcludeDialog` (reason 1..500 chars) on the overlay stack above Blink.
+It takes `FrameVM[]`: the page keeps a `key → FrameVM` map for the entries it opened Blink with and
+passes the matching VMs. On success the entries get the `excluded` badge, and the page reloads.
 
 **Don't publish** asks for confirmation only when the selection holds prepared frames, because their
 calibrated files are deleted. After Don't publish / Release, Blink keeps the entries and shows their
@@ -437,7 +567,7 @@ new state chip. Its `onFramesRemoved` contract is unchanged.
 | Source | Eligible when |
 | ---- | ---- |
 | raw | `path != null` and the source is not in the Black Hole |
-| calibrated | `calibratedPath != null` and `localState` is not `own_missing` |
+| calibrated | `calibratedPath != null` and `localState` is not `own_missing` (an `own_changed` file opens with a "changed on disk" badge) |
 | replica | `localState` is `held` or `own_held` |
 
 The action label follows the eligible-subset rule: "Blink 3 of 5", "Blink all 48".
@@ -480,35 +610,50 @@ the same change. New model types go into the `ts_export.rs` registry. The TS mir
    - The column default is `manual`.
    - `auto_publish` is no longer read.
 2. **`calibrate`.**
-   - It writes `c_*.fits` and prepared rows.
+   - It writes `c_*.fits` and prepared rows; each row is inserted right after its file's rename.
+   - An attested frame gets an `external` row, and no file is written.
+   - The own folder is pinned: a peer landing first with the same display name does not move it.
+   - Stale fits-writer temp files in the own folder are removed at start, and nothing else is.
+   - Prepared paths are absent from `list_foreign_files` and never recorded as foreign by the scanner.
    - It makes **no** seed or announce call; the fake hub records none.
    - Recipe and size are recorded.
    - Landing names avoid prepared paths.
-   - It is refused under a foreign A6 binding.
+   - It is refused under a foreign cached A6 binding.
 3. **`publish`.**
    - It consumes prepared rows and announces them.
    - A stale recipe or a missing file drops the prepared row back to Ready, reported as `stale`.
    - Update-pending frames regenerate.
    - Ready ids are refused.
+   - A prepared frame that now fails the gate is held back and keeps its row.
+   - A stale external row is dropped without touching the original file.
 4. **Withhold.**
    - A withheld frame is never a calibrate or publish candidate.
-   - Withholding a prepared frame deletes its file and row.
+   - Withholding a prepared frame deletes its file and row; an external one keeps the original.
+   - Project loss deletes prepared rows and files; unlink deletes only frames no longer reachable through another linked set.
    - Withholding a published frame is refused.
    - Release re-dirties the project.
-5. **Black Hole.** A black-holed source is not a candidate; a restore makes it one again.
+5. **Black Hole.**
+   - A black-holed unpublished source is held back with kind `blackHole` and is not a candidate.
+   - A published frame whose raw is black-holed stays in My frames.
+   - A restore makes it a candidate again.
 6. **Cancel.**
    - Queued → `cancelled`, nothing changed.
    - Between frames → the rest stay Ready, with no `calibration failed: cancelled` held-back entries.
-   - Mid-announce → the batch completes.
+   - The in-flight frame's "calibration failed: cancelled" hold-back is dropped.
+   - Mid-announce → the batch completes; seeded-but-unannounced frames are untagged.
 7. **Events.**
    - Progress stages arrive in order and are throttled.
-   - Exactly one `collab-publish-finished` per run, on every exit path.
+   - Exactly one `collab-publish-finished` per run, on every exit path, including signed out, unmounted, A6 and outdated.
    - `last_publish_run` is persisted.
 8. **Worker.** `manual` projects are never drained. `auto_calibrate` never announces a new frame. `automatic` calibrates and publishes.
-9. **Known files.** Neither the scanner's Collaboration-root reconcile nor the storage sweep touches prepared files.
+9. **Known files.** Neither the scanner's Collaboration-root reconcile nor the storage engine deletes or flags prepared files.
 10. **Live.**
-    - `hello` / `versions` / applied events stamp `synced_at`; a failed catch-up does not.
-    - `collab-project-synced` coalesces and ORs `changed`.
+    - `hello` / `versions` / applied events produce ok reports and stamp `synced_at`.
+    - A failed catch-up or a 403 produces `ok: false` and does not stamp.
+    - The epoch-change branch reports each project.
+    - `SyncBurst` sums changes, never coalesces a failure away, and flushes trailing.
+    - `changed` follows the manifest row counts, not `NeedSetChanged`.
+    - After `sync_now`, `DigestAll` runs after the hello, not before.
     - `ProjectCard.syncedAt` is `null` when the live exchange is off.
 11. **Blink commands.**
     - Paths come from the DB.
@@ -521,11 +666,11 @@ the same change. New model types go into the `ts_export.rs` registry. The TS mir
 - the tiles' derivation (hours, nights, filters, size source, held-back reasons);
 - the Project settings card (mode commit, failure keeps the old value, help line, run status);
 - the run panel (snapshot mid-run, progress, finished line, Cancel);
-- the pill (waits for the synced event, 30 s timeout, re-reads all four loaders);
-- the page reload on `changed`;
-- Blink with `actions` (no Black Hole button, eligible counts, view-only chip, image through `get_collab_frame_image`);
+- the pill (waits for the synced event; `ok: false` stops it with the error; 30 s timeout; re-reads all four loaders and bumps `syncToken`);
+- the page reload on `changed`, with its own timers, plus the Moderation / Exchange re-fetch on `syncToken`;
+- Blink with `actions` (no Black Hole and no "Locate in file browser", eligible counts, view-only chip, both image loads through `get_collab_frame_image`, key-stable badge updates, keydown ignored while `ExcludeDialog` is open above it, Escape closes only the dialog);
 - Blink eligibility labels in both tabs;
-- notifications per outcome;
+- notifications per outcome, and `usePublishing` no longer notifying run outcomes;
 - the `segment` deep link.
 
 **Harness:** `npm run ui:harness` gains a `review` scenario (prepared frames + a running calibrate)
@@ -544,6 +689,7 @@ and a side-by-side check against the canvas.
 
 - **Wave 1 — core and both hosts.**
   - Storage + migration, run kinds, gate changes, withhold, cancel, events, snapshot.
+  - Touch list for the mode rename: the 13 `CollabProjectRow { auto_publish }` literals, `SELECT_COLS` and its index-based reader in `db/collab.rs`, and `FrameSetProjectLink`.
   - Live confirmations and the synced event.
   - Blink commands.
   - ts export.
@@ -554,9 +700,12 @@ and a side-by-side check against the canvas.
   - The pill and page reloads.
   - Blink `actions` / `imageRef` / `contextLabel` and the table Blink actions.
   - Notifications, deep link, frame set Project block.
+  - The harness fixture (`scripts/ui-harness/fixtures.mjs` `autoPublish` → `publishMode`).
   - vitest.
 - **Wave 3 — references.**
-  - Harness scenario.
+  - Harness scenario. The harness SSE is idle, so the "running" state comes from the
+    `get_collab_publish_run` snapshot fixture.
+  - The logging spec's field dictionary: `publish_run_id`.
   - `docs/transfers/README.md` (collab publish section).
   - CLAUDE.md command count + the Transfers/collab bullet.
   - `docs/frontend/notifications.md` (new outcomes).
@@ -572,3 +721,21 @@ Merging and pushing wait for the owner's word. `wave-5.5-project-ui` must merge 
 - Review of updates to already-published frames (P6).
 - A per-run size or disk-space preflight for Calibrate (the calibrated set lands where the published set lands today).
 - Found while researching, not fixed here: Republishing an `own_missing` frame that regenerates to identical bytes deletes the temp file and does not restore the landed file (`collab.rs` around the identical-bytes branch). It goes to open-items for its own check.
+
+## 15. Review record (fable, 2026-10-01)
+
+| # | Finding | Resolution |
+| ---- | ---- | ---- |
+| 1 | Attested sets have no calibrated file; withhold / stale would delete originals; UNIQUE path breaks across projects | `external` prepared rows, never unlinked; uniqueness per project (§4.2, §4.3, §9.1) |
+| 2 | Confirmation plumbing: `FeedApplier` has no `Shared`; `DigestAll` runs ahead of the hello; per-project failures swallowed, so a refused project never confirms | `FeedOut::Synced` reports with `ok` / `error`; the runtime loop records; `DigestAll` after the hello; the pill stops on `ok: false` (§6.1–6.4) |
+| 3 | `changed` cannot come from `FeedEffect` | `SyncChanges` from the manifest row counts; a `SyncBurst` accumulator (§6.1, §6.2) |
+| 4 | Filtering the gate query by Black Hole hides published frames | No query filter; held-back kind `blackHole` for unpublished frames only (§4.4) |
+| 5 | Landing names, own-folder drift, foreign listing, temp files; §3 `delete_not_in` claim wrong | Own folder pinned; prepared paths excluded from foreign; temp sweep at calibrate start; §3 corrected (§3, §4.3) |
+| 6 | Blink feasibility: keydown vs dialog, `TableAction` shape, index-keyed state, Locate, OSC colour, Response / web helper | `BlinkFrame` + own `BlinkAction` type, overlay stack + keydown guard, Locate hidden, both load sites, desktop Response, web helper refactor (§9) |
+| 7 | State derivation precedence and the touch list | Derivation order + touch list (§4.1) |
+| 8 | A6 at calibrate is the cached binding | Stated; a stale cache refuses at announce, frames stay prepared (§4.3) |
+| 9 | Notifications double up; auto refusals would toast | One source; outcome `refused`, history-only for auto; the "nothing new" row kept (§5.2, §5.4) |
+| 10 | Modes need the live exchange | Help text + "Paused — collaboration is off" (§4.6) |
+| 11 | Leave / unlink hooks | Project loss via `refresh_projects`; unlink only for unreachable frames (§4.2) |
+| 12 | Cancel open question | Untag with `unseed_project_frame`; in-flight hold-back dropped (§4.7) |
+| 13 | Contract nits (`run_id` name, `fetchedAt`, emit points, timers, self-loading tabs, literals, fixture, grid class, `own_changed`, README) | Each fixed in place (§1, §3, §5, §6.5, §7.1, §9.4, §13) |
