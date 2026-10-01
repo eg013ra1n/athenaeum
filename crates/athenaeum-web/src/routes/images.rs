@@ -50,24 +50,39 @@ pub async fn get_frame_preview(
     State(state): State<WebAppState>,
     Json(args): Json<GetFramePreviewArgs>,
 ) -> Result<Response, (StatusCode, String)> {
-    // ── 1. Read path and settings from DB, then drop the lock ────────────────
-
-    let (file_path, resolution_str, quality) = {
+    let file_path: String = {
         let db = state.ctx.db.get()
             .ok_or_else(|| db_err("Database not initialized"))?;
         let conn = db.conn();
 
         // Resolve the file path for this file_id.
-        let path: String = conn
-            .query_row(
-                "SELECT path FROM files WHERE id = ?1",
-                rusqlite::params![args.frame_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| db_err(format!("File id {} not found: {}", args.frame_id, e)))?;
+        conn.query_row(
+            "SELECT path FROM files WHERE id = ?1",
+            rusqlite::params![args.frame_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| db_err(format!("File id {} not found: {}", args.frame_id, e)))?
+        // DB lock dropped here.
+    };
+    render_path_jpeg(&state, file_path, args.resolution).await
+}
+
+/// Render the FITS/XISF file at `file_path` to JPEG through the shared cache,
+/// gate, semaphore and pool. The caller has already resolved the path from the
+/// DB (never from the client). Also used by `get_collab_frame_image`.
+pub(crate) async fn render_path_jpeg(
+    state: &WebAppState,
+    file_path: String,
+    resolution: Option<String>,
+) -> Result<Response, (StatusCode, String)> {
+    // ── 1. Read resolution and quality settings, then drop the lock ──────────
+    let (resolution_str, quality) = {
+        let db = state.ctx.db.get()
+            .ok_or_else(|| db_err("Database not initialized"))?;
+        let conn = db.conn();
 
         // Determine resolution string: prefer explicit arg, fall back to DB setting.
-        let resolution_str = match args.resolution.as_deref() {
+        let resolution_str = match resolution.as_deref() {
             Some(r) if !r.is_empty() => r.to_string(),
             _ => db::get_setting(&conn, "blink.resolution")
                 .map_err(|e| db_err(e))?
@@ -81,7 +96,7 @@ pub async fn get_frame_preview(
             .map_err(|e| db_err(e))?
             .and_then(|v| v.parse::<u8>().ok());
 
-        (path, resolution_str, quality)
+        (resolution_str, quality)
         // DB lock dropped here.
     };
 

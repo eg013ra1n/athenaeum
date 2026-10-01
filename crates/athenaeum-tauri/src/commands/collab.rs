@@ -632,3 +632,41 @@ pub async fn cancel_collab_publish(
     athenaeum_core::api::collab_publish_run::cancel_collab_publish(&state.ctx, &project_id)
         .map_err(|e| e.to_string())
 }
+
+/// Blink's view of a project's frames (spec 2026-10-01 §9.1). Every path is
+/// resolved from the DB in core; fired per Blink open, so `debug`.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_collab_blink_frames(
+    state: State<'_, AppState>,
+    project_id: String,
+    refs: Vec<athenaeum_core::api::collab_blink::CollabFrameRef>,
+) -> Result<Vec<athenaeum_core::api::collab_blink::CollabBlinkEntry>, String> {
+    athenaeum_core::api::collab_blink::get_collab_blink_frames(&state.ctx, &project_id, &refs)
+        .map_err(|e| e.to_string())
+}
+
+/// JPEG bytes for one project frame. The wire arg is `frame`, not `ref`
+/// (`ref` is a Rust keyword).
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_collab_frame_image(
+    state: State<'_, AppState>,
+    project_id: String,
+    frame: athenaeum_core::api::collab_blink::CollabFrameRef,
+    resolution: Option<String>,
+) -> Result<tauri::ipc::Response, String> {
+    let (path, _) = athenaeum_core::api::collab_blink::resolve_collab_frame_path(
+        &state.ctx,
+        &project_id,
+        &frame,
+    )
+    .map_err(|e| e.to_string())?;
+    crate::commands_rustafits::read_fits_image_bytes(
+        path.to_string_lossy().into_owned(),
+        resolution,
+        state,
+    )
+    .await
+    .map(tauri::ipc::Response::new)
+}

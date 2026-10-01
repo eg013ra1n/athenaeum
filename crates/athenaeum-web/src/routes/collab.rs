@@ -998,3 +998,42 @@ mod args_serde_tests {
         assert_eq!(b.frame_ids, None);
     }
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlinkFramesArgs {
+    project_id: String,
+    refs: Vec<athenaeum_core::api::collab_blink::CollabFrameRef>,
+}
+
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn get_collab_blink_frames(
+    State(state): State<WebAppState>,
+    Json(args): Json<BlinkFramesArgs>,
+) -> Result<Json<Vec<athenaeum_core::api::collab_blink::CollabBlinkEntry>>, (axum::http::StatusCode, String)> {
+    athenaeum_core::api::collab_blink::get_collab_blink_frames(&state.ctx, &args.project_id, &args.refs)
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameImageArgs {
+    project_id: String,
+    frame: athenaeum_core::api::collab_blink::CollabFrameRef,
+    resolution: Option<String>,
+}
+
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn get_collab_frame_image(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameImageArgs>,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    let (path, _) = athenaeum_core::api::collab_blink::resolve_collab_frame_path(
+        &state.ctx,
+        &args.project_id,
+        &args.frame,
+    )
+    .map_err(api_err)?;
+    crate::routes::images::render_path_jpeg(&state, path.to_string_lossy().into_owned(), args.resolution).await
+}

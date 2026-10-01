@@ -10589,7 +10589,7 @@ pub(crate) mod tests {
             assert_eq!(f[0]["outcome"], "failed");
         }
 
-        const PID: &str = "p1";
+        pub(crate) const PID: &str = "p1";
 
         /// A direct `run_publish` under a tracker, as the entry points do.
         async fn run_publish_for_test(
@@ -10627,7 +10627,7 @@ pub(crate) mod tests {
         const W: usize = 512;
         const H: usize = 512;
 
-        pub(super) struct PubFx {
+        pub(crate) struct PubFx {
             pub tmp: tempfile::TempDir,
             pub ctx: Arc<ServiceContext>,
             pub server: MockServer,
@@ -10957,7 +10957,7 @@ pub(crate) mod tests {
             total
         }
 
-        fn own_dir(fx: &PubFx) -> PathBuf {
+        pub(crate) fn own_dir(fx: &PubFx) -> PathBuf {
             fx.collab.join("m31").join("me-myself")
         }
 
@@ -11110,7 +11110,7 @@ pub(crate) mod tests {
         /// `send_receive` member "Me Myself", dictionary `L`, no thresholds)
         /// and one linked set of `n` gate-passing LIGHT frames — each a real
         /// FITS on disk, all linked to one real master dark.
-        pub(super) async fn fixture(n: usize) -> PubFx {
+        pub(crate) async fn fixture(n: usize) -> PubFx {
             let (tmp, ctx) = test_ctx();
             let server = MockServer::start().await;
             wire_hub(&ctx, &server.uri());

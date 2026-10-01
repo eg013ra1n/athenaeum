@@ -88,6 +88,8 @@ pub mod collab_autopublish;
 // One tracker for every collab publish-family run (progress, one finished
 // event, last run, snapshot, cancel) and the prepared-frame bookkeeping.
 #[cfg(all(feature = "render", feature = "solver"))]
+pub mod collab_blink;
+#[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab_prepare;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab_publish_run;

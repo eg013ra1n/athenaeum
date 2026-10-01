@@ -1665,6 +1665,12 @@ export type CollabPublishFinished = { projectId: string, publishRunId: string, k
 
 export type CollabPublishRunView = { running: CollabPublishProgress | null, last: CollabPublishFinished | null, };
 
+export type CollabFrameRef = { frameId: number | null, frameUuid: string | null, };
+
+export type BlinkSource = "raw" | "calibrated" | "replica";
+
+export type CollabBlinkEntry = { key: string, source: BlinkSource, entry: FileWithFrame, frameUuid: string | null, sourceFrameId: number | null, publisherName: string | null, };
+
 export type HeldBackFrame = { frameId: number, filename: string, reasons: Array<string>, 
 /**
  * Amendment A6: set ONLY for a new frame held back because another
