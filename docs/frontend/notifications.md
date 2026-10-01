@@ -69,7 +69,9 @@ Spec `docs/superpowers/specs/2026-10-01-collab-publish-review-design.md` §5.4 a
 `usePublishing` no longer notifies run outcomes (F4): it keeps its inline error line, the
 `updateRequired` banner, the A6 refusal box and the busy info toast for refusals returned by the
 command before a run starts. The publish confirm and the republish guard close the moment the user
-confirms, so those refusals show in My frames, never inside a dialog (§16.1 N13).
+confirms, so those refusals show in My frames, never inside a dialog (§16.1 N13). A free-space
+refusal (`collab_no_space:<needed>:<free>`) shows its sizes on the action's line and raises no toast
+there: core ends that run `refused` with the same code, and the row below notifies it (§16.1 N41).
 
 | Outcome of `collab-publish-finished` | Title | Link |
 | ---- | ---- | ---- |
@@ -79,7 +81,8 @@ confirms, so those refusals show in My frames, never inside a dialog (§16.1 N13
 | `done`, only stale > 0 (frames whose source changed since calibration went back to Ready) | "n frame(s) changed since calibration in {title} — back to Ready" (warning, §16.1 N15) | `?tab=mine&segment=ready` |
 | `done`, all counts zero | silent | none |
 | `cancelled` | "Stopped in {title}" (info, history only: `toast: false`) | `?tab=mine` |
-| `refused` | "{Device} publishes {title}" for an A6 refusal (`collab_publishing_device:<name>`, F8; a nameless device reads "Another device of this account publishes {title}"); "Not published in {title}" with "This hub needs a newer Athenaeum — update to publish." for an outdated build (`collab_api_outdated…`), otherwise with the error; toast only for a manual run, history only for an auto run | `?tab=mine` |
+| `refused` for lack of free space (`collab_no_space:<needed>:<free>`, decimal bytes, `needed` incl. the 1 GB reserve; §16.1 N41) | "Not enough free space to calibrate in {title}" (warning, `hasErrors`; detail: "Not enough free space for the calibrated frames: X GB needed (incl. 1 GB reserve), Y GB free on the Collaboration folder's disk."). Toasts for a manual AND an auto run; an auto run carries `dedupeKey` `collab-no-space-{projectId}-{local YYYY-MM-DD}`, and a repeated key drops the toast and the history entry alike, so a worker refused on every scan notifies once a day per project | `?tab=mine` |
+| `refused`, any other reason | "{Device} publishes {title}" for an A6 refusal (`collab_publishing_device:<name>`, F8; a nameless device reads "Another device of this account publishes {title}"); "Not published in {title}" with "This hub needs a newer Athenaeum — update to publish." for an outdated build (`collab_api_outdated…`), otherwise with the error; toast only for a manual run, history only for an auto run | `?tab=mine` |
 | `failed` | "Publishing failed in {title}" + the error, `hasErrors` | `?tab=mine` |
 
 The `segment` URL parameter is handled like `tab` (applied, then removed from the URL).
