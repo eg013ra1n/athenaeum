@@ -67,6 +67,9 @@ Existing tokens already equal the mockup's variables (`surface` = `--bg`, `surfa
 | `table-group` | `#323946` | `tr.g td` | group row, level 0 |
 | `table-group-l1` | `#353c4a` | `tr.g.l1 td` | group row, level 1 |
 | `table-group-hover` | `#3a4251` | `tr.g:hover td` | group row hover |
+| `table-row-hover` | `rgba(67,76,94,.55)` | `table.ft tr:hover td` | frame-table row hover (added in execution, §21 R35) |
+| `table-plain-hover` | `rgba(67,76,94,.45)` | `table.plain tr.x:hover td` | clickable plain-table row hover (R35) |
+| `table-peer-hover` | `rgba(67,76,94,.30)` | `.peer:hover` | Exchange peer-flow row hover (R35) |
 | `teal` | `#8fbcbb` | `--teal` | member palette slot 7 |
 
 The `*-muted` backgrounds of `success`, `warning`, `error` and `info` change from `.25` to `.22`
@@ -478,7 +481,11 @@ Every column sorts. A row click opens the member card (§6.3). Durations everywh
   stays a real input.
 - Every icon-only control keeps an `aria-label`.
 - Focus-visible outline everywhere: 2 px `accent`, offset 1 px (mockup rule).
-- `prefers-reduced-motion`: no transitions.
+- `prefers-reduced-motion`: no transitions. Essential animation — the busy spinners — keeps running
+  (a frozen spinner reads as a stuck icon; §21 R35).
+- Every overlay that handles Escape is on the overlay stack, including the always-mounted
+  notification and transfers panels, the update dialog and the Held-back group menus, so one
+  Escape closes exactly the top layer (§21 R35).
 
 ## 15. Frontend files
 
@@ -630,3 +637,5 @@ departs from it. The full record, with the cost of each if wrong, is in the plan
 | R32 | `PeerFlowRow` sets its own 13 px / 1.4 so it renders the same on Transfers; the in-flight size column is a fixed 110 px on one line (the mockup's 80 px column wraps it). |
 | R33 | Dialogs on the shell: the web folder browser renders inside the export dialog's shell, and Escape closes it before the dialog; a self-opening device prompt focuses "Not now", never the irreversible Replace; the republish guard shows decimal sizes like the rest of the page; Link's footer button is "Done" (the shell's × is "Close"). |
 | R34 | The `link` button variant keeps the mockup's UA padding (1px 6px, 18.8 px tall); My frames' row buttons are left-aligned like the mockup's segment buttons. Scenario polish: the truncated project title shows in full on hover; a member holding nothing reads a ghost "—" in Holds; the reconnect countdown reads "Reconnecting…" at zero. |
+| R35 | Final review: the notification and transfers panels, the update dialog and the Held-back group menus joined the overlay stack (one shared `useOverlayEscape`), so one Escape closes one layer; reduced motion keeps spinners; an unknown member gets no colour (neutral), never this account's; Escape typed in a field outside the side panel leaves it open; selects take the §14 focus outline; the Card heading is named by its title alone; a busy dialog keeps Tab inside; "Last seen" ticks every minute; the Overview's offline-holders line says when it is the live exchange that is off; three hover tokens replace raw colours; `Button size="tile"` replaces the My frames overrides. |
+| R36 | Post-fix sweep of card insets: the Received card is the mockup's flush table card (`Card flush`: padding 12px 0 4px, header padded 16), the Exchange cards sit 12 px apart (the plan's 14 was off), and the Members table sits in a padding-0 card (radius 8, elevated background). |
