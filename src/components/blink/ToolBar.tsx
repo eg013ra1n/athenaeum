@@ -14,6 +14,12 @@ import {
 } from "lucide-react";
 import type { ToolBarProps } from "./types";
 
+const PROJECT_ACTION_TONE: Record<NonNullable<ToolBarProps['projectActions']>[number]['tone'], string> = {
+  warn: 'bg-warning text-surface',
+  danger: 'bg-error text-white',
+  default: 'bg-surface-elevated text-content',
+};
+
 /** Top toolbar for BlinkViewer with playback controls, selection actions, and close button */
 export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   currentIndex,
@@ -30,6 +36,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   onBlackhole,
   onRestore,
   isBlackholing,
+  projectActions,
   showAnnotations,
   onToggleAnnotations,
   fullResMode,
@@ -173,8 +180,19 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
 
       {/* Right: Selection actions + Close button */}
       <div className="flex items-center gap-2">
-        {/* Selection controls */}
-        {selectionCount > 0 && (
+        {/* Selection controls — a project caller's actions replace Restore / Blackhole */}
+        {selectionCount > 0 && projectActions && projectActions.map((a) => (
+          <button
+            key={a.id}
+            onClick={a.onClick}
+            disabled={projectActions.some((p) => p.busy)}
+            className={`flex items-center gap-1 px-3 py-1.5 text-sm rounded transition-colors hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed ${PROJECT_ACTION_TONE[a.tone]}`}
+          >
+            {a.busy && <Loader2 size={16} className="animate-spin" />}
+            {a.label}
+          </button>
+        ))}
+        {selectionCount > 0 && !projectActions && (
           <>
             {/* Restore button - shown when selection includes blackholed frames */}
             {blackholedInSelectionCount > 0 && (

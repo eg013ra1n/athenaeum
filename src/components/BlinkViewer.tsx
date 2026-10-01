@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from "react";
 import { api } from '../api';
 import { isTauri } from '../utils/platform';
 import {
@@ -15,8 +15,10 @@ import { fetchAndComposeFlatContour, loadFlatContourOpts } from "./blink/flatCon
 import { useBlinkCache } from "../hooks/useBlinkCache";
 import { useStarMetricsCache } from "../hooks/useStarMetricsCache";
 import { drawStarOverlay } from "./blink/StarOverlay";
+import { Chip } from "./ui";
+import { isTopOverlay, popOverlay, pushOverlay } from "./ui/overlayStack";
 
-import type { BlinkViewerProps, SortField, SortDirection } from "./blink/types";
+import type { BlinkFrame, BlinkViewerProps, SortField, SortDirection } from "./blink/types";
 
 /** Normalize a JPEG payload from either backend.
  *
@@ -34,6 +36,27 @@ function toJpegBytes(
   return new Uint8Array(payload);
 }
 
+/** A calibrated or replica project entry: core resolves its path from the
+ * DB, both hosts (spec §9.1). The wire key is `frame`. */
+function collabFrameImage(ref: NonNullable<BlinkFrame['imageRef']>, full: boolean) {
+  return api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>('get_collab_frame_image', {
+    projectId: ref.projectId,
+    frame: ref.frame,
+    ...(full ? { resolution: 'full' } : {}),
+  });
+}
+
+/** Input types that take typed text: a key pressed in one never drives Blink.
+ * A range, checkbox or button input (the toolbar's speed slider) does not
+ * swallow Blink's keys, as before. */
+const NON_TEXT_INPUT_TYPES = new Set(['range', 'checkbox', 'radio', 'button', 'submit', 'reset', 'color', 'file', 'image']);
+
+function isTypingTarget(t: EventTarget | null): boolean {
+  if (!(t instanceof HTMLElement)) return false;
+  if (t.tagName === 'INPUT') return !NON_TEXT_INPUT_TYPES.has((t as HTMLInputElement).type);
+  return t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable;
+}
+
 const BlinkViewer: React.FC<BlinkViewerProps> = ({
   frames,
   initialIndex = 0,
@@ -41,7 +64,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   sourceType = 'light',
   frameSetId,
   onFramesRemoved,
+  actions,
+  contextLabel,
+  viewOnly = false,
 }) => {
+  /** Project mode (spec §9.2): a caller that passes `actions` (even empty). */
+  const projectMode = actions !== undefined;
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const [isPlaying, setIsPlaying] = useState(false);
   const [blinkSpeed, setBlinkSpeed] = useState(2);
@@ -93,6 +121,36 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Resizable sidebar (stored in pixels, clamped on render)
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const isDraggingDivider = useRef(false);
+
+  // The header (toolbar + project context strip) is measured, so the canvas
+  // fills exactly what is left below it (F7).
+  const headerRef = useRef<HTMLDivElement>(null);
+  const [headerH, setHeaderH] = useState(48);
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => setHeaderH(el.getBoundingClientRect().height || 48));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Blink joins the one overlay stack (R35): a dialog opened above it owns
+  // the keys and Escape until it closes.
+  const overlayId = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const id = pushOverlay('dialog');
+    overlayId.current = id;
+    return () => {
+      popOverlay(id);
+      overlayId.current = null;
+    };
+  }, []);
+
+  // Project mode: the action whose run is in flight. The ref refuses a
+  // second run even when the busy action's button has left the toolbar (its
+  // entries stopped being eligible mid-run).
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const actionBusyRef = useRef<string | null>(null);
 
   // Load persisted sidebar width
   useEffect(() => {
@@ -159,13 +217,32 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       .catch(() => { /* use defaults */ });
   }, []);
 
+  // Project mode snapshots the entries when Blink opens (spec §9.2): project
+  // actions never remove entries, so indexes — and every index-keyed cache —
+  // stay stable while the caller reloads its rows. Badges come from the live
+  // prop, matched by `key`. Without `actions`, `frames` is read live as before.
+  const snapshot = useRef(frames);
+  const base = projectMode ? snapshot.current : frames;
+
   // Filter FITS and XISF files
   const fitsFrames = useMemo(
-    () => frames.filter((f) => f.file.format === "FITS" || f.file.format === "XISF"),
-    [frames]
+    () => base.filter((f) => f.file.format === "FITS" || f.file.format === "XISF"),
+    [base]
+  );
+
+  const liveByKey = useMemo(
+    () => new Map(frames.filter((f) => f.key).map((f) => [f.key!, f])),
+    [frames],
+  );
+  /** The live entry for a snapshot entry. Render, eligibility and action
+   * arguments go through it; image loading never does. */
+  const view = useCallback(
+    (f: BlinkFrame): BlinkFrame => (f.key && liveByKey.get(f.key)) || f,
+    [liveByKey],
   );
 
   const currentFrame = fitsFrames[currentIndex];
+  const cur = currentFrame ? view(currentFrame) : undefined;
 
   const frameIds = useMemo(() => fitsFrames.map(f => f.frame?.id ?? 0), [fitsFrames]);
 
@@ -188,6 +265,38 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   }, [selectedFrames, fitsFrames, blackholedFileIds]);
 
   const nonBlackholedInSelectionCount = selectionCount - blackholedInSelectionCount;
+
+  // Project mode: each caller action offers the eligible entries of the
+  // selection, read from the live entries; one with none is hidden.
+  const selectedViews = useMemo(
+    () => [...selectedFrames].map((i) => fitsFrames[i]).filter(Boolean).map(view),
+    [selectedFrames, fitsFrames, view],
+  );
+  const projectActions = useMemo(() => actions?.flatMap((a) => {
+    const eligible = selectedViews.filter(a.eligible);
+    if (eligible.length === 0) return [];
+    return [{
+      id: a.id,
+      label: a.label(eligible.length),
+      tone: a.tone,
+      busy: actionBusy === a.id,
+      onClick: () => {
+        if (actionBusyRef.current !== null) return;
+        actionBusyRef.current = a.id;
+        setActionBusy(a.id);
+        Promise.resolve()
+          .then(() => a.run(eligible))
+          .catch((err) => console.error(`[blink] action ${a.id} failed:`, err))
+          .finally(() => {
+            actionBusyRef.current = null;
+            setActionBusy(null);
+          });
+      },
+    }];
+  }), [actions, selectedViews, actionBusy]);
+
+  // The frame list renders the live entries (badges) over the snapshot's indexes.
+  const listFrames = useMemo(() => fitsFrames.map(view), [fitsFrames, view]);
 
   // Load image from backend
   const loadImage = useCallback(async (index: number) => {
@@ -212,13 +321,15 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     setError(null);
 
     try {
-      const imageData = isTauri
-        ? await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("read_fits_image_rustafits", {
-            path: frame.file.path,
-          })
-        : await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("get_frame_preview", {
-            frameId: frame.file.id,
-          });
+      const imageData = frame.imageRef
+        ? await collabFrameImage(frame.imageRef, false)
+        : isTauri
+          ? await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("read_fits_image_rustafits", {
+              path: frame.file.path,
+            })
+          : await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("get_frame_preview", {
+              frameId: frame.file.id,
+            });
 
       const binaryData = toJpegBytes(imageData);
 
@@ -448,7 +559,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
       const clampedSidebar = Math.max(200, Math.min(window.innerWidth * 0.4, sidebarWidth));
       const newWidth = window.innerWidth - clampedSidebar - 4; // 4px for divider
-      const newHeight = window.innerHeight - 48;
+      const newHeight = window.innerHeight - headerH;
 
       if (canvas.width !== newWidth || canvas.height !== newHeight) {
         canvas.width = newWidth;
@@ -476,7 +587,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     updateCanvasSize();
     window.addEventListener("resize", updateCanvasSize);
     return () => window.removeEventListener("resize", updateCanvasSize);
-  }, [renderImage, sidebarWidth]);
+  }, [renderImage, sidebarWidth, headerH]);
 
   // Blink playback
   useEffect(() => {
@@ -534,15 +645,17 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
     setLoadingFullRes(true);
     try {
-      const imageData = isTauri
-        ? await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("read_fits_image_rustafits", {
-            path: frame.file.path,
-            resolution: "full",
-          })
-        : await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("get_frame_preview", {
-            frameId: frame.file.id,
-            resolution: "full",
-          });
+      const imageData = frame.imageRef
+        ? await collabFrameImage(frame.imageRef, true)
+        : isTauri
+          ? await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("read_fits_image_rustafits", {
+              path: frame.file.path,
+              resolution: "full",
+            })
+          : await api.invoke<Uint8Array<ArrayBuffer> | ArrayBuffer | number[]>("get_frame_preview", {
+              frameId: frame.file.id,
+              resolution: "full",
+            });
 
       const binaryData = toJpegBytes(imageData);
 
@@ -622,6 +735,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyPress = (e: KeyboardEvent) => {
+      // A key typed into a field, already handled by an overlay, or pressed
+      // while a dialog above Blink is open belongs to that field or dialog
+      // (spec §9.2, R35).
+      if (e.defaultPrevented) return;
+      if (isTypingTarget(e.target)) return;
+      if (overlayId.current !== null && !isTopOverlay(overlayId.current)) return;
       switch (e.key) {
         case " ":
           e.preventDefault();
@@ -697,8 +816,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     return () => window.removeEventListener("keydown", handleKeyPress);
   }, [fitsFrames.length, onClose, toggleCurrentFrameSelection, fitsFrames, zoomIn, zoomOut, resetZoom, handleToggleAnnotations]);
 
-  // Check blackhole status on mount
+  // Check blackhole status on mount — never in project mode, whose actions
+  // replace the Black Hole.
   useEffect(() => {
+    if (projectMode) return;
     const check = async () => {
       const ids = frames.map((f) => f.file.id).filter((id): id is number => id != null);
       if (ids.length === 0) return;
@@ -710,7 +831,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       }
     };
     check();
-  }, [frames]);
+  }, [frames, projectMode]);
 
   // Load analysis data on mount
   useEffect(() => {
@@ -1007,41 +1128,56 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 bg-black flex flex-col">
-      {/* TOP TOOLBAR */}
-      <ToolBar
-        currentIndex={currentIndex}
-        totalFrames={fitsFrames.length}
-        isPlaying={isPlaying}
-        blinkSpeed={blinkSpeed}
-        onPrevious={handlePrevious}
-        onNext={handleNext}
-        onTogglePlay={handleTogglePlay}
-        onSpeedChange={handleSpeedChange}
-        selectionCount={selectionCount}
-        blackholedInSelectionCount={blackholedInSelectionCount}
-        nonBlackholedInSelectionCount={nonBlackholedInSelectionCount}
-        onClearSelection={handleClearSelection}
-        onBlackhole={() => setShowBlackholeConfirm(true)}
-        onRestore={handleRestoreSelected}
-        isBlackholing={isBlackholing}
-        showAnnotations={showAnnotations}
-        onToggleAnnotations={handleToggleAnnotations}
-        fullResMode={fullResMode}
-        loadingFullRes={loadingFullRes}
-        onToggleFullRes={handleToggleFullRes}
-        showHelp={showHelp}
-        onToggleHelp={() => setShowHelp(prev => !prev)}
-        canShowContour={canShowContour}
-        contourActive={contourMode && canShowContour}
-        onShowContourPlot={() => {
-          if (!canShowContour) return;
-          setContourMode(prev => !prev);
-        }}
-        isCaching={isCaching}
-        cacheProgress={cacheProgress}
-        cacheStats={cacheStats}
-        onClose={onClose}
-      />
+      {/* HEADER — toolbar + (project mode) context strip, measured for the canvas height */}
+      <div ref={headerRef}>
+        <ToolBar
+          currentIndex={currentIndex}
+          totalFrames={fitsFrames.length}
+          isPlaying={isPlaying}
+          blinkSpeed={blinkSpeed}
+          onPrevious={handlePrevious}
+          onNext={handleNext}
+          onTogglePlay={handleTogglePlay}
+          onSpeedChange={handleSpeedChange}
+          selectionCount={selectionCount}
+          blackholedInSelectionCount={blackholedInSelectionCount}
+          nonBlackholedInSelectionCount={nonBlackholedInSelectionCount}
+          onClearSelection={handleClearSelection}
+          onBlackhole={() => setShowBlackholeConfirm(true)}
+          onRestore={handleRestoreSelected}
+          isBlackholing={isBlackholing}
+          projectActions={projectMode ? projectActions : undefined}
+          showAnnotations={showAnnotations}
+          onToggleAnnotations={handleToggleAnnotations}
+          fullResMode={fullResMode}
+          loadingFullRes={loadingFullRes}
+          onToggleFullRes={handleToggleFullRes}
+          showHelp={showHelp}
+          onToggleHelp={() => setShowHelp(prev => !prev)}
+          canShowContour={canShowContour}
+          contourActive={contourMode && canShowContour}
+          onShowContourPlot={() => {
+            if (!canShowContour) return;
+            setContourMode(prev => !prev);
+          }}
+          isCaching={isCaching}
+          cacheProgress={cacheProgress}
+          cacheStats={cacheStats}
+          onClose={onClose}
+        />
+        {projectMode && (
+          <div className="flex items-center gap-2 border-b border-line bg-surface px-3 py-1 text-[12px] text-content-muted">
+            {cur?.source && (
+              <Chip tone={cur.source === 'raw' ? 'mute' : cur.source === 'calibrated' ? 'pur' : 'info'}>{cur.source}</Chip>
+            )}
+            {cur?.badge && <Chip tone="warn">{cur.badge}</Chip>}
+            <span className="truncate font-mono text-content">{cur?.file.filename}</span>
+            {cur && contextLabel && <span className="truncate">{contextLabel(cur)}</span>}
+            <span className="flex-1" />
+            {viewOnly && <Chip tone="mute">View only</Chip>}
+          </div>
+        )}
+      </div>
 
       {/* MAIN CONTENT AREA */}
       <div className="flex-1 flex overflow-hidden">
@@ -1132,7 +1268,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           {/* Frame list — takes available space */}
           <div className="flex-1 min-h-0">
             <FrameList
-              frames={fitsFrames}
+              frames={listFrames}
               currentIndex={currentIndex}
               selectedFrames={selectedFrames}
               blackholedFileIds={blackholedFileIds}
@@ -1146,11 +1282,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
               onSelectAll={handleSelectAll}
               onClearSelection={handleClearSelection}
               onInvertSelection={handleInvertSelection}
+              hideLocate={projectMode}
             />
           </div>
           {/* Info panel — fixed at bottom */}
           <FrameInfoPanel
-            currentFrame={currentFrame}
+            currentFrame={cur}
             metrics={
               (showAnnotations ? getStarMetrics(currentIndex)?.metrics : null)
               ?? (currentFrame?.frame?.id ? analysisMap.get(currentFrame.frame.id) ?? null : null)
@@ -1170,8 +1307,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         </div>
       )}
 
-      {/* Blackhole confirmation dialog */}
-      {showBlackholeConfirm && (
+      {/* Blackhole confirmation dialog — never in project mode (it cannot open there) */}
+      {!projectMode && showBlackholeConfirm && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-60">
           <div className="bg-surface-elevated rounded-lg shadow-xl border border-border p-6 max-w-md w-full mx-4">
             <div className="flex items-center gap-3 mb-4">

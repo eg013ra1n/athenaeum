@@ -63,6 +63,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
   onSelectAll,
   onClearSelection,
   onInvertSelection,
+  hideLocate = false,
 }) {
   const navigate = useNavigate();
 
@@ -192,7 +193,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
 
             return (
               <div
-                key={frame.file.id ?? index}
+                key={frame.key ?? frame.file.id ?? index}
                 onClick={(e) => onFrameClick(index, e)}
                 className={rowClasses}
                 title={frame.file.filename}
@@ -221,21 +222,26 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                       <span className="font-bold text-content-muted">{analysis.frame_snr.toFixed(1)}dB</span>
                     </>
                   )}
+                  {frame.badge && (
+                    <span className="flex-shrink-0 text-[10px] font-medium text-warning">{frame.badge}</span>
+                  )}
                   {loadingIndices.has(index) && (
                     <Loader2 className="animate-spin flex-shrink-0 ml-auto" size={11} />
                   )}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      navigate('/files', {
-                        state: { reveal: { path: frame.file.path, token: Date.now() } },
-                      });
-                    }}
-                    className="ml-auto p-1 rounded transition-colors flex-shrink-0 text-content-muted hover:text-content hover:bg-surface-hover"
-                    title="Locate in file browser"
-                  >
-                    <FolderOpen size={12} />
-                  </button>
+                  {!hideLocate && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        navigate('/files', {
+                          state: { reveal: { path: frame.file.path, token: Date.now() } },
+                        });
+                      }}
+                      className="ml-auto p-1 rounded transition-colors flex-shrink-0 text-content-muted hover:text-content hover:bg-surface-hover"
+                      title="Locate in file browser"
+                    >
+                      <FolderOpen size={12} />
+                    </button>
+                  )}
                 </div>
               </div>
             );
