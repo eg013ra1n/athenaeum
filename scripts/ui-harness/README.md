@@ -16,8 +16,3 @@ The `review` scenario (`/projects/p-m31?tab=mine`) shows 48 calibrated frames in
 To review, three withheld frames in Held back and a running calibrate run (12 of 48).
 The harness serves commands over HTTP only (no events), so the run shows through the
 `get_collab_publish_run` snapshot and never advances.
-
-The `review` scenario (`/projects/p-m31?tab=mine`) shows 48 calibrated frames in
-To review, three withheld frames in Held back and a running calibrate run (12 of 48).
-The harness serves commands over HTTP only (no events), so the run shows through the
-`get_collab_publish_run` snapshot and never advances.
