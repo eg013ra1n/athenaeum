@@ -1350,6 +1350,8 @@ pub fn get_frame_set_project_status(
         let own = crate::db::collab_frames::own_by_source_frame(&conn, &p.project_id)
             .map_err(internal)?;
 
+        let gated_ids: Vec<i64> = gated.iter().map(|(_, r)| r.frame_id).collect();
+        let local = ProjectLocal::load(&conn, &p.project_id, &gated_ids)?;
         let mut counts = ContributorCounts::default();
         let mut frames = Vec::new();
         for (identity, row) in gated
@@ -1363,7 +1365,7 @@ pub fn get_frame_set_project_status(
                 row.frame_id,
                 identity.attested,
                 own_row,
-                crate::collab::contributor_state::LocalFacts::default(),
+                local.facts(&conn, row.frame_id, identity.attested),
                 row.publishable,
                 row.failures.first().map(String::as_str),
                 "get_frame_set_project_status",
@@ -1523,6 +1525,75 @@ fn own_contributor_state(
     (state, reason, wire)
 }
 
+/// Plan W2: a prepared frame is current when its recipe still matches and
+/// its file is the one that was written (size + mtime).
+pub(crate) fn prepared_is_current(
+    conn: &Connection,
+    row: &crate::db::collab_prepare::PreparedRow,
+    attested: bool,
+) -> bool {
+    let recipe = current_recipe_for_frame(conn, row.source_frame_id, attested)
+        .unwrap_or_else(|| "none".into());
+    if recipe != row.recipe_hash {
+        return false;
+    }
+    let path = match (&row.calibrated_path, row.external) {
+        (Some(p), false) => std::path::PathBuf::from(p),
+        _ => match catalog_path_of_frame(conn, row.source_frame_id) {
+            Some(p) => p,
+            None => return false,
+        },
+    };
+    row.size_mtime_seen.is_some() && size_mtime_seen(&path) == row.size_mtime_seen
+}
+
+/// The catalog file path of a frame (the original of an attested frame).
+fn catalog_path_of_frame(conn: &Connection, frame_id: i64) -> Option<std::path::PathBuf> {
+    conn.query_row(
+        "SELECT fi.path FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
+        [frame_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .map(std::path::PathBuf::from)
+}
+
+/// The section 4.1 local facts of every gated frame of a project, read once.
+struct ProjectLocal {
+    prepared: HashMap<i64, crate::db::collab_prepare::PreparedRow>,
+    withheld: HashSet<i64>,
+    black_holed: HashSet<i64>,
+}
+
+impl ProjectLocal {
+    fn load(conn: &Connection, project_id: &str, frame_ids: &[i64]) -> Result<Self, ApiError> {
+        Ok(Self {
+            prepared: crate::db::collab_prepare::prepared_by_source(conn, project_id)
+                .map_err(internal)?,
+            withheld: crate::db::collab_prepare::withheld_ids(conn, project_id)
+                .map_err(internal)?,
+            black_holed: crate::db::collab_prepare::black_holed_frame_ids(conn, frame_ids)
+                .map_err(internal)?,
+        })
+    }
+
+    fn facts(
+        &self,
+        conn: &Connection,
+        frame_id: i64,
+        attested: bool,
+    ) -> crate::collab::contributor_state::LocalFacts {
+        crate::collab::contributor_state::LocalFacts {
+            withheld: self.withheld.contains(&frame_id),
+            black_holed: self.black_holed.contains(&frame_id),
+            prepared_current: self
+                .prepared
+                .get(&frame_id)
+                .is_some_and(|p| prepared_is_current(conn, p, attested)),
+        }
+    }
+}
+
 // ── Own frames (Task 5, spec 2026-09-29 §5.1) ────────────────────────────────
 
 /// One gate-row failure, pre-classified and ordered ([`crate::collab::gate::row_failures`]).
@@ -1558,11 +1629,19 @@ pub struct OwnFrameRow {
     pub eccentricity: Option<f64>,
     pub stars_detected: Option<i64>,
     pub median_snr: Option<f64>,
-    /// "ready" | "published" | "held"
+    /// "ready" | "review" | "published" | "held"
     pub segment: String,
     pub contributor_state: String,
     pub contributor_reason: Option<String>,
     pub failures: Vec<GateFailure>,
+    /// The calibrated file awaiting review (a prepared frame) or the one that
+    /// was published (own row of a calibrated frame); `None` otherwise.
+    pub calibrated_path: Option<String>,
+    pub calibrated_bytes: Option<i64>,
+    /// When the frame was prepared; only for a frame in review.
+    pub prepared_at: Option<String>,
+    /// The member chose "Don't publish" for this frame.
+    pub withheld: bool,
     pub content_version: Option<i32>,
     pub pub_state: Option<String>,
     pub accepted_reason: Option<String>,
@@ -1724,6 +1803,7 @@ pub fn list_project_own_frames(
             None
         }
     };
+    let local = ProjectLocal::load(&conn, project_id, &ids)?;
     let mut out = Vec::with_capacity(gated.len());
     for (identity, row) in gated {
         let own_row = own.get(&row.frame_id);
@@ -1733,11 +1813,54 @@ pub fn list_project_own_frames(
             row.frame_id,
             identity.attested,
             own_row,
-            crate::collab::contributor_state::LocalFacts::default(),
+            local.facts(&conn, row.frame_id, identity.attested),
             row.publishable,
             row.failures.first().map(String::as_str),
             "list_project_own_frames",
         );
+        use crate::collab::contributor_state::{
+            ContributorState, BLACK_HOLE_REASON, WITHHELD_REASON,
+        };
+        let prepared = local.prepared.get(&row.frame_id);
+        let calibrated_path = match (prepared, own_row) {
+            (Some(p), _) if state == ContributorState::Prepared => p.calibrated_path.clone(),
+            (_, Some(o))
+                if o.recipe_hash
+                    .as_deref()
+                    .is_some_and(|h| !h.starts_with("external:")) =>
+            {
+                o.landed_path.clone()
+            }
+            _ => None,
+        };
+        let calibrated_bytes = match (prepared, own_row) {
+            (Some(p), _) if state == ContributorState::Prepared => Some(p.byte_size),
+            (_, Some(o)) if calibrated_path.is_some() => Some(o.byte_size),
+            _ => None,
+        };
+        let failures: Vec<GateFailure> = match state {
+            ContributorState::Withheld => vec![GateFailure {
+                kind: "withheld".into(),
+                text: WITHHELD_REASON.into(),
+            }],
+            ContributorState::FailsGate if reason.as_deref() == Some(BLACK_HOLE_REASON) => {
+                vec![GateFailure {
+                    kind: "blackHole".into(),
+                    text: BLACK_HOLE_REASON.into(),
+                }]
+            }
+            _ => crate::collab::gate::row_failures(&row.failures)
+                .into_iter()
+                .map(|(kind, text)| GateFailure {
+                    kind: kind.to_string(),
+                    text,
+                })
+                .collect(),
+        };
+        let prepared_at = prepared
+            .filter(|_| state == ContributorState::Prepared)
+            .map(|p| p.prepared_at.clone());
+        let withheld = local.withheld.contains(&row.frame_id);
         let live = own_row.and_then(|o| counts.as_ref().map(|c| c.frame(o)));
         let f = facts.get(&row.frame_id);
         out.push(OwnFrameRow {
@@ -1765,13 +1888,11 @@ pub fn list_project_own_frames(
             segment: segment_of(state).to_string(),
             contributor_state: state.key().to_string(),
             contributor_reason: reason,
-            failures: crate::collab::gate::row_failures(&row.failures)
-                .into_iter()
-                .map(|(kind, text)| GateFailure {
-                    kind: kind.to_string(),
-                    text,
-                })
-                .collect(),
+            failures,
+            calibrated_path,
+            calibrated_bytes,
+            prepared_at,
+            withheld,
             rules: row.rules.clone(),
             content_version: own_row.map(|o| o.content_version),
             pub_state: own_row.map(|o| o.state.clone()),
@@ -7135,6 +7256,151 @@ pub(crate) mod tests {
         let (state, reason) = contrib.get("u-rej").unwrap();
         assert_eq!(state, "rejected");
         assert_eq!(reason.as_deref(), Some("FWHM too high"));
+    }
+
+    fn own_rows(ctx: &ServiceContext) -> Vec<OwnFrameRow> {
+        list_project_own_frames(ctx, "p-1").unwrap()
+    }
+
+    #[tokio::test]
+    async fn withheld_and_black_holed_frames_are_held_back_with_their_kind() {
+        let (_tmp, ctx) = test_ctx();
+        let frame_ids = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "me@example.org");
+            let (set_id, ids) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 3);
+            drop(conn);
+            link_frame_set(&ctx, "p-1", set_id).unwrap();
+            ids
+        };
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab_prepare::set_withheld(&conn, "p-1", &[frame_ids[0]], true).unwrap();
+            let file_id: i64 = conn
+                .query_row(
+                    "SELECT file_id FROM frames WHERE id = ?1",
+                    [frame_ids[2]],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::db::add_to_black_hole(&conn, file_id, "light", "/x").unwrap();
+        }
+        let rows = own_rows(&ctx);
+        let by_id = |id: i64| rows.iter().find(|r| r.frame_id == id).unwrap().clone();
+        let w = by_id(frame_ids[0]);
+        assert_eq!(
+            (w.segment.as_str(), w.contributor_state.as_str(), w.withheld),
+            ("held", "withheld", true)
+        );
+        assert_eq!(w.failures[0].kind, "withheld");
+        let b = by_id(frame_ids[2]);
+        assert_eq!(
+            (b.segment.as_str(), b.failures[0].kind.as_str()),
+            ("held", "blackHole")
+        );
+        assert_eq!(
+            b.contributor_reason.as_deref(),
+            Some(crate::collab::contributor_state::BLACK_HOLE_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_black_holed_raw_keeps_its_published_frame() {
+        let (_tmp, ctx) = test_ctx();
+        let frame_ids = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "me@example.org");
+            let (set_id, ids) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 1);
+            drop(conn);
+            link_frame_set(&ctx, "p-1", set_id).unwrap();
+            ids
+        };
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_own_row(
+                &conn,
+                "p-1",
+                "u-pub",
+                frame_ids[0],
+                "published",
+                Some("r1"),
+                true,
+            );
+            let file_id: i64 = conn
+                .query_row(
+                    "SELECT file_id FROM frames WHERE id = ?1",
+                    [frame_ids[0]],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::db::add_to_black_hole(&conn, file_id, "light", "/x").unwrap();
+        }
+        let rows = own_rows(&ctx);
+        assert_eq!(rows.len(), 1, "the published frame is still listed");
+        assert_eq!(rows[0].segment, "published");
+    }
+
+    #[tokio::test]
+    async fn a_current_prepared_frame_is_in_review_and_a_stale_one_is_ready() {
+        let (_tmp, ctx) = test_ctx();
+        let (frame_ids, dir) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "me@example.org");
+            // seed_set marks index 1 trailed (it fails the gate): use 0 and 2.
+            let (set_id, ids) = seed_set(&conn, "M101", "14 03 12", "+54 20 56", 210.8, 54.35, 3);
+            // Attested: skips the calibration-link precondition, so frames 0
+            // and 2 pass the gate (the unattested seed has no links).
+            crate::db::collab::set_frames_set_attestation(&conn, set_id, true).unwrap();
+            drop(conn);
+            link_frame_set(&ctx, "p-1", set_id).unwrap();
+            (vec![ids[0], ids[2]], _tmp.path().join("collab/m101/me"))
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        for (i, id) in frame_ids.iter().enumerate() {
+            let path = dir.join(format!("c_L_{i}.fits"));
+            std::fs::write(&path, vec![0u8; 64]).unwrap();
+            let recipe = if i == 0 {
+                current_recipe_for_frame(&conn, *id, true).unwrap_or_else(|| "none".into())
+            } else {
+                "stale-recipe".into()
+            };
+            crate::db::collab_prepare::upsert_prepared(
+                &conn,
+                &crate::db::collab_prepare::PreparedRow {
+                    project_id: "p-1".into(),
+                    source_frame_id: *id,
+                    frame_uuid: format!("u-{i}"),
+                    calibrated_path: Some(path.to_string_lossy().into()),
+                    external: false,
+                    own_dir: dir.to_string_lossy().into(),
+                    recipe_hash: recipe,
+                    xxh3: "x".into(),
+                    byte_size: 64,
+                    size_mtime_seen: size_mtime_seen(&path),
+                    prepared_at: String::new(),
+                    publish_run_id: "r".into(),
+                },
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let rows = own_rows(&ctx);
+        let r0 = rows.iter().find(|r| r.frame_id == frame_ids[0]).unwrap();
+        let r1 = rows.iter().find(|r| r.frame_id == frame_ids[1]).unwrap();
+        assert_eq!(r0.segment, "review");
+        assert!(
+            r0.calibrated_path.is_some()
+                && r0.calibrated_bytes == Some(64)
+                && r0.prepared_at.is_some()
+        );
+        assert_eq!(
+            r1.segment, "ready",
+            "a stale prepared row reads Ready (4.1 step 5)"
+        );
     }
 
     /// A minimal own `LocalFrameRow`, `record_own`'d directly (no live

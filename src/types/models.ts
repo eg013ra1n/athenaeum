@@ -2085,9 +2085,22 @@ export type GateFailure = { kind: string, text: string, };
 
 export type OwnFrameRow = { frameId: number, frameUuid: string | null, fileName: string, setId: number | null, setName: string | null, night: string | null, filter: string, filterMapped: boolean, camera: string, exptimeSec: number | null, byteSize: number, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, medianSnr: number | null, 
 /**
- * "ready" | "published" | "held"
+ * "ready" | "review" | "published" | "held"
  */
-segment: string, contributorState: string, contributorReason: string | null, failures: Array<GateFailure>, contentVersion: number | null, pubState: string | null, acceptedReason: string | null, holdersOnline: number | null, holdersTotal: number | null, localState: string | null, publishedAt: string | null, lastError: string | null, 
+segment: string, contributorState: string, contributorReason: string | null, failures: Array<GateFailure>, 
+/**
+ * The calibrated file awaiting review (a prepared frame) or the one that
+ * was published (own row of a calibrated frame); `None` otherwise.
+ */
+calibratedPath: string | null, calibratedBytes: number | null, 
+/**
+ * When the frame was prepared; only for a frame in review.
+ */
+preparedAt: string | null, 
+/**
+ * The member chose "Don't publish" for this frame.
+ */
+withheld: boolean, contentVersion: number | null, pubState: string | null, acceptedReason: string | null, holdersOnline: number | null, holdersTotal: number | null, localState: string | null, publishedAt: string | null, lastError: string | null, 
 /**
  * One entry per threshold rule the gate understood, for the drawer's
  * rule-by-rule section (Task 4, spec 2026-09-29 §4.1) — copied verbatim

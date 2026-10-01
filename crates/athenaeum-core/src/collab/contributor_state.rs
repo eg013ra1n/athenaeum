@@ -68,6 +68,10 @@ pub struct OwnRowFacts<'a> {
     pub reject_reason: Option<&'a str>,
 }
 
+/// `local` carries the on-this-machine review facts (withheld, Black Hole,
+/// a current prepared file); for a frame with no own row they are applied in
+/// the spec 4.1 order: withheld, Black Hole, gate failure, prepared, else
+/// not published. A frame with an own row ignores them.
 /// `current_recipe` is what a publish would compute now (`None` when the
 /// light cannot be resolved); `gate_reason` is the row's first failure.
 pub fn derive(
