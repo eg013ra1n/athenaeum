@@ -5,9 +5,10 @@ import { NotificationProvider } from '../../../contexts/NotificationContext';
 import { ToastStack } from '../../Toast';
 import { api } from '../../../api';
 import type { BlinkViewerProps } from '../../blink/types';
-import type { CollabBlinkEntry, FileWithFrame, OwnFrameRow, ProjectFrameView } from '../../../types/models';
+import type { CollabBlinkEntry, FileWithFrame } from '../../../types/models';
 import { fromLibrary, fromOwn, type FrameVM } from './frames';
 import ProjectBlink from './ProjectBlink';
+import { ownFrameRow as own, projectFrameView as lib } from './testFixtures';
 
 vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
 
@@ -24,28 +25,6 @@ beforeEach(() => {
   vi.mocked(api.listen).mockResolvedValue((() => {}) as never);
 });
 
-function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
-  return {
-    frameId: 1, frameUuid: null, fileName: 'f.fits', setId: null, setName: null, night: '2026-09-29',
-    filter: 'Ha', filterMapped: true, camera: 'ASI2600MM Pro', exptimeSec: 300, byteSize: 42_000_000,
-    fwhmArcsec: 2.4, eccentricity: 0.4, starsDetected: 1200, medianSnr: 18, segment: 'ready',
-    contributorState: 'published', contributorReason: null, failures: [], contentVersion: null,
-    pubState: null, acceptedReason: null, holdersOnline: null, holdersTotal: null, localState: null,
-    publishedAt: null, lastError: null, rules: [], path: '/r/a.fits', accepted: null,
-    calibratedPath: null, calibratedBytes: null, preparedAt: null, withheld: false, ...o,
-  };
-}
-function lib(o: Partial<ProjectFrameView> = {}): ProjectFrameView {
-  return {
-    frameUuid: 'u1', fileName: 'l.fits', publisher: 'Anna', publisherAccountId: 'acc', own: false,
-    filter: 'Ha', exptimeSec: 300, dateObs: null, state: 'published', accepted: true, acceptedReason: null,
-    localState: 'held', onDisk: true, holdersOnline: 1, holdersTotal: 1, waitingForPublisher: false,
-    newVersionWaiting: false, byteSize: 1024, contentVersion: 1, lastError: null, fwhmArcsec: null,
-    eccentricity: null, starsDetected: null, camera: null, telescope: null, night: null, medianSnr: null,
-    contributorState: null, contributorReason: null, receivedAt: null, receivedFromDevice: null,
-    receivedFromMember: 'Anna', ...o,
-  };
-}
 function entry(key: string, source: CollabBlinkEntry['source']): CollabBlinkEntry {
   return {
     key, source, entry: { file: { id: 1, path: '/x.fits' }, frame: null } as unknown as FileWithFrame,
@@ -134,10 +113,13 @@ describe('ProjectBlink', () => {
   });
 
   it('a member in Library is view only, with no actions and a moderator hint', async () => {
-    const vm = fromLibrary(lib(), new Map());
+    const vm = fromLibrary(lib({ receivedFromMember: 'Anna' }), new Map());
     vi.mocked(api.invoke).mockResolvedValueOnce([entry('u1', 'replica')] as never);
     render(tree({ table: 'library', vms: [vm], canModerate: false }));
     await waitFor(() => expect(blink).not.toBeNull());
+    // A replica loads through get_collab_frame_image, by uuid.
+    expect(blink!.frames[0].source).toBe('replica');
+    expect(blink!.frames[0].imageRef).toEqual({ projectId: 'p1', frame: { frameId: null, frameUuid: 'u1' } });
     expect(blink!.viewOnly).toBe(true);
     expect(blink!.actions).toEqual([]);
     const label = blink!.contextLabel!(blink!.frames[0]);

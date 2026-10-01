@@ -651,6 +651,25 @@ describe('MyFramesTab — Blink', () => {
     expect(screen.getByRole('button', { name: 'Blink 1 of 2' })).toBeInTheDocument();
   });
 
+  it.each([
+    ['review', [
+      own({ frameId: 1, fileName: 'a.fits', segment: 'review', calibratedPath: '/c/c_a.fits' }),
+      own({ frameId: 2, fileName: 'b.fits', segment: 'review', calibratedPath: null, path: null }),
+    ]],
+    ['published', [
+      own({ frameId: 1, fileName: 'a.fits', frameUuid: 'u1', segment: 'published', pubState: 'published', localState: 'own_held' }),
+      own({ frameId: 2, fileName: 'b.fits', frameUuid: 'u2', segment: 'published', pubState: 'published', localState: 'own_missing' }),
+    ]],
+    ['held', [
+      own({ frameId: 1, fileName: 'a.fits', segment: 'held', failures: [{ kind: 'solve', text: 'x' }] }),
+      own({ frameId: 2, fileName: 'b.fits', segment: 'held', failures: [{ kind: 'blackHole', text: 'In the Black Hole' }] }),
+    ]],
+  ] as const)('the %s table offers Blink with the eligible-subset label', (segment, rows) => {
+    renderTab({ segment, rows: [...rows] });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    expect(screen.getByRole('button', { name: 'Blink 1 of 2' })).toBeInTheDocument();
+  });
+
   it('a second Blink from another segment while the first resolve is in flight re-resolves with that table', () => {
     vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
       cmd === 'get_collab_blink_frames' ? new Promise(() => {}) : Promise.resolve(null)) as never);
