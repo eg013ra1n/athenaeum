@@ -260,8 +260,12 @@ export default function CollabLiveStatus({
     return () => {
       cancelled = true;
       unlisten?.();
+      // A project change mid-wait drops the wait and what was heard for the
+      // previous project: the new one starts from its own card.
       if (wait.current) clearTimeout(wait.current.timer);
       wait.current = null;
+      setSyncing(false);
+      setHeard(null);
     };
   }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
 

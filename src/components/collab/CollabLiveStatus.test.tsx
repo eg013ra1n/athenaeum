@@ -439,15 +439,15 @@ describe('CollabLiveStatus pill — waits for the hub (spec §6.4)', () => {
     }) as never);
   });
 
-  const renderWait = (props: Record<string, unknown>) =>
-    render(
-      <MemoryRouter>
-        <NotificationProvider>
-          <CollabLiveStatus variant="pill" {...props} />
-          <ToastStack />
-        </NotificationProvider>
-      </MemoryRouter>,
-    );
+  const waitTree = (props: Record<string, unknown>) => (
+    <MemoryRouter>
+      <NotificationProvider>
+        <CollabLiveStatus variant="pill" {...props} />
+        <ToastStack />
+      </NotificationProvider>
+    </MemoryRouter>
+  );
+  const renderWait = (props: Record<string, unknown>) => render(waitTree(props));
 
   it("the click waits for this project's synced report, then calls onSynced", async () => {
     const onSynced = vi.fn();
@@ -574,16 +574,42 @@ describe('CollabLiveStatus pill — waits for the hub (spec §6.4)', () => {
     await waitFor(() => expect(onSynced).toHaveBeenCalledTimes(1));
   });
 
-  it('a failed collab_sync_now ends the wait and notifies Sync now failed', async () => {
+  it('a failed collab_sync_now ends the wait and notifies Sync now failed, and nothing more after the wait time', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
-    vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
-      if (cmd === 'collab_sync_now') throw new Error('not signed in');
-      return base;
-    }) as never);
-    renderWait({ projectId: 'p1', syncedAt: null });
-    fireEvent.click(await screen.findByRole('button', { name: /Live/ }));
-    expect(await screen.findByText('Sync now failed')).toBeInTheDocument();
+    try {
+      vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
+        if (cmd === 'collab_sync_now') throw new Error('not signed in');
+        return base;
+      }) as never);
+      renderWait({ projectId: 'p1', syncedAt: null });
+      fireEvent.click(await screen.findByRole('button', { name: /Live/ }));
+      expect(await screen.findByText('Sync now failed')).toBeInTheDocument();
+      expect(screen.queryByText('Syncing…')).toBeNull();
+      // The wait ended with the failure: its timeout never fires a second notice.
+      await act(async () => {
+        vi.advanceTimersByTime(SYNC_WAIT_MS + 1_000);
+      });
+      expect(screen.queryByText(/Sync did not complete/)).toBeNull();
+      const history = (JSON.parse(localStorage.getItem('athenaeum.notifications.v1') ?? '{"notifications":[]}') as {
+        notifications: { title: string }[];
+      }).notifications.map((n) => n.title);
+      expect(history).toEqual(['Sync now failed']);
+    } finally {
+      vi.useRealTimers();
+      err.mockRestore();
+    }
+  });
+
+  it('a project change mid-wait drops the wait: no Syncing…, and the previous project\'s heard stamp is gone', async () => {
+    const old = new Date(Date.now() - 50_000).toISOString();
+    const { rerender } = renderWait({ projectId: 'p1', syncedAt: old });
+    await waitFor(() => expect(handlers.has('collab-project-synced')).toBe(true));
+    emitEv('collab-project-synced', synced({ syncedAt: new Date().toISOString() }));
+    fireEvent.click(await screen.findByRole('button', { name: /synced [0-2] s ago/ }));
+    expect(await screen.findByText('Syncing…')).toBeInTheDocument();
+    rerender(waitTree({ projectId: 'p2', syncedAt: old }));
     expect(screen.queryByText('Syncing…')).toBeNull();
-    err.mockRestore();
+    expect(screen.getByRole('button', { name: /synced 5\d s ago/ })).toBeEnabled();
   });
 });
