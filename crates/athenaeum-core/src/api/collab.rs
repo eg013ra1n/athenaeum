@@ -4638,6 +4638,14 @@ fn drop_stale_prepared(
     Ok(gone.len())
 }
 
+/// P6: the hub's manifest lists this frame as mine with no local binding (a
+/// replaced device's frame) — an update to adopt, never a New frame.
+fn is_adopt_class(conn: &Connection, project_id: &str, uuid: &str) -> anyhow::Result<bool> {
+    use crate::db::collab_frames::{self as frames_db, FrameOrigin};
+    Ok(frames_db::get(conn, project_id, uuid)?
+        .is_some_and(|r| r.origin == FrameOrigin::Own && r.source_frame_id.is_none()))
+}
+
 /// Plan W3 / review focus 2: frames withheld while a Publish run held them
 /// seeded lose their prepared rows and calibrated files (never an attested
 /// original). The run's own snapshot names the files too, so a file whose
@@ -4756,19 +4764,16 @@ async fn run_publish(
         let conn = db.conn();
         let ids: Vec<i64> = gated.iter().map(|(_, row)| row.frame_id).collect();
         // The section 4.1 local facts: Calibrate and Publish read them;
-        // Republish stays as it was.
-        let reads_local = !matches!(scope, RunScope::Republish { .. });
-        let (mut local, own_by_src) = if reads_local {
-            (
-                Some(ProjectLocal::load(&conn, project_id, &ids)?),
-                frames_db::own_by_source_frame(&conn, project_id).map_err(|e| {
-                    tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
-                    internal(e)
-                })?,
-            )
+        // Republish takes published (and adopt-class) frames only.
+        let mut local = if matches!(scope, RunScope::Republish { .. }) {
+            None
         } else {
-            (None, HashMap::new())
+            Some(ProjectLocal::load(&conn, project_id, &ids)?)
         };
+        let own_by_src = frames_db::own_by_source_frame(&conn, project_id).map_err(|e| {
+            tracing::error!(project_id, error = %format!("{e:#}"), "publish: read own frames failed");
+            internal(e)
+        })?;
         for (id, row) in gated {
             if !row.publishable {
                 // Plan W1: a gate failure is the run's business only when
@@ -4807,9 +4812,8 @@ async fn run_publish(
                     // P6: a frame the hub already lists as mine with no
                     // local binding (a replaced device's) is adopted as an
                     // update, never reviewed — whatever its prepared state.
-                    let adopt_class = match frames_db::get(&conn, project_id, &id.uuid) {
-                        Ok(Some(r)) => r.origin == FrameOrigin::Own && r.source_frame_id.is_none(),
-                        Ok(None) => false,
+                    let adopt_class = match is_adopt_class(&conn, project_id, &id.uuid) {
+                        Ok(a) => a,
                         Err(e) => {
                             tracing::error!(project_id, frame_id = row.frame_id, error = %format!("{e:#}"), "publish: read frame row failed");
                             held_back.push(held(
@@ -4849,6 +4853,34 @@ async fn run_publish(
                                 }
                                 continue;
                             }
+                        }
+                    }
+                }
+                // Ruling R5 (spec P2, P4): Republish never produces a New
+                // frame — a frame with no own row reaches the hub only
+                // through Calibrate → review → Publish, and never while
+                // withheld. Adopt-class frames stay (P6).
+                (RunScope::Republish { .. }, _) if !own_by_src.contains_key(&row.frame_id) => {
+                    match is_adopt_class(&conn, project_id, &id.uuid) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if only.is_some() {
+                                held_back.push(held(
+                                    row.frame_id,
+                                    &row.filename,
+                                    "not published yet — calibrate and publish it first".into(),
+                                ));
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!(project_id, frame_id = row.frame_id, error = %format!("{e:#}"), "publish: read frame row failed");
+                            held_back.push(held(
+                                row.frame_id,
+                                &row.filename,
+                                format!("cannot read the frame's project row: {e:#}"),
+                            ));
+                            continue;
                         }
                     }
                 }
@@ -5140,10 +5172,11 @@ async fn run_publish(
                     continue;
                 }
                 // Spec §4.3: a New frame reaches the hub only from its
-                // prepared file. The candidate read saw an own row or an
-                // adoption; this re-read does not (a manifest sync landed in
-                // between) — the frame waits for a calibrate.
-                (RunScope::Publish { .. }, PublishKind::New)
+                // prepared file (Republish never takes one: ruling R5). The
+                // candidate read saw an own row or an adoption; this re-read
+                // does not (a manifest sync landed in between) — the frame
+                // waits for a calibrate.
+                (RunScope::Publish { .. } | RunScope::Republish { .. }, PublishKind::New)
                     if !from_prepared.contains_key(&fid) =>
                 {
                     tracing::warn!(
@@ -14500,6 +14533,74 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert!(res.held_back.is_empty(), "plan W1: {res:?}");
+        }
+
+        /// Ruling R5 (spec P2, P4): a republish of every frame never
+        /// announces a Ready one — a New frame reaches the hub only through
+        /// Calibrate → review → Publish. An unselected Ready frame is no
+        /// run hold-back either (plan W1).
+        #[tokio::test]
+        async fn republish_all_never_announces_a_ready_frame() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            let first = [fx.frame_ids[0]];
+            calibrate_collab_frames(&fx.ctx, PID, Some(&first), None)
+                .await
+                .unwrap();
+            let res = publish_collab_frames(&fx.ctx, PID, Some(&first), None)
+                .await
+                .unwrap();
+            assert_eq!(res.announced, 1, "{res:?}");
+
+            let res = republish_collab_frames(&fx.ctx, PID, None, None)
+                .await
+                .unwrap();
+            assert_eq!(res.announced, 0, "{res:?}");
+            assert_eq!(res.updated + res.unchanged, 1, "{res:?}");
+            assert!(res.held_back.is_empty(), "plan W1: {res:?}");
+            let bodies = announce_bodies(&fx.server).await;
+            assert!(
+                bodies
+                    .iter()
+                    .flat_map(|b| b["frames"].as_array().unwrap())
+                    .all(|f| f["frameUuid"] != fx.uuids[1].as_str()),
+                "{bodies:?}"
+            );
+            assert!(own_row(&fx, &fx.uuids[1]).is_none());
+            let own = list_project_own_frames(&fx.ctx, PID).unwrap();
+            assert_eq!(
+                own.iter()
+                    .find(|r| r.frame_id == fx.frame_ids[1])
+                    .unwrap()
+                    .segment,
+                "ready"
+            );
+        }
+
+        /// Ruling R5: a never-published frame selected for a republish —
+        /// Ready or prepared alike — is held back with the remedy, and
+        /// nothing is announced; a prepared one stays prepared.
+        #[tokio::test]
+        async fn republish_of_a_selected_unpublished_frame_is_held() {
+            let fx = fixture(2).await;
+            mount_hub(&fx.server, "published").await;
+            calibrate_collab_frames(&fx.ctx, PID, Some(&[fx.frame_ids[0]]), None)
+                .await
+                .unwrap();
+            let res = republish_collab_frames(&fx.ctx, PID, Some(&fx.frame_ids), None)
+                .await
+                .unwrap();
+            assert_eq!((res.announced, res.updated), (0, 0), "{res:?}");
+            assert_eq!(res.held_back.len(), 2, "{res:?}");
+            for h in &res.held_back {
+                assert_eq!(
+                    h.reasons,
+                    vec!["not published yet — calibrate and publish it first".to_string()]
+                );
+            }
+            assert!(announce_bodies(&fx.server).await.is_empty());
+            assert_eq!(project_tag_count(&fx).await, 0);
+            assert_eq!(prepared(&fx).len(), 1, "the prepared frame stays prepared");
         }
 
         /// Plan W4 (Task 8 carry): a cancel that lands after the last
