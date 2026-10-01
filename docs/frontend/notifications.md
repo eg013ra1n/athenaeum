@@ -68,16 +68,18 @@ Spec `docs/superpowers/specs/2026-10-01-collab-publish-review-design.md` §5.4 a
 `collab-publish-finished` in `src/hooks/useCollabNotifications.ts`, mounted once at the app root.
 `usePublishing` no longer notifies run outcomes (F4): it keeps its inline error line, the
 `updateRequired` banner, the A6 refusal box and the busy info toast for refusals returned by the
-command before a run starts.
+command before a run starts. The publish confirm and the republish guard close the moment the user
+confirms, so those refusals show in My frames, never inside a dialog (§16.1 N13).
 
 | Outcome of `collab-publish-finished` | Title | Link |
 | ---- | ---- | ---- |
-| `done`, nothing sent, calibrated > 0 (a calibrate run, or an `auto` run in Auto-calibrate mode, F8) | "Calibrated n frames in {title} — review them" (success; `hasErrors` when frames were held back) | `/projects/{id}?tab=mine&segment=review` |
-| `done`, announced + updated > 0 | "Published n frames in {title}" (detail: n new · m updated, plus held back) | `?tab=mine&segment=published` |
-| `done`, nothing sent or calibrated, held back > 0 | "Nothing new to publish in {title}" (warning) | `?tab=mine&segment=held` |
+| `done`, nothing sent, calibrated > 0 (a calibrate run, or an `auto` run in Auto-calibrate mode, F8) | "Calibrated n frame(s) in {title} — review them" (success; detail: "n held back · m back to Ready" for the non-zero parts; `hasErrors` when frames were held back) | `/projects/{id}?tab=mine&segment=review` |
+| `done`, announced + updated > 0 | "Published n frame(s) in {title}" (detail: n new · m updated, plus held back and back to Ready) | `?tab=mine&segment=published` |
+| `done`, nothing sent or calibrated, held back > 0 | "Nothing new to publish in {title}" (warning; detail: held back, plus back to Ready) | `?tab=mine&segment=held` |
+| `done`, only stale > 0 (frames whose source changed since calibration went back to Ready) | "n frame(s) changed since calibration in {title} — back to Ready" (warning, §16.1 N15) | `?tab=mine&segment=ready` |
 | `done`, all counts zero | silent | none |
 | `cancelled` | "Stopped in {title}" (info, history only: `toast: false`) | `?tab=mine` |
-| `refused` | "{device} publishes {title}" for an A6 refusal (`collab_publishing_device:<name>`, F8), otherwise "Not published in {title}" with the error; toast only for a manual run, history only for an auto run | `?tab=mine` |
+| `refused` | "{Device} publishes {title}" for an A6 refusal (`collab_publishing_device:<name>`, F8; a nameless device reads "Another device of this account publishes {title}"); "Not published in {title}" with "This hub needs a newer Athenaeum — update to publish." for an outdated build (`collab_api_outdated…`), otherwise with the error; toast only for a manual run, history only for an auto run | `?tab=mine` |
 | `failed` | "Publishing failed in {title}" + the error, `hasErrors` | `?tab=mine` |
 
 The `segment` URL parameter is handled like `tab` (applied, then removed from the URL).

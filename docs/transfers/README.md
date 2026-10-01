@@ -279,3 +279,5 @@ shell) now composes six tabs under `src/components/collab/project/` — `GateTab
   after **Sync now** (`syncedAt` restarts the age on each confirmation) and the page reloads on a synced change
   (`syncToken`). **Project Blink** (`ProjectBlink`, from My frames and Library) mounts `BlinkViewer` in project
   mode with caller-supplied actions: no Black Hole, and `Blink N of M` opens only the frames held on this device.
+  The publish confirm and the republish guard close on confirm, so the run panel and its Cancel stay reachable
+  for the whole run; the pill's wait compares server stamps only (§16.1 N13–N15).
