@@ -197,6 +197,30 @@ describe('ReasonGroupAction', () => {
     expect(screen.queryByRole('complementary', { name: 'Frame details' })).toBeNull();
   });
 
+  it('a menu whose picker collapses on a refresh closes itself and frees Escape for the panel', () => {
+    const two = [fromOwn(own({ setId: 10, setName: 'M31' })), fromOwn(own({ setId: 11, setName: 'M42' }))];
+    const one = [fromOwn(own({ setId: 10, setName: 'M31' }))];
+    const panel = vi.fn();
+    const { rerender } = render(
+      <>
+        <SidePanel title="t" label="Frame details" onClose={panel}>kv</SidePanel>
+        <ReasonGroupAction {...baseProps({ kind: 'analyze', rows: two })} />
+      </>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Analyze' }));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    // The rows refresh while the menu is open: one set left, so a plain button.
+    rerender(
+      <>
+        <SidePanel title="t" label="Frame details" onClose={panel}>kv</SidePanel>
+        <ReasonGroupAction {...baseProps({ kind: 'analyze', rows: one })} />
+      </>,
+    );
+    expect(screen.queryByRole('menu')).toBeNull();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(panel).toHaveBeenCalledTimes(1);
+  });
+
   it('an outside mousedown still closes the open menu', () => {
     render(
       <div>

@@ -30,7 +30,7 @@ describe('deriveAttention', () => {
     ] as never;
     const members = [{ accountId: 'a-irina', displayName: 'Irina', online: false, lastSeenAt: '2026-09-28T10:00:00Z' }] as never;
     const off = deriveAttention({ own: [], library, members, canModerate: false, canReceive: true, liveRunning: false, pending: 0, now: NOW })[0];
-    expect(off).toMatchObject({ key: 'missing', tone: 'err', count: 2, title: '2 frames missing here', detail: 'The live exchange is off on this device — they download once it runs.', action: 'Show', target: { kind: 'tab', tab: 'library', state: 'missing' } });
+    expect(off).toMatchObject({ key: 'missing', tone: 'err', count: 2, title: '2 frames missing here', detail: 'This device is not connected to the live exchange — they download once it is.', action: 'Show', target: { kind: 'tab', tab: 'library', state: 'missing' } });
     expect(`${off.title} ${off.detail}`).not.toMatch(/holders|offline/);
     // Running: the same frames blame their offline holders, same count.
     const on = deriveAttention({ own: [], library, members, canModerate: false, canReceive: true, liveRunning: true, pending: 0, now: NOW })[0];

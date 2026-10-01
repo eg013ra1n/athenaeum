@@ -46,12 +46,16 @@ export function UpdateDialog() {
   const [copied, setCopied] = useState(false);
   const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
+  const isAvailable = dialog === 'available';
+  const version = isAvailable ? check?.latestVersion : whatsNew?.version;
+
   // Escape closes the dialog — the download itself is never cancelled (the
   // plugin offers no cancel), but the dialog must never trap the user for
   // its whole duration: reopening from About (or the bell link) restores
-  // live progress from the context. On the overlay stack while open, so one
-  // Escape closes this dialog alone.
-  useOverlayEscape(open, 'dialog', close);
+  // live progress from the context. On the overlay stack only while it
+  // renders (open AND a version to show): an invisible entry would eat the
+  // next Escape meant for the layer below.
+  useOverlayEscape(open && !!version, 'dialog', close);
 
   useEffect(() => {
     return () => {
@@ -61,8 +65,6 @@ export function UpdateDialog() {
 
   if (!open) return null;
 
-  const isAvailable = dialog === 'available';
-  const version = isAvailable ? check?.latestVersion : whatsNew?.version;
   const notes = isAvailable ? check?.notes : whatsNew?.notes;
   const blogUrl = isAvailable ? check?.blogUrl : whatsNew?.blogUrl;
   if (!version) return null;

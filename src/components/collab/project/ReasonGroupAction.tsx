@@ -54,6 +54,12 @@ export default function ReasonGroupAction({
   // Escape goes through the overlay stack as a popover: over a docked side
   // panel it closes the menu alone.
   useOverlayEscape(menuFor !== null, 'popover', () => setMenuFor(null));
+  // If the rows refresh while a menu is open and its picker collapses to a
+  // single button (or vanishes), nothing renders for `menuFor` any more:
+  // close it, so no invisible popover holds the stack or swallows Escape.
+  useEffect(() => {
+    if (menuFor !== null && !menuRef.current) setMenuFor(null);
+  });
   useEffect(() => {
     if (!menuFor) return;
     const onPointerDown = (e: MouseEvent) => {

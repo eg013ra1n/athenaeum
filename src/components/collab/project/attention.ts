@@ -107,7 +107,7 @@ export function deriveAttention({ own, library, members, canModerate, canReceive
     const frames = `${missing.length} ${plural(missing.length, 'frame', 'frames')} missing here`;
     const target: AttentionTarget = { kind: 'tab', tab: 'library', state: 'missing' };
     if (!liveRunning) {
-      out.push({ key: 'missing', tone: 'err', count: missing.length, title: frames, detail: 'The live exchange is off on this device — they download once it runs.', action: 'Show', target });
+      out.push({ key: 'missing', tone: 'err', count: missing.length, title: frames, detail: 'This device is not connected to the live exchange — they download once it is.', action: 'Show', target });
     } else {
       const offline = [...new Set(missing.map((f) => f.publisherAccountId))]
         .map((id) => members.find((m) => m.accountId === id))

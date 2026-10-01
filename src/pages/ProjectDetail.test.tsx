@@ -1185,7 +1185,7 @@ describe('ProjectDetail fix round 1', () => {
     renderProjectDetail();
     const attention = (await screen.findByRole('heading', { name: 'Needs attention' })).closest('section')!;
     expect(await within(attention).findByText('1 frame missing here')).toBeInTheDocument();
-    expect(within(attention).getByText(/The live exchange is off on this device/)).toBeInTheDocument();
+    expect(within(attention).getByText(/This device is not connected to the live exchange/)).toBeInTheDocument();
     expect(within(attention).queryByText(/holders are offline/)).toBeNull();
 
     fire('collab-live-status', status('live'));
