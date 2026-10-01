@@ -246,16 +246,16 @@ pub async fn set_project_auto_replicate(
         .map_err(|e| e.to_string())
 }
 
-/// Collab v3 wave 2 Task 10 (R16, P13): turn this project's coalesced
-/// auto-publish on or off (local preference — the hub never learns of it).
+/// Spec 2026-10-01 P3: set this project's publishing mode (local preference —
+/// the hub never learns of it).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn set_project_auto_publish(
+pub async fn set_project_publish_mode(
     state: State<'_, AppState>,
     project_id: String,
-    enabled: bool,
+    mode: athenaeum_core::db::collab::PublishMode,
 ) -> Result<(), String> {
-    api::set_project_auto_publish(&state.ctx, &project_id, enabled)
+    api::set_project_publish_mode(&state.ctx, &project_id, mode)
         .await
         .map_err(|e| e.to_string())
 }

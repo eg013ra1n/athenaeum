@@ -513,7 +513,7 @@ pub fn run() {
             commands::get_collab_exchange,
             commands::list_collab_receive_sessions,
             commands::set_project_auto_replicate,
-            commands::set_project_auto_publish,
+            commands::set_project_publish_mode,
             commands::set_collab_publishing_device,
             commands::get_collab_policy,
             commands::set_collab_policy,

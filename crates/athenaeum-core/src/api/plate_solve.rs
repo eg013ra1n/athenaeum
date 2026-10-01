@@ -11,7 +11,7 @@ use crate::services::ServiceContext;
 /// plate-solve batch is a free-form list of frame ids (not scoped to one
 /// frame set), so mapping it cheaply to "which linked projects care" isn't
 /// worth it here — this dirties every auto-publish-enabled project instead
-/// (the worker's `auto_publish = 1` + linked-set filter still applies, and a
+/// (the worker's non-Manual-mode + linked-set filter still applies, and a
 /// run with nothing new to generate is cheap — Task 7).
 pub fn on_batch_finished(_ctx: &ServiceContext) {
     crate::api::collab_autopublish::request_auto_publish(None);

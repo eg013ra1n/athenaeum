@@ -213,7 +213,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::account::AccountStatus,
             crate::api::collab::PublishingDeviceView,
             crate::db::collab::PublishMode,
-        crate::api::collab::ProjectCard,
+            crate::api::collab::ProjectCard,
             crate::api::collab::ProjectDetail,
             crate::api::collab::ProjectMemberView,
             crate::api::collab::LinkedSetView,

@@ -157,10 +157,10 @@ pub struct ProjectCard {
     /// D3 §3.3: this device auto-downloads the project's published contributions
     /// (default ON). Local preference — `set_project_auto_replicate` writes it.
     pub auto_replicate: bool,
-    /// Collab v3 wave 2 Task 10 (R16, P13): this device coalesces and
-    /// auto-publishes its own passing frames on scan/analysis/solve/link/
-    /// threshold changes (default ON). Local preference —
-    /// `set_project_auto_publish` writes it.
+    /// Collab v3 wave 2 Task 10 (R16, P13): the publishing mode. A mode other
+    /// than Manual coalesces and runs this device's own passing frames on
+    /// scan/analysis/solve/link/threshold changes (default Manual). Local
+    /// preference — `set_project_publish_mode` writes it.
     pub publish_mode: crate::db::collab::PublishMode,
     pub fetched_at: String,
     /// Amendment A6: the one device of this account that may announce new
@@ -698,28 +698,25 @@ pub fn unlink_frame_set(
     Ok(())
 }
 
-/// Set one project's auto-publish preference (P13, R16): whether a coalesced
-/// publish run fires for this project on scan/analysis/solve/link/master/
-/// calibration-link triggers. Local-only, like `set_project_auto_replicate`
-/// (`api::collab_exchange`) — the hub never learns of it, and `NotFound` when
-/// the project isn't cached or lost (R14; a toggle for a project this device
-/// doesn't know about, or was removed from, is a caller bug, not a silent
-/// no-op).
-pub async fn set_project_auto_publish(
+/// Spec 2026-10-01 P3/§4.6: the project's publishing mode (local only, like
+/// `set_project_auto_replicate`; the hub never learns of it). A non-manual
+/// mode dirties the project so the worker runs after its debounce. `NotFound`
+/// when the project isn't cached or lost (R14).
+pub async fn set_project_publish_mode(
     ctx: &ServiceContext,
     project_id: &str,
-    on: bool,
+    mode: crate::db::collab::PublishMode,
 ) -> Result<(), ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    crate::api::collab_exchange::live_project(&conn, project_id)?;
-    let mode = if on {
-        crate::db::collab::PublishMode::Automatic
-    } else {
-        crate::db::collab::PublishMode::Manual
-    };
-    crate::db::collab::set_publish_mode(&conn, project_id, mode).map_err(internal)?;
-    tracing::info!(project_id, on, "collab auto-publish toggled");
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::api::collab_exchange::live_project(&conn, project_id)?;
+        crate::db::collab::set_publish_mode(&conn, project_id, mode).map_err(internal)?;
+    }
+    tracing::info!(project_id, mode = mode.as_db(), "collab publish mode set");
+    if mode != crate::db::collab::PublishMode::Manual {
+        crate::api::collab_autopublish::request_auto_publish(Some(project_id));
+    }
     Ok(())
 }
 
@@ -2166,7 +2163,7 @@ async fn fetch_one_project(
         dictionary_json: None,
         policy_json: r#"{"mode":"all"}"#.into(),
         replication_paused: false,
-        publish_mode: crate::db::collab::PublishMode::Automatic,
+        publish_mode: crate::db::collab::PublishMode::Manual,
         fetched_at: String::new(), // filled by SQL
         feed_epoch: None,
         holder_seq: -1,
@@ -6177,6 +6174,42 @@ pub(crate) mod tests {
     /// writes them, so a wholesale poll refresh can never clobber the hub's
     /// dictionary cursor) — so the explicit call below is what actually seeds
     /// the dictionary this fixture's doc comment promises.
+    #[tokio::test]
+    async fn set_project_publish_mode_stores_and_dirties_only_for_auto_modes() {
+        let _guard = crate::api::collab_autopublish::test_lock();
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+        }
+        crate::api::collab_autopublish::reset_dirty_state_for_test();
+        set_project_publish_mode(&ctx, "p-1", crate::db::collab::PublishMode::Manual)
+            .await
+            .unwrap();
+        assert!(
+            !crate::api::collab_autopublish::is_dirty_for_test("p-1"),
+            "manual never dirties"
+        );
+        set_project_publish_mode(&ctx, "p-1", crate::db::collab::PublishMode::Automatic)
+            .await
+            .unwrap();
+        assert!(crate::api::collab_autopublish::is_dirty_for_test("p-1"));
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        let p = crate::db::collab::get_project(&conn, "p-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.publish_mode, crate::db::collab::PublishMode::Automatic);
+    }
+
+    #[tokio::test]
+    async fn set_project_publish_mode_refuses_an_unknown_project() {
+        let (_tmp, ctx) = test_ctx();
+        let err = set_project_publish_mode(&ctx, "nope", crate::db::collab::PublishMode::Automatic)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+    }
+
     fn cached_project(conn: &rusqlite::Connection) {
         crate::db::collab::upsert_project(
             conn,

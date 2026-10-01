@@ -1558,10 +1558,10 @@ canModerate: boolean, requireApproval: boolean, pendingFrames: number, projectSt
  */
 autoReplicate: boolean, 
 /**
- * Collab v3 wave 2 Task 10 (R16, P13): this device coalesces and
- * auto-publishes its own passing frames on scan/analysis/solve/link/
- * threshold changes (default ON). Local preference —
- * `set_project_auto_publish` writes it.
+ * Collab v3 wave 2 Task 10 (R16, P13): the publishing mode. A mode other
+ * than Manual coalesces and runs this device's own passing frames on
+ * scan/analysis/solve/link/threshold changes (default Manual). Local
+ * preference — `set_project_publish_mode` writes it.
  */
 publishMode: PublishMode, fetchedAt: string, 
 /**

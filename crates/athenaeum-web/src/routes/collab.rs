@@ -81,9 +81,9 @@ pub struct AutoReplicateArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AutoPublishArgs {
+pub struct PublishModeArgs {
     project_id: String,
-    enabled: bool,
+    mode: athenaeum_core::db::collab::PublishMode,
 }
 
 #[derive(Deserialize)]
@@ -435,14 +435,14 @@ pub async fn set_project_auto_replicate(
         .map_err(api_err)
 }
 
-/// Collab v3 wave 2 Task 10 (R16, P13): turn this project's coalesced
-/// auto-publish on or off (local preference — the hub never learns of it).
+/// Spec 2026-10-01 P3: set this project's publishing mode (local preference —
+/// the hub never learns of it).
 #[tracing::instrument(skip_all, err(Debug))]
-pub async fn set_project_auto_publish(
+pub async fn set_project_publish_mode(
     State(state): State<WebAppState>,
-    Json(args): Json<AutoPublishArgs>,
+    Json(args): Json<PublishModeArgs>,
 ) -> Result<Json<()>, (axum::http::StatusCode, String)> {
-    api::set_project_auto_publish(&state.ctx, &args.project_id, args.enabled)
+    api::set_project_publish_mode(&state.ctx, &args.project_id, args.mode)
         .await
         .map(Json)
         .map_err(api_err)

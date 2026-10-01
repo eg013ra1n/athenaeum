@@ -1,6 +1,6 @@
 //! Coalesced auto-publish per project (collab v3 wave 2, Task 10; R16, §5.2
-//! triggers; P13 — `collab_projects.auto_publish` is a LOCAL preference,
-//! default ON, never overwritten by a hub refresh).
+//! triggers; P13 — `collab_projects.publish_mode` is a LOCAL preference,
+//! default Manual, never overwritten by a hub refresh).
 //!
 //! One debounced, re-armed publish run per process: scan completion,
 //! analysis completion, a plate-solve batch, a frame-set link, a master
@@ -9,7 +9,7 @@
 //! project") dirty and kick the worker. The worker waits for a kick, debounces
 //! [`AUTO_PUBLISH_DEBOUNCE`] (so a scan and its immediately-following
 //! analysis coalesce into one run), drains the dirty state into the
-//! `auto_publish = 1` projects that have at least one linked set, and runs
+//! projects whose publish mode is not Manual and that have at least one linked set, and runs
 //! [`crate::api::collab::auto_publish_collab_frames`] for each, SEQUENTIALLY
 //! (the compute queue already serializes the heavy part). A project with a
 //! publish run in progress right then (a manual one) is NOT run in parallel:
@@ -58,7 +58,7 @@ static DIRTY_SETS: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
 
 /// Set by [`request_auto_publish(None)`] — a trigger too broad to cheaply map
 /// to specific sets (a scan, a plate-solve batch, a whole-camera calibration
-/// refresh). Drains to every project with `auto_publish = 1` and a linked
+/// refresh). Drains to every project with a non-Manual publish mode and a linked
 /// set, same filter as everything else.
 static ALL_DIRTY: AtomicBool = AtomicBool::new(false);
 
@@ -91,6 +91,22 @@ pub fn request_auto_publish(project_id: Option<&str>) {
         None => ALL_DIRTY.store(true, Ordering::SeqCst),
     }
     kick().notify_one();
+}
+
+/// Serializes tests that touch the process-global dirty statics (also used by
+/// `api::collab` tests).
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Clears the global dirty state (see the tests' `reset_dirty_state`).
+#[cfg(test)]
+pub(crate) fn reset_dirty_state_for_test() {
+    ALL_DIRTY.store(false, Ordering::SeqCst);
+    dirty().lock().unwrap().clear();
+    dirty_sets().lock().unwrap().clear();
 }
 
 /// Test-only peek at [`DIRTY`] that does NOT drain it (unlike
@@ -135,7 +151,7 @@ pub fn request_auto_publish_for_scan(_root_id: i64) {
 /// Drain the dirty state into a de-duplicated, gate-filtered project id list
 /// (worker step 3): resolves [`DIRTY_SETS`] to their linked projects, adds
 /// every cached project when [`ALL_DIRTY`] was set, unions with [`DIRTY`],
-/// then keeps only `auto_publish = 1` projects with at least one linked set.
+/// then keeps only non-Manual-mode projects with at least one linked set.
 /// A DB failure logs a `warn!` and yields an empty list for that half of the
 /// drain rather than panicking the worker.
 fn drain_due_projects(ctx: &ServiceContext) -> Vec<String> {
@@ -330,7 +346,7 @@ async fn run_publish_pass<F, Fut>(
 
 /// Whether a publish error is the A6 publishing-device refusal
 /// (`collab_publishing_device:<name>`).
-fn is_publishing_device_refusal(msg: &str) -> bool {
+pub(crate) fn is_publishing_device_refusal(msg: &str) -> bool {
     msg.starts_with(&format!(
         "{}:",
         crate::account::client::COLLAB_PUBLISHING_DEVICE
@@ -406,13 +422,7 @@ mod tests {
     /// `collab_exchange`'s `PKG_CHANGE_DRAIN_LOCK`). The loop-timing tests
     /// below use their own private `Notify` and never touch these statics,
     /// so they need no lock.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
     use crate::db::collab::PublishMode;
-
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
         let tmp = tempfile::tempdir().unwrap();
@@ -497,26 +507,31 @@ mod tests {
     }
 
     #[test]
-    fn auto_publish_off_is_skipped() {
+    fn manual_projects_are_never_due_and_auto_modes_are() {
         let _guard = test_lock();
         reset_dirty_state();
         let (_tmp, ctx) = test_ctx();
         let conn = crate::api::db(&ctx).unwrap().conn();
         conn.execute("INSERT INTO frames_set (id, name) VALUES (7, 'S')", [])
             .unwrap();
-        insert_project(&conn, "p-off", PublishMode::Manual);
-        crate::db::collab::link_set(&conn, "p-off", 7).unwrap();
+        for (id, mode) in [
+            ("p-man", PublishMode::Manual),
+            ("p-cal", PublishMode::AutoCalibrate),
+            ("p-auto", PublishMode::Automatic),
+        ] {
+            insert_project(&conn, id, mode);
+            crate::db::collab::link_set(&conn, id, 7).unwrap();
+        }
         drop(conn);
-
-        request_auto_publish(Some("p-off"));
-        assert!(
-            drain_due_projects(&ctx).is_empty(),
-            "a Manual project is never due"
+        request_auto_publish(None);
+        assert_eq!(
+            drain_due_projects(&ctx),
+            vec!["p-auto".to_string(), "p-cal".to_string()]
         );
     }
 
     /// A project with no linked set is never due either, even with
-    /// `auto_publish = 1` — nothing to publish.
+    /// a non-Manual publish mode — nothing to publish.
     #[test]
     fn unlinked_project_is_skipped() {
         let _guard = test_lock();
