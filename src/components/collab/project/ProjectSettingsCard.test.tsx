@@ -1,7 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../../../api';
 import { NotificationProvider } from '../../../contexts/NotificationContext';
+import { ToastStack } from '../../Toast';
 import ProjectSettingsCard from './ProjectSettingsCard';
 import { projectCard } from './testFixtures';
 import { formatTimestamp } from '../../../utils/dateFormatting';
@@ -18,11 +20,24 @@ const card = (o: Partial<ProjectCard> = {}): ProjectCard =>
 const idle: PublishRunState = { running: null, last: null, reached: -1, cancel: vi.fn(), cancelBusy: false };
 const renderCard = (o: Partial<Parameters<typeof ProjectSettingsCard>[0]> = {}) =>
   render(
-    <NotificationProvider>
-      <ProjectSettingsCard card={card()} canReceive run={idle} liveState="live" onChanged={vi.fn()}
-        onSwitchHere={vi.fn()} switchBusy={false} onOpenMyFrames={vi.fn()} {...o} />
-    </NotificationProvider>,
+    <MemoryRouter>
+      <NotificationProvider>
+        <ProjectSettingsCard card={card()} canReceive run={idle} liveState="live" onChanged={vi.fn()}
+          onSwitchHere={vi.fn()} switchBusy={false} onOpenMyFrames={vi.fn()} {...o} />
+        <ToastStack />
+      </NotificationProvider>
+    </MemoryRouter>,
   );
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+const MODE_NAMES = ['Manual', 'Auto-calibrate', 'Fully automatic'];
 
 describe('ProjectSettingsCard', () => {
   beforeEach(() => vi.mocked(api.invoke).mockReset());
@@ -32,7 +47,10 @@ describe('ProjectSettingsCard', () => {
     expect(screen.getByText(/This device · Mac Studio/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Manual', pressed: true })).toBeInTheDocument();
     expect(screen.getByText(/Nothing runs on its own/)).toBeInTheDocument();
-    expect(screen.getByRole('switch', { name: 'On' })).toBeChecked();
+    expect(screen.getByRole('group', { name: 'Publishing mode' })).toBeInTheDocument();
+    // Named by what it controls; the visible label still reads On/Off.
+    expect(screen.getByRole('switch', { name: 'Auto-replicate' })).toBeChecked();
+    expect(screen.getByText('On')).toBeInTheDocument();
   });
 
   it('a mode click commits set_project_publish_mode then re-reads the card', async () => {
@@ -50,8 +68,52 @@ describe('ProjectSettingsCard', () => {
     renderCard();
     fireEvent.click(screen.getByRole('button', { name: 'Fully automatic' }));
     await waitFor(() => expect(err).toHaveBeenCalled());
+    expect(await screen.findByRole('status')).toHaveTextContent('Could not change the publishing mode');
     expect(screen.getByRole('button', { name: 'Manual', pressed: true })).toBeInTheDocument();
     err.mockRestore();
+  });
+
+  it('the mode control and the switch are disabled while a write is in flight', async () => {
+    const write = deferred<void>();
+    vi.mocked(api.invoke).mockReturnValueOnce(write.promise as never);
+    renderCard();
+    fireEvent.click(screen.getByRole('button', { name: 'Auto-calibrate' }));
+    for (const name of MODE_NAMES) expect(screen.getByRole('button', { name })).toBeDisabled();
+    expect(screen.getByRole('group', { name: 'Publishing mode' }).className).toContain('opacity-60');
+    expect(screen.getByRole('switch', { name: 'Auto-replicate' })).toBeDisabled();
+    await act(async () => { write.resolve(); });
+    for (const name of MODE_NAMES) expect(screen.getByRole('button', { name })).toBeEnabled();
+    expect(screen.getByRole('switch', { name: 'Auto-replicate' })).toBeEnabled();
+  });
+
+  it('a failed auto-replicate write logs, notifies and keeps the stored value', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onChanged = vi.fn();
+    vi.mocked(api.invoke).mockRejectedValueOnce(new Error('nope'));
+    renderCard({ onChanged });
+    fireEvent.click(screen.getByRole('switch', { name: 'Auto-replicate' }));
+    expect(api.invoke).toHaveBeenCalledWith('set_project_auto_replicate', { projectId: 'p1', enabled: false });
+    expect(await screen.findByRole('status')).toHaveTextContent('Could not change auto-replicate');
+    expect(err).toHaveBeenCalled();
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(screen.getByRole('switch', { name: 'Auto-replicate' })).toBeChecked();
+    err.mockRestore();
+  });
+
+  it('Publish from this device is disabled while the switch is busy', () => {
+    renderCard({ card: card({ publishingHere: false, publishingDevice: { deviceId: 'd2', name: 'Observatory' } }), switchBusy: true });
+    expect(screen.getByRole('button', { name: 'Publish from this device' })).toBeDisabled();
+  });
+
+  it.each([
+    ['cancelled', null, 'text-warning'],
+    ['failed', 'disk full', 'text-error'],
+  ] as const)('a %s last run is coloured by its tone', (outcome, error, cls) => {
+    renderCard({ run: { ...idle, last: { projectId: 'p1', publishRunId: 'r', kind: 'publish', trigger: 'manual', outcome,
+      calibrated: 0, announced: 0, updated: 0, stale: 0, heldBack: 0, error, startedAt: '2026-10-02T10:00:00Z',
+      finishedAt: '2026-10-02T10:03:22Z' } } });
+    const text = outcome === 'cancelled' ? 'Stopped' : 'Failed — disk full';
+    expect(screen.getByText(text).className).toContain(cls);
   });
 
   it('another device publishing shows Publish from this device', async () => {

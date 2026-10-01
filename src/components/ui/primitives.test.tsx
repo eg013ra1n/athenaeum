@@ -58,6 +58,22 @@ describe('ui primitives', () => {
     expect(onTile).toHaveBeenCalledWith('held');
     expect(screen.getByRole('button', { name: /136 Ready to publish/ })).toHaveAttribute('aria-pressed', 'true');
   });
+  it('Seg with ariaLabel is a named group; disabled disables every option and dims', () => {
+    const onSeg = vi.fn();
+    render(<Seg ariaLabel="Mode" disabled options={[{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }]} value="a" onChange={onSeg} />);
+    const group = screen.getByRole('group', { name: 'Mode' });
+    expect(group.className).toContain('opacity-60');
+    expect(screen.getByRole('button', { name: 'A' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'B' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'B' }));
+    expect(onSeg).not.toHaveBeenCalled();
+  });
+  it('Seg without ariaLabel or disabled stays a plain enabled strip', () => {
+    render(<Seg options={[{ value: 'a', label: 'A' }]} value="a" onChange={vi.fn()} />);
+    expect(screen.queryByRole('group')).toBeNull();
+    expect(screen.getByRole('button', { name: 'A' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'A' }).parentElement!.className).not.toContain('opacity-60');
+  });
   it('SegmentTiles renders a tile sub-label under its label', () => {
     render(<SegmentTiles tiles={[{ value: 'review', n: 2, label: 'To review', tone: 'purple', sub: '1h 00m · 1 night' }]} value="review" onChange={vi.fn()} />);
     expect(screen.getByText('1h 00m · 1 night')).toBeInTheDocument();

@@ -22,6 +22,12 @@ describe('Checkbox', () => {
     expect(screen.getByTestId('cb-box').className).toContain('h-[13px]');
   });
 
+  it('ariaLabel names the control over its visible label', () => {
+    render(<Checkbox checked role="switch" onChange={() => {}} label="On" ariaLabel="Auto-replicate" />);
+    expect(screen.getByRole('switch', { name: 'Auto-replicate' })).toBeChecked();
+    expect(screen.getByText('On')).toBeInTheDocument();
+  });
+
   it('draws the 13px box and a tick only when checked', () => {
     const { rerender } = render(<Checkbox checked={false} onChange={() => {}} label="Auto check" />);
     const box = screen.getByTestId('cb-box');

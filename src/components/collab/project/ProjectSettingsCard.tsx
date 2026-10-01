@@ -102,6 +102,8 @@ export default function ProjectSettingsCard({
         <div className="border-t border-line py-2.5">
           <h3 className={HEADING}>Publishing</h3>
           <Seg
+            ariaLabel="Publishing mode"
+            disabled={busy !== null}
             options={MODES.map((m) => ({ value: m.value, label: m.label }))}
             value={card.publishMode}
             onChange={(v) => {
@@ -142,6 +144,7 @@ export default function ProjectSettingsCard({
             <h3 className={HEADING}>Auto-replicate</h3>
             <Checkbox
               role="switch"
+              ariaLabel="Auto-replicate"
               checked={card.autoReplicate}
               disabled={busy !== null}
               label={card.autoReplicate ? 'On' : 'Off'}
@@ -158,12 +161,18 @@ export default function ProjectSettingsCard({
   );
 }
 
+const TONE_CLASS: Record<ReturnType<typeof describeLastRun>['tone'], string> = {
+  ok: 'text-content',
+  warn: 'text-warning',
+  error: 'text-error',
+};
+
 function LastRunLine({ last }: { last: NonNullable<PublishRunState['last']> }) {
   const d = describeLastRun(last);
   return (
     <span>
       Last run ·{' '}
-      <b className={d.tone === 'error' ? 'font-semibold text-error' : 'font-semibold text-content'}>{d.text}</b>
+      <b className={`font-semibold ${TONE_CLASS[d.tone]}`}>{d.text}</b>
       {' · '}
       {formatTimestamp(last.finishedAt, { seconds: true })} · {last.trigger}
     </span>

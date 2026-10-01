@@ -1850,7 +1850,7 @@ describe('ProjectDetail page shell (wave 5.5)', () => {
     renderPage({ publishingHere: true, publishingDevice: { deviceId: 'dev-me', name: 'Laptop' } });
     expect(await screen.findByText(/This device · Laptop/)).toBeInTheDocument();
     expect(screen.queryByText(/Publishing from/)).toBeNull();
-    fireEvent.click(settingsCard().getByRole('switch', { name: 'On' }));
+    fireEvent.click(settingsCard().getByRole('switch', { name: 'Auto-replicate' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('set_project_auto_replicate', { projectId: 'proj-1', enabled: false }),
     );

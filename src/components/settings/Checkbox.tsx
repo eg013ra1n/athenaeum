@@ -23,9 +23,12 @@ export interface CheckboxProps {
   /** ARIA role — `switch` for an on/off toggle (`SwitchRow`, `SettingToggle`),
    *  `checkbox` (default) for a plain boolean option. */
   role?: 'checkbox' | 'switch';
+  /** Accessible name that overrides the visible label (e.g. a switch whose
+   *  label reads "On"/"Off" but which is named by what it controls). */
+  ariaLabel?: string;
 }
 
-export function Checkbox({ checked, onChange, label, description, disabled, size = 'md', role = 'checkbox' }: CheckboxProps) {
+export function Checkbox({ checked, onChange, label, description, disabled, size = 'md', role = 'checkbox', ariaLabel }: CheckboxProps) {
   const labelFont = size === 'sm' ? 'text-[12px] leading-4' : 'text-sm';
   // Centre the 13px box on the first label line: md = 20px line -> 3.5px, sm = 16px line -> 1.5px.
   const boxMargin = size === 'sm' ? 'mt-[1.5px]' : 'mt-[3.5px]';
@@ -34,6 +37,7 @@ export function Checkbox({ checked, onChange, label, description, disabled, size
       <input
         type="checkbox"
         role={role}
+        aria-label={ariaLabel}
         checked={checked}
         disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
