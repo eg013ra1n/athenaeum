@@ -61,7 +61,7 @@ notify({
 - Timestamps: `formatTimestamp` from `src/utils/dateFormatting.ts`
   (`YYYY-MM-DD HH:MM`). Don't re-implement.
 
-## Collab publishing and sync (2026-10-02)
+## Collab publishing and sync (2026-10-01)
 
 Spec `docs/superpowers/specs/2026-10-01-collab-publish-review-design.md` §5.4 and §16.1.
 `collab-published` is retired; a started publish-family run is notified in **one** place,
