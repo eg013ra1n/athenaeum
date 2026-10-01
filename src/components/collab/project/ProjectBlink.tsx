@@ -16,7 +16,7 @@ interface Row { e: CollabBlinkEntry; ref: CollabFrameRef; vmKey: string }
 /** Spec 2026-10-01 §9 — Blink over a project table's selection, with the role's actions.
  *  Mount one per open: Blink snapshots its frames at mount, so the viewer is rendered
  *  only after the entries resolved. */
-export default function ProjectBlink({ projectId, table, vms, lookup, canModerate, onClose, onChanged }: {
+export default function ProjectBlink({ projectId, table, vms, lookup, canModerate, onClose, onChanged, onExcluded }: {
   projectId: string;
   table: BlinkTable;
   vms: FrameVM[]; // the rows the Blink action ran on
@@ -24,6 +24,8 @@ export default function ProjectBlink({ projectId, table, vms, lookup, canModerat
   canModerate: boolean;
   onClose: () => void;
   onChanged: () => void;
+  /** A finished Exclude; defaults to `onChanged` (My frames re-reads the Library too). */
+  onExcluded?: () => void;
 }): JSX.Element {
   const { notify } = useNotifications();
   const [rows, setRows] = useState<Row[] | null>(null);
@@ -155,7 +157,7 @@ export default function ProjectBlink({ projectId, table, vms, lookup, canModerat
       )}
       {withhold.dialog}
       {excluding && (
-        <ExcludeDialog projectId={projectId} frames={excluding} onClose={() => setExcluding(null)} onDone={() => onChanged()} />
+        <ExcludeDialog projectId={projectId} frames={excluding} onClose={() => setExcluding(null)} onDone={() => (onExcluded ?? onChanged)()} />
       )}
     </>
   );

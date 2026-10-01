@@ -50,6 +50,9 @@ export interface MyFramesTabProps {
   calibrateError: string | null;
   /** Plan F1: publish these already-published frames' update with no confirm. */
   onUpdate: (frameIds: number[]) => void;
+  /** A finished Exclude (the Published table's or Blink's): the shell re-reads
+   *  own frames AND the Library rows, which show the exclusion too. */
+  onExcluded: () => void;
 }
 
 const TILE_LABEL: Record<Segment, string> = {
@@ -73,6 +76,7 @@ export default function MyFramesTab({
   projectId, rows, error, links, segment, onSegment, onReload, onDetailReload,
   onRequestPublish, publishBusy, onRequestRepublish, republishBusy, canRepublish, canModerate,
   republishError, refusal, onOpen, activeKey = null, run, onCalibrate, calibrateBusy, calibrateError, onUpdate,
+  onExcluded,
 }: MyFramesTabProps): JSX.Element {
   const navigate = useNavigate();
   const { notify } = useNotifications();
@@ -491,7 +495,7 @@ export default function MyFramesTab({
           projectId={projectId}
           frames={excluding}
           onClose={() => setExcluding(null)}
-          onDone={() => onReload()}
+          onDone={() => onExcluded()}
         />
       )}
 
@@ -505,6 +509,7 @@ export default function MyFramesTab({
           canModerate={canModerate}
           onClose={() => setBlinking(null)}
           onChanged={onReload}
+          onExcluded={onExcluded}
         />
       )}
     </div>

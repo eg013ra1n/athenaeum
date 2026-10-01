@@ -166,6 +166,23 @@ describe('ProjectBlink', () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
   });
 
+  it('a finished Exclude reports through onExcluded when given, not onChanged', async () => {
+    const vm = fromOwn(own({ frameId: 1, frameUuid: 'u1', segment: 'published', pubState: 'published', localState: 'own_held' }));
+    const onChanged = vi.fn();
+    const onExcluded = vi.fn();
+    vi.mocked(api.invoke).mockImplementation((async (cmd: string) => {
+      if (cmd === 'get_collab_blink_frames') return [entry('f1', 'calibrated')];
+      return null;
+    }) as never);
+    render(tree({ table: 'published', vms: [vm], canModerate: true, onChanged, onExcluded }));
+    await waitFor(() => expect(blink).not.toBeNull());
+    act(() => { void blink!.actions!.find((a) => a.id === 'exclude')!.run([blink!.frames[0]]); });
+    fireEvent.change(await screen.findByRole('textbox'), { target: { value: 'bad tracking' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude' }));
+    await waitFor(() => expect(onExcluded).toHaveBeenCalledTimes(1));
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+
   it('an entry whose key matches no requested frame is dropped and logged as a contract break', async () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.mocked(api.invoke).mockResolvedValueOnce([entry('f1', 'calibrated'), entry('f99', 'raw')] as never);

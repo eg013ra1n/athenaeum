@@ -12,6 +12,19 @@ vi.mock('../../../api', () => ({
   api: { invoke: vi.fn(), listen: vi.fn() },
 }));
 
+/** The props of the last `ProjectBlink` mounted — the real one still renders. */
+let blinkProps: Record<string, unknown> | null = null;
+vi.mock('./ProjectBlink', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./ProjectBlink')>();
+  const Real = real.default;
+  return {
+    default: (p: React.ComponentProps<typeof Real>) => {
+      blinkProps = p as unknown as Record<string, unknown>;
+      return <Real {...p} />;
+    },
+  };
+});
+
 afterEach(cleanup);
 
 function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
@@ -93,6 +106,7 @@ function defaultProps(overrides: Partial<MyFramesTabProps> = {}): MyFramesTabPro
     calibrateBusy: false,
     calibrateError: null,
     onUpdate: vi.fn(),
+    onExcluded: vi.fn(),
     ...overrides,
   };
 }
@@ -503,6 +517,28 @@ describe('MyFramesTab — Published', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
     fireEvent.click(screen.getByRole('button', { name: 'Exclude 2 of 3' }));
     expect(screen.getByText('Exclude 2 frames from the project')).toBeInTheDocument();
+  });
+
+  it('8c. a finished Exclude calls onExcluded (own frames and the Library re-read)', async () => {
+    const onExcluded = vi.fn();
+    const onReload = vi.fn();
+    renderTab({ rows: exclusionFixture, segment: 'published', canModerate: true, onExcluded, onReload });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude 2 of 3' }));
+    fireEvent.change(screen.getByRole('dialog').querySelector('textarea')!, { target: { value: 'bad tracking' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude' }));
+    await waitFor(() => expect(onExcluded).toHaveBeenCalledTimes(1));
+    expect(api.invoke).toHaveBeenCalledWith('exclude_collab_frame', { projectId: 'proj-1', frameUuid: 'u20', reason: 'bad tracking' });
+  });
+
+  it("8d. Blink's Exclude from project reports through onExcluded too", () => {
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
+      cmd === 'get_collab_blink_frames' ? new Promise(() => {}) : Promise.resolve(null)) as never);
+    const onExcluded = vi.fn();
+    const onDisk = exclusionFixture.map((r) => ({ ...r, localState: 'own_held' }));
+    renderTab({ rows: onDisk, segment: 'published', canModerate: true, onExcluded });
+    fireEvent.click(screen.getByRole('button', { name: 'Blink all 3' }));
+    expect(blinkProps?.onExcluded).toBe(onExcluded);
   });
 });
 

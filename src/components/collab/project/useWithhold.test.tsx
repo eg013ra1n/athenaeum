@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../../../api';
+import { MemoryRouter } from 'react-router-dom';
 import { NotificationProvider } from '../../../contexts/NotificationContext';
+import { ToastStack } from '../../Toast';
 import { useWithhold } from './useWithhold';
 
 vi.mock('../../../api', () => ({ api: { invoke: vi.fn(), listen: vi.fn() } }));
@@ -23,7 +25,7 @@ function renderWithhold(onChanged: () => void) {
     ref.current = h;
     return <>{h.dialog}</>;
   }
-  render(<NotificationProvider><Harness /></NotificationProvider>);
+  render(<MemoryRouter><NotificationProvider><Harness /><ToastStack /></NotificationProvider></MemoryRouter>);
   return { result: ref as { current: Hook } };
 }
 
@@ -66,6 +68,16 @@ describe('useWithhold', () => {
     await act(async () => { await expect(result.current.release([7])).resolves.toBe(false); });
     expect(err).toHaveBeenCalled();
     expect(onChanged).not.toHaveBeenCalled();
+    expect(screen.getByRole('status')).toHaveTextContent('Could not release the frames');
+    err.mockRestore();
+  });
+
+  it("a failed Don't publish notifies with its own title", async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(api.invoke).mockRejectedValueOnce(new Error('db locked'));
+    const { result } = renderWithhold(vi.fn());
+    await act(async () => { await expect(result.current.dontPublish([{ frameId: 5, prepared: false }])).resolves.toBe(false); });
+    expect(screen.getByRole('status')).toHaveTextContent('Could not withhold the frames');
     err.mockRestore();
   });
 

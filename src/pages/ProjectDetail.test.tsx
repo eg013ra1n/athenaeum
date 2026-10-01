@@ -446,27 +446,97 @@ describe('ProjectDetail manual publish', () => {
     err.mockRestore();
   });
 
-  it('Calibrate in My frames invokes calibrate_collab_frames with the selection', async () => {
+  it('Calibrate in My frames invokes calibrate_collab_frames with the selection, re-reads own frames and detail, and toasts nothing', async () => {
+    mockCommands(projectCard(), {
+      calibrate_collab_frames: () => Promise.resolve({ ...okPublish, announced: 0, calibrated: 2 }),
+    });
     renderProjectDetail();
     await openTab(/^My frames/);
-    fireEvent.click(await screen.findByRole('button', { name: 'Calibrate all 2' }));
+    const button = await screen.findByRole('button', { name: 'Calibrate all 2' });
+    const own = invokeCount('list_project_own_frames');
+    const detail = invokeCount('get_collab_project_detail');
+    fireEvent.click(button);
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('calibrate_collab_frames', { projectId: 'proj-1', frameIds: [1, 2] }),
     );
+    await waitFor(() => expect(invokeCount('list_project_own_frames')).toBe(own + 1));
+    await waitFor(() => expect(invokeCount('get_collab_project_detail')).toBe(detail + 1));
+    // The run's outcome is notified from collab-publish-finished only (F4).
+    expect(screen.queryAllByRole('status')).toHaveLength(0);
   });
 
-  it('calibrate invokes calibrate_collab_frames with the ids and toasts nothing on failure', async () => {
-    const { result } = renderHook(() => usePublishing('proj-1', {
-      reloadDetail: async () => {}, reloadOwn: async () => {}, onCard: () => {},
-    }), { wrapper: NotificationProvider });
+  it('calibrate invokes calibrate_collab_frames with the ids, re-reads on success and toasts nothing on failure', async () => {
+    const reloadOwn = vi.fn(async () => {});
+    const reloadDetail = vi.fn(async () => {});
+    const { result } = renderHook(() => usePublishing('proj-1', { reloadDetail, reloadOwn, onCard: () => {} }), {
+      wrapper: ({ children }) => (
+        <MemoryRouter>
+          <NotificationProvider>
+            {children}
+            <ToastStack />
+          </NotificationProvider>
+        </MemoryRouter>
+      ),
+    });
     vi.mocked(api.invoke).mockResolvedValueOnce(okPublish as never);
     await act(async () => { await result.current.calibrate([1, 2]); });
     expect(api.invoke).toHaveBeenCalledWith('calibrate_collab_frames', { projectId: 'proj-1', frameIds: [1, 2] });
+    expect(reloadOwn).toHaveBeenCalledTimes(1);
+    expect(reloadDetail).toHaveBeenCalledTimes(1);
     vi.mocked(api.invoke).mockRejectedValueOnce(new Error('boom'));
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
     await act(async () => { await result.current.calibrate([1]); });
     expect(result.current.calibrateError).toBe('boom');
+    expect(err).toHaveBeenCalled();
+    expect(screen.queryAllByRole('status')).toHaveLength(0);
     err.mockRestore();
+  });
+
+  it('Published → Update publishes the update-pending frames at once, with no dialog (F1)', async () => {
+    mockCommands(projectCard(), {
+      list_project_own_frames: () =>
+        Promise.resolve([published(5, { contributorState: 'updatePending' }), published(6)]),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /Published/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Update all 1' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('publish_collab_frames', { projectId: 'proj-1', frameIds: [5] }),
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('a run already going when the page opens shows the Publish run panel on My frames', async () => {
+    mockCommands(projectCard(), {
+      get_collab_publish_run: () =>
+        Promise.resolve({ running: progress({ kind: 'calibrate', stage: 'calibrating', current: 12, total: 48 }), last: null }),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    const panel = await screen.findByRole('region', { name: 'Publish run' });
+    expect(within(panel).getByText('Calibrating 12 of 48')).toBeInTheDocument();
+  });
+
+  it('excluding from My frames re-reads own frames and the Library rows', async () => {
+    mockCommands(projectCard({ coordinator: true, canModerate: true }), {
+      list_project_own_frames: () => Promise.resolve([published(5)]),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: /Published/ }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all shown' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude 1' }));
+    const dialog = within(await screen.findByRole('dialog'));
+    fireEvent.change(dialog.getByRole('textbox'), { target: { value: 'bad tracking' } });
+    const lib = invokeCount('list_collab_frames');
+    const own = invokeCount('list_project_own_frames');
+    fireEvent.click(dialog.getByRole('button', { name: 'Exclude' }));
+    await waitFor(() =>
+      expect(api.invoke).toHaveBeenCalledWith('exclude_collab_frame', { projectId: 'proj-1', frameUuid: 'u-5', reason: 'bad tracking' }),
+    );
+    await waitFor(() => expect(invokeCount('list_collab_frames')).toBe(lib + 1));
+    expect(invokeCount('list_project_own_frames')).toBe(own + 1);
   });
 
   it('a publish refused because another run is in progress reads as "already running", not a failure', async () => {
@@ -1104,6 +1174,16 @@ describe('ProjectDetail tabs', () => {
     renderProjectDetail();
     await screen.findByRole('tab', { name: 'Overview' });
     expect(screen.getByRole('tab', { name: /^Moderation/ })).toBeInTheDocument();
+  });
+
+  it.each([
+    ['ready only', () => twoReady, 'My frames 2 ready'],
+    ['review only', () => twoReview, 'My frames 2 to review'],
+    ['both', () => [...twoReady, ...twoReview], 'My frames 2 ready · 2 to review'],
+  ])('the My frames badge reads its non-zero parts (%s)', async (_case, rows, name) => {
+    mockCommands(projectCard(), { list_project_own_frames: () => Promise.resolve(rows()) });
+    renderProjectDetail();
+    expect(await screen.findByRole('tab', { name })).toBeInTheDocument();
   });
 
   it('the My frames badge shows the ready count', async () => {

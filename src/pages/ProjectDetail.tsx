@@ -434,6 +434,14 @@ function ProjectPage({ id }: { id: string | undefined }) {
     return drawer;
   }, [drawer, own, frames, exchange.projects, id]);
 
+  // The publish confirm's exact size: Σ calibratedBytes (else byteSize) of
+  // the chosen frames.
+  const publishBytes = useMemo(() => {
+    if (!publishIds || !own) return 0;
+    const chosen = new Set(publishIds);
+    return own.filter((r) => chosen.has(r.frameId)).reduce((sum, r) => sum + (r.calibratedBytes ?? r.byteSize), 0);
+  }, [own, publishIds]);
+
   const openPortal = async (path: string) => {
     if (!detail) return;
     const candidate = `${detail.portalBase}${path}`;
@@ -477,9 +485,6 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const needsApproval = c.requireApproval && !c.canModerate;
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
   const ownRows = own ?? [];
-  const publishBytes = ownRows
-    .filter((r) => publishIds?.includes(r.frameId))
-    .reduce((sum, r) => sum + (r.calibratedBytes ?? r.byteSize), 0);
   const readyCount = ownRows.filter((r) => r.segment === 'ready').length;
   const reviewCount = ownRows.filter((r) => r.segment === 'review').length;
   const publishedRows = ownRows.filter((r) => r.segment === 'published');
@@ -754,6 +759,10 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 calibrateBusy={publishing.calibrateBusy}
                 calibrateError={publishing.calibrateError}
                 onUpdate={(ids) => void publishing.publish(ids)}
+                onExcluded={() => {
+                  void loadOwn();
+                  void loadLibrary();
+                }}
               />
             </PanelLayout>
           )}
