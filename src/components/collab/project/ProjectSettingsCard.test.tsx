@@ -73,9 +73,15 @@ describe('ProjectSettingsCard', () => {
     expect(screen.getByText(/Calibrated 46/)).toBeInTheDocument();
   });
 
-  it('an auto mode with collaboration off reads Paused', () => {
-    renderCard({ card: card({ publishMode: 'automatic' }), liveState: 'off' });
+  it.each(['off', 'signedOut'])('an auto mode with live state %s reads Paused', (liveState) => {
+    renderCard({ card: card({ publishMode: 'automatic' }), liveState });
     expect(screen.getByText(/Paused — collaboration is off/)).toBeInTheDocument();
+  });
+
+  it('a nameless publishing device here reads just "This device"', () => {
+    renderCard({ card: card({ publishingDevice: { deviceId: 'd1', name: null } }) });
+    expect(screen.getByText(/This device/)).toBeInTheDocument();
+    expect(screen.queryByText(/another device/)).toBeNull();
   });
 
   it('auto-replicate is hidden for a member who cannot receive', () => {

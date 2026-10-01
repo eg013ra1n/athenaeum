@@ -69,8 +69,9 @@ export default function ProjectSettingsCard({
   };
 
   const mode = MODES.find((m) => m.value === card.publishMode) ?? MODES[0]!;
-  const paused = card.publishMode !== 'manual' && liveState === 'off';
+  const paused = card.publishMode !== 'manual' && (liveState === 'off' || liveState === 'signedOut');
   const r = run.running;
+  const ownName = card.publishingDevice?.name?.trim() || null;
 
   return (
     <section aria-label="Project settings">
@@ -80,7 +81,7 @@ export default function ProjectSettingsCard({
           <div className="flex flex-wrap items-center gap-2 text-[13px] text-content">
             {card.publishingHere ? (
               <>
-                <StatusDot state="live" /> This device · {deviceLabel(card.publishingDevice?.name)}
+                <StatusDot state="live" /> This device{ownName ? ` · ${ownName}` : ''}
               </>
             ) : card.publishingDevice ? (
               <>
