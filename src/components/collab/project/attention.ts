@@ -86,6 +86,10 @@ export function deriveAttention({ own, library, members, canModerate, canReceive
   // Counts equal what the button opens: a row is every held frame whose
   // Reason facet (`fromOwn(r).states`) includes the kind, so a frame with
   // two blockers counts in both rows.
+  const review = own.filter((r) => r.segment === 'review').length;
+  if (review > 0) {
+    out.push({ key: 'review', tone: 'warn', count: review, title: `${review} calibrated ${plural(review, 'frame waits', 'frames wait')} for your review`, detail: 'Blink them, drop the bad ones, then publish.', action: 'Review', target: { kind: 'segment', segment: 'review' } });
+  }
   const heldVms = own.filter((r) => r.segment === 'held').map((r) => ({ r, states: fromOwn(r).states }));
   const heldKinds = new Set(heldVms.flatMap((h) => h.states));
   const unknown = [...heldKinds].filter((k) => !(HELD_KIND_ORDER as readonly string[]).includes(k));

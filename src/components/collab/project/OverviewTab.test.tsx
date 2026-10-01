@@ -194,20 +194,48 @@ describe('OverviewTab — my contribution', () => {
       onOpenSegment,
     });
 
-    fireEvent.click(await screen.findByRole('button', { name: /2 ready to publish/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /2 ready to calibrate/ }));
     expect(onOpenSegment).toHaveBeenCalledWith('ready');
   });
 
-  it('renders Published N and Held back N from the segment counts', async () => {
+  it('renders all four tiles from the segment counts', async () => {
     renderTab({
       own: [
-        ownRow({ frameId: 1, segment: 'published' }),
-        ownRow({ frameId: 2, segment: 'held', failures: [{ kind: 'solve', text: 'No coordinates or pixel scale' }] }),
+        ownRow({ frameId: 1, segment: 'review' }),
+        ownRow({ frameId: 2, segment: 'published' }),
+        ownRow({ frameId: 3, segment: 'held', failures: [{ kind: 'solve', text: 'No coordinates or pixel scale' }] }),
       ],
     });
 
-    expect(await screen.findByRole('button', { name: /1 published/ })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /0 ready to calibrate/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /1 to review/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /1 published/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /1 held back/ })).toBeInTheDocument();
+  });
+
+  it('renders My contribution above Integration in the left column and the settings slot first on the right', () => {
+    renderTab({ settings: <section aria-label="Project settings">S</section> });
+    const left = screen.getByRole('heading', { name: 'My contribution' }).closest('[data-col="left"]');
+    expect(left).not.toBeNull();
+    const headings = within(left as HTMLElement).getAllByRole('heading').map((h) => h.textContent);
+    expect(headings.slice(0, 2)).toEqual(['My contribution', 'Integration toward goal']);
+    const right = screen.getByLabelText('Project settings').closest('[data-col="right"]');
+    expect(right?.firstElementChild?.getAttribute('aria-label')).toBe('Project settings');
+  });
+
+  it('each contribution tile shows hours, nights, size and per-filter hours', () => {
+    renderTab({ own: [ownRow({ segment: 'ready', exptimeSec: 3600, filter: 'L' })] });
+    const tile = screen.getByRole('button', { name: /ready to calibrate/i });
+    expect(tile).toHaveTextContent('1h 00m');
+    expect(tile).toHaveTextContent('1 night');
+    expect(tile).toHaveTextContent('L');
+  });
+
+  it('the To review tile opens the review segment', () => {
+    const onOpenSegment = vi.fn();
+    renderTab({ onOpenSegment, own: [ownRow({ segment: 'review' })] });
+    fireEvent.click(screen.getByRole('button', { name: /to review/i }));
+    expect(onOpenSegment).toHaveBeenCalledWith('review');
   });
 });
 
@@ -262,7 +290,7 @@ describe('OverviewTab — needs attention', () => {
     const attention = screen.getByRole('heading', { name: 'Needs attention' }).closest('section')!;
     expect(within(attention).getByText('Loading…')).toBeInTheDocument();
     expect(screen.queryByText('Nothing needs your attention.')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /ready to publish/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /ready to calibrate/ })).not.toBeInTheDocument();
   });
 
   it('own frames that failed to load (ownError) show neither Loading… nor zero counts in My contribution and Needs attention', async () => {
@@ -353,7 +381,7 @@ describe('OverviewTab — mockup cards', () => {
     const integration = screen.getByRole('heading', { name: 'Integration toward goal' });
     expect(integration.parentElement).toHaveTextContent('published, accepted frames · by member');
     expect(screen.getByRole('heading', { name: 'My contribution' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /136 ready to publish/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /136 ready to calibrate/ })).toBeInTheDocument();
     expect(screen.getByText(/8h 16m/)).toBeInTheDocument();
     expect(screen.getByText('FWHM ≤ 3.00″')).toBeInTheDocument();
     expect(screen.getByText('Reject trailed frames')).toBeInTheDocument();

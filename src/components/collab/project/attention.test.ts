@@ -90,4 +90,9 @@ describe('deriveAttention', () => {
     expect(err).not.toHaveBeenCalled();
     err.mockRestore();
   });
+  it('N prepared frames add a To review item first', () => {
+    const rev = { segment: 'review', failures: [] } as never;
+    const items = deriveAttention({ own: [rev, rev, held('solve')], library: [], members: [], canModerate: false, canReceive: true, liveRunning: true, pending: 0, now: NOW });
+    expect(items[0]).toMatchObject({ key: 'review', tone: 'warn', count: 2, title: '2 calibrated frames wait for your review', target: { kind: 'segment', segment: 'review' } });
+  });
 });

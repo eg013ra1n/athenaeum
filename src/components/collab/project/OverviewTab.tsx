@@ -1,9 +1,10 @@
-import { useMemo, useState, type JSX } from 'react';
+import { useMemo, useState, type JSX, type ReactNode } from 'react';
 import { useCollabExchange } from '../../../contexts/CollabExchangeContext';
 import { distinctNames, peerLabel, sumRate } from '../exchange/state';
-import { formatDurationPadded, formatRate } from '../format';
+import { formatDurationPadded, formatRate, formatSize } from '../format';
 import { Button, Card, Chip, EmptyState, FilterDot, MemberDot } from '../../ui';
 import { filterOrder } from './table/model';
+import { contributionTiles } from './contribution';
 import { deriveAttention, type AttentionTarget, type NavTarget } from './attention';
 import FilterMappingDialog from '../FilterMappingDialog';
 import { useMemberColor } from './MemberColorsContext';
@@ -12,8 +13,8 @@ import type { MemberSummary, OwnFrameRow, ProjectFrameView, ThresholdRuleView } 
 
 /**
  * Overview tab — the mockup's four cards: integration toward goal (member
- * coloured bars against the coordinator's goals), My contribution (three
- * tiles), Needs attention (one row per held-back cause, each with an action
+ * coloured bars against the coordinator's goals), My contribution (four
+ * detailed tiles, first), Needs attention (one row per held-back cause, each with an action
  * that opens the right segment with a pre-set filter — `attention.ts`),
  * Exchange now and Quality thresholds. While `own` is still loading
  * (`null`), the contribution and attention cards read `Loading…`
@@ -44,6 +45,8 @@ export interface OverviewTabProps {
   /** Reload own frames after the filter mapping is saved. */
   onReloadOwn: () => void;
   onAttention: (target: NavTarget) => void;
+  /** The Project settings card, rendered first in the right column. */
+  settings?: ReactNode;
 }
 
 // Keys are the gate's METRIC_REGISTRY (crates/athenaeum-core/src/collab/gate.rs).
@@ -57,6 +60,13 @@ function thresholdLine(r: ThresholdRuleView): string {
   if (r.metricKey === 'median_snr' && v !== null) return `SNR ${op} ${v}`;
   return `${r.metricKey} ${op} ${String(r.value)}`;
 }
+
+const TILE_META: Record<Segment, { label: string; tone: string }> = {
+  ready: { label: 'ready to calibrate', tone: 'text-accent' },
+  review: { label: 'to review', tone: 'text-purple' },
+  published: { label: 'published', tone: 'text-success' },
+  held: { label: 'held back', tone: 'text-warning' },
+};
 
 export default function OverviewTab({
   projectId,
@@ -75,16 +85,15 @@ export default function OverviewTab({
   liveRunning,
   onReloadOwn,
   onAttention,
+  settings,
 }: OverviewTabProps): JSX.Element {
   const { state } = useCollabExchange();
   const colorOf = useMemberColor();
   const [mapOpen, setMapOpen] = useState(false);
   const act = (t: AttentionTarget) => (t.kind === 'map' ? setMapOpen(true) : onAttention(t));
 
-  const rows = own ?? [];
-  const readyCount = rows.filter((r) => r.segment === 'ready').length;
-  const publishedCount = rows.filter((r) => r.segment === 'published').length;
-  const heldCount = rows.filter((r) => r.segment === 'held').length;
+  const rows = useMemo(() => own ?? [], [own]);
+  const tiles = useMemo(() => contributionTiles(rows), [rows]);
 
   const items = useMemo(
     () => deriveAttention({ own: own ?? [], library: library ?? [], members: members ?? [], canModerate, canReceive, liveRunning, pending, now: Date.now() }),
@@ -104,15 +113,46 @@ export default function OverviewTab({
   const send = state.projects[projectId]?.send ?? [];
   const label = (device: string) => peerLabel(state, projectId, device);
 
-  const tiles = [
-    ['ready', readyCount, 'ready to publish', 'text-accent'],
-    ['published', publishedCount, 'published', 'text-success'],
-    ['held', heldCount, 'held back', 'text-warning'],
-  ] as const;
-
   return (
     <>
     <div className="grid grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)] items-start gap-3.5 max-[900px]:grid-cols-1">
+      <div data-col="left" className="grid gap-3.5">
+      <Card title="My contribution">
+        {own === null ? (
+          <EmptyState>{ownError ? 'Not available.' : 'Loading…'}</EmptyState>
+        ) : (
+          <div className="grid grid-cols-4 gap-2 max-[900px]:grid-cols-2">
+            {tiles.map((t) => {
+              const meta = TILE_META[t.segment];
+              return (
+                <button
+                  key={t.segment}
+                  type="button"
+                  aria-label={`${t.count} ${meta.label}`}
+                  onClick={() => onOpenSegment(t.segment)}
+                  className="flex flex-col rounded-md border border-line px-2.5 py-2 text-left hover:border-accent"
+                >
+                  <span className={`block text-[22px] font-semibold ${meta.tone}`}>{t.count.toLocaleString('en-US')}</span>
+                  <span className="text-[11.5px] text-content-faint">{meta.label}</span>
+                  <span className="mt-1 block text-[11.5px] text-content-secondary">
+                    {formatDurationPadded(t.seconds)} · {t.nights} {t.nights === 1 ? 'night' : 'nights'} · {formatSize(t.bytes)}
+                  </span>
+                  <span className="mt-1 grid gap-0.5 text-[11.5px] text-content-muted">
+                    {t.filters.map((f) => (
+                      <span key={f.filter} className="flex items-center justify-between">
+                        <span className="inline-flex items-center"><FilterDot filter={f.filter} />{f.filter}</span>
+                        <span>{formatDurationPadded(f.seconds)}</span>
+                      </span>
+                    ))}
+                  </span>
+                  <span className="mt-auto border-t border-line pt-1.5 text-[11.5px] text-content-faint">{t.footer}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+
       <Card title="Integration toward goal" subtitle="published, accepted frames · by member">
         {members === null ? (
           <EmptyState>Loading…</EmptyState>
@@ -180,22 +220,10 @@ export default function OverviewTab({
         )}
       </Card>
 
-      <div className="grid gap-3.5">
-        <Card title="My contribution">
-          {own === null ? (
-            <EmptyState>{ownError ? 'Not available.' : 'Loading…'}</EmptyState>
-          ) : (
-            <div className="grid grid-cols-3 gap-2">
-              {tiles.map(([seg, n, text, tone]) => (
-                <button key={seg} type="button" onClick={() => onOpenSegment(seg)} className="rounded-md border border-line px-2.5 py-2 text-left hover:border-accent">
-                  <span className={`block text-[20px] font-semibold ${tone}`}>{n.toLocaleString('en-US')}</span>{' '}
-                  <span className="text-[11.5px] text-content-faint">{text}</span>
-                </button>
-              ))}
-            </div>
-          )}
-        </Card>
+      </div>
 
+      <div data-col="right" className="grid gap-3.5">
+        {settings}
         <Card title="Needs attention">
           {own === null ? (
             <EmptyState>{ownError ? 'Not available.' : 'Loading…'}</EmptyState>
