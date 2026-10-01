@@ -97,6 +97,8 @@ describe('useCollabPublishRun', () => {
     expect(result.current.reached).toBe(3);
   });
 
+  // The two "reset" tests below pin the no-op paths (nothing visible to
+  // reset): they are documentation, not coverage of the reset branch.
   it('a running: null reply resets when no unfinished run was heard', async () => {
     const snap = deferred<CollabPublishRunView>();
     vi.mocked(api.invoke).mockReturnValueOnce(snap.promise as never);
@@ -119,6 +121,17 @@ describe('useCollabPublishRun', () => {
     await act(async () => { snap.resolve({ running: null, last: null }); });
     expect(result.current.running).toBeNull();
     expect(result.current.reached).toBe(-1);
+  });
+
+  it('a finished event for an older run leaves a newer run shown and updates last', async () => {
+    vi.mocked(api.invoke).mockResolvedValueOnce({ running: null, last: null });
+    const { result } = renderHook(() => useCollabPublishRun('p1'), { wrapper });
+    await waitFor(() => expect(snapshotCalls()).toHaveLength(1));
+    act(() => listeners['collab-publish-progress'](progress({ publishRunId: 'r2', stage: 'announcing' })));
+    act(() => listeners['collab-publish-finished'](finished({ publishRunId: 'r1' })));
+    expect(result.current.running?.publishRunId).toBe('r2');
+    expect(result.current.reached).toBe(3);
+    expect(result.current.last?.publishRunId).toBe('r1');
   });
 
   it('a projectId change resets running, last and the reached step before the new snapshot', async () => {

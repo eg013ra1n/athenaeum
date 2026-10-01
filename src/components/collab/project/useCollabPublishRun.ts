@@ -103,8 +103,10 @@ export function useCollabPublishRun(projectId: string | undefined): PublishRunSt
       sub<CollabPublishFinished>('collab-publish-finished', (f) => {
         if (f.projectId !== projectId) return;
         finishedRunRef.current = f.publishRunId;
-        setRunning(null);
-        setReach(IDLE_REACH);
+        // Core drops a run from its list before emitting its finished event,
+        // so a newer run's progress can arrive first: clear only our own.
+        setRunning((cur) => (cur === null || cur.publishRunId === f.publishRunId ? null : cur));
+        setReach((cur) => (cur.runId === f.publishRunId || cur.runId === null ? IDLE_REACH : cur));
         setLast(f);
       }),
     ];
