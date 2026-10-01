@@ -41,6 +41,18 @@ describe('contributionTiles', () => {
     expect(t[3].footer).toBe('2 quality thresholds · 1 no analysis · 1 withheld by you');
   });
 
+  it('a Black Hole reason keeps its proper name in the held back footer', () => {
+    const t = contributionTiles([
+      row({ segment: 'held', failures: [{ kind: 'blackHole', text: 'In the Black Hole' }] }),
+      row({ segment: 'held', failures: [{ kind: 'solve', text: 'no coordinates' }] }),
+    ]);
+    expect(t[3].footer).toBe('1 no coordinates or pixel scale · 1 in the Black Hole');
+  });
+
+  it('an empty held back tile says nothing is held back', () => {
+    expect(contributionTiles([row({ segment: 'ready' })])[3].footer).toBe('Nothing held back');
+  });
+
   it('a null exptime counts the frame but adds no time', () => {
     const t = contributionTiles([row({ exptimeSec: null })]);
     expect([t[0].count, t[0].seconds]).toEqual([1, 0]);

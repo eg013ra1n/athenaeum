@@ -61,13 +61,13 @@ const TILE_LABEL: Record<Segment, string> = {
 const TILE_TONE = { ready: 'accent', review: 'purple', published: 'success', held: 'warning' } as const;
 
 /**
- * My frames — the three Ready/Published/Held back tables of the redesigned
- * collab project page (Task 10, spec 2026-09-30 §"My frames"). Carries the
- * solve/analyze orchestration moved verbatim from the old `ProjectDetail`
- * page, and Held back's per-Reason fix buttons (`ReasonGroupAction`), which
- * work from each group's own rows — the scope ruling that drops
- * `evaluate_collab_gate` from this page (the frame set's Project block
- * still uses the gate; untouched here).
+ * My frames — the four segments of the collab project page, one table each:
+ * Ready, To review, Published and Held back (spec 2026-10-01 §8.2), under the
+ * publish run panel (§8.1). Carries the solve/analyze orchestration moved
+ * verbatim from the old `ProjectDetail` page, and Held back's per-Reason fix
+ * buttons (`ReasonGroupAction`), which work from each group's own rows — the
+ * scope ruling that drops `evaluate_collab_gate` from this page (the frame
+ * set's Project block still uses the gate; untouched here).
  */
 export default function MyFramesTab({
   projectId, rows, error, links, segment, onSegment, onReload, onDetailReload,
@@ -202,7 +202,7 @@ export default function MyFramesTab({
   };
 
   // Memoized on `rows` alone: `ProjectPage` re-renders on every 1 Hz exchange
-  // event, and without this each of the three tables would re-derive its
+  // event, and without this each segment's table would re-derive its
   // whole `FrameVM[]` on every one of those renders even though `rows` (from
   // `list_project_own_frames`) hasn't changed.
   const readyRows: FrameVM[] = useMemo(

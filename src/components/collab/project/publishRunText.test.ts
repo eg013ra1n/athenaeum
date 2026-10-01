@@ -21,6 +21,8 @@ describe('describeLastRun', () => {
     [fin({ outcome: 'refused', trigger: 'auto', error: 'collab_publishing_device:Obs PC' }),
       'Not run — Obs PC publishes this project', null, 'warn'],
     [fin({ outcome: 'failed', error: 'disk full' }), 'Failed — disk full', null, 'error'],
+    [fin({ outcome: 'refused', error: 'collab_api_outdated: the hub requires collab API 4' }),
+      'This hub needs a newer Athenaeum — update to publish.', null, 'warn'],
   ])('%#', (last, text, segment, tone) => {
     expect(describeLastRun(last)).toEqual({ text, segment, tone });
   });

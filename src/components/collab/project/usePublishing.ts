@@ -5,9 +5,12 @@ import type { ProjectCard, PublishResult } from '../../../types/models';
 
 /** A hub call refused this build with the stable `collab_api_outdated`
  *  prefix (P17). */
-function isOutdated(msg: string): boolean {
+export function isOutdated(msg: string): boolean {
   return msg.startsWith('collab_api_outdated');
 }
+
+/** What a run refused for an outdated build reads, in place of the raw code. */
+export const HUB_OUTDATED_TEXT = 'This hub needs a newer Athenaeum — update to publish.';
 
 /** The backend's refusal while another publish run of the same project
  *  (manual, republish or the background auto-publish) is in progress —

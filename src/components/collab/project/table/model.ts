@@ -38,7 +38,7 @@ export interface GroupDef<R> {
   label: string;
   key: (r: R) => string;
   renderLabel: (key: string) => ReactNode;
-  /** Natural order of group keys (night newest first, filters L R G B…, reasons by BLOCKER_ORDER). */
+  /** Natural order of group keys (night newest first, filters L R G B…, reasons by HELD_KIND_ORDER). */
   order: (a: string, b: string) => number;
 }
 
@@ -89,8 +89,12 @@ export const ROW_H = 28;
 export const FILTER_ORDER = ['L', 'R', 'G', 'B', 'Ha', 'OIII', 'SII', 'OSC'];
 /** Mirror of `BLOCKER_ORDER` in `crates/athenaeum-core/src/collab/gate.rs` — keep in lockstep. */
 export const BLOCKER_ORDER = ['analyze', 'solve', 'linkCalibration', 'buildMasters', 'attest', 'mapFilter', 'threshold', 'uuid', 'outsideTarget'];
+/** Held-back order: the gate's blocker kinds, then the two local states (spec
+ *  §4.1). The Held back facet, the Reason grouping and the Overview footer
+ *  all rank by it. */
+export const HELD_KIND_ORDER = [...BLOCKER_ORDER, 'withheld', 'blackHole'] as const;
 
-function rankOrder(list: string[]) {
+function rankOrder(list: readonly string[]) {
   return (a: string, b: string): number => {
     const x = list.indexOf(a);
     const y = list.indexOf(b);
@@ -101,7 +105,7 @@ function rankOrder(list: string[]) {
   };
 }
 export const filterOrder = rankOrder(FILTER_ORDER);
-export const reasonOrder = rankOrder(BLOCKER_ORDER);
+export const reasonOrder = rankOrder(HELD_KIND_ORDER);
 export const alphaOrder = (a: string, b: string): number => a.localeCompare(b);
 /** Newest night first; the empty key ("Unknown night") last. */
 export const nightOrderDesc = (a: string, b: string): number => {

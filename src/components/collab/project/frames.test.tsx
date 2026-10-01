@@ -267,3 +267,8 @@ it('a review row has no states and a withheld held row carries the withheld kind
   expect(TABLES.held.stateFacet?.options.map(([k]) => k)).toEqual([...HELD_KIND_ORDER]);
   expect(TABLES.review.stateFacet).toBeNull();
 });
+
+it('the Held back Reason grouping ranks its groups in the facet order (withheld, Black Hole after the blockers)', () => {
+  expect(['blackHole', 'withheld', 'threshold', 'analyze'].sort(GROUPS.reason.order))
+    .toEqual(['analyze', 'threshold', 'withheld', 'blackHole']);
+});

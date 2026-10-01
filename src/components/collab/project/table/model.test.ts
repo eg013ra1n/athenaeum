@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  EMPTY_FACETS, actionLabel, actionTargets, applyFacets, buildTree, checkState, facetCounts, filterOrder,
-  flatten, initialExpanded, median, nightWithin, reasonOrder, ROW_H, sortRows, sum, windowSlice,
+  BLOCKER_ORDER, EMPTY_FACETS, HELD_KIND_ORDER, actionLabel, actionTargets, applyFacets, buildTree, checkState, facetCounts,
+  filterOrder, flatten, initialExpanded, median, nightWithin, reasonOrder, ROW_H, sortRows, sum, windowSlice,
   type ColumnDef, type FacetAccess, type GroupDef,
 } from './model';
 
@@ -145,5 +145,10 @@ describe('orders', () => {
   });
   it('reasons follow the core BLOCKER_ORDER', () => {
     expect(['threshold', 'solve', 'analyze'].sort(reasonOrder)).toEqual(['analyze', 'solve', 'threshold']);
+  });
+  it('reasons rank by HELD_KIND_ORDER: withheld and Black Hole after every blocker, unknown kinds last', () => {
+    expect(['zzz', 'blackHole', 'withheld', 'outsideTarget', 'analyze'].sort(reasonOrder))
+      .toEqual(['analyze', 'outsideTarget', 'withheld', 'blackHole', 'zzz']);
+    expect([...HELD_KIND_ORDER]).toEqual([...BLOCKER_ORDER, 'withheld', 'blackHole']);
   });
 });

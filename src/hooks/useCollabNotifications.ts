@@ -1,7 +1,12 @@
 import { useEffect, useRef } from 'react';
 import { api } from '../api';
 import { useNotifications, type NotifyLike } from '../contexts/NotificationContext';
-import { publishingDeviceRefusal } from '../components/collab/project/usePublishing';
+import {
+  HUB_OUTDATED_TEXT,
+  isOutdated,
+  leading,
+  publishingDeviceRefusal,
+} from '../components/collab/project/usePublishing';
 import type {
   CollabDeletionChoice,
   CollabFrameChanged,
@@ -260,13 +265,21 @@ export function useCollabNotifications() {
         const title = titleFor(f.projectId);
         const sent = f.announced + f.updated;
         const base = `/projects/${f.projectId}?tab=mine`;
+        const frames = (n: number) => `${n} ${n === 1 ? 'frame' : 'frames'}`;
+        // The detail's tail: frames held back, then frames a changed source
+        // sent back to Ready (final-review ruling).
+        const tail = [
+          f.heldBack > 0 ? `${f.heldBack} held back` : null,
+          f.stale > 0 ? `${f.stale} back to Ready` : null,
+        ];
+        const join = (parts: (string | null)[]) => parts.filter(Boolean).join(' · ');
         if (f.outcome === 'done' && f.calibrated + sent + f.heldBack + f.stale === 0) return;
         switch (f.outcome) {
           case 'done':
             if (sent === 0 && f.calibrated > 0) {
               notify({
-                title: `Calibrated ${f.calibrated} frames in ${title} — review them`,
-                detail: f.heldBack > 0 ? `${f.heldBack} held back` : '',
+                title: `Calibrated ${frames(f.calibrated)} in ${title} — review them`,
+                detail: join(tail),
                 kind: 'project',
                 tone: 'success',
                 hasErrors: f.heldBack > 0,
@@ -274,8 +287,8 @@ export function useCollabNotifications() {
               });
             } else if (sent > 0) {
               notify({
-                title: `Published ${sent} frames in ${title}`,
-                detail: `${f.announced} new · ${f.updated} updated${f.heldBack > 0 ? ` · ${f.heldBack} held back` : ''}`,
+                title: `Published ${frames(sent)} in ${title}`,
+                detail: join([`${f.announced} new · ${f.updated} updated`, ...tail]),
                 kind: 'project',
                 tone: 'success',
                 hasErrors: f.heldBack > 0,
@@ -284,10 +297,20 @@ export function useCollabNotifications() {
             } else if (f.heldBack > 0) {
               notify({
                 title: `Nothing new to publish in ${title}`,
-                detail: `${f.heldBack} held back`,
+                detail: join(tail),
                 kind: 'project',
                 tone: 'warning',
                 link: `${base}&segment=held`,
+              });
+            } else {
+              // Only stale: frames whose source changed since calibration
+              // went back to Ready — work the user has to redo.
+              notify({
+                title: `${frames(f.stale)} changed since calibration in ${title} — back to Ready`,
+                detail: '',
+                kind: 'project',
+                tone: 'warning',
+                link: `${base}&segment=ready`,
               });
             }
             break;
@@ -297,10 +320,12 @@ export function useCollabNotifications() {
           case 'refused': {
             const device = f.error ? publishingDeviceRefusal(f.error) : null;
             notify({
-              title: device ? `${device} publishes ${title}` : `Not published in ${title}`,
+              title: device ? `${leading(device)} publishes ${title}` : `Not published in ${title}`,
               detail: device
                 ? 'Use Publish from this device in Project settings to take over.'
-                : (f.error ?? ''),
+                : f.error && isOutdated(f.error)
+                  ? HUB_OUTDATED_TEXT
+                  : (f.error ?? ''),
               kind: 'project',
               tone: 'warning',
               toast: f.trigger === 'manual',

@@ -63,7 +63,7 @@ export default function PublishRunPanel({ run, onOpenSegment }: { run: PublishRu
             return (
               <li key={st.label} aria-current={active ? 'step' : undefined}
                 className={active ? 'font-semibold text-accent' : done ? 'text-success' : 'text-content-faint'}>
-                {done ? `✓ ${st.label}` : active ? `${st.label} ${r.current} / ${r.total}` : st.label}
+                {done ? `✓ ${st.label}` : active && !queued ? `${st.label} ${r.current} / ${r.total}` : st.label}
                 {i < all.length - 1 && <span className="ml-1.5 text-content-faint">→</span>}
               </li>
             );

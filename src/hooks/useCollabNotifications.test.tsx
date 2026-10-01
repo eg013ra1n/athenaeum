@@ -191,7 +191,8 @@ describe('useCollabNotifications', () => {
       calibrated: 0, announced: 0, updated: 0, stale: 0, heldBack: 0, error: null,
       startedAt: '2026-10-01T10:00:00Z', finishedAt: '2026-10-01T10:00:09Z', ...patch,
     });
-    type Stored = { title: string; detail: string; tone: string; link?: string; hasErrors?: boolean };
+    // History entries carry no tone — a tone is asserted on its toast.
+    type Stored = { title: string; detail: string; link?: string; hasErrors?: boolean };
     const history = (): Stored[] =>
       (JSON.parse(localStorage.getItem('athenaeum.notifications.v1') ?? '{"notifications":[]}') as { notifications: Stored[] })
         .notifications;
@@ -263,6 +264,50 @@ describe('useCollabNotifications', () => {
       await fire({});
       expect(history()).toHaveLength(0);
       expect(screen.queryAllByRole('status')).toHaveLength(0);
+    });
+
+    it('a refusal by a nameless device of this account starts with a capital', async () => {
+      await fire({ outcome: 'refused', error: 'collab_publishing_device:another device of this account' });
+      expect(history()[0].title).toBe('Another device of this account publishes M42 Mosaic');
+    });
+
+    it('a refused run on an outdated hub says to update, never the raw code', async () => {
+      await fire({ outcome: 'refused', error: 'collab_api_outdated: the hub requires collab API 4' });
+      const [n] = history();
+      expect(n.title).toBe('Not published in M42 Mosaic');
+      expect(n.detail).toBe('This hub needs a newer Athenaeum — update to publish.');
+    });
+
+    it('one frame reads in the singular', async () => {
+      await fire({ kind: 'calibrate', calibrated: 1 });
+      emit('collab-publish-finished', run({ announced: 1 }));
+      expect(history().map((n) => n.title)).toEqual([
+        'Published 1 frame in M42 Mosaic',
+        'Calibrated 1 frame in M42 Mosaic — review them',
+      ]);
+    });
+
+    it('a done run that only sent frames back to Ready warns and links Ready', async () => {
+      await fire({ stale: 2 });
+      emit('collab-publish-finished', run({ stale: 1 }));
+      const [one, two] = history();
+      expect(two.title).toBe('2 frames changed since calibration in M42 Mosaic — back to Ready');
+      expect(two.link).toBe('/projects/proj-1?tab=mine&segment=ready');
+      // A warning toast (the toast stack's warning look).
+      expect(screen.getByText(two.title).closest('[role="status"]')).toHaveClass('border-amber-700');
+      expect(one.title).toBe('1 frame changed since calibration in M42 Mosaic — back to Ready');
+    });
+
+    it('frames back to Ready beside a publish or a calibrate join the detail', async () => {
+      await fire({ announced: 3, stale: 2 });
+      emit('collab-publish-finished', run({ kind: 'calibrate', calibrated: 4, heldBack: 1, stale: 1 }));
+      emit('collab-publish-finished', run({ kind: 'calibrate', calibrated: 4, stale: 3 }));
+      const [cal, calHeld, pub] = history();
+      expect(pub.title).toBe('Published 3 frames in M42 Mosaic');
+      expect(pub.detail).toBe('3 new · 0 updated · 2 back to Ready');
+      expect(calHeld.title).toBe('Calibrated 4 frames in M42 Mosaic — review them');
+      expect(calHeld.detail).toBe('1 held back · 1 back to Ready');
+      expect(cal.detail).toBe('3 back to Ready');
     });
   });
 });

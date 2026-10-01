@@ -36,6 +36,12 @@ export function contributionTiles(own: OwnFrameRow[]): ContributionTile[] {
   });
 }
 
+/** Mid-sentence label: only the first letter drops, so a proper name such as
+ *  "Black Hole" keeps its capitals. */
+function lowerFirst(label: string): string {
+  return label.charAt(0).toLowerCase() + label.slice(1);
+}
+
 function kindRank(k: string): number {
   const i = (HELD_KIND_ORDER as readonly string[]).indexOf(k);
   return i === -1 ? HELD_KIND_ORDER.length : i;
@@ -53,6 +59,7 @@ function footerOf(segment: Segment, rows: OwnFrameRow[]): string {
       return `${accepted} accepted · ${pending} pending`;
     }
     case 'held': {
+      if (rows.length === 0) return 'Nothing held back';
       const byKind = new Map<string, number>();
       for (const r of rows) {
         const k = r.failures[0]?.kind ?? 'threshold';
@@ -62,7 +69,7 @@ function footerOf(segment: Segment, rows: OwnFrameRow[]): string {
       return [...byKind.entries()]
         .sort((a, b) => b[1] - a[1] || kindRank(a[0]) - kindRank(b[0]))
         .slice(0, 3)
-        .map(([k, n]) => `${n} ${(REASON_LABEL[k] ?? k).toLowerCase()}`)
+        .map(([k, n]) => `${n} ${lowerFirst(REASON_LABEL[k] ?? k)}`)
         .join(' · ');
     }
   }

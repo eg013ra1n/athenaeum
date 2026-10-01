@@ -49,10 +49,12 @@ describe('PublishRunPanel', () => {
     expect(screen.getByText('Calibrating 1 of 3')).toBeInTheDocument();
   });
 
-  it('a queued run says it waits for the compute slot', () => {
+  it('a queued run says it waits for the compute slot, with no counts on its step', () => {
     render(<PublishRunPanel run={state({ running: prog({ stage: 'queued', current: 0 }), reached: 0 })} onOpenSegment={vi.fn()} />);
     expect(screen.getByText('Waiting for a compute slot')).toBeInTheDocument();
     expect(screen.getByText('one compute slot · other runs wait')).toBeInTheDocument();
+    expect(screen.getByText('Queued')).toHaveAttribute('aria-current', 'step');
+    expect(screen.queryByText(/0 \/ 48/)).toBeNull();
   });
 
   it('a finished run shows its line and links the segment it points at', () => {

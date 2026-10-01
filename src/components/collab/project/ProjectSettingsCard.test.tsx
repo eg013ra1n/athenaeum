@@ -73,6 +73,14 @@ describe('ProjectSettingsCard', () => {
     expect(screen.getByText(/Calibrated 46/)).toBeInTheDocument();
   });
 
+  it('a queued run reads "Waiting for a compute slot" with no counts', () => {
+    const queued = { ...idle, running: { projectId: 'p1', publishRunId: 'r', kind: 'calibrate', trigger: 'manual', mode: null,
+      stage: 'queued', current: 0, total: 48, currentFile: null, startedAt: '2026-10-02T10:00:00Z' } } as PublishRunState;
+    renderCard({ run: queued });
+    expect(screen.getByText('Waiting for a compute slot')).toBeInTheDocument();
+    expect(screen.queryByText(/0 \/ 48/)).toBeNull();
+  });
+
   it.each(['off', 'signedOut'])('an auto mode with live state %s reads Paused', (liveState) => {
     renderCard({ card: card({ publishMode: 'automatic' }), liveState });
     expect(screen.getByText(/Paused — collaboration is off/)).toBeInTheDocument();

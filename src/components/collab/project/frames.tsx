@@ -5,7 +5,7 @@ import { Bar, Chip, FilterDot, MemberDot, ProgressBar, StatusDot, type ChipTone 
 import { formatDurationPadded, formatSize } from '../format';
 import { useMemberColor } from './MemberColorsContext';
 import {
-  alphaOrder, BLOCKER_ORDER, filterOrder, median, nightOrderDesc, reasonOrder, sum,
+  alphaOrder, filterOrder, HELD_KIND_ORDER, median, nightOrderDesc, reasonOrder, sum,
   type ColumnDef, type FacetAccess, type GroupDef,
 } from './table/model';
 
@@ -296,8 +296,9 @@ export const REASON_LABEL: Record<string, string> = {
   blackHole: 'In the Black Hole',
 };
 
-/** Held-back facet order: the gate's blocker kinds, then the two local states (spec §4.1). */
-export const HELD_KIND_ORDER = [...BLOCKER_ORDER, 'withheld', 'blackHole'] as const;
+/** Held-back facet order — defined beside `reasonOrder` in `table/model.ts`,
+ *  re-exported here for the existing imports. */
+export { HELD_KIND_ORDER };
 
 export const DEVICE_LABEL: Record<DeviceState, string> = {
   have: 'Have',

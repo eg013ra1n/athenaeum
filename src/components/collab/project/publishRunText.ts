@@ -1,6 +1,6 @@
 import type { CollabPublishFinished, PublishMode, PublishStage } from '../../../types/models';
 import type { Segment } from './MyFramesTab';
-import { publishingDeviceRefusal } from './usePublishing';
+import { HUB_OUTDATED_TEXT, isOutdated, publishingDeviceRefusal } from './usePublishing';
 
 /** The one stage wording of a publish run (settings card status, My frames run panel). */
 export const STAGE_TITLE: Record<PublishStage, string> = {
@@ -32,6 +32,8 @@ export function describeLastRun(last: CollabPublishFinished): {
     case 'cancelled':
       return { text: 'Stopped', segment: null, tone: 'warn' };
     case 'refused': {
+      // An outdated build: the update sentence, never the raw code.
+      if (last.error && isOutdated(last.error)) return { text: HUB_OUTDATED_TEXT, segment: null, tone: 'warn' };
       const device = last.error ? publishingDeviceRefusal(last.error) : null;
       return {
         text: `Not run — ${device ? `${device} publishes this project` : (last.error ?? 'refused')}`,

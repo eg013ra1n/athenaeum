@@ -115,7 +115,7 @@ export default function ProjectSettingsCard({
                 <div className="flex items-center gap-2">
                   <Chip tone="info">{r.trigger}</Chip>
                   <b className="font-semibold text-content">
-                    {STAGE_TITLE[r.stage]} {r.current} / {r.total}
+                    {r.stage === 'queued' ? STAGE_TITLE.queued : `${STAGE_TITLE[r.stage]} ${r.current} / ${r.total}`}
                   </b>
                   <span className="flex-1" />
                   <Button variant="link" size="sm" onClick={onOpenMyFrames}>
