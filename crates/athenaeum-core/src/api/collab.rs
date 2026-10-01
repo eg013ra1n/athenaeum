@@ -1549,13 +1549,21 @@ pub(crate) fn prepared_is_current(
 
 /// The catalog file path of a frame (the original of an attested frame).
 fn catalog_path_of_frame(conn: &Connection, frame_id: i64) -> Option<std::path::PathBuf> {
-    conn.query_row(
+    match conn.query_row(
         "SELECT fi.path FROM frames f JOIN files fi ON fi.id = f.file_id WHERE f.id = ?1",
         [frame_id],
         |r| r.get::<_, String>(0),
-    )
-    .ok()
-    .map(std::path::PathBuf::from)
+    ) {
+        Ok(p) => Some(std::path::PathBuf::from(p)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            tracing::debug!(frame_id, "prepared check: frame has no catalog file");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(frame_id, error = %e, "prepared check: catalog path unreadable");
+            None
+        }
+    }
 }
 
 /// The section 4.1 local facts of every gated frame of a project, read once.
