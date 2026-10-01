@@ -44,6 +44,10 @@ function ownRow(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
     rules: [],
     path: '/data/m31/Light_Ha_300s_0001.fits',
     accepted: null,
+    calibratedPath: null,
+    calibratedBytes: null,
+    preparedAt: null,
+    withheld: false,
     ...o,
   };
 }

@@ -74,4 +74,20 @@ describe('deriveAttention', () => {
     expect(offlineFor('2026-09-26T10:00:00Z', NOW)).toBe('3 days');
     expect(offlineFor(null, NOW)).toBe('a while');
   });
+
+  it('withheld and blackHole held kinds get their own items, never the unknown-kind error', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const items = deriveAttention({
+      own: [held('withheld'), held('blackHole')],
+      library: [], members: [], canModerate: false, canReceive: false, liveRunning: true, pending: 0, now: 0,
+    });
+    expect(items.map((i) => i.target)).toEqual(
+      expect.arrayContaining([
+        { kind: 'segment', segment: 'held', state: 'withheld' },
+        { kind: 'segment', segment: 'held', state: 'blackHole' },
+      ]),
+    );
+    expect(err).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
 });

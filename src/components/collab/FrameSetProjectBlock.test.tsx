@@ -15,11 +15,11 @@ afterEach(() => {
   notifyMock.mockClear();
 });
 
-const counts = { notPublished: 0, failsGate: 79, pendingApproval: 0, published: 812, updatePending: 3, rejected: 0, publishedNotOnDisk: 0, publishedNowFailsGate: 0 };
+const counts = { notPublished: 0, failsGate: 79, pendingApproval: 0, published: 812, updatePending: 3, rejected: 0, publishedNotOnDisk: 0, publishedNowFailsGate: 0, prepared: 0, withheld: 0 };
 
 describe('FrameSetProjectBlock', () => {
   it('shows the linked project with its counts and Open project', () => {
-    const status: FrameSetProjectStatus = { links: [{ projectId: 'p1', slug: 'm101', title: 'M 101', publishingHere: true, autoPublish: true, counts, frames: [] }], candidates: [] };
+    const status: FrameSetProjectStatus = { links: [{ projectId: 'p1', slug: 'm101', title: 'M 101', publishingHere: true, publishMode: 'manual', counts, frames: [] }], candidates: [] };
     render(<MemoryRouter><FrameSetProjectBlock framesSetId={5} status={status} onChanged={vi.fn()} /></MemoryRouter>);
     expect(screen.getByText(/Project M 101/)).toBeInTheDocument();
     expect(screen.getByText(/812 published · 79 fail gate · 3 update pending/)).toBeInTheDocument();

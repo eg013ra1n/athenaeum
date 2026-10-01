@@ -9,8 +9,10 @@ function summary(l: FrameSetProjectLink): string {
   const c = l.counts;
   const parts: string[] = [];
   if (c.published) parts.push(`${c.published} published`);
+  if (c.prepared) parts.push(`${c.prepared} to review`);
   if (c.pendingApproval) parts.push(`${c.pendingApproval} pending`);
   if (c.failsGate) parts.push(`${c.failsGate} fail gate`);
+  if (c.withheld) parts.push(`${c.withheld} withheld`);
   if (c.updatePending) parts.push(`${c.updatePending} update pending`);
   if (c.rejected) parts.push(`${c.rejected} rejected`);
   if (c.publishedNotOnDisk) parts.push(`${c.publishedNotOnDisk} not on disk`);

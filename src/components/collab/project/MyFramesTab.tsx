@@ -14,7 +14,7 @@ import ProjectFrameTable, { type TableAction } from './table/ProjectFrameTable';
 import type { GroupNode } from './table/model';
 import { fromOwn, type FrameVM } from './frames';
 
-export type Segment = 'ready' | 'published' | 'held';
+export type Segment = 'ready' | 'review' | 'published' | 'held';
 
 export interface MyFramesTabProps {
   projectId: string;

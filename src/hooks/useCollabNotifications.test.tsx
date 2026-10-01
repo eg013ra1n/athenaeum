@@ -9,6 +9,7 @@ import type {
   CollabDeletionChoice,
   CollabFrameChanged,
   CollabFrameLost,
+  CollabPublishFinished,
   ProjectCard,
 } from '../types/models';
 
@@ -44,7 +45,8 @@ function projectCard(overrides: Partial<ProjectCard>): ProjectCard {
     candidates: 0,
     publishable: 0,
     autoReplicate: true,
-    autoPublish: true,
+    publishMode: 'manual',
+    syncedAt: null,
     fetchedAt: '2026-09-24T00:00:00Z',
     publishingDevice: null,
     publishingHere: false,
@@ -181,5 +183,86 @@ describe('useCollabNotifications', () => {
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
     expect(toasts[0]).toHaveTextContent('c_a.fits changed on disk and was set aside');
+  });
+
+  describe('collab-publish-finished (spec 5.4)', () => {
+    const run = (patch: Partial<CollabPublishFinished>): CollabPublishFinished => ({
+      projectId: 'proj-1', publishRunId: 'r1', kind: 'publish', trigger: 'manual', outcome: 'done',
+      calibrated: 0, announced: 0, updated: 0, stale: 0, heldBack: 0, error: null,
+      startedAt: '2026-10-01T10:00:00Z', finishedAt: '2026-10-01T10:00:09Z', ...patch,
+    });
+    type Stored = { title: string; detail: string; tone: string; link?: string; hasErrors?: boolean };
+    const history = (): Stored[] =>
+      (JSON.parse(localStorage.getItem('athenaeum.notifications.v1') ?? '{"notifications":[]}') as { notifications: Stored[] })
+        .notifications;
+
+    async function fire(patch: Partial<CollabPublishFinished>) {
+      renderHarness();
+      await settle();
+      emit('collab-publish-finished', run(patch));
+    }
+
+    it('a calibrate run links To review', async () => {
+      await fire({ kind: 'calibrate', calibrated: 46 });
+      const [n] = history();
+      expect(n.title).toBe('Calibrated 46 frames in M42 Mosaic — review them');
+      expect(n.link).toBe('/projects/proj-1?tab=mine&segment=review');
+      expect(screen.getAllByRole('status')).toHaveLength(1);
+    });
+
+    it('an auto run that calibrated and sent nothing says review them (F8)', async () => {
+      await fire({ kind: 'auto', trigger: 'auto', calibrated: 5 });
+      expect(history()[0].title).toBe('Calibrated 5 frames in M42 Mosaic — review them');
+    });
+
+    it('a refusal by the publishing device names the device, never the raw code (F8)', async () => {
+      await fire({ outcome: 'refused', error: 'collab_publishing_device:Obs PC' });
+      expect(history()[0].title).toBe('Obs PC publishes M42 Mosaic');
+      expect(history()[0].detail).not.toContain('collab_publishing_device');
+    });
+
+    it('a publish links Published', async () => {
+      await fire({ announced: 3, updated: 1 });
+      const [n] = history();
+      expect(n.title).toBe('Published 4 frames in M42 Mosaic');
+      expect(n.link).toBe('/projects/proj-1?tab=mine&segment=published');
+    });
+
+    it('nothing sent with frames held back warns and links Held back', async () => {
+      await fire({ heldBack: 2 });
+      const [n] = history();
+      expect(n.title).toBe('Nothing new to publish in M42 Mosaic');
+      expect(n.link).toBe('/projects/proj-1?tab=mine&segment=held');
+    });
+
+    it('a cancelled run is a history entry, no toast', async () => {
+      await fire({ outcome: 'cancelled' });
+      expect(history()[0].title).toBe('Stopped in M42 Mosaic');
+      expect(screen.queryAllByRole('status')).toHaveLength(0);
+    });
+
+    it('a refused auto run is silent, a refused manual run toasts', async () => {
+      await fire({ outcome: 'refused', trigger: 'auto', error: 'busy' });
+      expect(history()).toHaveLength(1);
+      expect(screen.queryAllByRole('status')).toHaveLength(0);
+      emit('collab-publish-finished', run({ outcome: 'refused', trigger: 'manual', error: 'busy' }));
+      expect(screen.getAllByRole('status')).toHaveLength(1);
+    });
+
+    it('a failed run is an error entry that carries the cause', async () => {
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      await fire({ outcome: 'failed', error: 'disk full' });
+      const [n] = history();
+      expect(n.hasErrors).toBe(true);
+      expect(n.detail).toContain('disk full');
+      expect(err).toHaveBeenCalled();
+      err.mockRestore();
+    });
+
+    it('a done run with every count 0 notifies nothing', async () => {
+      await fire({});
+      expect(history()).toHaveLength(0);
+      expect(screen.queryAllByRole('status')).toHaveLength(0);
+    });
   });
 });

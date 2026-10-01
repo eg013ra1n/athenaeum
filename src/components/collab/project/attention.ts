@@ -1,12 +1,11 @@
 import type { MemberSummary, OwnFrameRow, ProjectFrameView } from '../../../types/models';
-import { BLOCKER_ORDER } from './table/model';
 import { formatSize } from '../format';
-import { fromOwn } from './frames';
+import { fromOwn, HELD_KIND_ORDER } from './frames';
 
 /** Where a Needs-attention action lands: a My frames segment or a tab,
  * with the table's state facet pre-set. */
 export type AttentionTarget =
-  | { kind: 'segment'; segment: 'ready' | 'published' | 'held'; state?: string }
+  | { kind: 'segment'; segment: 'ready' | 'review' | 'published' | 'held'; state?: string }
   | { kind: 'tab'; tab: 'library' | 'moderation'; state?: string }
   /** Not navigation: Overview opens the filter-mapping dialog itself. */
   | { kind: 'map' };
@@ -63,6 +62,16 @@ const CAUSE: Record<string, { title: (n: number, rows: OwnFrameRow[]) => string;
   },
   threshold: { title: (n) => `${n} ${plural(n, 'frame fails', 'frames fail')} the quality thresholds`, detail: null, action: 'Review' },
   uuid: { title: (n) => `${n} ${plural(n, 'frame has', 'frames have')} no frame uuid`, detail: 'Re-scan the folder.', action: 'Review' },
+  withheld: {
+    title: (n) => `${n} ${plural(n, 'frame', 'frames')} withheld by you`,
+    detail: 'They are never published. Release them to publish them.',
+    action: 'Review',
+  },
+  blackHole: {
+    title: (n) => `${n} ${plural(n, 'frame is', 'frames are')} in the Black Hole`,
+    detail: 'Restore them from the Black Hole to publish them.',
+    action: 'Review',
+  },
   outsideTarget: { title: (n) => `${n} ${plural(n, 'frame is', 'frames are')} outside the target`, detail: null, action: 'Review' },
 };
 
@@ -79,8 +88,8 @@ export function deriveAttention({ own, library, members, canModerate, canReceive
   // two blockers counts in both rows.
   const heldVms = own.filter((r) => r.segment === 'held').map((r) => ({ r, states: fromOwn(r).states }));
   const heldKinds = new Set(heldVms.flatMap((h) => h.states));
-  const unknown = [...heldKinds].filter((k) => !BLOCKER_ORDER.includes(k));
-  for (const kind of [...BLOCKER_ORDER, ...unknown]) {
+  const unknown = [...heldKinds].filter((k) => !(HELD_KIND_ORDER as readonly string[]).includes(k));
+  for (const kind of [...HELD_KIND_ORDER, ...unknown]) {
     const rows = heldVms.filter((h) => h.states.includes(kind)).map((h) => h.r);
     if (rows.length === 0) continue;
     const target: AttentionTarget = kind === 'mapFilter' ? { kind: 'map' } : { kind: 'segment', segment: 'held', state: kind };

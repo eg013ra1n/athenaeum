@@ -131,8 +131,8 @@ export default function FramePanel({
     }
   };
 
-  const copyPath = () => {
-    const path = frame.own?.path;
+  const copyPath = (which: 'path' | 'calibratedPath' = 'path') => {
+    const path = frame.own?.[which];
     if (!path) return;
     try {
       navigator.clipboard
@@ -149,6 +149,7 @@ export default function FramePanel({
   const H3 = PANEL_H3;
   const status = frame.own
     ? frame.own.segment === 'held' ? <Chip tone="warn">held back</Chip>
+      : frame.own.segment === 'review' ? <Chip tone="info">to review</Chip>
       : frame.own.segment === 'ready' ? <Chip tone="info">ready</Chip>
       : <Chip tone={statusTone(effectiveStatus(frame))}>{effectiveStatus(frame)}</Chip>
     : <><Chip tone={statusTone(effectiveStatus(frame))}>{effectiveStatus(frame)}</Chip>{frame.device !== null && <> {COLUMNS.device.cell(frame)}</>}</>;
@@ -247,11 +248,18 @@ export default function FramePanel({
         ))}
       </>)}
 
-      {(frame.own?.path || frame.lib?.receivedAt) && <h3 className={H3}>On this device</h3>}
+      {(frame.own?.path || frame.own?.calibratedPath || frame.lib?.receivedAt) && <h3 className={H3}>On this device</h3>}
       {frame.own?.path && (
         <div className="flex items-start gap-1.5">
           <span className="break-all font-mono text-[11.5px] text-content-faint">{frame.own.path}</span>
-          <Button size="sm" aria-label="Copy path" onClick={copyPath}><Copy size={11} /></Button>
+          <Button size="sm" aria-label="Copy path" onClick={() => copyPath('path')}><Copy size={11} /></Button>
+        </div>
+      )}
+      {frame.own?.calibratedPath && (
+        <div className="flex items-start gap-1.5">
+          <span className="shrink-0 text-[11.5px] text-content-muted">Calibrated</span>
+          <span className="break-all font-mono text-[11.5px] text-content-faint">{frame.own.calibratedPath}</span>
+          <Button size="sm" aria-label="Copy calibrated path" onClick={() => copyPath('calibratedPath')}><Copy size={11} /></Button>
         </div>
       )}
       {frame.lib?.receivedAt && (

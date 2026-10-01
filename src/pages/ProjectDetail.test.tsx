@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { useEffect } from 'react';
-import { render, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
+import { render, renderHook, screen, fireEvent, act, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import { NotificationProvider } from '../contexts/NotificationContext';
 import { SessionStateProvider, useSessionState } from '../contexts/SessionStateContext';
@@ -10,6 +10,7 @@ import { ToastStack } from '../components/Toast';
 import ProjectDetail, { resolveSelfAccount } from './ProjectDetail';
 import { useCollabNotifications } from '../hooks/useCollabNotifications';
 import { api } from '../api';
+import { usePublishing } from '../components/collab/project/usePublishing';
 import type {
   AccountStatus,
   MemberSummary,
@@ -18,6 +19,7 @@ import type {
   ProjectDetail as Detail,
   ProjectFrameView,
   PublishResult,
+  CollabPublishFinished,
 } from '../types/models';
 
 vi.mock('../api', () => ({
@@ -44,7 +46,8 @@ function projectCard(overrides: Partial<ProjectCard> = {}): ProjectCard {
     candidates: 2,
     publishable: 2,
     autoReplicate: true,
-    autoPublish: true,
+    publishMode: 'manual',
+    syncedAt: null,
     fetchedAt: '2026-09-24T00:00:00Z',
     publishingDevice: null,
     publishingHere: false,
@@ -96,6 +99,10 @@ function ownRow(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
     rules: [],
     path: '/data/L_0001.fits',
     accepted: null,
+    calibratedPath: null,
+    calibratedBytes: null,
+    preparedAt: null,
+    withheld: false,
     ...o,
   };
 }
@@ -183,12 +190,14 @@ const okPublish: PublishResult = {
   updated: 0,
   state: 'published',
   heldBack: [],
+  calibrated: 0,
+  stale: 0,
   unchanged: 0,
 } as PublishResult;
 
 /** Every `api.listen` registration this render made, by event name — ALL of
  *  them: the page and the app-root `useCollabNotifications` both listen to
- *  `collab-published`. `fire` delivers a payload to every one. */
+ *  `collab-publish-finished`. `fire` delivers a payload to every one. */
 const listeners: Record<string, ((payload: unknown) => void)[]> = {};
 
 function fire(event: string, payload: unknown) {
@@ -283,6 +292,18 @@ function SeedLegacyTab({ value }: { value: string }) {
   return null;
 }
 
+/** Shows the page's session-held My frames segment. The session hook copies
+ *  the store at mount, so the probe remounts whenever the URL's query changes
+ *  (the deep link cleans it) to read the settled value. */
+function SegmentProbe() {
+  const { search } = useLocation();
+  return <SegmentValue key={search} />;
+}
+function SegmentValue() {
+  const [segment] = useSessionState<string>('projectDetail.segment', 'ready');
+  return <span data-testid="segment">{segment}</span>;
+}
+
 function renderProjectDetail(entry = '/projects/proj-1', seed?: string) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
@@ -298,6 +319,7 @@ function renderProjectDetail(entry = '/projects/proj-1', seed?: string) {
                     <>
                       <ProjectDetail />
                       <LocationDisplay />
+                      <SegmentProbe />
                     </>
                   }
                 />
@@ -328,8 +350,17 @@ function invokeCount(command: string): number {
   return vi.mocked(api.invoke).mock.calls.filter(([c]) => c === command).length;
 }
 
+/** A `collab-publish-finished` payload; defaults to a done manual publish. */
+function finished(patch: Partial<CollabPublishFinished> = {}): CollabPublishFinished {
+  return {
+    projectId: 'proj-1', publishRunId: 'run-1', kind: 'publish', trigger: 'manual', outcome: 'done',
+    calibrated: 0, announced: 0, updated: 0, stale: 0, heldBack: 0, error: null,
+    startedAt: '2026-10-01T10:00:00Z', finishedAt: '2026-10-01T10:00:05Z', ...patch,
+  };
+}
+
 describe('ProjectDetail manual publish', () => {
-  it('raises no inline toast of its own; the live collab-published event produces exactly one', async () => {
+  it('raises no inline toast of its own; the live collab-publish-finished event produces exactly one', async () => {
     renderProjectDetail();
     await publishViaConfirm();
 
@@ -340,14 +371,14 @@ describe('ProjectDetail manual publish', () => {
     expect(api.invoke).toHaveBeenCalledWith('publish_collab_frames', { projectId: 'proj-1', frameIds: [1, 2] });
     await waitFor(() => expect(invokeCount('list_project_own_frames')).toBeGreaterThanOrEqual(2));
 
-    expect(listeners['collab-published']?.length ?? 0).toBeGreaterThan(0);
+    expect(listeners['collab-publish-finished']?.length ?? 0).toBeGreaterThan(0);
     // The invoke resolved successfully — ProjectDetail itself raises no toast.
     expect(screen.queryAllByRole('status')).toHaveLength(0);
 
-    // The backend always emits `collab-published` on a successful publish;
+    // The backend always emits `collab-publish-finished` on a successful publish;
     // the live listener (`useCollabNotifications`) is the one place that
     // turns it into a toast.
-    fire('collab-published', { projectId: 'proj-1', announced: 2, updated: 0, heldBack: 0 });
+    fire('collab-publish-finished', finished({ announced: 2 }));
 
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
@@ -383,7 +414,7 @@ describe('ProjectDetail manual publish', () => {
     expect(screen.getByText(/requires approval/)).toBeInTheDocument();
   });
 
-  it('a failed publish shows an inline error and a toast whose dedupeKey cannot collide with the live one', async () => {
+  it('a failed publish shows an inline error and no toast (F4: only the finished event notifies)', async () => {
     mockCommands(projectCard(), {
       publish_collab_frames: () => Promise.reject(new Error('hub unreachable')),
     });
@@ -392,9 +423,21 @@ describe('ProjectDetail manual publish', () => {
 
     expect(await screen.findByText('hub unreachable')).toBeInTheDocument();
 
-    const toasts = await screen.findAllByRole('status');
-    expect(toasts).toHaveLength(1);
-    expect(toasts[0]).toHaveTextContent('Publish failed');
+    expect(screen.queryAllByRole('status')).toHaveLength(0);
+  });
+
+  it('calibrate invokes calibrate_collab_frames with the ids and toasts nothing on failure', async () => {
+    const { result } = renderHook(() => usePublishing('proj-1', {
+      reloadDetail: async () => {}, reloadOwn: async () => {}, onCard: () => {}, closeConfirm: () => {},
+    }), { wrapper: NotificationProvider });
+    vi.mocked(api.invoke).mockResolvedValueOnce(okPublish as never);
+    await act(async () => { await result.current.calibrate([1, 2]); });
+    expect(api.invoke).toHaveBeenCalledWith('calibrate_collab_frames', { projectId: 'proj-1', frameIds: [1, 2] });
+    vi.mocked(api.invoke).mockRejectedValueOnce(new Error('boom'));
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await act(async () => { await result.current.calibrate([1]); });
+    expect(result.current.calibrateError).toBe('boom');
+    err.mockRestore();
   });
 
   it('a publish refused because another run is in progress reads as "already running", not a failure', async () => {
@@ -516,12 +559,9 @@ describe('ProjectDetail publishing device (A6)', () => {
     expect(refusal).toHaveTextContent('Obs PC publishes new frames to this project');
     expect(within(refusal).getByRole('button', { name: 'Publish from this device' })).toBeInTheDocument();
     expect(screen.queryByText('collab_publishing_device:Obs PC')).not.toBeInTheDocument();
-    // The publish confirm closed; the one toast names the device, not "Publish failed".
+    // The publish confirm closed; no toast of its own (F4) — the finished event notifies.
     expect(screen.queryByRole('button', { name: 'Publish' })).not.toBeInTheDocument();
-    const toasts = await screen.findAllByRole('status');
-    expect(toasts).toHaveLength(1);
-    expect(toasts[0]).toHaveTextContent('Obs PC publishes new frames to this project');
-    expect(toasts[0]).not.toHaveTextContent('Publish failed');
+    expect(screen.queryAllByRole('status')).toHaveLength(0);
 
     // The refusal's action opens the same confirm.
     fireEvent.click(within(refusal).getByRole('button', { name: 'Publish from this device' }));
@@ -783,7 +823,7 @@ describe('ProjectDetail republish guard', () => {
     expect(toasts[0]).not.toHaveTextContent('Republish failed');
   });
 
-  it('a failed republish shows the error inside the guard and one "Republish failed" toast', async () => {
+  it('a failed republish shows the error inside the guard and no toast (F4)', async () => {
     mockCommands(projectCard(), {
       list_project_own_frames: () => Promise.resolve([published(51)]),
       republish_collab_frames: () => Promise.reject(new Error('hub unreachable')),
@@ -794,30 +834,11 @@ describe('ProjectDetail republish guard', () => {
     fireEvent.change(screen.getByLabelText('Type 1 to confirm'), { target: { value: '1' } });
     fireEvent.click(screen.getByRole('button', { name: 'Republish' }));
     expect(await screen.findByText('hub unreachable')).toBeInTheDocument();
-    const toasts = await screen.findAllByRole('status');
-    expect(toasts).toHaveLength(1);
-    expect(toasts[0]).toHaveTextContent('Republish failed');
+    expect(screen.queryAllByRole('status')).toHaveLength(0);
   });
 });
 
 describe('ProjectDetail My frames header (F7, dead decision-C hint removed)', () => {
-  it('auto_publish_switch_visible_without_receive', async () => {
-    mockCommands(projectCard({ dataRole: 'send' }));
-    renderProjectDetail();
-    await openTab(/^My frames/);
-
-    // The page header's meta line owns the switch now.
-    const toggle = await screen.findByRole('button', { name: 'Auto-publish on' });
-    // The fixture's `autoPublish` defaults to true; the click toggles it off.
-    fireEvent.click(toggle);
-    await waitFor(() =>
-      expect(api.invoke).toHaveBeenCalledWith('set_project_auto_publish', {
-        projectId: 'proj-1',
-        enabled: false,
-      }),
-    );
-  });
-
   it('never shows the dead "not available in this version" hint, even when every frame is held back only on calibration', async () => {
     mockCommands(projectCard(), {
       list_project_own_frames: () =>
@@ -1051,6 +1072,14 @@ describe('ProjectDetail tabs', () => {
     await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/projects/proj-1'));
   });
 
+  it('?tab=mine&segment=review opens My frames on To review and cleans the URL', async () => {
+    renderProjectDetail('/projects/proj-1?tab=mine&segment=review');
+    const mine = await screen.findByRole('tab', { name: /^My frames/ });
+    await waitFor(() => expect(mine).toHaveAttribute('aria-selected', 'true'));
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/projects/proj-1'));
+    expect(screen.getByTestId('segment').textContent).toBe('review');
+  });
+
   it('?tab=contribute opens My frames', async () => {
     renderProjectDetail('/projects/proj-1?tab=contribute');
     const mine = await screen.findByRole('tab', { name: /^My frames/ });
@@ -1128,16 +1157,16 @@ describe('ProjectDetail tabs', () => {
 });
 
 describe('ProjectDetail fix round 1', () => {
-  it('collab-published for this project (e.g. an auto-publish) re-reads own frames, the library and the detail', async () => {
+  it('collab-publish-finished for this project (e.g. an auto-publish) re-reads own frames, the library and the detail', async () => {
     renderProjectDetail();
     await openTab(/^My frames/);
     await screen.findByRole('button', { name: 'Publish all 2' });
-    await waitFor(() => expect(listeners['collab-published']?.length ?? 0).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(listeners['collab-publish-finished']?.length ?? 0).toBeGreaterThanOrEqual(2));
     const own = invokeCount('list_project_own_frames');
     const lib = invokeCount('list_collab_frames');
     const det = invokeCount('get_collab_project_detail');
 
-    fire('collab-published', { projectId: 'proj-1', announced: 3, updated: 0, heldBack: 0 });
+    fire('collab-publish-finished', finished({ announced: 3 }));
     await waitFor(() => {
       expect(invokeCount('list_project_own_frames')).toBeGreaterThan(own);
       expect(invokeCount('list_collab_frames')).toBeGreaterThan(lib);
@@ -1145,16 +1174,16 @@ describe('ProjectDetail fix round 1', () => {
     });
   });
 
-  it('collab-published for another project re-reads nothing', async () => {
+  it('collab-publish-finished for another project re-reads nothing', async () => {
     renderProjectDetail();
     await openTab(/^My frames/);
     await screen.findByRole('button', { name: 'Publish all 2' });
-    await waitFor(() => expect(listeners['collab-published']?.length ?? 0).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(listeners['collab-publish-finished']?.length ?? 0).toBeGreaterThanOrEqual(2));
     const own = invokeCount('list_project_own_frames');
     const lib = invokeCount('list_collab_frames');
     const det = invokeCount('get_collab_project_detail');
 
-    fire('collab-published', { projectId: 'proj-other', announced: 3, updated: 0, heldBack: 0 });
+    fire('collab-publish-finished', finished({ projectId: 'proj-other', announced: 3 }));
     await new Promise((r) => setTimeout(r, 0));
     expect(invokeCount('list_project_own_frames')).toBe(own);
     expect(invokeCount('list_collab_frames')).toBe(lib);
@@ -1371,12 +1400,12 @@ describe('ProjectDetail presence (collab-peers-changed)', () => {
     spy.mockRestore();
   });
 
-  it('collab-published also reloads the members', async () => {
+  it('collab-publish-finished also reloads the members', async () => {
     renderProjectDetail();
     await screen.findByRole('tab', { name: 'Overview' });
-    await waitFor(() => expect(listeners['collab-published']?.length ?? 0).toBeGreaterThan(0));
+    await waitFor(() => expect(listeners['collab-publish-finished']?.length ?? 0).toBeGreaterThan(0));
     const mem0 = invokeCount('get_collab_member_summary');
-    fire('collab-published', { projectId: 'proj-1' });
+    fire('collab-publish-finished', finished());
     await waitFor(() => expect(invokeCount('get_collab_member_summary')).toBe(mem0 + 1));
   });
 
@@ -1623,10 +1652,10 @@ describe('ProjectDetail page shell (wave 5.5)', () => {
     expect(h.parentElement!.className).not.toContain('flex-wrap');
   });
 
-  it('the meta line carries the publishing device and both toggles', async () => {
+  it('the meta line carries the publishing device and the auto-replicate toggle', async () => {
     renderPage();
     expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Auto-publish on' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Auto-publish/ })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Auto-replicate on' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('set_project_auto_replicate', { projectId: 'proj-1', enabled: false }),
@@ -1637,7 +1666,7 @@ describe('ProjectDetail page shell (wave 5.5)', () => {
 
   it('a send-only member gets no auto-replicate toggle', async () => {
     renderPage({ dataRole: 'send', coordinator: false, canModerate: false });
-    expect(await screen.findByRole('button', { name: 'Auto-publish on' })).toBeInTheDocument();
+    expect(await screen.findByText('Publishing from this device')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Auto-replicate/ })).toBeNull();
   });
 

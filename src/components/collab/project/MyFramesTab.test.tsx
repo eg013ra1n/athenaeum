@@ -46,6 +46,10 @@ function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
     rules: [],
     path: '/data/f.fits',
     accepted: null,
+    calibratedPath: null,
+    calibratedBytes: null,
+    preparedAt: null,
+    withheld: false,
     ...o,
   };
 }

@@ -35,6 +35,7 @@ import type {
   OwnFrameRow,
   ProjectDetail as Detail,
   ProjectFrameView,
+  CollabPublishFinished,
 } from '../types/models';
 
 type Tab = 'overview' | 'mine' | 'library' | 'members' | 'exchange' | 'moderation';
@@ -150,6 +151,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const [segment, setSegment] = useSessionState<Segment>('projectDetail.segment', 'ready');
   // Write-only handles on the tables' facet session keys (`collab.<project>.<tableId>.facets`).
   const [, setReadyFacets] = useSessionState<Facets>(`collab.${id}.ready.facets`, EMPTY_FACETS);
+  const [, setReviewFacets] = useSessionState<Facets>(`collab.${id}.review.facets`, EMPTY_FACETS);
   const [, setHeldFacets] = useSessionState<Facets>(`collab.${id}.held.facets`, EMPTY_FACETS);
   const [, setPublishedFacets] = useSessionState<Facets>(`collab.${id}.published.facets`, EMPTY_FACETS);
   const [, setLibraryFacets] = useSessionState<Facets>(`collab.${id}.library.facets`, EMPTY_FACETS);
@@ -162,11 +164,15 @@ function ProjectPage({ id }: { id: string | undefined }) {
     if (!t) return;
     // A tab change closes the frame panel (spec §6.1).
     setDrawer(null);
+    // `&segment=` picks the My frames segment (a run notification's link).
+    const seg = searchParams.get('segment');
+    if (seg === 'ready' || seg === 'review' || seg === 'published' || seg === 'held') setSegment(seg);
     setTab(t);
     const next = new URLSearchParams(searchParams);
     next.delete('tab');
+    next.delete('segment');
     setSearchParams(next, { replace: true });
-  }, [searchParams, setSearchParams, setTab]);
+  }, [searchParams, setSearchParams, setTab, setSegment]);
 
   // Detail comes from the local cache of VERIFIED snapshots (core owns
   // verification). Its failure means "not in my local list".
@@ -219,7 +225,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
     void loadLibrary();
   }, [loadLibrary, storedTab]);
 
-  // Core emits `collab-published` at the end of EVERY publish run of a
+  // Core emits `collab-publish-finished` at the end of EVERY publish run of a
   // project — manual, republish and the background auto-publish — so this is
   // the one place that keeps own frames (Ready counts, `Publish all N`), the
   // library (the Library count pill) and the card current
@@ -229,7 +235,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     api
-      .listen<{ projectId: string }>('collab-published', (p) => {
+      .listen<CollabPublishFinished>('collab-publish-finished', (p) => {
         if (cancelled || p.projectId !== id) return;
         void loadOwn();
         void loadLibrary();
@@ -240,7 +246,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
         if (cancelled) fn();
         else unlisten = fn;
       })
-      .catch((err) => console.error('[projects] collab-published listen failed:', err));
+      .catch((err) => console.error('[projects] collab-publish-finished listen failed:', err));
     return () => {
       cancelled = true;
       unlisten?.();
@@ -419,6 +425,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
   const ownRows = own ?? [];
   const readyCount = ownRows.filter((r) => r.segment === 'ready').length;
+  const reviewCount = ownRows.filter((r) => r.segment === 'review').length;
   const publishedRows = ownRows.filter((r) => r.segment === 'published');
   const canRepublish = publishedRows.length > 0;
 
@@ -434,7 +441,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const activeTab: Tab = tabs.includes(requested) ? requested : 'overview';
   // Tab count pills (spec §8): "136 ready", "278 to go", the pending count.
   const badge: Partial<Record<Tab, { n: number; text: string; warn?: boolean }>> = {
-    mine: { n: readyCount, text: `${readyCount} ready` },
+    mine: { n: readyCount + reviewCount, text: [readyCount > 0 && `${readyCount} ready`, reviewCount > 0 && `${reviewCount} to review`].filter(Boolean).join(' · ') },
     library: { n: toCome, text: `${toCome} to go` },
     moderation: { n: c.pendingFrames, text: String(c.pendingFrames), warn: true },
   };
@@ -514,7 +521,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const openAttention = (t: NavTarget) => {
     const facets: Facets = { ...EMPTY_FACETS, state: t.state ?? null };
     if (t.kind === 'segment') {
-      ({ ready: setReadyFacets, held: setHeldFacets, published: setPublishedFacets })[t.segment](facets);
+      ({ ready: setReadyFacets, review: setReviewFacets, held: setHeldFacets, published: setPublishedFacets })[t.segment](facets);
       setSegment(t.segment);
       selectTab('mine');
     } else {
@@ -642,7 +649,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
                 onOpenSegment={(s) => {
                   // A tile opens the whole segment: clear its state facet.
                   const clear = (f: Facets): Facets => ({ ...f, state: null });
-                  ({ ready: setReadyFacets, held: setHeldFacets, published: setPublishedFacets })[s](clear);
+                  ({ ready: setReadyFacets, review: setReviewFacets, held: setHeldFacets, published: setPublishedFacets })[s](clear);
                   setSegment(s);
                   selectTab('mine');
                 }}

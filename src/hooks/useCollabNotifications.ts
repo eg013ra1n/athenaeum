@@ -1,25 +1,16 @@
 import { useEffect, useRef } from 'react';
 import { api } from '../api';
 import { useNotifications, type NotifyLike } from '../contexts/NotificationContext';
+import { publishingDeviceRefusal } from '../components/collab/project/usePublishing';
 import type {
   CollabDeletionChoice,
   CollabFrameChanged,
   CollabFrameLost,
   CollabFramesChange,
   CollabFramesLanded,
+  CollabPublishFinished,
   ProjectCard,
 } from '../types/models';
-
-/** Payload of the `collab-published` event (Task 7,
- * `api::collab::COLLAB_PUBLISHED_EVENT`) — emitted as raw JSON on the Rust
- * side (no ts-rs type), so it is declared by hand here. `heldBack` is a
- * COUNT on this event (unlike `PublishResult.heldBack`, an array). */
-interface CollabPublishedEvent {
-  projectId: string;
-  announced: number;
-  updated: number;
-  heldBack: number;
-}
 
 /* No content-shaped `dedupeKey` on any collab live notification (final
  * review I4): the dedupe set persists in localStorage, so a key such as
@@ -257,36 +248,84 @@ export function useCollabNotifications() {
     };
   }, [notify]);
 
-  // `collab-published` (Task 7) — surfaces a manual OR a background
-  // auto-publish (Task 10) outcome.
+  // `collab-publish-finished` (spec §5.4) — the ONE notification of a started
+  // run's outcome (calibrate, publish, republish or auto; manual or
+  // background). Commands refused before a run starts notify nowhere here.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     api
-      .listen<CollabPublishedEvent>('collab-published', (res) => {
+      .listen<CollabPublishFinished>('collab-publish-finished', (f) => {
         if (cancelled) return;
-        const sent = res.announced + res.updated;
-        if (sent === 0 && res.heldBack === 0) return;
-        const title = titleFor(res.projectId);
-        const link = `/projects/${res.projectId}`;
-        notify({
-          title:
-            sent === 0 ? `Nothing new to publish in ${title}` : `Published ${sent} frames in ${title}`,
-          detail:
-            res.heldBack > 0
-              ? `${res.announced} new · ${res.updated} updated · ${res.heldBack} held back`
-              : `${res.announced} new · ${res.updated} updated`,
-          kind: 'project',
-          tone: sent === 0 ? 'warning' : 'success',
-          hasErrors: res.heldBack > 0,
-          link,
-        });
+        const title = titleFor(f.projectId);
+        const sent = f.announced + f.updated;
+        const base = `/projects/${f.projectId}?tab=mine`;
+        if (f.outcome === 'done' && f.calibrated + sent + f.heldBack + f.stale === 0) return;
+        switch (f.outcome) {
+          case 'done':
+            if (sent === 0 && f.calibrated > 0) {
+              notify({
+                title: `Calibrated ${f.calibrated} frames in ${title} — review them`,
+                detail: f.heldBack > 0 ? `${f.heldBack} held back` : '',
+                kind: 'project',
+                tone: 'success',
+                hasErrors: f.heldBack > 0,
+                link: `${base}&segment=review`,
+              });
+            } else if (sent > 0) {
+              notify({
+                title: `Published ${sent} frames in ${title}`,
+                detail: `${f.announced} new · ${f.updated} updated${f.heldBack > 0 ? ` · ${f.heldBack} held back` : ''}`,
+                kind: 'project',
+                tone: 'success',
+                hasErrors: f.heldBack > 0,
+                link: `${base}&segment=published`,
+              });
+            } else if (f.heldBack > 0) {
+              notify({
+                title: `Nothing new to publish in ${title}`,
+                detail: `${f.heldBack} held back`,
+                kind: 'project',
+                tone: 'warning',
+                link: `${base}&segment=held`,
+              });
+            }
+            break;
+          case 'cancelled':
+            notify({ title: `Stopped in ${title}`, detail: '', kind: 'project', tone: 'info', toast: false, link: base });
+            break;
+          case 'refused': {
+            const device = f.error ? publishingDeviceRefusal(f.error) : null;
+            notify({
+              title: device ? `${device} publishes ${title}` : `Not published in ${title}`,
+              detail: device
+                ? 'Use Publish from this device in Project settings to take over.'
+                : (f.error ?? ''),
+              kind: 'project',
+              tone: 'warning',
+              toast: f.trigger === 'manual',
+              link: base,
+            });
+            break;
+          }
+          case 'failed':
+            console.error('[collab] publish run failed:', f.error);
+            notify({
+              title: `Publishing failed in ${title}`,
+              detail: f.error ?? '',
+              kind: 'project',
+              tone: 'warning',
+              hasErrors: true,
+              link: base,
+            });
+            break;
+        }
       })
       .then((fn) => {
         if (cancelled) fn();
         else unlisten = fn;
       })
-      .catch((err) => console.error('[collab] published listen failed:', err));
+      .catch((err) => console.error('[collab] publish-finished listen failed:', err));
     return () => {
       cancelled = true;
       unlisten?.();

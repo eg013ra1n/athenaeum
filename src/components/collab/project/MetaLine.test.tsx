@@ -30,7 +30,8 @@ function card(patch: Partial<ProjectCard>): ProjectCard {
     candidates: 0,
     publishable: 0,
     autoReplicate: true,
-    autoPublish: true,
+    publishMode: 'manual',
+    syncedAt: null,
     fetchedAt: '2026-09-29T10:00:00Z',
     publishingDevice: null,
     publishingHere: false,
@@ -62,14 +63,12 @@ const renderWithNotifications = (ui: ReactElement) =>
   );
 
 describe('MetaLine', () => {
-  it('reads like the mockup and flips auto-publish on click', async () => {
-    renderWithNotifications(<MetaLine card={card({ publishingHere: true, autoPublish: true, autoReplicate: true })} canReceive onChanged={onChanged} onSwitchHere={() => {}} switchBusy={false} />);
+  it('reads like the mockup', () => {
+    renderWithNotifications(<MetaLine card={card({ publishingHere: true, autoReplicate: true })} canReceive onChanged={onChanged} onSwitchHere={() => {}} switchBusy={false} />);
     expect(screen.getByText('Publishing from this device')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Auto-replicate on' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Publish from here' })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Auto-publish on' }));
-    await waitFor(() => expect(api.invoke).toHaveBeenCalledWith('set_project_auto_publish', { projectId: 'p', enabled: false }));
-    expect(onChanged).toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /Auto-publish/ })).toBeNull();
   });
 
   it('names the other publishing device and offers to switch', () => {
@@ -93,8 +92,6 @@ describe('MetaLine', () => {
   it('hides auto-replicate for a send-only member', () => {
     renderWithNotifications(<MetaLine card={card({})} canReceive={false} onChanged={() => {}} onSwitchHere={() => {}} switchBusy={false} />);
     expect(screen.queryByRole('button', { name: /Auto-replicate/ })).toBeNull();
-    // Auto-publish is every member's, never gated on receiving.
-    expect(screen.getByRole('button', { name: 'Auto-publish on' })).toBeInTheDocument();
   });
 
   // Moved from AutoReplicateBar.test.tsx ("writes the local preference and
@@ -109,28 +106,25 @@ describe('MetaLine', () => {
   });
 
   it('an off toggle reads off and turns on', async () => {
-    renderWithNotifications(<MetaLine card={card({ autoPublish: false, autoReplicate: false })} canReceive onChanged={onChanged} onSwitchHere={() => {}} switchBusy={false} />);
+    renderWithNotifications(<MetaLine card={card({ autoReplicate: false })} canReceive onChanged={onChanged} onSwitchHere={() => {}} switchBusy={false} />);
     fireEvent.click(screen.getByRole('button', { name: 'Auto-replicate off' }));
     await waitFor(() =>
       expect(api.invoke).toHaveBeenCalledWith('set_project_auto_replicate', { projectId: 'p', enabled: true }),
     );
-    expect(screen.getByRole('button', { name: 'Auto-publish off' })).toBeInTheDocument();
   });
 
-  it('both toggles are disabled while a write runs', async () => {
+  it('the toggle is disabled while a write runs', async () => {
     let finish: (() => void) | undefined;
     vi.mocked(api.invoke).mockImplementation((() => new Promise<void>((r) => { finish = r; })) as never);
     renderWithNotifications(<MetaLine card={card({})} canReceive onChanged={onChanged} onSwitchHere={() => {}} switchBusy={false} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Auto-publish on' }));
-    expect(screen.getByRole('button', { name: 'Auto-publish on' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Auto-replicate on' }));
     expect(screen.getByRole('button', { name: 'Auto-replicate on' })).toBeDisabled();
     await act(async () => finish?.());
     expect(screen.getByRole('button', { name: 'Auto-replicate on' })).toBeEnabled();
   });
 
-  it('explains each toggle in its tooltip', () => {
+  it('explains the toggle in its tooltip', () => {
     renderWithNotifications(<MetaLine card={card({})} canReceive onChanged={() => {}} onSwitchHere={() => {}} switchBusy={false} />);
-    expect(screen.getByRole('button', { name: 'Auto-publish on' }).getAttribute('title')).toMatch(/publish automatically/);
     expect(screen.getByRole('button', { name: 'Auto-replicate on' }).getAttribute('title')).toMatch(/download automatically/);
   });
 
@@ -149,19 +143,6 @@ describe('MetaLine', () => {
     expect(onChanged).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Auto-replicate on' })).toBeEnabled();
     expect(error).toHaveBeenCalled();
-    error.mockRestore();
-  });
-
-  it('a failed auto-publish write names auto-publish', async () => {
-    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-    vi.mocked(api.invoke).mockRejectedValueOnce('catalog busy');
-    renderWithNotifications(<MetaLine card={card({})} canReceive onChanged={onChanged} onSwitchHere={() => {}} switchBusy={false} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Auto-publish on' }));
-    expect(await screen.findByText('Could not change auto-publish')).toBeInTheDocument();
-    await waitFor(() =>
-      expect(localStorage.getItem('athenaeum.notifications.v1') ?? '').toContain('catalog busy'),
-    );
-    expect(onChanged).not.toHaveBeenCalled();
     error.mockRestore();
   });
 });

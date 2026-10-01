@@ -40,6 +40,10 @@ function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
     rules: [],
     path: null,
     accepted: null,
+    calibratedPath: null,
+    calibratedBytes: null,
+    preparedAt: null,
+    withheld: false,
     ...o,
   };
 }

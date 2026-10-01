@@ -35,7 +35,7 @@ const PUBLISHING_DEVICE_PREFIX = 'collab_publishing_device:';
  *  (`account::client::publishing_device_label`). */
 export const OTHER_DEVICE = 'another device of this account';
 
-function publishingDeviceRefusal(msg: string): string | null {
+export function publishingDeviceRefusal(msg: string): string | null {
   if (!msg.startsWith(PUBLISHING_DEVICE_PREFIX)) return null;
   return msg.slice(PUBLISHING_DEVICE_PREFIX.length).trim() || OTHER_DEVICE;
 }
@@ -77,11 +77,15 @@ export interface PublishingOptions {
 export interface Publishing {
   publish: (frameIds: number[]) => Promise<void>;
   republish: (frameIds: number[] | null) => Promise<void>;
+  /** Calibrate the frames for review; opens no confirm. */
+  calibrate: (frameIds: number[]) => Promise<void>;
   switchHere: () => Promise<void>;
   publishBusy: boolean;
   publishError: string | null;
   republishBusy: boolean;
   republishError: string | null;
+  calibrateBusy: boolean;
+  calibrateError: string | null;
   switchBusy: boolean;
   /** The publishing device a publish/republish was refused for (A6). */
   refusedBy: string | null;
@@ -101,17 +105,12 @@ export interface Publishing {
  * republish runs over every gate candidate and would announce never-published
  * Ready frames.
  *
- * R29 fix round 2: the backend always emits `collab-published` on a
- * successful publish/republish (manual or auto), and the app-root
- * `useCollabNotifications` hook is the one place that turns it into a
- * toast — a second, inline success notify here would double-toast on every
- * manual click. `publish`/`republish` do their own local UI work (close the
- * confirm, reload own frames + detail) and raise a notify() only for a failed
- * invoke, which the backend never emits an event for — nothing else would
- * ever tell the user. The live listener sets no dedupeKey at all (final
- * review I4), and these error toasts use a per-click `Date.now()` key, so
- * neither can swallow the other. A busy refusal (another run of this project
- * in progress) is an info toast, not a failure.
+ * F4: the app-root `useCollabNotifications` hook is the one place that turns
+ * `collab-publish-finished` (the outcome of every STARTED run) into a toast.
+ * `publish`/`republish`/`calibrate` do their own local UI work (close the
+ * confirm, reload own frames + detail) and show a refusal returned before any
+ * run starts inline (error line, `updateRequired`, the A6 box); only a busy
+ * refusal also raises an info toast, since no run exists to finish.
  */
 export function usePublishing(projectId: string | undefined, options: PublishingOptions): Publishing {
   const { notify } = useNotifications();
@@ -123,23 +122,17 @@ export function usePublishing(projectId: string | undefined, options: Publishing
   const [publishError, setPublishError] = useState<string | null>(null);
   const [republishBusy, setRepublishBusy] = useState(false);
   const [republishError, setRepublishError] = useState<string | null>(null);
+  const [calibrateBusy, setCalibrateBusy] = useState(false);
+  const [calibrateError, setCalibrateError] = useState<string | null>(null);
   const [refusedBy, setRefusedBy] = useState<string | null>(null);
   const [switchBusy, setSwitchBusy] = useState(false);
   const [updateRequired, setUpdateRequired] = useState(false);
 
   /** A6 refusal: the other device publishes new frames here. Inline with
-   *  the switch action, plus one warning toast (the backend raises no event
-   *  for a rejected run); the reload picks up the binding core recorded. */
+   *  the switch action; the finished event carries the notification (F4). The
+   *  reload picks up the binding core recorded. */
   const showPublishingDeviceRefusal = (name: string) => {
     setRefusedBy(name);
-    notify({
-      title: `${leading(name)} publishes new frames to this project`,
-      detail: 'Use "Publish from this device" on the project page to publish new frames from here.',
-      kind: 'project',
-      tone: 'warning',
-      link: `/projects/${projectId}`,
-      dedupeKey: `publishing-device-${projectId}-${Date.now()}`,
-    });
     void opts.current.reloadDetail();
   };
 
@@ -206,16 +199,9 @@ export function usePublishing(projectId: string | undefined, options: Publishing
           dedupeKey: `publish-busy-${projectId}-${Date.now()}`,
         });
       } else {
+        // F4: inline only. A started run that fails is notified once, from
+        // `collab-publish-finished`; this is a refusal before any run.
         setPublishError(msg);
-        notify({
-          title: 'Publish failed',
-          detail: msg,
-          kind: 'project',
-          tone: 'warning',
-          hasErrors: true,
-          link: `/projects/${projectId}`,
-          dedupeKey: `publish-failed-${projectId}-${Date.now()}`,
-        });
       }
     } finally {
       setPublishBusy(false);
@@ -254,18 +240,44 @@ export function usePublishing(projectId: string | undefined, options: Publishing
         });
       } else {
         setRepublishError(msg);
-        notify({
-          title: 'Republish failed',
-          detail: msg,
-          kind: 'project',
-          tone: 'warning',
-          hasErrors: true,
-          link: `/projects/${projectId}`,
-          dedupeKey: `republish-failed-${projectId}-${Date.now()}`,
-        });
       }
     } finally {
       setRepublishBusy(false);
+    }
+  };
+
+  const calibrate = async (frameIds: number[]) => {
+    if (!projectId) return;
+    setCalibrateBusy(true);
+    setCalibrateError(null);
+    try {
+      const res = await api.invoke<PublishResult>('calibrate_collab_frames', { projectId, frameIds });
+      setRefusedBy(heldForPublishingDevice(res));
+      await opts.current.reloadOwn();
+      await opts.current.reloadDetail();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[projects] calibrate failed:', err);
+      const refused = publishingDeviceRefusal(msg);
+      if (isOutdated(msg)) {
+        setUpdateRequired(true);
+      } else if (refused) {
+        showPublishingDeviceRefusal(refused);
+      } else if (isPublishBusy(msg)) {
+        setCalibrateError(PUBLISH_BUSY_INLINE);
+        notify({
+          title: 'Publication already running',
+          detail: 'Wait for the current run of this project to finish, then calibrate again.',
+          kind: 'project',
+          tone: 'info',
+          link: `/projects/${projectId}`,
+          dedupeKey: `calibrate-busy-${projectId}-${Date.now()}`,
+        });
+      } else {
+        setCalibrateError(msg);
+      }
+    } finally {
+      setCalibrateBusy(false);
     }
   };
 
@@ -275,11 +287,14 @@ export function usePublishing(projectId: string | undefined, options: Publishing
   return {
     publish,
     republish,
+    calibrate,
     switchHere,
     publishBusy,
     publishError,
     republishBusy,
     republishError,
+    calibrateBusy,
+    calibrateError,
     switchBusy,
     refusedBy,
     updateRequired,

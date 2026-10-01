@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import type { ModerationFrameView, OwnFrameRow, ProjectFrameView } from '../../../types/models';
-import { COLUMNS, copies, fromLibrary, fromModeration, fromOwn, GROUPS, TABLES } from './frames';
+import { COLUMNS, copies, fromLibrary, fromModeration, fromOwn, GROUPS, HELD_KIND_ORDER, REASON_LABEL, TABLES } from './frames';
 
 function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
   return {
@@ -35,6 +35,10 @@ function own(o: Partial<OwnFrameRow> = {}): OwnFrameRow {
     rules: [],
     path: '/data/m31/Light_Ha_300s_0001.fits',
     accepted: null,
+    calibratedPath: null,
+    calibratedBytes: null,
+    preparedAt: null,
+    withheld: false,
     ...o,
   };
 }
@@ -251,4 +255,15 @@ it('held-back "+N" uses the faint group-count style; an empty publisher group re
   expect(screen.getByText('+1').className).toContain('text-content-faint');
   expect(screen.getByText('+1').className).toContain('text-[11px]');
   expect(screen.getByText('Unknown publisher')).toBeInTheDocument();
+});
+
+it('a review row has no states and a withheld held row carries the withheld kind', () => {
+  const review = fromOwn(own({ segment: 'review', calibratedPath: '/c/c_a.fits', calibratedBytes: 64 }));
+  expect(review.states).toEqual([]);
+  const w = fromOwn(own({ segment: 'held', withheld: true, failures: [{ kind: 'withheld', text: 'Withheld by you' }] }));
+  expect(w.states).toEqual(['withheld']);
+  expect(REASON_LABEL.withheld).toBe('Withheld by you');
+  expect(REASON_LABEL.blackHole).toBe('In the Black Hole');
+  expect(TABLES.held.stateFacet?.options.map(([k]) => k)).toEqual([...HELD_KIND_ORDER]);
+  expect(TABLES.review.stateFacet).toBeNull();
 });

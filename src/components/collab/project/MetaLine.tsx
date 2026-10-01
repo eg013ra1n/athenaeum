@@ -35,12 +35,12 @@ export default function MetaLine({
   switchBusy: boolean;
 }) {
   const { notify } = useNotifications();
-  const [busy, setBusy] = useState<'publish' | 'replicate' | null>(null);
+  const [busy, setBusy] = useState<'replicate' | null>(null);
 
-  const flip = async (which: 'publish' | 'replicate', enabled: boolean) => {
+  const flip = async (which: 'replicate', enabled: boolean) => {
     setBusy(which);
     try {
-      await api.invoke(which === 'publish' ? 'set_project_auto_publish' : 'set_project_auto_replicate', {
+      await api.invoke('set_project_auto_replicate', {
         projectId: card.projectId,
         enabled,
       });
@@ -48,7 +48,7 @@ export default function MetaLine({
     } catch (err) {
       console.error(`[projects] set auto-${which} failed:`, err);
       notify({
-        title: `Could not change auto-${which === 'publish' ? 'publish' : 'replicate'}`,
+        title: 'Could not change auto-replicate',
         detail: err instanceof Error ? err.message : String(err),
         kind: 'project',
         tone: 'warning',
@@ -77,16 +77,6 @@ export default function MetaLine({
           Publish from here
         </Button>
       )}
-      <span aria-hidden>·</span>
-      <button
-        type="button"
-        className={toggle}
-        disabled={busy !== null}
-        onClick={() => void flip('publish', !card.autoPublish)}
-        title="Passing frames publish automatically as scans, analysis and links change."
-      >
-        Auto-publish {card.autoPublish ? 'on' : 'off'}
-      </button>
       {canReceive && (
         <>
           <span aria-hidden>·</span>

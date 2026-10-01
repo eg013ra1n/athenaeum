@@ -42,6 +42,10 @@ function baseOwn(overrides: Partial<OwnFrameRow> = {}): OwnFrameRow {
     rules: [],
     path: '/Volumes/Astro/M31/2026-09-20/light_001.fits',
     accepted: null,
+    calibratedPath: null,
+    calibratedBytes: null,
+    preparedAt: null,
+    withheld: false,
     ...overrides,
   };
 }

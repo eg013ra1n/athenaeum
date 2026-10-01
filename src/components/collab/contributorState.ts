@@ -5,6 +5,8 @@
  */
 export const SHORT: Record<string, string> = {
   notPublished: '—',
+  prepared: 'to review',
+  withheld: 'withheld',
   failsGate: 'fails gate',
   pendingApproval: 'pending',
   published: 'published',

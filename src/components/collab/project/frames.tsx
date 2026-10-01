@@ -11,7 +11,7 @@ import {
 
 /* ── View-model ─────────────────────────────────────────────────────────── */
 
-export type TableId = 'ready' | 'held' | 'published' | 'library' | 'moderation' | 'excluded';
+export type TableId = 'ready' | 'review' | 'held' | 'published' | 'library' | 'moderation' | 'excluded';
 
 export type DeviceState =
   | 'have' | 'downloading' | 'queued' | 'missing' | 'notKept' | 'needsChoice' | 'changed' | 'notReplicated';
@@ -292,7 +292,12 @@ export const REASON_LABEL: Record<string, string> = {
   threshold: 'Quality thresholds',
   uuid: 'No frame uuid — re-scan the folder',
   outsideTarget: 'Outside the target',
+  withheld: 'Withheld by you',
+  blackHole: 'In the Black Hole',
 };
+
+/** Held-back facet order: the gate's blocker kinds, then the two local states (spec §4.1). */
+export const HELD_KIND_ORDER = [...BLOCKER_ORDER, 'withheld', 'blackHole'] as const;
 
 export const DEVICE_LABEL: Record<DeviceState, string> = {
   have: 'Have',
@@ -757,13 +762,22 @@ export const TABLES: Record<TableId, TableConfig> = {
     stateFacet: null,
     publisherFacet: false,
   },
+  review: {
+    id: 'review',
+    columns: ['name', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'size'],
+    defaultColumns: ['name', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'size'],
+    groupings: ['night', 'filter', 'camera', 'object', 'none'],
+    defaultGrouping: ['night', 'filter'],
+    stateFacet: null,
+    publisherFacet: false,
+  },
   held: {
     id: 'held',
     columns: ['name', 'reason', 'night', 'filter', 'camera', 'exp', 'fwhm', 'ecc', 'stars', 'snr', 'size'],
     defaultColumns: ['name', 'reason', 'night', 'filter', 'exp', 'fwhm', 'ecc', 'stars'],
     groupings: ['reason', 'night', 'filter', 'camera', 'object', 'none'],
     defaultGrouping: ['reason', 'night'],
-    stateFacet: { label: 'Reason', options: BLOCKER_ORDER.map((k): [string, string] => [k, REASON_LABEL[k]]) },
+    stateFacet: { label: 'Reason', options: HELD_KIND_ORDER.map((k): [string, string] => [k, REASON_LABEL[k]]) },
     publisherFacet: false,
   },
   published: {
