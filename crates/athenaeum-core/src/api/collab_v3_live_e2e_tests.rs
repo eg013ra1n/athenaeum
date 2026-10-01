@@ -900,17 +900,29 @@ async fn unmapped_filter_then_mapped_and_an_attested_set() {
     };
     crate::api::collab::link_frame_set(&w.a.ctx, ts::PID, set_id).unwrap();
 
+    // Calibrate → publish (spec 2026-10-01 §4.3). Plan W1: an unselected
+    // run reports no gate failure; My frames shows it Held back.
+    let cal = crate::api::collab::calibrate_collab_frames(&w.a.ctx, ts::PID, None, None)
+        .await
+        .unwrap();
+    assert_eq!(cal.calibrated, 0, "{cal:?}");
     let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None, None)
         .await
         .unwrap();
     assert_eq!(res.announced, 0, "{:?}", res.held_back);
-    assert_eq!(res.held_back.len(), 1, "{:?}", res.held_back);
+    assert!(res.held_back.is_empty(), "{:?}", res.held_back);
+    let own = crate::api::collab::list_project_own_frames(&w.a.ctx, ts::PID).unwrap();
+    let row = own
+        .iter()
+        .find(|r| r.frame_uuid.as_deref() == Some(uuid.as_str()))
+        .expect("the light is in My frames");
+    assert_eq!(row.segment, "held");
     assert!(
-        res.held_back[0]
-            .reasons
-            .contains(&"no FILTER header — needs a filter mapping".to_string()),
+        row.failures
+            .iter()
+            .any(|f| f.text == "no FILTER header — needs a filter mapping"),
         "{:?}",
-        res.held_back
+        row.failures
     );
 
     {
@@ -933,6 +945,9 @@ async fn unmapped_filter_then_mapped_and_an_attested_set() {
     )
     .unwrap();
 
+    crate::api::collab::calibrate_collab_frames(&w.a.ctx, ts::PID, None, None)
+        .await
+        .unwrap();
     let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None, None)
         .await
         .unwrap();
@@ -965,6 +980,9 @@ async fn unmapped_filter_then_mapped_and_an_attested_set() {
     }
     crate::api::collab::link_frame_set(&w.a.ctx, ts::PID, set2_id).unwrap();
 
+    crate::api::collab::calibrate_collab_frames(&w.a.ctx, ts::PID, None, None)
+        .await
+        .unwrap();
     let res = crate::api::collab::publish_collab_frames(&w.a.ctx, ts::PID, None, None)
         .await
         .unwrap();
