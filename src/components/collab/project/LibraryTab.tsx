@@ -154,6 +154,7 @@ export default function LibraryTab({
           {
             id: 'exclude',
             verb: 'Exclude',
+            needsSelection: true,
             eligible: (v: FrameVM) => !v.excluded && v.pubState === 'published',
             run: (targets: FrameVM[]) => setExcluding(targets),
           } satisfies TableAction,

@@ -1,9 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Button, Chip, ProgressBar } from '../../ui';
-import { formatTimestamp } from '../../../utils/dateFormatting';
-import { describeLastRun, MODE_LABEL, STAGE_TITLE } from './publishRunText';
+import { MODE_LABEL, STAGE_TITLE } from './publishRunText';
 import { STEP_ORDER, stepIndex, type PublishRunState } from './useCollabPublishRun';
-import type { Segment } from './MyFramesTab';
 import type { PublishRunKind, PublishStage } from '../../../types/models';
 
 interface Step { label: string; stages: PublishStage[] }
@@ -21,15 +19,17 @@ const STEPS: Record<PublishRunKind, Step[]> = {
 const WHY: Record<PublishRunKind, string> = {
   calibrate: 'you clicked Calibrate', publish: 'you clicked Publish', republish: 'you clicked Republish', auto: 'started automatically',
 };
-const ACTION: Record<Segment, string> = { review: 'Review →', published: 'Open Published →', held: 'Open Held back →', ready: 'Open Ready →' };
 
 function formatElapsed(secs: number): string {
   const s = Math.max(0, Math.floor(secs));
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
 }
 
-/** Spec 2026-10-01 §8.1 — the publish run of this project, above the segments. */
-export default function PublishRunPanel({ run, onOpenSegment }: { run: PublishRunState; onOpenSegment: (s: Segment) => void }) {
+/** Spec 2026-10-01 §8.1 — the publish run of this project, above the segments,
+ *  while it runs. A finished run leaves nothing here (owner ruling 2026-10-02):
+ *  the segment tiles below already show the result, the outcome is notified,
+ *  and the Overview's Project settings card keeps the last-run line. */
+export default function PublishRunPanel({ run }: { run: PublishRunState }) {
   const r = run.running;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -78,15 +78,5 @@ export default function PublishRunPanel({ run, onOpenSegment }: { run: PublishRu
       </section>
     );
   }
-  if (!run.last) return null;
-  const d = describeLastRun(run.last);
-  return (
-    <section aria-label="Last publish run" className="mb-2.5 flex flex-wrap items-center gap-2 rounded-md border border-line px-3 py-2 text-[12px] text-content-muted">
-      <Chip tone={d.tone === 'ok' ? 'ok' : d.tone === 'warn' ? 'warn' : 'err'}>{run.last.outcome}</Chip>
-      <span className={d.tone === 'error' ? 'text-error' : undefined}>
-        {d.text} · {formatTimestamp(run.last.finishedAt, { seconds: true })} · {run.last.trigger}
-      </span>
-      {d.segment && <Button variant="link" size="sm" onClick={() => onOpenSegment(d.segment!)}>{ACTION[d.segment]}</Button>}
-    </section>
-  );
+  return null;
 }

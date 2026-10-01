@@ -183,7 +183,7 @@ describe('LibraryTab — ported from the retired receive tab', () => {
     renderTab([frame({})]);
     expect(screen.queryByText('Project frames')).toBeNull();
     const exportBtn = await screen.findByRole('button', { name: /Export for WBPP/ });
-    expect(exportBtn.closest('div')!.textContent).toContain('Columns');
+    expect(exportBtn.closest('div')!.textContent).toContain('Group by');
   });
 
   it('does not show the banner once a Collaboration folder is set', async () => {

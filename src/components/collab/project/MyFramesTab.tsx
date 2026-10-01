@@ -339,6 +339,7 @@ export default function MyFramesTab({
           {
             id: 'exclude',
             verb: 'Exclude',
+            needsSelection: true,
             eligible: (v: FrameVM) => !v.excluded && v.pubState === 'published' && v.frameUuid !== null,
             run: (targets: FrameVM[]) => setExcluding(targets),
           } satisfies TableAction,
@@ -353,7 +354,7 @@ export default function MyFramesTab({
     <div>
       {error && <p className="mb-2.5 text-[12.5px] text-error">Could not load your frames — see console.</p>}
 
-      <PublishRunPanel run={run} onOpenSegment={onSegment} />
+      <PublishRunPanel run={run} />
 
       <div className="mb-2.5 flex flex-wrap items-center gap-2">
         {rows !== null && (

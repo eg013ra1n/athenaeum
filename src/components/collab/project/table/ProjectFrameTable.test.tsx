@@ -142,6 +142,27 @@ it('the primary action covers the filtered view, then the eligible part of the s
   expect(run).toHaveBeenCalledWith([rows[1]]);
 });
 
+it('an action that needs a selection is disabled with nothing selected, then acts on the selection only', () => {
+  const run = vi.fn();
+  const r = [ready('1'), ready('2'), ready('3')];
+  renderTable({ rows: r, actions: [{ id: 'ex', verb: 'Exclude', eligible: () => true, needsSelection: true, run }] });
+  const idle = screen.getByRole('button', { name: 'Exclude' });
+  expect(idle).toBeDisabled();
+  expect(idle).toHaveAttribute('title', 'Select the frames to exclude');
+  expect(screen.queryByRole('button', { name: /Exclude all/ })).toBeNull();
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Select f2.fits' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Exclude 1' }));
+  expect(run).toHaveBeenCalledWith([r[1]]);
+});
+
+it('the column picker sits at the right end of the header row, outside the scroll box', () => {
+  renderTable({ tableId: 'library', rows: rows(2) });
+  const picker = screen.getByRole('button', { name: 'Columns' });
+  expect(screen.getByTestId('frame-table-scroll').contains(picker)).toBe(false);
+  expect(picker.parentElement!.parentElement!.contains(screen.getByTestId('frame-table-scroll'))).toBe(true);
+  expect(screen.queryByRole('button', { name: /Columns ⚙/ })).toBeNull();
+});
+
 it('selection is pruned when rows disappear', () => {
   const rows = [ready('1'), ready('2')];
   const { rerender } = renderTable({ rows, actions: [{ id: 'pub', verb: 'Publish', eligible: () => true, run: vi.fn() }] });
@@ -326,7 +347,7 @@ it('marks the active row', () => {
   expect(idle).not.toContain('rgba(');
 });
 
-it('renders groupRowExtra next to Columns', () => {
+it('renders groupRowExtra on the group row', () => {
   renderTable({ tableId: 'library', rows: rows(2), groupRowExtra: <button>Export for WBPP</button> });
   expect(screen.getByRole('button', { name: 'Export for WBPP' })).toBeInTheDocument();
 });
@@ -336,7 +357,7 @@ it('renders groupRowExtra next to Columns', () => {
 it('toggling a column keeps <col>, <th> and every row\'s <td> in lockstep', () => {
   const r = rows(2);
   const { container } = renderTable({ tableId: 'library', rows: r });
-  fireEvent.click(screen.getByRole('button', { name: 'Columns ⚙' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Columns' }));
   fireEvent.click(screen.getByRole('checkbox', { name: 'Size' }));
   const colCount = container.querySelectorAll('col').length;
   expect(colCount).toBe(container.querySelectorAll('th').length);

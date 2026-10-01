@@ -17,6 +17,12 @@ export function PanelLayout({ panel, children }: { panel: ReactNode | null; chil
  *  or radio is not text entry: Escape on one still closes the panel. */
 const EDITABLE = 'input:not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable]:not([contenteditable="false"])';
 
+/** The project page's bottom padding (`p-6`). The panel ends exactly that far
+ *  above the viewport's bottom: a smaller gap made the page itself 8 px taller
+ *  than the screen, so a short tab grew a page scrollbar the moment the panel
+ *  opened — and each scroll refit the panel taller again. */
+const PAGE_BOTTOM_GAP = 24;
+
 /** Spec §6.1 — sticky, own scroll, height = the viewport below its top edge. */
 export function SidePanel({ title, label, onClose, children }: { title: ReactNode; label: string; onClose: () => void; children: ReactNode }) {
   const ref = useRef<HTMLElement>(null);
@@ -28,7 +34,7 @@ export function SidePanel({ title, label, onClose, children }: { title: ReactNod
     const fit = () => {
       if (!ref.current) return;
       const top = Math.max(0, ref.current.getBoundingClientRect().top);
-      setHeight(Math.max(240, window.innerHeight - top - 16));
+      setHeight(Math.max(240, window.innerHeight - top - PAGE_BOTTOM_GAP));
     };
     const schedule = () => {
       if (raf) return;

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX, type ReactNode } from 'react';
-import { Loader2 } from 'lucide-react';
+import { Columns3, Loader2 } from 'lucide-react';
 import { useSessionState } from '../../../../contexts/SessionStateContext';
 import { Button, EmptyState, FilterChip, Popover, Select, TextInput } from '../../../ui';
 import { formatDurationPadded, formatSize } from '../../format';
@@ -19,6 +19,9 @@ export interface TableAction {
   eligible: (r: FrameVM) => boolean;
   primary?: boolean; // accent button
   busy?: boolean; // disables + spinner
+  /** Never offered on the whole view: with nothing selected the button is
+   *  disabled, so one click can't sweep every frame (Exclude). */
+  needsSelection?: boolean;
   run: (targets: FrameVM[]) => void; // receives actionTargets(...).targets
 }
 
@@ -33,7 +36,7 @@ export interface ProjectFrameTableProps {
   toolbarExtra?: ReactNode; // e.g. the moderation trust checkbox
   /** The row whose side panel is open — it gets the active background. */
   activeKey?: string | null;
-  /** Rendered left of "Columns ⚙" on the group row (Library: Export for WBPP). */
+  /** Rendered at the right end of the group row (Library: Export for WBPP). */
   groupRowExtra?: ReactNode;
   today?: string; // test seam; default localToday()
 }
@@ -438,22 +441,6 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
         </Button>
         <span className="flex-1" />
         {groupRowExtra}
-        <div className="relative">
-          <Button onClick={() => setColumnsOpen((o) => !o)}>Columns ⚙</Button>
-          <Popover open={columnsOpen} onClose={() => setColumnsOpen(false)}>
-            {config.columns.filter((id) => id !== 'name').map((id) => (
-              <CbBox
-                key={id}
-                checked={visibleColIds.includes(id)}
-                onChange={() => toggleColumn(id)}
-                label={COLUMNS[id].label}
-                className="flex items-center gap-2 whitespace-nowrap text-[12px] text-content-muted"
-              >
-                {COLUMNS[id].label}
-              </CbBox>
-            ))}
-          </Popover>
-        </div>
       </div>
 
       {/* ── Totals — mockup .totals ────────────────────────────────────── */}
@@ -482,11 +469,18 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
         <span className="flex-1" />
         {actions.map((a) => {
           const { targets, selectedCount } = actionTargets(filtered, inViewSelected, rowKey, a.eligible);
-          const disabled = targets.length === 0 || !!a.busy;
+          const needsPick = !!a.needsSelection && selectedCount === 0;
+          const disabled = needsPick || targets.length === 0 || !!a.busy;
           return (
-            <Button key={a.id} variant={a.primary ? 'primary' : 'default'} disabled={disabled} onClick={() => a.run(targets)}>
+            <Button
+              key={a.id}
+              variant={a.primary ? 'primary' : 'default'}
+              disabled={disabled}
+              title={needsPick ? `Select the frames to ${a.verb.toLowerCase()}` : undefined}
+              onClick={() => a.run(targets)}
+            >
               {a.busy && <Loader2 size={12} className="animate-spin" />}
-              {actionLabel(a.verb, targets.length, selectedCount)}
+              {needsPick ? a.verb : actionLabel(a.verb, targets.length, selectedCount)}
             </Button>
           );
         })}
@@ -494,6 +488,35 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
       </div>
 
       {/* ── Table box — mockup .tscroll ────────────────────────────────── */}
+      <div className="relative">
+      {/* The column picker sits at the right end of the header row. It lives
+          outside the scroll box, so neither the box's overflow nor the sticky
+          header cell clips its popover. */}
+      <div className="absolute right-1.5 top-px z-[3] flex h-[29px] items-center">
+        <button
+          type="button"
+          aria-label="Columns"
+          title="Columns"
+          aria-expanded={columnsOpen}
+          onClick={() => setColumnsOpen((o) => !o)}
+          className={`rounded p-1 hover:bg-surface-hover hover:text-content ${columnsOpen ? 'text-accent' : 'text-content-faint'}`}
+        >
+          <Columns3 size={13} />
+        </button>
+        <Popover open={columnsOpen} onClose={() => setColumnsOpen(false)}>
+          {config.columns.filter((id) => id !== 'name').map((id) => (
+            <CbBox
+              key={id}
+              checked={visibleColIds.includes(id)}
+              onChange={() => toggleColumn(id)}
+              label={COLUMNS[id].label}
+              className="flex items-center gap-2 whitespace-nowrap text-[12px] text-content-muted"
+            >
+              {COLUMNS[id].label}
+            </CbBox>
+          ))}
+        </Popover>
+      </div>
       <div
         ref={scrollRef}
         data-testid="frame-table-scroll"
@@ -519,12 +542,12 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
                 <th scope="col" className={`${TH} text-left text-content-faint`}>
                   <CbBox state={headerState} onChange={toggleSelectAllShown} label="Select all shown" />
                 </th>
-                {columns.map((col) => (
+                {columns.map((col, i) => (
                   <th
                     key={col.id}
                     scope="col"
                     onClick={() => onSortClick(col.id)}
-                    className={`${TH} cursor-pointer hover:text-content ${col.numeric ? 'text-right' : 'text-left'} ${sort.col === col.id ? 'text-accent' : 'text-content-faint'}`}
+                    className={`${TH} cursor-pointer hover:text-content ${col.numeric ? 'text-right' : 'text-left'} ${sort.col === col.id ? 'text-accent' : 'text-content-faint'} ${i === columns.length - 1 ? 'pr-8' : ''}`}
                   >
                     {col.label}
                     {sort.col === col.id ? (sort.dir === 1 ? ' ↑' : ' ↓') : ''}
@@ -584,6 +607,7 @@ export default function ProjectFrameTable(props: ProjectFrameTableProps): JSX.El
             </tbody>
           </table>
         </div>
+      </div>
       </div>
     </div>
   );

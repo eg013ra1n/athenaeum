@@ -111,6 +111,28 @@ describe('ProjectBlink', () => {
     expect(blink!.frames[0].key).toBe('f1');
   });
 
+  it('the strip hint only says what the chip and the file name do not: To review is the file Publish sends', async () => {
+    const published = fromOwn(own({ frameId: 1, segment: 'published', pubState: 'published', localState: 'own_held', frameUuid: 'u1' }));
+    vi.mocked(api.invoke).mockResolvedValueOnce([entry('f1', 'calibrated')] as never); // own refs go by id
+    const first = render(tree({ table: 'published', vms: [published], canModerate: true }));
+    await waitFor(() => expect(blink).not.toBeNull());
+    expect(blink!.contextLabel!(blink!.frames[0])).toBe('');
+    first.unmount();
+
+    blink = null;
+    const vms = [
+      fromOwn(own({ frameId: 2, segment: 'review', calibratedPath: '/c/c_b.fits' })),
+      fromOwn(own({ frameId: 3, segment: 'review' })), // attested: core serves the original as raw
+    ];
+    vi.mocked(api.invoke).mockResolvedValueOnce([entry('f2', 'calibrated'), entry('f3', 'raw')] as never);
+    render(tree({ table: 'review', vms }));
+    await waitFor(() => expect(blink).not.toBeNull());
+    expect(blink!.frames.map((f) => blink!.contextLabel!(f))).toEqual([
+      'exactly the file that will be published',
+      'exactly the file that will be published',
+    ]);
+  });
+
   it('a member in Library is view only, with no actions and a moderator hint', async () => {
     const vm = fromLibrary(lib(), new Map());
     vi.mocked(api.invoke).mockResolvedValueOnce([entry('u1', 'replica')] as never);

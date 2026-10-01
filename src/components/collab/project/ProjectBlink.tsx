@@ -131,14 +131,15 @@ export default function ProjectBlink({ projectId, table, vms, lookup, canModerat
   const contextLabel = (f: BlinkFrame): string => {
     const v = vmOf(f);
     const parts: string[] = [];
+    // Only a hint the source chip and the file name do not already give:
+    // where a replica came from, and that a To review entry (calibrated, or an
+    // attested original) is the very file Publish sends.
     if (f.source === 'replica') {
       const who = v?.lib?.receivedFromMember ?? v?.publisher ?? 'a member';
       const at = v?.lib?.receivedAt;
       parts.push(`received from ${who}${at ? ` · ${formatTimestamp(at, { seconds: true })}` : ''}`);
-    } else if (f.source === 'calibrated') {
-      parts.push(v?.own?.segment === 'review' ? 'exactly the file that will be published' : 'the calibrated file of this frame');
-    } else {
-      parts.push('the raw frame on this device');
+    } else if (v?.own?.segment === 'review') {
+      parts.push('exactly the file that will be published');
     }
     if (viewOnly) {
       parts.push(table === 'published' ? 'Only a moderator can exclude published frames.' : 'Only a moderator can exclude frames.');

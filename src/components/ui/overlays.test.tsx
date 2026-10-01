@@ -150,6 +150,16 @@ describe('overlay ownership and fixes', () => {
     fireEvent.click(scrim);
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+  it('side panel ends the page padding (24 px) above the viewport bottom, so a short page never overflows', () => {
+    const spy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(() => ({ top: 200 } as DOMRect));
+    try {
+      render(<SidePanel title="t" label="P" onClose={() => {}}>x</SidePanel>);
+      const aside = screen.getByRole('complementary', { name: 'P' });
+      expect(aside.style.height).toBe(`${window.innerHeight - 200 - 24}px`);
+    } finally {
+      spy.mockRestore();
+    }
+  });
   it('side panel refits on scroll', () => {
     vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => { cb(0); return 1; });
     let top = 100;
