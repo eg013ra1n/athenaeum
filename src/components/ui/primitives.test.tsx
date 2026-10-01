@@ -84,3 +84,12 @@ describe('ui primitives', () => {
     expect(cls).not.toContain('rgba(');
   });
 });
+
+describe('Button link variant', () => {
+  it('keeps the mockup link geometry: UA button padding 1px 6px', () => {
+    render(<Button variant="link">Expand all</Button>);
+    const b = screen.getByRole('button', { name: 'Expand all' });
+    expect(b.className).toContain('px-1.5');
+    expect(b.className).toContain('py-px');
+  });
+});

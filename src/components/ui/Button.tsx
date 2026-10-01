@@ -15,8 +15,9 @@ const VARIANT: Record<Exclude<ButtonVariant, 'link'>, string> = {
 };
 export function Button({ variant = 'default', size = 'md', className = '', type = 'button', ...rest }: ButtonProps) {
   const cls =
+    // `.linkbtn` never reset the UA button padding, so the mockup's links render with 1px 6px.
     variant === 'link'
-      ? `leading-[1.4] text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-45 disabled:no-underline ${size === 'sm' ? 'text-[11px]' : 'text-[12px]'}`
+      ? `px-1.5 py-px leading-[1.4] text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-45 disabled:no-underline ${size === 'sm' ? 'text-[11px]' : 'text-[12px]'}`
       : `inline-flex items-center gap-1.5 whitespace-nowrap rounded border leading-[1.4] transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${SIZE[size]} ${VARIANT[variant]}`;
   return <button type={type} className={`${cls} ${className}`} {...rest} />;
 }

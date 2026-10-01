@@ -39,7 +39,7 @@ export interface MyFramesTabProps {
 }
 
 /** The mockup's tile-row button box: 33 px tall, min 150, 7x14 padding, radius 6. */
-const ROW_BTN = 'h-[33px] min-w-[150px] justify-center !rounded-md !px-3.5 !py-[7px]';
+const ROW_BTN = 'h-[33px] min-w-[150px] !rounded-md !px-3.5 !py-[7px]';
 
 /**
  * My frames — the three Ready/Published/Held back tables of the redesigned
