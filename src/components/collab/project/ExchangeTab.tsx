@@ -128,7 +128,7 @@ export default function ExchangeTab({
   );
 
   return (
-    <div className="flex flex-col gap-3.5">
+    <div className="flex flex-col gap-3">
       <Card title="Receiving" subtitle={recvSub}>
         {canReceive ? (
           recv.length === 0 ? (
@@ -148,12 +148,12 @@ export default function ExchangeTab({
       </Card>
 
       {canReceive && (
-        <Card title="Received" subtitle="sessions · a session ends after 5 min without a landing">
+        <Card flush title="Received" subtitle="sessions · a session ends after 5 min without a landing">
           {sessionsError && (
-            <p className="text-[12.5px] text-error">Could not load receive sessions — see console.</p>
+            <p className="px-4 text-[12.5px] text-error">Could not load receive sessions — see console.</p>
           )}
-          {sessions === null && !sessionsError && <EmptyState>Loading…</EmptyState>}
-          {sessions !== null && sessions.length === 0 && <EmptyState>No sessions yet.</EmptyState>}
+          {sessions === null && !sessionsError && <div className="px-4"><EmptyState>Loading…</EmptyState></div>}
+          {sessions !== null && sessions.length === 0 && <div className="px-4"><EmptyState>No sessions yet.</EmptyState></div>}
           {sessions !== null && sessions.length > 0 && (
             <div className="overflow-x-auto">
               <table className="w-full border-collapse text-[12.5px]">

@@ -2,15 +2,16 @@ import type { ReactNode } from 'react';
 
 /** Mockup `.card` + `.card h2` + `.sub`. The header row holds the heading,
  *  then the subtitle and the action beside it, so the heading's accessible
- *  name is the title alone. */
-export function Card({ title, subtitle, action, children, className = '' }: { title?: ReactNode; subtitle?: ReactNode; action?: ReactNode; children?: ReactNode; className?: string }) {
+ *  name is the title alone. `flush` is the mockup's table card (`padding:
+ *  12px 0 4px`, header padded 16): the content runs edge to edge. */
+export function Card({ title, subtitle, action, children, className = '', flush = false }: { title?: ReactNode; subtitle?: ReactNode; action?: ReactNode; children?: ReactNode; className?: string; flush?: boolean }) {
   const hasTitle = title !== undefined && title !== null;
   const hasSubtitle = subtitle !== undefined && subtitle !== null;
   const hasAction = action !== undefined && action !== null;
   return (
-    <section className={`rounded-lg border border-line bg-surface-elevated px-4 py-3.5 ${className}`}>
+    <section className={`rounded-lg border border-line bg-surface-elevated ${flush ? 'pb-1 pt-3' : 'px-4 py-3.5'} ${className}`}>
       {(hasTitle || hasSubtitle || hasAction) && (
-        <div className="mb-2.5 flex items-center gap-2">
+        <div className={`mb-2.5 flex items-center gap-2 ${flush ? 'px-4' : ''}`}>
           {hasTitle && <h2 className="text-[13px] font-semibold text-content">{title}</h2>}
           {hasSubtitle && <span className="text-[12px] font-normal text-content-faint">{subtitle}</span>}
           {hasAction && <span className="ml-auto text-[12px] font-normal text-content">{action}</span>}

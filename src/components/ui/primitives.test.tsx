@@ -135,3 +135,13 @@ describe('Button link variant', () => {
     expect(b.className).toContain('py-px');
   });
 });
+
+describe('Card flush', () => {
+  it('runs content edge to edge and pads only the header (mockup table card)', () => {
+    render(<Card flush title="Received">body</Card>);
+    const section = screen.getByRole('heading', { name: 'Received' }).closest('section')!;
+    expect(section.className).toContain('pt-3');
+    expect(section.className).not.toContain('px-4');
+    expect(screen.getByRole('heading', { name: 'Received' }).parentElement!.className).toContain('px-4');
+  });
+});

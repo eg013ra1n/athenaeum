@@ -167,7 +167,7 @@ export default function MembersTab({
         {members === null && !error && <EmptyState>Loading…</EmptyState>}
         {members !== null && sorted.length === 0 && <EmptyState>No members yet.</EmptyState>}
         {members !== null && sorted.length > 0 && (
-          <div data-testid="members-scroll" className="overflow-x-auto rounded-md border border-line">
+          <div data-testid="members-scroll" className="overflow-x-auto rounded-lg border border-line bg-surface-elevated">
             <table className="w-full border-collapse text-[12.5px]">
               <thead>
                 <tr>
