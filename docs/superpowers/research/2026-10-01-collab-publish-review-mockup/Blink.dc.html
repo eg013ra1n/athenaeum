@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Blink in a project</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+.bk{--bg:#2e3440;--elev:#3b4252;--hover:#434c5e;--border:#4c566a;--line:rgba(76,86,106,.55);--text:#eceff4;--text2:#e5e9f0;--muted:#d8dee9;--faint:rgba(216,222,233,.68);--accent:#88c0d0;--accent-h:#81a1c1;--success:#a3be8c;--success-m:rgba(163,190,140,.22);--warning:#ebcb8b;--warning-m:rgba(235,203,139,.22);--error:#bf616a;--error-m:rgba(191,97,106,.22);--info:#81a1c1;--info-m:rgba(129,161,193,.22);--purple:#b48ead;--purple-m:rgba(180,142,173,.22)}
+.bk{background:#20242c;color:var(--text);font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
+.bk button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+.bk button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.tb{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--elev);border-bottom:1px solid var(--border)}
+.ib{width:30px;height:28px;border-radius:4px;display:grid;place-items:center;color:var(--muted)}
+.ib:hover{background:var(--hover)}
+.tg{padding:3px 9px;border:1px solid var(--border);border-radius:4px;font-size:12px;color:var(--muted)}
+.tg.on{border-color:var(--accent);color:var(--text);background:rgba(136,192,208,.12)}
+.grow{flex:1}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:12px;white-space:nowrap}
+.btn:hover{background:var(--hover)}
+.btn.warn{border-color:rgba(235,203,139,.55);color:var(--warning)}
+.btn.danger{border-color:rgba(191,97,106,.65);color:#e39aa1}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--bg);font-weight:600}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.chip{display:inline-flex;align-items:center;gap:4px;padding:0 6px;border-radius:3px;font-size:11px;line-height:18px;white-space:nowrap}
+.c-pur{background:var(--purple-m);color:var(--purple)}
+.c-info{background:var(--info-m);color:var(--info)}
+.c-mute{background:var(--hover);color:var(--muted)}
+.c-ok{background:var(--success-m);color:var(--success)}
+.ctx{display:flex;align-items:center;gap:10px;padding:6px 12px;background:#292e37;border-bottom:1px solid var(--line);font-size:12px;color:var(--faint)}
+.ctx code{font-family:ui-monospace,"SF Mono",Menlo,monospace;color:var(--text2)}
+.list{width:290px;flex:none;background:var(--bg);border-right:1px solid var(--line);overflow:hidden}
+.li{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid rgba(76,86,106,.3);font-size:12px}
+.li.cur{background:rgba(136,192,208,.16)}
+.li .nm{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:11.5px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.li small{display:block;color:var(--faint);font-size:11px}
+.cb{display:inline-block;width:14px;height:14px;border:1px solid var(--border);border-radius:3px;background:var(--bg);position:relative;flex:none}
+.cb.on{background:var(--accent);border-color:var(--accent)}
+.cb.on i{position:absolute;left:4px;top:1px;width:4px;height:8px;border:solid var(--bg);border-width:0 2px 2px 0;transform:rotate(45deg)}
+.img{position:relative;flex-grow:1;overflow:hidden;background:radial-gradient(ellipse 34% 28% at 48% 46%,rgba(208,135,112,.42),rgba(191,97,106,.16) 45%,rgba(0,0,0,0) 75%),radial-gradient(ellipse 18% 14% at 44% 42%,rgba(235,203,139,.30),rgba(0,0,0,0) 70%),#0b0d11}
+.img i{position:absolute;border-radius:50%;background:#f4f6fa;box-shadow:0 0 6px rgba(244,246,250,.7)}
+.ring{position:absolute;border:1.5px solid rgba(163,190,140,.85);border-radius:50%}
+.info{display:flex;gap:16px;align-items:center;padding:7px 12px;background:var(--elev);border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
+.info b{color:var(--text);font-weight:600}
+.ov{position:absolute;inset:0;background:rgba(15,17,21,.62);display:grid;place-items:center}
+.dlg{width:460px;background:var(--elev);border:1px solid var(--border);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,.5)}
+.dlg h3{margin:0;font-size:15px;font-weight:600;padding:14px 18px 6px}
+.dlg p{margin:0;padding:0 18px;font-size:12.5px;color:var(--faint);line-height:1.5}
+.dlg label{display:block;padding:12px 18px 4px;font-size:12px;color:var(--muted)}
+.dlg textarea{display:block;margin:0 18px;width:calc(100% - 36px);height:70px;box-sizing:border-box;font:inherit;font-size:12.5px;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:6px 8px;resize:none}
+.dlg footer{display:flex;justify-content:flex-end;gap:8px;padding:14px 18px}
+</style>
+</helmet>
+<div class="bk" style="width: 1440px; height: 840px; display: flex; flex-direction: column; position: relative; overflow: hidden">
+
+<div class="tb">
+<button type="button" class="ib" aria-label="Previous frame"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"></path></svg></button>
+<button type="button" class="ib" aria-label="Play"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4l12 8-12 8z"></path></svg></button>
+<button type="button" class="ib" aria-label="Next frame"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"></path></svg></button>
+<span style="font-size: 12px; color: var(--faint); margin: 0 6px">2.0 fps</span>
+<span class="tg on">Stars</span>
+<span class="tg">Full res</span>
+<span style="margin-left: 14px; font-weight: 600">{{title}}</span>
+<span class="grow"></span>
+<span style="font-size: 12px; color: var(--faint)">{{selText}}</span>
+<sc-for list="{{actions}}" as="a" hint-placeholder-count="1">
+<button type="button" class="{{a.cls}}" onClick="{{a.run}}">{{a.label}}</button>
+</sc-for>
+<sc-if value="{{viewOnly}}" hint-placeholder-val="{{ false }}">
+<span class="chip c-mute">View only</span>
+</sc-if>
+<span style="width: 1px; height: 20px; background: var(--line)"></span>
+<button type="button" class="btn">Close</button>
+</div>
+
+<div class="ctx">
+<span class="{{srcChip}}">{{srcLabel}}</span>
+<code>{{curFile}}</code>
+<span>{{srcHint}}</span>
+<span class="grow"></span>
+<span>{{roleHint}}</span>
+</div>
+
+<div style="display: flex; flex-grow: 1; min-height: 0">
+<div class="list">
+<sc-for list="{{frames}}" as="f" hint-placeholder-count="10">
+<div class="{{f.cls}}">
+<button type="button" class="{{f.cb}}" role="checkbox" aria-checked="{{f.checked}}" aria-label="Select frame" onClick="{{f.toggle}}"><i></i></button>
+<span style="min-width: 0; flex-grow: 1"><span class="nm" style="display: block">{{f.name}}</span><small>{{f.meta}}</small></span>
+<sc-if value="{{f.badge}}" hint-placeholder-val="{{ false }}"><span class="{{f.badgeCls}}">{{f.badge}}</span></sc-if>
+</div>
+</sc-for>
+</div>
+<div class="img">
+<sc-for list="{{stars}}" as="s" hint-placeholder-count="40">
+<i style="left: {{s.x}}%; top: {{s.y}}%; width: {{s.r}}px; height: {{s.r}}px"></i>
+</sc-for>
+<sc-for list="{{rings}}" as="g" hint-placeholder-count="6">
+<span class="ring" style="left: calc({{g.x}}% - 9px); top: calc({{g.y}}% - 9px); width: 18px; height: 18px"></span>
+</sc-for>
+</div>
+</div>
+
+<div class="info">
+<span><b>{{filter}}</b> · 300 s</span>
+<span>{{dateObs}}</span>
+<span>FWHM <b>2.62″</b></span><span>Ecc <b>0.38</b></span><span>Stars <b>803</b></span><span>SNR <b>40</b></span>
+<span>{{who}}</span>
+<span class="grow"></span>
+<span>Frame 12 of {{total}}</span>
+</div>
+
+<sc-if value="{{dialog}}" hint-placeholder-val="{{ false }}">
+<div class="ov">
+<div class="dlg" role="dialog" aria-label="Exclude frames">
+<h3>Exclude {{k}} frames from the project?</h3>
+<p>Members stop receiving them and they leave the integration totals. The files stay where they are; you can restore them in Moderation.</p>
+<label for="reason">Reason (members see it)</label>
+<textarea id="reason">Satellite trails across the core</textarea>
+<footer><button type="button" class="btn" onClick="{{closeDialog}}">Cancel</button><button type="button" class="btn danger" onClick="{{closeDialog}}">Exclude {{k}}</button></footer>
+</div>
+</div>
+</sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"ctx":{"editor":"enum","options":["review","libMod","libMember"],"default":"review"},"$preview":{"width":1440,"height":840}}'>
+class Component extends DCLogic {
+  state = { picked: { 2: true, 5: true }, dialog: false };
+  renderVals() {
+    const s = this.state;
+    const ctx = this.props.ctx ?? 'review';
+    const k = Object.values(s.picked).filter(Boolean).length;
+    const lib = ctx !== 'review';
+    const people = ['Anna', 'Marco', 'Kenji', 'Anna', 'Marco'];
+    const frames = Array.from({ length: 12 }, (_, i) => {
+      const on = !!s.picked[i];
+      const n = String(i + 7).padStart(4, '0');
+      return {
+        name: lib ? 'c_M42_OIII_300s_' + n + '.fits' : 'c_M42_Ha_300s_' + n + '.fits',
+        meta: (lib ? people[i % 5] + ' · ' : '') + 'FWHM ' + (2.4 + ((i * 37) % 60) / 100).toFixed(2) + '″ · ' + (820 - i * 17) + ' stars',
+        cls: i === 5 ? 'li cur' : 'li',
+        cb: on ? 'cb on' : 'cb',
+        checked: on ? 'true' : 'false',
+        toggle: () => this.setState({ picked: { ...this.state.picked, [i]: !this.state.picked[i] } }),
+        badge: !lib && i === 9 ? 'withheld' : '',
+        badgeCls: 'chip c-mute',
+      };
+    });
+    let seed = 7;
+    const rnd = () => ((seed = (seed * 9301 + 49297) % 233280) / 233280);
+    const stars = Array.from({ length: 70 }, () => ({ x: (rnd() * 98).toFixed(1), y: (rnd() * 96).toFixed(1), r: rnd() > 0.9 ? 4 : rnd() > 0.6 ? 2.5 : 1.5 }));
+    const rings = stars.filter((st) => st.r >= 2.5).slice(0, 14);
+    const all = lib ? 64 : 48;
+    const kk = k || 'all ' + all;
+    let actions = [];
+    if (ctx === 'review') actions = [{ label: "Don't publish (" + kk + ')', cls: 'btn warn', run: () => {} }];
+    if (ctx === 'libMod') actions = [{ label: 'Exclude from project (' + kk + ')', cls: 'btn danger', run: () => this.setState({ dialog: true }) }];
+    return {
+      title: lib ? 'Blink · Library · ' + all + ' frames held here' : 'Blink · To review · 48 frames',
+      selText: k ? k + ' selected' : '',
+      actions,
+      viewOnly: ctx === 'libMember',
+      srcChip: lib ? 'chip c-info' : 'chip c-pur',
+      srcLabel: lib ? 'replica' : 'calibrated',
+      curFile: lib ? 'c_M42_OIII_300s_0012.fits' : 'c_M42_Ha_300s_0012.fits',
+      srcHint: lib ? 'received from Marco · 2026-09-30 21:14:52' : 'exactly the file that will be published',
+      roleHint: ctx === 'review'
+        ? "Don't publish moves frames to Held back and deletes their calibrated file; Release brings them back."
+        : ctx === 'libMod'
+          ? 'You moderate this project.'
+          : 'Only a moderator can exclude published frames.',
+      frames,
+      stars,
+      rings,
+      filter: lib ? 'OIII' : 'Hα',
+      dateObs: '2026-09-28 22:41:07',
+      who: lib ? 'Marco · ZWO ASI2600MM' : 'this device · ZWO ASI2600MM',
+      total: all,
+      dialog: s.dialog,
+      k: k || all,
+      closeDialog: () => this.setState({ dialog: false }),
+    };
+  }
+}
+</script>
+</body>
+</html>

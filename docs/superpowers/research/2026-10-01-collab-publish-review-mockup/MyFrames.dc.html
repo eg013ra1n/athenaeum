@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>My frames</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+.ath{--bg:#2e3440;--elev:#3b4252;--hover:#434c5e;--border:#4c566a;--line:rgba(76,86,106,.55);--text:#eceff4;--text2:#e5e9f0;--muted:#d8dee9;--faint:rgba(216,222,233,.68);--accent:#88c0d0;--accent-h:#81a1c1;--success:#a3be8c;--success-m:rgba(163,190,140,.22);--warning:#ebcb8b;--warning-m:rgba(235,203,139,.22);--error:#bf616a;--error-m:rgba(191,97,106,.22);--info:#81a1c1;--info-m:rgba(129,161,193,.22);--purple:#b48ead;--purple-m:rgba(180,142,173,.22)}
+.ath{background:var(--bg);color:var(--text);font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
+.ath button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+.ath button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.side{width:56px;flex:none;background:#272c36;border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:12px 0;gap:6px}
+.side span{width:40px;height:36px;border-radius:6px;display:grid;place-items:center;color:var(--faint);font-size:10px}
+.side span.on{background:var(--elev);color:var(--accent)}
+.head{display:flex;align-items:center;gap:14px}
+.hnav{display:flex;gap:2px;color:var(--faint)}
+.hnav button{width:26px;height:26px;border-radius:4px;display:grid;place-items:center}
+.h1{font-size:24px;font-weight:700;margin:0;white-space:nowrap}
+.hsub{color:var(--faint);font-size:14px;white-space:nowrap}
+.grow{flex:1}
+.chip{display:inline-flex;align-items:center;gap:4px;padding:0 6px;border-radius:3px;font-size:11px;line-height:18px;white-space:nowrap}
+.c-info{background:var(--info-m);color:var(--info)}
+.c-ok{background:var(--success-m);color:var(--success)}
+.c-warn{background:var(--warning-m);color:var(--warning)}
+.c-err{background:var(--error-m);color:var(--error)}
+.c-pur{background:var(--purple-m);color:var(--purple)}
+.c-mute{background:var(--hover);color:var(--muted)}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;background:var(--elev);color:var(--muted);white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
+.live{background:var(--success);box-shadow:0 0 0 3px rgba(163,190,140,.18)}
+.linkbtn{color:var(--accent);font-size:13px}
+.linkbtn:hover{text-decoration:underline}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-top:14px}
+.tabs span{padding:8px 14px;color:var(--faint);border-bottom:2px solid transparent;display:inline-flex;gap:6px;align-items:center;white-space:nowrap}
+.tabs span.on{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
+.cnt{font-size:10.5px;padding:0 5px;border-radius:999px;background:var(--hover);color:var(--muted);font-weight:500}
+.cnt.w{background:var(--warning-m);color:var(--warning)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:12px;white-space:nowrap}
+.btn:hover{background:var(--hover)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--bg);font-weight:600}
+.btn.pri:hover{background:var(--accent-h)}
+.btn.warn{border-color:rgba(235,203,139,.5);color:var(--warning)}
+.runp{border:1px solid rgba(136,192,208,.45);background:rgba(136,192,208,.06);border-radius:8px;padding:12px 14px;margin-bottom:12px}
+.runp.done{border-color:var(--line);background:var(--elev);padding:8px 12px}
+.runh{display:flex;align-items:center;gap:8px}
+.runh b{font-size:14px;font-weight:600}
+.steps{display:flex;align-items:center;gap:8px;margin:10px 0 8px;font-size:12px}
+.st{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;border:1px solid var(--border);color:var(--faint);white-space:nowrap}
+.st.ok{border-color:rgba(163,190,140,.5);color:var(--success)}
+.st.now{border-color:var(--accent);color:var(--text);background:rgba(136,192,208,.14);font-weight:600}
+.arrow{color:var(--faint)}
+.pbar{height:6px;border-radius:3px;background:var(--hover);overflow:hidden}
+.pbar i{display:block;height:100%;background:var(--accent)}
+.rund{display:flex;gap:14px;margin-top:6px;font-size:12px;color:var(--faint)}
+.rund code{font-family:ui-monospace,"SF Mono",Menlo,monospace;color:var(--text2);font-size:12px}
+.segs{display:flex;gap:8px;margin-bottom:10px}
+.segs button{display:flex;flex-direction:column;align-items:flex-start;gap:1px;padding:7px 14px;border:1px solid var(--border);border-radius:6px;min-width:170px;text-align:left}
+.segs button:hover{border-color:var(--accent-h)}
+.segs .n{font-size:18px;font-weight:600}
+.segs .l{font-size:12px;color:var(--faint)}
+.segs .h{font-size:11.5px;color:var(--faint)}
+.segs button.on{border-color:var(--accent);background:rgba(136,192,208,.08)}
+.segs button.on .l{color:var(--accent)}
+.toolbar{display:flex;align-items:center;gap:8px;padding:6px 0 8px}
+.fchip{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border:1px solid var(--border);border-radius:999px;font-size:12px;color:var(--muted)}
+.fchip.on{border-color:var(--accent);background:rgba(136,192,208,.12);color:var(--text)}
+.fdot{width:8px;height:8px;border-radius:2px;display:inline-block}
+.sel{font:inherit;color:var(--text);background:var(--elev);border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:12px}
+.totals{display:flex;align-items:center;gap:14px;padding:7px 10px;background:var(--elev);border:1px solid var(--line);border-bottom:0;border-radius:6px 6px 0 0;font-size:12px;color:var(--muted)}
+.totals strong{color:var(--text);font-weight:600}
+.tw{border:1px solid var(--line);border-radius:0 0 6px 6px;overflow:hidden}
+table.ft{border-collapse:separate;border-spacing:0;table-layout:fixed;width:100%}
+table.ft th{background:#333a47;color:var(--faint);font-weight:500;font-size:11.5px;text-align:left;padding:0 8px;height:30px;border-bottom:1px solid var(--border);white-space:nowrap}
+table.ft td{height:28px;padding:0 8px;border-bottom:1px solid rgba(76,86,106,.28);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text2)}
+table.ft .num{text-align:right}
+table.ft tr.g td{background:#323946;color:var(--text);font-weight:500}
+table.ft tr.on td{background:rgba(136,192,208,.08)}
+.fname{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:12px}
+.cb{display:inline-block;width:14px;height:14px;border:1px solid var(--border);border-radius:3px;background:var(--bg);position:relative;vertical-align:-2px}
+.cb.on{background:var(--accent);border-color:var(--accent)}
+.cb.on i{position:absolute;left:4px;top:1px;width:4px;height:8px;border:solid var(--bg);border-width:0 2px 2px 0;transform:rotate(45deg)}
+</style>
+</helmet>
+<div class="ath" style="width: 1440px; height: 980px; display: flex; position: relative; overflow: hidden">
+<div class="side"><span>Files</span><span>Objects</span><span class="on">Projects</span><span>Transfers</span><span>Settings</span></div>
+<div style="flex-grow: 1; min-width: 0; padding: 24px">
+
+<div class="head">
+<span class="hnav">
+<button type="button" aria-label="Back"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"></path></svg></button>
+<button type="button" aria-label="Forward"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"></path></svg></button>
+</span>
+<h1 class="h1">Orion Deep Field 2026</h1>
+<span class="hsub">◎ M 42 · r 1.5° · 6 members</span>
+<span class="chip c-info">coordinator</span>
+<span class="grow"></span>
+<span class="pill"><span class="dot live"></span>Live · synced 8 s ago</span>
+<button type="button" class="linkbtn">Manage on portal ↗</button>
+</div>
+
+<div class="tabs">
+<span>Overview</span>
+<span class="on">My frames <span class="cnt">136 ready · 48 to review</span></span>
+<span>Library <span class="cnt">278 to go</span></span>
+<span>Members</span>
+<span>Exchange</span>
+<span>Moderation <span class="cnt w">3</span></span>
+</div>
+
+<div style="padding-top: 14px">
+
+<sc-if value="{{running}}" hint-placeholder-val="{{ true }}">
+<div class="runp">
+<div class="runh">
+<span class="{{kindChip}}">{{kindLabel}}</span>
+<b>{{runTitle}}</b>
+<span style="color: var(--faint); font-size: 12px">{{runWhy}}</span>
+<span class="grow"></span>
+<button type="button" class="btn" onClick="{{cancel}}">Cancel</button>
+</div>
+<div class="steps">
+<sc-for list="{{steps}}" as="st" hint-placeholder-count="2">
+<span class="{{st.cls}}">{{st.label}}</span>
+<sc-if value="{{st.more}}" hint-placeholder-val="{{ true }}"><span class="arrow">→</span></sc-if>
+</sc-for>
+</div>
+<div class="pbar"><i style="width: {{pct}}%"></i></div>
+<div class="rund"><code>{{file}}</code><span>{{elapsed}}</span><span>one compute slot · other runs wait</span></div>
+</div>
+</sc-if>
+
+<sc-if value="{{finished}}" hint-placeholder-val="{{ false }}">
+<div class="runp done">
+<div class="runh" style="font-size: 12.5px">
+<span class="{{endChip}}">{{endLabel}}</span>
+<span style="color: var(--text2)">{{endText}}</span>
+<span class="grow"></span>
+<button type="button" class="linkbtn" style="font-size: 12px" onClick="{{toReview}}">{{endAction}}</button>
+</div>
+</div>
+</sc-if>
+
+<div class="segs" role="group" aria-label="Segments">
+<sc-for list="{{segs}}" as="sg" hint-placeholder-count="4">
+<button type="button" class="{{sg.cls}}" onClick="{{sg.pick}}"><span class="n">{{sg.n}}</span><span class="l">{{sg.label}}</span><span class="h">{{sg.hours}}</span></button>
+</sc-for>
+</div>
+
+<div class="toolbar">
+<sc-for list="{{chips}}" as="c" hint-placeholder-count="3">
+<span class="fchip"><i class="fdot" style="background: {{c.c}}"></i>{{c.f}} <span style="color: var(--faint); font-size: 10.5px">{{c.n}}</span></span>
+</sc-for>
+<span style="width: 1px; height: 18px; background: var(--line)"></span>
+<span style="color: var(--faint); font-size: 11.5px">Group</span>
+<span class="sel">Night</span><span class="sel">Filter</span>
+<span class="grow"></span>
+<span class="sel" style="width: 180px; color: var(--faint)">Search file name</span>
+</div>
+
+<div class="totals">
+<span><strong>{{segN}}</strong> frames · {{segHours}} · {{segSize}}</span>
+<span>{{selText}}</span>
+<span class="grow"></span>
+<sc-for list="{{actions}}" as="a" hint-placeholder-count="3">
+<button type="button" class="{{a.cls}}">{{a.label}}</button>
+</sc-for>
+</div>
+<div class="tw">
+<table class="ft">
+<thead><tr>
+<th style="width: 34px"></th><th style="width: 260px">File</th><th style="width: 100px">Night</th><th style="width: 70px">Filter</th><th class="num" style="width: 60px">Exp</th><th class="num" style="width: 70px">FWHM</th><th class="num" style="width: 60px">Ecc</th><th class="num" style="width: 60px">Stars</th><th class="num" style="width: 60px">SNR</th><th>{{statusHead}}</th>
+</tr></thead>
+<tbody>
+<tr class="g"><td></td><td colspan="9">{{groupLabel}}</td></tr>
+<sc-for list="{{rows}}" as="r" hint-placeholder-count="10">
+<tr class="{{r.cls}}">
+<td><button type="button" class="{{r.cb}}" role="checkbox" aria-checked="{{r.checked}}" aria-label="Select frame" onClick="{{r.toggle}}"><i></i></button></td>
+<td class="fname">{{r.name}}</td><td>{{r.night}}</td><td>{{r.filter}}</td><td class="num">300 s</td><td class="num">{{r.fwhm}}</td><td class="num">{{r.ecc}}</td><td class="num">{{r.stars}}</td><td class="num">{{r.snr}}</td>
+<td><span class="{{r.chip}}">{{r.status}}</span></td>
+</tr>
+</sc-for>
+</tbody>
+</table>
+</div>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"runKind":{"editor":"enum","options":["calibrate","automatic"],"default":"calibrate"},"runState":{"editor":"enum","options":["running","done","cancelled"],"default":"running"},"$preview":{"width":1440,"height":980}}'>
+class Component extends DCLogic {
+  state = { seg: 'review', cur: 12, cancelled: false, picked: { 1: true, 3: true, 4: true } };
+  componentDidMount() {
+    this.tick = setInterval(() => {
+      if (this.state.cancelled) return;
+      this.setState({ cur: this.state.cur >= 48 ? 6 : this.state.cur + 1 });
+    }, 700);
+  }
+  componentWillUnmount() {
+    clearInterval(this.tick);
+  }
+  renderVals() {
+    const s = this.state;
+    const kind = this.props.runKind ?? 'calibrate';
+    const stateProp = this.props.runState ?? 'running';
+    const runState = s.cancelled ? 'cancelled' : stateProp;
+    const auto = kind === 'automatic';
+    const cur = s.cur;
+    const HA = '#d08770', O3 = '#8fbcbb', L = '#e5e9f0', R = '#bf616a';
+
+    const steps = auto
+      ? [
+          { label: '✓ Queued', cls: 'st ok' },
+          { label: '✓ Calibrate 48 / 48', cls: 'st ok' },
+          { label: 'Seed ' + Math.min(cur, 48) + ' / 48', cls: 'st now' },
+          { label: 'Announce', cls: 'st' },
+        ]
+      : [
+          { label: '✓ Queued 14:01:08', cls: 'st ok' },
+          { label: 'Calibrate ' + cur + ' / 48', cls: 'st now' },
+        ];
+    steps.forEach((st, i) => (st.more = i < steps.length - 1));
+
+    const SEGS = {
+      ready: { n: '136', label: 'Ready to calibrate', hours: '11h 20m · 5 nights', size: '6.1 GB raw', status: 'Gate', group: '2026-09-29 · L · 300 s — 60 frames · 5h 00m',
+        chips: [{ f: 'L', c: L, n: 60 }, { f: 'R', c: R, n: 26 }, { f: 'G', c: '#a3be8c', n: 26 }, { f: 'B', c: '#81a1c1', n: 24 }],
+        actions: (k, all) => [{ label: 'Calibrate ' + (k || 'all ' + all), cls: 'btn pri' }, { label: "Don't publish " + (k || 'all ' + all), cls: 'btn warn' }, { label: 'Blink ' + (k || 'all ' + all), cls: 'btn' }],
+        row: (i) => ({ name: 'M42_L_300s_' + String(i + 1).padStart(4, '0') + '.fits', night: '2026-09-29', filter: 'L', status: 'passes', chip: 'chip c-ok' }) },
+      review: { n: '48', label: 'To review', hours: '4h 00m · 2 nights', size: '2.1 GB calibrated', status: 'Calibrated', group: '2026-09-28 · Hα · 300 s — 24 frames · 2h 00m',
+        chips: [{ f: 'Hα', c: HA, n: 24 }, { f: 'OIII', c: O3, n: 24 }],
+        actions: (k, all) => [{ label: 'Publish ' + (k || 'all ' + all), cls: 'btn pri' }, { label: "Don't publish " + (k || 'all ' + all), cls: 'btn warn' }, { label: 'Blink ' + (k || 'all ' + all), cls: 'btn' }],
+        row: (i) => ({ name: 'c_M42_Ha_300s_' + String(i + 1).padStart(4, '0') + '.fits', night: '2026-09-28', filter: 'Hα', status: '2026-10-01 14:02:' + String(10 + i * 3), chip: 'chip c-pur' }) },
+      published: { n: '412', label: 'Published', hours: '34h 20m · 18 nights', size: '18.5 GB', status: 'Project', group: '2026-09-21 · L · 300 s — 48 frames · 4h 00m',
+        chips: [{ f: 'L', c: L, n: 152 }, { f: 'R', c: R, n: 74 }, { f: 'Hα', c: HA, n: 44 }],
+        actions: (k, all) => [{ label: 'Republish ' + (k || 'all ' + all), cls: 'btn' }, { label: 'Exclude ' + (k || 'all ' + all), cls: 'btn warn' }, { label: 'Blink ' + (k || 'all ' + all), cls: 'btn' }],
+        row: (i) => ({ name: 'c_M42_L_300s_' + String(i + 101).padStart(4, '0') + '.fits', night: '2026-09-21', filter: 'L', status: i === 2 ? 'pending' : 'accepted · 4 of 6 hold', chip: i === 2 ? 'chip c-warn' : 'chip c-ok' }) },
+      held: { n: '23', label: 'Held back', hours: '1h 55m · 4 nights', size: '1.0 GB raw', status: 'Reason', group: 'Withheld by you — 3 frames · 15m',
+        chips: [{ f: 'L', c: L, n: 10 }, { f: 'R', c: R, n: 5 }, { f: 'Hα', c: HA, n: 8 }],
+        actions: (k, all) => [{ label: 'Release ' + (k || 'all ' + all), cls: 'btn pri' }, { label: 'Analyze', cls: 'btn' }, { label: 'Blink ' + (k || 'all ' + all), cls: 'btn' }],
+        row: (i) => ({ name: 'M42_R_300s_' + String(i + 31).padStart(4, '0') + '.fits', night: '2026-09-24', filter: 'R', status: i < 3 ? 'withheld by you' : 'FWHM 3.41″ > 3.20″', chip: i < 3 ? 'chip c-mute' : 'chip c-warn' }) },
+    };
+    const seg = SEGS[s.seg];
+    const k = Object.values(s.picked).filter(Boolean).length;
+    const rows = Array.from({ length: 10 }, (_, i) => {
+      const r = seg.row(i);
+      const on = !!s.picked[i];
+      return {
+        ...r,
+        fwhm: (2.41 + ((i * 37) % 60) / 100).toFixed(2) + '″',
+        ecc: (0.31 + ((i * 13) % 20) / 100).toFixed(2),
+        stars: String(820 - i * 17),
+        snr: String(41 - (i % 5)),
+        cls: on ? 'on' : '',
+        cb: on ? 'cb on' : 'cb',
+        checked: on ? 'true' : 'false',
+        toggle: () => this.setState({ picked: { ...this.state.picked, [i]: !this.state.picked[i] } }),
+      };
+    });
+
+    return {
+      running: runState === 'running',
+      finished: runState !== 'running',
+      kindChip: auto ? 'chip c-pur' : 'chip c-info',
+      kindLabel: auto ? 'auto' : 'manual',
+      runTitle: auto ? 'Fully automatic · seeding ' + Math.min(cur, 48) + ' of 48' : 'Calibrating ' + cur + ' of 48',
+      runWhy: auto ? 'started after a scan of /Volumes/Astro/2026-09-28' : 'you clicked Calibrate',
+      steps,
+      pct: Math.round((cur / 48) * (auto ? 100 : 100)),
+      file: auto ? 'c_M42_Ha_300s_00' + String(cur).padStart(2, '0') + '.fits' : 'M42_Ha_300s_00' + String(cur).padStart(2, '0') + '.fits → c_M42_Ha_300s_00' + String(cur).padStart(2, '0') + '.fits',
+      elapsed: '2m 14s elapsed · about 7 min left',
+      cancel: () => this.setState({ cancelled: true }),
+      endChip: runState === 'cancelled' ? 'chip c-warn' : 'chip c-ok',
+      endLabel: runState === 'cancelled' ? 'cancelled' : 'done',
+      endText: runState === 'cancelled'
+        ? 'Stopped after ' + cur + ' of 48 · ' + cur + ' moved to To review · ' + (48 - cur) + ' stay Ready · 2026-10-01 14:05:40 · manual'
+        : (auto ? 'Published 48 · 2026-10-01 14:09:02 · auto, after a scan' : 'Calibrated 46 · 2 failed (see Held back) · 2026-10-01 14:03:22 · manual'),
+      endAction: auto && runState !== 'cancelled' ? 'Open Published →' : 'Review →',
+      toReview: () => this.setState({ seg: auto && runState !== 'cancelled' ? 'published' : 'review' }),
+      segs: ['ready', 'review', 'published', 'held'].map((id) => ({
+        n: SEGS[id].n,
+        label: SEGS[id].label,
+        hours: SEGS[id].hours,
+        cls: s.seg === id ? 'on' : '',
+        pick: () => this.setState({ seg: id }),
+      })),
+      chips: seg.chips,
+      segN: seg.n,
+      segHours: seg.hours,
+      segSize: seg.size,
+      selText: k ? k + ' selected' : 'nothing selected — actions apply to all',
+      actions: seg.actions(k, seg.n),
+      statusHead: seg.status,
+      groupLabel: seg.group,
+      rows,
+    };
+  }
+}
+</script>
+</body>
+</html>

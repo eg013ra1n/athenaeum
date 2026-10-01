@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Project overview</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+.ath{--bg:#2e3440;--elev:#3b4252;--hover:#434c5e;--border:#4c566a;--line:rgba(76,86,106,.55);--text:#eceff4;--text2:#e5e9f0;--muted:#d8dee9;--faint:rgba(216,222,233,.68);--accent:#88c0d0;--accent-h:#81a1c1;--success:#a3be8c;--success-m:rgba(163,190,140,.22);--warning:#ebcb8b;--warning-m:rgba(235,203,139,.22);--error:#bf616a;--info:#81a1c1;--info-m:rgba(129,161,193,.22);--purple:#b48ead;--purple-m:rgba(180,142,173,.22)}
+.ath{background:var(--bg);color:var(--text);font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
+.ath button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+.ath button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.side{width:56px;flex:none;background:#272c36;border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:12px 0;gap:6px}
+.side span{width:40px;height:36px;border-radius:6px;display:grid;place-items:center;color:var(--faint);font-size:10px}
+.side span.on{background:var(--elev);color:var(--accent)}
+.head{display:flex;align-items:center;gap:14px}
+.hnav{display:flex;gap:2px;color:var(--faint)}
+.hnav button{width:26px;height:26px;border-radius:4px;display:grid;place-items:center}
+.hnav button:hover{background:var(--hover)}
+.h1{font-size:24px;font-weight:700;margin:0;white-space:nowrap}
+.hsub{color:var(--faint);font-size:14px;white-space:nowrap}
+.grow{flex:1}
+.chip{display:inline-flex;align-items:center;gap:4px;padding:0 6px;border-radius:3px;font-size:11px;line-height:18px;white-space:nowrap}
+.c-info{background:var(--info-m);color:var(--info)}
+.c-ok{background:var(--success-m);color:var(--success)}
+.c-warn{background:var(--warning-m);color:var(--warning)}
+.c-pur{background:var(--purple-m);color:var(--purple)}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;background:var(--elev);color:var(--muted);white-space:nowrap;border:1px solid transparent}
+.pill:hover{border-color:var(--border)}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
+.live{background:var(--success);box-shadow:0 0 0 3px rgba(163,190,140,.18)}
+.busy{background:var(--accent);box-shadow:0 0 0 3px rgba(136,192,208,.25)}
+.linkbtn{color:var(--accent);font-size:13px}
+.linkbtn:hover{text-decoration:underline}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-top:14px}
+.tabs span{padding:8px 14px;color:var(--faint);border-bottom:2px solid transparent;display:inline-flex;gap:6px;align-items:center;white-space:nowrap}
+.tabs span.on{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
+.cnt{font-size:10.5px;padding:0 5px;border-radius:999px;background:var(--hover);color:var(--muted);font-weight:500}
+.cnt.w{background:var(--warning-m);color:var(--warning)}
+.card{background:var(--elev);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+.card h2{font-size:13px;font-weight:600;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+.card h2 small{font-weight:400;color:var(--faint);font-size:12px}
+.tile{display:flex;flex-direction:column;align-items:stretch;gap:3px;text-align:left;padding:10px 12px;border:1px solid var(--line);border-radius:6px;background:rgba(46,52,64,.35)}
+.tile:hover{border-color:var(--accent)}
+.tn{font-size:22px;font-weight:600;line-height:1.1}
+.tl{font-size:12px;color:var(--faint)}
+.tm{font-size:12px;color:var(--text2);margin-top:4px}
+.tf{display:flex;flex-wrap:wrap;gap:3px 10px;font-size:11.5px;color:var(--faint);margin-top:2px}
+.tf b{color:var(--text2);font-weight:500}
+.fdot{width:8px;height:8px;border-radius:2px;display:inline-block;margin-right:4px}
+.tfoot{margin-top:6px;padding-top:6px;border-top:1px solid var(--line);font-size:11.5px;color:var(--faint)}
+.tfoot b{color:var(--accent);font-weight:500}
+.goal{display:grid;grid-template-columns:54px 1fr 170px;gap:10px;align-items:center;margin:9px 0}
+.gb{position:relative;height:14px;border-radius:3px;background:var(--hover)}
+.gfill{display:flex;height:100%;border-radius:3px;overflow:hidden}
+.gfill i{display:block;height:100%}
+.gmark{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--text)}
+.gt{font-size:12px;color:var(--muted);text-align:right}
+.gt b{color:var(--text);font-weight:600}
+.legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:11.5px;color:var(--faint);margin-top:8px}
+.sgrp{padding:10px 0;border-top:1px solid var(--line)}
+.sgrp:first-of-type{border-top:0;padding-top:0}
+.slab{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.sval{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text)}
+.shelp{margin:5px 0 0;font-size:12px;color:var(--faint);line-height:1.45}
+.seg3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.seg3 button{padding:6px 8px;color:var(--faint);border-right:1px solid var(--border);font-size:12.5px;text-align:center}
+.seg3 button:last-child{border-right:0}
+.seg3 button.on{background:rgba(136,192,208,.14);color:var(--text);font-weight:600}
+.seg3 button:hover{color:var(--text)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:4px;color:var(--text2);font-size:12px;white-space:nowrap}
+.btn:hover{background:var(--hover)}
+.btn.sm{padding:1px 8px;font-size:11.5px}
+.run{margin-top:9px;padding:8px 10px;border-radius:6px;background:rgba(46,52,64,.55);border:1px solid var(--line);font-size:12px;color:var(--muted)}
+.run b{color:var(--text);font-weight:600}
+.pbar{height:4px;border-radius:2px;background:var(--hover);overflow:hidden;margin:6px 0 4px}
+.pbar i{display:block;height:100%;background:var(--accent)}
+.sw{position:relative;width:32px;height:18px;border-radius:999px;background:var(--hover);border:1px solid var(--border);flex:none}
+.sw i{position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:var(--muted)}
+.sw.on{background:var(--accent);border-color:var(--accent)}
+.sw.on i{left:16px;background:var(--bg)}
+.att{display:flex;gap:10px;align-items:flex-start;padding:7px 0;border-top:1px solid var(--line);font-size:12.5px}
+.att:first-of-type{border-top:0}
+.att small{display:block;color:var(--faint);font-size:11.5px}
+.toast{position:absolute;left:50%;bottom:24px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:8px 14px;border-radius:6px;font-size:12.5px;box-shadow:0 6px 20px rgba(0,0,0,.4)}
+</style>
+</helmet>
+<div class="ath" style="width: 1440px; height: 980px; display: flex; position: relative; overflow: hidden">
+<div class="side"><span>Files</span><span>Objects</span><span class="on">Projects</span><span>Transfers</span><span>Settings</span></div>
+<div style="flex-grow: 1; min-width: 0; padding: 24px">
+
+<div class="head">
+<span class="hnav">
+<button type="button" aria-label="Back"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"></path></svg></button>
+<button type="button" aria-label="Forward"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"></path></svg></button>
+</span>
+<h1 class="h1">Orion Deep Field 2026</h1>
+<span class="hsub">◎ M 42 · r 1.5° · 6 members</span>
+<span class="chip c-info">coordinator</span>
+<span class="grow"></span>
+<button type="button" class="pill" onClick="{{sync}}" title="Sync now: reconnect to the hub and check this project"><span class="{{dotCls}}"></span>{{pillText}}</button>
+<button type="button" class="linkbtn">Manage on portal ↗</button>
+</div>
+
+<div class="tabs">
+<span class="on">Overview</span>
+<span>My frames <span class="cnt">136 ready · 48 to review</span></span>
+<span>Library <span class="cnt">{{toGo}} to go</span></span>
+<span>Members</span>
+<span>Exchange</span>
+<span>Moderation <span class="cnt w">3</span></span>
+</div>
+
+<div style="display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 14px; align-items: start; padding-top: 14px">
+
+<div style="display: grid; gap: 14px">
+<div class="card">
+<h2>My contribution <small>this device · 3 linked frame sets</small></h2>
+<div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px">
+<sc-for list="{{tiles}}" as="t" hint-placeholder-count="4">
+<button type="button" class="tile">
+<span class="tn" style="color: {{t.tone}}">{{t.n}}</span>
+<span class="tl">{{t.label}}</span>
+<span class="tm">{{t.meta}}</span>
+<span class="tf">
+<sc-for list="{{t.filters}}" as="f" hint-placeholder-count="3">
+<span><i class="fdot" style="background: {{f.c}}"></i>{{f.f}} <b>{{f.h}}</b></span>
+</sc-for>
+</span>
+<span class="tfoot">{{t.foot}}</span>
+</button>
+</sc-for>
+</div>
+</div>
+
+<div class="card">
+<h2>Integration toward goal <small>published, accepted frames · by member</small></h2>
+<sc-for list="{{goals}}" as="g" hint-placeholder-count="6">
+<div class="goal">
+<span style="font-weight: 600; display: inline-flex; align-items: center"><i class="fdot" style="background: {{g.c}}"></i>{{g.f}}</span>
+<span class="gb">
+<span class="gfill">
+<sc-for list="{{g.segs}}" as="s" hint-placeholder-count="3">
+<i style="width: {{s.w}}%; background: {{s.c}}"></i>
+</sc-for>
+</span>
+<span class="gmark" style="left: {{g.mark}}%"></span>
+</span>
+<span class="gt"><b>{{g.total}}</b> of {{g.goal}} · <span style="color: {{g.leftColor}}">{{g.left}}</span></span>
+</div>
+</sc-for>
+<div class="legend">
+<span><i class="fdot" style="background: #88c0d0; border-radius: 50%"></i>Vilen (you)</span>
+<span><i class="fdot" style="background: #d08770; border-radius: 50%"></i>Anna</span>
+<span><i class="fdot" style="background: #b48ead; border-radius: 50%"></i>Marco</span>
+<span><i class="fdot" style="background: #a3be8c; border-radius: 50%"></i>Kenji</span>
+</div>
+</div>
+</div>
+
+<div style="display: grid; gap: 14px">
+<div class="card">
+<h2>Project settings <small>this device only</small></h2>
+
+<div class="sgrp">
+<div class="slab">Publishing device</div>
+<div class="sval"><span class="dot live"></span>This device · Mac Studio (observatory)</div>
+<p class="shelp">One device per account publishes to a project. Frames on your other devices are not published from them.</p>
+</div>
+
+<div class="sgrp">
+<div class="slab">Publishing</div>
+<div class="seg3" role="group" aria-label="Publishing mode">
+<sc-for list="{{modes}}" as="m" hint-placeholder-count="3">
+<button type="button" class="{{m.cls}}" onClick="{{m.pick}}" aria-pressed="{{m.pressed}}">{{m.label}}</button>
+</sc-for>
+</div>
+<p class="shelp">{{modeHelp}}</p>
+<sc-if value="{{running}}" hint-placeholder-val="{{ false }}">
+<div class="run">
+<div style="display: flex; align-items: center; gap: 8px"><span class="chip c-pur">auto</span><b>{{runTitle}}</b><span class="grow"></span><button type="button" class="linkbtn" style="font-size: 12px">Open My frames →</button></div>
+<div class="pbar"><i style="width: {{runPct}}%"></i></div>
+<div>{{runDetail}}</div>
+</div>
+</sc-if>
+<sc-if value="{{idle}}" hint-placeholder-val="{{ true }}">
+<div class="run">Last run · <b>Calibrated 46</b> · 2 failed · 2026-10-01 14:03:22 · manual</div>
+</sc-if>
+</div>
+
+<div class="sgrp">
+<div class="slab">Auto-replicate</div>
+<div class="sval">
+<button type="button" class="{{swCls}}" role="switch" aria-checked="{{replicate}}" aria-label="Auto-replicate" onClick="{{toggleReplicate}}"><i></i></button>
+<span>{{replicateText}}</span>
+</div>
+<p class="shelp">New approved contributions download to this device automatically. Every member who holds a frame helps distribute it.</p>
+</div>
+</div>
+
+<div class="card">
+<h2>Needs attention</h2>
+<div class="att"><span class="chip c-pur">48</span><span style="flex-grow: 1">Calibrated frames wait for your review<small>Blink them, drop the bad ones, then publish.</small></span><button type="button" class="btn sm">Review</button></div>
+<div class="att"><span class="chip c-warn">12</span><span style="flex-grow: 1">Held back: FWHM above 3.20″<small>Night 2026-09-21 · L</small></span><button type="button" class="btn sm">Open</button></div>
+<div class="att"><span class="chip c-warn">3</span><span style="flex-grow: 1">Frames waiting for moderation</span><button type="button" class="btn sm">Moderate</button></div>
+</div>
+
+<div class="card">
+<h2>Exchange now <span class="grow"></span><button type="button" class="linkbtn" style="font-weight: 400; font-size: 12px">Open Exchange →</button></h2>
+<div style="display: grid; gap: 4px; font-size: 12.5px; color: var(--muted)">
+<div>↓ <b style="color: var(--text)">38.2 MB/s</b> from Anna, Marco</div>
+<div>↑ <b style="color: var(--text)">12.9 MB/s</b> to Kenji</div>
+</div>
+</div>
+
+<div class="card">
+<h2>Quality thresholds <small>v4 · set by the coordinator</small></h2>
+<div style="font-size: 12.5px; color: var(--text2); display: grid; gap: 2px"><span>FWHM ≤ 3.20″</span><span>Eccentricity ≤ 0.55</span><span>Stars ≥ 150</span><span>Reject trailed frames</span></div>
+</div>
+</div>
+
+</div>
+</div>
+<sc-if value="{{toast}}" hint-placeholder-val="{{ false }}">
+<div class="toast">Synced · 3 new frames in Library</div>
+</sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":980}}'>
+class Component extends DCLogic {
+  state = { secs: 12, syncing: false, toGo: 278, mode: 'manual', replicate: true, toast: false };
+  componentDidMount() {
+    this.tick = setInterval(() => {
+      if (!this.state.syncing) this.setState({ secs: this.state.secs >= 59 ? 0 : this.state.secs + 1 });
+    }, 1000);
+  }
+  componentWillUnmount() {
+    clearInterval(this.tick);
+    clearTimeout(this.t1);
+    clearTimeout(this.t2);
+  }
+  renderVals() {
+    const s = this.state;
+    const L = '#e5e9f0', R = '#bf616a', G = '#a3be8c', B = '#81a1c1', HA = '#d08770', O3 = '#8fbcbb';
+    const MODES = [
+      ['manual', 'Manual', 'Nothing runs on its own. You calibrate, review and publish from My frames.'],
+      ['autocal', 'Auto-calibrate', 'New passing frames are calibrated after scans, analysis or new masters, then wait in To review until you publish them.'],
+      ['auto', 'Fully automatic', 'New passing frames are calibrated and published with no review. For a remote rig nobody watches.'],
+    ];
+    const cur = MODES.find((m) => m[0] === s.mode);
+    const running = s.mode !== 'manual';
+    return {
+      pillText: s.syncing ? 'Syncing…' : 'Live · synced ' + s.secs + ' s ago',
+      dotCls: s.syncing ? 'dot busy' : 'dot live',
+      toGo: s.toGo,
+      toast: s.toast,
+      sync: () => {
+        if (s.syncing) return;
+        this.setState({ syncing: true });
+        this.t1 = setTimeout(() => {
+          this.setState({ syncing: false, secs: 0, toGo: this.state.toGo + 3, toast: true });
+          this.t2 = setTimeout(() => this.setState({ toast: false }), 2600);
+        }, 1300);
+      },
+      tiles: [
+        { n: '136', label: 'ready to calibrate', tone: 'var(--accent)', meta: '11h 20m · 5 nights · 6.1 GB', filters: [{ f: 'L', c: L, h: '5h 00m' }, { f: 'R', c: R, h: '2h 10m' }, { f: 'G', c: G, h: '2h 10m' }, { f: 'B', c: B, h: '2h 00m' }], foot: 'Calibrate →' },
+        { n: '48', label: 'to review', tone: 'var(--purple)', meta: '4h 00m · 2 nights · 2.1 GB', filters: [{ f: 'Hα', c: HA, h: '2h 30m' }, { f: 'OIII', c: O3, h: '1h 30m' }], foot: 'Review and publish →' },
+        { n: '412', label: 'published', tone: 'var(--success)', meta: '34h 20m · 18 nights · 18.5 GB', filters: [{ f: 'L', c: L, h: '12h 40m' }, { f: 'R', c: R, h: '6h 10m' }, { f: 'G', c: G, h: '6h 00m' }, { f: 'B', c: B, h: '5h 50m' }, { f: 'Hα', c: HA, h: '3h 40m' }], foot: '397 accepted · 15 pending' },
+        { n: '23', label: 'held back', tone: 'var(--warning)', meta: '1h 55m · 4 nights · 1.0 GB', filters: [{ f: 'L', c: L, h: '50m' }, { f: 'R', c: R, h: '25m' }, { f: 'Hα', c: HA, h: '40m' }], foot: '12 FWHM · 8 trailed · 3 withheld by you' },
+      ],
+      goals: [
+        { f: 'L', c: L, segs: [{ w: 38, c: '#88c0d0' }, { w: 22, c: '#d08770' }, { w: 12, c: '#b48ead' }], mark: 80, total: '28h 40m', goal: '40h', left: '11h 20m to go', leftColor: 'var(--warning)' },
+        { f: 'R', c: R, segs: [{ w: 30, c: '#88c0d0' }, { w: 30, c: '#d08770' }], mark: 80, total: '12h 10m', goal: '20h', left: '7h 50m to go', leftColor: 'var(--warning)' },
+        { f: 'G', c: G, segs: [{ w: 32, c: '#88c0d0' }, { w: 28, c: '#a3be8c' }], mark: 80, total: '12h 00m', goal: '20h', left: '8h 00m to go', leftColor: 'var(--warning)' },
+        { f: 'B', c: B, segs: [{ w: 29, c: '#88c0d0' }, { w: 30, c: '#a3be8c' }], mark: 80, total: '11h 50m', goal: '20h', left: '8h 10m to go', leftColor: 'var(--warning)' },
+        { f: 'Hα', c: HA, segs: [{ w: 44, c: '#88c0d0' }, { w: 36, c: '#b48ead' }, { w: 18, c: '#d08770' }], mark: 82, total: '24h 30m', goal: '20h', left: 'goal met', leftColor: 'var(--success)' },
+        { f: 'OIII', c: O3, segs: [{ w: 20, c: '#b48ead' }], mark: 80, total: '4h 00m', goal: '20h', left: '16h 00m to go', leftColor: 'var(--warning)' },
+      ],
+      modes: MODES.map((m) => ({
+        label: m[1],
+        cls: s.mode === m[0] ? 'on' : '',
+        pressed: s.mode === m[0] ? 'true' : 'false',
+        pick: () => this.setState({ mode: m[0] }),
+      })),
+      modeHelp: cur[2],
+      running,
+      idle: !running,
+      runTitle: s.mode === 'auto' ? 'Announcing 300 / 412' : 'Calibrating 12 / 48',
+      runPct: s.mode === 'auto' ? 88 : 25,
+      runDetail: s.mode === 'auto' ? 'Calibrated 412 · seeded 412 · batch 1 of 1' : 'c_M42_Ha_0012.fits · started 14:01:08 · after a scan',
+      replicate: s.replicate ? 'true' : 'false',
+      swCls: s.replicate ? 'sw on' : 'sw',
+      replicateText: s.replicate ? 'On' : 'Off',
+      toggleReplicate: () => this.setState({ replicate: !s.replicate }),
+    };
+  }
+}
+</script>
+</body>
+</html>
