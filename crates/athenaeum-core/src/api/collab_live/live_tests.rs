@@ -1097,6 +1097,77 @@ async fn sync_now_before_the_runtime_runs_is_applied_when_it_starts() {
     }
 }
 
+// ── spec 2026-10-01 §6: per-project sync confirmations ──────────────────
+
+/// §6.2/§6.3: Sync now's reconnect `hello` confirms the project — a
+/// `collab-project-synced` with `ok` and a `syncedAt` arrives after the
+/// click, the runtime records the time, and the card reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_now_raises_a_confirmed_collab_project_synced() {
+    let w = ts::two_instances().await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before =
+        w.a.events
+            .payloads(crate::api::collab_live::COLLAB_PROJECT_SYNCED_EVENT)
+            .len();
+    ts::sync_now_serial(&w.a.ctx).await;
+    ts::wait_until(
+        "a confirmed collab-project-synced after Sync now",
+        Duration::from_secs(10),
+        || {
+            w.a.events
+                .payloads(crate::api::collab_live::COLLAB_PROJECT_SYNCED_EVENT)
+                .iter()
+                .skip(before)
+                .any(|p| p["projectId"] == ts::PID && p["ok"] == true && p["syncedAt"].is_string())
+        },
+    )
+    .await;
+    let recorded = crate::api::collab_live::live_synced_at(&w.a.ctx, ts::PID)
+        .expect("the runtime recorded the confirmation");
+    let card = crate::api::collab::list_projects(&w.a.ctx)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.project_id == ts::PID)
+        .expect("the project's card");
+    assert_eq!(
+        card.synced_at.as_deref(),
+        Some(recorded.as_str()),
+        "the card reads the runtime's confirmation time"
+    );
+}
+
+/// Review focus 4: Sync now while the project's catch-up fails — an
+/// `ok: false` report for it arrives promptly; nothing waits silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_project_reports_not_ok() {
+    let w = ts::two_instances().await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The head moves without the stream telling A (its event is dropped),
+    // so the reconnect's hello is what catches A up — and fails.
+    w.hub
+        .set_failing(&format!("/projects/{}/manifest", ts::PID), true);
+    w.hub.drop_next_events(ts::PID, 1);
+    w.hub.seed_frames(ts::PID, "acc-c", &["u-z"], "published");
+    let before =
+        w.a.events
+            .payloads(crate::api::collab_live::COLLAB_PROJECT_SYNCED_EVENT)
+            .len();
+    ts::sync_now_serial(&w.a.ctx).await;
+    ts::wait_until(
+        "an ok:false collab-project-synced",
+        Duration::from_secs(10),
+        || {
+            w.a.events
+                .payloads(crate::api::collab_live::COLLAB_PROJECT_SYNCED_EVENT)
+                .iter()
+                .skip(before)
+                .any(|p| p["projectId"] == ts::PID && p["ok"] == false && p["error"].is_string())
+        },
+    )
+    .await;
+}
+
 // ── final fix, group B: a moved or copied Collaboration folder ──────────
 
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) {

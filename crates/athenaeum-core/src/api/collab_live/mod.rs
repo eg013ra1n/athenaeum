@@ -42,7 +42,7 @@ pub(crate) mod session;
 #[cfg(all(feature = "render", feature = "solver"))]
 mod workers;
 #[cfg(all(feature = "render", feature = "solver"))]
-pub(crate) use runtime::live_presence;
+pub(crate) use runtime::{live_presence, live_synced_at};
 #[cfg(all(feature = "render", feature = "solver"))]
 pub use runtime::{
     notify_local_change, on_sign_out, set_receive_streams, shutdown, spawn_collab_live, status,
@@ -111,6 +111,25 @@ pub const COLLAB_ATTENTION_EVENT: &str = "collab-attention-changed";
 /// once a second while something moves, then one quiet payload per project.
 /// Ids only — names come from `get_collab_exchange`.
 pub const COLLAB_EXCHANGE_PROGRESS_EVENT: &str = "collab-exchange-progress";
+
+/// Spec 2026-10-01 §6.2: a project confirmed against the hub (or not).
+/// At most one per project per second; a window that saw a failure is
+/// never coalesced into an ok.
+pub const COLLAB_PROJECT_SYNCED_EVENT: &str = "collab-project-synced";
+
+/// Payload of [`COLLAB_PROJECT_SYNCED_EVENT`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabProjectSynced {
+    pub project_id: String,
+    /// RFC 3339; the newest successful confirmation in the window.
+    pub synced_at: Option<String>,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// Something was applied: manifest rows, members, holders or the
+    /// project snapshot (presence never counts).
+    pub changed: bool,
+}
 
 /// Payload of [`COLLAB_DELETION_CHOICE_EVENT`].
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]

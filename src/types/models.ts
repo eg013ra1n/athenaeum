@@ -1565,6 +1565,13 @@ autoReplicate: boolean,
  */
 publishMode: PublishMode, fetchedAt: string, 
 /**
+ * Spec 2026-10-01 §6.1: when the live exchange last confirmed this
+ * project against the hub (RFC 3339, in memory). `None` when no live
+ * exchange is armed (signed out) or it has not confirmed the project
+ * yet.
+ */
+syncedAt: string | null, 
+/**
  * Amendment A6: the one device of this account that may announce new
  * frames into the project, as the hub last reported it. `None` = no
  * device is publishing yet (nothing bound, or the bound device was
@@ -1821,6 +1828,17 @@ toFetch: number, toFetchBytes: number, };
 export type CollabFramesLanded = { projectId: string, landed: number, failed: number, awaitingGc: number, };
 
 export type CollabPeersChanged = { projectId: string, };
+
+export type CollabProjectSynced = { projectId: string, 
+/**
+ * RFC 3339; the newest successful confirmation in the window.
+ */
+syncedAt: string | null, ok: boolean, error: string | null, 
+/**
+ * Something was applied: manifest rows, members, holders or the
+ * project snapshot (presence never counts).
+ */
+changed: boolean, };
 
 export type LiveState = "off" | "connecting" | "live" | "reconnecting" | "unreachable" | "signedOut" | "outdated";
 

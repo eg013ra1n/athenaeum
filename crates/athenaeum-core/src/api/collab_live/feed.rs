@@ -66,9 +66,8 @@ pub struct SyncReport {
 /// counted: it stays on `collab-peers-changed`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncChanges {
-    /// Manifest rows the sync classified as a change (the counts the
-    /// manifest apply already computes; a full reload, whose counts are not
-    /// known, counts 1).
+    /// Manifest rows the manifest sync wrote or pruned (a full reload,
+    /// whose counts are not known, counts 1).
     pub manifest_rows: usize,
     pub members: bool,
     pub holders: bool,
@@ -1268,9 +1267,10 @@ impl FeedApplier {
                 // Already reloaded into this exact epoch, no further
                 // regression on either axis since — nothing to redo (item 4).
                 // Confirmed as it stands unless its head is ahead.
+                // As `plan_versions`: no holder map yet (`-1`) with a head
+                // `>= 0` is ahead too (a catch-up loads its snapshot).
                 let version_ahead = head.is_some_and(|(v, _)| v > stored.version);
-                let holder_ahead =
-                    head.is_some_and(|(_, h)| stored.holder_seq >= 0 && h > stored.holder_seq);
+                let holder_ahead = head.is_some_and(|(_, h)| h > stored.holder_seq);
                 match head {
                     Some((v, _)) if version_ahead || holder_ahead => {
                         ahead.push((pid, v, version_ahead, holder_ahead));
@@ -3611,6 +3611,37 @@ mod tests {
         let p2 = report_for(&r, "p2");
         assert!(!p2.ok && p2.error.is_some(), "{p2:?}");
         assert_eq!(project_cursor(&ctx, "p2"), stamped, "not stamped");
+    }
+
+    /// Task 13 re-review: a sibling with no holder map yet (`holder_seq ==
+    /// -1`) whose holder head is ≥ 0 is AHEAD on that axis, as
+    /// `plan_versions` says — the epoch change catches its holders up
+    /// instead of a bare ok.
+    #[tokio::test]
+    async fn an_epoch_change_catches_up_a_sibling_with_no_holder_map_yet() {
+        let (_t, ctx, hub, mut f) = rig().await;
+        let mut h = NoHolders(vec![]);
+        hub.add_project("p2", "m42", &[("acc-me", "send_receive", false)], false);
+        hub.seed_frames(PID, "acc-o", &["u0"], "published");
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        f.take_reports();
+        assert_eq!(full_cursor(&ctx, "p2").2, -1, "no holder map yet");
+        let (_, p1_version) = cursor(&ctx);
+        h.0.clear();
+
+        let mut vv = VersionsEvent::new();
+        vv.insert(PID.into(), (p1_version - 1, -1));
+        vv.insert("p2".into(), (hub.version("p2"), 0));
+        let effects = f.apply(LiveEvent::Versions(vv), &mut h).await.unwrap();
+        assert!(effects.contains(&FeedEffect::EpochChanged));
+        assert!(
+            h.0.contains(&"catch_up p2".to_string()),
+            "the holder side caught p2 up: {:?}",
+            h.0
+        );
+        assert!(report_for(&f.take_reports(), "p2").ok);
     }
 
     /// Fix round 1, item 3: a moderator's restore (accepted false → true)

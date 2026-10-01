@@ -34,7 +34,7 @@ use crate::api::collab_live::{
     CollabAttentionChanged, CollabDeletionChoice, CollabFrameChanged, CollabFrameLost,
     CollabLiveStatus, LiveState, StorageStateView, COLLAB_ATTENTION_EVENT,
     COLLAB_DELETION_CHOICE_EVENT, COLLAB_EXCHANGE_PROGRESS_EVENT, COLLAB_FRAME_CHANGED_EVENT,
-    COLLAB_FRAME_LOST_EVENT, COLLAB_LIVE_STATUS_EVENT,
+    COLLAB_FRAME_LOST_EVENT, COLLAB_LIVE_STATUS_EVENT, COLLAB_PROJECT_SYNCED_EVENT,
 };
 use crate::api::{db, ApiError};
 use crate::collab::hub_client::CollabClient;
@@ -115,6 +115,10 @@ pub(crate) struct Shared {
     /// Each live project's "to go", published by `Executor::step` whenever
     /// the scheduler's wants change (spec §6.2); the snapshot reads it.
     to_go: Arc<RwLock<HashMap<String, usize>>>,
+    /// When each project was last confirmed against the hub (spec
+    /// 2026-10-01 §6.1): written by the loop for every ok sync report, in
+    /// memory only, read by [`live_synced_at`].
+    synced_at: RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     /// Test only (final fix A-I3): how many runtimes this handle started.
     #[cfg(test)]
     starts: AtomicUsize,
@@ -149,6 +153,7 @@ impl Shared {
             running: std::sync::atomic::AtomicBool::new(false),
             meter: RwLock::new(None),
             to_go: Arc::new(RwLock::new(HashMap::new())),
+            synced_at: RwLock::new(HashMap::new()),
             #[cfg(test)]
             starts: AtomicUsize::new(0),
         }
@@ -581,12 +586,16 @@ pub fn sync_now(ctx: &ServiceContext) -> Result<(), ApiError> {
         tracing::info!("collab sync now requested; queued until the live exchange runs");
     }
     crate::collab::live::backoff::reset_all();
-    shared.reconnect_now();
+    // Queued BEFORE the reconnect (spec 2026-10-01 §6.3): the loop takes
+    // commands before stream events, so the reconciliation's
+    // `DigestAfterHello` reaches the feed worker ahead of the new stream's
+    // `hello`.
     if !send(ctx, LiveCommand::Reconcile) {
         let e = ApiError::Internal("the live exchange stopped".into());
         tracing::error!(error = %e, "sync now: reconciliation not queued");
         return Err(e);
     }
+    shared.reconnect_now();
     Ok(())
 }
 
@@ -735,6 +744,16 @@ pub(crate) fn live_presence(ctx: &ServiceContext) -> Option<(PresenceBook, Strin
         }
     };
     Some((shared.presence_copy(), me))
+}
+
+/// When this project was last confirmed against the hub by this catalog's
+/// live exchange (RFC 3339, in memory). `None` when no live exchange is
+/// armed (signed out, shut down) or none confirmed the project yet; while an
+/// armed runtime waits to start or restarts, the last time stays.
+pub(crate) fn live_synced_at(ctx: &ServiceContext, project_id: &str) -> Option<String> {
+    let shared = handle_shared(ctx)?;
+    let map = shared.synced_at.read().unwrap_or_else(|p| p.into_inner());
+    map.get(project_id).map(|t| t.to_rfc3339())
 }
 
 pub(crate) fn redundancy_of(
@@ -1046,6 +1065,88 @@ impl PeerBurst {
     }
 }
 
+/// What one project's sync window saw (spec 2026-10-01 §6.2).
+#[derive(Default)]
+struct PendingSync {
+    /// The newest successful confirmation in the window.
+    synced_at: Option<chrono::DateTime<chrono::Utc>>,
+    failed: bool,
+    /// The last failure's error.
+    error: Option<String>,
+    changed: bool,
+}
+
+/// Per-project throttle for [`COLLAB_PROJECT_SYNCED_EVENT`]: [`PeerBurst`]'s
+/// shape — the first report since the last emission fires at once, the
+/// ones inside the [`LANDED_BURST`] window flush once at its end — carrying
+/// what the window saw: any change counts, the newest ok time is kept, and
+/// a failure inside the window is never coalesced away.
+#[derive(Default)]
+struct SyncBurst {
+    /// Project → when its next `collab-project-synced` may fire.
+    due_at: HashMap<String, Instant>,
+    /// Project → when it last fired (the throttle anchor).
+    last: HashMap<String, Instant>,
+    pending: HashMap<String, PendingSync>,
+}
+
+impl SyncBurst {
+    /// Note `r`, recorded at `at`, for its project at `now`.
+    fn note(
+        &mut self,
+        r: crate::api::collab_live::feed::SyncReport,
+        at: chrono::DateTime<chrono::Utc>,
+        now: Instant,
+    ) {
+        let p = self.pending.entry(r.project_id.clone()).or_default();
+        if r.ok {
+            p.synced_at = Some(p.synced_at.map_or(at, |t| t.max(at)));
+        } else {
+            p.failed = true;
+            p.error = r.error.clone();
+        }
+        p.changed |= r.changes.any();
+        if !self.due_at.contains_key(&r.project_id) {
+            let when = self
+                .last
+                .get(&r.project_id)
+                .map_or(now, |l| (*l + LANDED_BURST).max(now));
+            self.due_at.insert(r.project_id, when);
+        }
+    }
+
+    /// The payloads due at `now` — removed from the schedule and stamped as
+    /// last-fired.
+    fn due(&mut self, now: Instant) -> Vec<crate::api::collab_live::CollabProjectSynced> {
+        let ready: Vec<String> = self
+            .due_at
+            .iter()
+            .filter(|(_, t)| **t <= now)
+            .map(|(p, _)| p.clone())
+            .collect();
+        let mut out = Vec::new();
+        for pid in ready {
+            self.due_at.remove(&pid);
+            self.last.insert(pid.clone(), now);
+            if let Some(p) = self.pending.remove(&pid) {
+                out.push(crate::api::collab_live::CollabProjectSynced {
+                    project_id: pid,
+                    synced_at: p.synced_at.map(|t| t.to_rfc3339()),
+                    ok: !p.failed,
+                    error: p.error,
+                    changed: p.changed,
+                });
+            }
+        }
+        out
+    }
+
+    /// The earliest scheduled emission, for the loop's `deadline()`.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.due_at.values().min().copied()
+    }
+}
+
 /// How a runtime's loop ended.
 enum Exit {
     /// `shutdown` / `on_sign_out` (or the handle dropped: `None`).
@@ -1103,6 +1204,8 @@ struct Runtime {
     burst: Burst,
     /// Throttles `collab-peers-changed` (presence or holders changed).
     peer_burst: PeerBurst,
+    /// Throttles `collab-project-synced` (spec 2026-10-01 §6.2).
+    sync_burst: SyncBurst,
     serving_dirty: bool,
     attention: BTreeSet<String>,
     /// Projects whose replication scope (`apply_policy`) is re-derived at
@@ -1309,6 +1412,7 @@ impl Runtime {
             gc_probe: cfg.gc_probe,
             burst: Burst::default(),
             peer_burst: PeerBurst::default(),
+            sync_burst: SyncBurst::default(),
             serving_dirty: true,
             attention: BTreeSet::new(),
             policy_dirty: BTreeSet::new(),
@@ -1406,6 +1510,9 @@ impl Runtime {
             }
         }
         if let Some(next) = self.peer_burst.next_deadline() {
+            d = d.min(next);
+        }
+        if let Some(next) = self.sync_burst.next_deadline() {
             d = d.min(next);
         }
         // Something in flight or moving, or a quiet payload owed: the
@@ -1721,9 +1828,23 @@ impl Runtime {
                 }
             }
             FeedOut::Refused { project_id, error } => self.refuse(project_id, &error),
-            // Task 14 records these in `Shared` and emits them.
+            // Spec 2026-10-01 §6.1/§6.2: the time is recorded in memory (no
+            // catalog access on this path) and the report coalesced into
+            // the project's `collab-project-synced`.
             FeedOut::Synced(r) => {
-                tracing::trace!(project_id = %r.project_id, ok = r.ok, "sync report")
+                let at = chrono::Utc::now();
+                if r.ok {
+                    self.shared
+                        .synced_at
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(r.project_id.clone(), at);
+                } else {
+                    tracing::warn!(project_id = %r.project_id, error = ?r.error, "project not confirmed against the hub");
+                }
+                let now = Instant::now();
+                self.sync_burst.note(r, at, now);
+                self.flush_sync_bursts(now);
             }
         }
     }
@@ -2075,6 +2196,14 @@ impl Runtime {
         }
     }
 
+    /// Emit each project's due `collab-project-synced` (at most one per
+    /// project per [`LANDED_BURST`] — see [`SyncBurst`]).
+    fn flush_sync_bursts(&mut self, now: Instant) {
+        for item in self.sync_burst.due(now) {
+            self.emit(COLLAB_PROJECT_SYNCED_EVENT, &item);
+        }
+    }
+
     // ── timers and reconciliation ───────────────────────────────────────
 
     /// The loop's own due work: the GC probe, the core's `Tick`, the
@@ -2104,6 +2233,7 @@ impl Runtime {
         }
         self.flush_bursts(now);
         self.flush_peer_bursts(now);
+        self.flush_sync_bursts(now);
         self.flush_exchange(now);
     }
 
@@ -2141,14 +2271,19 @@ impl Runtime {
     /// Sync now's reconciliation (P26): the refused projects are retried, a
     /// digest check per project and a stat sweep (both on their workers),
     /// every need set re-read (the stream itself was reopened by the
-    /// caller, so `hello` catches every project up).
+    /// caller, so `hello` catches every project up). The digest checks run
+    /// right after that `hello` is applied (spec 2026-10-01 §6.3): the
+    /// confirmation a click waits for never queues behind one hub call per
+    /// project. (`sync_now` queues this command before it signals the
+    /// reconnect, and the loop takes commands before stream events, so the
+    /// new stream's `hello` reaches the feed worker after it.)
     fn reconcile(&mut self) {
         if !self.refused.is_empty() {
             self.refused.clear();
             self.serving_dirty = true;
         }
         let projects = self.live_projects();
-        self.to_feed(FeedWork::DigestAll(projects.clone()));
+        self.to_feed(FeedWork::DigestAfterHello(projects.clone()));
         self.to_storage(StorageWork::Sweep);
         for p in projects {
             self.exec.dirty.insert(p);
@@ -2267,5 +2402,77 @@ mod tests {
             vec!["p2".to_string()],
             "p2's own first change is not held back by p1's window"
         );
+    }
+
+    fn rep(pid: &str, ok: bool, rows: usize) -> crate::api::collab_live::feed::SyncReport {
+        crate::api::collab_live::feed::SyncReport {
+            project_id: pid.into(),
+            ok,
+            error: (!ok).then(|| "manifest 500".into()),
+            changes: crate::api::collab_live::feed::SyncChanges {
+                manifest_rows: rows,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Spec 2026-10-01 §6.2: the first report fires at once; the ones inside
+    /// the window flush once at its end, with every change counted and a
+    /// failure inside the window never coalesced away.
+    #[test]
+    fn sync_burst_coalesces_ors_changes_and_never_hides_a_failure() {
+        let mut b = SyncBurst::default();
+        let t0 = Instant::now();
+        let at = chrono::Utc::now();
+        b.note(rep("p1", true, 0), at, t0);
+        let first = b.due(t0);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].ok && !first[0].changed);
+        b.note(rep("p1", true, 3), at, t0 + Duration::from_millis(100));
+        b.note(rep("p1", false, 0), at, t0 + Duration::from_millis(200));
+        b.note(rep("p1", true, 0), at, t0 + Duration::from_millis(300));
+        assert!(
+            b.due(t0 + Duration::from_millis(300)).is_empty(),
+            "inside the window"
+        );
+        assert_eq!(b.next_deadline(), Some(t0 + LANDED_BURST));
+        let flushed = b.due(t0 + LANDED_BURST);
+        assert_eq!(flushed.len(), 1);
+        assert!(flushed[0].changed, "rows inside the window count");
+        assert!(
+            !flushed[0].ok,
+            "a failure inside the window is never coalesced away"
+        );
+        assert_eq!(flushed[0].error.as_deref(), Some("manifest 500"));
+    }
+
+    /// A window's failure never leaks into the next one, and a window
+    /// carries the newest successful confirmation time it saw (a window of
+    /// failures alone carries none).
+    #[test]
+    fn sync_burst_a_new_window_starts_clean_and_keeps_the_newest_ok_time() {
+        let mut b = SyncBurst::default();
+        let t0 = Instant::now();
+        let at0 = chrono::Utc::now();
+        let at1 = at0 + chrono::Duration::milliseconds(400);
+        b.note(rep("p1", false, 0), at0, t0);
+        let failed = b.due(t0);
+        assert_eq!(failed.len(), 1);
+        assert!(!failed[0].ok && failed[0].synced_at.is_none(), "{failed:?}");
+
+        b.note(rep("p1", true, 0), at1, t0 + Duration::from_millis(400));
+        b.note(rep("p1", true, 0), at0, t0 + Duration::from_millis(500));
+        let next = b.due(t0 + LANDED_BURST);
+        assert_eq!(next.len(), 1);
+        assert!(next[0].ok && next[0].error.is_none(), "{next:?}");
+        assert_eq!(next[0].synced_at, Some(at1.to_rfc3339()));
+        assert!(b.next_deadline().is_none(), "nothing left pending");
+
+        // Another project in p1's window is never held back by it.
+        b.note(rep("p2", true, 1), at1, t0 + LANDED_BURST);
+        let other = b.due(t0 + LANDED_BURST);
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].project_id, "p2");
+        assert!(other[0].changed);
     }
 }

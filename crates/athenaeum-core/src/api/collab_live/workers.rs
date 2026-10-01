@@ -40,8 +40,10 @@ pub(crate) enum FeedWork {
     Event(LiveEvent),
     /// A claim change was appended for this project: its flush wait starts.
     NoteAppend(String, Instant),
-    /// Sync now: a digest check per project.
-    DigestAll(Vec<String>),
+    /// Sync now (spec 2026-10-01 §6.3): a digest check per project, run
+    /// right after the next `hello` is applied and its reports sent — the
+    /// confirmation never waits behind one hub call per project.
+    DigestAfterHello(Vec<String>),
     /// The publishing binding moved to this device: the re-announce check
     /// (final fix A-I1 — a command hands it here and returns at once; only
     /// this worker waits on its `Background` retries).
@@ -80,6 +82,8 @@ pub(crate) struct FeedWorker {
     /// Events sent and not applied yet (the loop's back-pressure on the
     /// stream).
     pending: Arc<AtomicUsize>,
+    /// Sync now's digest checks, owed after the next `hello`.
+    digest_after_hello: Option<Vec<String>>,
 }
 
 impl FeedWorker {
@@ -100,6 +104,7 @@ impl FeedWorker {
             creds: None,
             out,
             pending,
+            digest_after_hello: None,
         }
     }
 
@@ -150,15 +155,27 @@ impl FeedWorker {
             }
             #[cfg(test)]
             FeedWork::Panic => panic!("injected feed worker panic (test hook)"),
-            FeedWork::DigestAll(projects) => {
-                if let Some(h) = self.holdings.as_mut() {
-                    h.clear_backoffs();
-                    for p in &projects {
-                        if let Err(e) = h.digest_check(p).await {
-                            tracing::warn!(project_id = %p, error = %e, "sync now: claim digest check failed; retried on the next flush");
-                        }
-                    }
-                }
+            FeedWork::DigestAfterHello(projects) => {
+                tracing::debug!(
+                    count = projects.len(),
+                    "sync now: claim digest checks owed after the next hello"
+                );
+                self.digest_after_hello = Some(projects);
+            }
+        }
+    }
+
+    /// Sync now's claim digest check per project (its report back-offs
+    /// forgotten first, L10).
+    async fn digest(&mut self, projects: &[String]) {
+        let Some(h) = self.holdings.as_mut() else {
+            tracing::debug!("sync now: no holder side loaded yet; the digest checks are skipped");
+            return;
+        };
+        h.clear_backoffs();
+        for p in projects {
+            if let Err(e) = h.digest_check(p).await {
+                tracing::warn!(project_id = %p, error = %e, "sync now: claim digest check failed; retried on the next flush");
             }
         }
     }
@@ -254,6 +271,17 @@ impl FeedWorker {
             }
             Err(ApiError::Conflict(m)) if m == "epoch_changed" => {
                 tracing::warn!("the hub's epoch changed under the session; reconnecting to reload");
+                // Controller ruling R6: no report for this event — the
+                // reconnect's `hello` reports every project, and a not-ok
+                // here would end a Sync now's wait just before that
+                // confirmation.
+                if !reports.is_empty() {
+                    tracing::debug!(
+                        count = reports.len(),
+                        "sync reports of an epoch-changed event dropped; the reconnect's hello reports"
+                    );
+                    reports.clear();
+                }
                 self.shared.reconnect_now();
             }
             Err(ApiError::Forbidden(e)) => match project {
@@ -280,6 +308,13 @@ impl FeedWorker {
         }
         for r in reports {
             self.send(FeedOut::Synced(r));
+        }
+        // Sync now's digest checks run after the hello's reports are out
+        // (spec 2026-10-01 §6.3).
+        if hello {
+            if let Some(projects) = self.digest_after_hello.take() {
+                self.digest(&projects).await;
+            }
         }
     }
 
@@ -524,5 +559,101 @@ mod tests {
             synced[0] > refused,
             "the report follows the refusal: {outs:?}"
         );
+    }
+
+    /// A worker on a fake hub with project `p1`, its shared state, its
+    /// output channel and the hub's first `hello` already applied (and
+    /// drained).
+    async fn worker_after_hello() -> (
+        tempfile::TempDir,
+        FakeHub,
+        Arc<Shared>,
+        FeedWorker,
+        mpsc::UnboundedReceiver<FeedOut>,
+    ) {
+        let (tmp, ctx) = crate::api::collab_exchange::test_support::test_ctx();
+        let ctx = Arc::new(ctx);
+        let hub = FakeHub::start().await;
+        let me = crate::api::account::own_device_id(&ctx).unwrap();
+        hub.add_account("tok", "acc-me", "Me", &me, None);
+        hub.add_project("p1", "m31", &[("acc-me", "send_receive", false)], false);
+        crate::api::collab_exchange::test_support::wire_hub(&ctx, &hub.uri(), "tok");
+        crate::api::collab::refresh_projects(&ctx).await.unwrap();
+        let shared = Arc::new(Shared::new_for_test(Arc::clone(&ctx)));
+        shared.set_credentials(Some((hub.uri().to_string(), "tok".to_string())));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut worker = FeedWorker::new(
+            Arc::clone(&shared),
+            me,
+            HolderMaps::default(),
+            tx,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let hello: HelloEvent = serde_json::from_value(hub.hello_for("tok")).unwrap();
+        worker.on_event(LiveEvent::Hello(hello)).await;
+        let outs = drain(&mut rx);
+        assert!(
+            outs.contains(&"synced p1 ok=true error=false".to_string()),
+            "{outs:?}"
+        );
+        (tmp, hub, shared, worker, rx)
+    }
+
+    /// Controller ruling R6: a hub epoch change seen under the session (a
+    /// holder catch-up answered `410 epoch_changed`) reconnects and reports
+    /// nothing — the reconnect's `hello` reports every project, and a not-ok
+    /// here would stop the pill just before that confirmation.
+    #[tokio::test]
+    async fn an_epoch_change_under_the_session_reconnects_without_a_report() {
+        let (_tmp, hub, shared, mut worker, mut rx) = worker_after_hello().await;
+        let reconnect = shared.reconnect_signal();
+        hub.rotate_epoch();
+        worker
+            .on_event(LiveEvent::Resync(ResyncEvent {
+                project_id: "p1".into(),
+                what: ResyncWhat::Holders,
+            }))
+            .await;
+        let outs = drain(&mut rx);
+        assert!(
+            !outs.iter().any(|o| o.starts_with("synced")),
+            "no report for an epoch change: {outs:?}"
+        );
+        assert!(
+            reconnect.has_changed().unwrap(),
+            "the epoch change reconnects"
+        );
+    }
+
+    /// Spec 2026-10-01 §6.3: Sync now's claim digest waits for the next
+    /// `hello` — nothing reaches the hub before it — and runs once, after
+    /// it, with the hello's reports already sent.
+    #[tokio::test]
+    async fn the_sync_now_digest_runs_once_after_the_next_hello() {
+        let (_tmp, hub, _shared, mut worker, mut rx) = worker_after_hello().await;
+        let digests = || hub.requests_to("/projects/p1/holders/self");
+        let before = digests().await;
+        worker
+            .handle(FeedWork::DigestAfterHello(vec!["p1".to_string()]))
+            .await;
+        assert_eq!(digests().await, before, "nothing before the hello");
+        assert!(drain(&mut rx).is_empty());
+
+        let hello: HelloEvent = serde_json::from_value(hub.hello_for("tok")).unwrap();
+        worker.on_event(LiveEvent::Hello(hello)).await;
+        assert_eq!(
+            digests().await,
+            before + 1,
+            "the digest ran after the hello"
+        );
+        let outs = drain(&mut rx);
+        assert!(
+            outs.contains(&"synced p1 ok=true error=false".to_string()),
+            "{outs:?}"
+        );
+
+        let hello: HelloEvent = serde_json::from_value(hub.hello_for("tok")).unwrap();
+        worker.on_event(LiveEvent::Hello(hello)).await;
+        assert_eq!(digests().await, before + 1, "once, not on every hello");
     }
 }

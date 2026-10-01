@@ -163,6 +163,11 @@ pub struct ProjectCard {
     /// preference — `set_project_publish_mode` writes it.
     pub publish_mode: crate::db::collab::PublishMode,
     pub fetched_at: String,
+    /// Spec 2026-10-01 §6.1: when the live exchange last confirmed this
+    /// project against the hub (RFC 3339, in memory). `None` when no live
+    /// exchange is armed (signed out) or it has not confirmed the project
+    /// yet.
+    pub synced_at: Option<String>,
     /// Amendment A6: the one device of this account that may announce new
     /// frames into the project, as the hub last reported it. `None` = no
     /// device is publishing yet (nothing bound, or the bound device was
@@ -2108,6 +2113,7 @@ fn card_from_row(
     };
     let can_moderate = can_moderate(row.is_coordinator, &row.gov_caps_json);
     let gate = evaluate_project_gate(ctx, &row.project_id)?;
+    let synced_at = crate::api::collab_live::live_synced_at(ctx, &row.project_id);
     Ok(ProjectCard {
         project_id: row.project_id,
         slug: row.slug,
@@ -2129,6 +2135,7 @@ fn card_from_row(
         auto_replicate: row.auto_replicate,
         publish_mode: row.publish_mode,
         fetched_at: row.fetched_at,
+        synced_at,
         publishing_device: publishing.map(|p| PublishingDeviceView {
             device_id: p.device_id,
             name: p.name,
@@ -7335,6 +7342,23 @@ pub(crate) mod tests {
         }
         let card = card_from_row(&ctx, row, None).unwrap();
         assert!(!card.can_moderate);
+    }
+
+    /// Spec 2026-10-01 §6.1: `syncedAt` is the live runtime's in-memory
+    /// confirmation time — `None` when no live exchange runs.
+    #[test]
+    fn card_synced_at_is_none_without_a_live_runtime() {
+        let (_tmp, ctx) = test_ctx();
+        let row = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            cached_project(&conn);
+            crate::db::collab::get_project(&conn, "p-1")
+                .unwrap()
+                .unwrap()
+        };
+        let card = card_from_row(&ctx, row, None).unwrap();
+        assert!(card.synced_at.is_none());
     }
 
     /// The coordinator can moderate even with an empty caps list.
