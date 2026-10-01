@@ -654,6 +654,26 @@ impl StorageEngine {
                 if !crate::scanner::is_frame_file(path) || watch::is_ignored(&self.root, path) {
                     return;
                 }
+                // A calibrated file awaiting review is ours (spec 2026-10-01
+                // §4.3): no hash, no foreign row.
+                match db(&self.ctx).and_then(|d| {
+                    let conn = d.conn();
+                    if crate::db::collab_prepare::is_prepared_path(&conn, &path_str)? {
+                        frames_db::forget_foreign_file(&conn, &path_str)?;
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                }) {
+                    Ok(true) => {
+                        tracing::debug!(path = %path_str, "prepared project frame; not adopted or listed");
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(path = %path_str, error = %e, "prepared-path check failed")
+                    }
+                }
                 // An unknown file: a moved or put-back frame (§9.4 "Unknown
                 // files"), else "Other files" (R18).
                 if !self.readopt(path, now, ev).await {
@@ -2450,15 +2470,30 @@ mod tests {
             publish_run_id: "r".into(),
         };
         crate::db::collab_prepare::upsert_prepared(&conn, &prow).unwrap();
-        let before = crate::db::collab_frames::list_for_project(&conn, &pid).unwrap().len();
+        let before = crate::db::collab_frames::list_for_project(&conn, &pid)
+            .unwrap()
+            .len();
         drop(conn);
         let mut eng = rig.engine();
         eng.sweep(&Holders(2)).await;
         assert_eq!(std::fs::read(&prepared).unwrap(), b"prepared bytes");
         let conn = crate::api::db(&rig.ctx).unwrap().conn();
-        assert_eq!(crate::db::collab_prepare::list_prepared(&conn, &pid).unwrap().len(), 1);
-        assert!(crate::db::collab_prepare::is_prepared_path(&conn, &prepared.to_string_lossy()).unwrap());
-        assert_eq!(crate::db::collab_frames::list_for_project(&conn, &pid).unwrap().len(), before);
+        assert_eq!(
+            crate::db::collab_prepare::list_prepared(&conn, &pid)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            crate::db::collab_prepare::is_prepared_path(&conn, &prepared.to_string_lossy())
+                .unwrap()
+        );
+        assert_eq!(
+            crate::db::collab_frames::list_for_project(&conn, &pid)
+                .unwrap()
+                .len(),
+            before
+        );
     }
 
     #[tokio::test]
@@ -3494,6 +3529,45 @@ mod tests {
                 .is_some()
         );
         assert!(stray.exists());
+    }
+
+    #[tokio::test]
+    async fn a_prepared_file_is_neither_adopted_nor_listed_foreign() {
+        let rig = ts::landed_rig(1).await;
+        let prepared = rig.root.join("m31").join("me").join("c_L_0001.fits");
+        std::fs::create_dir_all(prepared.parent().unwrap()).unwrap();
+        std::fs::write(&prepared, b"prepared bytes").unwrap();
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        crate::db::collab_prepare::upsert_prepared(
+            &conn,
+            &crate::db::collab_prepare::PreparedRow {
+                project_id: rig.frames[0].0.clone(),
+                source_frame_id: 1,
+                frame_uuid: "u-prep".into(),
+                calibrated_path: Some(prepared.to_string_lossy().into()),
+                external: false,
+                own_dir: prepared.parent().unwrap().to_string_lossy().into(),
+                recipe_hash: "r".into(),
+                xxh3: "x".into(),
+                byte_size: 14,
+                size_mtime_seen: None,
+                prepared_at: String::new(),
+                publish_run_id: "r".into(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let mut eng = rig.engine();
+        let t0 = Instant::now();
+        eng.on_signal(FsSignal::Touched(prepared.clone()), t0);
+        eng.tick(t0 + AGG, &Holders(2)).await;
+        let conn = crate::api::db(&rig.ctx).unwrap().conn();
+        assert!(
+            frames_db::foreign_file_size_mtime(&conn, &prepared.to_string_lossy())
+                .unwrap()
+                .is_none()
+        );
+        assert!(prepared.exists());
     }
 
     #[tokio::test]

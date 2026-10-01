@@ -22,11 +22,23 @@ pub(crate) fn is_writer_temp(name: &str) -> bool {
 /// Remove stale writer temps from the own folder (spec §4.3 crash windows).
 /// Only that exact pattern; never anything else.
 pub(crate) fn sweep_writer_temps(dir: &std::path::Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "own folder not read for stale writer temps");
+            return 0;
+        }
     };
     let mut removed = 0;
-    for e in entries.flatten() {
+    for e in entries {
+        let e = match e {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(path = %dir.display(), error = %err, "own folder entry not read for stale writer temps");
+                continue;
+            }
+        };
         let name = e.file_name().to_string_lossy().to_string();
         if !is_writer_temp(&name) {
             continue;

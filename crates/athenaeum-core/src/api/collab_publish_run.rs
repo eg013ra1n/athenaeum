@@ -181,6 +181,8 @@ impl Drop for RunGuard {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        // A detached generation thread must stop writing too.
+        self.state.cancel.store(true, Ordering::SeqCst);
         tracing::warn!(project_id = %p.project_id, publish_run_id = %p.publish_run_id, "publish run interrupted");
         let finished = finished_of(
             &p,
@@ -587,8 +589,13 @@ mod tests {
             Some(rec.clone()),
         )
         .unwrap();
+        let cancel = run.cancel_flag();
         drop(run);
         drop(guard);
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "an interrupted run is cancelled"
+        );
         let f = rec.payloads(COLLAB_PUBLISH_FINISHED_EVENT);
         assert_eq!(f.len(), 1);
         assert_eq!(

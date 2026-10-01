@@ -3279,7 +3279,11 @@ pub(crate) fn own_folder(
         }
     }
     if let Some(d) = crate::db::collab_prepare::own_dir(conn, &project.project_id)? {
-        return Ok(std::path::PathBuf::from(d));
+        let project_dir = collab_root.join(crate::sync::ingest::sanitize_slug(&project.slug));
+        if Path::new(&d).parent() == Some(project_dir.as_path()) {
+            return Ok(std::path::PathBuf::from(d));
+        }
+        tracing::warn!(project_id = %project.project_id, path = %d, "pinned own folder is outside the Collaboration root; ignored");
     }
     crate::api::collab_exchange::publisher_folder(
         conn,
@@ -6563,6 +6567,39 @@ pub(crate) mod tests {
             peer, pinned,
             "a same-named peer never lands in our pinned folder"
         );
+    }
+
+    #[test]
+    fn a_pinned_folder_under_another_root_is_ignored() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        let root = _tmp.path().join("collab");
+        let old = _tmp.path().join("old-root").join("m101").join("me");
+        crate::db::collab_prepare::upsert_prepared(
+            &conn,
+            &crate::db::collab_prepare::PreparedRow {
+                project_id: "p-1".into(),
+                source_frame_id: 1,
+                frame_uuid: "u1".into(),
+                calibrated_path: Some(old.join("c_a.fits").to_string_lossy().into()),
+                external: false,
+                own_dir: old.to_string_lossy().into(),
+                recipe_hash: "r".into(),
+                xxh3: "x".into(),
+                byte_size: 1,
+                size_mtime_seen: None,
+                prepared_at: String::new(),
+                publish_run_id: "r".into(),
+            },
+        )
+        .unwrap();
+        let project = crate::db::collab::get_project(&conn, "p-1")
+            .unwrap()
+            .unwrap();
+        let got = own_folder(&conn, &root, &project, "acc-me", "Me").unwrap();
+        assert_ne!(got, old);
+        assert!(got.starts_with(&root), "{got:?}");
     }
 
     /// Cached project fixture: target M101 (210.8, +54.35), radius 1.5°, one
