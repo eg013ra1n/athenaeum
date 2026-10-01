@@ -227,7 +227,7 @@ export default function CollabLiveStatus({
           endWait();
           console.error('[collab] sync report not ok:', p.error);
           notify({
-            title: 'Sync did not complete',
+            title: `Sync did not complete — ${p.error ?? 'the hub did not confirm the project'}`,
             detail: p.error ?? 'the hub did not confirm the project',
             kind: 'project',
             tone: 'warning',
@@ -261,7 +261,7 @@ export default function CollabLiveStatus({
           endWait();
           console.error('[collab] sync confirmation timed out', { projectId });
           notify({
-            title: 'Sync did not complete',
+            title: 'Sync did not complete — no answer from the hub',
             detail: 'no answer from the hub',
             kind: 'project',
             tone: 'warning',
@@ -313,7 +313,7 @@ export default function CollabLiveStatus({
             .join(' · ')}
           dot={<StatusDot state={dotState(status)} />}
         >
-          {syncing && !reconnecting ? 'Syncing…' : pillLabel(status, elapsed, newer(syncedAt, heard), now)}
+          {syncing && (live || status.state === 'connecting') ? 'Syncing…' : pillLabel(status, elapsed, newer(syncedAt, heard), now)}
         </Pill>
         {showOwnerLink && (
           <Button variant="link" size="sm" onClick={requestOpen}>

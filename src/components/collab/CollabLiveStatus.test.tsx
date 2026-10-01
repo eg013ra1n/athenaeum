@@ -471,11 +471,9 @@ describe('CollabLiveStatus pill — waits for the hub (spec §6.4)', () => {
     await waitFor(() => expect(handlers.has('collab-project-synced')).toBe(true));
     emitEv('collab-project-synced', synced({ syncedAt: null, ok: false, error: 'the hub refused the project (403)' }));
     await waitFor(() => expect(screen.queryByText('Syncing…')).toBeNull());
-    expect(await screen.findByText('Sync did not complete')).toBeInTheDocument();
-    // The toast carries the title; the detail lives in the notification history.
-    await waitFor(() =>
-      expect(localStorage.getItem('athenaeum.notifications.v1') ?? '').toContain('the hub refused the project (403)'),
-    );
+    expect(
+      await screen.findByText('Sync did not complete — the hub refused the project (403)'),
+    ).toBeInTheDocument();
     expect(err).toHaveBeenCalled();
     expect(onSynced).not.toHaveBeenCalled();
     err.mockRestore();
@@ -499,12 +497,25 @@ describe('CollabLiveStatus pill — waits for the hub (spec §6.4)', () => {
         vi.advanceTimersByTime(SYNC_WAIT_MS);
       });
       expect(screen.queryByText('Syncing…')).toBeNull();
-      expect(screen.getByText('Sync did not complete')).toBeInTheDocument();
-      expect(localStorage.getItem('athenaeum.notifications.v1') ?? '').toContain('no answer from the hub');
+      expect(screen.getByText('Sync did not complete — no answer from the hub')).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
       err.mockRestore();
     }
+  });
+
+  it('a status that leaves live shows at once while the wait continues', async () => {
+    const onSynced = vi.fn();
+    renderWait({ projectId: 'p1', syncedAt: null, onSynced });
+    fireEvent.click(await screen.findByRole('button', { name: /Live/ }));
+    await waitFor(() => expect(handlers.has('collab-live-status')).toBe(true));
+    expect(await screen.findByText('Syncing…')).toBeInTheDocument();
+    emitEv('collab-live-status', { ...base, state: 'unreachable' });
+    expect(screen.getByRole('button', { name: 'Hub unreachable — retrying' })).toBeInTheDocument();
+    expect(screen.queryByText('Syncing…')).toBeNull();
+    emitEv('collab-live-status', base);
+    emitEv('collab-project-synced', synced());
+    await waitFor(() => expect(onSynced).toHaveBeenCalledTimes(1));
   });
 
   it('F5: a synced report restarts the age without a card re-read', async () => {
