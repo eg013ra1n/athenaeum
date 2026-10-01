@@ -138,6 +138,38 @@ pub fn request_auto_publish_for_sets(set_ids: &[i64]) {
     kick().notify_one();
 }
 
+/// A Black Hole add or restore changes which frames are candidates (spec
+/// §4.4): re-dirty the sets of these files' frames. Logs, never fails.
+pub fn note_black_hole_change(ctx: &ServiceContext, file_ids: &[i64]) {
+    let sets = (|| -> anyhow::Result<Vec<i64>> {
+        let d = db(ctx).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let conn = d.conn();
+        let mut frame_ids = Vec::new();
+        for chunk in file_ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(", ");
+            let mut st =
+                conn.prepare(&format!("SELECT id FROM frames WHERE file_id IN ({marks})"))?;
+            for id in st.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                r.get::<_, i64>(0)
+            })? {
+                frame_ids.push(id?);
+            }
+        }
+        Ok(crate::db::calibration_links::frame_set_ids_for_frames(
+            &conn, &frame_ids,
+        )?)
+    })();
+    match sets {
+        Ok(sets) if !sets.is_empty() => request_auto_publish_for_sets(&sets),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            count = file_ids.len(),
+            "black hole change: frame sets not resolved; auto-publish not re-dirtied"
+        ),
+    }
+}
+
 /// Trigger site: a scan's completion (`api::scan_roots::start_scan_with_progress`).
 /// A scan can create sessions, re-cluster frame sets and change a camera —
 /// mapping that cheaply to "which linked projects care" from the scan result
@@ -594,6 +626,56 @@ mod tests {
             drain_due_projects(&ctx).is_empty(),
             "a lost project is never due, dirtied directly or via its set"
         );
+    }
+
+    #[test]
+    fn a_black_hole_change_dirties_the_frames_sets() {
+        let _guard = test_lock();
+        reset_dirty_state_for_test();
+        let (_tmp, ctx) = test_ctx();
+        let set_id;
+        let file_id;
+        {
+            let d = db(&ctx).unwrap();
+            let conn = d.conn();
+            conn.execute("INSERT INTO frames_set (name) VALUES ('S')", [])
+                .unwrap();
+            set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
+                 VALUES (?1, '2026-07-01T20:00:00Z', '2026-07-02T03:00:00Z')",
+                [set_id],
+            )
+            .unwrap();
+            let night = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'X')",
+                [night],
+            )
+            .unwrap();
+            let session = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) \
+                 VALUES ('/d/L.fits', 'L.fits', 1, '2026-07-01T21:00:00Z', 'FITS')",
+                [],
+            )
+            .unwrap();
+            file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, uuid) VALUES (?1, 'Light', 'u-bh')",
+                [file_id],
+            )
+            .unwrap();
+            let frame = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                [session, frame],
+            )
+            .unwrap();
+        }
+        note_black_hole_change(&ctx, &[file_id]);
+        assert!(is_set_dirty_for_test(set_id));
+        reset_dirty_state_for_test();
     }
 
     // ── run_publish_pass ─────────────────────────────────────────────────────

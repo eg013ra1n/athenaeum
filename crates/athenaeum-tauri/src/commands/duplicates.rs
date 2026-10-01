@@ -39,6 +39,10 @@ pub async fn bulk_move_to_black_hole(
     let result = db::bulk_move_to_black_hole(&conn, &file_ids, &from_where, Some(&emitter))
         .map_err(|e| e.to_string())?;
 
+    // The note re-locks the catalog: release this handler's guard first.
+    drop(conn);
+    athenaeum_core::api::collab_autopublish::note_black_hole_change(&state.ctx, &file_ids);
+
     // Fire a single `blackhole-changed` event so other views (Black Hole
     // tab, file manager, missing-metadata) invalidate their caches. The
     // payload intentionally has no file_id — consumers should just refresh.
@@ -70,6 +74,9 @@ pub async fn move_to_black_hole(
         .map_err(|e| e.to_string())?;
 
     let id = db::add_to_black_hole(&conn, file_id, &from_where, &original_path).map_err(|e| e.to_string())?;
+
+    drop(conn);
+    athenaeum_core::api::collab_autopublish::note_black_hole_change(&state.ctx, &[file_id]);
 
     let _ = app_handle.emit("blackhole-changed", serde_json::json!({
         "file_id": file_id,
@@ -117,6 +124,9 @@ pub async fn restore_from_black_hole(
     let conn = db.conn();
 
     db::remove_from_black_hole(&conn, file_id).map_err(|e| e.to_string())?;
+
+    drop(conn);
+    athenaeum_core::api::collab_autopublish::note_black_hole_change(&state.ctx, &[file_id]);
 
     let _ = app_handle.emit("blackhole-changed", serde_json::json!({
         "file_id": file_id,

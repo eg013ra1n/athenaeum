@@ -43,8 +43,13 @@ pub async fn set_collab_frames_withheld(
         })();
         match res {
             Ok(v) => {
-                conn.execute_batch("COMMIT")
-                    .map_err(|e| crate::api::collab::internal(e.into()))?;
+                if let Err(e) = conn.execute_batch("COMMIT") {
+                    if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                        tracing::error!(project_id, error = %rb, "withhold rollback after failed commit failed");
+                    }
+                    tracing::error!(project_id, error = %e, "withhold commit failed");
+                    return Err(crate::api::collab::internal(e.into()));
+                }
                 v
             }
             Err(e) => {
@@ -85,10 +90,7 @@ pub(crate) fn drop_withheld_prepared(ctx: &ServiceContext, project_id: &str) {
 pub(crate) fn drop_withheld_prepared_db(db: &crate::db::Database, project_id: &str) {
     let gone = (|| -> anyhow::Result<Vec<crate::db::collab_prepare::PreparedRow>> {
         let conn = db.conn();
-        let withheld: Vec<i64> = crate::db::collab_prepare::withheld_ids(&conn, project_id)?
-            .into_iter()
-            .collect();
-        crate::db::collab_prepare::delete_prepared(&conn, project_id, &withheld)
+        crate::db::collab_prepare::delete_withheld_prepared(&conn, project_id)
     })();
     match gone {
         Ok(rows) if !rows.is_empty() => {

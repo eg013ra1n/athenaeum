@@ -308,7 +308,7 @@ fn light_count(conn: &Connection, frames_set_id: i64) -> anyhow::Result<i64> {
 /// The union of LIGHT `(frame_id, filename)` across many frame sets, de-duped
 /// by frame id — `api/lights.rs::load_light_members` generalized to
 /// `ino.frames_set_id IN (…)` with `SELECT DISTINCT`.
-fn union_light_frames(
+pub(crate) fn union_light_frames(
     conn: &rusqlite::Connection,
     set_ids: &[i64],
 ) -> anyhow::Result<Vec<(i64, String)>> {
@@ -695,7 +695,54 @@ pub fn unlink_frame_set(
         removed,
         "unlinked frame set from project"
     );
+    let gone = drop_unreachable_prepared(&conn, project_id)?;
+    if !gone.is_empty() {
+        let removed = crate::api::collab_prepare::remove_prepared_files(&gone);
+        tracing::info!(
+            project_id,
+            frames_set_id,
+            count = gone.len(),
+            removed,
+            "prepared frames of an unlinked set dropped"
+        );
+    }
     Ok(())
+}
+
+/// Spec §4.2: prepared rows whose frame no linked set reaches any more —
+/// rows deleted, (non-external) files removed by the caller.
+fn drop_unreachable_prepared(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<crate::db::collab_prepare::PreparedRow>, ApiError> {
+    let sets = crate::db::collab::linked_set_ids(conn, project_id).map_err(internal)?;
+    let reachable: HashSet<i64> = if sets.is_empty() {
+        HashSet::new()
+    } else {
+        union_light_frames(conn, &sets)
+            .map_err(internal)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    };
+    let orphaned: Vec<i64> = crate::db::collab_prepare::list_prepared(conn, project_id)
+        .map_err(internal)?
+        .into_iter()
+        .filter(|r| !reachable.contains(&r.source_frame_id))
+        .map(|r| r.source_frame_id)
+        .collect();
+    crate::db::collab_prepare::delete_prepared(conn, project_id, &orphaned).map_err(internal)
+}
+
+/// Spec §4.2: a lost project's local review state.
+pub(crate) fn forget_lost_project_local(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<crate::db::collab_prepare::PreparedRow>, ApiError> {
+    let gone = crate::db::collab_prepare::delete_project_prepared(conn, project_id)
+        .map_err(internal)?;
+    crate::db::collab_prepare::delete_project_withheld(conn, project_id).map_err(internal)?;
+    Ok(gone)
 }
 
 /// Spec 2026-10-01 P3/§4.6: the project's publishing mode (local only, like
@@ -2661,6 +2708,7 @@ pub(crate) async fn refresh_projects_reporting(
         .filter(|id| !keep.contains(id))
         .cloned()
         .collect();
+    let mut lost_prepared: Vec<crate::db::collab_prepare::PreparedRow> = Vec::new();
     {
         let db = db(ctx)?;
         let conn = db.conn();
@@ -2678,6 +2726,7 @@ pub(crate) async fn refresh_projects_reporting(
             // Task 15 R1: a lost project is never reported again — its claim
             // set, outbox and holder map go with it (a re-join reloads them).
             crate::db::collab_live::clear_project_live_state(&conn, lost).map_err(internal)?;
+            lost_prepared.extend(forget_lost_project_local(&conn, lost)?);
             // Its fetches stop at once (the runtime finds it lost).
             crate::api::collab_live::notify_local_change(ctx, lost);
             tracing::info!(project_id = %lost, count = removed, "project lost: marked, replica frame rows deleted");
@@ -2702,6 +2751,11 @@ pub(crate) async fn refresh_projects_reporting(
                 tracing::info!(%project_id, frames_set_id = set_id, "auto-linked source set from portal deep-link intent");
             }
         }
+    }
+
+    if !lost_prepared.is_empty() {
+        let removed = crate::api::collab_prepare::remove_prepared_files(&lost_prepared);
+        tracing::info!(count = lost_prepared.len(), removed, "prepared frames of lost projects dropped");
     }
 
     // Stop seeding every project the hub no longer lists (D3 T4). This is the
@@ -7735,6 +7789,76 @@ pub(crate) mod tests {
         unlink_frame_set(&ctx, "p-1", set_id).unwrap();
         assert_eq!(evaluate_project_gate(&ctx, "p-1").unwrap().total, 0);
     }
+    fn prep_row(
+        project: &str,
+        id: i64,
+        path: Option<std::path::PathBuf>,
+    ) -> crate::db::collab_prepare::PreparedRow {
+        crate::db::collab_prepare::PreparedRow {
+            project_id: project.into(),
+            source_frame_id: id,
+            frame_uuid: format!("u{id}"),
+            external: path.is_none(),
+            calibrated_path: path.map(|p| p.to_string_lossy().into_owned()),
+            own_dir: "/x".into(),
+            recipe_hash: "r".into(),
+            xxh3: "x".into(),
+            byte_size: 1,
+            size_mtime_seen: None,
+            prepared_at: String::new(),
+            publish_run_id: "r".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unlink_drops_unreachable_prepared_but_never_an_original() {
+        let (tmp, ctx) = test_ctx();
+        let (set_a, a_ids, b_ids) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            sign_in_as(&conn, "me@example.org");
+            let (a, a_ids) = seed_set(&conn, "A", "14 03 12", "+54 20 56", 210.8, 54.35, 2);
+            let (b, b_ids) = seed_set(&conn, "B", "14 03 12", "+54 20 56", 210.8, 54.35, 1);
+            drop(conn);
+            link_frame_set(&ctx, "p-1", a).unwrap();
+            link_frame_set(&ctx, "p-1", b).unwrap();
+            (a, a_ids, b_ids)
+        };
+        let fa = tmp.path().join("c_a0.fits");
+        let fb = tmp.path().join("c_b0.fits");
+        std::fs::write(&fa, b"x").unwrap();
+        std::fs::write(&fb, b"x").unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let up = crate::db::collab_prepare::upsert_prepared;
+            up(&conn, &prep_row("p-1", a_ids[0], Some(fa.clone()))).unwrap();
+            up(&conn, &prep_row("p-1", a_ids[1], None)).unwrap();
+            up(&conn, &prep_row("p-1", b_ids[0], Some(fb.clone()))).unwrap();
+        }
+        unlink_frame_set(&ctx, "p-1", set_a).unwrap();
+        assert!(!fa.exists(), "A's calibrated file is gone");
+        assert!(fb.exists(), "B is still linked");
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        let left: Vec<i64> = crate::db::collab_prepare::list_prepared(&conn, "p-1")
+            .unwrap()
+            .iter()
+            .map(|r| r.source_frame_id)
+            .collect();
+        assert_eq!(left, vec![b_ids[0]]);
+    }
+
+    #[test]
+    fn a_lost_project_forgets_its_prepared_and_withheld_rows() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        crate::db::collab_prepare::upsert_prepared(&conn, &prep_row("p-1", 1, None)).unwrap();
+        crate::db::collab_prepare::set_withheld(&conn, "p-1", &[2], true).unwrap();
+        let gone = forget_lost_project_local(&conn, "p-1").unwrap();
+        assert_eq!(gone.len(), 1);
+        assert!(crate::db::collab_prepare::withheld_ids(&conn, "p-1").unwrap().is_empty());
+    }
+
 
     fn sign_in_as(conn: &rusqlite::Connection, email: &str) {
         crate::db::set_setting(conn, crate::settings::keys::ACCOUNT_EMAIL, email).unwrap();

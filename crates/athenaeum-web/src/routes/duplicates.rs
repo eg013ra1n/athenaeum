@@ -138,6 +138,9 @@ pub async fn move_to_black_hole(
     let id = athenaeum_core::db::add_to_black_hole(&conn, args.file_id, &args.from_where, &original_path)
         .map_err(db_err)?;
 
+    drop(conn);
+    athenaeum_core::api::collab_autopublish::note_black_hole_change(&state.ctx, &[args.file_id]);
+
     let _ = state.event_tx.send(SseEvent {
         event_name: "blackhole-changed".to_string(),
         data: serde_json::json!({ "file_id": args.file_id, "action": "blackholed" }),
@@ -165,6 +168,9 @@ pub async fn bulk_move_to_black_hole(
         Some(&emitter),
     )
     .map_err(db_err)?;
+
+    drop(conn);
+    athenaeum_core::api::collab_autopublish::note_black_hole_change(&state.ctx, &args.file_ids);
 
     let _ = state.event_tx.send(SseEvent {
         event_name: "blackhole-changed".to_string(),
@@ -216,6 +222,9 @@ pub async fn restore_from_black_hole(
     let conn = db.conn();
 
     athenaeum_core::db::remove_from_black_hole(&conn, args.file_id).map_err(db_err)?;
+
+    drop(conn);
+    athenaeum_core::api::collab_autopublish::note_black_hole_change(&state.ctx, &[args.file_id]);
 
     let _ = state.event_tx.send(SseEvent {
         event_name: "blackhole-changed".to_string(),

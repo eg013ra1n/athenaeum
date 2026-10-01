@@ -137,6 +137,23 @@ pub fn delete_prepared(
     Ok(gone)
 }
 
+/// Atomically delete the prepared rows of every frame withheld in this
+/// project (one statement, so a Release landing meanwhile cannot lose a file);
+/// returns the deleted rows.
+pub fn delete_withheld_prepared(conn: &Connection, project_id: &str) -> Result<Vec<PreparedRow>> {
+    let mut st = conn.prepare(&format!(
+        "DELETE FROM collab_prepared_frames
+         WHERE project_id = ?1 AND source_frame_id IN
+               (SELECT source_frame_id FROM collab_withheld_frames WHERE project_id = ?1)
+         RETURNING {COLS}"
+    ))?;
+    let mut rows = st
+        .query_map([project_id], from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.sort_by_key(|r| r.source_frame_id);
+    Ok(rows)
+}
+
 /// Whether the member withheld this frame from the project.
 pub fn is_withheld(conn: &Connection, project_id: &str, source_frame_id: i64) -> Result<bool> {
     Ok(conn
@@ -357,6 +374,38 @@ mod tests {
             "a row is returned only by the call that removed it"
         );
         assert_eq!(delete_project_prepared(&conn, "p1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_withheld_prepared_takes_only_withheld_rows() {
+        let (_t, db) = conn_with_project();
+        let conn = db.conn();
+        for id in [1, 2] {
+            upsert_prepared(
+                &conn,
+                &PreparedRow {
+                    project_id: "p1".into(),
+                    source_frame_id: id,
+                    frame_uuid: format!("u{id}"),
+                    calibrated_path: Some(format!("/x/{id}")),
+                    external: false,
+                    own_dir: "/x".into(),
+                    recipe_hash: "r".into(),
+                    xxh3: "x".into(),
+                    byte_size: 1,
+                    size_mtime_seen: None,
+                    prepared_at: String::new(),
+                    publish_run_id: "r".into(),
+                },
+            )
+            .unwrap();
+        }
+        set_withheld(&conn, "p1", &[2], true).unwrap();
+        let gone = delete_withheld_prepared(&conn, "p1").unwrap();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].source_frame_id, 2);
+        assert_eq!(list_prepared(&conn, "p1").unwrap().len(), 1);
+        assert!(delete_withheld_prepared(&conn, "p1").unwrap().is_empty());
     }
 
     #[test]
