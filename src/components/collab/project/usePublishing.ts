@@ -43,6 +43,35 @@ export function publishingDeviceRefusal(msg: string): string | null {
   return msg.slice(PUBLISHING_DEVICE_PREFIX.length).trim() || OTHER_DEVICE;
 }
 
+/** Core refuses a whole run that would calibrate frames when the
+ *  Collaboration folder's disk is short: `collab_no_space:<needed>:<free>`,
+ *  decimal bytes, `needed` already including core's 1 GB reserve. A manual
+ *  calibrate / publish / republish rejects with it, and the run ends
+ *  `refused` with it. Parsed like the A6 prefix. */
+const NO_SPACE_PREFIX = 'collab_no_space:';
+
+export interface NoSpaceRefusal {
+  needed: number;
+  free: number;
+}
+
+export function noSpaceRefusal(msg: string): NoSpaceRefusal | null {
+  if (!msg.startsWith(NO_SPACE_PREFIX)) return null;
+  const m = /^(\d+):(\d+)$/.exec(msg.slice(NO_SPACE_PREFIX.length).trim());
+  return m ? { needed: Number(m[1]), free: Number(m[2]) } : null;
+}
+
+/** Decimal gigabytes, one decimal. */
+export function gb(n: number): string {
+  return `${(n / 1e9).toFixed(1)} GB`;
+}
+
+/** The one wording of a free-space refusal: My frames' inline line and the
+ *  notification's detail. */
+export function noSpaceText(r: NoSpaceRefusal): string {
+  return `Not enough free space for the calibrated frames: ${gb(r.needed)} needed (incl. 1 GB reserve), ${gb(r.free)} free on the Collaboration folder's disk.`;
+}
+
 /** A run that ALSO posted versions resolves Ok, with the refused new frames
  *  in `heldBack` carrying `publishingDevice` — the bound device's name (or
  *  `OTHER_DEVICE`). Keyed on that field only, never on the reason text. */
@@ -107,7 +136,10 @@ export interface Publishing {
  * `publish`/`republish`/`calibrate` do their own local UI work (reload own
  * frames + detail) and show a refusal returned before any run starts inline
  * in My frames (error line, `updateRequired`, the A6 box); only a busy
- * refusal also raises an info toast, since no run exists to finish. The
+ * refusal also raises an info toast, since no run exists to finish. A
+ * free-space refusal reads as `noSpaceText` on the action's line and raises
+ * no toast here: core ends that run `refused` with the same code, and its
+ * `collab-publish-finished` is the one notification. The
  * shell closes its confirm the moment the user confirms (final-review
  * ruling, spec §16.1), so the run panel and its Cancel stay reachable for
  * the whole run — nothing here keeps a dialog open.
@@ -183,10 +215,14 @@ export function usePublishing(projectId: string | undefined, options: Publishing
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[projects] publish failed:', err);
       const refused = publishingDeviceRefusal(msg);
+      const space = noSpaceRefusal(msg);
       if (isOutdated(msg)) {
         setUpdateRequired(true);
       } else if (refused) {
         showPublishingDeviceRefusal(refused);
+      } else if (space) {
+        // Inline only: the run's `refused` outcome toasts it (F4).
+        setPublishError(noSpaceText(space));
       } else if (isPublishBusy(msg)) {
         setPublishError(PUBLISH_BUSY_INLINE);
         notify({
@@ -220,10 +256,14 @@ export function usePublishing(projectId: string | undefined, options: Publishing
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[projects] republish failed:', err);
       const refused = publishingDeviceRefusal(msg);
+      const space = noSpaceRefusal(msg);
       if (isOutdated(msg)) {
         setUpdateRequired(true);
       } else if (refused) {
         showPublishingDeviceRefusal(refused);
+      } else if (space) {
+        // Inline only: the run's `refused` outcome toasts it (F4).
+        setRepublishError(noSpaceText(space));
       } else if (isPublishBusy(msg)) {
         setRepublishError(PUBLISH_BUSY_INLINE);
         notify({
@@ -255,10 +295,14 @@ export function usePublishing(projectId: string | undefined, options: Publishing
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[projects] calibrate failed:', err);
       const refused = publishingDeviceRefusal(msg);
+      const space = noSpaceRefusal(msg);
       if (isOutdated(msg)) {
         setUpdateRequired(true);
       } else if (refused) {
         showPublishingDeviceRefusal(refused);
+      } else if (space) {
+        // Inline only: the run's `refused` outcome toasts it (F4).
+        setCalibrateError(noSpaceText(space));
       } else if (isPublishBusy(msg)) {
         setCalibrateError(PUBLISH_BUSY_INLINE);
         notify({

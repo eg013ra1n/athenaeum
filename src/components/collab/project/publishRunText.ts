@@ -1,6 +1,6 @@
 import type { CollabPublishFinished, PublishMode, PublishStage } from '../../../types/models';
 import type { Segment } from './MyFramesTab';
-import { HUB_OUTDATED_TEXT, isOutdated, publishingDeviceRefusal } from './usePublishing';
+import { HUB_OUTDATED_TEXT, gb, isOutdated, noSpaceRefusal, publishingDeviceRefusal } from './usePublishing';
 
 /** The one stage wording of a publish run (settings card status, My frames run panel). */
 export const STAGE_TITLE: Record<PublishStage, string> = {
@@ -36,6 +36,14 @@ export function describeLastRun(last: CollabPublishFinished): {
       // its full stop, as the card goes on with " · {time}".
       if (last.error && isOutdated(last.error)) {
         return { text: HUB_OUTDATED_TEXT.replace(/\.$/, ''), segment: null, tone: 'warn' };
+      }
+      const space = last.error ? noSpaceRefusal(last.error) : null;
+      if (space) {
+        return {
+          text: `Not run — not enough free space (${gb(space.needed)} needed, ${gb(space.free)} free)`,
+          segment: null,
+          tone: 'warn',
+        };
       }
       const device = last.error ? publishingDeviceRefusal(last.error) : null;
       return {

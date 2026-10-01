@@ -192,7 +192,7 @@ describe('useCollabNotifications', () => {
       startedAt: '2026-10-01T10:00:00Z', finishedAt: '2026-10-01T10:00:09Z', ...patch,
     });
     // History entries carry no tone — a tone is asserted on its toast.
-    type Stored = { title: string; detail: string; link?: string; hasErrors?: boolean };
+    type Stored = { id: string; title: string; detail: string; link?: string; hasErrors?: boolean };
     const history = (): Stored[] =>
       (JSON.parse(localStorage.getItem('athenaeum.notifications.v1') ?? '{"notifications":[]}') as { notifications: Stored[] })
         .notifications;
@@ -298,6 +298,59 @@ describe('useCollabNotifications', () => {
       // A warning toast (the toast stack's warning look).
       expect(screen.getByText(two.title).closest('[role="status"]')).toHaveClass('border-amber-700');
       expect(one.title).toBe('1 frame changed since calibration in M42 Mosaic — back to Ready');
+    });
+
+    describe('a free-space refusal (collab_no_space)', () => {
+      const NO_SPACE = 'collab_no_space:12500000000:3200000000';
+      const TITLE = 'Not enough free space to calibrate in M42 Mosaic';
+      const DETAIL =
+        "Not enough free space for the calibrated frames: 12.5 GB needed (incl. 1 GB reserve), 3.2 GB free on the Collaboration folder's disk.";
+      /** The local calendar date (YYYY-MM-DD) of an ISO stamp. */
+      const localDate = (iso: string) => {
+        const d = new Date(iso);
+        const pad = (n: number) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+      };
+      const auto = (o: Partial<CollabPublishFinished> = {}) =>
+        run({ kind: 'auto', trigger: 'auto', outcome: 'refused', error: NO_SPACE, finishedAt: '2026-10-01T12:00:00Z', ...o });
+
+      it('a manual run toasts a warning that names both sizes, never the raw code', async () => {
+        await fire({ kind: 'calibrate', outcome: 'refused', error: NO_SPACE });
+        const [n] = history();
+        expect(n.title).toBe(TITLE);
+        expect(n.detail).toBe(DETAIL);
+        expect(n.hasErrors).toBe(true);
+        expect(n.link).toBe('/projects/proj-1?tab=mine');
+        const toast = screen.getByRole('status');
+        expect(toast).toHaveTextContent(TITLE);
+        expect(toast).toHaveClass('border-amber-700');
+      });
+
+      it('an auto run toasts too — a background run stopping for space is never silent', async () => {
+        renderHarness();
+        await settle();
+        emit('collab-publish-finished', auto());
+        expect(screen.getByRole('status')).toHaveTextContent(TITLE);
+        const [n] = history();
+        expect(n.detail).toBe(DETAIL);
+        expect(n.id).toBe(`collab-no-space-proj-1-${localDate('2026-10-01T12:00:00Z')}`);
+      });
+
+      it('an auto run refused again the same day toasts no second time', async () => {
+        renderHarness();
+        await settle();
+        emit('collab-publish-finished', auto());
+        // The worker is refused again on the next scan.
+        emit('collab-publish-finished', auto({ publishRunId: 'r2', finishedAt: '2026-10-01T12:00:30Z' }));
+        expect(screen.getAllByRole('status')).toHaveLength(1);
+        expect(history()).toHaveLength(1);
+        // A manual run is the user's own click: it always toasts.
+        emit('collab-publish-finished', auto({ publishRunId: 'r3', kind: 'calibrate', trigger: 'manual' }));
+        expect(screen.getAllByRole('status')).toHaveLength(2);
+        // Another day toasts again.
+        emit('collab-publish-finished', auto({ publishRunId: 'r4', finishedAt: '2026-10-03T12:00:00Z' }));
+        expect(screen.getAllByRole('status')).toHaveLength(3);
+      });
     });
 
     it('frames back to Ready beside a publish or a calibrate join the detail', async () => {

@@ -5,8 +5,11 @@ import {
   HUB_OUTDATED_TEXT,
   isOutdated,
   leading,
+  noSpaceRefusal,
+  noSpaceText,
   publishingDeviceRefusal,
 } from '../components/collab/project/usePublishing';
+import { formatTimestamp } from '../utils/dateFormatting';
 import type {
   CollabDeletionChoice,
   CollabFrameChanged,
@@ -24,9 +27,22 @@ import type {
  * one discrete outcome, and this hook is the ONE place each of these events
  * reaches `notify()` (R29), so there is no second delivery to collapse.
  *
- * The one key used is core's own `CollabDeletionChoice.dedupeKey`, which is
- * per OCCURRENCE (`collab-deletion-choice:<ids>:<batch id>`): a replay of the
- * same batch (a reconnect) is shown once, every new batch notifies. */
+ * Core's own `CollabDeletionChoice.dedupeKey` is per OCCURRENCE
+ * (`collab-deletion-choice:<ids>:<batch id>`): a replay of the same batch (a
+ * reconnect) is shown once, every new batch notifies.
+ *
+ * The one key this hook builds is an AUTO run's free-space refusal,
+ * `collab-no-space-<project>-<local day>`: the background worker is refused
+ * again on every scan while the disk stays short, and a repeated key drops
+ * both the toast and the history entry, so that is one notification per
+ * project per day. A manual refusal carries no key. */
+
+/** The local calendar date (YYYY-MM-DD) of a run's end; today when the
+ *  stamp does not parse. */
+function localDay(iso: string): string {
+  const d = new Date(iso);
+  return formatTimestamp((Number.isNaN(d.getTime()) ? new Date() : d).toISOString()).slice(0, 10);
+}
 
 function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title: string) {
   if (change.count === 0) return;
@@ -318,6 +334,21 @@ export function useCollabNotifications() {
             notify({ title: `Stopped in ${title}`, detail: '', kind: 'project', tone: 'info', toast: false, link: base });
             break;
           case 'refused': {
+            const space = f.error ? noSpaceRefusal(f.error) : null;
+            if (space) {
+              // Toasts for both triggers (owner ruling): an auto run that
+              // stops for space is never silent; once a day per project.
+              notify({
+                title: `Not enough free space to calibrate in ${title}`,
+                detail: noSpaceText(space),
+                kind: 'project',
+                tone: 'warning',
+                hasErrors: true,
+                link: base,
+                dedupeKey: f.trigger === 'auto' ? `collab-no-space-${f.projectId}-${localDay(f.finishedAt)}` : undefined,
+              });
+              break;
+            }
             const device = f.error ? publishingDeviceRefusal(f.error) : null;
             const outdated = !device && !!f.error && isOutdated(f.error);
             notify({

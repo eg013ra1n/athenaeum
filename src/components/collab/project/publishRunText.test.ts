@@ -27,6 +27,9 @@ describe('describeLastRun', () => {
     // Only frames sent back to Ready: what the stale-only toast says.
     [fin({ stale: 2 }), '2 frames back to Ready — changed since calibration', 'ready', 'warn'],
     [fin({ kind: 'calibrate', stale: 1 }), '1 frame back to Ready — changed since calibration', 'ready', 'warn'],
+    // The free-space refusal names both sizes, never the raw code.
+    [fin({ outcome: 'refused', trigger: 'auto', kind: 'auto', error: 'collab_no_space:12500000000:3200000000' }),
+      'Not run — not enough free space (12.5 GB needed, 3.2 GB free)', null, 'warn'],
   ])('%#', (last, text, segment, tone) => {
     expect(describeLastRun(last)).toEqual({ text, segment, tone });
   });

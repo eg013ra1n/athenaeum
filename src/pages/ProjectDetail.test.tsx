@@ -492,6 +492,33 @@ describe('ProjectDetail manual publish', () => {
     err.mockRestore();
   });
 
+  it('a calibrate refused for free space shows the sizes in My frames and is toasted once, from collab-publish-finished', async () => {
+    const NO_SPACE = 'collab_no_space:12500000000:3200000000';
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockCommands(projectCard(), {
+      // Tauri rejects with the bare message.
+      calibrate_collab_frames: () => Promise.reject(NO_SPACE),
+    });
+    renderProjectDetail();
+    await openTab(/^My frames/);
+    fireEvent.click(await screen.findByRole('button', { name: 'Calibrate all 2' }));
+    expect(
+      await screen.findByText(
+        "Not enough free space for the calibrated frames: 12.5 GB needed (incl. 1 GB reserve), 3.2 GB free on the Collaboration folder's disk.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/collab_no_space/)).toBeNull();
+    expect(screen.queryAllByRole('status')).toHaveLength(0);
+    expect(err).toHaveBeenCalled();
+
+    // Core ends the run `refused` with the same code: the one notification.
+    fire('collab-publish-finished', finished({ kind: 'calibrate', outcome: 'refused', error: NO_SPACE }));
+    const toasts = await screen.findAllByRole('status');
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toHaveTextContent('Not enough free space to calibrate in M42 Mosaic');
+    err.mockRestore();
+  });
+
   it('Published → Update publishes the update-pending frames at once, with no dialog (F1)', async () => {
     mockCommands(projectCard(), {
       list_project_own_frames: () =>
