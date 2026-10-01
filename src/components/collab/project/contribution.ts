@@ -48,7 +48,7 @@ function footerOf(segment: Segment, rows: OwnFrameRow[]): string {
     case 'review':
       return 'Review and publish →';
     case 'published': {
-      const accepted = rows.filter((r) => r.accepted === true).length;
+      const accepted = rows.filter((r) => r.pubState === 'published' && r.accepted !== false).length;
       const pending = rows.filter((r) => r.pubState === 'pending').length;
       return `${accepted} accepted · ${pending} pending`;
     }

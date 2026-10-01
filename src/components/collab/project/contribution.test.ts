@@ -18,7 +18,7 @@ describe('contributionTiles', () => {
       row({ segment: 'ready', filter: 'R', night: '2026-09-29', exptimeSec: 600 }),
       row({ segment: 'review', filter: 'Ha', calibratedBytes: 400 }),
       row({ segment: 'published', accepted: true, pubState: 'published', calibratedBytes: 500 }),
-      row({ segment: 'published', pubState: 'pending', calibratedBytes: null, byteSize: 50 }),
+      row({ segment: 'published', pubState: 'pending', accepted: true, calibratedBytes: null, byteSize: 50 }),
     ]);
     expect(t.map((x) => x.segment)).toEqual(['ready', 'review', 'published', 'held']);
     const [ready, review, published, held] = t;
