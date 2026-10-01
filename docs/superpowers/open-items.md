@@ -1475,8 +1475,14 @@ time on a 16 GB machine). The tab is enabled for every build since that run.
   check** (disclosure, toolbar wrap, table overflow at ≈ 900 px), which the
   acceptance harness could not take (its browser window ignored resizes).
 - **Owed:** one stacking run on Windows and one on Linux (the web build) — the
-  acceptance run was macOS only; the folder validator, `statvfs` free space and
-  the fan-out's RAM probe are the platform-specific parts.
+  acceptance run was macOS only; the folder validator, `statvfs` free space
+  (now also `GetDiskFreeSpaceExW` — stacking's `space` blocker is live on
+  Windows since the probe moved to `crate::disk`) and the fan-out's RAM probe
+  are the platform-specific parts.
+- **Owed:** the collab free-space check (spec N40) on Windows, including a
+  Collaboration root on a network share — `GetDiskFreeSpaceExW` has never run
+  on Windows; confirm the refusal figure and that an unreadable share stays
+  "unknown" (run proceeds, `warn!`).
 - **Follow-up (web host, found by the acceptance run):** opening Settings →
   General wedged the web server — `api::account::build_status` →
   `TokenStore::load` → `SecKeychainFindGenericPassword` blocked in a mach

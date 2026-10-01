@@ -274,6 +274,8 @@ Disabled levels cost ~an atomic load per call site (tracing callsite caching); f
 
 **Dictionary extension (collab publish-review, `api::collab` + `api::collab_publish_run`, 2026-10-01):** `publish_run_id` (string; a UUID — one publish-family run, Calibrate, Publish or Republish, from start to its one finished event; distinct from the stacking `run_id`, which is an integer `stacking_runs.id`). Every run-scoped line of the publish engine and its tracker carries it, alongside `project_id`.
 
+**Dictionary extension (collab calibrate free-space check, `api::collab`, publish-review spec §16.1 N40, 2026-10-02):** `needed_bytes` (u64; the bytes a calibrating run needs on its landing volume — the generated frames' estimate plus the 1 GB reserve) and `free_bytes` (u64; the bytes free to this process on that volume, as probed) on the `"publish: not enough free space to calibrate; run refused before any file is written"` error and the `"publish: space check passed"` debug; `needed_bytes` alone on the `"free space unknown, calibrating without the space check"` warn. Two names rather than the generic `bytes`, because one event carries both.
+
 ## Rollout shape
 
 Phased (detail in the implementation plan): (1) infra — deps, subscriber, files, reload, settings plumbing; (2) command boundary both backends; (3) core sweep module-by-module; (4) submodules (usual branch + bump); (5) Settings UI; (6) MCP crate. Next version branch per the version-branch rule. Docker image and uninstall scripts updated where touched.

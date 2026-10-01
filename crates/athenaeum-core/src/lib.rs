@@ -24,6 +24,9 @@ pub mod geometry;
 // `integration::read_concurrency` and `collab::storage::sweep`'s network-
 // volume sweep cadence both consume it.
 pub mod storage_class;
+// Free-space probe. Ungated (std/libc/windows-sys only): the stacking plan
+// gate and the collab calibrate space check both consume it.
+pub mod disk;
 pub mod scanner;
 pub mod monitor;
 pub mod auto_merge;

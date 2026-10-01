@@ -385,6 +385,14 @@ pub(crate) fn is_publishing_device_refusal(msg: &str) -> bool {
     ))
 }
 
+/// Whether a publish error is the N40 space refusal
+/// (`collab_no_space:<needed>:<free>`). An auto run refused this way falls
+/// to [`run_publish_pass`]'s generic arm: logged, neither re-marked nor
+/// kicked, so it is retried only on the project's next real trigger.
+pub(crate) fn is_no_space_refusal(msg: &str) -> bool {
+    msg.starts_with(&format!("{}:", crate::api::collab::COLLAB_NO_SPACE))
+}
+
 /// Re-marks a project dirty without waking the worker — the `DIRTY`-only
 /// half of [`request_auto_publish`], for [`run_publish_pass`]'s run-wide
 /// skip paths (signed out, no Collaboration root, `CollabApiOutdated`): the
