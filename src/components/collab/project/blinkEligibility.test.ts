@@ -40,8 +40,10 @@ describe('blinkBadge', () => {
     expect(blinkBadge(fromOwn(own({ segment: 'published', accepted: false })))).toBe('excluded');
     expect(blinkBadge(fromOwn(own()))).toBeUndefined();
   });
-  it('a library row never reads "changed on disk": Library blinks only held / own_held replicas', () => {
-    expect(blinkBadge(fromLibrary(lib({ localState: 'own_changed', own: true }), new Map()))).toBeUndefined();
+  it('an own frame blinked from the Library keeps "changed on disk" when a reload turns it own_changed', () => {
+    // Blink reads the CURRENT row: own_held when opened, own_changed after a reload.
+    expect(blinkBadge(fromLibrary(lib({ localState: 'own_held', own: true }), new Map()))).toBeUndefined();
+    expect(blinkBadge(fromLibrary(lib({ localState: 'own_changed', own: true }), new Map()))).toBe('changed on disk');
   });
 });
 

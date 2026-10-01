@@ -24,12 +24,13 @@ export function blinkRef(v: FrameVM, table: BlinkTable): CollabFrameRef | null {
   }
 }
 
-/** An entry's state chip. "changed on disk" is an own frame's only: Library
- *  blinks just `held` / `own_held` replicas (§9.4). */
+/** An entry's state chip. Blink reads the CURRENT row, so an own frame
+ *  blinked from the Library as `own_held` that a reload turns `own_changed`
+ *  keeps its "changed on disk" chip (§16.1 N32). */
 export function blinkBadge(v: FrameVM): string | undefined {
   if (v.own?.withheld) return 'withheld';
   if (v.excluded) return 'excluded';
-  if (v.own?.localState === 'own_changed') return 'changed on disk';
+  if (v.own?.localState === 'own_changed' || v.lib?.localState === 'own_changed') return 'changed on disk';
   return undefined;
 }
 

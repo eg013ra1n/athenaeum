@@ -217,18 +217,22 @@ describe('FramePanel', () => {
   it('(c2) a To review frame shows the "to review" chip and its Calibrated path with a copy button', async () => {
     const writeText = vi.fn(() => Promise.resolve());
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
-    const own = baseOwn({ segment: 'review', calibratedPath: '/Collab/prepared/c_light_001.fits', calibratedBytes: 84_000_000 });
-    renderPanel(baseFrame({ own }));
-    expect(screen.getByText('to review')).toBeInTheDocument();
-    const line = screen.getByText('/Collab/prepared/c_light_001.fits').parentElement!;
-    expect(line).toHaveTextContent('Calibrated');
-    fireEvent.click(screen.getByRole('button', { name: 'Copy calibrated path' }));
-    expect(writeText).toHaveBeenCalledWith('/Collab/prepared/c_light_001.fits');
-    // The raw path keeps its own copy button.
-    fireEvent.click(screen.getByRole('button', { name: 'Copy path' }));
-    expect(writeText).toHaveBeenLastCalledWith('/Volumes/Astro/M31/2026-09-20/light_001.fits');
-    await waitFor(() => expect(api.invoke).toHaveBeenCalled());
-    Reflect.deleteProperty(navigator, 'clipboard');
+    // Removed in `finally`, so a failing assertion cannot leak the stub.
+    try {
+      const own = baseOwn({ segment: 'review', calibratedPath: '/Collab/prepared/c_light_001.fits', calibratedBytes: 84_000_000 });
+      renderPanel(baseFrame({ own }));
+      expect(screen.getByText('to review')).toBeInTheDocument();
+      const line = screen.getByText('/Collab/prepared/c_light_001.fits').parentElement!;
+      expect(line).toHaveTextContent('Calibrated');
+      fireEvent.click(screen.getByRole('button', { name: 'Copy calibrated path' }));
+      expect(writeText).toHaveBeenCalledWith('/Collab/prepared/c_light_001.fits');
+      // The raw path keeps its own copy button.
+      fireEvent.click(screen.getByRole('button', { name: 'Copy path' }));
+      expect(writeText).toHaveBeenLastCalledWith('/Volumes/Astro/M31/2026-09-20/light_001.fits');
+      await waitFor(() => expect(api.invoke).toHaveBeenCalled());
+    } finally {
+      Reflect.deleteProperty(navigator, 'clipboard');
+    }
   });
 
   it('(d) holders load and render name/device/publisher chip; unknown member shows short id', async () => {
