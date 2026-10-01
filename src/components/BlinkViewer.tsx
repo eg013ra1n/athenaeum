@@ -17,6 +17,7 @@ import { useStarMetricsCache } from "../hooks/useStarMetricsCache";
 import { drawStarOverlay } from "./blink/StarOverlay";
 import { Chip } from "./ui";
 import { isTopOverlay, popOverlay, pushOverlay } from "./ui/overlayStack";
+import { useBlinkProjectMode } from "./blink/useBlinkProjectMode";
 
 import type { BlinkFrame, BlinkViewerProps, SortField, SortDirection } from "./blink/types";
 
@@ -68,8 +69,6 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   contextLabel,
   viewOnly = false,
 }) => {
-  /** Project mode (spec §9.2): a caller that passes `actions` (even empty). */
-  const projectMode = actions !== undefined;
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const [isPlaying, setIsPlaying] = useState(false);
   const [blinkSpeed, setBlinkSpeed] = useState(2);
@@ -146,12 +145,6 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
   }, []);
 
-  // Project mode: the action whose run is in flight. The ref refuses a
-  // second run even when the busy action's button has left the toolbar (its
-  // entries stopped being eligible mid-run).
-  const [actionBusy, setActionBusy] = useState<string | null>(null);
-  const actionBusyRef = useRef<string | null>(null);
-
   // Load persisted sidebar width
   useEffect(() => {
     (async () => {
@@ -217,29 +210,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       .catch(() => { /* use defaults */ });
   }, []);
 
-  // Project mode snapshots the entries when Blink opens (spec §9.2): project
-  // actions never remove entries, so indexes — and every index-keyed cache —
-  // stay stable while the caller reloads its rows. Badges come from the live
-  // prop, matched by `key`. Without `actions`, `frames` is read live as before.
-  const snapshot = useRef(frames);
-  const base = projectMode ? snapshot.current : frames;
-
-  // Filter FITS and XISF files
-  const fitsFrames = useMemo(
-    () => base.filter((f) => f.file.format === "FITS" || f.file.format === "XISF"),
-    [base]
-  );
-
-  const liveByKey = useMemo(
-    () => new Map(frames.filter((f) => f.key).map((f) => [f.key!, f])),
-    [frames],
-  );
-  /** The live entry for a snapshot entry. Render, eligibility and action
-   * arguments go through it; image loading never does. */
-  const view = useCallback(
-    (f: BlinkFrame): BlinkFrame => (f.key && liveByKey.get(f.key)) || f,
-    [liveByKey],
-  );
+  // Project mode (spec §9.2): the snapshot of `frames`, the live entries by
+  // `key`, and the caller's actions on the selection — `useBlinkProjectMode`.
+  const { projectMode, fitsFrames, view, projectActions, listFrames } = useBlinkProjectMode(frames, actions, selectedFrames);
 
   const currentFrame = fitsFrames[currentIndex];
   const cur = currentFrame ? view(currentFrame) : undefined;
@@ -265,39 +238,6 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   }, [selectedFrames, fitsFrames, blackholedFileIds]);
 
   const nonBlackholedInSelectionCount = selectionCount - blackholedInSelectionCount;
-
-  // Project mode: each caller action offers the eligible entries of the
-  // selection, read from the live entries; one with none is hidden.
-  const selectedViews = useMemo(
-    () => [...selectedFrames].map((i) => fitsFrames[i]).filter(Boolean).map(view),
-    [selectedFrames, fitsFrames, view],
-  );
-  const projectActions = useMemo(() => actions?.flatMap((a) => {
-    const eligible = selectedViews.filter(a.eligible);
-    if (eligible.length === 0) return [];
-    return [{
-      id: a.id,
-      label: a.label(eligible.length),
-      tone: a.tone,
-      busy: actionBusy === a.id,
-      disabled: actionBusy !== null,
-      onClick: () => {
-        if (actionBusyRef.current !== null) return;
-        actionBusyRef.current = a.id;
-        setActionBusy(a.id);
-        Promise.resolve()
-          .then(() => a.run(eligible))
-          .catch((err) => console.error(`[blink] action ${a.id} failed:`, err))
-          .finally(() => {
-            actionBusyRef.current = null;
-            setActionBusy(null);
-          });
-      },
-    }];
-  }), [actions, selectedViews, actionBusy]);
-
-  // The frame list renders the live entries (badges) over the snapshot's indexes.
-  const listFrames = useMemo(() => fitsFrames.map(view), [fitsFrames, view]);
 
   // Load image from backend
   const loadImage = useCallback(async (index: number) => {
