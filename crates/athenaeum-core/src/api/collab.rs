@@ -1273,6 +1273,8 @@ pub struct ContributorCounts {
     pub rejected: i64,
     pub published_not_on_disk: i64,
     pub published_now_fails_gate: i64,
+    pub prepared: i64,
+    pub withheld: i64,
 }
 
 impl ContributorCounts {
@@ -1287,6 +1289,8 @@ impl ContributorCounts {
             S::Rejected => self.rejected += 1,
             S::PublishedNotOnDisk => self.published_not_on_disk += 1,
             S::PublishedNowFailsGate => self.published_now_fails_gate += 1,
+            S::Prepared => self.prepared += 1,
+            S::Withheld => self.withheld += 1,
         }
     }
 }
@@ -1359,6 +1363,7 @@ pub fn get_frame_set_project_status(
                 row.frame_id,
                 identity.attested,
                 own_row,
+                crate::collab::contributor_state::LocalFacts::default(),
                 row.publishable,
                 row.failures.first().map(String::as_str),
                 "get_frame_set_project_status",
@@ -1449,6 +1454,7 @@ pub(crate) fn own_contributor_states(
             row.frame_id,
             identity.attested,
             Some(own_row),
+            crate::collab::contributor_state::LocalFacts::default(),
             row.publishable,
             row.failures.first().map(String::as_str),
             "own_contributor_states",
@@ -1480,6 +1486,7 @@ fn own_contributor_state(
     frame_id: i64,
     attested: bool,
     own_row: Option<&crate::db::collab_frames::LocalFrameRow>,
+    local: crate::collab::contributor_state::LocalFacts,
     gate_publishable: bool,
     gate_first_failure: Option<&str>,
     caller: &str,
@@ -1508,6 +1515,7 @@ fn own_contributor_state(
     });
     let (state, reason) = derive(
         facts,
+        local,
         current_recipe.as_deref(),
         gate_publishable,
         gate_first_failure,
@@ -1585,7 +1593,8 @@ pub fn segment_of(state: crate::collab::contributor_state::ContributorState) -> 
     use crate::collab::contributor_state::ContributorState as S;
     match state {
         S::NotPublished => "ready",
-        S::FailsGate => "held",
+        S::Prepared => "review",
+        S::FailsGate | S::Withheld => "held",
         _ => "published",
     }
 }
@@ -1724,6 +1733,7 @@ pub fn list_project_own_frames(
             row.frame_id,
             identity.attested,
             own_row,
+            crate::collab::contributor_state::LocalFacts::default(),
             row.publishable,
             row.failures.first().map(String::as_str),
             "list_project_own_frames",
@@ -6165,15 +6175,6 @@ pub(crate) mod tests {
         assert!(!card.can_moderate);
     }
 
-    /// Cached project fixture: target M101 (210.8, +54.35), radius 1.5°, one
-    /// threshold rule (reject trailed frames), a dictionary that recognizes
-    /// `seed_set`'s `L` filter (P3) so the gate tests below aren't ALSO
-    /// blocked by an unmapped filter. `dictionary_version`/`dictionary_json`
-    /// on the literal below are for the reader only — `upsert_project`
-    /// deliberately leaves both columns untouched (only [`set_dictionary`]
-    /// writes them, so a wholesale poll refresh can never clobber the hub's
-    /// dictionary cursor) — so the explicit call below is what actually seeds
-    /// the dictionary this fixture's doc comment promises.
     #[tokio::test]
     async fn set_project_publish_mode_stores_and_dirties_only_for_auto_modes() {
         let _guard = crate::api::collab_autopublish::test_lock();
@@ -6210,6 +6211,15 @@ pub(crate) mod tests {
         assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
     }
 
+    /// Cached project fixture: target M101 (210.8, +54.35), radius 1.5°, one
+    /// threshold rule (reject trailed frames), a dictionary that recognizes
+    /// `seed_set`'s `L` filter (P3) so the gate tests below aren't ALSO
+    /// blocked by an unmapped filter. `dictionary_version`/`dictionary_json`
+    /// on the literal below are for the reader only — `upsert_project`
+    /// deliberately leaves both columns untouched (only [`set_dictionary`]
+    /// writes them, so a wholesale poll refresh can never clobber the hub's
+    /// dictionary cursor) — so the explicit call below is what actually seeds
+    /// the dictionary this fixture's doc comment promises.
     fn cached_project(conn: &rusqlite::Connection) {
         crate::db::collab::upsert_project(
             conn,
@@ -7297,6 +7307,8 @@ pub(crate) mod tests {
         use crate::collab::contributor_state::ContributorState as S;
         assert_eq!(segment_of(S::NotPublished), "ready");
         assert_eq!(segment_of(S::FailsGate), "held");
+        assert_eq!(segment_of(S::Prepared), "review");
+        assert_eq!(segment_of(S::Withheld), "held");
         for s in [
             S::PendingApproval,
             S::Published,

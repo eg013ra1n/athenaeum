@@ -2077,7 +2077,7 @@ export type FrameProjectState = { frameId: number,
  */
 state: string, reason: string | null, };
 
-export type ContributorCounts = { notPublished: number, failsGate: number, pendingApproval: number, published: number, updatePending: number, rejected: number, publishedNotOnDisk: number, publishedNowFailsGate: number, };
+export type ContributorCounts = { notPublished: number, failsGate: number, pendingApproval: number, published: number, updatePending: number, rejected: number, publishedNotOnDisk: number, publishedNowFailsGate: number, prepared: number, withheld: number, };
 
 export type FrameSetProjectCandidate = { projectId: string, slug: string, title: string, distanceDeg: number, };
 

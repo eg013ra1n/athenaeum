@@ -12,6 +12,8 @@ pub enum ContributorState {
     Rejected,
     PublishedNotOnDisk,
     PublishedNowFailsGate,
+    Prepared,
+    Withheld,
 }
 
 impl ContributorState {
@@ -25,6 +27,8 @@ impl ContributorState {
             Self::Rejected => "rejected",
             Self::PublishedNotOnDisk => "publishedNotOnDisk",
             Self::PublishedNowFailsGate => "publishedNowFailsGate",
+            Self::Prepared => "prepared",
+            Self::Withheld => "withheld",
         }
     }
     pub fn short_label(&self) -> &'static str {
@@ -37,8 +41,23 @@ impl ContributorState {
             Self::Rejected => "rejected",
             Self::PublishedNotOnDisk => "not on disk",
             Self::PublishedNowFailsGate => "now fails",
+            Self::Prepared => "to review",
+            Self::Withheld => "withheld",
         }
     }
+}
+
+pub const WITHHELD_REASON: &str = "Withheld by you";
+pub const BLACK_HOLE_REASON: &str = "In the Black Hole";
+
+/// Spec 2026-10-01 §4.1: the local facts of a frame with no own row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalFacts {
+    pub withheld: bool,
+    pub black_holed: bool,
+    /// A prepared row exists, its recipe is current and its file is at the
+    /// recorded size/mtime (plan W2).
+    pub prepared_current: bool,
 }
 
 pub struct OwnRowFacts<'a> {
@@ -53,16 +72,31 @@ pub struct OwnRowFacts<'a> {
 /// light cannot be resolved); `gate_reason` is the row's first failure.
 pub fn derive(
     own: Option<OwnRowFacts<'_>>,
+    local: LocalFacts,
     current_recipe: Option<&str>,
     gate_publishable: bool,
     gate_reason: Option<&str>,
 ) -> (ContributorState, Option<String>) {
     let Some(row) = own else {
-        return if gate_publishable {
-            (ContributorState::NotPublished, None)
-        } else {
-            (ContributorState::FailsGate, gate_reason.map(str::to_string))
-        };
+        if local.withheld {
+            return (
+                ContributorState::Withheld,
+                Some(WITHHELD_REASON.to_string()),
+            );
+        }
+        if local.black_holed {
+            return (
+                ContributorState::FailsGate,
+                Some(BLACK_HOLE_REASON.to_string()),
+            );
+        }
+        if !gate_publishable {
+            return (ContributorState::FailsGate, gate_reason.map(str::to_string));
+        }
+        if local.prepared_current {
+            return (ContributorState::Prepared, None);
+        }
+        return (ContributorState::NotPublished, None);
     };
     // The hub's own-row `state` is one of "pending"/"published"/"rejected"
     // (the manifest wire contract); anything else is a hub protocol this
@@ -117,17 +151,77 @@ mod tests {
         }
     }
     #[test]
+    fn local_facts_follow_the_spec_order() {
+        let none = LocalFacts::default();
+        // 1. An own row wins over every local fact.
+        let all = LocalFacts {
+            withheld: true,
+            black_holed: true,
+            prepared_current: true,
+        };
+        let (s, _) = derive(
+            Some(own("published", Some("r1"), true)),
+            all,
+            Some("r1"),
+            true,
+            None,
+        );
+        assert_eq!(s, ContributorState::Published);
+        // 2. Withheld beats the Black Hole, the gate and prepared.
+        let (s, r) = derive(None, all, None, false, Some("FWHM 3.4″ > 3.0″"));
+        assert_eq!(
+            (s, r.as_deref()),
+            (ContributorState::Withheld, Some(WITHHELD_REASON))
+        );
+        // 3. The Black Hole is held back with its own reason.
+        let bh = LocalFacts {
+            black_holed: true,
+            prepared_current: true,
+            ..none
+        };
+        let (s, r) = derive(None, bh, None, true, None);
+        assert_eq!(
+            (s, r.as_deref()),
+            (ContributorState::FailsGate, Some(BLACK_HOLE_REASON))
+        );
+        // 4. A failing gate beats a prepared row.
+        let prep = LocalFacts {
+            prepared_current: true,
+            ..none
+        };
+        let (s, r) = derive(None, prep, None, false, Some("no analysis"));
+        assert_eq!(
+            (s, r.as_deref()),
+            (ContributorState::FailsGate, Some("no analysis"))
+        );
+        // 5. Prepared and current -> Prepared.
+        let (s, _) = derive(None, prep, None, true, None);
+        assert_eq!(s, ContributorState::Prepared);
+        // 6. Otherwise Ready.
+        let (s, _) = derive(None, none, None, true, None);
+        assert_eq!(s, ContributorState::NotPublished);
+        assert_eq!(ContributorState::Prepared.key(), "prepared");
+        assert_eq!(ContributorState::Withheld.short_label(), "withheld");
+    }
+    #[test]
     fn every_row_of_the_table() {
         assert_eq!(
-            derive(None, Some("r1"), true, None).0,
+            derive(None, LocalFacts::default(), Some("r1"), true, None).0,
             ContributorState::NotPublished
         );
-        let (s, r) = derive(None, Some("r1"), false, Some("no analysis"));
+        let (s, r) = derive(
+            None,
+            LocalFacts::default(),
+            Some("r1"),
+            false,
+            Some("no analysis"),
+        );
         assert_eq!(s, ContributorState::FailsGate);
         assert_eq!(r.as_deref(), Some("no analysis"));
         assert_eq!(
             derive(
                 Some(own("pending", Some("r1"), true)),
+                LocalFacts::default(),
                 Some("r1"),
                 true,
                 None
@@ -137,6 +231,7 @@ mod tests {
         );
         let (s, r) = derive(
             Some(own("published", Some("r1"), true)),
+            LocalFacts::default(),
             Some("r1"),
             true,
             None,
@@ -146,6 +241,7 @@ mod tests {
         assert_eq!(
             derive(
                 Some(own("published", Some("r1"), true)),
+                LocalFacts::default(),
                 Some("r2"),
                 true,
                 None
@@ -156,6 +252,7 @@ mod tests {
         assert_eq!(
             derive(
                 Some(own("pending", Some("r1"), true)),
+                LocalFacts::default(),
                 Some("r2"),
                 true,
                 None
@@ -168,6 +265,7 @@ mod tests {
                 reject_reason: Some("trailed"),
                 ..own("rejected", Some("r1"), true)
             }),
+            LocalFacts::default(),
             Some("r1"),
             true,
             None,
@@ -177,6 +275,7 @@ mod tests {
         assert_eq!(
             derive(
                 Some(own("published", Some("r1"), false)),
+                LocalFacts::default(),
                 Some("r1"),
                 true,
                 None
@@ -186,6 +285,7 @@ mod tests {
         );
         let (s, r) = derive(
             Some(own("published", Some("r1"), true)),
+            LocalFacts::default(),
             Some("r1"),
             false,
             Some("FWHM 3.4″ > 3.0″"),
@@ -196,6 +296,7 @@ mod tests {
         assert_eq!(
             derive(
                 Some(own("published", Some("r1"), false)),
+                LocalFacts::default(),
                 Some("r1"),
                 false,
                 Some("x")
@@ -206,6 +307,7 @@ mod tests {
         assert_eq!(
             derive(
                 Some(own("published", Some("r1"), true)),
+                LocalFacts::default(),
                 Some("r2"),
                 false,
                 Some("x")
@@ -215,7 +317,14 @@ mod tests {
         );
         // A recipe the app cannot compute (cannot resolve the light) reads as update pending only if the row had one.
         assert_eq!(
-            derive(Some(own("published", None, true)), Some("r1"), true, None).0,
+            derive(
+                Some(own("published", None, true)),
+                LocalFacts::default(),
+                Some("r1"),
+                true,
+                None
+            )
+            .0,
             ContributorState::Published
         );
         assert_eq!(ContributorState::UpdatePending.key(), "updatePending");
