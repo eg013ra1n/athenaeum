@@ -976,7 +976,7 @@ fn resolve_master_light(
     // handler in this module. Those run once per user action; this one runs
     // per group per panel mount, and a preview of an already-WRITTEN master
     // has nothing to heal — a stuck row cannot make a written file wrong.
-    let (master_path, row_group_key, working_dir, layout) = {
+    let (master_path, row_group_key, layout) = {
         let db_handle = db(ctx)?;
         let conn = db_handle.conn();
 
@@ -989,13 +989,21 @@ fn resolve_master_light(
                     kind.as_db_str()
                 ))
             })?;
-        let layout = layout_for(&conn, Path::new(&run_row.working_dir), &run_row.subject())?;
+        let layout = if run_row.working_dir.trim().is_empty() {
+            None
+        } else {
+            Some(layout_for(
+                &conn,
+                Path::new(&run_row.working_dir),
+                &run_row.subject(),
+            )?)
+        };
         // The cache path is built from the ROW's own `group_key`, not the
         // caller's argument — the two are equal by construction (the lookup
         // matched on it exactly), but sourcing every path component from the
         // catalog keeps a caller-supplied string out of a `create_dir_all`
         // target on principle rather than by argument.
-        (row.path, row.group_key, run_row.working_dir, layout)
+        (row.path, row.group_key, layout)
     };
 
     let master_path = PathBuf::from(master_path);
@@ -1008,11 +1016,8 @@ fn resolve_master_light(
             ))
         })?;
 
-    let cache_path = if working_dir.trim().is_empty() {
-        None
-    } else {
-        Some(layout.preview_path(run_id, &row_group_key, kind.as_db_str(), step))
-    };
+    let cache_path =
+        layout.map(|layout| layout.preview_path(run_id, &row_group_key, kind.as_db_str(), step));
 
     Ok(ResolvedMasterLight {
         master_path,

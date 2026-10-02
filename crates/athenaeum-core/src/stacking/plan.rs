@@ -970,6 +970,7 @@ fn resolve_config_and_exclusions(
 fn resolve_reference(
     conn: &Connection,
     subject: &StackSubject,
+    origins: &FrameOrigins,
     cfg: &StackingConfig,
     blockers: &mut Vec<PlanBlocker>,
 ) -> Result<PlanReference, ApiError> {
@@ -999,14 +1000,20 @@ fn resolve_reference(
         return Ok(no_reference_chosen(blockers));
     };
 
-    let file_row: Option<(String, String)> = conn
-        .query_row(
-            "SELECT fi.filename, fi.path FROM frames f JOIN files fi ON fi.id = f.file_id \
-             WHERE f.id = ?1",
-            params![reference_frame_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
+    // A manual reference whose frame is not in the plan's groups has no
+    // origin and stays "no reference chosen", as before. The match has no
+    // wildcard arm: a project origin must get its own lookup (6b-2).
+    let file_row: Option<(String, String)> = match origins.get(&reference_frame_id) {
+        Some(FrameOrigin::Catalog { .. }) => conn
+            .query_row(
+                "SELECT fi.filename, fi.path FROM frames f JOIN files fi ON fi.id = f.file_id \
+                 WHERE f.id = ?1",
+                params![reference_frame_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?,
+        None => None,
+    };
 
     let Some((filename, path)) = file_row else {
         return Ok(no_reference_chosen(blockers));
@@ -1798,7 +1805,7 @@ pub fn build_plan(
     }
 
     // Gate 2: reference.
-    let reference = resolve_reference(conn, subject, &cfg, &mut blockers)?;
+    let reference = resolve_reference(conn, subject, &origins, &cfg, &mut blockers)?;
 
     // M4b (rulings R-M4b-1/7, R-T1-1): pixel-scale warnings — never
     // blockers. A mixed-pixel-scale set is a real, supportable
@@ -6512,6 +6519,47 @@ mod tests {
             expected
         );
         assert_eq!(memo.calibration_hash(&f.conn, &cfg, &frame), Some(expected));
+    }
+
+    #[test]
+    fn resolve_reference_reads_the_catalog_only_for_a_frame_with_an_origin() {
+        use crate::stacking::groups::frame_source;
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        let mut first_path = None;
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, path) = test_fixtures::add_light(&f, &light_spec(&format!("l{i}"), t));
+            ids.push(id);
+            first_path.get_or_insert(path);
+        }
+        // The fixture's rows carry paths but no file; the reference must be on disk.
+        std::fs::write(first_path.unwrap(), b"x").unwrap();
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let subject = StackSubject::FrameSet(f.set_id);
+        let (_, origins) = frame_source(&f.conn, &subject, &cfg.grouping).unwrap();
+
+        // A frame with an origin resolves its filename and path.
+        set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
+        let mut blockers = Vec::new();
+        let reference =
+            resolve_reference(&f.conn, &subject, &origins, &cfg, &mut blockers).unwrap();
+        assert_eq!(reference.frame_id, Some(ids[0]));
+        assert!(reference.filename.is_some());
+        assert!(reference.on_disk, "{blockers:?}");
+        assert!(blockers.is_empty(), "{blockers:?}");
+
+        // A reference the plan's groups do not hold has no origin: the same
+        // "no reference chosen" outcome as before, not a failed plan.
+        let empty: FrameOrigins = std::sync::Arc::new(HashMap::new());
+        let mut blockers = Vec::new();
+        let reference = resolve_reference(&f.conn, &subject, &empty, &cfg, &mut blockers).unwrap();
+        assert_eq!(reference.frame_id, None);
+        assert_eq!(reference.filename, None);
+        assert!(!reference.on_disk);
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].code, "reference");
+        assert_eq!(blockers[0].message, "Choose a reference frame in Analysis");
     }
 
     #[test]

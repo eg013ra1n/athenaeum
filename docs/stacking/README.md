@@ -1102,8 +1102,10 @@ see moved; the wire shapes (`StackingRunRow.framesSetId`, events, `RunSummary`,
   `find_artifact` / `delete_artifacts` / `delete_all_artifacts` filter on the
   same COALESCE expressions so a per-frame lookup is a point lookup on that
   index (pinned by `EXPLAIN QUERY PLAN` tests; an `IS` pair there degrades to
-  a scan of every artifact of the set). `list_runs`, `active_run_for_subject`,
-  `list_unfinished_runs` and `list_artifacts` use `IS` pairs.
+  a scan of every artifact of the set). `list_runs`, `active_run_for_subject`
+  and `list_artifacts` use `IS` pairs (`list_unfinished_runs` has no subject
+  filter). `stacking_run_groups` gains a nullable `exposure_class` column in
+  the same rebuild (it is also a target of the in-transaction FK check).
 - **The rebuild** (detected by `stacking_runs` lacking `project_id`, so it
   runs once): `PRAGMA foreign_keys = OFF` before `BEGIN` (inside a transaction
   the pragma is a silent no-op, and with it ON dropping `stacking_runs`
@@ -1157,7 +1159,9 @@ see moved; the wire shapes (`StackingRunRow.framesSetId`, events, `RunSummary`,
   arm stores and reads nothing; `stored_registrations` returns the
   catalog-shaped record, so 6b-2 either maps the registered artifacts'
   payloads into it or changes its consumers); (3) confining all subject/origin
-  dispatch to the named funnels, with a grep test.
+  dispatch to the named funnels, with a grep test (the funnels include
+  `plan::last_run_reference_scale` and `plan::cleanup_stale_note`, which still
+  take `frames_set_id` and wrap it into a subject).
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,

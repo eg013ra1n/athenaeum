@@ -505,6 +505,12 @@ fn rebuild_stacking_tables_for_subjects(conn: &Connection) -> Result<()> {
     if let Err(e) = &outcome {
         tracing::error!(error = %e, "stacking subject rebuild failed");
     }
+    if let Err(e) = &re_enable {
+        tracing::error!(
+            error = %e,
+            "foreign keys could not be re-enabled after the stacking subject rebuild"
+        );
+    }
     outcome?;
     re_enable?;
     Ok(())
