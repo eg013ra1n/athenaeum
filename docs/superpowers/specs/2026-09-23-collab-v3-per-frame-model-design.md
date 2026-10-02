@@ -675,3 +675,12 @@ project WBPP export lands `<title>/<publisher>/<camera>/<filter>/`.
     gate table. R3's "stamped `CALSTAT`" is superseded by A1's "no stamps".
     Still unbuilt: the plate-solve precondition, R9, the `INSTRUME` alias,
     R3's export/stacking half.
+- **A8 (2026-10-02, owner) — wave 6: stacking a project and the project
+  export.** `2026-10-02-collab-v3-wave6-project-stacking-export-design.md`
+  (rulings W1–W9) builds §7 and R1's export hierarchy, and R3's
+  export/stacking half. It changes §6.2's last bullet (the landed file is
+  never rewritten; an exported copy always carries the canonical `FILTER`)
+  and §7's exposure modes (`seconds | stops | equivalent | none`; binning is
+  not a project group key). R9's zero point moves to sub-wave 6.5; the
+  plate-solve precondition stays unbuilt (stacking solves missing WCS
+  itself).
