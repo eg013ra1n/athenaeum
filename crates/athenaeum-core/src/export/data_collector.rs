@@ -202,7 +202,9 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
 ///   placed on the calibration side. Strict (spec 2026-08-28 D2): a linked set
 ///   that still has raw frames is an error, not an omission.
 /// - [`ExportMode::CalibratedLights`]: every calibration node is dropped (WBPP
-///   runs with calibration disabled) and each light is MARKED for generation —
+///   runs with calibration disabled) and each light is MARKED for generation
+///   (except for an attested set — "calibrated by an external tool" — whose
+///   lights are left unmarked and copied as they are) —
 ///   its `filename` becomes the `c_*` output name and `debayer_calibrated`
 ///   records whether that output will be debayered. The light keeps pointing
 ///   at its RAW file: the executor calibrates it into place
@@ -611,7 +613,9 @@ pub fn missing_raw_originals_sentence(n: i64) -> String {
     format!("{n} raw calibration file(s) missing on disk — restore from archive first")
 }
 
-/// Mark every light for calibration-at-export and rename it to its output.
+/// Mark every light for calibration-at-export and rename it to its output
+/// (an attested set is the exception: nothing is marked or renamed, its
+/// lights are copied as they are).
 ///
 /// This is a pure planning pass: it reads no artifact table, writes nothing to
 /// disk, and cannot fail on a per-frame basis. `file_path` deliberately keeps
@@ -633,7 +637,7 @@ fn apply_calibrated_lights(
     // export must not silently calibrate or skip.
     if crate::db::collab::frames_set_attested(conn, data.frame_set_id)? {
         tracing::info!(
-            frames_set_id = data.frame_set_id,
+            frame_set_id = data.frame_set_id,
             "calibrated-lights export of an attested set: lights copied as they are"
         );
         return Ok(Vec::new());

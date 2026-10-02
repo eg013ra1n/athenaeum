@@ -39,8 +39,10 @@ pub enum ExportRunOutcome {
 /// at all. `api::sync_prepare::open_generation` follows the same order for a
 /// transfer's package.
 ///
-/// A slot is taken only when the mode actually generates files. A plain copy
-/// export is not CPU work and must not queue behind master builds.
+/// A slot is taken only when the run actually generates files: the mode is
+/// calibrated-lights AND at least one light is marked for generation (an
+/// attested set's lights are copied as they are, so it takes none). A plain
+/// copy export is not CPU work and must not queue behind master builds.
 #[allow(clippy::too_many_arguments)]
 pub fn run_export_organize(
     ctx: &ServiceContext,
@@ -54,7 +56,15 @@ pub fn run_export_organize(
     mode: ExportMode,
     gen_opts: &CalibratedLightOptions,
 ) -> Result<ExportRunOutcome, ApiError> {
-    let generates = mode == ExportMode::CalibratedLights;
+    // The organizer's own marker: a light is calibrated into place exactly
+    // when `debayer_calibrated` is `Some` (`PlacementSource::CalibrateLight`).
+    let generates = mode == ExportMode::CalibratedLights
+        && data
+            .groups
+            .iter()
+            .flat_map(|g| g.subgroups.iter())
+            .flat_map(|sg| sg.frames.iter())
+            .any(|f| f.debayer_calibrated.is_some());
 
     // Admission. `acquire` fails only when THIS flag was raised — by
     // `cancel_export`, or by the queue's own cancel, which sets the very flag it
@@ -163,6 +173,41 @@ mod tests {
         }
     }
 
+    /// One light marked for generation, as the calibrated-lights transform
+    /// leaves it — the only shape that takes a compute slot.
+    fn marked_data() -> ExportData {
+        let mut data = empty_data();
+        data.groups[0]
+            .subgroups
+            .push(crate::export::models::CalibrationSubgroup {
+                subgroup_key: "s".to_string(),
+                display_name: "s".to_string(),
+                frames: vec![crate::export::models::ExportFrame {
+                    frame_id: 1,
+                    file_id: 1,
+                    file_path: "/nonexistent/L_1.fits".to_string(),
+                    filename: "c_L_1.fits".to_string(),
+                    exptime: None,
+                    filter: None,
+                    ccd_temp: None,
+                    gain: None,
+                    offset: None,
+                    binning: None,
+                    date_obs: None,
+                    focallen: None,
+                    xpixsz: None,
+                    bayerpat: None,
+                    instrume: None,
+                    debayer_calibrated: Some(false),
+                }],
+                flat: None,
+                dark: None,
+                bias: None,
+                warnings: Vec::new(),
+            });
+        data
+    }
+
     /// A cancel raised before admission comes back as `Cancelled` — never as an
     /// organizer run, and never as an `Err` the caller would report as a
     /// failure. This is the path both host commands turn into the cancelled
@@ -177,7 +222,7 @@ mod tests {
         let outcome = run_export_organize(
             &ctx,
             out.path(),
-            &empty_data(),
+            &marked_data(),
             false,
             &WbppExportConfig::default(),
             None,
@@ -228,5 +273,44 @@ mod tests {
             ExportRunOutcome::Organized(r) => assert_eq!(r.files_organized, 0),
             ExportRunOutcome::Cancelled => panic!("a copy export must not queue"),
         }
+    }
+
+    /// An attested set's calibrated-lights export marks no light for
+    /// generation, so it is a plain copy: it takes no compute slot and runs
+    /// to completion while the queue's only slot is held.
+    #[test]
+    fn an_attested_calibrated_lights_export_takes_no_compute_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(tmp.path());
+        let out = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_held, _id) = ctx
+            .compute_queue
+            .acquire(
+                ComputeJobKind::MasterBuild,
+                "held",
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+
+        // No light carries `debayer_calibrated`: what the transform leaves for
+        // an attested set.
+        let outcome = run_export_organize(
+            &ctx,
+            out.path(),
+            &empty_data(),
+            false,
+            &WbppExportConfig::default(),
+            None,
+            1,
+            &cancel,
+            ExportMode::CalibratedLights,
+            &CalibratedLightOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, ExportRunOutcome::Organized(_)),
+            "an attested export must not queue"
+        );
     }
 }

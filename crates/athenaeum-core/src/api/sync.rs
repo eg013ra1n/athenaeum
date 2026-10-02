@@ -3434,9 +3434,10 @@ pub(crate) fn plan_selection_package(
         // neither its hash nor its analysis may be attributed to that row. Nor
         // is a payload that does not exist yet: the read the worker pays for is
         // of the source, and banking that digest against a row whose file is
-        // the one being generated FROM would be a wrong `strong_hash`. Today
-        // the two conditions name the same entries; stated separately so a
-        // future generated kind cannot quietly land on the wrong side.
+        // the one being generated FROM would be a wrong `strong_hash`. The two
+        // conditions differ for an attested set's send: its lights are
+        // `CalibratedLight` entries that are NOT generated (plain copies of
+        // the catalog file) — stated separately so each case lands correctly.
         let is_catalog_file = entry.kind != PayloadKind::CalibratedLight && !entry.generate;
         let frame_meta = match serde_json::to_value(frame) {
             Ok(v) => v,
