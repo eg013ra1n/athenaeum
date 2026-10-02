@@ -15,9 +15,9 @@
 
 **Tech Stack:** Rust (`athenaeum-core`): rusqlite 0.40, serde, xxhash, blake3, rustafits (`astroimage`), solvemyastro. ts-rs (`tests/ts_contract.rs`). Axum (`athenaeum-web`) and Tauri (`athenaeum-tauri`) wrappers. React/TS: one hook guard and two test fixtures.
 
-**Spec:** `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` (owner-approved, fable-reviewed). Read §2, §4–§9 and §13–§16 before any task. This plan implements §18 plan 6b steps **3, 4, 5, 6, 7 and 13**, with the wire change of §9.2 brought forward. Steps 8–12 and 14 are plan 6b-3: registration onto the grid, LN on overlap, coverage and crop, drizzle and output on the grid, the seven project-stacking commands, and the fake-hub e2e. In 6b-2, `start_stacking` for a project still refuses with `PROJECT_STACKING_UNAVAILABLE`; project stages are exercised only through `project_test_context` in tests.
+**Spec:** `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` (owner-approved, fable-reviewed). Read §2, §4–§9 and §13–§16 before any task. This plan implements §18 plan 6b steps **3, 4, 5, 6, 7 and 13**, with the wire change of §9.2 brought forward. Steps 8–12 and 14 are plan 6b-3: registration onto the grid, LN on overlap, coverage and crop, drizzle and output on the grid, the seven project-stacking commands, and the fake-hub e2e. In 6b-2, `start_stacking` for a project still refuses with `PROJECT_STACKING_UNAVAILABLE`; project stages are exercised only through `project_test_context` (Task 6b) in tests.
 
-**Execution order:** Task 0, 1, 2, 3, 4, 5, 6, **8, 7**, 9, 10, 11. Task 8 (the grid) lands before Task 7 (the project plan), because the plan reports the grid state. The tasks keep the skeleton's numbers and appear in the document in execution order.
+**Execution order:** Task 0, 1, 2, 3, 4, 5, 6a, 6b, **8a, 8b, 7**, 9a, 9b, 10a, 10b, 10c, 11. Tasks 8a and 8b (the grid) land before Task 7 (the project plan), because the plan reports the grid state. Tasks 6, 8, 9 and 10 are split into halves (6a/6b, 8a/8b, 9a/9b, 10a/10b/10c) at the review's cut points; each half has its own Files, Interfaces, Steps, gate and commit, and leaves every gate green on its own. The tasks keep the skeleton's numbers and appear in the document in execution order.
 
 **Research behind this plan** (all in `docs/superpowers/research/6b/`, verified at `e03bc48f`):
 - `2026-10-03-6b2-source-plan-groups.md`: steps 3, 7 and 13;
@@ -41,13 +41,13 @@ The foundation is `docs/stacking/README.md` § "Run subjects (wave 6b-1)".
     - `db/stacking.rs:~1786`, the project run's wire `frames_set_id` (Task 1);
     - `config_hash_is_canonical_and_pinned`'s literal (Task 2);
     - the `GroupingConfig { exposure_tolerance_sec: 2.0 }` literal at `groups.rs:~734` (Task 2);
-    - `frame_source_returns_one_catalog_origin_per_frame`: its `Catalog { file_id }` value and its project-refusal tail (Task 6);
+    - `frame_source_returns_one_catalog_origin_per_frame`: its `Catalog { file_id }` value and its project-refusal tail (Task 6a);
     - the `projects` → `_projects` paths in `paths.rs:~1911` and `run.rs:~19936` / `~19986` (Task 5);
     - `a_project_plan_is_refused_until_6b2`, which is replaced (Task 7).
   - Mechanical edits are allowed anywhere the compiler demands them: a new struct field in a literal, `frame_source`'s config argument, `FanOutTicker::from_parts`'s subject argument.
   - Frame-set group keys, every stage hash (`stage_hashes_are_pinned_to_golden_literals` keeps its literals), frame-set log messages and fields, and error strings stay byte-identical. A log line that gains a subject-aware field records `set_id` as `Option<i64>`, which `tracing` records exactly as the old `i64` when it is `Some`, and `project_id` as `Option<&str>`, which records nothing when it is `None`.
   - `a_project_start_is_refused_until_6b2` (`run.rs:~19861`) stays green to the end of this plan.
-- **TypeScript:** `src/types/` may change only in **Tasks 1, 2, 3, 7 and 8**, and each of those tasks lists exactly what moves. Every other task ends with `git diff --exit-code src/types`. An exported field added by this plan carries a `//` comment, never `///`, because ts-rs copies `///` docs into the generated files.
+- **TypeScript:** `src/types/` may change only in **Tasks 1, 2, 3, 7 and 8b**, and each of those tasks lists exactly what moves. Task 8a adds `CanonicalGrid` with a `ts_rs::TS` derive but does not register it, so its TS does not move. Every other task ends with `git diff --exit-code src/types`. An exported field added by this plan carries a `//` comment, never `///`, because ts-rs copies `///` docs into the generated files.
 - **The headless build stays green:** `cargo check -p athenaeum-core --no-default-features`.
   - Ungated: `db::*`, `collab::grid`, `collab::hub_client`, `api::collab_exchange`, `services::*`.
   - Gated `all(render, solver)`: `stacking::*`, `api::stacking`, `api::collab`, `api::collab_grid`, `collab::frame_meta`, `collab::grid_geometry`, `plate_solve::*`, and the feed (`api::collab_live::feed`).
@@ -55,7 +55,7 @@ The foundation is `docs/stacking/README.md` § "Run subjects (wave 6b-1)".
   - No code path writes, renames or deletes a landed file.
   - No file a stacking run writes carries `ATH_PRJ`, `ATH_FILT`, `CALSTAT` or `ATH_CSRC`.
   - Cleanup removes directories under the working layout, never a file by an artifact's path.
-- **No project run starts.** `start_stacking(Project)` refuses. Project stages run only from tests, through `project_test_context` (Task 6).
+- **No project run starts.** `start_stacking(Project)` refuses. Project stages run only from tests, through `project_test_context` (Task 6b).
 - **Errors and logging:**
   - Never swallow an error; log at `warn!` or `error!` before degrading.
   - `tracing` only, with a short stable message and snake_case fields. Zero `println!` outside tests.
@@ -64,7 +64,7 @@ The foundation is `docs/stacking/README.md` § "Run subjects (wave 6b-1)".
   - `CARGO_BUILD_JOBS=4` and `--test-threads=4`, one compile at a time.
   - Format touched files with `rustfmt <files>`, never `cargo fmt -p`, and revert sibling-module reformatting that rustfmt drags in.
   - `cargo check -p athenaeum-core --lib` stays warning-free. Clippy is not a gate.
-- **Two backends in sync.** Task 8's two commands go on both hosts. Task 10's core catalog opener is called by both hosts' plate-solve modules.
+- **Two backends in sync.** Task 8b's two commands go on both hosts. Task 10a's core catalog opener is called by both hosts' plate-solve modules.
 - **Gate per task.** Each task leaves all of these green:
   ```bash
   CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --all-targets -- --test-threads=4 2>&1 | grep -E '^test result|FAILED'
@@ -77,7 +77,7 @@ The foundation is `docs/stacking/README.md` § "Run subjects (wave 6b-1)".
   ```
   - Run `npx vitest run <the task's touched frontend files>` too when the task touches `src/`.
   - The lib check must print no `warning`.
-  - `git diff --stat src/types` must be empty except in Tasks 1, 2, 3, 7 and 8.
+  - `git diff --stat src/types` must be empty except in Tasks 1, 2, 3, 7 and 8b.
   - Three tests are known to flake under full-suite load: the two wall-clock collab live tests and `landing_free_bytes_is_bounded_by_the_collaboration_root`. If one fails, re-run it alone and report both runs.
 - **Copy rules:** comments, docs and commit messages are in English. Never name a third-party project in the repo.
 
@@ -87,13 +87,14 @@ The foundation is `docs/stacking/README.md` § "Run subjects (wave 6b-1)".
    Pinned in:
    - Task 2: the golden extension;
    - Task 3: the keys, and `seconds_classes` equal to the old clustering;
-   - Task 9: the generator pixel pin and `calibrate_fan_out_matches_the_sequential_stage_byte_for_byte`;
+   - Task 9a: the generator pixel pin and `calibrate_fan_out_matches_the_sequential_stage_byte_for_byte`;
+   - Task 10b: `the_solve_sub_step_is_a_no_op_for_a_frame_set`; Task 10c: `a_frame_set_run_has_no_wcs_rule`;
    - every task's full core gate.
 2. **A project handle never reaches a catalog read, and the project path never writes the catalog.** The project frame source and Prepare run against a `frames` table that holds rows with the handles' ids and different data, and none of it is read. Solve never writes `plate_solves` or `frames`.
    Pinned in:
-   - Task 6: `the_project_frame_source_reads_the_manifest_never_the_catalog`;
-   - Task 9: `prepare_never_reads_the_catalog_for_a_project`;
-   - Task 10: `the_solve_sub_step_never_writes_plate_solves_or_frames`.
+   - Task 6a: `the_project_frame_source_reads_the_manifest_never_the_catalog`;
+   - Task 9b: `prepare_never_reads_the_catalog_for_a_project`;
+   - Task 10b: `the_solve_sub_step_never_writes_plate_solves_or_frames`.
 3. **The replica is sacred.**
    - Prepare leaves every landed file byte-identical.
    - No prepared file carries `ATH_PRJ`, `CALSTAT`, `ATH_CSRC` or `ATH_FILT`, and the scanner never catalogs one.
@@ -102,27 +103,28 @@ The foundation is `docs/stacking/README.md` § "Run subjects (wave 6b-1)".
    Pinned in:
    - Task 5: `_projects` and the overlap helper;
    - Task 7: the `folders` blocker;
-   - Task 9: the landed-bytes, card, scanner and cleanup tests.
+   - Task 9a: the card, scanner and `prepared/` cleanup tests;
+   - Task 9b: the landed-bytes test, and `CleanupWhat::All` leaving an in-place landed file on disk.
 4. **A landed file that changes during a run never feeds a stage.** The identity check runs at Prepare, Solve, Measure, Register candidates and the Output member snapshot. A mismatch excludes the frame with "changed during the run". A changed reference fails the run.
    Pinned in:
-   - Task 6: the funnel unit test, the Measure boundary and `exclude_changed_members`;
-   - Task 9: the Prepare boundary;
-   - Task 10: the Solve boundary.
+   - Task 6b: the `landed_unchanged` unit test, the Measure boundary and `exclude_changed_members`;
+   - Task 9b: the Prepare boundary;
+   - Task 10b: the Solve boundary.
 5. **The grid hash is one per grid.**
    - The grid is normalized before the PUT.
    - A jsonb echo with reordered keys, an integer-spelled float or `-0.0` hashes the same.
    - The local copy is written only after a 2xx.
-   - A no-op echo emits nothing.
+   - A no-op echo emits nothing; the saving device gets exactly one event, from the command (review I5).
    - The proposal is deterministic for a manifest.
 
-   Pinned in Task 8.
+   Pinned in Task 8a (the hash, normalization and the proposal) and Task 8b (the 2xx write, the echo, the events).
 6. **Exposure-class tokens can never collide** on `stacking_run_groups`' `UNIQUE(run_id, group_key)`. That includes two anchors that `fmt_num`'s two decimals would merge, and a dense sweep at the `stopsWidth` floor.
 
    Pinned in Task 3.
 
 ## Plan rulings (refine the spec where the code forced a choice)
 
-The controller's skeleton (C1–C17) is binding. The reasons are recorded here; where this plan had to refine a ruling, the refinement is marked **Refinement** and repeated in "Writer's notes for the controller" at the end.
+The controller's skeleton (C1–C17) is binding. The reasons are recorded here; where this plan had to refine a ruling, the refinement is marked **Refinement** and repeated in "Writer's notes for the controller" at the end. The controller's rulings on the plan review are folded in and marked **Refinement (review)**, with the review's finding number (I1–I12, M1–M21).
 
 - **C1 — The wire change comes first** (commands-e2e §2).
   - `StackingProgressEvent`, `StackingCompleteEvent`, `RunSummary`, `StackingRunRow` and `StackingPlan` each carry `set_id: Option<i64>` and `project_id: Option<String>`; exactly one is set. `RunSummary.project_id` is `#[serde(default)]`, because summaries are read back from `summary_json`.
@@ -154,6 +156,7 @@ The controller's skeleton (C1–C17) is binding. The reasons are recorded here; 
 - **C5 — The stackable predicate** is `exportable ∧ local_state.servable() ∧ ¬own_staged`.
   - `own_staged` is read into `LocalFrameRow`. Its reason is "being re-staged": the row's `blake3` is the old version's while the bytes are new.
   - **Refinement:** a row with a NULL `size_mtime_seen` is not stackable either ("waiting for its new version"). A version bump clears the stamp, so the landed file is not this version, and the identity check (C9) would have no baseline.
+  - **Refinement (review I3):** a non-NULL stamp that does not parse is corruption, not waiting: the frame is left out as "unreadable size:mtime stamp", with a `warn!` naming the stamp, and gets no handle.
 - **C6 — The working layout is `<working>/_projects/<slug>`.**
   - No frame-set slug can start with `_`, because `sanitize_for_filename` trims it. So a frame set can never share a folder with a project.
   - A `folders` blocker fires when the project's working root overlaps any scan root, the Collaboration root included (it is a scan root). It reuses `check_scan_root_overlap`.
@@ -167,10 +170,12 @@ The controller's skeleton (C1–C17) is binding. The reasons are recorded here; 
   - No variant path (`StackSubject::…`, `FrameOrigin::…`) appears in the production half of `stacking/run.rs` or `stacking/plan.rs` outside the named funnels.
   - The funnels are `frame_source`, `subject_layout`, `subject_label`, `stored_reference_frame`, `hash_by_origin`, `stored_solve`, `cfa_geometry`, `resolve_reference`, `resolve_calibrate_job`, `stored_registrations`, `store_registration`, `stage_one_kind` and `landed_unchanged`.
   - Allowlisted, each with a reason: `heal_interrupted_runs`, which is log-only; `start_stacking`, the frame-set-only guard until 6b-3; `build_plan`, the subject dispatch to the two plan arms; and the `#[cfg(test)]` constructors `test_context` and `project_test_context`.
+  - The test lands in Task 6a; `landed_unchanged` joins its `FUNNELS` list in Task 6b, with the function.
+  - `origin.rs`, which the test does not scan, holds the per-frame dispatch points the run calls without naming a variant: `stored_solve`, `cfa_geometry`, `landed_unchanged`, `needs_prepare`, `prepare_input`, `solve_plan`, `wcs_tier` and `local_solve_outcome` (review M18: listed in the README too).
   - `last_run_reference_scale` and `cleanup_stale_note` take `&StackSubject`.
 - **C9 — The landed-file identity check** is the funnel `origin::landed_unchanged(origin) -> Result<(), ExclusionReason>`, built on `collab::storage::sweep::{Stamp, stat_verdict}` (`"<len>:<mtime_secs>"`, 2 s tolerance). A mismatch excludes the frame with "changed during the run".
-  - It is called at five stage boundaries: Prepare (Task 9), Solve (Task 10), Measure (~`run.rs:2983`), Register candidates (~4317) and the member snapshot in `process_group_output` (~6824).
-  - Task 6 adds the funnel and the three existing-stage calls. The Prepare and Solve calls land with their stages.
+  - It is called at five stage boundaries: Prepare (Task 9b), Solve (Task 10b), Measure (~`run.rs:2983`), Register candidates (~4317) and the member snapshot in `process_group_output` (~6824).
+  - Task 6b adds the funnel and the three existing-stage calls. The Prepare and Solve calls land with their stages.
   - **Refinement:** a changed group reference fails the run with "the reference frame changed during the run", because a reference cannot be excluded from its own group.
 - **C10 — `build_plan`'s project arm writes.**
   - It mints handles (`project_frame_handles`, one IMMEDIATE transaction) and seeds the config document (`seed_project_config`, one IMMEDIATE transaction). This is a documented exception to "the plan reads only". The frame-set arm stays read-only.
@@ -178,27 +183,32 @@ The controller's skeleton (C1–C17) is binding. The reasons are recorded here; 
   - `StackingPlan.readiness` stays non-optional: `ExportReadiness` derives `Default` and a project sends it empty.
   - The project blockers, in order, are `grid` (no confirmed grid), `reference`, `folders` (incl. the C6 overlap), `space` (grid-size registered artifacts plus the prepared conversions), `frames` (nothing stackable, or the ≥ 3 rule) and `unsupported` (the shared drizzle-scale check).
   - The warnings follow spec §7. Unsupported FILES are a plan warning, and Prepare excludes them per frame (C12).
+  - **Refinement (review I1):** unsupported files are also plan-time exclusions. The shared core counts their handles out of every group's included frames and the ≥ 3 rule (`excluded_set ∪ unsupported_ids`), so a group Prepare would leave under three frames is blocked by `frames` at plan time instead of failing at run time. They are not added to `StackingPlan.excluded_frame_ids`, which stays the manual list, and no new blocker code exists.
 - **C11 — R3's stacking half.**
   - The frame source sets `Catalog.attested` from `frames_set.calibrated_externally`.
   - An attested frame runs Prepare, not Calibrate. `HashMemo` gives it the Prepare hash over its catalog identity, and `resolve_calibrate_job` refuses it.
-  - The plan gate drops `masters | links | masterFiles` and `masters_to_build` is empty for an attested set (Task 7). The run half is Task 9.
+  - The plan gate drops `masters | links | masterFiles` and `masters_to_build` is empty for an attested set (Task 7). The attested hash is Task 9a; the run half is Task 9b.
 - **C12 — Prepare.**
   - **In place** only when the file is a primary-HDU image with BITPIX −32 or −64 that the plane reader decodes, and it is mono, three-plane colour, or a CFA mosaic with `debayerOsc` off.
   - **Converted** to float32 FITS `prepared/<group>/p_<stem>.fits`:
     - integer BITPIX ÷ `scale_divisor_for_bitpix`;
     - XISF through `read_raw` ÷ 65535, within 1 ulp.
   - **Excluded** with "unsupported file": a tile-compressed FITS, an extension image or a distributed XISF.
+  - **Refinement (review I2):** spec §5.1 row 1 lists BITPIX 8/16/32 as usable in place; this plan narrows it to float. An integer FITS is converted, so an attested set's 16-bit lights and a published replica share the calibrated-light generator's unit domain, and every stage after stage 1 sees one value domain.
+  - **Refinement (review I10):** a file that cannot be opened is excluded "unsupported file: cannot open the file: …", and the decoder's fallback reason reads "not a 1- or 3-plane 8/16/32-bit or float primary image" (it also covers BITPIX 64 and 4-plane cubes).
+  - **Refinement (review I12):** Prepare excludes a frame whose post-Prepare plane count contradicts its group's colour (`expected_stage_one_planes`), with "plane count {n} disagrees with the group's colour mode". The group's colour comes from the manifest (or the catalog), the debayer from the file's own header, and nothing else reconciles the two.
   - **Debayer** through `debayer_plane` and `debayered_cards`, extracted from the generator, which then calls them (pixels pinned byte-identical). `debayer_file(src, dest, CfaGeometry, …)` writes `p_<stem>_d.fits`.
   - **Output cards:** `REGISTERED_COPY_THROUGH`, the CFA cards when the output is still a mosaic, `IMAGETYP`, `ATH_STK = T`, `ATH_STKV` and `ATH_PREP`. Never `ATH_PRJ`.
   - **Hash:** `prepare_subtree = {debayerOsc, debayerMethod: "VNG", prepareVersion}`. The project hash covers `blake3`, the byte size and the subtree; the attested-catalog hash covers the catalog identity and the subtree.
   - **Artifacts:** `calibrated` points at the in-place or prepared file. `calibrated_mosaic` points at the pre-debayer file when Bayer drizzle wants one.
   - **CFA geometry** comes from the file's own header (`cfa_geometry_of_file`).
   - **Layout:** `WorkingLayout::prepared_root()`. Work usage counts it in `calibrated_bytes`, the Calibrate slot's counter, so the TS does not change. Cleanup removes it under `Intermediates` and `All`.
-  - **Refinement:** `prepare_subtree` lands in Task 6, because `HashMemo`'s project arm compiles there. The file classifier (`probe_file`, `prepare_action`) lands in Task 7, because the plan's `space` estimate and its unsupported-file warning need it. The stage, the writers and the debayer extraction are Task 9.
+  - **Refinement:** `prepare_subtree` lands in Task 6a, because `HashMemo`'s project arm compiles there. The file classifier (`probe_file`, `prepare_action`) lands in Task 7, because the plan's `space` estimate and its unsupported-file warning need it. The writers, the debayer extraction and the attested hash are Task 9a; the stage is Task 9b.
 - **C13 — The OSC plane rule.**
   - A project group never mixes three-plane and mosaic frames. Its colour token is `osc` for a frame that is three-plane after Prepare, and `cfa` for one that stays a mosaic (`debayerOsc` off and the file is a one-plane mosaic).
   - With the default `debayerOsc = true`, every OSC frame is `osc`.
   - The plane count is probed from the file only when `debayerOsc` is off.
+  - **Refinement (review I12):** Prepare enforces the rule per frame (C12): one plane for mono; three for OSC with the debayer on; with it off, three for a project's `osc` group and one otherwise.
 - **C14 — Solve.**
   - The acceptance gate is extracted from `store_result` into the pure `acceptance_refusal`, which `store_result` still calls. `record_from_result` is extracted too.
   - Catalog opening moves into core (`plate_solve::open_catalog_layers`), and both hosts call it.
@@ -208,67 +218,76 @@ The controller's skeleton (C1–C17) is binding. The reasons are recorded here; 
   - Every outcome is cached as a `solve` artifact under `group_key = ""`: solved, failed or refused, keyed on `blake3`, the solver config hash and the catalog identity. `solve` stays out of `INTERMEDIATE_ARTIFACT_KINDS`.
   - `stored_solve`'s project arm reads the manifest WCS first, then the solve artifact.
   - A real-data probe reports the success rate on landed `.dev` replicas.
+  - **Refinement (review I7):** the `solve` payload also records the app version that wrote it. A cached failure or refusal written by another app version is a miss and is tried once more; a cached solve stays. `SOLVE_RECIPE_VERSION`'s doc and the README carry the bump rule: bump it to re-solve frames cached as solved.
+  - **Refinement (review I8, M16):** the probe samples mono and OSC frames separately (up to `limit / 2` each) and prints both sub-rates; a probe that solves nothing in either domain fails.
+  - **Refinement (review I9, M11, M12):** a frame without a stage-1 file is skipped with a `debug!` and left to Measure; the FOV hint is the scale times `naxis1`, as the hosts compute it; `SolveRequest` carries the handle, which names the solve's span.
+  - The gate extraction and the catalog opener are Task 10a; the seam and the sub-step Task 10b; the probe Task 10c.
 - **C15 — The reference rule** (spec §5.4).
   - Candidates must have a WCS. Manifest-WCS frames qualify run-wide; locally solved ones qualify only when no frame of the run has a manifest WCS. With no candidate, the stage fails: "no frame of this project could be plate-solved; the grid needs one".
   - Auto takes the largest group that holds a candidate.
   - A native-mode group without a candidate falls back to the run reference.
   - The two-pass re-pick never lets a non-candidate win (`two_pass_pick_among`).
   - A manual pin without a WCS fails the stage.
-  - It lands at the end of Task 10.
+  - **Refinement (review I6):** the manual pin's WCS check runs after the existing "the manual reference frame is excluded: {reason}" check, so a pin that stage 1 excluded keeps its real reason.
+  - It lands in Task 10c.
 - **C16 — The grid** (grid-geometry §1, §4–§5).
   - **Type:** `CanonicalGrid { scaleArcsec, widthPx, heightPx, crval1, crval2, rotationDeg }`, normalized before the PUT: `−0.0` becomes `0.0`, the rotation goes into `(−180, 180]` and `crval1` into `[0, 360)`.
   - **Hash:** the XXH3-64 of the typed struct's canonical JSON (sorted keys), as 16 hex digits. The hub's jsonb echo is never hashed.
   - **Client:** `CollabClient::put_grid` (204). `set_collab_project_grid` echoes its own normalized grid.
   - **Storage:** `ProjectWire.canonical_grid` carries the hub's copy. `collab_projects.canonical_grid_json` has a dedicated setter and getter. The refresh reports `grid_moved`.
   - **Feed:** `Kind::Grid` triggers the refresh. Every live-feed refresh site emits `collab-grid-changed { projectId }`.
+  - **Refinement (review I5):** `set_collab_project_grid` takes the host's emitter (Tauri's emitter; web's `SseProgressEmitter::new(state.event_tx.clone())`) and emits `collab-grid-changed { projectId }` after the successful cache write, on every successful save. The saving device's own cache write makes its feed refresh a no-op, so it gets the event from the command; every other device gets it from the feed.
+  - **Refinement (review I4):** `card_from_row` degrades an unreadable cached grid to none with a `warn!`, so one bad row cannot take the project list down; `get_collab_grid_proposal` and the plan stay strict.
+  - **Refinement (review M7):** a hub 400 reaches the user as the hub client's wrapped message (`hub returned 400 Bad Request (put project grid): …`). Local validation mirrors the hub's text, so the wrapper shows only when the two disagree.
   - **Fake hub:** the PUT grid route, `canonicalGrid` on the page, and a settable target.
   - **Orientation:** the grid is sky-standard (north up, east left, det(CD) < 0). Every solve in the owner's catalog has det(CD) > 0, so a grid master is the mirror image of a raw frame, which is correct on the sky. 6b-3 must not copy the reference's `ROWORDER` onto a grid master.
   - **Proposal:** deterministic for a manifest.
     - Scale is the median `pixelScaleArcsec`, rounded to 0.01″. Centre is the target; rotation is 0.
     - Size is the bounding box, in the proposed TAN, of the WCS frames' footprints, clipped to the target circle, rounded up to a multiple of 64 and clamped to `[64, 65536]`. With no WCS frame, it is a square of twice the target radius.
     - `framesInside` counts the frames at least half inside.
-  - **Commands:** `get_collab_grid_proposal { projectId } -> { current, proposal, framesInside, canEdit }` (`proposal` is `null` when no accepted frame has a pixel scale), and `set_collab_project_grid { projectId, grid } -> grid`, on both hosts.
+  - **Commands:** `get_collab_grid_proposal { projectId } -> { current, proposal, framesInside, canEdit }` (`proposal` is `null` when no accepted frame has a pixel scale, and also when the median scale rounds outside the hub's `(0, 100]`, review M8), and `set_collab_project_grid { projectId, grid } -> grid`, on both hosts.
+  - The type, hash, proposal geometry and cache columns are Task 8a; the hub client, refresh, feed, fake hub and commands Task 8b.
 - **C17 — Command count.** 6b-2 adds 2 commands (297 → 299). 6b-3 adds 7 (→ 306; the spec's "305" is stale, because 6a added 3). CLAUDE.md is updated by 6b-3. Task 11 records the running count.
 
 ## File map
 
 | File | Change |
 | ---- | ---- |
-| `crates/athenaeum-core/src/stacking/run.rs` | `wire_subject` (T1); `exposure_class` insert (T3); `changed_during_run`, `exclude_changed_members`, boundary calls, `project_test_context` (T6); `stage_one_kind`, `stage_prepare` (T9); `solver`, `wcs_tiers`, `solve_project_frames`, the reference rule (T10) |
+| `crates/athenaeum-core/src/stacking/run.rs` | `wire_subject` (T1); `exposure_class` insert (T3); `resolve_calibrate_job`'s project arm, `test_context`'s origin (T6a); `changed_during_run`, `exclude_changed_members`, boundary calls, `project_test_context` (T6b); `stage_one_kind`, `stage_prepare`, `expected_stage_one_planes` (T9b); `solver`, `solve_project_frames` (T10b); `wcs_rule`, `wcs_tiers`, the reference rule (T10c) |
 | `crates/athenaeum-core/src/stacking/provenance.rs` | `RunSummary` subject pair (T1) |
-| `crates/athenaeum-core/src/db/stacking.rs` | `StackingRunRow` pair (T1); `exposure_class` (T3); project config CRUD + seed (T5) |
-| `crates/athenaeum-core/src/stacking/plan.rs` | `StackingPlan` pair (T1); golden extension (T2); equivalence warning, `PlanGroup.exposure_class` (T3); `resolve_project_config_and_exclusions` (T5); `HashMemo` arms, `prepare_hash_for_project`, subject-taking helpers (T6); the two arms, `PlanGrid`, `PlanProjectFrame`, R3 gate (T7); attested hash (T9); solved-locally refinement (T10) |
-| `crates/athenaeum-core/src/stacking/config.rs` | `ExposureMode`, `stops_width`, `MIN_STOPS_WIDTH`, output fields, re-pin (T2); `project_seed_config` (T5); `prepare_subtree`, `PREPARE_VERSION` (T6) |
-| `crates/athenaeum-core/src/stacking/groups.rs` | classifier, tokens, `f_ratio`, `load_apertures` (T3); `frame_source(&StackingConfig)` with the project arm and `attested` (T6) |
+| `crates/athenaeum-core/src/db/stacking.rs` | `StackingRunRow` pair (T1); `exposure_class` (T3); project config CRUD + seed (T5); `project_frame_handles` returns at once for an empty list (T6a) |
+| `crates/athenaeum-core/src/stacking/plan.rs` | `StackingPlan` pair (T1); golden extension (T2); equivalence warning, `PlanGroup.exposure_class` (T3); `resolve_project_config_and_exclusions` (T5); `HashMemo` arms, `prepare_hash_for_project`, subject-taking helpers (T6a); the two arms, `PlanGrid`, `PlanProjectFrame`, R3 gate, unsupported files out of the counts (T7); attested hash (T9a); solved-locally refinement (T10b) |
+| `crates/athenaeum-core/src/stacking/config.rs` | `ExposureMode`, `stops_width`, `MIN_STOPS_WIDTH`, output fields, re-pin (T2); `project_seed_config` (T5); `prepare_subtree`, `PREPARE_VERSION` (T6a) |
+| `crates/athenaeum-core/src/stacking/groups.rs` | classifier, tokens, `f_ratio`, `load_apertures` (T3); `frame_source(&StackingConfig)` with the project arm and `attested` (T6a) |
 | `crates/athenaeum-core/src/fits_parser/stored_header.rs` | `aperture_mm_from_stored_header` (T3) |
 | `crates/athenaeum-core/src/collab/frame_meta.rs` | `ProjectFrameMeta`, `ManifestWcs`, parser, `to_record`, `meta.aperture` (T4) |
 | `crates/athenaeum-core/src/db/collab_frames.rs` | `own_staged`, `part_of_project`, `exportable`, `stackable`, `NotStackable` (T5) |
 | `crates/athenaeum-core/src/export/project_collector.rs` | calls the moved `exportable` (T5) |
-| `crates/athenaeum-core/src/stacking/paths.rs` | `PROJECTS_DIR`, `project_root_overlap` (T5); `estimate_project_bytes` (T7); `prepared_*`, usage, cleanup (T9) |
-| `crates/athenaeum-core/src/stacking/origin.rs` | the `Project` variant, `attested`, `landed_unchanged`, `cfa_geometry_of_file`, grep test (T6); `needs_prepare`, `prepare_input` (T9); `SolvePlan`, solve-artifact arm (T10) |
-| `crates/athenaeum-core/src/stacking/project_source.rs` | **new** — the project frame source (T6) |
-| `crates/athenaeum-core/src/stacking/prepare.rs` | **new** — classifier (T7); cards, converter, `debayer_file`, jobs (T9) |
-| `crates/athenaeum-core/src/stacking/solve.rs` | **new** — `FrameSolver`, `CatalogSolver`, `SolveOutcome`, probe (T10) |
-| `crates/athenaeum-core/src/stacking/test_fixtures.rs` | project frame fixture (T6); `write_fits_i16` `pub(crate)`, `write_empty_primary_fits` (T7); `ProjectFile::EmptyPrimary` (T9) |
-| `crates/athenaeum-core/src/stacking/weights.rs` | `two_pass_pick_among` (T10) |
-| `crates/athenaeum-core/src/stacking/mod.rs` | `pub mod project_source; pub mod prepare; pub mod solve;` |
-| `crates/athenaeum-core/src/export/calibrated_generator.rs` | `debayer_plane`, `debayered_cards` (T9) |
-| `crates/athenaeum-core/src/collab/grid.rs` | **new**, ungated — `CanonicalGrid` (T8) |
-| `crates/athenaeum-core/src/collab/grid_geometry.rs` | **new**, gated — proposal math (T8) |
-| `crates/athenaeum-core/src/collab/mod.rs`, `hub_client.rs`, `fake_hub.rs` | grid module decls, `ProjectWire.canonical_grid`, `put_grid`, fake route (T8) |
-| `crates/athenaeum-core/src/db/collab.rs` | `set_canonical_grid`, `canonical_grid` (T8) |
-| `crates/athenaeum-core/src/api/collab.rs` | `GridEcho`, refresh, `ProjectCard.canonical_grid`, `client_err` visibility (T8) |
-| `crates/athenaeum-core/src/api/collab_grid.rs` | **new** — event, `GridProposal`, the two commands' core (T8) |
-| `crates/athenaeum-core/src/api/collab_live/feed.rs` | `Kind::Grid` consumer, `emit_grid_moves` (T8) |
+| `crates/athenaeum-core/src/stacking/paths.rs` | `PROJECTS_DIR`, `project_root_overlap` (T5); `estimate_project_bytes` (T7); `prepared_*`, usage, cleanup (T9a) |
+| `crates/athenaeum-core/src/stacking/origin.rs` | the `Project` variant, `attested`, `cfa_geometry_of_file`, grep test (T6a); `landed_unchanged` (T6b); `needs_prepare`, `prepare_input` (T9b); `SolvePlan`, `local_solve_outcome`, solve-artifact arm (T10b); `WcsTier`, `wcs_tier` (T10c) |
+| `crates/athenaeum-core/src/stacking/project_source.rs` | **new** — the project frame source (T6a) |
+| `crates/athenaeum-core/src/stacking/prepare.rs` | **new** — classifier (T7); cards, converter, `debayer_file`, jobs (T9a) |
+| `crates/athenaeum-core/src/stacking/solve.rs` | **new** — `FrameSolver`, `CatalogSolver`, `SolveOutcome`, `cached_outcome_holds` (T10b); probe (T10c) |
+| `crates/athenaeum-core/src/stacking/test_fixtures.rs` | project frame fixture (T6a); `write_fits_i16` `pub(crate)`, `write_empty_primary_fits`, `ProjectFile::EmptyPrimary` (T7) |
+| `crates/athenaeum-core/src/stacking/weights.rs` | `two_pass_pick_among` (T10c) |
+| `crates/athenaeum-core/src/stacking/mod.rs` | `pub mod project_source;` (T6a), `pub mod prepare;` (T7), `pub mod solve;` (T10b) |
+| `crates/athenaeum-core/src/export/calibrated_generator.rs` | `debayer_plane`, `debayered_cards` (T9a) |
+| `crates/athenaeum-core/src/collab/grid.rs` | **new**, ungated — `CanonicalGrid` (T8a) |
+| `crates/athenaeum-core/src/collab/grid_geometry.rs` | **new**, gated — proposal math (T8a) |
+| `crates/athenaeum-core/src/collab/mod.rs`, `hub_client.rs`, `fake_hub.rs` | grid module decls (T8a); `ProjectWire.canonical_grid`, `put_grid`, fake route (T8b) |
+| `crates/athenaeum-core/src/db/collab.rs` | `set_canonical_grid`, `canonical_grid` (T8a) |
+| `crates/athenaeum-core/src/api/collab.rs` | `GridEcho`, refresh, `ProjectCard.canonical_grid` (degrades on an unreadable cache), `client_err` visibility (T8b) |
+| `crates/athenaeum-core/src/api/collab_grid.rs` | **new** — event, `GridProposal`, the two commands' core; the save emits (T8b) |
+| `crates/athenaeum-core/src/api/collab_live/feed.rs` | `Kind::Grid` consumer, `emit_grid_moves` (T8b) |
 | `crates/athenaeum-core/src/api/lights.rs` | `ExportReadiness: Default` (T7) |
-| `crates/athenaeum-core/src/plate_solve/{service,layers,mod}.rs` | `acceptance_refusal`, `record_from_result`, `solver_config_hash`, catalog opener (T10) |
-| `crates/athenaeum-core/src/scanner/mod.rs` | test: a prepared file is never cataloged (T9) |
-| `crates/athenaeum-core/src/ts_export.rs` | `ExposureMode` (T2); `PlanGrid`, `GridState`, `PlanProjectFrame`, import line (T7); `CanonicalGrid`, `GridProposal`, `CollabGridChanged` (T8) |
-| `crates/athenaeum-tauri/src/commands/{collab,plate_solve}.rs`, `lib.rs` | grid wrappers (T8); core catalog opener (T10) |
-| `crates/athenaeum-web/src/routes/{collab,plate_solve,mod}.rs` | grid routes (T8); core catalog opener (T10) |
+| `crates/athenaeum-core/src/plate_solve/{service,config,layers,mod}.rs` | `acceptance_refusal`, `record_from_result`, `solver_config_hash`, catalog opener (T10a) |
+| `crates/athenaeum-core/src/scanner/mod.rs` | test: a prepared file is never cataloged (T9a) |
+| `crates/athenaeum-core/src/ts_export.rs` | `ExposureMode` (T2); `PlanGrid`, `GridState`, `PlanProjectFrame`, import line (T7); `CanonicalGrid`, `GridProposal`, `CollabGridChanged` (T8b) |
+| `crates/athenaeum-tauri/src/commands/{collab,plate_solve}.rs`, `lib.rs` | grid wrappers (T8b); core catalog opener (T10a) |
+| `crates/athenaeum-web/src/routes/{collab,plate_solve,mod}.rs` | grid routes (T8b); core catalog opener (T10a) |
 | `src/hooks/useStackingRuns.ts` (+ `.test.tsx` new) | the guard (T1) |
-| `src/components/collab/project/testFixtures.ts`, `src/hooks/useCollabNotifications.test.tsx`, `scripts/ui-harness/fixtures.mjs` | `canonicalGrid: null` (T8) |
-| `src/types/{stacking,models}.ts` | regenerated (T1, T2, T3, T7, T8) |
+| `src/components/collab/project/testFixtures.ts`, `src/hooks/useCollabNotifications.test.tsx` | `canonicalGrid: null` (T8b) |
+| `src/types/{stacking,models}.ts` | regenerated (T1, T2, T3, T7, T8b) |
 | `docs/stacking/README.md`, `docs/transfers/README.md`, `docs/superpowers/specs/2026-07-03-logging-overhaul-design.md`, `docs/superpowers/open-items.md` | T11 |
 
 ---
@@ -459,7 +478,7 @@ Expected: the build fails. `wire_subject` does not exist, `from_parts` takes an 
 ```rust
 /// The subject pair every wire payload carries — `setId` for a frame set,
 /// `projectId` for a project, never both (plan 6b-2 C1). The frontend keys
-/// its maps by `set:<id>` / `project:<id>` (wave 6c).
+/// its maps by `set:<id>` / `project:<uuid>` (spec §9.2, wave 6c).
 pub(crate) fn wire_subject(subject: &StackSubject) -> (Option<i64>, Option<String>) {
     (
         subject.frame_set_id(),
@@ -921,7 +940,7 @@ pub(crate) fn classify_exposures(inputs: &[ClassInput], cfg: &GroupingConfig) ->
 pub(crate) fn class_token_num(x: f64) -> String;
 pub(crate) fn f_ratio(focal_mm: Option<f64>, aperture_mm: Option<f64>) -> Option<f64>;
 pub(crate) fn is_seconds_token(token: &str) -> bool;
-pub(crate) fn sanitized_or(value: Option<&str>, fallback: &str) -> String;   // visibility only (Task 6 uses it)
+pub(crate) fn sanitized_or(value: Option<&str>, fallback: &str) -> String;   // visibility only (Task 6a uses it)
 pub struct IntegrationGroup { /* … */ pub exposure_class: String, /* … */ }
 // fits_parser/stored_header.rs
 pub fn aperture_mm_from_stored_header(format: &str, header: &str) -> Option<f64>;
@@ -1154,7 +1173,10 @@ TS: `StackingRunGroupRow` gains `exposureClass: string | null`; `PlanGroup` gain
 `plan.rs` `mod tests`, beside `plan_warns_about_frames_without_exptime`:
 ```rust
     /// Spec §8: in `equivalent` mode, frames whose focal ratio is unknown are
-    /// classed by seconds, and the plan says how many.
+    /// classed by seconds, and the plan says how many. The fixture's lights
+    /// carry no `fits_header` blob, so `load_apertures` finds no aperture and
+    /// every frame classes by seconds; a fixture that wrote a header blob with
+    /// APTDIA would change what this test sees (review M5).
     #[test]
     fn plan_warns_when_exposure_equivalence_is_unknown() {
         let f = test_fixtures::frame_set("LDN 1272");
@@ -1353,7 +1375,9 @@ pub(crate) fn class_token_num(x: f64) -> String {
 }
 
 /// Whether a class token is a seconds token (`<t>s`) — in `equivalent` mode,
-/// the classes of frames whose focal ratio is unknown.
+/// the classes of frames whose focal ratio is unknown. A convention on the
+/// string: the other four tokens never end in `s` (`st<num>`, `eq<num>`,
+/// `all`, `unknown`), and a new token must keep it so (review M4).
 pub(crate) fn is_seconds_token(token: &str) -> bool {
     token.ends_with('s')
 }
@@ -1536,7 +1560,7 @@ pub struct ManifestSip { pub order: i32, pub a: Vec<Vec<f64>>, pub b: Vec<Vec<f6
 pub fn parse_project_frame_meta(manifest_json: &str) -> anyhow::Result<ProjectFrameMeta>;
 impl ManifestWcs { pub fn to_record(&self, pixel_scale_arcsec: Option<f64>) -> PlateSolveRecord; }
 ```
-Consumed by: Task 6 (the origin, the frame source), Task 8 (the proposal), Task 10 (the solve inputs).
+Consumed by: Task 6a (the origin, the frame source), Task 8a (the proposal), Task 10b (the solve inputs).
 
 - [ ] **Step 1: Write the failing tests** (`frame_meta.rs` `mod tests`):
 ```rust
@@ -2293,13 +2317,13 @@ fn canonical_or_nearest(path: &Path) -> PathBuf {
 
 ---
 
-### Task 6: `FrameOrigin::Project`, the project frame source, the identity check, the funnel test (C7, C8, C9; spec §4.3, §5.1, §7)
+### Task 6a: `FrameOrigin::Project` and the project frame source; the funnel test (C7, C8; spec §4.3, §5.1, §7)
 
 **Files:**
 - Modify `crates/athenaeum-core/src/stacking/origin.rs`:
   - the enum;
-  - add `ExclusionReason`, `CHANGED_DURING_THE_RUN`, `landed_unchanged` and `cfa_geometry_of_file`;
-  - the project arms;
+  - add `cfa_geometry_of_file`;
+  - the project arms of `stored_solve` and `cfa_geometry`;
   - tests, including the funnel grep test.
 - Create `crates/athenaeum-core/src/stacking/project_source.rs`, and declare `pub mod project_source;` in `stacking/mod.rs`.
 - Modify `crates/athenaeum-core/src/stacking/groups.rs`: `frame_source` (`~605-620`), and drop the `PROJECT_STACKING_UNAVAILABLE` import.
@@ -2314,11 +2338,9 @@ fn canonical_or_nearest(path: &Path) -> PathBuf {
 - Modify `crates/athenaeum-core/src/stacking/run.rs`:
   - `resolve_calibrate_job`'s origin match (`~1689`);
   - `start_stacking`'s `frame_source` call (`~813`);
-  - add `changed_during_run` and `exclude_changed_members`;
-  - the Measure (`~2983`), Register (`register_group_pass`, `~4304`) and Output (`process_group_output`, `~6804`) boundaries;
-  - `test_context` (`~9883`);
-  - add `project_test_context`;
-  - tests: the `solve_of` test literal (`~20082`) plus new ones.
+  - `test_context`'s origin literal (`~9883`);
+  - the `solve_of` test literal (`~20082`).
+- Modify `crates/athenaeum-core/src/db/stacking.rs`: `project_frame_handles` (`~1034`) returns at once for an empty list (review M2), plus a test.
 - Modify `crates/athenaeum-core/src/stacking/test_fixtures.rs`: add the project frame fixture.
 - Modify `crates/athenaeum-core/src/fits_parser/mod.rs`: `read_xisf_header` becomes `pub(crate)`. This is a visibility change only.
 
@@ -2330,9 +2352,6 @@ pub enum FrameOrigin {
     Project { project_id: String, frame_uuid: String, publisher: String, landed_path: String,
               blake3: String, byte_size: i64, size_mtime: String, meta: ProjectFrameMeta },
 }
-#[derive(Debug, Clone, PartialEq, Eq)] pub(crate) struct ExclusionReason(pub(crate) String);
-pub(crate) const CHANGED_DURING_THE_RUN: &str = "changed during the run";
-pub(crate) fn landed_unchanged(origin: &FrameOrigin) -> Result<(), ExclusionReason>;
 pub(crate) fn cfa_geometry_of_file(path: &Path) -> anyhow::Result<Option<CfaGeometry>>;
 // stacking/config.rs
 pub const PREPARE_VERSION: u32 = 1;
@@ -2352,11 +2371,6 @@ pub fn project_group_key(color_token: &str, canonical: &str, class_token: &str) 
 pub fn file_shape_quick(path: &Path) -> Option<(usize, usize, usize)>;
 pub fn is_xisf(path: &Path) -> bool;
 pub fn xisf_geometry(xml: &str) -> Option<(usize, usize, usize)>;
-// stacking/run.rs
-fn changed_during_run(rc: &RunContext, frame_id: i64) -> Result<Option<String>, RunError>;
-fn exclude_changed_members(rc: &mut RunContext, group: &IntegrationGroup) -> Result<usize, RunError>;
-#[cfg(test)] pub(crate) fn project_test_context(ctx: Arc<ServiceContext>, emitter: Arc<dyn ProgressEmitter>, run_id: i64, project_id: &str,
-    config: StackingConfig, plan_groups: Vec<IntegrationGroup>, origins: FrameOrigins, layout: WorkingLayout, output_dir: PathBuf, group_ids: HashMap<String, i64>) -> RunContext;
 // stacking/test_fixtures.rs
 pub(crate) enum ProjectFile { Mono32, Rgb32, Mosaic32, Mono16, Xisf32, Missing }
 pub(crate) struct ProjectFrameSpec<'a> { pub uuid: &'a str, pub publisher: &'a str, pub filter: &'a str, pub exptime_sec: f64,
@@ -2366,9 +2380,9 @@ pub(crate) fn project_frame_spec(uuid: &str) -> ProjectFrameSpec<'_>;
 pub(crate) fn manifest_wcs_json(width: usize, height: usize, ra: f64, dec: f64, scale_arcsec: f64) -> serde_json::Value;
 pub(crate) fn add_project_frame(conn: &Connection, dir: &Path, project_id: &str, spec: &ProjectFrameSpec<'_>) -> PathBuf;
 ```
-Consumed by: Task 7 (`ProjectSource.frames`, `file_shape_quick`), Task 9 (`cfa_geometry_of_file`, `project_test_context`, the fixture), Task 10 (the origin's `meta`).
+Consumed by: Task 6b (the origin, the fixture), Task 7 (`ProjectSource.frames`, `file_shape_quick`), Tasks 9a and 9b (`cfa_geometry_of_file`, the fixture), Task 10b (the origin's `meta`).
 
-- [ ] **Step 1: The project fixture** (`test_fixtures.rs`). Add the imports `use crate::fits_writer::{write_fits_f32, write_xisf_f32};` and `use crate::collab::hub_client::FrameViewWire;`, then append:
+- [ ] **Step 1: The project fixture** (`test_fixtures.rs`). Add `write_xisf_f32` to the existing `crate::fits_writer` import (`write_fits_f32` is already imported at `test_fixtures.rs:19`, so a second `use` of it is E0252; review M1), add `use crate::collab::hub_client::FrameViewWire;`, then append:
 ```rust
 // ── Project frames (plan 6b-2) ──────────────────────────────────────────────
 
@@ -2645,7 +2659,8 @@ mod tests {
 
     /// Spec §7: only stackable frames are grouped; every published, accepted
     /// frame is reported with why it is not stacked; a coordinator-excluded
-    /// frame is absent altogether (R12).
+    /// frame is absent altogether (R12). A landed stamp that does not parse is
+    /// corruption, never "waiting for its new version" (review I3).
     #[test]
     fn only_stackable_frames_are_grouped_and_the_rest_are_reported() {
         let conn = test_conn();
@@ -2660,6 +2675,9 @@ mod tests {
         add_project_frame(&conn, dir.path(), "p1", &excluded);
         add_project_frame(&conn, dir.path(), "p1", &project_frame_spec("d"));
         conn.execute("UPDATE project_frames_local SET own_staged = 1 WHERE frame_uuid = 'd'", []).unwrap();
+        add_project_frame(&conn, dir.path(), "p1", &project_frame_spec("e"));
+        conn.execute("UPDATE project_frames_local SET size_mtime_seen = 'garbage' WHERE frame_uuid = 'e'", [])
+            .unwrap();
 
         let source = project_frame_source(&conn, "p1", &StackingConfig::default()).unwrap();
         let grouped: Vec<&str> =
@@ -2676,6 +2694,7 @@ mod tests {
                 ("a", None, true),
                 ("b", Some("not on this device"), false),
                 ("d", Some("being re-staged"), false),
+                ("e", Some("unreadable size:mtime stamp"), false),
             ]
         );
     }
@@ -2735,44 +2754,6 @@ mod tests {
 - In `the_catalog_arms_read_what_they_read_today`, the literal becomes `FrameOrigin::Catalog { file_id: 0, attested: false }`.
 - Add:
 ```rust
-    /// Plan 6b-2 C9: a catalog frame always passes; a project frame passes
-    /// while its landed file matches the recorded stamp, and is excluded
-    /// "changed during the run" once rewritten or removed.
-    #[test]
-    fn landed_unchanged_follows_the_recorded_stamp() {
-        let catalog = FrameOrigin::Catalog { file_id: 1, attested: false };
-        assert_eq!(landed_unchanged(&catalog), Ok(()));
-
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::db::schema::init_db(&conn).unwrap();
-        crate::db::stacking::insert_test_project(&conn, "p1");
-        let dir = tempfile::tempdir().unwrap();
-        let path = test_fixtures::add_project_frame(
-            &conn,
-            dir.path(),
-            "p1",
-            &test_fixtures::project_frame_spec("a"),
-        );
-        let source = crate::stacking::project_source::project_frame_source(
-            &conn,
-            "p1",
-            &crate::stacking::config::StackingConfig::default(),
-        )
-        .unwrap();
-        let origin = source.origins.values().next().unwrap().clone();
-        assert_eq!(landed_unchanged(&origin), Ok(()));
-        std::fs::write(&path, vec![0u8; 4321]).unwrap();
-        assert_eq!(
-            landed_unchanged(&origin),
-            Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
-        );
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(
-            landed_unchanged(&origin),
-            Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
-        );
-    }
-
     /// Plan 6b-2 C12: CFA geometry from the file's own header — never the
     /// catalog — with an odd phase preserved.
     #[test]
@@ -2806,7 +2787,7 @@ mod tests {
             "frame_source", "subject_layout", "subject_label", "stored_reference_frame",
             "hash_by_origin", "stored_solve", "cfa_geometry", "resolve_reference",
             "resolve_calibrate_job", "stored_registrations", "store_registration",
-            "stage_one_kind", "landed_unchanged",
+            "stage_one_kind",
         ];
         const ALLOWLIST: &[(&str, &str)] = &[
             ("heal_interrupted_runs", "log-only: the frame-set and project heal lines carry different fields"),
@@ -2926,225 +2907,30 @@ mod tests {
         assert!(reference.on_disk);
     }
 ```
-`run.rs` tests (helpers first, then the two tests):
+`db/stacking.rs` tests:
 ```rust
-    fn project_conn(db_path: &Path) -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
-        crate::db::schema::init_db(&conn).unwrap();
-        conn
-    }
-
-    /// A project run's context over the project's own frame source (plan
-    /// 6b-2): a real run row and group rows, so stages can persist.
-    fn project_rc(
-        ctx: &Arc<ServiceContext>,
-        conn: &rusqlite::Connection,
-        project_id: &str,
-        cfg: StackingConfig,
-        working: &Path,
-        output: &Path,
-    ) -> RunContext {
-        let source =
-            crate::stacking::project_source::project_frame_source(conn, project_id, &cfg).unwrap();
-        let subject = StackSubject::Project(project_id.to_string());
-        let run_id = insert_run(
-            conn,
-            &NewRun {
-                subject: &subject,
-                config_json: &serde_json::to_string(&cfg).unwrap(),
-                config_hash: &config_hash(&cfg),
-                reference_frame_id: None,
-                reference_mode: "auto",
-                working_dir: working.to_str().unwrap(),
-                output_dir: output.to_str().unwrap(),
-            },
-        )
-        .unwrap();
-        let mut group_ids = HashMap::new();
-        for g in &source.groups {
-            let id = insert_group(
-                conn,
-                &NewGroup {
-                    run_id,
-                    group_key: &g.key,
-                    instrume: g.instrume.as_deref(),
-                    color_mode: color_mode_wire(g.color_mode),
-                    filter: g.filter.as_deref(),
-                    binning: Some(g.binning),
-                    width: None,
-                    height: None,
-                    exposure: g.exposure_s,
-                    exposure_class: Some(&g.exposure_class),
-                    frame_count: g.frames.len() as i64,
-                    included_count: g.frames.len() as i64,
-                },
-            )
-            .unwrap();
-            group_ids.insert(g.key.clone(), id);
-        }
-        let layout = subject_layout(conn, working, &subject).unwrap();
-        project_test_context(
-            ctx.clone(),
-            Arc::new(NullEmitter),
-            run_id,
-            project_id,
-            cfg,
-            source.groups,
-            source.origins,
-            layout,
-            output.to_path_buf(),
-            group_ids,
-        )
-    }
-
-    /// `calibrated` rows pointing at each project frame's landed file — what
-    /// Prepare writes for a float replica used in place (Task 9) — so
-    /// Measure can run without Prepare.
-    fn seed_in_place_calibrated(conn: &rusqlite::Connection, rc: &mut RunContext) {
-        for g in rc.plan_groups.clone() {
-            for f in &g.frames {
-                let hash = rc.memo.calibration_hash_checked(conn, &rc.config, f).unwrap();
-                let (size, modified_at) = file_identity(Path::new(&f.path)).unwrap();
-                upsert_artifact(
-                    conn,
-                    &NewArtifact {
-                        subject: &rc.subject,
-                        frame_id: Some(f.frame_id),
-                        group_key: &g.key,
-                        kind: "calibrated",
-                        path: Some(&f.path),
-                        config_hash: &hash,
-                        size: Some(size),
-                        modified_at: Some(&modified_at),
-                        payload_json: None,
-                    },
-                )
-                .unwrap();
-            }
-        }
-    }
-
-    /// Plan 6b-2 C9 (the Measure boundary): a landed file the exchange
-    /// rewrote after the frame source read its row is excluded "changed
-    /// during the run"; its neighbours are not.
+    /// Review M2: an empty handle list mints nothing and returns at once,
+    /// without the IMMEDIATE transaction (an empty project's plan must not
+    /// make the live-exchange writer wait for the write lock).
     #[test]
-    fn measure_excludes_a_project_frame_whose_landed_file_changed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let conn = project_conn(&db_path);
-        crate::db::stacking::insert_test_project(&conn, "p1");
-        let landed = tmp.path().join("collab");
-        let paths: Vec<PathBuf> = ["a", "b", "c", "d"]
-            .iter()
-            .map(|u| {
-                test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u))
-            })
-            .collect();
-        let mut rc = project_rc(
-            &ctx,
-            &conn,
-            "p1",
-            StackingConfig::default(),
-            &tmp.path().join("work"),
-            &tmp.path().join("out"),
-        );
-        seed_in_place_calibrated(&conn, &mut rc);
-        std::fs::write(&paths[1], vec![0u8; 5000]).unwrap();
-
-        // The synthetic frames may or may not measure well enough for a
-        // viable group; the exclusion is recorded either way.
-        if let Err(e) = stage_measure(&mut rc) {
-            eprintln!("stage_measure ended with {e:?} (expected on tiny synthetic frames)");
-        }
-        let b = rc.plan_groups[0]
-            .frames
-            .iter()
-            .find(|f| f.filename == "c_b.fits")
-            .unwrap()
-            .frame_id;
-        let reasons: HashMap<i64, String> = rc.runtime_exclusions.iter().cloned().collect();
-        assert_eq!(
-            reasons.get(&b).map(String::as_str),
-            Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
-        );
-        for f in rc.plan_groups[0].frames.iter().filter(|f| f.frame_id != b) {
-            assert_ne!(
-                reasons.get(&f.frame_id).map(String::as_str),
-                Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
-            );
-        }
-    }
-
-    /// Plan 6b-2 C9 (the Register and Output boundaries): a still-included
-    /// member whose landed file changed is excluded and persisted; a changed
-    /// reference fails the run.
-    #[test]
-    fn exclude_changed_members_excludes_and_fails_on_a_changed_reference() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let conn = project_conn(&db_path);
-        crate::db::stacking::insert_test_project(&conn, "p1");
-        let landed = tmp.path().join("collab");
-        for u in ["a", "b", "c"] {
-            test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u));
-        }
-        let mut rc = project_rc(
-            &ctx,
-            &conn,
-            "p1",
-            StackingConfig::default(),
-            &tmp.path().join("work"),
-            &tmp.path().join("out"),
-        );
-        let group = rc.plan_groups[0].clone();
-        let entries: Vec<MeasuredFrame> = group
-            .frames
-            .iter()
-            .map(|f| MeasuredFrame {
-                frame: f.clone(),
-                calibrated: Some(PathBuf::from(&f.path)),
-                planes: 1,
-                measurement: None,
-                weight: None,
-                included: true,
-                reason: None,
-                registration: None,
-                cached_calibrated: true,
-                cached_metrics: false,
-                ln_scale: None,
-                cached_ln: false,
-            })
-            .collect();
-        rc.measured.insert(group.key.clone(), entries);
-
-        std::fs::write(&group.frames[1].path, vec![0u8; 5000]).unwrap();
-        assert_eq!(exclude_changed_members(&mut rc, &group).unwrap(), 1);
-        let entry = &rc.measured[&group.key][1];
-        assert!(!entry.included);
-        assert_eq!(entry.reason.as_deref(), Some(crate::stacking::origin::CHANGED_DURING_THE_RUN));
-        assert_eq!(exclude_changed_members(&mut rc, &group).unwrap(), 0, "an excluded frame is not checked again");
-
-        rc.reference_frame_id = Some(group.frames[0].frame_id);
-        std::fs::write(&group.frames[0].path, vec![0u8; 6000]).unwrap();
-        let err = exclude_changed_members(&mut rc, &group).unwrap_err();
-        assert!(
-            matches!(err, RunError::Other(ref m) if m.contains("reference frame changed during the run")),
-            "{err:?}"
-        );
+    fn an_empty_handle_list_writes_nothing() {
+        let c = conn();
+        insert_test_project(&c, "p1");
+        assert!(project_frame_handles(&c, "p1", &[]).unwrap().is_empty());
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM stack_project_frames", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
     }
 ```
-In the `solve_of` test at `~20082`, the literal becomes `FrameOrigin::Catalog { file_id: 0, attested: false }`.
+This test is green before the change too: it pins the result, and the change removes the write lock.
+`run.rs`: in the `solve_of` test at `~20082`, the literal becomes `FrameOrigin::Catalog { file_id: 0, attested: false }`.
 
 - [ ] **Step 3: Run the tests and watch them fail.**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 project_source landed_unchanged cfa_geometry_comes subject_and_origin_variants the_prepare_subtree a_projects_manual_reference measure_excludes exclude_changed_members frame_source_returns`
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 project_source cfa_geometry_comes subject_and_origin_variants the_prepare_subtree a_projects_manual_reference frame_source_returns an_empty_handle_list`
 
 Expected: the build fails, because none of the new items exist.
 
-- [ ] **Step 4: Implement `origin.rs`.** Replace the enum and add the items below. Keep the module doc, and update its "6b-1 has one variant" sentences to describe the two variants. Add one line to its last paragraph: "`db::collab_frames::FrameOrigin` (`Own | Replica`) is the other `FrameOrigin`; never import both unqualified in one file."
+- [ ] **Step 4: Implement `origin.rs`.** Replace the enum and add `cfa_geometry_of_file` below it. Keep the module doc, and update its "6b-1 has one variant" sentences to describe the two variants. Add one line to its last paragraph: "`db::collab_frames::FrameOrigin` (`Own | Replica`) is the other `FrameOrigin`; never import both unqualified in one file."
 ```rust
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrameOrigin {
@@ -3169,43 +2955,6 @@ pub enum FrameOrigin {
         size_mtime: String,
         meta: ProjectFrameMeta,
     },
-}
-
-/// Why a frame leaves a stacking run — stored verbatim as its
-/// `stacking_run_frames.exclusion_reason`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExclusionReason(pub(crate) String);
-
-/// Spec §5.1: the live exchange landed a new version (or removed the file)
-/// while the run was reading it.
-pub(crate) const CHANGED_DURING_THE_RUN: &str = "changed during the run";
-
-/// The landed-file identity check (plan 6b-2 C9): a project frame's landed
-/// file must still match the `size:mtime` its row recorded (2 s mtime
-/// tolerance, `collab::storage::sweep`). Called at every stage boundary
-/// that reads it; reads never hold a file open across stages.
-pub(crate) fn landed_unchanged(origin: &FrameOrigin) -> Result<(), ExclusionReason> {
-    use crate::collab::storage::sweep::{stat_verdict, Stamp, StatVerdict};
-    match origin {
-        FrameOrigin::Catalog { .. } => Ok(()),
-        FrameOrigin::Project {
-            project_id,
-            frame_uuid,
-            landed_path,
-            size_mtime,
-            ..
-        } => match stat_verdict(Path::new(landed_path), Stamp::parse(size_mtime)) {
-            StatVerdict::Same => Ok(()),
-            StatVerdict::Unreadable(e) => {
-                tracing::warn!(project_id = %project_id, frame_uuid = %frame_uuid, path = %landed_path, error = %e, "landed project frame unreadable");
-                Err(ExclusionReason(format!("landed file unreadable: {e}")))
-            }
-            verdict => {
-                tracing::warn!(project_id = %project_id, frame_uuid = %frame_uuid, path = %landed_path, outcome = ?verdict, "landed project frame changed during the run");
-                Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
-            }
-        },
-    }
 }
 
 /// The CFA mosaic geometry a FILE's own header declares (plan 6b-2 C12):
@@ -3247,7 +2996,7 @@ pub(crate) fn cfa_geometry_of_file(path: &Path) -> anyhow::Result<Option<CfaGeom
 ```
 The new arms in `stored_solve` and `cfa_geometry`:
 ```rust
-        // The manifest WCS (spec §5.2); Task 10 adds the run's local solve.
+        // The manifest WCS (spec §5.2); Task 10b adds the run's local solve.
         FrameOrigin::Project { meta, .. } => Ok(meta
             .wcs
             .as_ref()
@@ -3300,7 +3049,7 @@ pub(crate) fn prepare_hash_for_project(cfg: &StackingConfig, blake3: &str, byte_
 ```rust
         match origin_of(&self.origins, frame.frame_id)? {
             // An attested set keeps today's generation hash until the Prepare
-            // stage lands (Task 9 splits this arm).
+            // stage lands (Task 9a splits this arm).
             FrameOrigin::Catalog { .. } => {
                 calibration_hash_for(conn, cfg, frame, &mut self.divisors)
             }
@@ -3364,7 +3113,7 @@ pub(crate) fn frame_source(
 `project_source.rs`. Write the module doc, then:
 ```rust
 //! A collaboration project as a stacking subject's frame source (spec
-//! 2026-10-02 §4.3, §7, §8; plan 6b-2 Task 6): the project's stackable
+//! 2026-10-02 §4.3, §7, §8; plan 6b-2 Task 6a): the project's stackable
 //! landed frames grouped by colour × canonical filter × exposure class
 //! (W7: camera and binning are not keys, W9: colour modes and filters never
 //! mix), each a `stack_project_frames` handle with a `FrameOrigin::Project`
@@ -3511,8 +3260,12 @@ pub fn project_frame_source(
         let verdict: Result<Stamp, String> = match (&meta, collab_frames::stackable(&row), stamp) {
             (None, _, _) => Err("unreadable frame metadata".to_string()),
             (Some(_), Err(reason), _) => Err(reason.reason().to_string()),
+            // `stackable` already refused a NULL stamp ("waiting for its new
+            // version"). A non-NULL one that does not parse is corruption,
+            // which no later sync repairs (review I3).
             (Some(_), Ok(()), None) => {
-                Err(collab_frames::NotStackable::WaitingForNewVersion.reason().to_string())
+                tracing::warn!(project_id, frame_uuid = %row.frame_uuid, stamp = ?row.size_mtime_seen, "landed stamp unreadable; frame left out");
+                Err("unreadable size:mtime stamp".to_string())
             }
             (Some(_), Ok(()), Some(stamp)) => Ok(stamp),
         };
@@ -3681,6 +3434,14 @@ pub fn project_frame_source(
     })
 }
 ```
+In `db/stacking.rs`, `project_frame_handles` starts with (review M2):
+```rust
+    // No frame, no write lock: an empty project, or one with nothing
+    // stackable on this device, must not make the live-exchange writer wait.
+    if frame_uuids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+```
 In `fits_parser/mod.rs`, make `read_xisf_header` `pub(crate)`. If `median_f64` or `GroupFrame`'s fields are not reachable from a sibling module, make them `pub(crate)`; this is a visibility change only.
 
 - [ ] **Step 7: Implement `run.rs`**
@@ -3702,7 +3463,345 @@ In `fits_parser/mod.rs`, make `read_xisf_header` `pub(crate)`. If `median_f64` o
             Err(e) => Err(e.to_string()),
         }
 ```
-  2. Next to `exclude_frame_and_persist`:
+  2. `test_context`: the origin literal becomes `FrameOrigin::Catalog { file_id: f.file_id, attested: false }`.
+
+- [ ] **Step 8: Run the tests and watch them pass.** Run the Step 3 command. Then `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 stacking:: db::stacking`: every existing stacking test passes. A frame set's frame source, hashes and Calibrate are unchanged: `Catalog { attested: false }` takes today's arms.
+
+- [ ] **Step 9: Run the gate.** TS must not move: `GroupFrame` and `FrameOrigin` are not exported.
+
+- [ ] **Step 10: Commit** with the message `feat(stacking): FrameOrigin::Project and the project frame source`, plus the trailers.
+
+---
+
+### Task 6b: The landed-file identity check at Measure, Register and Output; the project test context (C9; spec §5.1)
+
+**Files:**
+- Modify `crates/athenaeum-core/src/stacking/origin.rs`:
+  - add `ExclusionReason`, `CHANGED_DURING_THE_RUN` and `landed_unchanged`;
+  - the funnel test's `FUNNELS` gains `"landed_unchanged"`;
+  - a test.
+- Modify `crates/athenaeum-core/src/stacking/run.rs`:
+  - add `changed_during_run` and `exclude_changed_members`, next to `exclude_frame_and_persist`;
+  - the Measure (`~2983`), Register (`register_group_pass`, `~4304`) and Output (`process_group_output`, `~6804`) boundaries;
+  - add `project_test_context`, after `test_context`;
+  - tests: the helpers `project_conn`, `project_rc` and `seed_in_place_calibrated`, then two tests.
+
+**Interfaces:**
+```rust
+// stacking/origin.rs
+#[derive(Debug, Clone, PartialEq, Eq)] pub(crate) struct ExclusionReason(pub(crate) String);
+pub(crate) const CHANGED_DURING_THE_RUN: &str = "changed during the run";
+pub(crate) fn landed_unchanged(origin: &FrameOrigin) -> Result<(), ExclusionReason>;
+// stacking/run.rs
+fn changed_during_run(rc: &RunContext, frame_id: i64) -> Result<Option<String>, RunError>;
+fn exclude_changed_members(rc: &mut RunContext, group: &IntegrationGroup) -> Result<usize, RunError>;
+#[cfg(test)] pub(crate) fn project_test_context(ctx: Arc<ServiceContext>, emitter: Arc<dyn ProgressEmitter>, run_id: i64, project_id: &str,
+    config: StackingConfig, plan_groups: Vec<IntegrationGroup>, origins: FrameOrigins, layout: WorkingLayout, output_dir: PathBuf, group_ids: HashMap<String, i64>) -> RunContext;
+```
+Consumed by: Task 9b (the Prepare boundary; `project_test_context`, `project_rc`, `seed_in_place_calibrated`), Task 10b (the Solve boundary and the same helpers).
+
+- [ ] **Step 1: Write the failing tests**
+
+`origin.rs` `mod tests`: in `subject_and_origin_variants_stay_in_their_funnels`, `FUNNELS`' last line becomes `"stage_one_kind", "landed_unchanged",`. Add:
+```rust
+    /// Plan 6b-2 C9: a catalog frame always passes; a project frame passes
+    /// while its landed file matches the recorded stamp, and is excluded
+    /// "changed during the run" once rewritten or removed.
+    #[test]
+    fn landed_unchanged_follows_the_recorded_stamp() {
+        let catalog = FrameOrigin::Catalog { file_id: 1, attested: false };
+        assert_eq!(landed_unchanged(&catalog), Ok(()));
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = test_fixtures::add_project_frame(
+            &conn,
+            dir.path(),
+            "p1",
+            &test_fixtures::project_frame_spec("a"),
+        );
+        let source = crate::stacking::project_source::project_frame_source(
+            &conn,
+            "p1",
+            &crate::stacking::config::StackingConfig::default(),
+        )
+        .unwrap();
+        let origin = source.origins.values().next().unwrap().clone();
+        assert_eq!(landed_unchanged(&origin), Ok(()));
+        std::fs::write(&path, vec![0u8; 4321]).unwrap();
+        assert_eq!(
+            landed_unchanged(&origin),
+            Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            landed_unchanged(&origin),
+            Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
+        );
+    }
+
+```
+`run.rs` tests (helpers first, then the two tests):
+```rust
+    fn project_conn(db_path: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn
+    }
+
+    /// A project run's context over the project's own frame source (plan
+    /// 6b-2): a real run row and group rows, so stages can persist.
+    fn project_rc(
+        ctx: &Arc<ServiceContext>,
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        cfg: StackingConfig,
+        working: &Path,
+        output: &Path,
+    ) -> RunContext {
+        let source =
+            crate::stacking::project_source::project_frame_source(conn, project_id, &cfg).unwrap();
+        let subject = StackSubject::Project(project_id.to_string());
+        let run_id = insert_run(
+            conn,
+            &NewRun {
+                subject: &subject,
+                config_json: &serde_json::to_string(&cfg).unwrap(),
+                config_hash: &config_hash(&cfg),
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: working.to_str().unwrap(),
+                output_dir: output.to_str().unwrap(),
+            },
+        )
+        .unwrap();
+        let mut group_ids = HashMap::new();
+        for g in &source.groups {
+            let id = insert_group(
+                conn,
+                &NewGroup {
+                    run_id,
+                    group_key: &g.key,
+                    instrume: g.instrume.as_deref(),
+                    color_mode: color_mode_wire(g.color_mode),
+                    filter: g.filter.as_deref(),
+                    binning: Some(g.binning),
+                    width: None,
+                    height: None,
+                    exposure: g.exposure_s,
+                    exposure_class: Some(&g.exposure_class),
+                    frame_count: g.frames.len() as i64,
+                    included_count: g.frames.len() as i64,
+                },
+            )
+            .unwrap();
+            group_ids.insert(g.key.clone(), id);
+        }
+        let layout = subject_layout(conn, working, &subject).unwrap();
+        project_test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            run_id,
+            project_id,
+            cfg,
+            source.groups,
+            source.origins,
+            layout,
+            output.to_path_buf(),
+            group_ids,
+        )
+    }
+
+    /// `calibrated` rows pointing at each project frame's landed file — what
+    /// Prepare writes for a float replica used in place (Task 9b) — so
+    /// Measure can run without Prepare.
+    fn seed_in_place_calibrated(conn: &rusqlite::Connection, rc: &mut RunContext) {
+        for g in rc.plan_groups.clone() {
+            for f in &g.frames {
+                let hash = rc.memo.calibration_hash_checked(conn, &rc.config, f).unwrap();
+                let (size, modified_at) = file_identity(Path::new(&f.path)).unwrap();
+                upsert_artifact(
+                    conn,
+                    &NewArtifact {
+                        subject: &rc.subject,
+                        frame_id: Some(f.frame_id),
+                        group_key: &g.key,
+                        kind: "calibrated",
+                        path: Some(&f.path),
+                        config_hash: &hash,
+                        size: Some(size),
+                        modified_at: Some(&modified_at),
+                        payload_json: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Plan 6b-2 C9 (the Measure boundary): a landed file the exchange
+    /// rewrote after the frame source read its row is excluded "changed
+    /// during the run"; its neighbours are not.
+    #[test]
+    fn measure_excludes_a_project_frame_whose_landed_file_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        let paths: Vec<PathBuf> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|u| {
+                test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u))
+            })
+            .collect();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        seed_in_place_calibrated(&conn, &mut rc);
+        std::fs::write(&paths[1], vec![0u8; 5000]).unwrap();
+
+        // The synthetic frames may or may not measure well enough for a
+        // viable group; the exclusion is recorded either way.
+        if let Err(e) = stage_measure(&mut rc) {
+            eprintln!("stage_measure ended with {e:?} (expected on tiny synthetic frames)");
+        }
+        let b = rc.plan_groups[0]
+            .frames
+            .iter()
+            .find(|f| f.filename == "c_b.fits")
+            .unwrap()
+            .frame_id;
+        let reasons: HashMap<i64, String> = rc.runtime_exclusions.iter().cloned().collect();
+        assert_eq!(
+            reasons.get(&b).map(String::as_str),
+            Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
+        );
+        for f in rc.plan_groups[0].frames.iter().filter(|f| f.frame_id != b) {
+            assert_ne!(
+                reasons.get(&f.frame_id).map(String::as_str),
+                Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
+            );
+        }
+    }
+
+    /// Plan 6b-2 C9 (the Register and Output boundaries): a still-included
+    /// member whose landed file changed is excluded and persisted; a changed
+    /// reference fails the run.
+    #[test]
+    fn exclude_changed_members_excludes_and_fails_on_a_changed_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for u in ["a", "b", "c"] {
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u));
+        }
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let group = rc.plan_groups[0].clone();
+        let entries: Vec<MeasuredFrame> = group
+            .frames
+            .iter()
+            .map(|f| MeasuredFrame {
+                frame: f.clone(),
+                calibrated: Some(PathBuf::from(&f.path)),
+                planes: 1,
+                measurement: None,
+                weight: None,
+                included: true,
+                reason: None,
+                registration: None,
+                cached_calibrated: true,
+                cached_metrics: false,
+                ln_scale: None,
+                cached_ln: false,
+            })
+            .collect();
+        rc.measured.insert(group.key.clone(), entries);
+
+        std::fs::write(&group.frames[1].path, vec![0u8; 5000]).unwrap();
+        assert_eq!(exclude_changed_members(&mut rc, &group).unwrap(), 1);
+        let entry = &rc.measured[&group.key][1];
+        assert!(!entry.included);
+        assert_eq!(entry.reason.as_deref(), Some(crate::stacking::origin::CHANGED_DURING_THE_RUN));
+        assert_eq!(exclude_changed_members(&mut rc, &group).unwrap(), 0, "an excluded frame is not checked again");
+
+        rc.reference_frame_id = Some(group.frames[0].frame_id);
+        std::fs::write(&group.frames[0].path, vec![0u8; 6000]).unwrap();
+        let err = exclude_changed_members(&mut rc, &group).unwrap_err();
+        assert!(
+            matches!(err, RunError::Other(ref m) if m.contains("reference frame changed during the run")),
+            "{err:?}"
+        );
+    }
+```
+
+- [ ] **Step 2: Run the tests and watch them fail.**
+
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 landed_unchanged measure_excludes exclude_changed_members subject_and_origin_variants`
+
+Expected: the build fails, because the identity check, `project_test_context` and the helpers' callees do not exist.
+
+- [ ] **Step 3: Implement `origin.rs`.** Add, after the enum:
+```rust
+/// Why a frame leaves a stacking run — stored verbatim as its
+/// `stacking_run_frames.exclusion_reason`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExclusionReason(pub(crate) String);
+
+/// Spec §5.1: the live exchange landed a new version (or removed the file)
+/// while the run was reading it.
+pub(crate) const CHANGED_DURING_THE_RUN: &str = "changed during the run";
+
+/// The landed-file identity check (plan 6b-2 C9): a project frame's landed
+/// file must still match the `size:mtime` its row recorded (2 s mtime
+/// tolerance, `collab::storage::sweep`). Called at every stage boundary
+/// that reads it; reads never hold a file open across stages.
+pub(crate) fn landed_unchanged(origin: &FrameOrigin) -> Result<(), ExclusionReason> {
+    use crate::collab::storage::sweep::{stat_verdict, Stamp, StatVerdict};
+    match origin {
+        FrameOrigin::Catalog { .. } => Ok(()),
+        FrameOrigin::Project {
+            project_id,
+            frame_uuid,
+            landed_path,
+            size_mtime,
+            ..
+        } => match stat_verdict(Path::new(landed_path), Stamp::parse(size_mtime)) {
+            StatVerdict::Same => Ok(()),
+            StatVerdict::Unreadable(e) => {
+                tracing::warn!(project_id = %project_id, frame_uuid = %frame_uuid, path = %landed_path, error = %e, "landed project frame unreadable");
+                Err(ExclusionReason(format!("landed file unreadable: {e}")))
+            }
+            verdict => {
+                tracing::warn!(project_id = %project_id, frame_uuid = %frame_uuid, path = %landed_path, outcome = ?verdict, "landed project frame changed during the run");
+                Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
+            }
+        },
+    }
+}
+```
+
+- [ ] **Step 4: Implement `run.rs`**
+  1. Next to `exclude_frame_and_persist`:
 ```rust
 /// The run-thread side of the landed-file identity check (plan 6b-2 C9):
 /// the exclusion reason when this frame's landed file changed since the
@@ -3750,7 +3849,7 @@ fn exclude_changed_members(rc: &mut RunContext, group: &IntegrationGroup) -> Res
     Ok(excluded)
 }
 ```
-  3. **Measure** (`stage_measure`, right before `let planes = match PlaneReader::open(&calibrated_path) {`):
+  2. **Measure** (`stage_measure`, right before `let planes = match PlaneReader::open(&calibrated_path) {`):
 ```rust
             // Plan 6b-2 C9: a project frame whose landed file changed since
             // the frame source read it leaves the run here.
@@ -3775,21 +3874,20 @@ fn exclude_changed_members(rc: &mut RunContext, group: &IntegrationGroup) -> Res
             }
 ```
      This mirrors the `no calibrated artifact on record` branch just above it: the same `entries.push` shape and no progress tick.
-  4. **Register** (`register_group_pass`, right after its `included_count_of(...) < 3` early return):
+  3. **Register** (`register_group_pass`, right after its `included_count_of(...) < 3` early return):
 ```rust
     // Plan 6b-2 C9: the Register boundary of the landed-file identity check.
     if exclude_changed_members(rc, group)? > 0 && included_count_of(rc, &group.key) < 3 {
         return Ok(pass);
     }
 ```
-  5. **Output** (`process_group_output`, first statement after the `zero` closure):
+  4. **Output** (`process_group_output`, first statement after the `zero` closure):
 ```rust
     // Plan 6b-2 C9: the Output boundary — the member snapshot below reads
     // the files Normalize, Integrate and Drizzle work from.
     exclude_changed_members(rc, group)?;
 ```
-  6. `test_context`: the origin literal becomes `FrameOrigin::Catalog { file_id: f.file_id, attested: false }`.
-  7. After `test_context`:
+  5. After `test_context`:
 ```rust
 /// [`test_context`] for a project subject (plan 6b-2): the project frame
 /// source's own groups and origins, the project's handle namespace, a
@@ -3821,50 +3919,25 @@ pub(crate) fn project_test_context(
 }
 ```
 
-- [ ] **Step 8: Run the tests and watch them pass.** Run the Step 3 command. Then `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 stacking::`: every existing stacking test passes. The frame-set Measure, Register and Output paths are unchanged, because `landed_unchanged(Catalog)` is `Ok`.
+- [ ] **Step 5: Run the tests and watch them pass.** Run the Step 2 command. Then `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 stacking::`: every existing stacking test passes. The frame-set Measure, Register and Output paths are unchanged, because `landed_unchanged(Catalog)` is `Ok`.
 
-- [ ] **Step 9: Run the gate.** TS must not move: `GroupFrame` and `FrameOrigin` are not exported.
+- [ ] **Step 6: Run the gate.** TS must not move.
 
-- [ ] **Step 10: Commit** with the message `feat(stacking): FrameOrigin::Project, the project frame source, the landed-file identity check`, plus the trailers.
+- [ ] **Step 7: Commit** with the message `feat(stacking): the landed-file identity check at Measure, Register and Output`, plus the trailers.
 
 ---
 
-### Task 8: The canonical grid — type, hash, hub client, cache, feed, fake hub, proposal, two commands (C16, C17; spec §6, §9.1, §9.2)
+### Task 8a: The canonical grid's type, hash and proposal geometry; its cache columns (C16; spec §6.1, §6.2)
 
-*Executed before Task 7, which reads the grid state.*
+*Executed after Task 6b; Task 8b and then Task 7 follow.*
 
 **Files:**
 - Create `crates/athenaeum-core/src/collab/grid.rs`, ungated. Declare it as `pub mod grid;` in `collab/mod.rs`.
 - Create `crates/athenaeum-core/src/collab/grid_geometry.rs`, gated. Declare it as `#[cfg(all(feature = "render", feature = "solver"))] pub mod grid_geometry;` in `collab/mod.rs`.
-- Modify `crates/athenaeum-core/src/collab/hub_client.rs`: `ProjectWire` (`~78-97`) and `put_grid`.
 - Modify `crates/athenaeum-core/src/db/collab.rs`:
   - add `set_canonical_grid` and `canonical_grid`;
   - update `upsert_project`'s doc;
-  - extend `upsert_project_preserves_local_columns` (`~1012`).
-- Modify `crates/athenaeum-core/src/api/collab.rs`:
-  - `client_err` becomes `pub(crate)`;
-  - add `GridEcho` and `grid_echo_of`;
-  - `FetchedProject`, `fetch_one_project`, `RefreshReport` and the success arm (`~2328-2700`);
-  - `ProjectCard` (`~139`) and `card_from_row` (`~2148`).
-- Create `crates/athenaeum-core/src/api/collab_grid.rs`, gated `render+solver`. Declare it in `api/mod.rs` beside `collab_remap`.
-- Modify `crates/athenaeum-core/src/api/collab_live/feed.rs`:
-  - `ALL_KINDS` (`~31`);
-  - `note_card` (`~253`);
-  - `apply_contiguous` (`~733-756`) and `catch_up_project` (`~922`);
-  - the six refresh sites (`~553`, `~745`, `~959`, `~1164`, `~1177`, `~1401`);
-  - add `emit_grid_moves`;
-  - tests.
-- Modify `crates/athenaeum-core/src/collab/fake_hub.rs`:
-  - `FakeProject` (`~191`) and `add_project`'s literal (`~958`);
-  - add `set_target`, `set_grid` and `project_grid`;
-  - `project_page` (`~2130`);
-  - `route` (`~2104`);
-  - add `put_grid`.
-- Modify `crates/athenaeum-core/src/ts_export.rs` (`models.ts`).
-- Modify `crates/athenaeum-tauri/src/commands/collab.rs` and `crates/athenaeum-tauri/src/lib.rs` (`invoke_handler!`, after `commands::cancel_collab_remap,`).
-- Modify `crates/athenaeum-web/src/routes/collab.rs` and `crates/athenaeum-web/src/routes/mod.rs` (after `/api/cancel_collab_remap`).
-- Modify `src/components/collab/project/testFixtures.ts` and `src/hooks/useCollabNotifications.test.tsx`: add `canonicalGrid: null,`.
-- Regenerate `src/types/models.ts`.
+  - extend `upsert_project_preserves_local_columns` (`~1012`), and add a test.
 
 **Interfaces:**
 ```rust
@@ -3888,35 +3961,13 @@ pub fn grid_wcs(grid: &CanonicalGrid) -> solvemyastro::wcs::WcsSolution;
 pub fn propose_grid(inputs: &[GridInput], target: &GridTarget) -> Option<CanonicalGrid>;
 pub fn fraction_inside(footprint: &FrameFootprint, grid: &CanonicalGrid) -> f64;
 pub fn count_inside(inputs: &[GridInput], grid: &CanonicalGrid) -> usize;
-// collab/hub_client.rs
-pub struct ProjectWire { /* … */ #[serde(default)] pub canonical_grid: Option<serde_json::Value> }
-impl CollabClient { pub async fn put_grid(&self, token: &str, project_id: &str, grid: &CanonicalGrid) -> Result<(), AccountClientError>; }
 // db/collab.rs (ungated)
 pub fn set_canonical_grid(conn: &Connection, project_id: &str, grid_json: Option<&str>) -> Result<bool>;
 pub fn canonical_grid(conn: &Connection, project_id: &str) -> Result<Option<String>>;
-// api/collab.rs
-pub(crate) enum GridEcho { Absent, Grid(String), Malformed }
-pub(crate) fn grid_echo_of(page: &ProjectPageWire) -> GridEcho;
-pub(crate) struct RefreshReport { /* … */ pub grid_moved: Vec<String> }
-pub struct ProjectCard { /* … */ pub canonical_grid: Option<CanonicalGrid> }
-// api/collab_grid.rs (gated)
-pub const COLLAB_GRID_CHANGED_EVENT: &str = "collab-grid-changed";
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)] #[serde(rename_all = "camelCase")] pub struct CollabGridChanged { pub project_id: String }
-#[derive(Debug, Clone, Serialize, ts_rs::TS)] #[serde(rename_all = "camelCase")]
-pub struct GridProposal { pub current: Option<CanonicalGrid>, pub proposal: Option<CanonicalGrid>, pub frames_inside: usize, pub can_edit: bool }
-pub const NO_GRID_CAP_MSG: &str;
-pub fn stored_grid(conn: &Connection, project_id: &str) -> Result<Option<CanonicalGrid>, ApiError>;
-pub fn grid_inputs_of_project(conn: &Connection, project_id: &str) -> Result<Vec<GridInput>, ApiError>;
-pub fn get_collab_grid_proposal(ctx: &ServiceContext, project_id: &str) -> Result<GridProposal, ApiError>;
-pub async fn set_collab_project_grid(ctx: &ServiceContext, project_id: &str, grid: CanonicalGrid) -> Result<CanonicalGrid, ApiError>;
-// fake hub (cfg(test))
-impl FakeHub { pub fn set_target(&self, pid: &str, name: &str, ra: f64, dec: f64, radius: f64); pub fn set_grid(&self, pid: &str, grid: &CanonicalGrid); pub fn project_grid(&self, pid: &str) -> Option<Value>; }
 ```
-TS (`models.ts`), the only moves:
-- new `CanonicalGrid`, `GridProposal` and `CollabGridChanged`;
-- `ProjectCard` gains `canonicalGrid: CanonicalGrid | null`.
+TS: nothing moves. `CanonicalGrid` derives `ts_rs::TS` here, but Task 8b registers it.
 
-Commands: `get_collab_grid_proposal { projectId } -> GridProposal` and `set_collab_project_grid { projectId, grid } -> CanonicalGrid`, on both hosts. The strict count goes 297 → 299.
+Consumed by: Task 8b (everything here), Task 7 (`grid_input_of`, `count_inside`, `fraction_inside`, `GridTarget`, `canonical_json`, `set_canonical_grid`).
 
 - [ ] **Step 1: Write the failing pure tests**
 
@@ -4130,7 +4181,7 @@ Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 
 
 Expected: the build fails, because the modules and functions do not exist.
 
-- [ ] **Step 3: Implement the type and the geometry**
+- [ ] **Step 3: Implement the type, the geometry and the cache columns**
 
 `collab/grid.rs`:
 ```rust
@@ -4417,8 +4468,106 @@ pub fn count_inside(inputs: &[GridInput], grid: &CanonicalGrid) -> usize {
         .count()
 }
 ```
+`db/collab.rs`, beside `set_page_extras`. In the `upsert_project` doc, change "Eleven columns" to "Twelve columns", and add "`canonical_grid_json` ([`set_canonical_grid`])" to the list.
+```rust
+/// The hub's canonical grid as last cached (spec §6.1, plan 6b-2 C16): the
+/// canonical JSON of the normalized typed grid, never the hub's own text.
+/// Written only here (`upsert_project` leaves the column alone). Returns
+/// whether the stored value changed — what the refresh reports as a grid
+/// move.
+pub fn set_canonical_grid(conn: &Connection, project_id: &str, grid_json: Option<&str>) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE collab_projects SET canonical_grid_json = ?2
+         WHERE project_id = ?1 AND canonical_grid_json IS NOT ?2",
+        params![project_id, grid_json],
+    )?;
+    Ok(n > 0)
+}
 
-- [ ] **Step 4: The hub client, the cache and the refresh**
+/// The cached canonical grid JSON (`None` when the hub has none).
+pub fn canonical_grid(conn: &Connection, project_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT canonical_grid_json FROM collab_projects WHERE project_id = ?1",
+            params![project_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+```
+
+- [ ] **Step 4: Run the tests and watch them pass.** Run the Step 2 command, then `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 collab:: db::collab` (every existing collab test passes; nothing reads the new column yet).
+
+- [ ] **Step 5: Run the gate.** TS must not move (`git diff --exit-code src/types`). The headless check compiles `collab::grid` and the two `db::collab` functions, which are ungated.
+
+- [ ] **Step 6: Commit** with the message `feat(collab): CanonicalGrid type, hash, normalization and the proposal geometry`, plus the trailers.
+
+---
+
+### Task 8b: The canonical grid end to end — hub client, cache, feed, fake hub, two commands (C16, C17; spec §6, §9.1, §9.2)
+
+*Executed after Task 8a and before Task 7, which reads the grid state.*
+
+**Files:**
+- Modify `crates/athenaeum-core/src/collab/hub_client.rs`: `ProjectWire` (`~78-97`) and `put_grid`.
+- Modify `crates/athenaeum-core/src/api/collab.rs`:
+  - `client_err` becomes `pub(crate)`;
+  - add `GridEcho` and `grid_echo_of`;
+  - `FetchedProject`, `fetch_one_project`, `RefreshReport` and the success arm (`~2328-2700`);
+  - `ProjectCard` (`~139`) and `card_from_row` (`~2148`), which degrades an unreadable cached grid to none (review I4).
+- Create `crates/athenaeum-core/src/api/collab_grid.rs`, gated `render+solver`. Declare it in `api/mod.rs` beside `collab_remap`.
+- Modify `crates/athenaeum-core/src/api/collab_live/feed.rs`:
+  - `ALL_KINDS` (`~31`);
+  - `note_card` (`~253`);
+  - `apply_contiguous` (`~733-756`) and `catch_up_project` (`~922`);
+  - the six refresh sites (`~553`, `~745`, `~959`, `~1164`, `~1177`, `~1401`);
+  - add `emit_grid_moves`;
+  - tests.
+- Modify `crates/athenaeum-core/src/collab/fake_hub.rs`:
+  - `FakeProject` (`~191`) and `add_project`'s literal (`~958`);
+  - add `set_target`, `set_grid` and `project_grid`;
+  - `project_page` (`~2130`);
+  - `route` (`~2104`);
+  - add `put_grid`.
+- Modify `crates/athenaeum-core/src/ts_export.rs` (`models.ts`).
+- Modify `crates/athenaeum-tauri/src/commands/collab.rs` and `crates/athenaeum-tauri/src/lib.rs` (`invoke_handler!`, after `commands::cancel_collab_remap,`).
+- Modify `crates/athenaeum-web/src/routes/collab.rs` and `crates/athenaeum-web/src/routes/mod.rs` (after `/api/cancel_collab_remap`).
+- Modify `src/components/collab/project/testFixtures.ts` and `src/hooks/useCollabNotifications.test.tsx`: add `canonicalGrid: null,`.
+- Regenerate `src/types/models.ts`.
+
+**Interfaces:**
+```rust
+// collab/hub_client.rs
+pub struct ProjectWire { /* … */ #[serde(default)] pub canonical_grid: Option<serde_json::Value> }
+impl CollabClient { pub async fn put_grid(&self, token: &str, project_id: &str, grid: &CanonicalGrid) -> Result<(), AccountClientError>; }
+// api/collab.rs
+pub(crate) enum GridEcho { Absent, Grid(String), Malformed }
+pub(crate) fn grid_echo_of(page: &ProjectPageWire) -> GridEcho;
+pub(crate) struct RefreshReport { /* … */ pub grid_moved: Vec<String> }
+pub struct ProjectCard { /* … */ pub canonical_grid: Option<CanonicalGrid> }
+// api/collab_grid.rs (gated)
+pub const COLLAB_GRID_CHANGED_EVENT: &str = "collab-grid-changed";
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)] #[serde(rename_all = "camelCase")] pub struct CollabGridChanged { pub project_id: String }
+#[derive(Debug, Clone, Serialize, ts_rs::TS)] #[serde(rename_all = "camelCase")]
+pub struct GridProposal { pub current: Option<CanonicalGrid>, pub proposal: Option<CanonicalGrid>, pub frames_inside: usize, pub can_edit: bool }
+pub const NO_GRID_CAP_MSG: &str;
+pub fn stored_grid(conn: &Connection, project_id: &str) -> Result<Option<CanonicalGrid>, ApiError>;
+pub fn grid_inputs_of_project(conn: &Connection, project_id: &str) -> Result<Vec<GridInput>, ApiError>;
+pub fn get_collab_grid_proposal(ctx: &ServiceContext, project_id: &str) -> Result<GridProposal, ApiError>;
+pub async fn set_collab_project_grid(ctx: &ServiceContext, project_id: &str, grid: CanonicalGrid, emitter: Option<&dyn ProgressEmitter>) -> Result<CanonicalGrid, ApiError>;
+// fake hub (cfg(test))
+impl FakeHub { pub fn set_target(&self, pid: &str, name: &str, ra: f64, dec: f64, radius: f64); pub fn set_grid(&self, pid: &str, grid: &CanonicalGrid); pub fn project_grid(&self, pid: &str) -> Option<Value>; }
+```
+TS (`models.ts`), the only moves:
+- new `CanonicalGrid`, `GridProposal` and `CollabGridChanged`;
+- `ProjectCard` gains `canonicalGrid: CanonicalGrid | null`.
+
+Commands: `get_collab_grid_proposal { projectId } -> GridProposal` and `set_collab_project_grid { projectId, grid } -> CanonicalGrid`, on both hosts. The strict count goes 297 → 299. `set_collab_project_grid` emits `collab-grid-changed { projectId }` itself after a successful save (review I5): this device's own cache write makes its feed refresh a no-op, so the saving device gets the event from the command and every other device gets it from the feed.
+
+Consumed by: Task 7 (`stored_grid`, `PlanGrid`'s inputs).
+
+- [ ] **Step 1: The hub client, the cache read and the refresh**
 
 `hub_client.rs` `ProjectWire`, after `goals`:
 ```rust
@@ -4455,41 +4604,17 @@ pub fn count_inside(inputs: &[GridInput], grid: &CanonicalGrid) -> usize {
         Err(classify(status, resp, "put project grid").await)
     }
 ```
-`db/collab.rs`, beside `set_page_extras`. In the `upsert_project` doc, change "Eleven columns" to "Twelve columns", and add "`canonical_grid_json` ([`set_canonical_grid`])" to the list.
-```rust
-/// The hub's canonical grid as last cached (spec §6.1, plan 6b-2 C16): the
-/// canonical JSON of the normalized typed grid, never the hub's own text.
-/// Written only here (`upsert_project` leaves the column alone). Returns
-/// whether the stored value changed — what the refresh reports as a grid
-/// move.
-pub fn set_canonical_grid(conn: &Connection, project_id: &str, grid_json: Option<&str>) -> Result<bool> {
-    let n = conn.execute(
-        "UPDATE collab_projects SET canonical_grid_json = ?2
-         WHERE project_id = ?1 AND canonical_grid_json IS NOT ?2",
-        params![project_id, grid_json],
-    )?;
-    Ok(n > 0)
-}
-
-/// The cached canonical grid JSON (`None` when the hub has none).
-pub fn canonical_grid(conn: &Connection, project_id: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT canonical_grid_json FROM collab_projects WHERE project_id = ?1",
-            params![project_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten())
-}
-```
 `api/collab.rs`:
   - Make `client_err` `pub(crate)`.
   - Add, beside `page_extras_of`:
 ```rust
 /// The grid a project page carries (plan 6b-2 C16): absent, a parsed and
 /// normalized grid as its canonical JSON, or a value this build cannot read
-/// — then the cached grid is kept, and the reason logged.
+/// — then the cached grid is kept, and the reason logged. `Absent` clears
+/// the cached grid on purpose: the hub omits the key, or sends null, exactly
+/// when no grid is set. A hub predating `canonicalGrid` would clear it too;
+/// that is unreachable today, and keeping a grid the hub no longer has would
+/// be the worse error (review M10).
 pub(crate) enum GridEcho {
     Absent,
     Grid(String),
@@ -4541,17 +4666,30 @@ pub(crate) fn grid_echo_of(page: &crate::collab::hub_client::ProjectPageWire) ->
         // into the generated TS.
         pub canonical_grid: Option<crate::collab::grid::CanonicalGrid>,
     ```
-  - In `card_from_row`, inside the existing `db` block, read:
+  - In `card_from_row`, the existing `db` block reads a third tuple element, and the literal sets `canonical_grid`. One unreadable cached grid must not take the whole project list down (review I4): the card degrades to none with a `warn!`, while `get_collab_grid_proposal` and the plan stay strict.
     ```rust
-    crate::api::collab_grid::stored_grid(&conn, &row.project_id)?
+    let (linked_sets, publishing, canonical_grid) = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        (
+            crate::db::collab::linked_set_ids(&conn, &row.project_id)
+                .map_err(internal)?
+                .len() as i64,
+            crate::db::collab::publishing_device(&conn, &row.project_id).map_err(internal)?,
+            crate::api::collab_grid::stored_grid(&conn, &row.project_id).unwrap_or_else(|e| {
+                tracing::warn!(project_id = %row.project_id, error = %e, "cached canonical grid unreadable; card shows none");
+                None
+            }),
+        )
+    };
     ```
-    into a third tuple element, and set `canonical_grid` in the literal.
 
-- [ ] **Step 5: The core commands** (`api/collab_grid.rs`, declared `#[cfg(all(feature = "render", feature = "solver"))] pub mod collab_grid;` in `api/mod.rs`):
+- [ ] **Step 2: The core commands** (`api/collab_grid.rs`, declared `#[cfg(all(feature = "render", feature = "solver"))] pub mod collab_grid;` in `api/mod.rs`):
 ```rust
 //! The project's canonical grid at the command layer (spec 2026-10-02 §6,
 //! §9.1, plan 6b-2 C16): the proposal, the coordinator's save, and the
-//! `collab-grid-changed` event the live feed emits when the hub's grid moves.
+//! `collab-grid-changed` event. The saving device emits it from the save
+//! command; every other device's live feed emits it when the hub's grid moves.
 
 use rusqlite::Connection;
 
@@ -4561,9 +4699,11 @@ use crate::api::{db, ApiError};
 use crate::collab::grid::CanonicalGrid;
 use crate::collab::grid_geometry::{count_inside, grid_input_of, propose_grid, GridInput, GridTarget};
 use crate::collab::hub_client::CollabClient;
+use crate::events::{emit_event, ProgressEmitter};
 use crate::services::ServiceContext;
 
-/// Emitted by every live-feed refresh that moved a project's cached grid.
+/// Emitted by a successful `set_collab_project_grid` on the saving device,
+/// and by every live-feed refresh that moved a project's cached grid.
 pub const COLLAB_GRID_CHANGED_EVENT: &str = "collab-grid-changed";
 
 /// Payload of [`COLLAB_GRID_CHANGED_EVENT`].
@@ -4574,9 +4714,11 @@ pub struct CollabGridChanged {
 }
 
 /// What `get_collab_grid_proposal` answers (spec §9.1): the confirmed
-/// grid, the proposal from the whole manifest (`None` when no accepted frame
-/// carries a pixel scale), how many accepted frames with a WCS lie at least
-/// half inside the proposal, and whether this account may save a grid.
+/// grid, the proposal from the whole manifest, how many accepted frames with
+/// a WCS lie at least half inside the proposal, and whether this account may
+/// save a grid. `proposal` is `None` when no accepted frame carries a pixel
+/// scale, and also when the median scale rounds outside the hub's `(0, 100]`
+/// (review M8).
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct GridProposal {
@@ -4643,12 +4785,21 @@ pub fn get_collab_grid_proposal(ctx: &ServiceContext, project_id: &str) -> Resul
 /// `set_collab_project_grid` (spec §6.3): normalize, validate (the hub's
 /// bounds), refuse a cached card without `project.edit` before any request
 /// (the hub's 403 stays the backstop), `PUT /projects/{id}/grid`, and only
-/// after the hub's 2xx write the local copy. Returns the grid it sent — the
-/// hub answers 204 with no body.
+/// after the hub's 2xx write the local copy and emit
+/// [`COLLAB_GRID_CHANGED_EVENT`]. The event comes from here because this
+/// device's own cache write makes its feed refresh a no-op (review I5); it
+/// is emitted on every successful save, and a re-plan is idempotent.
+/// Returns the grid it sent: the hub answers 204 with no body.
+///
+/// A hub 400 reaches the caller as the hub client's wrapped message
+/// (`hub returned 400 Bad Request (put project grid): …`, review M7). Local
+/// validation mirrors the hub's own text, so the wrapper shows only when the
+/// two disagree.
 pub async fn set_collab_project_grid(
     ctx: &ServiceContext,
     project_id: &str,
     grid: CanonicalGrid,
+    emitter: Option<&dyn ProgressEmitter>,
 ) -> Result<CanonicalGrid, ApiError> {
     let grid = grid.normalized();
     grid.validate().map_err(|m| ApiError::Invalid(m.to_string()))?;
@@ -4679,12 +4830,21 @@ pub async fn set_collab_project_grid(
             .map_err(internal)?;
     }
     tracing::info!(project_id, grid_hash = %grid.hash(), "grid saved");
+    if let Some(em) = emitter {
+        emit_event(
+            em,
+            COLLAB_GRID_CHANGED_EVENT,
+            &CollabGridChanged {
+                project_id: project_id.to_string(),
+            },
+        );
+    }
     Ok(grid)
 }
 ```
 If `CollabClient::new` takes `impl AsRef<str>` or `&str`, match `exclude_collab_frame`'s call form exactly.
 
-- [ ] **Step 6: The feed** (`api/collab_live/feed.rs`):
+- [ ] **Step 3: The feed** (`api/collab_live/feed.rs`):
   - Make `ALL_KINDS` `[ChangeKind; 6]` with `ChangeKind::Grid` appended. Update its doc: a gap catches up on the grid too.
   - In both `small_docs` matches (`apply_contiguous`, `catch_up_project`), add `| ChangeKind::Grid`.
   - In `note_card`, extend the snapshot kinds to `ChangeKind::Meta | ChangeKind::Thresholds | ChangeKind::Dictionary | ChangeKind::Grid`.
@@ -4715,7 +4875,7 @@ If `CollabClient::new` takes `impl AsRef<str>` or `&str`, match `exclude_collab_
     - at the hello-join site, change `Ok(_) =>` to `Ok(report) => { self.emit_grid_moves(&report); … }`;
     - in the account-left arm, bind the result `let report = …?;` and emit.
 
-    The device-replace refresh (`collab_live/replace.rs`) and the host's `refresh_projects` hold no emitter. The command returns the cards, which carry `canonicalGrid`.
+    The device-replace refresh (`collab_live/replace.rs`) and the host's `refresh_projects` hold no emitter. The command returns the cards, which carry `canonicalGrid`. The saving device gets its event from `set_collab_project_grid` itself (Step 2), because its own cache write makes this refresh a no-op.
 
 Feed test (feed.rs `mod tests`):
 ```rust
@@ -4775,7 +4935,7 @@ Feed test (feed.rs `mod tests`):
 ```
 Re-run the existing feed pins `catch_up_project_prunes_when_its_own_small_document_refresh_reveals_a_caps_change` and the `FeedEffect::MembersChanged` assertions; they must pass unchanged.
 
-- [ ] **Step 7: The fake hub** (`collab/fake_hub.rs`):
+- [ ] **Step 4: The fake hub** (`collab/fake_hub.rs`):
   - `FakeProject` gains:
     ```rust
         /// The hub's `projects.canonical_grid` (plan 6b-2): `None` until a
@@ -4839,7 +4999,7 @@ and on `impl FakeHub`:
     }
 ```
 
-- [ ] **Step 8: API tests** (`api/collab_grid.rs` `mod tests`, modelled on `collab_remap`'s fixture at `~456`):
+- [ ] **Step 5: API tests** (`api/collab_grid.rs` `mod tests`, modelled on `collab_remap`'s fixture at `~456`):
 ```rust
 #[cfg(test)]
 mod tests {
@@ -4849,6 +5009,17 @@ mod tests {
     use crate::collab::grid::GRID_INVALID_MSG;
     use base64::Engine;
     use std::sync::Arc;
+
+    struct Rec(std::sync::Mutex<Vec<(String, serde_json::Value)>>);
+    impl ProgressEmitter for Rec {
+        fn emit_json(&self, name: &str, payload: serde_json::Value) {
+            self.0.lock().unwrap().push((name.to_string(), payload));
+        }
+    }
+
+    fn rec() -> Rec {
+        Rec(std::sync::Mutex::new(Vec::new()))
+    }
 
     async fn fixture(coordinator: bool) -> (tempfile::TempDir, Arc<ServiceContext>, FakeHub) {
         let hub = FakeHub::start().await;
@@ -4896,14 +5067,21 @@ mod tests {
     }
 
     /// Spec §6.3, C16: normalized before the PUT, cached only after the hub
-    /// answers, returned as sent; the card carries it; a refresh echoing it
-    /// back moves nothing.
+    /// answers, returned as sent; the saving device gets exactly one
+    /// `collab-grid-changed` from the command (review I5); the card carries
+    /// the grid; a refresh echoing it back moves nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_grid_is_saved_on_the_hub_then_cached() {
         let (_t, ctx, hub) = fixture(true).await;
         let sent = CanonicalGrid { crval1: 370.5, rotation_deg: 540.0, ..valid_grid() };
-        let saved = set_collab_project_grid(&ctx, "p1", sent).await.unwrap();
+        let events = rec();
+        let saved = set_collab_project_grid(&ctx, "p1", sent, Some(&events)).await.unwrap();
         assert_eq!((saved.crval1, saved.rotation_deg), (10.5, 180.0));
+        assert_eq!(
+            *events.0.lock().unwrap(),
+            vec![(COLLAB_GRID_CHANGED_EVENT.to_string(), serde_json::json!({ "projectId": "p1" }))],
+            "exactly one event, from the command"
+        );
         let on_hub = CanonicalGrid::from_value(&hub.project_grid("p1").expect("stored on the hub")).unwrap();
         assert_eq!(on_hub.hash(), saved.hash());
         let stored = {
@@ -4927,20 +5105,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invalid_grids_and_members_without_the_cap_are_refused_locally() {
         let (_t, ctx, hub) = fixture(false).await;
-        let err = set_collab_project_grid(&ctx, "p1", CanonicalGrid { width_px: 63, ..valid_grid() })
+        let events = rec();
+        let err = set_collab_project_grid(&ctx, "p1", CanonicalGrid { width_px: 63, ..valid_grid() }, Some(&events))
             .await
             .unwrap_err();
         assert!(matches!(err, ApiError::Invalid(ref m) if m == GRID_INVALID_MSG), "{err:?}");
-        let err = set_collab_project_grid(&ctx, "p1", valid_grid()).await.unwrap_err();
+        let err = set_collab_project_grid(&ctx, "p1", valid_grid(), Some(&events)).await.unwrap_err();
         assert!(matches!(err, ApiError::Forbidden(ref m) if m == NO_GRID_CAP_MSG), "{err:?}");
         assert!(hub.project_grid("p1").is_none(), "nothing reached the hub");
+        assert!(events.0.lock().unwrap().is_empty(), "a refused save emits nothing");
         assert!(!get_collab_grid_proposal(&ctx, "p1").unwrap().can_edit);
     }
 }
 ```
 If `FrameViewWire.meta` cannot be assigned in the `seed_frames_with` closure, or the closure must be `Fn` and capturing `wcs` by reference fails, clone `wcs` once outside and use `move`. The intent is fixed: three frames with this WCS and one with a scale only.
 
-- [ ] **Step 9: The hosts.** `crates/athenaeum-tauri/src/commands/collab.rs`:
+- [ ] **Step 6: The hosts.** Both pass the host's emitter, as `remap_collab_filter` does. `crates/athenaeum-tauri/src/commands/collab.rs`:
 ```rust
 /// The grid proposal for a project (spec §6.2): the confirmed grid, the
 /// proposal from the manifest, how many frames lie inside it, and whether
@@ -4956,15 +5136,17 @@ pub async fn get_collab_grid_proposal(
 }
 
 /// Save the project's canonical grid on the hub (`project.edit`); returns
-/// the normalized grid it saved.
+/// the normalized grid it saved and emits `collab-grid-changed`.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn set_collab_project_grid(
     state: State<'_, AppState>,
+    app: AppHandle,
     project_id: String,
     grid: athenaeum_core::collab::grid::CanonicalGrid,
 ) -> Result<athenaeum_core::collab::grid::CanonicalGrid, String> {
-    athenaeum_core::api::collab_grid::set_collab_project_grid(&state.ctx, &project_id, grid)
+    let emitter = TauriProgressEmitter(app);
+    athenaeum_core::api::collab_grid::set_collab_project_grid(&state.ctx, &project_id, grid, Some(&emitter))
         .await
         .map_err(|e| e.to_string())
 }
@@ -4995,7 +5177,8 @@ pub async fn set_collab_project_grid(
     State(state): State<WebAppState>,
     Json(args): Json<SetCollabProjectGridArgs>,
 ) -> Result<Json<athenaeum_core::collab::grid::CanonicalGrid>, (axum::http::StatusCode, String)> {
-    athenaeum_core::api::collab_grid::set_collab_project_grid(&state.ctx, &args.project_id, args.grid)
+    let emitter = SseProgressEmitter::new(state.event_tx.clone());
+    athenaeum_core::api::collab_grid::set_collab_project_grid(&state.ctx, &args.project_id, args.grid, Some(&emitter))
         .await
         .map(Json)
         .map_err(api_err)
@@ -5056,7 +5239,7 @@ In `routes/mod.rs`, after the `cancel_collab_remap` route, add:
 
 Frontend: add `canonicalGrid: null,` after `canEditGrid: false,` in `src/components/collab/project/testFixtures.ts` and in `src/hooks/useCollabNotifications.test.tsx`.
 
-- [ ] **Step 10: Run the tests and watch them pass.**
+- [ ] **Step 7: Run the tests and watch them pass.**
   1. `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 collab:: api::collab_grid api::collab_live::feed db::collab`
   2. `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-web -- --test-threads=4 grid_route_tests`
   3. Regenerate the TS: the diff must be exactly the Interfaces list.
@@ -5067,15 +5250,15 @@ Frontend: add `canonicalGrid: null,` after `canEditGrid: false,` in `src/compone
      ```
      Expected: `299`.
 
-- [ ] **Step 11: Run the gate.** TS diff is allowed: it must be exactly the `models.ts` list.
+- [ ] **Step 8: Run the gate.** TS diff is allowed: it must be exactly the `models.ts` list.
 
-- [ ] **Step 12: Commit** with the message `feat(collab): the canonical grid — hub client, cache, feed, proposal and two commands`, plus the trailers.
+- [ ] **Step 9: Commit** with the message `feat(collab): the canonical grid end to end — hub client, cache, feed, two commands`, plus the trailers.
 
 ---
 
 ### Task 7: `build_plan`'s project arm — blockers, warnings, grid state, Frames rows; R3's plan gate (C10, C11; spec §7, §13)
 
-*Executed after Task 8.*
+*Executed after Tasks 8a and 8b.*
 
 **Files:**
 - Create `crates/athenaeum-core/src/stacking/prepare.rs`, holding the file classifier. Declare `pub mod prepare;` in `stacking/mod.rs`.
@@ -5090,7 +5273,8 @@ Frontend: add `canonicalGrid: null,` after `canEditGrid: false,` in `src/compone
   - new tests.
 - Modify `crates/athenaeum-core/src/stacking/test_fixtures.rs`:
   - `write_fits_i16` becomes `pub(crate)`, a visibility change only;
-  - add `write_empty_primary_fits` (below).
+  - add `write_empty_primary_fits` (below);
+  - `ProjectFile` gains `EmptyPrimary`, an unsupported file (the plan test of review I1; Task 9b uses it too).
 - Modify `crates/athenaeum-core/src/ts_export.rs`, `stacking.ts`:
   - `GridState`, `PlanGrid` and `PlanProjectFrame` go before `StackingPlan`;
   - the preamble imports `CanonicalGrid`.
@@ -5114,8 +5298,11 @@ pub struct PlanGrid { pub state: GridState, pub current: Option<CanonicalGrid>, 
 pub struct PlanProjectFrame { pub handle: Option<i64>, pub frame_uuid: String, pub file_name: String, pub publisher: String,
     pub filter_canonical: String, pub exptime_sec: f64, pub color_mode: ColorMode, pub has_wcs: bool, pub on_disk: bool, pub reason: Option<String> }
 pub struct StackingPlan { /* … */ pub grid: Option<PlanGrid>, pub project_frames: Vec<PlanProjectFrame> }
+// stacking/test_fixtures.rs
+pub(crate) enum ProjectFile { Mono32, Rgb32, Mosaic32, Mono16, Xisf32, Missing, EmptyPrimary }
+pub(crate) fn write_empty_primary_fits(path: &Path);
 ```
-Task 9 uses `probe_file`, `prepare_action` and `PrepareAction`/`PrepareRead`.
+Tasks 9a and 9b use `probe_file`, `prepare_action` and `PrepareAction`/`PrepareRead`.
 
 TS (`stacking.ts`), the only moves:
 - new `GridState`, `PlanGrid` and `PlanProjectFrame`;
@@ -5128,6 +5315,8 @@ TS (`stacking.ts`), the only moves:
    - `frame_set_inputs`: today's config resolution, frame source, readiness, masters and gate 1, moved verbatim, with gate 1 skipped and no masters for an attested set;
    - `project_inputs`: the seeded config, the project source, the grid, the project warnings and the prepared bytes.
 3. The **shared core**, in today's order: EXPTIME and equivalence warnings, then the arm's warnings, then gates 2–6, staleness, and the plan.
+
+A project's unsupported files (review I1) are plan-time exclusions: the shared core counts them out of every group's included frames and the ≥ 3 rule, so a group that Prepare would leave under three frames is blocked by `frames` at plan time. They are not added to `StackingPlan.excluded_frame_ids`, which stays the manual list, and no new blocker code exists.
 
 The order of blockers is therefore:
 - frame set: `masters, links, masterFiles, reference, folders, space, frames, unsupported` (unchanged);
@@ -5190,8 +5379,17 @@ mod tests {
             PrepareAction::Write { read: PrepareRead::ScaledFits { divisor: 65535.0 }, debayer: None }
         );
         assert_eq!(action("x.xisf", true), PrepareAction::Write { read: PrepareRead::Xisf, debayer: None });
-        assert!(matches!(action("tile.fits", true), PrepareAction::Unsupported(_)));
+        assert_eq!(
+            action("tile.fits", true),
+            PrepareAction::Unsupported("not a 1- or 3-plane 8/16/32-bit or float primary image".into())
+        );
         assert_eq!(action("dist.xisf", true), PrepareAction::Unsupported("distributed XISF".into()));
+        // Review I10: a file that cannot be opened says so.
+        assert!(
+            matches!(action("absent.fits", true), PrepareAction::Unsupported(ref m) if m.starts_with("cannot open the file: ")),
+            "{:?}",
+            action("absent.fits", true)
+        );
 
         let shape = probe_file(&p("adu.fits"));
         assert_eq!((shape.width, shape.height, shape.planes), (8, 8, 1));
@@ -5284,6 +5482,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!((plan.set_id, plan.project_id.as_deref()), (None, Some("p1")));
+        // `insert_test_project` sets `title = project_id` (review M6).
         assert_eq!(plan.set_name, "p1");
         let mut keys: Vec<(&str, usize)> =
             plan.groups.iter().map(|g| (g.key.as_str(), g.frame_count)).collect();
@@ -5424,6 +5623,42 @@ mod tests {
         assert_eq!(plan.blockers[4].message, "No frame of this project is on this device yet");
     }
 
+    /// Review I1 (plan 6b-2 C10): an unsupported file leaves the plan's
+    /// included counts, so a group that Prepare would leave under three frames
+    /// is blocked at plan time, not at run time. The file is not a manual
+    /// exclusion.
+    #[test]
+    fn an_unsupported_file_does_not_count_toward_three_frames() {
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec, ProjectFile};
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        for uuid in ["a", "b"] {
+            add_project_frame(&f.conn, &landed, "p1", &project_frame_spec(uuid));
+        }
+        let mut tile = project_frame_spec("t");
+        tile.file = ProjectFile::EmptyPrimary;
+        add_project_frame(&f.conn, &landed, "p1", &tile);
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.groups.len(), 1, "{:?}", plan.groups);
+        let g = &plan.groups[0];
+        assert_eq!((g.frame_count, g.included_count), (3, 2));
+        assert!(plan.excluded_frame_ids.is_empty(), "an unsupported file is not a manual exclusion");
+        assert!(plan.blockers.iter().any(|b| b.code == "frames"), "{:?}", plan.blockers);
+        assert!(
+            plan.warnings.iter().any(|w| w.ends_with("(unsupported file): c_t.fits")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
     /// Spec §13 (R3): an attested set needs no masters — no masters / links
     /// / masterFiles blocker and nothing to build; its unattested twin does.
     #[test]
@@ -5453,11 +5688,11 @@ mod tests {
 
 - [ ] **Step 2: Run the tests and watch them fail.**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 stacking::prepare a_project_estimate a_project_plan a_confirmed_grid a_project_working_folder a_projects_blocker an_attested_set_plans`
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 stacking::prepare a_project_estimate a_project_plan a_confirmed_grid a_project_working_folder a_projects_blocker an_unsupported_file_does_not_count an_attested_set_plans`
 
 Expected: the build fails. `prepare`, `estimate_project_bytes`, `StackingPlan.grid` and `project_frames` do not exist, and `build_plan` still refuses a project.
 
-- [ ] **Step 3: The classifier** (`stacking/prepare.rs`; Task 9 extends this module):
+- [ ] **Step 3: The classifier** (`stacking/prepare.rs`; Task 9a extends this module):
 ```rust
 //! Prepare — stage 1 of a run whose frames are already calibrated (spec
 //! 2026-10-02 §5.1, §13; plan 6b-2 C12): a project's landed replicas and an
@@ -5539,6 +5774,11 @@ pub fn probe_file(path: &Path) -> FileShape {
             None
         }
     };
+    // Review I10: a file that cannot be opened (offline, renamed, archived)
+    // says so, instead of looking like an image no reader here decodes.
+    if let Err(e) = std::fs::File::open(path) {
+        return unsupported(format!("cannot open the file: {e}"));
+    }
     if is_xisf(path) {
         let xml = match crate::fits_parser::read_xisf_header(path) {
             Ok(raw) => String::from_utf8_lossy(&raw).into_owned(),
@@ -5573,10 +5813,9 @@ pub fn probe_file(path: &Path) -> FileShape {
             planes: info.naxis3,
             cfa: if info.naxis3 == 1 { cfa_of(path) } else { None },
         },
-        None => unsupported(
-            "no one- or three-plane image in the primary HDU (a tile-compressed FITS or an extension image)"
-                .to_string(),
-        ),
+        // Also a tile-compressed FITS or an extension image (primary NAXIS 0),
+        // BITPIX 64, or a 4-plane cube.
+        None => unsupported("not a 1- or 3-plane 8/16/32-bit or float primary image".to_string()),
     }
 }
 
@@ -5639,6 +5878,12 @@ pub(crate) fn write_empty_primary_fits(path: &Path) {
     std::fs::write(path, bytes).expect("write the empty-primary fixture");
 }
 ```
+`ProjectFile` gains the variant
+```rust
+    /// A primary HDU with no image (`NAXIS = 0`): an unsupported file.
+    EmptyPrimary,
+```
+and `add_project_frame`'s match gains the arm `ProjectFile::EmptyPrimary => write_empty_primary_fits(&path),`.
 
 - [ ] **Step 4: The project estimate** (`paths.rs`). Rename the body of `estimate_bytes` to a private `estimate_bytes_with(i, geometry: Option<(u64, u64)>, calibrated_override: Option<u64>) -> u64`, and make:
 ```rust
@@ -5752,6 +5997,9 @@ struct ProjectInputs {
     grid_dims: Option<(u64, u64)>,
     /// What Prepare writes (conversions and debayers).
     prepared_bytes: u64,
+    /// The handles of the frames Prepare cannot read (review I1): they leave
+    /// the plan's included counts and the ≥ 3 rule, not `excluded_frame_ids`.
+    unsupported_ids: HashSet<i64>,
 }
 ```
 **`frame_set_inputs`** is today's code, moved. Cut, from the top of `build_plan`, everything from `let (cfg, excluded_frame_ids) = resolve_config_and_exclusions(…)` through `collect_masters_to_build`, together with the whole **Gate 1** block. Paste it into:
@@ -5915,11 +6163,15 @@ fn project_inputs(
     // Spec §5.1 / §7: what Prepare will write, and the files it cannot read.
     let mut prepared = 0u64;
     let mut unsupported: Vec<&str> = Vec::new();
+    let mut unsupported_ids: HashSet<i64> = HashSet::new();
     for g in &source.groups {
         for f in g.frames.iter().filter(|f| !excluded_set.contains(&f.frame_id)) {
             let shape = probe_file(Path::new(&f.path));
             match prepare_action(&shape, cfg.calibration.debayer_osc) {
-                PrepareAction::Unsupported(_) => unsupported.push(f.filename.as_str()),
+                PrepareAction::Unsupported(_) => {
+                    unsupported.push(f.filename.as_str());
+                    unsupported_ids.insert(f.frame_id);
+                }
                 action => prepared += prepared_bytes(&shape, &action),
             }
         }
@@ -5976,6 +6228,7 @@ fn project_inputs(
             grid_scale: in_use.map(|g| g.scale_arcsec),
             grid_dims: in_use.map(|g| (g.width_px as u64, g.height_px as u64)),
             prepared_bytes: prepared,
+            unsupported_ids,
         }),
     })
 }
@@ -6003,7 +6256,14 @@ Change the **shared core** of `build_plan` as follows; everything else is untouc
             project_inputs(conn, settings, project_id, config_override)?
         }
     };
-    let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
+    // Review I1: a project's unsupported files leave the included counts
+    // and the ≥ 3 rule (Prepare would exclude them), but not
+    // `excluded_frame_ids`, which stays the user's manual list.
+    let excluded_set: HashSet<i64> = excluded_frame_ids
+        .iter()
+        .copied()
+        .chain(project.iter().flat_map(|p| p.unsupported_ids.iter().copied()))
+        .collect();
     let mut blockers: Vec<PlanBlocker> = arm_blockers;
     let mut warnings: Vec<String> = Vec::new();
 ```
@@ -6091,7 +6351,7 @@ Update `build_plan`'s doc: "pure DB reads plus cheap filesystem probes — for a
 
 ---
 
-### Task 9: Prepare — in place, converted or debayered; the attested set's run (C11 run half, C12, C13; spec §5.1, §13)
+### Task 9a: The Prepare writers, the debayer extraction, the `prepared/` layout and the attested hash (C11, C12; spec §5.1, §13)
 
 **Files:**
 - Modify `crates/athenaeum-core/src/export/calibrated_generator.rs`:
@@ -6103,18 +6363,10 @@ Update `build_plan`'s doc: "pure DB reads plus cheap filesystem probes — for a
   - add `prepared_root` and `prepared_dir`;
   - `work_usage` (`~741`) and `cleanup_work` (`~840`);
   - a test.
-- Modify `crates/athenaeum-core/src/stacking/origin.rs`: add `needs_prepare`, `PrepareInput` and `prepare_input`.
 - Modify `crates/athenaeum-core/src/stacking/plan.rs`:
   - add `prepare_hash_for_catalog`;
   - split `HashMemo::hash_by_origin`'s catalog arm;
   - a test.
-- Modify `crates/athenaeum-core/src/stacking/run.rs`:
-  - add `StageOneKind` and `stage_one_kind`;
-  - `stage_calibrate`'s head (`~2001-2005`);
-  - `resolve_calibrate_job`'s origin match;
-  - add `PrepareResolved`, `PrepareRunJob`, `resolve_prepare_job`, `commit_prepared` and `stage_prepare`;
-  - tests.
-- Modify `crates/athenaeum-core/src/stacking/test_fixtures.rs`: `ProjectFile` gains `EmptyPrimary`.
 - Modify `crates/athenaeum-core/src/scanner/mod.rs`: a test in `calibrated_light_scan_tests`.
 
 **Interfaces:**
@@ -6135,20 +6387,10 @@ pub fn debayer_file(src: &Path, dest: &Path, geom: CfaGeometry, cards: &[Card], 
 pub fn execute_prepare(job: &PrepareJob, pool: Option<&Arc<rayon::ThreadPool>>, cancel: &AtomicBool) -> anyhow::Result<PreparedFiles>;
 // stacking/paths.rs
 impl WorkingLayout { pub fn prepared_root(&self) -> PathBuf; pub fn prepared_dir(&self, group_key: &str) -> PathBuf; }
-// stacking/origin.rs
-pub(crate) fn needs_prepare(origin: &FrameOrigin) -> bool;
-pub(crate) struct PrepareInput { pub(crate) path: PathBuf, pub(crate) frame_uuid: Option<String> }
-pub(crate) fn prepare_input(origin: &FrameOrigin, frame: &GroupFrame) -> PrepareInput;
 // stacking/plan.rs
 pub(crate) fn prepare_hash_for_catalog(cfg: &StackingConfig, frame: &GroupFrame) -> String;
-// stacking/run.rs
-enum StageOneKind { Calibrate, Prepare }
-fn stage_one_kind(rc: &RunContext) -> Result<StageOneKind, RunError>;
-fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError>;
 ```
-Consumed by: Task 10 (the `calibrated` artifact the Solve sub-step solves on; `execute_prepare` in the real-data probe), plan 6b-3 (the prepared files Register reads).
-
-The prepared files' names keep the replica's own stem: a replica `c_<uuid>.fits` becomes `p_c_<uuid>.fits` and `p_c_<uuid>_d.fits` (through `calibrated_file_stem`, so two members sharing a stem stay apart). Progress and timings report Prepare under `Stage::Calibrate`: the board keeps its ten rows, and 6c names the row "Prepare" for a project.
+Consumed by: Task 9b (`execute_prepare`, `PrepareJob`, `PreparedFiles`, `prepared_dir`, `prepare_hash_for_catalog` through `HashMemo`), Task 10b (`source_cards_of` in `adu_scaled_copy`), Task 10c (`execute_prepare` in the real-data probe), plan 6b-3 (the prepared files Register reads).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -6504,14 +6746,400 @@ The prepared files' names keep the replica's own stem: a replica `c_<uuid>.fits`
         }
     }
 ```
-`test_fixtures.rs`, which carries no test of its own: add the variant
-```rust
-    /// A primary HDU with no image (`NAXIS = 0`): an unsupported file.
-    EmptyPrimary,
-```
-to `ProjectFile`, and the arm `ProjectFile::EmptyPrimary => write_empty_primary_fits(&path),` to `add_project_frame`'s match.
 
-`run.rs` tests (they use Task 6's `project_conn`, `project_rc` and the fixture):
+- [ ] **Step 2: Run the tests and watch them fail.**
+
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 debayer_plane_is debayer_file_reproduces stacking::prepare prepared_copies an_attested_lights_hash scan_never_catalogs_a_prepared`
+
+Expected: the build fails, because `debayer_plane`, `debayered_cards`, the Prepare writers, `prepared_root` and `prepare_hash_for_catalog` do not exist.
+
+- [ ] **Step 3: The debayer extraction** (`calibrated_generator.rs`). After `bayer_for`, add:
+```rust
+/// The VNG debayer of one CFA plane, its `XBAYROFF`/`YBAYROFF` phase folded
+/// in through [`bayer_for`] — the one debayer the generator and the stacking
+/// run's Prepare share (plan 6b-2 C12). Full resolution, three planes,
+/// planar RGB.
+pub fn debayer_plane(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    geom: CfaGeometry,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<f32> {
+    let pattern = bayer_for(geom);
+    match pool {
+        Some(p) => p.install(|| vng_debayer_f32(data, width, height, pattern)),
+        None => vng_debayer_f32(data, width, height, pattern),
+    }
+}
+
+/// A debayered file's header (plan 6b-2 C12): the mosaic keywords removed
+/// (they describe a mosaic that no longer exists in the file) and
+/// `ATH_CDBM = 'VNG'` added.
+pub fn debayered_cards(cards: &mut Vec<Card>) -> Result<(), crate::fits_writer::FitsWriteError> {
+    cards.retain(|c| !MOSAIC_KEYWORDS.contains(&c.keyword.as_str()));
+    cards.push(Card::new("ATH_CDBM", CardValue::Str("VNG".into()))?);
+    Ok(())
+}
+```
+In `execute_generation`, the debayer match becomes:
+```rust
+    let (data, channels) = match (spec.debayer, spec.cfa_geometry) {
+        (true, Some(geom)) => (
+            debayer_plane(&frame.data, frame.width, frame.height, geom, pool),
+            3usize,
+        ),
+        _ => (frame.data, 1usize),
+    };
+```
+and the final-header block becomes:
+```rust
+    let mut cards = spec.cards.clone();
+    if debayered {
+        debayered_cards(&mut cards)?;
+    }
+```
+Every other line of `execute_generation` stays as it is.
+
+- [ ] **Step 4: The Prepare writers** (`stacking/prepare.rs`). Extend the `use` lines:
+```rust
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use anyhow::Context;
+
+use crate::calibration_library::light_resolve::card_from_kv;
+use crate::export::calibrated_generator::{debayer_plane, debayered_cards};
+use crate::fits_parser::stored_header::parse_stored_header_keys;
+use crate::fits_writer::{write_fits_f32_with, Card, CardValue, Durability};
+use crate::integration::plane_reader::PlaneReader;
+use crate::integration::IntegrationError;
+use crate::models::FileFormat;
+use crate::stacking::master_cards::ATH_STK_VERSION;
+use crate::stacking::register::writer::{source_cards_from_file, REGISTERED_COPY_THROUGH};
+```
+Then append:
+```rust
+/// `astroimage::ImageConverter::read_raw` returns an XISF's samples
+/// bounds-normalized and multiplied by this (the reader's documented
+/// contract); Prepare divides it back out, which lands within one ulp of the
+/// stored value.
+pub const XISF_READ_SCALE: f64 = 65535.0;
+
+/// The copy-through cards (`REGISTERED_COPY_THROUGH`) of a FITS or XISF
+/// file, from its own header — no catalog.
+pub fn source_cards_of(path: &Path) -> anyhow::Result<Vec<Card>> {
+    if !is_xisf(path) {
+        return source_cards_from_file(path);
+    }
+    let raw = crate::fits_parser::read_xisf_header(path)
+        .with_context(|| format!("reading the XISF header of {}", path.display()))?;
+    let keys = parse_stored_header_keys(FileFormat::XISF, &String::from_utf8_lossy(&raw));
+    let mut cards: Vec<Card> = keys
+        .iter()
+        .filter(|(k, _)| REGISTERED_COPY_THROUGH.contains(&k.to_ascii_uppercase().as_str()))
+        .filter_map(|(k, v)| card_from_kv(k, v))
+        .collect();
+    cards.sort_by(|a, b| a.keyword.cmp(&b.keyword));
+    Ok(cards)
+}
+
+/// The header of a file Prepare writes (plan 6b-2 C12):
+/// - the source's copy-through cards;
+/// - the CFA cards when the output is still a mosaic;
+/// - `IMAGETYP = 'LIGHT'`;
+/// - `ATH_STK = T` (a stacking intermediate, which the scanner never catalogs);
+/// - `ATH_STKV`;
+/// - `ATH_PREP` (`converted` | `debayered`).
+/// It never carries `CALSTAT`, `ATH_CSRC`, `ATH_PRJ` or `ATH_FILT`: none of
+/// them is in the copy-through list.
+pub fn prepare_cards(source: &[Card], mosaic: Option<CfaGeometry>, prepared: &str) -> anyhow::Result<Vec<Card>> {
+    let mut cards: Vec<Card> = source
+        .iter()
+        .filter(|c| REGISTERED_COPY_THROUGH.contains(&c.keyword.as_str()))
+        .cloned()
+        .collect();
+    if let Some(g) = mosaic {
+        cards.push(Card::new("BAYERPAT", CardValue::Str(g.pattern.as_str().to_string()))?);
+        cards.push(Card::new("XBAYROFF", CardValue::Integer(g.xoff))?);
+        cards.push(Card::new("YBAYROFF", CardValue::Integer(g.yoff))?);
+    }
+    cards.push(Card::new("IMAGETYP", CardValue::Str("LIGHT".into()))?);
+    cards.push(
+        Card::new("ATH_STK", CardValue::Logical(true))?
+            .with_comment("stacking intermediate; never cataloged"),
+    );
+    cards.push(Card::new("ATH_STKV", CardValue::Integer(ATH_STK_VERSION))?);
+    cards.push(
+        Card::new("ATH_PREP", CardValue::Str(prepared.to_string()))?
+            .with_comment("how Prepare produced this file"),
+    );
+    Ok(cards)
+}
+
+/// `(width, height, planes, planar data)` of `src` in the unit domain, read
+/// per `read`: a FITS through the plane reader (physical values, then ÷ the
+/// divisor for an integer file), an XISF through `read_raw` ÷
+/// [`XISF_READ_SCALE`].
+fn read_unit_planes(src: &Path, read: &PrepareRead) -> anyhow::Result<(usize, usize, usize, Vec<f32>)> {
+    match read {
+        PrepareRead::InPlaceFits | PrepareRead::ScaledFits { .. } => {
+            let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
+            let (w, h, c) = (reader.width(), reader.height(), reader.channels());
+            let mut data = Vec::with_capacity(w * h * c);
+            for plane in 0..c {
+                data.extend(reader.read_plane(plane).with_context(|| format!("reading {}", src.display()))?);
+            }
+            if let PrepareRead::ScaledFits { divisor } = read {
+                for v in &mut data {
+                    *v = (*v as f64 / divisor) as f32;
+                }
+            }
+            Ok((w, h, c, data))
+        }
+        PrepareRead::Xisf => {
+            let (meta, pixels) = astroimage::ImageConverter::read_raw(src)
+                .map_err(|e| anyhow::anyhow!("{}: {e:#}", src.display()))?;
+            let data: Vec<f32> = match pixels {
+                astroimage::PixelData::Float32(v) => {
+                    v.into_iter().map(|x| (x as f64 / XISF_READ_SCALE) as f32).collect()
+                }
+                // `read_raw` returns `Float32` for every XISF sample format
+                // (review M21); this arm exists only because the enum has two
+                // variants.
+                astroimage::PixelData::Uint16(v) => {
+                    v.into_iter().map(|x| (x as f64 / XISF_READ_SCALE) as f32).collect()
+                }
+            };
+            Ok((meta.width, meta.height, meta.channels, data))
+        }
+    }
+}
+
+/// Read `src` into the unit domain per `read` and write it as a float32 FITS
+/// at `dest` with `cards` (atomic: temp file + rename). Returns `(width,
+/// height, planes)`.
+pub fn convert_to_float_fits(
+    src: &Path,
+    dest: &Path,
+    read: &PrepareRead,
+    cards: &[Card],
+    durability: Durability,
+) -> anyhow::Result<(usize, usize, usize)> {
+    let (w, h, c, data) = read_unit_planes(src, read)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_fits_f32_with(dest, w, h, c, &data, cards, durability)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest.display()))?;
+    Ok((w, h, c))
+}
+
+/// Debayer a one-plane float FITS mosaic at `src` into a three-plane float32
+/// FITS at `dest` (plan 6b-2 C12), through the generator's own
+/// [`debayer_plane`] with `geom`'s phase. `cards` are written as given (the
+/// caller applies [`debayered_cards`]). It checks `cancel` before the
+/// debayer, the expensive part, and fails with
+/// [`IntegrationError::Cancelled`]. Returns the written file's size.
+pub fn debayer_file(
+    src: &Path,
+    dest: &Path,
+    geom: CfaGeometry,
+    cards: &[Card],
+    durability: Durability,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    cancel: &AtomicBool,
+) -> anyhow::Result<u64> {
+    let (w, h, mosaic) = {
+        let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
+        if reader.channels() != 1 {
+            anyhow::bail!("{}: a {}-plane image is not a CFA mosaic", src.display(), reader.channels());
+        }
+        let plane = reader.read_plane(0).with_context(|| format!("reading {}", src.display()))?;
+        (reader.width(), reader.height(), plane)
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(IntegrationError::Cancelled.into());
+    }
+    let rgb = debayer_plane(&mosaic, w, h, geom, pool);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_fits_f32_with(dest, w, h, 3, &rgb, cards, durability)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest.display()))?;
+    Ok(std::fs::metadata(dest)?.len())
+}
+
+/// One frame's Prepare work, resolved on the run thread: no catalog, no
+/// `RunContext`.
+#[derive(Debug, Clone)]
+pub struct PrepareJob {
+    /// The file Prepare reads: the landed replica, or an attested light.
+    pub src: PathBuf,
+    pub shape: FileShape,
+    pub action: PrepareAction,
+    /// `prepared/<group>/p_<stem>.fits`, for a converted copy.
+    pub converted_out: PathBuf,
+    /// `prepared/<group>/p_<stem>_d.fits`, for a debayered copy.
+    pub debayered_out: PathBuf,
+    pub durability: Durability,
+}
+
+/// What Prepare hands on for one frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedFiles {
+    /// The file stage 1 hands on (the `calibrated` artifact).
+    pub calibrated: PathBuf,
+    /// The CFA mosaic the debayer read (the `calibrated_mosaic` artifact
+    /// when Bayer drizzle wants one): the file itself for a float mosaic,
+    /// its converted copy otherwise. `None` when nothing was debayered.
+    pub mosaic: Option<PathBuf>,
+    /// `in_place` | `converted` | `debayered` — the `prepared` log field.
+    pub prepared: &'static str,
+}
+
+/// Prepare one frame (plan 6b-2 C12):
+/// - in place: nothing is written;
+/// - converted: the unit-domain copy;
+/// - debayered: from the file itself (a float mosaic) or from its converted
+///   copy.
+/// Never writes, renames or deletes `job.src`.
+pub fn execute_prepare(
+    job: &PrepareJob,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    cancel: &AtomicBool,
+) -> anyhow::Result<PreparedFiles> {
+    match &job.action {
+        PrepareAction::InPlace => Ok(PreparedFiles {
+            calibrated: job.src.clone(),
+            mosaic: None,
+            prepared: "in_place",
+        }),
+        PrepareAction::Unsupported(why) => anyhow::bail!("unsupported file: {why}"),
+        PrepareAction::Write { read, debayer } => {
+            let source = source_cards_of(&job.src)?;
+            let base = if *read == PrepareRead::InPlaceFits {
+                job.src.clone()
+            } else {
+                let mosaic = if job.shape.planes == 1 { job.shape.cfa } else { None };
+                let cards = prepare_cards(&source, mosaic, "converted")?;
+                convert_to_float_fits(&job.src, &job.converted_out, read, &cards, job.durability)?;
+                job.converted_out.clone()
+            };
+            match debayer {
+                None => Ok(PreparedFiles {
+                    calibrated: base,
+                    mosaic: None,
+                    prepared: "converted",
+                }),
+                Some(geom) => {
+                    let mut cards = prepare_cards(&source, None, "debayered")?;
+                    debayered_cards(&mut cards)?;
+                    debayer_file(&base, &job.debayered_out, *geom, &cards, job.durability, pool, cancel)?;
+                    Ok(PreparedFiles {
+                        calibrated: job.debayered_out.clone(),
+                        mosaic: Some(base),
+                        prepared: "debayered",
+                    })
+                }
+            }
+        }
+    }
+}
+```
+Update the module doc's last sentence to: "The classifier reads a file from its header alone; the plan's space estimate and warnings and the run read the same answer. The writers below never touch the file they read."
+
+- [ ] **Step 5: The layout** (`paths.rs`). Add to `impl WorkingLayout`, after `calibrated_dir`:
+```rust
+    /// `root/prepared` — Prepare's converted and debayered copies (plan
+    /// 6b-2 C12). A file used in place is never here: its artifact points at
+    /// the landed file, which no cleanup ever removes.
+    pub fn prepared_root(&self) -> PathBuf {
+        self.root.join("prepared")
+    }
+
+    /// `root/prepared/<group_key>`.
+    pub fn prepared_dir(&self, group_key: &str) -> PathBuf {
+        self.prepared_root().join(group_key)
+    }
+```
+In `work_usage`, use `let calibrated_bytes = crate::api::sync::dir_size_bytes(&layout.calibrated_root()) + crate::api::sync::dir_size_bytes(&layout.prepared_root());`. Add one line to its doc: "Prepare's copies count as calibrated bytes, because they fill stage 1's slot." Do not touch `WorkUsage`'s field docs, which are exported. In `cleanup_work`, push `layout.prepared_root()` right after `layout.calibrated_root()` in both the `Intermediates` and the `All` arms. Add one sentence to its doc: "`prepared/` goes with `calibrated/`; a `calibrated` row pointing at a file used in place loses its row, never its file."
+
+- [ ] **Step 6: The attested hash** (`plan.rs`). Beside `prepare_hash_for_project`:
+```rust
+/// Stage 1's hash for an ATTESTED light (spec §13, plan 6b-2 C11): the
+/// Prepare subtree and the light's own `files` identity, with no master
+/// upstream, because an attested light is never calibrated.
+pub(crate) fn prepare_hash_for_catalog(cfg: &StackingConfig, frame: &GroupFrame) -> String {
+    stage_hash(
+        &crate::stacking::config::prepare_subtree(cfg),
+        &[],
+        &[SourceIdentity {
+            file_id: frame.file_id,
+            size: frame.size,
+            modified_at: frame.modified_at.clone(),
+        }],
+    )
+}
+```
+`HashMemo::hash_by_origin` becomes:
+```rust
+        match origin_of(&self.origins, frame.frame_id)? {
+            FrameOrigin::Catalog { attested: false, .. } => {
+                calibration_hash_for(conn, cfg, frame, &mut self.divisors)
+            }
+            // Spec §13 (R3): an attested light is prepared, never calibrated.
+            FrameOrigin::Catalog { attested: true, .. } => Ok(prepare_hash_for_catalog(cfg, frame)),
+            FrameOrigin::Project {
+                blake3, byte_size, ..
+            } => Ok(prepare_hash_for_project(cfg, blake3, *byte_size)),
+        }
+```
+Delete Task 6a's "(Task 9a splits this arm)" comment. Until Task 9b lands the stage dispatch, an attested light is still calibrated; only its stage-1 hash key changes, and no test runs an attested set before 9b.
+
+- [ ] **Step 7: Run the tests and watch them pass.** First the Step 2 command. Then the Review Focus 1 pins, which must pass unchanged:
+```bash
+CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 export::calibrated_generator calibrate_fan_out_matches_the_sequential_stage_byte_for_byte calibrate_stage_reuses_fresh_artifacts calibrate_outputs_disambiguate turning_bayer_on_regenerates stacking::paths stage_hashes_are_pinned scanner::
+```
+  Expected: all pass. The generator tests pin its pixels and cards, and `stage_hashes_are_pinned_to_golden_literals` is untouched.
+
+- [ ] **Step 8: Run the gate.** TS must not move, because `WorkUsage`'s shape is unchanged: `git diff --exit-code src/types`.
+
+- [ ] **Step 9: Commit** with the message `feat(stacking): Prepare writers and the debayer extraction`, plus the trailers.
+
+---
+
+### Task 9b: The Prepare stage for projects and attested sets (C11 run half, C12, C13; spec §5.1, §13)
+
+**Files:**
+- Modify `crates/athenaeum-core/src/stacking/origin.rs`: add `needs_prepare`, `PrepareInput` and `prepare_input`.
+- Modify `crates/athenaeum-core/src/stacking/run.rs`:
+  - add `StageOneKind` and `stage_one_kind`;
+  - `stage_calibrate`'s head (`~2001-2005`);
+  - `resolve_calibrate_job`'s origin match;
+  - add `PrepareResolved`, `PrepareRunJob`, `expected_stage_one_planes`, `resolve_prepare_job`, `commit_prepared` and `stage_prepare`;
+  - tests.
+
+**Interfaces:**
+```rust
+// stacking/origin.rs
+pub(crate) fn needs_prepare(origin: &FrameOrigin) -> bool;
+pub(crate) struct PrepareInput { pub(crate) path: PathBuf, pub(crate) frame_uuid: Option<String> }
+pub(crate) fn prepare_input(origin: &FrameOrigin, frame: &GroupFrame) -> PrepareInput;
+// stacking/run.rs
+enum StageOneKind { Calibrate, Prepare }
+fn stage_one_kind(rc: &RunContext) -> Result<StageOneKind, RunError>;
+fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError>;
+fn expected_stage_one_planes(cfg: &StackingConfig, subject: &StackSubject, group: &IntegrationGroup) -> usize;
+```
+Consumed by: Task 10b (the `calibrated` artifact the Solve sub-step solves on), plan 6b-3 (the prepared files Register reads).
+
+The prepared files' names keep the replica's own stem: a replica `c_<uuid>.fits` becomes `p_c_<uuid>.fits` and `p_c_<uuid>_d.fits` (through `calibrated_file_stem`, so two members sharing a stem stay apart). Progress and timings report Prepare under `Stage::Calibrate`: the board keeps its ten rows, and 6c names the row "Prepare" for a project.
+
+- [ ] **Step 1: Write the failing tests**
+
+`run.rs` tests (they use Task 6b's `project_conn` and `project_rc`, and Task 6a's fixture):
 ```rust
     /// Plan 6b-2 C12 (Review Focus 3): a unit-domain float replica, mono or
     /// three-plane, is used IN PLACE. Its `calibrated` artifact is the landed
@@ -6720,8 +7348,40 @@ to `ProjectFile`, and the arm `ProjectFile::EmptyPrimary => write_empty_primary_
         assert_eq!(reasons.len(), 1, "{reasons:?}");
         assert_eq!(
             reasons[&t1],
-            "unsupported file: no one- or three-plane image in the primary HDU (a tile-compressed FITS or an extension image)"
+            "unsupported file: not a 1- or 3-plane 8/16/32-bit or float primary image"
         );
+    }
+
+    /// Review I12 (plan 6b-2 C13): the group's colour comes from the manifest,
+    /// Prepare's debayer from the file's own header. A file whose post-Prepare
+    /// plane count contradicts its group is excluded, never fed to Measure.
+    /// Here the manifest has no `bayerpat` (a `mono` group) while the file
+    /// declares a mosaic, which Prepare would debayer to three planes.
+    #[test]
+    fn prepare_excludes_a_file_whose_planes_contradict_its_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for u in ["m1", "m2", "m3"] {
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u));
+        }
+        // `Mosaic32` writes BAYERPAT RGGB into the file; `bayerpat: None`
+        // keeps it out of the manifest.
+        let mut odd = test_fixtures::project_frame_spec("x1");
+        odd.file = test_fixtures::ProjectFile::Mosaic32;
+        test_fixtures::add_project_frame(&conn, &landed, "p1", &odd);
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &tmp.path().join("work"), &tmp.path().join("out"));
+        assert_eq!(rc.plan_groups.len(), 1, "every frame is in the mono group");
+        assert_eq!(rc.plan_groups[0].key, "mono__L__300s");
+        stage_calibrate(&mut rc).unwrap();
+        let x1 = rc.plan_groups[0].frames.iter().find(|f| f.filename == "c_x1.fits").unwrap().frame_id;
+        let reasons: HashMap<i64, String> = rc.runtime_exclusions.iter().cloned().collect();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert_eq!(reasons[&x1], "plane count 3 disagrees with the group's colour mode");
+        assert!(!rc.layout.prepared_root().exists(), "nothing was written for it");
     }
 
     /// Plan 6b-2 C9 (the Prepare boundary): a landed file the exchange
@@ -6806,10 +7466,12 @@ to `ProjectFile`, and the arm `ProjectFile::EmptyPrimary => write_empty_primary_
 
     /// Spec §13 (R3), plan 6b-2 C11: an attested set (externally calibrated
     /// lights, no masters at all) runs end to end:
+    /// - its plan asks for no master;
     /// - stage 1 prepares, converting the 16-bit lights into the unit domain
-    ///   under `prepared/`;
+    ///   under `prepared/`, and reports in the stage-1 slot;
     /// - nothing is calibrated;
-    /// - no master is built.
+    /// - the run builds no master (review I11: read from the run's summary,
+    ///   not from a catalog count that is zero either way).
     #[test]
     fn an_attested_set_stacks_without_masters() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6823,6 +7485,15 @@ to `ProjectFile`, and the arm `ProjectFile::EmptyPrimary => write_empty_primary_
             .conn
             .execute("UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1", [fixture.set_id])
             .unwrap();
+        let plan = crate::stacking::plan::build_plan(
+            &fixture.conn,
+            &crate::settings::SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(fixture.set_id),
+            None,
+        )
+        .unwrap();
+        assert!(plan.masters_to_build.is_empty(), "{:?}", plan.masters_to_build);
         let recorder = Arc::new(Recording::new());
         let started = start_stacking(
             ctx.clone(),
@@ -6850,11 +7521,14 @@ to `ProjectFile`, and the arm `ProjectFile::EmptyPrimary => write_empty_primary_
             assert_eq!(h.get_str("CALSTAT"), None);
         }
         assert!(!layout.calibrated_root().exists(), "nothing was calibrated");
-        let masters: i64 = fixture
-            .conn
-            .query_row("SELECT COUNT(*) FROM calibration_set WHERE is_master_library = 1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(masters, 0, "no master was built");
+        let summary: RunSummary =
+            serde_json::from_str(run_row.summary_json.as_deref().expect("summary_json set")).unwrap();
+        assert!(summary.masters_built.is_empty(), "{:?}", summary.masters_built);
+        assert!(
+            summary.stages.iter().any(|t| t.stage == Stage::Calibrate),
+            "Prepare reports in the stage-1 slot: {:?}",
+            summary.stages
+        );
     }
 
     /// Plan 6b-2 C11: one stage-1 path per run. A run whose frames mix
@@ -6899,321 +7573,11 @@ to `ProjectFile`, and the arm `ProjectFile::EmptyPrimary => write_empty_primary_
 
 - [ ] **Step 2: Run the tests and watch them fail.**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 debayer_plane_is debayer_file_reproduces stacking::prepare prepared_copies an_attested_lights_hash scan_never_catalogs_a_prepared prepare_ an_attested_set_stacks a_run_mixing`
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 prepare_ an_attested_set_stacks a_run_mixing`
 
-Expected: the build fails, because `debayer_plane`, `debayered_cards`, the Prepare writers, `prepared_root`, `prepare_hash_for_catalog`, `ProjectFile::EmptyPrimary` and `stage_one_kind` do not exist.
+Expected: the build fails, because `stage_one_kind`, `stage_prepare` and `prepare_input` do not exist.
 
-- [ ] **Step 3: The debayer extraction** (`calibrated_generator.rs`). After `bayer_for`, add:
-```rust
-/// The VNG debayer of one CFA plane, its `XBAYROFF`/`YBAYROFF` phase folded
-/// in through [`bayer_for`] — the one debayer the generator and the stacking
-/// run's Prepare share (plan 6b-2 C12). Full resolution, three planes,
-/// planar RGB.
-pub fn debayer_plane(
-    data: &[f32],
-    width: usize,
-    height: usize,
-    geom: CfaGeometry,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) -> Vec<f32> {
-    let pattern = bayer_for(geom);
-    match pool {
-        Some(p) => p.install(|| vng_debayer_f32(data, width, height, pattern)),
-        None => vng_debayer_f32(data, width, height, pattern),
-    }
-}
-
-/// A debayered file's header (plan 6b-2 C12): the mosaic keywords removed
-/// (they describe a mosaic that no longer exists in the file) and
-/// `ATH_CDBM = 'VNG'` added.
-pub fn debayered_cards(cards: &mut Vec<Card>) -> Result<(), crate::fits_writer::FitsWriteError> {
-    cards.retain(|c| !MOSAIC_KEYWORDS.contains(&c.keyword.as_str()));
-    cards.push(Card::new("ATH_CDBM", CardValue::Str("VNG".into()))?);
-    Ok(())
-}
-```
-In `execute_generation`, the debayer match becomes:
-```rust
-    let (data, channels) = match (spec.debayer, spec.cfa_geometry) {
-        (true, Some(geom)) => (
-            debayer_plane(&frame.data, frame.width, frame.height, geom, pool),
-            3usize,
-        ),
-        _ => (frame.data, 1usize),
-    };
-```
-and the final-header block becomes:
-```rust
-    let mut cards = spec.cards.clone();
-    if debayered {
-        debayered_cards(&mut cards)?;
-    }
-```
-Every other line of `execute_generation` stays as it is.
-
-- [ ] **Step 4: The Prepare writers** (`stacking/prepare.rs`). Extend the `use` lines:
-```rust
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-use anyhow::Context;
-
-use crate::calibration_library::light_resolve::card_from_kv;
-use crate::export::calibrated_generator::{debayer_plane, debayered_cards};
-use crate::fits_parser::stored_header::parse_stored_header_keys;
-use crate::fits_writer::{write_fits_f32_with, Card, CardValue, Durability};
-use crate::integration::plane_reader::PlaneReader;
-use crate::integration::IntegrationError;
-use crate::models::FileFormat;
-use crate::stacking::master_cards::ATH_STK_VERSION;
-use crate::stacking::register::writer::{source_cards_from_file, REGISTERED_COPY_THROUGH};
-```
-Then append:
-```rust
-/// `astroimage::ImageConverter::read_raw` returns an XISF's samples
-/// bounds-normalized and multiplied by this (the reader's documented
-/// contract); Prepare divides it back out, which lands within one ulp of the
-/// stored value.
-pub const XISF_READ_SCALE: f64 = 65535.0;
-
-/// The copy-through cards (`REGISTERED_COPY_THROUGH`) of a FITS or XISF
-/// file, from its own header — no catalog.
-pub fn source_cards_of(path: &Path) -> anyhow::Result<Vec<Card>> {
-    if !is_xisf(path) {
-        return source_cards_from_file(path);
-    }
-    let raw = crate::fits_parser::read_xisf_header(path)
-        .with_context(|| format!("reading the XISF header of {}", path.display()))?;
-    let keys = parse_stored_header_keys(FileFormat::XISF, &String::from_utf8_lossy(&raw));
-    let mut cards: Vec<Card> = keys
-        .iter()
-        .filter(|(k, _)| REGISTERED_COPY_THROUGH.contains(&k.to_ascii_uppercase().as_str()))
-        .filter_map(|(k, v)| card_from_kv(k, v))
-        .collect();
-    cards.sort_by(|a, b| a.keyword.cmp(&b.keyword));
-    Ok(cards)
-}
-
-/// The header of a file Prepare writes (plan 6b-2 C12):
-/// - the source's copy-through cards;
-/// - the CFA cards when the output is still a mosaic;
-/// - `IMAGETYP = 'LIGHT'`;
-/// - `ATH_STK = T` (a stacking intermediate, which the scanner never catalogs);
-/// - `ATH_STKV`;
-/// - `ATH_PREP` (`converted` | `debayered`).
-/// It never carries `CALSTAT`, `ATH_CSRC`, `ATH_PRJ` or `ATH_FILT`: none of
-/// them is in the copy-through list.
-pub fn prepare_cards(source: &[Card], mosaic: Option<CfaGeometry>, prepared: &str) -> anyhow::Result<Vec<Card>> {
-    let mut cards: Vec<Card> = source
-        .iter()
-        .filter(|c| REGISTERED_COPY_THROUGH.contains(&c.keyword.as_str()))
-        .cloned()
-        .collect();
-    if let Some(g) = mosaic {
-        cards.push(Card::new("BAYERPAT", CardValue::Str(g.pattern.as_str().to_string()))?);
-        cards.push(Card::new("XBAYROFF", CardValue::Integer(g.xoff))?);
-        cards.push(Card::new("YBAYROFF", CardValue::Integer(g.yoff))?);
-    }
-    cards.push(Card::new("IMAGETYP", CardValue::Str("LIGHT".into()))?);
-    cards.push(
-        Card::new("ATH_STK", CardValue::Logical(true))?
-            .with_comment("stacking intermediate; never cataloged"),
-    );
-    cards.push(Card::new("ATH_STKV", CardValue::Integer(ATH_STK_VERSION))?);
-    cards.push(
-        Card::new("ATH_PREP", CardValue::Str(prepared.to_string()))?
-            .with_comment("how Prepare produced this file"),
-    );
-    Ok(cards)
-}
-
-/// `(width, height, planes, planar data)` of `src` in the unit domain, read
-/// per `read`: a FITS through the plane reader (physical values, then ÷ the
-/// divisor for an integer file), an XISF through `read_raw` ÷
-/// [`XISF_READ_SCALE`].
-fn read_unit_planes(src: &Path, read: &PrepareRead) -> anyhow::Result<(usize, usize, usize, Vec<f32>)> {
-    match read {
-        PrepareRead::InPlaceFits | PrepareRead::ScaledFits { .. } => {
-            let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
-            let (w, h, c) = (reader.width(), reader.height(), reader.channels());
-            let mut data = Vec::with_capacity(w * h * c);
-            for plane in 0..c {
-                data.extend(reader.read_plane(plane).with_context(|| format!("reading {}", src.display()))?);
-            }
-            if let PrepareRead::ScaledFits { divisor } = read {
-                for v in &mut data {
-                    *v = (*v as f64 / divisor) as f32;
-                }
-            }
-            Ok((w, h, c, data))
-        }
-        PrepareRead::Xisf => {
-            let (meta, pixels) = astroimage::ImageConverter::read_raw(src)
-                .map_err(|e| anyhow::anyhow!("{}: {e:#}", src.display()))?;
-            let data: Vec<f32> = match pixels {
-                astroimage::PixelData::Float32(v) => {
-                    v.into_iter().map(|x| (x as f64 / XISF_READ_SCALE) as f32).collect()
-                }
-                astroimage::PixelData::Uint16(v) => {
-                    v.into_iter().map(|x| (x as f64 / XISF_READ_SCALE) as f32).collect()
-                }
-            };
-            Ok((meta.width, meta.height, meta.channels, data))
-        }
-    }
-}
-
-/// Read `src` into the unit domain per `read` and write it as a float32 FITS
-/// at `dest` with `cards` (atomic: temp file + rename). Returns `(width,
-/// height, planes)`.
-pub fn convert_to_float_fits(
-    src: &Path,
-    dest: &Path,
-    read: &PrepareRead,
-    cards: &[Card],
-    durability: Durability,
-) -> anyhow::Result<(usize, usize, usize)> {
-    let (w, h, c, data) = read_unit_planes(src, read)?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    write_fits_f32_with(dest, w, h, c, &data, cards, durability)
-        .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest.display()))?;
-    Ok((w, h, c))
-}
-
-/// Debayer a one-plane float FITS mosaic at `src` into a three-plane float32
-/// FITS at `dest` (plan 6b-2 C12), through the generator's own
-/// [`debayer_plane`] with `geom`'s phase. `cards` are written as given (the
-/// caller applies [`debayered_cards`]). It checks `cancel` before the
-/// debayer, the expensive part, and fails with
-/// [`IntegrationError::Cancelled`]. Returns the written file's size.
-pub fn debayer_file(
-    src: &Path,
-    dest: &Path,
-    geom: CfaGeometry,
-    cards: &[Card],
-    durability: Durability,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-    cancel: &AtomicBool,
-) -> anyhow::Result<u64> {
-    let (w, h, mosaic) = {
-        let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
-        if reader.channels() != 1 {
-            anyhow::bail!("{}: a {}-plane image is not a CFA mosaic", src.display(), reader.channels());
-        }
-        let plane = reader.read_plane(0).with_context(|| format!("reading {}", src.display()))?;
-        (reader.width(), reader.height(), plane)
-    };
-    if cancel.load(Ordering::Relaxed) {
-        return Err(IntegrationError::Cancelled.into());
-    }
-    let rgb = debayer_plane(&mosaic, w, h, geom, pool);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    write_fits_f32_with(dest, w, h, 3, &rgb, cards, durability)
-        .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest.display()))?;
-    Ok(std::fs::metadata(dest)?.len())
-}
-
-/// One frame's Prepare work, resolved on the run thread: no catalog, no
-/// `RunContext`.
-#[derive(Debug, Clone)]
-pub struct PrepareJob {
-    /// The file Prepare reads: the landed replica, or an attested light.
-    pub src: PathBuf,
-    pub shape: FileShape,
-    pub action: PrepareAction,
-    /// `prepared/<group>/p_<stem>.fits`, for a converted copy.
-    pub converted_out: PathBuf,
-    /// `prepared/<group>/p_<stem>_d.fits`, for a debayered copy.
-    pub debayered_out: PathBuf,
-    pub durability: Durability,
-}
-
-/// What Prepare hands on for one frame.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PreparedFiles {
-    /// The file stage 1 hands on (the `calibrated` artifact).
-    pub calibrated: PathBuf,
-    /// The CFA mosaic the debayer read (the `calibrated_mosaic` artifact
-    /// when Bayer drizzle wants one): the file itself for a float mosaic,
-    /// its converted copy otherwise. `None` when nothing was debayered.
-    pub mosaic: Option<PathBuf>,
-    /// `in_place` | `converted` | `debayered` — the `prepared` log field.
-    pub prepared: &'static str,
-}
-
-/// Prepare one frame (plan 6b-2 C12):
-/// - in place: nothing is written;
-/// - converted: the unit-domain copy;
-/// - debayered: from the file itself (a float mosaic) or from its converted
-///   copy.
-/// Never writes, renames or deletes `job.src`.
-pub fn execute_prepare(
-    job: &PrepareJob,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-    cancel: &AtomicBool,
-) -> anyhow::Result<PreparedFiles> {
-    match &job.action {
-        PrepareAction::InPlace => Ok(PreparedFiles {
-            calibrated: job.src.clone(),
-            mosaic: None,
-            prepared: "in_place",
-        }),
-        PrepareAction::Unsupported(why) => anyhow::bail!("unsupported file: {why}"),
-        PrepareAction::Write { read, debayer } => {
-            let source = source_cards_of(&job.src)?;
-            let base = if *read == PrepareRead::InPlaceFits {
-                job.src.clone()
-            } else {
-                let mosaic = if job.shape.planes == 1 { job.shape.cfa } else { None };
-                let cards = prepare_cards(&source, mosaic, "converted")?;
-                convert_to_float_fits(&job.src, &job.converted_out, read, &cards, job.durability)?;
-                job.converted_out.clone()
-            };
-            match debayer {
-                None => Ok(PreparedFiles {
-                    calibrated: base,
-                    mosaic: None,
-                    prepared: "converted",
-                }),
-                Some(geom) => {
-                    let mut cards = prepare_cards(&source, None, "debayered")?;
-                    debayered_cards(&mut cards)?;
-                    debayer_file(&base, &job.debayered_out, *geom, &cards, job.durability, pool, cancel)?;
-                    Ok(PreparedFiles {
-                        calibrated: job.debayered_out.clone(),
-                        mosaic: Some(base),
-                        prepared: "debayered",
-                    })
-                }
-            }
-        }
-    }
-}
-```
-Update the module doc's last sentence to: "The classifier reads a file from its header alone; the plan's space estimate and warnings and the run read the same answer. The writers below never touch the file they read."
-
-- [ ] **Step 5: The layout** (`paths.rs`). Add to `impl WorkingLayout`, after `calibrated_dir`:
-```rust
-    /// `root/prepared` — Prepare's converted and debayered copies (plan
-    /// 6b-2 C12). A file used in place is never here: its artifact points at
-    /// the landed file, which no cleanup ever removes.
-    pub fn prepared_root(&self) -> PathBuf {
-        self.root.join("prepared")
-    }
-
-    /// `root/prepared/<group_key>`.
-    pub fn prepared_dir(&self, group_key: &str) -> PathBuf {
-        self.prepared_root().join(group_key)
-    }
-```
-In `work_usage`, use `let calibrated_bytes = crate::api::sync::dir_size_bytes(&layout.calibrated_root()) + crate::api::sync::dir_size_bytes(&layout.prepared_root());`. Add one line to its doc: "Prepare's copies count as calibrated bytes, because they fill stage 1's slot." Do not touch `WorkUsage`'s field docs, which are exported. In `cleanup_work`, push `layout.prepared_root()` right after `layout.calibrated_root()` in both the `Intermediates` and the `All` arms. Add one sentence to its doc: "`prepared/` goes with `calibrated/`; a `calibrated` row pointing at a file used in place loses its row, never its file."
-
-- [ ] **Step 6: The origin and the hash** (`origin.rs`, `plan.rs`). In `origin.rs` add `use std::path::PathBuf;` and `use crate::stacking::groups::GroupFrame;`, then:
+- [ ] **Step 3: The origin** (`origin.rs`). Add `use std::path::PathBuf;` and `use crate::stacking::groups::GroupFrame;`, then:
 ```rust
 /// Whether stage 1 PREPARES this frame instead of calibrating it (spec
 /// §5.1, §13): every project frame, and an attested set's lights.
@@ -7249,39 +7613,8 @@ pub(crate) fn prepare_input(origin: &FrameOrigin, frame: &GroupFrame) -> Prepare
     }
 }
 ```
-In `plan.rs`, beside `prepare_hash_for_project`:
-```rust
-/// Stage 1's hash for an ATTESTED light (spec §13, plan 6b-2 C11): the
-/// Prepare subtree and the light's own `files` identity, with no master
-/// upstream, because an attested light is never calibrated.
-pub(crate) fn prepare_hash_for_catalog(cfg: &StackingConfig, frame: &GroupFrame) -> String {
-    stage_hash(
-        &crate::stacking::config::prepare_subtree(cfg),
-        &[],
-        &[SourceIdentity {
-            file_id: frame.file_id,
-            size: frame.size,
-            modified_at: frame.modified_at.clone(),
-        }],
-    )
-}
-```
-`HashMemo::hash_by_origin` becomes:
-```rust
-        match origin_of(&self.origins, frame.frame_id)? {
-            FrameOrigin::Catalog { attested: false, .. } => {
-                calibration_hash_for(conn, cfg, frame, &mut self.divisors)
-            }
-            // Spec §13 (R3): an attested light is prepared, never calibrated.
-            FrameOrigin::Catalog { attested: true, .. } => Ok(prepare_hash_for_catalog(cfg, frame)),
-            FrameOrigin::Project {
-                blake3, byte_size, ..
-            } => Ok(prepare_hash_for_project(cfg, blake3, *byte_size)),
-        }
-```
-Delete Task 6's "(Task 9 splits this arm)" comment.
 
-- [ ] **Step 7: The stage** (`run.rs`).
+- [ ] **Step 4: The stage** (`run.rs`).
   1. `resolve_calibrate_job`'s origin match gains an attested arm, ahead of the catalog one:
 ```rust
             Ok(FrameOrigin::Catalog { attested: true, .. }) => {
@@ -7338,6 +7671,20 @@ fn stage_one_kind(rc: &RunContext) -> Result<StageOneKind, RunError> {
   Add one sentence to `stage_calibrate`'s doc: "A project or an attested set takes [`stage_prepare`] instead (plan 6b-2 C11, C12)."
   4. Add after `commit_calibrated`:
 ```rust
+/// The plane count every member of `group` has after stage 1 (plan 6b-2
+/// C13, review I12): one for mono; three for OSC with the debayer on; with
+/// it off, three for a project's `osc` group (its members are three-plane
+/// files) and one otherwise (a frame set's OSC group or a project's `cfa`
+/// group: mosaics kept as mosaics).
+fn expected_stage_one_planes(cfg: &StackingConfig, subject: &StackSubject, group: &IntegrationGroup) -> usize {
+    match group.color_mode {
+        ColorMode::Mono => 1,
+        ColorMode::Osc if cfg.calibration.debayer_osc => 3,
+        ColorMode::Osc if subject.project_id().is_some() && group.key.starts_with("osc__") => 3,
+        ColorMode::Osc => 1,
+    }
+}
+
 /// One frame's Prepare RESOLVE outcome (plan 6b-2 C12), the twin of
 /// [`CalibrateResolved`].
 enum PrepareResolved {
@@ -7362,8 +7709,10 @@ struct PrepareRunJob {
 /// - the identity check (C9's Prepare boundary);
 /// - the stage-1 hash through `rc.memo`;
 /// - the header-only classification;
+/// - the plane-count check against the group's colour (review I12);
 /// - the freshness lookup.
-/// A frame whose file no reader decodes is excluded here.
+/// A frame whose file no reader decodes, or whose planes contradict its
+/// group, is excluded here.
 fn resolve_prepare_job(
     rc: &mut RunContext,
     cfg: &StackingConfig,
@@ -7391,6 +7740,18 @@ fn resolve_prepare_job(
     if let PrepareAction::Unsupported(why) = &action {
         return Ok(PrepareResolved::Excluded {
             reason: format!("unsupported file: {why}"),
+        });
+    }
+    // Review I12 (C13): the group's colour comes from the manifest (or the
+    // catalog), Prepare's debayer from the file's own header. A file whose
+    // post-Prepare plane count contradicts its group never reaches Measure.
+    let planes = match &action {
+        PrepareAction::Write { debayer: Some(_), .. } => 3,
+        _ => shape.planes,
+    };
+    if planes != expected_stage_one_planes(cfg, &rc.subject, group) {
+        return Ok(PrepareResolved::Excluded {
+            reason: format!("plane count {planes} disagrees with the group's colour mode"),
         });
     }
     let keep_mosaic = wants_cfa_mosaic(cfg, group)
@@ -7456,6 +7817,9 @@ fn commit_prepared(
         prepared = files.prepared,
         "frame prepared"
     );
+    // A deferred transaction on purpose, as `commit_calibrated` does: these
+    // are write-only upserts, so the `BEGIN IMMEDIATE` rule for
+    // read-then-write does not apply (review M20).
     let mut conn = db(&rc.ctx)?.conn();
     let tx = conn
         .transaction()
@@ -7628,21 +7992,21 @@ fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
     Ok(())
 }
 ```
-  `rustfmt` will re-wrap the long single-line calls; that is expected. `stage_one_kind` is a funnel (C8) and names no variant. `resolve_prepare_job`, `commit_prepared` and `stage_prepare` name none, so the grep test of Task 6 stays green.
+  `rustfmt` will re-wrap the long single-line calls; that is expected. `stage_one_kind` is a funnel (C8) and names no variant. `resolve_prepare_job`, `commit_prepared` and `stage_prepare` name none, so the grep test of Task 6a stays green.
 
-- [ ] **Step 8: Run the tests and watch them pass.** First the Step 2 command. Then the Review Focus 1 pins, which must pass unchanged:
+- [ ] **Step 5: Run the tests and watch them pass.** First the Step 2 command. Then, unchanged:
 ```bash
-CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 export::calibrated_generator calibrate_fan_out_matches_the_sequential_stage_byte_for_byte calibrate_stage_reuses_fresh_artifacts calibrate_outputs_disambiguate turning_bayer_on_regenerates stacking::paths stage_hashes_are_pinned subject_and_origin_variants_stay_in_their_funnels
+CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 calibrate_fan_out_matches_the_sequential_stage_byte_for_byte calibrate_stage_reuses_fresh_artifacts calibrate_outputs_disambiguate turning_bayer_on_regenerates subject_and_origin_variants_stay_in_their_funnels a_project_start_is_refused_until_6b2
 ```
-  Expected: all pass. The generator tests pin its pixels and cards, and `stage_hashes_are_pinned_to_golden_literals` is untouched.
+  Expected: all pass. A frame set without attestation still takes Calibrate, and a project start is still refused.
 
-- [ ] **Step 9: Run the gate.** TS must not move, because `WorkUsage`'s shape is unchanged: `git diff --exit-code src/types`.
+- [ ] **Step 6: Run the gate.** TS must not move: `git diff --exit-code src/types`.
 
-- [ ] **Step 10: Commit** with the message `feat(stacking): Prepare — project replicas and attested lights in place, converted or debayered`, plus the trailers.
+- [ ] **Step 7: Commit** with the message `feat(stacking): the Prepare stage for projects and attested sets`, plus the trailers.
 
 ---
 
-### Task 10: Solve — the gate, the core catalog, the solver seam, the Solve sub-step, the reference rule, the real-data probe (C14, C15; spec §5.2, §5.4, §15.2)
+### Task 10a: The plate-solve core — the extracted gate, the solver config hash, one catalog opener for both hosts (C14)
 
 **Files:**
 - Modify `crates/athenaeum-core/src/plate_solve/service.rs`:
@@ -7653,18 +8017,6 @@ CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 export
 - Modify `crates/athenaeum-core/src/plate_solve/layers.rs`: add `CatalogOpenError`, `catalog_root`, `open_catalog_layers` and `catalog_identity`, plus a test.
 - Modify `crates/athenaeum-core/src/plate_solve/mod.rs`: the re-exports.
 - Modify `crates/athenaeum-tauri/src/commands/plate_solve.rs` (`resolve_layer_caches`, `~17-47`) and `crates/athenaeum-web/src/routes/plate_solve.rs` (`resolve_layer_caches`, `~38-78`): call the core opener.
-- Create `crates/athenaeum-core/src/stacking/solve.rs`, and declare `pub mod solve;` in `stacking/mod.rs`.
-- Modify `crates/athenaeum-core/src/stacking/origin.rs`:
-  - add `SolvePlan`, `solve_plan`, `WcsTier`, `wcs_tier` and `local_solve_outcome`;
-  - `stored_solve`'s project arm;
-  - a test.
-- Modify `crates/athenaeum-core/src/stacking/weights.rs`: add `two_pass_pick_among`, which `two_pass_pick` delegates to, plus a test.
-- Modify `crates/athenaeum-core/src/stacking/run.rs`:
-  - `RunContext` gains `solver` and `wcs_rule`, with their two constructors (`start_stacking ~944`, `test_context ~9916`);
-  - add `WcsRule`, `NO_PROJECT_REFERENCE`, `MANUAL_REFERENCE_WITHOUT_WCS`, `solve_project_frames`, `wcs_tiers`, `best_included_idx_where` and `best_candidate_idx`;
-  - change `stage_measure`'s head, `stage_reference`, `group_reference_idx` and `two_pass_refine`'s pick (`~5168`);
-  - tests.
-- Modify `crates/athenaeum-core/src/stacking/plan.rs`: `project_inputs`'s solved-locally warning (Task 7), plus a test.
 
 **Interfaces:**
 ```rust
@@ -7680,43 +8032,8 @@ pub fn solver_config_hash(cfg: &PlateSolveConfig) -> String;
 pub fn catalog_root(app_data_dir: &Path) -> PathBuf;
 pub fn open_catalog_layers(app_data_dir: &Path) -> Result<Vec<Arc<solvemyastro::StarCache>>, CatalogOpenError>;
 pub fn catalog_identity(app_data_dir: &Path) -> Result<String, CatalogOpenError>;
-// stacking/solve.rs (pub mod)
-pub trait FrameSolver: Send + Sync {
-    fn identity(&self) -> Result<String, String>;
-    fn solve(&self, request: &SolveRequest, cancel: &AtomicBool) -> SolveOutcome;
-}
-#[derive(Debug, Clone)] pub struct SolveRequest { pub path: PathBuf, pub hints: SolveHints, pub expected_scale_arcsec: Option<f64>,
-    pub date_obs: Option<DateTime<Utc>>, pub focal_len: Option<f64>, pub instrume: Option<String>, pub naxis: Option<(i64, i64)> }
-impl SolveRequest { pub fn for_frame(path: &Path, meta: &ProjectFrameMeta, target: Option<(f64, f64)>) -> Self; }
-#[derive(Debug, Clone, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
-pub enum SolveOutcome { Solved(PlateSolveRecord), Failed(String), Refused(String) }
-impl SolveOutcome { pub fn label(&self) -> &'static str; }
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct SolveArtifact { pub blake3: String, pub outcome: SolveOutcome }
-pub fn solve_hash(blake3: &str, solver_identity: &str) -> String;
-pub fn solve_with(request: &SolveRequest, caches: &solvemyastro::Caches<'_>, config: &PlateSolveConfig, cancel: &AtomicBool) -> SolveOutcome;
-pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()>;
-pub(crate) fn stored_outcome(conn: &Connection, project_id: &str, frame_id: i64, blake3: &str) -> anyhow::Result<Option<SolveOutcome>>;
-pub(crate) fn write_outcome(conn: &Connection, project_id: &str, frame_id: i64, blake3: &str, hash: &str, outcome: SolveOutcome) -> anyhow::Result<()>;
-pub struct CatalogSolver { /* private */ } impl CatalogSolver { pub fn new(ctx: Arc<ServiceContext>) -> Self; }
-#[cfg(test)] pub(crate) struct FakeSolver { /* private */ }
-// stacking/origin.rs
-pub(crate) struct SolvePlan { pub(crate) project_id: String, pub(crate) frame_uuid: String, pub(crate) blake3: String, pub(crate) meta: ProjectFrameMeta }
-pub(crate) fn solve_plan(origin: &FrameOrigin) -> Option<SolvePlan>;
-#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub(crate) enum WcsTier { NotApplicable, Manifest, Local, Missing }
-pub(crate) fn wcs_tier(conn: &Connection, origin: &FrameOrigin, frame_id: i64) -> anyhow::Result<WcsTier>;
-pub(crate) fn local_solve_outcome(conn: &Connection, origin: &FrameOrigin, frame_id: i64) -> anyhow::Result<Option<SolveOutcome>>;
-// stacking/weights.rs
-pub(crate) fn two_pass_pick_among(candidates: &[TwoPassCandidate], reference_idx: usize, diagonal_px: f64, min_gain_px: f64, allowed: &dyn Fn(usize) -> bool) -> Option<usize>;
-// stacking/run.rs
-pub(crate) struct WcsRule { pub(crate) candidates: HashSet<i64>, pub(crate) with_wcs: HashSet<i64> }
-const NO_PROJECT_REFERENCE: &str = "no frame of this project could be plate-solved; the grid needs one";
-const MANUAL_REFERENCE_WITHOUT_WCS: &str = "the manual reference frame has no WCS (none in the manifest, and the run could not plate-solve it); the grid needs one";
-fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError>;
-fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError>;
 ```
-Consumed by: plan 6b-3 (`stored_solve`'s local WCS seeds registration onto the grid; `rc.wcs_rule` is the grid reference's rule).
-
-The solve artifact's hash is `solve_hash(blake3, identity)`, where `identity = "<solver_config_hash>:<catalog_identity>"`. It is not the Prepare hash, so toggling the debayer never re-solves. The artifact's payload carries the content's `blake3`, so `stored_solve` never serves a solve of an older version of the frame, even when the run could not refresh it.
+Consumed by: Task 10b (`acceptance_refusal`, `record_from_result`, `solver_config_hash`, `open_catalog_layers`, `catalog_identity` in `CatalogSolver`), Task 10c (`open_catalog_layers` in the real-data probe). No stacking code changes here; no command is added or changed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -7808,49 +8125,402 @@ The solve artifact's hash is `solve_hash(blake3, identity)`, where `identity = "
         assert!(moved.starts_with("tier_500:3:"), "{moved}");
     }
 ```
-`stacking/solve.rs` tests (the module is created in Step 4; write its test module here):
+
+- [ ] **Step 2: Run the tests and watch them fail.**
+
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 acceptance_refusal record_from_result the_solver_config_hash the_catalog_identity`
+
+Expected: the build fails. None of the new items exist.
+
+- [ ] **Step 3: The plate-solve core** (`plate_solve/`).
+
+`service.rs`. Add, after `store_result`:
+```rust
+/// The persist gate as a pure check (plan 6b-2 C14): `Some(user-facing
+/// reason)` when `config` refuses `result`, given the scale the frame's own
+/// optics, or its manifest, imply. [`store_result`] and a stacking run's
+/// local solve share it.
+pub(crate) fn acceptance_refusal(
+    result: &SolveResult,
+    expected_scale_arcsec: Option<f64>,
+    config: &PlateSolveConfig,
+) -> Option<String> {
+    if !config.blind_gate_enabled {
+        return None;
+    }
+    let m = BlindGateMetrics {
+        inliers: result.matched_stars,
+        expected_in_fov: result.expected_catalog_stars_in_fov,
+        rms_px: result.rms_residual_px,
+        adaptive_tol_px: adaptive_tol_px(
+            result.pixel_scale_arcsec,
+            config.base_verification_tolerance_arcsec,
+        ),
+        inlier_ratio: result.inlier_ratio,
+        recovered_scale_arcsec: result.pixel_scale_arcsec,
+        header_scale_arcsec: expected_scale_arcsec,
+    };
+    if blind_gate_ok(GateStage::ScaleCleared, &m, config) {
+        None
+    } else {
+        Some(format!(
+            "Rejected: low confidence ({} inliers, ratio {:.2}, {:.2}\"/px)",
+            result.matched_stars, result.inlier_ratio, result.pixel_scale_arcsec
+        ))
+    }
+}
+
+/// The `plate_solves` row a solve becomes (pure; `solved_at` is now).
+pub(crate) fn record_from_result(frame_id: i64, result: &SolveResult) -> PlateSolveRecord {
+    PlateSolveRecord {
+        id: None,
+        frame_id,
+        crpix1: result.wcs.crpix.0,
+        crpix2: result.wcs.crpix.1,
+        crval1: result.wcs.crval.0,
+        crval2: result.wcs.crval.1,
+        cd1_1: result.wcs.cd[0][0],
+        cd1_2: result.wcs.cd[0][1],
+        cd2_1: result.wcs.cd[1][0],
+        cd2_2: result.wcs.cd[1][1],
+        // SIP coefficients — populated from solvemyastro when fit_sip=true.
+        // The DB columns already exist (schema unchanged); legacy solves wrote
+        // NULL, now we write real values.
+        sip_order: result.sip_order.map(|o| o as i32),
+        sip_a_coeffs: result.sip_a_coeffs.clone(),
+        sip_b_coeffs: result.sip_b_coeffs.clone(),
+        sip_ap_coeffs: result.sip_ap_coeffs.clone(),
+        sip_bp_coeffs: result.sip_bp_coeffs.clone(),
+        matched_stars: result.matched_stars as i32,
+        total_detected: result.total_detected as i32,
+        rms_residual_px: result.rms_residual_px,
+        rms_residual_arcsec: result.rms_residual_arcsec,
+        pixel_scale_arcsec: result.pixel_scale_arcsec,
+        field_rotation_deg: result.field_rotation_deg,
+        solve_time_ms: result.solve_time_ms as i64,
+        catalog_used: result.catalog_used.clone(),
+        algorithm_used: result.algorithm_used.clone(),
+        solved_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        expected_catalog_stars_in_fov: Some(result.expected_catalog_stars_in_fov as i32),
+        inlier_ratio: Some(result.inlier_ratio),
+    }
+}
+```
+This is today's `PlateSolveRecord { … }` literal from `store_result` (`~439-468`), moved verbatim with `frame_id` the parameter; delete it from `store_result`. In `store_result`, the gate block becomes:
+```rust
+    if config.blind_gate_enabled {
+        // The frame's own optics, when it declares them (2026-09-05: on
+        // wind-shaken frames the solver walks its autoFOV ladder and returns a
+        // confident-looking solve at 16–193× the header's scale). Read only
+        // while the gate is on, as before.
+        if let Some(reason) =
+            acceptance_refusal(result, header_pixel_scale_arcsec(conn, frame_id), config)
+        {
+            tracing::warn!(
+                frame_id,
+                stage = "store",
+                outcome = "rejected_low_confidence",
+                inliers = result.matched_stars,
+                inlier_ratio = result.inlier_ratio,
+                scale_arcsec_px = result.pixel_scale_arcsec,
+                "refusing to persist low-confidence solve, WCS/focal length not written back"
+            );
+            return Ok(StoreOutcome::RejectedLowConfidence { reason });
+        }
+    }
+
+    let record = record_from_result(frame_id, result);
+```
+Keep `store_result`'s doc and its "Defense-in-depth" comment block above the gate. Every existing service test passes unchanged; this is the behaviour pin.
+
+`config.rs`. Append after `save_config`:
+```rust
+/// Bumped when the solver recipe hard-coded in
+/// [`crate::plate_solve::service::solve_frame_with_hints`] changes (quad
+/// tolerance, catalog magnitude limit, SIP fitting), and whenever a solver
+/// upgrade should re-solve frames a stacking run cached as SOLVED: bumping it
+/// moves every cached solve's hash. A cached failure or refusal needs no
+/// bump: one written by another app version is tried once more anyway
+/// (review I7, `stacking::solve::cached_outcome_holds`).
+pub const SOLVE_RECIPE_VERSION: u32 = 1;
+
+/// What a cached solve depends on (plan 6b-2 C14): the recipe, the SIP
+/// order, and every acceptance-gate field. Not the batch concurrency, the
+/// autofind tolerance, the input gate (a run applies none) or the camera
+/// defaults (they only back-fill a catalog row's focal length).
+pub fn solver_config_value(cfg: &PlateSolveConfig) -> serde_json::Value {
+    serde_json::json!({
+        "recipe": SOLVE_RECIPE_VERSION,
+        "sipOrder": cfg.sip_order,
+        "baseVerificationToleranceArcsec": cfg.base_verification_tolerance_arcsec,
+        "blindGateEnabled": cfg.blind_gate_enabled,
+        "blindRmsMaxPxMult": cfg.blind_rms_max_px_mult,
+        "blindMinInlierRatio": cfg.blind_min_inlier_ratio,
+        "blindInlierFloor": cfg.blind_inlier_floor,
+        "blindScaleSanityMin": cfg.blind_scale_sanity_min,
+        "blindScaleSanityMax": cfg.blind_scale_sanity_max,
+        "blindScaleHeaderTol": cfg.blind_scale_header_tol,
+    })
+}
+
+/// [`solver_config_value`]'s canonical JSON (sorted keys) as XXH3-64, 16 hex
+/// digits.
+pub fn solver_config_hash(cfg: &PlateSolveConfig) -> String {
+    let json = serde_json::to_string(&solver_config_value(cfg))
+        .expect("a solver config value always serializes");
+    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(json.as_bytes()))
+}
+```
+`layers.rs`. Add `use std::sync::Arc;` and `use std::time::UNIX_EPOCH;`, then append after `discover_layers`:
+```rust
+/// Why the plate-solve star catalog could not be opened.
+#[derive(Debug)]
+pub enum CatalogOpenError {
+    /// No tier and no legacy `stars.smac` under `root`.
+    NotInstalled { root: PathBuf },
+    /// A tier exists, but it could not be opened or read.
+    Open { dir: PathBuf, error: String },
+}
+
+impl std::fmt::Display for CatalogOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CatalogOpenError::NotInstalled { root } => {
+                write!(f, "the plate-solve star catalog is not installed under {}", root.display())
+            }
+            CatalogOpenError::Open { dir, error } => {
+                write!(f, "Failed to open star cache at {}: {error}", dir.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for CatalogOpenError {}
+
+/// `<app-data>/catalogs/smac_gaia`, where the hosts install the catalog.
+pub fn catalog_root(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("catalogs").join("smac_gaia")
+}
+
+/// Open the additive tier stack under [`catalog_root`] (base → deepest), or
+/// a legacy single cache. This is the one opener: both hosts and a stacking
+/// run call it. Opens fresh on each call; the mmap is cheap.
+pub fn open_catalog_layers(
+    app_data_dir: &Path,
+) -> Result<Vec<Arc<solvemyastro::StarCache>>, CatalogOpenError> {
+    let root = catalog_root(app_data_dir);
+    let dirs = discover_layers(&root);
+    if dirs.is_empty() {
+        return Err(CatalogOpenError::NotInstalled { root });
+    }
+    let mut layers = Vec::with_capacity(dirs.len());
+    for dir in &dirs {
+        let cache = solvemyastro::StarCache::open(dir).map_err(|e| CatalogOpenError::Open {
+            dir: dir.clone(),
+            error: e.to_string(),
+        })?;
+        layers.push(Arc::new(cache));
+    }
+    tracing::debug!(count = layers.len(), path = %root.display(), "opened catalog layers");
+    Ok(layers)
+}
+
+/// The installed catalog's identity, for a cached solve's hash: every tier's
+/// directory name (`legacy` for a bare root cache), with its `stars.smac`
+/// size and mtime in seconds, in tier order. Stat only, no read. It walks the
+/// tiers apart from [`open_catalog_layers`]: a catalog swapped between the
+/// two walks could pair the new identity with the old layers for one run,
+/// which is negligible (review M15).
+pub fn catalog_identity(app_data_dir: &Path) -> Result<String, CatalogOpenError> {
+    let root = catalog_root(app_data_dir);
+    let dirs = discover_layers(&root);
+    if dirs.is_empty() {
+        return Err(CatalogOpenError::NotInstalled { root });
+    }
+    let mut parts = Vec::with_capacity(dirs.len());
+    for dir in &dirs {
+        let meta = std::fs::metadata(dir.join("stars.smac")).map_err(|e| CatalogOpenError::Open {
+            dir: dir.clone(),
+            error: e.to_string(),
+        })?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        let name = if *dir == root {
+            "legacy".to_string()
+        } else {
+            dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        };
+        parts.push(format!("{name}:{}:{mtime}", meta.len()));
+    }
+    Ok(parts.join(","))
+}
+```
+`mod.rs`: `pub use layers::{catalog_identity, catalog_root, discover_layers, open_catalog_layers, CatalogOpenError};` replaces `pub use layers::discover_layers;`.
+
+- [ ] **Step 4: The hosts call the core opener.** Tauri (`commands/plate_solve.rs`): add `use athenaeum_core::plate_solve::CatalogOpenError;`, then replace `resolve_layer_caches`'s body after `let parent = …;`. The user-facing strings stay byte-identical, and the `debug!` moves into core with the same message and fields.
+```rust
+    athenaeum_core::plate_solve::open_catalog_layers(parent).map_err(|e| match e {
+        CatalogOpenError::NotInstalled { root } => format!(
+            "solvemyastro star catalog not found under {}. \
+             Please download the Gaia DR3 prebuilt catalog from Settings → Plate Solving.",
+            root.display()
+        ),
+        CatalogOpenError::Open { dir, error } => {
+            format!("Failed to open star cache at {}: {error}", dir.display())
+        }
+    })
+```
+Web (`routes/plate_solve.rs`): the same `use`, and after `let parent = …;`:
+```rust
+    athenaeum_core::plate_solve::open_catalog_layers(parent).map_err(|e| match e {
+        CatalogOpenError::NotInstalled { root } => (
+            StatusCode::PRECONDITION_FAILED,
+            format!(
+                "solvemyastro star catalog not found under {}. \
+                 Please download the Gaia DR3 prebuilt catalog.",
+                root.display()
+            ),
+        ),
+        CatalogOpenError::Open { dir, error } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to open star cache at {}: {error}", dir.display()),
+        ),
+    })
+```
+Drop the `catalog_root` bindings, loops and `debug!` the core function now does. Keep each function's doc comment. Remove any import that becomes unused (the compiler names it). No command is added or changed, so the strict count stays at 299.
+
+- [ ] **Step 5: Run the tests and watch them pass.** First the Step 2 command. Then:
+```bash
+CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 plate_solve::
+CARGO_BUILD_JOBS=4 cargo check -p athenaeum-tauri
+CARGO_BUILD_JOBS=4 cargo test -p athenaeum-web -- --test-threads=4 plate_solve
+```
+  Expected: all pass, including every existing `store_result` / `blind_gate` test, unchanged.
+
+- [ ] **Step 6: Run the gate.** TS must not move: `git diff --exit-code src/types`.
+
+- [ ] **Step 7: Commit** with the message `feat(plate_solve): the acceptance gate as a pure check, the solver config hash, one catalog opener for both hosts`, plus the trailers.
+
+---
+
+### Task 10b: The solver seam and the Solve sub-step (C14; spec §5.2, §15.2)
+
+**Files:**
+- Create `crates/athenaeum-core/src/stacking/solve.rs`, and declare `pub mod solve;` in `stacking/mod.rs`.
+- Modify `crates/athenaeum-core/src/stacking/origin.rs`:
+  - add `SolvePlan`, `solve_plan` and `local_solve_outcome`;
+  - `stored_solve`'s project arm;
+  - a test.
+- Modify `crates/athenaeum-core/src/stacking/run.rs`:
+  - `RunContext` gains `solver`, with its two constructors (`start_stacking ~944`, `test_context ~9916`);
+  - add `solve_project_frames`;
+  - change `stage_measure`'s head;
+  - tests.
+- Modify `crates/athenaeum-core/src/stacking/plan.rs`: `project_inputs`'s solved-locally warning (Task 7), plus a test.
+
+**Interfaces:**
+```rust
+// stacking/solve.rs (pub mod)
+pub trait FrameSolver: Send + Sync {
+    fn identity(&self) -> Result<String, String>;
+    fn solve(&self, request: &SolveRequest, cancel: &AtomicBool) -> SolveOutcome;
+}
+#[derive(Debug, Clone)] pub struct SolveRequest { pub handle: i64, pub path: PathBuf, pub hints: SolveHints, pub expected_scale_arcsec: Option<f64>,
+    pub date_obs: Option<DateTime<Utc>>, pub focal_len: Option<f64>, pub instrume: Option<String>, pub naxis: Option<(i64, i64)> }
+impl SolveRequest { pub fn for_frame(handle: i64, path: &Path, meta: &ProjectFrameMeta, target: Option<(f64, f64)>) -> Self; }
+#[derive(Debug, Clone, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub enum SolveOutcome { Solved(PlateSolveRecord), Failed(String), Refused(String) }
+impl SolveOutcome { pub fn label(&self) -> &'static str; }
+#[derive(Debug, Clone, Serialize, Deserialize)] pub struct SolveArtifact { pub blake3: String, #[serde(default)] pub app_version: String, pub outcome: SolveOutcome }
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub fn solve_hash(blake3: &str, solver_identity: &str) -> String;
+pub fn solve_with(request: &SolveRequest, caches: &solvemyastro::Caches<'_>, config: &PlateSolveConfig, cancel: &AtomicBool) -> SolveOutcome;
+pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()>;
+pub(crate) fn cached_outcome_holds(row: &StackingArtifactRow, hash: &str) -> bool;
+pub(crate) fn stored_outcome(conn: &Connection, project_id: &str, frame_id: i64, blake3: &str) -> anyhow::Result<Option<SolveOutcome>>;
+pub(crate) fn write_outcome(conn: &Connection, project_id: &str, frame_id: i64, blake3: &str, hash: &str, outcome: SolveOutcome) -> anyhow::Result<()>;
+pub(crate) fn write_artifact(conn: &Connection, project_id: &str, frame_id: i64, hash: &str, artifact: &SolveArtifact) -> anyhow::Result<()>;
+pub struct CatalogSolver { /* private */ } impl CatalogSolver { pub fn new(ctx: Arc<ServiceContext>) -> Self; }
+#[cfg(test)] pub(crate) struct FakeSolver { /* private */ }
+// stacking/origin.rs
+pub(crate) struct SolvePlan { pub(crate) project_id: String, pub(crate) frame_uuid: String, pub(crate) blake3: String, pub(crate) meta: ProjectFrameMeta }
+pub(crate) fn solve_plan(origin: &FrameOrigin) -> Option<SolvePlan>;
+pub(crate) fn local_solve_outcome(conn: &Connection, origin: &FrameOrigin, frame_id: i64) -> anyhow::Result<Option<SolveOutcome>>;
+// stacking/run.rs
+fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError>;
+```
+Consumed by: Task 10c (`stored_outcome` through `wcs_tier`, the helpers, the probe's `solve_with` and `adu_scaled_copy`), plan 6b-3 (`stored_solve`'s local WCS seeds registration onto the grid).
+
+The solve artifact's hash is `solve_hash(blake3, identity)`, where `identity = "<solver_config_hash>:<catalog_identity>"`. It is not the Prepare hash, so toggling the debayer never re-solves. The artifact's payload carries the content's `blake3`, so `stored_solve` never serves a solve of an older version of the frame, even when the run could not refresh it. It also carries the app version that wrote it (review I7): a cached failure or refusal from another app version is a miss, and is tried once more, because a release may carry a solver that rescues the frame; a cached solve stays.
+
+- [ ] **Step 1: Write the failing tests**
+
+`stacking/solve.rs` tests (the module is created in Step 3; write its test module here):
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Plan 6b-2 C14: the `solve` artifact's payload, and its hash over the
-    /// frame's content and the solver's identity.
+    /// Plan 6b-2 C14: the `solve` artifact's payload (the content, the app
+    /// version that wrote it, review I7, and the outcome) and its hash over
+    /// the frame's content and the solver's identity.
     #[test]
     fn the_solve_artifact_payload_and_hash_are_pinned() {
-        let failed = SolveArtifact { blake3: "bb".into(), outcome: SolveOutcome::Failed("no match".into()) };
-        assert_eq!(serde_json::to_string(&failed).unwrap(), r#"{"blake3":"bb","outcome":{"failed":"no match"}}"#);
-        let refused = SolveArtifact { blake3: "bb".into(), outcome: SolveOutcome::Refused("r".into()) };
-        assert_eq!(serde_json::to_string(&refused).unwrap(), r#"{"blake3":"bb","outcome":{"refused":"r"}}"#);
+        let failed = SolveArtifact {
+            blake3: "bb".into(),
+            app_version: "1.2.3".into(),
+            outcome: SolveOutcome::Failed("no match".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&failed).unwrap(),
+            r#"{"blake3":"bb","app_version":"1.2.3","outcome":{"failed":"no match"}}"#
+        );
+        let refused = SolveArtifact { outcome: SolveOutcome::Refused("r".into()), ..failed.clone() };
+        assert_eq!(
+            serde_json::to_string(&refused).unwrap(),
+            r#"{"blake3":"bb","app_version":"1.2.3","outcome":{"refused":"r"}}"#
+        );
         let back: SolveArtifact = serde_json::from_str(
             &serde_json::to_string(&SolveArtifact {
-                blake3: "bb".into(),
                 outcome: SolveOutcome::Solved(FakeSolver::fixture_record()),
+                ..failed.clone()
             })
             .unwrap(),
         )
         .unwrap();
         assert!(matches!(back.outcome, SolveOutcome::Solved(ref r) if r.crval1 == 83.8 && r.crval2 == -5.4));
+        let unversioned: SolveArtifact = serde_json::from_str(r#"{"blake3":"bb","outcome":{"failed":"x"}}"#).unwrap();
+        assert_eq!(unversioned.app_version, "", "a payload without a version reads as another version");
+        assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
         let expected = stage_hash(&serde_json::json!({ "solver": "s:c" }), &["blake3:bb"], &[]);
         assert_eq!(solve_hash("bb", "s:c"), expected);
         assert_ne!(solve_hash("bb", "s:d"), expected);
         assert_ne!(solve_hash("cc", "s:c"), expected);
         assert_eq!(
-            [SolveOutcome::Solved(FakeSolver::fixture_record()).label(), SolveOutcome::Failed(String::new()).label(), SolveOutcome::Refused(String::new()).label()],
+            [
+                SolveOutcome::Solved(FakeSolver::fixture_record()).label(),
+                SolveOutcome::Failed(String::new()).label(),
+                SolveOutcome::Refused(String::new()).label(),
+            ],
             ["solved", "failed", "refused"]
         );
     }
 
-    /// Spec §5.2: a project frame's request carries the project's target as
-    /// the position hint, and the manifest's scale as both the scale hint and
-    /// the gate's expected scale.
+    /// Spec §5.2: a project frame's request carries its handle (it names the
+    /// solve's span, review M12), the project's target as the position hint,
+    /// and the manifest's scale as both the scale hint and the gate's expected
+    /// scale. The field of view is that scale times the frame's WIDTH, as the
+    /// hosts compute it (review M11).
     #[test]
     fn a_solve_request_carries_the_manifest_scale_and_the_target() {
         let meta = ProjectFrameMeta {
             exptime_sec: 300.0,
             date_obs: Some("2026-01-10T21:00:00".into()),
-            naxis1: Some(64),
-            naxis2: Some(48),
+            naxis1: Some(48),
+            naxis2: Some(64),
             pixel_scale_arcsec: Some(1.5),
             bayerpat: None,
             focal_len: Some(400.0),
@@ -7858,30 +8528,45 @@ mod tests {
             instrume: Some("cam".into()),
             wcs: None,
         };
-        let r = SolveRequest::for_frame(Path::new("/w/p.fits"), &meta, Some((83.8, -5.4)));
+        let r = SolveRequest::for_frame(7, Path::new("/w/p.fits"), &meta, Some((83.8, -5.4)));
+        assert_eq!(r.handle, 7);
         assert_eq!((r.hints.ra, r.hints.dec), (Some(83.8), Some(-5.4)));
         assert_eq!(r.hints.pixel_scale_arcsec, Some(1.5));
-        assert_eq!(r.hints.fov_deg, Some(1.5 * 64.0 / 3600.0));
+        assert_eq!(r.hints.fov_deg, Some(1.5 * 48.0 / 3600.0), "the width, not the larger side");
         assert_eq!(r.expected_scale_arcsec, Some(1.5));
         assert_eq!(r.date_obs.map(|d| d.to_rfc3339()).as_deref(), Some("2026-01-10T21:00:00+00:00"));
-        assert_eq!((r.focal_len, r.naxis), (Some(400.0), Some((64, 48))));
+        assert_eq!((r.focal_len, r.naxis), (Some(400.0), Some((48, 64))));
         let bare = SolveRequest::for_frame(
+            7,
             Path::new("/w/p.fits"),
             &ProjectFrameMeta { pixel_scale_arcsec: None, ..meta },
             None,
         );
         assert_eq!((bare.hints.ra, bare.hints.fov_deg, bare.expected_scale_arcsec), (None, None, None));
     }
+
+    /// Review M17: without an installed catalog the production solver says
+    /// so: `identity` fails, and `solve` reports the same reason without
+    /// touching the file.
+    #[test]
+    fn the_catalog_solver_without_a_catalog_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let solver = CatalogSolver::new(Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db"))));
+        let err = solver.identity().unwrap_err();
+        assert!(err.contains("not installed"), "{err}");
+        let request = SolveRequest::for_frame(1, Path::new("/nowhere/p.fits"), &ProjectFrameMeta::default(), None);
+        assert!(matches!(solver.solve(&request, &AtomicBool::new(false)), SolveOutcome::Failed(ref e) if *e == err));
+    }
 }
 ```
-The real-data probe is added in Step 10.
+The real-data probe is added in Task 10c.
 
 `stacking/origin.rs` tests:
 ```rust
-    /// Plan 6b-2 C14, C15: a project frame's WCS. The manifest's comes first,
-    /// then the run's cached solve of THIS content (a solve of other content
-    /// is never served). The tests also cover the tier the reference rule
-    /// reads and which frames the Solve sub-step takes.
+    /// Plan 6b-2 C14: a project frame's WCS. The manifest's comes first, then
+    /// the run's own cached solve of THIS content (a solve of other content is
+    /// never served). The test also covers which frames the Solve sub-step
+    /// takes, and the outcome the plan reads.
     #[test]
     fn a_project_frames_wcs_is_the_manifests_then_the_runs_own_solve() {
         use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
@@ -7915,48 +8600,22 @@ The real-data probe is added in Step 10.
         let (m_id, m, _) = of("m");
 
         assert!(stored_solve(&conn, &a, a_id).unwrap().is_none());
-        assert_eq!(wcs_tier(&conn, &a, a_id).unwrap(), WcsTier::Missing);
         assert!(solve_plan(&a).is_some_and(|p| p.frame_uuid == "a" && p.blake3 == a_blake3));
         assert!(local_solve_outcome(&conn, &a, a_id).unwrap().is_none());
 
         write_outcome(&conn, "p1", a_id, &a_blake3, "h", SolveOutcome::Solved(FakeSolver::fixture_record())).unwrap();
         assert_eq!(stored_solve(&conn, &a, a_id).unwrap().unwrap().crval1, 83.8);
-        assert_eq!(wcs_tier(&conn, &a, a_id).unwrap(), WcsTier::Local);
         assert!(matches!(local_solve_outcome(&conn, &a, a_id).unwrap(), Some(SolveOutcome::Solved(_))));
 
         write_outcome(&conn, "p1", a_id, "other-content", "h", SolveOutcome::Solved(FakeSolver::fixture_record())).unwrap();
         assert!(stored_solve(&conn, &a, a_id).unwrap().is_none(), "a solve of other content is not served");
 
         assert_eq!(stored_solve(&conn, &m, m_id).unwrap().unwrap().crval1, 10.0);
-        assert_eq!(wcs_tier(&conn, &m, m_id).unwrap(), WcsTier::Manifest);
         assert!(solve_plan(&m).is_none());
 
         let catalog = FrameOrigin::Catalog { file_id: 1, attested: false };
-        assert_eq!(wcs_tier(&conn, &catalog, 1).unwrap(), WcsTier::NotApplicable);
         assert!(solve_plan(&catalog).is_none());
         assert!(local_solve_outcome(&conn, &catalog, 1).unwrap().is_none());
-    }
-```
-`stacking/weights.rs` tests:
-```rust
-    /// Plan 6b-2 C15: the re-pick among WCS candidates. The median still
-    /// spans every usable frame; only an allowed frame can win; with nothing
-    /// allowed but the reference itself there is no switch.
-    #[test]
-    fn two_pass_pick_among_never_lets_a_non_candidate_win() {
-        let c = |idx: usize, weight: f64, tx: f64| TwoPassCandidate {
-            idx,
-            weight,
-            rotation_deg: 0.0,
-            translation: (tx, 0.0),
-        };
-        // Median translation x = (1 + 2) / 2 = 1.5; deviations 38.5, 1.5, 0.5, 0.5.
-        let set = [c(0, 1.0, 40.0), c(1, 0.9, 0.0), c(2, 0.8, 1.0), c(3, 0.7, 2.0)];
-        assert_eq!(two_pass_pick(&set, 0, 100.0, 4.0), Some(2), "a tie at 0.5 goes to the lower idx");
-        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|_| true), Some(2));
-        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|i| i != 2), Some(3));
-        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|i| i == 1), Some(1));
-        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|_| false), None);
     }
 ```
 `plan.rs` tests (Task 7's `seed_project` and `with_folders`):
@@ -8008,42 +8667,6 @@ The real-data probe is added in Step 10.
 ```
 `run.rs` tests. The helpers come first, then the tests:
 ```rust
-    /// Every frame of `rc` measured and included, its weight from `weights`
-    /// by file name (0.5 by default), its calibrated file its own landed path:
-    /// what stages 4 and 5 read, without running Measure.
-    fn measure_all(rc: &mut RunContext, weights: &HashMap<&str, f64>) {
-        for g in rc.plan_groups.clone() {
-            let entries: Vec<MeasuredFrame> = g
-                .frames
-                .iter()
-                .map(|f| {
-                    let w = weights.get(f.filename.as_str()).copied().unwrap_or(0.5);
-                    MeasuredFrame {
-                        frame: f.clone(),
-                        calibrated: Some(PathBuf::from(&f.path)),
-                        planes: 1,
-                        measurement: None,
-                        weight: Some(FrameWeight {
-                            channels: vec![w],
-                            normalized: vec![w],
-                            mean: w,
-                            normalized_mean: w,
-                            missing: None,
-                        }),
-                        included: true,
-                        reason: None,
-                        registration: None,
-                        cached_calibrated: true,
-                        cached_metrics: false,
-                        ln_scale: None,
-                        cached_ln: false,
-                    }
-                })
-                .collect();
-            rc.measured.insert(g.key.clone(), entries);
-        }
-    }
-
     fn handle_of(rc: &RunContext, file_name: &str) -> i64 {
         rc.plan_groups
             .iter()
@@ -8178,6 +8801,43 @@ The real-data probe is added in Step 10.
         }
     }
 
+    /// Review I7: a failure or refusal cached by ANOTHER app version is tried
+    /// once more (a release may carry a solver that rescues the frame); a solve
+    /// cached by another version is kept; this version's new outcomes then hold.
+    #[test]
+    fn a_failure_cached_by_another_app_version_is_solved_again() {
+        use crate::stacking::solve::{solve_hash, write_artifact, FakeSolver, SolveArtifact, SolveOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &tmp.path().join("work"), &tmp.path().join("out"));
+        let fake = Arc::new(FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        for (uuid, outcome) in [
+            ("r1", SolveOutcome::Failed("no match".into())),
+            ("r2", SolveOutcome::Refused("refused".into())),
+            ("r3", SolveOutcome::Solved(FakeSolver::fixture_record())),
+        ] {
+            let blake3 = blake3_of(&conn, "p1", uuid);
+            write_artifact(
+                &conn,
+                "p1",
+                handle_of(&rc, &format!("c_{uuid}.fits")),
+                &solve_hash(&blake3, "fake:1"),
+                &SolveArtifact { blake3, app_version: "0.0.0-older".into(), outcome },
+            )
+            .unwrap();
+        }
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 2, "the two failures are tried again; the solve is kept");
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 2, "now cached by this version");
+    }
+
     /// Plan 6b-2 C9 (the Solve boundary): a landed file that changed since
     /// the frame source read it is excluded "changed during the run" and is
     /// never handed to the solver.
@@ -8257,395 +8917,16 @@ The real-data probe is added in Step 10.
         solve_project_frames(&mut rc).unwrap();
         assert_eq!(fake.calls(), 0);
         assert!(rc.warnings.is_empty(), "{:?}", rc.warnings);
-        assert!(wcs_tiers(&rc).unwrap().is_none());
-    }
-
-    /// Spec §5.4, plan 6b-2 C15: a project's auto reference is the best frame
-    /// WITH a WCS, from the largest group that holds one. It is never taken
-    /// from a larger, better-weighted group without one. In native geometry,
-    /// a group with no candidate takes the run reference.
-    #[test]
-    fn a_projects_auto_reference_is_the_best_frame_with_a_wcs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let conn = project_conn(&db_path);
-        crate::db::stacking::insert_test_project(&conn, "p1");
-        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 4, 3);
-        let weights: HashMap<&str, f64> = [
-            ("c_r1.fits", 0.9),
-            ("c_r2.fits", 0.9),
-            ("c_r3.fits", 0.9),
-            ("c_r4.fits", 0.9),
-            ("c_g1.fits", 0.4),
-            ("c_g2.fits", 0.7),
-            ("c_g3.fits", 0.6),
-        ]
-        .into_iter()
-        .collect();
-        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
-        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &work, &out);
-        measure_all(&mut rc, &weights);
-        stage_reference(&mut rc).unwrap();
-        let g2 = handle_of(&rc, "c_g2.fits");
-        assert_eq!(rc.reference_frame_id, Some(g2));
-        assert_eq!(rc.summary.reference.filename.as_deref(), Some("c_g2.fits"));
-        let rule = rc.wcs_rule.as_ref().unwrap();
-        assert_eq!(rule.candidates.len(), 3);
-        assert!(!rule.candidates.contains(&handle_of(&rc, "c_r1.fits")));
-
-        let mut native = StackingConfig::default();
-        native.registration.geometry = RegistrationGeometry::Native;
-        let mut rc = project_rc(&ctx, &conn, "p1", native, &work, &out);
-        measure_all(&mut rc, &weights);
-        stage_reference(&mut rc).unwrap();
-        assert_eq!(rc.group_geometry["mono__G__300s"].reference_frame_id, g2);
-        assert_eq!(
-            rc.group_geometry["mono__R__300s"].reference_frame_id, g2,
-            "a group with no candidate takes the run reference"
-        );
-    }
-
-    /// Spec §5.4, plan 6b-2 C15: a frame the run solved locally qualifies
-    /// only when no included frame has a manifest WCS.
-    #[test]
-    fn a_locally_solved_frame_qualifies_only_without_a_manifest_wcs() {
-        use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let conn = project_conn(&db_path);
-        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
-
-        crate::db::stacking::insert_test_project(&conn, "p1");
-        seed_r_and_g(&conn, &tmp.path().join("collab1"), "p1", 3, 0);
-        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &work, &out);
-        let r2 = handle_of(&rc, "c_r2.fits");
-        write_outcome(&conn, "p1", r2, &blake3_of(&conn, "p1", "r2"), "h", SolveOutcome::Solved(FakeSolver::fixture_record())).unwrap();
-        let weights: HashMap<&str, f64> =
-            [("c_r1.fits", 0.9), ("c_r2.fits", 0.5), ("c_r3.fits", 0.8)].into_iter().collect();
-        measure_all(&mut rc, &weights);
-        stage_reference(&mut rc).unwrap();
-        assert_eq!(rc.reference_frame_id, Some(r2), "the one frame with a WCS, not the best-weighted");
-
-        crate::db::stacking::insert_test_project(&conn, "p2");
-        seed_r_and_g(&conn, &tmp.path().join("collab2"), "p2", 3, 3);
-        let mut rc = project_rc(&ctx, &conn, "p2", StackingConfig::default(), &work, &out);
-        let r2 = handle_of(&rc, "c_r2.fits");
-        write_outcome(&conn, "p2", r2, &blake3_of(&conn, "p2", "r2"), "h", SolveOutcome::Solved(FakeSolver::fixture_record())).unwrap();
-        measure_all(&mut rc, &[("c_r2.fits", 0.99)].into_iter().collect());
-        stage_reference(&mut rc).unwrap();
-        let rule = rc.wcs_rule.as_ref().unwrap();
-        assert!(!rule.candidates.contains(&r2) && rule.with_wcs.contains(&r2), "{rule:?}");
-        let g: HashSet<i64> = ["c_g1.fits", "c_g2.fits", "c_g3.fits"].iter().map(|n| handle_of(&rc, n)).collect();
-        assert!(g.contains(&rc.reference_frame_id.unwrap()));
-    }
-
-    /// Spec §5.4: with no frame carrying a WCS the reference stage fails, in
-    /// the spec's words.
-    #[test]
-    fn with_no_frame_with_a_wcs_the_reference_stage_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let conn = project_conn(&db_path);
-        crate::db::stacking::insert_test_project(&conn, "p1");
-        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
-        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &tmp.path().join("work"), &tmp.path().join("out"));
-        measure_all(&mut rc, &HashMap::new());
-        let err = stage_reference(&mut rc).unwrap_err();
-        assert!(matches!(err, RunError::Other(ref m) if m == NO_PROJECT_REFERENCE), "{err:?}");
-        assert_eq!(NO_PROJECT_REFERENCE, "no frame of this project could be plate-solved; the grid needs one");
-    }
-
-    /// Plan 6b-2 C15: a manual pin without a WCS fails the stage; a pin with
-    /// one is the reference.
-    #[test]
-    fn a_manual_pin_without_a_wcs_fails_the_reference_stage() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let conn = project_conn(&db_path);
-        crate::db::stacking::insert_test_project(&conn, "p1");
-        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 3);
-        let mut cfg = StackingConfig::default();
-        cfg.reference.mode = ReferenceMode::Manual;
-        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
-
-        let mut rc = project_rc(&ctx, &conn, "p1", cfg.clone(), &work, &out);
-        crate::db::stacking::set_project_config(&conn, "p1", "{}", &[], Some("r1")).unwrap();
-        measure_all(&mut rc, &HashMap::new());
-        let err = stage_reference(&mut rc).unwrap_err();
-        assert!(matches!(err, RunError::Other(ref m) if m == MANUAL_REFERENCE_WITHOUT_WCS), "{err:?}");
-
-        let mut rc = project_rc(&ctx, &conn, "p1", cfg, &work, &out);
-        crate::db::stacking::set_project_config(&conn, "p1", "{}", &[], Some("g2")).unwrap();
-        measure_all(&mut rc, &HashMap::new());
-        stage_reference(&mut rc).unwrap();
-        assert_eq!(rc.reference_frame_id, Some(handle_of(&rc, "c_g2.fits")));
     }
 ```
 
 - [ ] **Step 2: Run the tests and watch them fail.**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 acceptance_refusal record_from_result the_solver_config_hash the_catalog_identity stacking::solve a_project_frames_wcs two_pass_pick_among a_project_plan_reports_frames_that the_solve_sub_step a_failed_or_refused without_a_solver a_projects_auto_reference a_locally_solved with_no_frame_with_a_wcs a_manual_pin_without`
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 stacking::solve a_project_frames_wcs a_project_plan_reports_frames_that the_solve_sub_step a_failed_or_refused a_failure_cached_by_another without_a_solver`
 
 Expected: the build fails. None of the new items exist.
 
-- [ ] **Step 3: The plate-solve core** (`plate_solve/`).
-
-`service.rs`. Add, after `store_result`:
-```rust
-/// The persist gate as a pure check (plan 6b-2 C14): `Some(user-facing
-/// reason)` when `config` refuses `result`, given the scale the frame's own
-/// optics, or its manifest, imply. [`store_result`] and a stacking run's
-/// local solve share it.
-pub(crate) fn acceptance_refusal(
-    result: &SolveResult,
-    expected_scale_arcsec: Option<f64>,
-    config: &PlateSolveConfig,
-) -> Option<String> {
-    if !config.blind_gate_enabled {
-        return None;
-    }
-    let m = BlindGateMetrics {
-        inliers: result.matched_stars,
-        expected_in_fov: result.expected_catalog_stars_in_fov,
-        rms_px: result.rms_residual_px,
-        adaptive_tol_px: adaptive_tol_px(
-            result.pixel_scale_arcsec,
-            config.base_verification_tolerance_arcsec,
-        ),
-        inlier_ratio: result.inlier_ratio,
-        recovered_scale_arcsec: result.pixel_scale_arcsec,
-        header_scale_arcsec: expected_scale_arcsec,
-    };
-    if blind_gate_ok(GateStage::ScaleCleared, &m, config) {
-        None
-    } else {
-        Some(format!(
-            "Rejected: low confidence ({} inliers, ratio {:.2}, {:.2}\"/px)",
-            result.matched_stars, result.inlier_ratio, result.pixel_scale_arcsec
-        ))
-    }
-}
-
-/// The `plate_solves` row a solve becomes (pure; `solved_at` is now).
-pub(crate) fn record_from_result(frame_id: i64, result: &SolveResult) -> PlateSolveRecord {
-    PlateSolveRecord {
-        id: None,
-        frame_id,
-        crpix1: result.wcs.crpix.0,
-        crpix2: result.wcs.crpix.1,
-        crval1: result.wcs.crval.0,
-        crval2: result.wcs.crval.1,
-        cd1_1: result.wcs.cd[0][0],
-        cd1_2: result.wcs.cd[0][1],
-        cd2_1: result.wcs.cd[1][0],
-        cd2_2: result.wcs.cd[1][1],
-        // SIP coefficients — populated from solvemyastro when fit_sip=true.
-        // The DB columns already exist (schema unchanged); legacy solves wrote
-        // NULL, now we write real values.
-        sip_order: result.sip_order.map(|o| o as i32),
-        sip_a_coeffs: result.sip_a_coeffs.clone(),
-        sip_b_coeffs: result.sip_b_coeffs.clone(),
-        sip_ap_coeffs: result.sip_ap_coeffs.clone(),
-        sip_bp_coeffs: result.sip_bp_coeffs.clone(),
-        matched_stars: result.matched_stars as i32,
-        total_detected: result.total_detected as i32,
-        rms_residual_px: result.rms_residual_px,
-        rms_residual_arcsec: result.rms_residual_arcsec,
-        pixel_scale_arcsec: result.pixel_scale_arcsec,
-        field_rotation_deg: result.field_rotation_deg,
-        solve_time_ms: result.solve_time_ms as i64,
-        catalog_used: result.catalog_used.clone(),
-        algorithm_used: result.algorithm_used.clone(),
-        solved_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        expected_catalog_stars_in_fov: Some(result.expected_catalog_stars_in_fov as i32),
-        inlier_ratio: Some(result.inlier_ratio),
-    }
-}
-```
-This is today's `PlateSolveRecord { … }` literal from `store_result` (`~439-468`), moved verbatim with `frame_id` the parameter; delete it from `store_result`. In `store_result`, the gate block becomes:
-```rust
-    if config.blind_gate_enabled {
-        // The frame's own optics, when it declares them (2026-09-05: on
-        // wind-shaken frames the solver walks its autoFOV ladder and returns a
-        // confident-looking solve at 16–193× the header's scale). Read only
-        // while the gate is on, as before.
-        if let Some(reason) =
-            acceptance_refusal(result, header_pixel_scale_arcsec(conn, frame_id), config)
-        {
-            tracing::warn!(
-                frame_id,
-                stage = "store",
-                outcome = "rejected_low_confidence",
-                inliers = result.matched_stars,
-                inlier_ratio = result.inlier_ratio,
-                scale_arcsec_px = result.pixel_scale_arcsec,
-                "refusing to persist low-confidence solve, WCS/focal length not written back"
-            );
-            return Ok(StoreOutcome::RejectedLowConfidence { reason });
-        }
-    }
-
-    let record = record_from_result(frame_id, result);
-```
-Keep `store_result`'s doc and its "Defense-in-depth" comment block above the gate. Every existing service test passes unchanged; this is the behaviour pin.
-
-`config.rs`. Append after `save_config`:
-```rust
-/// Bumped when the solver recipe hard-coded in
-/// [`crate::plate_solve::service::solve_frame_with_hints`] changes (quad
-/// tolerance, catalog magnitude limit, SIP fitting).
-pub const SOLVE_RECIPE_VERSION: u32 = 1;
-
-/// What a cached solve depends on (plan 6b-2 C14): the recipe, the SIP
-/// order, and every acceptance-gate field. Not the batch concurrency, the
-/// autofind tolerance, the input gate (a run applies none) or the camera
-/// defaults (they only back-fill a catalog row's focal length).
-pub fn solver_config_value(cfg: &PlateSolveConfig) -> serde_json::Value {
-    serde_json::json!({
-        "recipe": SOLVE_RECIPE_VERSION,
-        "sipOrder": cfg.sip_order,
-        "baseVerificationToleranceArcsec": cfg.base_verification_tolerance_arcsec,
-        "blindGateEnabled": cfg.blind_gate_enabled,
-        "blindRmsMaxPxMult": cfg.blind_rms_max_px_mult,
-        "blindMinInlierRatio": cfg.blind_min_inlier_ratio,
-        "blindInlierFloor": cfg.blind_inlier_floor,
-        "blindScaleSanityMin": cfg.blind_scale_sanity_min,
-        "blindScaleSanityMax": cfg.blind_scale_sanity_max,
-        "blindScaleHeaderTol": cfg.blind_scale_header_tol,
-    })
-}
-
-/// [`solver_config_value`]'s canonical JSON (sorted keys) as XXH3-64, 16 hex
-/// digits.
-pub fn solver_config_hash(cfg: &PlateSolveConfig) -> String {
-    let json = serde_json::to_string(&solver_config_value(cfg))
-        .expect("a solver config value always serializes");
-    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(json.as_bytes()))
-}
-```
-`layers.rs`. Add `use std::sync::Arc;` and `use std::time::UNIX_EPOCH;`, then append after `discover_layers`:
-```rust
-/// Why the plate-solve star catalog could not be opened.
-#[derive(Debug)]
-pub enum CatalogOpenError {
-    /// No tier and no legacy `stars.smac` under `root`.
-    NotInstalled { root: PathBuf },
-    /// A tier exists, but it could not be opened or read.
-    Open { dir: PathBuf, error: String },
-}
-
-impl std::fmt::Display for CatalogOpenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CatalogOpenError::NotInstalled { root } => {
-                write!(f, "the plate-solve star catalog is not installed under {}", root.display())
-            }
-            CatalogOpenError::Open { dir, error } => {
-                write!(f, "Failed to open star cache at {}: {error}", dir.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for CatalogOpenError {}
-
-/// `<app-data>/catalogs/smac_gaia`, where the hosts install the catalog.
-pub fn catalog_root(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("catalogs").join("smac_gaia")
-}
-
-/// Open the additive tier stack under [`catalog_root`] (base → deepest), or
-/// a legacy single cache. This is the one opener: both hosts and a stacking
-/// run call it. Opens fresh on each call; the mmap is cheap.
-pub fn open_catalog_layers(
-    app_data_dir: &Path,
-) -> Result<Vec<Arc<solvemyastro::StarCache>>, CatalogOpenError> {
-    let root = catalog_root(app_data_dir);
-    let dirs = discover_layers(&root);
-    if dirs.is_empty() {
-        return Err(CatalogOpenError::NotInstalled { root });
-    }
-    let mut layers = Vec::with_capacity(dirs.len());
-    for dir in &dirs {
-        let cache = solvemyastro::StarCache::open(dir).map_err(|e| CatalogOpenError::Open {
-            dir: dir.clone(),
-            error: e.to_string(),
-        })?;
-        layers.push(Arc::new(cache));
-    }
-    tracing::debug!(count = layers.len(), path = %root.display(), "opened catalog layers");
-    Ok(layers)
-}
-
-/// The installed catalog's identity, for a cached solve's hash: every tier's
-/// directory name (`legacy` for a bare root cache), with its `stars.smac`
-/// size and mtime in seconds, in tier order. Stat only, no read.
-pub fn catalog_identity(app_data_dir: &Path) -> Result<String, CatalogOpenError> {
-    let root = catalog_root(app_data_dir);
-    let dirs = discover_layers(&root);
-    if dirs.is_empty() {
-        return Err(CatalogOpenError::NotInstalled { root });
-    }
-    let mut parts = Vec::with_capacity(dirs.len());
-    for dir in &dirs {
-        let meta = std::fs::metadata(dir.join("stars.smac")).map_err(|e| CatalogOpenError::Open {
-            dir: dir.clone(),
-            error: e.to_string(),
-        })?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
-        let name = if *dir == root {
-            "legacy".to_string()
-        } else {
-            dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-        };
-        parts.push(format!("{name}:{}:{mtime}", meta.len()));
-    }
-    Ok(parts.join(","))
-}
-```
-`mod.rs`: `pub use layers::{catalog_identity, catalog_root, discover_layers, open_catalog_layers, CatalogOpenError};` replaces `pub use layers::discover_layers;`.
-
-- [ ] **Step 4: The hosts call the core opener.** Tauri (`commands/plate_solve.rs`): add `use athenaeum_core::plate_solve::CatalogOpenError;`, then replace `resolve_layer_caches`'s body after `let parent = …;`. The user-facing strings stay byte-identical, and the `debug!` moves into core with the same message and fields.
-```rust
-    athenaeum_core::plate_solve::open_catalog_layers(parent).map_err(|e| match e {
-        CatalogOpenError::NotInstalled { root } => format!(
-            "solvemyastro star catalog not found under {}. \
-             Please download the Gaia DR3 prebuilt catalog from Settings → Plate Solving.",
-            root.display()
-        ),
-        CatalogOpenError::Open { dir, error } => {
-            format!("Failed to open star cache at {}: {error}", dir.display())
-        }
-    })
-```
-Web (`routes/plate_solve.rs`): the same `use`, and after `let parent = …;`:
-```rust
-    athenaeum_core::plate_solve::open_catalog_layers(parent).map_err(|e| match e {
-        CatalogOpenError::NotInstalled { root } => (
-            StatusCode::PRECONDITION_FAILED,
-            format!(
-                "solvemyastro star catalog not found under {}. \
-                 Please download the Gaia DR3 prebuilt catalog.",
-                root.display()
-            ),
-        ),
-        CatalogOpenError::Open { dir, error } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to open star cache at {}: {error}", dir.display()),
-        ),
-    })
-```
-Drop the `catalog_root` bindings, loops and `debug!` the core function now does. Keep each function's doc comment. Remove any import that becomes unused (the compiler names it). No command is added or changed, so the count stays at 299.
-
-- [ ] **Step 5: The solver seam** (`stacking/solve.rs`, a new file; add `pub mod solve;` to `stacking/mod.rs` after `pub mod run;`):
+- [ ] **Step 3: The solver seam** (`stacking/solve.rs`, a new file; add `pub mod solve;` to `stacking/mod.rs` after `pub mod run;`):
 ```rust
 //! The Solve sub-step's solver seam (spec 2026-10-02 §5.2, plan 6b-2 C14).
 //! A project frame whose manifest carries no WCS is plate-solved by the run
@@ -8655,6 +8936,12 @@ Drop the `catalog_root` bindings, loops and `debug!` the core function now does.
 //! the installed catalog. The run never writes `plate_solves` or `frames`.
 //! [`FrameSolver`] is the seam: [`CatalogSolver`] in production, a fake in
 //! tests.
+//!
+//! Concurrency (review M18): [`write_outcome`] is a single UPSERT, so it
+//! needs no `BEGIN IMMEDIATE`; one run per subject is enforced upstream, by
+//! `start_stacking`'s admission. [`CatalogSolver`] opens the catalog once per
+//! run through a `OnceLock`; each concurrent run, like each host, maps its
+//! own.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -8666,7 +8953,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::collab::frame_meta::ProjectFrameMeta;
-use crate::db::stacking::{find_artifact, upsert_artifact, NewArtifact, StackSubject};
+use crate::db::stacking::{find_artifact, upsert_artifact, NewArtifact, StackSubject, StackingArtifactRow};
 use crate::fits_writer::{write_fits_f32_with, Durability};
 use crate::integration::plane_reader::PlaneReader;
 use crate::models::Frame;
@@ -8679,6 +8966,8 @@ use crate::stacking::config::stage_hash;
 /// One solve the run asks for.
 #[derive(Debug, Clone)]
 pub struct SolveRequest {
+    /// The frame's handle; it names the solve's tracing span (review M12).
+    pub handle: i64,
     /// The file to solve: the `calibrated` artifact stage 1 handed on.
     pub path: PathBuf,
     pub hints: SolveHints,
@@ -8695,13 +8984,15 @@ impl SolveRequest {
     /// - the position hint is the project's target;
     /// - the scale hint and the gate's expected scale are the manifest's
     ///   `pixelScaleArcsec`;
-    /// - the field of view is that scale times the frame's larger side.
-    pub fn for_frame(path: &Path, meta: &ProjectFrameMeta, target: Option<(f64, f64)>) -> Self {
-        let fov_deg = match (meta.pixel_scale_arcsec, meta.naxis1, meta.naxis2) {
-            (Some(scale), Some(w), Some(h)) if scale > 0.0 => Some(scale * w.max(h) as f64 / 3600.0),
+    /// - the field of view is that scale times the frame's width, as the
+    ///   hosts compute it from the optics (review M11).
+    pub fn for_frame(handle: i64, path: &Path, meta: &ProjectFrameMeta, target: Option<(f64, f64)>) -> Self {
+        let fov_deg = match (meta.pixel_scale_arcsec, meta.naxis1) {
+            (Some(scale), Some(w)) if scale > 0.0 => Some(scale * w as f64 / 3600.0),
             _ => None,
         };
         SolveRequest {
+            handle,
             path: path.to_path_buf(),
             hints: SolveHints {
                 ra: target.map(|t| t.0),
@@ -8747,11 +9038,41 @@ impl SolveOutcome {
     }
 }
 
-/// A `solve` artifact's payload: the outcome, and the content it is about.
+/// A `solve` artifact's payload: the content it is about, the app version
+/// that wrote it (review I7; empty for a payload without one), and the
+/// outcome.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolveArtifact {
     pub blake3: String,
+    #[serde(default)]
+    pub app_version: String,
     pub outcome: SolveOutcome,
+}
+
+/// The app version a `solve` artifact records: the core crate's, which the
+/// release bumps with the app.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Whether a cached `solve` artifact still answers for this frame (plan 6b-2
+/// C14, review I7). Its hash must match (same content, solver config and
+/// catalog), and it must be a solve, or a failure or refusal written by this
+/// very app version. A release may carry a solver that rescues a frame, so a
+/// failure from another version is tried once more; a solve is kept.
+pub(crate) fn cached_outcome_holds(row: &StackingArtifactRow, hash: &str) -> bool {
+    if row.config_hash != hash {
+        return false;
+    }
+    let Some(payload) = row.payload_json.as_deref() else {
+        tracing::warn!(frame_id = ?row.frame_id, "solve artifact without a payload; solving again");
+        return false;
+    };
+    match serde_json::from_str::<SolveArtifact>(payload) {
+        Ok(artifact) => matches!(artifact.outcome, SolveOutcome::Solved(_)) || artifact.app_version == APP_VERSION,
+        Err(e) => {
+            tracing::warn!(frame_id = ?row.frame_id, error = %e, "solve artifact unreadable; solving again");
+            false
+        }
+    }
 }
 
 /// The `solve` artifact's hash: the frame's content and the solver's
@@ -8791,7 +9112,7 @@ pub(crate) fn stored_outcome(
 }
 
 /// Cache one outcome as the frame's `solve` artifact (group key `""`, no
-/// file), replacing any earlier one.
+/// file), replacing any earlier one, stamped with this app version.
 pub(crate) fn write_outcome(
     conn: &Connection,
     project_id: &str,
@@ -8800,11 +9121,30 @@ pub(crate) fn write_outcome(
     hash: &str,
     outcome: SolveOutcome,
 ) -> anyhow::Result<()> {
+    write_artifact(
+        conn,
+        project_id,
+        frame_id,
+        hash,
+        &SolveArtifact {
+            blake3: blake3.to_string(),
+            app_version: APP_VERSION.to_string(),
+            outcome,
+        },
+    )
+}
+
+/// [`write_outcome`] with the whole payload given (a test writes another
+/// app version's outcome through it).
+pub(crate) fn write_artifact(
+    conn: &Connection,
+    project_id: &str,
+    frame_id: i64,
+    hash: &str,
+    artifact: &SolveArtifact,
+) -> anyhow::Result<()> {
     let subject = StackSubject::Project(project_id.to_string());
-    let payload = serde_json::to_string(&SolveArtifact {
-        blake3: blake3.to_string(),
-        outcome,
-    })?;
+    let payload = serde_json::to_string(artifact)?;
     upsert_artifact(
         conn,
         &NewArtifact {
@@ -8842,6 +9182,8 @@ pub fn solve_with(
     cancel: &AtomicBool,
 ) -> SolveOutcome {
     let frame = Frame {
+        // Only the solve's tracing span reads it (review M12).
+        id: Some(request.handle),
         date_obs: request.date_obs,
         focallen: request.focal_len,
         instrume: request.instrume.clone(),
@@ -8870,7 +9212,7 @@ pub fn solve_with(
 
 /// An ADU-scaled (×65535) float32 copy of a unit-domain FITS, with its
 /// copy-through cards. It is the real-data probe's comparison input, and the
-/// fallback a probe result may call for (plan 6b-2 Task 10 Step 11). It
+/// fallback a probe result may call for (plan 6b-2 Task 10c Step 8). It
 /// never touches `src`.
 pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
     let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
@@ -9019,7 +9361,7 @@ impl FrameSolver for FakeSolver {
 ```
 If `ManifestWcs`, `ProjectFrameMeta` or `parse_date_obs` live under different paths, use the ones Task 4 and `fits_parser/mod.rs:947` define. All three exist by Task 4.
 
-- [ ] **Step 6: The origin funnels** (`origin.rs`). Add `use crate::stacking::solve::{stored_outcome, SolveOutcome};`. Replace Task 6's project arm in `stored_solve` with:
+- [ ] **Step 4: The origin funnels** (`origin.rs`). Add `use crate::stacking::solve::{stored_outcome, SolveOutcome};`. Replace Task 6a's project arm in `stored_solve` with:
 ```rust
         // Spec §5.2: the manifest's WCS first, then the run's own cached
         // solve of this content.
@@ -9068,33 +9410,6 @@ pub(crate) fn solve_plan(origin: &FrameOrigin) -> Option<SolvePlan> {
     }
 }
 
-/// Where a frame's WCS comes from, for the reference rule (spec §5.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WcsTier {
-    /// A catalog frame: the rule does not apply.
-    NotApplicable,
-    Manifest,
-    /// Solved by a run (the cached `solve` artifact of this content).
-    Local,
-    /// No WCS at all.
-    Missing,
-}
-
-pub(crate) fn wcs_tier(conn: &Connection, origin: &FrameOrigin, frame_id: i64) -> anyhow::Result<WcsTier> {
-    match origin {
-        FrameOrigin::Catalog { .. } => Ok(WcsTier::NotApplicable),
-        FrameOrigin::Project { meta, .. } if meta.wcs.is_some() => Ok(WcsTier::Manifest),
-        FrameOrigin::Project {
-            project_id,
-            blake3,
-            ..
-        } => Ok(match stored_outcome(conn, project_id, frame_id, blake3)? {
-            Some(SolveOutcome::Solved(_)) => WcsTier::Local,
-            _ => WcsTier::Missing,
-        }),
-    }
-}
-
 /// The run's cached solve outcome for a frame's current content, which the
 /// plan's "will be solved" and "could not be solved" warnings read. `None`
 /// for a catalog frame, and for a frame never solved.
@@ -9114,61 +9429,33 @@ pub(crate) fn local_solve_outcome(
 }
 ```
 
-- [ ] **Step 7: The re-pick among candidates** (`weights.rs`). Rename `two_pass_pick`'s body into `two_pass_pick_among` with the extra `allowed: &dyn Fn(usize) -> bool` parameter. Insert one statement right after `reference_px` is computed and before `usable.sort_by(…)`:
-```rust
-    // Plan 6b-2 C15: the median and the reference's own deviation span every
-    // usable frame; only an allowed one enters the top-N cut and can win.
-    usable.retain(|c| c.idx == reference_idx || allowed(c.idx));
-```
-`two_pass_pick` keeps its doc and signature and becomes `two_pass_pick_among(candidates, reference_idx, diagonal_px, min_gain_px, &|_| true)`. Give `two_pass_pick_among` the doc: "[`two_pass_pick`] restricted to the candidates `allowed` accepts (spec §5.4, plan 6b-2 C15). The median and the current reference's deviation still span every usable candidate, because where the set points does not depend on who may win. Only an allowed frame enters the top-N cut."
-
-- [ ] **Step 8: The run** (`run.rs`).
-  1. Add, beside `GroupGeometry`:
-```rust
-/// A project run's reference candidates (spec §5.4, plan 6b-2 C15).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct WcsRule {
-    /// Frames that may be the reference: those with a manifest WCS or, only
-    /// when no included frame has one, those the run solved locally.
-    pub(crate) candidates: HashSet<i64>,
-    /// Every measured frame with any WCS (what a manual pin needs).
-    pub(crate) with_wcs: HashSet<i64>,
-}
-
-/// Spec §5.4: the grid needs a reference with a WCS.
-const NO_PROJECT_REFERENCE: &str = "no frame of this project could be plate-solved; the grid needs one";
-
-/// Plan 6b-2 C15: a manual pin must carry a WCS.
-const MANUAL_REFERENCE_WITHOUT_WCS: &str =
-    "the manual reference frame has no WCS (none in the manifest, and the run could not plate-solve it); the grid needs one";
-```
-  2. `RunContext` gains, after `origins`:
+- [ ] **Step 5: The run** (`run.rs`).
+  1. `RunContext` gains, after `origins`:
 ```rust
     /// The Solve sub-step's solver (plan 6b-2 C14): the installed catalog,
     /// opened on first use. Tests inject a fake.
     pub(crate) solver: Arc<dyn crate::stacking::solve::FrameSolver>,
-    /// A project run's reference candidates, set by stage 4 (spec §5.4).
-    /// `None` for a frame set, which has no WCS rule.
-    pub(crate) wcs_rule: Option<WcsRule>,
 ```
-  In `start_stacking`'s literal add `solver: Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone())),` and `wcs_rule: None,`. In `test_context`, bind `let solver: Arc<dyn crate::stacking::solve::FrameSolver> = Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone()));` before the literal, because `ctx` moves into it, and add `solver,` and `wcs_rule: None,`.
-  3. `stage_measure`: right after `let stage_start = Instant::now();`:
+  In `start_stacking`'s literal add `solver: Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone())),`. In `test_context`, bind `let solver: Arc<dyn crate::stacking::solve::FrameSolver> = Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone()));` before the literal, because `ctx` moves into it, and add `solver,`.
+  2. `stage_measure`: right after `let stage_start = Instant::now();`:
 ```rust
     // Plan 6b-2 C14: a project's frames without a manifest WCS are solved
     // first; the Solve boundary's exclusions reach `stage1_failed` below.
     solve_project_frames(rc)?;
 ```
-  4. Add before `stage_measure`:
+  3. Add before `stage_measure`:
 ```rust
 /// The Solve sub-step (spec §5.2, plan 6b-2 C14), the first thing Measure
-/// does. Every project frame still in the run whose manifest carries no WCS
-/// is solved once per content version, solver config and catalog. It is
-/// solved through `rc.solver`, on the file stage 1 handed on, and its
-/// outcome (solved, failed or refused) is cached as a `solve` artifact under
-/// group key `""`, so a regroup never re-solves. A failed or refused solve
-/// leaves the frame in the run, without a WCS. Nothing here writes
-/// `plate_solves` or `frames`. A frame set has no such frame, and reads and
-/// logs nothing.
+/// does. Every project frame still in the run whose manifest carries no WCS,
+/// and that has a stage-1 file, is solved once per content version, solver
+/// config and catalog (and once more per app version after a failure,
+/// review I7). It is solved through `rc.solver`, on the file stage 1 handed
+/// on, and its outcome (solved, failed or refused) is cached as a `solve`
+/// artifact under group key `""`, so a regroup never re-solves. A failed or
+/// refused solve leaves the frame in the run, without a WCS. A frame without
+/// a stage-1 file is skipped with a `debug!` and left to Measure, which
+/// excludes it (review I9). Nothing here writes `plate_solves` or `frames`.
+/// A frame set has no such frame, and reads and logs nothing.
 fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
     use crate::stacking::solve::{solve_hash, write_outcome, SolveOutcome, SolveRequest};
     let excluded: HashSet<i64> = rc.excluded.iter().copied().collect();
@@ -9226,14 +9513,16 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
         let hash = solve_hash(&plan.blake3, &identity);
         let conn = db(&rc.ctx)?.conn();
         let cached = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(frame_id))?
-            .is_some_and(|a| a.config_hash == hash);
+            .is_some_and(|row| crate::stacking::solve::cached_outcome_holds(&row, &hash));
         if cached {
             continue;
         }
         let calibrated = crate::db::stacking::find_artifact(&conn, &rc.subject, &key, "calibrated", Some(frame_id))?
             .and_then(|a| a.path);
-        // No stage-1 file: Measure reports the frame.
+        // No stage-1 file (its artifact row is gone): Measure reports and
+        // excludes the frame (review I9).
         let Some(path) = calibrated else {
+            tracing::debug!(run_id = rc.run_id, frame_id, "no stage-1 file; solve skipped");
             continue;
         };
         jobs.push((frame_id, hash, plan, PathBuf::from(path)));
@@ -9244,7 +9533,7 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
     for (done, (frame_id, hash, plan, path)) in jobs.into_iter().enumerate() {
         rc.check_cancel()?;
         rc.progress(Stage::Measure, None, done, total, 0, 0, Some(frame_id), Some("solving".to_string()));
-        let request = SolveRequest::for_frame(&path, &plan.meta, target);
+        let request = SolveRequest::for_frame(frame_id, &path, &plan.meta, target);
         let solver = rc.solver.clone();
         let cancel = rc.cancel.clone();
         let started = Instant::now();
@@ -9285,7 +9574,423 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
     Ok(())
 }
 ```
-  5. The reference rule. Replace `best_included_idx` with:
+
+- [ ] **Step 6: The plan's refinement** (`plan.rs`, `project_inputs`). Replace Task 7's `unsolved` block (from `// Spec §5.2: an in-scope frame without a manifest WCS is solved locally.` through its `if unsolved > 0 { … }`) with:
+```rust
+    // Spec §5.2: an in-scope frame without a manifest WCS is solved by the
+    // run. The last cached outcome for its content (plan 6b-2 Task 10b) says
+    // which frames are still to solve and which could not be solved. The plan
+    // reads the outcome, not its hash: after a solver or catalog change the
+    // run re-solves, and the plan learns the new outcome only then.
+    let (mut to_solve, mut unsolvable) = (0usize, 0usize);
+    for f in source
+        .frames
+        .iter()
+        .filter(in_scope)
+        .filter(|f| f.meta.as_ref().is_some_and(|m| m.wcs.is_none()))
+    {
+        let Some(handle) = f.handle else { continue };
+        let outcome =
+            crate::stacking::origin::local_solve_outcome(conn, origin_of(&source.origins, handle)?, handle)
+                .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+        match outcome {
+            None => to_solve += 1,
+            Some(crate::stacking::solve::SolveOutcome::Solved(_)) => {}
+            Some(_) => unsolvable += 1,
+        }
+    }
+    if to_solve > 0 {
+        warnings.push(format!(
+            "{to_solve} frame{} no WCS in the manifest and will be plate-solved locally",
+            if to_solve == 1 { " has" } else { "s have" }
+        ));
+    }
+    if unsolvable > 0 {
+        warnings.push(format!(
+            "{unsolvable} frame{} could not be plate-solved and cannot anchor the grid",
+            if unsolvable == 1 { "" } else { "s" }
+        ));
+    }
+```
+  Task 7's `a_project_plan_reports_its_groups_frames_grid_and_warnings` keeps passing: no outcome is cached there, so `o1` still reads "will be plate-solved locally".
+
+- [ ] **Step 7: Run the tests and watch them pass.** First the Step 2 command. Then:
+```bash
+CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 stacking:: subject_and_origin_variants_stay_in_their_funnels
+```
+  Expected: all pass. A frame-set run's Measure is unchanged: the sub-step finds no frame to solve and returns before any read.
+
+- [ ] **Step 8: Run the gate.** TS must not move: `git diff --exit-code src/types`.
+
+- [ ] **Step 9: Commit** with the message `feat(stacking): the solver seam and the Solve sub-step`, plus the trailers.
+
+---
+
+### Task 10c: The WCS reference rule and the real-data solve probe (C14, C15; spec §5.4)
+
+**Files:**
+- Modify `crates/athenaeum-core/src/stacking/weights.rs`: add `two_pass_pick_among`, which `two_pass_pick` delegates to, plus a test.
+- Modify `crates/athenaeum-core/src/stacking/origin.rs`: add `WcsTier` and `wcs_tier`, plus a test.
+- Modify `crates/athenaeum-core/src/stacking/run.rs`:
+  - `RunContext` gains `wcs_rule`, with its two constructors;
+  - add `WcsRule`, `NO_PROJECT_REFERENCE`, `MANUAL_REFERENCE_WITHOUT_WCS`, `wcs_tiers`, `best_included_idx_where` and `best_candidate_idx`;
+  - change `stage_reference`, `group_reference_idx` and `two_pass_refine`'s pick (`~5168`);
+  - tests.
+- Modify `crates/athenaeum-core/src/stacking/solve.rs`: the `#[ignore]` real-data probe; Step 8's conditional fallback.
+
+**Interfaces:**
+```rust
+// stacking/origin.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub(crate) enum WcsTier { NotApplicable, Manifest, Local, Missing }
+pub(crate) fn wcs_tier(conn: &Connection, origin: &FrameOrigin, frame_id: i64) -> anyhow::Result<WcsTier>;
+// stacking/weights.rs
+pub(crate) fn two_pass_pick_among(candidates: &[TwoPassCandidate], reference_idx: usize, diagonal_px: f64, min_gain_px: f64, allowed: &dyn Fn(usize) -> bool) -> Option<usize>;
+// stacking/run.rs
+pub(crate) struct WcsRule { pub(crate) candidates: HashSet<i64>, pub(crate) with_wcs: HashSet<i64> }
+const NO_PROJECT_REFERENCE: &str = "no frame of this project could be plate-solved; the grid needs one";
+const MANUAL_REFERENCE_WITHOUT_WCS: &str = "the manual reference frame has no WCS (none in the manifest, and the run could not plate-solve it); the grid needs one";
+fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError>;
+```
+Consumed by: plan 6b-3 (`rc.wcs_rule` is the grid reference's rule).
+
+`WcsRule`, the `wcs_rule` field and `wcs_tier` land here, not in Task 10b, because nothing reads them before the reference rule; in 10b they would be dead code in the lib check.
+
+- [ ] **Step 1: Write the failing tests**
+
+`stacking/origin.rs` tests:
+```rust
+    /// Plan 6b-2 C15: the tier the reference rule reads. It is the manifest's
+    /// WCS, then the run's own solve of this content (a cached failure is no
+    /// WCS), else none; a catalog frame has no rule.
+    #[test]
+    fn the_wcs_tier_is_the_manifest_then_the_local_solve() {
+        use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let dir = tempfile::tempdir().unwrap();
+        test_fixtures::add_project_frame(&conn, dir.path(), "p1", &test_fixtures::project_frame_spec("a"));
+        let mut with_wcs = test_fixtures::project_frame_spec("m");
+        with_wcs.wcs = Some(test_fixtures::manifest_wcs_json(64, 48, 10.0, 20.0, 1.5));
+        test_fixtures::add_project_frame(&conn, dir.path(), "p1", &with_wcs);
+        let source = crate::stacking::project_source::project_frame_source(
+            &conn,
+            "p1",
+            &crate::stacking::config::StackingConfig::default(),
+        )
+        .unwrap();
+        let of = |uuid: &str| -> (i64, FrameOrigin, String) {
+            source
+                .origins
+                .iter()
+                .find_map(|(id, o)| match o {
+                    FrameOrigin::Project { frame_uuid, blake3, .. } if frame_uuid == uuid => {
+                        Some((*id, o.clone(), blake3.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let (a_id, a, a_blake3) = of("a");
+        let (m_id, m, _) = of("m");
+        assert_eq!(wcs_tier(&conn, &a, a_id).unwrap(), WcsTier::Missing);
+        write_outcome(&conn, "p1", a_id, &a_blake3, "h", SolveOutcome::Failed("no match".into())).unwrap();
+        assert_eq!(wcs_tier(&conn, &a, a_id).unwrap(), WcsTier::Missing, "a failure is no WCS");
+        write_outcome(&conn, "p1", a_id, &a_blake3, "h", SolveOutcome::Solved(FakeSolver::fixture_record())).unwrap();
+        assert_eq!(wcs_tier(&conn, &a, a_id).unwrap(), WcsTier::Local);
+        assert_eq!(wcs_tier(&conn, &m, m_id).unwrap(), WcsTier::Manifest);
+        let catalog = FrameOrigin::Catalog { file_id: 1, attested: false };
+        assert_eq!(wcs_tier(&conn, &catalog, 1).unwrap(), WcsTier::NotApplicable);
+    }
+```
+`stacking/weights.rs` tests:
+```rust
+    /// Plan 6b-2 C15: the re-pick among WCS candidates. The median still
+    /// spans every usable frame; only an allowed frame can win; with nothing
+    /// allowed but the reference itself there is no switch.
+    #[test]
+    fn two_pass_pick_among_never_lets_a_non_candidate_win() {
+        let c = |idx: usize, weight: f64, tx: f64| TwoPassCandidate {
+            idx,
+            weight,
+            rotation_deg: 0.0,
+            translation: (tx, 0.0),
+        };
+        // Median translation x = (1 + 2) / 2 = 1.5; deviations 38.5, 1.5, 0.5, 0.5.
+        let set = [c(0, 1.0, 40.0), c(1, 0.9, 0.0), c(2, 0.8, 1.0), c(3, 0.7, 2.0)];
+        assert_eq!(two_pass_pick(&set, 0, 100.0, 4.0), Some(2), "a tie at 0.5 goes to the lower idx");
+        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|_| true), Some(2));
+        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|i| i != 2), Some(3));
+        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|i| i == 1), Some(1));
+        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|_| false), None);
+    }
+```
+`run.rs` tests (they use Task 10b's `handle_of`, `seed_r_and_g` and `blake3_of`). The helper first, then the tests:
+```rust
+    /// Every frame of `rc` measured and included, its weight from `weights`
+    /// by file name (0.5 by default), its calibrated file its own landed path:
+    /// what stages 4 and 5 read, without running Measure.
+    fn measure_all(rc: &mut RunContext, weights: &HashMap<&str, f64>) {
+        for g in rc.plan_groups.clone() {
+            let entries: Vec<MeasuredFrame> = g
+                .frames
+                .iter()
+                .map(|f| {
+                    let w = weights.get(f.filename.as_str()).copied().unwrap_or(0.5);
+                    MeasuredFrame {
+                        frame: f.clone(),
+                        calibrated: Some(PathBuf::from(&f.path)),
+                        planes: 1,
+                        measurement: None,
+                        weight: Some(FrameWeight {
+                            channels: vec![w],
+                            normalized: vec![w],
+                            mean: w,
+                            normalized_mean: w,
+                            missing: None,
+                        }),
+                        included: true,
+                        reason: None,
+                        registration: None,
+                        cached_calibrated: true,
+                        cached_metrics: false,
+                        ln_scale: None,
+                        cached_ln: false,
+                    }
+                })
+                .collect();
+            rc.measured.insert(g.key.clone(), entries);
+        }
+    }
+
+    /// Spec §5.4, plan 6b-2 C15: a project's auto reference is the best frame
+    /// WITH a WCS, from the largest group that holds one. It is never taken
+    /// from a larger, better-weighted group without one. In native geometry,
+    /// a group with no candidate takes the run reference.
+    #[test]
+    fn a_projects_auto_reference_is_the_best_frame_with_a_wcs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 4, 3);
+        let weights: HashMap<&str, f64> = [
+            ("c_r1.fits", 0.9),
+            ("c_r2.fits", 0.9),
+            ("c_r3.fits", 0.9),
+            ("c_r4.fits", 0.9),
+            ("c_g1.fits", 0.4),
+            ("c_g2.fits", 0.7),
+            ("c_g3.fits", 0.6),
+        ]
+        .into_iter()
+        .collect();
+        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &work, &out);
+        measure_all(&mut rc, &weights);
+        stage_reference(&mut rc).unwrap();
+        let g2 = handle_of(&rc, "c_g2.fits");
+        assert_eq!(rc.reference_frame_id, Some(g2));
+        assert_eq!(rc.summary.reference.filename.as_deref(), Some("c_g2.fits"));
+        let rule = rc.wcs_rule.as_ref().unwrap();
+        assert_eq!(rule.candidates.len(), 3);
+        assert!(!rule.candidates.contains(&handle_of(&rc, "c_r1.fits")));
+
+        let mut native = StackingConfig::default();
+        native.registration.geometry = RegistrationGeometry::Native;
+        let mut rc = project_rc(&ctx, &conn, "p1", native, &work, &out);
+        measure_all(&mut rc, &weights);
+        stage_reference(&mut rc).unwrap();
+        assert_eq!(rc.group_geometry["mono__G__300s"].reference_frame_id, g2);
+        assert_eq!(
+            rc.group_geometry["mono__R__300s"].reference_frame_id, g2,
+            "a group with no candidate takes the run reference"
+        );
+    }
+
+    /// Spec §5.4, plan 6b-2 C15: a frame the run solved locally qualifies
+    /// only when no included frame has a manifest WCS.
+    #[test]
+    fn a_locally_solved_frame_qualifies_only_without_a_manifest_wcs() {
+        use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
+
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab1"), "p1", 3, 0);
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &work, &out);
+        let r2 = handle_of(&rc, "c_r2.fits");
+        write_outcome(&conn, "p1", r2, &blake3_of(&conn, "p1", "r2"), "h", SolveOutcome::Solved(FakeSolver::fixture_record())).unwrap();
+        let weights: HashMap<&str, f64> =
+            [("c_r1.fits", 0.9), ("c_r2.fits", 0.5), ("c_r3.fits", 0.8)].into_iter().collect();
+        measure_all(&mut rc, &weights);
+        stage_reference(&mut rc).unwrap();
+        assert_eq!(rc.reference_frame_id, Some(r2), "the one frame with a WCS, not the best-weighted");
+
+        crate::db::stacking::insert_test_project(&conn, "p2");
+        seed_r_and_g(&conn, &tmp.path().join("collab2"), "p2", 3, 3);
+        let mut rc = project_rc(&ctx, &conn, "p2", StackingConfig::default(), &work, &out);
+        let r2 = handle_of(&rc, "c_r2.fits");
+        write_outcome(&conn, "p2", r2, &blake3_of(&conn, "p2", "r2"), "h", SolveOutcome::Solved(FakeSolver::fixture_record())).unwrap();
+        measure_all(&mut rc, &[("c_r2.fits", 0.99)].into_iter().collect());
+        stage_reference(&mut rc).unwrap();
+        let rule = rc.wcs_rule.as_ref().unwrap();
+        assert!(!rule.candidates.contains(&r2) && rule.with_wcs.contains(&r2), "{rule:?}");
+        let g: HashSet<i64> = ["c_g1.fits", "c_g2.fits", "c_g3.fits"].iter().map(|n| handle_of(&rc, n)).collect();
+        assert!(g.contains(&rc.reference_frame_id.unwrap()));
+    }
+
+    /// Spec §5.4: with no frame carrying a WCS the reference stage fails, in
+    /// the spec's words.
+    #[test]
+    fn with_no_frame_with_a_wcs_the_reference_stage_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &tmp.path().join("work"), &tmp.path().join("out"));
+        measure_all(&mut rc, &HashMap::new());
+        let err = stage_reference(&mut rc).unwrap_err();
+        assert!(matches!(err, RunError::Other(ref m) if m == NO_PROJECT_REFERENCE), "{err:?}");
+        assert_eq!(NO_PROJECT_REFERENCE, "no frame of this project could be plate-solved; the grid needs one");
+    }
+
+    /// Plan 6b-2 C15: a manual pin without a WCS fails the stage; a pin with
+    /// one is the reference.
+    #[test]
+    fn a_manual_pin_without_a_wcs_fails_the_reference_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 3);
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
+
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg.clone(), &work, &out);
+        crate::db::stacking::set_project_config(&conn, "p1", "{}", &[], Some("r1")).unwrap();
+        measure_all(&mut rc, &HashMap::new());
+        let err = stage_reference(&mut rc).unwrap_err();
+        assert!(matches!(err, RunError::Other(ref m) if m == MANUAL_REFERENCE_WITHOUT_WCS), "{err:?}");
+
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg, &work, &out);
+        crate::db::stacking::set_project_config(&conn, "p1", "{}", &[], Some("g2")).unwrap();
+        measure_all(&mut rc, &HashMap::new());
+        stage_reference(&mut rc).unwrap();
+        assert_eq!(rc.reference_frame_id, Some(handle_of(&rc, "c_g2.fits")));
+    }
+
+    /// Review Focus 1, plan 6b-2 C15: a frame-set run has no WCS rule, so its
+    /// reference pick, its native groups and its two-pass re-pick take
+    /// today's paths unchanged.
+    #[test]
+    fn a_frame_set_run_has_no_wcs_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], &[5.0f32; 3]);
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) =
+            seed_run_and_groups(&fixture.conn, fixture.set_id, &plan_groups, working.path(), output.path());
+        let rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            WorkingLayout::new(working.path(), &set_slug(SET_NAME)),
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        assert!(wcs_tiers(&rc).unwrap().is_none());
+        assert!(rc.wcs_rule.is_none());
+    }
+```
+
+- [ ] **Step 2: Run the tests and watch them fail.**
+
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 the_wcs_tier_is two_pass_pick_among a_projects_auto_reference a_locally_solved with_no_frame_with_a_wcs a_manual_pin_without a_frame_set_run_has_no_wcs_rule`
+
+Expected: the build fails. None of the new items exist.
+
+- [ ] **Step 3: The re-pick among candidates** (`weights.rs`). Rename `two_pass_pick`'s body into `two_pass_pick_among` with the extra `allowed: &dyn Fn(usize) -> bool` parameter. Insert one statement right after `reference_px` is computed and before `usable.sort_by(…)`:
+```rust
+    // Plan 6b-2 C15: the median and the reference's own deviation span every
+    // usable frame; only an allowed one enters the top-N cut and can win.
+    usable.retain(|c| c.idx == reference_idx || allowed(c.idx));
+```
+`two_pass_pick` keeps its doc and signature and becomes `two_pass_pick_among(candidates, reference_idx, diagonal_px, min_gain_px, &|_| true)`. Give `two_pass_pick_among` the doc: "[`two_pass_pick`] restricted to the candidates `allowed` accepts (spec §5.4, plan 6b-2 C15). The median and the current reference's deviation still span every usable candidate, because where the set points does not depend on who may win. Only an allowed frame enters the top-N cut."
+
+- [ ] **Step 4: The WCS tier** (`origin.rs`). Append:
+```rust
+/// Where a frame's WCS comes from, for the reference rule (spec §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WcsTier {
+    /// A catalog frame: the rule does not apply.
+    NotApplicable,
+    Manifest,
+    /// Solved by a run (the cached `solve` artifact of this content).
+    Local,
+    /// No WCS at all.
+    Missing,
+}
+
+pub(crate) fn wcs_tier(conn: &Connection, origin: &FrameOrigin, frame_id: i64) -> anyhow::Result<WcsTier> {
+    match origin {
+        FrameOrigin::Catalog { .. } => Ok(WcsTier::NotApplicable),
+        FrameOrigin::Project { meta, .. } if meta.wcs.is_some() => Ok(WcsTier::Manifest),
+        FrameOrigin::Project {
+            project_id,
+            blake3,
+            ..
+        } => Ok(match stored_outcome(conn, project_id, frame_id, blake3)? {
+            Some(SolveOutcome::Solved(_)) => WcsTier::Local,
+            _ => WcsTier::Missing,
+        }),
+    }
+}
+```
+
+- [ ] **Step 5: The run** (`run.rs`).
+  1. Add, beside `GroupGeometry`:
+```rust
+/// A project run's reference candidates (spec §5.4, plan 6b-2 C15).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WcsRule {
+    /// Frames that may be the reference: those with a manifest WCS or, only
+    /// when no included frame has one, those the run solved locally.
+    pub(crate) candidates: HashSet<i64>,
+    /// Every measured frame with any WCS (what a manual pin needs).
+    pub(crate) with_wcs: HashSet<i64>,
+}
+
+/// Spec §5.4: the grid needs a reference with a WCS.
+const NO_PROJECT_REFERENCE: &str = "no frame of this project could be plate-solved; the grid needs one";
+
+/// Plan 6b-2 C15: a manual pin must carry a WCS.
+const MANUAL_REFERENCE_WITHOUT_WCS: &str =
+    "the manual reference frame has no WCS (none in the manifest, and the run could not plate-solve it); the grid needs one";
+```
+  2. `RunContext` gains, after `solver`:
+```rust
+    /// A project run's reference candidates, set by stage 4 (spec §5.4).
+    /// `None` for a frame set, which has no WCS rule.
+    pub(crate) wcs_rule: Option<WcsRule>,
+```
+  In `start_stacking`'s and `test_context`'s literals add `wcs_rule: None,`.
+  3. The reference rule. Replace `best_included_idx` with:
 ```rust
 fn best_included_idx(entries: &[MeasuredFrame]) -> Option<usize> {
     best_included_idx_where(entries, |_| true)
@@ -9364,7 +10069,7 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
     // Spec §5.4, plan 6b-2 C15: a project's reference must carry a WCS.
     rc.wcs_rule = wcs_tiers(rc)?;
 ```
-  In the `Manual` arm, right after `let frame_id = stored.ok_or_else(…)?;`:
+  In the `Manual` arm, right after the `calibrated_missing` block (the `if calibrated_missing { … return Err(…) }` that ends at `~run.rs:3745`), so that "the manual reference frame is excluded: {reason}" keeps precedence over a missing WCS (review I6):
 ```rust
             if rc.wcs_rule.as_ref().is_some_and(|rule| !rule.with_wcs.contains(&frame_id)) {
                 return Err(RunError::Other(MANUAL_REFERENCE_WITHOUT_WCS.to_string()));
@@ -9392,7 +10097,7 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
             };
 ```
   and `best_included_idx(entries)` in that arm becomes `best_candidate_idx(entries, rc.wcs_rule.as_ref())`. In `group_reference_idx`, `best_included_idx(entries)` becomes `best_candidate_idx(entries, rc.wcs_rule.as_ref())`. A native project group without a candidate then gets `None` and takes the run geometry, as today's `None` arm does.
-  6. `two_pass_refine` (`~5168`): replace the `let Some(new_idx) = two_pass_pick(…) else { return Ok(None); };` statement with:
+  4. `two_pass_refine` (`~5168`): replace the `let Some(new_idx) = two_pass_pick(…) else { return Ok(None); };` statement with:
 ```rust
     // Plan 6b-2 C15: on a project run only a WCS candidate may win the
     // re-pick; a frame set calls today's pick, unchanged.
@@ -9424,46 +10129,13 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
 ```
   Add `two_pass_pick_among` to the `weights` import.
 
-- [ ] **Step 9: The plan's refinement** (`plan.rs`, `project_inputs`). Replace Task 7's `unsolved` block (from `// Spec §5.2: an in-scope frame without a manifest WCS is solved locally.` through its `if unsolved > 0 { … }`) with:
-```rust
-    // Spec §5.2: an in-scope frame without a manifest WCS is solved by the
-    // run. The last cached outcome for its content (plan 6b-2 Task 10) says
-    // which frames are still to solve and which could not be solved. The plan
-    // reads the outcome, not its hash: after a solver or catalog change the
-    // run re-solves, and the plan learns the new outcome only then.
-    let (mut to_solve, mut unsolvable) = (0usize, 0usize);
-    for f in source
-        .frames
-        .iter()
-        .filter(in_scope)
-        .filter(|f| f.meta.as_ref().is_some_and(|m| m.wcs.is_none()))
-    {
-        let Some(handle) = f.handle else { continue };
-        let outcome =
-            crate::stacking::origin::local_solve_outcome(conn, origin_of(&source.origins, handle)?, handle)
-                .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
-        match outcome {
-            None => to_solve += 1,
-            Some(crate::stacking::solve::SolveOutcome::Solved(_)) => {}
-            Some(_) => unsolvable += 1,
-        }
-    }
-    if to_solve > 0 {
-        warnings.push(format!(
-            "{to_solve} frame{} no WCS in the manifest and will be plate-solved locally",
-            if to_solve == 1 { " has" } else { "s have" }
-        ));
-    }
-    if unsolvable > 0 {
-        warnings.push(format!(
-            "{unsolvable} frame{} could not be plate-solved and cannot anchor the grid",
-            if unsolvable == 1 { "" } else { "s" }
-        ));
-    }
+- [ ] **Step 6: Run the tests and watch them pass.** First the Step 2 command. Then:
+```bash
+CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 stacking::weights stacking::origin two_pass stage_reference reference_ subject_and_origin_variants_stay_in_their_funnels
 ```
-  Task 7's `a_project_plan_reports_its_groups_frames_grid_and_warnings` keeps passing: no outcome is cached there, so `o1` still reads "will be plate-solved locally".
+  Expected: all pass, including the frame-set reference and two-pass tests, which run unchanged.
 
-- [ ] **Step 10: The real-data probe** (`stacking/solve.rs` tests). Add to the test module:
+- [ ] **Step 7: The real-data probe** (`stacking/solve.rs` tests). Add to the test module:
 ```rust
     fn describe(o: &SolveOutcome) -> String {
         match o {
@@ -9476,13 +10148,25 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
         }
     }
 
+    /// One kind's counts in the probe: mono, or OSC by the manifest's `bayerpat`.
+    #[derive(Default)]
+    struct Tally {
+        tried: usize,
+        unit_ok: usize,
+        adu_ok: usize,
+    }
+
     /// Plan 6b-2 C14, "real data first": the real solver and the real catalog
     /// on the landed project replicas of a COPY of the `.dev` catalog. These
     /// files are calibrated to 0..1, which no production solve has seen. It
     /// reports per frame and in total how many solve on their prepared pixels,
-    /// and for the rest whether an ADU-scaled (×65535) copy would. It is
-    /// read-only on the catalog copy and on every landed file; prepared and
-    /// scaled copies go to a temp dir.
+    /// and for the rest whether an ADU-scaled (×65535) copy would.
+    /// - The sample is stratified (review I8): up to `limit / 2` frames with a
+    ///   manifest `bayerpat` (OSC, debayered by Prepare into a three-plane file)
+    ///   and up to `limit / 2` without; the summary prints both sub-rates.
+    /// - A probe that solves nothing in either domain fails (review M16).
+    /// - It is read-only on the catalog copy and on every landed file; prepared
+    ///   and scaled copies go to a temp dir.
     #[test]
     #[ignore = "needs ATHENAEUM_SOLVE_PROBE_DB (a copy of the .dev catalog) and ATHENAEUM_SOLVE_PROBE_APP_DATA (the .dev app-data dir, for its star catalog)"]
     fn real_data_solve_probe() {
@@ -9512,15 +10196,25 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
                 .collect::<Result<_, _>>()
                 .unwrap()
         };
-        let (mut tried, mut unit_ok, mut adu_ok, mut unsupported, mut manifest_wcs, mut absent) = (0, 0, 0, 0, 0, 0);
-        for (project_id, uuid, landed, manifest_json) in rows.into_iter().take(limit) {
-            let meta = match crate::collab::frame_meta::parse_project_frame_meta(&manifest_json) {
-                Ok(m) => m,
-                Err(e) => {
-                    println!("{uuid}: manifest unreadable: {e:#}");
-                    continue;
-                }
-            };
+        let (mut osc_rows, mut mono_rows) = (Vec::new(), Vec::new());
+        for (project_id, uuid, landed, manifest_json) in rows {
+            match crate::collab::frame_meta::parse_project_frame_meta(&manifest_json) {
+                Ok(meta) if meta.bayerpat.is_some() => osc_rows.push((project_id, uuid, landed, meta)),
+                Ok(meta) => mono_rows.push((project_id, uuid, landed, meta)),
+                Err(e) => println!("{uuid}: manifest unreadable: {e:#}"),
+            }
+        }
+        let half = limit / 2;
+        let sample: Vec<(bool, (String, String, String, ProjectFrameMeta))> = osc_rows
+            .into_iter()
+            .take(half)
+            .map(|r| (true, r))
+            .chain(mono_rows.into_iter().take(half).map(|r| (false, r)))
+            .collect();
+        let (mut mono, mut osc) = (Tally::default(), Tally::default());
+        let (mut unsupported, mut absent, mut manifest_wcs) = (0usize, 0usize, 0usize);
+        for (is_osc, (project_id, uuid, landed, meta)) in sample {
+            let tally = if is_osc { &mut osc } else { &mut mono };
             if meta.wcs.is_some() {
                 manifest_wcs += 1;
             }
@@ -9555,12 +10249,13 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
                     execute_prepare(&job, None, &go).expect("prepare").calibrated
                 }
             };
-            tried += 1;
-            let request = SolveRequest::for_frame(&path, &meta, target);
+            tally.tried += 1;
+            // No stacking handle exists outside a run; 0 names the span.
+            let request = SolveRequest::for_frame(0, &path, &meta, target);
             let unit = solve_with(&request, &caches, &config, &go);
             let unit_solved = matches!(unit, SolveOutcome::Solved(_));
             if unit_solved {
-                unit_ok += 1;
+                tally.unit_ok += 1;
             }
             let adu_note = if unit_solved {
                 String::new()
@@ -9569,20 +10264,27 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
                 adu_scaled_copy(&path, &adu).expect("adu-scaled copy");
                 let rescued = solve_with(&SolveRequest { path: adu, ..request.clone() }, &caches, &config, &go);
                 if matches!(rescued, SolveOutcome::Solved(_)) {
-                    adu_ok += 1;
+                    tally.adu_ok += 1;
                 }
                 format!(" | adu-scaled: {}", describe(&rescued))
             };
             println!(
-                "{uuid} ({}): {}{adu_note}",
+                "{uuid} ({}, {}): {}{adu_note}",
+                if is_osc { "osc" } else { "mono" },
                 if meta.wcs.is_some() { "manifest wcs" } else { "no manifest wcs" },
                 describe(&unit)
             );
         }
         println!(
-            "solve probe: tried {tried}, solved on unit-domain pixels {unit_ok}, rescued by the adu-scaled copy {adu_ok}, unsupported {unsupported}, not on disk {absent}, with a manifest wcs {manifest_wcs}"
+            "solve probe: mono {}/{} solved on unit-domain pixels, {} rescued by the adu-scaled copy; osc {}/{} solved on unit-domain pixels, {} rescued by the adu-scaled copy; unsupported {unsupported}, not on disk {absent}, with a manifest wcs {manifest_wcs}",
+            mono.unit_ok, mono.tried, mono.adu_ok, osc.unit_ok, osc.tried, osc.adu_ok
         );
-        assert!(tried > 0, "no landed project frame in the catalog copy");
+        assert!(mono.tried + osc.tried > 0, "no landed project frame in the catalog copy");
+        // Review M16: a probe that solved nothing is a red run, not a line to read.
+        assert!(
+            mono.unit_ok + mono.adu_ok + osc.unit_ok + osc.adu_ok > 0,
+            "no frame solved, in either domain"
+        );
     }
 ```
   Make the copy and run it. The copy lives under the session scratchpad; never commit it. The catalog and the landed files are only read.
@@ -9594,13 +10296,13 @@ ATHENAEUM_SOLVE_PROBE_DB=$SCR/solve-probe.db ATHENAEUM_SOLVE_PROBE_APP_DATA="$DE
   CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --ignored --nocapture real_data_solve_probe
 rm -f "$SCR/solve-probe.db" "$SCR/solve-probe.db-wal" "$SCR/solve-probe.db-shm"
 ```
-  Expected: PASS, ending with the `solve probe:` line. Record that line and every per-frame line in the report, and in Task 11's open-items entry. The research found the `.dev` catalog's one project with frames, "LDN1272-test Project": mono `L` (ATR2600M) and OSC (ASI2600MC Duo) replicas, all 180 s, every one with a manifest WCS, landed under `/Volumes/bigbase3/Projects/ldn1272-test-project/vilen/`. The probe solves them anyway, because the point is whether calibrated 0..1 pixels solve; the OSC replicas go through the debayer first.
-  - If that volume is not mounted, every frame reports "not on disk" and the test fails on `tried > 0`. Say so in the report and ask for the volume; do not copy the replicas elsewhere.
+  Expected: PASS, ending with the `solve probe:` line, which carries the mono and the OSC sub-rates. Record that line and every per-frame line in the report, and in Task 11's open-items entry. The research found the `.dev` catalog's one project with frames, "LDN1272-test Project": mono `L` (ATR2600M) and OSC (ASI2600MC Duo) replicas, all 180 s, every one with a manifest WCS, landed under `/Volumes/bigbase3/Projects/ldn1272-test-project/vilen/`. The probe solves them anyway, because the point is whether calibrated 0..1 pixels solve; the OSC replicas go through the debayer first, so the OSC sub-rate is the first solve ever run on a debayered three-plane float file.
+  - If that volume is not mounted, every frame reports "not on disk" and the test fails on its first assertion. Say so in the report and ask for the volume; do not copy the replicas elsewhere.
   - If the `.dev` catalog has no landed project frame, the test fails with "no landed project frame in the catalog copy". Say so in the report. Do not substitute the production catalog.
   - If `$DEV/catalogs/smac_gaia` is missing, say so. Do not download a catalog.
 
-- [ ] **Step 11: Only if the probe's `rescued by the adu-scaled copy` count is above 0** (some frames solve only in the ADU domain), add the fallback to `CatalogSolver`:
-  - `SolveRequest` gains `pub scratch_dir: Option<PathBuf>`, set to `None` in `for_frame`.
+- [ ] **Step 8: Only if either sub-rate's `rescued by the adu-scaled copy` count, mono or OSC, is above 0** (some frames solve only in the ADU domain), add the fallback to `CatalogSolver` (Task 10b's code):
+  - `SolveRequest` gains `pub scratch_dir: Option<PathBuf>`, set to `None` in `for_frame` (the tests that build a request through `for_frame` need no change).
   - `solve_project_frames` sets `request.scratch_dir = Some(rc.layout.root.join("tmp"))` after `for_frame`.
   - `CatalogSolver::solve` ends with:
 ```rust
@@ -9628,18 +10330,12 @@ rm -f "$SCR/solve-probe.db" "$SCR/solve-probe.db-wal" "$SCR/solve-probe.db-shm"
         tracing::debug!(path = %request.path.display(), outcome = second.label(), "retried the solve on an adu-scaled copy");
         second
 ```
-  - Re-run the probe after the change and record both lines.
-  - Without the condition, skip this step and record "unit-domain solving holds on real data" in the report.
+  - Re-run the probe after the change and record both `solve probe:` lines.
+  - Without the condition, skip this step and record "unit-domain solving holds on real data, mono and OSC" in the report.
 
-- [ ] **Step 12: Run the tests and watch them pass.** First the Step 2 command. Then:
-```bash
-CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 plate_solve:: stacking::weights stacking::origin two_pass stage_reference reference_ subject_and_origin_variants_stay_in_their_funnels
-```
-  Expected: all pass, including every existing `store_result` / `blind_gate` test and the frame-set reference and two-pass tests, which run unchanged. Then `CARGO_BUILD_JOBS=4 cargo check -p athenaeum-tauri` and `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-web -- --test-threads=4 plate_solve`.
+- [ ] **Step 9: Run the gate.** TS must not move: `git diff --exit-code src/types`.
 
-- [ ] **Step 13: Run the gate.** TS must not move: `git diff --exit-code src/types`.
-
-- [ ] **Step 14: Commit** with the message `feat(stacking): the Solve sub-step and the WCS reference rule; one catalog opener for both hosts`, plus the trailers.
+- [ ] **Step 10: Commit** with the message `feat(stacking): the WCS reference rule; the real-data solve probe`, plus the trailers. If Step 8 ran, its fallback is part of this commit, and the message adds `; the adu-scaled solve fallback`.
 
 ---
 
@@ -9649,7 +10345,7 @@ CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- --test-threads=4 plate_
 - Modify `docs/stacking/README.md`: the 6b-1 block (three sentences), a new block "The project path (wave 6b-2)", and the key files.
 - Modify `docs/transfers/README.md`: a new section at the end.
 - Modify `docs/superpowers/specs/2026-07-03-logging-overhaul-design.md`: one dictionary paragraph after the wave 6a one (`~279`).
-- Modify `docs/superpowers/open-items.md`: one entry at the top of "Unverified by hand".
+- Modify `docs/superpowers/open-items.md`: one entry at the top of "Unverified by hand", and one line under "Release notes owed at the next tag".
 
 `CLAUDE.md` is not touched; its command count moves with 6b-3's docs (C17). No code changes in this task.
 
@@ -9706,8 +10402,9 @@ registration onto its canonical grid. `start_stacking` still refuses a project
 - **The project frame source** (`stacking::project_source`) reads
   `project_frames_local` and the landed files' headers, never the catalog.
   - A frame is stackable when it is exportable, servable, not `own_staged`, and
-    has a recorded `size_mtime_seen`. Every other published, accepted frame is a
-    Frames row with its reason.
+    has a recorded `size_mtime_seen` that parses (one that does not is
+    "unreadable size:mtime stamp", never "waiting"). Every other published,
+    accepted frame is a Frames row with its reason.
   - Groups are colour × canonical filter × class, keyed
     `<mono|osc|cfa>__<filter>__<class>`, with no binning and no camera. `cfa`
     appears only when `debayerOsc` is off and the file is a one-plane mosaic.
@@ -9715,7 +10412,11 @@ registration onto its canonical grid. `start_stacking` still refuses a project
 - **Funnels.** `origin::tests::subject_and_origin_variants_stay_in_their_funnels`
   keeps every `StackSubject::` / `FrameOrigin::` path in the production half of
   `run.rs` and `plan.rs` inside the named funnels, or in an allowlist where each
-  entry has its reason.
+  entry has its reason. The per-frame dispatch points the run calls live in
+  `stacking::origin`, which the test does not scan: `stored_solve`,
+  `cfa_geometry`, `landed_unchanged`, `needs_prepare`, `prepare_input`,
+  `solve_plan`, `wcs_tier` and `local_solve_outcome`. A third subject or origin
+  touches exactly these and the named funnels.
 - **The identity check.** `origin::landed_unchanged` compares a landed file with
   its row's `size:mtime` (2 s tolerance). It runs at Prepare, Solve, Measure,
   the Register candidates and the Output member snapshot. A mismatch excludes the
@@ -9730,6 +10431,9 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   - Warnings (spec §7): frames not on this device, other reasons a frame is left
     out, frames to be solved locally or that could not be, frames outside the
     grid, unsupported files, and unknown exposure equivalence.
+  - Unsupported files also leave every group's included count and the ≥ 3
+    rule, so a group Prepare would leave short is blocked by `frames` at plan
+    time; they are not manual exclusions.
   - It carries `grid` (state, current, proposal, framesInside, canEdit) and
     `projectFrames`.
 - **R3 (attested sets).** A frame set with `calibrated_externally` needs no
@@ -9741,11 +10445,19 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     is. The `calibrated` artifact is the landed file, which no cleanup removes.
   - **Converted:** an integer FITS (÷ `scale_divisor_for_bitpix`) or an XISF
     (`read_raw` ÷ 65535) becomes float32 FITS `prepared/<group>/p_<stem>.fits`.
+    An integer FITS is never used in place, although spec §5.1 row 1 allows
+    it: converting gives an attested set's 16-bit lights and a published
+    replica the calibrated-light generator's one unit domain.
   - **Debayered:** a CFA mosaic, when `debayerOsc` is on, goes through the
     generator's own VNG (`debayer_plane`) into `p_<stem>_d.fits`. The
     pre-debayer mosaic is the `calibrated_mosaic` for Bayer drizzle.
-  - **Excluded:** a tile-compressed FITS, an extension image or a distributed
-    XISF, as "unsupported file".
+  - **Excluded:** a tile-compressed FITS, an extension image, a distributed
+    XISF or a file that cannot be opened, as "unsupported file: …" (the
+    decoder's reason reads "not a 1- or 3-plane 8/16/32-bit or float primary
+    image"); and a frame whose plane count after Prepare contradicts its
+    group's colour, as "plane count {n} disagrees with the group's colour
+    mode" (the group's colour comes from the manifest, the debayer from the
+    file's own header).
   - Prepared files carry the copy-through cards, `ATH_STK`, `ATH_STKV` and
     `ATH_PREP`, and never `CALSTAT`, `ATH_CSRC`, `ATH_PRJ` or `ATH_FILT`, so the
     scanner never catalogs one.
@@ -9761,18 +10473,27 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     as hints, through `solve_frame_with_hints` and the extracted gate
     `acceptance_refusal` at the manifest scale.
   - Every outcome (solved, failed, refused) is a `solve` artifact: group key
-    `""`, payload `{blake3, outcome}`, hash over blake3, the solver config hash
-    and the catalog identity.
+    `""`, payload `{blake3, app_version, outcome}`, hash over blake3, the
+    solver config hash and the catalog identity. A cached failure or refusal
+    written by another app version is tried once more; a cached solve stays.
+    Bump `plate_solve::config::SOLVE_RECIPE_VERSION` when a solver change
+    should re-solve frames cached as solved.
+  - `solve` is not an intermediate: `CleanupWhat::Intermediates` keeps it, and
+    only `CleanupWhat::All` (every artifact row) deletes the solve cache.
   - `plate_solves` and `frames` are never written. `stored_solve`'s project arm
     reads the manifest WCS, then the run's solve of this content.
-  - Real-data probe on the `.dev` replicas: <the `solve probe:` line from Task 10 Step 10>.
+  - For 6c: the sub-step's own progress runs `Measure` to 100 % with the
+    message `"solving"`, and Measure then restarts at 0, so a project run's
+    Measure bar goes back once.
+  - Real-data probe on the `.dev` replicas (mono and OSC sub-rates): <the `solve probe:` line from Task 10c Step 7>.
 - **The reference rule** (spec §5.4). On a project run the reference must carry a WCS.
   - Candidates are the manifest-WCS frames, or the locally solved ones only when
     no included frame has a manifest WCS.
   - Auto takes the largest group that holds a candidate. A native group without
     one takes the run reference.
   - The two-pass re-pick never lets a non-candidate win (`two_pass_pick_among`).
-  - A manual pin without a WCS fails the stage.
+  - A manual pin without a WCS fails the stage; a pin that stage 1 excluded
+    still fails with its own reason ("the manual reference frame is excluded: …").
   - With no candidate, the stage fails with "no frame of this project could be
     plate-solved; the grid needs one".
 - **The canonical grid** is described in `docs/transfers/README.md` (wave 6b-2).
@@ -9790,7 +10511,7 @@ registration onto its canonical grid. `start_stacking` still refuses a project
 
   `start_stacking` lifts its project guard then.
 ```
-  Replace the `<…>` placeholder in the Solve bullet with the actual line Task 10 Step 10 printed. If the probe could not run, write "not run: <why>".
+  Replace the `<…>` placeholder in the Solve bullet with the actual line Task 10c Step 7 printed. If the probe could not run, write "not run: <why>".
   4. In `**Key files**`, add `stacking/{origin,project_source,prepare,solve}.rs`, `collab/{grid,grid_geometry,frame_meta}.rs` and `api/collab_grid.rs` to the core list, and `plate_solve/{service,layers}.rs` after them.
 
 - [ ] **Step 2: The transfers reference** (`docs/transfers/README.md`). Append:
@@ -9806,18 +10527,18 @@ Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-
 - **Hub and cache.**
   - `CollabClient::put_grid` sends `PUT /projects/{id}/grid` (204).
   - `ProjectWire.canonical_grid` carries the hub's copy. The refresh writes `collab_projects.canonical_grid_json` through `db::collab::set_canonical_grid` and reports the projects whose grid moved in `RefreshReport.grid_moved`. The setter compares with `IS NOT`, so an unchanged echo writes nothing.
-  - `ProjectCard.canonicalGrid` exposes the cached grid.
+  - `ProjectCard.canonicalGrid` exposes the cached grid. A cached grid that no longer parses shows as none on the card, with a warning; the proposal command fails on it instead.
   - A malformed echo keeps the cached grid, with a warning.
   - `set_collab_project_grid` writes the local copy only after the hub's 2xx.
-- **Feed.** `ChangeKind::Grid` now triggers the project refresh. Each of the six live-feed refresh sites emits `collab-grid-changed { projectId }` for every project whose grid moved (`FeedApplier::emit_grid_moves`). The hosts' `refresh_projects` command and the device-replace refresh emit nothing; their cards carry the grid.
+- **Feed and event.** `ChangeKind::Grid` now triggers the project refresh. Each of the six live-feed refresh sites emits `collab-grid-changed { projectId }` for every project whose grid moved (`FeedApplier::emit_grid_moves`). The saving device gets the event from the command, and every other device from the feed: the saving device's own cache write makes its feed refresh a no-op. The hosts' `refresh_projects` command and the device-replace refresh emit nothing; their cards carry the grid.
 - **Proposal** (`collab::grid_geometry::propose_grid`). It is deterministic for a manifest version.
   - Scale: the median `pixelScaleArcsec` of the accepted frames, rounded to 0.01″. Centre: the project target. Rotation: 0.
   - Size: the bounding box, in the proposed TAN, of the WCS frames' footprints (SIP applied), clipped to the target circle, rounded up to a multiple of 64 and clamped to [64, 65536]. With no WCS frame, a square of 2 × the target radius.
   - `framesInside` counts the frames at least half inside (a 16 × 16 sample).
-  - With no accepted frame carrying a scale, there is no proposal.
+  - With no accepted frame carrying a scale there is no proposal, and none either when the median scale rounds outside the hub's (0, 100].
 - **Two commands, on both hosts** (strict count 297 → 299):
   - `get_collab_grid_proposal { projectId } -> { current, proposal, framesInside, canEdit }`, DB-only.
-  - `set_collab_project_grid { projectId, grid } -> grid`. It validates and normalizes the grid, and refuses a caller without `project.edit` with "This account cannot edit the project's grid (it needs project.edit and membership)." It then PUTs, writes the cache and echoes its own normalized grid. A hub 400 is `Invalid`.
+  - `set_collab_project_grid { projectId, grid } -> grid`. It validates and normalizes the grid, and refuses a caller without `project.edit` with "This account cannot edit the project's grid (it needs project.edit and membership)." It then PUTs, writes the cache, emits `collab-grid-changed` (on every successful save) and echoes its own normalized grid. A hub 400 is `Invalid`, carrying the hub client's wrapped message (`hub returned 400 Bad Request (put project grid): …`); local validation mirrors the hub's text, so that wrapper shows only when the two disagree.
 
   Plan 6b-3 adds the seven project-stacking commands (→ 306).
 - **Fake hub:** `PUT /projects/{id}/grid`, `canonicalGrid` on the project page, and a settable target.
@@ -9834,11 +10555,12 @@ Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-
 - **`grid_hash`** (16-hex XXH3 of a canonical grid's canonical JSON) on the info `"grid saved"`.
 - **`frames_inside`** (usize): frames at least half inside a proposed grid, on the debug `"grid proposed"`.
 - **`bayerpat`** (string): a CFA pattern a file's own header declared that no reader recognizes, on the warn `"unrecognized bayer pattern in the file's header; treated as no mosaic"`.
+- **`stamp`** (debug-formatted `Option<String>`): a landed frame's recorded `size:mtime` stamp that does not parse, on the warn `"landed stamp unreadable; frame left out"`.
 
 Reused in their existing senses:
 - `project_id`, `run_id`, `group_key`, `count`, `groups`, `path`, `error`, `duration_ms` and `config_hash`;
 - `frame_uuid`;
-- `frame_id`: a stacking frame id, which is a catalog `frames.id`, or a `stack_project_frames` handle on a project run;
+- `frame_id`: a stacking frame id, which is a catalog `frames.id`, or a `stack_project_frames` handle on a project run (also on the solver's `"solve"` span for a project frame; the real-data probe, which runs outside a run, records 0);
 - `reason`: an exclusion reason, `"changed during the run"` among them;
 - `outcome`: a solve's `solved` / `failed` / `refused`, or the stat verdict on `"landed project frame changed during the run"`;
 - `set_id`: stacking's own sense, a run's frame set. It is an `Option` now, recorded exactly as before for a frame set and absent on a project run.
@@ -9858,14 +10580,19 @@ Code-complete with green gates:
 
 Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §5–§9 and §13; plan `docs/superpowers/plans/2026-10-03-collab-v3-wave6b2-project-path-plan.md`. Reference: `docs/stacking/README.md` (The project path, wave 6b-2) and `docs/transfers/README.md` (wave 6b-2). No project run starts until 6b-3, so there is no project UI to smoke. Owed:
 
-- **Unit-domain solving on real data.** Task 10's probe on the `.dev` LDN1272-test replicas printed: <the `solve probe:` line>. If it shows rescues by the ADU-scaled copy, the fallback (Task 10 Step 11) landed with it; re-check that both rates hold on the first real project run.
+- **Unit-domain solving on real data, mono and OSC.** Task 10c's probe on the `.dev` LDN1272-test replicas printed: <the `solve probe:` line, with both sub-rates>. If either sub-rate shows rescues by the ADU-scaled copy, the fallback (Task 10c Step 8) landed with it; re-check both sub-rates on the first real project run.
 - **An attested set end to end on real data.** Mark a real externally calibrated set attested and stack it. Check that it runs without masters, that integer lights are converted under `prepared/`, and that the master looks right.
-- **Unsupported files are excluded, not read.** A tile-compressed FITS, an image in an extension HDU and a distributed XISF leave a project run as "unsupported file", and the plan names them. Nothing in the owner's data needs them today. A reader for any of them is its own cycle.
+- **Unsupported files are excluded, not read.** A tile-compressed FITS, an image in an extension HDU and a distributed XISF leave a project run as "unsupported file", and the plan names them and counts them out of the ≥ 3 rule. Nothing in the owner's data needs them today. A reader for any of them is its own cycle.
 - **A float file in the ADU domain is used in place as if it were 0..1.** Prepare does not look at pixel values, so a float FITS another tool wrote in ADU (0..65535) would be measured and stacked in ADU. Every replica a member publishes is 0..1 by construction; an attested set's float lights are the open case. Check the first real attested float set. If it is in ADU, add a value-range probe to `prepare_action`, in its own cycle.
 - **The 25 % LN-overlap threshold cannot be re-measured on the acceptance set (6b-3).** LDN1272-test's two rigs are two groups whose members share their framing, so nothing falls under 25 %. The fallback is reachable only in synthetic fixtures and the fake-hub e2e. The owner's option is to publish set 195 "Ghost Nebula QHY" (~60 % overlap) into a test-hub project; that exercises partial overlap, not the < 25 % fallback.
 - **The grid's orientation (6b-3).** A master on the grid will be the mirror image of a raw frame: the grid is sky-standard (det CD < 0), while every solve in the owner's catalog has det CD > 0. That is correct on the sky. Check the first grid master against a sky chart, and never copy `ROWORDER` onto it.
 ```
   Replace the `<…>` with the probe's line, or "not run: <why>".
+
+  Under "## Release notes owed at the next tag", add:
+```markdown
+- **Externally calibrated frame sets stack without masters.** A frame set marked as calibrated elsewhere is now stacked as it is: its lights are used, or converted to the app's unit domain, instead of being calibrated, and no master is asked for or built.
+```
 
 - [ ] **Step 5: The final gates.** Run, one at a time, from the repo root:
 ```bash
@@ -9881,7 +10608,7 @@ grep -rE '^\s*#\[tauri::command(\]|\()' crates/athenaeum-tauri/src/commands/*.rs
 git diff --stat e03bc48f -- src/types
 ```
   Expected:
-  - every `test result` is `ok`, and the counts are Task 0's plus this plan's new tests, with no test lost;
+  - every `test result` is `ok`, and the counts are Task 0's plus this plan's new tests, with no test lost (one `#[ignore]` more: the real-data probe);
   - the lib check prints no `warning`, and the headless check is clean;
   - `git diff --stat src/types` is empty: the TS was committed with its tasks;
   - the command count is `299`;
@@ -9895,21 +10622,20 @@ git diff --stat e03bc48f -- src/types
 
 ## Writer's notes for the controller
 
-Each item is a place where the skeleton and the code disagreed, or where the skeleton left a choice open. Each gives the fix this plan made. All of them are also marked **Refinement** in the rulings where they apply.
+Each item is a place where the skeleton and the code disagreed, or where the skeleton left a choice open. Each gives the fix this plan made. All of them are also marked **Refinement** in the rulings where they apply. Items 5, 9 and 20 were updated, and items 22 and 23 added, by the controller's rulings on the plan review.
 
 1. **TS moves in five tasks, not three.**
    - Problem: the skeleton allows `src/types` diffs only in Tasks 1, 3 and 8. But Task 2's four config fields live in ts-exported `GroupingConfig`/`OutputConfig`/`ExposureMode`, and Task 7's `PlanGrid`/`GridState`/`PlanProjectFrame` and the two `StackingPlan` fields are exported.
-   - Fix: the gate allows Tasks 1, 2, 3, 7 and 8, and each lists its exact TS moves.
-2. **The identity check's call sites are split.** Measure, Register and Output land in Task 6 with the funnel. Prepare and Solve land with their stages (Tasks 9 and 10).
-3. **`prepare_subtree` lands in Task 6, the classifier in Task 7.**
-   - `HashMemo`'s project arm must compile in Task 6, and the plan's space estimate and its unsupported-file warning need `probe_file`/`prepare_action` in Task 7.
-   - The writers, the stage and the debayer extraction stay in Task 9.
+   - Fix: the gate allows Tasks 1, 2, 3, 7 and 8b, and each lists its exact TS moves. (Task 8a adds `CanonicalGrid` unregistered, so its TS does not move.)
+2. **The identity check's call sites are split.** Measure, Register and Output land in Task 6b with the funnel. Prepare and Solve land with their stages (Tasks 9b and 10b).
+3. **`prepare_subtree` lands in Task 6a, the classifier in Task 7.**
+   - `HashMemo`'s project arm must compile in Task 6a, and the plan's space estimate and its unsupported-file warning need `probe_file`/`prepare_action` in Task 7.
+   - The writers and the debayer extraction are Task 9a; the stage is Task 9b.
    - The subtree key is the skeleton's `debayerMethod`.
 4. **The stackable predicate also needs a recorded `size_mtime_seen`.** A version bump clears the stamp, so the landed file is not the manifest's version, and the identity check would have no baseline. The reason is "waiting for its new version".
-5. **"Every refresh site emits `collab-grid-changed`" is narrowed to the six live-feed sites.**
-   - Only they have an emitter.
-   - The hosts' `refresh_projects` command and the device-replace refresh return cards that carry `canonicalGrid`.
-   - Fix if the controller wants events there too: thread an emitter into those two paths (a wider change than 6b-2 needs).
+5. **Who emits `collab-grid-changed`.** The six live-feed refresh sites, and the save command (review I5, controller ruling).
+   - The saving device's own cache write makes its feed refresh a no-op, so `set_collab_project_grid` takes the host's emitter and emits after the successful cache write, on every successful save (a re-plan is idempotent). The saving device gets the event from the command; every other device gets it from the feed.
+   - The hosts' `refresh_projects` command and the device-replace refresh still hold no emitter; the cards they return carry `canonicalGrid`.
 6. **`none` keeps `unknown` apart.** Frames without EXPTIME keep their own `unknown` class in every mode, so `none` means one class per colour × filter among frames with a known exposure. This keeps the EXPTIME warning byte-identical.
 7. **The token collision proof rests on two choices this plan made:**
    - `MIN_STOPS_WIDTH` = 0.1 (the skeleton said "a positive floor");
@@ -9919,9 +10645,9 @@ Each item is a place where the skeleton and the code disagreed, or where the ske
 8. **C10's "one IMMEDIATE transaction" is two atomic writes.**
    - The config seed and the handle mint are separate IMMEDIATE transactions, because `start_stacking` (6b-3) mints through the same frame source.
    - Both are idempotent, so a crash between them is harmless.
-9. **There is no project-only `unsupported` blocker.**
-   - Unsupported FILES are a plan warning plus a per-frame Prepare exclusion. The `unsupported` code stays the shared drizzle-scale check.
-   - A blocker would stop a project over one odd file that a member can simply re-publish.
+9. **There is no project-only `unsupported` blocker, but unsupported files leave the plan's counts** (corrected by review I1).
+   - Unsupported FILES are a plan warning plus a per-frame Prepare exclusion. The `unsupported` code stays the shared drizzle-scale check; a blocker would stop a project over one odd file that a member can simply re-publish.
+   - They are also plan-time exclusions: the shared core counts their handles out of every group's included frames and the ≥ 3 rule (`excluded_set ∪ unsupported_ids`), so a group that Prepare would leave under three frames is blocked by `frames` at plan time instead of failing at run time. `StackingPlan.excluded_frame_ids` stays the manual list.
 10. **Reference-rule details the spec left open:**
     - tiers are decided run-wide over included frames;
     - Auto takes the largest group that holds a candidate;
@@ -9932,10 +10658,11 @@ Each item is a place where the skeleton and the code disagreed, or where the ske
 12. **The proposal is optional.** `GridProposal.proposal` / `PlanGrid.proposal` are `Option`: with no accepted frame carrying a scale there is no proposal, and the plan's grid state is `unset`.
 13. **The grep test's allowlist.**
     - It also carries `build_plan` (the subject dispatch to the two plan arms and its per-subject debug line) and the two `#[cfg(test)]` constructors.
+    - The test lands in Task 6a without `landed_unchanged` in `FUNNELS`; Task 6b adds it with the function.
     - The skeleton's "registration store" funnels are `stored_registrations` / `store_registration`, and "the `stage_prepare` dispatch" is the funnel `stage_one_kind`.
 14. **`publisher` in `FrameOrigin::Project` is the display name** (`publisher_display`), as the Frames table shows it.
 15. **`WorkUsage` does not move.**
-    - Prepare's copies are counted in `calibrated_bytes`, stage 1's slot, so no TS regenerates in Task 9.
+    - Prepare's copies are counted in `calibrated_bytes`, stage 1's slot, so no TS regenerates in Task 9a.
     - The research assumed a new `prepared_bytes` field.
 16. **The working root is `_projects`, per the skeleton.** Spec §9.3 still says `projects/` and is stale on this point.
 17. **Prepared file names keep the replica's stem:** `p_c_<uuid>.fits`, and `p_c_<uuid>_d.fits` when debayered (through `calibrated_file_stem`).
@@ -9943,6 +10670,10 @@ Each item is a place where the skeleton and the code disagreed, or where the ske
     - This is beyond the skeleton: `stored_solve` then never serves a solve of an older version of the frame, even when a run could not refresh it (no catalog).
     - The plan's "could not be plate-solved" warning reads that last outcome without its hash.
 19. **No new `Stage` variant.** Prepare reports under `Stage::Calibrate` and Solve under `Stage::Measure` (message `"solving"`), so the board keeps its ten rows. Plan 6c names the Calibrate row "Prepare" for a project.
-20. **R3 is live for frame sets in 6b-2.** An attested frame set now starts and stacks with no masters through `start_stacking`, because only the project guard stays (Task 9's end-to-end test). This is user-visible before 6b-3; the controller may want a release-notes line.
-21. **Task 10 Step 11 is conditional on real data.** The ADU-scaled solve fallback is added only if the probe shows frames that solve only in the ADU domain. The probe needs the `.dev` replicas' volume (`/Volumes/bigbase3`) mounted.
-
+20. **R3 is live for frame sets in 6b-2.** An attested frame set now starts and stacks with no masters through `start_stacking`, because only the project guard stays (Task 9b's end-to-end test). This is user-visible before 6b-3. Controller ruling: kept; Task 11 adds a "release-note line owed" entry to `open-items.md` (externally calibrated frame sets now stack without masters), and the real-data smoke entry stays.
+21. **Task 10c Step 8 is conditional on real data.** The ADU-scaled solve fallback is added only if the probe shows frames, mono or OSC, that solve only in the ADU domain. The probe samples both kinds (review I8) and needs the `.dev` replicas' volume (`/Volumes/bigbase3`) mounted.
+22. **Integer FITS are converted, not used in place** (review I2). Spec §5.1 row 1 lists BITPIX 8/16/32 among the files used in place; this plan narrows it to float, so an attested set's 16-bit lights and a published replica share the calibrated-light generator's unit domain and every stage after stage 1 sees one value domain. Recorded in C12 and in the README's Prepare bullet.
+23. **Three placements differ from the review's cut points, to keep each half's lib check warning-free.**
+    - `needs_prepare`, `PrepareInput` and `prepare_input` land in Task 9b, not 9a: nothing calls them before the stage, so in 9a they would be dead code.
+    - `WcsRule`, the `wcs_rule` field and `WcsTier`/`wcs_tier` land in Task 10c, not 10b, for the same reason; 10c adds `wcs_rule: None` to both constructors. Task 10b's no-op test drops its `wcs_tiers` assertion, and Task 10c's `a_frame_set_run_has_no_wcs_rule` carries it.
+    - `ProjectFile::EmptyPrimary` moves to Task 7, which needs it for the review I1 plan test; Task 9b uses it.
