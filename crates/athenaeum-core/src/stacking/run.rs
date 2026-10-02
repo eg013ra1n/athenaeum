@@ -54,7 +54,7 @@ use crate::integration::io_policy::IoPolicy;
 use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{NormalizationPair, RejectionNormalization};
 use crate::integration::IntegrationError;
-use crate::plate_solve::storage::{get_plate_solve, PlateSolveRecord};
+use crate::plate_solve::storage::PlateSolveRecord;
 use crate::registration::db::RegistrationRecord;
 use crate::resample::Interpolation;
 use crate::services::compute_queue::ComputeJobKind;
@@ -66,7 +66,7 @@ use crate::stacking::drizzle::{
     drizzle_group, DrizzleError, DrizzleFrame, DrizzleInput, DrizzleProgress, DrizzleStats,
 };
 use crate::stacking::fits_artifact;
-use crate::stacking::groups::{group_frames, ColorMode, GroupFrame, IntegrationGroup};
+use crate::stacking::groups::{frame_source, ColorMode, GroupFrame, IntegrationGroup};
 use crate::stacking::integrate::{
     included_after_min_weight, integrate_group, large_scale_passes, GroupInput, GroupProgress,
     GroupStats, StackFrame,
@@ -81,6 +81,7 @@ use crate::stacking::master_cards::{
     write_drizzled_master, write_master_light, MasterCardInputs, WrittenDrizzle,
 };
 use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
+use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigins};
 use crate::stacking::paths::{cleanup_work, subject_layout, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
@@ -278,6 +279,9 @@ pub(crate) struct RunContext {
     /// hash lookups AND its `resolve_generation_cached` calls share the same
     /// [`crate::export::DivisorCache`] via [`HashMemo::divisors_mut`].
     pub(crate) memo: HashMemo,
+    /// Where each frame of this run comes from (see [`crate::stacking::origin`]):
+    /// every per-frame catalog read after the frame source dispatches on it.
+    pub(crate) origins: FrameOrigins,
     /// This run's ONE hot-pixel-map cache, keyed by resolved master dark path
     /// (decision 4) — a dark shared by every frame in a group pays the
     /// measurement once.
@@ -752,10 +756,9 @@ pub fn start_stacking(
     config: Option<StackingConfig>,
     rerun_from: Option<Stage>,
 ) -> Result<StartedStacking, ApiError> {
-    let StackSubject::FrameSet(frames_set_id) = &subject else {
+    let StackSubject::FrameSet(_) = &subject else {
         return Err(ApiError::Invalid(PROJECT_STACKING_UNAVAILABLE.into()));
     };
-    let frames_set_id = *frames_set_id;
     let db_handle = db(&ctx)?;
     let conn = db_handle.conn();
 
@@ -807,7 +810,7 @@ pub fn start_stacking(
     let working_dir = validated_dirs.working.to_string_lossy().into_owned();
     let output_dir_str = validated_dirs.output.to_string_lossy().into_owned();
 
-    let plan_groups = group_frames(&conn, frames_set_id, &plan.config.grouping)?;
+    let (plan_groups, origins) = frame_source(&conn, &subject, &plan.config.grouping)?;
 
     let config_json = serde_json::to_string(&plan.config)
         .map_err(|e| ApiError::Internal(format!("failed to serialize stacking config: {e}")))?;
@@ -959,7 +962,8 @@ pub fn start_stacking(
         summary,
         last_emit: Instant::now(),
         rerun_from,
-        memo: HashMemo::new(),
+        memo: HashMemo::new(origins.clone()),
+        origins,
         hot_maps: HashMap::new(),
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
@@ -4006,10 +4010,16 @@ type SolveCache = HashMap<i64, Option<PlateSolveRecord>>;
 fn solve_of(
     solves: &mut SolveCache,
     conn: &rusqlite::Connection,
+    origins: &FrameOrigins,
     frame_id: i64,
 ) -> Option<PlateSolveRecord> {
     if !solves.contains_key(&frame_id) {
-        let row = match get_plate_solve(conn, frame_id) {
+        // A frame with no origin was already logged at `error!` by
+        // `origin_of`; it is treated like a read error below.
+        let read = origin_of(origins, frame_id)
+            .map_err(anyhow::Error::from)
+            .and_then(|origin| stored_solve(conn, origin, frame_id));
+        let row = match read {
             Ok(row) => row,
             Err(e) => {
                 tracing::warn!(
@@ -4054,6 +4064,7 @@ fn solve_of(
 fn registration_gate_and_hint(
     solves: &mut SolveCache,
     conn: &rusqlite::Connection,
+    origins: &FrameOrigins,
     frame: &GroupFrame,
     reference_frame_id: i64,
     reference_scale: Option<f64>,
@@ -4066,8 +4077,8 @@ fn registration_gate_and_hint(
         SeedPolicy::QuadFirst
     };
     let hint = match (
-        solve_of(solves, conn, frame.frame_id),
-        solve_of(solves, conn, reference_frame_id),
+        solve_of(solves, conn, origins, frame.frame_id),
+        solve_of(solves, conn, origins, reference_frame_id),
     ) {
         (Some(subject), Some(reference)) => seed_from_solves(
             &subject,
@@ -4317,6 +4328,7 @@ fn register_group_pass(
     let reference_scale = find_frame_in_groups(&rc.plan_groups, reference_frame_id)
         .and_then(|f| f.pixel_scale_arcsec);
 
+    let origins = rc.origins.clone();
     let mut to_register: Vec<PendingRegistration> = Vec::new();
     // Perf tier A Task 6a fix round 1 (ruling R-TA-5): cache-hit
     // registrations whose artifact needs (re)writing — see the `reused`
@@ -4442,6 +4454,7 @@ fn register_group_pass(
                 registration_gate_and_hint(
                     solves,
                     &conn,
+                    &origins,
                     &frame,
                     reference_frame_id,
                     reference_scale,
@@ -5388,6 +5401,7 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
 
     let groups = rc.plan_groups.clone();
     let force_fresh = stage_forces_fresh(rc.rerun_from, Stage::Register);
+    let origins = rc.origins.clone();
     let mut solves: SolveCache = SolveCache::new();
 
     // One progress total for both passes of every group, the same way the
@@ -5457,7 +5471,7 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
         // answer).
         {
             let conn = db(&rc.ctx)?.conn();
-            solve_of(&mut solves, &conn, reference_frame_id);
+            solve_of(&mut solves, &conn, &origins, reference_frame_id);
         }
 
         if group_two_pass_wanted(&cfg, reference_frame_id, manual_reference_frame_id) {
@@ -5649,10 +5663,11 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
     // M4b Task 2: one stored-solve lookup per frame for the WHOLE stage,
     // shared by the dry pass and the persisting one. The reference's own
     // row goes in first — every cross-scale frame's seed needs it.
+    let origins = rc.origins.clone();
     let mut solves: SolveCache = SolveCache::new();
     {
         let conn = db(&rc.ctx)?.conn();
-        solve_of(&mut solves, &conn, reference_frame_id);
+        solve_of(&mut solves, &conn, &origins, reference_frame_id);
     }
 
     let mut viable_total = 0usize;
@@ -7947,21 +7962,21 @@ fn process_group_output(
                     )?
                     .and_then(|a| a.path)
                     .map(PathBuf::from);
-                    let pattern =
-                        match crate::calibration_library::light_resolve::resolve_cfa_geometry(
-                            &conn, frame_id,
-                        ) {
-                            Ok(geom) => geom.map(crate::export::calibrated_generator::bayer_for),
-                            Err(error) => {
-                                tracing::warn!(
-                                    run_id = rc.run_id,
-                                    frame_id,
-                                    error = %format!("{error:#}"),
-                                    "bayer drizzle: reading the frame's mosaic phase failed"
-                                );
-                                None
-                            }
-                        };
+                    let pattern = match origin_of(&rc.origins, frame_id)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|origin| cfa_geometry(&conn, origin, frame_id))
+                    {
+                        Ok(geom) => geom.map(crate::export::calibrated_generator::bayer_for),
+                        Err(error) => {
+                            tracing::warn!(
+                                run_id = rc.run_id,
+                                frame_id,
+                                error = %format!("{error:#}"),
+                                "bayer drizzle: reading the frame's mosaic phase failed"
+                            );
+                            None
+                        }
+                    };
                     bayer_sources[k] = match (path, pattern) {
                         (Some(path), Some(pattern)) => Some((path, pattern)),
                         _ => None,
@@ -9726,7 +9741,8 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
                 solves.entry(reference_frame_id)
             {
                 let conn = db(&rc.ctx)?.conn();
-                slot.insert(get_plate_solve(&conn, reference_frame_id)?);
+                let origin = origin_of(&rc.origins, reference_frame_id)?;
+                slot.insert(stored_solve(&conn, origin, reference_frame_id)?);
             }
             solves
                 .get(&reference_frame_id)
@@ -9851,6 +9867,18 @@ pub(crate) fn test_context(
     group_ids: HashMap<String, i64>,
 ) -> RunContext {
     let hash = config_hash(&config);
+    let origins: FrameOrigins = Arc::new(
+        plan_groups
+            .iter()
+            .flat_map(|g| g.frames.iter())
+            .map(|f| {
+                (
+                    f.frame_id,
+                    crate::stacking::origin::FrameOrigin::Catalog { file_id: f.file_id },
+                )
+            })
+            .collect(),
+    );
     let summary = RunSummary {
         run_id,
         set_id,
@@ -9900,7 +9928,8 @@ pub(crate) fn test_context(
         summary,
         last_emit: Instant::now(),
         rerun_from: None,
-        memo: HashMemo::new(),
+        memo: HashMemo::new(origins.clone()),
+        origins,
         hot_maps: HashMap::new(),
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
@@ -9923,7 +9952,7 @@ mod tests {
     use super::*;
     use crate::events::NullEmitter;
     use crate::registration::db::get_registration_for_frame_set;
-    use crate::stacking::groups::set_slug;
+    use crate::stacking::groups::{group_frames, set_slug};
     use crate::stacking::integrate::{LargeScaleRejection, RejectionChoice};
     use crate::stacking::rej::RejBitmap;
     use crate::stacking::test_fixtures::{self, LightSpec};
@@ -20019,5 +20048,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(run_row.status, "running");
+    }
+
+    #[test]
+    fn solve_of_reads_through_the_origin_and_treats_a_missing_origin_as_no_solve() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let (frame_id, _) = test_fixtures::add_light(
+            &f,
+            &LightSpec {
+                stem: "a",
+                instrume: "cam",
+                filter: Some("L"),
+                binning: 1,
+                width: 64,
+                height: 48,
+                exptime: 60.0,
+                date_obs: "2025-01-01T20:00:00",
+                bayerpat: None,
+                write_file: false,
+            },
+        );
+        test_fixtures::seed_plate_solve_scale(&f.conn, frame_id, 1.5);
+
+        let with_origin: FrameOrigins = Arc::new(
+            [(
+                frame_id,
+                crate::stacking::origin::FrameOrigin::Catalog { file_id: 0 },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mut solves = SolveCache::new();
+        let found = solve_of(&mut solves, &f.conn, &with_origin, frame_id).unwrap();
+        assert!((found.pixel_scale_arcsec - 1.5).abs() < 1e-9);
+
+        let none: FrameOrigins = Arc::new(HashMap::new());
+        let mut solves = SolveCache::new();
+        assert!(solve_of(&mut solves, &f.conn, &none, frame_id).is_none());
     }
 }

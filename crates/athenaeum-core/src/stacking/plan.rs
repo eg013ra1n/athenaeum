@@ -38,10 +38,11 @@ use crate::stacking::config::{
 };
 use crate::stacking::fits_artifact;
 use crate::stacking::groups::{
-    group_frames, median_f64, ColorMode, GroupFrame, IntegrationGroup, ScaleSource,
+    frame_source, median_f64, ColorMode, GroupFrame, IntegrationGroup, ScaleSource,
 };
 use crate::stacking::ln::SeedsCalibration;
 use crate::stacking::measure::FrameMeasurement;
+use crate::stacking::origin::{origin_of, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{self, EstimateInputs};
 use crate::stacking::register::{RegistrationGeometry, SCALE_TOLERANCE};
 use crate::stacking::run::group_anchor_geometry;
@@ -361,13 +362,31 @@ pub(crate) fn calibration_hash_for(
 pub(crate) struct HashMemo {
     divisors: DivisorCache,
     by_frame: HashMap<i64, Option<String>>,
+    /// Where each frame comes from; the stage-1 hash dispatches on it. A
+    /// frame with no origin is an error, never a silent catalog read.
+    origins: FrameOrigins,
 }
 
 impl HashMemo {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(origins: FrameOrigins) -> Self {
         HashMemo {
             divisors: DivisorCache::new(),
             by_frame: HashMap::new(),
+            origins,
+        }
+    }
+
+    /// The stage-1 hash of one frame, dispatched by its origin.
+    fn hash_by_origin(
+        &mut self,
+        conn: &Connection,
+        cfg: &StackingConfig,
+        frame: &GroupFrame,
+    ) -> Result<String, ApiError> {
+        match origin_of(&self.origins, frame.frame_id)? {
+            FrameOrigin::Catalog { .. } => {
+                calibration_hash_for(conn, cfg, frame, &mut self.divisors)
+            }
         }
     }
 
@@ -383,7 +402,7 @@ impl HashMemo {
         if let Some(cached) = self.by_frame.get(&frame.frame_id) {
             return cached.clone();
         }
-        let result = match calibration_hash_for(conn, cfg, frame, &mut self.divisors) {
+        let result = match self.hash_by_origin(conn, cfg, frame) {
             Ok(hash) => Some(hash),
             Err(error) => {
                 tracing::warn!(
@@ -417,7 +436,7 @@ impl HashMemo {
         if let Some(cached) = self.by_frame.get(&frame.frame_id).and_then(|o| o.as_ref()) {
             return Ok(cached.clone());
         }
-        let result = calibration_hash_for(conn, cfg, frame, &mut self.divisors);
+        let result = self.hash_by_origin(conn, cfg, frame);
         self.by_frame
             .insert(frame.frame_id, result.as_ref().ok().cloned());
         result
@@ -1658,7 +1677,7 @@ pub fn build_plan(
         resolve_config_and_exclusions(conn, settings, frames_set_id, config_override)?;
     let hash = config_hash(&cfg);
 
-    let groups = group_frames(conn, frames_set_id, &cfg.grouping)?;
+    let (groups, origins) = frame_source(conn, subject, &cfg.grouping)?;
 
     // M4b (ruling R-T6-6, real-data finding on set 195 "Ghost Nebula"):
     // readiness must be judged over the frames a run will actually touch —
@@ -1963,7 +1982,7 @@ pub fn build_plan(
     // resolves every frame through, and memoizes each frame's own stage-1
     // hash so this loop and `compute_register_stale` below never resolve
     // the same frame twice.
-    let mut memo = HashMemo::new();
+    let mut memo = HashMemo::new(origins);
     let mut plan_groups = Vec::with_capacity(groups.len());
     let mut calibrate_stale = false;
     let mut measure_stale = false;
@@ -2428,6 +2447,7 @@ mod tests {
     use crate::api::lights::compute_export_readiness;
     use crate::db::stacking::set_set_config;
     use crate::registration::db::set_frame_set_reference;
+    use crate::stacking::groups::group_frames;
     use crate::stacking::test_fixtures::{self, LightSpec};
 
     fn light_spec<'a>(stem: &'a str, date_obs: &'a str) -> LightSpec<'a> {
@@ -6444,5 +6464,88 @@ mod tests {
         );
         assert!(stored_registrations(&f.conn, &project).unwrap().is_empty());
         store_registration(&f.conn, &project, |_| panic!("a project stores nothing")).unwrap();
+    }
+
+    #[test]
+    fn the_hash_memo_refuses_a_frame_it_has_no_origin_for() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+        let cfg = StackingConfig::default();
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        let frame = groups[0].frames[0].clone();
+
+        let mut divisors = DivisorCache::new();
+        let expected = calibration_hash_for(&f.conn, &cfg, &frame, &mut divisors).unwrap();
+
+        // No origin: an error naming the frame, never a silent catalog read.
+        let mut memo = HashMemo::new(std::sync::Arc::new(HashMap::new()));
+        let err = memo
+            .calibration_hash_checked(&f.conn, &cfg, &frame)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(&frame.frame_id.to_string()),
+            "{err}"
+        );
+        assert_eq!(memo.calibration_hash(&f.conn, &cfg, &frame), None);
+
+        // With the frame's Catalog origin: the same hash calibration_hash_for returns.
+        let origins: crate::stacking::origin::FrameOrigins = std::sync::Arc::new(
+            [(
+                frame.frame_id,
+                crate::stacking::origin::FrameOrigin::Catalog {
+                    file_id: frame.file_id,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mut memo = HashMemo::new(origins);
+        assert_eq!(
+            memo.calibration_hash_checked(&f.conn, &cfg, &frame)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(memo.calibration_hash(&f.conn, &cfg, &frame), Some(expected));
+    }
+
+    #[test]
+    fn frame_source_returns_one_catalog_origin_per_frame() {
+        use crate::stacking::groups::frame_source;
+        use crate::stacking::origin::FrameOrigin;
+        let f = test_fixtures::frame_set("LDN 1272");
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            test_fixtures::add_light(&f, &light_spec(&format!("l{i}"), t));
+        }
+        let cfg = StackingConfig::default();
+        let (groups, origins) =
+            frame_source(&f.conn, &StackSubject::FrameSet(f.set_id), &cfg.grouping).unwrap();
+        let direct = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(format!("{groups:?}"), format!("{direct:?}"));
+
+        let frames: Vec<&GroupFrame> = groups.iter().flat_map(|g| g.frames.iter()).collect();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(origins.len(), frames.len());
+        for fr in frames {
+            assert_eq!(
+                origins.get(&fr.frame_id),
+                Some(&FrameOrigin::Catalog {
+                    file_id: fr.file_id
+                })
+            );
+        }
+
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let err =
+            frame_source(&f.conn, &StackSubject::Project("p1".into()), &cfg.grouping).unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m == PROJECT_STACKING_UNAVAILABLE),
+            "{err:?}"
+        );
     }
 }

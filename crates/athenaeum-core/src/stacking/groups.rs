@@ -12,14 +12,19 @@
 //! the `GroupingConfig` the caller already resolved (`config.rs`, Plan 5a).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::api::ApiError;
 use crate::archive::path_layout::sanitize_for_filename;
 use crate::calibration_library::paths::fmt_num;
+use crate::db::stacking::StackSubject;
 use crate::stacking::config::GroupingConfig;
+use crate::stacking::origin::{FrameOrigin, FrameOrigins};
+use crate::stacking::plan::PROJECT_STACKING_UNAVAILABLE;
 
 /// Mono vs colour (CFA) sensor, decided from `frames.bayerpat` (spec §2:
 /// "colour mode ... from the Bayer cards"). A non-empty, trimmed `bayerpat`
@@ -592,6 +597,26 @@ pub fn group_frames(
     );
 
     Ok(groups)
+}
+
+/// The frame source of a stacking subject: its integration groups plus the
+/// origin of every frame in them (wave 6 spec section 4.3). A frame set reads
+/// the catalog through [`group_frames`]; a project is refused until 6b-2.
+pub(crate) fn frame_source(
+    conn: &Connection,
+    subject: &StackSubject,
+    grouping: &GroupingConfig,
+) -> Result<(Vec<IntegrationGroup>, FrameOrigins), ApiError> {
+    let StackSubject::FrameSet(frames_set_id) = subject else {
+        return Err(ApiError::Invalid(PROJECT_STACKING_UNAVAILABLE.into()));
+    };
+    let groups = group_frames(conn, *frames_set_id, grouping)?;
+    let origins = groups
+        .iter()
+        .flat_map(|g| g.frames.iter())
+        .map(|f| (f.frame_id, FrameOrigin::Catalog { file_id: f.file_id }))
+        .collect();
+    Ok((groups, Arc::new(origins)))
 }
 
 #[cfg(test)]
