@@ -434,6 +434,7 @@ Seed helper and the tests (seed through raw SQL in the legacy shape — the CRUD
             n("master_lights"),
         )
     }
+```
 
 ```rust
     #[test]
