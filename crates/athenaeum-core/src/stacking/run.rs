@@ -139,7 +139,9 @@ pub(crate) static FITS_WRITE_FAILURE_LOG: std::sync::Mutex<Vec<PathBuf>> =
 #[serde(rename_all = "camelCase")]
 pub struct StackingProgressEvent {
     pub run_id: i64,
-    pub set_id: i64,
+    // Exactly one of `set_id` / `project_id` is set (plan 6b-2 C1).
+    pub set_id: Option<i64>,
+    pub project_id: Option<String>,
     pub stage: Stage,
     pub group_key: Option<String>,
     pub current: usize,
@@ -170,7 +172,9 @@ pub struct StackingMasterRef {
 #[serde(rename_all = "camelCase")]
 pub struct StackingCompleteEvent {
     pub run_id: i64,
-    pub set_id: i64,
+    // Exactly one of `set_id` / `project_id` is set (plan 6b-2 C1).
+    pub set_id: Option<i64>,
+    pub project_id: Option<String>,
     pub success: bool,
     pub cancelled: bool,
     pub error: Option<String>,
@@ -454,12 +458,14 @@ impl RunContext {
             return;
         }
         self.last_emit = now;
+        let (set_id, project_id) = wire_subject(&self.subject);
         emit_event(
             self.emitter.as_ref(),
             STACKING_PROGRESS_EVENT,
             &StackingProgressEvent {
                 run_id: self.run_id,
-                set_id: wire_set_id(&self.subject),
+                set_id,
+                project_id,
                 stage,
                 group_key,
                 current,
@@ -522,11 +528,14 @@ fn file_identity(path: &Path) -> anyhow::Result<(i64, String)> {
     Ok((meta.len() as i64, modified_at))
 }
 
-/// The `setId` the events, `RunSummary` and `StackingPlan` carry until 6b-2
-/// makes them subject-aware (B8); a project run never reaches an emitter in
-/// 6b-1.
-pub(crate) fn wire_set_id(subject: &StackSubject) -> i64 {
-    subject.frame_set_id().unwrap_or(0)
+/// The subject pair every wire payload carries — `setId` for a frame set,
+/// `projectId` for a project, never both (plan 6b-2 C1). The frontend keys
+/// its maps by `set:<id>` / `project:<uuid>` (spec §9.2, wave 6c).
+pub(crate) fn wire_subject(subject: &StackSubject) -> (Option<i64>, Option<String>) {
+    (
+        subject.frame_set_id(),
+        subject.project_id().map(str::to_string),
+    )
 }
 
 /// Heal every `stacking_runs` row a crashed or killed process left
@@ -913,9 +922,11 @@ pub fn start_stacking(
     };
     let output_dir = PathBuf::from(&output_dir_str);
 
+    let (set_id, project_id) = wire_subject(&subject);
     let summary = RunSummary {
         run_id,
-        set_id: wire_set_id(&subject),
+        set_id,
+        project_id,
         set_name: plan.set_name.clone(),
         app_version: app_version.clone(),
         started_at,
@@ -1033,7 +1044,7 @@ pub fn cancel_stacking(ctx: &ServiceContext, run_id: i64) -> Result<(), ApiError
 /// still said `running`, which is the confusing state this avoids.
 fn run_thread(mut rc: RunContext) {
     let run_id = rc.run_id;
-    let set_id = wire_set_id(&rc.subject);
+    let (set_id, project_id) = wire_subject(&rc.subject);
     let run_started = Instant::now();
 
     // The de-registration itself is RAII (M4a Task 4 fix round 1, item 1):
@@ -1163,6 +1174,7 @@ fn run_thread(mut rc: RunContext) {
     tracing::info!(
         run_id,
         set_id,
+        project_id = project_id.as_deref(),
         duration_ms,
         outcome = status,
         "stacking run finished"
@@ -1199,6 +1211,7 @@ fn run_thread(mut rc: RunContext) {
         &StackingCompleteEvent {
             run_id,
             set_id,
+            project_id: project_id.clone(),
             success,
             cancelled,
             error,
@@ -2741,7 +2754,7 @@ where
 pub(crate) struct FanOutTicker {
     emitter: Arc<dyn ProgressEmitter>,
     run_id: i64,
-    wire_set_id: i64,
+    subject: StackSubject,
     stage: Stage,
     group_key: Option<String>,
     total: usize,
@@ -2772,7 +2785,7 @@ impl FanOutTicker {
         Self::from_parts(
             rc.emitter.clone(),
             rc.run_id,
-            wire_set_id(&rc.subject),
+            &rc.subject,
             stage,
             group_key,
             done_so_far,
@@ -2786,7 +2799,7 @@ impl FanOutTicker {
     fn from_parts(
         emitter: Arc<dyn ProgressEmitter>,
         run_id: i64,
-        set_id: i64,
+        subject: &StackSubject,
         stage: Stage,
         group_key: Option<String>,
         done_so_far: usize,
@@ -2797,7 +2810,7 @@ impl FanOutTicker {
         Self {
             emitter,
             run_id,
-            wire_set_id: set_id,
+            subject: subject.clone(),
             stage,
             group_key,
             total,
@@ -2828,6 +2841,7 @@ impl FanOutTicker {
             return current;
         }
         *gate = (now, current);
+        let (set_id, project_id) = wire_subject(&self.subject);
         let percent = if self.total == 0 {
             100.0
         } else {
@@ -2838,7 +2852,8 @@ impl FanOutTicker {
             STACKING_PROGRESS_EVENT,
             &StackingProgressEvent {
                 run_id: self.run_id,
-                set_id: self.wire_set_id,
+                set_id,
+                project_id,
                 stage: self.stage,
                 group_key: self.group_key.clone(),
                 current,
@@ -4814,7 +4829,7 @@ fn register_group_pass(
                         // overwrites it with the real one. What a project run
                         // keeps in this record is B10's open 6b-2 item.
                         let rec = to_record(
-                            wire_set_id(&subject),
+                            subject.frame_set_id().unwrap_or(0),
                             item.frame_id,
                             reference_frame_id,
                             is_reference_row,
@@ -6537,7 +6552,7 @@ fn emit_integrate_tick(
     state: &Mutex<IntegrateTickState>,
     emitter: &dyn ProgressEmitter,
     run_id: i64,
-    set_id: i64,
+    subject: &StackSubject,
     group_key: &str,
     channels: usize,
     plane: usize,
@@ -6547,6 +6562,7 @@ fn emit_integrate_tick(
     force: bool,
     message: Option<String>,
 ) {
+    let (set_id, project_id) = wire_subject(subject);
     let now = Instant::now();
     let percent = 100.0 * (plane as f64 + frac) / channels.max(1) as f64;
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -6591,6 +6607,7 @@ fn emit_integrate_tick(
         &StackingProgressEvent {
             run_id,
             set_id,
+            project_id,
             stage: Stage::Integrate,
             group_key: Some(group_key.to_string()),
             current: plane,
@@ -6691,13 +6708,14 @@ fn emit_drizzle_tick(
     state: &Mutex<DrizzleTickState>,
     emitter: &dyn ProgressEmitter,
     run_id: i64,
-    set_id: i64,
+    subject: &StackSubject,
     group_key: &str,
     current: usize,
     total: usize,
     frame_id: Option<i64>,
     force: bool,
 ) {
+    let (set_id, project_id) = wire_subject(subject);
     let now = Instant::now();
     let percent = if total == 0 {
         100.0
@@ -6715,6 +6733,7 @@ fn emit_drizzle_tick(
         &StackingProgressEvent {
             run_id,
             set_id,
+            project_id,
             stage: Stage::Drizzle,
             group_key: Some(group_key.to_string()),
             current,
@@ -7424,7 +7443,7 @@ fn process_group_output(
     let plane_rows = rc.geometry_of(&group.key).height as u64;
     let emitter = rc.emitter.clone();
     let run_id = rc.run_id;
-    let set_id = wire_set_id(&rc.subject);
+    let tick_subject = rc.subject.clone();
     let group_key_for_progress = group.key.clone();
 
     let on_plane = |p: usize, _total: usize| {
@@ -7438,7 +7457,7 @@ fn process_group_output(
             &tick_state,
             emitter.as_ref(),
             run_id,
-            set_id,
+            &tick_subject,
             &group_key_for_progress,
             integrate_planes_total,
             p,
@@ -7470,7 +7489,7 @@ fn process_group_output(
             &tick_state,
             emitter.as_ref(),
             run_id,
-            set_id,
+            &tick_subject,
             &group_key_for_progress,
             integrate_planes_total,
             plane,
@@ -7497,7 +7516,7 @@ fn process_group_output(
             &tick_state,
             emitter.as_ref(),
             run_id,
-            set_id,
+            &tick_subject,
             &group_key_for_progress,
             integrate_planes_total,
             plane,
@@ -7547,7 +7566,7 @@ fn process_group_output(
         &tick_state,
         emitter.as_ref(),
         run_id,
-        set_id,
+        &tick_subject,
         &group_key_for_progress,
         integrate_planes_total,
         integrate_planes_total,
@@ -8125,7 +8144,7 @@ fn process_group_output(
                         Mutex::new(DrizzleTickState::new());
                     let drizzle_tick_emitter = rc.emitter.clone();
                     let drizzle_tick_run_id = rc.run_id;
-                    let drizzle_tick_set_id = wire_set_id(&rc.subject);
+                    let drizzle_tick_subject = rc.subject.clone();
                     let drizzle_tick_group_key = group.key.clone();
                     let drizzle_on_frame = |done: usize, total: usize| {
                         let n = drizzle_frame_ids.len();
@@ -8138,7 +8157,7 @@ fn process_group_output(
                             &drizzle_tick_state,
                             drizzle_tick_emitter.as_ref(),
                             drizzle_tick_run_id,
-                            drizzle_tick_set_id,
+                            &drizzle_tick_subject,
                             &drizzle_tick_group_key,
                             done,
                             total,
@@ -9443,7 +9462,8 @@ fn measure_ln_seeds_calibration(
     // `build_and_write_ln_reference` uses, since `rc` is borrowed
     // immutably here and `RunContext::progress` needs `&mut self`.
     let emitter = rc.emitter.clone();
-    let (run_id, set_id, group_key) = (rc.run_id, wire_set_id(&rc.subject), group.key.clone());
+    let (run_id, group_key) = (rc.run_id, group.key.clone());
+    let (set_id, project_id) = wire_subject(&rc.subject);
     // C-17: the row counts the CALIBRATION's own frames while it runs —
     // `current`/`total`/`percent` over the sample, not the group. Reporting
     // `0 / 0 %` against the member count (what the first cut did) made a
@@ -9462,6 +9482,7 @@ fn measure_ln_seeds_calibration(
             &StackingProgressEvent {
                 run_id,
                 set_id,
+                project_id: project_id.clone(),
                 stage: Stage::Normalize,
                 group_key: Some(group_key.clone()),
                 current,
@@ -9568,8 +9589,8 @@ fn build_and_write_ln_reference(
     // Normalize row sitting at 0 of N. Plane-level ticks with a message
     // are what `build_reference` offers; enough to say what is happening.
     let build_emitter = rc.emitter.clone();
-    let (build_run_id, build_set_id, build_group_key) =
-        (rc.run_id, wire_set_id(&rc.subject), group.key.clone());
+    let (build_run_id, build_group_key) = (rc.run_id, group.key.clone());
+    let (build_set_id, build_project_id) = wire_subject(&rc.subject);
     // The stage's own total (every included member of the group), not the
     // top-`n` slice — the row's count must be the same number the per-frame
     // ticks that follow climb towards.
@@ -9582,6 +9603,7 @@ fn build_and_write_ln_reference(
             &StackingProgressEvent {
                 run_id: build_run_id,
                 set_id: build_set_id,
+                project_id: build_project_id.clone(),
                 stage: Stage::Normalize,
                 group_key: Some(build_group_key.clone()),
                 current: 0,
@@ -9887,7 +9909,8 @@ pub(crate) fn test_context(
     );
     let summary = RunSummary {
         run_id,
-        set_id,
+        set_id: Some(set_id),
+        project_id: None,
         set_name: set_name.to_string(),
         app_version: "test".to_string(),
         started_at: chrono::Utc::now().to_rfc3339(),
@@ -10292,6 +10315,8 @@ mod tests {
         assert_eq!(completes.len(), 1, "{completes:?}");
         assert_eq!(completes[0]["cancelled"].as_bool(), Some(true));
         assert_eq!(completes[0]["success"].as_bool(), Some(false));
+        assert_eq!(completes[0]["setId"], serde_json::json!(fixture.set_id));
+        assert!(completes[0]["projectId"].is_null(), "{:?}", completes[0]);
 
         // Never even reached "running" — the queue wait handles it before
         // `run_pipeline` gets that far.
@@ -14098,7 +14123,7 @@ mod tests {
                     &tick_state,
                     &recorder,
                     1,
-                    1,
+                    &StackSubject::FrameSet(1),
                     "g",
                     CHANNELS,
                     0,
@@ -14135,6 +14160,55 @@ mod tests {
         }
     }
 
+    /// Plan 6b-2 C1: one convention on every wire type — exactly one side of
+    /// the subject pair is set.
+    #[test]
+    fn wire_subject_sets_exactly_one_side() {
+        assert_eq!(wire_subject(&StackSubject::FrameSet(7)), (Some(7), None));
+        assert_eq!(
+            wire_subject(&StackSubject::Project("p1".into())),
+            (None, Some("p1".to_string()))
+        );
+    }
+
+    /// Plan 6b-2 C1: a frame-set tick still carries its set id (and a null
+    /// project id); a project tick carries the project id and a null set id.
+    #[test]
+    fn a_tick_carries_the_subject_pair() {
+        for (subject, set_id, project_id) in [
+            (
+                StackSubject::FrameSet(7),
+                serde_json::json!(7),
+                serde_json::Value::Null,
+            ),
+            (
+                StackSubject::Project("p1".into()),
+                serde_json::Value::Null,
+                serde_json::json!("p1"),
+            ),
+        ] {
+            let rec = Arc::new(Recording::new());
+            let ticker = FanOutTicker::from_parts(
+                rec.clone(),
+                1,
+                &subject,
+                Stage::Measure,
+                None,
+                0,
+                1,
+                0,
+                0,
+            );
+            ticker.tick(Some(3));
+            let last = rec
+                .events(STACKING_PROGRESS_EVENT)
+                .pop()
+                .expect("the first tick is always emitted");
+            assert_eq!(last["setId"], set_id, "{last}");
+            assert_eq!(last["projectId"], project_id, "{last}");
+        }
+    }
+
     /// v0.6.3: the fan-out stages' per-frame ticker. Two workers race 250
     /// ticks through one ticker: the recorded percents never go backwards
     /// (the gate is held across the emit), the first tick is emitted (the
@@ -14163,7 +14237,7 @@ mod tests {
         let ticker = FanOutTicker::from_parts(
             rec.clone(),
             1,
-            1,
+            &StackSubject::FrameSet(1),
             Stage::Measure,
             Some("g".to_string()),
             DONE_SO_FAR,
@@ -14256,7 +14330,7 @@ mod tests {
                     &tick_state,
                     &recorder,
                     1,
-                    1,
+                    &StackSubject::FrameSet(1),
                     "g",
                     CHANNELS,
                     0,

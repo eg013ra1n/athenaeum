@@ -71,14 +71,18 @@ export function useStackingRuns() {
     api
       .listen<StackingProgressEvent>('stacking-progress', (payload) => {
         if (cancelled) return;
+        // A project run (no set id) is keyed and shown by the project's
+        // Stacking tab — wave 6c. Until then this hook tracks frame sets only.
+        const setId = payload.setId;
+        if (setId == null) return;
         setProgress((prev) => {
           const next = new Map(prev);
-          const existing = prev.get(payload.setId);
+          const existing = prev.get(setId);
           const startedAt =
             existing && existing.runId === payload.runId ? existing.startedAt : Date.now();
-          next.set(payload.setId, {
+          next.set(setId, {
             runId: payload.runId,
-            setId: payload.setId,
+            setId,
             stage: payload.stage,
             groupKey: payload.groupKey,
             current: payload.current,
@@ -99,13 +103,15 @@ export function useStackingRuns() {
     api
       .listen<StackingCompleteEvent>('stacking-complete', (payload) => {
         if (cancelled) return;
+        const setId = payload.setId;
+        if (setId == null) return;
         const finishedAt = Date.now();
 
         setLastOutcome((prev) => {
           const next = new Map(prev);
-          next.set(payload.setId, {
+          next.set(setId, {
             runId: payload.runId,
-            setId: payload.setId,
+            setId,
             success: payload.success,
             cancelled: payload.cancelled,
             error: payload.error,
@@ -120,10 +126,10 @@ export function useStackingRuns() {
         // — a stale/duplicate event for a superseded run must not erase a
         // newer run's live progress.
         setProgress((prev) => {
-          const existing = prev.get(payload.setId);
+          const existing = prev.get(setId);
           if (!existing || existing.runId !== payload.runId) return prev;
           const next = new Map(prev);
-          next.delete(payload.setId);
+          next.delete(setId);
           return next;
         });
 
@@ -142,7 +148,7 @@ export function useStackingRuns() {
           hasErrors: !payload.success && !payload.cancelled,
           tone: payload.success ? 'success' : payload.cancelled ? 'info' : 'warning',
           dedupeKey: `stack-${payload.runId}`,
-          link: `/objects/${payload.setId}?tab=stacking`,
+          link: `/objects/${setId}?tab=stacking`,
         });
 
         if (payload.success) {

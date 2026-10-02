@@ -97,13 +97,8 @@ impl std::fmt::Display for StackSubject {
 #[serde(rename_all = "camelCase")]
 pub struct StackingRunRow {
     pub id: i64,
-    // `0` for a project run until 6b-2 makes the wire subject-aware; code
-    // reads `StackingRunRow::subject()`. (Plain comment: a doc comment would
-    // leak into the generated TS.)
-    pub frames_set_id: i64,
-    /// The project of a project run (wave 6b). Not on the wire in 6b-1 (B8).
-    #[serde(skip)]
-    #[ts(skip)]
+    // Exactly one of `frames_set_id` / `project_id` is set (the table's CHECK).
+    pub frames_set_id: Option<i64>,
     pub project_id: Option<String>,
     pub status: String,
     pub started_at: String,
@@ -121,9 +116,12 @@ pub struct StackingRunRow {
 impl StackingRunRow {
     /// What this run stacks.
     pub fn subject(&self) -> StackSubject {
-        match &self.project_id {
-            Some(id) => StackSubject::Project(id.clone()),
-            None => StackSubject::FrameSet(self.frames_set_id),
+        match (&self.project_id, self.frames_set_id) {
+            (Some(id), _) => StackSubject::Project(id.clone()),
+            (None, Some(id)) => StackSubject::FrameSet(id),
+            // Unreachable for a row read from the database: the table's
+            // CHECK guarantees exactly one of the pair.
+            (None, None) => StackSubject::FrameSet(0),
         }
     }
 }
@@ -131,7 +129,7 @@ impl StackingRunRow {
 fn row_to_run(r: &Row) -> rusqlite::Result<StackingRunRow> {
     Ok(StackingRunRow {
         id: r.get(0)?,
-        frames_set_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+        frames_set_id: r.get(1)?,
         project_id: r.get(2)?,
         status: r.get(3)?,
         started_at: r.get(4)?,
@@ -1783,7 +1781,11 @@ mod tests {
         assert_eq!(active_run_for_subject(&c, &pr).unwrap(), Some(pr_run));
         let row = get_run(&c, pr_run).unwrap().unwrap();
         assert_eq!(row.subject(), pr);
-        assert_eq!(row.frames_set_id, 0, "the wire value of a project run");
+        assert_eq!(
+            row.frames_set_id, None,
+            "a project run has no set id on the wire"
+        );
+        assert_eq!(row.project_id.as_deref(), Some("p1"));
         assert_eq!(get_run(&c, fs_run).unwrap().unwrap().subject(), fs);
     }
 

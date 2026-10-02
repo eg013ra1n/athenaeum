@@ -220,7 +220,11 @@ pub struct SummaryGroup {
 #[serde(rename_all = "camelCase")]
 pub struct RunSummary {
     pub run_id: i64,
-    pub set_id: i64,
+    // Exactly one of `set_id` / `project_id` is set (plan 6b-2 C1). A summary
+    // written before 6b-2 has a number here and no `projectId`.
+    pub set_id: Option<i64>,
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub set_name: String,
     pub app_version: String,
     pub started_at: String,
@@ -240,4 +244,52 @@ pub struct RunSummary {
     pub stages: Vec<StageTiming>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan 6b-2 C1: a `summary_json` written before 6b-2 (`"setId": 5`, no
+    /// `projectId`) still decodes, with no project.
+    #[test]
+    fn a_summary_written_before_6b2_still_decodes() {
+        let config = StackingConfig::default();
+        let mode = config.reference.mode.clone();
+        let scale_estimator = config.normalization.scale_estimator.clone();
+        let summary = RunSummary {
+            run_id: 1,
+            set_id: Some(5),
+            project_id: None,
+            set_name: "LDN 1272".into(),
+            app_version: "test".into(),
+            started_at: "2026-10-03T00:00:00Z".into(),
+            finished_at: None,
+            status: "done".into(),
+            config_hash: "h".into(),
+            reference: SummaryReference {
+                frame_id: None,
+                filename: None,
+                mode,
+                weight: None,
+                switched_from: None,
+            },
+            measurement: SummaryMeasurement {
+                seed_source: "fast".into(),
+                scale_estimator,
+            },
+            config,
+            groups: Vec::new(),
+            masters_built: Vec::new(),
+            stages: Vec::new(),
+            warnings: Vec::new(),
+            error: None,
+        };
+        let mut v = serde_json::to_value(&summary).unwrap();
+        v.as_object_mut().unwrap().remove("projectId");
+        assert_eq!(v["setId"], serde_json::json!(5));
+        let back: RunSummary = serde_json::from_value(v).unwrap();
+        assert_eq!(back.set_id, Some(5));
+        assert_eq!(back.project_id, None);
+    }
 }

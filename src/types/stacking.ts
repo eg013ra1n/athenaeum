@@ -370,7 +370,7 @@ scaleSource: ScaleSource | null, };
 
 export type PlanReference = { mode: ReferenceMode, frameId: number | null, filename: string | null, onDisk: boolean, };
 
-export type StackingPlan = { setId: number, setName: string, config: StackingConfig, configHash: string, groups: Array<PlanGroup>, blockers: Array<PlanBlocker>, warnings: Array<string>, readiness: ExportReadiness, 
+export type StackingPlan = { setId: number | null, projectId: string | null, setName: string, config: StackingConfig, configHash: string, groups: Array<PlanGroup>, blockers: Array<PlanBlocker>, warnings: Array<string>, readiness: ExportReadiness, 
 /**
  * Stage 0.5's work list (spec §2 row 0.5, owner requirement 2026-09-09):
  * every buildable raw set and rebuildable missing master, sorted by
@@ -381,7 +381,7 @@ export type StackingPlan = { setId: number, setName: string, config: StackingCon
  */
 mastersToBuild: Array<PlanMaster>, reference: PlanReference, frameCount: number, includedCount: number, excludedFrameIds: Array<number>, estimateBytes: number, freeBytes: number | null, workingDir: string | null, outputDir: string | null, staleStages: Array<Stage>, activeRunId: number | null, };
 
-export type StackingRunRow = { id: number, framesSetId: number, status: string, startedAt: string, finishedAt: string | null, configJson: string, configHash: string, referenceFrameId: number | null, referenceMode: string, workingDir: string, outputDir: string, summaryJson: string | null, error: string | null, };
+export type StackingRunRow = { id: number, framesSetId: number | null, projectId: string | null, status: string, startedAt: string, finishedAt: string | null, configJson: string, configHash: string, referenceFrameId: number | null, referenceMode: string, workingDir: string, outputDir: string, summaryJson: string | null, error: string | null, };
 
 export type StackingRunGroupRow = { id: number, runId: number, groupKey: string, instrume: string | null, colorMode: string, filter: string | null, binning: number | null, 
 /**
@@ -520,7 +520,7 @@ export type StageTiming = { stage: Stage, durationMs: number, };
 
 export type MasterBuilt = { setId: number, kind: MasterWork, masterSetId: number, path: string, durationMs: number, };
 
-export type RunSummary = { runId: number, setId: number, setName: string, appVersion: string, startedAt: string, finishedAt: string | null, status: string, config: StackingConfig, configHash: string, reference: SummaryReference, measurement: SummaryMeasurement, groups: Array<SummaryGroup>, 
+export type RunSummary = { runId: number, setId: number | null, projectId: string | null, setName: string, appVersion: string, startedAt: string, finishedAt: string | null, status: string, config: StackingConfig, configHash: string, reference: SummaryReference, measurement: SummaryMeasurement, groups: Array<SummaryGroup>, 
 /**
  * Stage 0.5's own result list (spec §2 row 0.5, owner requirement
  * 2026-09-09) — every master the run built or rebuilt before
@@ -529,11 +529,11 @@ export type RunSummary = { runId: number, setId: number, setName: string, appVer
  */
 mastersBuilt: Array<MasterBuilt>, stages: Array<StageTiming>, warnings: Array<string>, error: string | null, };
 
-export type StackingProgressEvent = { runId: number, setId: number, stage: Stage, groupKey: string | null, current: number, total: number, percent: number, bytesDone: number, bytesTotal: number, frameId: number | null, message: string | null, };
+export type StackingProgressEvent = { runId: number, setId: number | null, projectId: string | null, stage: Stage, groupKey: string | null, current: number, total: number, percent: number, bytesDone: number, bytesTotal: number, frameId: number | null, message: string | null, };
 
 export type StackingMasterRef = { groupKey: string, path: string, drizzlePath: string | null, };
 
-export type StackingCompleteEvent = { runId: number, setId: number, success: boolean, cancelled: boolean, error: string | null, warnings: Array<string>, masters: Array<StackingMasterRef>, };
+export type StackingCompleteEvent = { runId: number, setId: number | null, projectId: string | null, success: boolean, cancelled: boolean, error: string | null, warnings: Array<string>, masters: Array<StackingMasterRef>, };
 
 export type StartedStacking = { runId: number, };
 

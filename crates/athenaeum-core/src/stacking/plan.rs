@@ -230,7 +230,9 @@ pub struct PlanReference {
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct StackingPlan {
-    pub set_id: i64,
+    // Exactly one of `set_id` / `project_id` is set (plan 6b-2 C1).
+    pub set_id: Option<i64>,
+    pub project_id: Option<String>,
     pub set_name: String,
     pub config: StackingConfig,
     pub config_hash: String,
@@ -2425,8 +2427,10 @@ pub fn build_plan(
         "stacking plan built"
     );
 
+    let (set_id, project_id) = crate::stacking::run::wire_subject(subject);
     Ok(StackingPlan {
-        set_id: frames_set_id,
+        set_id,
+        project_id,
         set_name,
         config: cfg,
         config_hash: hash,
