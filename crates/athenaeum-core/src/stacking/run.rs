@@ -55,10 +55,7 @@ use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{NormalizationPair, RejectionNormalization};
 use crate::integration::IntegrationError;
 use crate::plate_solve::storage::{get_plate_solve, PlateSolveRecord};
-use crate::registration::db::{
-    get_frame_set_reference, get_registration_for_frame_set, upsert_registration,
-    RegistrationRecord,
-};
+use crate::registration::db::RegistrationRecord;
 use crate::resample::Interpolation;
 use crate::services::compute_queue::ComputeJobKind;
 use crate::services::{ServiceContext, StackHandle};
@@ -69,7 +66,7 @@ use crate::stacking::drizzle::{
     drizzle_group, DrizzleError, DrizzleFrame, DrizzleInput, DrizzleProgress, DrizzleStats,
 };
 use crate::stacking::fits_artifact;
-use crate::stacking::groups::{group_frames, set_slug, ColorMode, GroupFrame, IntegrationGroup};
+use crate::stacking::groups::{group_frames, ColorMode, GroupFrame, IntegrationGroup};
 use crate::stacking::integrate::{
     included_after_min_weight, integrate_group, large_scale_passes, GroupInput, GroupProgress,
     GroupStats, StackFrame,
@@ -84,12 +81,13 @@ use crate::stacking::master_cards::{
     write_drizzled_master, write_master_light, MasterCardInputs, WrittenDrizzle,
 };
 use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
-use crate::stacking::paths::{cleanup_work, CleanupWhat, WorkingLayout};
+use crate::stacking::paths::{cleanup_work, subject_layout, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
     measurement_hash_for, normalization_hash_for, registration_hash_for, registration_row_is_fresh,
-    seeds_calibration_hash_for, wants_cfa_mosaic, HashMemo, LnReferencePayload, MasterWork,
-    PlanMaster, Stage,
+    seeds_calibration_hash_for, store_registration, stored_reference_frame, stored_registrations,
+    wants_cfa_mosaic, HashMemo, LnReferencePayload, MasterWork, PlanMaster, Stage,
+    PROJECT_STACKING_UNAVAILABLE,
 };
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
@@ -241,10 +239,8 @@ pub(crate) struct RunContext {
     pub(crate) ctx: Arc<ServiceContext>,
     pub(crate) emitter: Arc<dyn ProgressEmitter>,
     pub(crate) run_id: i64,
-    /// What this run stacks; every persistence call keys on it. `set_id`
-    /// stays beside it until Task 4 removes it.
+    /// What this run stacks; every persistence call keys on it.
     pub(crate) subject: StackSubject,
-    pub(crate) set_id: i64,
     pub(crate) set_name: String,
     pub(crate) config: StackingConfig,
     pub(crate) hash: String,
@@ -459,7 +455,7 @@ impl RunContext {
             STACKING_PROGRESS_EVENT,
             &StackingProgressEvent {
                 run_id: self.run_id,
-                set_id: self.set_id,
+                set_id: wire_set_id(&self.subject),
                 stage,
                 group_key,
                 current,
@@ -522,6 +518,13 @@ fn file_identity(path: &Path) -> anyhow::Result<(i64, String)> {
     Ok((meta.len() as i64, modified_at))
 }
 
+/// The `setId` the events, `RunSummary` and `StackingPlan` carry until 6b-2
+/// makes them subject-aware (B8); a project run never reaches an emitter in
+/// 6b-1.
+pub(crate) fn wire_set_id(subject: &StackSubject) -> i64 {
+    subject.frame_set_id().unwrap_or(0)
+}
+
 /// Heal every `stacking_runs` row a crashed or killed process left
 /// `planning`/`running` forever (final fix wave, Critical item 1): such a
 /// row has no live cancel handle in [`ServiceContext::active_stacks`] (that
@@ -565,29 +568,18 @@ pub(crate) fn heal_interrupted_runs(
 
     let mut healed = 0usize;
     for (run_id, subject) in stuck {
-        // 6b-1 Task 4 gives a project run its own sweep; until a project run
-        // can exist, only a frame-set run has a `rej/` to remove.
-        let Some(frames_set_id) = subject.frame_set_id() else {
-            tracing::warn!(
+        match &subject {
+            StackSubject::FrameSet(frames_set_id) => tracing::warn!(
                 run_id,
-                project_id = subject.project_id().unwrap_or_default(),
+                frames_set_id = *frames_set_id,
                 "stacking run interrupted by a restart"
-            );
-            finish_run(
-                conn,
+            ),
+            StackSubject::Project(project_id) => tracing::warn!(
                 run_id,
-                "failed",
-                None,
-                Some("interrupted by a restart"),
-            )?;
-            healed += 1;
-            continue;
-        };
-        tracing::warn!(
-            run_id,
-            frames_set_id,
-            "stacking run interrupted by a restart"
-        );
+                project_id = %project_id,
+                "stacking run interrupted by a restart"
+            ),
+        }
         // B12 (M3 final fix wave, M9): a crashed run's `rej/run-<id>` is
         // worthless — nothing will ever finish writing it, and no future
         // run reads a PRIOR run's bitmaps — so it is swept here too,
@@ -596,13 +588,21 @@ pub(crate) fn heal_interrupted_runs(
         // `status`/`finished_at`/`summary_json`/`error`, never `config_
         // json`/`working_dir` — order does not matter, but reads the row
         // in its most complete state regardless).
-        if let Err(e) = remove_rej_dir_for_interrupted_run(conn, run_id, frames_set_id) {
-            tracing::warn!(
-                run_id,
-                frames_set_id,
-                error = %e,
-                "stacking run heal: failed to remove rej/run-<id>"
-            );
+        if let Err(e) = remove_rej_dir_for_interrupted_run(conn, run_id, &subject) {
+            match &subject {
+                StackSubject::FrameSet(frames_set_id) => tracing::warn!(
+                    run_id,
+                    frames_set_id = *frames_set_id,
+                    error = %e,
+                    "stacking run heal: failed to remove rej/run-<id>"
+                ),
+                StackSubject::Project(project_id) => tracing::warn!(
+                    run_id,
+                    project_id = %project_id,
+                    error = %e,
+                    "stacking run heal: failed to remove rej/run-<id>"
+                ),
+            }
         }
         finish_run(
             conn,
@@ -629,7 +629,7 @@ pub(crate) fn heal_interrupted_runs(
 fn remove_rej_dir_for_interrupted_run(
     conn: &rusqlite::Connection,
     run_id: i64,
-    frames_set_id: i64,
+    subject: &StackSubject,
 ) -> anyhow::Result<()> {
     let Some(row) = crate::db::stacking::get_run(conn, run_id)? else {
         return Ok(()); // the row vanished between listing and healing — nothing to sweep
@@ -652,8 +652,7 @@ fn remove_rej_dir_for_interrupted_run(
         return Ok(());
     }
 
-    let set_name = crate::stacking::plan::frame_set_name(conn, frames_set_id)?;
-    let layout = WorkingLayout::new(Path::new(&row.working_dir), &set_slug(&set_name));
+    let layout = subject_layout(conn, Path::new(&row.working_dir), subject)?;
     let dir = layout.rej_run_dir(run_id);
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
@@ -749,10 +748,14 @@ pub fn start_stacking(
     emitter: Arc<dyn ProgressEmitter>,
     policy: &PathPolicy,
     app_version: String,
-    frames_set_id: i64,
+    subject: StackSubject,
     config: Option<StackingConfig>,
     rerun_from: Option<Stage>,
 ) -> Result<StartedStacking, ApiError> {
+    let StackSubject::FrameSet(frames_set_id) = &subject else {
+        return Err(ApiError::Invalid(PROJECT_STACKING_UNAVAILABLE.into()));
+    };
+    let frames_set_id = *frames_set_id;
     let db_handle = db(&ctx)?;
     let conn = db_handle.conn();
 
@@ -762,8 +765,7 @@ pub fn start_stacking(
     // active" forever, with no command able to clear it.
     heal_interrupted_runs(&ctx, &conn)?;
 
-    let subject = StackSubject::FrameSet(frames_set_id);
-    let plan = build_plan(&conn, &ctx.settings, policy, frames_set_id, config)?;
+    let plan = build_plan(&conn, &ctx.settings, policy, &subject, config)?;
 
     if let Some(blocker) = plan.blockers.first() {
         return Err(ApiError::Invalid(blocker.message.clone()));
@@ -776,7 +778,7 @@ pub fn start_stacking(
     // actually serializes the run-row insert and the handle registration.
     if let Some(active_id) = plan.active_run_id {
         return Err(ApiError::Conflict(format!(
-            "a stacking run (id {active_id}) is already active for frame set {frames_set_id}"
+            "a stacking run (id {active_id}) is already active for {subject}"
         )));
     }
 
@@ -822,7 +824,7 @@ pub fn start_stacking(
         let mut active = ctx.active_stacks.lock().unwrap();
         if active.values().any(|h| h.subject == subject) {
             return Err(ApiError::Conflict(format!(
-                "a stacking run is already active for frame set {frames_set_id}"
+                "a stacking run is already active for {subject}"
             )));
         }
         let run_id = insert_run(
@@ -899,13 +901,18 @@ pub fn start_stacking(
         group_ids.insert(g.key.clone(), group_id);
     }
 
-    let set_slug_str = set_slug(&plan.set_name);
-    let layout = WorkingLayout::new(Path::new(&working_dir), &set_slug_str);
+    let layout = match subject_layout(&conn, Path::new(&working_dir), &subject) {
+        Ok(layout) => layout,
+        Err(e) => {
+            guard.fail(&e);
+            return Err(e.into());
+        }
+    };
     let output_dir = PathBuf::from(&output_dir_str);
 
     let summary = RunSummary {
         run_id,
-        set_id: frames_set_id,
+        set_id: wire_set_id(&subject),
         set_name: plan.set_name.clone(),
         app_version: app_version.clone(),
         started_at,
@@ -936,7 +943,6 @@ pub fn start_stacking(
         emitter: emitter.clone(),
         run_id,
         subject: subject.clone(),
-        set_id: frames_set_id,
         set_name: plan.set_name,
         config: plan.config,
         hash: plan.config_hash,
@@ -1023,7 +1029,7 @@ pub fn cancel_stacking(ctx: &ServiceContext, run_id: i64) -> Result<(), ApiError
 /// still said `running`, which is the confusing state this avoids.
 fn run_thread(mut rc: RunContext) {
     let run_id = rc.run_id;
-    let set_id = rc.set_id;
+    let set_id = wire_set_id(&rc.subject);
     let run_started = Instant::now();
 
     // The de-registration itself is RAII (M4a Task 4 fix round 1, item 1):
@@ -1983,6 +1989,10 @@ const CANCELLED_MARKER: &str = "__cancelled__";
 /// `IntegrationError::Cancelled` (surfaced by a worker as
 /// [`CANCELLED_MARKER`]) propagates as [`RunError::Cancelled`].
 fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
+    // Calibrate only ever runs for a frame set; the id feeds the log lines.
+    let Some(set_id) = rc.subject.frame_set_id() else {
+        return Err(RunError::Other(PROJECT_STACKING_UNAVAILABLE.into()));
+    };
     let stage_start = Instant::now();
     let excluded_set: HashSet<i64> = rc.excluded.iter().copied().collect();
     let groups = rc.plan_groups.clone();
@@ -1997,7 +2007,7 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
 
     tracing::info!(
         run_id = rc.run_id,
-        set_id = rc.set_id,
+        set_id,
         count = total,
         groups = groups.len(),
         config_hash = %rc.hash,
@@ -2018,7 +2028,7 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
     {
         tracing::warn!(
             run_id = rc.run_id,
-            set_id = rc.set_id,
+            set_id,
             "bayer drizzle ignored: the osc debayer is off for this run"
         );
         rc.warnings.push(
@@ -2721,7 +2731,7 @@ where
 pub(crate) struct FanOutTicker {
     emitter: Arc<dyn ProgressEmitter>,
     run_id: i64,
-    set_id: i64,
+    wire_set_id: i64,
     stage: Stage,
     group_key: Option<String>,
     total: usize,
@@ -2752,7 +2762,7 @@ impl FanOutTicker {
         Self::from_parts(
             rc.emitter.clone(),
             rc.run_id,
-            rc.set_id,
+            wire_set_id(&rc.subject),
             stage,
             group_key,
             done_so_far,
@@ -2777,7 +2787,7 @@ impl FanOutTicker {
         Self {
             emitter,
             run_id,
-            set_id,
+            wire_set_id: set_id,
             stage,
             group_key,
             total,
@@ -2818,7 +2828,7 @@ impl FanOutTicker {
             STACKING_PROGRESS_EVENT,
             &StackingProgressEvent {
                 run_id: self.run_id,
-                set_id: self.set_id,
+                set_id: self.wire_set_id,
                 stage: self.stage,
                 group_key: self.group_key.clone(),
                 current,
@@ -3686,13 +3696,12 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
 
     let (reference_frame_id, filename, weight_val, calibrated) = match cfg.reference.mode {
         ReferenceMode::Manual => {
-            let row = {
+            let stored = {
                 let conn = db(&rc.ctx)?.conn();
-                get_frame_set_reference(&conn, rc.set_id)?
+                stored_reference_frame(&conn, &rc.subject)?
             };
-            let row =
-                row.ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
-            let frame_id = row.reference_frame_id;
+            let frame_id =
+                stored.ok_or_else(|| RunError::Other("no reference frame chosen".to_string()))?;
 
             let location = rc.measured.iter().find_map(|(key, v)| {
                 v.iter()
@@ -4534,7 +4543,7 @@ fn register_group_pass(
     let interp = cfg.registration.interpolation;
     let clamping = cfg.registration.clamping_threshold;
     let run_id = rc.run_id;
-    let set_id = rc.set_id;
+    let subject = rc.subject.clone();
 
     // ── Cache-hit rewrite batch (ruling R-TA-5): parallel, admitted the
     // SAME way as the main fan-out below — no per-frame `rc` access, so it
@@ -4783,7 +4792,7 @@ fn register_group_pass(
                             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                         let is_reference_row = item.frame_id == reference_frame_id;
                         let rec = to_record(
-                            set_id,
+                            wire_set_id(&subject),
                             item.frame_id,
                             reference_frame_id,
                             is_reference_row,
@@ -4929,7 +4938,7 @@ fn register_group_pass(
                             let map = alignment.map.clone();
                             {
                                 let conn = db(&rc.ctx)?.conn();
-                                upsert_registration(&conn, &rec)?;
+                                store_registration(&conn, &rc.subject, |_| rec.clone())?;
                             }
                             if let Some(out_path) = &written {
                                 if let Err(e) = record_registered_artifact(
@@ -4967,18 +4976,19 @@ fn register_group_pass(
                         } else {
                             let now = chrono::Utc::now()
                                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                            let rec = to_record(
-                                rc.set_id,
-                                frame.frame_id,
-                                reference_frame_id,
-                                false,
-                                &reg,
-                                hash,
-                                &now,
-                            );
                             {
                                 let conn = db(&rc.ctx)?.conn();
-                                upsert_registration(&conn, &rec)?;
+                                store_registration(&conn, &rc.subject, |set_id| {
+                                    to_record(
+                                        set_id,
+                                        frame.frame_id,
+                                        reference_frame_id,
+                                        false,
+                                        &reg,
+                                        hash,
+                                        &now,
+                                    )
+                                })?;
                             }
                             if cfg.selection.exclude_on_registration_failure {
                                 rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
@@ -5362,7 +5372,7 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
 
     let by_frame: HashMap<i64, RegistrationRecord> = {
         let conn = db(&rc.ctx)?.conn();
-        get_registration_for_frame_set(&conn, rc.set_id)?
+        stored_registrations(&conn, &rc.subject)?
             .into_iter()
             .map(|r| (r.frame_id, r))
             .collect()
@@ -5619,7 +5629,7 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
 
     let by_frame: HashMap<i64, RegistrationRecord> = {
         let conn = db(&rc.ctx)?.conn();
-        get_registration_for_frame_set(&conn, rc.set_id)?
+        stored_registrations(&conn, &rc.subject)?
             .into_iter()
             .map(|r| (r.frame_id, r))
             .collect()
@@ -7385,7 +7395,7 @@ fn process_group_output(
     let plane_rows = rc.geometry_of(&group.key).height as u64;
     let emitter = rc.emitter.clone();
     let run_id = rc.run_id;
-    let set_id = rc.set_id;
+    let set_id = wire_set_id(&rc.subject);
     let group_key_for_progress = group.key.clone();
 
     let on_plane = |p: usize, _total: usize| {
@@ -8086,7 +8096,7 @@ fn process_group_output(
                         Mutex::new(DrizzleTickState::new());
                     let drizzle_tick_emitter = rc.emitter.clone();
                     let drizzle_tick_run_id = rc.run_id;
-                    let drizzle_tick_set_id = rc.set_id;
+                    let drizzle_tick_set_id = wire_set_id(&rc.subject);
                     let drizzle_tick_group_key = group.key.clone();
                     let drizzle_on_frame = |done: usize, total: usize| {
                         let n = drizzle_frame_ids.len();
@@ -9404,7 +9414,7 @@ fn measure_ln_seeds_calibration(
     // `build_and_write_ln_reference` uses, since `rc` is borrowed
     // immutably here and `RunContext::progress` needs `&mut self`.
     let emitter = rc.emitter.clone();
-    let (run_id, set_id, group_key) = (rc.run_id, rc.set_id, group.key.clone());
+    let (run_id, set_id, group_key) = (rc.run_id, wire_set_id(&rc.subject), group.key.clone());
     // C-17: the row counts the CALIBRATION's own frames while it runs —
     // `current`/`total`/`percent` over the sample, not the group. Reporting
     // `0 / 0 %` against the member count (what the first cut did) made a
@@ -9529,7 +9539,8 @@ fn build_and_write_ln_reference(
     // Normalize row sitting at 0 of N. Plane-level ticks with a message
     // are what `build_reference` offers; enough to say what is happening.
     let build_emitter = rc.emitter.clone();
-    let (build_run_id, build_set_id, build_group_key) = (rc.run_id, rc.set_id, group.key.clone());
+    let (build_run_id, build_set_id, build_group_key) =
+        (rc.run_id, wire_set_id(&rc.subject), group.key.clone());
     // The stage's own total (every included member of the group), not the
     // top-`n` slice — the row's count must be the same number the per-frame
     // ticks that follow climb towards.
@@ -9865,7 +9876,6 @@ pub(crate) fn test_context(
         emitter,
         run_id,
         subject: StackSubject::FrameSet(set_id),
-        set_id,
         set_name: set_name.to_string(),
         config,
         hash,
@@ -9904,6 +9914,8 @@ pub(crate) fn test_context(
 mod tests {
     use super::*;
     use crate::events::NullEmitter;
+    use crate::registration::db::get_registration_for_frame_set;
+    use crate::stacking::groups::set_slug;
     use crate::stacking::integrate::{LargeScaleRejection, RejectionChoice};
     use crate::stacking::rej::RejBitmap;
     use crate::stacking::test_fixtures::{self, LightSpec};
@@ -10065,7 +10077,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            empty_fixture.set_id,
+            StackSubject::FrameSet(empty_fixture.set_id),
             None,
             None,
         )
@@ -10092,7 +10104,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -10103,7 +10115,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -10147,7 +10159,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -10178,7 +10190,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -10210,7 +10222,7 @@ mod tests {
             recorder.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -11131,7 +11143,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg.clone()),
             None,
         )
@@ -11146,7 +11158,7 @@ mod tests {
             &fixture.conn,
             &ctx.settings,
             &PathPolicy::AllowAll,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some(cfg.clone()),
         )
         .expect("the plan should build");
@@ -11172,7 +11184,7 @@ mod tests {
             &fixture.conn,
             &ctx.settings,
             &PathPolicy::AllowAll,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
         )
         .expect("the plan should build");
@@ -11380,7 +11392,7 @@ mod tests {
             &fixture.conn,
             &ctx.settings,
             &PathPolicy::AllowAll,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some(cfg.clone()),
         )
         .unwrap();
@@ -11421,7 +11433,7 @@ mod tests {
             &fixture.conn,
             &ctx.settings,
             &PathPolicy::AllowAll,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -11476,7 +11488,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg.clone()),
             None,
         )
@@ -11516,7 +11528,7 @@ mod tests {
             &fixture.conn,
             &ctx.settings,
             &PathPolicy::AllowAll,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some(cfg.clone()),
         )
         .expect("the plan should build");
@@ -11542,7 +11554,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg.clone()),
             None,
         )
@@ -11592,7 +11604,7 @@ mod tests {
             &fixture.conn,
             &ctx.settings,
             &PathPolicy::AllowAll,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
         )
         .expect("the plan should build");
@@ -11653,7 +11665,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg.clone()),
             None,
         )
@@ -11688,7 +11700,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg.clone()),
             None,
         )
@@ -11763,7 +11775,7 @@ mod tests {
             &fixture.conn,
             &ctx.settings,
             &PathPolicy::AllowAll,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
         )
         .expect("the plan should build");
@@ -14258,7 +14270,7 @@ mod tests {
             recorder.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -14426,7 +14438,7 @@ mod tests {
             recorder.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -14526,7 +14538,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -14544,7 +14556,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -14645,7 +14657,7 @@ mod tests {
             emitter.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -14709,7 +14721,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -14754,7 +14766,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg2),
             None,
         )
@@ -14809,7 +14821,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -15288,7 +15300,7 @@ mod tests {
             &fixture.conn,
             &ctx.settings,
             &PathPolicy::AllowAll,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some(cfg.clone()),
         )
         .expect("the plan should build");
@@ -16463,7 +16475,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(base_config()),
             None,
         )
@@ -16498,7 +16510,7 @@ mod tests {
             recorder.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg_on),
             None,
         )
@@ -16680,7 +16692,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -16819,7 +16831,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -16911,7 +16923,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -17028,7 +17040,7 @@ mod tests {
             recorder.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -17261,7 +17273,7 @@ mod tests {
             Arc::new(Recording::new()),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -17429,7 +17441,7 @@ mod tests {
                 Arc::new(Recording::new()),
                 &PathPolicy::AllowAll,
                 "test".to_string(),
-                fixture.set_id,
+                StackSubject::FrameSet(fixture.set_id),
                 Some(cfg),
                 None,
             )
@@ -17527,7 +17539,7 @@ mod tests {
                 Arc::new(Recording::new()),
                 &PathPolicy::AllowAll,
                 "test".to_string(),
-                fixture.set_id,
+                StackSubject::FrameSet(fixture.set_id),
                 Some(cfg()),
                 None,
             )
@@ -17657,7 +17669,7 @@ mod tests {
                 Arc::new(Recording::new()),
                 &PathPolicy::AllowAll,
                 "test".to_string(),
-                fixture.set_id,
+                StackSubject::FrameSet(fixture.set_id),
                 Some(cfg(bayer)),
                 None,
             )
@@ -17673,7 +17685,7 @@ mod tests {
                 &fixture.conn,
                 &ctx.settings,
                 &PathPolicy::AllowAll,
-                fixture.set_id,
+                &StackSubject::FrameSet(fixture.set_id),
                 Some(cfg(bayer)),
             )
             .expect("the plan should build")
@@ -17821,7 +17833,7 @@ mod tests {
             recorder.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -17951,7 +17963,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -18020,7 +18032,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -18095,7 +18107,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -18145,7 +18157,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             None,
             None,
         )
@@ -18181,7 +18193,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg_on),
             None,
         )
@@ -18279,7 +18291,7 @@ mod tests {
             emitter.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -18393,7 +18405,7 @@ mod tests {
             recorder.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -18529,7 +18541,7 @@ mod tests {
             emitter.clone(),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -18725,7 +18737,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -19499,7 +19511,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -19672,7 +19684,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -19748,7 +19760,7 @@ mod tests {
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
             "test".to_string(),
-            fixture.set_id,
+            StackSubject::FrameSet(fixture.set_id),
             Some(cfg),
             None,
         )
@@ -19800,5 +19812,204 @@ mod tests {
         // 16 GB, 10-worker pool: at least 3 OSC frames in flight.
         let n = (16u64 << 30) / 4 / one_channel;
         assert!(n >= 3, "admission would be {n}");
+    }
+
+    #[test]
+    fn a_project_start_is_refused_until_6b2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
+        {
+            let handle = db(&ctx).unwrap();
+            crate::db::stacking::insert_test_project(&handle.conn(), "p1");
+        }
+
+        let err = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            StackSubject::Project("p1".into()),
+            None,
+            None,
+        )
+        .expect_err("a project start is refused");
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m == PROJECT_STACKING_UNAVAILABLE),
+            "{err:?}"
+        );
+
+        let handle = db(&ctx).unwrap();
+        let runs: i64 = handle
+            .conn()
+            .query_row("SELECT COUNT(*) FROM stacking_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs, 0, "no stacking_runs row is written");
+        assert!(ctx.active_stacks.lock().unwrap().is_empty());
+    }
+
+    /// Review Focus 5 (heal half).
+    #[test]
+    fn the_heal_marks_an_interrupted_project_run_failed_and_leaves_frame_sets_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _light_ids, working, output) = seed_ready(&db_path, SET_NAME);
+        crate::db::stacking::insert_test_project(&fixture.conn, "p1");
+
+        let mut cfg = StackingConfig::default();
+        cfg.output.cleanup = CleanupPolicy::DeleteIntermediates;
+        let config_json = serde_json::to_string(&cfg).unwrap();
+        let new_run = |subject: &StackSubject| {
+            let id = insert_run(
+                &fixture.conn,
+                &NewRun {
+                    subject,
+                    config_json: &config_json,
+                    config_hash: "h",
+                    reference_frame_id: None,
+                    reference_mode: "auto",
+                    working_dir: working.path().to_str().unwrap(),
+                    output_dir: output.path().to_str().unwrap(),
+                },
+            )
+            .unwrap();
+            crate::db::stacking::set_run_status(&fixture.conn, id, "running").unwrap();
+            id
+        };
+        let set_subject = StackSubject::FrameSet(fixture.set_id);
+        let project_subject = StackSubject::Project("p1".into());
+        let set_run = new_run(&set_subject);
+        let project_run = new_run(&project_subject);
+        ctx.active_stacks.lock().unwrap().insert(
+            set_run,
+            StackHandle {
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                subject: set_subject.clone(),
+            },
+        );
+
+        let project_rej = working
+            .path()
+            .join("projects")
+            .join("p1")
+            .join("rej")
+            .join(format!("run-{project_run}"));
+        std::fs::create_dir_all(&project_rej).unwrap();
+        std::fs::write(project_rej.join("leftover.rej"), b"stale").unwrap();
+
+        let healed = heal_interrupted_runs(&ctx, &fixture.conn).unwrap();
+        assert_eq!(healed, 1, "only the project run is stuck");
+
+        let project_row = crate::db::stacking::get_run(&fixture.conn, project_run)
+            .unwrap()
+            .unwrap();
+        assert_eq!(project_row.status, "failed");
+        assert_eq!(
+            project_row.error.as_deref(),
+            Some("interrupted by a restart")
+        );
+        assert!(
+            !project_rej.exists(),
+            "the project run's rej dir is swept through subject_layout"
+        );
+        let set_row = crate::db::stacking::get_run(&fixture.conn, set_run)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            set_row.status, "running",
+            "a live frame-set run is untouched"
+        );
+    }
+
+    /// Review Focus 5 (work usage and cleanup half): a project run row and
+    /// project artifacts/folder do not disturb a frame set's usage or cleanup.
+    #[test]
+    fn work_usage_and_cleanup_of_a_frame_set_ignore_project_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _light_ids, working, output) = seed_ready(&db_path, SET_NAME);
+        crate::db::stacking::insert_test_project(&fixture.conn, "p1");
+
+        let mut cfg = StackingConfig::default();
+        cfg.paths.working_dir = Some(working.path().to_string_lossy().into_owned());
+        crate::api::stacking::set_stacking_config(&ctx, fixture.set_id, cfg, Vec::new()).unwrap();
+
+        let set_group = WorkingLayout::new(working.path(), &set_slug(SET_NAME)).calibrated_dir("g");
+        std::fs::create_dir_all(&set_group).unwrap();
+        std::fs::write(set_group.join("x.bin"), vec![0u8; 1024]).unwrap();
+        let project_group = working
+            .path()
+            .join("projects")
+            .join("p1")
+            .join("calibrated")
+            .join("g");
+        std::fs::create_dir_all(&project_group).unwrap();
+        std::fs::write(project_group.join("y.bin"), vec![0u8; 512]).unwrap();
+
+        let project_subject = StackSubject::Project("p1".into());
+        let project_run = insert_run(
+            &fixture.conn,
+            &NewRun {
+                subject: &project_subject,
+                config_json: "{}",
+                config_hash: "h",
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: working.path().to_str().unwrap(),
+                output_dir: output.path().to_str().unwrap(),
+            },
+        )
+        .unwrap();
+        crate::db::stacking::set_run_status(&fixture.conn, project_run, "running").unwrap();
+        // A live handle: the project run is genuinely active, so the heal
+        // sweep inside the two commands leaves it alone.
+        ctx.active_stacks.lock().unwrap().insert(
+            project_run,
+            StackHandle {
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                subject: project_subject.clone(),
+            },
+        );
+        crate::db::stacking::upsert_artifact(
+            &fixture.conn,
+            &crate::db::stacking::NewArtifact {
+                subject: &project_subject,
+                frame_id: None,
+                group_key: "g",
+                kind: "calibrated",
+                path: None,
+                config_hash: "h",
+                size: None,
+                modified_at: None,
+                payload_json: None,
+            },
+        )
+        .unwrap();
+
+        let usage = crate::api::stacking::get_stacking_work_usage(&ctx, fixture.set_id).unwrap();
+        assert_eq!(
+            usage.calibrated_bytes, 1024,
+            "only the frame set's own folder"
+        );
+
+        crate::api::stacking::cleanup_stacking_work(&ctx, fixture.set_id, CleanupWhat::All)
+            .unwrap();
+        assert!(!set_group.join("x.bin").exists());
+        assert!(
+            project_group.join("y.bin").exists(),
+            "the project folder is untouched"
+        );
+        assert_eq!(
+            crate::db::stacking::list_artifacts(&fixture.conn, &project_subject, None)
+                .unwrap()
+                .len(),
+            1,
+            "the project's artifact row is untouched"
+        );
+        let run_row = crate::db::stacking::get_run(&fixture.conn, project_run)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run_row.status, "running");
     }
 }

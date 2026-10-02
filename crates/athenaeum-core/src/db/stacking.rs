@@ -886,6 +886,25 @@ pub fn list_artifacts(
 /// Delete every artifact of the given `kinds` for a subject (e.g. when a
 /// config change invalidates cached masters). Returns the number of rows
 /// removed.
+/// The SQL of [`delete_artifacts`] for `kind_count` kinds, written in the
+/// subject-key prefix's own expressions so it plans on
+/// `stacking_artifacts_subject_key` (the `IS` form plans on
+/// `idx_stacking_artifacts_project` and visits every frame-set artifact of
+/// the catalog).
+fn delete_artifacts_sql(kind_count: usize) -> String {
+    let placeholders: Vec<String> = (0..kind_count).map(|i| format!("?{}", i + 3)).collect();
+    format!(
+        "DELETE FROM stacking_artifacts
+         WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2
+           AND kind IN ({})",
+        placeholders.join(", ")
+    )
+}
+
+/// The SQL of [`delete_all_artifacts`], on the same subject-key prefix.
+const DELETE_ALL_ARTIFACTS_SQL: &str = "DELETE FROM stacking_artifacts
+     WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2";
+
 pub fn delete_artifacts(
     conn: &Connection,
     subject: &StackSubject,
@@ -894,14 +913,9 @@ pub fn delete_artifacts(
     if kinds.is_empty() {
         return Ok(0);
     }
-    let placeholders: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 3)).collect();
-    let sql = format!(
-        "DELETE FROM stacking_artifacts
-         WHERE frames_set_id IS ?1 AND project_id IS ?2 AND kind IN ({})",
-        placeholders.join(", ")
-    );
-    let set_id = subject.frame_set_id();
-    let project_id = subject.project_id();
+    let sql = delete_artifacts_sql(kinds.len());
+    let set_id = subject.frame_set_id().unwrap_or(0);
+    let project_id = subject.project_id().unwrap_or("");
     let mut vals: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(kinds.len() + 2);
     vals.push(&set_id);
     vals.push(&project_id);
@@ -921,8 +935,11 @@ pub fn delete_artifacts(
 /// files that cleanup just deleted. Returns the number of rows removed.
 pub fn delete_all_artifacts(conn: &Connection, subject: &StackSubject) -> Result<usize> {
     let n = conn.execute(
-        "DELETE FROM stacking_artifacts WHERE frames_set_id IS ?1 AND project_id IS ?2",
-        params![subject.frame_set_id(), subject.project_id()],
+        DELETE_ALL_ARTIFACTS_SQL,
+        params![
+            subject.frame_set_id().unwrap_or(0),
+            subject.project_id().unwrap_or("")
+        ],
     )?;
     Ok(n)
 }
@@ -1840,7 +1857,39 @@ mod tests {
             .unwrap();
         assert!(
             plan.iter()
-                .any(|d| d.contains("stacking_artifacts_subject_key")),
+                .any(|d| d.starts_with("SEARCH") && d.contains("stacking_artifacts_subject_key")),
+            "{plan:?}"
+        );
+    }
+
+    fn plan_details(c: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Vec<String> {
+        c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params, |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn delete_artifacts_is_a_search_on_the_subject_key_prefix() {
+        let c = conn();
+        let sql = delete_artifacts_sql(2);
+        let plan = plan_details(&c, &sql, &[&7_i64, &"", &"calibrated", &"metrics"]);
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH") && d.contains("stacking_artifacts_subject_key")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn delete_all_artifacts_is_a_search_on_the_subject_key_prefix() {
+        let c = conn();
+        let plan = plan_details(&c, DELETE_ALL_ARTIFACTS_SQL, &[&7_i64, &""]);
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH") && d.contains("stacking_artifacts_subject_key")),
             "{plan:?}"
         );
     }

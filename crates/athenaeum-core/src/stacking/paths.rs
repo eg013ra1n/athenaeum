@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::api::sync::OverlapRule;
@@ -26,6 +26,37 @@ use crate::stacking::groups::{ColorMode, IntegrationGroup};
 #[derive(Debug, Clone)]
 pub struct WorkingLayout {
     pub root: PathBuf,
+}
+
+/// The working layout of one stacking subject: a frame set's lives at
+/// `<working>/<set_slug(name)>`, a project's at
+/// `<working>/projects/<set_slug(slug)>` (spec section 9.3).
+pub(crate) fn subject_layout(
+    conn: &Connection,
+    working_dir: &Path,
+    subject: &StackSubject,
+) -> anyhow::Result<WorkingLayout> {
+    use crate::stacking::groups::set_slug;
+    match subject {
+        StackSubject::FrameSet(id) => {
+            let name = crate::stacking::plan::frame_set_name(conn, *id)?;
+            Ok(WorkingLayout::new(working_dir, &set_slug(&name)))
+        }
+        StackSubject::Project(id) => {
+            let slug: Option<String> = conn
+                .query_row(
+                    "SELECT slug FROM collab_projects WHERE project_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let slug = slug.ok_or_else(|| anyhow::anyhow!("project {id} not found"))?;
+            Ok(WorkingLayout::new(
+                &working_dir.join("projects"),
+                &set_slug(&slug),
+            ))
+        }
+    }
 }
 
 impl WorkingLayout {
@@ -1851,5 +1882,35 @@ mod tests {
         .unwrap();
         assert_eq!(freed, 128);
         assert!(!layout.rej_root().exists());
+    }
+
+    #[test]
+    fn subject_layout_puts_a_project_under_projects_slug() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (name) VALUES ('M42 2026')", [])
+            .unwrap();
+        let set_id = c.last_insert_rowid();
+        crate::db::stacking::insert_test_project(&c, "p1");
+        c.execute(
+            "UPDATE collab_projects SET slug = 'orion-mosaic' WHERE project_id = 'p1'",
+            [],
+        )
+        .unwrap();
+        let working = Path::new("/work");
+
+        let set_layout = subject_layout(&c, working, &StackSubject::FrameSet(set_id)).unwrap();
+        assert_eq!(
+            set_layout.root,
+            WorkingLayout::new(working, &crate::stacking::groups::set_slug("M42 2026")).root
+        );
+
+        let project_layout =
+            subject_layout(&c, working, &StackSubject::Project("p1".into())).unwrap();
+        assert_eq!(
+            project_layout.root,
+            working.join("projects").join("orion-mosaic")
+        );
+
+        assert!(subject_layout(&c, working, &StackSubject::Project("nope".into())).is_err());
     }
 }

@@ -34,11 +34,11 @@ use crate::stacking::config::{
 };
 use crate::stacking::groups::set_slug;
 use crate::stacking::paths::{
-    cleanup_work, resolve_dirs, validate_dirs, work_usage, CleanupWhat, ValidateMode, WorkUsage,
-    WorkingLayout,
+    cleanup_work, resolve_dirs, subject_layout, validate_dirs, work_usage, CleanupWhat,
+    ValidateMode, WorkUsage, WorkingLayout,
 };
 use crate::stacking::plan::{
-    build_plan, frame_set_name, read_global_config_json, StackingPlan, Stage,
+    build_plan, read_global_config_json, subject_label, StackingPlan, Stage,
 };
 use crate::stacking::provenance::RunSummary;
 use crate::stacking::run::{self, StartedStacking};
@@ -160,7 +160,13 @@ pub fn get_stacking_plan(
     // `planning`/`running` — otherwise `active_run_id` below would read a
     // stuck row as still active forever.
     run::heal_interrupted_runs(ctx, &conn)?;
-    build_plan(&conn, &ctx.settings, policy, set_id, config)
+    build_plan(
+        &conn,
+        &ctx.settings,
+        policy,
+        &StackSubject::FrameSet(set_id),
+        config,
+    )
 }
 
 /// Ruling R-M3-9: drizzle has no cache of its own — the bitmaps a re-run
@@ -216,7 +222,7 @@ pub fn start_stacking(
         emitter,
         policy,
         app_version,
-        set_id,
+        StackSubject::FrameSet(set_id),
         config,
         rerun_from,
     )
@@ -793,6 +799,18 @@ pub fn set_stacking_paths(
     get_stacking_paths(ctx)
 }
 
+/// The working layout of a stacking subject. The subject's label is read
+/// first so a missing frame set / project stays a `NotFound`, not an
+/// `Internal` folded in from the layout's `anyhow` error.
+fn layout_for(
+    conn: &rusqlite::Connection,
+    working: &Path,
+    subject: &StackSubject,
+) -> Result<WorkingLayout, ApiError> {
+    subject_label(conn, subject)?;
+    Ok(subject_layout(conn, working, subject)?)
+}
+
 /// A frame set's working-layout byte usage. Fix round 1, item 2: resolves
 /// the SET's own config (its `paths.workingDir` override, if any, else the
 /// global default — [`resolve_set_stacking_config`], the same reader
@@ -809,8 +827,7 @@ pub fn get_stacking_work_usage(ctx: &ServiceContext, set_id: i64) -> Result<Work
     let Some(working) = dirs.working else {
         return Ok(WorkUsage::default());
     };
-    let set_name = frame_set_name(&conn, set_id)?;
-    let layout = WorkingLayout::new(Path::new(&working), &set_slug(&set_name));
+    let layout = layout_for(&conn, Path::new(&working), &StackSubject::FrameSet(set_id))?;
     Ok(work_usage(&layout))
 }
 
@@ -862,8 +879,7 @@ pub fn cleanup_stacking_work(
     let Some(working) = dirs.working else {
         return Ok(0);
     };
-    let set_name = frame_set_name(&conn, set_id)?;
-    let layout = WorkingLayout::new(Path::new(&working), &set_slug(&set_name));
+    let layout = layout_for(&conn, Path::new(&working), &subject)?;
     let freed = cleanup_work(&conn, &subject, &layout, what)?;
     Ok(freed)
 }
@@ -961,7 +977,7 @@ fn resolve_master_light(
     // handler in this module. Those run once per user action; this one runs
     // per group per panel mount, and a preview of an already-WRITTEN master
     // has nothing to heal — a stuck row cannot make a written file wrong.
-    let (master_path, row_group_key, working_dir, set_name) = {
+    let (master_path, row_group_key, working_dir, layout) = {
         let db_handle = db(ctx)?;
         let conn = db_handle.conn();
 
@@ -974,13 +990,13 @@ fn resolve_master_light(
                     kind.as_db_str()
                 ))
             })?;
-        let set_name = frame_set_name(&conn, run_row.frames_set_id)?;
+        let layout = layout_for(&conn, Path::new(&run_row.working_dir), &run_row.subject())?;
         // The cache path is built from the ROW's own `group_key`, not the
         // caller's argument — the two are equal by construction (the lookup
         // matched on it exactly), but sourcing every path component from the
         // catalog keeps a caller-supplied string out of a `create_dir_all`
         // target on principle rather than by argument.
-        (row.path, row.group_key, run_row.working_dir, set_name)
+        (row.path, row.group_key, run_row.working_dir, layout)
     };
 
     let master_path = PathBuf::from(master_path);
@@ -996,14 +1012,7 @@ fn resolve_master_light(
     let cache_path = if working_dir.trim().is_empty() {
         None
     } else {
-        Some(
-            WorkingLayout::new(Path::new(&working_dir), &set_slug(&set_name)).preview_path(
-                run_id,
-                &row_group_key,
-                kind.as_db_str(),
-                step,
-            ),
-        )
+        Some(layout.preview_path(run_id, &row_group_key, kind.as_db_str(), step))
     };
 
     Ok(ResolvedMasterLight {

@@ -27,7 +27,8 @@ use crate::db::stacking::{
 use crate::export::{resolve_generation_cached, resolved_master_paths, DivisorCache};
 use crate::integration::stats::RejectionNormalization;
 use crate::registration::db::{
-    get_frame_set_reference, get_registration_for_frame_set, RegistrationRecord,
+    get_frame_set_reference, get_registration_for_frame_set, upsert_registration,
+    RegistrationRecord,
 };
 use crate::settings::{keys, SettingsManager};
 use crate::stacking::config::{
@@ -821,6 +822,78 @@ pub(crate) fn frame_set_name(conn: &Connection, frames_set_id: i64) -> Result<St
     .ok_or_else(|| ApiError::NotFound(format!("frame set {frames_set_id} not found")))
 }
 
+/// Refusal text for every project entry point until plan 6b-2 lands the
+/// project path.
+pub const PROJECT_STACKING_UNAVAILABLE: &str =
+    "Stacking a collaboration project is not available yet.";
+
+/// The subject's display label: a frame set's name, a project's title.
+pub(crate) fn subject_label(conn: &Connection, subject: &StackSubject) -> Result<String, ApiError> {
+    match subject {
+        StackSubject::FrameSet(id) => frame_set_name(conn, *id),
+        StackSubject::Project(id) => conn
+            .query_row(
+                "SELECT title FROM collab_projects WHERE project_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| ApiError::NotFound(format!("project {id} not found"))),
+    }
+}
+
+/// The subject's stored manual reference frame, as an id in the run's own
+/// namespace (a catalog frame id for a frame set, a project-frame handle for
+/// a project).
+pub(crate) fn stored_reference_frame(
+    conn: &Connection,
+    subject: &StackSubject,
+) -> anyhow::Result<Option<i64>> {
+    match subject {
+        StackSubject::FrameSet(id) => {
+            Ok(get_frame_set_reference(conn, *id)?.map(|r| r.reference_frame_id))
+        }
+        StackSubject::Project(id) => Ok(conn
+            .query_row(
+                "SELECT h.id FROM stacking_project_config c \
+                 JOIN stack_project_frames h ON h.project_id = c.project_id \
+                 AND h.frame_uuid = c.reference_frame_uuid \
+                 WHERE c.project_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?),
+    }
+}
+
+// B10: a project run keeps its registration in the registered artifact's
+// payload (spec section 4.2); it never writes `registration_results`, so the
+// Project arms below read nothing and store nothing.
+
+/// The subject's stored registration rows.
+pub(crate) fn stored_registrations(
+    conn: &Connection,
+    subject: &StackSubject,
+) -> anyhow::Result<Vec<RegistrationRecord>> {
+    match subject {
+        StackSubject::FrameSet(id) => get_registration_for_frame_set(conn, *id),
+        StackSubject::Project(_) => Ok(Vec::new()),
+    }
+}
+
+/// Upsert one registration row for the subject; `build` receives the frame
+/// set id the record carries.
+pub(crate) fn store_registration(
+    conn: &Connection,
+    subject: &StackSubject,
+    build: impl FnOnce(i64) -> RegistrationRecord,
+) -> anyhow::Result<()> {
+    match subject {
+        StackSubject::FrameSet(id) => upsert_registration(conn, &build(*id)).map(|_| ()),
+        StackSubject::Project(_) => Ok(()),
+    }
+}
+
 pub(crate) fn read_global_config_json(
     conn: &Connection,
     settings: &SettingsManager,
@@ -877,7 +950,7 @@ fn resolve_config_and_exclusions(
 /// an empty [`PlanReference`].
 fn resolve_reference(
     conn: &Connection,
-    frames_set_id: i64,
+    subject: &StackSubject,
     cfg: &StackingConfig,
     blockers: &mut Vec<PlanBlocker>,
 ) -> Result<PlanReference, ApiError> {
@@ -903,7 +976,7 @@ fn resolve_reference(
         }
     };
 
-    let Some(reference_row) = get_frame_set_reference(conn, frames_set_id)? else {
+    let Some(reference_frame_id) = stored_reference_frame(conn, subject)? else {
         return Ok(no_reference_chosen(blockers));
     };
 
@@ -911,7 +984,7 @@ fn resolve_reference(
         .query_row(
             "SELECT fi.filename, fi.path FROM frames f JOIN files fi ON fi.id = f.file_id \
              WHERE f.id = ?1",
-            params![reference_row.reference_frame_id],
+            params![reference_frame_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -930,7 +1003,7 @@ fn resolve_reference(
 
     Ok(PlanReference {
         mode: ReferenceMode::Manual,
-        frame_id: Some(reference_row.reference_frame_id),
+        frame_id: Some(reference_frame_id),
         filename: Some(filename),
         on_disk,
     })
@@ -1191,15 +1264,12 @@ fn cleanup_stale_note(
 fn compute_register_stale(
     conn: &Connection,
     cfg: &StackingConfig,
-    frames_set_id: i64,
+    subject: &StackSubject,
     groups: &[IntegrationGroup],
     reference: &PlanReference,
     memo: &mut HashMemo,
 ) -> Result<bool, ApiError> {
-    let Some(last_run) = list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
-        .into_iter()
-        .next()
-    else {
+    let Some(last_run) = list_runs(conn, subject, 1)?.into_iter().next() else {
         return Ok(true);
     };
 
@@ -1260,7 +1330,7 @@ fn compute_register_stale(
         reference_hashes.insert(reference_frame_id, hash);
     }
 
-    let rows = get_registration_for_frame_set(conn, frames_set_id)?;
+    let rows = stored_registrations(conn, subject)?;
     let by_frame: HashMap<i64, &RegistrationRecord> =
         rows.iter().map(|r| (r.frame_id, r)).collect();
 
@@ -1311,13 +1381,7 @@ fn compute_register_stale(
         // the run actually warped and wrote every included frame; the
         // same was true after any cleanup that deletes the `registered/`
         // directory (`CleanupPolicy::DeleteRegistered`/`DeleteIntermediates`).
-        let artifact = find_artifact(
-            conn,
-            &StackSubject::FrameSet(frames_set_id),
-            &group.key,
-            "registered",
-            Some(frame_id),
-        )?;
+        let artifact = find_artifact(conn, subject, &group.key, "registered", Some(frame_id))?;
         if !artifact.is_some_and(|row| is_fresh(&row, &expected)) {
             return Ok(true);
         }
@@ -1582,11 +1646,14 @@ pub fn build_plan(
     conn: &Connection,
     settings: &SettingsManager,
     policy: &PathPolicy,
-    frames_set_id: i64,
+    subject: &StackSubject,
     config_override: Option<StackingConfig>,
 ) -> Result<StackingPlan, ApiError> {
-    let set_name = frame_set_name(conn, frames_set_id)?;
-    let subject = StackSubject::FrameSet(frames_set_id);
+    let StackSubject::FrameSet(frames_set_id) = subject else {
+        return Err(ApiError::Invalid(PROJECT_STACKING_UNAVAILABLE.into()));
+    };
+    let frames_set_id = *frames_set_id;
+    let set_name = subject_label(conn, subject)?;
     let (cfg, excluded_frame_ids) =
         resolve_config_and_exclusions(conn, settings, frames_set_id, config_override)?;
     let hash = config_hash(&cfg);
@@ -1712,7 +1779,7 @@ pub fn build_plan(
     }
 
     // Gate 2: reference.
-    let reference = resolve_reference(conn, frames_set_id, &cfg, &mut blockers)?;
+    let reference = resolve_reference(conn, subject, &cfg, &mut blockers)?;
 
     // M4b (rulings R-M4b-1/7, R-T1-1): pixel-scale warnings — never
     // blockers. A mixed-pixel-scale set is a real, supportable
@@ -1910,7 +1977,7 @@ pub fn build_plan(
     // once for the whole build, not per group/frame, same rationale as
     // `compute_register_stale`'s own `by_frame` map below.
     let ln_registration_by_frame: HashMap<i64, Option<String>> = if local_normalization_active {
-        get_registration_for_frame_set(conn, frames_set_id)?
+        stored_registrations(conn, subject)?
             .into_iter()
             .map(|r| (r.frame_id, r.config_hash))
             .collect()
@@ -2008,7 +2075,7 @@ pub fn build_plan(
         // reports fresh against the OLD set until a real run updates it —
         // documented, not fixed, here (weights are pixel-phase data).
         let ln_reference_info: Option<LnReferencePayload> = if local_normalization_active {
-            find_artifact(conn, &subject, &g.key, "ln_reference", None)?
+            find_artifact(conn, subject, &g.key, "ln_reference", None)?
                 .and_then(|row| row.payload_json)
                 .and_then(|s| serde_json::from_str::<LnReferencePayload>(&s).ok())
         } else {
@@ -2028,7 +2095,7 @@ pub fn build_plan(
         // under, which is the question this gate is asking.
         let ln_calibration: Option<SeedsCalibration> = if local_normalization_active {
             let ln_channels = expected_ln_channels(&cfg, g);
-            find_artifact(conn, &subject, &g.key, "ln_calibration", None)?
+            find_artifact(conn, subject, &g.key, "ln_calibration", None)?
                 .and_then(|row| row.payload_json)
                 .and_then(|s| serde_json::from_str::<SeedsCalibration>(&s).ok())
                 // C-17: the same shape filter the run applies
@@ -2058,9 +2125,9 @@ pub fn build_plan(
             }
 
             let calib_artifact =
-                find_artifact(conn, &subject, &g.key, "calibrated", Some(f.frame_id))?;
+                find_artifact(conn, subject, &g.key, "calibrated", Some(f.frame_id))?;
             let metrics_artifact =
-                find_artifact(conn, &subject, &g.key, "metrics", Some(f.frame_id))?;
+                find_artifact(conn, subject, &g.key, "metrics", Some(f.frame_id))?;
 
             // Only worth resolving the frame's current stage-1 hash when
             // there is an existing artifact to compare it against — a frame
@@ -2083,13 +2150,8 @@ pub fn build_plan(
             // the calibrated half already passed, so a group without Bayer
             // drizzle costs no extra query at all.
             let calib_fresh = if calib_fresh && group_wants_mosaic {
-                let mosaic_artifact = find_artifact(
-                    conn,
-                    &subject,
-                    &g.key,
-                    "calibrated_mosaic",
-                    Some(f.frame_id),
-                )?;
+                let mosaic_artifact =
+                    find_artifact(conn, subject, &g.key, "calibrated_mosaic", Some(f.frame_id))?;
                 match (&mosaic_artifact, &current_calib_hash) {
                     (Some(row), Some(hash)) => is_fresh(row, hash),
                     _ => false,
@@ -2129,7 +2191,7 @@ pub fn build_plan(
             let fits_fresh = if metrics_fresh {
                 fits_artifact_fresh(
                     conn,
-                    &subject,
+                    subject,
                     &g.key,
                     f.frame_id,
                     metrics_artifact
@@ -2158,7 +2220,7 @@ pub fn build_plan(
             // info/no registration row/an unparseable payload are all
             // "can't verify" → stale, never assumed fresh.
             if local_normalization_active {
-                let ln_artifact = find_artifact(conn, &subject, &g.key, "ln", Some(f.frame_id))?;
+                let ln_artifact = find_artifact(conn, subject, &g.key, "ln", Some(f.frame_id))?;
                 let ln_fresh = match (&ln_reference_info, &ln_artifact) {
                     (Some(ref_info), Some(row)) => {
                         match ln_registration_by_frame.get(&f.frame_id) {
@@ -2291,7 +2353,7 @@ pub fn build_plan(
     }
 
     let register_stale =
-        compute_register_stale(conn, &cfg, frames_set_id, &groups, &reference, &mut memo)?;
+        compute_register_stale(conn, &cfg, subject, &groups, &reference, &mut memo)?;
 
     let mut stale_stages = Vec::new();
     if calibrate_stale {
@@ -2331,7 +2393,7 @@ pub fn build_plan(
 
     let frame_count: usize = groups.iter().map(|g| g.frames.len()).sum();
     let included_count: usize = plan_groups.iter().map(|g| g.included_count).sum();
-    let active_run_id = active_run_for_subject(conn, &subject)?;
+    let active_run_id = active_run_for_subject(conn, subject)?;
 
     tracing::debug!(
         set_id = frames_set_id,
@@ -2421,7 +2483,14 @@ mod tests {
         }
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(plan.included_count, 3);
         assert!(
@@ -2454,7 +2523,14 @@ mod tests {
         );
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             plan.groups.len(),
@@ -2495,7 +2571,14 @@ mod tests {
         }
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(
             plan.warnings.iter().any(|w| w.contains("noexp.fits")),
@@ -2542,7 +2625,14 @@ mod tests {
         .unwrap();
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 1);
@@ -2607,7 +2697,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -2704,7 +2794,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg.clone()),
         )
         .unwrap();
@@ -2720,7 +2810,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -2800,7 +2890,14 @@ mod tests {
         // call and no previous run — the largest-group fallback is the
         // only source `reference_scale` can come from.
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
@@ -2889,7 +2986,14 @@ mod tests {
         seed_run_frame_rows(&f.conn, f.set_id, Some(small_ids[0]), "auto", &all_ids);
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
@@ -2992,7 +3096,14 @@ mod tests {
         set_set_config(&f.conn, f.set_id, "{}", &excluded_from_big).unwrap();
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
@@ -3092,7 +3203,14 @@ mod tests {
         .unwrap();
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups.len(), 1, "{:?}", plan.groups);
@@ -3129,8 +3247,14 @@ mod tests {
         ids.push(outlier_id);
 
         let settings = SettingsManager::new();
-        let plan_all =
-            build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan_all = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         assert!(
             plan_all
                 .warnings
@@ -3141,7 +3265,14 @@ mod tests {
         );
 
         set_set_config(&f.conn, f.set_id, "{}", &[outlier_id]).unwrap();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         assert!(
             !plan
                 .warnings
@@ -3182,7 +3313,14 @@ mod tests {
         .unwrap();
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.groups[0].pixel_scale_arcsec, None);
@@ -3236,7 +3374,14 @@ mod tests {
         .unwrap();
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(
             !plan.blockers.iter().any(|b| b.code == "masters"),
@@ -3314,8 +3459,14 @@ mod tests {
 
         // Sanity: with the outlier INCLUDED, the unbuildable flat blocks —
         // the existing behaviour this fix must not disturb.
-        let plan_included =
-            build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan_included = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         assert!(
             plan_included.blockers.iter().any(|b| b.code == "masters"),
             "sanity: an unbuildable raw set must block while its only light is included: {:?}",
@@ -3332,7 +3483,14 @@ mod tests {
 
         // Manually exclude the ONLY light that needs the unbuildable flat.
         set_set_config(&f.conn, f.set_id, "{}", &[outlier_id]).unwrap();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         assert!(
             !plan.blockers.iter().any(|b| b.code == "masters"),
             "no included light needs this set any more: {:?}",
@@ -3377,7 +3535,14 @@ mod tests {
         .unwrap();
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(
             plan.masters_to_build.is_empty(),
@@ -3483,7 +3648,14 @@ mod tests {
         .unwrap();
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(
             !plan.blockers.iter().any(|b| b.code == "masterFiles"),
@@ -3772,7 +3944,14 @@ mod tests {
         .unwrap();
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(
             !plan
@@ -3857,7 +4036,14 @@ mod tests {
         }
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(
             plan.masters_to_build.is_empty(),
@@ -3900,7 +4086,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -3926,7 +4112,14 @@ mod tests {
         }
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert!(
             plan.blockers.iter().any(|b| b.code == "frames"),
@@ -3952,13 +4145,26 @@ mod tests {
             ids.push(id);
         }
         let settings = SettingsManager::new();
-        let plan_all =
-            build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan_all = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         assert_eq!(plan_all.included_count, 4);
 
         set_set_config(&f.conn, f.set_id, "{}", &[ids[0]]).unwrap();
 
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(plan.included_count, 3);
         assert_eq!(plan.excluded_frame_ids, vec![ids[0]]);
@@ -3996,7 +4202,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -4018,7 +4224,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg2),
         )
         .unwrap();
@@ -4095,7 +4301,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg.clone()),
         )
         .unwrap();
@@ -4129,7 +4335,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -4439,7 +4645,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg.clone()),
         )
         .unwrap();
@@ -4473,7 +4679,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -4912,7 +5118,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg.clone()),
         )
         .unwrap();
@@ -4933,7 +5139,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg2),
         )
         .unwrap();
@@ -5223,7 +5429,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg.clone()),
         )
         .unwrap();
@@ -5248,7 +5454,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg.clone()),
         )
         .unwrap();
@@ -5282,7 +5488,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg3),
         )
         .unwrap();
@@ -5338,7 +5544,14 @@ mod tests {
         };
 
         // No run at all: stale for the ordinary reason, no story.
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         assert!(
             plan.stale_stages.contains(&Stage::Calibrate),
             "{:?}",
@@ -5352,7 +5565,14 @@ mod tests {
 
         // A finished keepAll run: still no story.
         finished_run(CleanupPolicy::KeepAll, "done");
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         assert!(
             !plan.warnings.iter().any(|w| w.contains("cleanup")),
             "{:?}",
@@ -5361,7 +5581,14 @@ mod tests {
 
         // A finished deleteIntermediates run with nothing cached: named.
         let run_id = finished_run(CleanupPolicy::DeleteIntermediates, "done");
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         let note = plan
             .warnings
             .iter()
@@ -5398,7 +5625,14 @@ mod tests {
             )
             .unwrap();
         }
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         let note = plan
             .warnings
             .iter()
@@ -5420,7 +5654,14 @@ mod tests {
         // An INTERRUPTED deleteIntermediates run never ran its cleanup —
         // no story either.
         finished_run(CleanupPolicy::DeleteIntermediates, "failed");
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         assert!(
             !plan.warnings.iter().any(|w| w.contains("cleanup")),
             "{:?}",
@@ -5558,7 +5799,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -5644,7 +5885,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg.clone()),
         )
         .unwrap();
@@ -5662,7 +5903,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -5754,7 +5995,7 @@ mod tests {
                 &f.conn,
                 &settings,
                 &PathPolicy::AllowAll,
-                f.set_id,
+                &StackSubject::FrameSet(f.set_id),
                 Some(cfg.clone()),
             )
             .unwrap()
@@ -5866,7 +6107,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg.clone()),
         )
         .unwrap();
@@ -5882,7 +6123,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(off),
         )
         .unwrap();
@@ -5904,7 +6145,14 @@ mod tests {
         }
 
         let settings = SettingsManager::new();
-        let plan = build_plan(&f.conn, &settings, &PathPolicy::AllowAll, f.set_id, None).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
         assert!(
             plan.stale_stages.contains(&Stage::Register),
             "{:?}",
@@ -5942,7 +6190,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -5980,7 +6228,7 @@ mod tests {
             &f.conn,
             &settings,
             &PathPolicy::AllowAll,
-            f.set_id,
+            &StackSubject::FrameSet(f.set_id),
             Some(cfg),
         )
         .unwrap();
@@ -6132,5 +6380,75 @@ mod tests {
             calibration_hash_for(&f.conn, &cfg, frame, &mut divisors).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn a_project_plan_is_refused_until_6b2() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let settings = SettingsManager::new();
+        let err = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(ref m) if m == PROJECT_STACKING_UNAVAILABLE),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn subject_label_and_stored_reference_by_subject() {
+        // Frame set: the frames_set name and the frame_set_reference row.
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("l{i}"), t));
+            ids.push(id);
+        }
+        let set = StackSubject::FrameSet(f.set_id);
+        assert_eq!(subject_label(&f.conn, &set).unwrap(), "LDN 1272");
+        assert_eq!(stored_reference_frame(&f.conn, &set).unwrap(), None);
+        set_frame_set_reference(&f.conn, f.set_id, ids[1]).unwrap();
+        assert_eq!(stored_reference_frame(&f.conn, &set).unwrap(), Some(ids[1]));
+        assert!(matches!(
+            subject_label(&f.conn, &StackSubject::FrameSet(f.set_id + 999)),
+            Err(ApiError::NotFound(_))
+        ));
+
+        // Project: the collab_projects title and the handle of the stored uuid.
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        f.conn
+            .execute(
+                "UPDATE collab_projects SET title = 'Orion Mosaic' WHERE project_id = 'p1'",
+                [],
+            )
+            .unwrap();
+        let project = StackSubject::Project("p1".into());
+        assert_eq!(subject_label(&f.conn, &project).unwrap(), "Orion Mosaic");
+        assert!(matches!(
+            subject_label(&f.conn, &StackSubject::Project("nope".into())),
+            Err(ApiError::NotFound(_))
+        ));
+        let handles =
+            crate::db::stacking::project_frame_handles(&f.conn, "p1", &["u1", "u2"]).unwrap();
+        assert_eq!(stored_reference_frame(&f.conn, &project).unwrap(), None);
+        f.conn
+            .execute(
+                "INSERT INTO stacking_project_config (project_id, config_json, reference_frame_uuid, updated_at)
+                 VALUES ('p1', '{}', 'u2', '2026-10-02T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            stored_reference_frame(&f.conn, &project).unwrap(),
+            Some(handles["u2"])
+        );
+        assert!(stored_registrations(&f.conn, &project).unwrap().is_empty());
+        store_registration(&f.conn, &project, |_| panic!("a project stores nothing")).unwrap();
     }
 }
