@@ -81,7 +81,7 @@ use crate::stacking::master_cards::{
     write_drizzled_master, write_master_light, MasterCardInputs, WrittenDrizzle,
 };
 use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
-use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigins};
+use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{cleanup_work, subject_layout, CleanupWhat, WorkingLayout};
 use crate::stacking::plan::{
     build_plan, fits_artifact_fresh, fits_artifact_fresh_for_planes, is_fresh,
@@ -1684,19 +1684,25 @@ fn resolve_calibrate_job(
 
     let spec = {
         let conn = db(&rc.ctx)?.conn();
-        resolve_generation_cached(
-            &conn,
-            frame.frame_id,
-            &calibration_opts,
-            scratch,
-            rc.memo.divisors_mut(),
-        )
+        // Dispatched by origin like the stage-1 hash above: a frame whose id
+        // is not a catalog `frames.id` must never reach this catalog read.
+        match origin_of(&rc.origins, frame.frame_id) {
+            Ok(FrameOrigin::Catalog { .. }) => resolve_generation_cached(
+                &conn,
+                frame.frame_id,
+                &calibration_opts,
+                scratch,
+                rc.memo.divisors_mut(),
+            )
+            .map_err(|e| format!("{e:#}")),
+            Err(e) => Err(e.to_string()),
+        }
     };
     let spec = match spec {
         Ok(s) => s,
         Err(e) => {
             return Ok(CalibrateResolved::Excluded {
-                reason: format!("calibration failed: {e:#}"),
+                reason: format!("calibration failed: {e}"),
             })
         }
     };
