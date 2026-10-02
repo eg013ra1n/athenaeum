@@ -3,7 +3,7 @@ import { Folder, FolderOutput, Loader2 } from 'lucide-react';
 import { api, type UnlistenFn } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
-import { exportCountsText } from '../../utils/exportCounts';
+import { exportCountsText, limitWarnings } from '../../utils/exportCounts';
 import { FolderBrowserModal } from '../FolderBrowserModal';
 import { Button, DialogShell, TextInput } from '../ui';
 import { Checkbox } from '../settings/Checkbox';
@@ -122,7 +122,7 @@ export default function ProjectExportDialog({
       if (res.success) {
         setResult(res);
       } else {
-        // Cancellation and per-publisher aborts arrive as success:false + error.
+        // Cancellation arrives as success:false + error.
         setError(res.error ?? 'Export did not complete.');
       }
     } catch (err) {
@@ -263,15 +263,24 @@ export default function ProjectExportDialog({
             )}
             <p className="mt-0.5 break-all text-[11.5px] text-content-faint">{result.outputDir}</p>
             {result.warnings.length > 0 && (
-              <p className="mt-1 text-[11.5px] text-warning">
-                {result.warnings.length} warning{result.warnings.length === 1 ? '' : 's'} — see the
-                notification history.
-              </p>
+              <div className="mt-2 text-[11.5px] text-warning">
+                <p>
+                  {result.warnings.length} warning{result.warnings.length === 1 ? '' : 's'}
+                </p>
+                <ul className="mt-0.5 list-disc space-y-0.5 pl-4 break-words">
+                  {limitWarnings(result.warnings, 20).shown.map((w, i) => (
+                    <li key={i}>{w}</li>
+                  ))}
+                </ul>
+                {limitWarnings(result.warnings, 20).more > 0 && (
+                  <p className="mt-0.5">and {limitWarnings(result.warnings, 20).more} more</p>
+                )}
+              </div>
             )}
           </div>
         )}
 
-        {/* Inline error (bad path, nothing to export, cancelled, per-publisher abort). */}
+        {/* Inline error (bad path, nothing to export, cancelled). */}
         {error && <p className="mt-4 text-[12.5px] text-error">{error}</p>}
 
         {/* Web mode: folder browser, inside the shell so it shares its portal and stacking context. */}

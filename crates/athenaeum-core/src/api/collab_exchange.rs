@@ -1847,19 +1847,41 @@ pub fn set_project_auto_replicate(
 
 // ── Project-scoped WBPP export (slice 5, "processor payoff") ──────────────────
 
-/// Refuse an export folder that lies inside (or canonicalizes into) the
-/// Collaboration root or any scan root: a computed destination could then land
-/// on another frame's replica or original (the replica is sacred). Works for a
-/// folder that does not exist yet by resolving its deepest existing ancestor.
-fn refuse_output_inside_roots(
+/// Validate the export folder and return the ONE resolved path the export
+/// uses. Rejects a relative path and any `.`/`..` component (they defeat the
+/// ancestor resolution below). The deepest existing ancestor is canonicalized
+/// so a symlinked or not-yet-created folder resolves honestly.
+///
+/// Then refuses when the folder the organizer will actually write into
+/// (`<resolved>/<sanitized title>`) is inside or equal to the Collaboration
+/// root or any scan root, OR contains one: a computed destination could
+/// otherwise land on a replica or an original (the replica is sacred), and the
+/// scanner would catalog other members' patched frames as the user's own.
+/// A project that is not in the cache skips the title check (the collector
+/// refuses it right after).
+fn resolve_export_dir(
     conn: &rusqlite::Connection,
+    project_id: &str,
     output_dir: &str,
-) -> Result<(), ApiError> {
+) -> Result<PathBuf, ApiError> {
+    use std::path::Component;
     let raw = output_dir.trim();
     let candidate = Path::new(raw);
     if raw.is_empty() || !candidate.is_absolute() {
         return Err(ApiError::Invalid(
             "Export folder: enter an absolute path".into(),
+        ));
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        tracing::warn!(
+            output_dir = raw,
+            "project export refused: path has . or .. components"
+        );
+        return Err(ApiError::Invalid(
+            "Export folder: the path must not contain \".\" or \"..\" components".into(),
         ));
     }
     let resolve = |p: &Path| -> PathBuf {
@@ -1881,23 +1903,50 @@ fn refuse_output_inside_roots(
         }
     };
     let out = resolve(candidate);
+    let title_dir = match crate::db::collab::get_project(conn, project_id)? {
+        Some(p) => out.join(crate::export::models::sanitize_display_folder_name(
+            &p.title,
+        )),
+        None => out.clone(),
+    };
     let roots = crate::db::get_scan_roots(conn)
         .map_err(|e| ApiError::Internal(format!("read scan roots: {e:#}")))?;
     for root in roots {
         let root_path = resolve(Path::new(&root.path));
-        if out.starts_with(&root_path) {
+        if title_dir.starts_with(&root_path) || root_path.starts_with(&title_dir) {
             tracing::warn!(
                 output_dir = %out.display(),
                 path = %root_path.display(),
-                "project export refused: output folder is inside a root"
+                "project export refused: export folder overlaps a root"
             );
             return Err(ApiError::Invalid(format!(
-                "Export folder must not be inside a monitored or Collaboration folder ({}): the export could overwrite catalogued files.",
+                "The export folder ({}) must not be inside, or contain, a monitored or Collaboration folder ({}): the export could overwrite catalogued files.",
+                title_dir.display(),
                 root_path.display()
             )));
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// Holds the project-export slot. Dropping it (normal end, a panic, or the
+/// handler future being dropped on a client disconnect) frees the slot and
+/// raises the cancel flag so an orphaned organizer stops at its next frame.
+struct ExportSlot {
+    registry: Arc<std::sync::Mutex<HashMap<i64, crate::services::ExportHandle>>>,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ExportSlot {
+    fn drop(&mut self) {
+        self.cancel_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut exports = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        exports.remove(&crate::export::project_organizer::PROJECT_EXPORT_SENTINEL);
+    }
 }
 
 /// The project export: collect, then lay every frame under
@@ -1921,15 +1970,15 @@ pub async fn export_project_for_wbpp(
     use crate::export::project_organizer::PROJECT_EXPORT_SENTINEL as SENTINEL;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    {
+    let resolved_out = {
         let db = db(ctx)?;
         let conn = db.conn();
-        refuse_output_inside_roots(&conn, output_dir)?;
-    }
+        resolve_export_dir(&conn, project_id, output_dir)?
+    };
 
     // Register the cancel flag under the sentinel (the registry is core-resident).
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
+    let slot = {
         let mut exports = ctx
             .active_exports
             .lock()
@@ -1949,11 +1998,16 @@ pub async fn export_project_for_wbpp(
                 cancel_flag: cancel_flag.clone(),
             },
         );
-    }
+        ExportSlot {
+            registry: ctx.active_exports.clone(),
+            cancel_flag: cancel_flag.clone(),
+        }
+    };
 
-    // The whole export runs inside a scoped block so the terminal event AND the
-    // deregister below fire on every path (success, collector error, organize
-    // error) — never swallowed.
+    // The whole export runs inside a scoped block so the terminal event fires
+    // on every path that returns (success, collector error, organize error).
+    // The slot is an RAII guard, so it is also freed if this future is dropped
+    // or panics (no terminal event is possible then).
     let outcome: Result<ExportResult, ApiError> = async {
         if let Some(e) = emitter.as_deref() {
             crate::events::emit_event(
@@ -2008,7 +2062,7 @@ pub async fn export_project_for_wbpp(
             .map_err(|e| ApiError::Internal(format!("collect join error: {e}")))??
         };
 
-        let title_dir = Path::new(output_dir)
+        let title_dir = resolved_out
             .join(crate::export::models::sanitize_display_folder_name(&data.title));
         let organized = {
             let pubs = data.publishers.clone();
@@ -2050,10 +2104,8 @@ pub async fn export_project_for_wbpp(
     }
     .await;
 
-    // Deregister on every path.
-    if let Ok(mut exports) = ctx.active_exports.lock() {
-        exports.remove(&SENTINEL);
-    }
+    // Free the slot before the terminal event.
+    drop(slot);
 
     // Terminal event (success or failure), never swallowed.
     if let Some(e) = emitter.as_deref() {
@@ -2326,6 +2378,28 @@ mod tests {
             ctx.active_exports.lock().unwrap().contains_key(&-1),
             "the running export's handle is left alone"
         );
+    }
+
+    /// A dropped runner future must free the slot (no permanent lockout).
+    #[tokio::test]
+    async fn a_dropped_project_export_frees_the_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let landed = tmp.path().join("Collab").join("Alice").join("L_0001.fits");
+        seed_landed_frame(&ctx, &landed);
+        let out = tmp.path().join("out");
+        let out_str = out.to_string_lossy().into_owned();
+        let fut = export_project_for_wbpp(&ctx, "p-1", &out_str, false, None);
+        let timed = tokio::time::timeout(std::time::Duration::ZERO, fut).await;
+        assert!(timed.is_err(), "the first poll must not finish the export");
+        assert!(
+            ctx.active_exports.lock().unwrap().is_empty(),
+            "dropping the future freed the slot"
+        );
+        let r = export_project_for_wbpp(&ctx, "p-1", &out.to_string_lossy(), false, None)
+            .await
+            .unwrap();
+        assert!(r.success, "{:?}", r.error);
     }
 
     /// An output folder inside the Collaboration root or a scan root is refused

@@ -14,3 +14,11 @@ export function exportCountsText(c: {
     .filter(Boolean)
     .join(' · ');
 }
+
+/** The first `limit` warnings, then "and N more" / "+N more" tail text. */
+export function limitWarnings(
+  warnings: string[],
+  limit: number,
+): { shown: string[]; more: number } {
+  return { shown: warnings.slice(0, limit), more: Math.max(0, warnings.length - limit) };
+}

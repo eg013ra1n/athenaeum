@@ -68,7 +68,7 @@ describe('ProjectExportDialog', () => {
       cmd === 'export_collab_project'
         ? Promise.resolve({
             success: true, filesOrganized: 3, linked: 1, copied: 0, rewritten: 2, failed: 0,
-            outputDir: '/o', warnings: [], scriptsGenerated: [], error: null,
+            outputDir: '/o', warnings: ['Failed to export a.fits: boom'], scriptsGenerated: [], error: null,
           })
         : Promise.resolve(null)) as never);
     render(<ProjectExportDialog projectId="p" onClose={vi.fn()} />);
@@ -76,5 +76,6 @@ describe('ProjectExportDialog', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /Export$/ })).not.toBeDisabled());
     fireEvent.click(screen.getByRole('button', { name: /Export$/ }));
     expect(await screen.findByText('1 linked · 2 with FILTER rewritten')).toBeInTheDocument();
+    expect(screen.getByText('Failed to export a.fits: boom')).toBeInTheDocument();
   });
 });
