@@ -5982,4 +5982,83 @@ mod tests {
             plan.blockers
         );
     }
+
+    /// Spec 2026-10-02 §8 / plan 6b-1 Task 1 (fable C1): every stage hash of
+    /// fixed configs, computed through the SAME pure formula the plan uses,
+    /// pinned to literals recorded on `main` BEFORE `calibration_subtree`
+    /// stopped serializing `grouping` whole. A later config field that leaks
+    /// into a stage subtree moves one of these and fails here, instead of
+    /// silently recomputing every frame set's cache on its next run.
+    #[test]
+    fn stage_hashes_are_pinned_to_golden_literals() {
+        use crate::stacking::config::{
+            calibration_subtree, preset, stage_hash, SourceIdentity, StackingPreset,
+        };
+        let mut custom = StackingConfig::default();
+        custom.grouping.exposure_tolerance_sec = 5.0;
+        custom.normalization.local.enabled = true;
+        custom.registration.distortion = crate::stacking::register::DistortionChoice::Tps;
+        let configs = [
+            ("default", StackingConfig::default()),
+            ("fastPreview", preset(StackingPreset::FastPreview)),
+            ("maximumQuality", preset(StackingPreset::MaximumQuality)),
+            ("custom", custom),
+        ];
+        let masters = [
+            "/m/dark.fits|100|2026-01-01T00:00:00+00:00",
+            "/m/flat.fits|200|2026-01-01T00:00:00+00:00",
+        ];
+        let src = || {
+            [SourceIdentity {
+                file_id: 42,
+                size: 123_456,
+                modified_at: "2026-01-01T00:00:00Z".into(),
+            }]
+        };
+        let calib_k = crate::stacking::ln::SeedsCalibration {
+            frame_ids: vec![11, 22],
+            k: vec![0.994],
+        };
+        let mut got = Vec::new();
+        for (name, cfg) in &configs {
+            let calib = stage_hash(&calibration_subtree(cfg), &masters, &src());
+            let meas = measurement_hash_for(cfg, &calib);
+            let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas);
+            let ln_ref =
+                normalization_hash_for(cfg, "r1,r2", "m1,m2", &[11, 22], "", None, Some(1.5));
+            let ln = normalization_hash_for(
+                cfg,
+                &reg,
+                &meas,
+                &[11, 22],
+                &ln_ref,
+                Some(&calib_k),
+                Some(1.5),
+            );
+            let ln_cal = seeds_calibration_hash_for(
+                cfg,
+                &ln_ref,
+                &[(11, "r1", "m1"), (22, "r2", "m2")],
+                Some(1.5),
+            );
+            got.push(format!(
+                "{name}: calib={calib} meas={meas} reg={reg} ln_ref={ln_ref} ln={ln} ln_cal={ln_cal}"
+            ));
+        }
+        // GOLDEN: recorded on main 17e2e96e before the Task 1 edit.
+        assert_eq!(
+            got,
+            vec![
+                "default: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=d30b801f5d97b6ca ln_ref=004b8d8e1d474def ln=97b19ecf5b4bc774 ln_cal=0c2d2df3876ece32",
+                "fastPreview: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=8c11c39a4715fa26 ln_ref=004b8d8e1d474def ln=5aa2e757a576257b ln_cal=0c2d2df3876ece32",
+                "maximumQuality: calib=f3cf4be2b2178358 meas=42d4b9fb12cf554e reg=6cc95c58dfa40ee0 ln_ref=75c6f0835d9d9cab ln=d8259ff416645417 ln_cal=60a1d2b69a0b80f9",
+                "custom: calib=2b725e5e99c87f49 meas=ba5d1831b34dccf8 reg=ed7dc06cf6f32c9b ln_ref=75c6f0835d9d9cab ln=3d958bff2ee0136e ln_cal=60a1d2b69a0b80f9",
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&calibration_subtree(&StackingConfig::default())["grouping"])
+                .unwrap(),
+            r#"{"exposureToleranceSec":2.0}"#
+        );
+    }
 }
