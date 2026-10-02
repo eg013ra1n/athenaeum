@@ -4,6 +4,7 @@ import { api } from '../../../api';
 import { Checkbox } from '../../settings/Checkbox';
 import { Button, DialogShell, TextArea } from '../../ui';
 import ProjectFrameTable, { type TableAction } from './table/ProjectFrameTable';
+import FilterRemapSection from './FilterRemapSection';
 import { fromLibrary, fromModeration, type FrameVM } from './frames';
 import type { ModerationFrameView, ProjectFrameView } from '../../../types/models';
 
@@ -50,6 +51,8 @@ function byUuid(library: ProjectFrameView[] | null): ReadonlyMap<string, Project
  */
 export default function ModerationTab({
   projectId,
+  canModerate,
+  canRemap,
   requireApproval,
   library,
   libraryError,
@@ -59,6 +62,10 @@ export default function ModerationTab({
   syncToken,
 }: {
   projectId: string;
+  /** Review and Excluded sections (coordinator or `data.moderate`). */
+  canModerate: boolean;
+  /** The Filters section (plan ruling P10). */
+  canRemap: boolean;
   requireApproval: boolean;
   library: ProjectFrameView[] | null;
   libraryError: boolean;
@@ -98,9 +105,9 @@ export default function ModerationTab({
   }, [projectId]);
 
   useEffect(() => {
-    if (!requireApproval) return;
+    if (!requireApproval || !canModerate) return;
     void load();
-  }, [load, requireApproval, syncToken]);
+  }, [load, requireApproval, canModerate, syncToken]);
 
   const mirror = byUuid(library);
   const rows: FrameVM[] = (items ?? []).map((m) => fromModeration(m, mirror));
@@ -233,6 +240,8 @@ export default function ModerationTab({
 
   return (
     <>
+      {canModerate && (
+      <>
       <>
         <h3 className={HEADER}>Waiting for review</h3>
         {error && <p className="text-[12.5px] text-error">{error}</p>}
@@ -288,6 +297,9 @@ export default function ModerationTab({
           />
         )}
       </>
+      </>
+      )}
+      {canRemap && <FilterRemapSection projectId={projectId} syncToken={syncToken} />}
     </>
   );
 }

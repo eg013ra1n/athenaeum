@@ -10,6 +10,7 @@ import type {
   CollabFrameChanged,
   CollabFrameLost,
   CollabPublishFinished,
+  CollabRemapFinished,
   ProjectCard,
 } from '../types/models';
 
@@ -185,6 +186,38 @@ describe('useCollabNotifications', () => {
     const toasts = await screen.findAllByRole('status');
     expect(toasts).toHaveLength(1);
     expect(toasts[0]).toHaveTextContent('c_a.fits changed on disk and was set aside');
+  });
+
+  describe('remap notifications', () => {
+    type Stored = { title: string; detail: string; hasErrors?: boolean };
+    const history = (): Stored[] =>
+      (JSON.parse(localStorage.getItem('athenaeum.notifications.v1') ?? '{"notifications":[]}') as { notifications: Stored[] })
+        .notifications;
+
+    it('a remapped feed change is a history-only entry (no toast)', async () => {
+      renderHarness();
+      await settle();
+      emit('collab-frames-changed', { projectId: 'proj-1', kind: 'remapped', count: 3 });
+      expect(history()[0].title).toBe('3 of your frames remapped in M42 Mosaic');
+      expect(screen.queryAllByRole('status')).toHaveLength(0);
+    });
+
+    it('a finished remap with an error notifies with hasErrors', async () => {
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      renderHarness();
+      await settle();
+      const f: CollabRemapFinished = { projectId: 'proj-1', canonical: 'R', done: 2, failed: 0, total: 5, cancelled: false, error: 'hub down' };
+      emit('collab-remap-finished', f);
+      expect(history()[0]).toMatchObject({ title: 'Filter remap stopped', detail: 'hub down', hasErrors: true });
+      err.mockRestore();
+    });
+
+    it('a finished remap reports the count and the project', async () => {
+      renderHarness();
+      await settle();
+      emit('collab-remap-finished', { projectId: 'proj-1', canonical: 'R', done: 5, failed: 1, total: 6, cancelled: false, error: null });
+      expect(history()[0]).toMatchObject({ title: 'Remapped 5 frames to R', detail: 'M42 Mosaic · 1 failed' });
+    });
   });
 
   describe('collab-publish-finished (spec 5.4)', () => {

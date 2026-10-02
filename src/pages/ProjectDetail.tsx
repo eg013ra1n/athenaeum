@@ -496,7 +496,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
     ...(canReceive ? (['library'] as const) : []),
     'members',
     'exchange',
-    ...(canModerate ? (['moderation'] as const) : []),
+    ...(canModerate || c.canRemap ? (['moderation'] as const) : []),
   ];
   const requested = resolveTab(storedTab) ?? 'overview';
   const activeTab: Tab = tabs.includes(requested) ? requested : 'overview';
@@ -504,7 +504,7 @@ function ProjectPage({ id }: { id: string | undefined }) {
   const badge: Partial<Record<Tab, { n: number; text: string; warn?: boolean }>> = {
     mine: { n: readyCount + reviewCount, text: [readyCount > 0 && `${readyCount} ready`, reviewCount > 0 && `${reviewCount} to review`].filter(Boolean).join(' · ') },
     library: { n: toCome, text: `${toCome} to go` },
-    moderation: { n: c.pendingFrames, text: String(c.pendingFrames), warn: true },
+    moderation: canModerate ? { n: c.pendingFrames, text: String(c.pendingFrames), warn: true } : { n: 0, text: '' },
   };
 
   // The republish guard's figures and the ids it sends. "All" = the
@@ -793,6 +793,8 @@ function ProjectPage({ id }: { id: string | undefined }) {
               <ModerationTab
                 projectId={id}
                 syncToken={syncToken}
+                canModerate={canModerate}
+                canRemap={c.canRemap}
                 requireApproval={c.requireApproval}
                 library={canReceive ? frames : []}
                 libraryError={framesError}

@@ -1171,6 +1171,14 @@ describe('ProjectDetail tabs', () => {
     expect(within(drawer).getByRole('button', { name: 'Restore' })).toBeInTheDocument();
   });
 
+  it('a member with canRemap only sees the Moderation tab, without the pending badge (P10)', async () => {
+    mockCommands(projectCard({ coordinator: false, canModerate: false, canRemap: true, requireApproval: true, pendingFrames: 2 }), {
+      list_collab_frames: () => Promise.resolve([]),
+    });
+    renderProjectDetail();
+    expect(await screen.findByRole('tab', { name: 'Moderation' })).toBeInTheDocument();
+  });
+
   it('a member with canModerate: false sees none of these', async () => {
     const eligible = libraryFrame({ frameUuid: 'lib-1', fileName: 'alice_001.fits', accepted: true });
     const excluded = libraryFrame({

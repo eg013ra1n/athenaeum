@@ -85,6 +85,8 @@ function renderTab(
     requireApproval?: boolean;
     libraryError?: boolean;
     syncToken?: number;
+    canModerate?: boolean;
+    canRemap?: boolean;
   } = {},
 ) {
   const onDecided = overrides.onDecided ?? vi.fn();
@@ -95,6 +97,8 @@ function renderTab(
     <SessionStateProvider>
       <ModerationTab
         projectId="proj-1"
+        canModerate={overrides.canModerate ?? true}
+        canRemap={overrides.canRemap ?? false}
         requireApproval={requireApproval}
         library={library}
         libraryError={libraryError}
@@ -127,6 +131,22 @@ function restoreCalls(): { projectId: string; frameUuid: string }[] {
     .mock.calls.filter(([cmd]) => cmd === 'restore_collab_frame')
     .map(([, args]) => args as { projectId: string; frameUuid: string });
 }
+
+describe('ModerationTab — visibility (P10)', () => {
+  it('canRemap only: renders just the Filters section', async () => {
+    renderTab(null, { canModerate: false, canRemap: true });
+    expect(await screen.findByText('Filters')).toBeInTheDocument();
+    expect(screen.queryByText('Waiting for review')).not.toBeInTheDocument();
+    expect(screen.queryByText('Excluded frames')).not.toBeInTheDocument();
+    expect(vi.mocked(api.invoke)).not.toHaveBeenCalledWith('list_collab_moderation', expect.anything());
+  });
+
+  it('canModerate only: no Filters section', async () => {
+    renderTab();
+    await screen.findByText('Waiting for review');
+    expect(screen.queryByText('Filters')).not.toBeInTheDocument();
+  });
+});
 
 describe('ModerationTab — empty and load', () => {
   it('shows the empty text when nothing is pending', async () => {
@@ -458,6 +478,8 @@ describe('ModerationTab — sync token', () => {
       <SessionStateProvider>
         <ModerationTab
           projectId="proj-1"
+          canModerate
+          canRemap={false}
           requireApproval
           library={null}
           libraryError={false}

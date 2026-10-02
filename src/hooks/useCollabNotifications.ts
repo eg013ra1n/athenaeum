@@ -17,6 +17,7 @@ import type {
   CollabFramesChange,
   CollabFramesLanded,
   CollabPublishFinished,
+  CollabRemapFinished,
   ProjectCard,
 } from '../types/models';
 
@@ -102,6 +103,16 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
         detail: 'A member republished a new version.',
         kind: 'project',
         link,
+      });
+      break;
+    case 'remapped':
+      // Own frames only (plan ruling P12): history entry, no toast.
+      notify({
+        title: `${n} of your ${plural} remapped in ${title}`,
+        detail: 'A coordinator changed their canonical filter. Files are unchanged.',
+        kind: 'project',
+        link,
+        toast: false,
       });
       break;
     default:
@@ -389,6 +400,41 @@ export function useCollabNotifications() {
         else unlisten = fn;
       })
       .catch((err) => console.error('[collab] publish-finished listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [notify]);
+
+  // `collab-remap-finished` — the ONE outcome notification of a coordinator's
+  // filter remap run (never on `collab-remap-progress`).
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<CollabRemapFinished>('collab-remap-finished', (f) => {
+        if (cancelled) return;
+        const title = titleFor(f.projectId);
+        const link = `/projects/${f.projectId}?tab=moderation`;
+        if (f.error) {
+          console.error('[collab] filter remap stopped:', f.error);
+          notify({ title: 'Filter remap stopped', detail: f.error, kind: 'project', tone: 'warning', hasErrors: true, link });
+          return;
+        }
+        const failed = f.failed ? ` · ${f.failed} failed` : '';
+        notify({
+          title: f.cancelled ? 'Filter remap cancelled' : `Remapped ${f.done} frames to ${f.canonical}`,
+          detail: f.cancelled ? `${title} · ${f.done} of ${f.total} remapped to ${f.canonical}${failed}` : `${title}${failed}`,
+          kind: 'project',
+          tone: f.cancelled || f.failed ? 'warning' : 'success',
+          link,
+        });
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[collab] remap-finished listen failed:', err));
     return () => {
       cancelled = true;
       unlisten?.();
