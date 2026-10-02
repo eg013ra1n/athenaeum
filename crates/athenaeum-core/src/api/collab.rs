@@ -146,6 +146,12 @@ pub struct ProjectCard {
     /// `data.moderate` capability ([`can_moderate`]) — the moderation
     /// surface (exclude/restore/reject) checks this, not `coordinator`.
     pub can_moderate: bool,
+    /// True for the coordinator, or for an account holding `thresholds.edit`
+    /// — the filter-remap surface checks this.
+    pub can_remap: bool,
+    /// True for the coordinator, or for an account holding `project.edit` —
+    /// the grid-editing surface checks this.
+    pub can_edit_grid: bool,
     pub require_approval: bool,
     pub pending_frames: i64,
     pub project_status: String,
@@ -1064,7 +1070,9 @@ pub struct FilterMappingEdit {
     pub canonical: Option<String>,
 }
 
-pub(crate) fn project_dictionary(project: &CollabProjectRow) -> Result<Vec<DictionaryEntry>, ApiError> {
+pub(crate) fn project_dictionary(
+    project: &CollabProjectRow,
+) -> Result<Vec<DictionaryEntry>, ApiError> {
     match &project.dictionary_json {
         Some(json) => serde_json::from_str(json).map_err(|e| {
             tracing::error!(project_id = %project.project_id, error = %e, "cached filter dictionary does not parse");
@@ -2111,12 +2119,11 @@ fn device_for_cards(ctx: &ServiceContext) -> Option<String> {
     }
 }
 
-/// True for the coordinator, or for a member whose cached `gov_caps_json`
-/// (the hub's governance caps, wholesale-refreshed by `upsert_project`)
-/// contains `"data.moderate"`. A `gov_caps_json` that fails to parse is
-/// `warn!`-logged and read as no caps — never moderator through a malformed
-/// cache row.
-fn can_moderate(is_coordinator: bool, gov_caps_json: &str) -> bool {
+/// True for the coordinator (every cap is implicit), or when the cached
+/// `gov_caps_json` (the hub's governance caps, wholesale-refreshed by
+/// `upsert_project`) contains `cap`. A malformed cache row is `warn!`-logged
+/// and read as no caps.
+fn has_cap(is_coordinator: bool, gov_caps_json: &str, cap: &str) -> bool {
     if is_coordinator {
         return true;
     }
@@ -2127,7 +2134,13 @@ fn can_moderate(is_coordinator: bool, gov_caps_json: &str) -> bool {
             Vec::new()
         }
     };
-    caps.iter().any(|c| c == "data.moderate")
+    caps.iter().any(|c| c == cap)
+}
+
+/// The `data.moderate` capability — never moderator through a malformed
+/// cache row.
+fn can_moderate(is_coordinator: bool, gov_caps_json: &str) -> bool {
+    has_cap(is_coordinator, gov_caps_json, "data.moderate")
 }
 
 /// Build a [`ProjectCard`] from a cached row, computing the live counts.
@@ -2153,6 +2166,8 @@ fn card_from_row(
         _ => false,
     };
     let can_moderate = can_moderate(row.is_coordinator, &row.gov_caps_json);
+    let can_remap = has_cap(row.is_coordinator, &row.gov_caps_json, "thresholds.edit");
+    let can_edit_grid = has_cap(row.is_coordinator, &row.gov_caps_json, "project.edit");
     let gate = evaluate_project_gate(ctx, &row.project_id)?;
     let synced_at = crate::api::collab_live::live_synced_at(ctx, &row.project_id);
     Ok(ProjectCard {
@@ -2162,6 +2177,8 @@ fn card_from_row(
         data_role: row.data_role,
         coordinator: row.is_coordinator,
         can_moderate,
+        can_remap,
+        can_edit_grid,
         require_approval: row.require_approval,
         pending_frames: row.pending_frames,
         project_status: row.project_status,
@@ -7601,6 +7618,20 @@ pub(crate) mod tests {
             feed_epoch: None,
             holder_seq: -1,
         }
+    }
+
+    #[test]
+    fn card_caps_follow_the_cached_governance_caps() {
+        assert!(
+            has_cap(true, "[]", "thresholds.edit"),
+            "the coordinator holds every cap"
+        );
+        assert!(has_cap(false, r#"["thresholds.edit"]"#, "thresholds.edit"));
+        assert!(!has_cap(false, r#"["data.moderate"]"#, "project.edit"));
+        assert!(
+            !has_cap(false, "not json", "data.moderate"),
+            "a malformed cache row is no caps"
+        );
     }
 
     /// A non-coordinator holding `data.moderate` can moderate.

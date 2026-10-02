@@ -33,6 +33,8 @@ function projectCard(overrides: Partial<ProjectCard>): ProjectCard {
     dataRole: 'send_receive',
     coordinator: false,
     canModerate: false,
+    canRemap: false,
+    canEditGrid: false,
     requireApproval: false,
     pendingFrames: 0,
     projectStatus: 'open',

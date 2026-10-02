@@ -1556,7 +1556,17 @@ export type ProjectCard = { projectId: string, slug: string, title: string, data
  * `data.moderate` capability ([`can_moderate`]) — the moderation
  * surface (exclude/restore/reject) checks this, not `coordinator`.
  */
-canModerate: boolean, requireApproval: boolean, pendingFrames: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
+canModerate: boolean, 
+/**
+ * True for the coordinator, or for an account holding `thresholds.edit`
+ * — the filter-remap surface checks this.
+ */
+canRemap: boolean, 
+/**
+ * True for the coordinator, or for an account holding `project.edit` —
+ * the grid-editing surface checks this.
+ */
+canEditGrid: boolean, requireApproval: boolean, pendingFrames: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
 /**
  * D3 §3.3: this device auto-downloads the project's published contributions
  * (default ON). Local preference — `set_project_auto_replicate` writes it.
@@ -1799,7 +1809,7 @@ receivedFromDevice: string | null,
  */
 receivedFromMember: string | null, };
 
-export type FramesChangeKind = "newFrames" | "pendingFrames" | "approved" | "rejected" | "excluded" | "newVersions";
+export type FramesChangeKind = "newFrames" | "pendingFrames" | "approved" | "rejected" | "excluded" | "newVersions" | "remapped";
 
 export type CollabFramesChange = { projectId: string, kind: FramesChangeKind, count: number, };
 

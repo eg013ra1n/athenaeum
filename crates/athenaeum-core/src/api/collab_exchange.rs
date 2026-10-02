@@ -108,6 +108,8 @@ pub enum FramesChangeKind {
     Excluded,
     /// Another member published a new content version of a frame.
     NewVersions,
+    /// My frames' canonical filter was changed by a coordinator remap (P12).
+    Remapped,
 }
 
 impl FramesChangeKind {
@@ -120,6 +122,7 @@ impl FramesChangeKind {
             FramesChangeKind::Rejected => "rejected",
             FramesChangeKind::Excluded => "excluded",
             FramesChangeKind::NewVersions => "newVersions",
+            FramesChangeKind::Remapped => "remapped",
         }
     }
 }
@@ -427,6 +430,9 @@ pub(crate) fn classify_frame_change(
     }
     if prev.is_some_and(|p| p.accepted) && !v.accepted {
         out.push(K::Excluded);
+    }
+    if v.own && prev.is_some_and(|p| p.filter_canonical != v.filter_canonical) {
+        out.push(K::Remapped);
     }
     out
 }
@@ -3402,6 +3408,19 @@ mod tests {
                 )
                 .is_empty(),
                 "an unchanged row is no change"
+            );
+            let mut p = prev(own, "published", true, 1);
+            p.filter_canonical = "Lum".into();
+            assert_eq!(
+                classify_frame_change(Some(&p), &view(true, "published", true, 1)),
+                vec![K::Remapped]
+            );
+            let mut r = prev(rep, "published", true, 1);
+            r.filter_canonical = "Lum".into();
+            assert!(
+                !classify_frame_change(Some(&r), &view(false, "published", true, 1))
+                    .contains(&K::Remapped),
+                "others' remaps notify nothing (P12)"
             );
         }
     }
