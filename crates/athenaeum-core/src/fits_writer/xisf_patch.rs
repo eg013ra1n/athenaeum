@@ -102,7 +102,7 @@ fn note_location(
                 "distributed XISF (data blocks in external files) is not supported",
             ));
         }
-        let Some(rest) = body.strip_prefix("attachment:") else {
+        let Some(rest) = l.strip_prefix("attachment:") else {
             continue;
         };
         let begin = (raw.as_ptr() as usize)
@@ -110,11 +110,16 @@ fn note_location(
             .filter(|b| b + raw.len() <= xml.len())
             .ok_or_else(|| malformed("XISF location offset outside the header"))?;
         let mut parts = rest.split(':');
-        if let (Some(Ok(p)), Some(Ok(s))) = (
+        match (
             parts.next().map(|p| p.trim().parse()),
             parts.next().map(|s| s.trim().parse()),
         ) {
-            out.push((begin..begin + raw.len(), p, s));
+            (Some(Ok(p)), Some(Ok(s))) => out.push((begin..begin + raw.len(), p, s)),
+            _ => {
+                return Err(malformed(format!(
+                    "XISF attachment location is not pos:size: {body:?}"
+                )))
+            }
         }
     }
     Ok(())
@@ -264,7 +269,9 @@ fn apply(xml: &str, parsed: &Parsed, edits: &[XisfEdit]) -> String {
             }
         }
     }
-    splices.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    // Back to front; at equal starts the non-empty range goes first so a
+    // zero-width insert never sits inside a later replacement.
+    splices.sort_by(|a, b| b.0.start.cmp(&a.0.start).then(b.0.end.cmp(&a.0.end)));
     let mut out = xml.to_string();
     for (r, text) in splices {
         out.replace_range(r, &text);
@@ -615,5 +622,57 @@ mod tests {
             "no tmp left"
         );
         assert!(read_xisf_keyword(&src, "FILTER").is_err());
+    }
+
+    #[test]
+    fn an_insert_and_a_property_replacement_at_the_same_offset_compose() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("adj.xisf");
+        let xml = "<?xml version=\"1.0\"?>\n<xisf version=\"1.0\">\n<Image geometry=\"1:1:1\" sampleFormat=\"UInt8\" location=\"attachment:{POS}:{SIZE}\"><Property id=\"Instrument:Filter:Name\" type=\"String\" value=\"Red\"/></Image>\n</xisf>\n";
+        std::fs::write(&src, xisf(xml, &[7], &[])).unwrap();
+        let dest = dir.path().join("o.xisf");
+        patch_xisf_keywords(
+            &src,
+            &dest,
+            &[
+                filter_edit("R", "was unset"),
+                XisfEdit::PropertyIfPresent {
+                    id: "Instrument:Filter:Name".into(),
+                    value: "R".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            read_xisf_keyword(&dest, "FILTER").unwrap().as_deref(),
+            Some("R")
+        );
+        let mut f = File::open(&dest).unwrap();
+        let (out, _) = read_header(&mut f).unwrap();
+        assert_eq!(out.matches("Instrument:Filter:Name").count(), 1, "{out}");
+        assert!(
+            out.contains(r#"id="Instrument:Filter:Name" type="String" value="R""#),
+            "{out}"
+        );
+        assert!(!out.contains("Red"), "{out}");
+        assert_eq!(blocks(&src), blocks(&dest));
+    }
+
+    #[test]
+    fn an_unparseable_attachment_location_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        for loc in [
+            "attachment:4096:1&#x20;x",
+            " attachment:4096",
+            "attachment:abc:1",
+        ] {
+            let src = dir.path().join("bad.xisf");
+            let xml = format!("<?xml version=\"1.0\"?>\n<xisf version=\"1.0\">\n<Image geometry=\"1:1:1\" sampleFormat=\"UInt8\" location=\"{loc}\"/>\n</xisf>\n");
+            std::fs::write(&src, xisf(&xml, &[1], &[])).unwrap();
+            let dest = dir.path().join("o.xisf");
+            let err = patch_xisf_keywords(&src, &dest, &[filter_edit("R", "")]).unwrap_err();
+            assert!(err.to_string().contains("not pos:size"), "{loc}: {err}");
+            assert!(!dest.exists());
+        }
     }
 }
