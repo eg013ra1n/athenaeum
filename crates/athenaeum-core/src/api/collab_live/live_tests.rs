@@ -1534,7 +1534,9 @@ async fn a_burst_of_pull_events_is_folded_into_few_pulls() {
     let w = ts::two_instances().await;
     let uuids: Vec<String> = (0..300).map(|i| format!("burst-{i:03}")).collect();
     let refs: Vec<&str> = uuids.iter().map(String::as_str).collect();
-    // Never inlined: every event below asks for a pull.
+    // B moderates, so it stores pending rows (a plain member does not);
+    // never inlined: every event below asks for a pull.
+    w.hub.set_caps(ts::PID, "acc-b", &["data.moderate"]);
     w.hub.seed_frames(ts::PID, "acc-a", &refs, "pending");
     let target = w.hub.version(ts::PID);
     wait_feed_version(&w.b.ctx, target, Duration::from_secs(20)).await;
@@ -1547,10 +1549,23 @@ async fn a_burst_of_pull_events_is_folded_into_few_pulls() {
     let target = w.hub.version(ts::PID);
     wait_feed_version(&w.b.ctx, target, Duration::from_secs(60)).await;
     let pulls = w.hub.requests_to(&manifest).await - before;
-    eprintln!("burst: {pulls} manifest pulls for 300 events");
     assert!(
         pulls > 0 && pulls < 100,
         "{pulls} manifest pulls for 300 events"
+    );
+    // Every row arrived, not just the cursor.
+    let db = crate::api::db(&w.b.ctx).unwrap();
+    let rows = crate::db::collab_frames::list_for_project(&db.conn(), ts::PID).unwrap();
+    let stale: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.filter_canonical != "R")
+        .map(|r| r.frame_uuid.as_str())
+        .collect();
+    assert_eq!(rows.len(), 300, "all 300 frames are in B's catalog");
+    assert!(
+        stale.is_empty(),
+        "{} rows not updated: {stale:?}",
+        stale.len()
     );
 }
 

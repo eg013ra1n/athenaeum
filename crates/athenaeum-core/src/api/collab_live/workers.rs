@@ -825,40 +825,76 @@ mod tests {
         assert!(matches!(&q[1], FeedWork::Event(LiveEvent::Project(e)) if e.version == 4));
     }
 
-    /// Plan P7 / Review Focus 5 at worker level: a burst of pull-needing
-    /// events with a `hello` and another project's event interleaved is
-    /// applied through `run`, costs fewer pulls than events, and `pending`
-    /// returns to zero (one decrement per ORIGINAL event).
+    /// Plan P7 / Review Focus 5 through `run`: two projects' pull-needing
+    /// events with a non-project item (`NoteAppend`) and a `hello` between
+    /// them. The carried re-dispatch path is exercised (a run is cut by
+    /// another project's event and resumes after it). Nothing is lost: both
+    /// projects' stored versions reach their heads, `pending` returns to
+    /// zero (one decrement per ORIGINAL event), and no more manifests are
+    /// pulled than project events were sent (unfolded costs one more).
     #[tokio::test]
     async fn run_folds_a_burst_and_pending_returns_to_zero() {
         let (_tmp, hub, _shared, worker, _rx) = worker_after_hello().await;
-        let uuids: Vec<String> = (0..40).map(|i| format!("burst-{i:03}")).collect();
-        let refs: Vec<&str> = uuids.iter().map(String::as_str).collect();
-        hub.seed_frames("p1", "acc-me", &refs, "pending");
-        let v0 = hub.version("p1");
-        let mut events = Vec::new();
-        for u in &uuids {
-            hub.update_frame("p1", u, |f| f.filter_canonical = "R".into());
-        }
-        let head = hub.version("p1");
-        assert!(head > v0);
-        // The worker's stored version is the hello's; fold from there.
-        let base =
-            crate::db::collab::get_project(&crate::api::db(&worker.ctx).unwrap().conn(), "p1")
+        let me = crate::api::account::own_device_id(&worker.ctx).unwrap();
+        hub.add_account("tok", "acc-me", "Me", &me, None);
+        hub.add_project("p2", "m42", &[("acc-me", "send_receive", false)], false);
+        crate::api::collab::refresh_projects(&worker.ctx)
+            .await
+            .unwrap();
+        let ctx = Arc::clone(&worker.ctx);
+        let stored = |p: &str| {
+            crate::db::collab::get_project(&crate::api::db(&ctx).unwrap().conn(), p)
                 .unwrap()
-                .map(|p| p.hub_version)
-                .unwrap_or(0);
-        for v in base..head {
-            events.push(q_event(pev("p1", v, v + 1, &[ChangeKind::Frames], true)));
-        }
-        let total = events.len();
-        let pulls = || hub.requests_to("/projects/p1/manifest");
-        let before = pulls().await;
-        worker.pending.store(total, Ordering::SeqCst);
+                .map(|r| r.hub_version)
+                .unwrap_or(0)
+        };
+        let u1: Vec<String> = (0..4).map(|i| format!("p1-{i}")).collect();
+        let u2: Vec<String> = (0..2).map(|i| format!("p2-{i}")).collect();
+        let r1: Vec<&str> = u1.iter().map(String::as_str).collect();
+        let r2: Vec<&str> = u2.iter().map(String::as_str).collect();
+        hub.seed_frames("p1", "acc-me", &r1, "pending");
+        hub.seed_frames("p2", "acc-me", &r2, "pending");
+        let (b1, b2) = (hub.version("p1"), hub.version("p2"));
+        let bump = |p: &str, us: &[String]| {
+            for u in us {
+                hub.update_frame(p, u, |f| f.filter_canonical = "R".into());
+            }
+        };
+        // First half of the burst, then the hello (built at that head), then
+        // the second half: events after the hello are live, not stale.
+        bump("p1", &u1[..2]);
+        bump("p2", &u2[..1]);
+        let hello: HelloEvent = serde_json::from_value(hub.hello_for("tok")).unwrap();
+        bump("p1", &u1[2..]);
+        bump("p2", &u2[1..]);
+        let (h1, h2) = (hub.version("p1"), hub.version("p2"));
+        let ev = |p: &str, v: i64| q_event(pev(p, v, v + 1, &[ChangeKind::Frames], true));
+        let work = vec![
+            ev("p1", b1),
+            ev("p1", b1 + 1),
+            ev("p2", b2),
+            FeedWork::Event(LiveEvent::Hello(hello)),
+            FeedWork::NoteAppend("p1".into(), Instant::now()),
+            ev("p1", b1 + 2),
+            ev("p1", b1 + 3),
+            ev("p2", b2 + 1),
+        ];
+        assert_eq!((b1 + 4, b2 + 2), (h1, h2));
+        let events = work
+            .iter()
+            .filter(|w| matches!(w, FeedWork::Event(LiveEvent::Project(_))))
+            .count();
+        let counted = events + 1; // the hello is an Event too
+        let manifests = || async {
+            hub.requests_to("/projects/p1/manifest").await
+                + hub.requests_to("/projects/p2/manifest").await
+        };
+        let before = manifests().await;
+        worker.pending.store(counted, Ordering::SeqCst);
         let pending = Arc::clone(&worker.pending);
         let (tx, rx) = mpsc::unbounded_channel();
-        for e in events {
-            tx.send(e).unwrap();
+        for w in work {
+            tx.send(w).unwrap();
         }
         drop(tx);
         worker.run(rx).await;
@@ -867,10 +903,14 @@ mod tests {
             0,
             "one decrement per original event"
         );
-        let used = pulls().await - before;
+        assert_eq!(stored("p1"), h1, "p1 reaches its head");
+        assert_eq!(stored("p2"), h2, "p2 reaches its head");
+        let used = manifests().await - before;
+        // Folded: a+b, x, c+d, y = 4 pulls, plus the hello's catch-up of
+        // the two projects. Unfolded it is 5 + 2 (one more than the events).
         assert!(
-            used >= 1 && used * 4 < total,
-            "{used} pulls for {total} events"
+            used <= events,
+            "{used} manifest pulls for {events} project events"
         );
     }
 }
