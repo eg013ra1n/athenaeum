@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
@@ -194,12 +195,60 @@ describe('useCollabNotifications', () => {
       (JSON.parse(localStorage.getItem('athenaeum.notifications.v1') ?? '{"notifications":[]}') as { notifications: Stored[] })
         .notifications;
 
-    it('a remapped feed change is a history-only entry (no toast)', async () => {
+    it('a burst of remapped events coalesces per project into one history-only entry each', async () => {
+      vi.useFakeTimers();
+      try {
+        renderHarness();
+        await settle();
+        for (let i = 0; i < 50; i++) emit('collab-frames-changed', { projectId: 'proj-1', kind: 'remapped', count: 1 });
+        for (let i = 0; i < 2; i++) emit('collab-frames-changed', { projectId: 'proj-2', kind: 'remapped', count: 1 });
+        act(() => vi.advanceTimersByTime(2900));
+        expect(history()).toHaveLength(0);
+        act(() => vi.advanceTimersByTime(200));
+        const titles = history().map((h) => h.title).sort();
+        expect(titles).toEqual(['2 of your frames remapped in proj-2', '50 of your frames remapped in M42 Mosaic']);
+        expect(screen.queryAllByRole('status')).toHaveLength(0);
+        act(() => vi.advanceTimersByTime(10000));
+        expect(history()).toHaveLength(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('an unmount mid-window flushes the pending total once', async () => {
+      vi.useFakeTimers();
+      try {
+        // Unmount only the hook's host; the provider stays to persist history.
+        let setShown: (v: boolean) => void = () => {};
+        function Host() {
+          const [shown, set] = useState(true);
+          setShown = set;
+          return shown ? <Harness /> : null;
+        }
+        render(
+          <MemoryRouter>
+            <NotificationProvider>
+              <Host />
+            </NotificationProvider>
+          </MemoryRouter>,
+        );
+        await settle();
+        emit('collab-frames-changed', { projectId: 'proj-1', kind: 'remapped', count: 3 });
+        emit('collab-frames-changed', { projectId: 'proj-1', kind: 'remapped', count: 4 });
+        act(() => setShown(false));
+        expect(history().map((h) => h.title)).toEqual(['7 of your frames remapped in M42 Mosaic']);
+        act(() => vi.advanceTimersByTime(10000));
+        expect(history()).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('a cancelled finished remap is a warning entry with the partial count', async () => {
       renderHarness();
       await settle();
-      emit('collab-frames-changed', { projectId: 'proj-1', kind: 'remapped', count: 3 });
-      expect(history()[0].title).toBe('3 of your frames remapped in M42 Mosaic');
-      expect(screen.queryAllByRole('status')).toHaveLength(0);
+      emit('collab-remap-finished', { projectId: 'proj-1', canonical: 'R', done: 4, failed: 0, total: 9, cancelled: true, error: null });
+      expect(history()[0]).toMatchObject({ title: 'Filter remap cancelled', detail: 'M42 Mosaic · 4 of 9 remapped to R' });
     });
 
     it('a finished remap with an error notifies with hasErrors', async () => {

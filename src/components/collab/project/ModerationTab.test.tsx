@@ -134,8 +134,21 @@ function restoreCalls(): { projectId: string; frameUuid: string }[] {
 
 describe('ModerationTab — visibility (P10)', () => {
   it('canRemap only: renders just the Filters section', async () => {
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'get_collab_filter_buckets')
+        return Promise.resolve({
+          projectId: 'proj-1',
+          dictionary: [{ canonical: 'L', aliases: [], kind: 'mono' }],
+          buckets: [
+            { publisherAccountId: 'acc-1', publisher: 'Alice', instrume: 'ASI', filterRaw: 'Red', canonical: 'L', frameUuids: ['u-1'] },
+          ],
+          running: null,
+        });
+      return Promise.resolve(null);
+    }) as never);
     renderTab(null, { canModerate: false, canRemap: true });
     expect(await screen.findByText('Filters')).toBeInTheDocument();
+    expect(await screen.findByText('Red')).toBeInTheDocument();
     expect(screen.queryByText('Waiting for review')).not.toBeInTheDocument();
     expect(screen.queryByText('Excluded frames')).not.toBeInTheDocument();
     expect(vi.mocked(api.invoke)).not.toHaveBeenCalledWith('list_collab_moderation', expect.anything());

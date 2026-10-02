@@ -45,6 +45,11 @@ function localDay(iso: string): string {
   return formatTimestamp((Number.isNaN(d.getTime()) ? new Date() : d).toISOString()).slice(0, 10);
 }
 
+/** Trailing window over which `remapped` events of one project are summed: a
+ *  coordinator's remap of N frames arrives as up to N events of count 1, which
+ *  would otherwise evict the capped history. */
+const REMAP_WINDOW_MS = 3000;
+
 function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title: string) {
   if (change.count === 0) return;
   const link = `/projects/${change.projectId}`;
@@ -105,16 +110,7 @@ function notifyFrameChange(notify: NotifyLike, change: CollabFramesChange, title
         link,
       });
       break;
-    case 'remapped':
-      // Own frames only (plan ruling P12): history entry, no toast.
-      notify({
-        title: `${n} of your ${plural} remapped in ${title}`,
-        detail: 'A coordinator changed their canonical filter. Files are unchanged.',
-        kind: 'project',
-        link,
-        toast: false,
-      });
-      break;
+    // `remapped` is coalesced by the hook (see REMAP_WINDOW_MS), never here.
     default:
       // Any future kind: the outcome is visible in the project itself, no
       // toast needed.
@@ -155,6 +151,9 @@ export function useCollabNotifications() {
       cancelled = true;
     };
   }, []);
+
+  // Pending `remapped` totals + trailing timers, per project.
+  const remapRef = useRef<Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>>(new Map());
 
   const titleFor = (projectId: string) => titlesRef.current.get(projectId) ?? projectId;
 
@@ -258,6 +257,22 @@ export function useCollabNotifications() {
     };
   }, [notify]);
 
+  // One history-only entry per project for a burst of own-frame remaps (P12).
+  const flushRemap = (projectId: string) => {
+    const pending = remapRef.current.get(projectId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    remapRef.current.delete(projectId);
+    const n = pending.count;
+    notify({
+      title: `${n} of your ${n === 1 ? 'frame' : 'frames'} remapped in ${titleFor(projectId)}`,
+      detail: 'A coordinator changed their canonical filter. Files are unchanged.',
+      kind: 'project',
+      link: `/projects/${projectId}`,
+      toast: false,
+    });
+  };
+
   // `collab-frames-changed` (Task 8) — manifest changes the live exchange
   // applies from the hub's event feed (wave 3: no poll) reach the frontend
   // here.
@@ -267,6 +282,16 @@ export function useCollabNotifications() {
     api
       .listen<CollabFramesChange>('collab-frames-changed', (change) => {
         if (cancelled) return;
+        if (change.kind === 'remapped') {
+          if (change.count === 0) return;
+          const pending = remapRef.current.get(change.projectId);
+          if (pending) clearTimeout(pending.timer);
+          const count = (pending?.count ?? 0) + change.count;
+          const projectId = change.projectId;
+          const timer = setTimeout(() => flushRemap(projectId), REMAP_WINDOW_MS);
+          remapRef.current.set(projectId, { count, timer });
+          return;
+        }
         notifyFrameChange(notify, change, titleFor(change.projectId));
       })
       .then((fn) => {
@@ -274,9 +299,12 @@ export function useCollabNotifications() {
         else unlisten = fn;
       })
       .catch((err) => console.error('[collab] frames-changed listen failed:', err));
+    const pendingRemaps = remapRef.current;
     return () => {
       cancelled = true;
       unlisten?.();
+      // Flush what is pending so nothing is lost (or doubled) on unmount.
+      for (const projectId of [...pendingRemaps.keys()]) flushRemap(projectId);
     };
   }, [notify]);
 

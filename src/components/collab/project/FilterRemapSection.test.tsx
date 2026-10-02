@@ -96,6 +96,13 @@ describe('FilterRemapSection', () => {
     );
   });
 
+  it('shows a run already in progress on mount, without any event', async () => {
+    current = sheet([bucket()], { projectId: 'proj-1', canonical: 'R', done: 2, failed: 1, total: 10 });
+    await renderSection();
+    expect(await screen.findByText(/Remapping… 3 of 10/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled();
+  });
+
   it('shows progress with a Cancel button that cancels the run', async () => {
     await renderSection();
     emit<CollabRemapProgress>('collab-remap-progress', { projectId: 'proj-1', canonical: 'R', done: 3, failed: 0, total: 12 });
