@@ -10,7 +10,7 @@
 - Catalog reads by frame id move behind a per-frame `FrameOrigin` (one variant, `Catalog`, in 6b-1), so 6b-2 adding the `Project` variant makes the compiler name every site that needs a project twin.
 - `calibration_subtree` emits a fixed legacy grouping shape, and every stage hash of fixed configs is pinned to golden literals recorded before any change.
 
-**Tech Stack:** Rust (`athenaeum-core`: rusqlite 0.3x/SQLite ≥ 3.45, serde, xxhash), ts-rs (`tests/ts_contract.rs` pins every wire type). No frontend change, no host change, no new command.
+**Tech Stack:** Rust (`athenaeum-core`: rusqlite 0.40 (bundled SQLite), serde, xxhash), ts-rs (`tests/ts_contract.rs` pins every wire type). No frontend change, no host change, no new command.
 
 **Spec:** `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` (owner-approved 2026-10-02, fable-reviewed). This plan implements §18 plan 6b steps **0, 1, 2** (§4.1, §4.2, §4.3, §8's cache rule). Read §2 (W8), §4 and §8 before any task. Steps 3–14 are plan 6b-2.
 
@@ -39,9 +39,10 @@
 
 1. **Upgrading a real catalog that already holds runs, artifacts and masters.** Every row survives with the same id and values; the children (`stacking_run_groups`, `stacking_run_frames`, `master_lights`) are not cascade-wiped when their parent table is dropped; `foreign_key_check` is clean; a second start is a no-op. Pinned in Task 2 (unit) and Task 2's rehearsal on a copy of the real `.dev` catalog.
 2. **A fresh database and a migrated one end up with the same schema** — same columns, same CHECKs, same index names and uniqueness — and the OLD `stacking_artifacts_key` is never re-created on a later start (a second unique index on the new table would make upserts hit only one of them). Pinned in Task 2.
-3. **A rebuild that cannot complete** (a pre-existing foreign-key violation in a stacking table) rolls back completely: the old shape and every row stay, `PRAGMA foreign_keys` is back ON, and the error is surfaced, not swallowed. Pinned in Task 2.
+3. **A rebuild that cannot complete** (a pre-existing foreign-key violation in a stacking table) rolls back completely: the old shape and every row stay, `PRAGMA foreign_keys` is back ON, and the error is surfaced, not swallowed. Consequence the user sees: startup refuses on every launch until the violation is repaired, so the error text names the table, the `PRAGMA foreign_key_check` that lists the rows, and that deleting those orphan rows is safe (they are cache and run-history rows). Pinned in Task 2.
 4. **An existing frame set keeps its caches across the upgrade.** An artifact written before the rebuild is found by `find_artifact(FrameSet)` after it, with the same id and hash, and every stage hash of fixed configs equals the golden literal recorded before the change — so the first run after the upgrade recomputes nothing. Pinned in Task 1 (golden) and Task 3 (lookup across the rebuild).
-5. **A project-subject run row in the database** (written by SQL, as 6b-2 will) does not break the heal sweep, a frame set's run list, a frame set's admission check, work usage or cleanup; the heal marks it failed like any interrupted run. Pinned in Task 3 (db) and Task 4 (heal).
+5. **A project-subject run row in the database** (written by SQL, as 6b-2 will) does not break the heal sweep, a frame set's run list, a frame set's admission check, work usage or cleanup; the heal marks it failed like any interrupted run. Pinned in Task 3 (db) and Task 4 (heal, work usage, cleanup).
+6. **A large frame set's plan and run stay as fast as today.** `find_artifact` is called per frame per kind (8 sites in `build_plan`'s per-frame loop, 12 in the run); its new statement must still be a point lookup on the artifacts key, never a scan of every artifact of the set (the `IS` form of the first draft of this plan degraded to `idx_stacking_artifacts_set` plus a scan — ~40 M row visits per `build_plan` on a 1 000-frame set). Pinned in Task 3 by an `EXPLAIN QUERY PLAN` test.
 
 ## Plan rulings (refine the spec where the code forced a choice)
 
@@ -58,11 +59,18 @@
   - The non-wire `StackingArtifactRow` and `MasterLight` replace `frames_set_id` with `subject: StackSubject`.
   - Events, `RunSummary` and `StackingPlan` keep `set_id: i64`, filled by one helper `wire_set_id(&subject)`; 6b-2's commands step makes them subject-aware together with the minimal frontend guard.
 - **B9 — `FrameOrigin` has ONE variant in 6b-1: `Catalog { file_id }`.** 6b-2 adds `Project { … }`; every `match` on it then fails to compile at exactly the sites that need a project twin. The spec's checklist (§4.3) plus the site it missed — `stage_reference`'s Manual read of `get_frame_set_reference` (`run.rs:~3667`) — are the sites.
-- **B10 — Subject-level reads get a subject dispatcher now, with real Project arms where they only need the schema**: the working layout (`<working>/projects/<slug>`, spec §9.3), the display label (`collab_projects.title`), the stored manual reference (`stacking_project_config.reference_frame_uuid` → handle). The registration store's Project arm stores nothing and reads nothing — a project run keeps its registration in the registered artifact's payload (spec §4.2, last paragraph), written in 6b-2.
+- **B10 — Subject-level reads get a subject dispatcher now, with real Project arms where they only need the schema**: the working layout (`<working>/projects/<slug>`, spec §9.3), the display label (`collab_projects.title`), the stored manual reference (`stacking_project_config.reference_frame_uuid` → handle). The registration store's Project arm stores nothing and reads nothing — a project run keeps its registration in the registered artifact's payload (spec §4.2, last paragraph), written in 6b-2. **Open for 6b-2:** `stored_registrations` returns the catalog-shaped `Vec<RegistrationRecord>` (it carries `frames_set_id`); 6b-2 either maps the registered artifacts' payloads into it or changes its consumers (`plan.rs:~1261, ~1910`, `run.rs:~5341, ~5598`) — 6b-2's plan decides, it does not inherit this shape unexamined.
 - **B11 — `HashMemo` dispatches the stage-1 hash by origin** (constructed with the run's origin map; a frame with no origin is an error, never a silent catalog read), so its 8 run-side callers and the 9 direct `calibration_hash_for` test calls stay untouched.
 - **B12 — Golden stage-hash pins use the pure helpers with literal inputs** (a DB-backed hash carries tempdir paths and mtimes, so it cannot be golden). A second, DB-backed test proves `calibration_hash_for` uses exactly the pinned formula.
 - **B13 — Handles are minted by `db::stacking::project_frame_handles` (Task 2)**, in an IMMEDIATE transaction; 6b-1 calls it only from tests.
 - **B14 — New schema that 6b-2 fills is created now** (spec §4.2 in one rebuild): `stack_project_frames`, `stacking_project_config`, `collab_projects.canonical_grid_json`, `stacking_run_groups.exposure_class`. Their readers/writers other than the handle minting are 6b-2.
+
+## Review record (fable, 2026-10-02)
+
+Verdict "ready after fixes"; rulings B1–B14 hold; the rebuild SQL, the six-expression ON CONFLICT, the CHECKs and the cascades were run in sqlite3 3.54 as written; the legacy fixture matches `schema.rs@17e2e96e`. Folded in:
+- **C1** — `find_artifact` is written in the key's own six expressions (a covering point lookup), pinned by an `EXPLAIN QUERY PLAN` test; Review Focus 6.
+- **I1** — the shape test normalizes the rename's quoting and the dropped `IF NOT EXISTS`. **I2** — the heal's log lines and the Conflict text are spelled out per subject. **I3** — `SqliteConnectionManager::setup_connection`. **I4** — the registration store lives in `plan.rs`, `pub(crate)`. **I5** — `solve_of` takes the origins; the fan-out clones the subject and the origins out of `rc`. **I6** — the formula test reads the master paths through the catalog. **I7** — the FK-violation error names the remedy; Review Focus 3 states the startup consequence. **I8** — mechanical completeness greps in Tasks 3 and 4.
+- Minor: `subject_label`'s NotFound text, `StackSubject` camelCase serde, the `seed_frame` note, RF5's work usage/cleanup, `index_shape` via stored index SQL, the `RegistrationRecord` shape as a 6b-2 open item (B10), the busy-timeout note, the early index loop disappearing entirely, rusqlite 0.40.
 
 ## File map
 
@@ -216,8 +224,15 @@ git commit -m "test(stacking): pin every stage hash of fixed configs to golden l
     fn calibration_hash_for_is_the_pinned_formula() {
         // Build the same fixture `fresh_artifacts_and_registration_leave_nothing_stale`
         // builds: a frame set, one light, a master dark and flat linked to it.
-        // Then, with `frame` = that light's `GroupFrame` (from `group_frames`)
-        // and `paths` = the two master files the fixture wrote:
+        // `add_master_dark_and_flat` returns the two CALIBRATION-SET ids, not
+        // paths. Read the master paths through the catalog, independently of
+        // `calibration_hash_for` (that independence is what makes the test
+        // prove the formula):
+        //   SELECT fi.path FROM calibration_set_frames csf
+        //   JOIN frames fr ON fr.id = csf.frame_id JOIN files fi ON fi.id = fr.file_id
+        //   WHERE csf.set_id = ?1
+        // (the same query the plan tests already run at plan.rs:~3452), once per set id.
+        // Then, with `frame` = that light's `GroupFrame` (from `group_frames`):
         //
         // let expected = stage_hash(
         //     &calibration_subtree(&cfg),
@@ -362,7 +377,7 @@ Seed helper and the tests (seed through raw SQL in the legacy shape — the CRUD
 ```rust
     fn mem_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::db::Database::setup_connection(&conn).unwrap(); // `db/mod.rs:~51` — the production pragma set (FKs ON); adjust the path if it is not an associated fn of `Database`
+        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap(); // db/mod.rs:~38-51, as stacking/test_fixtures.rs:~55 calls it
         init_db(&conn).unwrap();
         conn
     }
@@ -473,7 +488,7 @@ Seed helper and the tests (seed through raw SQL in the legacy shape — the CRUD
         }
     }
 ```
-`index_shape(conn, table) -> Vec<(String /*name*/, bool /*unique*/, Vec<String> /*columns or expressions*/)>` sorted by name: `PRAGMA index_list` + `PRAGMA index_xinfo` (an expression column has `cid = -2`; read the expression from `sqlite_master.sql` instead, or compare the index's `sql` text normalized). Skip `sqlite_autoindex_*` names in the name comparison but compare their column lists (autoindex names follow the constraint order, which B6's shared DDL constants make identical anyway). `table_sql_normalized` = `sqlite_master.sql` for the table with the table name replaced by a placeholder and whitespace collapsed — after `ALTER TABLE … RENAME`, SQLite rewrites the stored CREATE text, so the two must match exactly once both come from the same constant.
+`index_shape(conn, table) -> Vec<(String, Option<String>)>`: every `(name, sql)` row of `SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 ORDER BY name`, with `sql` whitespace-collapsed (`sql` is NULL for an autoindex; its name follows the constraint order, which the shared DDL constants make identical). Comparing the stored `sql` text per index name is what compares expression indexes faithfully (`PRAGMA index_xinfo` reports an expression column as `cid = -2`, `name = NULL`). `table_sql_normalized(conn, table)` = the table's `sqlite_master.sql` with, in this order: `"<table>"` replaced by `T` (after `ALTER TABLE … RENAME` SQLite stores the new name double-quoted: `CREATE TABLE "stacking_runs" (`), then `<table>` replaced by `T`, then `IF NOT EXISTS ` removed (SQLite drops it from the stored text — verified), then whitespace collapsed. Once both shapes come from the same body constant, the two strings are equal.
 
 ```rust
     #[test]
@@ -650,7 +665,7 @@ const MASTER_LIGHTS_BODY: &str = "(
     CHECK ((frames_set_id IS NULL) <> (project_id IS NULL))
 )";
 ```
-Replace the four early `CREATE TABLE IF NOT EXISTS` statements with `format!("CREATE TABLE IF NOT EXISTS stacking_runs {STACKING_RUNS_BODY}")` etc., issued the same way the current code issues them. `stacking_run_groups`, `stacking_set_config` keep their CREATEs. Remove every stacking statement from the early index loop (~1284-1310) — they move to Step 4's helper; keep the loop's other statements (if none remain, remove the loop and its comments move with the statements).
+Replace the four early `CREATE TABLE IF NOT EXISTS` statements with `format!("CREATE TABLE IF NOT EXISTS stacking_runs {STACKING_RUNS_BODY}")` etc., issued the same way the current code issues them. `stacking_run_groups`, `stacking_set_config` keep their CREATEs. Every statement of the early index loop (~1284-1310) is a stacking statement, so the loop disappears entirely; its statements move to Step 4's helper, and its two comments (the rowid-alias note on `idx_stacking_set_config_set`, the M4d note on `master_lights`) move with them.
 
 - [ ] **Step 4: The late section** (`schema.rs`, right after the `stacking_run_groups.beta` ALTER at ~2838-2840; `collab_projects` already exists there)
 
@@ -723,7 +738,10 @@ fn rebuild_stacking_tables_for_subjects(conn: &Connection) -> Result<()> {
         )?;
         // Another process (desktop and web may share one catalog) may have
         // rebuilt between our probe and our write lock: `INIT_DB_LOCK` is
-        // process-wide only. Re-check under the lock.
+        // process-wide only. Re-check under the lock. (A second process whose
+        // BEGIN IMMEDIATE waits past `busy_timeout` — 5 s — on a very large
+        // catalog fails its startup once with SQLITE_BUSY; its next start
+        // finds the rebuilt shape.)
         if column_exists(&tx, "stacking_runs", "project_id")? {
             return Ok(());
         }
@@ -781,7 +799,10 @@ fn rebuild_stacking_tables_for_subjects(conn: &Connection) -> Result<()> {
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
                     Some(format!(
                         "stacking subject rebuild refused: {violations} foreign-key violation(s) \
-                         reported by foreign_key_check on {table}; the database was left unchanged"
+                         in {table}; the database was left unchanged and the app will not start \
+                         until they are repaired. `PRAGMA foreign_key_check('{table}')` lists the \
+                         rows; deleting those orphan rows is safe (stacking cache and run-history \
+                         rows only)."
                     )),
                 ));
             }
@@ -893,7 +914,7 @@ Add an `#[ignore]`d test in `stacking_subject_schema_tests`:
     fn the_subject_rebuild_rehearses_on_a_real_catalog_copy() {
         let path = std::env::var("ATHENAEUM_REHEARSAL_DB").expect("ATHENAEUM_REHEARSAL_DB");
         let conn = Connection::open(&path).unwrap();
-        crate::db::Database::setup_connection(&conn).unwrap();
+        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
         let before = stacking_row_counts(&conn);
         init_db(&conn).unwrap();
         assert!(column_exists(&conn, "stacking_runs", "project_id").unwrap());
@@ -984,8 +1005,7 @@ pub fn delete_all_artifacts(conn, subject: &StackSubject) -> Result<usize>;
         let c = conn();
         let set = seed_set(&c);            // existing helper (~912)
         let frame = 501;
-        seed_frame(&c, frame);             // existing helper (~926): inserts a frame with this id
-                                           // (check how it ties the frame to `set`; tie it the same way)
+        seed_frame(&c, frame);             // existing helper (~926): inserts a `files` + `frames` row with this id
         insert_test_project(&c, "p1");
         let handle = project_frame_handles(&c, "p1", &["u1"]).unwrap()["u1"];
         let fs = StackSubject::FrameSet(set);
@@ -1065,6 +1085,7 @@ Write the four commented tests' bodies for real (the comments are the exact asse
 /// `frames.id` for a frame set, a `stack_project_frames.id` handle for a
 /// project. The two never meet in one map or one query.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum StackSubject {
     FrameSet(i64),
     Project(String),
@@ -1162,7 +1183,42 @@ Add `pub use crate::db::stacking::StackSubject;` to `stacking/mod.rs`.
     For a frame set this is today's statement byte for byte. (The CHECK makes the other column NULL by construction.)
   - `set_frame_rejected_fraction(conn, subject, run_id, frame_id, fraction)`: `WHERE run_id = ?2 AND {col} = ?3`.
   - `upsert_artifact`: column list gains `project_id, project_frame`; `let (fid, pf) = a.subject.frame_columns(a.frame_id);` params `a.subject.frame_set_id(), a.subject.project_id(), fid, pf, …`; target as Task 2.
-  - `find_artifact`: `WHERE frames_set_id IS ?1 AND project_id IS ?2 AND group_key = ?3 AND kind = ?4 AND frame_id IS ?5 AND project_frame IS ?6` with `(fid, pf) = subject.frame_columns(frame_id)`.
+  - `find_artifact` — written in the unique key's OWN six expressions, so it stays a covering point lookup on `stacking_artifacts_subject_key` (Review Focus 6; an `IS`-based WHERE would fall back to `idx_stacking_artifacts_set` plus a scan of every artifact of the set):
+    ```rust
+    let (fid, pf) = subject.frame_columns(frame_id);
+    let sql = format!(
+        "SELECT {ARTIFACT_COLUMNS} FROM stacking_artifacts
+         WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2
+           AND group_key = ?3 AND kind = ?4
+           AND COALESCE(frame_id, 0) = ?5 AND COALESCE(project_frame, 0) = ?6"
+    );
+    conn.query_row(
+        &sql,
+        params![
+            subject.frame_set_id().unwrap_or(0),
+            subject.project_id().unwrap_or(""),
+            group_key,
+            kind,
+            fid.unwrap_or(0),
+            pf.unwrap_or(0),
+        ],
+        row_to_artifact,
+    )
+    .optional()
+    ```
+    The `NULL ≡ 0` / `NULL ≡ ''` equivalence is the key's own (and `upsert_artifact` already relies on it); no frame id 0, set id 0 or project id `''` exists. Add a test:
+    ```rust
+    #[test]
+    fn find_artifact_is_a_point_lookup_on_the_artifacts_key() {
+        let c = conn();
+        let sql = find_artifact_sql(); // factor the format! above into a `fn find_artifact_sql() -> String` used by find_artifact
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
+            .query_map(params![7_i64, "", "g", "calibrated", 5_i64, 0_i64], |r| r.get::<_, String>(3)).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert!(plan.iter().any(|d| d.contains("stacking_artifacts_subject_key")), "{plan:?}");
+    }
+    ```
   - `list_artifacts`, `delete_artifacts`, `delete_all_artifacts`: `frames_set_id = ?1` → `frames_set_id IS ?1 AND project_id IS ?2` (renumber the following placeholders; `delete_artifacts` builds its `IN` placeholders from `?3`).
   - `insert_master_light`: column list gains `project_id`; `DO UPDATE SET frames_set_id = excluded.frames_set_id, project_id = excluded.project_id, …`.
   - Doc comments that say "for a frame set" become "for a subject".
@@ -1176,7 +1232,7 @@ Add `pub use crate::db::stacking::StackSubject;` to `stacking/mod.rs`.
   - `examples/ln_probe.rs` (`list_runs` ~316, ~592; `find_artifact` ~342, ~356) and `crates/athenaeum-web/src/routes/stacking.rs` test literals (`NewRun` ~691, `NewMasterLight` ~713, ~866).
   - Test call sites: the ~110 mechanical edits of the inventory (a set id argument → `&StackSubject::FrameSet(id)`; a literal field `frames_set_id: x` → `subject: &StackSubject::FrameSet(x)`; a test emitter's `frames_set_id: i64` field and its `h.frames_set_id == …` read → `subject`). Test-only helpers (`test_context`, `seed_run_and_groups`, `seed_run_frame_rows`, `seed_registered_artifact`, `seed_fits_artifact`, `seed_artifact`, `seed_master_light`) keep their `i64` parameters and wrap inside. NO expectation changes besides Step 1's one tuple.
 
-- [ ] **Step 7: Run the new tests, then the whole Gate per task** (the ts_contract regeneration must leave `src/types` unchanged — `#[ts(skip)]` keeps `StackingRunRow`'s TS identical).
+- [ ] **Step 7: Run the new tests, then the whole Gate per task** (the ts_contract regeneration must leave `src/types` unchanged — `#[ts(skip)]` keeps `StackingRunRow`'s TS identical). Mechanical completeness check: `grep -rn 'frames_set_id:' crates/athenaeum-core/src/stacking crates/athenaeum-core/src/api/stacking.rs crates/athenaeum-web/src/routes/stacking.rs crates/athenaeum-core/examples` must show only `RegistrationRecord` / `to_record` hits (and the `StackingRunRow` wire field); paste the output into the report.
 
 - [ ] **Step 8: Commit** — `refactor(stacking): StackSubject keys the stacking persistence (behaviour-preserving)` (+ trailers).
 
@@ -1202,8 +1258,9 @@ pub(crate) fn subject_layout(conn: &Connection, working_dir: &Path, subject: &St
 // stacking/run.rs
 pub fn start_stacking(ctx, emitter, policy, app_version, subject: StackSubject, config, rerun_from) -> Result<…, ApiError>;
 pub(crate) fn wire_set_id(subject: &StackSubject) -> i64;   // the events' / RunSummary's / StackingPlan's `set_id`
-fn stored_registrations(conn: &Connection, subject: &StackSubject) -> anyhow::Result<Vec<RegistrationRecord>>;
-fn store_registration(conn: &Connection, subject: &StackSubject, build: impl FnOnce(i64) -> RegistrationRecord) -> anyhow::Result<()>;
+// stacking/plan.rs, beside stored_reference_frame (plan.rs reads it; run.rs already imports from plan):
+pub(crate) fn stored_registrations(conn: &Connection, subject: &StackSubject) -> anyhow::Result<Vec<RegistrationRecord>>;
+pub(crate) fn store_registration(conn: &Connection, subject: &StackSubject, build: impl FnOnce(i64) -> RegistrationRecord) -> anyhow::Result<()>;
 // RunContext loses `set_id`; keeps `subject` and `set_name` (the subject's display label)
 ```
 (Use the exact parameter types `build_plan` / `start_stacking` already have for `settings`, `policy`, `config_override`, `config`, `rerun_from`; only the subject parameter changes.)
@@ -1255,6 +1312,9 @@ fn store_registration(conn: &Connection, subject: &StackSubject, build: impl FnO
         // StackHandle in ctx.active_stacks → heal_interrupted_runs marks only the project run
         // failed (status + error as for any interrupted run), the frame-set run untouched, and the
         // project run's rej dir sweep resolves its layout through subject_layout (no error).
+        // While the project run row exists, `api::stacking::get_stacking_work_usage(set)` and
+        // `api::stacking::cleanup_stacking_work(set, All)` for the frame set succeed and touch
+        // only the frame set's folder and rows (the project's rows and folder are untouched).
     }
 ```
 Write the bodies for real, imitating the neighbouring tests' fixtures (`test_fixtures::frame_set`, `test_ctx`, the existing heal tests — grep `heal_interrupted_runs` in run.rs tests).
@@ -1262,7 +1322,7 @@ Write the bodies for real, imitating the neighbouring tests' fixtures (`test_fix
 - [ ] **Step 2: Run** → FAIL (no `PROJECT_STACKING_UNAVAILABLE`, `subject_label`, `subject_layout`, subject parameters).
 
 - [ ] **Step 3: Subject-level helpers**
-  - `subject_label`: FrameSet → today's `frame_set_name(conn, id)` (unchanged behaviour and error); Project → `SELECT title FROM collab_projects WHERE project_id = ?1`, missing row → `ApiError::NotFound(format!("project {id}"))` (use the variant `frame_set_name` uses for a missing set).
+  - `subject_label`: FrameSet → today's `frame_set_name(conn, id)` (unchanged behaviour and error); Project → `SELECT title FROM collab_projects WHERE project_id = ?1`, missing row → `ApiError::NotFound(format!("project {id} not found"))` (mirrors `frame_set_name`'s `"frame set {id} not found"`, plan.rs:~822-829).
   - `subject_layout`: FrameSet → `WorkingLayout::new(working_dir, &set_slug(&frame_set_name(conn, id)?))` (exactly the 5 sites' current expression); Project → `SELECT slug FROM collab_projects WHERE project_id = ?1` → `WorkingLayout::new(&working_dir.join("projects"), &set_slug(&slug))` (spec §9.3).
   - `stored_reference_frame`: FrameSet → `registration::db::get_frame_set_reference(conn, id)?.map(|r| r.reference_frame_id)`; Project →
     ```sql
@@ -1271,11 +1331,11 @@ Write the bodies for real, imitating the neighbouring tests' fixtures (`test_fix
     WHERE c.project_id = ?1
     ```
   - `wire_set_id(subject)`: `subject.frame_set_id().unwrap_or(0)` with the doc comment "the `setId` the events, `RunSummary` and `StackingPlan` carry until 6b-2 makes them subject-aware (B8); a project run never reaches an emitter in 6b-1".
-  - Registration store in run.rs: `stored_registrations` (FrameSet → `get_registration_for_frame_set(conn, id)`; Project → `Ok(Vec::new())`) and `store_registration` (FrameSet → `upsert_registration(conn, &build(id))`; Project → `Ok(())`), both documented with B10 ("a project run keeps its registration in the registered artifact's payload, spec §4.2; it never writes `registration_results`").
+  - Registration store in `plan.rs` (both `pub(crate)`, next to `stored_reference_frame`): `stored_registrations` (FrameSet → `get_registration_for_frame_set(conn, id)`; Project → `Ok(Vec::new())`) and `store_registration` (FrameSet → `upsert_registration(conn, &build(id))`; Project → `Ok(())`), both documented with B10 ("a project run keeps its registration in the registered artifact's payload, spec §4.2; it never writes `registration_results`").
 
 - [ ] **Step 4: Move every subject read**
   - `RunContext.set_id` is removed. The 35 subject sites already use `rc.subject` (Task 3) or now use `wire_set_id(&rc.subject)` for event plumbing (inventory: 458, 2731, 2797, 7362, 8063, 9381, 9506 and `run_thread` 1002 → complete event 1167 + log 1131 — the log keeps field `set_id` with the same integer).
-  - The 5 catalog-by-set reads: `stage_reference` Manual (~3667) → `stored_reference_frame(&conn, &rc.subject)`; registration reads (~5341 `register_native_groups`, ~5598 `stage_register`; plan.rs ~1261 `compute_register_stale`, ~1910 `ln_registration_by_frame`) → `stored_registrations`; the writes (~4908, ~4957, with the `to_record` calls at ~4761 and ~4946 and the `set_id` copy at ~4513) → `store_registration(conn, &subject, |set_id| to_record(set_id, …))`.
+  - The 5 catalog-by-set reads: `stage_reference` Manual (~3667) → `stored_reference_frame(&conn, &rc.subject)`; registration reads (~5341 `register_native_groups`, ~5598 `stage_register`; plan.rs ~1261 `compute_register_stale`, ~1910 `ln_registration_by_frame`) → `stored_registrations`; the writes (~4908, ~4957, with the `to_record` calls at ~4761 and ~4946) → `store_registration(conn, &subject, |set_id| to_record(set_id, …))`. The registration fan-out (`register_group_pass`, ~4409) has no `rc`: today it copies `set_id` out at ~4512-4513; replace that copy with `let subject = rc.subject.clone();` beside `run_id`, and use `subject` inside the fan-out's builder closure (~4756-4766).
   - The 2 log-only reads in `stage_calibrate` (~1976, ~1997): Calibrate only runs for a frame set; take the id with `let Some(set_id) = rc.subject.frame_set_id() else { return Err(ApiError::Invalid(PROJECT_STACKING_UNAVAILABLE.into())) };` (or the stage's own error type with the same message) and keep the log lines byte-identical.
   - `build_plan(…, subject: &StackSubject, …)`: first statement
     ```rust
@@ -1286,10 +1346,11 @@ Write the bodies for real, imitating the neighbouring tests' fixtures (`test_fix
     (`StackSubject` is not `Copy`; bind with `let StackSubject::FrameSet(set_id) = subject else { … }` and deref `*set_id` where an `i64` is needed — no `expect` in production code). Inside, the subject-level calls take `subject` (`subject_label`, `stored_reference_frame` replacing `resolve_reference`'s direct `get_frame_set_reference` read at ~913 — keep the `frames ⋈ files` filename/path read beside it in the FrameSet path, it is catalog by nature; `list_runs`, `active_run_for_subject`, `fits_artifact_fresh*`, `find_artifact`, `list_frame_rows` unchanged). Frame-set-only steps (`resolve_config_and_exclusions`, the readiness gate, `collect_masters_to_build`, `group_frames`) keep `set_id`. `StackingPlan.set_id` = `set_id` (same value as today).
   - `start_stacking(…, subject: StackSubject, …)`: same guard first; then as today with `subject` where the run is keyed (`NewRun`, `StackHandle`, the admission scan, the Conflict message `format!("… {subject} …")` — it prints `frame set {id}` as today), `subject_layout` for the layout (~879-880), `subject_label` for `set_name`, `RunSummary.set_id = wire_set_id(&subject)`.
   - `heal_interrupted_runs`: iterate `list_unfinished_runs` `(run_id, subject)`; the "is a live handle covering it" check compares `h.subject == subject`; `remove_rej_dir_for_interrupted_run(conn, run_id, &subject)` resolves the layout with `subject_layout`. A project run's heal works for real (Review Focus 5).
+    **Log lines stay byte-identical for a frame set.** The heal's warnings at ~566 and ~580 (`warn!(run_id, frames_set_id, …)`) and the rej-dir failure warning at ~579-584 become a `match subject` with two `tracing` calls: the FrameSet arm is today's line exactly (`frames_set_id = id`, same message); the Project arm logs the same message with `project_id = %id`. Never `subject = %subject`. The Conflict texts at ~756 and ~802 (`"… for frame set {frames_set_id}"`) become `format!("… for {subject}")`, which prints the same bytes for a frame set.
   - `api/stacking.rs`: every fn keeps its host-facing `set_id: i64` signature and builds `StackSubject::FrameSet(set_id)`; `get_stacking_work_usage` / `cleanup_stacking_work` / the preview's run-id lookup (~969-1007) use `subject_layout` (the preview gets the subject from `run_row.subject()`), `cleanup_stacking_work` uses `active_run_for_subject` and keeps its message text.
   - The test call sites: `build_plan(…, &StackSubject::FrameSet(f.set_id), …)` (59) and `run::start_stacking(…, StackSubject::FrameSet(set_id), …)` (42). `test_context` keeps its `set_id: i64` parameter and builds `subject: StackSubject::FrameSet(set_id)`.
 
-- [ ] **Step 5: Run the new tests, then the whole Gate per task.** In particular every heal test, every cleanup/work-usage test, the preview tests (`api/stacking.rs` and web), and ts_contract with no `src/types` diff.
+- [ ] **Step 5: Run the new tests, then the whole Gate per task.** In particular every heal test, every cleanup/work-usage test, the preview tests (`api/stacking.rs` and web), and ts_contract with no `src/types` diff. Mechanical completeness check: `grep -c 'rc\.set_id\|self\.set_id' crates/athenaeum-core/src/stacking/run.rs` was 42 before this task and must be 0 now; paste both numbers into the report.
 
 - [ ] **Step 6: Commit** — `refactor(stacking): the run, the plan and the entry points are keyed by StackSubject` (+ trailers).
 
@@ -1419,7 +1480,7 @@ plus `cfa_geometry` with the same shape over `crate::calibration_library::light_
 - [ ] **Step 4: Wire it**
   - `groups::frame_source`: FrameSet → `group_frames(conn, set_id, grouping)` and an origins map built from every `GroupFrame` (`frame_id → Catalog { file_id }`); Project → `Err(ApiError::Invalid(PROJECT_STACKING_UNAVAILABLE.into()))`. `build_plan` (~1591) and `start_stacking` (~785) call `frame_source` instead of `group_frames`; the plan keeps the origins for its `HashMemo`, the run stores them in `RunContext.origins`.
   - `HashMemo::new(origins)` (constructions: plan ~1896, run ~932, `test_context` ~9858 — `test_context` builds the map from its `plan_groups` the same way `frame_source` does). Inside `calibration_hash` / `calibration_hash_checked`, before calling `calibration_hash_for`: `match origin_of(&self.origins, frame.frame_id)? { FrameOrigin::Catalog { .. } => calibration_hash_for(…) }`. Their signatures, and all 8 run-side call sites, do not change. If `calibration_hash` currently returns a type that cannot carry `ApiError`, convert with the same mapping its existing error path uses.
-  - The two solve reads keep their caches and their policies: `solve_of` (~3973-3994) calls `stored_solve(&conn, origin_of(&rc.origins, frame_id)?, frame_id)` and keeps its `warn!` + `None` on a read error; `stage_output` (~9684) calls the same and keeps `?` (fail the run). If `solve_of` cannot return a `Result`, an `origin_of` error there is logged at `error!` and treated as no solve, exactly like its read error today — never a panic.
+  - The two solve reads keep their caches and their policies. `solve_of` (~3973-3994) runs inside the registration fan-out, which has no `rc`: give it an `origins: &FrameOrigins` parameter; its three callers (`registration_gate_and_hint` ~4036 ← `register_group_pass` ~4409, `register_native_groups` ~5418, `stage_register` ~5613) pass it, and the fan-out clones the `Arc` out of `rc` before it starts (beside `subject`, Task 4). Inside, `solve_of` calls `stored_solve(conn, origin, frame_id)` after `origin_of(origins, frame_id)` and keeps its `warn!` + `None` on a read error; `stage_output` (~9684) calls the same and keeps `?` (fail the run). If `solve_of` cannot return a `Result`, an `origin_of` error there is logged at `error!` and treated as no solve, exactly like its read error today — never a panic.
   - Bayer drizzle (~7907): `cfa_geometry(&conn, origin_of(&rc.origins, frame_id)?, frame_id)` (same error handling as the current call).
 
 - [ ] **Step 5: Run the new tests, then the whole Gate per task.**
