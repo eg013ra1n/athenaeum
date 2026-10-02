@@ -663,9 +663,15 @@ pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     if let Some(obj) = calibration.as_object_mut() {
         obj.remove("format");
     }
+    // Spec 2026-10-02 §8 (fable C1): the grouping half is written out field
+    // by field, in exactly today's shape. A new `GroupingConfig` field
+    // regroups frames (its group keys change, so group-keyed artifacts are
+    // recomputed under the new keys) but must never move this hash, which
+    // would make every frame set recompute once. Pinned by
+    // `stage_hashes_are_pinned_to_golden_literals`.
     serde_json::json!({
         "calibration": calibration,
-        "grouping": cfg.grouping,
+        "grouping": { "exposureToleranceSec": cfg.grouping.exposure_tolerance_sec },
     })
 }
 
@@ -1486,8 +1492,9 @@ mod tests {
         // `GroupingConfig.splitByExposure` changes the canonical JSON of
         // every stored `StackingConfig`, so `config_hash` moves — no
         // per-frame `stacking_artifacts` row goes stale over this (the
-        // calibrate/measure/register stage hashes never fold in
-        // `grouping`), only this whole-config fingerprint.
+        // calibration subtree folds in `grouping.exposureToleranceSec`
+        // only, in a fixed shape, and every other grouping field stays
+        // out of every stage hash), only this whole-config fingerprint.
         //
         // Changed again here (M4a Task 2, ruling R-M4a-1/R-M4a-9): adding
         // `MeasurementConfig.detectionSigma` changes the canonical JSON of

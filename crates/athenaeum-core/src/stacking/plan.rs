@@ -6061,4 +6061,60 @@ mod tests {
             r#"{"exposureToleranceSec":2.0}"#
         );
     }
+
+    /// Plan 6b-1 Task 1 (B12): the golden test above pins `stage_hash` over
+    /// `calibration_subtree`; this proves `calibration_hash_for`, which a run
+    /// and the plan actually call, is exactly that formula, so the golden
+    /// literals guard the real cache keys. The master paths are read through
+    /// the catalog, independently of `calibration_hash_for`'s own resolution.
+    #[test]
+    fn calibration_hash_for_is_the_pinned_formula() {
+        use crate::stacking::config::{calibration_subtree, stage_hash, SourceIdentity};
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _path) =
+                test_fixtures::add_light(&f, &light_spec_written(&format!("f{i}"), t));
+            ids.push(id);
+        }
+        let (dark_set, flat_set) = test_fixtures::add_master_dark_and_flat(&f, &ids, 64, 48);
+
+        let mut master_paths: Vec<std::path::PathBuf> = Vec::new();
+        for set_id in [dark_set, flat_set] {
+            let path: String = f
+                .conn
+                .query_row(
+                    "SELECT fi.path FROM calibration_set_frames csf
+                     JOIN frames fr ON fr.id = csf.frame_id
+                     JOIN files fi ON fi.id = fr.file_id
+                     WHERE csf.set_id = ?1",
+                    [set_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            master_paths.push(std::path::PathBuf::from(path));
+        }
+
+        let cfg = StackingConfig::default();
+        let groups = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
+        assert_eq!(groups.len(), 1, "one group expected for this fixture");
+        let frame = &groups[0].frames[0];
+
+        let identities: Vec<String> = master_paths.iter().map(|p| master_identity(p)).collect();
+        let identity_refs: Vec<&str> = identities.iter().map(String::as_str).collect();
+        let expected = stage_hash(
+            &calibration_subtree(&cfg),
+            &identity_refs,
+            &[SourceIdentity {
+                file_id: frame.file_id,
+                size: frame.size,
+                modified_at: frame.modified_at.clone(),
+            }],
+        );
+        let mut divisors = DivisorCache::new();
+        assert_eq!(
+            calibration_hash_for(&f.conn, &cfg, frame, &mut divisors).unwrap(),
+            expected
+        );
+    }
 }
