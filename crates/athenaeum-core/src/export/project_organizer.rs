@@ -93,6 +93,47 @@ fn not_older(dest_meta: &fs::Metadata, src_mtime: Option<std::time::SystemTime>)
     }
 }
 
+/// fsync a freshly copied tmp. `fs::copy` carries the source's mode, so a
+/// read-only source yields a read-only tmp: on Unix fsync works on a read-only
+/// descriptor; on Windows the readonly attribute is cleared first.
+fn sync_file(tmp: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut perms = fs::metadata(tmp)?.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(tmp, perms)?;
+        }
+        fs::File::options().write(true).open(tmp)?.sync_all()
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(tmp)?.sync_all()
+    }
+}
+
+/// Refuse a placement whose destination resolves to the source itself (an
+/// identical path or a symlinked directory in the tree). The destination's
+/// PARENT is resolved, not the destination, so an old symlink AT dest (to be
+/// replaced) is not mistaken for the file.
+fn refuse_dest_is_source(src: &Path, dest: &Path) -> Result<()> {
+    let (Ok(s), Some(parent), Some(name)) =
+        (fs::canonicalize(src), dest.parent(), dest.file_name())
+    else {
+        return Ok(());
+    };
+    if let Ok(p) = fs::canonicalize(parent) {
+        if p.join(name) == s {
+            return Err(anyhow!(
+                "the destination {} is the source file itself",
+                dest.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn copy_atomic(src: &Path, dest: &Path) -> Result<()> {
     let tmp = sibling_tmp(dest);
     if let Err(e) = fs::copy(src, &tmp) {
@@ -100,10 +141,7 @@ fn copy_atomic(src: &Path, dest: &Path) -> Result<()> {
         return Err(anyhow!("copy {} → {}: {e}", src.display(), dest.display()));
     }
     // Durable before the rename (house rule, fits_writer/mod.rs).
-    let synced = fs::File::options()
-        .write(true)
-        .open(&tmp)
-        .and_then(|f| f.sync_all());
+    let synced = sync_file(&tmp);
     if let Err(e) = synced {
         discard_tmp(&tmp, "project export");
         return Err(anyhow!("sync {}: {e}", tmp.display()));
@@ -127,7 +165,9 @@ fn place_one(
     canonical: &str,
     byte_size: i64,
     use_symlinks: bool,
+    keep_ok: bool,
 ) -> Result<Placed> {
+    refuse_dest_is_source(src, dest)?;
     let len = fs::metadata(src)
         .with_context(|| format!("stat {}", src.display()))?
         .len();
@@ -146,7 +186,8 @@ fn place_one(
             link_atomic(src, dest)?;
             return Ok(Placed::Linked);
         }
-        if !is_symlink(dest)
+        if keep_ok
+            && !is_symlink(dest)
             && fs::metadata(dest).is_ok_and(|m| m.len() == len && not_older(&m, src_mtime))
         {
             return Ok(Placed::Copied);
@@ -164,7 +205,7 @@ fn place_one(
         }
         return Ok(Placed::Copied);
     }
-    if !is_symlink(dest) && dest.exists() {
+    if keep_ok && !is_symlink(dest) && dest.exists() {
         let fresh = fs::metadata(dest).is_ok_and(|m| not_older(&m, src_mtime));
         if fresh {
             if let Ok((_, Some(v))) = read_file_filter(dest) {
@@ -226,6 +267,8 @@ fn stale_warning(
             Some(now) => now != *path,
             None => !cancelled,
         })
+        // A path another frame now occupies was replaced, not left behind.
+        .filter(|(_, path)| !placed.values().any(|p| p == *path))
         .map(|(_, path)| path)
         .collect();
     if stale.is_empty() {
@@ -289,6 +332,7 @@ pub fn organize_project_export(
                 &f.filter,
                 f.byte_size,
                 use_symlinks,
+                prev.frames.get(&f.frame_uuid) == Some(&rel),
             ) {
                 Ok(p) => {
                     match p {
@@ -302,6 +346,12 @@ pub fn organize_project_export(
                     counts.failed += 1;
                     tracing::warn!(project_id, frame_uuid = %f.frame_uuid, path = %f.landed_path, error = %format!("{e:#}"), "project export: frame failed");
                     warnings.push(format!("Failed to export {}: {e:#}", f.file_name));
+                    // Its previous copy is not "gone from the export": carry
+                    // the record entry forward so it is neither reported
+                    // stale nor dropped from the record.
+                    if let Some(old) = prev.frames.get(&f.frame_uuid) {
+                        placed.insert(f.frame_uuid.clone(), old.clone());
+                    }
                 }
             }
             done += 1;
@@ -368,9 +418,9 @@ pub fn organize_project_export(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::fits_writer::header_patch::read_image_keyword;
     use crate::fits_writer::{write_fits_f32, Card, CardValue};
+    use std::path::PathBuf;
 
     fn landed(dir: &Path, name: &str, filter: Option<&str>) -> (PathBuf, i64) {
         let p = dir.join("Collab").join(name);
@@ -683,5 +733,112 @@ mod tests {
         run(&title, &pubs, false);
         let after = std::fs::metadata(&dest).unwrap().modified().unwrap();
         assert!(after > before, "the patched copy was regenerated");
+    }
+
+    /// Two same-named, same-size frames share a bucket (`x.fits`, `x_2.fits`);
+    /// the first leaves; the survivor claims `x.fits`, where the other's bytes
+    /// sit. The dest must end up holding the survivor's own bytes.
+    #[test]
+    fn a_dropped_collision_peer_never_leaves_its_bytes_under_the_survivor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, asz) = landed(&tmp.path().join("a"), "x.fits", Some("R"));
+        let (b, bsz) = landed(&tmp.path().join("b"), "x.fits", Some("R"));
+        let mut bytes = std::fs::read(&b).unwrap();
+        bytes[2880] ^= 0xFF;
+        std::fs::write(&b, &bytes).unwrap();
+        let f = std::fs::File::options().write(true).open(&b).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(100))
+            .unwrap();
+        drop(f);
+        let title = tmp.path().join("T");
+        let both = vec![(
+            "Alice".to_string(),
+            vec![frame("uA", &a, asz, "R"), frame("uB", &b, bsz, "R")],
+        )];
+        run(&title, &both, false);
+        let x = title.join("Alice/camera_cama/R/x.fits");
+        assert_eq!(std::fs::read(&x).unwrap(), std::fs::read(&a).unwrap());
+        let res = run(
+            &title,
+            &[("Alice".to_string(), vec![frame("uB", &b, bsz, "R")])],
+            false,
+        );
+        assert_eq!(res.counts.copied, 1);
+        assert_eq!(
+            std::fs::read(&x).unwrap(),
+            bytes,
+            "the survivor's own bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_source_exports_in_copy_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, rs) = landed(tmp.path(), "r.fits", Some("R"));
+        std::fs::set_permissions(&r, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let title = tmp.path().join("T");
+        let res = run(
+            &title,
+            &[("Alice".into(), vec![frame("u1", &r, rs, "R")])],
+            false,
+        );
+        assert_eq!(res.counts.copied, 1, "{:?}", res.warnings);
+        assert_eq!(
+            std::fs::read(title.join("Alice/camera_cama/R/r.fits")).unwrap(),
+            std::fs::read(&r).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_destination_that_is_the_source_fails_the_frame_and_keeps_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let title = tmp.path().join("T");
+        let dir = title.join("Alice/camera_cama/R");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("r.fits");
+        let cards = [Card::new("FILTER", CardValue::Str("R".into())).unwrap()];
+        write_fits_f32(&src, 2, 2, 1, &[1.0, 2.0, 3.0, 4.0], &cards).unwrap();
+        let size = std::fs::metadata(&src).unwrap().len() as i64;
+        let before = std::fs::read(&src).unwrap();
+        for links in [false, true] {
+            let res = run(
+                &title,
+                &[("Alice".into(), vec![frame("u1", &src, size, "R")])],
+                links,
+            );
+            assert_eq!(res.counts.failed, 1, "links={links} {:?}", res.warnings);
+            assert!(!is_symlink(&src));
+            assert_eq!(std::fs::read(&src).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn a_failed_frame_keeps_its_previous_copy_unreported_and_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, rs) = landed(tmp.path(), "r.fits", Some("R"));
+        let title = tmp.path().join("T");
+        run(
+            &title,
+            &[("Alice".into(), vec![frame("u1", &r, rs, "R")])],
+            false,
+        );
+        let res = run(
+            &title,
+            &[("Alice".into(), vec![frame("u1", &r, rs + 1, "R")])],
+            false,
+        );
+        assert_eq!(res.counts.failed, 1);
+        assert!(
+            !res.warnings.iter().any(|w| w.contains("no longer part")),
+            "{:?}",
+            res.warnings
+        );
+        let rec = std::fs::read_to_string(title.join(EXPORT_RECORD_FILE)).unwrap();
+        assert!(
+            rec.contains("u1") && rec.contains("Alice/camera_cama/R/r.fits"),
+            "{rec}"
+        );
     }
 }
