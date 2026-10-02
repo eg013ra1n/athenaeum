@@ -1524,3 +1524,51 @@ async fn the_receiver_emits_live_flows_from_the_publisher_then_a_quiet_event() {
         "the event never reads the catalog: {quiet}"
     );
 }
+
+/// Plan P7: a burst of pull-needing project events (a coordinator's remap of
+/// pending rows, say) costs a holder far fewer manifest pulls than events.
+/// The worker-level test `run_folds_a_burst_and_pending_returns_to_zero`
+/// pins the `pending` counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_pull_events_is_folded_into_few_pulls() {
+    let w = ts::two_instances().await;
+    let uuids: Vec<String> = (0..300).map(|i| format!("burst-{i:03}")).collect();
+    let refs: Vec<&str> = uuids.iter().map(String::as_str).collect();
+    // Never inlined: every event below asks for a pull.
+    w.hub.seed_frames(ts::PID, "acc-a", &refs, "pending");
+    let target = w.hub.version(ts::PID);
+    wait_feed_version(&w.b.ctx, target, Duration::from_secs(20)).await;
+    let manifest = format!("/projects/{}/manifest", ts::PID);
+    let before = w.hub.requests_to(&manifest).await;
+    for u in &uuids {
+        w.hub
+            .update_frame(ts::PID, u, |f| f.filter_canonical = "R".into());
+    }
+    let target = w.hub.version(ts::PID);
+    wait_feed_version(&w.b.ctx, target, Duration::from_secs(60)).await;
+    let pulls = w.hub.requests_to(&manifest).await - before;
+    eprintln!("burst: {pulls} manifest pulls for 300 events");
+    assert!(
+        pulls > 0 && pulls < 100,
+        "{pulls} manifest pulls for 300 events"
+    );
+}
+
+async fn wait_feed_version(ctx: &crate::services::ServiceContext, version: i64, within: Duration) {
+    let deadline = Instant::now() + within;
+    loop {
+        let db = crate::api::db(ctx).unwrap();
+        let v = crate::db::collab::get_project(&db.conn(), ts::PID)
+            .unwrap()
+            .map(|p| p.hub_version)
+            .unwrap_or(0);
+        if v >= version {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "feed version {v} < {version} after {within:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

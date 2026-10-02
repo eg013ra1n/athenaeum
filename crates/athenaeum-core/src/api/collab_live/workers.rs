@@ -16,6 +16,7 @@
 //! events, the yield signal, commands and stop are serviced within
 //! milliseconds whatever these workers are doing.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,7 +29,7 @@ use crate::api::collab_live::runtime::Shared;
 use crate::api::collab_live::storage_task::{HolderView, StorageEngine, StorageEvent};
 use crate::api::ApiError;
 use crate::collab::hub_client::CollabClient;
-use crate::collab::live::wire::LiveEvent;
+use crate::collab::live::wire::{ChangeKind, LiveEvent, ProjectEvent};
 use crate::services::ServiceContext;
 
 // ── the feed worker ─────────────────────────────────────────────────────
@@ -84,6 +85,47 @@ pub(crate) struct FeedWorker {
     pending: Arc<AtomicUsize>,
     /// Sync now's digest checks, owed after the next `hello`.
     digest_after_hello: Option<Vec<String>>,
+    /// Work drained from the channel while looking for events to fold; it is
+    /// served, in order, before the channel is read again (plan P7).
+    carry: VecDeque<FeedWork>,
+}
+
+/// Plan P7 (wave 6 §11.2): a `project` event that will pull the manifest
+/// (frames changed and not inlined).
+pub(crate) fn needs_pull(ev: &ProjectEvent) -> bool {
+    ev.kinds.contains(&ChangeKind::Frames) && (ev.more || ev.frames.is_none())
+}
+
+/// Fold `next` into `into` when it is the same project, contiguous, and
+/// changes frames only: the pull `into` forces reads from the stored cursor
+/// to the head, so it covers `next`'s rows whether inlined or not.
+pub(crate) fn absorb(into: &mut ProjectEvent, next: &ProjectEvent) -> bool {
+    let frames_only = !next.kinds.is_empty() && next.kinds.iter().all(|k| *k == ChangeKind::Frames);
+    if next.project_id != into.project_id || next.prev != into.version || !frames_only {
+        return false;
+    }
+    into.version = next.version;
+    into.more = true;
+    into.frames = None;
+    true
+}
+
+/// Take `first` and, from the front of `queue`, every work item `absorb`
+/// accepts; stop at the first one it refuses (left in place, in order).
+/// Returns the merged event and how many queued events it absorbed.
+pub(crate) fn coalesce(
+    mut first: ProjectEvent,
+    queue: &mut VecDeque<FeedWork>,
+) -> (ProjectEvent, usize) {
+    let mut n = 0;
+    while let Some(FeedWork::Event(LiveEvent::Project(next))) = queue.front() {
+        if !absorb(&mut first, next) {
+            break;
+        }
+        queue.pop_front();
+        n += 1;
+    }
+    (first, n)
 }
 
 impl FeedWorker {
@@ -105,6 +147,7 @@ impl FeedWorker {
             out,
             pending,
             digest_after_hello: None,
+            carry: VecDeque::new(),
         }
     }
 
@@ -114,6 +157,11 @@ impl FeedWorker {
             // A due timer runs before more work, whatever is queued.
             if due.is_some_and(|d| Instant::now() >= d) {
                 self.timers().await;
+            }
+            // Work drained while folding a burst is served before the channel.
+            if let Some(w) = self.carry.pop_front() {
+                self.dispatch(w, &mut work).await;
+                continue;
             }
             let due = self.holdings.as_ref().and_then(Holdings::next_deadline);
             let sleep = async move {
@@ -126,10 +174,37 @@ impl FeedWorker {
                 biased;
                 w = work.recv() => match w {
                     None => return,
-                    Some(w) => self.handle(w).await,
+                    Some(w) => self.dispatch(w, &mut work).await,
                 },
                 _ = sleep => self.timers().await,
             }
+        }
+    }
+
+    /// Handle one work item; a pull-needing `project` event first drains
+    /// what is already queued and folds the contiguous run behind it into
+    /// one pull. `pending` drops once per ORIGINAL event, absorbed ones
+    /// included.
+    async fn dispatch(&mut self, w: FeedWork, work: &mut mpsc::UnboundedReceiver<FeedWork>) {
+        match w {
+            FeedWork::Event(LiveEvent::Project(ev)) if needs_pull(&ev) => {
+                while let Ok(w) = work.try_recv() {
+                    self.carry.push_back(w);
+                }
+                let (merged, absorbed) = coalesce(ev, &mut self.carry);
+                if absorbed > 0 {
+                    tracing::debug!(
+                        project_id = %merged.project_id,
+                        merged = absorbed,
+                        version = merged.version,
+                        "feed: pull-needing events merged"
+                    );
+                    self.pending.fetch_sub(absorbed, Ordering::SeqCst);
+                }
+                self.handle(FeedWork::Event(LiveEvent::Project(merged)))
+                    .await;
+            }
+            w => self.handle(w).await,
         }
     }
 
@@ -655,5 +730,147 @@ mod tests {
         let hello: HelloEvent = serde_json::from_value(hub.hello_for("tok")).unwrap();
         worker.on_event(LiveEvent::Hello(hello)).await;
         assert_eq!(digests().await, before + 1, "once, not on every hello");
+    }
+
+    fn pev(pid: &str, prev: i64, version: i64, kinds: &[ChangeKind], more: bool) -> ProjectEvent {
+        ProjectEvent {
+            project_id: pid.into(),
+            prev,
+            version,
+            kinds: kinds.to_vec(),
+            frames: None,
+            more,
+        }
+    }
+
+    fn q_event(e: ProjectEvent) -> FeedWork {
+        FeedWork::Event(LiveEvent::Project(e))
+    }
+
+    #[test]
+    fn a_contiguous_frames_only_run_is_absorbed_into_one_pull() {
+        let mut first = pev("p", 1, 2, &[ChangeKind::Frames], true);
+        assert!(needs_pull(&first));
+        assert!(absorb(
+            &mut first,
+            &pev("p", 2, 3, &[ChangeKind::Frames], true)
+        ));
+        assert!(
+            absorb(&mut first, &pev("p", 3, 4, &[ChangeKind::Frames], false)),
+            "an inline one is covered by the pull too"
+        );
+        assert_eq!(
+            (
+                first.prev,
+                first.version,
+                first.more,
+                first.frames.is_none()
+            ),
+            (1, 4, true, true)
+        );
+    }
+
+    #[test]
+    fn absorb_refuses_another_project_a_gap_or_other_kinds() {
+        let mut first = pev("p", 1, 2, &[ChangeKind::Frames], true);
+        assert!(!absorb(
+            &mut first,
+            &pev("q", 2, 3, &[ChangeKind::Frames], true)
+        ));
+        assert!(
+            !absorb(&mut first, &pev("p", 5, 6, &[ChangeKind::Frames], true)),
+            "a gap is the applier's catch-up"
+        );
+        assert!(!absorb(
+            &mut first,
+            &pev("p", 2, 3, &[ChangeKind::Frames, ChangeKind::Members], true)
+        ));
+        assert_eq!(first.version, 2);
+    }
+
+    #[test]
+    fn an_inline_event_does_not_start_a_merge() {
+        let mut inline = pev("p", 1, 2, &[ChangeKind::Frames], false);
+        inline.frames = Some(Vec::new());
+        assert!(!needs_pull(&inline));
+    }
+
+    #[test]
+    fn coalesce_keeps_every_refused_item_in_order() {
+        let mut q: VecDeque<FeedWork> = VecDeque::new();
+        q.push_back(q_event(pev("p", 2, 3, &[ChangeKind::Frames], true)));
+        q.push_back(q_event(pev("q", 7, 8, &[ChangeKind::Frames], true)));
+        q.push_back(q_event(pev("p", 3, 4, &[ChangeKind::Frames], true)));
+        let (merged, n) = coalesce(pev("p", 1, 2, &[ChangeKind::Frames], true), &mut q);
+        assert_eq!(
+            (merged.version, n),
+            (3, 1),
+            "stops at the other project's event"
+        );
+        assert_eq!(q.len(), 2, "q's event and p's later event stay, in order");
+        assert!(matches!(&q[0], FeedWork::Event(LiveEvent::Project(e)) if e.project_id == "q"));
+        assert!(matches!(&q[1], FeedWork::Event(LiveEvent::Project(e)) if e.project_id == "p"));
+    }
+
+    #[test]
+    fn coalesce_stops_at_a_non_project_item_and_resumes_after_it() {
+        let mut q: VecDeque<FeedWork> = VecDeque::new();
+        q.push_back(q_event(pev("p", 2, 3, &[ChangeKind::Frames], true)));
+        q.push_back(FeedWork::NoteAppend("p".into(), Instant::now()));
+        q.push_back(q_event(pev("p", 3, 4, &[ChangeKind::Frames], true)));
+        let (merged, n) = coalesce(pev("p", 1, 2, &[ChangeKind::Frames], true), &mut q);
+        assert_eq!((merged.version, n), (3, 1));
+        assert_eq!(q.len(), 2);
+        assert!(matches!(&q[0], FeedWork::NoteAppend(p, _) if p == "p"));
+        assert!(matches!(&q[1], FeedWork::Event(LiveEvent::Project(e)) if e.version == 4));
+    }
+
+    /// Plan P7 / Review Focus 5 at worker level: a burst of pull-needing
+    /// events with a `hello` and another project's event interleaved is
+    /// applied through `run`, costs fewer pulls than events, and `pending`
+    /// returns to zero (one decrement per ORIGINAL event).
+    #[tokio::test]
+    async fn run_folds_a_burst_and_pending_returns_to_zero() {
+        let (_tmp, hub, _shared, worker, _rx) = worker_after_hello().await;
+        let uuids: Vec<String> = (0..40).map(|i| format!("burst-{i:03}")).collect();
+        let refs: Vec<&str> = uuids.iter().map(String::as_str).collect();
+        hub.seed_frames("p1", "acc-me", &refs, "pending");
+        let v0 = hub.version("p1");
+        let mut events = Vec::new();
+        for u in &uuids {
+            hub.update_frame("p1", u, |f| f.filter_canonical = "R".into());
+        }
+        let head = hub.version("p1");
+        assert!(head > v0);
+        // The worker's stored version is the hello's; fold from there.
+        let base =
+            crate::db::collab::get_project(&crate::api::db(&worker.ctx).unwrap().conn(), "p1")
+                .unwrap()
+                .map(|p| p.hub_version)
+                .unwrap_or(0);
+        for v in base..head {
+            events.push(q_event(pev("p1", v, v + 1, &[ChangeKind::Frames], true)));
+        }
+        let total = events.len();
+        let pulls = || hub.requests_to("/projects/p1/manifest");
+        let before = pulls().await;
+        worker.pending.store(total, Ordering::SeqCst);
+        let pending = Arc::clone(&worker.pending);
+        let (tx, rx) = mpsc::unbounded_channel();
+        for e in events {
+            tx.send(e).unwrap();
+        }
+        drop(tx);
+        worker.run(rx).await;
+        assert_eq!(
+            pending.load(Ordering::SeqCst),
+            0,
+            "one decrement per original event"
+        );
+        let used = pulls().await - before;
+        assert!(
+            used >= 1 && used * 4 < total,
+            "{used} pulls for {total} events"
+        );
     }
 }
