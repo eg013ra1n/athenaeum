@@ -3,6 +3,7 @@ pub mod card;
 pub mod header_patch;
 pub mod keywords;
 pub mod writer;
+pub mod xisf_patch;
 pub mod xisf_writer;
 // Consumes plate_solve::storage::PlateSolveRecord, which is itself gated —
 // plate_solve builds on astroimage (render) and solvemyastro (solver).
