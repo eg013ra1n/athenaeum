@@ -295,7 +295,7 @@ fn place_at(
 /// placement used to hit copy_or_link's exists-skip, get counted as
 /// organized, and silently vanish from the export.
 #[derive(Default)]
-struct DestClaims(std::collections::HashSet<String>);
+pub(crate) struct DestClaims(std::collections::HashSet<String>);
 
 impl DestClaims {
     /// The case-insensitive key one destination is tracked under. ONE spelling,
@@ -310,7 +310,7 @@ impl DestClaims {
         self.0.contains(&Self::key(rel_dir, filename))
     }
 
-    fn claim(&mut self, rel_dir: &str, filename: &str) -> String {
+    pub(crate) fn claim(&mut self, rel_dir: &str, filename: &str) -> String {
         if self.0.insert(Self::key(rel_dir, filename)) {
             return filename.to_string();
         }

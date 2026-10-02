@@ -11,6 +11,7 @@ pub mod filter_header;
 pub mod frame_set_queries;
 pub mod models;
 pub mod project_collector;
+pub mod project_organizer;
 
 #[cfg(feature = "render")]
 pub use calibrated_generator::{
