@@ -194,6 +194,9 @@ fn read_layouts(f: &mut File) -> Result<(Vec<HduLayout>, u64, u64), FitsWriteErr
         });
         offset = data_offset + data_len_padded;
     }
+    if layouts.is_empty() {
+        return Err(malformed("empty file: no FITS HDU"));
+    }
     Ok((layouts, offset.min(file_len), file_len))
 }
 
@@ -346,6 +349,7 @@ pub fn patch_cards(
             std::io::copy(&mut f, &mut w)?;
         }
         w.flush()?;
+        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         Ok(grown)
     })();
     match written {
@@ -614,6 +618,19 @@ mod tests {
         let dest = dir.path().join("no_such_dir").join("out.fits");
         assert!(commit_tmp(&tmp, &dest).is_err());
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn a_zero_byte_file_is_malformed_for_both_entry_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("empty.fits");
+        std::fs::write(&src, b"").unwrap();
+        let dest = dir.path().join("out.fits");
+        assert!(patch_cards(&src, &dest, &[]).is_err());
+        assert!(!dest.exists());
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "only the source remains, no tmp");
+        assert!(read_image_keyword(&src, "FILTER").is_err());
     }
 
     #[test]
