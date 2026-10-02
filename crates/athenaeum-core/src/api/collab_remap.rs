@@ -22,6 +22,7 @@ const IN_FLIGHT: usize = 4;
 const MIN_SPACING: Duration = Duration::from_millis(100);
 const RATE_LIMIT_WAIT: Duration = Duration::from_secs(5);
 const RATE_LIMIT_RETRIES: u32 = 3;
+const HALT_POLL: Duration = Duration::from_millis(20);
 const THROTTLE: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
@@ -69,7 +70,29 @@ pub struct FilterBucketSheet {
 
 struct RemapState {
     cancel: AtomicBool,
+    /// Set when a 403/400 stops the run: no further request is sent.
+    stopped: AtomicBool,
     progress: Mutex<CollabRemapProgress>,
+}
+
+impl RemapState {
+    fn new(project_id: &str, canonical: &str, total: u32) -> Self {
+        Self {
+            cancel: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            progress: Mutex::new(CollabRemapProgress {
+                project_id: project_id.to_string(),
+                canonical: canonical.to_string(),
+                done: 0,
+                failed: 0,
+                total,
+            }),
+        }
+    }
+
+    fn halted(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst) || self.stopped.load(Ordering::SeqCst)
+    }
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<RemapState>>> {
@@ -144,8 +167,11 @@ enum Stop {
     Refused(String),
 }
 
-/// One PATCH, a 429 waited out (`wait`, up to RATE_LIMIT_RETRIES times).
+/// One PATCH, a 429 waited out (`wait`, up to RATE_LIMIT_RETRIES times). A
+/// cancel or a stop interrupts the wait and forbids any further request; the
+/// frame then ends as the rate-limit error (counted failed by the caller).
 async fn patch_with_retry(
+    state: &RemapState,
     client: &CollabClient,
     token: &str,
     pid: &str,
@@ -153,18 +179,26 @@ async fn patch_with_retry(
     canonical: &str,
     wait: Duration,
 ) -> Result<(), AccountClientError> {
-    let mut tries = 0;
+    let mut attempt = 0;
     loop {
         match client.patch_frame_filter(token, pid, uuid, canonical).await {
-            Err(AccountClientError::RateLimited) if tries < RATE_LIMIT_RETRIES => {
-                tries += 1;
+            Err(AccountClientError::RateLimited)
+                if attempt < RATE_LIMIT_RETRIES && !state.halted() =>
+            {
+                attempt += 1;
                 tracing::debug!(
                     project_id = pid,
                     frame_uuid = uuid,
-                    tries,
+                    attempt,
                     "remap: rate limited, waiting"
                 );
-                tokio::time::sleep(wait).await;
+                let deadline = Instant::now() + wait;
+                while Instant::now() < deadline && !state.halted() {
+                    tokio::time::sleep(HALT_POLL.min(deadline - Instant::now())).await;
+                }
+                if state.halted() {
+                    return Err(AccountClientError::RateLimited);
+                }
             }
             other => return other,
         }
@@ -199,16 +233,7 @@ pub async fn remap_collab_filter(
         Arc::new(CollabClient::new(&hub_url).map_err(crate::api::collab_exchange::client_err)?);
     let k = key(&ctx, &project_id)?;
     let total = frame_uuids.len() as u32;
-    let state = Arc::new(RemapState {
-        cancel: AtomicBool::new(false),
-        progress: Mutex::new(CollabRemapProgress {
-            project_id: project_id.clone(),
-            canonical: canonical.clone(),
-            done: 0,
-            failed: 0,
-            total,
-        }),
-    });
+    let state = Arc::new(RemapState::new(&project_id, &canonical, total));
     {
         let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
         if reg.contains_key(&k) {
@@ -233,21 +258,19 @@ pub async fn remap_collab_filter(
         let mut inflight = tokio::task::JoinSet::new();
         let mut next_send = Instant::now();
         loop {
-            while stop.is_none()
-                && !state.cancel.load(Ordering::SeqCst)
-                && inflight.len() < IN_FLIGHT
-            {
+            while stop.is_none() && !state.halted() && inflight.len() < IN_FLIGHT {
                 let Some(uuid) = queue.next() else { break };
                 tokio::time::sleep_until(next_send.into()).await;
                 next_send = Instant::now() + MIN_SPACING;
-                let (c, t, p, can) = (
+                let (st, c, t, p, can) = (
+                    state.clone(),
                     client.clone(),
                     token.clone(),
                     project_id.clone(),
                     canonical.clone(),
                 );
                 inflight.spawn(async move {
-                    let r = patch_with_retry(&c, &t, &p, &uuid, &can, RATE_LIMIT_WAIT).await;
+                    let r = patch_with_retry(&st, &c, &t, &p, &uuid, &can, RATE_LIMIT_WAIT).await;
                     (uuid, r)
                 });
             }
@@ -272,6 +295,7 @@ pub async fn remap_collab_filter(
                     Ok(()) => p.done += 1,
                     Err(AccountClientError::Forbidden) => {
                         p.failed += 1;
+                        state.stopped.store(true, Ordering::SeqCst);
                         stop.get_or_insert(Stop::Forbidden);
                     }
                     Err(AccountClientError::Http {
@@ -279,6 +303,7 @@ pub async fn remap_collab_filter(
                         message,
                     }) => {
                         p.failed += 1;
+                        state.stopped.store(true, Ordering::SeqCst);
                         stop.get_or_insert(Stop::Refused(message));
                     }
                     Err(e) => {
@@ -303,7 +328,7 @@ pub async fn remap_collab_filter(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let cancelled = state.cancel.load(Ordering::SeqCst) && stop.is_none();
+        let cancelled = state.cancel.load(Ordering::SeqCst) && stop.is_none() && p.done < p.total;
         let error = match stop {
             Some(Stop::Forbidden) => {
                 Some("This account lacks thresholds.edit on the project.".to_string())
@@ -311,10 +336,6 @@ pub async fn remap_collab_filter(
             Some(Stop::Refused(m)) => Some(format!("The hub refused the remap: {m}")),
             None => None,
         };
-        registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&k);
         let fin = CollabRemapFinished {
             project_id: p.project_id.clone(),
             canonical: p.canonical.clone(),
@@ -335,6 +356,12 @@ pub async fn remap_collab_filter(
         if let Some(em) = emitter.as_deref() {
             emit_event(em, COLLAB_REMAP_FINISHED_EVENT, &fin);
         }
+        // Released only after the finished event, so a remap admitted next can
+        // never emit progress ahead of this run's finished event.
+        registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&k);
     });
     Ok(())
 }
@@ -485,17 +512,31 @@ mod tests {
         assert!(f.cancelled, "{f:?}");
         assert!(f.done < 12, "{f:?}");
         assert!(f.error.is_none());
-        // The registry slot is released just before the finished event.
+        // The slot is released right AFTER the finished event: admission may
+        // refuse for a moment, never for long.
         let rec2 = Arc::new(Rec(StdMutex::new(Vec::new())));
-        remap_collab_filter(
-            ctx.clone(),
-            "p1".into(),
-            uuids,
-            "G".into(),
-            Some(rec2.clone()),
-        )
-        .await
-        .unwrap();
+        let mut admitted = false;
+        for _ in 0..100 {
+            match remap_collab_filter(
+                ctx.clone(),
+                "p1".into(),
+                uuids.clone(),
+                "G".into(),
+                Some(rec2.clone()),
+            )
+            .await
+            {
+                Ok(()) => {
+                    admitted = true;
+                    break;
+                }
+                Err(ApiError::Conflict(_)) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert!(admitted, "a third remap was never admitted");
         cancel_collab_remap(&ctx, "p1").unwrap();
         finished(&rec2).await;
     }
@@ -543,14 +584,61 @@ mod tests {
             .mount(&server)
             .await;
         let client = CollabClient::new(server.uri()).unwrap();
-        patch_with_retry(&client, "tok", "p1", "u00", "R", Duration::from_millis(1))
-            .await
-            .unwrap();
+        let st = RemapState::new("p1", "R", 1);
+        patch_with_retry(
+            &st,
+            &client,
+            "tok",
+            "p1",
+            "u00",
+            "R",
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_interrupts_a_rate_limit_wait_and_sends_nothing_more() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let client = CollabClient::new(server.uri()).unwrap();
+        let st = Arc::new(RemapState::new("p1", "R", 1));
+        let t0 = Instant::now();
+        let task = {
+            let (st, client) = (st.clone(), client);
+            tokio::spawn(async move {
+                patch_with_retry(
+                    &st,
+                    &client,
+                    "tok",
+                    "p1",
+                    "u00",
+                    "R",
+                    Duration::from_secs(5),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        st.cancel.store(true, Ordering::SeqCst);
+        let r = task.await.unwrap();
+        assert!(matches!(r, Err(AccountClientError::RateLimited)), "{r:?}");
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        let n = server.received_requests().await.unwrap().len();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(n, 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), n);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_member_without_thresholds_edit_stops_at_the_first_forbidden() {
-        let (_t, ctx, _hub) = fixture(false).await;
+        let (_t, ctx, hub) = fixture(false).await;
         let uuids = get_collab_filter_buckets(&ctx, "p1").unwrap().buckets[0]
             .frame_uuids
             .clone();
@@ -570,6 +658,48 @@ mod tests {
             f.error.as_deref().unwrap_or("").contains("thresholds.edit"),
             "{f:?}"
         );
+        assert_stopped_early(&f);
+        assert!(hub.requests_matching("/frames/", "p1").await <= IN_FLIGHT);
+    }
+
+    fn assert_stopped_early(f: &CollabRemapFinished) {
+        assert_eq!(f.total, 12);
+        assert!(
+            (1..=IN_FLIGHT as u32).contains(&f.failed),
+            "failed out of bounds: {f:?}"
+        );
+        assert!(f.done + f.failed < f.total, "did not stop: {f:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hub_refusal_400_stops_the_run() {
+        let (_t, ctx, hub) = fixture(true).await;
+        let uuids = get_collab_filter_buckets(&ctx, "p1").unwrap().buckets[0]
+            .frame_uuids
+            .clone();
+        // The hub drops "R" after the local cache was filled.
+        let entries: Vec<_> = crate::collab::fake_hub::default_dictionary()
+            .into_iter()
+            .filter(|d| d.canonical != "R")
+            .collect();
+        hub.set_dictionary("p1", 99, entries);
+        let rec = Arc::new(Rec(StdMutex::new(Vec::new())));
+        remap_collab_filter(
+            ctx.clone(),
+            "p1".into(),
+            uuids,
+            "R".into(),
+            Some(rec.clone()),
+        )
+        .await
+        .unwrap();
+        let f = finished(&rec).await;
+        assert_eq!(f.done, 0);
+        assert!(
+            f.error.as_deref().unwrap_or("").contains("refused"),
+            "{f:?}"
+        );
+        assert_stopped_early(&f);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
