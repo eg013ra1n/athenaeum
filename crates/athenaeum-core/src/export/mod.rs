@@ -7,6 +7,7 @@
 pub mod calibrated_generator;
 pub mod data_collector;
 pub mod file_organizer;
+pub mod filter_header;
 pub mod frame_set_queries;
 pub mod models;
 pub mod project_collector;
