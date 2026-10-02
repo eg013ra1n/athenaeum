@@ -752,7 +752,12 @@ mastersRebuildable: Array<number>,
  * `check_rebuild_source_ready` failure text — archived originals or
  * missing source frames).
  */
-mastersUnrebuildable: Array<[number, string]>, };
+mastersUnrebuildable: Array<[number, string]>, 
+/**
+ * R3 (wave 6 §13): the set is attested "calibrated by an external
+ * tool" — the calibrated-lights mode copies its lights as they are.
+ */
+attested: boolean, };
 
 export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
 

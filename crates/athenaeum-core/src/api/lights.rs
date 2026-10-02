@@ -124,6 +124,10 @@ pub struct ExportReadiness {
     /// missing source frames).
     #[serde(default)]
     pub masters_unrebuildable: Vec<(i64, String)>,
+    /// R3 (wave 6 §13): the set is attested "calibrated by an external
+    /// tool" — the calibrated-lights mode copies its lights as they are.
+    #[serde(default)]
+    pub attested: bool,
 }
 
 // ── Membership ──────────────────────────────────────────────────────────────
@@ -187,6 +191,9 @@ pub fn check_mode_ready(r: &ExportReadiness, mode: ExportMode) -> Result<(), Str
         // build is the step that can also change what a light resolves to, so
         // reporting the link count over it would send the operator to the wrong
         // screen.
+        // R3 (wave 6 §13): an attested set's lights are already calibrated by
+        // an external tool and are copied as they are — no masters needed.
+        ExportMode::CalibratedLights if r.attested => Ok(()),
         ExportMode::CalibratedLights if r.raw_sets_without_master > 0 => {
             let n = r.raw_sets_without_master;
             Err(format!(
@@ -510,6 +517,10 @@ pub(crate) fn readiness_from_data(
         missing_raw_calibration_files,
         "export readiness computed"
     );
+    let attested = crate::db::collab::frames_set_attested(conn, set_id).unwrap_or_else(|e| {
+        tracing::warn!(set_id, error = %e, "attestation read failed; treated as not attested");
+        false
+    });
     Ok(ExportReadiness {
         total,
         unlinked_lights,
@@ -522,6 +533,7 @@ pub(crate) fn readiness_from_data(
         raw_sets_unbuildable,
         masters_rebuildable,
         masters_unrebuildable,
+        attested,
     })
 }
 
@@ -1053,6 +1065,30 @@ mod tests {
     }
 
     #[test]
+    fn an_attested_set_is_ready_for_calibrated_lights_without_masters() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session);
+        // A RAW dark set with member frames, no master.
+        let raw = seed_raw_set_with_frames(&conn, 100, "Dark", 2);
+        add_link(&conn, 10, raw, "Dark");
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(r.raw_sets_without_master, 1);
+        assert!(
+            check_mode_ready(&r, ExportMode::CalibratedLights).is_err(),
+            "not attested: build masters first"
+        );
+        crate::db::collab::set_frames_set_attestation(&conn, 1, true).unwrap();
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert!(r.attested);
+        assert_eq!(check_mode_ready(&r, ExportMode::CalibratedLights), Ok(()));
+        assert!(
+            check_mode_ready(&r, ExportMode::RawWithMasters).is_err(),
+            "raw modes keep their own gate"
+        );
+    }
+
+    #[test]
     fn check_mode_ready_truth_table() {
         let ready = ExportReadiness {
             total: 4,
@@ -1066,6 +1102,7 @@ mod tests {
             raw_sets_unbuildable: vec![],
             masters_rebuildable: vec![],
             masters_unrebuildable: vec![],
+            attested: false,
         };
         for mode in [
             ExportMode::LightsOnly,

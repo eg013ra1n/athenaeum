@@ -1,0 +1,46 @@
+import type { ExportMode } from '../../types/export';
+import type { ExportReadiness } from '../../types/models';
+
+/** Why `mode` is not ready, or null. Mirrors core `check_mode_ready` verbatim —
+ *  wording included: with nothing linked at all the two raw modes are blocked
+ *  first (they would land exactly what Lights only lands, and the masters rule
+ *  is vacuously true with no sets); `rawWithMasters` and the calibrated mode's
+ *  masters-missing blocker read different sentences on the backend even though
+ *  both gate on `rawSetsWithoutMaster`, and the calibrated mode's blocker ORDER
+ *  is masters-missing → unlinked-lights → missing master FILES (a build is what
+ *  can also change where a light's links resolve to; a missing FILE is a
+ *  distinct failure from "not built yet"). The sets mode lands the raw
+ *  originals behind every built master, so it is the one mode a raw original
+ *  missing on disk (archived after the build) blocks. An attested set (calibrated
+ *  by an external tool) passes the calibrated mode with no masters at all. */
+export function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null {
+  const nothingLinked = r.total > 0 && r.unlinkedLights === r.total;
+  if ((mode === 'rawWithCalibrationSets' || mode === 'rawWithMasters') && nothingLinked) {
+    return 'No calibration is linked to this set — only the lights would land';
+  }
+  if (mode === 'rawWithCalibrationSets' && r.missingRawCalibrationFiles > 0) {
+    const n = r.missingRawCalibrationFiles;
+    return `${n} raw calibration file(s) missing on disk — restore from archive first`;
+  }
+  if (mode === 'rawWithMasters' && r.rawSetsWithoutMaster > 0) {
+    const n = r.rawSetsWithoutMaster;
+    return `${n} calibration set${n === 1 ? '' : 's'} ${n === 1 ? 'has' : 'have'} no master — build masters first`;
+  }
+  if (mode === 'calibratedLights') {
+    // R3: an attested set's lights are copied as they are — no masters needed.
+    if (r.attested) return null;
+    if (r.rawSetsWithoutMaster > 0) {
+      const n = r.rawSetsWithoutMaster;
+      return `Build masters first — ${n} set${n === 1 ? '' : 's'} without a master`;
+    }
+    if (r.unlinkedLights > 0) {
+      const n = r.unlinkedLights;
+      return `${n} light${n === 1 ? '' : 's'} ${n === 1 ? 'has' : 'have'} no calibration links`;
+    }
+    if (r.missingMasterFiles > 0) {
+      const n = r.missingMasterFiles;
+      return `${n} master file(s) missing on disk — restore from archive first`;
+    }
+  }
+  return null;
+}

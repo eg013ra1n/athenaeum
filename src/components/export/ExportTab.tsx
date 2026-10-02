@@ -18,6 +18,7 @@ import { useExportProgressContext } from '../../contexts/ExportProgressContext';
 import type { ExportLightCalPrefs } from '../../hooks/useExportProgress';
 import { ExportSummary } from './ExportSummary';
 import { WarningsPanel } from './WarningsPanel';
+import { modeBlocker } from './modeBlocker';
 import { FolderBrowserModal } from '../FolderBrowserModal';
 import { SendToNodeDialog } from '../transfers/SendToNodeDialog';
 import {
@@ -65,47 +66,6 @@ const EXPORT_MODE_OPTIONS: { value: ExportMode; label: string; hint: string; cou
 /** Where the tab lands when the remembered mode is blocked on the current set:
  *  the documented default first (it has no blocker), then list order. */
 const MODE_FALLBACK_ORDER: ExportMode[] = ['rawWithCalibrationSets', ...EXPORT_MODE_OPTIONS.map(o => o.value)];
-
-/** Why `mode` is not ready, or null. Mirrors core `check_mode_ready` verbatim —
- *  wording included: with nothing linked at all the two raw modes are blocked
- *  first (they would land exactly what Lights only lands, and the masters rule
- *  is vacuously true with no sets); `rawWithMasters` and the calibrated mode's
- *  masters-missing blocker read different sentences on the backend even though
- *  both gate on `rawSetsWithoutMaster`, and the calibrated mode's blocker ORDER
- *  is masters-missing → unlinked-lights → missing master FILES (a build is what
- *  can also change where a light's links resolve to; a missing FILE is a
- *  distinct failure from "not built yet"). The sets mode lands the raw
- *  originals behind every built master, so it is the one mode a raw original
- *  missing on disk (archived after the build) blocks. */
-function modeBlocker(r: ExportReadiness, mode: ExportMode): string | null {
-  const nothingLinked = r.total > 0 && r.unlinkedLights === r.total;
-  if ((mode === 'rawWithCalibrationSets' || mode === 'rawWithMasters') && nothingLinked) {
-    return 'No calibration is linked to this set — only the lights would land';
-  }
-  if (mode === 'rawWithCalibrationSets' && r.missingRawCalibrationFiles > 0) {
-    const n = r.missingRawCalibrationFiles;
-    return `${n} raw calibration file(s) missing on disk — restore from archive first`;
-  }
-  if (mode === 'rawWithMasters' && r.rawSetsWithoutMaster > 0) {
-    const n = r.rawSetsWithoutMaster;
-    return `${n} calibration set${n === 1 ? '' : 's'} ${n === 1 ? 'has' : 'have'} no master — build masters first`;
-  }
-  if (mode === 'calibratedLights') {
-    if (r.rawSetsWithoutMaster > 0) {
-      const n = r.rawSetsWithoutMaster;
-      return `Build masters first — ${n} set${n === 1 ? '' : 's'} without a master`;
-    }
-    if (r.unlinkedLights > 0) {
-      const n = r.unlinkedLights;
-      return `${n} light${n === 1 ? '' : 's'} ${n === 1 ? 'has' : 'have'} no calibration links`;
-    }
-    if (r.missingMasterFiles > 0) {
-      const n = r.missingMasterFiles;
-      return `${n} master file(s) missing on disk — restore from archive first`;
-    }
-  }
-  return null;
-}
 
 /** Read the persisted export mode, defaulting to `rawWithCalibrationSets` when
  *  unset or corrupt. */
@@ -555,7 +515,11 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                           {readiness ? `${opt.count(readiness.fileCounts)} files` : ''}
                         </span>
                       </span>
-                      <span className="block text-xs text-content-muted mt-0.5">{opt.hint}</span>
+                      <span className="block text-xs text-content-muted mt-0.5">
+                        {opt.value === 'calibratedLights' && readiness?.attested
+                          ? 'This set is attested as calibrated by an external tool — its lights are copied as they are.'
+                          : opt.hint}
+                      </span>
                       {reason && (
                         <span className="mt-1 flex items-center gap-2 text-xs text-error">
                           <AlertTriangle size={12} /> {reason}

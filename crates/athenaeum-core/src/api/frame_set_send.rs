@@ -321,6 +321,26 @@ mod tests {
     }
 
     #[test]
+    fn an_attested_set_sends_its_lights_as_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(tmp.path());
+        {
+            let db = ctx.db.get().unwrap();
+            seed(&db.conn(), tmp.path());
+            crate::db::collab::set_frames_set_attestation(&db.conn(), 1, true).unwrap();
+        }
+        let entries = frame_set_entries(&ctx, 1, ExportMode::CalibratedLights, &opts()).unwrap();
+        assert!(!entries.is_empty());
+        assert!(
+            entries.iter().all(|e| !e.generate),
+            "an attested set's lights are copies"
+        );
+        assert!(entries
+            .iter()
+            .all(|e| e.kind == PayloadKind::CalibratedLight));
+    }
+
+    #[test]
     fn calibrated_lights_compose_from_marked_lights_and_refuse_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ctx_with(tmp.path());

@@ -628,6 +628,16 @@ fn apply_calibrated_lights(
     // so the BIAS/DARKS/FLAT nesting is dropped entirely and the lights land
     // directly under the camera folder.
     drop_calibration_nodes(data);
+    // R3 (wave 6 §13): an attested set's lights are already calibrated by an
+    // external tool — copy them as they are. The read error propagates: an
+    // export must not silently calibrate or skip.
+    if crate::db::collab::frames_set_attested(conn, data.frame_set_id)? {
+        tracing::info!(
+            frames_set_id = data.frame_set_id,
+            "calibrated-lights export of an attested set: lights copied as they are"
+        );
+        return Ok(Vec::new());
+    }
     let mut total = 0usize;
     let mut debayered = 0usize;
     for group in &mut data.groups {
@@ -2815,6 +2825,34 @@ mod export_mode_tests {
             before,
             "default mode must leave ExportData unchanged"
         );
+    }
+
+    #[test]
+    fn apply_calibrated_lights_passes_an_attested_set_through() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        crate::db::collab::set_frames_set_attestation(&conn, 1, true).unwrap();
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let names_before: Vec<String> = lights_by_id(&data)
+            .values()
+            .map(|f| f.filename.clone())
+            .collect();
+        apply_export_mode(
+            &conn,
+            &mut data,
+            ExportMode::CalibratedLights,
+            Some(&CalibratedLightOptions::default()),
+        )
+        .unwrap();
+        for f in lights_by_id(&data).values() {
+            assert_eq!(f.debayer_calibrated, None, "copied as is");
+        }
+        let names_after: Vec<String> = lights_by_id(&data)
+            .values()
+            .map(|f| f.filename.clone())
+            .collect();
+        assert_eq!(names_before, names_after, "original file names");
     }
 
     /// The calibrated-lights transform is a MARKING pass: it renames each light

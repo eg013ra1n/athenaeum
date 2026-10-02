@@ -905,6 +905,7 @@ mod tests {
             raw_sets_unbuildable: vec![],
             masters_rebuildable: vec![],
             masters_unrebuildable: vec![],
+            attested: false,
         };
         // The three ways `check_mode_ready` refuses `CalibratedLights`
         // (`api/lights.rs::check_mode_ready_truth_table` exercises the same
