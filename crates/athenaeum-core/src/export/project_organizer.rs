@@ -57,8 +57,31 @@ enum Placed {
 struct ExportRecord {
     version: u32,
     project_id: String,
-    /// frame uuid → path placed, relative to the title folder, `/`-separated.
-    frames: BTreeMap<String, String>,
+    /// frame uuid → what was placed for it.
+    frames: BTreeMap<String, RecordEntry>,
+}
+
+/// One placed file: its path (relative to the title folder, `/`-separated)
+/// and the identity (`symlink_metadata` size + mtime) it had right after
+/// placement. A destination is kept on a re-export only while it still has
+/// exactly this identity, so a file another frame overwrote is never trusted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordEntry {
+    path: String,
+    size: u64,
+    mtime_ns: i128,
+}
+
+/// `(size, mtime in ns since the epoch)` of the path itself (a link's own metadata).
+fn identity(p: &Path) -> Option<(u64, i128)> {
+    let m = fs::symlink_metadata(p).ok()?;
+    let t = m.modified().ok()?;
+    let ns = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i128,
+        Err(e) => -(e.duration().as_nanos() as i128),
+    };
+    Some((m.len(), ns))
 }
 
 fn rel_dir(publisher: &str, f: &ProjectExportFrame) -> String {
@@ -257,19 +280,19 @@ fn write_record(title_dir: &Path, record: &ExportRecord) -> Result<()> {
 
 fn stale_warning(
     prev: &ExportRecord,
-    placed: &BTreeMap<String, String>,
+    placed: &BTreeMap<String, RecordEntry>,
     cancelled: bool,
 ) -> Option<String> {
     let stale: Vec<&String> = prev
         .frames
         .iter()
-        .filter(|(uuid, path)| match placed.get(*uuid) {
-            Some(now) => now != *path,
+        .filter(|(uuid, e)| match placed.get(*uuid) {
+            Some(now) => now.path != e.path,
             None => !cancelled,
         })
         // A path another frame now occupies was replaced, not left behind.
-        .filter(|(_, path)| !placed.values().any(|p| p == *path))
-        .map(|(_, path)| path)
+        .filter(|(_, e)| !placed.values().any(|p| p.path == e.path))
+        .map(|(_, e)| &e.path)
         .collect();
     if stale.is_empty() {
         return None;
@@ -303,7 +326,7 @@ pub fn organize_project_export(
     let total: usize = publishers.iter().map(|(_, f)| f.len()).sum();
     let mut counts = PlaceCounts::default();
     let mut warnings = Vec::new();
-    let mut placed: BTreeMap<String, String> = BTreeMap::new();
+    let mut placed: BTreeMap<String, RecordEntry> = BTreeMap::new();
     let mut claims = DestClaims::default();
     let mut cancelled = false;
     let mut done = 0usize;
@@ -332,7 +355,9 @@ pub fn organize_project_export(
                 &f.filter,
                 f.byte_size,
                 use_symlinks,
-                prev.frames.get(&f.frame_uuid) == Some(&rel),
+                prev.frames.get(&f.frame_uuid).is_some_and(|e| {
+                    e.path == rel && identity(&dest) == Some((e.size, e.mtime_ns))
+                }),
             ) {
                 Ok(p) => {
                     match p {
@@ -340,7 +365,22 @@ pub fn organize_project_export(
                         Placed::Copied => counts.copied += 1,
                         Placed::Rewritten => counts.rewritten += 1,
                     }
-                    placed.insert(f.frame_uuid.clone(), rel);
+                    match identity(&dest) {
+                        Some((size, mtime_ns)) => {
+                            placed.insert(
+                                f.frame_uuid.clone(),
+                                RecordEntry {
+                                    path: rel,
+                                    size,
+                                    mtime_ns,
+                                },
+                            );
+                        }
+                        None => {
+                            // Not trustable next time: no entry, so it is replaced then.
+                            tracing::warn!(project_id, frame_uuid = %f.frame_uuid, path = %dest.display(), "project export: placed file not stat-able; not recorded");
+                        }
+                    }
                 }
                 Err(e) => {
                     counts.failed += 1;
@@ -839,6 +879,50 @@ mod tests {
         assert!(
             rec.contains("u1") && rec.contains("Alice/camera_cama/R/r.fits"),
             "{rec}"
+        );
+    }
+
+    /// NB1: A fails in run N while B takes A's old path; in run N+1 A's path
+    /// returns. A must get its OWN bytes, never B's under A's name.
+    #[test]
+    fn a_carried_entry_never_keeps_another_frames_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, asz) = landed(&tmp.path().join("a"), "x.fits", Some("R"));
+        let (b, bsz) = landed(&tmp.path().join("b"), "x.fits", Some("R"));
+        let mut b_bytes = std::fs::read(&b).unwrap();
+        b_bytes[2880] ^= 0xFF;
+        std::fs::write(&b, &b_bytes).unwrap();
+        let title = tmp.path().join("T");
+        let fa = |sz: i64, f: &str| {
+            (
+                "Alice".to_string(),
+                vec![frame("uA", &a, sz, f), frame("uB", &b, bsz, "R")],
+            )
+        };
+        run(&title, &[fa(asz, "R")], false);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Run N: A is remapped to G and fails (size mismatch); B now claims R/x.fits.
+        let res = run(
+            &title,
+            &[(
+                "Alice".to_string(),
+                vec![frame("uA", &a, asz + 1, "G"), frame("uB", &b, bsz, "R")],
+            )],
+            false,
+        );
+        assert_eq!(res.counts.failed, 1);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Run N+1: A is back at R/x.fits, first in the bucket.
+        run(&title, &[fa(asz, "R")], false);
+        let x = title.join("Alice/camera_cama/R/x.fits");
+        assert_eq!(
+            std::fs::read(&x).unwrap(),
+            std::fs::read(&a).unwrap(),
+            "A's own bytes"
+        );
+        assert_eq!(
+            std::fs::read(title.join("Alice/camera_cama/R/x_2.fits")).unwrap(),
+            b_bytes
         );
     }
 }
