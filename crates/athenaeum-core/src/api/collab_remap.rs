@@ -95,6 +95,12 @@ impl RemapState {
     }
 }
 
+/// A run reports `cancelled` only when the user cancelled, nothing else
+/// stopped it, and frames were left undispatched.
+fn is_cancelled(cancel_requested: bool, stopped: bool, undispatched: usize) -> bool {
+    cancel_requested && !stopped && undispatched > 0
+}
+
 fn registry() -> &'static Mutex<HashMap<String, Arc<RemapState>>> {
     static R: OnceLock<Mutex<HashMap<String, Arc<RemapState>>>> = OnceLock::new();
     R.get_or_init(Default::default)
@@ -194,7 +200,10 @@ async fn patch_with_retry(
                 );
                 let deadline = Instant::now() + wait;
                 while Instant::now() < deadline && !state.halted() {
-                    tokio::time::sleep(HALT_POLL.min(deadline - Instant::now())).await;
+                    tokio::time::sleep(
+                        HALT_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
                 }
                 if state.halted() {
                     return Err(AccountClientError::RateLimited);
@@ -259,8 +268,15 @@ pub async fn remap_collab_filter(
         let mut next_send = Instant::now();
         loop {
             while stop.is_none() && !state.halted() && inflight.len() < IN_FLIGHT {
-                let Some(uuid) = queue.next() else { break };
+                if queue.len() == 0 {
+                    break;
+                }
                 tokio::time::sleep_until(next_send.into()).await;
+                // A cancel or stop landing during the spacing sleep sends nothing more.
+                if state.halted() {
+                    break;
+                }
+                let Some(uuid) = queue.next() else { break };
                 next_send = Instant::now() + MIN_SPACING;
                 let (st, c, t, p, can) = (
                     state.clone(),
@@ -328,7 +344,11 @@ pub async fn remap_collab_filter(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let cancelled = state.cancel.load(Ordering::SeqCst) && stop.is_none() && p.done < p.total;
+        let cancelled = is_cancelled(
+            state.cancel.load(Ordering::SeqCst),
+            stop.is_some(),
+            queue.len(),
+        );
         let error = match stop {
             Some(Stop::Forbidden) => {
                 Some("This account lacks thresholds.edit on the project.".to_string())
@@ -353,15 +373,15 @@ pub async fn remap_collab_filter(
                 tracing::info!(project_id = %p.project_id, done = p.done, failed = p.failed, cancelled, duration_ms = started.elapsed().as_millis() as u64, "filter remap finished")
             }
         }
+        // The registry lock is held across the finished emit and the slot
+        // removal (both hosts' emit is a non-blocking enqueue that never touches
+        // this registry): a remap admitted next sees the slot free only after
+        // the finished event, and never refuses once that event is observed.
+        let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
         if let Some(em) = emitter.as_deref() {
             emit_event(em, COLLAB_REMAP_FINISHED_EVENT, &fin);
         }
-        // Released only after the finished event, so a remap admitted next can
-        // never emit progress ahead of this run's finished event.
-        registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&k);
+        reg.remove(&k);
     });
     Ok(())
 }
@@ -512,31 +532,17 @@ mod tests {
         assert!(f.cancelled, "{f:?}");
         assert!(f.done < 12, "{f:?}");
         assert!(f.error.is_none());
-        // The slot is released right AFTER the finished event: admission may
-        // refuse for a moment, never for long.
+        // The slot is released under the same lock as the finished emit.
         let rec2 = Arc::new(Rec(StdMutex::new(Vec::new())));
-        let mut admitted = false;
-        for _ in 0..100 {
-            match remap_collab_filter(
-                ctx.clone(),
-                "p1".into(),
-                uuids.clone(),
-                "G".into(),
-                Some(rec2.clone()),
-            )
-            .await
-            {
-                Ok(()) => {
-                    admitted = true;
-                    break;
-                }
-                Err(ApiError::Conflict(_)) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await
-                }
-                Err(e) => panic!("{e:?}"),
-            }
-        }
-        assert!(admitted, "a third remap was never admitted");
+        remap_collab_filter(
+            ctx.clone(),
+            "p1".into(),
+            uuids,
+            "G".into(),
+            Some(rec2.clone()),
+        )
+        .await
+        .expect("a third remap right after the finished event is admitted");
         cancel_collab_remap(&ctx, "p1").unwrap();
         finished(&rec2).await;
     }
@@ -662,6 +668,15 @@ mod tests {
         assert!(hub.requests_matching("/frames/", "p1").await <= IN_FLIGHT);
     }
 
+    #[test]
+    fn cancelled_means_cancel_requested_without_stop_and_frames_left() {
+        assert!(is_cancelled(true, false, 3));
+        // Everything dispatched (one already failed, last PATCH in flight): not cancelled.
+        assert!(!is_cancelled(true, false, 0));
+        assert!(!is_cancelled(true, true, 3));
+        assert!(!is_cancelled(false, false, 3));
+    }
+
     fn assert_stopped_early(f: &CollabRemapFinished) {
         assert_eq!(f.total, 12);
         assert!(
@@ -700,6 +715,7 @@ mod tests {
             "{f:?}"
         );
         assert_stopped_early(&f);
+        assert!(hub.requests_matching("/frames/", "p1").await <= IN_FLIGHT);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
