@@ -306,6 +306,317 @@ pub(crate) fn resync_membership_counts(conn: &Connection) -> rusqlite::Result<us
     Ok(sets + sessions)
 }
 
+/// Wave 6b-1 (spec 2026-10-02 §4.2, plan rulings B3–B6): the stacking tables
+/// that carry a run SUBJECT have a subject pair — `frames_set_id` for a frame
+/// set, `project_id` for a collaboration project, exactly one set — and, per
+/// frame, a frame pair — `frame_id` (a catalog `frames` row) or
+/// `project_frame` (a `stack_project_frames` handle). ONE body per table,
+/// used by both the fresh `CREATE TABLE IF NOT EXISTS` and the upgrade
+/// rebuild, so the two shapes cannot drift
+/// (`fresh_and_migrated_stacking_tables_have_the_same_shape`).
+const STACKING_RUNS_BODY: &str = "(
+    id INTEGER PRIMARY KEY,
+    frames_set_id INTEGER REFERENCES frames_set(id) ON DELETE CASCADE,
+    project_id TEXT REFERENCES collab_projects(project_id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    config_json TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    reference_frame_id INTEGER,
+    reference_mode TEXT NOT NULL,
+    working_dir TEXT NOT NULL,
+    output_dir TEXT NOT NULL,
+    summary_json TEXT,
+    error TEXT,
+    CHECK ((frames_set_id IS NULL) <> (project_id IS NULL))
+)";
+
+const STACKING_RUN_FRAMES_BODY: &str = "(
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES stacking_runs(id) ON DELETE CASCADE,
+    group_id INTEGER NOT NULL REFERENCES stacking_run_groups(id) ON DELETE CASCADE,
+    frame_id INTEGER REFERENCES frames(id) ON DELETE CASCADE,
+    project_frame INTEGER REFERENCES stack_project_frames(id) ON DELETE CASCADE,
+    included INTEGER NOT NULL,
+    exclusion_reason TEXT,
+    weight REAL,
+    weight_channels_json TEXT,
+    metrics_json TEXT,
+    reg_status TEXT,
+    reg_model TEXT,
+    reg_rms_px REAL,
+    reg_inliers INTEGER,
+    reg_inlier_ratio REAL,
+    reg_flipped INTEGER,
+    rejected_fraction REAL,
+    UNIQUE(run_id, frame_id),
+    UNIQUE(run_id, project_frame),
+    CHECK ((frame_id IS NULL) <> (project_frame IS NULL))
+)";
+
+const STACKING_ARTIFACTS_BODY: &str = "(
+    id INTEGER PRIMARY KEY,
+    frames_set_id INTEGER REFERENCES frames_set(id) ON DELETE CASCADE,
+    project_id TEXT REFERENCES collab_projects(project_id) ON DELETE CASCADE,
+    frame_id INTEGER REFERENCES frames(id) ON DELETE CASCADE,
+    project_frame INTEGER REFERENCES stack_project_frames(id) ON DELETE CASCADE,
+    group_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    path TEXT,
+    config_hash TEXT NOT NULL,
+    size INTEGER,
+    modified_at TEXT,
+    payload_json TEXT,
+    created_at TEXT NOT NULL,
+    CHECK ((frames_set_id IS NULL) <> (project_id IS NULL)),
+    CHECK (frame_id IS NULL OR project_frame IS NULL),
+    CHECK (frame_id IS NULL OR frames_set_id IS NOT NULL),
+    CHECK (project_frame IS NULL OR project_id IS NOT NULL)
+)";
+
+// M4d Task 3 (ruling R-M4d-4, spec §9.1): the master lights a stacking run
+// WROTE — one row per written output (the master, its drizzled master, that
+// drizzle's weight map). This is the ONLY place a master light is cataloged:
+// it never becomes a `frames` row, and the scanner's `CALSTAT` + `ATH_CSRC`
+// skip rule is untouched. `kind` is `master | drizzle | weight_map`, `format`
+// is `fits | xisf` (the run's own `output.format`); `total_exposure_s` is
+// nullable because a group whose members carry no `EXPTIME` has no honest
+// total to state.
+const MASTER_LIGHTS_BODY: &str = "(
+    id INTEGER PRIMARY KEY,
+    frames_set_id INTEGER REFERENCES frames_set(id) ON DELETE CASCADE,
+    project_id TEXT REFERENCES collab_projects(project_id) ON DELETE CASCADE,
+    run_id INTEGER NOT NULL REFERENCES stacking_runs(id) ON DELETE CASCADE,
+    group_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    format TEXT NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    channels INTEGER NOT NULL,
+    frames INTEGER NOT NULL,
+    total_exposure_s REAL,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, group_key, kind),
+    CHECK ((frames_set_id IS NULL) <> (project_id IS NULL))
+)";
+
+/// Upgrade an existing database's four subject tables to the wave-6b shape
+/// (plan 6b-1 rulings B3–B6). SQLite cannot relax a NOT NULL or add a CHECK
+/// through ALTER, so this is the 12-step rebuild: foreign-key enforcement
+/// OFF before BEGIN (the pragma is a silent no-op inside a transaction, and
+/// with it ON `DROP TABLE stacking_runs` would cascade-delete every group,
+/// run-frame and master-light row), then one IMMEDIATE transaction that
+/// creates, copies, drops and renames, and checks `foreign_key_check` on
+/// the rebuilt tables BEFORE committing. A violation rolls everything back
+/// and is returned (B5). Foreign keys go back ON whatever happened.
+/// Detected by the absence of `stacking_runs.project_id`, so it runs once;
+/// a fresh database is created in the new shape and never gets here.
+fn rebuild_stacking_tables_for_subjects(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "stacking_runs", "project_id")? {
+        return Ok(());
+    }
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let outcome = (|| -> Result<()> {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        // Another process (desktop and web may share one catalog) may have
+        // rebuilt between our probe and our write lock: `INIT_DB_LOCK` is
+        // process-wide only. Re-check under the lock. (A second process whose
+        // BEGIN IMMEDIATE waits past `busy_timeout` — 5 s — on a very large
+        // catalog fails its startup once with SQLITE_BUSY; its next start
+        // finds the rebuilt shape.)
+        if column_exists(&tx, "stacking_runs", "project_id")? {
+            return Ok(());
+        }
+        tx.execute_batch(&format!(
+            "CREATE TABLE stacking_runs_new {STACKING_RUNS_BODY};
+             INSERT INTO stacking_runs_new (id, frames_set_id, project_id, status, started_at,
+               finished_at, config_json, config_hash, reference_frame_id, reference_mode,
+               working_dir, output_dir, summary_json, error)
+             SELECT id, frames_set_id, NULL, status, started_at, finished_at, config_json,
+               config_hash, reference_frame_id, reference_mode, working_dir, output_dir,
+               summary_json, error FROM stacking_runs;
+             CREATE TABLE stacking_run_frames_new {STACKING_RUN_FRAMES_BODY};
+             INSERT INTO stacking_run_frames_new (id, run_id, group_id, frame_id, project_frame,
+               included, exclusion_reason, weight, weight_channels_json, metrics_json, reg_status,
+               reg_model, reg_rms_px, reg_inliers, reg_inlier_ratio, reg_flipped, rejected_fraction)
+             SELECT id, run_id, group_id, frame_id, NULL, included, exclusion_reason, weight,
+               weight_channels_json, metrics_json, reg_status, reg_model, reg_rms_px, reg_inliers,
+               reg_inlier_ratio, reg_flipped, rejected_fraction FROM stacking_run_frames;
+             CREATE TABLE stacking_artifacts_new {STACKING_ARTIFACTS_BODY};
+             INSERT INTO stacking_artifacts_new (id, frames_set_id, project_id, frame_id,
+               project_frame, group_key, kind, path, config_hash, size, modified_at, payload_json,
+               created_at)
+             SELECT id, frames_set_id, NULL, frame_id, NULL, group_key, kind, path, config_hash,
+               size, modified_at, payload_json, created_at FROM stacking_artifacts;
+             CREATE TABLE master_lights_new {MASTER_LIGHTS_BODY};
+             INSERT INTO master_lights_new (id, frames_set_id, project_id, run_id, group_key, kind,
+               path, format, width, height, channels, frames, total_exposure_s, created_at)
+             SELECT id, frames_set_id, NULL, run_id, group_key, kind, path, format, width, height,
+               channels, frames, total_exposure_s, created_at FROM master_lights;
+             DROP TABLE master_lights;
+             DROP TABLE stacking_artifacts;
+             DROP TABLE stacking_run_frames;
+             DROP TABLE stacking_runs;
+             ALTER TABLE stacking_runs_new RENAME TO stacking_runs;
+             ALTER TABLE stacking_run_frames_new RENAME TO stacking_run_frames;
+             ALTER TABLE stacking_artifacts_new RENAME TO stacking_artifacts;
+             ALTER TABLE master_lights_new RENAME TO master_lights;"
+        ))?;
+        for table in [
+            "stacking_runs",
+            "stacking_run_groups",
+            "stacking_run_frames",
+            "stacking_artifacts",
+            "master_lights",
+        ] {
+            let violations: i64 = tx.query_row(
+                &format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{table}')"),
+                [],
+                |r| r.get(0),
+            )?;
+            if violations > 0 {
+                tracing::error!(
+                    table,
+                    count = violations,
+                    "stacking subject rebuild refused: foreign-key violations"
+                );
+                // `tx` is dropped un-committed below: rusqlite rolls it back.
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                    Some(format!(
+                        "stacking subject rebuild refused: {violations} foreign-key violation(s) \
+                         in {table}; the database was left unchanged and the app will not start \
+                         until they are repaired. `PRAGMA foreign_key_check('{table}')` lists the \
+                         rows; deleting those orphan rows is safe (stacking cache and run-history \
+                         rows only)."
+                    )),
+                )
+                .into());
+            }
+        }
+        tx.commit()?;
+        tracing::info!("stacking tables rebuilt for run subjects");
+        Ok(())
+    })();
+    let re_enable = conn.pragma_update(None, "foreign_keys", true);
+    if let Err(e) = &outcome {
+        tracing::error!(error = %e, "stacking subject rebuild failed");
+    }
+    outcome?;
+    re_enable?;
+    Ok(())
+}
+
+/// Every index of the stacking tables, created AFTER the subject rebuild
+/// point (B4): the early unconditional index loop would otherwise re-create
+/// the pre-6b `stacking_artifacts_key` on the rebuilt table at the next
+/// start. Every foreign-key child column has an index whose leftmost column
+/// it is (`every_foreign_key_child_column_is_indexed`).
+fn create_stacking_indexes(conn: &Connection) -> Result<()> {
+    for stmt in [
+        "DROP INDEX IF EXISTS stacking_artifacts_key",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_runs_set ON stacking_runs(frames_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_runs_project ON stacking_runs(project_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_run_groups_run ON stacking_run_groups(run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_run ON stacking_run_frames(run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_frame ON stacking_run_frames(frame_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_project_frame ON stacking_run_frames(project_frame)",
+        // Not in the spec's §9.1 index list — added so the FK child columns
+        // don't trip `every_foreign_key_child_column_is_indexed` (a parent-row
+        // delete would otherwise full-scan these tables; see that test's own
+        // doc comment for the cost this avoids).
+        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_group ON stacking_run_frames(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_set ON stacking_artifacts(frames_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_project ON stacking_artifacts(project_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_frame ON stacking_artifacts(frame_id)",
+        "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_project_frame ON stacking_artifacts(project_frame)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS stacking_artifacts_subject_key ON stacking_artifacts(
+           COALESCE(frames_set_id, 0), COALESCE(project_id, ''), group_key, kind,
+           COALESCE(frame_id, 0), COALESCE(project_frame, 0))",
+        // Same reasoning as the existing `idx_frame_set_reference_set` on that
+        // table's own `INTEGER PRIMARY KEY` FK column: being the rowid alias
+        // does not put it in `PRAGMA index_list`, so the invariant still needs
+        // an explicit index on `stacking_set_config.frames_set_id`.
+        "CREATE INDEX IF NOT EXISTS idx_stacking_set_config_set ON stacking_set_config(frames_set_id)",
+        // M4d Task 3: both of `master_lights`' FK child columns (plus the
+        // project subject), per R-M4d-4's own index list and the same
+        // `every_foreign_key_child_column_is_indexed` invariant.
+        "CREATE INDEX IF NOT EXISTS idx_master_lights_set ON master_lights(frames_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_master_lights_project ON master_lights(project_id)",
+        "CREATE INDEX IF NOT EXISTS idx_master_lights_run ON master_lights(run_id)",
+    ] {
+        conn.execute(stmt, [])?;
+    }
+    Ok(())
+}
+
+/// Pre-6b stacking shapes, verbatim from `schema.rs` at 17e2e96e — the upgrade
+/// input of every rebuild test.
+#[cfg(test)]
+const LEGACY_STACKING_DDL: &str = "
+    CREATE TABLE stacking_runs (
+        id INTEGER PRIMARY KEY,
+        frames_set_id INTEGER NOT NULL REFERENCES frames_set(id) ON DELETE CASCADE,
+        status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+        config_json TEXT NOT NULL, config_hash TEXT NOT NULL, reference_frame_id INTEGER,
+        reference_mode TEXT NOT NULL, working_dir TEXT NOT NULL, output_dir TEXT NOT NULL,
+        summary_json TEXT, error TEXT);
+    CREATE TABLE stacking_run_frames (
+        id INTEGER PRIMARY KEY,
+        run_id INTEGER NOT NULL REFERENCES stacking_runs(id) ON DELETE CASCADE,
+        group_id INTEGER NOT NULL REFERENCES stacking_run_groups(id) ON DELETE CASCADE,
+        frame_id INTEGER NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
+        included INTEGER NOT NULL, exclusion_reason TEXT, weight REAL,
+        weight_channels_json TEXT, metrics_json TEXT, reg_status TEXT, reg_model TEXT,
+        reg_rms_px REAL, reg_inliers INTEGER, reg_inlier_ratio REAL, reg_flipped INTEGER,
+        rejected_fraction REAL,
+        UNIQUE(run_id, frame_id));
+    CREATE TABLE stacking_artifacts (
+        id INTEGER PRIMARY KEY,
+        frames_set_id INTEGER NOT NULL REFERENCES frames_set(id) ON DELETE CASCADE,
+        frame_id INTEGER REFERENCES frames(id) ON DELETE CASCADE,
+        group_key TEXT NOT NULL, kind TEXT NOT NULL, path TEXT, config_hash TEXT NOT NULL,
+        size INTEGER, modified_at TEXT, payload_json TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE master_lights (
+        id INTEGER PRIMARY KEY,
+        frames_set_id INTEGER NOT NULL REFERENCES frames_set(id) ON DELETE CASCADE,
+        run_id INTEGER NOT NULL REFERENCES stacking_runs(id) ON DELETE CASCADE,
+        group_key TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, format TEXT NOT NULL,
+        width INTEGER NOT NULL, height INTEGER NOT NULL, channels INTEGER NOT NULL,
+        frames INTEGER NOT NULL, total_exposure_s REAL, created_at TEXT NOT NULL,
+        UNIQUE(run_id, group_key, kind));
+    CREATE INDEX idx_stacking_runs_set ON stacking_runs(frames_set_id);
+    CREATE INDEX idx_stacking_run_frames_run ON stacking_run_frames(run_id);
+    CREATE INDEX idx_stacking_run_frames_frame ON stacking_run_frames(frame_id);
+    CREATE INDEX idx_stacking_run_frames_group ON stacking_run_frames(group_id);
+    CREATE INDEX idx_stacking_artifacts_set ON stacking_artifacts(frames_set_id);
+    CREATE INDEX idx_stacking_artifacts_frame ON stacking_artifacts(frame_id);
+    CREATE UNIQUE INDEX stacking_artifacts_key
+        ON stacking_artifacts(frames_set_id, group_key, kind, COALESCE(frame_id, 0));
+    CREATE INDEX idx_master_lights_set ON master_lights(frames_set_id);
+    CREATE INDEX idx_master_lights_run ON master_lights(run_id);";
+
+/// Turn a fresh (new-shape) database into the pre-6b shape: drop the four
+/// subject tables and the two new tables, re-create the legacy ones.
+#[cfg(test)]
+pub(crate) fn downgrade_stacking_tables_to_legacy(conn: &Connection) {
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.execute_batch(
+        "DROP TABLE master_lights; DROP TABLE stacking_artifacts;
+         DROP TABLE stacking_run_frames; DROP TABLE stacking_runs;
+         DROP TABLE stacking_project_config; DROP TABLE stack_project_frames;",
+    )
+    .unwrap();
+    conn.execute_batch(LEGACY_STACKING_DDL).unwrap();
+    conn.pragma_update(None, "foreign_keys", true).unwrap();
+    // `canonical_grid_json` / `exposure_class` stay: an ALTER-added column is
+    // guarded by `column_exists`, so leaving them is what an older database
+    // that already got them would look like — harmless.
+}
+
 fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
@@ -1165,21 +1476,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // artifacts, and the per-frame-set persisted configuration. See
     // docs/superpowers/specs/2026-09-08-stacking-pipeline-design.md §9.1.
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS stacking_runs (
-            id INTEGER PRIMARY KEY,
-            frames_set_id INTEGER NOT NULL REFERENCES frames_set(id) ON DELETE CASCADE,
-            status TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            config_json TEXT NOT NULL,
-            config_hash TEXT NOT NULL,
-            reference_frame_id INTEGER,
-            reference_mode TEXT NOT NULL,
-            working_dir TEXT NOT NULL,
-            output_dir TEXT NOT NULL,
-            summary_json TEXT,
-            error TEXT
-        )",
+        &format!("CREATE TABLE IF NOT EXISTS stacking_runs {STACKING_RUNS_BODY}"),
         [],
     )?;
     conn.execute(
@@ -1208,41 +1505,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS stacking_run_frames (
-            id INTEGER PRIMARY KEY,
-            run_id INTEGER NOT NULL REFERENCES stacking_runs(id) ON DELETE CASCADE,
-            group_id INTEGER NOT NULL REFERENCES stacking_run_groups(id) ON DELETE CASCADE,
-            frame_id INTEGER NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
-            included INTEGER NOT NULL,
-            exclusion_reason TEXT,
-            weight REAL,
-            weight_channels_json TEXT,
-            metrics_json TEXT,
-            reg_status TEXT,
-            reg_model TEXT,
-            reg_rms_px REAL,
-            reg_inliers INTEGER,
-            reg_inlier_ratio REAL,
-            reg_flipped INTEGER,
-            rejected_fraction REAL,
-            UNIQUE(run_id, frame_id)
-        )",
+        &format!("CREATE TABLE IF NOT EXISTS stacking_run_frames {STACKING_RUN_FRAMES_BODY}"),
         [],
     )?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS stacking_artifacts (
-            id INTEGER PRIMARY KEY,
-            frames_set_id INTEGER NOT NULL REFERENCES frames_set(id) ON DELETE CASCADE,
-            frame_id INTEGER REFERENCES frames(id) ON DELETE CASCADE,
-            group_key TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            path TEXT,
-            config_hash TEXT NOT NULL,
-            size INTEGER,
-            modified_at TEXT,
-            payload_json TEXT,
-            created_at TEXT NOT NULL
-        )",
+        &format!("CREATE TABLE IF NOT EXISTS stacking_artifacts {STACKING_ARTIFACTS_BODY}"),
         [],
     )?;
     conn.execute(
@@ -1254,60 +1521,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )",
         [],
     )?;
-    // M4d Task 3 (ruling R-M4d-4, spec §9.1): the master lights a stacking
-    // run WROTE — one row per written output (the master, its drizzled
-    // master, that drizzle's weight map). This is the ONLY place a master
-    // light is cataloged: it never becomes a `frames` row, and the
-    // scanner's `CALSTAT` + `ATH_CSRC` skip rule is untouched. `kind` is
-    // `master | drizzle | weight_map`, `format` is `fits | xisf` (the run's
-    // own `output.format`); `total_exposure_s` is nullable because a group
-    // whose members carry no `EXPTIME` has no honest total to state.
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS master_lights (
-            id INTEGER PRIMARY KEY,
-            frames_set_id INTEGER NOT NULL REFERENCES frames_set(id) ON DELETE CASCADE,
-            run_id INTEGER NOT NULL REFERENCES stacking_runs(id) ON DELETE CASCADE,
-            group_key TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            path TEXT NOT NULL,
-            format TEXT NOT NULL,
-            width INTEGER NOT NULL,
-            height INTEGER NOT NULL,
-            channels INTEGER NOT NULL,
-            frames INTEGER NOT NULL,
-            total_exposure_s REAL,
-            created_at TEXT NOT NULL,
-            UNIQUE(run_id, group_key, kind)
-        )",
+        &format!("CREATE TABLE IF NOT EXISTS master_lights {MASTER_LIGHTS_BODY}"),
         [],
     )?;
-    for stmt in [
-        "CREATE INDEX IF NOT EXISTS idx_stacking_runs_set ON stacking_runs(frames_set_id)",
-        "CREATE INDEX IF NOT EXISTS idx_stacking_run_groups_run ON stacking_run_groups(run_id)",
-        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_run ON stacking_run_frames(run_id)",
-        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_frame ON stacking_run_frames(frame_id)",
-        "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_set ON stacking_artifacts(frames_set_id)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS stacking_artifacts_key
-           ON stacking_artifacts(frames_set_id, group_key, kind, COALESCE(frame_id, 0))",
-        // Not in the spec's §9.1 index list — added so the FK child columns
-        // introduced above don't trip `every_foreign_key_child_column_is_indexed`
-        // (a parent-row delete would otherwise full-scan these tables; see that
-        // test's own doc comment for the cost this avoids). Same reasoning as
-        // the existing `idx_frame_set_reference_set` on that table's own
-        // `INTEGER PRIMARY KEY` FK column: being the rowid alias does not put
-        // it in `PRAGMA index_list`, so the invariant still needs an explicit
-        // index on `stacking_set_config.frames_set_id`.
-        "CREATE INDEX IF NOT EXISTS idx_stacking_run_frames_group ON stacking_run_frames(group_id)",
-        "CREATE INDEX IF NOT EXISTS idx_stacking_artifacts_frame ON stacking_artifacts(frame_id)",
-        "CREATE INDEX IF NOT EXISTS idx_stacking_set_config_set ON stacking_set_config(frames_set_id)",
-        // M4d Task 3: both of `master_lights`' FK child columns, per
-        // R-M4d-4's own index list and the same `every_foreign_key_child_
-        // column_is_indexed` invariant every table above satisfies.
-        "CREATE INDEX IF NOT EXISTS idx_master_lights_set ON master_lights(frames_set_id)",
-        "CREATE INDEX IF NOT EXISTS idx_master_lights_run ON master_lights(run_id)",
-    ] {
-        conn.execute(stmt, [])?;
-    }
 
     // A5: keep `calibration_set_to_frames.source_id` consistent. The
     // `calibration_set_id` column has a FK with ON DELETE CASCADE, but
@@ -2839,6 +3056,53 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE stacking_run_groups ADD COLUMN beta REAL", [])?;
     }
 
+    // ── Wave 6b-1: stacking subjects (spec 2026-10-02 §4.1/§4.2) ─────────────
+    // The project-frame handle: a project frame's stable i64 inside the
+    // stacking pipeline, minted the first time a plan includes it and never
+    // re-used. NO foreign key to `project_frames_local` on purpose — that
+    // table's rows are deleted and re-inserted by ordinary exchange writes
+    // (`delete_not_in`, `record_own`'s INSERT OR REPLACE), and a cascade from
+    // there would wipe a frame's run rows and artifacts and re-mint its
+    // handle. A handle lives as long as its project.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stack_project_frames (
+            id INTEGER PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES collab_projects(project_id) ON DELETE CASCADE,
+            frame_uuid TEXT NOT NULL,
+            UNIQUE (project_id, frame_uuid)
+        )",
+        [],
+    )?;
+    // The per-project stacking document (6b-2 reads and writes it): whole-
+    // config precedence as for a set, manual exclusions and the manual
+    // reference by frame uuid.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stacking_project_config (
+            project_id TEXT PRIMARY KEY REFERENCES collab_projects(project_id) ON DELETE CASCADE,
+            config_json TEXT NOT NULL,
+            excluded_frame_uuids_json TEXT NOT NULL DEFAULT '[]',
+            reference_frame_uuid TEXT,
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    // The exposure-class token of a group (spec §8), shown by the Groups table.
+    if !column_exists(conn, "stacking_run_groups", "exposure_class")? {
+        conn.execute(
+            "ALTER TABLE stacking_run_groups ADD COLUMN exposure_class TEXT",
+            [],
+        )?;
+    }
+    // The hub's canonical grid (spec §6.1), refreshed with the project meta by 6b-2.
+    if !column_exists(conn, "collab_projects", "canonical_grid_json")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN canonical_grid_json TEXT",
+            [],
+        )?;
+    }
+    rebuild_stacking_tables_for_subjects(conn)?;
+    create_stacking_indexes(conn)?;
+
     // ── Foreign-key child columns ────────────────────────────────────────────
     //
     // SQLite indexes the PARENT side of a foreign key automatically and the
@@ -3550,7 +3814,7 @@ mod identity_schema_tests {
     }
 
     /// Sorted column-name set of a table (order-independent comparison).
-    fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+    pub(crate) fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
         let mut cols: Vec<String> = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap()
@@ -5564,5 +5828,349 @@ mod duplicate_cache_tests {
             "fan-out must not inflate the cache"
         );
         assert_eq!(groups[0].file_ids.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod stacking_subject_schema_tests {
+    use super::identity_schema_tests::table_columns;
+    use super::*;
+    use rusqlite::Connection;
+
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    fn collapse(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Every `(name, sql)` index row of a table, whitespace-collapsed. `sql`
+    /// is NULL for an autoindex.
+    fn index_shape(conn: &Connection, table: &str) -> Vec<(String, Option<String>)> {
+        conn.prepare(
+            "SELECT name, sql FROM sqlite_master
+             WHERE type = 'index' AND tbl_name = ?1 ORDER BY name",
+        )
+        .unwrap()
+        .query_map([table], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .unwrap()
+        .map(|r| {
+            let (n, s) = r.unwrap();
+            (n, s.map(|s| collapse(&s)))
+        })
+        .collect()
+    }
+
+    /// The table's stored `CREATE` text with the rename's double-quoting, the
+    /// table name and the dropped `IF NOT EXISTS` normalised away.
+    fn table_sql_normalized(conn: &Connection, table: &str) -> String {
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        collapse(
+            &sql.replace(&format!("\"{table}\""), "T")
+                .replace(table, "T")
+                .replace("IF NOT EXISTS ", ""),
+        )
+    }
+
+    fn seed_legacy_stacking_rows(conn: &Connection) -> (i64, i64, i64) {
+        let (set, f1, f2) = (7_i64, 101_i64, 102_i64);
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (?1, 'LDN 1272')",
+            [set],
+        )
+        .unwrap();
+        for f in [f1, f2] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 'f.fits', 100, '2026-09-09T00:00:00Z', 'FITS')",
+                rusqlite::params![f, format!("/f/{f}.fits")],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (id, file_id) VALUES (?1, ?1)", [f])
+                .unwrap();
+        }
+        conn.execute_batch(&format!(
+            "INSERT INTO stacking_runs (id, frames_set_id, status, started_at, config_json,
+               config_hash, reference_mode, working_dir, output_dir)
+             VALUES (1, {set}, 'done', 't', '{{}}', 'h', 'auto', '/w', '/o');
+             INSERT INTO stacking_run_groups (id, run_id, group_key, color_mode, frame_count,
+               included_count, status)
+             VALUES (1, 1, 'mono__L__300s', 'mono', 2, 2, 'done');
+             INSERT INTO stacking_run_frames (run_id, group_id, frame_id, included)
+             VALUES (1, 1, {f1}, 1), (1, 1, {f2}, 0);
+             INSERT INTO stacking_artifacts (frames_set_id, frame_id, group_key, kind, path,
+               config_hash, created_at)
+             VALUES ({set}, {f1}, 'mono__L__300s', 'calibrated', '/w/c1.fits', 'c1', 't'),
+                    ({set}, NULL, 'mono__L__300s', 'ln_reference', '/w/lnref.fits', 'lr', 't');
+             INSERT INTO master_lights (frames_set_id, run_id, group_key, kind, path, format,
+               width, height, channels, frames, created_at)
+             VALUES ({set}, 1, 'mono__L__300s', 'master', '/o/m.fits', 'fits', 10, 10, 1, 2, 't');"
+        ))
+        .unwrap();
+        (set, f1, f2)
+    }
+
+    /// `(runs, groups, run_frames, artifacts, master_lights)` row counts.
+    fn stacking_row_counts(conn: &Connection) -> (i64, i64, i64, i64, i64) {
+        let n = |t: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        (
+            n("stacking_runs"),
+            n("stacking_run_groups"),
+            n("stacking_run_frames"),
+            n("stacking_artifacts"),
+            n("master_lights"),
+        )
+    }
+
+    #[test]
+    fn the_subject_rebuild_preserves_every_row_and_child() {
+        let conn = mem_db();
+        downgrade_stacking_tables_to_legacy(&conn);
+        let (set, f1, _f2) = seed_legacy_stacking_rows(&conn);
+        let before = stacking_row_counts(&conn);
+        init_db(&conn).unwrap();
+        assert!(column_exists(&conn, "stacking_runs", "project_id").unwrap());
+        assert_eq!(stacking_row_counts(&conn), before);
+        // Children still join their parents (no cascade wipe):
+        let joined: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stacking_run_frames rf
+                 JOIN stacking_runs r ON r.id = rf.run_id
+                 JOIN stacking_run_groups g ON g.id = rf.group_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined, 2);
+        let (fs, frame, pf): (Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT frames_set_id, frame_id, project_frame FROM stacking_artifacts
+                 WHERE kind = 'calibrated'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((fs, frame, pf), (Some(set), Some(f1), None));
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        let fk_on: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1);
+        // Idempotent:
+        init_db(&conn).unwrap();
+        assert_eq!(stacking_row_counts(&conn), before);
+    }
+
+    #[test]
+    fn fresh_and_migrated_stacking_tables_have_the_same_shape() {
+        let fresh = mem_db();
+        let migrated = mem_db();
+        downgrade_stacking_tables_to_legacy(&migrated);
+        init_db(&migrated).unwrap();
+        init_db(&migrated).unwrap(); // a second start must not re-add the old key
+        for table in [
+            "stacking_runs",
+            "stacking_run_frames",
+            "stacking_artifacts",
+            "master_lights",
+            "stacking_run_groups",
+            "stack_project_frames",
+            "stacking_project_config",
+        ] {
+            assert_eq!(
+                table_columns(&fresh, table),
+                table_columns(&migrated, table),
+                "{table}"
+            );
+            assert_eq!(
+                index_shape(&fresh, table),
+                index_shape(&migrated, table),
+                "{table}"
+            );
+            assert_eq!(
+                table_sql_normalized(&fresh, table),
+                table_sql_normalized(&migrated, table),
+                "{table}"
+            );
+        }
+        for conn in [&fresh, &migrated] {
+            let old: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='index' AND name='stacking_artifacts_key'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(old, 0, "the pre-6b artifacts key must never come back");
+        }
+    }
+
+    #[test]
+    fn a_rebuild_with_a_foreign_key_violation_rolls_back_and_surfaces_the_error() {
+        let conn = mem_db();
+        downgrade_stacking_tables_to_legacy(&conn);
+        let (_set, _f1, _f2) = seed_legacy_stacking_rows(&conn);
+        // A run-frame pointing at a frame that does not exist, written with FKs off:
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO stacking_run_frames (run_id, group_id, frame_id, included)
+             VALUES (1, 1, 999999, 1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let before = stacking_row_counts(&conn);
+        let err = init_db(&conn).unwrap_err().to_string();
+        assert!(err.contains("foreign-key"), "{err}");
+        assert!(
+            !column_exists(&conn, "stacking_runs", "project_id").unwrap(),
+            "rolled back"
+        );
+        assert_eq!(stacking_row_counts(&conn), before);
+        let fk_on: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1, "foreign keys back on after a failed rebuild");
+    }
+
+    #[test]
+    fn subject_and_frame_pairs_are_enforced() {
+        let conn = mem_db();
+        super::super::stacking::insert_test_project(&conn, "p1");
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (7, 'LDN 1272')",
+            [],
+        )
+        .unwrap();
+        // A run with both subjects, or neither, is refused:
+        let run = |set: &str, project: &str| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO stacking_runs (frames_set_id, project_id, status, started_at,
+                       config_json, config_hash, reference_mode, working_dir, output_dir)
+                     VALUES ({set}, {project}, 'done', 't', '{{}}', 'h', 'auto', '/w', '/o')"
+                ),
+                [],
+            )
+        };
+        assert!(run("NULL", "NULL").is_err(), "neither subject");
+        assert!(run("7", "'p1'").is_err(), "both subjects");
+        assert!(run("7", "NULL").is_ok(), "a frame-set run");
+        assert!(run("NULL", "'p1'").is_ok(), "a project run");
+        // A project-frame handle under a frame-set artifact subject is refused
+        // (the CHECK fires before the FK), and so is a catalog frame under a
+        // project subject, and both frame columns at once.
+        conn.execute(
+            "INSERT INTO stack_project_frames (id, project_id, frame_uuid) VALUES (5, 'p1', 'u')",
+            [],
+        )
+        .unwrap();
+        let art = |set: &str, project: &str, frame: &str, pf: &str| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO stacking_artifacts (frames_set_id, project_id, frame_id,
+                       project_frame, group_key, kind, config_hash, created_at)
+                     VALUES ({set}, {project}, {frame}, {pf}, 'g', 'k', 'h', 't')"
+                ),
+                [],
+            )
+        };
+        assert!(art("7", "NULL", "NULL", "5").is_err(), "pf under a set");
+        assert!(
+            art("NULL", "'p1'", "1", "NULL").is_err(),
+            "frame under a project"
+        );
+        assert!(art("7", "NULL", "1", "5").is_err(), "both frame columns");
+        assert!(art("7", "'p1'", "NULL", "NULL").is_err(), "both subjects");
+        assert!(art("NULL", "'p1'", "NULL", "5").is_ok(), "project + handle");
+        // A run-frame with both frame columns, or neither, is refused.
+        conn.execute(
+            "INSERT INTO stacking_run_groups (id, run_id, group_key, color_mode, frame_count,
+               included_count, status)
+             SELECT 1, id, 'g', 'mono', 1, 1, 'done' FROM stacking_runs
+             WHERE project_id = 'p1'",
+            [],
+        )
+        .unwrap();
+        let rf = |frame: &str, pf: &str| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO stacking_run_frames (run_id, group_id, frame_id, project_frame,
+                       included)
+                     SELECT id, 1, {frame}, {pf}, 1 FROM stacking_runs WHERE project_id = 'p1'"
+                ),
+                [],
+            )
+        };
+        assert!(rf("NULL", "NULL").is_err(), "neither frame column");
+        assert!(rf("1", "5").is_err(), "both frame columns");
+        assert!(rf("NULL", "5").is_ok(), "a handle");
+    }
+
+    #[test]
+    fn deleting_a_frame_set_or_a_frame_still_cascades_after_the_rebuild() {
+        let conn = mem_db();
+        downgrade_stacking_tables_to_legacy(&conn);
+        let (set, f1, _f2) = seed_legacy_stacking_rows(&conn);
+        init_db(&conn).unwrap();
+        conn.execute("DELETE FROM frames WHERE id = ?1", [f1])
+            .unwrap();
+        let rf: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stacking_run_frames WHERE frame_id = ?1",
+                [f1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rf, 0);
+        conn.execute("DELETE FROM frames_set WHERE id = ?1", [set])
+            .unwrap();
+        assert_eq!(stacking_row_counts(&conn), (0, 0, 0, 0, 0));
+    }
+
+    /// Run by hand: `ATHENAEUM_REHEARSAL_DB=<path to a COPY> cargo test -p athenaeum-core
+    /// --lib -- --ignored the_subject_rebuild_rehearses_on_a_real_catalog_copy`.
+    /// Never point it at a live database: it upgrades the file it is given.
+    #[test]
+    #[ignore = "needs ATHENAEUM_REHEARSAL_DB pointing at a copy of a real catalog"]
+    fn the_subject_rebuild_rehearses_on_a_real_catalog_copy() {
+        let path = std::env::var("ATHENAEUM_REHEARSAL_DB").expect("ATHENAEUM_REHEARSAL_DB");
+        let conn = Connection::open(&path).unwrap();
+        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
+        let before = stacking_row_counts(&conn);
+        eprintln!("rehearsal before: {before:?}");
+        init_db(&conn).unwrap();
+        assert!(column_exists(&conn, "stacking_runs", "project_id").unwrap());
+        assert_eq!(stacking_row_counts(&conn), before);
+        eprintln!("rehearsal after: {:?}", stacking_row_counts(&conn));
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        init_db(&conn).unwrap();
+        assert_eq!(stacking_row_counts(&conn), before);
     }
 }

@@ -647,10 +647,11 @@ pub fn list_frame_rows(conn: &Connection, run_id: i64) -> Result<Vec<StackingRun
 // Artifacts
 // ---------------------------------------------------------------------
 
-/// Insert or refresh a cached artifact, keyed on `(frames_set_id, group_key,
-/// kind, COALESCE(frame_id, 0))` — the expression unique index means a NULL
-/// `frame_id` collapses onto the same row (a set-level artifact) rather than
-/// creating a new one on every rebuild.
+/// Insert or refresh a cached artifact, keyed on the six expressions of
+/// `stacking_artifacts_subject_key` — `(COALESCE(frames_set_id, 0),
+/// COALESCE(project_id, ''), group_key, kind, COALESCE(frame_id, 0),
+/// COALESCE(project_frame, 0))` — so a NULL frame collapses onto the same row
+/// (a set-level artifact) rather than creating a new one on every rebuild.
 pub fn upsert_artifact(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
     let created_at = now();
     conn.query_row(
@@ -658,7 +659,8 @@ pub fn upsert_artifact(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
          (frames_set_id, frame_id, group_key, kind, path, config_hash, size, modified_at,
           payload_json, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(frames_set_id, group_key, kind, COALESCE(frame_id, 0)) DO UPDATE SET
+         ON CONFLICT(COALESCE(frames_set_id, 0), COALESCE(project_id, ''), group_key, kind,
+                     COALESCE(frame_id, 0), COALESCE(project_frame, 0)) DO UPDATE SET
            path = excluded.path,
            config_hash = excluded.config_hash,
            size = excluded.size,
@@ -841,6 +843,58 @@ pub fn find_master_light(
     Ok(conn
         .query_row(&sql, params![run_id, group_key, kind], row_to_master_light)
         .optional()?)
+}
+
+// ---------------------------------------------------------------------
+// Project-frame handles (wave 6b, spec 2026-10-02 §4.1)
+// ---------------------------------------------------------------------
+
+/// The stable `i64` handle of each `(project_id, frame_uuid)`, minted on
+/// first use and never re-used for another frame: inside the stacking
+/// pipeline a project frame is this id, exactly as a catalog frame is its
+/// `frames.id`. A new content version keeps the uuid and therefore the
+/// handle (its artifacts go stale through the content hash). Handles live
+/// as long as their project (`collab_projects` cascade) and are never
+/// deleted otherwise.
+///
+/// One IMMEDIATE transaction (read-then-write, CLAUDE.md): never call this
+/// with a transaction already open on `conn`.
+pub fn project_frame_handles(
+    conn: &Connection,
+    project_id: &str,
+    frame_uuids: &[&str],
+) -> Result<std::collections::HashMap<String, i64>> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let mut out = std::collections::HashMap::with_capacity(frame_uuids.len());
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT OR IGNORE INTO stack_project_frames (project_id, frame_uuid) VALUES (?1, ?2)",
+        )?;
+        let mut select = tx.prepare_cached(
+            "SELECT id FROM stack_project_frames WHERE project_id = ?1 AND frame_uuid = ?2",
+        )?;
+        for uuid in frame_uuids {
+            insert.execute(params![project_id, uuid])?;
+            let id: i64 = select.query_row(params![project_id, uuid], |r| r.get(0))?;
+            out.insert((*uuid).to_string(), id);
+        }
+    }
+    tx.commit()?;
+    Ok(out)
+}
+
+/// Test helper: a minimal `collab_projects` row (slug and title are the id).
+/// Writes every NOT NULL column; the rest take schema defaults.
+#[cfg(test)]
+pub(crate) fn insert_test_project(conn: &Connection, project_id: &str) {
+    conn.execute(
+        "INSERT INTO collab_projects (project_id, slug, title, data_role, target_name,
+           target_ra_deg, target_dec_deg, target_radius_deg, membership_version,
+           snapshot_payload_b64, snapshot_signature_b64, members_json)
+         VALUES (?1, ?1, ?1, 'processor', 'M42', 83.8, -5.4, 1.0, 1, '', '', '[]')",
+        [project_id],
+    )
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------
@@ -1303,5 +1357,31 @@ mod tests {
         c.execute("DELETE FROM stacking_runs WHERE id = ?1", params![run])
             .unwrap();
         assert!(list_master_lights(&c, run).unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_frame_handles_are_stable_and_never_reused() {
+        let conn = conn();
+        insert_test_project(&conn, "p1");
+        insert_test_project(&conn, "p2");
+        let a = project_frame_handles(&conn, "p1", &["u-a", "u-b"]).unwrap();
+        let b = project_frame_handles(&conn, "p1", &["u-b", "u-c"]).unwrap();
+        assert_eq!(a["u-b"], b["u-b"], "a uuid keeps its handle");
+        assert_ne!(b["u-c"], a["u-a"]);
+        assert_ne!(b["u-c"], a["u-b"]);
+        let other = project_frame_handles(&conn, "p2", &["u-a"]).unwrap();
+        assert_ne!(other["u-a"], a["u-a"], "handles are per project");
+        conn.execute("DELETE FROM collab_projects WHERE project_id = 'p1'", [])
+            .unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stack_project_frames WHERE project_id = 'p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "handles live as long as their project");
+        let c = project_frame_handles(&conn, "p2", &[]).unwrap();
+        assert!(c.is_empty());
     }
 }
