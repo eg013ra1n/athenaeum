@@ -57,6 +57,8 @@
 //! bright-night excess, but not every R-M4a-2 target passes, which is that
 //! ruling's bar for taking the default.
 
+pub use crate::db::stacking::StackSubject;
+
 pub mod config;
 pub mod drizzle;
 pub mod fits_artifact;

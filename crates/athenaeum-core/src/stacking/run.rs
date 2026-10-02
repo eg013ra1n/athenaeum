@@ -37,6 +37,7 @@ use crate::db::stacking::{
     finish_run, get_run, insert_group, insert_master_light, insert_run,
     set_frame_rejected_fraction, set_run_reference, set_run_status, update_group, upsert_artifact,
     upsert_frame_row, GroupUpdate, NewArtifact, NewFrameRow, NewGroup, NewMasterLight, NewRun,
+    StackSubject,
 };
 use crate::events::{emit_event, ProgressEmitter};
 use crate::export::{
@@ -240,6 +241,9 @@ pub(crate) struct RunContext {
     pub(crate) ctx: Arc<ServiceContext>,
     pub(crate) emitter: Arc<dyn ProgressEmitter>,
     pub(crate) run_id: i64,
+    /// What this run stacks; every persistence call keys on it. `set_id`
+    /// stays beside it until Task 4 removes it.
+    pub(crate) subject: StackSubject,
     pub(crate) set_id: i64,
     pub(crate) set_name: String,
     pub(crate) config: StackingConfig,
@@ -551,7 +555,7 @@ pub(crate) fn heal_interrupted_runs(
         return Ok(0);
     }
 
-    let stuck: Vec<(i64, i64)> = {
+    let stuck: Vec<(i64, StackSubject)> = {
         let active = ctx.active_stacks.lock().unwrap();
         unfinished
             .into_iter()
@@ -560,7 +564,25 @@ pub(crate) fn heal_interrupted_runs(
     };
 
     let mut healed = 0usize;
-    for (run_id, frames_set_id) in stuck {
+    for (run_id, subject) in stuck {
+        // 6b-1 Task 4 gives a project run its own sweep; until a project run
+        // can exist, only a frame-set run has a `rej/` to remove.
+        let Some(frames_set_id) = subject.frame_set_id() else {
+            tracing::warn!(
+                run_id,
+                project_id = subject.project_id().unwrap_or_default(),
+                "stacking run interrupted by a restart"
+            );
+            finish_run(
+                conn,
+                run_id,
+                "failed",
+                None,
+                Some("interrupted by a restart"),
+            )?;
+            healed += 1;
+            continue;
+        };
         tracing::warn!(
             run_id,
             frames_set_id,
@@ -740,6 +762,7 @@ pub fn start_stacking(
     // active" forever, with no command able to clear it.
     heal_interrupted_runs(&ctx, &conn)?;
 
+    let subject = StackSubject::FrameSet(frames_set_id);
     let plan = build_plan(&conn, &ctx.settings, policy, frames_set_id, config)?;
 
     if let Some(blocker) = plan.blockers.first() {
@@ -797,7 +820,7 @@ pub fn start_stacking(
     let cancel = Arc::new(AtomicBool::new(false));
     let run_id = {
         let mut active = ctx.active_stacks.lock().unwrap();
-        if active.values().any(|h| h.frames_set_id == frames_set_id) {
+        if active.values().any(|h| h.subject == subject) {
             return Err(ApiError::Conflict(format!(
                 "a stacking run is already active for frame set {frames_set_id}"
             )));
@@ -805,7 +828,7 @@ pub fn start_stacking(
         let run_id = insert_run(
             &conn,
             &NewRun {
-                frames_set_id,
+                subject: &subject,
                 config_json: &config_json,
                 config_hash: &plan.config_hash,
                 reference_frame_id: plan.reference.frame_id,
@@ -818,7 +841,7 @@ pub fn start_stacking(
             run_id,
             StackHandle {
                 cancel_flag: cancel.clone(),
-                frames_set_id,
+                subject: subject.clone(),
             },
         );
         run_id
@@ -912,6 +935,7 @@ pub fn start_stacking(
         ctx: ctx.clone(),
         emitter: emitter.clone(),
         run_id,
+        subject: subject.clone(),
         set_id: frames_set_id,
         set_name: plan.set_name,
         config: plan.config,
@@ -1597,7 +1621,7 @@ fn resolve_calibrate_job(
             let conn = db(&rc.ctx)?.conn();
             let existing = crate::db::stacking::find_artifact(
                 &conn,
-                rc.set_id,
+                &rc.subject,
                 group_key,
                 "calibrated",
                 Some(frame.frame_id),
@@ -1605,7 +1629,7 @@ fn resolve_calibrate_job(
             let mosaic_row = if want_mosaic {
                 crate::db::stacking::find_artifact(
                     &conn,
-                    rc.set_id,
+                    &rc.subject,
                     group_key,
                     "calibrated_mosaic",
                     Some(frame.frame_id),
@@ -1876,7 +1900,7 @@ fn commit_calibrated(
         upsert_artifact(
             &tx,
             &NewArtifact {
-                frames_set_id: rc.set_id,
+                subject: &rc.subject,
                 frame_id: Some(job.frame_id),
                 group_key: &job.group_key,
                 kind: "calibrated",
@@ -1891,7 +1915,7 @@ fn commit_calibrated(
             upsert_artifact(
                 &tx,
                 &NewArtifact {
-                    frames_set_id: rc.set_id,
+                    subject: &rc.subject,
                     frame_id: Some(job.frame_id),
                     group_key: &job.group_key,
                     kind: "calibrated_mosaic",
@@ -2908,7 +2932,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                 let conn = db(&rc.ctx)?.conn();
                 crate::db::stacking::find_artifact(
                     &conn,
-                    rc.set_id,
+                    &rc.subject,
                     &group.key,
                     "calibrated",
                     Some(frame.frame_id),
@@ -3040,7 +3064,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                     let conn = db(&rc.ctx)?.conn();
                     crate::db::stacking::find_artifact(
                         &conn,
-                        rc.set_id,
+                        &rc.subject,
                         &group.key,
                         "metrics",
                         Some(frame.frame_id),
@@ -3055,7 +3079,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                                         let conn = db(&rc.ctx)?.conn();
                                         fits_artifact_fresh(
                                             &conn,
-                                            rc.set_id,
+                                            &rc.subject,
                                             &group.key,
                                             frame.frame_id,
                                             Some(payload.as_str()),
@@ -3180,7 +3204,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                             upsert_artifact(
                                 &conn,
                                 &NewArtifact {
-                                    frames_set_id: rc.set_id,
+                                    subject: &rc.subject,
                                     frame_id: Some(frame.frame_id),
                                     group_key: &group.key,
                                     kind: "metrics",
@@ -3250,7 +3274,7 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                             upsert_artifact(
                                 &conn,
                                 &NewArtifact {
-                                    frames_set_id: rc.set_id,
+                                    subject: &rc.subject,
                                     frame_id: Some(frame.frame_id),
                                     group_key: &group.key,
                                     kind: &kind,
@@ -4084,7 +4108,7 @@ fn resolve_register_fits(
         let conn = db(&rc.ctx)?.conn();
         Ok(fits_artifact_fresh_for_planes(
             &conn,
-            rc.set_id,
+            &rc.subject,
             group_key,
             frame_id,
             planes,
@@ -4123,7 +4147,7 @@ fn resolve_register_fits(
         let conn = db(&rc.ctx)?.conn();
         Ok(crate::db::stacking::find_artifact(
             &conn,
-            rc.set_id,
+            &rc.subject,
             group_key,
             &kind,
             Some(frame_id),
@@ -5795,7 +5819,7 @@ fn record_registered_artifact(
     upsert_artifact(
         &conn,
         &NewArtifact {
-            frames_set_id: rc.set_id,
+            subject: &rc.subject,
             frame_id: Some(frame_id),
             group_key,
             kind: "registered",
@@ -5824,7 +5848,7 @@ fn registered_artifact_is_fresh(
     let conn = db(&rc.ctx)?.conn();
     Ok(crate::db::stacking::find_artifact(
         &conn,
-        rc.set_id,
+        &rc.subject,
         group_key,
         "registered",
         Some(frame_id),
@@ -5868,7 +5892,7 @@ fn write_frame_rows(rc: &mut RunContext) -> Result<(), RunError> {
             continue;
         };
         for entry in entries {
-            upsert_frame_row_for_entry(&conn, rc.run_id, group_id, entry)?;
+            upsert_frame_row_for_entry(&conn, &rc.subject, rc.run_id, group_id, entry)?;
         }
     }
     Ok(())
@@ -5890,6 +5914,7 @@ fn write_frame_rows(rc: &mut RunContext) -> Result<(), RunError> {
 /// yet in THIS run (a fresh run's row never had one).
 fn upsert_frame_row_for_entry(
     conn: &rusqlite::Connection,
+    subject: &StackSubject,
     run_id: i64,
     group_id: i64,
     entry: &MeasuredFrame,
@@ -5930,6 +5955,7 @@ fn upsert_frame_row_for_entry(
 
     upsert_frame_row(
         conn,
+        subject,
         &NewFrameRow {
             run_id,
             group_id,
@@ -5977,7 +6003,7 @@ fn exclude_frame_and_persist(
         .and_then(|entries| entries.iter().find(|e| e.frame.frame_id == frame_id));
     if let Some(entry) = entry {
         let conn = db(&rc.ctx)?.conn();
-        upsert_frame_row_for_entry(&conn, rc.run_id, group_id, entry)?;
+        upsert_frame_row_for_entry(&conn, &rc.subject, rc.run_id, group_id, entry)?;
     }
     Ok(())
 }
@@ -6800,7 +6826,7 @@ fn process_group_output(
                 let conn = db(&rc.ctx)?.conn();
                 crate::db::stacking::find_artifact(
                     &conn,
-                    rc.set_id,
+                    &rc.subject,
                     &group.key,
                     "registered",
                     Some(e.frame.frame_id),
@@ -7758,7 +7784,7 @@ fn process_group_output(
         insert_master_light(
             &conn,
             &NewMasterLight {
-                frames_set_id: rc.set_id,
+                subject: &rc.subject,
                 run_id: rc.run_id,
                 group_key: &group.key,
                 kind: MasterLightKind::Master.as_db_str(),
@@ -7775,7 +7801,7 @@ fn process_group_output(
         for (k, &idx) in output.included.iter().enumerate() {
             if let Some(frac) = output.stats.rejected_fraction_per_frame.get(k).copied() {
                 let frame_id = members[idx].frame_id;
-                set_frame_rejected_fraction(&conn, rc.run_id, frame_id, frac)?;
+                set_frame_rejected_fraction(&conn, &rc.subject, rc.run_id, frame_id, frac)?;
                 rejected_by_frame.insert(frame_id, frac);
             }
         }
@@ -7896,7 +7922,7 @@ fn process_group_output(
                     let frame_id = members[idx].frame_id;
                     let path = crate::db::stacking::find_artifact(
                         &conn,
-                        rc.set_id,
+                        &rc.subject,
                         &group.key,
                         "calibrated_mosaic",
                         Some(frame_id),
@@ -8186,7 +8212,7 @@ fn process_group_output(
                         insert_master_light(
                             &conn,
                             &NewMasterLight {
-                                frames_set_id: rc.set_id,
+                                subject: &rc.subject,
                                 run_id: rc.run_id,
                                 group_key: &group.key,
                                 kind: MasterLightKind::Drizzle.as_db_str(),
@@ -8203,7 +8229,7 @@ fn process_group_output(
                             insert_master_light(
                                 &conn,
                                 &NewMasterLight {
-                                    frames_set_id: rc.set_id,
+                                    subject: &rc.subject,
                                     run_id: rc.run_id,
                                     group_key: &group.key,
                                     kind: MasterLightKind::WeightMap.as_db_str(),
@@ -8589,7 +8615,7 @@ fn run_group_normalization(
 
     let existing_reference_artifact = {
         let conn = db(&rc.ctx)?.conn();
-        crate::db::stacking::find_artifact(&conn, rc.set_id, &group.key, "ln_reference", None)?
+        crate::db::stacking::find_artifact(&conn, &rc.subject, &group.key, "ln_reference", None)?
     };
     let cached_reference_path: Option<PathBuf> = if force_fresh {
         None
@@ -8781,7 +8807,7 @@ fn run_group_normalization(
                         let conn = db(&rc.ctx)?.conn();
                         crate::db::stacking::find_artifact(
                             &conn,
-                            rc.set_id,
+                            &rc.subject,
                             &group.key,
                             &kind,
                             Some(m.frame_id),
@@ -8819,7 +8845,7 @@ fn run_group_normalization(
             let conn = db(&rc.ctx)?.conn();
             crate::db::stacking::find_artifact(
                 &conn,
-                rc.set_id,
+                &rc.subject,
                 &group.key,
                 "ln",
                 Some(m.frame_id),
@@ -8866,7 +8892,7 @@ fn run_group_normalization(
         None
     } else {
         let conn = db(&rc.ctx)?.conn();
-        crate::db::stacking::find_artifact(&conn, rc.set_id, &group.key, "ln_calibration", None)?
+        crate::db::stacking::find_artifact(&conn, &rc.subject, &group.key, "ln_calibration", None)?
             .filter(|row| row.config_hash == calibration_input_hash)
             .and_then(|row| row.payload_json)
             .and_then(|s| serde_json::from_str::<ln::SeedsCalibration>(&s).ok())
@@ -8926,7 +8952,7 @@ fn run_group_normalization(
             upsert_artifact(
                 &conn,
                 &NewArtifact {
-                    frames_set_id: rc.set_id,
+                    subject: &rc.subject,
                     frame_id: None,
                     group_key: &group.key,
                     kind: "ln_calibration",
@@ -9233,7 +9259,7 @@ fn run_group_normalization(
                     upsert_artifact(
                         &conn,
                         &NewArtifact {
-                            frames_set_id: rc.set_id,
+                            subject: &rc.subject,
                             frame_id: Some(frame_id),
                             group_key: &group.key,
                             kind: "ln",
@@ -9572,7 +9598,7 @@ fn build_and_write_ln_reference(
         upsert_artifact(
             &conn,
             &NewArtifact {
-                frames_set_id: rc.set_id,
+                subject: &rc.subject,
                 frame_id: None,
                 group_key: &group.key,
                 kind: "ln_reference",
@@ -9756,14 +9782,14 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
         CleanupPolicy::DeleteRegistered => {
             let freed = {
                 let conn = db(&rc.ctx)?.conn();
-                cleanup_work(&conn, rc.set_id, &rc.layout, CleanupWhat::Registered)?
+                cleanup_work(&conn, &rc.subject, &rc.layout, CleanupWhat::Registered)?
             };
             tracing::info!(run_id = rc.run_id, freed_bytes = freed, "cleanup applied");
         }
         CleanupPolicy::DeleteIntermediates => {
             let freed = {
                 let conn = db(&rc.ctx)?.conn();
-                cleanup_work(&conn, rc.set_id, &rc.layout, CleanupWhat::Intermediates)?
+                cleanup_work(&conn, &rc.subject, &rc.layout, CleanupWhat::Intermediates)?
             };
             tracing::info!(run_id = rc.run_id, freed_bytes = freed, "cleanup applied");
         }
@@ -9838,6 +9864,7 @@ pub(crate) fn test_context(
         ctx,
         emitter,
         run_id,
+        subject: StackSubject::FrameSet(set_id),
         set_id,
         set_name: set_name.to_string(),
         config,
@@ -10132,7 +10159,12 @@ mod tests {
             "the guard must remove the handle on this early-return path"
         );
 
-        let rows = crate::db::stacking::list_runs(&fixture.conn, fixture.set_id, 10).unwrap();
+        let rows = crate::db::stacking::list_runs(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            10,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].status, "failed", "must never stay stuck planning");
         assert!(rows[0].finished_at.is_some());
@@ -10233,7 +10265,7 @@ mod tests {
         let run_id = insert_run(
             &fixture.conn,
             &NewRun {
-                frames_set_id: fixture.set_id,
+                subject: &StackSubject::FrameSet(fixture.set_id),
                 config_json: "{}",
                 config_hash: "test-hash",
                 reference_frame_id: None,
@@ -10266,7 +10298,7 @@ mod tests {
                 run_id,
                 StackHandle {
                     cancel_flag: cancel,
-                    frames_set_id: fixture.set_id,
+                    subject: StackSubject::FrameSet(fixture.set_id),
                 },
             );
         }
@@ -10532,9 +10564,12 @@ mod tests {
         let files_on_disk = std::fs::read_dir(&calibrated_dir).unwrap().count();
         assert_eq!(files_on_disk, 3);
 
-        let artifacts_after_1 =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("calibrated"))
-                .unwrap();
+        let artifacts_after_1 = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("calibrated"),
+        )
+        .unwrap();
         assert_eq!(artifacts_after_1.len(), 3);
 
         let snapshot = |artifacts: &[crate::db::stacking::StackingArtifactRow]| -> HashMap<i64, (std::time::SystemTime, String)> {
@@ -10552,9 +10587,12 @@ mod tests {
         // Second pass: 0 files rewritten (mtimes unchanged), rows unchanged.
         let mut rc2 = build(2, plan_groups.clone());
         stage_calibrate(&mut rc2).unwrap();
-        let artifacts_after_2 =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("calibrated"))
-                .unwrap();
+        let artifacts_after_2 = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("calibrated"),
+        )
+        .unwrap();
         assert_eq!(artifacts_after_2.len(), 3);
         let after_reuse = snapshot(&artifacts_after_2);
         assert_eq!(
@@ -10575,9 +10613,12 @@ mod tests {
             group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         let mut rc3 = build(3, plan_groups_touched);
         stage_calibrate(&mut rc3).unwrap();
-        let artifacts_after_3 =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("calibrated"))
-                .unwrap();
+        let artifacts_after_3 = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("calibrated"),
+        )
+        .unwrap();
         let after_touch = snapshot(&artifacts_after_3);
         assert_ne!(
             after_touch[&light_ids[0]], before[&light_ids[0]],
@@ -10597,9 +10638,12 @@ mod tests {
         let mut rc4 = build(4, plan_groups_rerun);
         rc4.rerun_from = Some(Stage::Calibrate);
         stage_calibrate(&mut rc4).unwrap();
-        let artifacts_after_4 =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("calibrated"))
-                .unwrap();
+        let artifacts_after_4 = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("calibrated"),
+        )
+        .unwrap();
         let after_rerun = snapshot(&artifacts_after_4);
         for &id in &light_ids {
             assert_ne!(
@@ -10697,9 +10741,12 @@ mod tests {
         );
         stage_calibrate(&mut rc).unwrap();
 
-        let artifacts =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("calibrated"))
-                .unwrap();
+        let artifacts = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("calibrated"),
+        )
+        .unwrap();
         assert_eq!(artifacts.len(), 3, "{artifacts:?}");
 
         let path_of = |frame_id: i64| -> String {
@@ -10854,7 +10901,7 @@ mod tests {
         let run_id = insert_run(
             conn,
             &NewRun {
-                frames_set_id,
+                subject: &StackSubject::FrameSet(frames_set_id),
                 config_json: "{}",
                 config_hash: "test-hash",
                 reference_frame_id: None,
@@ -11184,9 +11231,12 @@ mod tests {
         let mut rc1 = build(run_id1, group_ids1);
         run_stages_for_test(&mut rc1, Stage::Measure).unwrap();
 
-        let metrics1 =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
-                .unwrap();
+        let metrics1 = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("metrics"),
+        )
+        .unwrap();
         assert_eq!(metrics1.len(), 4, "{metrics1:?}");
         let before: HashMap<i64, String> = metrics1
             .iter()
@@ -11203,9 +11253,12 @@ mod tests {
         let mut rc2 = build(run_id2, group_ids2);
         run_stages_for_test(&mut rc2, Stage::Measure).unwrap();
 
-        let metrics2 =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
-                .unwrap();
+        let metrics2 = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("metrics"),
+        )
+        .unwrap();
         assert_eq!(metrics2.len(), 4, "{metrics2:?}");
         let after: HashMap<i64, String> = metrics2
             .iter()
@@ -11272,13 +11325,19 @@ mod tests {
         let mut rc1 = build(run_id1, group_ids1);
         run_stages_for_test(&mut rc1, Stage::Measure).unwrap();
 
-        let metrics =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
-                .unwrap();
+        let metrics = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("metrics"),
+        )
+        .unwrap();
         assert_eq!(metrics.len(), 4, "{metrics:?}");
-        let fits_rows =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
-                .unwrap();
+        let fits_rows = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("fits.0"),
+        )
+        .unwrap();
         assert_eq!(
             fits_rows.len(),
             4,
@@ -11341,9 +11400,12 @@ mod tests {
         );
         let mut rc2 = build(run_id2, group_ids2);
         run_stages_for_test(&mut rc2, Stage::Measure).unwrap();
-        let fits_rows2 =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
-                .unwrap();
+        let fits_rows2 = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("fits.0"),
+        )
+        .unwrap();
         assert_eq!(
             fits_rows2.iter().map(|a| &a.created_at).collect::<Vec<_>>(),
             fits_rows.iter().map(|a| &a.created_at).collect::<Vec<_>>(),
@@ -11425,13 +11487,19 @@ mod tests {
             .unwrap();
         assert_eq!(row1.status, "done", "{row1:?}");
 
-        let metrics_before =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
-                .unwrap();
+        let metrics_before = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("metrics"),
+        )
+        .unwrap();
         assert_eq!(metrics_before.len(), 4, "{metrics_before:?}");
-        let fits_before =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
-                .unwrap();
+        let fits_before = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("fits.0"),
+        )
+        .unwrap();
         assert_eq!(fits_before.len(), 4, "{fits_before:?}");
         let created_before: HashMap<i64, String> = metrics_before
             .iter()
@@ -11485,9 +11553,12 @@ mod tests {
             .unwrap();
         assert_eq!(row2.status, "done", "{row2:?}");
 
-        let metrics_after =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
-                .unwrap();
+        let metrics_after = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("metrics"),
+        )
+        .unwrap();
         assert_eq!(metrics_after.len(), 4, "{metrics_after:?}");
         for a in &metrics_after {
             let fid = a.frame_id.unwrap();
@@ -11505,9 +11576,12 @@ mod tests {
             }
         }
 
-        let fits_after =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
-                .unwrap();
+        let fits_after = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("fits.0"),
+        )
+        .unwrap();
         assert_eq!(fits_after.len(), 4, "{fits_after:?}");
         assert!(
             Path::new(&victim_path).exists(),
@@ -11593,9 +11667,12 @@ mod tests {
             "done"
         );
 
-        let fits_before =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
-                .unwrap();
+        let fits_before = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("fits.0"),
+        )
+        .unwrap();
         assert_eq!(fits_before.len(), 4, "{fits_before:?}");
 
         // Plant the collision: the file goes, a directory takes its name.
@@ -11657,9 +11734,12 @@ mod tests {
 
         // The `metrics` row is KEPT — only the plane's `fits` row is
         // skipped, and only for the frame whose write failed.
-        let metrics_after =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("metrics"))
-                .unwrap();
+        let metrics_after = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("metrics"),
+        )
+        .unwrap();
         assert_eq!(metrics_after.len(), 4, "{metrics_after:?}");
 
         // No row was written for a file that is not on disk: the victim's
@@ -11668,9 +11748,12 @@ mod tests {
         // exactly the `resolve_register_fits` gate — a frame with no fresh
         // `fits.0` registers through `detect_frame_stars`'s detection arm,
         // `star_source = "detected"`. Its three siblings stay `"fits"`.
-        let fits_after =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("fits.0"))
-                .unwrap();
+        let fits_after = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("fits.0"),
+        )
+        .unwrap();
         assert_eq!(
             fits_after.len(),
             4,
@@ -13248,7 +13331,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &fixture.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: fixture.set_id,
+                    subject: &StackSubject::FrameSet(fixture.set_id),
                     frame_id: Some(frame_id),
                     group_key,
                     kind: &fits_artifact::artifact_kind(0),
@@ -14528,7 +14611,7 @@ mod tests {
                 {
                     let active = self.ctx.active_stacks.lock().unwrap();
                     for h in active.values() {
-                        if h.frames_set_id == self.frames_set_id {
+                        if h.subject == StackSubject::FrameSet(self.frames_set_id) {
                             h.cancel_flag.store(true, Ordering::SeqCst);
                         }
                     }
@@ -14915,12 +14998,16 @@ mod tests {
             assert!(!f.cached_ln, "first run must not be cached: {f:?}");
         }
 
-        let ln_artifacts =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("ln")).unwrap();
+        let ln_artifacts = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("ln"),
+        )
+        .unwrap();
         assert_eq!(ln_artifacts.len(), 4, "{ln_artifacts:?}");
         let ln_ref_artifacts = crate::db::stacking::list_artifacts(
             &fixture.conn,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some("ln_reference"),
         )
         .unwrap();
@@ -15020,8 +15107,12 @@ mod tests {
         // The pin itself: PER FRAME, from each one's own `ln` artifact
         // payload. f0 (the victim) must record `"detected"`; every sibling,
         // whose `fits` artifacts were never touched, must record `"seeds"`.
-        let ln_rows =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("ln")).unwrap();
+        let ln_rows = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("ln"),
+        )
+        .unwrap();
         assert_eq!(ln_rows.len(), 4, "{ln_rows:?}");
         let mut seen_victim = false;
         for row in &ln_rows {
@@ -15159,12 +15250,16 @@ mod tests {
             assert!(f.cached_ln, "{f:?}");
         }
 
-        let ln_artifacts =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("ln")).unwrap();
+        let ln_artifacts = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("ln"),
+        )
+        .unwrap();
         assert_eq!(ln_artifacts.len(), 4, "{ln_artifacts:?}");
         let ln_ref_artifacts = crate::db::stacking::list_artifacts(
             &fixture.conn,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some("ln_reference"),
         )
         .unwrap();
@@ -15518,12 +15613,16 @@ mod tests {
             assert!(!f.cached_ln, "{f:?}");
         }
 
-        let ln_artifacts =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("ln")).unwrap();
+        let ln_artifacts = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("ln"),
+        )
+        .unwrap();
         assert!(ln_artifacts.is_empty(), "{ln_artifacts:?}");
         let ln_ref_artifacts = crate::db::stacking::list_artifacts(
             &fixture.conn,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some("ln_reference"),
         )
         .unwrap();
@@ -16837,7 +16936,7 @@ mod tests {
         );
 
         let master = rows.iter().find(|r| r.kind == "master").unwrap();
-        assert_eq!(master.frames_set_id, fixture.set_id);
+        assert_eq!(master.subject, StackSubject::FrameSet(fixture.set_id));
         assert_eq!(master.run_id, started.run_id);
         assert_eq!(master.group_key, group.group_key);
         assert_eq!(
@@ -17184,12 +17283,15 @@ mod tests {
 
         // One mosaic artifact per calibrated frame, each a single-plane file
         // of the frame's own geometry beside its `_d` sibling.
-        let calibrated =
-            crate::db::stacking::list_artifacts(&fixture.conn, fixture.set_id, Some("calibrated"))
-                .unwrap();
+        let calibrated = crate::db::stacking::list_artifacts(
+            &fixture.conn,
+            &StackSubject::FrameSet(fixture.set_id),
+            Some("calibrated"),
+        )
+        .unwrap();
         let mosaics = crate::db::stacking::list_artifacts(
             &fixture.conn,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some("calibrated_mosaic"),
         )
         .unwrap();
@@ -17276,7 +17378,7 @@ mod tests {
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         cleanup_work(
             &fixture.conn,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             &layout,
             CleanupWhat::Intermediates,
         )
@@ -17284,7 +17386,7 @@ mod tests {
         assert!(
             crate::db::stacking::list_artifacts(
                 &fixture.conn,
-                fixture.set_id,
+                &StackSubject::FrameSet(fixture.set_id),
                 Some("calibrated_mosaic")
             )
             .unwrap()
@@ -17341,7 +17443,7 @@ mod tests {
         let hashes = || -> Vec<(Option<i64>, String)> {
             let mut rows = crate::db::stacking::list_artifacts(
                 &fixture.conn,
-                fixture.set_id,
+                &StackSubject::FrameSet(fixture.set_id),
                 Some("calibrated"),
             )
             .unwrap()
@@ -17358,7 +17460,7 @@ mod tests {
         assert!(
             crate::db::stacking::list_artifacts(
                 &fixture.conn,
-                fixture.set_id,
+                &StackSubject::FrameSet(fixture.set_id),
                 Some("calibrated_mosaic")
             )
             .unwrap()
@@ -17369,7 +17471,7 @@ mod tests {
         run_with_bayer(true);
         let mosaics = crate::db::stacking::list_artifacts(
             &fixture.conn,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             Some("calibrated_mosaic"),
         )
         .unwrap();
@@ -17460,7 +17562,7 @@ mod tests {
         assert!(
             crate::db::stacking::list_artifacts(
                 &fixture.conn,
-                fixture.set_id,
+                &StackSubject::FrameSet(fixture.set_id),
                 Some("calibrated_mosaic")
             )
             .unwrap()
@@ -18138,7 +18240,7 @@ mod tests {
                 {
                     let active = self.ctx.active_stacks.lock().unwrap();
                     for h in active.values() {
-                        if h.frames_set_id == self.frames_set_id {
+                        if h.subject == StackSubject::FrameSet(self.frames_set_id) {
                             h.cancel_flag.store(true, Ordering::SeqCst);
                         }
                     }
@@ -18368,7 +18470,7 @@ mod tests {
                         let active = self.ctx.active_stacks.lock().unwrap();
                         active
                             .iter()
-                            .find(|(_, h)| h.frames_set_id == self.frames_set_id)
+                            .find(|(_, h)| h.subject == StackSubject::FrameSet(self.frames_set_id))
                             .map(|(id, _)| *id)
                             .expect("this run must be active")
                     };
@@ -19052,7 +19154,7 @@ mod tests {
 
         let artifact = crate::db::stacking::find_artifact(
             &fixture.conn,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             &group_key,
             "ln_reference",
             None,
@@ -19345,7 +19447,7 @@ mod tests {
         // `small` despite its own top raw score.
         let artifact = crate::db::stacking::find_artifact(
             &fixture.conn,
-            fixture.set_id,
+            &StackSubject::FrameSet(fixture.set_id),
             &group_key,
             "ln_reference",
             None,

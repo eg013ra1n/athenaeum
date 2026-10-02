@@ -488,7 +488,7 @@ fn rebuild_stacking_tables_for_subjects(conn: &Connection) -> Result<()> {
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
                     Some(format!(
                         "stacking subject rebuild refused: {violations} foreign-key violation(s) \
-                         in {table}; the database was left unchanged and the app will not start \
+                         in {table}; the stacking tables were left unchanged and the app will not start \
                          until they are repaired. `PRAGMA foreign_key_check('{table}')` lists the \
                          rows; deleting those orphan rows is safe (stacking cache and run-history \
                          rows only)."
@@ -3066,7 +3066,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // handle. A handle lives as long as its project.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS stack_project_frames (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id TEXT NOT NULL REFERENCES collab_projects(project_id) ON DELETE CASCADE,
             frame_uuid TEXT NOT NULL,
             UNIQUE (project_id, frame_uuid)
@@ -6063,6 +6063,20 @@ mod stacking_subject_schema_tests {
             [],
         )
         .unwrap();
+        // A real catalog frame, so every negative case below fails on its
+        // CHECK and never on a foreign key.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (501, '/f/501.fits', 'f.fits', 100, '2026-09-09T00:00:00Z', 'FITS')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO frames (id, file_id) VALUES (501, 501)", [])
+            .unwrap();
+        let refused = |r: rusqlite::Result<usize>, what: &str| {
+            let e = r.expect_err(what).to_string();
+            assert!(e.contains("CHECK constraint failed"), "{what}: {e}");
+        };
         // A run with both subjects, or neither, is refused:
         let run = |set: &str, project: &str| {
             conn.execute(
@@ -6074,8 +6088,8 @@ mod stacking_subject_schema_tests {
                 [],
             )
         };
-        assert!(run("NULL", "NULL").is_err(), "neither subject");
-        assert!(run("7", "'p1'").is_err(), "both subjects");
+        refused(run("NULL", "NULL"), "neither subject");
+        refused(run("7", "'p1'"), "both subjects");
         assert!(run("7", "NULL").is_ok(), "a frame-set run");
         assert!(run("NULL", "'p1'").is_ok(), "a project run");
         // A project-frame handle under a frame-set artifact subject is refused
@@ -6096,13 +6110,14 @@ mod stacking_subject_schema_tests {
                 [],
             )
         };
-        assert!(art("7", "NULL", "NULL", "5").is_err(), "pf under a set");
+        refused(art("7", "NULL", "NULL", "5"), "pf under a set");
+        refused(art("NULL", "'p1'", "501", "NULL"), "frame under a project");
+        refused(art("7", "NULL", "501", "5"), "both frame columns");
+        refused(art("7", "'p1'", "NULL", "NULL"), "both subjects");
         assert!(
-            art("NULL", "'p1'", "1", "NULL").is_err(),
-            "frame under a project"
+            art("7", "NULL", "501", "NULL").is_ok(),
+            "set + catalog frame"
         );
-        assert!(art("7", "NULL", "1", "5").is_err(), "both frame columns");
-        assert!(art("7", "'p1'", "NULL", "NULL").is_err(), "both subjects");
         assert!(art("NULL", "'p1'", "NULL", "5").is_ok(), "project + handle");
         // A run-frame with both frame columns, or neither, is refused.
         conn.execute(
@@ -6123,8 +6138,8 @@ mod stacking_subject_schema_tests {
                 [],
             )
         };
-        assert!(rf("NULL", "NULL").is_err(), "neither frame column");
-        assert!(rf("1", "5").is_err(), "both frame columns");
+        refused(rf("NULL", "NULL"), "neither frame column");
+        refused(rf("501", "5"), "both frame columns");
         assert!(rf("NULL", "5").is_ok(), "a handle");
     }
 

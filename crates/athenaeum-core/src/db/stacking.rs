@@ -19,11 +19,92 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// What a stacking run stacks (wave 6, spec 2026-10-02 §4.3, ruling W8): a
+/// catalog frame set, or a collaboration project. One pipeline, two
+/// subjects; a run has exactly one. Lives here, in the ungated persistence
+/// layer, because `db::stacking` and `services::StackHandle` take it in a
+/// headless build (plan 6b-1 B7); re-exported as `stacking::StackSubject`.
+///
+/// A frame id is always read in the subject's namespace: a catalog
+/// `frames.id` for a frame set, a `stack_project_frames.id` handle for a
+/// project. The two never meet in one map or one query.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StackSubject {
+    FrameSet(i64),
+    Project(String),
+}
+
+impl StackSubject {
+    pub fn frame_set_id(&self) -> Option<i64> {
+        match self {
+            StackSubject::FrameSet(id) => Some(*id),
+            StackSubject::Project(_) => None,
+        }
+    }
+
+    pub fn project_id(&self) -> Option<&str> {
+        match self {
+            StackSubject::FrameSet(_) => None,
+            StackSubject::Project(id) => Some(id),
+        }
+    }
+
+    /// The `(frame_id, project_frame)` column pair for a frame id of this
+    /// subject's namespace.
+    fn frame_columns(&self, frame: Option<i64>) -> (Option<i64>, Option<i64>) {
+        match self {
+            StackSubject::FrameSet(_) => (frame, None),
+            StackSubject::Project(_) => (None, frame),
+        }
+    }
+
+    /// The run-frame column that holds this subject's frame id.
+    fn frame_column(&self) -> &'static str {
+        match self {
+            StackSubject::FrameSet(_) => "frame_id",
+            StackSubject::Project(_) => "project_frame",
+        }
+    }
+
+    fn from_columns(
+        frames_set_id: Option<i64>,
+        project_id: Option<String>,
+    ) -> rusqlite::Result<Self> {
+        match (frames_set_id, project_id) {
+            (Some(id), None) => Ok(StackSubject::FrameSet(id)),
+            (None, Some(id)) => Ok(StackSubject::Project(id)),
+            other => Err(rusqlite::Error::InvalidColumnType(
+                1,
+                format!("stacking subject pair {other:?}"),
+                rusqlite::types::Type::Null,
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for StackSubject {
+    /// Byte-identical to the pre-6b error texts (`frame set {id}`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StackSubject::FrameSet(id) => write!(f, "frame set {id}"),
+            StackSubject::Project(id) => write!(f, "project {id}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct StackingRunRow {
     pub id: i64,
+    // `0` for a project run until 6b-2 makes the wire subject-aware; code
+    // reads `StackingRunRow::subject()`. (Plain comment: a doc comment would
+    // leak into the generated TS.)
     pub frames_set_id: i64,
+    /// The project of a project run (wave 6b). Not on the wire in 6b-1 (B8).
+    #[serde(skip)]
+    #[ts(skip)]
+    pub project_id: Option<String>,
     pub status: String,
     pub started_at: String,
     pub finished_at: Option<String>,
@@ -37,25 +118,37 @@ pub struct StackingRunRow {
     pub error: Option<String>,
 }
 
+impl StackingRunRow {
+    /// What this run stacks.
+    pub fn subject(&self) -> StackSubject {
+        match &self.project_id {
+            Some(id) => StackSubject::Project(id.clone()),
+            None => StackSubject::FrameSet(self.frames_set_id),
+        }
+    }
+}
+
 fn row_to_run(r: &Row) -> rusqlite::Result<StackingRunRow> {
     Ok(StackingRunRow {
         id: r.get(0)?,
-        frames_set_id: r.get(1)?,
-        status: r.get(2)?,
-        started_at: r.get(3)?,
-        finished_at: r.get(4)?,
-        config_json: r.get(5)?,
-        config_hash: r.get(6)?,
-        reference_frame_id: r.get(7)?,
-        reference_mode: r.get(8)?,
-        working_dir: r.get(9)?,
-        output_dir: r.get(10)?,
-        summary_json: r.get(11)?,
-        error: r.get(12)?,
+        frames_set_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+        project_id: r.get(2)?,
+        status: r.get(3)?,
+        started_at: r.get(4)?,
+        finished_at: r.get(5)?,
+        config_json: r.get(6)?,
+        config_hash: r.get(7)?,
+        reference_frame_id: r.get(8)?,
+        reference_mode: r.get(9)?,
+        working_dir: r.get(10)?,
+        output_dir: r.get(11)?,
+        summary_json: r.get(12)?,
+        error: r.get(13)?,
     })
 }
 
-const RUN_COLUMNS: &str = "id, frames_set_id, status, started_at, finished_at, config_json, \
+const RUN_COLUMNS: &str =
+    "id, frames_set_id, project_id, status, started_at, finished_at, config_json, \
     config_hash, reference_frame_id, reference_mode, working_dir, output_dir, summary_json, error";
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
@@ -141,6 +234,8 @@ pub struct StackingRunFrameRow {
     pub id: i64,
     pub run_id: i64,
     pub group_id: i64,
+    // The frame id in the run's namespace (a catalog id or a project handle).
+    // Plain comment: a doc comment would leak into the generated TS.
     pub frame_id: i64,
     pub included: bool,
     pub exclusion_reason: Option<String>,
@@ -177,7 +272,8 @@ fn row_to_frame(r: &Row) -> rusqlite::Result<StackingRunFrameRow> {
     })
 }
 
-const FRAME_COLUMNS: &str = "id, run_id, group_id, frame_id, included, exclusion_reason, weight, \
+const FRAME_COLUMNS: &str =
+    "id, run_id, group_id, COALESCE(frame_id, project_frame), included, exclusion_reason, weight, \
     weight_channels_json, metrics_json, reg_status, reg_model, reg_rms_px, reg_inliers, \
     reg_inlier_ratio, reg_flipped, rejected_fraction";
 
@@ -185,7 +281,9 @@ const FRAME_COLUMNS: &str = "id, run_id, group_id, frame_id, included, exclusion
 #[serde(rename_all = "camelCase")]
 pub struct StackingArtifactRow {
     pub id: i64,
-    pub frames_set_id: i64,
+    pub subject: StackSubject,
+    /// The frame id in the subject's namespace (a catalog id or a project
+    /// handle); `None` for a group-level artifact.
     pub frame_id: Option<i64>,
     pub group_key: String,
     pub kind: String,
@@ -200,20 +298,20 @@ pub struct StackingArtifactRow {
 fn row_to_artifact(r: &Row) -> rusqlite::Result<StackingArtifactRow> {
     Ok(StackingArtifactRow {
         id: r.get(0)?,
-        frames_set_id: r.get(1)?,
-        frame_id: r.get(2)?,
-        group_key: r.get(3)?,
-        kind: r.get(4)?,
-        path: r.get(5)?,
-        config_hash: r.get(6)?,
-        size: r.get(7)?,
-        modified_at: r.get(8)?,
-        payload_json: r.get(9)?,
-        created_at: r.get(10)?,
+        subject: StackSubject::from_columns(r.get(1)?, r.get(2)?)?,
+        frame_id: r.get(3)?,
+        group_key: r.get(4)?,
+        kind: r.get(5)?,
+        path: r.get(6)?,
+        config_hash: r.get(7)?,
+        size: r.get(8)?,
+        modified_at: r.get(9)?,
+        payload_json: r.get(10)?,
+        created_at: r.get(11)?,
     })
 }
 
-const ARTIFACT_COLUMNS: &str = "id, frames_set_id, frame_id, group_key, kind, path, config_hash, \
+const ARTIFACT_COLUMNS: &str = "id, frames_set_id, project_id, COALESCE(frame_id, project_frame), group_key, kind, path, config_hash, \
     size, modified_at, payload_json, created_at";
 
 /// One master light a run WROTE (M4d Task 3, ruling R-M4d-4, spec §9.1):
@@ -225,7 +323,7 @@ const ARTIFACT_COLUMNS: &str = "id, frames_set_id, frame_id, group_key, kind, pa
 #[serde(rename_all = "camelCase")]
 pub struct MasterLight {
     pub id: i64,
-    pub frames_set_id: i64,
+    pub subject: StackSubject,
     pub run_id: i64,
     pub group_key: String,
     /// `master | drizzle | weight_map`.
@@ -249,26 +347,27 @@ pub struct MasterLight {
 fn row_to_master_light(r: &Row) -> rusqlite::Result<MasterLight> {
     Ok(MasterLight {
         id: r.get(0)?,
-        frames_set_id: r.get(1)?,
-        run_id: r.get(2)?,
-        group_key: r.get(3)?,
-        kind: r.get(4)?,
-        path: r.get(5)?,
-        format: r.get(6)?,
-        width: r.get(7)?,
-        height: r.get(8)?,
-        channels: r.get(9)?,
-        frames: r.get(10)?,
-        total_exposure_s: r.get(11)?,
-        created_at: r.get(12)?,
+        subject: StackSubject::from_columns(r.get(1)?, r.get(2)?)?,
+        run_id: r.get(3)?,
+        group_key: r.get(4)?,
+        kind: r.get(5)?,
+        path: r.get(6)?,
+        format: r.get(7)?,
+        width: r.get(8)?,
+        height: r.get(9)?,
+        channels: r.get(10)?,
+        frames: r.get(11)?,
+        total_exposure_s: r.get(12)?,
+        created_at: r.get(13)?,
     })
 }
 
-const MASTER_LIGHT_COLUMNS: &str = "id, frames_set_id, run_id, group_key, kind, path, format, \
+const MASTER_LIGHT_COLUMNS: &str =
+    "id, frames_set_id, project_id, run_id, group_key, kind, path, format, \
     width, height, channels, frames, total_exposure_s, created_at";
 
 pub struct NewArtifact<'a> {
-    pub frames_set_id: i64,
+    pub subject: &'a StackSubject,
     pub frame_id: Option<i64>,
     pub group_key: &'a str,
     pub kind: &'a str,
@@ -280,7 +379,7 @@ pub struct NewArtifact<'a> {
 }
 
 pub struct NewMasterLight<'a> {
-    pub frames_set_id: i64,
+    pub subject: &'a StackSubject,
     pub run_id: i64,
     pub group_key: &'a str,
     pub kind: &'a str,
@@ -294,7 +393,7 @@ pub struct NewMasterLight<'a> {
 }
 
 pub struct NewRun<'a> {
-    pub frames_set_id: i64,
+    pub subject: &'a StackSubject,
     pub config_json: &'a str,
     pub config_hash: &'a str,
     pub reference_frame_id: Option<i64>,
@@ -373,11 +472,12 @@ pub struct SetConfigRow {
 pub fn insert_run(conn: &Connection, run: &NewRun<'_>) -> Result<i64> {
     conn.execute(
         "INSERT INTO stacking_runs
-         (frames_set_id, status, started_at, config_json, config_hash, reference_frame_id,
-          reference_mode, working_dir, output_dir)
-         VALUES (?1, 'planning', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (frames_set_id, project_id, status, started_at, config_json, config_hash,
+          reference_frame_id, reference_mode, working_dir, output_dir)
+         VALUES (?1, ?2, 'planning', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            run.frames_set_id,
+            run.subject.frame_set_id(),
+            run.subject.project_id(),
             now(),
             run.config_json,
             run.config_hash,
@@ -435,52 +535,59 @@ pub fn get_run(conn: &Connection, run_id: i64) -> Result<Option<StackingRunRow>>
         .optional()?)
 }
 
-/// Runs for a frame set, newest first.
+/// Runs for a subject, newest first.
 pub fn list_runs(
     conn: &Connection,
-    frames_set_id: i64,
+    subject: &StackSubject,
     limit: usize,
 ) -> Result<Vec<StackingRunRow>> {
     let sql = format!(
-        "SELECT {RUN_COLUMNS} FROM stacking_runs WHERE frames_set_id = ?1 \
-         ORDER BY started_at DESC, id DESC LIMIT ?2"
+        "SELECT {RUN_COLUMNS} FROM stacking_runs \
+         WHERE frames_set_id IS ?1 AND project_id IS ?2 \
+         ORDER BY started_at DESC, id DESC LIMIT ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(params![frames_set_id, limit as i64], row_to_run)?
+        .query_map(
+            params![subject.frame_set_id(), subject.project_id(), limit as i64],
+            row_to_run,
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-/// The id of the frame set's in-flight run (`status IN ('planning',
-/// 'running')`), if any. A frame set has at most one active run by
+/// The id of the subject's in-flight run (`status IN ('planning',
+/// 'running')`), if any. A subject has at most one active run by
 /// construction (the orchestration layer's gate, not enforced here).
-pub fn active_run_for_set(conn: &Connection, frames_set_id: i64) -> Result<Option<i64>> {
+pub fn active_run_for_subject(conn: &Connection, subject: &StackSubject) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
             "SELECT id FROM stacking_runs
-             WHERE frames_set_id = ?1 AND status IN ('planning', 'running')
+             WHERE frames_set_id IS ?1 AND project_id IS ?2
+               AND status IN ('planning', 'running')
              ORDER BY id DESC LIMIT 1",
-            params![frames_set_id],
+            params![subject.frame_set_id(), subject.project_id()],
             |r| r.get(0),
         )
         .optional()?)
 }
 
-/// Every run row still `planning`/`running` for ANY frame set, oldest first
+/// Every run row still `planning`/`running` for ANY subject, oldest first
 /// — the healing sweep's own input (final fix wave item 1): a row left in
 /// one of these two statuses by a killed/crashed process, since neither is
-/// ever reached again except by the run thread itself. `(id, frames_set_id)`
+/// ever reached again except by the run thread itself. `(id, subject)`
 /// only — the caller needs nothing else to decide whether a live
 /// `active_stacks` handle still covers it.
-pub fn list_unfinished_runs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+pub fn list_unfinished_runs(conn: &Connection) -> Result<Vec<(i64, StackSubject)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, frames_set_id FROM stacking_runs
+        "SELECT id, frames_set_id, project_id FROM stacking_runs
          WHERE status IN ('planning', 'running')
          ORDER BY id",
     )?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([], |r| {
+            Ok((r.get(0)?, StackSubject::from_columns(r.get(1)?, r.get(2)?)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -565,17 +672,23 @@ pub fn list_groups(conn: &Connection, run_id: i64) -> Result<Vec<StackingRunGrou
 // Frames
 // ---------------------------------------------------------------------
 
-/// Insert or replace the per-frame decision for `(run_id, frame_id)` —
+/// Insert or replace the per-frame decision for `(run_id, frame)` —
 /// registration/weighting is re-run per stage, and each stage's result
-/// simply overwrites the previous one for that frame within the run.
-pub fn upsert_frame_row(conn: &Connection, f: &NewFrameRow<'_>) -> Result<i64> {
-    conn.query_row(
+/// simply overwrites the previous one for that frame within the run. The
+/// frame id lands in the column of the subject's namespace.
+pub fn upsert_frame_row(
+    conn: &Connection,
+    subject: &StackSubject,
+    f: &NewFrameRow<'_>,
+) -> Result<i64> {
+    let col = subject.frame_column();
+    let sql = format!(
         "INSERT INTO stacking_run_frames
-         (run_id, group_id, frame_id, included, exclusion_reason, weight, weight_channels_json,
+         (run_id, group_id, {col}, included, exclusion_reason, weight, weight_channels_json,
           metrics_json, reg_status, reg_model, reg_rms_px, reg_inliers, reg_inlier_ratio,
           reg_flipped, rejected_fraction)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-         ON CONFLICT(run_id, frame_id) DO UPDATE SET
+         ON CONFLICT(run_id, {col}) DO UPDATE SET
            group_id = excluded.group_id,
            included = excluded.included,
            exclusion_reason = excluded.exclusion_reason,
@@ -589,7 +702,10 @@ pub fn upsert_frame_row(conn: &Connection, f: &NewFrameRow<'_>) -> Result<i64> {
            reg_inlier_ratio = excluded.reg_inlier_ratio,
            reg_flipped = excluded.reg_flipped,
            rejected_fraction = excluded.rejected_fraction
-         RETURNING id",
+         RETURNING id"
+    );
+    conn.query_row(
+        &sql,
         params![
             f.run_id,
             f.group_id,
@@ -612,7 +728,7 @@ pub fn upsert_frame_row(conn: &Connection, f: &NewFrameRow<'_>) -> Result<i64> {
     .map_err(Into::into)
 }
 
-/// Set just `rejected_fraction` on an existing `(run_id, frame_id)` row —
+/// Set just `rejected_fraction` on an existing `(run_id, frame)` row —
 /// the Output stage (Plan 5a Task 8) calls this once per frame
 /// `integrate_group` actually combined, after the row already exists from
 /// [`upsert_frame_row`] (stage 5), without re-deriving every other column a
@@ -622,14 +738,16 @@ pub fn upsert_frame_row(conn: &Connection, f: &NewFrameRow<'_>) -> Result<i64> {
 /// function enforces.
 pub fn set_frame_rejected_fraction(
     conn: &Connection,
+    subject: &StackSubject,
     run_id: i64,
     frame_id: i64,
     fraction: f64,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE stacking_run_frames SET rejected_fraction = ?1 WHERE run_id = ?2 AND frame_id = ?3",
-        params![fraction, run_id, frame_id],
-    )?;
+    let col = subject.frame_column();
+    let sql = format!(
+        "UPDATE stacking_run_frames SET rejected_fraction = ?1 WHERE run_id = ?2 AND {col} = ?3"
+    );
+    conn.execute(&sql, params![fraction, run_id, frame_id])?;
     Ok(())
 }
 
@@ -654,11 +772,12 @@ pub fn list_frame_rows(conn: &Connection, run_id: i64) -> Result<Vec<StackingRun
 /// (a set-level artifact) rather than creating a new one on every rebuild.
 pub fn upsert_artifact(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
     let created_at = now();
+    let (fid, pf) = a.subject.frame_columns(a.frame_id);
     conn.query_row(
         "INSERT INTO stacking_artifacts
-         (frames_set_id, frame_id, group_key, kind, path, config_hash, size, modified_at,
-          payload_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         (frames_set_id, project_id, frame_id, project_frame, group_key, kind, path,
+          config_hash, size, modified_at, payload_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(COALESCE(frames_set_id, 0), COALESCE(project_id, ''), group_key, kind,
                      COALESCE(frame_id, 0), COALESCE(project_frame, 0)) DO UPDATE SET
            path = excluded.path,
@@ -669,8 +788,10 @@ pub fn upsert_artifact(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
            created_at = excluded.created_at
          RETURNING id",
         params![
-            a.frames_set_id,
-            a.frame_id,
+            a.subject.frame_set_id(),
+            a.subject.project_id(),
+            fid,
+            pf,
             a.group_key,
             a.kind,
             a.path,
@@ -685,21 +806,41 @@ pub fn upsert_artifact(conn: &Connection, a: &NewArtifact<'_>) -> Result<i64> {
     .map_err(Into::into)
 }
 
+/// The SQL of [`find_artifact`], written in the unique key's own six
+/// expressions so it stays a covering point lookup on
+/// `stacking_artifacts_subject_key` (an `IS`-based WHERE would fall back to a
+/// scan of every artifact of the subject). `NULL ≡ 0` / `NULL ≡ ''` is the
+/// key's own equivalence ([`upsert_artifact`] relies on it); no frame id 0,
+/// set id 0 or project id `''` exists.
+fn find_artifact_sql() -> String {
+    format!(
+        "SELECT {ARTIFACT_COLUMNS} FROM stacking_artifacts
+         WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2
+           AND group_key = ?3 AND kind = ?4
+           AND COALESCE(frame_id, 0) = ?5 AND COALESCE(project_frame, 0) = ?6"
+    )
+}
+
 pub fn find_artifact(
     conn: &Connection,
-    frames_set_id: i64,
+    subject: &StackSubject,
     group_key: &str,
     kind: &str,
     frame_id: Option<i64>,
 ) -> Result<Option<StackingArtifactRow>> {
-    let sql = format!(
-        "SELECT {ARTIFACT_COLUMNS} FROM stacking_artifacts
-         WHERE frames_set_id = ?1 AND group_key = ?2 AND kind = ?3 AND frame_id IS ?4"
-    );
+    let (fid, pf) = subject.frame_columns(frame_id);
+    let sql = find_artifact_sql();
     Ok(conn
         .query_row(
             &sql,
-            params![frames_set_id, group_key, kind, frame_id],
+            params![
+                subject.frame_set_id().unwrap_or(0),
+                subject.project_id().unwrap_or(""),
+                group_key,
+                kind,
+                fid.unwrap_or(0),
+                pf.unwrap_or(0),
+            ],
             row_to_artifact,
         )
         .optional()?)
@@ -707,49 +848,63 @@ pub fn find_artifact(
 
 pub fn list_artifacts(
     conn: &Connection,
-    frames_set_id: i64,
+    subject: &StackSubject,
     kind: Option<&str>,
 ) -> Result<Vec<StackingArtifactRow>> {
     match kind {
         Some(k) => {
             let sql = format!(
                 "SELECT {ARTIFACT_COLUMNS} FROM stacking_artifacts \
-                 WHERE frames_set_id = ?1 AND kind = ?2 ORDER BY id"
+                 WHERE frames_set_id IS ?1 AND project_id IS ?2 AND kind = ?3 ORDER BY id"
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
-                .query_map(params![frames_set_id, k], row_to_artifact)?
+                .query_map(
+                    params![subject.frame_set_id(), subject.project_id(), k],
+                    row_to_artifact,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         }
         None => {
             let sql = format!(
                 "SELECT {ARTIFACT_COLUMNS} FROM stacking_artifacts \
-                 WHERE frames_set_id = ?1 ORDER BY id"
+                 WHERE frames_set_id IS ?1 AND project_id IS ?2 ORDER BY id"
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
-                .query_map(params![frames_set_id], row_to_artifact)?
+                .query_map(
+                    params![subject.frame_set_id(), subject.project_id()],
+                    row_to_artifact,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         }
     }
 }
 
-/// Delete every artifact of the given `kinds` for a frame set (e.g. when a
+/// Delete every artifact of the given `kinds` for a subject (e.g. when a
 /// config change invalidates cached masters). Returns the number of rows
 /// removed.
-pub fn delete_artifacts(conn: &Connection, frames_set_id: i64, kinds: &[&str]) -> Result<usize> {
+pub fn delete_artifacts(
+    conn: &Connection,
+    subject: &StackSubject,
+    kinds: &[&str],
+) -> Result<usize> {
     if kinds.is_empty() {
         return Ok(0);
     }
-    let placeholders: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 2)).collect();
+    let placeholders: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 3)).collect();
     let sql = format!(
-        "DELETE FROM stacking_artifacts WHERE frames_set_id = ?1 AND kind IN ({})",
+        "DELETE FROM stacking_artifacts
+         WHERE frames_set_id IS ?1 AND project_id IS ?2 AND kind IN ({})",
         placeholders.join(", ")
     );
-    let mut vals: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(kinds.len() + 1);
-    vals.push(&frames_set_id);
+    let set_id = subject.frame_set_id();
+    let project_id = subject.project_id();
+    let mut vals: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(kinds.len() + 2);
+    vals.push(&set_id);
+    vals.push(&project_id);
     for k in kinds {
         vals.push(k);
     }
@@ -757,17 +912,17 @@ pub fn delete_artifacts(conn: &Connection, frames_set_id: i64, kinds: &[&str]) -
     Ok(n)
 }
 
-/// Delete every artifact row for a frame set, regardless of `kind` — unlike
+/// Delete every artifact row for a subject, regardless of `kind` — unlike
 /// [`delete_artifacts`], which only removes the kinds it is given.
 /// `stacking_artifacts.kind` is free-form TEXT, not an enum the schema can
 /// enumerate, so a caller clearing "everything" (`CleanupWhat::All`) must not
 /// name a fixed kind list: a future stage adding a new kind this crate
 /// doesn't know about yet would otherwise survive `All` and keep pointing at
 /// files that cleanup just deleted. Returns the number of rows removed.
-pub fn delete_all_artifacts(conn: &Connection, frames_set_id: i64) -> Result<usize> {
+pub fn delete_all_artifacts(conn: &Connection, subject: &StackSubject) -> Result<usize> {
     let n = conn.execute(
-        "DELETE FROM stacking_artifacts WHERE frames_set_id = ?1",
-        params![frames_set_id],
+        "DELETE FROM stacking_artifacts WHERE frames_set_id IS ?1 AND project_id IS ?2",
+        params![subject.frame_set_id(), subject.project_id()],
     )?;
     Ok(n)
 }
@@ -785,11 +940,12 @@ pub fn insert_master_light(conn: &Connection, m: &NewMasterLight<'_>) -> Result<
     let created_at = now();
     conn.query_row(
         "INSERT INTO master_lights
-         (frames_set_id, run_id, group_key, kind, path, format, width, height, channels,
-          frames, total_exposure_s, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         (frames_set_id, project_id, run_id, group_key, kind, path, format, width, height,
+          channels, frames, total_exposure_s, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(run_id, group_key, kind) DO UPDATE SET
            frames_set_id = excluded.frames_set_id,
+           project_id = excluded.project_id,
            path = excluded.path,
            format = excluded.format,
            width = excluded.width,
@@ -800,7 +956,8 @@ pub fn insert_master_light(conn: &Connection, m: &NewMasterLight<'_>) -> Result<
            created_at = excluded.created_at
          RETURNING id",
         params![
-            m.frames_set_id,
+            m.subject.frame_set_id(),
+            m.subject.project_id(),
             m.run_id,
             m.group_key,
             m.kind,
@@ -1021,7 +1178,7 @@ mod tests {
         let run = insert_run(
             &c,
             &NewRun {
-                frames_set_id: set,
+                subject: &StackSubject::FrameSet(set),
                 config_json: "{}",
                 config_hash: "abc",
                 reference_frame_id: None,
@@ -1031,7 +1188,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(active_run_for_set(&c, set).unwrap(), Some(run));
+        assert_eq!(
+            active_run_for_subject(&c, &StackSubject::FrameSet(set)).unwrap(),
+            Some(run)
+        );
         let g = insert_group(
             &c,
             &NewGroup {
@@ -1051,6 +1211,7 @@ mod tests {
         .unwrap();
         upsert_frame_row(
             &c,
+            &StackSubject::FrameSet(set),
             &NewFrameRow {
                 run_id: run,
                 group_id: g,
@@ -1072,6 +1233,7 @@ mod tests {
         .unwrap();
         upsert_frame_row(
             &c,
+            &StackSubject::FrameSet(set),
             &NewFrameRow {
                 run_id: run,
                 group_id: g,
@@ -1117,8 +1279,16 @@ mod tests {
         let r = get_run(&c, run).unwrap().unwrap();
         assert_eq!(r.status, "done");
         assert!(r.finished_at.is_some());
-        assert_eq!(active_run_for_set(&c, set).unwrap(), None);
-        assert_eq!(list_runs(&c, set, 10).unwrap().len(), 1);
+        assert_eq!(
+            active_run_for_subject(&c, &StackSubject::FrameSet(set)).unwrap(),
+            None
+        );
+        assert_eq!(
+            list_runs(&c, &StackSubject::FrameSet(set), 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1130,7 +1300,7 @@ mod tests {
             let run = insert_run(
                 &c,
                 &NewRun {
-                    frames_set_id: set,
+                    subject: &StackSubject::FrameSet(set),
                     config_json: "{}",
                     config_hash: "h",
                     reference_frame_id: None,
@@ -1154,8 +1324,8 @@ mod tests {
         let unfinished: Vec<i64> = list_unfinished_runs(&c)
             .unwrap()
             .into_iter()
-            .map(|(id, frames_set_id)| {
-                assert_eq!(frames_set_id, set);
+            .map(|(id, subject)| {
+                assert_eq!(subject, StackSubject::FrameSet(set));
                 id
             })
             .collect();
@@ -1170,7 +1340,7 @@ mod tests {
         let set = seed_set(&c);
         seed_frame(&c, 5);
         let a = NewArtifact {
-            frames_set_id: set,
+            subject: &StackSubject::FrameSet(set),
             frame_id: None,
             group_key: "g",
             kind: "ln_reference",
@@ -1191,7 +1361,7 @@ mod tests {
         .unwrap();
         assert_eq!(id1, id2, "NULL frame_id must not create a second row");
         assert_eq!(
-            find_artifact(&c, set, "g", "ln_reference", None)
+            find_artifact(&c, &StackSubject::FrameSet(set), "g", "ln_reference", None)
                 .unwrap()
                 .unwrap()
                 .config_hash,
@@ -1206,19 +1376,31 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(list_artifacts(&c, set, None).unwrap().len(), 2);
-        assert_eq!(delete_artifacts(&c, set, &["calibrated"]).unwrap(), 1);
         assert_eq!(
-            list_artifacts(&c, set, None).unwrap().len(),
+            list_artifacts(&c, &StackSubject::FrameSet(set), None)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            delete_artifacts(&c, &StackSubject::FrameSet(set), &["calibrated"]).unwrap(),
+            1
+        );
+        assert_eq!(
+            list_artifacts(&c, &StackSubject::FrameSet(set), None)
+                .unwrap()
+                .len(),
             1,
             "only the calibrated row is gone"
         );
         assert_eq!(
-            delete_all_artifacts(&c, set).unwrap(),
+            delete_all_artifacts(&c, &StackSubject::FrameSet(set)).unwrap(),
             1,
             "the remaining ln_reference row goes too, by no kind name at all"
         );
-        assert!(list_artifacts(&c, set, None).unwrap().is_empty());
+        assert!(list_artifacts(&c, &StackSubject::FrameSet(set), None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1243,7 +1425,7 @@ mod tests {
         let run = insert_run(
             &c,
             &NewRun {
-                frames_set_id: set,
+                subject: &StackSubject::FrameSet(set),
                 config_json: "{}",
                 config_hash: "abc",
                 reference_frame_id: None,
@@ -1257,7 +1439,7 @@ mod tests {
         let id = insert_master_light(
             &c,
             &NewMasterLight {
-                frames_set_id: set,
+                subject: &StackSubject::FrameSet(set),
                 run_id: run,
                 group_key: "mono__NoFilter__bin1__180s",
                 kind: "master",
@@ -1277,7 +1459,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
         assert_eq!(r.id, id);
-        assert_eq!(r.frames_set_id, set);
+        assert_eq!(r.subject, StackSubject::FrameSet(set));
         assert_eq!(r.run_id, run);
         assert_eq!(r.group_key, "mono__NoFilter__bin1__180s");
         assert_eq!(r.kind, "master");
@@ -1300,7 +1482,7 @@ mod tests {
                 width: 12448,
                 height: 8336,
                 ..NewMasterLight {
-                    frames_set_id: set,
+                    subject: &StackSubject::FrameSet(set),
                     run_id: run,
                     group_key: "mono__NoFilter__bin1__180s",
                     kind: "master",
@@ -1318,7 +1500,7 @@ mod tests {
         let re_id = insert_master_light(
             &c,
             &NewMasterLight {
-                frames_set_id: set,
+                subject: &StackSubject::FrameSet(set),
                 run_id: run,
                 group_key: "mono__NoFilter__bin1__180s",
                 kind: "master",
@@ -1383,5 +1565,283 @@ mod tests {
         assert_eq!(left, 0, "handles live as long as their project");
         let c = project_frame_handles(&conn, "p2", &[]).unwrap();
         assert!(c.is_empty());
+        // AUTOINCREMENT: a handle is never re-used, even the highest one.
+        let minted = project_frame_handles(&conn, "p2", &["u-z"]).unwrap()["u-z"];
+        conn.execute("DELETE FROM stack_project_frames WHERE id = ?1", [minted])
+            .unwrap();
+        let next = project_frame_handles(&conn, "p2", &["u-y"]).unwrap()["u-y"];
+        assert!(
+            next > minted,
+            "{next} must be greater than the deleted {minted}"
+        );
+    }
+
+    fn new_run<'a>(subject: &'a StackSubject) -> NewRun<'a> {
+        NewRun {
+            subject,
+            config_json: "{}",
+            config_hash: "h",
+            reference_frame_id: None,
+            reference_mode: "auto",
+            working_dir: "/w",
+            output_dir: "/o",
+        }
+    }
+
+    fn new_group(run_id: i64) -> NewGroup<'static> {
+        NewGroup {
+            run_id,
+            group_key: "g",
+            instrume: None,
+            color_mode: "mono",
+            filter: None,
+            binning: Some(1),
+            width: Some(10),
+            height: Some(10),
+            exposure: None,
+            frame_count: 1,
+            included_count: 1,
+        }
+    }
+
+    fn new_frame_row(
+        run_id: i64,
+        group_id: i64,
+        frame_id: i64,
+        included: bool,
+    ) -> NewFrameRow<'static> {
+        NewFrameRow {
+            run_id,
+            group_id,
+            frame_id,
+            included,
+            exclusion_reason: None,
+            weight: None,
+            weight_channels_json: None,
+            metrics_json: None,
+            reg_status: None,
+            reg_model: None,
+            reg_rms_px: None,
+            reg_inliers: None,
+            reg_inlier_ratio: None,
+            reg_flipped: None,
+            rejected_fraction: None,
+        }
+    }
+
+    #[test]
+    fn subject_display_and_columns() {
+        let fs = StackSubject::FrameSet(7);
+        let pr = StackSubject::Project("p1".into());
+        assert_eq!(fs.to_string(), "frame set 7");
+        assert_eq!(pr.to_string(), "project p1");
+        assert_eq!((fs.frame_set_id(), fs.project_id()), (Some(7), None));
+        assert_eq!((pr.frame_set_id(), pr.project_id()), (None, Some("p1")));
+    }
+
+    #[test]
+    fn frame_set_and_project_artifacts_never_collide() {
+        let c = conn();
+        let set = seed_set(&c);
+        let frame = 501;
+        seed_frame(&c, frame);
+        insert_test_project(&c, "p1");
+        let handle = project_frame_handles(&c, "p1", &["u1"]).unwrap()["u1"];
+        let fs = StackSubject::FrameSet(set);
+        let pr = StackSubject::Project("p1".into());
+        for (subject, f, path) in [(&fs, frame, "/a"), (&pr, handle, "/b")] {
+            for _ in 0..2 {
+                upsert_artifact(
+                    &c,
+                    &NewArtifact {
+                        subject,
+                        frame_id: Some(f),
+                        group_key: "g",
+                        kind: "calibrated",
+                        path: Some(path),
+                        config_hash: "h",
+                        size: None,
+                        modified_at: None,
+                        payload_json: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            list_artifacts(&c, &fs, None).unwrap().len(),
+            1,
+            "an upsert refreshes in place"
+        );
+        assert_eq!(list_artifacts(&c, &pr, None).unwrap().len(), 1);
+        let a = find_artifact(&c, &pr, "g", "calibrated", Some(handle))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (a.subject.clone(), a.frame_id, a.path.as_deref()),
+            (pr.clone(), Some(handle), Some("/b"))
+        );
+        let b = find_artifact(&c, &fs, "g", "calibrated", Some(frame))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (b.subject.clone(), b.frame_id, b.path.as_deref()),
+            (fs.clone(), Some(frame), Some("/a"))
+        );
+        // The first minted handle is 1, the catalog frame is 501: a frame id of
+        // one namespace never finds the other subject's row.
+        assert_ne!(handle, frame);
+        assert!(find_artifact(&c, &fs, "g", "calibrated", Some(handle))
+            .unwrap()
+            .is_none());
+        assert!(find_artifact(&c, &pr, "g", "calibrated", Some(frame))
+            .unwrap()
+            .is_none());
+        assert_eq!(delete_all_artifacts(&c, &pr).unwrap(), 1);
+        assert_eq!(
+            list_artifacts(&c, &fs, None).unwrap().len(),
+            1,
+            "the frame set's row survives"
+        );
+    }
+
+    #[test]
+    fn run_frame_rows_of_both_subjects_upsert_in_place() {
+        let c = conn();
+        let set = seed_set(&c);
+        seed_frame(&c, 501);
+        insert_test_project(&c, "p1");
+        let handle = project_frame_handles(&c, "p1", &["u1"]).unwrap()["u1"];
+        let fs = StackSubject::FrameSet(set);
+        let pr = StackSubject::Project("p1".into());
+        let fs_run = insert_run(&c, &new_run(&fs)).unwrap();
+        let pr_run = insert_run(&c, &new_run(&pr)).unwrap();
+        let fs_group = insert_group(&c, &new_group(fs_run)).unwrap();
+        let pr_group = insert_group(&c, &new_group(pr_run)).unwrap();
+        for _ in 0..2 {
+            upsert_frame_row(&c, &fs, &new_frame_row(fs_run, fs_group, 501, true)).unwrap();
+            upsert_frame_row(&c, &pr, &new_frame_row(pr_run, pr_group, handle, true)).unwrap();
+        }
+        let fs_rows = list_frame_rows(&c, fs_run).unwrap();
+        let pr_rows = list_frame_rows(&c, pr_run).unwrap();
+        assert_eq!(fs_rows.len(), 1, "one row per run");
+        assert_eq!(pr_rows.len(), 1);
+        assert_eq!(fs_rows[0].frame_id, 501);
+        assert_eq!(pr_rows[0].frame_id, handle);
+        set_frame_rejected_fraction(&c, &pr, pr_run, handle, 0.25).unwrap();
+        assert_eq!(
+            list_frame_rows(&c, pr_run).unwrap()[0].rejected_fraction,
+            Some(0.25)
+        );
+        assert_eq!(
+            list_frame_rows(&c, fs_run).unwrap()[0].rejected_fraction,
+            None
+        );
+    }
+
+    #[test]
+    fn a_project_run_row_leaves_the_frame_set_queries_alone() {
+        let c = conn();
+        let set = seed_set(&c);
+        insert_test_project(&c, "p1");
+        let fs = StackSubject::FrameSet(set);
+        let pr = StackSubject::Project("p1".into());
+        let fs_run = insert_run(&c, &new_run(&fs)).unwrap();
+        let pr_run = insert_run(&c, &new_run(&pr)).unwrap();
+        set_run_status(&c, fs_run, "running").unwrap();
+        set_run_status(&c, pr_run, "running").unwrap();
+        assert_eq!(
+            list_unfinished_runs(&c).unwrap(),
+            vec![(fs_run, fs.clone()), (pr_run, pr.clone())]
+        );
+        let fs_runs = list_runs(&c, &fs, 10).unwrap();
+        assert_eq!(
+            fs_runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![fs_run]
+        );
+        let pr_runs = list_runs(&c, &pr, 10).unwrap();
+        assert_eq!(
+            pr_runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![pr_run]
+        );
+        assert_eq!(active_run_for_subject(&c, &fs).unwrap(), Some(fs_run));
+        assert_eq!(active_run_for_subject(&c, &pr).unwrap(), Some(pr_run));
+        let row = get_run(&c, pr_run).unwrap().unwrap();
+        assert_eq!(row.subject(), pr);
+        assert_eq!(row.frames_set_id, 0, "the wire value of a project run");
+        assert_eq!(get_run(&c, fs_run).unwrap().unwrap().subject(), fs);
+    }
+
+    #[test]
+    fn master_lights_carry_their_subject() {
+        let c = conn();
+        insert_test_project(&c, "p1");
+        let pr = StackSubject::Project("p1".into());
+        let run = insert_run(&c, &new_run(&pr)).unwrap();
+        insert_master_light(
+            &c,
+            &NewMasterLight {
+                subject: &pr,
+                run_id: run,
+                group_key: "g",
+                kind: "master",
+                path: "/o/m.fits",
+                format: "fits",
+                width: 10,
+                height: 10,
+                channels: 1,
+                frames: 3,
+                total_exposure_s: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(list_master_lights(&c, run).unwrap()[0].subject, pr);
+    }
+
+    #[test]
+    fn an_artifact_written_before_the_rebuild_is_found_after_it() {
+        let c = conn();
+        let set = seed_set(&c);
+        seed_frame(&c, 101);
+        crate::db::schema::downgrade_stacking_tables_to_legacy(&c);
+        c.execute(
+            "INSERT INTO stacking_artifacts (frames_set_id, frame_id, group_key, kind,
+               config_hash, created_at)
+             VALUES (?1, 101, 'g', 'calibrated', 'c1', 't')",
+            [set],
+        )
+        .unwrap();
+        let legacy_id = c.last_insert_rowid();
+        init_db(&c).unwrap();
+        let row = find_artifact(
+            &c,
+            &StackSubject::FrameSet(set),
+            "g",
+            "calibrated",
+            Some(101),
+        )
+        .unwrap()
+        .expect("the legacy row is found through the new key");
+        assert_eq!((row.id, row.config_hash.as_str()), (legacy_id, "c1"));
+    }
+
+    #[test]
+    fn find_artifact_is_a_point_lookup_on_the_artifacts_key() {
+        let c = conn();
+        let sql = find_artifact_sql();
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params![7_i64, "", "g", "calibrated", 5_i64, 0_i64], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("stacking_artifacts_subject_key")),
+            "{plan:?}"
+        );
     }
 }

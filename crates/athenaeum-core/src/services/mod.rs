@@ -63,11 +63,11 @@ pub struct MasterBuildHandle {
 }
 
 /// Handle to track an active stacking run (M1 Plan 5a Task 6), keyed by
-/// `stacking_runs.id`. `frames_set_id` lets `cancel_stacking` and any future
-/// "is this set already running" check answer without a DB read.
+/// `stacking_runs.id`. `subject` lets `cancel_stacking` and the per-subject
+/// admission check answer without a DB read.
 pub struct StackHandle {
     pub cancel_flag: Arc<AtomicBool>,
-    pub frames_set_id: i64,
+    pub subject: crate::db::stacking::StackSubject,
 }
 
 /// Shared application state accessible from any backend (Tauri, Axum, CLI).
@@ -110,8 +110,7 @@ pub struct ServiceContext {
     /// down at shutdown (`SharedIrohNode::shutdown`). A `tokio::sync::Mutex`
     /// (held across the async first-bind) serializes concurrent first callers;
     /// the `Option` allows a re-bind after shutdown.
-    pub iroh_node:
-        Arc<tokio::sync::Mutex<Option<Arc<crate::sharing::iroh::node::SharedIrohNode>>>>,
+    pub iroh_node: Arc<tokio::sync::Mutex<Option<Arc<crate::sharing::iroh::node::SharedIrohNode>>>>,
 }
 
 impl ServiceContext {

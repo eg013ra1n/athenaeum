@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
-use athenaeum_core::db::stacking::{find_artifact, list_frame_rows, list_runs};
+use athenaeum_core::db::stacking::{find_artifact, list_frame_rows, list_runs, StackSubject};
 use athenaeum_core::db::Database;
 use athenaeum_core::geometry::{Linear, PixelMap};
 use athenaeum_core::integration::banded::BandPlanes;
@@ -313,20 +313,21 @@ fn main() {
     // Weight: the frame SET's latest stacking run's own `stacking_run_frames`
     // rows (cached, like everything else this probe reads) — `None` (no run
     // yet) leaves every candidate at an equal 1.0.
-    let weight_by_frame: HashMap<i64, f64> = match list_runs(&conn, args.set_id, 1)
-        .ok()
-        .and_then(|r| r.into_iter().next())
-    {
-        Some(run) => list_frame_rows(&conn, run.id)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|r| r.weight.map(|w| (r.frame_id, w)))
-            .collect(),
-        None => {
-            eprintln!("note: no prior stacking run for this set — every candidate weighs 1.0");
-            HashMap::new()
-        }
-    };
+    let weight_by_frame: HashMap<i64, f64> =
+        match list_runs(&conn, &StackSubject::FrameSet(args.set_id), 1)
+            .ok()
+            .and_then(|r| r.into_iter().next())
+        {
+            Some(run) => list_frame_rows(&conn, run.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| r.weight.map(|w| (r.frame_id, w)))
+                .collect(),
+            None => {
+                eprintln!("note: no prior stacking run for this set — every candidate weighs 1.0");
+                HashMap::new()
+            }
+        };
 
     let registration_by_frame = get_registration_for_frame_set(&conn, args.set_id)
         .unwrap_or_else(|e| {
@@ -341,7 +342,7 @@ fn main() {
     for gf in &group.frames {
         let calibrated = match find_artifact(
             &conn,
-            args.set_id,
+            &StackSubject::FrameSet(args.set_id),
             &group.key,
             "calibrated",
             Some(gf.frame_id),
@@ -352,18 +353,23 @@ fn main() {
             },
             _ => continue,
         };
-        let measurement =
-            match find_artifact(&conn, args.set_id, &group.key, "metrics", Some(gf.frame_id)) {
-                Ok(Some(row)) => match row
-                    .payload_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<FrameMeasurement>(s).ok())
-                {
-                    Some(m) => m,
-                    None => continue,
-                },
-                _ => continue,
-            };
+        let measurement = match find_artifact(
+            &conn,
+            &StackSubject::FrameSet(args.set_id),
+            &group.key,
+            "metrics",
+            Some(gf.frame_id),
+        ) {
+            Ok(Some(row)) => match row
+                .payload_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<FrameMeasurement>(s).ok())
+            {
+                Some(m) => m,
+                None => continue,
+            },
+            _ => continue,
+        };
         let Some(reg) = registration_by_frame.get(&gf.frame_id) else {
             continue;
         };
@@ -589,7 +595,7 @@ registration row for each — run stacking through Register first); found {}",
     let calibration_scratch =
         tempfile::tempdir().expect("create a tempdir for the calibration scratch");
     if args.measure_calibration {
-        let reference_frame_id = list_runs(&conn, args.set_id, 1)
+        let reference_frame_id = list_runs(&conn, &StackSubject::FrameSet(args.set_id), 1)
             .ok()
             .and_then(|r| r.into_iter().next())
             .and_then(|r| r.reference_frame_id)

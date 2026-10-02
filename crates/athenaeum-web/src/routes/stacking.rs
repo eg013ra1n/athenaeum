@@ -677,7 +677,7 @@ mod tests {
         dir: &std::path::Path,
         working_dir: &std::path::Path,
     ) -> (i64, String) {
-        use athenaeum_core::db::stacking::{insert_run, NewMasterLight, NewRun};
+        use athenaeum_core::db::stacking::{insert_run, NewMasterLight, NewRun, StackSubject};
 
         conn.execute(
             "INSERT INTO frames_set (name) VALUES ('LDN 1272')",
@@ -689,7 +689,7 @@ mod tests {
         let run_id = insert_run(
             conn,
             &NewRun {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 config_json: "{}",
                 config_hash: "hash",
                 reference_frame_id: None,
@@ -711,7 +711,7 @@ mod tests {
         athenaeum_core::db::stacking::insert_master_light(
             conn,
             &NewMasterLight {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 run_id,
                 group_key: &group_key,
                 kind: "master",
@@ -864,7 +864,7 @@ mod tests {
         athenaeum_core::db::stacking::insert_master_light(
             &db.conn(),
             &athenaeum_core::db::stacking::NewMasterLight {
-                frames_set_id,
+                subject: &athenaeum_core::db::stacking::StackSubject::FrameSet(frames_set_id),
                 run_id,
                 group_key: &group_key,
                 kind: "weight_map",

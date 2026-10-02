@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use crate::api::sync::{validate_transfer_dir, OverlapRule, PathSetting};
 use crate::api::{db, ApiError, PathPolicy};
 use crate::db::stacking::{
-    active_run_for_set, find_master_light, get_run, get_set_config, list_frame_rows, list_groups,
-    list_runs, set_set_config, SetConfigRow, StackingRunFrameRow, StackingRunGroupRow,
-    StackingRunRow,
+    active_run_for_subject, find_master_light, get_run, get_set_config, list_frame_rows,
+    list_groups, list_runs, set_set_config, SetConfigRow, StackSubject, StackingRunFrameRow,
+    StackingRunGroupRow, StackingRunRow,
 };
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
@@ -239,7 +239,7 @@ pub fn get_stacking_runs(
     // history the user reads should never show a `running` row that is
     // actually dead.
     run::heal_interrupted_runs(ctx, &conn)?;
-    let runs = list_runs(&conn, set_id, limit.unwrap_or(20))?;
+    let runs = list_runs(&conn, &StackSubject::FrameSet(set_id), limit.unwrap_or(20))?;
     let mut out = Vec::with_capacity(runs.len());
     for run_row in runs {
         let groups = list_groups(&conn, run_row.id)?;
@@ -569,14 +569,22 @@ pub fn save_stacking_preset(
     let mut presets = read_presets_for_write(&tx)?;
 
     match presets.iter().position(|p| preset_name_eq(&p.name, &name)) {
-        Some(i) => presets[i] = NamedPreset { name: name.clone(), config },
+        Some(i) => {
+            presets[i] = NamedPreset {
+                name: name.clone(),
+                config,
+            }
+        }
         None => {
             if presets.len() >= PRESETS_MAX {
                 return Err(ApiError::Invalid(format!(
                     "too many presets ({PRESETS_MAX})"
                 )));
             }
-            presets.push(NamedPreset { name: name.clone(), config });
+            presets.push(NamedPreset {
+                name: name.clone(),
+                config,
+            });
         }
     }
 
@@ -841,7 +849,8 @@ pub fn cleanup_stacking_work(
     // forever.
     run::heal_interrupted_runs(ctx, &conn)?;
 
-    if let Some(run_id) = active_run_for_set(&conn, set_id)? {
+    let subject = StackSubject::FrameSet(set_id);
+    if let Some(run_id) = active_run_for_subject(&conn, &subject)? {
         return Err(ApiError::Conflict(format!(
             "a stacking run (id {run_id}) is active for frame set {set_id}"
         )));
@@ -855,7 +864,7 @@ pub fn cleanup_stacking_work(
     };
     let set_name = frame_set_name(&conn, set_id)?;
     let layout = WorkingLayout::new(Path::new(&working), &set_slug(&set_name));
-    let freed = cleanup_work(&conn, set_id, &layout, what)?;
+    let freed = cleanup_work(&conn, &subject, &layout, what)?;
     Ok(freed)
 }
 
@@ -958,14 +967,13 @@ fn resolve_master_light(
 
         let run_row = get_run(&conn, run_id)?
             .ok_or_else(|| ApiError::NotFound(format!("stacking run {run_id} not found")))?;
-        let row = find_master_light(&conn, run_id, group_key, kind.as_db_str())?.ok_or_else(
-            || {
+        let row =
+            find_master_light(&conn, run_id, group_key, kind.as_db_str())?.ok_or_else(|| {
                 ApiError::NotFound(format!(
                     "stacking run {run_id} wrote no {} for group {group_key}",
                     kind.as_db_str()
                 ))
-            },
-        )?;
+            })?;
         let set_name = frame_set_name(&conn, run_row.frames_set_id)?;
         // The cache path is built from the ROW's own `group_key`, not the
         // caller's argument — the two are equal by construction (the lookup
@@ -998,7 +1006,12 @@ fn resolve_master_light(
         )
     };
 
-    Ok(ResolvedMasterLight { master_path, master_mtime, cache_path, max_px })
+    Ok(ResolvedMasterLight {
+        master_path,
+        master_mtime,
+        cache_path,
+        max_px,
+    })
 }
 
 /// A fresh cache read for an already-resolved master light. Fresh means
@@ -1163,10 +1176,7 @@ mod tests {
             Some(Stage::Integrate)
         );
         assert_eq!(clamp_rerun_from(None), None);
-        assert_eq!(
-            clamp_rerun_from(Some(Stage::Measure)),
-            Some(Stage::Measure)
-        );
+        assert_eq!(clamp_rerun_from(Some(Stage::Measure)), Some(Stage::Measure));
         assert_eq!(
             clamp_rerun_from(Some(Stage::Integrate)),
             Some(Stage::Integrate)
@@ -1396,9 +1406,13 @@ mod tests {
         assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
 
         assert!(
-            crate::db::stacking::list_runs(&fixture.conn, fixture.set_id, 10)
-                .unwrap()
-                .is_empty(),
+            crate::db::stacking::list_runs(
+                &fixture.conn,
+                &StackSubject::FrameSet(fixture.set_id),
+                10
+            )
+            .unwrap()
+            .is_empty(),
             "a refused start must not insert a run row"
         );
     }
@@ -1490,7 +1504,7 @@ mod tests {
             let run_id = crate::db::stacking::insert_run(
                 &conn,
                 &crate::db::stacking::NewRun {
-                    frames_set_id: set_id,
+                    subject: &StackSubject::FrameSet(set_id),
                     config_json: "{}",
                     config_hash: "h",
                     reference_frame_id: None,
@@ -1507,7 +1521,7 @@ mod tests {
             run_id,
             crate::services::StackHandle {
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                frames_set_id: set_id,
+                subject: StackSubject::FrameSet(set_id),
             },
         );
 
@@ -1547,7 +1561,7 @@ mod tests {
         let stuck_run_id = crate::db::stacking::insert_run(
             &fixture.conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: fixture.set_id,
+                subject: &StackSubject::FrameSet(fixture.set_id),
                 config_json: "{}",
                 config_hash: "h",
                 reference_frame_id: None,
@@ -1630,7 +1644,7 @@ mod tests {
         let stuck_run_id = crate::db::stacking::insert_run(
             &fixture.conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: fixture.set_id,
+                subject: &StackSubject::FrameSet(fixture.set_id),
                 config_json: &config_json_delete,
                 config_hash: "h",
                 reference_frame_id: None,
@@ -1667,7 +1681,7 @@ mod tests {
         let stuck_run_id2 = crate::db::stacking::insert_run(
             &fixture.conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: fixture.set_id,
+                subject: &StackSubject::FrameSet(fixture.set_id),
                 config_json: &config_json_keep,
                 config_hash: "h",
                 reference_frame_id: None,
@@ -1723,7 +1737,7 @@ mod tests {
         let run_id = crate::db::stacking::insert_run(
             &fixture.conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: fixture.set_id,
+                subject: &StackSubject::FrameSet(fixture.set_id),
                 config_json: "{}",
                 config_hash: "h",
                 reference_frame_id: None,
@@ -1738,7 +1752,7 @@ mod tests {
             run_id,
             crate::services::StackHandle {
                 cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                frames_set_id: fixture.set_id,
+                subject: StackSubject::FrameSet(fixture.set_id),
             },
         );
 
@@ -1846,7 +1860,7 @@ mod tests {
         let run_id = crate::db::stacking::insert_run(
             &conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 config_json: "{}",
                 config_hash: "h",
                 reference_frame_id: None,
@@ -1857,19 +1871,20 @@ mod tests {
         )
         .unwrap();
 
-        let err = render_master_light_preview(&ctx, run_id + 999, "g", MasterLightKind::Master, 256)
-            .unwrap_err();
+        let err =
+            render_master_light_preview(&ctx, run_id + 999, "g", MasterLightKind::Master, 256)
+                .unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
 
-        let err =
-            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap_err();
+        let err = render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256)
+            .unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
 
         // A row whose file never existed on disk.
         crate::db::stacking::insert_master_light(
             &conn,
             &crate::db::stacking::NewMasterLight {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 run_id,
                 group_key: "g",
                 kind: "master",
@@ -1883,8 +1898,8 @@ mod tests {
             },
         )
         .unwrap();
-        let err =
-            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap_err();
+        let err = render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256)
+            .unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
     }
 
@@ -1907,7 +1922,7 @@ mod tests {
         let run_id = crate::db::stacking::insert_run(
             &conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 config_json: "{}",
                 config_hash: "h",
                 reference_frame_id: None,
@@ -1925,7 +1940,7 @@ mod tests {
         crate::db::stacking::insert_master_light(
             &conn,
             &crate::db::stacking::NewMasterLight {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 run_id,
                 group_key: "g",
                 kind: "master",
@@ -1990,7 +2005,7 @@ mod tests {
         let run_id = crate::db::stacking::insert_run(
             &conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 config_json: "{}",
                 config_hash: "h",
                 reference_frame_id: None,
@@ -2002,8 +2017,9 @@ mod tests {
         .unwrap();
 
         // An unknown run is `NotFound` through the cache-only path too.
-        let err = cached_master_light_preview(&ctx, run_id + 999, "g", MasterLightKind::Master, 256)
-            .unwrap_err();
+        let err =
+            cached_master_light_preview(&ctx, run_id + 999, "g", MasterLightKind::Master, 256)
+                .unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
 
         let (width, height) = (32usize, 24usize);
@@ -2013,7 +2029,7 @@ mod tests {
         crate::db::stacking::insert_master_light(
             &conn,
             &crate::db::stacking::NewMasterLight {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 run_id,
                 group_key: "g",
                 kind: "master",
@@ -2029,17 +2045,21 @@ mod tests {
         .unwrap();
 
         // Cold cache: `Ok(None)`, no permit needed, nothing rendered.
-        let miss = cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256)
-            .unwrap();
+        let miss =
+            cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
         assert_eq!(miss, None, "a cold cache must not render");
 
         let rendered =
             render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
         assert_eq!(&rendered[..3], &[0xFF, 0xD8, 0xFF], "JPEG magic");
 
-        let hit = cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256)
-            .unwrap();
-        assert_eq!(hit, Some(rendered), "a warm cache must match the render exactly");
+        let hit =
+            cached_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 256).unwrap();
+        assert_eq!(
+            hit,
+            Some(rendered),
+            "a warm cache must match the render exactly"
+        );
     }
 
     /// Fix round 1, I1: `max_px` is clamped into
@@ -2064,7 +2084,7 @@ mod tests {
         let run_id = crate::db::stacking::insert_run(
             &conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 config_json: "{}",
                 config_hash: "h",
                 reference_frame_id: None,
@@ -2082,7 +2102,7 @@ mod tests {
         crate::db::stacking::insert_master_light(
             &conn,
             &crate::db::stacking::NewMasterLight {
-                frames_set_id: set_id,
+                subject: &StackSubject::FrameSet(set_id),
                 run_id,
                 group_key: "g",
                 kind: "master",
@@ -2122,9 +2142,15 @@ mod tests {
 
         // (1) An out-of-range request clamps: `u32::MAX` writes the SAME file
         // the ceiling writes, and never a `full` one.
-        let huge = render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, u32::MAX)
-            .unwrap();
-        assert_eq!(names(), vec!["g_master_preview.jpg".to_string()], "{:?}", names());
+        let huge =
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, u32::MAX)
+                .unwrap();
+        assert_eq!(
+            names(),
+            vec!["g_master_preview.jpg".to_string()],
+            "{:?}",
+            names()
+        );
         let ceiling = render_master_light_preview(
             &ctx,
             run_id,
@@ -2150,7 +2176,8 @@ mod tests {
         assert_eq!(zero, floor);
 
         // (2) 64 and 512 both resolve to `thumbnail` — one more file, not two.
-        let _ = render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 512).unwrap();
+        let _ =
+            render_master_light_preview(&ctx, run_id, "g", MasterLightKind::Master, 512).unwrap();
         assert_eq!(
             names(),
             vec![
@@ -2261,9 +2288,12 @@ mod tests {
     fn saving_the_same_name_in_another_case_upserts() {
         let (_tmp, ctx) = test_ctx();
         save_stacking_preset(&ctx, "foo".into(), StackingConfig::default()).unwrap();
-        let after =
-            save_stacking_preset(&ctx, "  FOO  ".into(), preset(StackingPreset::MaximumQuality))
-                .unwrap();
+        let after = save_stacking_preset(
+            &ctx,
+            "  FOO  ".into(),
+            preset(StackingPreset::MaximumQuality),
+        )
+        .unwrap();
 
         assert_eq!(after.len(), 1, "one entry, not two");
         assert_eq!(
@@ -2353,7 +2383,10 @@ mod tests {
         // The literal the brief specifies, pinned once — every other
         // assertion below compares against the constant, which would pass
         // whatever it said.
-        assert_eq!(PRESET_NAME_ERROR, "preset name must be 1\u{2013}60 characters");
+        assert_eq!(
+            PRESET_NAME_ERROR,
+            "preset name must be 1\u{2013}60 characters"
+        );
         assert_eq!(PRESET_NAME_MAX, 60);
 
         for bad in ["", "   ", "\t\n"] {
@@ -2476,7 +2509,9 @@ mod tests {
         let (_tmp, ctx) = test_ctx();
 
         for ch in ['ä', '名'] {
-            let exactly = std::iter::repeat(ch).take(PRESET_NAME_MAX).collect::<String>();
+            let exactly = std::iter::repeat(ch)
+                .take(PRESET_NAME_MAX)
+                .collect::<String>();
             assert!(
                 exactly.len() > PRESET_NAME_MAX,
                 "the fixture must be multibyte, or it proves nothing"

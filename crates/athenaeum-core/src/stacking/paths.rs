@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::sync::OverlapRule;
 use crate::api::{ApiError, PathPolicy};
+use crate::db::stacking::StackSubject;
 use crate::settings::{keys, SettingsManager};
 use crate::stacking::groups::{ColorMode, IntegrationGroup};
 
@@ -807,7 +808,7 @@ const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
 /// calls below.
 pub fn cleanup_work(
     conn: &Connection,
-    frames_set_id: i64,
+    subject: &StackSubject,
     layout: &WorkingLayout,
     what: CleanupWhat,
 ) -> anyhow::Result<u64> {
@@ -849,26 +850,30 @@ pub fn cleanup_work(
 
     match what {
         CleanupWhat::Registered => {
-            crate::db::stacking::delete_artifacts(conn, frames_set_id, &["registered"])?;
+            crate::db::stacking::delete_artifacts(conn, subject, &["registered"])?;
         }
         CleanupWhat::Intermediates => {
-            crate::db::stacking::delete_artifacts(
-                conn,
-                frames_set_id,
-                INTERMEDIATE_ARTIFACT_KINDS,
-            )?;
+            crate::db::stacking::delete_artifacts(conn, subject, INTERMEDIATE_ARTIFACT_KINDS)?;
         }
         CleanupWhat::All => {
-            crate::db::stacking::delete_all_artifacts(conn, frames_set_id)?;
+            crate::db::stacking::delete_all_artifacts(conn, subject)?;
         }
     }
 
-    tracing::debug!(
-        frame_set_id = frames_set_id,
-        count = dirs.len(),
-        freed_bytes = freed,
-        "stacking work cleaned up"
-    );
+    match subject {
+        StackSubject::FrameSet(id) => tracing::debug!(
+            frame_set_id = id,
+            count = dirs.len(),
+            freed_bytes = freed,
+            "stacking work cleaned up"
+        ),
+        StackSubject::Project(id) => tracing::debug!(
+            project_id = %id,
+            count = dirs.len(),
+            freed_bytes = freed,
+            "stacking work cleaned up"
+        ),
+    }
 
     Ok(freed)
 }
@@ -1572,7 +1577,7 @@ mod tests {
         crate::db::stacking::upsert_artifact(
             c,
             &NewArtifact {
-                frames_set_id,
+                subject: &StackSubject::FrameSet(frames_set_id),
                 frame_id: None,
                 group_key: "g",
                 kind,
@@ -1624,17 +1629,23 @@ mod tests {
         assert_eq!(usage.total_bytes, 300);
 
         // Registered: removes only registered/ and its row.
-        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Registered).unwrap();
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(set_id),
+            &layout,
+            CleanupWhat::Registered,
+        )
+        .unwrap();
         assert_eq!(freed, 200);
         assert!(!layout.registered_dir("g").exists());
         assert!(calibrated_file.exists(), "calibrated/ untouched");
         assert_eq!(
-            delete_artifacts(&c, set_id, &["registered"]).unwrap(),
+            delete_artifacts(&c, &StackSubject::FrameSet(set_id), &["registered"]).unwrap(),
             0,
             "the registered row is already gone"
         );
         assert_eq!(
-            delete_artifacts(&c, set_id, &["calibrated"]).unwrap(),
+            delete_artifacts(&c, &StackSubject::FrameSet(set_id), &["calibrated"]).unwrap(),
             1,
             "the calibrated row is still there"
         );
@@ -1667,7 +1678,13 @@ mod tests {
 
         // Intermediates: also removes calibrated/, but not the unknown kind
         // and not the file-less measurement row.
-        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Intermediates).unwrap();
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(set_id),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
         assert_eq!(freed, 300);
         assert!(!layout.registered_dir("g").exists());
         assert!(!layout.calibrated_dir("g").exists());
@@ -1675,7 +1692,7 @@ mod tests {
             layout.root.exists(),
             "the layout's own root is never removed"
         );
-        let mut remaining: Vec<String> = list_artifacts(&c, set_id, None)
+        let mut remaining: Vec<String> = list_artifacts(&c, &StackSubject::FrameSet(set_id), None)
             .unwrap()
             .into_iter()
             .map(|a| a.kind)
@@ -1693,10 +1710,18 @@ mod tests {
         std::fs::create_dir_all(&output_dir).unwrap();
         let output_file = output_dir.join("master.fits");
         write_bytes(&output_file, 42);
-        cleanup_work(&c, set_id, &layout, CleanupWhat::All).unwrap();
+        cleanup_work(
+            &c,
+            &StackSubject::FrameSet(set_id),
+            &layout,
+            CleanupWhat::All,
+        )
+        .unwrap();
         assert!(output_file.exists(), "output folder untouched");
         assert!(
-            list_artifacts(&c, set_id, None).unwrap().is_empty(),
+            list_artifacts(&c, &StackSubject::FrameSet(set_id), None)
+                .unwrap()
+                .is_empty(),
             "All drops every artifact row, including a kind it doesn't name"
         );
     }
@@ -1728,7 +1753,13 @@ mod tests {
             "the symlink is neither followed nor double-counted"
         );
 
-        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Intermediates).unwrap();
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(set_id),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
         assert_eq!(freed, 1024);
         assert!(!layout.calibrated_dir("g").exists());
     }
@@ -1785,21 +1816,39 @@ mod tests {
 
         // Registered: rej/ survives — it sits at the same level as
         // calibrated/ and ln/, not registered/'s narrower level.
-        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Registered).unwrap();
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(set_id),
+            &layout,
+            CleanupWhat::Registered,
+        )
+        .unwrap();
         assert_eq!(freed, 0);
         assert!(rej_file.exists(), "Registered must not remove rej/");
         assert!(rejl_file.exists(), "Registered must not remove rej/ either");
         assert!(pass2_file.exists(), "…nor the second pass's own set");
 
         // Intermediates: rej/ is removed alongside calibrated/ and ln/.
-        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::Intermediates).unwrap();
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(set_id),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
         assert_eq!(freed, 112);
         assert!(!layout.rej_root().exists());
         assert_eq!(work_usage(&layout).rej_bytes, 0);
 
         // Re-seed for the All level too.
         write_bytes(&rej_file, 128);
-        let freed = cleanup_work(&c, set_id, &layout, CleanupWhat::All).unwrap();
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(set_id),
+            &layout,
+            CleanupWhat::All,
+        )
+        .unwrap();
         assert_eq!(freed, 128);
         assert!(!layout.rej_root().exists());
     }

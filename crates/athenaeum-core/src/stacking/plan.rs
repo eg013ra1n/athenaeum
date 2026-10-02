@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::lights::{compute_export_readiness_for_frames, ExportReadiness};
 use crate::api::{ApiError, PathPolicy};
 use crate::db::stacking::{
-    active_run_for_set, find_artifact, get_set_config, list_frame_rows, list_runs,
-    StackingArtifactRow,
+    active_run_for_subject, find_artifact, get_set_config, list_frame_rows, list_runs,
+    StackSubject, StackingArtifactRow,
 };
 use crate::export::{resolve_generation_cached, resolved_master_paths, DivisorCache};
 use crate::integration::stats::RejectionNormalization;
@@ -713,7 +713,7 @@ pub(crate) fn is_fresh(artifact: &StackingArtifactRow, current_hash: &str) -> bo
 /// plane counts against.
 pub(crate) fn fits_artifact_fresh(
     conn: &Connection,
-    frames_set_id: i64,
+    subject: &StackSubject,
     group_key: &str,
     frame_id: i64,
     metrics_payload: Option<&str>,
@@ -725,14 +725,7 @@ pub(crate) fn fits_artifact_fresh(
     else {
         return Ok(false);
     };
-    fits_artifact_fresh_for_planes(
-        conn,
-        frames_set_id,
-        group_key,
-        frame_id,
-        planes,
-        expected_hash,
-    )
+    fits_artifact_fresh_for_planes(conn, subject, group_key, frame_id, planes, expected_hash)
 }
 
 /// [`fits_artifact_fresh`]'s own per-plane freshness loop, with the plane
@@ -745,7 +738,7 @@ pub(crate) fn fits_artifact_fresh(
 /// `is_fresh` pair that could quietly drift from it.
 pub(crate) fn fits_artifact_fresh_for_planes(
     conn: &Connection,
-    frames_set_id: i64,
+    subject: &StackSubject,
     group_key: &str,
     frame_id: i64,
     planes: usize,
@@ -756,7 +749,7 @@ pub(crate) fn fits_artifact_fresh_for_planes(
     }
     for plane in 0..planes {
         let kind = fits_artifact::artifact_kind(plane);
-        let plane_fresh = find_artifact(conn, frames_set_id, group_key, &kind, Some(frame_id))?
+        let plane_fresh = find_artifact(conn, subject, group_key, &kind, Some(frame_id))?
             .is_some_and(|row| is_fresh(&row, expected_hash));
         if !plane_fresh {
             return Ok(false);
@@ -978,7 +971,10 @@ fn last_run_reference_scale(
     frames_set_id: i64,
     groups: &[IntegrationGroup],
 ) -> Result<Option<f64>, ApiError> {
-    let Some(last_run) = list_runs(conn, frames_set_id, 1)?.into_iter().next() else {
+    let Some(last_run) = list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
+        .into_iter()
+        .next()
+    else {
         return Ok(None);
     };
     Ok(last_run
@@ -1116,7 +1112,10 @@ fn cleanup_stale_note(
     if !calibrate_stale && !register_stale {
         return Ok(None);
     }
-    let Some(last) = list_runs(conn, frames_set_id, 1)?.into_iter().next() else {
+    let Some(last) = list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
+        .into_iter()
+        .next()
+    else {
         return Ok(None);
     };
     if last.status != "done" {
@@ -1197,7 +1196,10 @@ fn compute_register_stale(
     reference: &PlanReference,
     memo: &mut HashMemo,
 ) -> Result<bool, ApiError> {
-    let Some(last_run) = list_runs(conn, frames_set_id, 1)?.into_iter().next() else {
+    let Some(last_run) = list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
+        .into_iter()
+        .next()
+    else {
         return Ok(true);
     };
 
@@ -1311,7 +1313,7 @@ fn compute_register_stale(
         // directory (`CleanupPolicy::DeleteRegistered`/`DeleteIntermediates`).
         let artifact = find_artifact(
             conn,
-            frames_set_id,
+            &StackSubject::FrameSet(frames_set_id),
             &group.key,
             "registered",
             Some(frame_id),
@@ -1584,6 +1586,7 @@ pub fn build_plan(
     config_override: Option<StackingConfig>,
 ) -> Result<StackingPlan, ApiError> {
     let set_name = frame_set_name(conn, frames_set_id)?;
+    let subject = StackSubject::FrameSet(frames_set_id);
     let (cfg, excluded_frame_ids) =
         resolve_config_and_exclusions(conn, settings, frames_set_id, config_override)?;
     let hash = config_hash(&cfg);
@@ -1943,7 +1946,10 @@ pub fn build_plan(
     // ordinary "no fresh `ln` artifact" staleness until a real run either
     // re-excludes it (under the new config) or produces one.
     let ln_runtime_excluded_by_frame: HashSet<i64> = if local_normalization_active {
-        match list_runs(conn, frames_set_id, 1)?.into_iter().next() {
+        match list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
+            .into_iter()
+            .next()
+        {
             Some(last_run) if last_run.config_hash == hash => list_frame_rows(conn, last_run.id)?
                 .into_iter()
                 .filter(|row| {
@@ -1976,7 +1982,10 @@ pub fn build_plan(
     // needless re-normalize, never a false cache hit. Fetched once for the
     // whole build, like `ln_registration_by_frame` above.
     let ln_beta_by_group: HashMap<String, f64> = if local_normalization_active {
-        match list_runs(conn, frames_set_id, 1)?.into_iter().next() {
+        match list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
+            .into_iter()
+            .next()
+        {
             Some(last_run) => crate::db::stacking::list_groups(conn, last_run.id)?
                 .into_iter()
                 .filter_map(|row| row.beta.map(|b| (row.group_key, b)))
@@ -1999,7 +2008,7 @@ pub fn build_plan(
         // reports fresh against the OLD set until a real run updates it —
         // documented, not fixed, here (weights are pixel-phase data).
         let ln_reference_info: Option<LnReferencePayload> = if local_normalization_active {
-            find_artifact(conn, frames_set_id, &g.key, "ln_reference", None)?
+            find_artifact(conn, &subject, &g.key, "ln_reference", None)?
                 .and_then(|row| row.payload_json)
                 .and_then(|s| serde_json::from_str::<LnReferencePayload>(&s).ok())
         } else {
@@ -2019,7 +2028,7 @@ pub fn build_plan(
         // under, which is the question this gate is asking.
         let ln_calibration: Option<SeedsCalibration> = if local_normalization_active {
             let ln_channels = expected_ln_channels(&cfg, g);
-            find_artifact(conn, frames_set_id, &g.key, "ln_calibration", None)?
+            find_artifact(conn, &subject, &g.key, "ln_calibration", None)?
                 .and_then(|row| row.payload_json)
                 .and_then(|s| serde_json::from_str::<SeedsCalibration>(&s).ok())
                 // C-17: the same shape filter the run applies
@@ -2049,9 +2058,9 @@ pub fn build_plan(
             }
 
             let calib_artifact =
-                find_artifact(conn, frames_set_id, &g.key, "calibrated", Some(f.frame_id))?;
+                find_artifact(conn, &subject, &g.key, "calibrated", Some(f.frame_id))?;
             let metrics_artifact =
-                find_artifact(conn, frames_set_id, &g.key, "metrics", Some(f.frame_id))?;
+                find_artifact(conn, &subject, &g.key, "metrics", Some(f.frame_id))?;
 
             // Only worth resolving the frame's current stage-1 hash when
             // there is an existing artifact to compare it against — a frame
@@ -2076,7 +2085,7 @@ pub fn build_plan(
             let calib_fresh = if calib_fresh && group_wants_mosaic {
                 let mosaic_artifact = find_artifact(
                     conn,
-                    frames_set_id,
+                    &subject,
                     &g.key,
                     "calibrated_mosaic",
                     Some(f.frame_id),
@@ -2120,7 +2129,7 @@ pub fn build_plan(
             let fits_fresh = if metrics_fresh {
                 fits_artifact_fresh(
                     conn,
-                    frames_set_id,
+                    &subject,
                     &g.key,
                     f.frame_id,
                     metrics_artifact
@@ -2149,8 +2158,7 @@ pub fn build_plan(
             // info/no registration row/an unparseable payload are all
             // "can't verify" → stale, never assumed fresh.
             if local_normalization_active {
-                let ln_artifact =
-                    find_artifact(conn, frames_set_id, &g.key, "ln", Some(f.frame_id))?;
+                let ln_artifact = find_artifact(conn, &subject, &g.key, "ln", Some(f.frame_id))?;
                 let ln_fresh = match (&ln_reference_info, &ln_artifact) {
                     (Some(ref_info), Some(row)) => {
                         match ln_registration_by_frame.get(&f.frame_id) {
@@ -2323,7 +2331,7 @@ pub fn build_plan(
 
     let frame_count: usize = groups.iter().map(|g| g.frames.len()).sum();
     let included_count: usize = plan_groups.iter().map(|g| g.included_count).sum();
-    let active_run_id = active_run_for_set(conn, frames_set_id)?;
+    let active_run_id = active_run_for_subject(conn, &subject)?;
 
     tracing::debug!(
         set_id = frames_set_id,
@@ -4069,7 +4077,7 @@ mod tests {
         crate::db::stacking::upsert_artifact(
             &f.conn,
             &crate::db::stacking::NewArtifact {
-                frames_set_id: f.set_id,
+                subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame.frame_id),
                 group_key: &group_key,
                 kind: "calibrated",
@@ -4104,7 +4112,7 @@ mod tests {
         crate::db::stacking::upsert_artifact(
             &f.conn,
             &crate::db::stacking::NewArtifact {
-                frames_set_id: f.set_id,
+                subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame.frame_id),
                 group_key: &group_key,
                 kind: "calibrated",
@@ -4148,7 +4156,7 @@ mod tests {
         let run_id = crate::db::stacking::insert_run(
             conn,
             &crate::db::stacking::NewRun {
-                frames_set_id,
+                subject: &StackSubject::FrameSet(frames_set_id),
                 config_json: "{}",
                 config_hash: "h",
                 reference_frame_id,
@@ -4178,6 +4186,7 @@ mod tests {
         for &frame_id in frame_ids {
             crate::db::stacking::upsert_frame_row(
                 conn,
+                &StackSubject::FrameSet(frames_set_id),
                 &crate::db::stacking::NewFrameRow {
                     run_id,
                     group_id,
@@ -4221,7 +4230,7 @@ mod tests {
         crate::db::stacking::upsert_artifact(
             &f.conn,
             &crate::db::stacking::NewArtifact {
-                frames_set_id: f.set_id,
+                subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
                 group_key,
                 kind: "registered",
@@ -4271,7 +4280,7 @@ mod tests {
         crate::db::stacking::upsert_artifact(
             &f.conn,
             &crate::db::stacking::NewArtifact {
-                frames_set_id: f.set_id,
+                subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: Some(frame_id),
                 group_key,
                 kind: &fits_artifact::artifact_kind(plane),
@@ -4350,7 +4359,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: &group_key,
                     kind: "calibrated",
@@ -4368,7 +4377,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: &group_key,
                     kind: "metrics",
@@ -4764,7 +4773,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: &group_key,
                     kind: "calibrated",
@@ -4782,7 +4791,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: &group_key,
                     kind: "metrics",
@@ -4855,7 +4864,7 @@ mod tests {
         crate::db::stacking::upsert_artifact(
             &f.conn,
             &crate::db::stacking::NewArtifact {
-                frames_set_id: f.set_id,
+                subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: None,
                 group_key: &group_key,
                 kind: "ln_reference",
@@ -4884,7 +4893,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: &group_key,
                     kind: "ln",
@@ -5011,7 +5020,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: &group_key,
                     kind: "calibrated",
@@ -5029,7 +5038,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: &group_key,
                     kind: "metrics",
@@ -5049,7 +5058,7 @@ mod tests {
         let run_id = crate::db::stacking::insert_run(
             &f.conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: f.set_id,
+                subject: &StackSubject::FrameSet(f.set_id),
                 config_json: "{}",
                 config_hash: &run_config_hash,
                 reference_frame_id: Some(ids[0]),
@@ -5079,6 +5088,7 @@ mod tests {
         let seed_frame_row = |included: bool, reason: Option<&str>, frame_id: i64| {
             crate::db::stacking::upsert_frame_row(
                 &f.conn,
+                &StackSubject::FrameSet(f.set_id),
                 &crate::db::stacking::NewFrameRow {
                     run_id,
                     group_id,
@@ -5164,7 +5174,7 @@ mod tests {
         crate::db::stacking::upsert_artifact(
             &f.conn,
             &crate::db::stacking::NewArtifact {
-                frames_set_id: f.set_id,
+                subject: &StackSubject::FrameSet(f.set_id),
                 frame_id: None,
                 group_key: &group_key,
                 kind: "ln_reference",
@@ -5194,7 +5204,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(frame_id),
                     group_key: &group_key,
                     kind: "ln",
@@ -5313,7 +5323,7 @@ mod tests {
             let run_id = crate::db::stacking::insert_run(
                 &f.conn,
                 &crate::db::stacking::NewRun {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     config_json: &serde_json::to_string(&cfg).unwrap(),
                     config_hash: "h",
                     reference_frame_id: Some(ids[0]),
@@ -5375,7 +5385,7 @@ mod tests {
             crate::db::stacking::upsert_artifact(
                 &f.conn,
                 &crate::db::stacking::NewArtifact {
-                    frames_set_id: f.set_id,
+                    subject: &StackSubject::FrameSet(f.set_id),
                     frame_id: Some(gf.frame_id),
                     group_key: &groups[0].key,
                     kind: "metrics",
@@ -5400,7 +5410,12 @@ mod tests {
         );
         assert!(note.contains("measurements are still cached"), "{note}");
         assert!(!note.contains("nothing is cached"), "{note}");
-        crate::db::stacking::delete_artifacts(&f.conn, f.set_id, &["metrics"]).unwrap();
+        crate::db::stacking::delete_artifacts(
+            &f.conn,
+            &StackSubject::FrameSet(f.set_id),
+            &["metrics"],
+        )
+        .unwrap();
 
         // An INTERRUPTED deleteIntermediates run never ran its cleanup —
         // no story either.
@@ -5447,7 +5462,7 @@ mod tests {
         let run_id = crate::db::stacking::insert_run(
             &f.conn,
             &crate::db::stacking::NewRun {
-                frames_set_id: f.set_id,
+                subject: &StackSubject::FrameSet(f.set_id),
                 config_json: "{}",
                 config_hash: "h",
                 reference_frame_id: Some(ids[0]),
@@ -5477,6 +5492,7 @@ mod tests {
         for (i, &frame_id) in ids.iter().enumerate() {
             crate::db::stacking::upsert_frame_row(
                 &f.conn,
+                &StackSubject::FrameSet(f.set_id),
                 &crate::db::stacking::NewFrameRow {
                     run_id,
                     group_id,
