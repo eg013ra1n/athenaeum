@@ -510,10 +510,11 @@ mod tests {
             read_xisf_keyword(&dest, "FILTER").unwrap().as_deref(),
             Some("R")
         );
-        let text = crate::fits_parser::extract_xisf_header(&dest).unwrap();
-        assert!(
-            text.contains("FILTER"),
-            "the app's own XISF reader still reads it: {text}"
+        let frame = crate::fits_parser::parse_xisf(&dest, 1).unwrap();
+        assert_eq!(
+            frame.filter.as_deref(),
+            Some("R"),
+            "the app's own XISF parser reads the patched header"
         );
     }
 
