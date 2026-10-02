@@ -32,7 +32,6 @@ use crate::settings::{keys, SettingsManager};
 use crate::stacking::config::{
     preset, resolve_config, PathsConfig, StackingConfig, StackingPreset,
 };
-use crate::stacking::groups::set_slug;
 use crate::stacking::paths::{
     cleanup_work, resolve_dirs, subject_layout, validate_dirs, work_usage, CleanupWhat,
     ValidateMode, WorkUsage, WorkingLayout,
@@ -1173,6 +1172,7 @@ mod tests {
     use super::*;
     use crate::events::NullEmitter;
     use crate::stacking::config::CleanupPolicy;
+    use crate::stacking::groups::set_slug;
     use crate::stacking::test_fixtures::{self, LightSpec};
 
     /// M3 Task 5, fix round 1, Important I2: `clamp_rerun_from` directly —

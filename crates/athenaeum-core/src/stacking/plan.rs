@@ -2013,10 +2013,7 @@ pub fn build_plan(
     // ordinary "no fresh `ln` artifact" staleness until a real run either
     // re-excludes it (under the new config) or produces one.
     let ln_runtime_excluded_by_frame: HashSet<i64> = if local_normalization_active {
-        match list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
-            .into_iter()
-            .next()
-        {
+        match list_runs(conn, subject, 1)?.into_iter().next() {
             Some(last_run) if last_run.config_hash == hash => list_frame_rows(conn, last_run.id)?
                 .into_iter()
                 .filter(|row| {
@@ -2049,10 +2046,7 @@ pub fn build_plan(
     // needless re-normalize, never a false cache hit. Fetched once for the
     // whole build, like `ln_registration_by_frame` above.
     let ln_beta_by_group: HashMap<String, f64> = if local_normalization_active {
-        match list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
-            .into_iter()
-            .next()
-        {
+        match list_runs(conn, subject, 1)?.into_iter().next() {
             Some(last_run) => crate::db::stacking::list_groups(conn, last_run.id)?
                 .into_iter()
                 .filter_map(|row| row.beta.map(|b| (row.group_key, b)))

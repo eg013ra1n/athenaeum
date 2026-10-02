@@ -4252,7 +4252,7 @@ fn resolve_reference_fits(
 ///
 /// `persist = true` is stage 5 as it has always been: an existing fresh
 /// `registration_results` row is reused, everything else is registered and
-/// then WRITTEN — the row ([`upsert_registration`]), the optional registered
+/// then WRITTEN — the row ([`crate::stacking::plan::store_registration`]), the optional registered
 /// artifact, the entry's own `registration` outcome, and the
 /// exclusion/warning bookkeeping a failure implies.
 ///
@@ -4791,6 +4791,9 @@ fn register_group_pass(
                         let now =
                             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                         let is_reference_row = item.frame_id == reference_frame_id;
+                        // The set id here is a placeholder: `store_registration`
+                        // overwrites it with the real one. What a project run
+                        // keeps in this record is B10's open 6b-2 item.
                         let rec = to_record(
                             wire_set_id(&subject),
                             item.frame_id,
@@ -4938,7 +4941,12 @@ fn register_group_pass(
                             let map = alignment.map.clone();
                             {
                                 let conn = db(&rc.ctx)?.conn();
-                                store_registration(&conn, &rc.subject, |_| rec.clone())?;
+                                store_registration(&conn, &rc.subject, |set_id| {
+                                    RegistrationRecord {
+                                        frames_set_id: set_id,
+                                        ..rec.clone()
+                                    }
+                                })?;
                             }
                             if let Some(out_path) = &written {
                                 if let Err(e) = record_registered_artifact(

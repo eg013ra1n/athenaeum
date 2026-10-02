@@ -883,14 +883,9 @@ pub fn list_artifacts(
     }
 }
 
-/// Delete every artifact of the given `kinds` for a subject (e.g. when a
-/// config change invalidates cached masters). Returns the number of rows
-/// removed.
-/// The SQL of [`delete_artifacts`] for `kind_count` kinds, written in the
-/// subject-key prefix's own expressions so it plans on
-/// `stacking_artifacts_subject_key` (the `IS` form plans on
-/// `idx_stacking_artifacts_project` and visits every frame-set artifact of
-/// the catalog).
+/// The SQL of [`delete_artifacts`] for `kind_count` kinds, on the subject-key
+/// prefix (the `IS` form plans on `idx_stacking_artifacts_project` and visits
+/// every frame-set artifact of the catalog).
 fn delete_artifacts_sql(kind_count: usize) -> String {
     let placeholders: Vec<String> = (0..kind_count).map(|i| format!("?{}", i + 3)).collect();
     format!(
@@ -905,6 +900,9 @@ fn delete_artifacts_sql(kind_count: usize) -> String {
 const DELETE_ALL_ARTIFACTS_SQL: &str = "DELETE FROM stacking_artifacts
      WHERE COALESCE(frames_set_id, 0) = ?1 AND COALESCE(project_id, '') = ?2";
 
+/// Delete every artifact of the given `kinds` for a subject (e.g. when a
+/// config change invalidates cached masters). Returns the number of rows
+/// removed.
 pub fn delete_artifacts(
     conn: &Connection,
     subject: &StackSubject,
