@@ -1904,9 +1904,13 @@ fn resolve_export_dir(
     };
     let out = resolve(candidate);
     let title_dir = match crate::db::collab::get_project(conn, project_id)? {
-        Some(p) => out.join(crate::export::models::sanitize_display_folder_name(
-            &p.title,
-        )),
+        // Resolved through the same path as the roots, so letter case on a
+        // case-insensitive filesystem and a pre-existing symlink are honest.
+        Some(p) => resolve(
+            &out.join(crate::export::models::sanitize_display_folder_name(
+                &p.title,
+            )),
+        ),
         None => out.clone(),
     };
     let roots = crate::db::get_scan_roots(conn)
@@ -2451,6 +2455,108 @@ mod tests {
             ctx.active_exports.lock().unwrap().is_empty(),
             "a refused export leaves no handle behind"
         );
+    }
+
+    /// Shared rig for the title-folder guard tests: a seeded project titled
+    /// "T", one landed replica, and `roots` registered as scan roots.
+    fn guard_rig(roots: &[&std::path::Path]) -> (tempfile::TempDir, ServiceContext, Vec<u8>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let landed = tmp.path().join("Collab").join("Alice").join("L_0001.fits");
+        let before = seed_landed_frame(&ctx, &landed);
+        let _ = roots;
+        (tmp, ctx, before)
+    }
+
+    fn add_root(ctx: &ServiceContext, path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        crate::db::upsert_scan_root(&conn, &path.to_string_lossy(), "normal").unwrap();
+    }
+
+    async fn assert_refused(ctx: &ServiceContext, out: &std::path::Path) {
+        let err = export_project_for_wbpp(ctx, "p-1", &out.to_string_lossy(), false, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(_)),
+            "{}: {err:?}",
+            out.display()
+        );
+        assert!(ctx.active_exports.lock().unwrap().is_empty());
+    }
+
+    fn dir_is_empty(p: &std::path::Path) -> bool {
+        std::fs::read_dir(p).unwrap().next().is_none()
+    }
+
+    /// Output = the PARENT of a root named like the sanitized title ("T"): the
+    /// title folder IS the root, so the export is refused and writes nothing.
+    #[tokio::test]
+    async fn project_export_refuses_when_the_title_folder_is_a_root() {
+        let (tmp, ctx, _) = guard_rig(&[]);
+        let astro = tmp.path().join("x");
+        add_root(&ctx, &astro.join("T"));
+        assert_refused(&ctx, &astro).await;
+        assert!(
+            dir_is_empty(&astro.join("T")),
+            "nothing written into the root"
+        );
+        assert_eq!(
+            std::fs::read_dir(&astro).unwrap().count(),
+            1,
+            "nothing created beside it"
+        );
+    }
+
+    /// A title differing from the root folder only in letter case, on a
+    /// case-insensitive filesystem (detected at runtime), is still the root.
+    #[tokio::test]
+    async fn project_export_refuses_a_title_folder_that_is_a_root_up_to_case() {
+        let (tmp, ctx, _) = guard_rig(&[]);
+        let astro = tmp.path().join("x");
+        std::fs::create_dir_all(astro.join("Probe")).unwrap();
+        if !astro.join("probe").exists() {
+            return; // case-sensitive filesystem: the two names are distinct folders
+        }
+        add_root(&ctx, &astro.join("t"));
+        assert_refused(&ctx, &astro).await;
+        assert!(
+            dir_is_empty(&astro.join("t")),
+            "nothing written into the root"
+        );
+    }
+
+    /// `<abs>/<missing>/../<root>/x` must not slip past the ancestor resolution.
+    #[tokio::test]
+    async fn project_export_refuses_dot_dot_paths() {
+        let (tmp, ctx, _) = guard_rig(&[]);
+        let root = tmp.path().join("lights");
+        add_root(&ctx, &root);
+        let sneaky = tmp
+            .path()
+            .join("missing")
+            .join("..")
+            .join("lights")
+            .join("x");
+        assert_refused(&ctx, &sneaky).await;
+        assert!(dir_is_empty(&root), "nothing written into the root");
+        assert!(!tmp.path().join("missing").exists(), "nothing created");
+    }
+
+    /// A pre-existing `<out>/<title>` symlink that points into a root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_export_refuses_a_title_symlink_into_a_root() {
+        let (tmp, ctx, _) = guard_rig(&[]);
+        let root = tmp.path().join("lights");
+        add_root(&ctx, &root);
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::os::unix::fs::symlink(&root, out.join("T")).unwrap();
+        assert_refused(&ctx, &out).await;
+        assert!(dir_is_empty(&root), "nothing written through the link");
     }
 
     /// `list_project_frames` (wave 2 Task 11) reads the reliable local columns
