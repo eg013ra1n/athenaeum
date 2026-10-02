@@ -1,7 +1,8 @@
 # Collaboration v3, wave 6 — stacking a project, and the project export
 
 Status: design approved section by section in conversation (2026-10-02);
-this document awaits the owner's review of the written text.
+reviewed by fable the same day ("ready after fixes" — every finding folded
+in, record in §19); awaits the owner's review of the written text.
 
 Parent spec: `2026-09-23-collab-v3-per-frame-model-design.md` (cited as
 "v3"); wave numbering per its amendment A4 (6 = stacking a project). This
@@ -104,20 +105,32 @@ excluded frame is never stacked or exported); R1's export hierarchy; R3
 ```
 stack_project_frames(
   id          INTEGER PRIMARY KEY,
-  project_id  TEXT NOT NULL,
+  project_id  TEXT NOT NULL REFERENCES collab_projects(project_id) ON DELETE CASCADE,
   frame_uuid  TEXT NOT NULL,
-  UNIQUE (project_id, frame_uuid),
-  FOREIGN KEY (project_id, frame_uuid)
-    REFERENCES project_frames_local(project_id, frame_uuid) ON DELETE CASCADE)
+  UNIQUE (project_id, frame_uuid))
 ```
 
 A row is minted the first time a plan includes the frame and is never
 re-used for another frame. Inside the pipeline a project frame is this
 `id` — an `i64` like a catalog `frame_id` — so `GroupFrame`, `RunContext`,
 `HashMemo`, `SolveCache` and every map keyed by a frame id keep their type.
-A run belongs to exactly one subject, so a handle and a catalog id never
-meet in one map. A new content version keeps the uuid and therefore the
-handle; its artifacts go stale through the content hash (§5.1).
+A new content version keeps the uuid and therefore the handle; its
+artifacts go stale through the content hash (§5.1).
+
+**No foreign key to `project_frames_local`, on purpose.** That table's rows
+are deleted and re-inserted by ordinary exchange writes: `delete_not_in` on
+a caps change or a lost project (`api/collab_exchange.rs:~683`,
+`api/collab.rs:~2770`) and `record_own`'s `INSERT OR REPLACE`
+(`db/collab_frames.rs:~898`, a DELETE + INSERT under `foreign_keys = ON`). A
+cascade from there would silently wipe a frame's run rows and artifacts and
+re-mint its handle. A handle therefore lives as long as its project
+(`collab_projects` cascade) and is never deleted otherwise. Artifacts of a
+frame that has left the project are swept by
+`cleanup_project_stacking_work` (§9.3).
+
+**A handle and a catalog id never meet in one map** (a run has one
+subject), **and never in one SQL read either**: §4.3 lists the catalog reads
+by frame id that must sit behind `FrameOrigin::Catalog`.
 
 ### 4.2 Stacking tables (rebuilt once, in `init_db`)
 
@@ -127,19 +140,30 @@ handle; its artifacts go stale through the content hash (§5.1).
 | `stacking_run_frames` | `frame_id INTEGER NULL → frames CASCADE`, new `project_frame INTEGER NULL → stack_project_frames CASCADE`, `CHECK` exactly one; two partial unique indexes replace `UNIQUE(run_id, frame_id)`. |
 | `stacking_artifacts` | the subject pair as on `stacking_runs`; the frame pair as on `stacking_run_frames` but both may be NULL (group-level rows); the unique index becomes `(COALESCE(frames_set_id,0), COALESCE(project_id,''), group_key, kind, COALESCE(frame_id,0), COALESCE(project_frame,0))`. |
 | `master_lights` | the subject pair. |
-| `stacking_run_groups` | unchanged (FK to the run). |
+| `stacking_run_groups` | `ALTER ADD exposure_class TEXT NULL` (the class token of §8, for the Groups table); otherwise unchanged. |
 | `stacking_set_config` | unchanged (frame sets only). |
 | **new** `stacking_project_config` | `project_id TEXT PRIMARY KEY → collab_projects CASCADE, config_json, excluded_frame_uuids_json DEFAULT '[]', reference_frame_uuid TEXT NULL, updated_at`. |
 | `collab_projects` | `ALTER ADD canonical_grid_json TEXT NULL` (the hub's grid, §6). |
 
-The rebuild is the standard SQLite table rebuild (new table, copy, drop,
-rename, recreate indexes) inside one transaction under `INIT_DB_LOCK`, with
-foreign keys off for the copy and `PRAGMA foreign_key_check` before commit.
-It is guarded by a schema probe (`pragma table_info(stacking_runs)` lacks
-`project_id`) and is therefore idempotent. Existing rows copy verbatim, the
-new columns NULL. Registration rows of a project run do not go to
-`registration_results` (catalog-keyed); the registered artifact's
-`payload_json` holds the star-based map and its quality (§5.5).
+The rebuild follows SQLite's 12-step table rebuild, exactly as the
+existing `archive_operations` rebuild does (`db/schema.rs:~2012-2030`):
+
+- `PRAGMA foreign_keys = OFF` is issued **before** `BEGIN` (the pragma is a
+  no-op inside a transaction; with it on, `DROP TABLE` cascades into every
+  child table);
+- then one transaction creates the new tables, copies, drops, renames and
+  recreates the indexes, and runs `PRAGMA foreign_key_check` before commit;
+- foreign keys go back on after the commit; all of it under `INIT_DB_LOCK`.
+
+It is guarded by a schema probe (`stacking_runs` lacks `project_id`), so it
+is idempotent. Existing rows copy verbatim, the new columns NULL. Every new
+foreign-key child column gets an index
+(`every_foreign_key_child_column_is_indexed`, `schema.rs:~3416`). It is
+tested on a copy of a real database before merge.
+
+Registration rows of a project run do not go to `registration_results`
+(catalog-keyed). The registered artifact's `payload_json` holds the
+star-based map, the composed grid map and the quality (§5.5).
 
 ### 4.3 The subject in code
 
@@ -151,7 +175,37 @@ frame's column from the subject. A frame source returns the plan's
 `GroupFrame`s plus a per-frame origin:
 `FrameOrigin::Catalog { file_id }` or
 `FrameOrigin::Project { frame_uuid, publisher, landed_path, blake3, size_mtime, manifest }`.
-`ActiveStacks` admits one active run per subject.
+
+**`GroupFrame` of a project frame** (`stacking/groups.rs:59-72`):
+
+| Field | Value |
+| ---- | ---- |
+| `frame_id` | the handle |
+| `file_id` | `0` (it enters `SourceIdentity` of a catalog frame only; a project frame's identity is `blake3`) |
+| `filename` | `file_name` |
+| `path` | `landed_path` |
+| `size`, `modified_at` | from `size_mtime_seen` |
+| `exposure_s` | `exptimeSec` |
+| `date_obs` | `dateObs` |
+| `width`, `height` | `meta.naxis1/2` |
+| `pixel_scale_arcsec`, `scale_source` | `meta.pixelScaleArcsec` (source `Solve` when `meta.wcs` is present, else `Header`) |
+
+**Catalog reads by frame id move behind `FrameOrigin::Catalog`** — a
+deliverable of 6b's seam step, with this list as its checklist:
+
+- `solve_of` → `get_plate_solve(conn, frame_id)` (`run.rs:~3973-3990`);
+- `stage_output` → `get_plate_solve` (`run.rs:~9684`);
+- the Bayer-drizzle `resolve_cfa_geometry(conn, frame_id)` (`run.rs:~7889`);
+- `calibration_hash_for` → `resolve_generation_cached(conn, frame_id, …)`
+  (`plan.rs:~314-325`);
+- `resolve_reference` → `frame_set_reference` / `frames` (`plan.rs:~912-922`);
+- `registration_results` reads and writes, `get_registration_for_frame_set`.
+
+For a project frame each has an origin-aware twin (§5.2, §5.5, §5.8, §5.9).
+`heal_interrupted_runs`, `list_unfinished_runs` (`db/stacking.rs:~476`, today
+`(run_id, set_id)`) and `active_run_for_set` become per subject. `ActiveStacks`
+admits one active run per subject. The ComputeQueue label is
+`"Stacking · <project title>"`.
 
 ## 5. The pipeline for a project subject
 
@@ -169,15 +223,33 @@ Input: the frame's `landed_path` from `project_frames_local`.
 
 | The file is | Prepare does |
 | ---- | ---- |
-| uncompressed float32 FITS, one plane (mono, or an OSC CFA mosaic with `debayer_osc` off) | nothing — the file is used **in place**; the `calibrated` artifact points at `landed_path` |
-| an OSC CFA mosaic with `debayer_osc` on | VNG debayer into `prepared/<group>/p_<stem>_d.fits`; for Bayer drizzle the mosaic is the landed file itself (no `calibrated_mosaic` copy) |
-| uncompressed float32 FITS, three planes | used in place |
-| XISF, an integer or compressed FITS, another layout | converted to float32 FITS in `prepared/<group>/p_<stem>.fits` (then debayered if OSC and `debayer_osc` on) |
+| an uncompressed FITS image the plane reader decodes — BITPIX 8/16/32/−32/−64 with BZERO/BSCALE, one or three planes (`integration/banded.rs:~31-39`, `plane_reader.rs:~22-36`) — mono, three-plane colour, or an OSC CFA mosaic with `debayer_osc` off | nothing — used **in place**; the `calibrated` artifact points at `landed_path` |
+| such an image, an OSC CFA mosaic, with `debayer_osc` on | VNG debayer into `prepared/<group>/p_<stem>_d.fits` |
+| a tile-compressed FITS, an XISF, another layout | converted to float32 FITS in `prepared/<group>/p_<stem>.fits` (then debayered as above when OSC and `debayer_osc` on) |
 | distributed XISF, unreadable | excluded, reason "unsupported file" |
 
+- **Bayer drizzle.** The deposit reads the `calibrated_mosaic` artifact and
+  the CFA geometry (`run.rs:~7877-7900`). Prepare records a
+  `calibrated_mosaic` artifact pointing at the pre-debayer file: the landed
+  file when it was usable in place, else the converted `p_<stem>.fits`. The
+  CFA pattern and phase come from that file's own header through an
+  origin-aware `cfa_geometry_of`, not from the catalog.
+- **Debayer of a file.** The VNG debayer today runs only inside
+  `execute_generation` on a catalog-resolved `GenerationSpec`
+  (`export/calibrated_generator.rs:~293-519`). 6b extracts a
+  `debayer_file(src, dest, pattern)` from it; the generator then calls it.
+  Bytes are identical for the catalog path, pinned by a test.
+- **Headers of files Prepare writes.** A replica's header carries
+  `CALSTAT + ATH_CSRC + ATH_PRJ`, and the scanner diverts any file with
+  `ATH_PRJ` to the project reconcile (`scanner/mod.rs:~474-481`). A
+  converted or debayered output therefore copies only the
+  `REGISTERED_COPY_THROUGH` allowlist (`register/writer.rs:~38-42`) and
+  carries the stacking-artifact card the scanner already skips
+  (`ATH_REG`/`ATH_STK`, `scanner/mod.rs:~492`). **No file a stacking run
+  writes ever carries `ATH_PRJ`.**
 - Only `calibration.debayerOsc` (and the debayer method) of the
   `calibration` subtree applies to a project; the rest is hidden in the
-  panel and kept out of the Prepare hash.
+  panel and kept out of the Prepare hash (its own `prepare_subtree`).
 - Stage hash: `blake3` and byte size of the row + the prepare subtree. The
   file identity (`size:mtime`) is re-checked against the row's
   `size_mtime_seen` before every read of a landed file in any stage; a
@@ -192,13 +264,28 @@ Input: the frame's `landed_path` from `project_frames_local`.
 - A frame whose manifest has `meta.wcs` uses it (TAN, 1-based CRPIX, CD,
   optional SIP — `collab/frame_meta.rs`). The manifest WCS refers to the
   published file's own geometry, which Prepare does not change.
-- A frame without it is solved on its prepared file with
-  `plate_solve::solve_frame_with_hints`, the `Frame` built transiently from
-  the manifest (no catalog row), hints = the manifest's `pixelScaleArcsec`
-  and the project target's RA/Dec. Result: a `solve` artifact
-  (`payload_json` = the `PlateSolveRecord`), hash = `blake3` + the solver
-  config hash + the catalog identity. Never re-solved while the hash holds.
-- A failed solve is not an error: the frame continues without WCS (W3).
+- A frame without it is solved on its prepared file.
+  - **The solver call.** `plate_solve::solve_frame_with_hints`
+    (`plate_solve/service.rs:~130`), which is DB-free. The `Frame` is built
+    transiently from the manifest (no catalog row). Hints are the manifest's
+    `pixelScaleArcsec` and the project target's RA/Dec.
+  - **Never `solve_frame` or `store_result`.** `solve_frame` extracts hints
+    through the catalog. `store_result` (`service.rs:~387`) writes
+    `plate_solves` and `frames` by frame id, and a handle there would land on
+    a real catalog frame.
+  - **The acceptance gate is still applied.** Today it runs inside
+    `store_result` (`blind_gate_ok`, `service.rs:~396-421`, the defence
+    against wrong-scale solves of shaken frames). 6b extracts it into a pure
+    check. The project path applies it with the manifest's
+    `pixelScaleArcsec` as the expected scale.
+  - **No input gate.** The catalog input gate (`input_gate_reason`,
+    `service.rs:~589`) reads `frame_analysis` by frame id, which a project
+    frame does not have, so it is not applied.
+  - **Result.** A `solve` artifact (`payload_json` = the `PlateSolveRecord`
+    with `frame_id = 0`). Hash = `blake3` + the solver config hash + the
+    catalog identity. Never re-solved while the hash holds.
+- A failed or gate-refused solve is not an error: the frame continues
+  without WCS (W3).
 
 ### 5.3 Measure
 
@@ -209,7 +296,11 @@ display-only (the publisher's analysis ran on another pipeline).
 
 Unchanged selection (Auto: best weight in the largest group with the
 two-pass re-pick; Manual: `stacking_project_config.reference_frame_uuid`),
-with one new rule: **candidates must have a WCS** (manifest or §5.2).
+with one new rule: **candidates must have a WCS**. Frames with a manifest
+WCS (solved by their publisher through the full gates) come first; locally
+solved frames are candidates only when no manifest-WCS frame is. The
+reference's WCS places the whole run on the grid, so a wrong one would shift
+every master.
 
 - `registration.geometry = coRegistered` (the project default): one run
   reference for every group, so cross-filter alignment stays star-based.
@@ -224,16 +315,33 @@ with one new rule: **candidates must have a WCS** (manifest or §5.2).
   (quad seed, WCS seed from §5.2 across scales, polynomial or TPS
   distortion, the per-frame scale gate). It is cached in the `registered`
   artifact's payload together with `reg_*` quality and the reference handle.
-- **The output geometry is the grid.** The resampler's per-pixel chain is
-  grid pixel → sky (the grid's TAN) → reference pixel (the reference's WCS,
-  SIP inverse included) → subject pixel (`PixelMap::inverse_eval`). One
-  interpolation, as today. The grid→reference part is sampled once per
-  reference onto a displacement grid (every 32 px, bilinear; pinned by a
-  test at < 0.01 px against the exact chain).
+- **The output geometry is the grid, through ONE composed `PixelMap`.** The
+  exact chain is subject pixel → reference pixel (the star map) → sky (the
+  reference's WCS with SIP) → grid pixel (the grid's TAN). It is sampled
+  over the subject frame (every 32 px) and fitted as a regular `PixelMap`:
+  - an affine fit as `linear`;
+  - the residual as a TPS distortion layer (the R-M4c-5 machinery).
+
+  Pinned at < 0.01 px against the exact chain at cell centres, both
+  directions.
+- Every consumer takes this one object, so none of them needs a new map
+  type:
+  - the registered-frame writer;
+  - `RegisteredSource`'s on-the-fly warp fallback, which LN also uses
+    (`integration/registered_source.rs:~30-57`, `ln/mod.rs:~654-668`).
+    Without the composed map it would warp into reference geometry at the
+    grid's size;
+  - integration;
+  - drizzle. Its C-3 single-parallelogram overlap plan is valid for affine
+    plus a displacement layer (`drizzle/mod.rs:~896-925`).
+- The registered artifact's payload holds both maps.
+  - The star map is cached under today's registration hash, which has no
+    grid in it.
+  - The registered file's freshness adds the grid hash.
+  - So a grid change refits only the composition, with no star matching, and
+    rewrites the registered frames.
 - The registered file has the grid's width × height, NaN outside the
   frame's footprint (`register/writer.rs` already writes NaN outside).
-- The registration hash folds in the grid hash, so a grid change
-  re-registers on the next run.
 - The two-pass dry pass and the scale statistics work in reference space,
   unchanged.
 
@@ -241,10 +349,19 @@ with one new rule: **candidates must have a WCS** (manifest or §5.2).
 
 - The LN reference is built on the grid from the group's sky-penalized best
   members with a per-pixel count; a pixel no member covers is NaN.
+  - **Seam 1.** The integration engine writes `0.0` where every sample is
+    non-finite (`integration/engine.rs:~536-538`). The LN reference build
+    passes an "empty → NaN" option, so an uncovered pixel is never data.
+    The master path keeps `0.0`.
 - Every member's LN models are fitted on its overlap with the LN reference
-  (both finite). A member whose overlap is under 25 % of its own footprint
-  falls back to the global normalization for that member, with one warning
-  naming the count.
+  (both finite).
+  - **Seam 2.** `relative_scale`'s star detection sanitizes NaN to the
+    location (`ln/mod.rs:~742-750`). With large uncovered regions that biases
+    detection and background. Detection and background therefore run on the
+    member ∩ reference overlap, masked, never on sanitized NaN.
+- A member whose overlap is under 25 % of its own footprint falls back to
+  the global normalization for that member, with one warning naming the
+  count. The threshold is re-measured on the acceptance set.
 - This is the wave's numeric risk (§16): partial coverage is new to LN.
 
 ### 5.7 Integrate and the coverage map
@@ -262,23 +379,37 @@ with one new rule: **candidates must have a WCS** (manifest or §5.2).
 ### 5.8 Drizzle
 
 The output grid is the canonical grid × the drizzle scale. The forward map
-is subject → reference (`forward_eval`) → sky (the reference's WCS) → grid.
-With `output.coverageMap` on, drizzle writes its own coverage (frames whose
-drop touched the pixel) beside its weight map.
+is the composed `PixelMap` of §5.5 (`forward_eval`), scaled by the drizzle
+factor as today. With `output.coverageMap` on, drizzle writes its own
+coverage (frames whose drop touched the pixel) beside its weight map.
 
 ### 5.9 Output
 
-- The master's WCS is the grid's TAN (a synthetic `PlateSolveRecord`:
-  CRVAL = grid centre, CRPIX = grid centre pixel, CD from scale and
-  rotation, no SIP); drizzle scales it with `scale_plate_solve`.
-- `output.cropToCoverage = K` (default 0 = off): every master, rejection
-  map and coverage map of the run is cropped to ONE run-wide rectangle — the
-  union over groups of the bounding boxes of `coverage ≥ K` — so the run's
-  masters stay pixel-aligned; CRPIX shifts by the crop origin. In `native`
-  mode the rectangle is per group.
+- The master's WCS is the grid's TAN, from a synthetic `PlateSolveRecord`
+  (`plate_solve/storage.rs:~11-41`). Filled fields:
+  - `frame_id = 0`;
+  - `crval1/2` = the grid centre, `crpix1/2` = the grid centre pixel
+    (1-based);
+  - `cd` from `scaleArcsec` and `rotationDeg`;
+  - `pixel_scale_arcsec = scaleArcsec`, `field_rotation_deg = rotationDeg`;
+  - `sip_order = None`, no SIP tables.
+
+  Drizzle scales it with `scale_plate_solve`.
+- `output.cropToCoverage = K` (default 0 = off).
+  - Both registration modes put every group on the same grid; only the crop
+    differs.
+  - In `coRegistered` every master, rejection map and coverage map of the run
+    is cropped to ONE run-wide rectangle: the union over groups of the
+    bounding boxes of `coverage ≥ K`. The run's masters stay pixel-aligned.
+  - In `native` the rectangle is per group.
+  - CRPIX shifts by the crop origin.
+- The master's `FILTER` is the group's canonical filter. Today it is copied
+  from the reference's file (`register/writer.rs:~38-42`,
+  `master_cards.rs:~134-141`), which would be a publisher's raw name.
 - Cards: `ATH_SPRJ` (project id), `ATH_GRID` (grid hash, 16 hex),
-  `ATH_RGEO = 'grid'`. **Never `ATH_PRJ`**: the scanner diverts any file
-  carrying it to the project reconcile branch.
+  `ATH_RGEO = 'grid'`. **Never `ATH_PRJ`**, on the master or on any file
+  the run writes (§5.1): the scanner diverts any file carrying it to the
+  project reconcile branch.
 - Masters go to `<output_dir>/<sanitized project title>/`, named as
   personal masters are.
 
@@ -319,7 +450,7 @@ It also reports how many accepted frames fall at least half inside it.
 - Everyone else, while the grid is unset, gets the blocker `grid`: "waiting
   for the coordinator to confirm the grid", with the proposal shown.
 - Changing a confirmed grid warns that every processor's next run
-  re-registers.
+  rewrites its registered frames (the star matching is kept, §5.5).
 - A confirmed grid that leaves accepted frames outside raises a plan
   warning ("N frames lie outside the grid").
 
@@ -365,13 +496,25 @@ Frame-set keys are unchanged.
 | `equivalent` | as `stops`, but on `e = t / N²` with `N = FOCALLEN / APTDIA` when both are known; frames with an unknown `N` are classed by seconds in classes of their own, with the warning "exposure equivalence unknown for N frames — grouped by seconds" | `eq<e0>` / `<t>s` |
 | `none` | one class per colour × filter | `all` |
 
-- APTDIA: publication starts putting `meta.aperture` (from the source's
-  APTDIA) into the manifest; older frames lack it and fall to seconds. A
-  frame set reads APTDIA from its stored header (`fits_header`).
-- The new grouping and output fields sit outside the per-frame stage
-  subtrees (calibration / measurement / registration / LN), so adding them
-  invalidates no cached artifact of any existing frame set. A test pins
-  this.
+- APTDIA has no `frames` column. Publication starts putting
+  `meta.aperture` into the manifest, read from the source frame's stored
+  header blob (`fits_header`). Older frames lack it and fall to seconds. A
+  frame set reads APTDIA from the same stored header.
+- **No cache invalidation for existing frame sets.** Today
+  `calibration_subtree` serializes `cfg.grouping` whole
+  (`stacking/config.rs:~654-671`). New grouping fields would therefore move
+  every set's calibration hash, and through it the measurement,
+  registration and LN hashes (`plan.rs:~442, 474-508`). Every set would then
+  recompute once. So:
+  - `calibration_subtree` emits exactly today's grouping JSON
+    (`{"exposureToleranceSec": x}`) and nothing else;
+  - the new fields enter no stage hash. A different exposure mode changes
+    the group keys, and the group-keyed artifacts are recomputed under the
+    new keys; that is the existing behaviour for any regrouping;
+  - the pin compares against a golden hash literal recorded on `main`
+    before the change, not old-config against new-config.
+- `output.*` is in no stage subtree today (`config.rs:~589-760`); the new
+  output fields keep it that way.
 
 ## 9. Commands, events, paths, config
 
@@ -400,6 +543,14 @@ The run-id commands (`cancel_stacking`, `get_stacking_run`,
 working folder from the run row's subject. Frame-set commands do not
 change.
 
+The hub client gains two calls:
+- `patch_frame_filter` (`PATCH …/frames/{uuid} {filterCanonical}`). Today
+  it has only `set_frame_acceptance`.
+- `put_grid`.
+
+The project wire (`ProjectWire` / the card) gains `canonicalGrid`, which
+the hub already returns (`athenaeum-hub/src/routes/projects.rs:~195, 222`).
+
 ### 9.2 Events
 
 - `stacking-progress`, `stacking-complete`: `setId` becomes optional and
@@ -415,8 +566,17 @@ change.
 ### 9.3 Paths
 
 `<working_dir>/projects/<project-slug>/{prepared,registered,ln,fits,rej,runs,previews}/`
-(project slug from `collab_projects.slug`). Work usage and cleanup operate
-on that folder. Masters in `<output_dir>/<sanitized project title>/`.
+(project slug from `collab_projects.slug`). Masters in
+`<output_dir>/<sanitized project title>/`.
+
+- **Work usage and cleanup** operate on that folder.
+  - `WorkingLayout` gains a `prepared` accessor beside its fixed ones
+    (`paths.rs:~40-67`).
+  - Cleanup removes directories, never an artifact's path, so a `calibrated`
+    artifact that points at a landed file in place never deletes it. Its
+    row is dropped; the file stays.
+  - `cleanup_project_stacking_work` also sweeps artifact rows whose handle's
+    `(project, uuid)` is no longer in `project_frames_local`.
 
 ### 9.4 Config
 
@@ -441,6 +601,17 @@ today's project layout goes. Selection is unchanged:
 excluded, R31). Grouping and the folder use `filter_canonical`, never
 `filterRaw`.
 
+- **A layout mode, not a fork.** `compute_wbpp_placements` pushes `lights/`
+  into every dataset (`export/file_organizer.rs:~265`). The organizer gains
+  a project layout mode: a filter level, no `lights/`, and the compare-and-
+  place of §10.5. The personal frame-set export and its skip-if-exists
+  behaviour do not change.
+- **One project export at a time.** The project export runs under the
+  frame-set sentinel `-1` (`api/collab_exchange.rs:~1895-1915`). The dialog
+  and `useExportProgress` key progress by it, and `cancel_export { -1 }`
+  cancels it. A second project export while one runs is refused with
+  "another project export is running".
+
 ### 10.2 The FILTER rule (W4)
 
 For each exported frame, read the file's own `FILTER`: FITS — the header of
@@ -450,7 +621,10 @@ absent = empty. Compare exactly (case-sensitive) with the canonical name.
 
 - Equal → the file is exported as is (copy, or symlink in symlink mode).
 - Different → a copy is written with:
-  - `FILTER = '<canonical>' / was '<raw>'` (`/ was unset` when absent);
+  - `FILTER = '<canonical>' / was '<raw>'` (`/ was unset` when absent). The
+    comment is truncated so the card fits 80 columns. The value is never
+    truncated: a canonical name too long for one card is written with the
+    CONTINUE convention `fits_writer::card::format_card` already handles;
   - `ATH_FILT` updated when present;
   - FITS `CHECKSUM` removed when present (`DATASUM` stays valid; the data
     unit is unchanged).
@@ -500,10 +674,14 @@ export".
   it is already what this export would write. That means a symlink to the
   same target, an as-is copy of the same size, or a patched copy whose
   `FILTER` is the canonical name. Otherwise it is replaced (temp + rename).
-  - The export writes `<out>/<title>/.athenaeum-export.json` listing the
-    relative paths it placed with their frame uuids.
-  - On a re-export, paths listed before and not placed now are named in one
-    warning (first 20 + count), **never deleted** (W6).
+  - The export writes `<out>/<title>/.athenaeum-export.json` listing, per
+    frame uuid, the relative path it actually placed. That path is the one
+    after `DestClaims`' case-collision renaming (`_2`, `_3`,
+    `file_organizer.rs:~293-315`).
+  - On a re-export, a recorded path no longer placed for its uuid (the
+    frame left, or moved to another filter folder) is named in one warning
+    (first 20 + count). It is **never deleted** (W6). An unchanged frame
+    re-placed at the same path never warns.
 - A copy is checked against the row's `byte_size` after writing. A mismatch
   warns "changed during export" and the frame counts as failed.
 - `ExportResult` gains `linked`, `copied`, `rewritten`, `failed`. The dialog
@@ -536,7 +714,17 @@ export".
   is refused).
 - It runs in the background: per frame
   `PATCH /projects/{id}/frames/{uuid} {filterCanonical}`, four in flight,
-  cooperative cancel between requests.
+  paced to at most 10 requests per second, cooperative cancel between
+  requests.
+- **Feed load on every holder.** Each PATCH bumps the project version and
+  emits one `Frames` event (`athenaeum-hub/src/routes/frames.rs:~1089-1090`).
+  A published row arrives inline and costs one small transaction. A row
+  that is not inlined (`more: true`) asks for a manifest pull.
+  - The feed worker coalesces pulls per project: one in flight plus at most
+    one queued; later requests fold into the queued one.
+  - 6a verifies it with a 500-frame remap on the fake hub, counting the
+    pulls and the inline applications on a holder.
+  - W2 stands: no hub batch route.
 - A 403 stops the task with "this account lacks thresholds.edit". Other
   per-frame failures are collected.
 - It emits `collab-remap-progress` / one `collab-remap-finished` and logs
@@ -568,8 +756,8 @@ export".
   - the notification link is `/projects/<id>?tab=stacking`.
 - **Grid card** above the board: unset (proposal + "frames inside" count +
   `Use proposal` / `Edit…` for `canEditGrid`, a waiting line for others) or
-  confirmed (values + `Change…` for `canEditGrid`, with the re-register
-  warning).
+  confirmed (values + `Change…` for `canEditGrid`, with the "rewrites
+  every processor's registered frames" warning).
 - `OutputPanel` gains the coverage-map switch and the crop field.
   `GroupsTable` shows the exposure-class token.
 - The export dialog shows linked / copied / rewritten / failed.
@@ -617,8 +805,17 @@ export".
 - **Migration.** A DB with frame-set runs, artifacts and masters rebuilt:
   rows intact, cascades intact (deleting a set or a frame removes its rows),
   idempotent second run.
-- **Groups.** The four exposure modes, the token formats, `None`. No cache
-  invalidation for an existing set's stages (pin).
+- **Groups.** The four exposure modes, the token formats, `None`.
+  `calibration_subtree` and every stage hash of a fixed frame-set config
+  equal golden literals recorded on `main` before the change (§8).
+- **Seam.** Every existing stacking test passes unchanged after 6b's seam
+  step. No catalog read by frame id is reachable for a project subject:
+  a test runs a project plan and stage on a database whose `frames` table
+  holds rows with the handles' ids, and asserts none is read.
+- **Solve.** The project path never writes `plate_solves` or `frames`. The
+  extracted acceptance gate refuses a wrong-scale solve.
+- **Debayer.** `debayer_file` is byte-identical to the generator's
+  in-line debayer.
 - **Grid.**
   - The proposal is deterministic for a manifest; hash stability.
   - The grid→reference displacement grid is < 0.01 px from the exact chain.
@@ -645,13 +842,26 @@ and cached (a second run does not solve it again).
 
 ### 15.3 Acceptance (the stacking method rules)
 
-- **Real data.** A real project on the test hub with frames from two rigs.
-  Each group's master on the grid is compared with a personal stack of the
-  same frames, over the reference's footprint, on the rows of the Tier C §8
-  tolerance table (median, MAD, noise, FWHM;
-  `2026-09-20-stacking-compute-tierC-design.md`). It is a full group at
-  master level, never a few-frame probe. A missed row is reported with its
-  numbers for an owner ruling, never tuned toward the tolerance.
+- **Real data, run A (comparable geometry).** A real project on the test
+  hub with frames from two rigs.
+  - The grid is set to the reference frame's own scale, rotation and centre,
+    with its size. The project master then shares the personal master's
+    geometry up to the reference's own reprojection through its WCS.
+  - Each group's master is compared with a personal co-registered stack of
+    the same frames and the same reference, over the reference's footprint,
+    on the rows of the Tier C §8 tolerance table (median 0.1 %, MAD 1 %,
+    noise 2 %, FWHM 1 %; `2026-09-20-stacking-compute-tierC-design.md`).
+  - It is a full group at master level, never a few-frame probe.
+  - The reference frame is now resampled once, where in a personal stack it
+    is not. That is 1/N of the master, so the rows are expected to hold.
+  - M4b's pin "the reference's own master is bit-identical between modes"
+    does not apply to grid mode (it still holds for frame sets).
+  - A missed row is reported with its numbers for an owner ruling, never
+    tuned toward the tolerance.
+- **Real data, run B (the proposed grid).** The same set on the proposed
+  grid (median scale, north up). Reported for the owner: FWHM in arcsec,
+  eccentricity, background noise per arcsec², the coverage map. No
+  tolerance is pre-set, because geometry differs from every baseline.
 - **WCS.** An independent plate solve of a grid master agrees with the grid
   within 0.5 px.
 - **Owner smoke.** An export with a remapped filter opens in WBPP grouped by
@@ -670,10 +880,14 @@ and cached (a second run does not solve it again).
 - **Disk.** Registered artifacts at grid size can exceed a frame's own size
   many times over for a wide grid. The `space` blocker and the estimate make
   this visible; nothing is silently skipped.
-- **Reading replicas in place.** The exchange may land a new version under
-  a running stack. The identity re-check excludes such a frame. On Windows a
-  rename over an open file fails and the exchange retries later (its
-  existing behaviour).
+- **Reading replicas in place.** The exchange lands a new version as
+  `<target>.athtmp` + rename over the target (`landing.rs:~792, 871`).
+  - On POSIX an already-open old inode stays readable, and the identity
+    re-check before every open excludes a frame that changed.
+  - On Windows the rename over an open file fails and the landing removes
+    its temp. Whether the storage engine retries on its own cadence is to be
+    verified in 6b. Either way the run's identity check keeps the stack
+    consistent.
 - **The table rebuild** touches the user's run history. It runs once,
   guarded, in one transaction with `foreign_key_check`, and is tested on a
   copy of a real database before merge.
@@ -704,24 +918,34 @@ and cached (a second run does not solve it again).
 Each plan gets per-task and whole-branch review; merge and push wait for
 the owner's word.
 
-- **6a — export and remap.** Patchers, layout, the FILTER rule, mixed
-  symlink, re-export, result counts, the dialog. Plus the remap commands,
-  the Filters section, `canRemap`/`canEditGrid`, and the `remapped` feed
-  kind. Independent of 6b; goes first.
+- **6a — export and remap.** Independent of 6b; goes first.
+  - Export: the patchers, the organizer's project layout mode, the FILTER
+    rule, mixed symlink, re-export, result counts, the one-at-a-time guard,
+    the dialog.
+  - Remap: `patch_frame_filter`, the remap commands with pacing, the Filters
+    section, `canRemap`/`canEditGrid`, the `remapped` feed kind, the
+    feed-pull coalescing with its 500-frame check.
+  - R3's export half: an attested set passes through the calibrated-lights
+    export.
 - **6b — core.** In order:
-  1. the subject seam (behaviour-preserving);
+  0. the config pin: `calibration_subtree`'s grouping shape plus the golden
+     hash literals (§8). It touches every existing set, so it comes first;
+  1. the subject seam, behaviour-preserving, including the catalog-read
+     checklist of §4.3;
   2. the table rebuild and handles;
   3. the project frame source and plan;
-  4. Prepare, Solve;
-  5. the grid (storage, proposal, commands, feed);
-  6. groups and exposure modes;
-  7. registration onto the grid;
-  8. LN on overlap;
-  9. coverage and crop;
-  10. drizzle and output on the grid;
-  11. the project commands on both hosts;
-  12. R3;
-  13. the fake-hub e2e.
+  4. Prepare, with `debayer_file` extracted from the generator;
+  5. Solve, with the acceptance gate extracted from `store_result`;
+  6. the grid: storage, `put_grid`, the wire field, proposal, commands, the
+     feed consumer;
+  7. groups and exposure modes;
+  8. registration onto the grid through the composed `PixelMap`;
+  9. LN on overlap (both seams);
+  10. coverage and crop;
+  11. drizzle and output on the grid;
+  12. the project commands on both hosts;
+  13. R3's stacking half;
+  14. the fake-hub e2e.
 - **6c — frontend.** The `StackingTab` subject refactor, the project tab,
   the grid card, Prepare, `FramesTable` by uuid, the context keys,
   notifications, the harness scenario.
@@ -733,3 +957,49 @@ the owner's word.
   deferred" line); the same stale claim in
   `docs/export/calibrated-lights.md`; v3 §16 A8; the logging dictionary;
   open-items (owner smokes, the acceptance run).
+
+## 19. Review record (fable, 2026-10-02)
+
+Verdict "ready after fixes", no redesign; W1–W9 hold. Every finding is
+folded in.
+
+**Critical**
+- **C1 — the cache-invalidation claim was false.** `calibration_subtree`
+  serializes `grouping` whole. Fixed in §8: the legacy grouping shape plus
+  golden-hash pins, and plan 6b step 0.
+- **C2 — the handle table's cascade.** It collided with `delete_not_in` and
+  `record_own`'s `INSERT OR REPLACE`. The FK to `project_frames_local` is
+  dropped (§4.1). The pragma ordering of the rebuild is corrected and child
+  columns are indexed (§4.2).
+- **C3 — catalog side effects by frame id.** The review said the solver
+  writes the catalog. The DB-free half already exists
+  (`solve_frame_with_hints`) and `store_result` is the writer. The gap was
+  the acceptance gate living inside `store_result`; it is extracted (§5.2).
+  The run's catalog reads by frame id are listed and gated (§4.3).
+
+**Important**
+- **I1** — the grid chain fitted as ONE `PixelMap` for every consumer
+  (§5.5, §5.8).
+- **I2** — the Bayer-drizzle mosaic artifact and an origin-aware CFA
+  geometry; `debayer_file` extracted (§5.1).
+- **I3** — no run output carries `ATH_PRJ`; the master's FILTER is
+  canonical (§5.1, §5.9).
+- **I4** — the two LN seams named (§5.6).
+- **I5** — acceptance geometry defined as runs A and B (§15.3).
+- **I6** — one project export at a time (§10.1).
+- **I7** — the organizer layout mode; the export record keyed by uuid
+  after renames; the hub-client calls and the wire field (§9.1, §10).
+- **I8** — remap pacing and feed-pull coalescing (§11.2).
+- **I9** — the `GroupFrame` mapping; APTDIA from the stored header (§4.3,
+  §8).
+- **I10** — the synthetic `PlateSolveRecord` fields (§5.9).
+
+**Minor**, all folded:
+- the wider in-place row (§5.1);
+- crop by mode (§5.9);
+- the 80-column card (§10.2);
+- the `prepared` accessor and cleanup never deleting a landed file (§9.3);
+- the `exposure_class` column (§4.2);
+- per-subject heal and active-run lookups (§4.3);
+- the Windows retry stated as to-verify (§16);
+- the plan order (§18).
