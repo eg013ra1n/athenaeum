@@ -1068,6 +1068,97 @@ reverted with its numbers. Harness: `tier1-compare.py --numeric`, the
 `tierC-external.sh` gate (C-8/C-9), `drizzle_probe`, `ln_probe --diag /
 --seeds-calibration / --measure-calibration`, `register_probe --fits`.
 
+**Run subjects (wave 6b-1, 2026-10-02)** (plan
+`2026-10-02-collab-v3-wave6b1-stacking-foundation-plan.md`, spec
+`2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §18 steps 0-2): the
+behaviour-preserving seam under project stacking. Nothing a frame-set user can
+see moved; the wire shapes (`StackingRunRow.framesSetId`, events, `RunSummary`,
+`StackingPlan.setId`, filled by `run::wire_set_id`) are unchanged.
+
+- **`StackSubject::{FrameSet(i64), Project(String)}`** (`db::stacking`,
+  ungated, re-exported as `stacking::StackSubject`; its `Display` prints
+  `frame set {id}` so frame-set log fields and error strings are
+  byte-identical) keys runs, run-frames, artifacts, `master_lights`, the
+  admission check, work usage / cleanup and the heal sweep. A frame id is read
+  in the subject's namespace: a catalog `frames.id` for a frame set, a
+  `stack_project_frames.id` handle for a project; the two never meet in one
+  map or query. `StackHandle.subject` replaces the set id.
+- **The four rebuilt tables** (`db/schema.rs::rebuild_stacking_tables_for_subjects`):
+
+| Table | Subject pair | Frame pair | Constraints |
+| ---- | ---- | ---- | ---- |
+| `stacking_runs` | `frames_set_id` / `project_id` | none | exactly one of the subject pair |
+| `stacking_run_frames` | via the run | `frame_id` / `project_frame` | exactly one of the frame pair; `UNIQUE(run_id, frame_id)` + `UNIQUE(run_id, project_frame)` |
+| `stacking_artifacts` | `frames_set_id` / `project_id` | `frame_id` / `project_frame` | exactly one subject; at most one frame; `frame_id` needs a set, `project_frame` needs a project |
+| `master_lights` | `frames_set_id` / `project_id` | none | exactly one subject; `UNIQUE(run_id, group_key, kind)` |
+
+  The run-frame uniques are table-level, not partial indexes:
+  `upsert_frame_row`'s `ON CONFLICT(run_id, frame_id)` cannot match a partial
+  index, and NULLs are distinct in a UNIQUE, so the two kinds of row never
+  collide. The artifacts' unique key is `stacking_artifacts_subject_key` on six
+  expressions, `COALESCE(frames_set_id, 0), COALESCE(project_id, ''),
+  group_key, kind, COALESCE(frame_id, 0), COALESCE(project_frame, 0)`;
+  `upsert_artifact`'s `ON CONFLICT` repeats them token for token, and
+  `find_artifact` / `delete_artifacts` / `delete_all_artifacts` filter on the
+  same COALESCE expressions so a per-frame lookup is a point lookup on that
+  index (pinned by `EXPLAIN QUERY PLAN` tests; an `IS` pair there degrades to
+  a scan of every artifact of the set). `list_runs`, `active_run_for_subject`,
+  `list_unfinished_runs` and `list_artifacts` use `IS` pairs.
+- **The rebuild** (detected by `stacking_runs` lacking `project_id`, so it
+  runs once): `PRAGMA foreign_keys = OFF` before `BEGIN` (inside a transaction
+  the pragma is a silent no-op, and with it ON dropping `stacking_runs`
+  would cascade-delete every group, run-frame and master-light row), one
+  IMMEDIATE transaction that creates `*_new`, copies with the same ids,
+  drops and renames, re-probes under the lock, and runs `foreign_key_check`
+  INSIDE the transaction on the rebuilt tables plus `stacking_run_groups`
+  before COMMIT. A violation rolls everything back, foreign keys go back ON,
+  and startup refuses until the rows are repaired; the error names the table,
+  `PRAGMA foreign_key_check('<table>')`, and that deleting those orphan rows
+  is safe (cache and run-history rows). A fresh database is created in the new
+  shape from the same DDL constants (`STACKING_RUNS_BODY` and siblings), so the
+  two shapes cannot drift
+  (`fresh_and_migrated_stacking_tables_have_the_same_shape`). Every stacking
+  index is created by `create_stacking_indexes` AFTER the rebuild point
+  (outside its transaction), which first drops the pre-6b
+  `stacking_artifacts_key` so a later start never re-creates it on the new
+  table. Also created now for 6b-2 to fill: `stack_project_frames`
+  (`INTEGER PRIMARY KEY AUTOINCREMENT`, so a handle is never re-used; no
+  foreign key to `project_frames_local`, whose rows exchange writes delete and
+  re-insert; minted only by `db::stacking::project_frame_handles`, one
+  IMMEDIATE transaction, called only from tests in 6b-1),
+  `stacking_project_config`, `collab_projects.canonical_grid_json`,
+  `stacking_run_groups.exposure_class`.
+- **Per-frame catalog reads go through `stacking::origin`.** `FrameOrigin`
+  has one variant, `Catalog { file_id }`; `origin_of` refuses a frame with no
+  origin (an error, never a silent catalog read); `stored_solve` and
+  `cfa_geometry` are the dispatchers. `HashMemo` is built with the run's
+  origin map and dispatches the stage-1 hash by origin, so its callers did not
+  change. Calibrate's generation read dispatches the same way: a missing
+  origin is a per-frame exclusion in Calibrate and fails the run in later
+  stages. 6b-2 adds `Project { .. }` and every `match` then fails to compile at
+  exactly the sites that need a project arm. Subject-level reads have a
+  dispatcher too: `paths::subject_layout` (`<working>/<set_slug(name)>` for a
+  frame set, `<working>/projects/<set_slug(slug)>` for a project).
+- **The config pin.** `calibration_subtree` writes grouping as
+  `{"exposureToleranceSec": x}` only, pinned by
+  `stage_hashes_are_pinned_to_golden_literals` (pure helpers, literal inputs).
+  A new grouping or output field must leave those literals unchanged, so an
+  existing frame set keeps its caches across an upgrade; only
+  `config_hash_is_canonical_and_pinned` moves.
+- **For future editors**: ts-rs copies `///` docs of exported fields into
+  `src/types`; exported fields carry `//` comments so the generated files stay
+  byte-identical (`git diff --exit-code src/types`).
+- **Next (plan 6b-2, the project path).** Project stacking itself is not
+  here: every project entry point answers `PROJECT_STACKING_UNAVAILABLE`, and
+  no code path opens a project file or runs a project stage. Open for 6b-2:
+  (1) the working-folder namespace overlap, a frame set slugged `projects`
+  against project slugs equal to a fixed subtree name; (2) the
+  `RegistrationRecord` shape for a project (the registration store's Project
+  arm stores and reads nothing; `stored_registrations` returns the
+  catalog-shaped record, so 6b-2 either maps the registered artifacts'
+  payloads into it or changes its consumers); (3) confining all subject/origin
+  dispatch to the named funnels, with a grep test.
+
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
 integrate,master_cards}.rs`,

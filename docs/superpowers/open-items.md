@@ -228,6 +228,11 @@ contain forward slashes.
   writing or freeing disk between the two reads breaks it. Not fixed; if it
   fails again, replace the equality with a tolerance (or read the free space
   once), not a change to the landing code.
+- `collab_pool` `concurrent_gets_for_an_unreachable_provider_share_one_dial`
+  failed once in a full `cargo test -p athenaeum-core --all-targets` on the dev
+  Mac (2026-10-02, during plan 6b-1 Task 3) and passed alone. Not
+  investigated; it exercises a shared dial under parallel load, so look at
+  timing against the other tests' load before the pool logic.
 
 ## Standing decisions — do not re-flag these
 
