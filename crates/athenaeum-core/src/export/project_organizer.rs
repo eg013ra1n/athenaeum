@@ -116,24 +116,27 @@ fn not_older(dest_meta: &fs::Metadata, src_mtime: Option<std::time::SystemTime>)
     }
 }
 
-/// fsync a freshly copied tmp. `fs::copy` carries the source's mode, so a
-/// read-only source yields a read-only tmp: on Unix fsync works on a read-only
-/// descriptor; on Windows the readonly attribute is cleared first.
-fn sync_file(tmp: &Path) -> std::io::Result<()> {
+/// Stamp a freshly copied tmp with its own placement time, then fsync it.
+/// `fs::copy` keeps the source's mtime on macOS and Windows (and carries the
+/// source's mode, so the tmp may be read-only), which would make the recorded
+/// identity the SOURCE's. Stamping `now` makes a copy's identity its own on
+/// every platform. Unix: futimens and fsync both work on a read-only fd;
+/// Windows: the readonly attribute is cleared first, then opened for write.
+fn stamp_and_sync(tmp: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
-    {
+    let f = {
         let mut perms = fs::metadata(tmp)?.permissions();
         if perms.readonly() {
             #[allow(clippy::permissions_set_readonly_false)]
             perms.set_readonly(false);
             fs::set_permissions(tmp, perms)?;
         }
-        fs::File::options().write(true).open(tmp)?.sync_all()
-    }
+        fs::File::options().write(true).open(tmp)?
+    };
     #[cfg(not(windows))]
-    {
-        fs::File::open(tmp)?.sync_all()
-    }
+    let f = fs::File::open(tmp)?;
+    f.set_modified(std::time::SystemTime::now())?;
+    f.sync_all()
 }
 
 /// Refuse a placement whose destination resolves to the source itself (an
@@ -164,10 +167,10 @@ fn copy_atomic(src: &Path, dest: &Path) -> Result<()> {
         return Err(anyhow!("copy {} → {}: {e}", src.display(), dest.display()));
     }
     // Durable before the rename (house rule, fits_writer/mod.rs).
-    let synced = sync_file(&tmp);
+    let synced = stamp_and_sync(&tmp);
     if let Err(e) = synced {
         discard_tmp(&tmp, "project export");
-        return Err(anyhow!("sync {}: {e}", tmp.display()));
+        return Err(anyhow!("stamp/sync {}: {e}", tmp.display()));
     }
     commit_tmp(&tmp, dest).with_context(|| format!("rename onto {}", dest.display()))
 }
@@ -892,6 +895,13 @@ mod tests {
         let mut b_bytes = std::fs::read(&b).unwrap();
         b_bytes[2880] ^= 0xFF;
         std::fs::write(&b, &b_bytes).unwrap();
+        // One shared source mtime: platforms whose copy preserves it (macOS,
+        // Windows) would give both copies the same identity by clock luck.
+        let shared = std::time::SystemTime::now() - std::time::Duration::from_secs(100);
+        for p in [&a, &b] {
+            let f = std::fs::File::options().write(true).open(p).unwrap();
+            f.set_modified(shared).unwrap();
+        }
         let title = tmp.path().join("T");
         let fa = |sz: i64, f: &str| {
             (
