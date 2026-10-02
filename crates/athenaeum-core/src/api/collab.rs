@@ -1064,7 +1064,7 @@ pub struct FilterMappingEdit {
     pub canonical: Option<String>,
 }
 
-fn project_dictionary(project: &CollabProjectRow) -> Result<Vec<DictionaryEntry>, ApiError> {
+pub(crate) fn project_dictionary(project: &CollabProjectRow) -> Result<Vec<DictionaryEntry>, ApiError> {
     match &project.dictionary_json {
         Some(json) => serde_json::from_str(json).map_err(|e| {
             tracing::error!(project_id = %project.project_id, error = %e, "cached filter dictionary does not parse");

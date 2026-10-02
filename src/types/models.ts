@@ -2113,6 +2113,18 @@ resolution: string, canonical: string | null, proposal: string | null, };
 
 export type FilterMappingSheet = { projectId: string, dictionary: Array<DictionaryEntry>, rows: Array<FilterMappingRowView>, };
 
+export type CollabRemapProgress = { projectId: string, canonical: string, done: number, failed: number, total: number, };
+
+export type CollabRemapFinished = { projectId: string, canonical: string, done: number, failed: number, total: number, cancelled: boolean, error: string | null, };
+
+export type FilterBucket = { publisherAccountId: string, publisher: string, instrume: string, filterRaw: string, 
+/**
+ * The bucket's canonical filter, `None` when its frames disagree.
+ */
+canonical: string | null, frameUuids: Array<string>, };
+
+export type FilterBucketSheet = { projectId: string, dictionary: Array<DictionaryEntry>, buckets: Array<FilterBucket>, running: CollabRemapProgress | null, };
+
 export type FilterMappingEdit = { instrume: string, filterRaw: string, 
 /**
  * `None` = delete the row ("back to automatic").

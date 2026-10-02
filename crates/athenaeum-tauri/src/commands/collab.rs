@@ -633,6 +633,51 @@ pub async fn cancel_collab_publish(
         .map_err(|e| e.to_string())
 }
 
+/// The Filters section's buckets (publisher x camera x raw filter) and the
+/// running remap's progress (wave 6a, plan P3).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_collab_filter_buckets(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<athenaeum_core::api::collab_remap::FilterBucketSheet, String> {
+    athenaeum_core::api::collab_remap::get_collab_filter_buckets(&state.ctx, &project_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Start the coordinator's paced, cancellable filter remap; returns once the
+/// task is admitted (`collab-remap-progress` / `collab-remap-finished`).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn remap_collab_filter(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+    frame_uuids: Vec<String>,
+    canonical: String,
+) -> Result<(), String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    athenaeum_core::api::collab_remap::remap_collab_filter(
+        state.ctx.clone(),
+        project_id,
+        frame_uuids,
+        canonical,
+        Some(emitter),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn cancel_collab_remap(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
+    athenaeum_core::api::collab_remap::cancel_collab_remap(&state.ctx, &project_id)
+        .map_err(|e| e.to_string())
+}
+
 /// Blink's view of a project's frames (spec 2026-10-01 §9.1). Every path is
 /// resolved from the DB in core; fired per Blink open, so `debug`.
 #[tauri::command]

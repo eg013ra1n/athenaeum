@@ -944,6 +944,56 @@ pub async fn cancel_collab_publish(
         .map_err(api_err)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemapArgs {
+    project_id: String,
+    frame_uuids: Vec<String>,
+    canonical: String,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_collab_filter_buckets(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<
+    Json<athenaeum_core::api::collab_remap::FilterBucketSheet>,
+    (axum::http::StatusCode, String),
+> {
+    athenaeum_core::api::collab_remap::get_collab_filter_buckets(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn remap_collab_filter(
+    State(state): State<WebAppState>,
+    Json(args): Json<RemapArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    let emitter: Arc<dyn ProgressEmitter> =
+        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    athenaeum_core::api::collab_remap::remap_collab_filter(
+        state.ctx.clone(),
+        args.project_id,
+        args.frame_uuids,
+        args.canonical,
+        Some(emitter),
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn cancel_collab_remap(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    athenaeum_core::api::collab_remap::cancel_collab_remap(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// Whole-branch review finding 1: `SessionsArgs` lacked `camelCase`, so the
 /// frontend's `{"projectId":...}` body deserialized with `project_id: None`
 /// via `#[serde(default)]` — the web build silently returned every
@@ -1040,4 +1090,21 @@ pub async fn get_collab_frame_image(
     )
     .map_err(api_err)?;
     crate::routes::images::render_path_jpeg(&state, path.to_string_lossy().into_owned(), args.resolution).await
+}
+
+#[cfg(test)]
+mod remap_args_tests {
+    use super::*;
+
+    #[test]
+    fn remap_args_are_camel_case() {
+        let a: RemapArgs = serde_json::from_value(
+            serde_json::json!({"projectId": "p", "frameUuids": ["u"], "canonical": "R"}),
+        )
+        .unwrap();
+        assert_eq!(
+            (a.project_id.as_str(), a.frame_uuids.len(), a.canonical.as_str()),
+            ("p", 1, "R")
+        );
+    }
 }

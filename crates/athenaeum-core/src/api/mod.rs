@@ -67,6 +67,9 @@ pub mod export;
 // `cargo build -p perseus --no-default-features`.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab;
+// Coordinator filter remap (wave 6a, Task 9): calls the gated `api::collab`.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod collab_remap;
 
 // The collab v3 wave-3 live exchange (Task 5): the feed applier that drives
 // the hub's `/me/events` stream — cursors, catch-up, resync, the versions
