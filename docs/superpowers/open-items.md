@@ -78,7 +78,7 @@ full outcome. `athenaeum-core`'s 39 pre-existing Windows test failures (research
 `research/2026-09-06-windows-test-failures.md`) are believed closed — every
 family was diagnosed and fixed, including one real production defect (a
 received file's path was stored with a mixed separator on Windows, now fixed in
-`sync/ingest.rs` and, by the same shape, in `sync/project_ingest.rs`) — but no
+`sync/ingest.rs`) — but no
 single Windows run has yet reported `0 failed` for the whole crate after all
 eight tasks landed; the closest confirmed readings are 34 then 31, taken
 mid-cycle. That gap is now closed — see the workspace-wide green reading
@@ -221,6 +221,13 @@ contain forward slashes.
   both CI jobs of the same commit. Not investigated; if it fails again, look
   at what the two runs share on disk (the LN sidecar cache under a tempdir)
   and at the parallel test load, not at the LN maths.
+- `api::collab::tests::publish::landing_free_bytes_is_bounded_by_the_collaboration_root`
+  failed once in a full `cargo test -p athenaeum-core --lib` on the dev Mac
+  (2026-10-02) and passed alone twice and in a second full run. It compares two
+  successive free-space readings of the volume for equality, so another test
+  writing or freeing disk between the two reads breaks it. Not fixed; if it
+  fails again, replace the equality with a tolerance (or read the free space
+  once), not a change to the landing code.
 
 ## Standing decisions — do not re-flag these
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type JSX } from 'react';
+import { useCallback, useEffect, useRef, useState, type JSX } from 'react';
 import { Loader2 } from 'lucide-react';
 import { api } from '../../../api';
 import { Button, DialogShell, Select } from '../../ui';
@@ -23,14 +23,21 @@ export default function FilterRemapSection({ projectId, syncToken }: { projectId
   const [result, setResult] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
 
+  // Request sequence: a response older than the latest request is ignored, so a
+  // load started just before the finished event can never re-set `running`.
+  const loadSeq = useRef(0);
+
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
     try {
       const s = await api.invoke<FilterBucketSheet>('get_collab_filter_buckets', { projectId });
+      if (seq !== loadSeq.current) return;
       setSheet(s);
       setRunning(s.running);
       setLoadError(null);
     } catch (err) {
       console.error('[FilterRemapSection] get_collab_filter_buckets failed:', err);
+      if (seq !== loadSeq.current) return;
       setLoadError(String(err));
     }
   }, [projectId]);

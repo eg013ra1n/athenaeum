@@ -132,4 +132,21 @@ describe('FilterRemapSection', () => {
     expect(err).toHaveBeenCalled();
     err.mockRestore();
   });
+
+  it('an older load resolving after a newer one is ignored', async () => {
+    const running: CollabRemapProgress = { projectId: 'proj-1', canonical: 'R', done: 1, failed: 0, total: 5 };
+    const pending: Array<(s: FilterBucketSheet) => void> = [];
+    const { rerender } = await renderSection();
+    vi.mocked(api.invoke).mockImplementation(((command: string) => {
+      if (command === 'get_collab_filter_buckets') return new Promise<FilterBucketSheet>((res) => pending.push(res));
+      return Promise.resolve(null);
+    }) as never);
+    rerender(<FilterRemapSection projectId="proj-1" syncToken={1} />);
+    rerender(<FilterRemapSection projectId="proj-1" syncToken={2} />);
+    await waitFor(() => expect(pending).toHaveLength(2));
+    // The newer request (no run) resolves first, the older one (run still set) resolves last.
+    await act(async () => pending[1](sheet([bucket()], null)));
+    await act(async () => pending[0](sheet([bucket()], running)));
+    expect(screen.queryByText(/Remapping…/)).not.toBeInTheDocument();
+  });
 });

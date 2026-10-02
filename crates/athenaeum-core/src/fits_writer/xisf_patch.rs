@@ -132,6 +132,7 @@ fn parse(xml: &str) -> Result<Parsed, FitsWriteError> {
     let mut locations = Vec::new();
     let mut in_image: Option<usize> = None;
     let mut open_property: Option<(String, usize)> = None;
+    let mut open_keyword: Option<(String, usize)> = None;
     loop {
         let start = reader.buffer_position() as usize;
         let ev = reader
@@ -151,6 +152,9 @@ fn parse(xml: &str) -> Result<Parsed, FitsWriteError> {
                         in_image = Some(images.len() - 1);
                     }
                     b"Property" => open_property = attr(&e, b"id")?.map(|id| (id, start)),
+                    b"FITSKeyword" if in_image.is_some() => {
+                        open_keyword = attr(&e, b"name")?.map(|n| (n, start));
+                    }
                     _ => {}
                 }
             }
@@ -177,6 +181,11 @@ fn parse(xml: &str) -> Result<Parsed, FitsWriteError> {
             }
             Event::End(e) => match e.name().as_ref() {
                 b"Image" => in_image = None,
+                b"FITSKeyword" => {
+                    if let (Some(i), Some((name, s))) = (in_image, open_keyword.take()) {
+                        images[i].keywords.push((name, s..end));
+                    }
+                }
                 b"Property" => {
                     if let Some((id, s)) = open_property.take() {
                         properties.push((id, s..end));
@@ -393,7 +402,7 @@ pub fn read_xisf_keyword(path: &Path, name: &str) -> Result<Option<String>, Fits
     let ev = reader
         .read_event()
         .map_err(|e| malformed(format!("XISF keyword element: {e}")))?;
-    if let Event::Empty(e) = ev {
+    if let Event::Empty(e) | Event::Start(e) = ev {
         if let Some(v) = attr(&e, b"value")? {
             let v = v.trim();
             let v = match v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
@@ -675,5 +684,30 @@ mod tests {
             assert!(err.to_string().contains("not pos:size"), "{loc}: {err}");
             assert!(!dest.exists());
         }
+    }
+
+    #[test]
+    fn an_open_close_form_keyword_is_seen_and_replaced_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("oc.xisf");
+        let xml = "<?xml version=\"1.0\"?>\n<xisf version=\"1.0\">\n  <Image geometry=\"1:1:1\" sampleFormat=\"UInt8\" location=\"attachment:{POS}:{SIZE}\">\n    <FITSKeyword name=\"FILTER\" value=\"'Red'\" comment=\"\"></FITSKeyword>\n  </Image>\n</xisf>\n";
+        std::fs::write(&src, xisf(xml, &[9], &[])).unwrap();
+        assert_eq!(
+            read_xisf_keyword(&src, "FILTER").unwrap().as_deref(),
+            Some("Red"),
+            "the raw open/close keyword is readable"
+        );
+        let dest = dir.path().join("o.xisf");
+        patch_xisf_keywords(&src, &dest, &[filter_edit("R", "was 'Red'")]).unwrap();
+        let mut f = File::open(&dest).unwrap();
+        let (out, _) = read_header(&mut f).unwrap();
+        assert_eq!(out.matches("name=\"FILTER\"").count(), 1, "{out}");
+        assert!(!out.contains("value=\"'Red'\""), "{out}");
+        assert!(!out.contains("</FITSKeyword>"), "{out}");
+        assert_eq!(
+            read_xisf_keyword(&dest, "FILTER").unwrap().as_deref(),
+            Some("R")
+        );
+        assert_eq!(blocks(&src), blocks(&dest));
     }
 }

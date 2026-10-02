@@ -342,6 +342,11 @@ filter, bucketed by publisher, and `organize_project_export`
   **never deletes them**. A frame that failed keeps its previous record entry (it
   is not reported stale); a cancelled run keeps the previous entries of frames not
   reached. An unreadable record is a warning and is treated as empty.
+  A record written by **another project** (its `projectId` differs from the running
+  one — two projects whose titles sanitize to the same folder, exported into the same
+  output) is ONE warning ("This folder already holds the export of another project
+  (…); its files were left in place.") and is treated as empty: no stale list from it,
+  nothing kept; this project's record then replaces it.
 - **Output-root guard:** an output whose `<output>/<sanitized title>` folder is
   inside, equal to, or contains a scan root or the Collaboration root (both
   canonicalized, case and symlinks resolved) is refused, as is a path with `.` or

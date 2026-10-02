@@ -267,7 +267,7 @@ export default function ProjectExportDialog({
                 <p>
                   {result.warnings.length} warning{result.warnings.length === 1 ? '' : 's'}
                 </p>
-                <ul className="mt-0.5 list-disc space-y-0.5 pl-4 break-words">
+                <ul className="mt-0.5 max-h-40 list-disc space-y-0.5 overflow-y-auto pl-4 break-words">
                   {limitWarnings(result.warnings, 20).shown.map((w, i) => (
                     <li key={i}>{w}</li>
                   ))}

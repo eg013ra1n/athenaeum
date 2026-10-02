@@ -2123,7 +2123,7 @@ fn device_for_cards(ctx: &ServiceContext) -> Option<String> {
 /// `gov_caps_json` (the hub's governance caps, wholesale-refreshed by
 /// `upsert_project`) contains `cap`. A malformed cache row is `warn!`-logged
 /// and read as no caps.
-fn has_cap(is_coordinator: bool, gov_caps_json: &str, cap: &str) -> bool {
+pub(crate) fn has_cap(is_coordinator: bool, gov_caps_json: &str, cap: &str) -> bool {
     if is_coordinator {
         return true;
     }

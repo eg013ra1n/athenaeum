@@ -335,8 +335,16 @@ pub fn organize_project_export(
     let mut done = 0usize;
     let mut last_emit = Instant::now();
     fs::create_dir_all(title_dir).with_context(|| format!("create {}", title_dir.display()))?;
-    let (prev, record_warning) = read_record(title_dir);
+    let (mut prev, record_warning) = read_record(title_dir);
     warnings.extend(record_warning);
+    if !prev.project_id.is_empty() && prev.project_id != project_id {
+        tracing::warn!(project_id, path = %title_dir.display(), "project export: folder holds another project's export record; ignored");
+        warnings.push(format!(
+            "This folder already holds the export of another project ({}); its files were left in place.",
+            prev.project_id
+        ));
+        prev = ExportRecord::default();
+    }
     'outer: for (publisher, frames) in publishers {
         for f in frames {
             if cancel_flag.load(Ordering::Relaxed) {
@@ -934,5 +942,41 @@ mod tests {
             std::fs::read(title.join("Alice/camera_cama/R/x_2.fits")).unwrap(),
             b_bytes
         );
+    }
+
+    #[test]
+    fn another_projects_record_is_one_warning_and_never_a_stale_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, asz) = landed(tmp.path(), "a.fits", Some("R"));
+        let (b, bsz) = landed(tmp.path(), "b.fits", Some("R"));
+        let title = tmp.path().join("out").join("T");
+        run(
+            &title,
+            &[("Alice".into(), vec![frame("ua", &a, asz, "R")])],
+            false,
+        );
+        let res = organize_project_export(
+            &title,
+            "p2",
+            &[("Bob".into(), vec![frame("ub", &b, bsz, "R")])],
+            false,
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(res.warnings.len(), 1, "{:?}", res.warnings);
+        assert!(
+            res.warnings[0].contains("another project"),
+            "{:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings.iter().any(|w| w.contains("Alice/")),
+            "{:?}",
+            res.warnings
+        );
+        let (rec, _) = read_record(&title);
+        assert_eq!(rec.project_id, "p2");
+        assert!(rec.frames.contains_key("ub") && !rec.frames.contains_key("ua"));
     }
 }

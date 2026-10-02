@@ -1947,6 +1947,11 @@ struct ExportSlot {
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Dropping the slot frees the project's export slot at once, so a new export
+/// can be admitted while an orphaned organizer is still placing its current
+/// frame (it stops at its next frame). That overlap is safe: every placement is
+/// tmp + rename, so bytes stay whole, and the identity record self-heals on the
+/// next run.
 impl Drop for ExportSlot {
     fn drop(&mut self) {
         self.cancel_flag

@@ -18,6 +18,10 @@ use crate::services::ServiceContext;
 pub const COLLAB_REMAP_PROGRESS_EVENT: &str = "collab-remap-progress";
 pub const COLLAB_REMAP_FINISHED_EVENT: &str = "collab-remap-finished";
 pub const REMAP_BUSY_MSG: &str = "A filter remap is already running for this project.";
+/// The refusal text for a missing `thresholds.edit` (the hub's 403 also
+/// covers a non-member, so the text names both).
+pub const NO_REMAP_CAP_MSG: &str =
+    "This account cannot remap filters on this project (it needs thresholds.edit and membership).";
 const IN_FLIGHT: usize = 4;
 const MIN_SPACING: Duration = Duration::from_millis(100);
 const RATE_LIMIT_WAIT: Duration = Duration::from_secs(5);
@@ -224,16 +228,51 @@ pub async fn remap_collab_filter(
     if frame_uuids.is_empty() {
         return Err(ApiError::Invalid("no frames to remap".into()));
     }
-    {
+    let frame_uuids = {
         let database = db(&ctx)?;
         let conn = database.conn();
         let project = crate::api::collab_exchange::live_project(&conn, &project_id)?;
+        // The hub stays authoritative (its 403 is the backstop); this is the
+        // immediate refusal for a caller whose cached card lacks the cap.
+        if !crate::api::collab::has_cap(
+            project.is_coordinator,
+            &project.gov_caps_json,
+            "thresholds.edit",
+        ) {
+            tracing::warn!(
+                project_id,
+                "remap refused: the cached card lacks thresholds.edit"
+            );
+            return Err(ApiError::Forbidden(NO_REMAP_CAP_MSG.into()));
+        }
         let dictionary = crate::api::collab::project_dictionary(&project)?;
         if !dictionary.iter().any(|d| d.canonical == canonical) {
             return Err(ApiError::Invalid(format!(
                 "{canonical:?} is not in the project's filter dictionary"
             )));
         }
+        // A frame already at the target would be a no-op PATCH that still
+        // bumps the hub's project version and emits a feed event: drop it
+        // (and any duplicate) before admission.
+        let current: HashMap<String, String> =
+            crate::db::collab_frames::list_for_project(&conn, &project_id)?
+                .into_iter()
+                .map(|r| (r.frame_uuid, r.filter_canonical))
+                .collect();
+        let mut seen = std::collections::HashSet::new();
+        frame_uuids
+            .into_iter()
+            .filter(|u| seen.insert(u.clone()))
+            .filter(|u| current.get(u).map(String::as_str) != Some(canonical.as_str()))
+            .collect::<Vec<String>>()
+    };
+    if frame_uuids.is_empty() {
+        tracing::info!(
+            project_id,
+            canonical,
+            "filter remap skipped: every frame is already at the target"
+        );
+        return Ok(());
     }
     let Some((hub_url, token)) = crate::api::account::hub_credentials(&ctx)? else {
         return Err(ApiError::SignedOut("Sign in to remap filters.".into()));
@@ -350,9 +389,7 @@ pub async fn remap_collab_filter(
             queue.len(),
         );
         let error = match stop {
-            Some(Stop::Forbidden) => {
-                Some("This account lacks thresholds.edit on the project.".to_string())
-            }
+            Some(Stop::Forbidden) => Some(NO_REMAP_CAP_MSG.to_string()),
             Some(Stop::Refused(m)) => Some(format!("The hub refused the remap: {m}")),
             None => None,
         };
@@ -642,9 +679,21 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), n);
     }
 
+    /// Cached caps say the member may edit, the hub disagrees (changed after
+    /// the last sync): the hub's 403 is the authoritative backstop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_member_without_thresholds_edit_stops_at_the_first_forbidden() {
+    async fn a_hub_side_403_stops_at_the_first_forbidden() {
         let (_t, ctx, hub) = fixture(false).await;
+        {
+            let database = db(&ctx).unwrap();
+            database
+                .conn()
+                .execute(
+                    "UPDATE collab_projects SET gov_caps_json = '[\"thresholds.edit\"]' WHERE project_id = 'p1'",
+                    [],
+                )
+                .unwrap();
+        }
         let uuids = get_collab_filter_buckets(&ctx, "p1").unwrap().buckets[0]
             .frame_uuids
             .clone();
@@ -660,12 +709,116 @@ mod tests {
         .unwrap();
         let f = finished(&rec).await;
         assert_eq!(f.done, 0);
-        assert!(
-            f.error.as_deref().unwrap_or("").contains("thresholds.edit"),
-            "{f:?}"
-        );
+        assert_eq!(f.error.as_deref(), Some(NO_REMAP_CAP_MSG), "{f:?}");
         assert_stopped_early(&f);
         assert!(hub.requests_matching("/frames/", "p1").await <= IN_FLIGHT);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_member_without_thresholds_edit_is_refused_before_any_slot_or_request() {
+        let (_t, ctx, hub) = fixture(false).await;
+        let uuids = get_collab_filter_buckets(&ctx, "p1").unwrap().buckets[0]
+            .frame_uuids
+            .clone();
+        let before = hub.requests_matching("/frames/", "p1").await;
+        let rec = Arc::new(Rec(StdMutex::new(Vec::new())));
+        let err = remap_collab_filter(
+            ctx.clone(),
+            "p1".into(),
+            uuids,
+            "R".into(),
+            Some(rec.clone()),
+        )
+        .await
+        .unwrap_err();
+        match &err {
+            ApiError::Forbidden(m) => assert_eq!(m, NO_REMAP_CAP_MSG),
+            other => panic!("{other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(rec.0.lock().unwrap().is_empty(), "no event of any kind");
+        assert_eq!(hub.requests_matching("/frames/", "p1").await, before);
+        assert!(get_collab_filter_buckets(&ctx, "p1")
+            .unwrap()
+            .running
+            .is_none());
+        assert!(!registry()
+            .lock()
+            .unwrap()
+            .contains_key(&key(&ctx, "p1").unwrap()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frames_already_at_the_target_are_not_patched_again() {
+        let (_t, ctx, hub) = fixture(true).await;
+        let uuids: Vec<String> = get_collab_filter_buckets(&ctx, "p1").unwrap().buckets[0]
+            .frame_uuids
+            .iter()
+            .take(5)
+            .cloned()
+            .collect();
+        {
+            let database = db(&ctx).unwrap();
+            let conn = database.conn();
+            for u in &uuids[..2] {
+                conn.execute(
+                    "UPDATE project_frames_local SET filter_canonical = 'R' WHERE project_id = 'p1' AND frame_uuid = ?1",
+                    [u],
+                )
+                .unwrap();
+            }
+        }
+        let mut sent = uuids.clone();
+        sent.push(uuids[3].clone()); // a duplicate is dropped too
+        let before = hub.requests_matching("/frames/", "p1").await;
+        let rec = Arc::new(Rec(StdMutex::new(Vec::new())));
+        remap_collab_filter(
+            ctx.clone(),
+            "p1".into(),
+            sent,
+            "R".into(),
+            Some(rec.clone()),
+        )
+        .await
+        .unwrap();
+        let f = finished(&rec).await;
+        assert_eq!((f.done, f.failed, f.total), (3, 0, 3), "{f:?}");
+        assert_eq!(hub.requests_matching("/frames/", "p1").await - before, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remap_with_nothing_to_change_starts_no_run() {
+        let (_t, ctx, hub) = fixture(true).await;
+        let uuids: Vec<String> = get_collab_filter_buckets(&ctx, "p1").unwrap().buckets[0]
+            .frame_uuids
+            .iter()
+            .take(2)
+            .cloned()
+            .collect();
+        {
+            let database = db(&ctx).unwrap();
+            database
+                .conn()
+                .execute(
+                    "UPDATE project_frames_local SET filter_canonical = 'R' WHERE project_id = 'p1'",
+                    [],
+                )
+                .unwrap();
+        }
+        let before = hub.requests_matching("/frames/", "p1").await;
+        let rec = Arc::new(Rec(StdMutex::new(Vec::new())));
+        remap_collab_filter(
+            ctx.clone(),
+            "p1".into(),
+            uuids,
+            "R".into(),
+            Some(rec.clone()),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(rec.0.lock().unwrap().is_empty());
+        assert_eq!(hub.requests_matching("/frames/", "p1").await, before);
     }
 
     #[test]
