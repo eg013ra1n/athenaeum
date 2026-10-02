@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::account::keys::{device_key_path, DeviceKey};
 use crate::api::{db, ApiError};
@@ -22,7 +22,6 @@ use crate::collab::hub_client::CollabClient;
 use crate::collab::snapshot::{member_of_device, own_display_name, SnapshotMember};
 use crate::db::collab_frames::{FrameOrigin, LocalFrameRow};
 use crate::events::ProgressEmitter;
-use crate::export::models::WbppExportConfig;
 use crate::services::ServiceContext;
 
 /// Map an [`AccountClientError`](crate::account::AccountClientError) onto the api
@@ -1848,41 +1847,69 @@ pub fn set_project_auto_replicate(
 
 // ── Project-scoped WBPP export (slice 5, "processor payoff") ──────────────────
 
-/// Load the WBPP config from settings, or the default when absent. A private
-/// reproduction of the byte-identical `load_wbpp_config` in both host crates
-/// (`commands/export.rs` / `routes/export.rs`) — the runner is core-resident and
-/// must not depend on a host. Absent row ⇒ default; a parse failure ⇒ `warn!` +
-/// `Err` (callers use `.unwrap_or_default()`, exactly like both hosts).
-fn load_wbpp_config(conn: &rusqlite::Connection) -> Result<WbppExportConfig> {
-    let result: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            rusqlite::params!["export.wbpp_config"],
-            |row| row.get(0),
-        )
-        .ok();
-    match result {
-        Some(json) => serde_json::from_str(&json).map_err(|e| {
-            tracing::warn!(error = %e, "failed to parse WBPP config");
-            anyhow!(e)
-        }),
-        None => Ok(WbppExportConfig::default()),
+/// Refuse an export folder that lies inside (or canonicalizes into) the
+/// Collaboration root or any scan root: a computed destination could then land
+/// on another frame's replica or original (the replica is sacred). Works for a
+/// folder that does not exist yet by resolving its deepest existing ancestor.
+fn refuse_output_inside_roots(
+    conn: &rusqlite::Connection,
+    output_dir: &str,
+) -> Result<(), ApiError> {
+    let raw = output_dir.trim();
+    let candidate = Path::new(raw);
+    if raw.is_empty() || !candidate.is_absolute() {
+        return Err(ApiError::Invalid(
+            "Export folder: enter an absolute path".into(),
+        ));
     }
+    let resolve = |p: &Path| -> PathBuf {
+        let mut tail = Vec::new();
+        let mut cur = p.to_path_buf();
+        loop {
+            if let Ok(c) = cur.canonicalize() {
+                let mut out = crate::api::scan_roots::normalize_path(&c);
+                out.extend(tail.iter().rev());
+                return out;
+            }
+            match (cur.file_name().map(|n| n.to_os_string()), cur.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name);
+                    cur = parent.to_path_buf();
+                }
+                _ => return p.to_path_buf(),
+            }
+        }
+    };
+    let out = resolve(candidate);
+    let roots = crate::db::get_scan_roots(conn)
+        .map_err(|e| ApiError::Internal(format!("read scan roots: {e:#}")))?;
+    for root in roots {
+        let root_path = resolve(Path::new(&root.path));
+        if out.starts_with(&root_path) {
+            tracing::warn!(
+                output_dir = %out.display(),
+                path = %root_path.display(),
+                "project export refused: output folder is inside a root"
+            );
+            return Err(ApiError::Invalid(format!(
+                "Export folder must not be inside a monitored or Collaboration folder ({}): the export could overwrite catalogued files.",
+                root_path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
-/// The project export: collect (Task 1) → organize one folder tree per publisher
-/// under `<output_dir>/<sanitized project title>/`, with each dataset's
-/// `frame_set_name` = the publisher display (Д2 — one organizer call per
-/// publisher). Rides the standard export events with the Д3 sentinel
-/// `frame_set_id = -1`, registering its cancel flag under that key exactly like
-/// the frame-set export.
+/// The project export: collect, then lay every frame under
+/// `<output_dir>/<sanitized project title>/<publisher>/camera_<instrume>/<canonical filter>/`
+/// ([`organize_project_export`](crate::export::project_organizer::organize_project_export):
+/// symlink, plain copy, or a FILTER-patched copy; the replica is never
+/// written). Rides the standard export events with the sentinel
+/// `frame_set_id = -1`, registering its cancel flag under that key. One project
+/// export at a time: a second is refused with `Conflict`.
 ///
-/// Ungated: the collector is a pure catalog read and the organizer is reused
-/// untouched, so this compiles in the headless build.
-///
-/// Progress limitation (accepted): each organizer call emits percent against ITS
-/// OWN dataset total, so the bar restarts per publisher — the Task-2 dialog
-/// shows current file + publisher count, not one monotonic percent.
+/// Ungated: a pure catalog read plus file placement, so it compiles in the
+/// headless build.
 pub async fn export_project_for_wbpp(
     ctx: &ServiceContext,
     project_id: &str,
@@ -1890,12 +1917,15 @@ pub async fn export_project_for_wbpp(
     use_symlinks: bool,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<crate::export::models::ExportResult, ApiError> {
-    use crate::export::models::{
-        ExportCompleteEvent, ExportProgressEvent, ExportResult,
-    };
-    use std::sync::atomic::AtomicBool;
+    use crate::export::models::{ExportCompleteEvent, ExportProgressEvent, ExportResult};
+    use crate::export::project_organizer::PROJECT_EXPORT_SENTINEL as SENTINEL;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    const SENTINEL: i64 = -1;
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        refuse_output_inside_roots(&conn, output_dir)?;
+    }
 
     // Register the cancel flag under the sentinel (the registry is core-resident).
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -1904,6 +1934,15 @@ pub async fn export_project_for_wbpp(
             .active_exports
             .lock()
             .map_err(|e| ApiError::Internal(format!("active_exports lock poisoned: {e}")))?;
+        if exports.contains_key(&SENTINEL) {
+            tracing::warn!(
+                project_id,
+                "project export refused: another project export is running"
+            );
+            return Err(ApiError::Conflict(
+                "Another project export is running.".into(),
+            ));
+        }
         exports.insert(
             SENTINEL,
             crate::services::ExportHandle {
@@ -1931,14 +1970,13 @@ pub async fn export_project_for_wbpp(
             );
         }
 
-        // Resolve own_display (Д2) + the WBPP config with the DB borrow scoped out
-        // before the spawn_blocking/await.
-        // The device key is IDENTITY — always the identity dir.
+        // Resolve own_display with the DB borrow scoped out before the
+        // spawn_blocking/await. The device key is IDENTITY: the identity dir.
         let identity_dir = crate::api::sync::sync_dirs(ctx)?.identity_dir;
         let own_node = DeviceKey::load_or_create(&device_key_path(&identity_dir))
             .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?
             .node_id();
-        let (own_display, config) = {
+        let own_display = {
             let db = db(ctx)?;
             let conn = db.conn();
             let members: Vec<SnapshotMember> = crate::db::collab::get_project(&conn, project_id)?
@@ -1952,7 +1990,7 @@ pub async fn export_project_for_wbpp(
                 );
                 display = "own".to_string();
             }
-            (display, load_wbpp_config(&conn).unwrap_or_default())
+            display
         };
 
         // Collect on a blocking thread (pure catalog read; own DB handle).
@@ -1970,13 +2008,45 @@ pub async fn export_project_for_wbpp(
             .map_err(|e| ApiError::Internal(format!("collect join error: {e}")))??
         };
 
-        // TEMPORARY (wave 6 Task 4): the organizer is rebuilt in Task 6. Fail
-        // loudly rather than report a silent success.
-        let _ = (&data, &config, use_symlinks, &cancel_flag);
-        tracing::error!(project_id, "project export is being rebuilt (wave 6 Task 6)");
-        Err::<ExportResult, ApiError>(ApiError::Internal(
-            "project export is being rebuilt (wave 6 Task 6)".into(),
-        ))
+        let title_dir = Path::new(output_dir)
+            .join(crate::export::models::sanitize_display_folder_name(&data.title));
+        let organized = {
+            let pubs = data.publishers.clone();
+            let flag = cancel_flag.clone();
+            let em = emitter.clone();
+            let pid = project_id.to_string();
+            let dir = title_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::export::project_organizer::organize_project_export(
+                    &dir,
+                    &pid,
+                    &pubs,
+                    use_symlinks,
+                    em.as_deref(),
+                    &flag,
+                )
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("organize join error: {e}")))?
+            .map_err(|e| ApiError::Internal(format!("organize project export: {e:#}")))?
+        };
+        let mut warnings = data.warnings.clone();
+        warnings.extend(organized.warnings);
+        let c = organized.counts;
+        let files_organized = c.linked + c.copied + c.rewritten;
+        let cancelled = organized.cancelled || cancel_flag.load(Ordering::Relaxed);
+        Ok(ExportResult {
+            success: !cancelled,
+            output_dir: output_dir.to_string(),
+            files_organized,
+            scripts_generated: Vec::new(),
+            warnings,
+            error: cancelled.then(|| "Export cancelled".to_string()),
+            linked: c.linked,
+            copied: c.copied,
+            rewritten: c.rewritten,
+            failed: c.failed,
+        })
     }
     .await;
 
@@ -1995,6 +2065,10 @@ pub async fn export_project_for_wbpp(
                 warnings: r.warnings.clone(),
                 error: r.error.clone(),
                 output_dir: output_dir.to_string(),
+                linked: r.linked,
+                copied: r.copied,
+                rewritten: r.rewritten,
+                failed: r.failed,
             },
             Err(err) => ExportCompleteEvent {
                 frame_set_id: SENTINEL,
@@ -2003,6 +2077,10 @@ pub async fn export_project_for_wbpp(
                 warnings: Vec::new(),
                 error: Some(err.to_string()),
                 output_dir: output_dir.to_string(),
+                linked: 0,
+                copied: 0,
+                rewritten: 0,
+                failed: 0,
             },
         };
         crate::events::emit_event(e, "export-complete", &complete);
@@ -2012,6 +2090,10 @@ pub async fn export_project_for_wbpp(
         Ok(r) => tracing::info!(
             project_id,
             files_organized = r.files_organized,
+            linked = r.linked,
+            copied = r.copied,
+            rewritten = r.rewritten,
+            failed = r.failed,
             outcome = if r.success { "ok" } else { "cancelled" },
             "project export finished"
         ),
@@ -2159,36 +2241,24 @@ mod tests {
 
     // ── Project export runner (P26: paths from `project_frames_local`) ───────
 
-    /// The project export runner lays a per-publisher WBPP tree under the
-    /// project title and copies the replica's landed FITS byte-exact:
-    /// `<out>/<title>/<publisher>/camera_<instrume>/lights/<basename>`. The
-    /// file is found through the row's `landed_path`, its metadata read from
-    /// the manifest row.
-    #[tokio::test]
-    #[ignore = "rebuilt in wave 6 Task 6"]
-    async fn export_project_lays_per_publisher_tree() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
-
-        // A real tiny FITS as the landed replica file.
-        let landed = tmp.path().join("Collab").join("Alice").join("L_0001.fits");
+    /// Seed one landed replica frame (`Alice`, filter `Lum` → canonical `L`).
+    fn seed_landed_frame(ctx: &ServiceContext, landed: &std::path::Path) -> Vec<u8> {
         std::fs::create_dir_all(landed.parent().unwrap()).unwrap();
-        let pixels = vec![0.25f32, 0.5, 0.75, 1.0];
-        crate::fits_writer::write_fits_f32(&landed, 2, 2, 1, &pixels, &[]).unwrap();
-
+        crate::fits_writer::write_fits_f32(landed, 2, 2, 1, &[0.25, 0.5, 0.75, 1.0], &[]).unwrap();
+        let size = std::fs::metadata(landed).unwrap().len() as i64;
         {
-            let db = db(&ctx).unwrap();
+            let db = db(ctx).unwrap();
             let conn = db.conn();
             seed_project(&conn, "p-1", "[]");
             let view: crate::collab::hub_client::FrameViewWire =
                 serde_json::from_value(serde_json::json!({
                     "frameUuid": "u-1", "publisherAccountId": "acc-alice",
                     "publisherDisplayName": "Alice", "own": false, "fileName": "L_0001.fits",
-                    "contentVersion": 1, "blake3": "b".repeat(64), "byteSize": 1,
-                    "xxh3": "0123456789abcdef", "filterRaw": "L", "filterCanonical": "L",
+                    "contentVersion": 1, "blake3": "b".repeat(64), "byteSize": size,
+                    "xxh3": "0123456789abcdef", "filterRaw": "Lum", "filterCanonical": "L",
                     "channel": "mono", "exptimeSec": 300.0, "meta": {"instrume": "CamA"},
                     "gateVersion": 0, "accepted": true, "state": "published",
-                    "manifestVersion": 1, "createdAt": "2026-07-13T00:00:00Z", "holderCount": 1
+                    "manifestVersion": 1, "createdAt": "2026-07-13T00:00:00Z"
                 }))
                 .unwrap();
             crate::db::collab_frames::upsert_from_manifest(&conn, "p-1", &view).unwrap();
@@ -2201,26 +2271,111 @@ mod tests {
             )
             .unwrap();
         }
+        std::fs::read(landed).unwrap()
+    }
 
+    /// The project export lays `<title>/<publisher>/camera_<instrume>/<canonical
+    /// filter>/`, with the canonical name in the copy's FILTER card; the replica
+    /// is never touched.
+    #[tokio::test]
+    async fn export_project_lays_canonical_filter_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let landed = tmp.path().join("Collab").join("Alice").join("L_0001.fits");
+        let before = seed_landed_frame(&ctx, &landed);
         let out = tmp.path().join("out");
-        let result = export_project_for_wbpp(&ctx, "p-1", &out.to_string_lossy(), false, None)
+        let r = export_project_for_wbpp(&ctx, "p-1", &out.to_string_lossy(), false, None)
             .await
             .unwrap();
-        assert!(result.success, "export succeeded: {:?}", result.error);
-        assert_eq!(result.files_organized, 1, "one replica frame organized");
-
-        // seed_project titles the project "T"; instrume "CamA" → camera_cama.
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!((r.files_organized, r.rewritten, r.failed), (1, 1, 0));
         let dest = out
             .join("T")
             .join("Alice")
             .join("camera_cama")
-            .join("lights")
+            .join("L")
             .join("L_0001.fits");
-        assert!(dest.exists(), "expected {dest:?}");
         assert_eq!(
-            std::fs::read(&dest).unwrap(),
+            crate::fits_writer::header_patch::read_image_keyword(&dest, "FILTER")
+                .unwrap()
+                .as_deref(),
+            Some("L")
+        );
+        assert_eq!(
             std::fs::read(&landed).unwrap(),
-            "the organized copy is byte-identical to the landed replica"
+            before,
+            "the replica is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_project_export_while_one_runs_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        ctx.active_exports.lock().unwrap().insert(
+            crate::export::project_organizer::PROJECT_EXPORT_SENTINEL,
+            crate::services::ExportHandle {
+                cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let err = export_project_for_wbpp(&ctx, "p-1", "/tmp/x", false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+        assert!(
+            ctx.active_exports.lock().unwrap().contains_key(&-1),
+            "the running export's handle is left alone"
+        );
+    }
+
+    /// An output folder inside the Collaboration root or a scan root is refused
+    /// before anything is written (the replica is sacred).
+    #[tokio::test]
+    async fn project_export_refuses_an_output_dir_inside_a_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let landed = tmp.path().join("Collab").join("Alice").join("L_0001.fits");
+        let before = seed_landed_frame(&ctx, &landed);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::upsert_scan_root(
+                &conn,
+                &tmp.path().join("Collab").to_string_lossy(),
+                "collaboration",
+            )
+            .unwrap();
+            crate::db::upsert_scan_root(
+                &conn,
+                &tmp.path().join("lights").to_string_lossy(),
+                "normal",
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("lights")).unwrap();
+        for out in [
+            tmp.path().join("Collab").join("Alice"),
+            tmp.path().join("Collab").join("new"),
+            tmp.path().join("lights"),
+            tmp.path().join("lights").join("exports"),
+        ] {
+            let err = export_project_for_wbpp(&ctx, "p-1", &out.to_string_lossy(), false, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ApiError::Invalid(_)),
+                "{}: {err:?}",
+                out.display()
+            );
+        }
+        assert_eq!(std::fs::read(&landed).unwrap(), before);
+        assert!(
+            !tmp.path().join("Collab").join("new").exists(),
+            "nothing created"
+        );
+        assert!(
+            ctx.active_exports.lock().unwrap().is_empty(),
+            "a refused export leaves no handle behind"
         );
     }
 

@@ -5,6 +5,7 @@ import type { ExportProgressEvent, ExportCompleteEvent, ExportResult, ExportMode
 import type { FlatNormMode, LightCalParams } from '../types/models';
 import type { CalibratedLightFormat } from '../components/export/lightCalPrefs';
 import { useNotifications } from '../contexts/NotificationContext';
+import { exportCountsText } from '../utils/exportCounts';
 
 /** Generation options forwarded to `export_to_wbpp`. In `calibratedLights` mode
  *  the backend calibrates every light from its linked masters as it places it,
@@ -78,6 +79,10 @@ export function useExportProgress() {
                 scriptsGenerated: [],
                 warnings: payload.warnings,
                 error: payload.error,
+                linked: payload.linked,
+                copied: payload.copied,
+                rewritten: payload.rewritten,
+                failed: payload.failed,
               },
               progress: null,
             });
@@ -87,13 +92,14 @@ export function useExportProgress() {
 
         const exportWarnings = payload.warnings?.length ?? 0;
         const exportFailed = !payload.success || !!payload.error;
+        const countsText = payload.frameSetId === -1 ? exportCountsText(payload) : '';
         notify({
           title: exportFailed
             ? 'Export failed'
             : `Export complete — ${payload.filesOrganized} files`,
           detail: payload.error
             ? String(payload.error)
-            : `${payload.outputDir}${exportWarnings ? ` · ${exportWarnings} warning${exportWarnings === 1 ? '' : 's'}` : ''}`,
+            : `${payload.outputDir}${countsText ? ` · ${countsText}` : ''}${exportWarnings ? ` · ${exportWarnings} warning${exportWarnings === 1 ? '' : 's'}` : ''}`,
           kind: 'export',
           hasErrors: exportFailed,
           tone: exportFailed || exportWarnings > 0 ? 'warning' : 'success',

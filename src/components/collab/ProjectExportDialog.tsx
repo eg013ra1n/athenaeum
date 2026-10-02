@@ -3,6 +3,7 @@ import { Folder, FolderOutput, Loader2 } from 'lucide-react';
 import { api, type UnlistenFn } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
+import { exportCountsText } from '../../utils/exportCounts';
 import { FolderBrowserModal } from '../FolderBrowserModal';
 import { Button, DialogShell, TextInput } from '../ui';
 import { Checkbox } from '../settings/Checkbox';
@@ -12,17 +13,13 @@ import type { ExportProgressEvent, ExportResult } from '../../types/export';
  *  same key the existing `cancel_export` command cancels. */
 const PROJECT_EXPORT_SENTINEL = -1;
 
-/** Dialog-local snapshot of the running export. Because each publisher subtree
- *  is organized in its own pass, the emitted percent restarts per publisher
- *  (Д2) — `publisher` is a running subtree counter derived from `current`
- *  resets, shown alongside the bar instead of a fake monotonic total. */
+/** Dialog-local snapshot of the running export (one count across all publishers). */
 interface DialogProgress {
   phase: string; // 'collecting' | 'copying'
   current: number;
   total: number;
   percent: number;
   currentFile: string | null;
-  publisher: number;
 }
 
 /**
@@ -33,7 +30,7 @@ interface DialogProgress {
  * Progress is dialog-local: the project export never registers with the global
  * export indicator (that hook only tracks its own `export_to_wbpp` starts), so
  * this listens for `export-progress` filtered on the `-1` sentinel and drives a
- * per-publisher bar; the busy state comes from the invoke promise. Cancel reuses
+ * bar; the busy state comes from the invoke promise. Cancel reuses
  * the existing `cancel_export` command with `frameSetId: -1`.
  *
  * Empty-state honesty: no pre-flight readiness check — the dialog always opens,
@@ -79,23 +76,12 @@ export default function ProjectExportDialog({
       .listen<ExportProgressEvent>('export-progress', (payload) => {
         if (cancelled) return;
         if (payload.frameSetId !== PROJECT_EXPORT_SENTINEL) return;
-        setProgress((prev) => {
-          let publisher = prev?.publisher ?? 0;
-          if (payload.phase === 'copying') {
-            // A new publisher subtree starts either from the first copy event or
-            // whenever `current` drops below the previous (it is monotonic within
-            // a single subtree's organize pass).
-            const startedNew = !prev || prev.phase !== 'copying' || payload.current < prev.current;
-            if (startedNew) publisher += 1;
-          }
-          return {
-            phase: payload.phase,
-            current: payload.current,
-            total: payload.total,
-            percent: payload.percent,
-            currentFile: payload.currentFile,
-            publisher,
-          };
+        setProgress({
+          phase: payload.phase,
+          current: payload.current,
+          total: payload.total,
+          percent: payload.percent,
+          currentFile: payload.currentFile,
         });
       })
       .then((fn) => {
@@ -240,13 +226,13 @@ export default function ProjectExportDialog({
           ) : null}
         </div>
 
-        {/* Progress — dialog-local, per publisher (the bar restarts each subtree). */}
+        {/* Progress — dialog-local, one count across all publishers. */}
         {busy && (
           <div className="mt-4 space-y-1.5">
             <div className="flex items-center justify-between">
               <span>
                 {progress?.phase === 'copying'
-                  ? `Copying — publisher ${progress.publisher} · file ${progress.current} of ${progress.total}`
+                  ? `Copying — file ${progress.current} of ${progress.total}`
                   : 'Collecting files…'}
               </span>
               {progress?.phase === 'copying' && <span>{Math.round(barPercent)}%</span>}
@@ -272,6 +258,9 @@ export default function ProjectExportDialog({
               Export complete — {result.filesOrganized}{' '}
               {result.filesOrganized === 1 ? 'file' : 'files'} organized
             </p>
+            {exportCountsText(result) && (
+              <p className="mt-0.5 text-[11.5px] text-content-faint">{exportCountsText(result)}</p>
+            )}
             <p className="mt-0.5 break-all text-[11.5px] text-content-faint">{result.outputDir}</p>
             {result.warnings.length > 0 && (
               <p className="mt-1 text-[11.5px] text-warning">

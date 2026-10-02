@@ -250,6 +250,10 @@ pub async fn export_to_wbpp(
         scripts_generated: Vec::new(),
         warnings: Vec::new(),
         error: Some(error),
+        linked: 0,
+        copied: 0,
+        rewritten: 0,
+        failed: 0,
     };
 
     let result = match collected {
@@ -359,6 +363,10 @@ pub async fn export_to_wbpp(
                                 scripts_generated: Vec::new(),
                                 warnings: mode_warnings,
                                 error: Some("Export cancelled".to_string()),
+                                linked: 0,
+                                copied: 0,
+                                rewritten: 0,
+                                failed: 0,
                             },
                             Ok(Ok(ExportRunOutcome::Organized(org_result))) => {
                                 let was_cancelled = cancel_flag.load(Ordering::Relaxed);
@@ -372,6 +380,10 @@ pub async fn export_to_wbpp(
                                         scripts_generated: Vec::new(),
                                         warnings,
                                         error: Some("Export cancelled".to_string()),
+                                        linked: 0,
+                                        copied: 0,
+                                        rewritten: 0,
+                                        failed: 0,
                                     }
                                 } else {
                                     ExportResult {
@@ -381,6 +393,10 @@ pub async fn export_to_wbpp(
                                         scripts_generated: Vec::new(),
                                         warnings,
                                         error: None,
+                                        linked: 0,
+                                        copied: 0,
+                                        rewritten: 0,
+                                        failed: 0,
                                     }
                                 }
                             }
@@ -418,6 +434,10 @@ fn finish_export(
             warnings: result.warnings.clone(),
             error: result.error.clone(),
             output_dir: result.output_dir.clone(),
+            linked: 0,
+            copied: 0,
+            rewritten: 0,
+            failed: 0,
         },
     );
     Ok(result)

@@ -551,6 +551,16 @@ pub struct ExportCompleteEvent {
     pub warnings: Vec<String>,
     pub error: Option<String>,
     pub output_dir: String,
+    /// Project export only (plan P11): files symlinked / copied as is /
+    /// written as a FILTER-patched copy / failed. `0` for a frame-set export.
+    #[serde(default)]
+    pub linked: i32,
+    #[serde(default)]
+    pub copied: i32,
+    #[serde(default)]
+    pub rewritten: i32,
+    #[serde(default)]
+    pub failed: i32,
 }
 
 // ============================================================================
@@ -636,6 +646,16 @@ pub struct ExportResult {
     pub warnings: Vec<String>,
     /// Error message if failed
     pub error: Option<String>,
+    /// Project export only (plan P11): files symlinked / copied as is /
+    /// written as a FILTER-patched copy / failed. `0` for a frame-set export.
+    #[serde(default)]
+    pub linked: i32,
+    #[serde(default)]
+    pub copied: i32,
+    #[serde(default)]
+    pub rewritten: i32,
+    #[serde(default)]
+    pub failed: i32,
 }
 
 // ============================================================================

@@ -631,6 +631,10 @@ pub async fn export_collab_project(
                     "Export path must be within {}",
                     export_dir.display()
                 )),
+                linked: 0,
+                copied: 0,
+                rewritten: 0,
+                failed: 0,
             }));
         }
     }

@@ -467,7 +467,12 @@ warnings: Array<string>,
 /**
  * Error message if failed
  */
-error: string | null, };
+error: string | null, 
+/**
+ * Project export only (plan P11): files symlinked / copied as is /
+ * written as a FILTER-patched copy / failed. `0` for a frame-set export.
+ */
+linked: number, copied: number, rewritten: number, failed: number, };
 
 export type ExportSummary = { 
 /**
@@ -775,7 +780,12 @@ total: number, percent: number, currentFile: string | null,
  */
 phase: string, };
 
-export type ExportCompleteEvent = { frameSetId: number, success: boolean, filesOrganized: number, warnings: Array<string>, error: string | null, outputDir: string, };
+export type ExportCompleteEvent = { frameSetId: number, success: boolean, filesOrganized: number, warnings: Array<string>, error: string | null, outputDir: string, 
+/**
+ * Project export only (plan P11): files symlinked / copied as is /
+ * written as a FILTER-patched copy / failed. `0` for a frame-set export.
+ */
+linked: number, copied: number, rewritten: number, failed: number, };
 
 export type ExportMode = "lightsOnly" | "calibratedLights" | "rawWithMasters" | "rawWithCalibrationSets";
 

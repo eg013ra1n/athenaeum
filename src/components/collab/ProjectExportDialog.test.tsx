@@ -62,4 +62,19 @@ describe('ProjectExportDialog', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalled();
   });
+
+  it('shows the non-zero result counts after a successful export', async () => {
+    vi.mocked(api.invoke).mockImplementation(((cmd: string) =>
+      cmd === 'export_collab_project'
+        ? Promise.resolve({
+            success: true, filesOrganized: 3, linked: 1, copied: 0, rewritten: 2, failed: 0,
+            outputDir: '/o', warnings: [], scriptsGenerated: [], error: null,
+          })
+        : Promise.resolve(null)) as never);
+    render(<ProjectExportDialog projectId="p" onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /Browse/ }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Export$/ })).not.toBeDisabled());
+    fireEvent.click(screen.getByRole('button', { name: /Export$/ }));
+    expect(await screen.findByText('1 linked · 2 with FILTER rewritten')).toBeInTheDocument();
+  });
 });
