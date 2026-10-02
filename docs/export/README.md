@@ -14,12 +14,12 @@ This is the whole of the *frame-set* export. There is no script generator, no CL
 runner, no execution-mode selector, and no template-token engine (`{OBJECT}`,
 `{FRAME_FOLDER}`, `:slug`, etc. do not exist in this module — see "What this doc
 replaces" below). A second, project-scoped entry point (collab) reuses the same
-organizer over a different collector — see "Project-scoped export (collab)" below.
+organizer idea over a different collector — see "Project-scoped export (collab)" below.
 
 Module: `crates/athenaeum-core/src/export/` — `models.rs`, `data_collector.rs`,
-`file_organizer.rs`, and `project_collector.rs` (re-exported by `mod.rs`). The
-first three are the frame-set path described here; `project_collector.rs` feeds
-the collab project export.
+`file_organizer.rs`, and `project_collector.rs` + `project_organizer.rs` +
+`filter_header.rs` (re-exported by `mod.rs`). The first three are the frame-set path
+described here; the last three are the collab project export.
 
 ## What this doc replaces
 
@@ -288,41 +288,79 @@ drives them.
 ## Project-scoped export (collab)
 
 A second entry point exports a *collaboration project* instead of a single frame
-set. It reuses `organize_files_wbpp` untouched but swaps the collector:
-`collect_project_export_data` (`project_collector.rs`) gathers the project's
+set. It no longer goes through `organize_files_wbpp`: the collector
+(`collect_project_export_data`, `project_collector.rs`) gathers the project's
 **received contributions ∪ this device's own calibrated outputs** — the frames the
-project actually holds on disk, not a catalog frame set — and buckets them by
-publisher (Д2).
+project actually holds on disk — as `ProjectExportFrame`s carrying the canonical
+filter, bucketed by publisher, and `organize_project_export`
+(`export/project_organizer.rs`) places them. Spec
+`docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §10.
 
 - **Runner:** `export_project_for_wbpp` (`api/collab_exchange.rs`), wrapped by the
   `export_collab_project` command (Tauri `commands/collab.rs` + Axum
-  `routes/collab.rs`, the web mirror validating `output_dir` is within the
-  configured export dir like `export_to_wbpp`). UI: an "Export for WBPP" button on
-  a project's **Receive** tab opening `ProjectExportDialog.tsx`.
-- **Tree shape** — one subtree per publisher under the sanitized project title:
-
-  ```
-  <output_dir>/
-  └── <project title, sanitized>/
-      └── <publisher display, sanitized>/     # one per contributor (own = your display)
-          └── camera_<instrume, sanitized>/
-              └── lights/                      # calibrated light frames
-  ```
-
-  Each publisher subtree is a separate `organize_files_wbpp` call whose dataset
-  `frame_set_name` is that publisher's display name.
-- **No calibration folders (calibration-off by design).** Project contributions are
-  already-calibrated lights, so per-publisher datasets carry no linked calibration
-  sets — there are no `BIAS_*` / `DARKS_*` / `FLAT_*` levels, only `lights/`. WBPP
-  runs with its own calibration step disabled.
-- **Events / cancel:** rides the standard `export-progress` / `export-complete`
-  events with the Д3 sentinel `frame_set_id = -1`, and registers its cancel flag
-  under that key — so the existing `cancel_export` command
-  (`api.invoke('cancel_export', { frameSetId: -1 })`) cancels a running project
-  export. Because each publisher is organized in its own pass, the emitted percent
-  **restarts per publisher**; the dialog shows a per-publisher counter alongside
-  the bar rather than one monotonic total. An empty project surfaces the
-  collector's "nothing to export" error inline (no separate pre-flight check).
+  `routes/collab.rs`). UI: "Export for WBPP" on a project's **Receive** tab opening
+  `ProjectExportDialog.tsx`; the dialog lists the result's warnings (first 20 plus
+  "and N more") and the completion notification carries the four counts and the
+  first 3 warnings.
+- **Layout:** `<output_dir>/<project title>/<publisher>/camera_<instrume>/<canonical filter>/<file>`
+  (every segment sanitized; an empty INSTRUME or filter is `unknown`). WBPP groups by
+  the filter folder, so a filter the coordinator remapped lands in one folder.
+  No calibration folders — project frames are already-calibrated lights.
+- **The FILTER rule (W4):** a file's own `FILTER` card is compared with the frame's
+  canonical filter — exact, case-sensitive, after trimming; an absent card differs
+  (`export::filter_header::needs_rewrite`). Equal: the file is exported as it is.
+  Different: it is exported as a **patched copy** whose `FILTER` is the canonical
+  name with the comment `/ was '<raw>'` (`/ was unset` when the card was absent;
+  the comment is shortened, never the value, to fit 80 columns). The same copy sets
+  `ATH_FILT` to the canonical name **only when the file already has it** (never
+  inserted), and a FITS `CHECKSUM` card is dropped (`DATASUM` stays valid because
+  the data is streamed verbatim). In an XISF copy the `FILTER` and `ATH_FILT`
+  keywords get the same treatment and an existing `Instrument:Filter:Name`
+  property is rewritten (never inserted).
+- **Patchers:** `fits_writer::header_patch` (replace or insert cards, multi-HDU,
+  data blocks copied verbatim, tmp + fsync + rename) and `fits_writer::xisf_patch`
+  (splices the XML keywords and shifts every attachment offset when the header
+  grows). The source is only ever opened for reading; `src == dest` is refused. A
+  distributed XISF (`path(…)`/`url(…)` data locations) and an unparseable
+  attachment location are refused — that frame counts as failed, with a warning.
+- **Symlink mode:** a file that needs no rewrite becomes a symlink to the replica;
+  a rewrite is a real copy (a link cannot carry a patched header). So in symlink
+  mode only the rewritten frames are files.
+- **Re-export:** into the same folder an existing destination is **kept** only when
+  the previous export record maps THIS frame uuid to THIS path AND the destination's
+  current size + mtime still match the recorded identity (plus the published size
+  and, for a rewrite, the destination's FILTER and a source-mtime check);
+  otherwise it is **replaced** through a temp file + rename. A copy never writes
+  through a link: an old symlink at the destination is removed first, so the
+  replica is never modified. Every as-is copy is stamped with its own placement
+  time (so a recorded identity is never the source's), a destination that resolves
+  to its own source is refused, and read-only sources export fine in copy mode.
+- **Export record:** `<title>/.athenaeum-export.json` — `{version, projectId, frames:
+  {<frame uuid>: {path, size, mtimeNs}}}` of the file actually placed. A re-export
+  names the files of the previous export that are no longer placed (a remapped
+  filter moves a frame to another folder) in ONE warning (first 20 listed) and
+  **never deletes them**. A frame that failed keeps its previous record entry (it
+  is not reported stale); a cancelled run keeps the previous entries of frames not
+  reached. An unreadable record is a warning and is treated as empty.
+- **Output-root guard:** an output whose `<output>/<sanitized title>` folder is
+  inside, equal to, or contains a scan root or the Collaboration root (both
+  canonicalized, case and symlinks resolved) is refused, as is a path with `.` or
+  `..` components, so an export can never overwrite catalogued files. The web
+  mirror also validates `output_dir` against the configured export dir.
+- **One at a time:** the cancel flag is registered under the sentinel
+  `frame_set_id = -1`; a second project export is refused with `Conflict`
+  ("Another project export is running."). The slot is an RAII guard, freed on
+  success, error, panic, or when the request future is dropped (it also raises the
+  cancel flag so an orphaned organizer stops at its next frame).
+- **Counts:** `ExportResult` / `ExportCompleteEvent` carry `linked`, `copied`,
+  `rewritten`, `failed` beside `filesOrganized` (= linked + copied + rewritten). A
+  per-frame failure is a warning and the batch goes on; `success` is false only for
+  a cancel (`error = "Export cancelled"`).
+- **Events / cancel:** standard `export-progress` (phase `"collecting"` then
+  `"copying"`, throttled to 100 ms; the percent is one monotonic run over all
+  publishers) / `export-complete` with the sentinel `frame_set_id = -1`, so
+  `api.invoke('cancel_export', { frameSetId: -1 })` cancels a running project
+  export. Cancel stops between frames.
 
 ## Commands
 
@@ -400,6 +438,9 @@ and `export-complete` (`ExportCompleteEvent`, final outcome). `useExportProgress
 | `crates/athenaeum-core/src/export/models.rs` | All export data structures, incl. `WbppExportConfig` |
 | `crates/athenaeum-core/src/export/data_collector.rs` | Reads the catalog + existing calibration links, builds `ExportData`/`ExportSummary` |
 | `crates/athenaeum-core/src/export/file_organizer.rs` | Builds the folder tree, copies or symlinks files, emits progress |
+| `crates/athenaeum-core/src/export/project_organizer.rs` | Collab project export: layout, mixed symlink/copy, export record |
+| `crates/athenaeum-core/src/export/filter_header.rs` | The project FILTER rule and the patched copy |
+| `crates/athenaeum-core/src/fits_writer/{header_patch,xisf_patch}.rs` | Header patchers for a copy (FITS, XISF) |
 | `crates/athenaeum-tauri/src/commands/export.rs` | Tauri commands (desktop) |
 | `crates/athenaeum-web/src/routes/export.rs` | Axum routes (web/Docker), same surface + `get_export_dir` |
 | `src/components/export/ExportTab.tsx` | The live export UI |

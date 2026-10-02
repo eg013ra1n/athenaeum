@@ -151,12 +151,6 @@ deterministically, at each frame boundary through a test-only hook, and runs on
 CI again; the yield's fairness effect has no deterministic test and is what
 this question is about.
 
-**The collab-contribution path fix (`sync/project_ingest.rs`) has no
-regression test of its own**, unlike its sibling fix in `sync/ingest.rs`
-(`ingest_stores_native_path_matching_landed_file`). Deliberate for this fix —
-the mechanism is identical and already covered on the sibling path — but it is
-a real coverage gap on `project_ingest.rs` specifically.
-
 **The CI job needed `--no-fail-fast`**; without it the job measured one crate
 and reported on nine, and would have gone green while 228 failures sat
 unexecuted. `cargo test` is fail-fast across test binaries, so `cargo test
@@ -257,6 +251,32 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
+
+### Collab wave 6a — owner smoke (2026-10-02)
+
+Project export (FILTER-patched copies, mixed symlink/copy, export record), the coordinator filter
+remap, the attested pass-through and feed coalescing are code-complete with green gates. Spec
+`docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` (§10, §11, §13),
+plan `.superpowers/sdd/2026-10-02-collab-v3-wave6a-export-remap-plan/`. Reference: `docs/export/README.md`
+(Project-scoped export), `docs/transfers/README.md` (wave 6a). Owed, on real data:
+
+- Export a project with a remapped filter in copy mode. WBPP groups the frames by the canonical FILTER.
+- The same export in symlink mode: only the rewritten frames are files; the rest are links to the replica.
+- Remap a filter, then re-export into the same folder. The old copy is named in the stale warning and left
+  on disk (never deleted); the record `.athenaeum-export.json` lists the new path.
+- Export an XISF attested frame with a different raw FILTER. The copy opens in the app and in a second
+  XISF reader, and its FILTER is canonical.
+- Remap in Moderation → Filters as the coordinator, and as a member who holds only `thresholds.edit`.
+  A member without it sees the control disabled (and a stopped run names `thresholds.edit`).
+- Cancel a remap mid-way: the finished line reads cancelled, the frames already sent stay remapped.
+- An attested set in the export tab's Calibrated lights mode: no masters asked for, original file names,
+  no compute slot taken (the sidebar queue stays empty).
+- Real-window (Tauri/WebKit) check of the Moderation → Filters section: row height and typography against
+  the review table. The plan's harness step was not run by an agent.
+- Remap a member's published frames and watch it on the member's device: ONE coalesced history entry
+  ("N of your frames remapped in <project>"), not N.
+- Windows: the project export without symlinks (a copy-mode export: the placement-time stamp clears the
+  readonly attribute and sets the mtime through a write handle, exercised only on macOS so far); a remap.
 
 ### Collab project page — wave 5.5 pixel pass (2026-10-01)
 
@@ -1733,11 +1753,6 @@ Spec `docs/superpowers/specs/2026-08-30-transfer-prepare-and-footprint-design.md
   the backend re-validates it (`create_dir_all` + write probe). An unreachable
   working folder therefore blocks an outgoing-only change — with an honest
   message, on the right card.
-- `fetch_collection_multi`'s Copy-export loop has no stale-target guard (Task 7
-  deferred it): a swarm retry into the same staging path could hit the self-copy
-  truncation if a collab package ever shares a hash with a push-path package now
-  referenced in place. The guard is `export_child`'s — delete the complete staged
-  children on every retry.
 - An `announced` row's bar sits at the 0.95 cap it inherited from the final
   indexing byte count; speed and ETA are correctly suppressed there.
 - `cleanup_finished_transfers` (Settings → Transfers → Clean up) removes terminal
