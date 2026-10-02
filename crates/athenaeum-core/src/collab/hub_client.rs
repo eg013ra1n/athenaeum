@@ -710,6 +710,32 @@ impl CollabClient {
         Err(classify(status, resp, "set frame acceptance").await)
     }
 
+    /// `PATCH /projects/{id}/frames/{uuid}` with `filterCanonical` — the
+    /// coordinator's filter remap (requires `thresholds.edit`; the canonical
+    /// name must be in the project dictionary). A manifest edit, never a
+    /// re-transfer. Accepts 200 or 204.
+    pub async fn patch_frame_filter(
+        &self,
+        token: &str,
+        project_id: &str,
+        frame_uuid: &str,
+        canonical: &str,
+    ) -> Result<(), AccountClientError> {
+        let resp = self
+            .http
+            .patch(self.url(&format!("/projects/{project_id}/frames/{frame_uuid}")))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "filterCanonical": canonical }))
+            .send()
+            .await
+            .map_err(net)?;
+        let status = resp.status();
+        if status == StatusCode::OK || status == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        Err(classify(status, resp, "remap frame filter").await)
+    }
+
     /// `GET /projects/{id}/dictionary` — the project's current filter/channel
     /// dictionary (canonical names + aliases the gate and the manifest both
     /// validate against).

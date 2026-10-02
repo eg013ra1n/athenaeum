@@ -2112,6 +2112,7 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
             approve(st, &acct, pid, uuid, req)
         }
         ("POST", ["projects", pid, "frames", uuid, "reject"]) => reject(st, &acct, pid, uuid, req),
+        ("PATCH", ["projects", pid, "frames", uuid]) => patch_frame(st, &acct, pid, uuid, req),
         ("GET", ["projects", pid, "holders", "snapshot"]) => holders_snapshot(st, &acct, pid),
         ("GET", ["projects", pid, "holders"]) => holders_since(st, &acct, pid, req),
         ("PUT", ["projects", pid, "holders", "self"]) => report_holders(st, &acct, pid, req),
@@ -3057,6 +3058,81 @@ fn reject(
     ok(json!({ "state": "rejected" }))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FramePatch {
+    accepted: Option<bool>,
+    accepted_reason: Option<String>,
+    filter_canonical: Option<String>,
+}
+
+/// Mirrors the hub's `patch_frame`, in its check order: body shape (400),
+/// membership and caps (403: `accepted` needs `data.moderate`,
+/// `filterCanonical` needs `thresholds.edit`), frame lookup (404), then the
+/// dictionary (400). One bump and one `frames` event per PATCH.
+fn patch_frame(
+    st: &mut FakeHubState,
+    acct: &FakeAccount,
+    pid: &str,
+    uuid: &str,
+    req: &Request,
+) -> ResponseTemplate {
+    let body: FramePatch = match req.body_json() {
+        Ok(b) => b,
+        Err(e) => return error(422, format!("bad patch body: {e}")),
+    };
+    if body.accepted.is_none() && body.filter_canonical.is_none() {
+        return error(400, "accepted or filterCanonical is required");
+    }
+    let reason = body
+        .accepted_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if body.accepted == Some(false) && reason.as_ref().is_none_or(|r| r.chars().count() > 500) {
+        return error(
+            400,
+            "acceptedReason (1..=500 chars) is required when excluding a frame",
+        );
+    }
+    let Some(p) = st.projects.get_mut(pid) else {
+        return not_found_project();
+    };
+    let Some(member) = p.member(&acct.account_id).cloned() else {
+        return empty(403);
+    };
+    if (body.accepted.is_some() && !member.has_cap("data.moderate"))
+        || (body.filter_canonical.is_some() && !member.has_cap("thresholds.edit"))
+    {
+        return empty(403);
+    }
+    if !p.frames.contains_key(uuid) {
+        return error(404, "frame not found");
+    }
+    if let Some(f) = &body.filter_canonical {
+        if !p.dictionary.iter().any(|d| &d.canonical == f) {
+            return error(
+                400,
+                format!("filter {f:?} is not in the project dictionary"),
+            );
+        }
+    }
+    let prev = p.version;
+    let version = p.bump();
+    let frame = p.frames.get_mut(uuid).expect("checked above");
+    frame.manifest_version = version;
+    if let Some(f) = body.filter_canonical {
+        frame.filter_canonical = f;
+    }
+    if let Some(a) = body.accepted {
+        frame.accepted = a;
+        frame.accepted_reason = if a { None } else { reason };
+    }
+    st.publish_bump(pid, prev, &["frames"], &[uuid.to_string()]);
+    empty(204)
+}
+
 /// One run-length-encoded claim triple `[startSeq, runLength, contentVersion]`
 /// (hub § "Run-length claims").
 fn run_length_encode(rows: &[(i32, i32)]) -> Vec<[i32; 3]> {
@@ -3517,6 +3593,56 @@ mod tests {
     use crate::collab::hub_client::CollabClient;
     use crate::collab::live::digest::ClaimDigest;
     use crate::collab::live::wire::{BeatWire, ClaimWire, HoldersReportWire};
+
+    #[tokio::test]
+    async fn patch_remaps_a_frame_and_enforces_caps_and_the_dictionary() {
+        use crate::account::AccountClientError as E;
+        let hub = FakeHub::start().await;
+        hub.add_account("tok-c", "acc-c", "Coord", &B64.encode([1u8; 32]), None);
+        hub.add_account("tok-m", "acc-m", "Member", &B64.encode([2u8; 32]), None);
+        hub.add_project(
+            "p1",
+            "m31",
+            &[
+                ("acc-c", "send_receive", true),
+                ("acc-m", "send_receive", false),
+            ],
+            false,
+        );
+        hub.seed_frames("p1", "acc-m", &["u1"], "published");
+        let client = CollabClient::new(&hub.uri()).unwrap();
+        let v0 = hub.version("p1");
+        client
+            .patch_frame_filter("tok-c", "p1", "u1", "R")
+            .await
+            .unwrap();
+        assert_eq!(hub.frame("p1", "u1").unwrap().filter_canonical, "R");
+        assert_eq!(hub.version("p1"), v0 + 1, "one bump per PATCH");
+        assert!(matches!(
+            client.patch_frame_filter("tok-m", "p1", "u1", "G").await,
+            Err(E::Forbidden)
+        ));
+        assert!(matches!(
+            client
+                .patch_frame_filter("tok-c", "p1", "u1", "NotInDict")
+                .await,
+            Err(E::Http { status: 400, .. })
+        ));
+        assert!(matches!(
+            client.patch_frame_filter("tok-c", "p1", "nope", "R").await,
+            Err(E::Http { status: 404, .. })
+        ));
+        // The hub's order: an unknown frame with an unknown canonical is 404
+        // (frame lookup precedes the dictionary check), never 400.
+        assert!(matches!(
+            client
+                .patch_frame_filter("tok-c", "p1", "nope", "NotInDict")
+                .await,
+            Err(E::Http { status: 404, .. })
+        ));
+        // A refused PATCH never bumps.
+        assert_eq!(hub.version("p1"), v0 + 1);
+    }
 
     async fn hub_with_member() -> FakeHub {
         let hub = FakeHub::start().await;
