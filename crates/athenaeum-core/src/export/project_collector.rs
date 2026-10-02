@@ -1,18 +1,19 @@
 //! Project-scoped WBPP export collector (collab v3 wave 2, plan P26 / spec
-//! amendment A1): every project frame this device holds — the frames I
-//! published (`own`) and the replicas I pulled (`replica`) — read from
-//! `project_frames_local`, one [`ExportData`] per publisher, so the WBPP
-//! organizer can lay a per-publisher folder tree under a single
-//! project-titled root. The WBPP hierarchy itself is unchanged in this wave.
+//! amendment A1): every project frame this device holds, the frames I
+//! published (`own`) and the replicas I pulled (`replica`), read from
+//! `project_frames_local` and partitioned per publisher, so the organizer can
+//! lay a per-publisher folder tree under a single project-titled root.
+//! Wave 6 (spec section 10.1): the filter is the row's canonical (remaps
+//! included), never `filterRaw`.
 //!
 //! The path of a project frame comes ONLY from its row's `landed_path` (an
-//! own frame may live outside the Collaboration root), and its metadata only
-//! from the row's manifest JSON — never a header card, never the folder
-//! layout. Pure catalog/db read — no hub I/O — so it lives in the ungated
+//! own frame may live outside the Collaboration root), and its camera only
+//! from the row's manifest JSON, never a header card, never the folder
+//! layout. Pure catalog/db read, no hub I/O, so it lives in the ungated
 //! `export` module and compiles in the headless (`--no-default-features`)
 //! build.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
@@ -20,43 +21,47 @@ use rusqlite::Connection;
 
 use crate::db::collab::get_project;
 use crate::db::collab_frames::{list_for_project, FrameOrigin, LocalFrameRow};
-use crate::export::models::{
-    CalibrationSubgroup, CalibrationSummary, CameraType, ExportData, ExportFrame, ExportGroup,
-    MasterCreationPlan,
-};
 
-/// One [`ExportData`] per publisher: my own frames under `own_display`, then
-/// each replica publisher under its display name.
+/// One exportable project frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectExportFrame {
+    pub frame_uuid: String,
+    pub landed_path: String,
+    /// The landed file's basename (the export keeps it).
+    pub file_name: String,
+    pub instrume: Option<String>,
+    /// The canonical filter (`project_frames_local.filter_canonical`).
+    pub filter: String,
+    /// The hub's byte size of the current content version.
+    pub byte_size: i64,
+}
+
+/// A project's exportable frames, per publisher.
 ///
-/// BINDING for the runner and command layers — do not change the shape
-/// without updating them.
+/// BINDING for the runner and organizer: do not change the shape without
+/// updating them.
 #[derive(Debug, Clone)]
 pub struct ProjectExportData {
-    /// The project title → the export root folder.
+    /// The project title, the export root folder.
     pub title: String,
-    /// `(publisher display → folder, dataset)`, own first, then replica
-    /// publishers in first-seen order.
-    pub publishers: Vec<(String, ExportData)>,
-    /// Human-readable, one-per-skip notes for frames the collector dropped (a
-    /// row whose manifest JSON is unreadable). The runner prepends these to
-    /// the organizer warnings so `ExportResult.warnings` — and thus the export
-    /// dialog — names the omitted frames instead of silently reporting a
-    /// smaller file count.
+    /// `(publisher display, frames)`, own first, then replica publishers in
+    /// first-seen order.
+    pub publishers: Vec<(String, Vec<ProjectExportFrame>)>,
+    /// One note per frame the collector dropped (a row whose manifest JSON is
+    /// unreadable), so the export dialog names the omission.
     pub warnings: Vec<String>,
 }
 
 /// Collect a project's exportable frames: every `project_frames_local` row
 /// that is published, accepted, on disk and not awaiting GC (R31), own and
-/// replica alike, at its `landed_path` (P26), partitioned into one dataset
-/// per publisher display.
+/// replica alike, at its `landed_path` (P26), partitioned by publisher display.
 ///
-/// `own_display` is resolved by the runner from the cached membership
-/// snapshot; it is the folder/dataset key for my own frames. A replica
-/// publisher whose display equals it merges into the same dataset.
+/// `own_display` is the bucket key for my own frames; a replica publisher
+/// whose display equals it merges into the same bucket.
 ///
-/// Errors: the project row must be in the local cache (`get_project`) —
-/// missing ⇒ "project not in the local cache"; no exportable frame ⇒
-/// "nothing to export for this project".
+/// Errors: the project row must be in the local cache (`get_project`), else
+/// "project not in the local cache"; no exportable frame gives "nothing to
+/// export for this project".
 pub fn collect_project_export_data(
     conn: &Connection,
     project_id: &str,
@@ -64,21 +69,15 @@ pub fn collect_project_export_data(
 ) -> Result<ProjectExportData> {
     let project =
         get_project(conn, project_id)?.ok_or_else(|| anyhow!("project not in the local cache"))?;
-    let title = project.title;
-    let object_name = project.target_name;
-
     let mut rows: Vec<LocalFrameRow> = list_for_project(conn, project_id)?
         .into_iter()
         .filter(exportable)
         .collect();
     // Own first (stable: the table's order within each origin is kept).
     rows.sort_by_key(|r| r.origin != FrameOrigin::Own);
-
-    // display name → its frames, insertion-ordered.
     let mut order: Vec<String> = Vec::new();
-    let mut by_display: HashMap<String, Vec<ExportFrame>> = HashMap::new();
-    let mut warnings: Vec<String> = Vec::new();
-
+    let mut by_display: HashMap<String, Vec<ProjectExportFrame>> = HashMap::new();
+    let mut warnings = Vec::new();
     for row in rows {
         let display = match row.origin {
             FrameOrigin::Own => own_display.to_string(),
@@ -101,24 +100,33 @@ pub fn collect_project_export_data(
             }
         };
         let landed = row.landed_path.clone().unwrap_or_default();
-        add_frame(
-            &mut order,
-            &mut by_display,
-            &display,
-            export_frame(&landed, &manifest),
-        );
+        let meta = manifest
+            .get("meta")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let frame = ProjectExportFrame {
+            frame_uuid: row.frame_uuid.clone(),
+            file_name: basename(&landed),
+            landed_path: landed,
+            instrume: meta_str(&meta, "instrume"),
+            filter: row.filter_canonical.clone(),
+            byte_size: row.byte_size,
+        };
+        if !by_display.contains_key(&display) {
+            order.push(display.clone());
+        }
+        by_display.entry(display).or_default().push(frame);
     }
-
     if order.is_empty() {
         return Err(anyhow!("nothing to export for this project"));
     }
-
-    let mut publishers = Vec::with_capacity(order.len());
-    for display in order {
-        let frames = by_display.remove(&display).unwrap_or_default();
-        let data = build_dataset(&display, &object_name, frames);
-        publishers.push((display, data));
-    }
+    let publishers: Vec<(String, Vec<ProjectExportFrame>)> = order
+        .into_iter()
+        .map(|d| {
+            let frames = by_display.remove(&d).unwrap_or_default();
+            (d, frames)
+        })
+        .collect();
     tracing::info!(
         project_id,
         publishers = publishers.len(),
@@ -126,7 +134,7 @@ pub fn collect_project_export_data(
         "collected project export data"
     );
     Ok(ProjectExportData {
-        title,
+        title: project.title,
         publishers,
         warnings,
     })
@@ -139,147 +147,6 @@ fn exportable(r: &LocalFrameRow) -> bool {
     r.state == "published" && r.accepted && r.on_disk && !r.awaiting_gc && r.landed_path.is_some()
 }
 
-/// One [`ExportFrame`] for a project frame: the file at `landed`, its
-/// metadata from the manifest row (top-level `filterRaw`/`exptimeSec`/
-/// `dateObs`, the rest from `meta`). Project frames carry no catalog ids.
-fn export_frame(landed: &str, manifest: &serde_json::Value) -> ExportFrame {
-    let meta = manifest
-        .get("meta")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let filter = meta_str(manifest, "filterRaw")
-        .filter(|f| !f.is_empty())
-        .or_else(|| meta_str(manifest, "filterCanonical").filter(|f| !f.is_empty()));
-    ExportFrame {
-        frame_id: -1,
-        file_id: -1,
-        file_path: landed.to_string(),
-        filename: basename(landed),
-        exptime: meta_f64(manifest, "exptimeSec"),
-        filter,
-        ccd_temp: None,
-        gain: None,
-        offset: None,
-        binning: meta
-            .get("xbinning")
-            .and_then(|b| b.as_i64())
-            .map(|b| format!("{b}x{b}")),
-        date_obs: meta_str(manifest, "dateObs"),
-        focallen: meta_f64(&meta, "focalLen"),
-        xpixsz: None,
-        bayerpat: meta_str(&meta, "bayerpat"),
-        instrume: meta_str(&meta, "instrume"),
-        debayer_calibrated: None,
-    }
-}
-
-/// Append `ef` to the bucket for `display`, registering the display's insertion
-/// order on first use.
-fn add_frame(
-    order: &mut Vec<String>,
-    by_display: &mut HashMap<String, Vec<ExportFrame>>,
-    display: &str,
-    ef: ExportFrame,
-) {
-    if !by_display.contains_key(display) {
-        order.push(display.to_string());
-        by_display.insert(display.to_string(), Vec::new());
-    }
-    by_display
-        .get_mut(display)
-        .expect("bucket just inserted")
-        .push(ef);
-}
-
-/// Build one publisher dataset: group by `(filter, camera_type)`, one subgroup
-/// per `instrume` within each group (so the organizer lays a `camera_<instrume>`
-/// folder per camera). Subgroups carry no calibration nodes.
-fn build_dataset(display: &str, object_name: &str, frames: Vec<ExportFrame>) -> ExportData {
-    // group_key → (filter, camera_type, frames). BTreeMap for deterministic order.
-    let mut groups_map: BTreeMap<String, (Option<String>, CameraType, Vec<ExportFrame>)> =
-        BTreeMap::new();
-    for f in frames {
-        let camera = CameraType::from_bayerpat(f.bayerpat.as_deref());
-        let key = ExportGroup::make_group_key(f.filter.as_deref(), &camera);
-        groups_map
-            .entry(key)
-            .or_insert_with(|| (f.filter.clone(), camera.clone(), Vec::new()))
-            .2
-            .push(f);
-    }
-
-    let mut groups = Vec::with_capacity(groups_map.len());
-    let mut total_light_frames = 0i32;
-    let mut total_exposure_seconds = 0f64;
-
-    for (group_key, (filter, camera, gframes)) in groups_map {
-        // One subgroup per instrume (deterministic order via BTreeMap; "" key =
-        // no instrume → "unknown" camera folder derived by the organizer).
-        let mut sub_map: BTreeMap<String, Vec<ExportFrame>> = BTreeMap::new();
-        for f in gframes {
-            let inst = f.instrume.clone().unwrap_or_default();
-            sub_map.entry(inst).or_default().push(f);
-        }
-
-        let display_name = ExportGroup::make_display_name(filter.as_deref(), &camera);
-        let mut subgroups = Vec::with_capacity(sub_map.len());
-        let mut group_frames = 0i32;
-        let mut group_exposure = 0f64;
-
-        for (inst, sframes) in sub_map {
-            group_frames += sframes.len() as i32;
-            group_exposure += sframes.iter().filter_map(|f| f.exptime).sum::<f64>();
-            subgroups.push(CalibrationSubgroup {
-                subgroup_key: format!("{group_key}__{inst}"),
-                display_name: if inst.is_empty() {
-                    "Default".to_string()
-                } else {
-                    inst
-                },
-                frames: sframes,
-                flat: None,
-                dark: None,
-                bias: None,
-                warnings: Vec::new(),
-            });
-        }
-
-        total_light_frames += group_frames;
-        total_exposure_seconds += group_exposure;
-        groups.push(ExportGroup {
-            group_key,
-            filter,
-            camera_type: camera,
-            display_name,
-            subgroups,
-            total_frames: group_frames,
-            total_exposure: group_exposure,
-            warnings: Vec::new(),
-        });
-    }
-
-    ExportData {
-        frame_set_id: -1,
-        frame_set_name: display.to_string(),
-        object_name: Some(object_name.to_string()),
-        groups,
-        master_plan: MasterCreationPlan::default(),
-        filters: Vec::new(),
-        calibration_summary: CalibrationSummary {
-            flat_count: 0,
-            dark_count: 0,
-            bias_count: 0,
-            dark_flat_count: 0,
-            flats_complete: false,
-            darks_complete: false,
-            bias_complete: false,
-            warnings: Vec::new(),
-        },
-        total_light_frames,
-        total_exposure_seconds,
-    }
-}
-
 /// The trailing path component of `path`, or the whole string when it has none.
 fn basename(path: &str) -> String {
     Path::new(path)
@@ -288,12 +155,7 @@ fn basename(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Read a JSON number field as `f64` (absent / non-numeric ⇒ `None`).
-fn meta_f64(v: &serde_json::Value, key: &str) -> Option<f64> {
-    v.get(key).and_then(|x| x.as_f64())
-}
-
-/// Read a JSON string field (absent / non-string ⇒ `None`).
+/// Read a JSON string field (absent / non-string gives `None`).
 fn meta_str(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(str::to_string)
 }
@@ -363,6 +225,7 @@ mod tests {
         publisher: &str,
         landed: Option<&str>,
         manifest: serde_json::Value,
+        filter_canonical: &str,
     ) -> LocalFrameRow {
         let row = LocalFrameRow {
             project_id: project_id.into(),
@@ -372,7 +235,7 @@ mod tests {
             publisher_account_id: format!("acc-{publisher}"),
             publisher_display: publisher.into(),
             file_name: format!("{uuid}.fits"),
-            filter_canonical: "L".into(),
+            filter_canonical: filter_canonical.into(),
             state: "published".into(),
             accepted: true,
             byte_size: 1,
@@ -409,32 +272,18 @@ mod tests {
         })
     }
 
-    fn find<'a>(data: &'a ProjectExportData, display: &str) -> &'a ExportData {
-        &data
-            .publishers
+    fn find<'a>(d: &'a ProjectExportData, display: &str) -> &'a [ProjectExportFrame] {
+        &d.publishers
             .iter()
-            .find(|(d, _)| d == display)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no dataset for {display}; have {:?}",
-                    data.publishers.iter().map(|(d, _)| d).collect::<Vec<_>>()
-                )
-            })
+            .find(|(p, _)| p == display)
+            .expect("publisher present")
             .1
     }
 
-    /// The flat list of every ExportFrame in a dataset (across groups/subgroups).
-    fn all_frames(d: &ExportData) -> Vec<&ExportFrame> {
-        d.groups
-            .iter()
-            .flat_map(|g| g.subgroups.iter().flat_map(|s| s.frames.iter()))
-            .collect()
-    }
-
-    // Two publishers, same basename → two datasets, filenames unprefixed, the
-    // file path taken from the row's `landed_path` (P26).
+    // Two publishers, same basename → two publisher buckets, file name
+    // unprefixed, the path taken from the row's `landed_path` (P26).
     #[test]
-    fn two_publishers_same_basename_land_in_two_datasets() {
+    fn two_publishers_same_basename_land_in_two_buckets() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = test_conn();
         seed_project(&conn, "p-1");
@@ -450,6 +299,7 @@ mod tests {
             "Alice",
             Some(&a),
             m.clone(),
+            "L",
         );
         mk_frame(
             &conn,
@@ -459,22 +309,21 @@ mod tests {
             "Bob",
             Some(&b),
             m,
+            "L",
         );
 
         let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
         assert_eq!(data.title, "Proj Title");
-        assert_eq!(data.publishers.len(), 2, "one dataset per publisher");
-        let alice = find(&data, "Alice");
-        assert_eq!(alice.frame_set_name, "Alice");
-        let af = all_frames(alice);
+        assert_eq!(data.publishers.len(), 2, "one bucket per publisher");
+        let af = find(&data, "Alice");
         assert_eq!(af.len(), 1);
-        assert_eq!(af[0].filename, "L_0001.fits");
-        assert_eq!(af[0].file_path, a);
-        assert_eq!(af[0].frame_id, -1, "project frames use sentinel ids");
-        assert_eq!(all_frames(find(&data, "Bob"))[0].file_path, b);
+        assert_eq!(af[0].file_name, "L_0001.fits");
+        assert_eq!(af[0].landed_path, a);
+        assert_eq!(af[0].frame_uuid, "u-a");
+        assert_eq!(find(&data, "Bob")[0].landed_path, b);
     }
 
-    // Own frames export too — under `own_display`, first, from wherever they
+    // Own frames export too, under `own_display`, first, from wherever they
     // live (an own frame may sit outside the Collaboration root, A1).
     #[test]
     fn own_and_replica_frames_are_both_exported() {
@@ -488,6 +337,7 @@ mod tests {
             "Alice",
             Some("/collab/m42/Alice/r1.fits"),
             manifest("L", "CamA"),
+            "L",
         );
         mk_frame(
             &conn,
@@ -497,20 +347,20 @@ mod tests {
             "My Name",
             Some("/elsewhere/originals/o1.fits"),
             manifest("L", "CamMe"),
+            "L",
         );
 
         let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
         let order: Vec<&str> = data.publishers.iter().map(|(d, _)| d.as_str()).collect();
         assert_eq!(order, vec!["Me", "Alice"], "own first, under own_display");
-        let mine = all_frames(find(&data, "Me"));
+        let mine = find(&data, "Me");
         assert_eq!(mine.len(), 1);
-        assert_eq!(mine[0].file_path, "/elsewhere/originals/o1.fits");
+        assert_eq!(mine[0].landed_path, "/elsewhere/originals/o1.fits");
+        assert_eq!(mine[0].instrume.as_deref(), Some("CamMe"));
         assert!(data.warnings.is_empty(), "{:?}", data.warnings);
     }
 
-    // Only published frames on disk AND accepted by the gate export (R31): a
-    // row with no landed path, one not on disk, a gate-rejected one, one
-    // awaiting GC, and an own pending or moderator-rejected frame are skipped.
+    // Only published frames on disk AND accepted by the gate export (R31).
     #[test]
     fn only_published_on_disk_accepted_frames_are_exported() {
         let conn = test_conn();
@@ -524,6 +374,7 @@ mod tests {
             "Alice",
             Some("/c/live.fits"),
             m.clone(),
+            "L",
         );
         mk_frame(
             &conn,
@@ -533,6 +384,7 @@ mod tests {
             "Alice",
             None,
             m.clone(),
+            "L",
         );
         mk_frame(
             &conn,
@@ -542,6 +394,7 @@ mod tests {
             "Alice",
             Some("/c/gone.fits"),
             m.clone(),
+            "L",
         );
         mk_frame(
             &conn,
@@ -551,6 +404,7 @@ mod tests {
             "Alice",
             Some("/c/rej.fits"),
             m,
+            "L",
         );
         conn.execute(
             "UPDATE project_frames_local SET on_disk = 0 WHERE frame_uuid = 'gone'",
@@ -580,6 +434,7 @@ mod tests {
                 "Alice",
                 Some(path),
                 manifest("L", "CamA"),
+                "L",
             );
         }
         conn.execute(
@@ -602,15 +457,17 @@ mod tests {
         assert_eq!(
             data.publishers.len(),
             1,
-            "no own dataset: nothing own is published"
+            "no own bucket: nothing own is published"
         );
-        let frames = all_frames(find(&data, "Alice"));
-        let names: Vec<&str> = frames.iter().map(|f| f.filename.as_str()).collect();
+        let names: Vec<&str> = find(&data, "Alice")
+            .iter()
+            .map(|f| f.file_name.as_str())
+            .collect();
         assert_eq!(names, vec!["live.fits"]);
     }
 
-    // A row whose manifest JSON does not parse is skipped — only that row —
-    // with one warning naming it, so the export dialog reports the omission.
+    // A row whose manifest JSON does not parse is skipped, only that row,
+    // with one warning naming it.
     #[test]
     fn malformed_manifest_row_skips_only_that_row() {
         let conn = test_conn();
@@ -623,6 +480,7 @@ mod tests {
             "Alice",
             Some("/c/good.fits"),
             manifest("L", "CamA"),
+            "L",
         );
         mk_frame(
             &conn,
@@ -632,6 +490,7 @@ mod tests {
             "Alice",
             Some("/c/bad.fits"),
             manifest("L", "CamA"),
+            "L",
         );
         conn.execute(
             "UPDATE project_frames_local SET manifest_json = '{not json' WHERE frame_uuid = 'bad'",
@@ -640,8 +499,10 @@ mod tests {
         .unwrap();
 
         let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
-        let frames = all_frames(find(&data, "Alice"));
-        let names: Vec<&str> = frames.iter().map(|f| f.filename.as_str()).collect();
+        let names: Vec<&str> = find(&data, "Alice")
+            .iter()
+            .map(|f| f.file_name.as_str())
+            .collect();
         assert_eq!(names, vec!["good.fits"]);
         assert_eq!(
             data.warnings,
@@ -649,11 +510,9 @@ mod tests {
         );
     }
 
-    // Frame metadata comes from the manifest row, never a header card: one
-    // publisher with two filters lands in two (filter, camera) groups, and the
-    // numeric/camera fields are read from `meta`.
+    // Camera and size come from the row/manifest, never a header card.
     #[test]
-    fn metadata_comes_from_the_manifest_row() {
+    fn metadata_comes_from_the_row_and_manifest() {
         let conn = test_conn();
         seed_project(&conn, "p-1");
         mk_frame(
@@ -664,9 +523,10 @@ mod tests {
             "Alice",
             Some("/c/l.fits"),
             manifest("L", "CamA"),
+            "L",
         );
-        let mut osc = manifest("R", "CamA");
-        osc["meta"]["bayerpat"] = serde_json::json!("RGGB");
+        let mut m = manifest("R", "CamB");
+        m["meta"]["bayerpat"] = serde_json::json!("RGGB");
         mk_frame(
             &conn,
             "p-1",
@@ -674,25 +534,57 @@ mod tests {
             FrameOrigin::Replica,
             "Alice",
             Some("/c/r.fits"),
-            osc,
+            m,
+            "R",
+        );
+        let mut noinst = manifest("G", "x");
+        noinst["meta"] = serde_json::json!({});
+        mk_frame(
+            &conn,
+            "p-1",
+            "u-n",
+            FrameOrigin::Replica,
+            "Alice",
+            Some("/c/n.fits"),
+            noinst,
+            "G",
         );
 
         let data = collect_project_export_data(&conn, "p-1", "Me").unwrap();
-        let alice = find(&data, "Alice");
-        let mut keys: Vec<_> = alice.groups.iter().map(|g| g.group_key.clone()).collect();
-        keys.sort();
-        assert_eq!(keys, vec!["L_Mono".to_string(), "R_OSC".to_string()]);
-        let l = all_frames(alice)
-            .into_iter()
-            .find(|f| f.filename == "l.fits")
-            .unwrap();
-        assert_eq!(l.exptime, Some(300.0));
-        assert_eq!(l.filter.as_deref(), Some("L"));
+        let frames = find(&data, "Alice");
+        assert_eq!(frames.len(), 3);
+        let l = frames.iter().find(|f| f.file_name == "l.fits").unwrap();
         assert_eq!(l.instrume.as_deref(), Some("CamA"));
-        assert_eq!(l.focallen, Some(530.0));
-        assert_eq!(l.date_obs.as_deref(), Some("2026-07-01T21:00:00Z"));
-        assert_eq!(l.binning.as_deref(), Some("1x1"));
-        assert_eq!(alice.total_light_frames, 2);
+        assert_eq!(l.filter, "L");
+        assert_eq!(l.byte_size, 1);
+        let r = frames.iter().find(|f| f.file_name == "r.fits").unwrap();
+        assert_eq!(r.instrume.as_deref(), Some("CamB"));
+        assert_eq!(r.filter, "R");
+        let n = frames.iter().find(|f| f.file_name == "n.fits").unwrap();
+        assert_eq!(n.instrume, None);
+    }
+
+    #[test]
+    fn the_filter_is_the_row_canonical_never_filter_raw() {
+        let conn = test_conn();
+        seed_project(&conn, "p");
+        mk_frame(
+            &conn,
+            "p",
+            "u1",
+            FrameOrigin::Replica,
+            "Alice",
+            Some("/c/a.fits"),
+            manifest("Red", "CamA"),
+            "R",
+        );
+        let d = collect_project_export_data(&conn, "p", "Me").unwrap();
+        let f = &find(&d, "Alice")[0];
+        assert_eq!(f.filter, "R");
+        assert_eq!(f.instrume.as_deref(), Some("CamA"));
+        assert_eq!(f.landed_path, "/c/a.fits");
+        assert_eq!(f.file_name, "a.fits");
+        assert_eq!(f.frame_uuid, "u1");
     }
 
     #[test]

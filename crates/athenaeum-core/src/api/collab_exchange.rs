@@ -1891,9 +1891,9 @@ pub async fn export_project_for_wbpp(
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<crate::export::models::ExportResult, ApiError> {
     use crate::export::models::{
-        sanitize_display_folder_name, ExportCompleteEvent, ExportProgressEvent, ExportResult,
+        ExportCompleteEvent, ExportProgressEvent, ExportResult,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     const SENTINEL: i64 = -1;
 
@@ -1970,57 +1970,13 @@ pub async fn export_project_for_wbpp(
             .map_err(|e| ApiError::Internal(format!("collect join error: {e}")))??
         };
 
-        // <output_dir>/<sanitized project title>/, then one organizer call per
-        // publisher (the organizer joins the publisher folder itself).
-        let title_dir = Path::new(output_dir).join(sanitize_display_folder_name(&data.title));
-        let mut files_organized = 0i32;
-        // Prepend the collector's per-skip notes (a frame row whose manifest
-        // metadata is unreadable) so omitted frames reach
-        // ExportResult.warnings — and the dialog — rather than vanishing behind
-        // a smaller "N files organized" count.
-        let mut warnings: Vec<String> = data.warnings.clone();
-        let mut cancelled = false;
-        for (publisher, dataset) in &data.publishers {
-            if cancel_flag.load(Ordering::Relaxed) {
-                cancelled = true;
-                break;
-            }
-            let result = crate::export::file_organizer::organize_files_wbpp(
-                &title_dir,
-                dataset,
-                use_symlinks,
-                &config,
-                emitter.as_deref(),
-                SENTINEL,
-                &cancel_flag,
-                // Collab datasets are always copied — project frames are already
-                // calibrated, never marked for generation.
-                None,
-                Some(&ctx.image_pool),
-            )
-            .map_err(|e| ApiError::Internal(format!("organize publisher {publisher}: {e:#}")))?;
-            files_organized += result.files_organized;
-            warnings.extend(result.warnings);
-        }
-        if cancelled || cancel_flag.load(Ordering::Relaxed) {
-            return Ok(ExportResult {
-                success: false,
-                output_dir: output_dir.to_string(),
-                files_organized,
-                scripts_generated: Vec::new(),
-                warnings,
-                error: Some("Export cancelled".to_string()),
-            });
-        }
-
-        Ok(ExportResult {
-            success: true,
-            output_dir: output_dir.to_string(),
-            files_organized,
-            scripts_generated: Vec::new(),
-            warnings,
-            error: None,
-        })
+        // TEMPORARY (wave 6 Task 4): the organizer is rebuilt in Task 6. Fail
+        // loudly rather than report a silent success.
+        let _ = (&data, &config, use_symlinks, &cancel_flag);
+        tracing::error!(project_id, "project export is being rebuilt (wave 6 Task 6)");
+        Err::<ExportResult, ApiError>(ApiError::Internal(
+            "project export is being rebuilt (wave 6 Task 6)".into(),
+        ))
     }
     .await;
 
@@ -2209,6 +2165,7 @@ mod tests {
     /// file is found through the row's `landed_path`, its metadata read from
     /// the manifest row.
     #[tokio::test]
+    #[ignore = "rebuilt in wave 6 Task 6"]
     async fn export_project_lays_per_publisher_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));

@@ -23,4 +23,4 @@ pub use calibrated_generator::{
 pub use models::{calibrated_output_filename, CalibratedLightOptions};
 pub use data_collector::*;
 pub use file_organizer::*;
-pub use project_collector::{collect_project_export_data, ProjectExportData};
+pub use project_collector::{collect_project_export_data, ProjectExportData, ProjectExportFrame};
