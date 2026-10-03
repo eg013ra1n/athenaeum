@@ -488,7 +488,9 @@ fn seconds_classes(inputs: &[ClassInput], idx: &[usize], tolerance: f64) -> Vec<
 }
 
 /// `stops` / `equivalent` (spec §8): values sorted ascending; a class starts
-/// at the shortest remaining value `v0` and takes every value `≤ v0 · 2^W`.
+/// at the shortest remaining value `v0` and takes every value
+/// `≤ max(v0, v0 · 2^W)` (the `max` keeps a zero or negative anchor from
+/// splitting equal values).
 /// Token `<prefix><class_token_num(v0)>`; the class's seconds value is its
 /// shortest member's exposure.
 fn ratio_classes(
@@ -504,7 +506,7 @@ fn ratio_classes(
     let mut out: Vec<ExposureClass> = Vec::new();
     let mut anchor: Option<f64> = None;
     for (v, i) in sorted {
-        if anchor.is_none_or(|a| v > a * factor) {
+        if anchor.is_none_or(|a| v > a.max(a * factor)) {
             anchor = Some(v);
             out.push(ExposureClass {
                 token: format!("{prefix}{}", class_token_num(v)),
@@ -533,7 +535,9 @@ fn ratio_classes(
 /// bucket never print the same: consecutive anchors differ by more than
 /// `2^MIN_STOPS_WIDTH` (×1.07), and rounding to four significant digits
 /// moves a value by at most 0.05 %. A non-positive or non-finite anchor (an
-/// `EXPTIME` of 0 in a frame set) prints in full, which is injective.
+/// `EXPTIME` of 0 in a frame set) prints in full, which is injective, and
+/// `ratio_classes` closes such a class over equal values (`max(a, a·2^W)`),
+/// so two classes never share an anchor.
 pub(crate) fn class_token_num(x: f64) -> String {
     if !x.is_finite() || x <= 0.0 {
         return format!("{x}");
@@ -599,6 +603,10 @@ fn load_apertures(conn: &Connection, frame_ids: &[i64]) -> Result<HashMap<i64, f
                 out.insert(frame_id, a);
             }
         }
+    }
+    let missing = frame_ids.len() - out.len();
+    if missing > 0 {
+        tracing::debug!(count = missing, "frames without a usable aperture");
     }
     Ok(out)
 }
@@ -840,7 +848,7 @@ mod tests {
             stops_width: MIN_STOPS_WIDTH,
             ..GroupingConfig::default()
         };
-        let inputs: Vec<ClassInput> = (0..4000)
+        let inputs: Vec<ClassInput> = (0..7000)
             .map(|k| ClassInput {
                 exposure_s: Some(0.001 * 1.003f64.powi(k)),
                 f_ratio: None,
@@ -928,6 +936,46 @@ mod tests {
         assert!(is_seconds_token("120s"));
         assert!(!is_seconds_token("st60") && !is_seconds_token("eq2.4"));
         assert!(!is_seconds_token("all") && !is_seconds_token("unknown"));
+    }
+
+    /// Plan 6b-2 C3 (fix round 1): a zero or negative anchor must still close
+    /// its class over equal values, or two classes share one token and collide
+    /// on `UNIQUE(run_id, group_key)`.
+    #[test]
+    fn non_positive_anchors_never_open_duplicate_classes() {
+        use crate::stacking::config::ExposureMode;
+        let cfg = GroupingConfig {
+            exposure_mode: ExposureMode::Stops,
+            stops_width: 1.0,
+            ..GroupingConfig::default()
+        };
+        let run = |values: [f64; 3]| {
+            let inputs: Vec<ClassInput> = values
+                .iter()
+                .map(|&t| ClassInput {
+                    exposure_s: Some(t),
+                    f_ratio: None,
+                })
+                .collect();
+            classify_exposures(&inputs, &cfg)
+                .into_iter()
+                .map(|c| (c.token, c.members))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            run([-5.0, -5.0, 60.0]),
+            vec![
+                ("st-5".to_string(), vec![0, 1]),
+                ("st60".to_string(), vec![2])
+            ]
+        );
+        assert_eq!(
+            run([0.0, 0.0, 60.0]),
+            vec![
+                ("st0".to_string(), vec![0, 1]),
+                ("st60".to_string(), vec![2])
+            ]
+        );
     }
 
     /// Plan 6b-2 C3: `stops_width` has no upper bound, so a huge value turns
