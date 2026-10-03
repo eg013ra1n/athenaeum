@@ -918,6 +918,10 @@ pub enum CleanupWhat {
 /// changes. The LN reference is rebuilt byte-identically from the same
 /// inputs, so the stored `k` is still a measurement of exactly this group
 /// against exactly this reference. Only `All` drops it.
+///
+/// `registration` (`plan::REGISTRATION_ARTIFACT_KIND`, a project's star-map
+/// cache) is deliberately absent too: it is a payload row that only `All`
+/// drops.
 const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
     "registered",
     "calibrated",

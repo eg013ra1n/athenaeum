@@ -5840,8 +5840,8 @@ fn register_group_pass(
                             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                         let is_reference_row = item.frame_id == reference_frame_id;
                         // The set id here is a placeholder: `store_registration`
-                        // overwrites it with the real one. What a project run
-                        // keeps in this record is B10's open 6b-2 item.
+                        // overwrites it with the real one (a project's record
+                        // is its payload-only star-map artifact, plan 6b-3 D2).
                         let rec = to_record(
                             subject.frame_set_id().unwrap_or(0),
                             item.frame_id,
@@ -6413,7 +6413,8 @@ fn two_pass_refine(
 ///
 /// `rc.reference_frame_id`/`reference_width`/`reference_height` are the
 /// source of truth here; the calibrated path and stage-1 hash come from
-/// the caller, which has just resolved both.
+/// the caller, which has just resolved both. On a grid the delivered
+/// dimensions are the grid's and deliberately differ from the reference's.
 fn adopt_co_registered_geometry(rc: &mut RunContext, calibrated: &Path, hash: &str) {
     let Some(reference_frame_id) = rc.reference_frame_id else {
         return;
@@ -6641,7 +6642,8 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
 /// native mode): the frame, the geometry its own `reference_stars` read
 /// reports, its calibrated file and its stage-1 hash. Also refreshes the
 /// run-wide `reference_width`/`height` when this group's reference is the
-/// run's, so the two never disagree about the same frame.
+/// run's, so the two never disagree about the same frame. On a grid the
+/// group's delivered dimensions are the grid's, not the reference's.
 fn set_group_geometry(
     rc: &mut RunContext,
     key: &str,

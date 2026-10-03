@@ -1568,6 +1568,9 @@ fn compute_register_stale(
             if reference_wcs_hashes.contains_key(&reference_frame_id) {
                 continue;
             }
+            if !origins.contains_key(&reference_frame_id) {
+                return Ok(true);
+            }
             match crate::stacking::grid_map::reference_wcs_hash_of(
                 conn,
                 origins,
@@ -2672,6 +2675,13 @@ pub fn build_plan(
                 let mut wcs: HashMap<i64, Option<String>> = HashMap::new();
                 let mut out = HashMap::with_capacity(rows.len());
                 for r in rows {
+                    // A stored star map outlives its reference's replica (gone,
+                    // re-staged, excluded, unsupported): that frame has no
+                    // registered hash, so Normalize reads stale; never an error.
+                    if !origins.contains_key(&r.reference_frame_id) {
+                        out.insert(r.frame_id, None);
+                        continue;
+                    }
                     let w = match wcs.get(&r.reference_frame_id) {
                         Some(w) => w.clone(),
                         None => {
@@ -3238,6 +3248,220 @@ mod tests {
             stored_registrations(&conn, &subject).unwrap().is_empty(),
             "All drops it"
         );
+    }
+
+    /// Plan 6b-3 D2: a stored star map whose reference is no longer among the
+    /// run's frames never fails the plan; the frame reads Normalize-stale.
+    #[test]
+    fn a_star_map_with_a_vanished_reference_leaves_the_plan_ok_and_normalize_stale() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        let grid = crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.5,
+            width_px: 128,
+            height_px: 128,
+            crval1: 83.8,
+            crval2: -5.4,
+            rotation_deg: 0.0,
+        };
+        crate::db::collab::set_canonical_grid(&f.conn, "p1", Some(&grid.canonical_json())).unwrap();
+        let handles =
+            crate::db::stacking::project_frame_handles(&f.conn, "p1", &["r1", "r2", "r3"]).unwrap();
+        let subject = StackSubject::Project("p1".into());
+        let gone = 9_999_999;
+        for uuid in ["r1", "r2", "r3"] {
+            store_registration(&f.conn, &subject, |set_id| RegistrationRecord {
+                frames_set_id: set_id,
+                frame_id: handles[uuid],
+                reference_frame_id: gone,
+                config_hash: Some("reghash".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let mut cfg = with_folders(&working, &output);
+        cfg.normalization.local.enabled = true;
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &subject,
+            Some(cfg),
+        )
+        .expect("a vanished reference must not fail the plan");
+        assert!(
+            plan.stale_stages.contains(&Stage::Normalize),
+            "{:?}",
+            plan.stale_stages
+        );
+    }
+
+    /// Plan 6b-3 D2: on a grid the registered artifact is keyed on the
+    /// composed hash. A composed-hash artifact reads cached, a plain-hash one
+    /// stale, and a reference with no WCS stale.
+    #[test]
+    fn register_stale_on_a_grid_keys_the_registered_artifact_on_the_composed_hash() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        let grid = crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.5,
+            width_px: 128,
+            height_px: 128,
+            crval1: 83.8,
+            crval2: -5.4,
+            rotation_deg: 0.0,
+        };
+        let subject = StackSubject::Project("p1".into());
+        let cfg = with_folders(&working, &output);
+        let inputs =
+            project_inputs(&f.conn, &SettingsManager::new(), "p1", Some(cfg.clone())).unwrap();
+        let groups = inputs.groups;
+        let origins = inputs.origins;
+        let handles =
+            crate::db::stacking::project_frame_handles(&f.conn, "p1", &["r1", "r2", "r3", "o1"])
+                .unwrap();
+        let mut memo = HashMemo::new(origins.clone());
+
+        // Cases: (reference uuid, artifact keyed composed?) -> stale?
+        let mut stale_for = |reference_uuid: &str, composed: bool| -> bool {
+            let reference_id = handles[reference_uuid];
+            // A fresh run row and fresh rows per case.
+            crate::db::stacking::delete_all_artifacts(&f.conn, &subject).unwrap();
+            f.conn.execute("DELETE FROM stacking_runs", []).unwrap();
+            let run_id = crate::db::stacking::insert_run(
+                &f.conn,
+                &crate::db::stacking::NewRun {
+                    subject: &subject,
+                    config_json: "{}",
+                    config_hash: "h",
+                    reference_frame_id: Some(reference_id),
+                    reference_mode: "auto",
+                    working_dir: "/w",
+                    output_dir: "/o",
+                },
+            )
+            .unwrap();
+            let group_id = crate::db::stacking::insert_group(
+                &f.conn,
+                &crate::db::stacking::NewGroup {
+                    run_id,
+                    group_key: "g",
+                    instrume: None,
+                    color_mode: "mono",
+                    filter: None,
+                    binning: Some(1),
+                    width: Some(1),
+                    height: Some(1),
+                    exposure: None,
+                    exposure_class: None,
+                    frame_count: 3,
+                    included_count: 3,
+                },
+            )
+            .unwrap();
+            let reference_calib = {
+                let (_, gf) = find_group_of(&groups, reference_id).unwrap();
+                memo.calibration_hash(&f.conn, &cfg, gf).unwrap()
+            };
+            let wcs =
+                crate::stacking::grid_map::reference_wcs_hash_of(&f.conn, &origins, reference_id)
+                    .unwrap();
+            for uuid in ["r1", "r2", "r3"] {
+                let frame_id = handles[uuid];
+                crate::db::stacking::upsert_frame_row(
+                    &f.conn,
+                    &subject,
+                    &crate::db::stacking::NewFrameRow {
+                        run_id,
+                        group_id,
+                        frame_id,
+                        included: true,
+                        exclusion_reason: None,
+                        weight: None,
+                        weight_channels_json: None,
+                        metrics_json: None,
+                        reg_status: None,
+                        reg_model: None,
+                        reg_rms_px: None,
+                        reg_inliers: None,
+                        reg_inlier_ratio: None,
+                        reg_flipped: None,
+                        rejected_fraction: None,
+                    },
+                )
+                .unwrap();
+                let (group, gf) = find_group_of(&groups, frame_id).unwrap();
+                let frame_calib = memo.calibration_hash(&f.conn, &cfg, gf).unwrap();
+                let expected = registration_hash_for(
+                    &cfg,
+                    reference_id,
+                    &reference_calib,
+                    &frame_calib,
+                    &measurement_hash_for(&cfg, &frame_calib),
+                );
+                store_registration(&f.conn, &subject, |set_id| RegistrationRecord {
+                    frames_set_id: set_id,
+                    frame_id,
+                    reference_frame_id: reference_id,
+                    is_reference: frame_id == reference_id,
+                    status: if frame_id == reference_id {
+                        "reference"
+                    } else {
+                        "aligned"
+                    }
+                    .to_string(),
+                    config_hash: Some(expected.clone()),
+                    ..Default::default()
+                })
+                .unwrap();
+                let artifact_hash = match (&wcs, composed) {
+                    (Some(w), true) => registered_hash_for(&expected, Some((w, &grid.hash()))),
+                    _ => expected.clone(),
+                };
+                let path = f.dir.path().join(format!("registered_{frame_id}.fits"));
+                std::fs::write(&path, [0u8]).unwrap();
+                crate::db::stacking::upsert_artifact(
+                    &f.conn,
+                    &crate::db::stacking::NewArtifact {
+                        subject: &subject,
+                        frame_id: Some(frame_id),
+                        group_key: &group.key,
+                        kind: "registered",
+                        path: Some(path.to_str().unwrap()),
+                        config_hash: &artifact_hash,
+                        size: Some(1),
+                        modified_at: None,
+                        payload_json: None,
+                    },
+                )
+                .unwrap();
+            }
+            let reference = PlanReference {
+                mode: ReferenceMode::Auto,
+                frame_id: Some(reference_id),
+                filename: None,
+                on_disk: true,
+            };
+            compute_register_stale(
+                &f.conn,
+                &cfg,
+                &subject,
+                &groups,
+                &reference,
+                &mut memo,
+                &origins,
+                Some(&grid),
+            )
+            .unwrap()
+        };
+        assert!(!stale_for("r1", true), "a composed-hash artifact is cached");
+        assert!(
+            stale_for("r1", false),
+            "a plain-hash artifact is stale on a grid"
+        );
+        assert!(stale_for("o1", true), "a reference with no WCS is stale");
     }
 
     /// Plan 6b-3 D2: a frame set's registered artifact is keyed on its
