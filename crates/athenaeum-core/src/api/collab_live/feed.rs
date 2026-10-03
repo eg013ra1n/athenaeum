@@ -246,15 +246,12 @@ impl FeedApplier {
             .or_default() += rows;
     }
 
-    /// `project_id`'s snapshot was refreshed for a change of `kinds`: a
-    /// meta, thresholds or dictionary kind — or a refresh that saw its
-    /// thresholds or dictionary move (`gate_moved`) — marks its next
-    /// report's `card` (spec 2026-10-01 §6.1; members are reported on their
-    /// own).
     /// Plan 6b-2 C16: `collab-grid-changed` for every project whose cached
     /// grid a refresh just moved — driven by the refresh's own report, so a
-    /// manual refresh, a gap catch-up and an epoch reload each emit once and
-    /// an unchanged echo emits nothing.
+    /// gap catch-up, an epoch reload or a hello join each emit once and an
+    /// unchanged echo emits nothing. The host's own refresh holds no emitter
+    /// and the saving device gets its event from `set_collab_project_grid`;
+    /// every other device gets it here.
     fn emit_grid_moves(&self, report: &crate::api::collab::RefreshReport) {
         for project_id in &report.grid_moved {
             tracing::debug!(project_id = %project_id, "project grid changed on the hub");
@@ -270,6 +267,11 @@ impl FeedApplier {
         }
     }
 
+    /// `project_id`'s snapshot was refreshed for a change of `kinds`: a
+    /// meta, thresholds, dictionary or grid kind — or a refresh that saw its
+    /// thresholds or dictionary move (`gate_moved`) — marks its next
+    /// report's `card` (spec 2026-10-01 §6.1; members are reported on their
+    /// own).
     fn note_card(&mut self, project_id: &str, kinds: &[ChangeKind], gate_moved: bool) {
         let snapshot_kind = kinds.iter().any(|k| {
             matches!(

@@ -359,4 +359,100 @@ mod tests {
         );
         assert!(!get_collab_grid_proposal(&ctx, "p1").unwrap().can_edit);
     }
+
+    /// A hub failure on the PUT leaves everything as it was: an `Err`, no
+    /// cached grid, no event. (A hub 400 is not covered: the fake hub
+    /// validates with the same `CanonicalGrid::validate`, so it cannot
+    /// disagree with the local check without a new fake-hub feature.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hub_failure_caches_nothing_and_emits_nothing() {
+        let (_t, ctx, hub) = fixture(true).await;
+        hub.set_failing("/projects/p1/grid", true);
+        let events = rec();
+        let err = set_collab_project_grid(&ctx, "p1", valid_grid(), Some(&events))
+            .await
+            .unwrap_err();
+        tracing::debug!(?err, "expected hub failure");
+        let stored = {
+            let conn = db(&ctx).unwrap().conn();
+            crate::db::collab::canonical_grid(&conn, "p1").unwrap()
+        };
+        assert_eq!(stored, None, "a failed save caches nothing");
+        assert!(hub.project_grid("p1").is_none());
+        assert!(
+            events.0.lock().unwrap().is_empty(),
+            "a failed save emits nothing"
+        );
+    }
+
+    fn page_with(grid: Option<serde_json::Value>) -> crate::collab::hub_client::ProjectPageWire {
+        let mut project = serde_json::json!({
+            "id": "p1", "slug": "m31", "title": "M31", "status": "active",
+            "requireApproval": false,
+            "target": {"name": "M31", "raDeg": 10.5, "decDeg": 41.25, "radiusDeg": 1.0},
+        });
+        if let Some(g) = grid {
+            project["canonicalGrid"] = g;
+        }
+        serde_json::from_value(serde_json::json!({ "project": project, "members": [] })).unwrap()
+    }
+
+    /// `grid_echo_of`: absent and null both clear; a valid grid is parsed
+    /// and normalized; anything unreadable is `Malformed`.
+    #[test]
+    fn the_grid_echo_distinguishes_absent_grid_and_malformed() {
+        use crate::api::collab::{grid_echo_of, GridEcho};
+        assert!(matches!(grid_echo_of(&page_with(None)), GridEcho::Absent));
+        assert!(matches!(
+            grid_echo_of(&page_with(Some(serde_json::Value::Null))),
+            GridEcho::Absent
+        ));
+        let raw = serde_json::to_value(CanonicalGrid {
+            crval1: 370.5,
+            rotation_deg: 540.0,
+            ..valid_grid()
+        })
+        .unwrap();
+        match grid_echo_of(&page_with(Some(raw))) {
+            GridEcho::Grid(json) => {
+                let g: CanonicalGrid = serde_json::from_str(&json).unwrap();
+                assert_eq!((g.crval1, g.rotation_deg), (10.5, 180.0));
+            }
+            _ => panic!("a valid grid must parse"),
+        }
+        assert!(matches!(
+            grid_echo_of(&page_with(Some(serde_json::json!({"bad": 1})))),
+            GridEcho::Malformed
+        ));
+    }
+
+    /// A refresh whose page carries an unreadable grid keeps the cached
+    /// grid and reports no move; a later `null` clears it and reports one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_echo_keeps_the_cached_grid_and_null_clears_it() {
+        let (_t, ctx, hub) = fixture(true).await;
+        let saved = set_collab_project_grid(&ctx, "p1", valid_grid(), None)
+            .await
+            .unwrap();
+        hub.before_next("/projects/p1", |st| {
+            st.projects.get_mut("p1").unwrap().canonical_grid = Some(serde_json::json!({"bad": 1}));
+        });
+        let report = crate::api::collab::refresh_projects_reporting(&ctx, None)
+            .await
+            .unwrap();
+        assert!(report.grid_moved.is_empty(), "{:?}", report.grid_moved);
+        assert_eq!(
+            stored_grid(&db(&ctx).unwrap().conn(), "p1").unwrap(),
+            Some(saved)
+        );
+
+        hub.before_next("/projects/p1", |st| {
+            st.projects.get_mut("p1").unwrap().canonical_grid = None;
+        });
+        let report = crate::api::collab::refresh_projects_reporting(&ctx, None)
+            .await
+            .unwrap();
+        assert_eq!(report.grid_moved, vec!["p1".to_string()]);
+        assert_eq!(stored_grid(&db(&ctx).unwrap().conn(), "p1").unwrap(), None);
+    }
 }
