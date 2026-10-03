@@ -169,8 +169,9 @@ pub const LN_LOCAL_SCALE_MAX_DEVIATION: f64 = 0.25;
 /// sanitizes non-finite pixels to the plane's median for detection, exactly
 /// as before. `Masked` — a project on its grid — fits each member on its
 /// overlap with the reference: detection planes fill the rest with 0.0
-/// (the fast detector leaves values <= 0 out of its histogram and exact
-/// zeros out of its RMS), seeds within [`LN_MASK_MARGIN_PX`] of the
+/// (the fast detector leaves values <= 0 out of its global background
+/// histogram and exact zeros out of its global RMS; its local steps still
+/// see them, which is why seeds near the edge are dropped), seeds within [`LN_MASK_MARGIN_PX`] of the
 /// overlap's edge are dropped, and both backgrounds are modelled on the
 /// overlap only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +479,9 @@ fn a_grid(
 /// `sanitized_planes`/`locations` already are: the reference is immutable
 /// for the whole group, so this is built once and read by every frame's
 /// [`scale::relative_scale_against`] call instead.
+///
+/// The median sanitizing described here applies to [`LnOverlap::Legacy`]
+/// only; [`Self::build_masked`] fills non-finite pixels with 0.0.
 ///
 /// `sanitized_planes[p]` (M4a Task 5) borrows `reference`'s own plane
 /// (`Cow::Borrowed`) instead of unconditionally cloning it — the common
@@ -811,10 +815,12 @@ pub fn normalize_frame(
 
         // Plan 6b-3 D6 (spec §5.6 seam 2): on a grid, the member's models are
         // fitted on its overlap with the LN reference, never on sanitized NaN.
-        // Only the overlap's grid nodes are defined by the fit: a node outside
-        // it carries whatever `background_grid` extrapolates into masked
-        // cells (on both sides, so it may or may not cancel). Integration
-        // never reads it - the member is NaN there - so do not "fix" it.
+        // Nodes outside the overlap hold the flood-fill extension of both
+        // overlap backgrounds (`background_grid` fills masked cells from
+        // their neighbours) and ARE read: integration samples the grid
+        // through its 4x4 cubic B-spline, so nodes up to two strides
+        // outside the overlap reach pixels inside it, and it also
+        // normalizes member pixels the reference does not cover.
         let masked = reference_for_detection.overlap == LnOverlap::Masked;
         let mut member_ref_bg: Option<BackgroundGrid> = None;
         let mut allowed: Option<Vec<bool>> = None;
@@ -919,6 +925,7 @@ pub fn normalize_frame(
         // value in that strip regardless; the plane's own finite median
         // (not a flat `0.0`) keeps a large strip from dragging the
         // detector's global background/σ estimate.
+        // `fill`: see [`LnOverlap`] for why Masked uses 0.0 and Legacy the median.
         let fill = if masked { 0.0f32 } else { location_tgt as f32 };
         if !target.iter().all(|v| v.is_finite()) {
             for v in target.iter_mut() {
@@ -1948,14 +1955,15 @@ mod tests {
             outcome.scale
         );
         // The overlap is x in 100..420; eroded by LN_MASK_MARGIN_PX (48) it is
-        // x in 148..372, y in 48..336. Node (i, j) sits at pixel (i, j)·stride.
+        // x in 148..372, y in 0..384 (the image border counts as valid, so
+        // only the x edges erode). Node (i, j) sits at pixel (i, j)·stride.
         let g = &grids.channels[0];
         let stride = g.stride();
         let mut checked = 0usize;
         for j in 0..g.gh {
             for i in 0..g.gw {
                 let (x, y) = (i * stride, j * stride);
-                if !(148..372).contains(&x) || !(48..336).contains(&y) {
+                if !(148..372).contains(&x) {
                     continue;
                 }
                 let b = g.b[j * g.gw + i];
@@ -2109,10 +2117,240 @@ mod tests {
                     "node ({i}, {j}): a {a}, b {b}"
                 );
                 if footprint(((j * stride).min(H - 1)) * W + (i * stride).min(W - 1)) {
+                    // Outside the overlap a node holds the flood-fill
+                    // extension of both backgrounds, which is read: on this
+                    // flat fixture it is the same truth B = 0.03.
+                    assert!(
+                        (b - 0.03).abs() < 0.002,
+                        "footprint node ({}, {}): b {b}",
+                        i * stride,
+                        j * stride
+                    );
                     on_footprint += 1;
                 }
             }
         }
         assert!(on_footprint >= 20, "{on_footprint} nodes on the footprint");
+    }
+
+    /// One pixel invalid gives a (2m+1)^2 hole, clipped at the border: the
+    /// column pass of [`eroded_mask`] spreads what the row pass found.
+    #[test]
+    fn eroded_mask_spreads_one_invalid_pixel_into_a_square_hole() {
+        let (w, h, m) = (21usize, 15usize, 3usize);
+        for (px, py) in [(10usize, 7usize), (1, 1), (20, 14)] {
+            let mut valid = vec![true; w * h];
+            valid[py * w + px] = false;
+            let e = eroded_mask(&valid, w, h, m);
+            for y in 0..h {
+                for x in 0..w {
+                    let in_hole = x.abs_diff(px) <= m && y.abs_diff(py) <= m;
+                    assert_eq!(
+                        e[y * w + x],
+                        !in_hole,
+                        "({x}, {y}) for hole at ({px}, {py})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The half-covered fixture shared by the bias guards and the seeds
+    /// test: the reference covers x < `ref_cover`, the member x >= `from`,
+    /// truth R = 1.25*T + 0.03. `seeds` hands the member's own measured
+    /// fits in (the production path), else forced detection.
+    fn masked_probe(
+        interpolation: crate::resample::Interpolation,
+        ref_cover: usize,
+        from: usize,
+        mode: LnOverlap,
+        seeds: bool,
+    ) -> (LnFrameOutcome, LnFrameGrids) {
+        use crate::fits_writer::write_fits_f32;
+        use crate::geometry::{Linear, PixelMap};
+        use crate::stacking::measure::FrameMeasurement;
+        use crate::stacking::test_fixtures::synthetic_star_field;
+        use crate::stacking::weights::FrameWeight;
+
+        const W: usize = 512;
+        const H: usize = 384;
+        let mut stars: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..6 {
+            for col in 0..10 {
+                let x = 26.0 + col as f64 * 46.0 + ((row * 7 + col) % 5) as f64;
+                let y = 24.0 + row as f64 * 58.0 + ((row * 3 + col) % 4) as f64;
+                stars.push((x, y, 0.10 + ((row * 10 + col) % 9) as f64 * 0.02));
+            }
+        }
+        let field = synthetic_star_field(W, H, &stars, 4.2, 0.002, 11);
+        let reference_plane: Vec<f32> = field
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| if k % W < ref_cover { v } else { f32::NAN })
+            .collect();
+        let target: Vec<f32> = field
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                if k % W >= from {
+                    (v - 0.03) / 1.25
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let reference = LnReference {
+            width: W,
+            height: H,
+            planes: vec![reference_plane],
+            frames_used: Vec::new(),
+        };
+        let cfg = LocalNormalizationConfig {
+            enabled: true,
+            scale: 256,
+            ..LocalNormalizationConfig::default()
+        };
+        let measure = crate::stacking::measure::MeasureOptions {
+            psf_model: PsfModel::Moffat4,
+            max_stars: 200,
+            ..Default::default()
+        };
+        let for_detection = match mode {
+            LnOverlap::Masked => {
+                LnReferenceForDetection::build_masked(&reference, PsfModel::Moffat4, 200, None)
+            }
+            LnOverlap::Legacy => {
+                LnReferenceForDetection::build(&reference, PsfModel::Moffat4, 200, None)
+            }
+        };
+        let ref_bg = vec![background_grid(
+            &reference.planes[0],
+            W,
+            H,
+            &BackgroundParams {
+                scale: cfg.scale,
+                ..DEFAULT_PARAMS
+            },
+            None,
+        )];
+        let path = dir.path().join("member.fits");
+        write_fits_f32(&path, W, H, 1, &target, &[]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let fits = if seeds {
+            Some(
+                crate::stacking::measure::measure_frame_with_fits(&path, &measure, None, &cancel)
+                    .expect("measuring the member's own fits")
+                    .1,
+            )
+        } else {
+            None
+        };
+        let frame = StackFrame {
+            path,
+            map: PixelMap::linear(Linear::identity()).unwrap(),
+            measurement: FrameMeasurement {
+                width: W,
+                height: H,
+                channels: vec![Default::default()],
+                duration_ms: 0,
+            },
+            weight: FrameWeight {
+                channels: vec![1.0],
+                normalized: vec![1.0],
+                mean: 1.0,
+                normalized_mean: 1.0,
+                missing: None,
+            },
+            exposure_s: 180.0,
+            date_obs: None,
+            frame_id: 1,
+            registered_path: None,
+        };
+        let sidecar = dir.path().join("member.athln");
+        let outcome = normalize_frame(
+            &reference,
+            &for_detection,
+            &ref_bg,
+            &frame,
+            match &fits {
+                Some(f) => LnScaleSeeds::Measured(f),
+                None => LnScaleSeeds::ForcedDetection,
+            },
+            &cfg,
+            &measure,
+            interpolation,
+            0.3,
+            &sidecar,
+            None,
+            None,
+            &cancel,
+        )
+        .expect("the probe member normalizes");
+        (outcome, LnFrameGrids::read(&sidecar).unwrap())
+    }
+
+    /// Bias guard (a): at full coverage Masked is a bit-exact no-op against
+    /// Legacy, under the production warp kernel too.
+    #[test]
+    fn masked_ln_is_a_bit_exact_no_op_at_full_coverage() {
+        use crate::resample::Interpolation;
+        let bicubic = Interpolation::BicubicBSpline;
+        let (lo, lg) = masked_probe(bicubic, 512, 0, LnOverlap::Legacy, false);
+        let (mo, mg) = masked_probe(bicubic, 512, 0, LnOverlap::Masked, false);
+        assert_eq!(lg, mg, "the sidecar grids must be identical");
+        assert_eq!(lo.channel_scales, mo.channel_scales);
+        assert_eq!(lo.matches, mo.matches);
+    }
+
+    /// Bias guard (b): under `BicubicBSpline` the half-covered Masked fit
+    /// agrees with Legacy at full coverage to 0.3 %. Both sit ~2.7 % under
+    /// 1.25 here: the fixture's reference is raw while the member is read
+    /// through the smoothing B-spline kernel, a fixture asymmetry and not a
+    /// property of masking.
+    #[test]
+    fn masked_ln_half_coverage_agrees_with_legacy_full_coverage_under_the_production_kernel() {
+        use crate::resample::Interpolation;
+        let bicubic = Interpolation::BicubicBSpline;
+        let (full, _) = masked_probe(bicubic, 512, 0, LnOverlap::Legacy, false);
+        let (half, _) = masked_probe(bicubic, 420, 100, LnOverlap::Masked, false);
+        let rel = (half.scale - full.scale).abs() / full.scale;
+        assert!(
+            rel < 0.003,
+            "half {} vs full {}: {rel}",
+            half.scale,
+            full.scale
+        );
+    }
+
+    /// The production masked scale path: the member's own measured fits seed
+    /// the fit (`relative_scale_from_seeds_masked`), same tolerances.
+    #[test]
+    fn masked_ln_recovers_the_half_covered_scale_from_measured_seeds() {
+        use crate::resample::Interpolation;
+        let (outcome, grids) =
+            masked_probe(Interpolation::Bilinear, 420, 100, LnOverlap::Masked, true);
+        assert_eq!(outcome.ln_scale_source, "seeds");
+        assert_eq!(outcome.channel_from_seeds, vec![true]);
+        assert!(
+            (outcome.scale - 1.25).abs() < 0.0125,
+            "scale {}",
+            outcome.scale
+        );
+        let g = &grids.channels[0];
+        let stride = g.stride();
+        let mut checked = 0usize;
+        for j in 0..g.gh {
+            for i in 0..g.gw {
+                let x = i * stride;
+                if !(148..372).contains(&x) {
+                    continue;
+                }
+                let b = g.b[j * g.gw + i];
+                assert!((b - 0.03).abs() < 0.002, "B node at x {x}: {b}");
+                checked += 1;
+            }
+        }
+        assert!(checked >= 40, "{checked} nodes");
     }
 }

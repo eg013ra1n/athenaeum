@@ -735,14 +735,11 @@ mod tests {
             assert_eq!(r.planes.len(), C);
             for (p, plane) in r.planes.iter().enumerate() {
                 for (k, &v) in plane.iter().enumerate() {
-                    // The footprint's last column is the warp's own edge:
-                    // the bilinear kernel there reaches a NaN neighbour, so
-                    // its value is a property of the resampler, not of the
-                    // coverage count. Every other pixel is pinned exactly.
-                    if k % W + 1 == COVER[p] {
-                        continue;
-                    }
-                    let covered = k % W < COVER[p];
+                    // The footprint's last column is the warp's own edge: the
+                    // bilinear kernel there reaches a NaN neighbour, so every
+                    // member is NaN at it. Deterministic, hence pinned like
+                    // the uncovered pixels (NaN when true, 0.0 when false).
+                    let covered = k % W + 1 < COVER[p];
                     if covered {
                         assert!(v.is_finite(), "plane {p} pixel {k} is covered, got {v}");
                     } else if empty_as_nan {

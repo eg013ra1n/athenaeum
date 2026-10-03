@@ -3080,7 +3080,9 @@ pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
 
 /// Plan 6b-3 D6: masked LN also holds, per worker, the overlap and eroded
 /// masks (a byte per pixel each) and a masked copy of the reference plane
-/// (four bytes): counted as three f32 planes, rounded up from 1.5.
+/// (four bytes), the masked `background_grid` copy of the reference plane
+/// and its row buffer (about one more plane): counted as three f32 planes,
+/// rounded up from about 2.5.
 pub(crate) const LN_MASKED_EXTRA_PLANES: u64 = 3;
 
 pub(crate) fn ln_working_set_bytes_masked(w: u64, h: u64) -> u64 {
@@ -24553,13 +24555,50 @@ mod tests {
         assert!(plane[192 * 512 + 256].is_finite(), "the centre is data");
         for f in &rc.plan_groups[0].frames {
             assert!(
-                crate::db::stacking::find_artifact(&conn, &rc.subject, &group, "ln", Some(f.frame_id))
-                    .unwrap()
-                    .is_some(),
+                crate::db::stacking::find_artifact(
+                    &conn,
+                    &rc.subject,
+                    &group,
+                    "ln",
+                    Some(f.frame_id)
+                )
+                .unwrap()
+                .is_some(),
                 "{} has its sidecar",
                 f.filename
             );
         }
+    }
+
+    /// Plan/run agreement (plan 6b-3 D6): after a project run with LN on, the
+    /// plan gate recomputes the masked LN hashes (registration upstream +
+    /// `lnmask:1`) and does not list Normalize as stale.
+    #[test]
+    fn a_project_plan_agrees_with_its_ln_run() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, conn, _rc, grid) =
+            run_sky_project(tmp.path(), |cfg| cfg.normalization.local.enabled = true);
+        crate::db::collab::set_canonical_grid(&conn, "p1", Some(&grid.canonical_json())).unwrap();
+        for (key, dir) in [
+            (
+                crate::settings::keys::STACKING_WORKING_DIR,
+                tmp.path().join("work"),
+            ),
+            (
+                crate::settings::keys::STACKING_OUTPUT_DIR,
+                tmp.path().join("out"),
+            ),
+        ] {
+            crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        let subject = StackSubject::Project("p1".into());
+        let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &subject, None).unwrap();
+        assert!(
+            !plan.stale_stages.contains(&Stage::Normalize),
+            "{:?}",
+            plan.stale_stages
+        );
     }
 
     fn drizzle_2x(cfg: &mut StackingConfig) {

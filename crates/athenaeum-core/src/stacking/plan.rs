@@ -3195,6 +3195,13 @@ pub fn build_plan(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::api::lights::compute_export_readiness;
+    use crate::db::stacking::set_set_config;
+    use crate::registration::db::set_frame_set_reference;
+    use crate::stacking::groups::{group_frames, is_seconds_token};
+    use crate::stacking::test_fixtures::{self, LightSpec};
+
     /// Plan 6b-3 D6: a frame set's LN upstream is its registration hash,
     /// byte for byte; a project's carries the masked-LN token.
     #[test]
@@ -3205,13 +3212,6 @@ mod tests {
             format!("h+{LN_MASKED_TOKEN}")
         );
     }
-
-    use super::*;
-    use crate::api::lights::compute_export_readiness;
-    use crate::db::stacking::set_set_config;
-    use crate::registration::db::set_frame_set_reference;
-    use crate::stacking::groups::{group_frames, is_seconds_token};
-    use crate::stacking::test_fixtures::{self, LightSpec};
 
     /// Plan 6b-3 D2: a project's star map is a payload-only `registration`
     /// artifact — read back by `stored_registrations`, kept by an
