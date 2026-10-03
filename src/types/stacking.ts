@@ -318,7 +318,7 @@ export type PlanMaster = { setId: number, kind: MasterWork, imagetyp: string, fr
 
 export type PlanBlocker = { code: string, message: string, };
 
-export type PlanGroup = { key: string, instrume: string | null, colorMode: ColorMode, filter: string | null, binning: number, cameras: Array<string>, exposureS: number | null, frameCount: number, includedCount: number, totalExposureS: number, calibratedCached: number, metricsCached: number, 
+export type PlanGroup = { key: string, instrume: string | null, colorMode: ColorMode, filter: string | null, binning: number, cameras: Array<string>, exposureS: number | null, exposureClass: string, frameCount: number, includedCount: number, totalExposureS: number, calibratedCached: number, metricsCached: number, 
 /**
  * Tier C Task 1: frames (of `frame_count`) whose `metrics` row AND
  * every one of its planes' `fits` rows are all fresh — a subset of
@@ -414,7 +414,7 @@ width: number | null, height: number | null, exposure: number | null, frameCount
  * value stage 3 just resolved; the two must agree, which is what
  * `local_normalization_sidecars_are_cached_on_the_second_run` pins.
  */
-beta: number | null, };
+beta: number | null, exposureClass: string | null, };
 
 export type StackingRunFrameRow = { id: number, runId: number, groupId: number, frameId: number, included: boolean, exclusionReason: string | null, weight: number | null, weightChannelsJson: string | null, metricsJson: string | null, regStatus: string | null, regModel: string | null, regRmsPx: number | null, regInliers: number | null, regInlierRatio: number | null, regFlipped: boolean | null, rejectedFraction: number | null, };
 

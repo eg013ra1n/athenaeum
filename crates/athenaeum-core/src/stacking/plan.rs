@@ -161,6 +161,9 @@ pub struct PlanGroup {
     pub binning: i64,
     pub cameras: Vec<String>,
     pub exposure_s: Option<f64>,
+    // The group's exposure-class token (spec §8) — what the Groups table
+    // shows beside the seconds value.
+    pub exposure_class: String,
     pub frame_count: usize,
     pub included_count: usize,
     pub total_exposure_s: f64,
@@ -1713,7 +1716,7 @@ pub fn build_plan(
 
     // Owner decision 2026-09-10: exposure always splits a group now, and a
     // frame with no EXPTIME lands in its own "unknown" cluster
-    // (`groups::cluster_indices`) rather than being silently folded in with
+    // (`groups::seconds_classes`) rather than being silently folded in with
     // a real 0 s exposure — but that frame's set is never actually excluded
     // from stacking, so this is a WARNING, never a blocker, naming the
     // frames so the operator can go fix the header if that was a mistake.
@@ -1740,6 +1743,22 @@ pub fn build_plan(
                 "{} frame{} without EXPTIME grouped separately: {shown}{suffix}",
                 names.len(),
                 if names.len() == 1 { "" } else { "s" },
+            ));
+        }
+    }
+
+    // Spec §8: in `equivalent` mode a frame with no known focal ratio is
+    // classed by seconds — say how many, once.
+    if cfg.grouping.exposure_mode == crate::stacking::config::ExposureMode::Equivalent {
+        let n: usize = groups
+            .iter()
+            .filter(|g| crate::stacking::groups::is_seconds_token(&g.exposure_class))
+            .map(|g| g.frames.len())
+            .sum();
+        if n > 0 {
+            warnings.push(format!(
+                "exposure equivalence unknown for {n} frame{} — grouped by seconds",
+                if n == 1 { "" } else { "s" }
             ));
         }
     }
@@ -2322,6 +2341,7 @@ pub fn build_plan(
             binning: g.binning,
             cameras: g.cameras.clone(),
             exposure_s: g.exposure_s,
+            exposure_class: g.exposure_class.clone(),
             frame_count: g.frames.len(),
             included_count,
             total_exposure_s: g.total_exposure_s,
@@ -2458,7 +2478,7 @@ mod tests {
     use crate::api::lights::compute_export_readiness;
     use crate::db::stacking::set_set_config;
     use crate::registration::db::set_frame_set_reference;
-    use crate::stacking::groups::group_frames;
+    use crate::stacking::groups::{group_frames, is_seconds_token};
     use crate::stacking::test_fixtures::{self, LightSpec};
 
     fn light_spec<'a>(stem: &'a str, date_obs: &'a str) -> LightSpec<'a> {
@@ -2574,8 +2594,42 @@ mod tests {
         );
     }
 
+    /// Spec §8: in `equivalent` mode, frames whose focal ratio is unknown are
+    /// classed by seconds, and the plan says how many. The fixture's lights
+    /// carry no `fits_header` blob, so `load_apertures` finds no aperture and
+    /// every frame classes by seconds; a fixture that wrote a header blob with
+    /// APTDIA would change what this test sees (review M5).
+    #[test]
+    fn plan_warns_when_exposure_equivalence_is_unknown() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            test_fixtures::add_light(&f, &light_spec(&format!("l{i}"), t));
+        }
+        let mut cfg = StackingConfig::default();
+        cfg.grouping.exposure_mode = crate::stacking::config::ExposureMode::Equivalent;
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            Some(cfg),
+        )
+        .unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w == "exposure equivalence unknown for 3 frames — grouped by seconds"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(plan
+            .groups
+            .iter()
+            .all(|g| is_seconds_token(&g.exposure_class)));
+    }
+
     /// A frame with no `EXPTIME` never blocks the plan — it gets its own
-    /// "unknown" exposure cluster (`groups::cluster_indices`) and a
+    /// "unknown" exposure cluster (`groups::seconds_classes`) and a
     /// warning naming it.
     #[test]
     fn plan_warns_about_frames_without_exptime() {
@@ -4409,6 +4463,7 @@ mod tests {
                 width: Some(1),
                 height: Some(1),
                 exposure: None,
+                exposure_class: None,
                 frame_count: frame_ids.len() as i64,
                 included_count: frame_ids.len() as i64,
             },
@@ -5311,6 +5366,7 @@ mod tests {
                 width: Some(1),
                 height: Some(1),
                 exposure: None,
+                exposure_class: None,
                 frame_count: 3,
                 included_count: 2,
             },
@@ -5750,6 +5806,7 @@ mod tests {
                 width: Some(1),
                 height: Some(1),
                 exposure: None,
+                exposure_class: None,
                 frame_count: 3,
                 included_count: 2,
             },

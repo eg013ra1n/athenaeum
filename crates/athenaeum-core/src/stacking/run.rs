@@ -900,6 +900,7 @@ pub fn start_stacking(
                 width: anchor_width,
                 height: anchor_height,
                 exposure: g.exposure_s,
+                exposure_class: Some(&g.exposure_class),
                 frame_count: g.frames.len() as i64,
                 included_count: included_count as i64,
             },
@@ -11007,6 +11008,7 @@ mod tests {
                     width: anchor_width,
                     height: anchor_height,
                     exposure: g.exposure_s,
+                    exposure_class: None,
                     frame_count: g.frames.len() as i64,
                     included_count: g.frames.len() as i64,
                 },
@@ -18822,7 +18824,7 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         // Grouping clusters by exposure too (spec §2) — its anchor-relative
-        // rule (`cluster_indices`, `groups.rs`) compares every sorted
+        // rule (`seconds_classes`, `groups.rs`) compares every sorted
         // exposure against the CLUSTER'S FIRST value, so the 0.001s..60s
         // spread here needs a tolerance past the full span, or the 5
         // frames would fragment into several undersized groups before this

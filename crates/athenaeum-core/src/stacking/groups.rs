@@ -22,7 +22,7 @@ use crate::api::ApiError;
 use crate::archive::path_layout::sanitize_for_filename;
 use crate::calibration_library::paths::fmt_num;
 use crate::db::stacking::StackSubject;
-use crate::stacking::config::GroupingConfig;
+use crate::stacking::config::{ExposureMode, GroupingConfig};
 use crate::stacking::origin::{FrameOrigin, FrameOrigins};
 use crate::stacking::plan::PROJECT_STACKING_UNAVAILABLE;
 
@@ -99,6 +99,9 @@ pub struct IntegrationGroup {
     /// carries exactly one entry here.
     pub cameras: Vec<String>,
     pub exposure_s: Option<f64>,
+    /// The group's exposure-class token (spec §8, plan 6b-2 C3): `<t>s`,
+    /// `st<t0>`, `eq<e0>`, `all` or `unknown` — the key's last segment.
+    pub exposure_class: String,
     pub frames: Vec<GroupFrame>,
     pub total_exposure_s: f64,
     /// The group's own pixel scale (M4b): the median `pixel_scale_arcsec`
@@ -135,7 +138,7 @@ pub fn group_key(
     exposure_s: Option<f64>,
 ) -> String {
     let filt = sanitized_or(filter, "NoFilter");
-    compose_key(color, &filt, binning, exposure_s)
+    compose_key(color, &filt, binning, &exposure_token(exposure_s))
 }
 
 /// Format the group-key string from an ALREADY-sanitized filter token — the
@@ -143,20 +146,12 @@ pub fn group_key(
 /// value itself) and `group_frames` (sanitizes once per bucket, then reuses
 /// ITS OWN bucket's token here) go through, so a group's key can never
 /// disagree with the token its own bucket was built from.
-fn compose_key(
-    color: ColorMode,
-    filter_token: &str,
-    binning: i64,
-    exposure_s: Option<f64>,
-) -> String {
+fn compose_key(color: ColorMode, filter_token: &str, binning: i64, class_token: &str) -> String {
     let color_tok = match color {
         ColorMode::Mono => "mono",
         ColorMode::Osc => "osc",
     };
-    format!(
-        "{color_tok}__{filter_token}__bin{binning}__{}",
-        exposure_token(exposure_s)
-    )
+    format!("{color_tok}__{filter_token}__bin{binning}__{class_token}")
 }
 
 /// The exposure component of a group key / master filename: the cluster's
@@ -192,7 +187,7 @@ pub fn header_pixel_scale_arcsec(xpixsz_um: Option<f64>, focallen_mm: Option<f64
 /// `sanitize_for_filename` a possibly-absent, possibly-blank value, falling
 /// back to `fallback` when the value is `None`, empty/whitespace, or
 /// sanitizes away to nothing.
-fn sanitized_or(value: Option<&str>, fallback: &str) -> String {
+pub(crate) fn sanitized_or(value: Option<&str>, fallback: &str) -> String {
     let trimmed = value.map(str::trim).filter(|s| !s.is_empty());
     match trimmed {
         Some(s) => {
@@ -377,68 +372,235 @@ fn to_group_frame(m: &LightMember, solved_scales: &HashMap<i64, f64>) -> GroupFr
     }
 }
 
-/// Partition one bucket's members into exposure clusters (spec §2, owner
-/// decision 2026-09-10 — exposure ALWAYS splits, there is no opt-out any
-/// more). Members with a known `EXPTIME`: sort ascending, then start a new
-/// cluster whenever the next exposure is more than `exposure_tolerance_sec`
-/// past the CURRENT cluster's first (label) value — not the previous
-/// frame's, so a slow drift across many frames cannot walk arbitrarily far
-/// from where the cluster started. Members with NO `EXPTIME` never join a
-/// numeric cluster — a missing value is not "0 s", and conflating the two
-/// would silently merge a real bias-like 0 s exposure with a frame whose
-/// header simply lacks the keyword — they form their own single cluster,
-/// labelled `None` (`"unknown"` in the key; `build_plan` turns this into a
-/// warning naming the frames, never a blocker). Each cluster's member
-/// indices are restored to `members`' own order (date_obs then id) before
-/// being handed back, so the exposure sort used to detect clusters never
-/// leaks into a group's frame order.
-///
-/// `cfg.exposure_tolerance_sec` itself is trusted here — `config::
-/// resolve_config` (fix round 1, minor 5) already clamps it to
-/// [`crate::stacking::config::MIN_EXPOSURE_TOLERANCE_SEC`] before a
-/// `GroupingConfig` ever reaches this function, so a zero/negative/NaN
-/// stored value (which would let two distinct clusters format to the same
-/// `fmt_num` token and collide on `stacking_run_groups`'s
-/// `UNIQUE(run_id, group_key)`) can never arrive here.
-fn cluster_indices(
-    members: &[LightMember],
+/// One frame's input to [`classify_exposures`] (plan 6b-2 C3): its exposure
+/// (`None` = no `EXPTIME`) and its focal ratio (`None` = unknown; read only in
+/// `equivalent` mode). Source-agnostic, so a frame set and a project class
+/// by one rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ClassInput {
+    pub(crate) exposure_s: Option<f64>,
+    pub(crate) f_ratio: Option<f64>,
+}
+
+/// One exposure class: its group-key token, the SECONDS value its group's
+/// `exposure_s` carries — the shortest member's exposure, never an `eq`
+/// anchor, because the EXPTIME warning, `PlanGroup`, `stacking_run_groups.exposure`
+/// and the master file name all read it as seconds — and its members'
+/// indices in input order.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExposureClass {
+    pub(crate) token: String,
+    pub(crate) exposure_s: Option<f64>,
+    pub(crate) members: Vec<usize>,
+}
+
+/// Partition one bucket's frames into exposure classes (spec §8, plan 6b-2
+/// C3). Frames without `EXPTIME` form their own `unknown` class in every
+/// mode — a missing value is not "0 s" — so the EXPTIME warning stays
+/// keyed on `exposure_s == None`. `cfg.stops_width` is trusted: `resolve_config`
+/// clamps it to [`crate::stacking::config::MIN_STOPS_WIDTH`].
+pub(crate) fn classify_exposures(
+    inputs: &[ClassInput],
     cfg: &GroupingConfig,
-) -> Vec<(Option<f64>, Vec<usize>)> {
-    let mut known: Vec<usize> = Vec::new();
-    let mut unknown: Vec<usize> = Vec::new();
-    for (i, m) in members.iter().enumerate() {
-        if m.exptime.is_some() {
-            known.push(i);
-        } else {
-            unknown.push(i);
+) -> Vec<ExposureClass> {
+    let (known, unknown): (Vec<usize>, Vec<usize>) =
+        (0..inputs.len()).partition(|&i| inputs[i].exposure_s.is_some());
+    let exposure = |i: usize| inputs[i].exposure_s.expect("known exposures only");
+    let mut classes = match cfg.exposure_mode {
+        ExposureMode::Seconds => seconds_classes(inputs, &known, cfg.exposure_tolerance_sec),
+        ExposureMode::Stops => ratio_classes(inputs, &known, exposure, cfg.stops_width, "st"),
+        ExposureMode::Equivalent => {
+            let (with_n, without_n): (Vec<usize>, Vec<usize>) =
+                known.iter().partition(|&&i| inputs[i].f_ratio.is_some());
+            let equivalent = |i: usize| {
+                let n = inputs[i]
+                    .f_ratio
+                    .expect("partitioned on a known focal ratio");
+                exposure(i) / (n * n)
+            };
+            let mut classes = ratio_classes(inputs, &with_n, equivalent, cfg.stops_width, "eq");
+            classes.extend(seconds_classes(
+                inputs,
+                &without_n,
+                cfg.exposure_tolerance_sec,
+            ));
+            classes
         }
+        ExposureMode::NoSplit => {
+            if known.is_empty() {
+                Vec::new()
+            } else {
+                let shortest = known
+                    .iter()
+                    .map(|&i| exposure(i))
+                    .fold(f64::INFINITY, f64::min);
+                vec![ExposureClass {
+                    token: "all".to_string(),
+                    exposure_s: Some(shortest),
+                    members: known,
+                }]
+            }
+        }
+    };
+    if !unknown.is_empty() {
+        classes.push(ExposureClass {
+            token: "unknown".to_string(),
+            exposure_s: None,
+            members: unknown,
+        });
     }
-    known.sort_by(|&a, &b| {
-        members[a]
-            .exptime
-            .partial_cmp(&members[b].exptime)
+    classes
+}
+
+/// Today's clustering (owner decision 2026-09-10), byte for byte: sorted
+/// ascending, a new class whenever the next exposure is more than
+/// `tolerance` past the CURRENT class's first value (not the previous
+/// frame's, so a slow drift cannot walk away from where the class started).
+/// Members restored to input order. `tolerance` is clamped upstream to
+/// `MIN_EXPOSURE_TOLERANCE_SEC`, which keeps `fmt_num`'s tokens distinct.
+fn seconds_classes(inputs: &[ClassInput], idx: &[usize], tolerance: f64) -> Vec<ExposureClass> {
+    let mut sorted: Vec<usize> = idx.to_vec();
+    sorted.sort_by(|&a, &b| {
+        inputs[a]
+            .exposure_s
+            .partial_cmp(&inputs[b].exposure_s)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut clusters: Vec<(f64, Vec<usize>)> = Vec::new();
-    for idx in known {
-        let e = members[idx].exptime.expect("filtered to Some above");
+    for i in sorted {
+        let e = inputs[i].exposure_s.expect("known exposures only");
         match clusters.last_mut() {
-            Some(last) if e - last.0 <= cfg.exposure_tolerance_sec => last.1.push(idx),
-            _ => clusters.push((e, vec![idx])),
+            Some(last) if e - last.0 <= tolerance => last.1.push(i),
+            _ => clusters.push((e, vec![i])),
         }
     }
-    for (_, idxs) in &mut clusters {
-        idxs.sort_unstable();
-    }
-    let mut result: Vec<(Option<f64>, Vec<usize>)> = clusters
+    clusters
         .into_iter()
-        .map(|(label, idxs)| (Some(label), idxs))
-        .collect();
-    if !unknown.is_empty() {
-        unknown.sort_unstable();
-        result.push((None, unknown));
+        .map(|(label, mut members)| {
+            members.sort_unstable();
+            ExposureClass {
+                token: exposure_token(Some(label)),
+                exposure_s: Some(label),
+                members,
+            }
+        })
+        .collect()
+}
+
+/// `stops` / `equivalent` (spec §8): values sorted ascending; a class starts
+/// at the shortest remaining value `v0` and takes every value `≤ v0 · 2^W`.
+/// Token `<prefix><class_token_num(v0)>`; the class's seconds value is its
+/// shortest member's exposure.
+fn ratio_classes(
+    inputs: &[ClassInput],
+    idx: &[usize],
+    value: impl Fn(usize) -> f64,
+    width_stops: f64,
+    prefix: &str,
+) -> Vec<ExposureClass> {
+    let factor = 2f64.powf(width_stops);
+    let mut sorted: Vec<(f64, usize)> = idx.iter().map(|&i| (value(i), i)).collect();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut out: Vec<ExposureClass> = Vec::new();
+    let mut anchor: Option<f64> = None;
+    for (v, i) in sorted {
+        if anchor.is_none_or(|a| v > a * factor) {
+            anchor = Some(v);
+            out.push(ExposureClass {
+                token: format!("{prefix}{}", class_token_num(v)),
+                exposure_s: None,
+                members: Vec::new(),
+            });
+        }
+        out.last_mut()
+            .expect("a class was pushed above")
+            .members
+            .push(i);
     }
-    result
+    for class in &mut out {
+        class.members.sort_unstable();
+        class.exposure_s = class
+            .members
+            .iter()
+            .filter_map(|&i| inputs[i].exposure_s)
+            .reduce(f64::min);
+    }
+    out
+}
+
+/// The number in a `st`/`eq` class token (plan 6b-2 C3): four significant
+/// digits, trailing zeros trimmed, never an exponent. Two classes of one
+/// bucket never print the same: consecutive anchors differ by more than
+/// `2^MIN_STOPS_WIDTH` (×1.07), and rounding to four significant digits
+/// moves a value by at most 0.05 %. A non-positive or non-finite anchor (an
+/// `EXPTIME` of 0 in a frame set) prints in full, which is injective.
+pub(crate) fn class_token_num(x: f64) -> String {
+    if !x.is_finite() || x <= 0.0 {
+        return format!("{x}");
+    }
+    let magnitude = x.log10().floor() as i32;
+    let decimals = (3 - magnitude).max(0) as usize;
+    let s = format!("{x:.decimals$}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
+/// Whether a class token is a seconds token (`<t>s`) — in `equivalent` mode,
+/// the classes of frames whose focal ratio is unknown. A convention on the
+/// string: the other four tokens never end in `s` (`st<num>`, `eq<num>`,
+/// `all`, `unknown`), and a new token must keep it so (review M4).
+pub(crate) fn is_seconds_token(token: &str) -> bool {
+    token.ends_with('s')
+}
+
+/// `N = focal length / aperture` when both are known, finite and positive
+/// (spec §8).
+pub(crate) fn f_ratio(focal_mm: Option<f64>, aperture_mm: Option<f64>) -> Option<f64> {
+    match (focal_mm, aperture_mm) {
+        (Some(f), Some(a)) if f.is_finite() && a.is_finite() && f > 0.0 && a > 0.0 => Some(f / a),
+        _ => None,
+    }
+}
+
+/// `APTDIA` of each frame from its stored header blob (spec §8: `frames` has
+/// no aperture column). One query per 500 ids; read only in `equivalent`
+/// mode. The first `fits_header` row of a frame that carries one wins.
+fn load_apertures(conn: &Connection, frame_ids: &[i64]) -> Result<HashMap<i64, f64>> {
+    let mut out = HashMap::new();
+    for chunk in frame_ids.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT f.id, fi.format, fh.header FROM frames f
+             JOIN files fi ON fi.id = f.file_id
+             JOIN fits_header fh ON fh.file_id = f.file_id
+             WHERE f.id IN ({placeholders}) ORDER BY f.id, fh.id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (frame_id, format, header) = row?;
+            if out.contains_key(&frame_id) {
+                continue;
+            }
+            if let Some(a) =
+                crate::fits_parser::stored_header::aperture_mm_from_stored_header(&format, &header)
+            {
+                out.insert(frame_id, a);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// One bucket: every LIGHT member sharing a (sanitized-token) colour /
@@ -476,7 +638,7 @@ struct Bucket {
 /// Each final group's "reference-anchor member" — the source of its
 /// `instrume` display value — is the first member of its own cluster in
 /// `(date_obs, id)` order (the cluster's own restored order, see
-/// [`cluster_indices`]). Plan time has no weights to pick a real
+/// [`seconds_classes`]). Plan time has no weights to pick a real
 /// best-weighted member from (spec's own "at plan time the first member"
 /// note); a run may later prefer a different member once stage 3 has
 /// weighed the group, but that does not change this DISPLAY field.
@@ -494,6 +656,11 @@ pub fn group_frames(
     // never one per frame.
     let frame_ids: Vec<i64> = members.iter().map(|m| m.frame_id).collect();
     let solved_scales = load_solved_scales(conn, &frame_ids)?;
+    let apertures = if cfg.exposure_mode == ExposureMode::Equivalent {
+        load_apertures(conn, &frame_ids)?
+    } else {
+        HashMap::new()
+    };
 
     // Bucketed by a plain tuple rather than a dedicated struct: `ColorMode`
     // deliberately does not derive `Hash` (it is a wire type, not a map key
@@ -523,7 +690,17 @@ pub fn group_frames(
         } else {
             ColorMode::Mono
         };
-        for (label, idxs) in cluster_indices(&bucket.members, cfg) {
+        let inputs: Vec<ClassInput> = bucket
+            .members
+            .iter()
+            .map(|m| ClassInput {
+                exposure_s: m.exptime,
+                f_ratio: f_ratio(m.focallen, apertures.get(&m.frame_id).copied()),
+            })
+            .collect();
+        for class in classify_exposures(&inputs, cfg) {
+            let idxs = class.members;
+            let label = class.exposure_s;
             let frames: Vec<GroupFrame> = idxs
                 .iter()
                 .map(|&i| to_group_frame(&bucket.members[i], &solved_scales))
@@ -543,7 +720,7 @@ pub fn group_frames(
 
             // The reference-anchor member is the cluster's own first member
             // (idxs is already restored to date_obs/id order — see
-            // `cluster_indices`); a cluster is never empty by construction.
+            // `seconds_classes`); a cluster is never empty by construction.
             let instrume = idxs
                 .first()
                 .and_then(|&i| trimmed_or_none(bucket.members[i].instrume.as_deref()));
@@ -561,7 +738,7 @@ pub fn group_frames(
                 cameras.push("unknown".to_string());
             }
 
-            let key = compose_key(color, &filter_token, binning, label);
+            let key = compose_key(color, &filter_token, binning, &class.token);
             groups.push(IntegrationGroup {
                 key,
                 instrume,
@@ -570,6 +747,7 @@ pub fn group_frames(
                 binning,
                 cameras,
                 exposure_s: label,
+                exposure_class: class.token,
                 frames,
                 total_exposure_s,
                 pixel_scale_arcsec,
@@ -623,6 +801,214 @@ pub(crate) fn frame_source(
 mod tests {
     use super::*;
     use crate::stacking::test_fixtures::{self, LightSpec};
+
+    /// Plan 6b-2 C3: a class token is formatted at a precision that never
+    /// merges two anchors — `fmt_num`'s two decimals merge these, and a
+    /// merged token would collide on `stacking_run_groups`'
+    /// `UNIQUE(run_id, group_key)`.
+    #[test]
+    fn class_tokens_never_merge_two_anchors_fmt_num_would() {
+        use crate::calibration_library::paths::fmt_num;
+        assert_eq!(
+            fmt_num(0.002),
+            fmt_num(0.004),
+            "the premise: fmt_num merges them"
+        );
+        assert_eq!(
+            fmt_num(0.005),
+            fmt_num(0.0101),
+            "the premise: fmt_num merges them"
+        );
+        assert_ne!(class_token_num(0.002), class_token_num(0.004));
+        assert_ne!(class_token_num(0.005), class_token_num(0.0101));
+        assert_eq!(class_token_num(300.0), "300");
+        assert_eq!(class_token_num(0.5), "0.5");
+        assert_eq!(class_token_num(2.4), "2.4");
+        assert_eq!(class_token_num(9.566326530612244), "9.566");
+        assert_eq!(class_token_num(0.005), "0.005");
+        assert_eq!(class_token_num(0.0101), "0.0101");
+        assert_eq!(class_token_num(12345.6), "12346");
+    }
+
+    /// Plan 6b-2 C3: at the `stopsWidth` floor, a dense sweep over five
+    /// orders of magnitude never yields two classes with one token.
+    #[test]
+    fn stop_classes_never_share_a_token() {
+        use crate::stacking::config::{ExposureMode, MIN_STOPS_WIDTH};
+        let cfg = GroupingConfig {
+            exposure_mode: ExposureMode::Stops,
+            stops_width: MIN_STOPS_WIDTH,
+            ..GroupingConfig::default()
+        };
+        let inputs: Vec<ClassInput> = (0..4000)
+            .map(|k| ClassInput {
+                exposure_s: Some(0.001 * 1.003f64.powi(k)),
+                f_ratio: None,
+            })
+            .collect();
+        let classes = classify_exposures(&inputs, &cfg);
+        let mut tokens: Vec<&str> = classes.iter().map(|c| c.token.as_str()).collect();
+        let n = tokens.len();
+        assert!(n > 100, "the sweep spans many classes: {n}");
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert_eq!(tokens.len(), n, "two classes share a token");
+    }
+
+    /// Plan 6b-2 C3 / spec §8: the four modes, their tokens, the seconds
+    /// value each class carries (never an `eq` anchor), and frames without
+    /// EXPTIME in their own `unknown` class in every mode.
+    #[test]
+    fn the_four_exposure_modes_class_and_token_as_the_spec_says() {
+        use crate::stacking::config::ExposureMode;
+        let input = |t: Option<f64>, n: Option<f64>| ClassInput {
+            exposure_s: t,
+            f_ratio: n,
+        };
+        let inputs = [
+            input(Some(60.0), Some(5.0)),
+            input(Some(90.0), Some(5.0)),
+            input(Some(120.0), None),
+            input(Some(180.0), Some(2.0)),
+            input(Some(300.0), Some(2.0)),
+            input(Some(600.0), Some(2.0)),
+            input(None, None),
+        ];
+        let run = |mode| {
+            let cfg = GroupingConfig {
+                exposure_mode: mode,
+                ..GroupingConfig::default()
+            };
+            classify_exposures(&inputs, &cfg)
+                .into_iter()
+                .map(|c| (c.token, c.exposure_s, c.members))
+                .collect::<Vec<_>>()
+        };
+        let row = |t: &str, e: Option<f64>, m: &[usize]| (t.to_string(), e, m.to_vec());
+
+        assert_eq!(
+            run(ExposureMode::Seconds),
+            vec![
+                row("60s", Some(60.0), &[0]),
+                row("90s", Some(90.0), &[1]),
+                row("120s", Some(120.0), &[2]),
+                row("180s", Some(180.0), &[3]),
+                row("300s", Some(300.0), &[4]),
+                row("600s", Some(600.0), &[5]),
+                row("unknown", None, &[6]),
+            ]
+        );
+        assert_eq!(
+            run(ExposureMode::Stops),
+            vec![
+                row("st60", Some(60.0), &[0, 1, 2]),
+                row("st180", Some(180.0), &[3, 4]),
+                row("st600", Some(600.0), &[5]),
+                row("unknown", None, &[6]),
+            ]
+        );
+        // e = t / N²: 2.4, 3.6 | 45, 75 | 150; the frame with no N is classed by seconds.
+        assert_eq!(
+            run(ExposureMode::Equivalent),
+            vec![
+                row("eq2.4", Some(60.0), &[0, 1]),
+                row("eq45", Some(180.0), &[3, 4]),
+                row("eq150", Some(600.0), &[5]),
+                row("120s", Some(120.0), &[2]),
+                row("unknown", None, &[6]),
+            ]
+        );
+        assert_eq!(
+            run(ExposureMode::NoSplit),
+            vec![
+                row("all", Some(60.0), &[0, 1, 2, 3, 4, 5]),
+                row("unknown", None, &[6]),
+            ]
+        );
+        assert!(is_seconds_token("120s"));
+        assert!(!is_seconds_token("st60") && !is_seconds_token("eq2.4"));
+        assert!(!is_seconds_token("all") && !is_seconds_token("unknown"));
+    }
+
+    /// Plan 6b-2 C3: `stops_width` has no upper bound, so a huge value turns
+    /// the class factor into infinity — one class, no panic.
+    #[test]
+    fn a_huge_stops_width_is_one_class() {
+        use crate::stacking::config::ExposureMode;
+        let cfg = GroupingConfig {
+            exposure_mode: ExposureMode::Stops,
+            stops_width: 1.0e9,
+            ..GroupingConfig::default()
+        };
+        let inputs: Vec<ClassInput> = [1.0, 60.0, 3600.0]
+            .iter()
+            .map(|&t| ClassInput {
+                exposure_s: Some(t),
+                f_ratio: None,
+            })
+            .collect();
+        let classes = classify_exposures(&inputs, &cfg);
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].token, "st1");
+        assert_eq!(classes[0].members, vec![0, 1, 2]);
+    }
+
+    /// Plan 6b-2 C3: a frame set in `equivalent` mode reads APTDIA from the
+    /// stored header blob and FOCALLEN from the column; 60 s at f/5 and 240 s
+    /// at f/10 are one class.
+    #[test]
+    fn a_frame_set_in_equivalent_mode_classes_by_focal_ratio() {
+        use crate::stacking::config::ExposureMode;
+        let f = test_fixtures::frame_set("LDN 1272");
+        let spec = |stem: &'static str, exptime: f64| LightSpec {
+            stem,
+            instrume: "cam",
+            filter: Some("L"),
+            binning: 1,
+            width: 64,
+            height: 48,
+            exptime,
+            date_obs: "2025-01-01T20:00:00",
+            bayerpat: None,
+            write_file: false,
+        };
+        let (fast, _) = test_fixtures::add_light(&f, &spec("fast", 60.0));
+        let (slow, _) = test_fixtures::add_light(&f, &spec("slow", 240.0));
+        for (id, focal) in [(fast, 500.0), (slow, 1000.0)] {
+            f.conn
+                .execute(
+                    "UPDATE frames SET focallen = ?2 WHERE id = ?1",
+                    rusqlite::params![id, focal],
+                )
+                .unwrap();
+            let card_text = format!(
+                "{:<80}{:<80}",
+                "APTDIA  =                100.0 / aperture diameter (mm)", "END"
+            );
+            f.conn
+                .execute(
+                    "INSERT INTO fits_header (file_id, header)
+                     VALUES ((SELECT file_id FROM frames WHERE id = ?1), ?2)",
+                    rusqlite::params![id, card_text],
+                )
+                .unwrap();
+        }
+        let seconds = group_frames(&f.conn, f.set_id, &GroupingConfig::default()).unwrap();
+        assert_eq!(seconds.len(), 2, "seconds keeps 60 s and 240 s apart");
+        let cfg = GroupingConfig {
+            exposure_mode: ExposureMode::Equivalent,
+            ..GroupingConfig::default()
+        };
+        let groups = group_frames(&f.conn, f.set_id, &cfg).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].key, "mono__L__bin1__eq2.4");
+        assert_eq!(groups[0].exposure_class, "eq2.4");
+        assert_eq!(
+            groups[0].exposure_s,
+            Some(60.0),
+            "the class's seconds value is its shortest member's"
+        );
+    }
 
     #[test]
     fn key_format() {

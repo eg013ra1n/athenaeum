@@ -387,9 +387,46 @@ fn parse_xisf_xml_text(text: &str) -> HashMap<String, String> {
     result
 }
 
+/// `APTDIA` (mm) of a stored header blob — finite and positive, else `None`
+/// (plan 6b-2 C3/C4). `format` is `files.format` (`"FITS"` / `"XISF"`); any
+/// other value reads as no aperture.
+pub fn aperture_mm_from_stored_header(format: &str, header: &str) -> Option<f64> {
+    let format = match format {
+        "FITS" => FileFormat::FITS,
+        "XISF" => FileFormat::XISF,
+        _ => return None,
+    };
+    parse_stored_header_keys(format, header)
+        .get("APTDIA")
+        .and_then(|v| v.trim().trim_matches('\'').trim().parse::<f64>().ok())
+        .filter(|a| a.is_finite() && *a > 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aperture_reads_aptdia_finite_and_positive_only() {
+        let fits = |v: &str| {
+            format!(
+                "{:<80}{:<80}",
+                format!("APTDIA  = {v:>20} / aperture"),
+                "END"
+            )
+        };
+        assert_eq!(
+            aperture_mm_from_stored_header("FITS", &fits("200.0")),
+            Some(200.0)
+        );
+        assert_eq!(aperture_mm_from_stored_header("FITS", &fits("0")), None);
+        assert_eq!(aperture_mm_from_stored_header("FITS", &fits("-5")), None);
+        assert_eq!(
+            aperture_mm_from_stored_header("FITS", &format!("{:<80}", "END")),
+            None
+        );
+        assert_eq!(aperture_mm_from_stored_header("ZIP", &fits("200.0")), None);
+    }
 
     /// The scanner's one-rule skip for Athenaeum artifacts keys on
     /// `ATH_STK` being visible in the stored header (spec §6.4). An XISF

@@ -195,6 +195,10 @@ pub struct StackingRunGroupRow {
     /// value stage 3 just resolved; the two must agree, which is what
     /// `local_normalization_sidecars_are_cached_on_the_second_run` pins.
     pub beta: Option<f64>,
+    // The group's exposure-class token (spec 2026-10-02 §8); `None` for a
+    // run written before 6b-2. Plain comment: a doc comment would leak into
+    // the generated TS.
+    pub exposure_class: Option<String>,
 }
 
 fn row_to_group(r: &Row) -> rusqlite::Result<StackingRunGroupRow> {
@@ -219,12 +223,13 @@ fn row_to_group(r: &Row) -> rusqlite::Result<StackingRunGroupRow> {
         status: r.get(17)?,
         error: r.get(18)?,
         beta: r.get(19)?,
+        exposure_class: r.get(20)?,
     })
 }
 
 const GROUP_COLUMNS: &str = "id, run_id, group_key, instrume, color_mode, filter, binning, width, \
     height, exposure, frame_count, included_count, master_path, drizzle_path, rejection_low_path, \
-    rejection_high_path, stats_json, status, error, beta";
+    rejection_high_path, stats_json, status, error, beta, exposure_class";
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -413,6 +418,7 @@ pub struct NewGroup<'a> {
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub exposure: Option<f64>,
+    pub exposure_class: Option<&'a str>,
     pub frame_count: i64,
     pub included_count: i64,
 }
@@ -599,8 +605,8 @@ pub fn insert_group(conn: &Connection, g: &NewGroup<'_>) -> Result<i64> {
     conn.execute(
         "INSERT INTO stacking_run_groups
          (run_id, group_key, instrume, color_mode, filter, binning, width, height, exposure,
-          frame_count, included_count, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending')",
+          frame_count, included_count, status, exposure_class)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12)",
         params![
             g.run_id,
             g.group_key,
@@ -613,6 +619,7 @@ pub fn insert_group(conn: &Connection, g: &NewGroup<'_>) -> Result<i64> {
             g.exposure,
             g.frame_count,
             g.included_count,
+            g.exposure_class,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1129,6 +1136,34 @@ mod tests {
         c
     }
 
+    #[test]
+    fn a_group_row_carries_its_exposure_class() {
+        let c = conn();
+        let set = seed_set(&c);
+        let run = insert_run(&c, &new_run(&StackSubject::FrameSet(set))).unwrap();
+        insert_group(
+            &c,
+            &NewGroup {
+                run_id: run,
+                group_key: "mono__L__bin1__st60",
+                instrume: None,
+                color_mode: "mono",
+                filter: Some("L"),
+                binning: Some(1),
+                width: None,
+                height: None,
+                exposure: Some(60.0),
+                exposure_class: Some("st60"),
+                frame_count: 3,
+                included_count: 3,
+            },
+        )
+        .unwrap();
+        let groups = list_groups(&c, run).unwrap();
+        assert_eq!(groups[0].exposure_class.as_deref(), Some("st60"));
+        assert_eq!(groups[0].exposure, Some(60.0), "exposure stays seconds");
+    }
+
     /// `frames_set` has no NOT NULL column besides the `id` primary key
     /// (`is_custom` is `NOT NULL DEFAULT 0`, so it needs no explicit value)
     /// and, notably, no `created_at` column at all — the brief's seed SQL
@@ -1217,6 +1252,7 @@ mod tests {
                 width: Some(10),
                 height: Some(10),
                 exposure: None,
+                exposure_class: None,
                 frame_count: 3,
                 included_count: 3,
             },
@@ -1612,6 +1648,7 @@ mod tests {
             width: Some(10),
             height: Some(10),
             exposure: None,
+            exposure_class: None,
             frame_count: 1,
             included_count: 1,
         }

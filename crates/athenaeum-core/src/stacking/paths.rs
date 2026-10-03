@@ -1318,6 +1318,7 @@ mod tests {
             binning: 1,
             cameras: vec![],
             exposure_s: Some(60.0),
+            exposure_class: "unknown".to_string(),
             frames: (0..n_frames).map(|id| frame(id, w, h)).collect(),
             total_exposure_s: n_frames as f64 * 60.0,
             pixel_scale_arcsec: None,
