@@ -114,15 +114,53 @@ fn color_token(
     if meta.bayerpat.is_none() {
         return "mono";
     }
-    if debayer_osc {
-        return "osc";
-    }
-    match file_shape_quick(landed) {
-        Some((_, _, 3)) => "osc",
-        Some(_) => "cfa",
+    match osc_or_cfa(landed, debayer_osc) {
+        Some(token) => token,
         None => {
             tracing::warn!(project_id, frame_uuid, path = %landed.display(), "file shape unreadable; colour token assumed cfa");
             "cfa"
+        }
+    }
+}
+
+/// The `osc` vs `cfa` half of the C13 rule, shared by projects and attested
+/// frame sets: `osc` when the debayer is on or the file is already
+/// three-plane, `cfa` for a one-plane mosaic kept as a mosaic; `None` when
+/// the file's shape cannot be read (the caller warns and decides).
+fn osc_or_cfa(landed: &Path, debayer_osc: bool) -> Option<&'static str> {
+    if debayer_osc {
+        return Some("osc");
+    }
+    match file_shape_quick(landed) {
+        Some((_, _, 3)) => Some("osc"),
+        Some(_) => Some("cfa"),
+        None => None,
+    }
+}
+
+/// The colour token of an attested frame set's light (spec §13, plan 6b-2
+/// C13): a catalog BAYERPAT means colour (then [`osc_or_cfa`]); without one
+/// the file's own header decides: three planes are `osc`, anything else
+/// `mono`. An unreadable file warns and falls back to the catalog rule.
+pub(crate) fn attested_color_token(
+    frames_set_id: i64,
+    frame_id: i64,
+    catalog_bayerpat: bool,
+    path: &Path,
+    debayer_osc: bool,
+) -> &'static str {
+    if catalog_bayerpat {
+        return osc_or_cfa(path, debayer_osc).unwrap_or_else(|| {
+            tracing::warn!(set_id = frames_set_id, frame_id, path = %path.display(), "file shape unreadable; colour token assumed cfa");
+            "cfa"
+        });
+    }
+    match file_shape_quick(path) {
+        Some((_, _, 3)) => "osc",
+        Some(_) => "mono",
+        None => {
+            tracing::warn!(set_id = frames_set_id, frame_id, path = %path.display(), "file shape unreadable; colour token falls back to the catalog (mono)");
+            "mono"
         }
     }
 }

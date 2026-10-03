@@ -56,6 +56,17 @@ pub(crate) fn needs_prepare(origin: &FrameOrigin) -> bool {
     }
 }
 
+/// Whether a frame's Prepare output stem must carry its frame id: an
+/// attested catalog light's file name is not unique by itself (`X.fits`
+/// debayered and `X_d.fits` converted would both be `p_X_d.fits`), while a
+/// project frame's `c_<uuid>` stem is.
+pub(crate) fn prepare_stem_needs_frame_id(origin: &FrameOrigin) -> bool {
+    match origin {
+        FrameOrigin::Catalog { .. } => true,
+        FrameOrigin::Project { .. } => false,
+    }
+}
+
 /// What Prepare reads for one frame, and the uuid its log line carries.
 pub(crate) struct PrepareInput {
     pub(crate) path: PathBuf,

@@ -7725,9 +7725,22 @@ mod tests {
     #[test]
     fn an_attested_set_plans_without_masters() {
         let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
         for (i, t) in THREE_TIMES.iter().enumerate() {
-            test_fixtures::add_light(&f, &light_spec(&format!("l{i}"), t));
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("l{i}"), t));
+            ids.push(id);
         }
+        // Review I11: a buildable raw linked dark, so "nothing to build" is
+        // a real claim about the attested plan.
+        test_fixtures::add_raw_linked_dark(&f, &ids, 64, 48);
+        let library_dir = f.dir.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &library_dir.to_string_lossy(),
+        )
+        .unwrap();
         let plan = |f: &test_fixtures::Fixture| {
             build_plan(
                 &f.conn,
@@ -7739,10 +7752,8 @@ mod tests {
             .unwrap()
         };
         let calibration_codes = ["masters", "links", "masterFiles"];
-        assert!(plan(&f)
-            .blockers
-            .iter()
-            .any(|b| calibration_codes.contains(&b.code.as_str())));
+        let unattested = plan(&f);
+        assert_eq!(unattested.masters_to_build.len(), 1, "the unattested twin owes a master");
         f.conn
             .execute(
                 "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",

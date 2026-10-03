@@ -150,6 +150,18 @@ fn compose_key(color: ColorMode, filter_token: &str, binning: i64, class_token: 
         ColorMode::Mono => "mono",
         ColorMode::Osc => "osc",
     };
+    compose_key_token(color_tok, filter_token, binning, class_token)
+}
+
+/// [`compose_key`] over a colour TOKEN (`mono` | `osc` | `cfa`): an attested
+/// frame set's keys follow the project rule (plan 6b-2 C13), where a mosaic
+/// kept as a mosaic is `cfa`.
+fn compose_key_token(
+    color_tok: &str,
+    filter_token: &str,
+    binning: i64,
+    class_token: &str,
+) -> String {
     format!("{color_tok}__{filter_token}__bin{binning}__{class_token}")
 }
 
@@ -701,6 +713,21 @@ pub fn group_frames(
     frames_set_id: i64,
     cfg: &GroupingConfig,
 ) -> Result<Vec<IntegrationGroup>> {
+    group_frames_with(conn, frames_set_id, cfg, None)
+}
+
+/// [`group_frames`] with the colour rule of an ATTESTED frame set (spec §13,
+/// plan 6b-2 C13): `Some(debayer_osc)` derives each light's colour token the
+/// way a project does ([`crate::stacking::project_source::attested_color_token`]:
+/// catalog BAYERPAT, else the file's own plane count), so externally
+/// debayered three-plane lights group as `osc`. `None` is the catalog rule,
+/// byte-identical to before, with no file probe.
+pub(crate) fn group_frames_with(
+    conn: &Connection,
+    frames_set_id: i64,
+    cfg: &GroupingConfig,
+    attested_debayer_osc: Option<bool>,
+) -> Result<Vec<IntegrationGroup>> {
     let members = load_group_members(conn, frames_set_id)?;
     let total_frames = members.len();
 
@@ -724,12 +751,22 @@ pub fn group_frames(
     // concrete string, its own fallback included), so two members can only
     // land in different buckets when `group_key` would actually emit
     // different keys for them.
-    type BucketKey = (bool, String, i64);
+    type BucketKey = (&'static str, String, i64);
     let mut buckets: HashMap<BucketKey, Bucket> = HashMap::new();
     for m in members {
-        let is_osc = color_mode_of(&m.bayerpat) == ColorMode::Osc;
+        let token: &'static str = match attested_debayer_osc {
+            Some(debayer_osc) => crate::stacking::project_source::attested_color_token(
+                frames_set_id,
+                m.frame_id,
+                color_mode_of(&m.bayerpat) == ColorMode::Osc,
+                std::path::Path::new(&m.path),
+                debayer_osc,
+            ),
+            None if color_mode_of(&m.bayerpat) == ColorMode::Osc => "osc",
+            None => "mono",
+        };
         let filter_token = sanitized_or(m.filter.as_deref(), "NoFilter");
-        let key: BucketKey = (is_osc, filter_token, m.xbinning.unwrap_or(1));
+        let key: BucketKey = (token, filter_token, m.xbinning.unwrap_or(1));
         let bucket = buckets.entry(key).or_insert_with(|| Bucket {
             filter_raw: trimmed_or_none(m.filter.as_deref()),
             members: Vec::new(),
@@ -738,11 +775,11 @@ pub fn group_frames(
     }
 
     let mut groups = Vec::new();
-    for ((is_osc, filter_token, binning), bucket) in buckets {
-        let color = if is_osc {
-            ColorMode::Osc
-        } else {
+    for ((color_token, filter_token, binning), bucket) in buckets {
+        let color = if color_token == "mono" {
             ColorMode::Mono
+        } else {
+            ColorMode::Osc
         };
         let inputs: Vec<ClassInput> = bucket
             .members
@@ -772,7 +809,7 @@ pub fn group_frames(
             let (instrume, cameras) =
                 camera_summary(idxs.iter().map(|&i| bucket.members[i].instrume.as_deref()));
 
-            let key = compose_key(color, &filter_token, binning, &class.token);
+            let key = compose_key_token(color_token, &filter_token, binning, &class.token);
             groups.push(IntegrationGroup {
                 key,
                 instrume,
@@ -813,8 +850,15 @@ pub(crate) fn frame_source(
 ) -> Result<(Vec<IntegrationGroup>, FrameOrigins), ApiError> {
     match subject {
         StackSubject::FrameSet(frames_set_id) => {
-            let groups = group_frames(conn, *frames_set_id, &cfg.grouping)?;
             let attested = crate::db::collab::frames_set_attested(conn, *frames_set_id)?;
+            // Only an attested set takes the project colour rule (C13); a
+            // plain frame set is grouped by the catalog alone, no file probe.
+            let groups = group_frames_with(
+                conn,
+                *frames_set_id,
+                &cfg.grouping,
+                attested.then_some(cfg.calibration.debayer_osc),
+            )?;
             let origins = groups
                 .iter()
                 .flat_map(|g| g.frames.iter())
