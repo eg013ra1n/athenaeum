@@ -9244,7 +9244,7 @@ fn process_group_output(
                 total_exposure_s,
             },
         )?;
-        // Plan 6b-3 D9: the coverage map's own row, in the same transaction
+        // Plan 6b-3 D9: the coverage map's own row, in the same DB
         // block as the master's.
         if let Some(coverage) = coverage_path_str.as_deref() {
             insert_master_light(
@@ -20103,12 +20103,12 @@ mod tests {
     }
 
     /// Plan 6b-3 D4 refinement (review I1): a grid master's statistics are
-    /// measured over covered pixels only, coverage map or not. On a grid
-    /// three times the frames' area, three quarters of the plane are the
-    /// uncovered 0.0; the master's location still reads the frames' sky
-    /// level and its noise about theirs over √4 (resampling lowers it
-    /// further), and with `coverageMap` off no map is written although
-    /// the count was taken.
+    /// measured on its largest covered rectangle. On a grid three times the
+    /// frames' area most of the plane is the uncovered 0.0, so the test reads
+    /// the written master and its coverage map back and pins the stored
+    /// noise and PSF SNR to `measure_plane` on exactly that crop; a
+    /// whole-plane measurement of the same master must differ, which proves
+    /// the fixture can tell the two apart.
     #[test]
     fn a_grid_masters_statistics_ignore_uncovered_pixels() {
         let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
@@ -20123,7 +20123,7 @@ mod tests {
             ..grid
         };
         let mut cfg = sky_config(&conn);
-        cfg.output.coverage_map = false;
+        cfg.output.coverage_map = true;
         crate::db::stacking::set_project_config(
             &conn,
             "p1",
@@ -20136,7 +20136,7 @@ mod tests {
             &ctx,
             &conn,
             "p1",
-            cfg,
+            cfg.clone(),
             &tmp.path().join("work"),
             &tmp.path().join("out"),
         );
@@ -20145,37 +20145,36 @@ mod tests {
 
         let group = &rc.summary.groups[0];
         let stats = group.stats.as_ref().expect("the group's stats");
-        let median = |mut v: Vec<f64>| {
-            v.sort_by(f64::total_cmp);
-            v[v.len() / 2]
-        };
-        let frames: Vec<&crate::stacking::measure::ChannelMeasurement> = rc.measured[&group.key]
-            .iter()
-            .filter(|e| e.included)
-            .filter_map(|e| e.measurement.as_ref())
-            .map(|m| &m.channels[0])
-            .collect();
-        let frame_location = median(frames.iter().map(|c| c.location).collect());
-        let frame_noise = median(frames.iter().map(|c| c.noise).collect());
+        let master = PlaneReader::open(Path::new(group.master_path.as_deref().unwrap())).unwrap();
+        let coverage =
+            PlaneReader::open(Path::new(group.coverage_path.as_deref().unwrap())).unwrap();
+        let (w, h) = (master.width(), master.height());
+        assert_eq!((w, h), (768, 576));
+        let plane = master.read_plane(0).unwrap();
+        let count = coverage.read_plane(0).unwrap();
+        let rect = crate::stacking::crop::largest_covered_rect(&count, w, h, 1).expect("a rect");
         assert!(
-            (stats.master_location[0] - frame_location).abs() < 0.1 * frame_location.abs(),
-            "master location {} vs the frames' {frame_location}",
-            stats.master_location[0]
+            rect.width * 3 < w * 2 && rect.height * 3 < h * 2,
+            "{rect:?} is a part of the grid"
         );
-        let ratio = stats.master_noise[0] / frame_noise;
-        // √4 would give 0.5; the sub-pixel resampling onto the grid smooths
-        // the noise further (measured 0.18). Whole-plane statistics would
-        // read the uncovered 0.0 and fail the location check above.
-        assert!(
-            (0.1..0.8).contains(&ratio),
-            "master noise / frame noise = {ratio}"
+        let opts = cfg
+            .measurement
+            .measure_options(cfg.normalization.scale_estimator);
+        let sub = crate::stacking::crop::crop_plane(&plane, w, rect);
+        let on_rect = crate::stacking::measure::measure_plane(
+            &sub,
+            rect.width,
+            rect.height,
+            &opts,
+            None,
         );
+        assert_eq!(stats.master_noise[0].to_bits(), on_rect.noise.to_bits());
+        assert_eq!(stats.master_psf_snr[0].to_bits(), on_rect.psf_snr.to_bits());
+        let whole = crate::stacking::measure::measure_plane(&plane, w, h, &opts, None);
         assert!(
-            crate::db::stacking::list_master_lights(&conn, rc.run_id)
-                .unwrap()
-                .iter()
-                .all(|m| m.kind != "coverage"),
-            "the count taken for the statistics writes no map"
+            whole.noise.to_bits() != on_rect.noise.to_bits()
+                || whole.psf_snr.to_bits() != on_rect.psf_snr.to_bits(),
+            "the fixture tells the covered rectangle from the whole plane"
         );
     }
 

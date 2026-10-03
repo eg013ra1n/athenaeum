@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::geometry::PixelMap;
 use crate::integration::combine::{Combination, IntegrationRecipe, Rejection};
@@ -376,6 +376,13 @@ pub struct GroupInput<'a> {
     /// `false` for a frame set, whose statistics never move.
     pub stats_on_covered: bool,
 }
+
+/// The smallest covered rectangle (per side, px) a grid master's statistics
+/// are measured on (plan 6b-3 D4 refinement). The noise and PSF estimators
+/// need a real image: B3-spline smoothing reflects two samples past an edge
+/// (a 1-2 px row panics) and both want at least 100 samples. A narrower
+/// covered rectangle fails the group instead.
+pub const MIN_STATS_RECT_PX: usize = 16;
 
 // `Clone, Serialize, Deserialize, ts_rs::TS` pulled forward from Task 9's own
 // ts_export registration work (spec plan, "GroupStats (integrate.rs — derive
@@ -1343,26 +1350,35 @@ pub fn integrate_group(
         // pool, and pass `None` for the explicit handle.
         // Plan 6b-3 D4 refinement (review I1): on a grid the statistics come
         // from the largest rectangle every pixel of which at least one frame
-        // covers (plane 0's count; the planes share the footprint). No such
-        // rectangle (no covered pixel, or a count of the wrong length) fails
-        // the group: whole-plane statistics would read the uncovered 0.0 as
-        // data.
+        // covers (plane 0's count; the planes share the footprint). The
+        // group fails, visibly, when no frame covers the grid (the master
+        // would be all zeros) or when that rectangle is under
+        // [`MIN_STATS_RECT_PX`] on a side: whole-plane statistics would read
+        // the uncovered 0.0 as data.
         if p == 0 && input.stats_on_covered {
             measure_rect = coverage.as_deref().and_then(|c| {
                 crate::stacking::crop::largest_covered_rect(c, input.width, input.height, 1)
             });
             match measure_rect {
-                Some(r) => debug!(
-                    crop_x0 = r.x0,
-                    crop_y0 = r.y0,
-                    crop_width = r.width,
-                    crop_height = r.height,
-                    "master statistics on the covered rectangle"
-                ),
+                Some(r) if r.width >= MIN_STATS_RECT_PX && r.height >= MIN_STATS_RECT_PX => {
+                    debug!(
+                        crop_x0 = r.x0,
+                        crop_y0 = r.y0,
+                        crop_width = r.width,
+                        crop_height = r.height,
+                        "master statistics on the covered rectangle"
+                    )
+                }
+                Some(r) => {
+                    return Err(IntegrationError::BadInput(format!(
+                        "the covered part of the grid is only {} x {} px, below the {} x {} px \
+                         minimum for the master's statistics",
+                        r.width, r.height, MIN_STATS_RECT_PX, MIN_STATS_RECT_PX
+                    )));
+                }
                 None => {
-                    error!("no covered rectangle for the master statistics");
                     return Err(IntegrationError::BadInput(
-                        "no covered pixel to measure the grid master's statistics on".to_string(),
+                        "no frame of this group covers the grid".to_string(),
                     ));
                 }
             }
@@ -2389,6 +2405,119 @@ mod tests {
             "the centre is covered by every frame"
         );
         assert!(cov[0] < 3.0, "the (-5, 3)-shifted frame leaves the corner");
+    }
+
+    /// Runs `three_shifted_frames` through `integrate_group` with
+    /// `stats_on_covered` set, every frame's map moved by `shift` (a
+    /// whole-frame shift leaves a sliver, or nothing, covered).
+    fn integrate_on_covered(
+        coverage_map: bool,
+        shift: Option<(f64, f64)>,
+    ) -> Result<GroupOutput, IntegrationError> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut frames = three_shifted_frames(dir.path());
+        if let Some((dx, dy)) = shift {
+            for f in &mut frames {
+                f.map = shift_map(dx, dy);
+            }
+        }
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: 400,
+            height: 300,
+            channels: 1,
+            interpolation: Interpolation::BicubicBSpline,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+            second_pass_bitmaps: false,
+            coverage_map,
+            stats_on_covered: true,
+        };
+        let on_plane = nop_plane();
+        let on_band = nop_band();
+        let progress = GroupProgress {
+            on_plane: &on_plane,
+            engine: EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
+        };
+        integrate_group(
+            &input,
+            &MeasureOptions::default(),
+            &pool(),
+            &AtomicBool::new(false),
+            &progress,
+            io(1 << 24),
+        )
+    }
+
+    /// Review I1, plan 6b-3: with `stats_on_covered` the master's statistics
+    /// are those of its largest covered rectangle, not of the whole plane,
+    /// and no map is returned unless `coverage_map` asked for one.
+    #[test]
+    fn stats_on_covered_measure_the_covered_rectangle() {
+        let out = integrate_on_covered(false, Some((200.0, 0.0))).unwrap();
+        assert!(
+            out.coverage.is_none(),
+            "the count taken for the statistics is no map"
+        );
+        let with_map = integrate_on_covered(true, Some((200.0, 0.0))).unwrap();
+        let cov = with_map.coverage.as_deref().expect("a coverage map");
+        let rect = crate::stacking::crop::largest_covered_rect(cov, 400, 300, 1).unwrap();
+        assert!(
+            rect.width < 300 && rect.height == 300,
+            "a partial rectangle: {rect:?}"
+        );
+        let sub = crate::stacking::crop::crop_plane(&out.data, 400, rect);
+        let expect = measure_plane(
+            &sub,
+            rect.width,
+            rect.height,
+            &MeasureOptions::default(),
+            None,
+        );
+        assert_eq!(out.stats.master_noise[0].to_bits(), expect.noise.to_bits());
+        assert_eq!(
+            out.stats.master_psf_snr[0].to_bits(),
+            expect.psf_snr.to_bits()
+        );
+        let whole = measure_plane(&out.data, 400, 300, &MeasureOptions::default(), None);
+        assert_ne!(
+            out.stats.master_noise[0].to_bits(),
+            whole.noise.to_bits(),
+            "the fixture discriminates the rectangle from the whole plane"
+        );
+    }
+
+    /// A covered rectangle under `MIN_STATS_RECT_PX` fails the group with a
+    /// message that names it, never a panic in the estimators.
+    #[test]
+    fn a_sliver_of_coverage_fails_the_group_with_its_own_message() {
+        // Every frame moved 397 px right: only a 3-px-wide column is covered.
+        match integrate_on_covered(false, Some((397.0, 0.0))) {
+            Err(IntegrationError::BadInput(m)) => {
+                assert!(m.contains("covered part of the grid is only"), "{m}")
+            }
+            other => panic!("expected a BadInput, got {:?}", other.map(|o| o.width)),
+        }
+    }
+
+    /// No frame covering the grid at all fails the group, with its own text.
+    #[test]
+    fn empty_coverage_fails_the_group() {
+        match integrate_on_covered(false, Some((5000.0, 0.0))) {
+            Err(IntegrationError::BadInput(m)) => {
+                assert!(m.contains("no frame of this group covers the grid"), "{m}")
+            }
+            other => panic!("expected a BadInput, got {:?}", other.map(|o| o.width)),
+        }
     }
 
     #[test]
