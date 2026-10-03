@@ -232,6 +232,10 @@ pub struct RunSummary {
     pub status: String,
     pub config: StackingConfig,
     pub config_hash: String,
+    // The canonical grid a project run was registered onto (plan 6b-3 D18);
+    // `None` for a frame set and for a summary written before 6b-3.
+    #[serde(default)]
+    pub grid: Option<crate::collab::grid::CanonicalGrid>,
     pub reference: SummaryReference,
     pub measurement: SummaryMeasurement,
     pub groups: Vec<SummaryGroup>,
@@ -267,6 +271,7 @@ mod tests {
             finished_at: None,
             status: "done".into(),
             config_hash: "h".into(),
+            grid: None,
             reference: SummaryReference {
                 frame_id: None,
                 filename: None,
@@ -287,9 +292,14 @@ mod tests {
         };
         let mut v = serde_json::to_value(&summary).unwrap();
         v.as_object_mut().unwrap().remove("projectId");
+        v.as_object_mut().unwrap().remove("grid");
         assert_eq!(v["setId"], serde_json::json!(5));
         let back: RunSummary = serde_json::from_value(v).unwrap();
         assert_eq!(back.set_id, Some(5));
         assert_eq!(back.project_id, None);
+        assert!(
+            back.grid.is_none(),
+            "a summary written before 6b-3 has no grid"
+        );
     }
 }

@@ -528,7 +528,7 @@ export type StageTiming = { stage: Stage, durationMs: number, };
 
 export type MasterBuilt = { setId: number, kind: MasterWork, masterSetId: number, path: string, durationMs: number, };
 
-export type RunSummary = { runId: number, setId: number | null, projectId: string | null, setName: string, appVersion: string, startedAt: string, finishedAt: string | null, status: string, config: StackingConfig, configHash: string, reference: SummaryReference, measurement: SummaryMeasurement, groups: Array<SummaryGroup>, 
+export type RunSummary = { runId: number, setId: number | null, projectId: string | null, setName: string, appVersion: string, startedAt: string, finishedAt: string | null, status: string, config: StackingConfig, configHash: string, grid: CanonicalGrid | null, reference: SummaryReference, measurement: SummaryMeasurement, groups: Array<SummaryGroup>, 
 /**
  * Stage 0.5's own result list (spec §2 row 0.5, owner requirement
  * 2026-09-09) — every master the run built or rebuilt before

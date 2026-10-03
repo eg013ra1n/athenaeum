@@ -54,6 +54,9 @@ pub struct RegisteredCards<'a> {
     /// `ROWORDER` of the reference frame; when set it replaces the subject's
     /// card (the registered array is the reference's grid).
     pub reference_roworder: Option<&'a str>,
+    /// The grid hash of a frame registered onto a project's canonical grid
+    /// (plan 6b-3 D2) — stamped as `ATH_GRID`; `None` for a frame set.
+    pub grid_hash: Option<&'a str>,
 }
 
 /// The copy-through cards of a FITS file, read from its own header (no
@@ -111,7 +114,7 @@ pub fn build_registered_cards(source: &[Card], reg: &RegisteredCards) -> anyhow:
         cards.retain(|c| c.keyword != "ROWORDER");
         cards.push(
             Card::new("ROWORDER", CardValue::Str(order.into()))?
-                .with_comment("row order of the reference grid"),
+                .with_comment("row order of the output grid"),
         );
     }
     let kernel = serde_json::to_value(reg.interpolation)?
@@ -142,6 +145,12 @@ pub fn build_registered_cards(source: &[Card], reg: &RegisteredCards) -> anyhow:
     cards.push(
         Card::new("ATH_REGS", CardValue::Real(reg.rms_px))?.with_comment("[px] registration RMS"),
     );
+    if let Some(grid) = reg.grid_hash {
+        cards.push(
+            Card::new("ATH_GRID", CardValue::Str(grid.to_string()))?
+                .with_comment("canonical grid hash"),
+        );
+    }
     // Arbitrary length → CONTINUE chain; no comment (it could overflow the last record).
     cards.push(Card::new(
         "ATH_REGT",
@@ -432,6 +441,7 @@ mod tests {
             clamping: 0.3,
             rms_px: 0.42,
             reference_roworder: None,
+            grid_hash: None,
         };
         build_registered_cards(&[], &reg).unwrap()
     }
@@ -504,6 +514,7 @@ mod tests {
             clamping: 0.3,
             rms_px: 0.42,
             reference_roworder: None,
+            grid_hash: None,
         };
         let cards = build_registered_cards(&source, &reg).unwrap();
         let out = dir.path().join("registered").join("r_sub.fits");
@@ -567,6 +578,7 @@ mod tests {
             clamping: 0.3,
             rms_px: 0.42,
             reference_roworder: Some("BOTTOM-UP"),
+            grid_hash: None,
         };
         let cards = build_registered_cards(&source, &reg).unwrap();
         let orders: Vec<&Card> = cards.iter().filter(|c| c.keyword == "ROWORDER").collect();
@@ -670,5 +682,54 @@ mod tests {
         let p2 = r.read_plane(2).unwrap();
         assert!((p0[20 * w + 20] - base[20 * w + 20]).abs() < 1e-5);
         assert!((p2[20 * w + 20] - 0.5 * base[20 * w + 20]).abs() < 1e-5);
+    }
+
+    /// Plan 6b-3 D2, D3: a grid-registered frame states the grid it was
+    /// resampled onto (`ATH_GRID`) and the grid's own row order; a
+    /// frame-set registered frame carries neither, byte for byte as before.
+    #[test]
+    fn a_grid_registered_frame_states_its_grid_and_row_order() {
+        let source = vec![
+            Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap(),
+            Card::new("FILTER", CardValue::Str("L".into())).unwrap(),
+        ];
+        let build = |grid_hash: Option<&str>| {
+            build_registered_cards(
+                &source,
+                &RegisteredCards {
+                    reference_name: "c_ref",
+                    model: "affine",
+                    transform_json: "{}",
+                    interpolation: Interpolation::BicubicBSpline,
+                    clamping: 0.3,
+                    rms_px: 0.1,
+                    reference_roworder: grid_hash.map(|_| "BOTTOM-UP"),
+                    grid_hash,
+                },
+            )
+            .unwrap()
+        };
+        let get = |cards: &[Card], k: &str| {
+            cards
+                .iter()
+                .find(|c| c.keyword == k)
+                .and_then(|c| c.value.clone())
+        };
+        let grid = build(Some("0123456789abcdef"));
+        assert_eq!(
+            get(&grid, "ATH_GRID"),
+            Some(CardValue::Str("0123456789abcdef".into()))
+        );
+        assert_eq!(
+            get(&grid, "ROWORDER"),
+            Some(CardValue::Str("BOTTOM-UP".into()))
+        );
+        assert_eq!(grid.iter().filter(|c| c.keyword == "ROWORDER").count(), 1);
+        let set = build(None);
+        assert!(get(&set, "ATH_GRID").is_none());
+        assert_eq!(
+            get(&set, "ROWORDER"),
+            Some(CardValue::Str("TOP-DOWN".into()))
+        );
     }
 }

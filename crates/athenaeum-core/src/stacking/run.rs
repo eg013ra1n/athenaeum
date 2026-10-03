@@ -292,6 +292,10 @@ pub(crate) struct RunContext {
     /// A project run's reference candidates, set by stage 4 (spec §5.4).
     /// `None` for a frame set, which has no WCS rule.
     pub(crate) wcs_rule: Option<WcsRule>,
+    /// A project run's canonical grid (spec §5.5, plan 6b-3): every group is
+    /// delivered in its geometry, through one composed map per frame.
+    /// `None` for a frame set.
+    pub(crate) grid: Option<Arc<crate::stacking::grid_map::GridRun>>,
     /// This run's ONE hot-pixel-map cache, keyed by resolved master dark path
     /// (decision 4) — a dark shared by every frame in a group pays the
     /// measurement once.
@@ -959,6 +963,7 @@ pub fn start_stacking(
         status: "planning".to_string(),
         config: plan.config.clone(),
         config_hash: plan.config_hash.clone(),
+        grid: None,
         reference: SummaryReference {
             frame_id: plan.reference.frame_id,
             filename: plan.reference.filename.clone(),
@@ -1002,6 +1007,7 @@ pub fn start_stacking(
         origins,
         solver: Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone())),
         wcs_rule: None,
+        grid: None,
         hot_maps: HashMap::new(),
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
@@ -2909,6 +2915,10 @@ pub(crate) enum RegisteredFrameOutcome {
         record: RegistrationRecord,
         #[allow(dead_code)] // read by Task 8/9 (provenance)
         cached: bool,
+        /// The hash this frame's `registered` artifact is cached under:
+        /// its registration hash, or the composed one on a grid (plan 6b-3
+        /// D2). Integration's materialized lookup and LN key on it.
+        registered_hash: String,
     },
     /// The failure text — kept alongside (not read back today: the SAME
     /// text is already stored on the frame's `MeasuredFrame::reason`, which
@@ -4929,6 +4939,9 @@ struct RegisteredWrite {
     /// Already-resolved (`to_record`) — the sequential loop's
     /// `upsert_registration` uses this SAME record, never rebuilding it.
     rec: RegistrationRecord,
+    /// The hash the `registered` artifact is recorded under: the
+    /// registration hash, or the composed one on a grid (plan 6b-3 D2).
+    registered_hash: String,
     /// `Some(out_path)` iff the write succeeded; `None` on a write failure
     /// (logged here, non-fatal — the sequential loop then records no
     /// artifact row, and every downstream reader falls back to the
@@ -4985,6 +4998,8 @@ struct ArtifactRewriteItem {
     frame: GroupFrame,
     map: PixelMap,
     rec: RegistrationRecord,
+    // The hash the rewritten artifact is recorded under (plan 6b-3 D2).
+    registered_hash: String,
     planes: usize,
 }
 
@@ -5367,6 +5382,7 @@ fn register_group_pass(
                                 map,
                                 record: row.clone(),
                                 cached: true,
+                                registered_hash: row.config_hash.clone().unwrap_or_default(),
                             });
                         }
                         Err(e) => {
@@ -5403,8 +5419,14 @@ fn register_group_pass(
             // immediately; a rewrite item is counted when the rewrite
             // fan-out's own ticker ticks it.
             let mut needs_rewrite = false;
-            if let RegisteredFrameOutcome::Aligned { map, record, .. } = &outcome {
-                let hash = record.config_hash.as_deref().unwrap_or_default();
+            if let RegisteredFrameOutcome::Aligned {
+                map,
+                record,
+                registered_hash,
+                ..
+            } = &outcome
+            {
+                let hash = registered_hash.as_str();
                 let fresh = registered_artifact_is_fresh(rc, &group.key, frame.frame_id, hash)
                     .unwrap_or_else(|e| {
                         tracing::warn!(
@@ -5429,6 +5451,7 @@ fn register_group_pass(
                         frame: frame.clone(),
                         map: map.clone(),
                         rec: record.clone(),
+                        registered_hash: registered_hash.clone(),
                         planes,
                     });
                 }
@@ -5597,7 +5620,7 @@ fn register_group_pass(
             needs_artifact_rewrite,
             admission_n,
             cancel_ref,
-            move |item: ArtifactRewriteItem| -> Result<(i64, RegistrationRecord, Result<PathBuf, String>), String> {
+            move |item: ArtifactRewriteItem| -> Result<(i64, String, Result<PathBuf, String>), String> {
                 let frame_id = item.frame_id;
                 let stem = calibrated_file_stem(group_ref, &item.frame);
                 let out = out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
@@ -5610,11 +5633,12 @@ fn register_group_pass(
                     clamping,
                     reference_name_ref,
                     &item.rec,
+                    None,
                     Some(pool_ref),
                     &out,
                 );
                 let result = match written {
-                    Ok(()) => Ok((item.frame_id, item.rec, Ok(out))),
+                    Ok(()) => Ok((item.frame_id, item.registered_hash, Ok(out))),
                     Err(e) => {
                         tracing::warn!(
                             run_id,
@@ -5622,7 +5646,7 @@ fn register_group_pass(
                             error = ?e,
                             "failed to write registered frame"
                         );
-                        Ok((item.frame_id, item.rec, Err(format!("{e:#}"))))
+                        Ok((item.frame_id, item.registered_hash, Err(format!("{e:#}"))))
                     }
                 };
                 rewrite_ticker_ref.tick(Some(frame_id));
@@ -5634,10 +5658,14 @@ fn register_group_pass(
         for res in rewrite_results {
             match res {
                 None => return Err(RunError::Cancelled),
-                Some(Ok((frame_id, rec, Ok(out_path)))) => {
-                    if let Err(e) =
-                        record_registered_artifact(rc, &group.key, frame_id, &rec, &out_path)
-                    {
+                Some(Ok((frame_id, registered_hash, Ok(out_path)))) => {
+                    if let Err(e) = record_registered_artifact(
+                        rc,
+                        &group.key,
+                        frame_id,
+                        &registered_hash,
+                        &out_path,
+                    ) {
                         tracing::warn!(
                             run_id = rc.run_id,
                             frame_id,
@@ -5835,6 +5863,7 @@ fn register_group_pass(
                             clamping,
                             reference_name_ref,
                             &rec,
+                            None,
                             Some(pool_ref),
                             &out_path,
                         ) {
@@ -5851,6 +5880,7 @@ fn register_group_pass(
                         };
                         Some(RegisteredWrite {
                             rec,
+                            registered_hash: item.expected_hash.clone(),
                             written,
                             write_error,
                         })
@@ -5961,6 +5991,7 @@ fn register_group_pass(
                             // not `Send` across `fan_out`'s plain threads.
                             let RegisteredWrite {
                                 rec,
+                                registered_hash,
                                 written,
                                 write_error,
                             } = persisted.expect(
@@ -5984,7 +6015,7 @@ fn register_group_pass(
                                     rc,
                                     &group.key,
                                     frame.frame_id,
-                                    &rec,
+                                    &registered_hash,
                                     out_path,
                                 ) {
                                     tracing::warn!(
@@ -6000,6 +6031,7 @@ fn register_group_pass(
                                     map,
                                     record: rec,
                                     cached: false,
+                                    registered_hash,
                                 });
                             }
                         }
@@ -6386,7 +6418,7 @@ fn adopt_co_registered_geometry(rc: &mut RunContext, calibrated: &Path, hash: &s
     let Some(reference_frame_id) = rc.reference_frame_id else {
         return;
     };
-    let (width, height) = (rc.reference_width, rc.reference_height);
+    let (width, height) = delivered_dims(rc, (rc.reference_width, rc.reference_height));
     for entry in rc.group_geometry.values_mut() {
         entry.reference_frame_id = reference_frame_id;
         entry.width = width;
@@ -6618,10 +6650,11 @@ fn set_group_geometry(
     calibrated: &Path,
     hash: &str,
 ) {
+    let (width, height) = delivered_dims(rc, (ref_stars.width, ref_stars.height));
     if let Some(entry) = rc.group_geometry.get_mut(key) {
         entry.reference_frame_id = reference_frame_id;
-        entry.width = ref_stars.width;
-        entry.height = ref_stars.height;
+        entry.width = width;
+        entry.height = height;
         entry.calibrated = calibrated.to_path_buf();
         entry.hash = hash.to_string();
     }
@@ -6629,6 +6662,12 @@ fn set_group_geometry(
         rc.reference_width = ref_stars.width;
         rc.reference_height = ref_stars.height;
     }
+}
+
+/// The geometry a group is delivered in (plan 6b-3): the grid's on a
+/// project run, else the group reference's own `native` dimensions.
+fn delivered_dims(rc: &RunContext, native: (usize, usize)) -> (usize, usize) {
+    rc.grid.as_ref().map(|g| g.dims()).unwrap_or(native)
 }
 
 /// Stage 5 (register, spec §3, ruling 10): register every included frame of
@@ -6876,6 +6915,7 @@ fn write_one_registered_frame(
     clamping: f32,
     reference_name: &str,
     rec: &RegistrationRecord,
+    grid_hash: Option<&str>,
     pool: Option<&Arc<rayon::ThreadPool>>,
     out: &Path,
 ) -> anyhow::Result<()> {
@@ -6889,7 +6929,10 @@ fn write_one_registered_frame(
             interpolation: interp,
             clamping,
             rms_px: rec.rms_residual_px,
-            reference_roworder: None,
+            // D3: a grid frame states the grid's own row order, never the
+            // reference's.
+            reference_roworder: grid_hash.map(|_| "BOTTOM-UP"),
+            grid_hash,
         },
     )?;
     write_registered_frame(
@@ -6900,10 +6943,11 @@ fn write_one_registered_frame(
 
 /// Perf tier A Task 6a fix round 1: the registered artifact's DB
 /// bookkeeping ONLY — `file_identity` + the `registered` artifact row,
-/// keyed on `rec.config_hash` (the registration config hash, already
+/// keyed on `registered_hash` (plan 6b-3 D2): the registration hash, already
 /// folded with the frame's own calibration hash by `registration_hash_for`
 /// — a re-registration or a re-calibration invalidates it exactly like the
-/// LN `.athln` sidecars). Split from the pixel work
+/// LN `.athln` sidecars — or, on a grid, the composed hash that also folds
+/// the reference's WCS and the grid. Split from the pixel work
 /// ([`write_one_registered_frame`]) because `rusqlite` connections are not
 /// `Send` across `fan_out`'s plain `thread::scope` workers — this runs on
 /// the run thread, in the sequential results loop, right after the write
@@ -6912,7 +6956,7 @@ fn record_registered_artifact(
     rc: &mut RunContext,
     group_key: &str,
     frame_id: i64,
-    rec: &RegistrationRecord,
+    registered_hash: &str,
     out: &Path,
 ) -> anyhow::Result<()> {
     let (size, modified_at) = file_identity(out)?;
@@ -6925,7 +6969,7 @@ fn record_registered_artifact(
             group_key,
             kind: "registered",
             path: out.to_str(),
-            config_hash: rec.config_hash.as_deref().unwrap_or_default(),
+            config_hash: registered_hash,
             size: Some(size),
             modified_at: Some(&modified_at),
             payload_json: None,
@@ -7974,9 +8018,11 @@ fn process_group_output(
                 continue;
             };
             let (map, registration_hash) = match &e.registration {
-                Some(RegisteredFrameOutcome::Aligned { map, record, .. }) => {
-                    (map.clone(), record.config_hash.clone().unwrap_or_default())
-                }
+                Some(RegisteredFrameOutcome::Aligned {
+                    map,
+                    registered_hash,
+                    ..
+                }) => (map.clone(), registered_hash.clone()),
                 _ => continue,
             };
             let weight = e.weight.clone().unwrap_or(FrameWeight {
@@ -11053,6 +11099,7 @@ pub(crate) fn test_context(
         status: "planning".to_string(),
         config: config.clone(),
         config_hash: hash.clone(),
+        grid: None,
         reference: SummaryReference {
             frame_id: None,
             filename: None,
@@ -11096,6 +11143,7 @@ pub(crate) fn test_context(
         origins,
         solver,
         wcs_rule: None,
+        grid: None,
         hot_maps: HashMap::new(),
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),

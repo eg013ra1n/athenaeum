@@ -125,6 +125,23 @@ pub fn wcs_record_hash(r: &PlateSolveRecord) -> String {
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(text.as_bytes()))
 }
 
+/// The WCS geometry hash of a registration reference — its manifest WCS,
+/// else the run's local solve of it (`origin::stored_solve`) — or `None`
+/// when it has neither. The plan and the run key a grid-registered frame on
+/// it (plan 6b-3 D2).
+pub fn reference_wcs_hash_of(
+    conn: &rusqlite::Connection,
+    origins: &crate::stacking::origin::FrameOrigins,
+    frame_id: i64,
+) -> anyhow::Result<Option<String>> {
+    let origin =
+        crate::stacking::origin::origin_of(origins, frame_id).map_err(anyhow::Error::from)?;
+    Ok(
+        crate::stacking::origin::stored_solve(conn, origin, frame_id)?
+            .map(|record| wcs_record_hash(&record)),
+    )
+}
+
 /// The exact chain subject → grid, as a [`DisplacementField`] around the
 /// fitted affine `linear`.
 ///

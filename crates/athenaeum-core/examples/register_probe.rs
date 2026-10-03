@@ -366,6 +366,7 @@ fn main() {
                     clamping: args.cfg.clamping_threshold,
                     rms_px: a.rms_px,
                     reference_roworder: None,
+                    grid_hash: None,
                 },
             )?;
             write_registered_frame(

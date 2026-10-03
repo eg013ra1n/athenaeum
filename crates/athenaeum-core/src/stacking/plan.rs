@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::lights::{compute_export_readiness_for_frames, ExportReadiness};
 use crate::api::{ApiError, PathPolicy};
 use crate::db::stacking::{
-    active_run_for_subject, find_artifact, get_set_config, list_frame_rows, list_runs,
-    StackSubject, StackingArtifactRow,
+    active_run_for_subject, find_artifact, get_set_config, list_artifacts, list_frame_rows,
+    list_runs, upsert_artifact, NewArtifact, StackSubject, StackingArtifactRow,
 };
 use crate::export::{resolve_generation_cached, resolved_master_paths, DivisorCache};
 use crate::integration::stats::RejectionNormalization;
@@ -980,23 +980,54 @@ pub(crate) fn stored_reference_frame(
     }
 }
 
-// B10: a project run keeps its registration in the registered artifact's
-// payload (spec section 4.2); it never writes `registration_results`, so the
-// Project arms below read nothing and store nothing.
+/// The payload-only artifact a project run caches each frame's star map in
+/// (spec §4.2, plan 6b-3 D2): one row per handle, `group_key = ""`, keyed
+/// on the frame's registration hash, the `RegistrationRecord` as JSON with
+/// `frames_set_id = 0`. Not in `paths::INTERMEDIATE_ARTIFACT_KINDS`, so only
+/// `CleanupWhat::All` drops it: a cleanup that removes the registered
+/// frames keeps the star matching. A project never writes
+/// `registration_results` (catalog-keyed).
+pub(crate) const REGISTRATION_ARTIFACT_KIND: &str = "registration";
 
-/// The subject's stored registration rows.
+/// The subject's stored registration rows: `registration_results` for a
+/// frame set, the `registration` artifacts for a project. A project row
+/// whose payload does not parse is skipped with a warning, and the frame
+/// registers again.
 pub(crate) fn stored_registrations(
     conn: &Connection,
     subject: &StackSubject,
 ) -> anyhow::Result<Vec<RegistrationRecord>> {
     match subject {
         StackSubject::FrameSet(id) => get_registration_for_frame_set(conn, *id),
-        StackSubject::Project(_) => Ok(Vec::new()),
+        StackSubject::Project(project_id) => {
+            let mut out = Vec::new();
+            for row in list_artifacts(conn, subject, Some(REGISTRATION_ARTIFACT_KIND))? {
+                match row
+                    .payload_json
+                    .as_deref()
+                    .map(serde_json::from_str::<RegistrationRecord>)
+                {
+                    Some(Ok(record)) => out.push(record),
+                    Some(Err(e)) => tracing::warn!(
+                        project_id = %project_id,
+                        frame_id = ?row.frame_id,
+                        error = %e,
+                        "stored star map unreadable; the frame registers again"
+                    ),
+                    None => tracing::warn!(
+                        project_id = %project_id,
+                        frame_id = ?row.frame_id,
+                        "stored star map has no payload; the frame registers again"
+                    ),
+                }
+            }
+            Ok(out)
+        }
     }
 }
 
 /// Upsert one registration row for the subject; `build` receives the frame
-/// set id the record carries.
+/// set id the record carries (0 for a project).
 pub(crate) fn store_registration(
     conn: &Connection,
     subject: &StackSubject,
@@ -1004,7 +1035,40 @@ pub(crate) fn store_registration(
 ) -> anyhow::Result<()> {
     match subject {
         StackSubject::FrameSet(id) => upsert_registration(conn, &build(*id)).map(|_| ()),
-        StackSubject::Project(_) => Ok(()),
+        StackSubject::Project(_) => {
+            let record = build(0);
+            let payload = serde_json::to_string(&record)?;
+            upsert_artifact(
+                conn,
+                &NewArtifact {
+                    subject,
+                    frame_id: Some(record.frame_id),
+                    group_key: "",
+                    kind: REGISTRATION_ARTIFACT_KIND,
+                    path: None,
+                    config_hash: record.config_hash.as_deref().unwrap_or_default(),
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some(&payload),
+                },
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// The hash a frame's `registered` artifact is cached under (spec §5.5,
+/// plan 6b-3 D2): its registration hash for a frame set; on a grid,
+/// `grid_registered_hash` over the reference's WCS and the grid, so a grid
+/// move or a re-solved reference rewrites the frame without star matching.
+pub(crate) fn registered_hash_for(registration_hash: &str, grid: Option<(&str, &str)>) -> String {
+    match grid {
+        None => registration_hash.to_string(),
+        Some((reference_wcs_hash, grid_hash)) => crate::stacking::grid_map::grid_registered_hash(
+            registration_hash,
+            reference_wcs_hash,
+            grid_hash,
+        ),
     }
 }
 
@@ -1430,6 +1494,8 @@ fn compute_register_stale(
     groups: &[IntegrationGroup],
     reference: &PlanReference,
     memo: &mut HashMemo,
+    origins: &FrameOrigins,
+    grid: Option<&crate::collab::grid::CanonicalGrid>,
 ) -> Result<bool, ApiError> {
     let Some(last_run) = list_runs(conn, subject, 1)?.into_iter().next() else {
         return Ok(true);
@@ -1492,6 +1558,31 @@ fn compute_register_stale(
         reference_hashes.insert(reference_frame_id, hash);
     }
 
+    // Plan 6b-3 D2: on a grid, the registered artifact also folds each
+    // reference's WCS geometry and the grid; a reference without a WCS
+    // cannot have produced one, so the stage reads stale.
+    let grid_hash = grid.map(|g| g.hash());
+    let mut reference_wcs_hashes: HashMap<i64, String> = HashMap::new();
+    if grid_hash.is_some() {
+        for &reference_frame_id in expected_reference.values() {
+            if reference_wcs_hashes.contains_key(&reference_frame_id) {
+                continue;
+            }
+            match crate::stacking::grid_map::reference_wcs_hash_of(
+                conn,
+                origins,
+                reference_frame_id,
+            )
+            .map_err(|e| ApiError::Internal(format!("{e:#}")))?
+            {
+                Some(h) => {
+                    reference_wcs_hashes.insert(reference_frame_id, h);
+                }
+                None => return Ok(true),
+            }
+        }
+    }
+
     let rows = stored_registrations(conn, subject)?;
     let by_frame: HashMap<i64, &RegistrationRecord> =
         rows.iter().map(|r| (r.frame_id, r)).collect();
@@ -1543,8 +1634,15 @@ fn compute_register_stale(
         // the run actually warped and wrote every included frame; the
         // same was true after any cleanup that deletes the `registered/`
         // directory (`CleanupPolicy::DeleteRegistered`/`DeleteIntermediates`).
+        let artifact_hash = match &grid_hash {
+            None => expected.clone(),
+            Some(g) => match reference_wcs_hashes.get(&reference_frame_id) {
+                Some(w) => registered_hash_for(&expected, Some((w, g))),
+                None => return Ok(true),
+            },
+        };
         let artifact = find_artifact(conn, subject, &group.key, "registered", Some(frame_id))?;
-        if !artifact.is_some_and(|row| is_fresh(&row, &expected)) {
+        if !artifact.is_some_and(|row| is_fresh(&row, &artifact_hash)) {
             return Ok(true);
         }
     }
@@ -2267,6 +2365,8 @@ pub fn build_plan(
             project_inputs(conn, settings, project_id, config_override)?
         }
     };
+    let project_grid: Option<crate::collab::grid::CanonicalGrid> =
+        project.as_ref().and_then(|p| p.grid.current);
     // Review I1: a project's unsupported files leave the included counts
     // and the ≥ 3 rule (Prepare would exclude them), but not
     // `excluded_frame_ids`, which stays the user's manual list.
@@ -2546,7 +2646,7 @@ pub fn build_plan(
     // resolves every frame through, and memoizes each frame's own stage-1
     // hash so this loop and `compute_register_stale` below never resolve
     // the same frame twice.
-    let mut memo = HashMemo::new(origins);
+    let mut memo = HashMemo::new(origins.clone());
     let mut plan_groups = Vec::with_capacity(groups.len());
     let mut calibrate_stale = false;
     let mut measure_stale = false;
@@ -2560,10 +2660,40 @@ pub fn build_plan(
     // once for the whole build, not per group/frame, same rationale as
     // `compute_register_stale`'s own `by_frame` map below.
     let ln_registration_by_frame: HashMap<i64, Option<String>> = if local_normalization_active {
-        stored_registrations(conn, subject)?
-            .into_iter()
-            .map(|r| (r.frame_id, r.config_hash))
-            .collect()
+        let rows = stored_registrations(conn, subject)?;
+        match project_grid.as_ref().map(|g| g.hash()) {
+            None => rows
+                .into_iter()
+                .map(|r| (r.frame_id, r.config_hash))
+                .collect(),
+            // Plan 6b-3 D2: on a grid, LN's registration upstream is the
+            // registered (composed) hash the run folds in.
+            Some(grid_hash) => {
+                let mut wcs: HashMap<i64, Option<String>> = HashMap::new();
+                let mut out = HashMap::with_capacity(rows.len());
+                for r in rows {
+                    let w = match wcs.get(&r.reference_frame_id) {
+                        Some(w) => w.clone(),
+                        None => {
+                            let w = crate::stacking::grid_map::reference_wcs_hash_of(
+                                conn,
+                                &origins,
+                                r.reference_frame_id,
+                            )
+                            .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+                            wcs.insert(r.reference_frame_id, w.clone());
+                            w
+                        }
+                    };
+                    let registered = match (r.config_hash, w) {
+                        (Some(h), Some(w)) => Some(registered_hash_for(&h, Some((&w, &grid_hash)))),
+                        _ => None,
+                    };
+                    out.insert(r.frame_id, registered);
+                }
+                out
+            }
+        }
     } else {
         HashMap::new()
     };
@@ -2934,8 +3064,16 @@ pub fn build_plan(
         });
     }
 
-    let register_stale =
-        compute_register_stale(conn, &cfg, subject, &groups, &reference, &mut memo)?;
+    let register_stale = compute_register_stale(
+        conn,
+        &cfg,
+        subject,
+        &groups,
+        &reference,
+        &mut memo,
+        &origins,
+        project_grid.as_ref(),
+    )?;
 
     let mut stale_stages = Vec::new();
     if calibrate_stale {
@@ -3033,6 +3171,85 @@ mod tests {
     use crate::registration::db::set_frame_set_reference;
     use crate::stacking::groups::{group_frames, is_seconds_token};
     use crate::stacking::test_fixtures::{self, LightSpec};
+
+    /// Plan 6b-3 D2: a project's star map is a payload-only `registration`
+    /// artifact — read back by `stored_registrations`, kept by an
+    /// `Intermediates` cleanup, dropped only by `All`.
+    #[test]
+    fn the_star_map_cache_survives_intermediates_cleanup() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let handle =
+            crate::db::stacking::project_frame_handles(&conn, "p1", &["u1"]).unwrap()["u1"];
+        let subject = StackSubject::Project("p1".into());
+        store_registration(&conn, &subject, |set_id| RegistrationRecord {
+            frames_set_id: set_id,
+            frame_id: handle,
+            reference_frame_id: handle,
+            is_reference: true,
+            status: "reference".into(),
+            config_hash: Some("reghash".into()),
+            transform_json: Some(
+                crate::geometry::PixelMap::linear(crate::geometry::Linear::identity())
+                    .unwrap()
+                    .to_json(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+        let rows = stored_registrations(&conn, &subject).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].frame_id, rows[0].frames_set_id), (handle, 0));
+        assert_eq!(rows[0].config_hash.as_deref(), Some("reghash"));
+        let row = find_artifact(
+            &conn,
+            &subject,
+            "",
+            REGISTRATION_ARTIFACT_KIND,
+            Some(handle),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((row.path, row.config_hash.as_str()), (None, "reghash"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = crate::stacking::paths::WorkingLayout::new(tmp.path(), "p1");
+        crate::stacking::paths::cleanup_work(
+            &conn,
+            &subject,
+            &layout,
+            crate::stacking::paths::CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert_eq!(
+            stored_registrations(&conn, &subject).unwrap().len(),
+            1,
+            "Intermediates keeps the star map"
+        );
+        crate::stacking::paths::cleanup_work(
+            &conn,
+            &subject,
+            &layout,
+            crate::stacking::paths::CleanupWhat::All,
+        )
+        .unwrap();
+        assert!(
+            stored_registrations(&conn, &subject).unwrap().is_empty(),
+            "All drops it"
+        );
+    }
+
+    /// Plan 6b-3 D2: a frame set's registered artifact is keyed on its
+    /// registration hash exactly as before; on a grid it is the composed hash.
+    #[test]
+    fn a_frame_sets_registered_hash_is_its_registration_hash() {
+        assert_eq!(registered_hash_for("abc", None), "abc");
+        assert_eq!(
+            registered_hash_for("abc", Some(("w", "g"))),
+            crate::stacking::grid_map::grid_registered_hash("abc", "w", "g")
+        );
+    }
 
     fn light_spec<'a>(stem: &'a str, date_obs: &'a str) -> LightSpec<'a> {
         LightSpec {
@@ -7077,7 +7294,20 @@ mod tests {
             Some(handles["u2"])
         );
         assert!(stored_registrations(&f.conn, &project).unwrap().is_empty());
-        store_registration(&f.conn, &project, |_| panic!("a project stores nothing")).unwrap();
+        // Plan 6b-3 D2 (was B10: "a project stores nothing"): a project keeps
+        // its star map as a payload-only artifact, with no set id.
+        store_registration(&f.conn, &project, |set_id| RegistrationRecord {
+            frames_set_id: set_id,
+            frame_id: handles["u1"],
+            ..Default::default()
+        })
+        .unwrap();
+        let stored = stored_registrations(&f.conn, &project).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            (stored[0].frame_id, stored[0].frames_set_id),
+            (handles["u1"], 0)
+        );
     }
 
     #[test]
@@ -7779,7 +8009,11 @@ mod tests {
         };
         let calibration_codes = ["masters", "links", "masterFiles"];
         let unattested = plan(&f);
-        assert_eq!(unattested.masters_to_build.len(), 1, "the unattested twin owes a master");
+        assert_eq!(
+            unattested.masters_to_build.len(),
+            1,
+            "the unattested twin owes a master"
+        );
         f.conn
             .execute(
                 "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
