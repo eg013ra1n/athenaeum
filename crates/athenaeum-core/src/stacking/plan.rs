@@ -2835,7 +2835,10 @@ pub fn build_plan(
         // Plan 6b-3 D8: the group's LN field hash on a grid — the in-scope
         // rule is the run's own (manual list plus unsupported files).
         let ln_field_hash: Option<String> = match project_grid.as_ref() {
-            Some(grid) if local_normalization_active => {
+            // Without a stored LN reference no hash is compared (the
+            // per-frame check below needs `ln_reference_info`), so the
+            // field is not built.
+            Some(grid) if local_normalization_active && ln_reference_info.is_some() => {
                 let in_scope: Vec<i64> = g
                     .frames
                     .iter()
@@ -8483,5 +8486,175 @@ mod tests {
             stage_one_planes(&cfg, &group("osc__None__bin1__300s", ColorMode::Osc), false),
             3
         );
+    }
+
+    /// Plan 6b-3 D15 (review fix 5): an attested `osc__` group with the
+    /// debayer off is three-plane after stage 1, so the plan's C-17 shape
+    /// filter keeps a three-channel `ln_calibration` — its `ln` rows read
+    /// fresh at hashes folding it — and drops a one-channel one.
+    #[test]
+    fn an_attested_osc_group_counts_a_three_channel_ln_calibration() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let stem = format!("f{i}");
+            let mut spec = light_spec(&stem, t);
+            spec.bayerpat = Some("RGGB");
+            let (id, path) = test_fixtures::add_light(&f, &spec);
+            // Three planes on disk: an `osc__` group, not a `cfa__` one.
+            crate::fits_writer::write_fits_f32(&path, 64, 48, 3, &vec![0.5f32; 64 * 48 * 3], &[])
+                .unwrap();
+            ids.push(id);
+        }
+        f.conn
+            .execute(
+                "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                [f.set_id],
+            )
+            .unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        for (key, dir) in [
+            (keys::STACKING_WORKING_DIR, working.path()),
+            (keys::STACKING_OUTPUT_DIR, output.path()),
+        ] {
+            crate::db::set_setting(&f.conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        cfg.normalization.local.enabled = true;
+        cfg.calibration.debayer_osc = false;
+        set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
+        let subject = StackSubject::FrameSet(f.set_id);
+        let (groups, _origins) = frame_source(&f.conn, &subject, &cfg).unwrap();
+        assert_eq!(groups.len(), 1);
+        let group_key = groups[0].key.clone();
+        assert!(group_key.starts_with("osc__"), "{group_key}");
+        let up = |kind: &str,
+                  frame_id: Option<i64>,
+                  hash: &str,
+                  path: Option<&str>,
+                  payload: Option<&str>| {
+            let size = path.map(|p| std::fs::metadata(p).unwrap().len() as i64);
+            crate::db::stacking::upsert_artifact(
+                &f.conn,
+                &crate::db::stacking::NewArtifact {
+                    subject: &subject,
+                    frame_id,
+                    group_key: &group_key,
+                    kind,
+                    path,
+                    config_hash: hash,
+                    size,
+                    modified_at: None,
+                    payload_json: payload,
+                },
+            )
+            .unwrap();
+        };
+        let mut calib: HashMap<i64, String> = HashMap::new();
+        let mut metrics: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let c = prepare_hash_for_catalog(&cfg, gf);
+            let m = measurement_hash_for(&cfg, &c);
+            up("metrics", Some(gf.frame_id), &m, None, Some("{}"));
+            calib.insert(gf.frame_id, c);
+            metrics.insert(gf.frame_id, m);
+        }
+        seed_run_frame_rows(&f.conn, f.set_id, Some(ids[0]), "manual", &ids);
+        let mut registration: HashMap<i64, String> = HashMap::new();
+        for gf in &groups[0].frames {
+            let h = registration_hash_for(
+                &cfg,
+                ids[0],
+                &calib[&ids[0]],
+                &calib[&gf.frame_id],
+                &metrics[&gf.frame_id],
+            );
+            registration.insert(gf.frame_id, h.clone());
+            let is_ref = gf.frame_id == ids[0];
+            crate::registration::db::upsert_registration(
+                &f.conn,
+                &RegistrationRecord {
+                    frames_set_id: f.set_id,
+                    frame_id: gf.frame_id,
+                    reference_frame_id: ids[0],
+                    is_reference: is_ref,
+                    status: if is_ref { "reference" } else { "aligned" }.to_string(),
+                    compute_time_ms: 0,
+                    registered_at: "2025-01-01T00:00:00Z".to_string(),
+                    config_hash: Some(h),
+                    source_kind: Some("calibrated".to_string()),
+                    ..RegistrationRecord::default()
+                },
+            )
+            .unwrap();
+        }
+        let combined = {
+            let mut hs: Vec<&str> = ids.iter().map(|id| registration[id].as_str()).collect();
+            hs.sort_unstable();
+            hs.join(",")
+        };
+        let reference_hash = normalization_hash_for(&cfg, &combined, "", &ids, "", None, None);
+        let ref_payload = serde_json::to_string(&LnReferencePayload {
+            reference_member_ids: ids.clone(),
+            reference_hash: reference_hash.clone(),
+        })
+        .unwrap();
+        let ref_path = f.dir.path().join("reference.fits");
+        std::fs::write(&ref_path, [0u8]).unwrap();
+        up(
+            "ln_reference",
+            None,
+            &reference_hash,
+            ref_path.to_str(),
+            Some(&ref_payload),
+        );
+        let calibration = SeedsCalibration {
+            frame_ids: ids.clone(),
+            k: vec![0.99, 0.98, 0.97],
+        };
+        let calibration_json = serde_json::to_string(&calibration).unwrap();
+        up("ln_calibration", None, "x", None, Some(&calibration_json));
+        for gf in &groups[0].frames {
+            let h = normalization_hash_for(
+                &cfg,
+                &registration[&gf.frame_id],
+                &metrics[&gf.frame_id],
+                &ids,
+                &reference_hash,
+                Some(&calibration),
+                None,
+            );
+            let p = f.dir.path().join(format!("f{}.athln", gf.frame_id));
+            std::fs::write(&p, [0u8]).unwrap();
+            up("ln", Some(gf.frame_id), &h, p.to_str(), None);
+        }
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &subject,
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        assert_eq!(plan.groups[0].ln_cached, 3, "{:?}", plan.groups[0]);
+        // A one-channel payload is the wrong shape for a three-plane group:
+        // it reads absent, the hashes move, nothing is cached.
+        let one = serde_json::to_string(&SeedsCalibration {
+            frame_ids: ids.clone(),
+            k: vec![0.99],
+        })
+        .unwrap();
+        up("ln_calibration", None, "x", None, Some(&one));
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &subject,
+            Some(cfg),
+        )
+        .unwrap();
+        assert_eq!(plan.groups[0].ln_cached, 0, "{:?}", plan.groups[0]);
     }
 }

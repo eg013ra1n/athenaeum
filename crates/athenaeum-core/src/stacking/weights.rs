@@ -743,10 +743,17 @@ pub(crate) fn ln_field(
         })
         .filter(|v| v.is_finite() && *v > 0.0)
         .collect();
+    // No frame with a usable footprint: an empty field, before anything is
+    // allocated (a per-pixel lattice would cost O(grid pixels)).
+    if sides.is_empty() {
+        return LnField {
+            sky: Vec::new(),
+            in_field: Vec::new(),
+            n_field: 0,
+        };
+    }
     sides.sort_by(f64::total_cmp);
-    let step = sides
-        .get(sides.len() / 2)
-        .map_or(1.0, |m| (m / LN_FIELD_PROBES_PER_FRAME_SIDE).max(1.0));
+    let step = (sides[sides.len() / 2] / LN_FIELD_PROBES_PER_FRAME_SIDE).max(1.0);
     let (gw, gh) = (g.width_px as f64, g.height_px as f64);
     let cols = (gw / step).ceil().max(1.0) as usize;
     let rows = (gh / step).ceil().max(1.0) as usize;
@@ -801,6 +808,11 @@ impl LnField {
             .zip(&self.in_field)
             .filter(|(&p, &f)| f && footprint_covers(fp, p))
             .count();
+        // A frame that covers no probe at all is not forgiven, whatever the
+        // field's size.
+        if covered == 0 {
+            return 0.0;
+        }
         (covered + 1).min(self.n_field) as f64 / self.n_field as f64
     }
 }
@@ -1787,5 +1799,43 @@ mod tests {
         );
         // 30 px reaches ±0.0063°: two probes inside.
         assert_eq!(field.coverage(Some(&footprint_east(0.0, 30.0, 30.0))), 0.75);
+    }
+
+    /// Review fix 1: a group with no usable footprint costs nothing — the
+    /// empty field is returned before any lattice is allocated, whatever
+    /// the grid's size.
+    #[test]
+    fn an_empty_ln_field_allocates_no_lattice_on_a_huge_grid() {
+        let grid = crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.5,
+            width_px: 65536,
+            height_px: 65536,
+            crval1: 83.8,
+            crval2: -5.4,
+            rotation_deg: 0.0,
+        };
+        let field = ln_field(&[], &grid);
+        assert!(field.is_empty());
+        assert_eq!(field.sky.capacity(), 0);
+        assert_eq!(field.in_field.capacity(), 0);
+    }
+
+    /// Review fix 2: the one-probe grace never lifts a frame that covers no
+    /// probe, even on a one-probe field.
+    #[test]
+    fn a_frame_covering_no_probe_reads_zero_even_on_a_one_probe_field() {
+        let field = LnField {
+            sky: vec![(83.8, -5.4)],
+            in_field: vec![true],
+            n_field: 1,
+        };
+        assert_eq!(
+            field.coverage(Some(&footprint_east(0.0, 100.0, 100.0))),
+            1.0
+        );
+        assert_eq!(
+            field.coverage(Some(&footprint_east(5000.0, 100.0, 100.0))),
+            0.0
+        );
     }
 }

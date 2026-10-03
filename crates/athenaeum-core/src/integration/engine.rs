@@ -765,7 +765,8 @@ pub struct StackParams<'a, 'f> {
     /// `None` (the whole option) means no frame has a grid — every Plan 4
     /// caller passes this, and the band loop skips the local-normalization
     /// work entirely, byte-identical to before this field existed. A
-    /// frame's own entry is `None` when that frame has no sidecar; it then
+    /// frame's own entry is `None` when that frame has no sidecar (including
+    /// the plan 6b-3 D7 low-overlap fallback to global normalization); it then
     /// keeps using its global `rejection`/`output` pair (see
     /// `local_for_rejection`/`local_for_output` below for which pair(s) a
     /// grid actually replaces). A `Some` entry is a FACTORY, not the

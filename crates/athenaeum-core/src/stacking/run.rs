@@ -3130,7 +3130,9 @@ fn member_coverages(
         Some(field) => members.iter().map(|m| field.coverage_of(m.frame_id)).collect(),
         None => members
             .iter()
-            .map(|m| reference_coverage(&m.map, m.measurement.width, m.measurement.height, ref_w, ref_h))
+            .map(|m| {
+                reference_coverage(&m.map, m.measurement.width, m.measurement.height, ref_w, ref_h)
+            })
             .collect(),
     }
 }
@@ -8516,7 +8518,15 @@ fn process_group_output(
     // Task 5's re-review: `Some` means "LN ran", full stop).
     let mut ln_sidecar_grids: Option<HashMap<i64, LnFrameGrids>> = None;
     if ln_active {
-        match run_group_normalization(rc, group, &members, &input, measure_opts, io) {
+        match run_group_normalization(
+            rc,
+            group,
+            &members,
+            &input,
+            measure_opts,
+            io,
+            ln_field.as_ref(),
+        ) {
             Ok(outcome) => {
                 ln_reference_path = outcome.reference_path.clone();
                 if outcome.reference_path.is_some() {
@@ -8635,7 +8645,8 @@ fn process_group_output(
     // file I/O and no exclusion handling here, both moved to the source
     // (see `ln_sidecar_grids`'s own doc above). A member absent from the
     // map (kept with a warning while LN drives rejection only, after its
-    // OWN `normalize_frame` call failed this run) gets `None`. `None`
+    // OWN `normalize_frame` call failed this run, or a plan 6b-3 D7
+    // low-overlap member that keeps global normalization) gets `None`. `None`
     // (the whole field) whenever LN never ran for the group at all,
     // matching every M1 caller byte-for-byte.
     let ln_grids: Option<Vec<Option<LnFrameGrids>>> = ln_sidecar_grids
@@ -9890,12 +9901,12 @@ fn run_group_normalization(
     input: &GroupInput<'_>,
     measure_opts: &MeasureOptions,
     io: IoPolicy,
+    ln_field: Option<&crate::stacking::origin::GroupLnField>,
 ) -> Result<LnGroupOutcome, RunError> {
     let cfg = rc.config.clone();
     let ln_cfg = cfg.normalization.local;
     let ln_drives_output = ln_cfg.enabled;
     let grid_mode = rc.grid.is_some();
-    let ln_field = group_ln_field_for(rc, group)?;
 
     // Sky-penalized members first (spec §4.4/§5.2, ruling R-M3-17 v2 —
     // supersedes plain best-weighted-first): the SAME `sky_penalized_order`
@@ -9921,7 +9932,7 @@ fn run_group_normalization(
         let geometry = rc.geometry_of(&group.key);
         (geometry.width, geometry.height)
     };
-    let coverage = member_coverages(ln_field.as_ref(), members, ref_width, ref_height);
+    let coverage = member_coverages(ln_field, members, ref_width, ref_height);
     let coverage_mask: Vec<bool> = coverage
         .iter()
         .map(|&c| c >= MIN_REFERENCE_COVERAGE)
@@ -9977,9 +9988,13 @@ fn run_group_normalization(
     // Plan 6b-3 D6: what every LN hash folds as a member's registration.
     let member_ln_upstreams: Vec<String> = members
         .iter()
-        .map(|m| match &ln_field {
-            Some(field) => crate::stacking::plan::ln_upstream_on_field(&m.registration_hash, &field.hash),
-            None => crate::stacking::plan::ln_registration_upstream(&m.registration_hash, grid_mode),
+        .map(|m| match ln_field {
+            Some(field) => {
+                crate::stacking::plan::ln_upstream_on_field(&m.registration_hash, &field.hash)
+            }
+            None => {
+                crate::stacking::plan::ln_registration_upstream(&m.registration_hash, grid_mode)
+            }
         })
         .collect();
     let mut member_reg_hashes: Vec<&str> = reference_members
@@ -24973,8 +24988,12 @@ mod tests {
                 assert!(ln.is_some() && marker.is_none(), "{} is normalized locally", e.frame.filename);
             }
         }
-        assert!(
-            rc.warnings.iter().any(|w| w.contains("2 frame(s)") && w.contains("global normalization")),
+        assert_eq!(
+            rc.warnings
+                .iter()
+                .filter(|w| w.contains("2 frame(s)") && w.contains("global normalization"))
+                .count(),
+            1,
             "{:?}",
             rc.warnings
         );
@@ -24985,6 +25004,31 @@ mod tests {
         }
         let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &StackSubject::Project("p1".into()), None).unwrap();
         assert!(!plan.stale_stages.contains(&Stage::Normalize), "{:?}", plan.stale_stages);
+
+        // Review fix 5: a lost marker is re-derived — the member is
+        // normalized again (falls back again) and the marker is rewritten.
+        let b0 = again.measured[&group]
+            .iter()
+            .find(|e| e.frame.filename.starts_with("c_b"))
+            .unwrap()
+            .frame
+            .frame_id;
+        let deleted = conn
+            .execute(
+                "DELETE FROM stacking_artifacts WHERE kind = ?1 AND project_frame = ?2",
+                rusqlite::params![LN_GLOBAL_ARTIFACT_KIND, b0],
+            )
+            .unwrap();
+        assert_eq!(deleted, 1, "the marker row of {b0} existed");
+        let third = run(cfg.clone());
+        let e = third.measured[&group].iter().find(|e| e.frame.frame_id == b0).unwrap();
+        assert!(!e.cached_ln, "{}: no marker, so no cache hit", e.frame.filename);
+        assert!(
+            crate::db::stacking::find_artifact(&conn, &third.subject, &group, LN_GLOBAL_ARTIFACT_KIND, Some(b0))
+                .unwrap()
+                .is_some(),
+            "the marker is rewritten"
+        );
 
         // The twin: excluding a central member moves the field (five frames
         // in scope, three needed), so every LN hash moves — and the plan says

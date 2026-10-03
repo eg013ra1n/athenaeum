@@ -329,8 +329,9 @@ pub struct GroupInput<'a> {
     /// (not like a group's `included`/`frame_indices` subset) — `stacking::run`
     /// reads these back from cached `.athln` artifacts once stage 6 has run
     /// for the group; `None` for a frame with no sidecar (LN never ran for
-    /// it, or it drives rejection only and its own `normalize_frame` call
-    /// failed). The whole field is `None` when local normalization never ran
+    /// it, it drives rejection only and its own `normalize_frame` call
+    /// failed, or it overlaps the LN reference on under `ln::LN_MIN_OVERLAP`
+    /// and keeps global normalization — plan 6b-3 D7). The whole field is `None` when local normalization never ran
     /// for this group at all (disabled, or a ruling-R3-shaped fallback to
     /// global normalization) — `integrate_group` forwards it verbatim to
     /// [`integrate_planes`], which already treats `None` the same way for

@@ -375,6 +375,7 @@ pub(crate) fn group_ln_field(
     let mut footprints = HashMap::new();
     for &id in &ids {
         let Some(origin) = origins.get(&id) else {
+            tracing::warn!(frame_id = id, "ln field: frame has no origin; skipped");
             continue;
         };
         if let Some(fp) = ln_footprint(conn, origin, id)? {
