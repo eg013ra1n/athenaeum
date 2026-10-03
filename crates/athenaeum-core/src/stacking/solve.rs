@@ -1050,6 +1050,82 @@ pub(crate) mod tests {
         );
     }
 
+    /// Spec §15.3 "WCS": an independent plate solve of a grid master agrees
+    /// with the grid's WCS written on it within 0.5 px. Run by the 6b-3
+    /// acceptance agent on a real project master.
+    #[test]
+    #[ignore = "needs ATHENAEUM_GRID_PROBE_MASTER (a grid master FITS) and ATHENAEUM_SOLVE_PROBE_APP_DATA (the .dev app-data dir, for its star catalog)"]
+    fn real_data_grid_master_wcs_probe() {
+        let master = PathBuf::from(
+            std::env::var("ATHENAEUM_GRID_PROBE_MASTER").expect("ATHENAEUM_GRID_PROBE_MASTER"),
+        );
+        let app_data = std::env::var("ATHENAEUM_SOLVE_PROBE_APP_DATA")
+            .expect("ATHENAEUM_SOLVE_PROBE_APP_DATA");
+        let header = crate::fits_parser::FitsHeader::from_path(&master).unwrap();
+        let f = |k: &str| header.get_f64(k).unwrap_or_else(|| panic!("{k} missing"));
+        let written = solvemyastro::wcs::WcsSolution {
+            crpix: (f("CRPIX1") - 1.0, f("CRPIX2") - 1.0),
+            crval: (f("CRVAL1"), f("CRVAL2")),
+            cd: [[f("CD1_1"), f("CD1_2")], [f("CD2_1"), f("CD2_2")]],
+            sip_forward: None,
+            sip_reverse: None,
+        };
+        let (w, h) = {
+            let r = PlaneReader::open(&master).unwrap();
+            (r.width(), r.height())
+        };
+        let scale = written.pixel_scale_arcsec();
+        let centre = written.pixel_to_sky((w as f64 - 1.0) / 2.0, (h as f64 - 1.0) / 2.0);
+        let layers = crate::plate_solve::open_catalog_layers(Path::new(&app_data))
+            .expect("the .dev star catalog");
+        let refs: Vec<&solvemyastro::StarCache> = layers.iter().map(|l| l.as_ref()).collect();
+        let caches = solvemyastro::Caches::layered(&refs);
+        let config = PlateSolveConfig::default();
+        let scratch = tempfile::tempdir().unwrap();
+        let go = AtomicBool::new(false);
+        let request = SolveRequest {
+            handle: 0,
+            path: master.clone(),
+            hints: SolveHints {
+                ra: Some(centre.0),
+                dec: Some(centre.1),
+                fov_deg: Some(scale * w as f64 / 3600.0),
+                rotation: None,
+                pixel_scale_arcsec: Some(scale),
+            },
+            expected_scale_arcsec: Some(scale),
+            date_obs: None,
+            focal_len: None,
+            instrume: None,
+            naxis: Some((w as _, h as _)),
+            scratch_dir: Some(scratch.path().to_path_buf()),
+        };
+        let outcome = solve_in_domains(&request, Some(scratch.path()), &go, &mut |r| {
+            solve_with(r, &caches, &config, &go)
+        });
+        let SolveOutcome::Solved(record) = outcome else {
+            panic!("the grid master did not solve: {outcome:?}");
+        };
+        let solved = record.to_solution().unwrap();
+        let mut worst = 0f64;
+        for i in 1..10 {
+            for j in 1..10 {
+                let (x, y) = (i as f64 * w as f64 / 10.0, j as f64 * h as f64 / 10.0);
+                let (ra, dec) = written.pixel_to_sky(x, y);
+                let (sx, sy) = solved.sky_to_pixel(ra, dec);
+                worst = worst.max((sx - x).hypot(sy - y));
+            }
+        }
+        println!(
+            "grid master wcs probe: {}: worst distance written vs solved {worst:.3} px",
+            master.display()
+        );
+        assert!(
+            worst <= 0.5,
+            "the grid WCS disagrees with an independent solve by {worst} px"
+        );
+    }
+
     // ---- solve_in_domains (plan 6b-2 Task 10c, review fix round 1) ----
 
     fn plain_request(handle: i64, path: &Path) -> SolveRequest {

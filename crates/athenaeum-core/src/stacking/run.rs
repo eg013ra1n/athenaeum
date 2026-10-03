@@ -81,7 +81,8 @@ use crate::stacking::ln::{
 };
 use crate::stacking::master_cards::{
     build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
-    write_drizzled_master, write_master_light, MasterCardInputs, WrittenDrizzle,
+    stamp_grid_cards, write_drizzled_master, write_master_light, GridStamp, MasterCardInputs,
+    WrittenDrizzle,
 };
 use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
@@ -952,7 +953,11 @@ pub fn start_stacking(
             return Err(e.into());
         }
     };
-    let output_dir = PathBuf::from(&output_dir_str);
+    let output_dir = crate::stacking::paths::subject_output_dir(
+        Path::new(&output_dir_str),
+        &subject,
+        &plan.set_name,
+    );
 
     let (set_id, project_id) = wire_subject(&subject);
     let summary = RunSummary {
@@ -8907,6 +8912,13 @@ fn process_group_output(
 
     let output_start = Instant::now();
 
+    // Spec §5.9, plan 6b-3 D3, D11: what a grid master states — cloned out
+    // so the drizzle block below can read it while `rc` is borrowed.
+    let grid_stamp: Option<(Arc<crate::stacking::grid_map::GridRun>, String)> = rc
+        .grid
+        .clone()
+        .zip(rc.subject.project_id().map(str::to_string));
+
     let group_reference_calibrated = members[reference_idx].calibrated.clone();
     let reference_cards = match source_cards_from_file(&group_reference_calibrated) {
         Ok(c) => c,
@@ -8957,7 +8969,7 @@ fn process_group_output(
     );
     let run_id_str = rc.run_id.to_string();
 
-    let cards = match build_master_light_cards(&MasterCardInputs {
+    let mut cards = match build_master_light_cards(&MasterCardInputs {
         reference_cards: &reference_cards,
         wcs,
         frames: output.stats.included,
@@ -8991,6 +9003,48 @@ fn process_group_output(
             ));
         }
     };
+    if grid_stamp.is_some()
+        && group
+            .filter
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    {
+        // Review M4: a grid master never carries the reference's raw FILTER.
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            "the group's canonical filter is empty; the grid master carries no FILTER"
+        );
+        rc.warnings.push(format!(
+            "group {}: its canonical filter is empty, so the master carries no FILTER card",
+            group.key
+        ));
+    }
+    if let Some((grid, project_id)) = &grid_stamp {
+        if let Err(e) = stamp_grid_cards(
+            &mut cards,
+            &GridStamp {
+                project_id,
+                grid_hash: &grid.hash,
+                filter: group.filter.as_deref(),
+            },
+        ) {
+            let outcome = fail_group(
+                rc,
+                group,
+                members.len(),
+                &format!("failed to build the master header: {e}"),
+            )?;
+            return Ok((
+                outcome,
+                normalize_dur,
+                integrate_dur,
+                Duration::ZERO,
+                output_start.elapsed(),
+            ));
+        }
+    }
 
     let name = master_file_name(
         &rc.set_name,
@@ -9462,7 +9516,7 @@ fn process_group_output(
                             Ok(s) => s,
                             Err(e) => break 'attempt Err(DrizzleFailure::Other(e.to_string())),
                         };
-                        let drz_cards = match build_drizzle_cards(
+                        let mut drz_cards = match build_drizzle_cards(
                             &cards,
                             scaled.as_ref(),
                             scale,
@@ -9473,6 +9527,18 @@ fn process_group_output(
                             Ok(c) => c,
                             Err(e) => break 'attempt Err(DrizzleFailure::Other(e.to_string())),
                         };
+                        if let Some((grid, project_id)) = &grid_stamp {
+                            if let Err(e) = stamp_grid_cards(
+                                &mut drz_cards,
+                                &GridStamp {
+                                    project_id,
+                                    grid_hash: &grid.hash,
+                                    filter: group.filter.as_deref(),
+                                },
+                            ) {
+                                break 'attempt Err(DrizzleFailure::Other(e.to_string()));
+                            }
+                        }
                         let master_stem = written
                             .master
                             .file_stem()
@@ -11012,6 +11078,7 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
     let mut integrate_total = Duration::ZERO;
     let mut drizzle_total = Duration::ZERO;
     let mut output_total = Duration::ZERO;
+    let solved_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // Same expression `process_group_output` uses per group to decide
     // whether its own LN pass ran at all — one run has one `normalization`
     // config, so this is the same answer for every group.
@@ -11030,17 +11097,26 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
         // may still skip after passing this gate (the solve lookup is then
         // merely wasted, never wrong).
         let wcs = if included_count_of(rc, &group.key) >= 3 {
-            if let std::collections::hash_map::Entry::Vacant(slot) =
-                solves.entry(reference_frame_id)
-            {
-                let conn = db(&rc.ctx)?.conn();
-                let origin = origin_of(&rc.origins, reference_frame_id)?;
-                slot.insert(stored_solve(&conn, origin, reference_frame_id)?);
+            match &rc.grid {
+                // Spec §5.9, plan 6b-3 D11: every master of a project run
+                // carries the grid's TAN.
+                Some(grid) => Some(crate::stacking::grid_map::grid_plate_solve(
+                    &grid.grid, &solved_at,
+                )),
+                None => {
+                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                        solves.entry(reference_frame_id)
+                    {
+                        let conn = db(&rc.ctx)?.conn();
+                        let origin = origin_of(&rc.origins, reference_frame_id)?;
+                        slot.insert(stored_solve(&conn, origin, reference_frame_id)?);
+                    }
+                    solves
+                        .get(&reference_frame_id)
+                        .and_then(|s| s.as_ref())
+                        .cloned()
+                }
             }
-            solves
-                .get(&reference_frame_id)
-                .and_then(|s| s.as_ref())
-                .cloned()
         } else {
             None
         };
@@ -21587,6 +21663,11 @@ mod tests {
         let source =
             crate::stacking::project_source::project_frame_source(conn, project_id, &cfg).unwrap();
         let subject = StackSubject::Project(project_id.to_string());
+        let output = crate::stacking::paths::subject_output_dir(
+            output,
+            &subject,
+            &crate::stacking::plan::subject_label(conn, &subject).unwrap(),
+        );
         let run_id = insert_run(
             conn,
             &NewRun {
@@ -24362,6 +24443,166 @@ mod tests {
             plan.stale_stages.contains(&Stage::Register),
             "{:?}",
             plan.stale_stages
+        );
+    }
+
+    /// Runs the whole pipeline on the 4-frame sky project, on its grid, with
+    /// `tweak` applied to the project's stored config. The files' raw
+    /// `FILTER` is `L`; the canonical filter is `Lum`.
+    fn run_sky_project(
+        tmp: &Path,
+        tweak: impl FnOnce(&mut StackingConfig),
+    ) -> (
+        Arc<ServiceContext>,
+        rusqlite::Connection,
+        RunContext,
+        crate::collab::grid::CanonicalGrid,
+    ) {
+        let db_path = tmp.join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.join("collab"), 4);
+        conn.execute(
+            "UPDATE project_frames_local SET filter_canonical = 'Lum' WHERE project_id = 'p1'",
+            [],
+        )
+        .unwrap();
+        let mut cfg = sky_config(&conn);
+        tweak(&mut cfg);
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.join("work"), &tmp.join("out"));
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        run_pipeline(&mut rc).unwrap();
+        (ctx, conn, rc, grid)
+    }
+
+    fn drizzle_2x(cfg: &mut StackingConfig) {
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 2;
+    }
+
+    fn written_wcs(header: &crate::fits_parser::FitsHeader) -> solvemyastro::wcs::WcsSolution {
+        let f = |k: &str| header.get_f64(k).unwrap_or_else(|| panic!("{k} missing"));
+        solvemyastro::wcs::WcsSolution {
+            crpix: (f("CRPIX1") - 1.0, f("CRPIX2") - 1.0),
+            crval: (f("CRVAL1"), f("CRVAL2")),
+            cd: [[f("CD1_1"), f("CD1_2")], [f("CD2_1"), f("CD2_2")]],
+            sip_forward: None,
+            sip_reverse: None,
+        }
+    }
+
+    fn nearest_sky_star() -> (f64, f64, f64) {
+        test_fixtures::sky_stars((83.8, -5.4), 0.12, 50.0, 7)
+            .into_iter()
+            .min_by(|a, b| {
+                (a.0 - 83.8)
+                    .hypot(a.1 + 5.4)
+                    .total_cmp(&(b.0 - 83.8).hypot(b.1 + 5.4))
+            })
+            .unwrap()
+    }
+
+    /// Spec §5.8, §5.9, plan 6b-3 D3, D11: a project master lands in
+    /// `<output>/<title>/` at the grid's size with the grid's TAN, and its
+    /// stars sit where that WCS puts their sky positions — the drizzled
+    /// master too, at twice the size. Both state the canonical filter, the
+    /// grid's row order, the project and the grid, and claim no plate solve.
+    #[test]
+    fn a_project_run_writes_grid_masters_with_the_grid_wcs() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ctx, conn, rc, grid) = run_sky_project(tmp.path(), drizzle_2x);
+        let masters = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
+        let master = masters.iter().find(|m| m.kind == "master").expect("a master");
+        let drizzled = masters
+            .iter()
+            .find(|m| m.kind == "drizzle")
+            .expect("a drizzled master");
+        assert!(
+            Path::new(&master.path).starts_with(tmp.path().join("out").join("p1")),
+            "{}",
+            master.path
+        );
+        assert_eq!((master.width, master.height), (512, 384));
+        assert_eq!((drizzled.width, drizzled.height), (1024, 768));
+        let star = nearest_sky_star();
+        for (path, tol) in [(&master.path, 0.5), (&drizzled.path, 1.0)] {
+            let header = crate::fits_parser::FitsHeader::from_path(Path::new(path)).unwrap();
+            let wcs = written_wcs(&header);
+            let reader = PlaneReader::open(Path::new(path)).unwrap();
+            let plane = reader.read_plane(0).unwrap();
+            let (x, y) = wcs.sky_to_pixel(star.0, star.1);
+            let (mx, my) = centroid_near(&plane, reader.width(), x, y);
+            assert!(
+                (mx - x).hypot(my - y) < tol,
+                "{path}: star at ({mx}, {my}), the WCS says ({x}, {y})"
+            );
+            assert_eq!(header.get_str("FILTER").as_deref(), Some("Lum"), "the canonical filter");
+            assert_eq!(header.get_str("ROWORDER").as_deref(), Some("BOTTOM-UP"));
+            assert_eq!(header.get_str("ATH_RGEO").as_deref(), Some("grid"));
+            assert_eq!(header.get_str("ATH_SPRJ").as_deref(), Some("p1"));
+            assert_eq!(header.get_str("ATH_GRID").as_deref(), Some(grid.hash().as_str()));
+            assert!(header.get_str("PLTSOLVD").is_none(), "a grid TAN is not a plate solve");
+        }
+        let header = crate::fits_parser::FitsHeader::from_path(Path::new(&master.path)).unwrap();
+        assert!((header.get_f64("CRVAL1").unwrap() - 83.8).abs() < 1e-9);
+        assert!(
+            (header.get_f64("CRPIX1").unwrap() - 256.5).abs() < 1e-9,
+            "1-based centre of 512 px"
+        );
+        assert!(
+            !rc.warnings
+                .iter()
+                .any(|w| w.contains("no plate solve on the reference frame")),
+            "a grid master always has a WCS: {:?}",
+            rc.warnings
+        );
+    }
+
+    /// Spec §5.1, §5.9 (review I3): no file a project run writes carries
+    /// `ATH_PRJ`, and every one carries the scanner's skip marker
+    /// (`ATH_STK` or `ATH_REG`).
+    #[test]
+    fn no_file_a_project_run_writes_carries_ath_prj() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let _run = run_sky_project(tmp.path(), |cfg| {
+            drizzle_2x(cfg);
+            // The weight map is off by default; the test's count names it.
+            cfg.drizzle.write_weight_map = true;
+        });
+        let mut seen = 0usize;
+        for root in [tmp.path().join("work"), tmp.path().join("out")] {
+            for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("fits") {
+                    continue;
+                }
+                let header = crate::fits_parser::FitsHeader::from_path(p).unwrap();
+                assert!(
+                    header.get_str("ATH_PRJ").is_none(),
+                    "{} carries ATH_PRJ",
+                    p.display()
+                );
+                assert!(
+                    header.get_str("ATH_STK").is_some() || header.get_str("ATH_REG").is_some(),
+                    "{} would be cataloged",
+                    p.display()
+                );
+                seen += 1;
+            }
+        }
+        assert!(
+            seen >= 7,
+            "4 registered frames, the master, the drizzled master, its weight map: {seen}"
         );
     }
 }

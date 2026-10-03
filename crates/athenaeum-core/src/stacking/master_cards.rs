@@ -41,6 +41,83 @@ pub const ATH_DRZK: &str = "ATH_DRZK"; // kernel serde name
 /// group's.
 pub const ATH_RGEO: &str = "ATH_RGEO";
 
+/// `ATH_SPRJ`: the collaboration project a master was stacked for (spec
+/// §5.9). Never `ATH_PRJ`, which the scanner reads as "a landed replica".
+pub const ATH_SPRJ: &str = "ATH_SPRJ";
+/// `ATH_GRID`: the canonical grid's hash, 16 hex (spec §6.1).
+pub const ATH_GRID: &str = "ATH_GRID";
+/// `ATH_RGEO`'s value for a master on a project's canonical grid (spec §5.9).
+pub const RGEO_GRID: &str = "grid";
+
+/// What a master on a project's canonical grid states (spec §5.9, plan
+/// 6b-3 D3, D11).
+pub struct GridStamp<'a> {
+    pub project_id: &'a str,
+    pub grid_hash: &'a str,
+    /// The group's canonical filter; `None` writes no `FILTER` card.
+    pub filter: Option<&'a str>,
+}
+
+/// A string card that keeps `comment` only when the whole card fits one
+/// 80-column record; the value is never shortened (a long one continues).
+pub fn card_with_optional_comment(
+    keyword: &str,
+    value: &str,
+    comment: &str,
+) -> Result<Card, FitsWriteError> {
+    let with = Card::new(keyword, CardValue::Str(value.to_string()))?.with_comment(comment);
+    match crate::fits_writer::card::format_card(&with) {
+        Ok(_) => Ok(with),
+        Err(FitsWriteError::CommentTooLong(_)) => {
+            Card::new(keyword, CardValue::Str(value.to_string()))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-states a grid master's (or drizzled master's) cards (spec §5.9, plan
+/// 6b-3 D3, D11): the canonical `FILTER` (the reference's copy-through card
+/// carries a publisher's raw name), `ROWORDER = 'BOTTOM-UP'` (the grid's own;
+/// never the reference's), `ATH_RGEO = 'grid'`, `ATH_SPRJ`, `ATH_GRID`, and
+/// no `PLTSOLVD` (a grid TAN is not a plate solve). Every earlier card of
+/// those keys is dropped first, and `ATH_PRJ` defensively too, so each
+/// appears once. Variable-length values carry no comment unless it fits.
+/// An empty canonical filter writes no `FILTER` at all (review M4): the
+/// reference's card is a publisher's raw name and must not leak; the run
+/// warns once for such a group.
+pub fn stamp_grid_cards(
+    cards: &mut Vec<Card>,
+    stamp: &GridStamp<'_>,
+) -> Result<(), FitsWriteError> {
+    cards.retain(|c| {
+        !matches!(
+            c.keyword.as_str(),
+            "FILTER" | "ROWORDER" | "PLTSOLVD" | "ATH_PRJ" | ATH_SPRJ | ATH_GRID | ATH_RGEO
+        )
+    });
+    if let Some(filter) = stamp.filter.map(str::trim).filter(|f| !f.is_empty()) {
+        cards.push(Card::new("FILTER", CardValue::Str(filter.to_string()))?);
+    }
+    cards.push(
+        Card::new("ROWORDER", CardValue::Str("BOTTOM-UP".into()))?
+            .with_comment("row order of the canonical grid"),
+    );
+    cards.push(card_with_optional_comment(
+        ATH_SPRJ,
+        stamp.project_id,
+        "collaboration project",
+    )?);
+    cards.push(
+        Card::new(ATH_GRID, CardValue::Str(stamp.grid_hash.to_string()))?
+            .with_comment("canonical grid hash"),
+    );
+    cards.push(
+        Card::new(ATH_RGEO, CardValue::Str(RGEO_GRID.into()))?
+            .with_comment("registration geometry mode"),
+    );
+    Ok(())
+}
+
 pub struct MasterCardInputs<'a> {
     /// Copy-through cards of the REFERENCE frame (`source_cards_from_file`).
     pub reference_cards: &'a [Card],
@@ -744,6 +821,89 @@ mod tests {
     use super::*;
     use crate::fits_parser::FitsHeader;
     use crate::stacking::integrate::GroupStats;
+
+    /// Plan 6b-3 D3, D11 and the 6b-2 acceptance lesson (an `ATH_REGR`
+    /// overflow): grid cards never fail a write — a long project id loses
+    /// its comment, a long canonical filter is written whole — each key
+    /// appears once, and a grid master claims no plate solve.
+    #[test]
+    fn grid_cards_survive_long_values() {
+        let mut cards = vec![
+            Card::new("FILTER", CardValue::Str("raw".into())).unwrap(),
+            Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap(),
+            Card::new("PLTSOLVD", CardValue::Logical(true)).unwrap(),
+            Card::new(ATH_RGEO, CardValue::Str("coRegistered".into())).unwrap(),
+        ];
+        let project_id = "p".repeat(60);
+        let filter = "Optolong L-eXtreme dual narrowband, an unusually long canonical filter name";
+        stamp_grid_cards(
+            &mut cards,
+            &GridStamp {
+                project_id: &project_id,
+                grid_hash: "0123456789abcdef",
+                filter: Some(filter),
+            },
+        )
+        .unwrap();
+        for c in &cards {
+            crate::fits_writer::card::format_card(c).unwrap();
+        }
+        let get = |k: &str| cards.iter().filter(|c| c.keyword == k).collect::<Vec<_>>();
+        assert_eq!(get("FILTER").len(), 1);
+        assert_eq!(get("FILTER")[0].value, Some(CardValue::Str(filter.into())));
+        assert_eq!(
+            get("ROWORDER")[0].value,
+            Some(CardValue::Str("BOTTOM-UP".into()))
+        );
+        assert_eq!(get(ATH_RGEO).len(), 1);
+        assert_eq!(
+            get(ATH_RGEO)[0].value,
+            Some(CardValue::Str(RGEO_GRID.into()))
+        );
+        assert_eq!(
+            get(ATH_SPRJ)[0].value,
+            Some(CardValue::Str(project_id.clone()))
+        );
+        assert!(
+            get(ATH_SPRJ)[0].comment.is_none(),
+            "a long id drops its comment"
+        );
+        assert_eq!(
+            get(ATH_GRID)[0].value,
+            Some(CardValue::Str("0123456789abcdef".into()))
+        );
+        assert!(
+            get("PLTSOLVD").is_empty(),
+            "a grid TAN is not a plate solve"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        crate::fits_writer::write_fits_f32(&tmp.path().join("g.fits"), 2, 2, 1, &[0.0; 4], &cards)
+            .unwrap();
+
+        let mut short = Vec::new();
+        stamp_grid_cards(
+            &mut short,
+            &GridStamp {
+                project_id: "af136ec9-1885-4087-b684-9136ad655e9b",
+                grid_hash: "0123456789abcdef",
+                filter: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            short
+                .iter()
+                .find(|c| c.keyword == ATH_SPRJ)
+                .unwrap()
+                .comment
+                .is_some(),
+            "a UUID keeps its comment"
+        );
+        assert!(
+            short.iter().all(|c| c.keyword != "FILTER"),
+            "no canonical filter, no FILTER card"
+        );
+    }
 
     fn dummy_stats() -> GroupStats {
         GroupStats {

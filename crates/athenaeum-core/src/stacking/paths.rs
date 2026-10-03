@@ -1020,9 +1020,53 @@ pub fn cleanup_work(
     Ok(freed)
 }
 
+/// The folder a subject's masters land in (spec §5.9): the output root for
+/// a frame set (today's layout), `<output>/<sanitized title>/` for a
+/// project. A title that sanitizes to nothing becomes `project`.
+pub fn subject_output_dir(output_root: &Path, subject: &StackSubject, label: &str) -> PathBuf {
+    match subject {
+        StackSubject::FrameSet(_) => output_root.to_path_buf(),
+        StackSubject::Project(_) => {
+            let name = crate::archive::path_layout::sanitize_for_filename(label);
+            output_root.join(if name.is_empty() {
+                "project".to_string()
+            } else {
+                name
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec §5.9: a project's masters land in `<output>/<title>/`; a frame
+    /// set's stay at the output root.
+    #[test]
+    fn a_projects_masters_folder_is_its_title() {
+        let root = Path::new("/out");
+        assert_eq!(
+            subject_output_dir(root, &StackSubject::FrameSet(3), "LDN 1272"),
+            PathBuf::from("/out")
+        );
+        assert_eq!(
+            subject_output_dir(
+                root,
+                &StackSubject::Project("p".into()),
+                "LDN1272-test Project"
+            ),
+            PathBuf::from("/out").join(crate::archive::path_layout::sanitize_for_filename(
+                "LDN1272-test Project"
+            ))
+        );
+        assert_eq!(
+            subject_output_dir(root, &StackSubject::Project("p".into()), "///"),
+            PathBuf::from("/out/project"),
+            "a title that sanitizes to nothing still gets a folder"
+        );
+    }
+
     use crate::db::schema::init_db;
     use crate::db::stacking::{delete_artifacts, list_artifacts, NewArtifact};
     use crate::stacking::config::PathsConfig;
