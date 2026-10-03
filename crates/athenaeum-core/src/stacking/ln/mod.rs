@@ -164,6 +164,58 @@ pub(crate) mod fallback_counters {
 /// grid, only the spline it hands over.
 pub const LN_LOCAL_SCALE_MAX_DEVIATION: f64 = 0.25;
 
+/// How a group's LN fits treat what a member and the LN reference do not
+/// both cover (spec §5.6, plan 6b-3 D6). `Legacy` — every frame set —
+/// sanitizes non-finite pixels to the plane's median for detection, exactly
+/// as before. `Masked` — a project on its grid — fits each member on its
+/// overlap with the reference: detection planes fill the rest with 0.0
+/// (the fast detector leaves values <= 0 out of its histogram and exact
+/// zeros out of its RMS), seeds within [`LN_MASK_MARGIN_PX`] of the
+/// overlap's edge are dropped, and both backgrounds are modelled on the
+/// overlap only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LnOverlap {
+    Legacy,
+    Masked,
+}
+
+/// Spec §5.6: a member whose overlap with the LN reference is under this
+/// fraction of its own footprint keeps global normalization (plan 6b-3 D7).
+pub const LN_MIN_OVERLAP: f64 = 0.25;
+
+/// The PSF fit region's hard cap (`psf_signal::fit_one`, `.min(48)`): a
+/// seed this far inside the overlap fits on overlap pixels only.
+pub const LN_MASK_MARGIN_PX: usize = 48;
+
+/// `valid` eroded by `margin` (Chebyshev): a pixel stays valid when every
+/// pixel within `margin` of it, inside the image, is valid. Two separable
+/// passes over prefix sums, `O(width * height)`.
+pub fn eroded_mask(valid: &[bool], width: usize, height: usize, margin: usize) -> Vec<bool> {
+    let mut rows = vec![false; valid.len()];
+    let mut prefix = vec![0u32; width.max(height) + 1];
+    for y in 0..height {
+        let row = &valid[y * width..(y + 1) * width];
+        for x in 0..width {
+            prefix[x + 1] = prefix[x] + (!row[x]) as u32;
+        }
+        for x in 0..width {
+            let (a, b) = (x.saturating_sub(margin), (x + margin + 1).min(width));
+            rows[y * width + x] = prefix[b] - prefix[a] == 0;
+        }
+    }
+    let mut out = vec![false; valid.len()];
+    for x in 0..width {
+        for y in 0..height {
+            prefix[y + 1] = prefix[y] + (!rows[y * width + x]) as u32;
+        }
+        for y in 0..height {
+            let (a, b) = (y.saturating_sub(margin), (y + margin + 1).min(height));
+            out[y * width + x] = prefix[b] - prefix[a] == 0;
+        }
+    }
+    out
+}
+
 /// Local-normalization errors shared by every M2 task past detection: a
 /// frame that cannot be trusted for LN (too few matched stars — see
 /// [`scale::relative_scale`]), sidecar/artifact I/O, or anything else a
@@ -180,6 +232,12 @@ pub enum LnError {
     },
     Io(std::io::Error),
     Other(String),
+    /// Plan 6b-3 D7 (spec §5.6): the member overlaps the LN reference on
+    /// less than [`LN_MIN_OVERLAP`] of its own footprint (channel 0). The
+    /// run keeps it on its global normalization; it is never an exclusion.
+    LowOverlap {
+        fraction: f64,
+    },
 }
 
 impl std::fmt::Display for LnError {
@@ -194,6 +252,12 @@ impl std::fmt::Display for LnError {
             }
             LnError::Io(e) => write!(f, "local normalization: I/O error: {e}"),
             LnError::Other(msg) => write!(f, "local normalization: {msg}"),
+            LnError::LowOverlap { fraction } => write!(
+                f,
+                "local normalization: the frame overlaps the LN reference on {:.0} % of its footprint (< {:.0} %)",
+                fraction * 100.0,
+                LN_MIN_OVERLAP * 100.0
+            ),
         }
     }
 }
@@ -202,7 +266,7 @@ impl std::error::Error for LnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             LnError::Io(e) => Some(e),
-            LnError::TooFewMatches { .. } | LnError::Other(_) => None,
+            LnError::TooFewMatches { .. } | LnError::Other(_) | LnError::LowOverlap { .. } => None,
         }
     }
 }
@@ -426,6 +490,7 @@ pub struct LnReferenceForDetection<'a> {
     pub sanitized_planes: Vec<Cow<'a, [f32]>>,
     pub locations: Vec<f64>,
     pub prepared: Vec<scale::PreparedReferenceChannel>,
+    pub overlap: LnOverlap,
 }
 
 impl<'a> LnReferenceForDetection<'a> {
@@ -481,6 +546,58 @@ impl<'a> LnReferenceForDetection<'a> {
             sanitized_planes,
             locations,
             prepared,
+            overlap: LnOverlap::Legacy,
+        }
+    }
+
+    /// The `Masked` preparation (plan 6b-3 D6): non-finite reference pixels
+    /// — the grid no member covers — become 0.0 for detection, never the
+    /// median, and the reference's own stars within [`LN_MASK_MARGIN_PX`]
+    /// of its coverage edge are dropped before they are fitted.
+    pub fn build_masked(
+        reference: &'a LnReference,
+        psf: crate::stacking::psf_signal::PsfModel,
+        max_stars: usize,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+    ) -> LnReferenceForDetection<'a> {
+        let mut sanitized_planes = Vec::with_capacity(reference.planes.len());
+        let mut locations = Vec::with_capacity(reference.planes.len());
+        let mut prepared = Vec::with_capacity(reference.planes.len());
+        for plane in &reference.planes {
+            let finite: Vec<bool> = plane.iter().map(|v| v.is_finite()).collect();
+            let sanitized: Cow<'a, [f32]> = if finite.iter().all(|&f| f) {
+                Cow::Borrowed(plane.as_slice())
+            } else {
+                Cow::Owned(
+                    plane
+                        .iter()
+                        .map(|&v| if v.is_finite() { v } else { 0.0 })
+                        .collect(),
+                )
+            };
+            let allowed = eroded_mask(
+                &finite,
+                reference.width,
+                reference.height,
+                LN_MASK_MARGIN_PX,
+            );
+            prepared.push(scale::PreparedReferenceChannel::build_masked(
+                &sanitized,
+                reference.width,
+                reference.height,
+                psf,
+                max_stars,
+                pool,
+                &allowed,
+            ));
+            locations.push(median_of_finite(plane));
+            sanitized_planes.push(sanitized);
+        }
+        LnReferenceForDetection {
+            sanitized_planes,
+            locations,
+            prepared,
+            overlap: LnOverlap::Masked,
         }
     }
 }
@@ -692,6 +809,63 @@ pub fn normalize_frame(
         band.decode_frame_into(0, &mut target);
         warp_ms += t.elapsed().as_millis() as u64;
 
+        // Plan 6b-3 D6 (spec §5.6 seam 2): on a grid, the member's models are
+        // fitted on its overlap with the LN reference, never on sanitized NaN.
+        // Only the overlap's grid nodes are defined by the fit: a node outside
+        // it carries whatever `background_grid` extrapolates into masked
+        // cells (on both sides, so it may or may not cancel). Integration
+        // never reads it - the member is NaN there - so do not "fix" it.
+        let masked = reference_for_detection.overlap == LnOverlap::Masked;
+        let mut member_ref_bg: Option<BackgroundGrid> = None;
+        let mut allowed: Option<Vec<bool>> = None;
+        if masked {
+            let ref_plane = &reference.planes[p];
+            let mut overlap = vec![false; target.len()];
+            let (mut covered, mut both) = (0usize, 0usize);
+            for (k, o) in overlap.iter_mut().enumerate() {
+                let in_target = target[k].is_finite();
+                covered += in_target as usize;
+                *o = in_target && ref_plane[k].is_finite();
+                both += *o as usize;
+            }
+            if p == 0 {
+                let fraction = if covered == 0 {
+                    0.0
+                } else {
+                    both as f64 / covered as f64
+                };
+                if fraction < LN_MIN_OVERLAP {
+                    return Err(LnError::LowOverlap { fraction });
+                }
+            }
+            for (v, &o) in target.iter_mut().zip(&overlap) {
+                if !o {
+                    *v = f32::NAN;
+                }
+            }
+            let ref_masked: Vec<f32> = ref_plane
+                .iter()
+                .zip(&overlap)
+                .map(|(&v, &o)| if o { v } else { f32::NAN })
+                .collect();
+            member_ref_bg = Some(background_grid(
+                &ref_masked,
+                reference.width,
+                reference.height,
+                &BackgroundParams {
+                    scale: cfg.scale,
+                    ..DEFAULT_PARAMS
+                },
+                pool,
+            ));
+            allowed = Some(eroded_mask(
+                &overlap,
+                reference.width,
+                reference.height,
+                LN_MASK_MARGIN_PX,
+            ));
+        }
+
         let t = Instant::now();
         // Perf tier A Task 12: `pool` fans `background_grid`'s per-cell
         // loop (and `clean_plane`'s two passes) out across workers instead
@@ -745,10 +919,11 @@ pub fn normalize_frame(
         // value in that strip regardless; the plane's own finite median
         // (not a flat `0.0`) keeps a large strip from dragging the
         // detector's global background/σ estimate.
+        let fill = if masked { 0.0f32 } else { location_tgt as f32 };
         if !target.iter().all(|v| v.is_finite()) {
             for v in target.iter_mut() {
                 if !v.is_finite() {
-                    *v = location_tgt as f32;
+                    *v = fill;
                 }
             }
         }
@@ -787,33 +962,63 @@ pub fn normalize_frame(
                 #[cfg(test)]
                 fallback_counters::on_fallback();
             }
-            scale::relative_scale_against(
-                &reference_for_detection.prepared[p],
-                &target,
-                reference.width,
-                reference.height,
-                measure.max_stars,
-                4.0,
-                0.3,
-                cfg.local_scale,
-                pool,
-            )
+            match allowed.as_deref() {
+                Some(a) => scale::relative_scale_against_masked(
+                    &reference_for_detection.prepared[p],
+                    &target,
+                    reference.width,
+                    reference.height,
+                    measure.max_stars,
+                    4.0,
+                    0.3,
+                    cfg.local_scale,
+                    pool,
+                    a,
+                ),
+                None => scale::relative_scale_against(
+                    &reference_for_detection.prepared[p],
+                    &target,
+                    reference.width,
+                    reference.height,
+                    measure.max_stars,
+                    4.0,
+                    0.3,
+                    cfg.local_scale,
+                    pool,
+                ),
+            }
         };
         let mut plane_from_seeds = true;
         let scale_result = match plane_fits {
-            Some(pf) => match scale::relative_scale_from_seeds(
-                &reference_for_detection.prepared[p],
-                pf,
-                &frame.map,
-                &target,
-                reference.width,
-                reference.height,
-                measure.max_stars,
-                4.0,
-                0.3,
-                cfg.local_scale,
-                pool,
-            ) {
+            Some(pf) => match match allowed.as_deref() {
+                Some(a) => scale::relative_scale_from_seeds_masked(
+                    &reference_for_detection.prepared[p],
+                    pf,
+                    &frame.map,
+                    &target,
+                    reference.width,
+                    reference.height,
+                    measure.max_stars,
+                    4.0,
+                    0.3,
+                    cfg.local_scale,
+                    pool,
+                    a,
+                ),
+                None => scale::relative_scale_from_seeds(
+                    &reference_for_detection.prepared[p],
+                    pf,
+                    &frame.map,
+                    &target,
+                    reference.width,
+                    reference.height,
+                    measure.max_stars,
+                    4.0,
+                    0.3,
+                    cfg.local_scale,
+                    pool,
+                ),
+            } {
                 Ok(r) => r,
                 Err(LnError::TooFewMatches { .. }) => {
                     plane_from_seeds = false;
@@ -853,7 +1058,7 @@ pub fn normalize_frame(
         scales.push(channel_scale);
         from_seeds_per_channel.push(plane_from_seeds);
 
-        let ref_bg = &ref_backgrounds[p];
+        let ref_bg = member_ref_bg.as_ref().unwrap_or(&ref_backgrounds[p]);
         // Fix round 1, item 8: a real length check, not just the
         // `debug_assert_eq!` above (which only pins `target_bg`'s OWN dims
         // against what the stride geometry implies — it says nothing about
@@ -1592,5 +1797,322 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "the B pin must have checked real cells");
+    }
+
+    /// Plan 6b-3 D6: erosion by `margin` keeps a pixel only when every
+    /// pixel within `margin` of it (inside the image) is valid; the image's
+    /// own border is not an edge of the mask.
+    #[test]
+    fn eroded_mask_shrinks_the_valid_region_by_the_margin() {
+        let (w, h) = (20usize, 10usize);
+        let valid: Vec<bool> = (0..w * h).map(|k| k % w >= 5).collect();
+        let e = eroded_mask(&valid, w, h, 3);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(e[y * w + x], x >= 8, "({x}, {y})");
+            }
+        }
+        assert!(eroded_mask(&vec![true; w * h], w, h, 3).iter().all(|&v| v));
+    }
+
+    /// Plan 6b-3 D6, spec §5.6: a member that covers only part of the LN
+    /// reference — and a reference that covers only part of the member — is
+    /// normalized on their overlap and recovers the truth `R = 1.25·T + 0.03`:
+    /// the relative scale within 1 % and the additive term within 0.002 on
+    /// every grid node inside the overlap eroded by the 48 px seed margin
+    /// (review I2: what a node outside the overlap holds is
+    /// `background_grid`'s extrapolation into masked cells, which the method
+    /// does not define). Under a quarter of overlap the frame is refused
+    /// `LowOverlap` before any fit.
+    #[test]
+    fn masked_ln_recovers_a_half_covered_members_scale() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::geometry::{Linear, PixelMap};
+        use crate::resample::Interpolation;
+        use crate::stacking::measure::FrameMeasurement;
+        use crate::stacking::test_fixtures::synthetic_star_field;
+        use crate::stacking::weights::FrameWeight;
+
+        const W: usize = 512;
+        const H: usize = 384;
+        let mut stars: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..6 {
+            for col in 0..10 {
+                let x = 26.0 + col as f64 * 46.0 + ((row * 7 + col) % 5) as f64;
+                let y = 24.0 + row as f64 * 58.0 + ((row * 3 + col) % 4) as f64;
+                stars.push((x, y, 0.10 + ((row * 10 + col) % 9) as f64 * 0.02));
+            }
+        }
+        let field = synthetic_star_field(W, H, &stars, 4.2, 0.002, 11);
+        // The reference covers x < 420; the member covers x >= `from`.
+        let reference_plane: Vec<f32> = field
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| if k % W < 420 { v } else { f32::NAN })
+            .collect();
+        let target_of = |from: usize| -> Vec<f32> {
+            field
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| {
+                    if k % W >= from {
+                        (v - 0.03) / 1.25
+                    } else {
+                        f32::NAN
+                    }
+                })
+                .collect()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let reference = LnReference {
+            width: W,
+            height: H,
+            planes: vec![reference_plane],
+            frames_used: Vec::new(),
+        };
+        let cfg = LocalNormalizationConfig {
+            enabled: true,
+            scale: 256,
+            ..LocalNormalizationConfig::default()
+        };
+        let measure = crate::stacking::measure::MeasureOptions {
+            psf_model: PsfModel::Moffat4,
+            max_stars: 200,
+            ..Default::default()
+        };
+        let for_detection = LnReferenceForDetection::build_masked(
+            &reference,
+            PsfModel::Moffat4,
+            measure.max_stars,
+            None,
+        );
+        assert_eq!(for_detection.overlap, LnOverlap::Masked);
+        let ref_bg = vec![background_grid(
+            &reference.planes[0],
+            W,
+            H,
+            &BackgroundParams {
+                scale: cfg.scale,
+                ..DEFAULT_PARAMS
+            },
+            None,
+        )];
+        let cancel = AtomicBool::new(false);
+        let run = |from: usize, name: &str| {
+            let path = dir.path().join(format!("{name}.fits"));
+            write_fits_f32(&path, W, H, 1, &target_of(from), &[]).unwrap();
+            let frame = StackFrame {
+                path,
+                map: PixelMap::linear(Linear::identity()).unwrap(),
+                measurement: FrameMeasurement {
+                    width: W,
+                    height: H,
+                    channels: vec![Default::default()],
+                    duration_ms: 0,
+                },
+                weight: FrameWeight {
+                    channels: vec![1.0],
+                    normalized: vec![1.0],
+                    mean: 1.0,
+                    normalized_mean: 1.0,
+                    missing: None,
+                },
+                exposure_s: 180.0,
+                date_obs: None,
+                frame_id: 1,
+                registered_path: None,
+            };
+            let sidecar = dir.path().join(format!("{name}.athln"));
+            normalize_frame(
+                &reference,
+                &for_detection,
+                &ref_bg,
+                &frame,
+                LnScaleSeeds::ForcedDetection,
+                &cfg,
+                &measure,
+                Interpolation::Bilinear,
+                0.3,
+                &sidecar,
+                None,
+                None,
+                &cancel,
+            )
+            .map(|outcome| (outcome, LnFrameGrids::read(&sidecar).unwrap()))
+        };
+
+        let (outcome, grids) = run(100, "half").expect("a 78 % overlap normalizes");
+        assert!(
+            (outcome.scale - 1.25).abs() < 0.0125,
+            "scale {}",
+            outcome.scale
+        );
+        // The overlap is x in 100..420; eroded by LN_MASK_MARGIN_PX (48) it is
+        // x in 148..372, y in 48..336. Node (i, j) sits at pixel (i, j)·stride.
+        let g = &grids.channels[0];
+        let stride = g.stride();
+        let mut checked = 0usize;
+        for j in 0..g.gh {
+            for i in 0..g.gw {
+                let (x, y) = (i * stride, j * stride);
+                if !(148..372).contains(&x) || !(48..336).contains(&y) {
+                    continue;
+                }
+                let b = g.b[j * g.gw + i];
+                assert!((b - 0.03).abs() < 0.002, "B node at ({x}, {y}): {b}");
+                checked += 1;
+            }
+        }
+        assert!(checked >= 40, "{checked} nodes inside the eroded overlap");
+
+        match run(400, "sliver") {
+            Err(LnError::LowOverlap { fraction }) => {
+                assert!(fraction < LN_MIN_OVERLAP, "{fraction}");
+            }
+            other => panic!("a 18 % overlap must be refused LowOverlap, got {other:?}"),
+        }
+    }
+
+    /// Review of Task 4: a masked member's `(a, b)` coefficients are FINITE on
+    /// every node of its registered footprint (and in fact everywhere),
+    /// whatever part of it the LN reference does not cover. A non-finite
+    /// coefficient would turn a raw-finite sample non-finite after
+    /// normalization, over-counting coverage and leaving a pixel at 0.0
+    /// instead of NaN under `empty_as_nan`.
+    #[test]
+    fn masked_ln_coefficients_are_finite_over_the_members_footprint() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::geometry::{Linear, PixelMap};
+        use crate::resample::Interpolation;
+        use crate::stacking::measure::FrameMeasurement;
+        use crate::stacking::test_fixtures::synthetic_star_field;
+        use crate::stacking::weights::FrameWeight;
+
+        const W: usize = 512;
+        const H: usize = 384;
+        let mut stars: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..14 {
+            for col in 0..20 {
+                let x = 14.0 + col as f64 * 25.0 + ((row * 7 + col) % 5) as f64;
+                let y = 14.0 + row as f64 * 26.0 + ((row * 3 + col) % 4) as f64;
+                stars.push((x, y, 0.10 + ((row * 10 + col) % 9) as f64 * 0.02));
+            }
+        }
+        let field = synthetic_star_field(W, H, &stars, 4.2, 0.002, 11);
+        // The reference covers x < 420 and y < 300; the member covers
+        // x in 120..W and y >= 60, so each leaves a strip the other lacks.
+        let reference_plane: Vec<f32> = field
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                if k % W < 420 && k / W < 300 {
+                    v
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect();
+        let footprint = |k: usize| k % W >= 120 && k / W >= 60;
+        let target: Vec<f32> = field
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                if footprint(k) {
+                    (v - 0.03) / 1.25
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let reference = LnReference {
+            width: W,
+            height: H,
+            planes: vec![reference_plane],
+            frames_used: Vec::new(),
+        };
+        let cfg = LocalNormalizationConfig {
+            enabled: true,
+            scale: 256,
+            ..LocalNormalizationConfig::default()
+        };
+        let measure = crate::stacking::measure::MeasureOptions {
+            psf_model: PsfModel::Moffat4,
+            max_stars: 200,
+            ..Default::default()
+        };
+        let for_detection = LnReferenceForDetection::build_masked(
+            &reference,
+            PsfModel::Moffat4,
+            measure.max_stars,
+            None,
+        );
+        let ref_bg = vec![background_grid(
+            &reference.planes[0],
+            W,
+            H,
+            &BackgroundParams {
+                scale: cfg.scale,
+                ..DEFAULT_PARAMS
+            },
+            None,
+        )];
+        let path = dir.path().join("member.fits");
+        write_fits_f32(&path, W, H, 1, &target, &[]).unwrap();
+        let frame = StackFrame {
+            path,
+            map: PixelMap::linear(Linear::identity()).unwrap(),
+            measurement: FrameMeasurement {
+                width: W,
+                height: H,
+                channels: vec![Default::default()],
+                duration_ms: 0,
+            },
+            weight: FrameWeight {
+                channels: vec![1.0],
+                normalized: vec![1.0],
+                mean: 1.0,
+                normalized_mean: 1.0,
+                missing: None,
+            },
+            exposure_s: 180.0,
+            date_obs: None,
+            frame_id: 1,
+            registered_path: None,
+        };
+        let sidecar = dir.path().join("member.athln");
+        normalize_frame(
+            &reference,
+            &for_detection,
+            &ref_bg,
+            &frame,
+            LnScaleSeeds::ForcedDetection,
+            &cfg,
+            &measure,
+            Interpolation::Bilinear,
+            0.3,
+            &sidecar,
+            None,
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("a partially overlapping member normalizes");
+        let grids = LnFrameGrids::read(&sidecar).unwrap();
+        let g = &grids.channels[0];
+        let stride = g.stride();
+        let mut on_footprint = 0usize;
+        for j in 0..g.gh {
+            for i in 0..g.gw {
+                let (a, b) = (g.a[j * g.gw + i], g.b[j * g.gw + i]);
+                assert!(
+                    a.is_finite() && b.is_finite(),
+                    "node ({i}, {j}): a {a}, b {b}"
+                );
+                if footprint(((j * stride).min(H - 1)) * W + (i * stride).min(W - 1)) {
+                    on_footprint += 1;
+                }
+            }
+        }
+        assert!(on_footprint >= 20, "{on_footprint} nodes on the footprint");
     }
 }

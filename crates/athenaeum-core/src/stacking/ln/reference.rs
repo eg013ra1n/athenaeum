@@ -650,4 +650,108 @@ mod tests {
         assert_eq!(header.get_i32("ATH_STKV"), Some(ATH_STK_VERSION as i32));
         assert_eq!(header.get_str("ATH_STKI").as_deref(), Some("run-42"));
     }
+
+    /// Plan 6b-3 D5 (review of Task 4): with `empty_as_nan`, each plane of a
+    /// multi-channel reference is NaN at exactly the pixels no member covers
+    /// IN THAT PLANE, and finite on every covered one; with it off the same
+    /// pixels are 0.0 (the frame-set behaviour).
+    #[test]
+    fn empty_as_nan_marks_each_planes_own_uncovered_pixels() {
+        const W: usize = 96;
+        const H: usize = 64;
+        const C: usize = 3;
+        // Plane p is covered on x < COVER[p] by every member.
+        const COVER: [usize; C] = [40, 60, 80];
+        let dir = tempfile::tempdir().unwrap();
+        let mut frames = Vec::new();
+        for i in 0..4usize {
+            let mut data = Vec::with_capacity(W * H * C);
+            for (p, &cover) in COVER.iter().enumerate() {
+                let mut plane = vec![0.1f32 + 0.05 * p as f32; W * H];
+                add_noise(&mut plane, 0.003, 3000 + (i * C + p) as u64);
+                for (k, v) in plane.iter_mut().enumerate() {
+                    if k % W >= cover {
+                        *v = f32::NAN;
+                    }
+                }
+                data.extend_from_slice(&plane);
+            }
+            let path = dir.path().join(format!("rgb{i}.fits"));
+            write_fits_f32(&path, W, H, C, &data, &[]).unwrap();
+            frames.push(StackFrame {
+                path,
+                map: identity_map(),
+                measurement: FrameMeasurement {
+                    width: W,
+                    height: H,
+                    channels: vec![ChannelMeasurement::default(); C],
+                    duration_ms: 0,
+                },
+                weight: FrameWeight {
+                    channels: vec![1.0; C],
+                    normalized: vec![1.0; C],
+                    mean: 1.0,
+                    normalized_mean: 1.0,
+                    missing: None,
+                },
+                exposure_s: 60.0,
+                date_obs: None,
+                frame_id: 900200 + i as i64,
+                registered_path: None,
+            });
+        }
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: W,
+            height: H,
+            channels: C,
+            interpolation: Interpolation::Bilinear,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+            second_pass_bitmaps: false,
+            coverage_map: false,
+        };
+        let pool = pool();
+        let cancel = AtomicBool::new(false);
+        let included: Vec<usize> = (0..4).collect();
+        for empty_as_nan in [true, false] {
+            let r = build_reference(
+                &input,
+                &included,
+                3,
+                &pool,
+                &cancel,
+                io(20_000_000),
+                &|_, _| {},
+                empty_as_nan,
+            )
+            .unwrap();
+            assert_eq!(r.planes.len(), C);
+            for (p, plane) in r.planes.iter().enumerate() {
+                for (k, &v) in plane.iter().enumerate() {
+                    // The footprint's last column is the warp's own edge:
+                    // the bilinear kernel there reaches a NaN neighbour, so
+                    // its value is a property of the resampler, not of the
+                    // coverage count. Every other pixel is pinned exactly.
+                    if k % W + 1 == COVER[p] {
+                        continue;
+                    }
+                    let covered = k % W < COVER[p];
+                    if covered {
+                        assert!(v.is_finite(), "plane {p} pixel {k} is covered, got {v}");
+                    } else if empty_as_nan {
+                        assert!(v.is_nan(), "plane {p} pixel {k} is uncovered, got {v}");
+                    } else {
+                        assert_eq!(v, 0.0, "plane {p} pixel {k}");
+                    }
+                }
+            }
+        }
+    }
 }

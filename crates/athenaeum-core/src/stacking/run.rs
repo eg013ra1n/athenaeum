@@ -3078,6 +3078,15 @@ pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
     LN_PLANES_RESIDENT * w * h * 4
 }
 
+/// Plan 6b-3 D6: masked LN also holds, per worker, the overlap and eroded
+/// masks (a byte per pixel each) and a masked copy of the reference plane
+/// (four bytes): counted as three f32 planes, rounded up from 1.5.
+pub(crate) const LN_MASKED_EXTRA_PLANES: u64 = 3;
+
+pub(crate) fn ln_working_set_bytes_masked(w: u64, h: u64) -> u64 {
+    ln_working_set_bytes(w, h) + LN_MASKED_EXTRA_PLANES * w * h * 4
+}
+
 /// `CALIBRATE_PLANES_RESIDENT` planes of one w×h channel, in bytes — ONE
 /// worker's own Calibrate fan-out footprint (perf tier 1 Task 5 fix round
 /// 1, Important finding 2). The group's shared preloaded master planes are
@@ -9841,6 +9850,7 @@ fn run_group_normalization(
     let cfg = rc.config.clone();
     let ln_cfg = cfg.normalization.local;
     let ln_drives_output = ln_cfg.enabled;
+    let grid_mode = rc.grid.is_some();
 
     // Sky-penalized members first (spec §4.4/§5.2, ruling R-M3-17 v2 —
     // supersedes plain best-weighted-first): the SAME `sky_penalized_order`
@@ -9930,9 +9940,14 @@ fn run_group_normalization(
         .map(|&i| members[i].frame_id)
         .collect();
 
+    // Plan 6b-3 D6: what every LN hash folds as a member's registration.
+    let member_ln_upstreams: Vec<String> = members
+        .iter()
+        .map(|m| crate::stacking::plan::ln_registration_upstream(&m.registration_hash, grid_mode))
+        .collect();
     let mut member_reg_hashes: Vec<&str> = reference_members
         .iter()
-        .map(|&i| members[i].registration_hash.as_str())
+        .map(|&i| member_ln_upstreams[i].as_str())
         .collect();
     member_reg_hashes.sort_unstable();
     let combined_registration_hash = member_reg_hashes.join(",");
@@ -10148,12 +10163,21 @@ fn run_group_normalization(
         psf_signal::PsfModel::Auto => psf_signal::PsfModel::Fixed(group_beta),
         other => other,
     };
-    let reference_for_detection = LnReferenceForDetection::build(
-        &ln_reference,
-        reference_psf,
-        measure_opts.max_stars,
-        Some(&rc.ctx.image_pool),
-    );
+    let reference_for_detection = if grid_mode {
+        LnReferenceForDetection::build_masked(
+            &ln_reference,
+            reference_psf,
+            measure_opts.max_stars,
+            Some(&rc.ctx.image_pool),
+        )
+    } else {
+        LnReferenceForDetection::build(
+            &ln_reference,
+            reference_psf,
+            measure_opts.max_stars,
+            Some(&rc.ctx.image_pool),
+        )
+    };
 
     // Perf tier C Task 2 (spec §2.2.3): resolve each member's per-plane
     // `fits` artifact PATHS up front — a metadata-only DB lookup, the same
@@ -10264,7 +10288,7 @@ fn run_group_normalization(
         .map(|&i| {
             (
                 members[i].frame_id,
-                members[i].registration_hash.as_str(),
+                member_ln_upstreams[i].as_str(),
                 member_measurement_hashes[i].as_str(),
             )
         })
@@ -10291,10 +10315,10 @@ fn run_group_normalization(
         members
             .iter()
             .enumerate()
-            .map(|(i, m)| {
+            .map(|(i, _m)| {
                 normalization_hash_for(
                     &cfg,
-                    &m.registration_hash,
+                    &member_ln_upstreams[i],
                     &member_measurement_hashes[i],
                     &reference_member_ids,
                     &reference_hash,
@@ -10464,7 +10488,11 @@ fn run_group_normalization(
         None,
     );
 
-    let working_set_bytes = ln_working_set_bytes(input.width as u64, input.height as u64);
+    let working_set_bytes = if grid_mode {
+        ln_working_set_bytes_masked(input.width as u64, input.height as u64)
+    } else {
+        ln_working_set_bytes(input.width as u64, input.height as u64)
+    };
     let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
     log_admission(
         rc,
@@ -10914,6 +10942,7 @@ fn build_and_write_ln_reference(
     reference_member_ids: &[i64],
 ) -> Result<LnReference, RunError> {
     let build_start = Instant::now();
+    let empty_as_nan = rc.grid.is_some();
     // v0.6.3: the reference build is an integration of the group's best
     // `n` members — a minute or more on a real set that used to show as a
     // Normalize row sitting at 0 of N. Plane-level ticks with a message
@@ -10952,14 +10981,23 @@ fn build_and_write_ln_reference(
     let cancel: &AtomicBool = &rc.cancel;
     let pool: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
 
-    let built = build_ln_reference(input, included, n, pool, cancel, io, &on_build_progress, false)
-        .map_err(|e| {
-            if matches!(e, IntegrationError::Cancelled) {
-                RunError::Cancelled
-            } else {
-                RunError::Other(format!("LN reference build failed: {e}"))
-            }
-        })?;
+    let built = build_ln_reference(
+        input,
+        included,
+        n,
+        pool,
+        cancel,
+        io,
+        &on_build_progress,
+        empty_as_nan,
+    )
+    .map_err(|e| {
+        if matches!(e, IntegrationError::Cancelled) {
+            RunError::Cancelled
+        } else {
+            RunError::Other(format!("LN reference build failed: {e}"))
+        }
+    })?;
 
     let reference_path = rc.layout.ln_reference_path(&group.key);
     let cards = vec![
@@ -24496,6 +24534,32 @@ mod tests {
         rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
         run_pipeline(&mut rc).unwrap();
         (ctx, conn, rc, grid)
+    }
+
+    /// Spec §5.6 seam 1, plan 6b-3 D5: a project's LN reference lies on the
+    /// grid with the pixels no member covers NaN (never data), and every
+    /// member is normalized on its overlap and cached.
+    #[test]
+    fn a_project_ln_reference_leaves_uncovered_pixels_nan() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ctx, conn, rc, _grid) =
+            run_sky_project(tmp.path(), |cfg| cfg.normalization.local.enabled = true);
+        let group = rc.plan_groups[0].key.clone();
+        let reference = PlaneReader::open(&rc.layout.ln_reference_path(&group)).unwrap();
+        assert_eq!((reference.width(), reference.height()), (512, 384));
+        let plane = reference.read_plane(0).unwrap();
+        assert!(plane[0].is_nan(), "a corner no member covers is NaN");
+        assert!(plane[192 * 512 + 256].is_finite(), "the centre is data");
+        for f in &rc.plan_groups[0].frames {
+            assert!(
+                crate::db::stacking::find_artifact(&conn, &rc.subject, &group, "ln", Some(f.frame_id))
+                    .unwrap()
+                    .is_some(),
+                "{} has its sidecar",
+                f.filename
+            );
+        }
     }
 
     fn drizzle_2x(cfg: &mut StackingConfig) {

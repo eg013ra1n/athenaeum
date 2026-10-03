@@ -148,6 +148,19 @@ impl PartialEq for ScaleResult {
     }
 }
 
+/// Whether a position, rounded to its pixel, lies inside `allowed` (plan
+/// 6b-3 D6). Out of the image is not allowed.
+fn allowed_at(allowed: &[bool], width: usize, x: f64, y: f64) -> bool {
+    let (cx, cy) = (x.round(), y.round());
+    if !(cx >= 0.0 && cy >= 0.0) || cx as usize >= width {
+        return false;
+    }
+    allowed
+        .get(cy as usize * width + cx as usize)
+        .copied()
+        .unwrap_or(false)
+}
+
 /// Detect star seeds on one plane: registration's own detector for
 /// positions (its saturation/eccentricity/SNR cuts are exactly the ones a
 /// reliable flux match wants), converted to fit seeds. Fits (not run
@@ -578,8 +591,46 @@ impl PreparedReferenceChannel {
         max_stars: usize,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> PreparedReferenceChannel {
+        Self::build_with(reference, width, height, psf, max_stars, pool, None)
+    }
+
+    /// The masked preparation (plan 6b-3 D6): the reference's own seeds are
+    /// kept only where `allowed` holds (the coverage eroded by the PSF fit
+    /// region), so no reference star is fitted across the coverage edge.
+    pub fn build_masked(
+        reference: &[f32],
+        width: usize,
+        height: usize,
+        psf: PsfModel,
+        max_stars: usize,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+        allowed: &[bool],
+    ) -> PreparedReferenceChannel {
+        Self::build_with(
+            reference,
+            width,
+            height,
+            psf,
+            max_stars,
+            pool,
+            Some(allowed),
+        )
+    }
+
+    fn build_with(
+        reference: &[f32],
+        width: usize,
+        height: usize,
+        psf: PsfModel,
+        max_stars: usize,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+        allowed: Option<&[bool]>,
+    ) -> PreparedReferenceChannel {
         let fit_params = FitParams::default();
-        let ref_seeds = detect_seeds(reference, width, height, max_stars, pool);
+        let mut ref_seeds = detect_seeds(reference, width, height, max_stars, pool);
+        if let Some(a) = allowed {
+            ref_seeds.retain(|s| allowed_at(a, width, s.x, s.y));
+        }
         let outcome = fit_stars(reference, width, height, &ref_seeds, psf, &fit_params, pool);
         let beta = outcome.beta;
 
@@ -659,6 +710,37 @@ pub fn relative_scale_against(
         rcr_limit,
         local_scale,
         pool,
+        None,
+    )
+    .map(|(r, _diag)| r)
+}
+
+/// [`relative_scale_against`] fitted on `allowed` only (plan 6b-3 D6): the
+/// target's seeds outside it are dropped before they are fitted.
+#[allow(clippy::too_many_arguments)]
+pub fn relative_scale_against_masked(
+    prepared: &PreparedReferenceChannel,
+    target: &[f32],
+    width: usize,
+    height: usize,
+    max_stars: usize,
+    match_radius_px: f64,
+    rcr_limit: f64,
+    local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    allowed: &[bool],
+) -> Result<ScaleResult, LnError> {
+    relative_scale_against_core(
+        prepared,
+        target,
+        width,
+        height,
+        max_stars,
+        match_radius_px,
+        rcr_limit,
+        local_scale,
+        pool,
+        Some(allowed),
     )
     .map(|(r, _diag)| r)
 }
@@ -692,6 +774,7 @@ pub fn relative_scale_against_with_diag(
         rcr_limit,
         local_scale,
         pool,
+        None,
     )
 }
 
@@ -706,6 +789,7 @@ fn relative_scale_against_core(
     rcr_limit: f64,
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    allowed: Option<&[bool]>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
     let fit_params = FitParams::default();
 
@@ -713,7 +797,10 @@ fn relative_scale_against_core(
     // stage's own `scale_ms` (ln/mod.rs) splits into where it actually
     // goes instead of staying one opaque number.
     let t = Instant::now();
-    let tgt_seeds = detect_seeds(target, width, height, max_stars, pool);
+    let mut tgt_seeds = detect_seeds(target, width, height, max_stars, pool);
+    if let Some(a) = allowed {
+        tgt_seeds.retain(|s| allowed_at(a, width, s.x, s.y));
+    }
     let detect_ms = t.elapsed().as_millis() as u64;
 
     let t = Instant::now();
@@ -960,6 +1047,41 @@ pub fn relative_scale_from_seeds(
         rcr_limit,
         local_scale,
         pool,
+        None,
+    )
+    .map(|(r, _diag, _breakdown)| r)
+}
+
+/// [`relative_scale_from_seeds`] on `allowed` only (plan 6b-3 D6): a seed
+/// whose mapped position lies outside it is counted as out of coverage.
+#[allow(clippy::too_many_arguments)]
+pub fn relative_scale_from_seeds_masked(
+    prepared: &PreparedReferenceChannel,
+    fits: &[StarFit],
+    map: &PixelMap,
+    target_plane: &[f32],
+    ref_width: usize,
+    ref_height: usize,
+    max_stars: usize,
+    match_radius_px: f64,
+    rcr_limit: f64,
+    local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    allowed: &[bool],
+) -> Result<ScaleResult, LnError> {
+    relative_scale_from_seeds_core(
+        prepared,
+        fits,
+        map,
+        target_plane,
+        ref_width,
+        ref_height,
+        max_stars,
+        match_radius_px,
+        rcr_limit,
+        local_scale,
+        pool,
+        Some(allowed),
     )
     .map(|(r, _diag, _breakdown)| r)
 }
@@ -1026,6 +1148,7 @@ pub fn relative_scale_from_seeds_with_breakdown(
         rcr_limit,
         local_scale,
         pool,
+        None,
     )
     .map(|(r, _diag, breakdown)| (r, breakdown))
 }
@@ -1061,6 +1184,7 @@ pub fn relative_scale_from_seeds_with_diag(
         rcr_limit,
         local_scale,
         pool,
+        None,
     )
     .map(|(r, diag, _breakdown)| (r, diag))
 }
@@ -1078,6 +1202,7 @@ fn relative_scale_from_seeds_core(
     rcr_limit: f64,
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    allowed: Option<&[bool]>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>, SeedFilterBreakdown), LnError> {
     let fit_params = FitParams::default();
     let mut breakdown = SeedFilterBreakdown {
@@ -1115,6 +1240,9 @@ fn relative_scale_from_seeds_core(
         let Some((mx, my)) = map_seed_position(f, map, ref_width, ref_height) else {
             continue;
         };
+        if allowed.is_some_and(|a| !allowed_at(a, ref_width, mx, my)) {
+            continue;
+        }
         breakdown.in_coverage += 1;
         if warped_pixel_is_saturated(target_plane, ref_width, mx.round(), my.round()) {
             continue;

@@ -2334,6 +2334,23 @@ fn project_inputs(
     })
 }
 
+/// The token a project's LN hashes fold beside each frame's registered
+/// hash (plan 6b-3 D6): masked LN is a different computation from the
+/// frame-set one, so the two never share a sidecar. Bump it when masked
+/// LN's arithmetic changes.
+pub(crate) const LN_MASKED_TOKEN: &str = "lnmask:1";
+
+/// A frame's registration upstream as every LN hash folds it: a frame
+/// set's registration hash unchanged; on a grid, the registered hash plus
+/// [`LN_MASKED_TOKEN`].
+pub(crate) fn ln_registration_upstream(registration_hash: &str, masked: bool) -> String {
+    if masked {
+        format!("{registration_hash}+{LN_MASKED_TOKEN}")
+    } else {
+        registration_hash.to_string()
+    }
+}
+
 /// Build the plan for a subject (a frame set or a project): its groups, the
 /// resolved config, every gate blocker (spec §2, checked in a fixed order so the first blocker a
 /// user sees is always the most fundamental one), and which of the three
@@ -2952,7 +2969,10 @@ pub fn build_plan(
                             // ABSENCE of a registration row at all (no entry
                             // in the map) stays "can't verify".
                             Some(hash_opt) => {
-                                let frame_registration_hash = hash_opt.clone().unwrap_or_default();
+                                let frame_registration_hash = ln_registration_upstream(
+                                    &hash_opt.clone().unwrap_or_default(),
+                                    project_grid.is_some(),
+                                );
                                 // C-17: the same measurement hash the
                                 // Measure check above resolved for this
                                 // frame, and the same value `run.rs` folds
@@ -3175,6 +3195,17 @@ pub fn build_plan(
 
 #[cfg(test)]
 mod tests {
+    /// Plan 6b-3 D6: a frame set's LN upstream is its registration hash,
+    /// byte for byte; a project's carries the masked-LN token.
+    #[test]
+    fn the_ln_upstream_is_unchanged_for_a_frame_set() {
+        assert_eq!(ln_registration_upstream("h", false), "h");
+        assert_eq!(
+            ln_registration_upstream("h", true),
+            format!("h+{LN_MASKED_TOKEN}")
+        );
+    }
+
     use super::*;
     use crate::api::lights::compute_export_readiness;
     use crate::db::stacking::set_set_config;
