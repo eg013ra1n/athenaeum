@@ -141,7 +141,9 @@ fn osc_or_cfa(landed: &Path, debayer_osc: bool) -> Option<&'static str> {
 /// The colour token of an attested frame set's light (spec §13, plan 6b-2
 /// C13): a catalog BAYERPAT means colour (then [`osc_or_cfa`]); without one
 /// the file's own header decides: three planes are `osc`, anything else
-/// `mono`. An unreadable file warns and falls back to the catalog rule.
+/// `mono`. An unreadable file warns and follows the project rule with the
+/// shape unknown: `cfa` under a catalog BAYERPAT, `mono` without one. Prepare
+/// excludes the unreadable file anyway.
 pub(crate) fn attested_color_token(
     frames_set_id: i64,
     frame_id: i64,
@@ -151,7 +153,12 @@ pub(crate) fn attested_color_token(
 ) -> &'static str {
     if catalog_bayerpat {
         return osc_or_cfa(path, debayer_osc).unwrap_or_else(|| {
-            tracing::warn!(set_id = frames_set_id, frame_id, path = %path.display(), "file shape unreadable; colour token assumed cfa");
+            tracing::warn!(
+                set_id = frames_set_id,
+                frame_id,
+                path = %path.display(),
+                "file shape unreadable; colour token assumed cfa"
+            );
             "cfa"
         });
     }
@@ -159,7 +166,12 @@ pub(crate) fn attested_color_token(
         Some((_, _, 3)) => "osc",
         Some(_) => "mono",
         None => {
-            tracing::warn!(set_id = frames_set_id, frame_id, path = %path.display(), "file shape unreadable; colour token falls back to the catalog (mono)");
+            tracing::warn!(
+                set_id = frames_set_id,
+                frame_id,
+                path = %path.display(),
+                "file shape unreadable; colour token falls back to the catalog (mono)"
+            );
             "mono"
         }
     }

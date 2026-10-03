@@ -745,8 +745,9 @@ pub(crate) fn group_frames_with(
 
     // Bucketed by a plain tuple rather than a dedicated struct: `ColorMode`
     // deliberately does not derive `Hash` (it is a wire type, not a map key
-    // elsewhere), so the colour axis rides along as a `bool` (`true` = OSC)
-    // instead of pulling that derive in just for this. `filter` is the
+    // elsewhere), so the colour axis rides along as its key token
+    // (`mono` | `osc` | `cfa`, a `&'static str`) instead of pulling that
+    // derive in just for this. `filter` is the
     // SANITIZED token (never `None` — `sanitized_or` always resolves to a
     // concrete string, its own fallback included), so two members can only
     // land in different buckets when `group_key` would actually emit
@@ -840,8 +841,9 @@ pub(crate) fn group_frames_with(
 
 /// The frame source of a stacking subject: its integration groups plus the
 /// origin of every frame in them (wave 6 spec §4.3). A frame set reads the
-/// catalog through [`group_frames`] (its `calibrated_externally` flag rides
-/// every origin, spec §13); a project reads its manifest mirror through
+/// catalog through [`group_frames`] (an attested set, whose
+/// `calibrated_externally` flag rides every origin, spec §13, through
+/// [`group_frames_with`] and the project colour rule); a project reads its manifest mirror through
 /// [`crate::stacking::project_source::project_frame_source`].
 pub(crate) fn frame_source(
     conn: &Connection,

@@ -21510,6 +21510,12 @@ mod tests {
             let h = FitsHeader::from_path(&p).unwrap();
             assert_eq!(h.get_str("ATH_PREP").as_deref(), Some("converted"));
             assert_eq!(h.get_str("CALSTAT"), None);
+            // An attested light's output stem carries its frame id.
+            let name = p.file_name().unwrap().to_str().unwrap().to_string();
+            assert!(
+                name.ends_with(&format!("_f{}.fits", a.frame_id.unwrap())),
+                "{name}"
+            );
         }
         assert!(!layout.calibrated_root().exists(), "nothing was calibrated");
         let summary: RunSummary =
@@ -21596,6 +21602,18 @@ mod tests {
     /// keeps the old `mono__` key: the frame-set rule did not move.
     #[test]
     fn an_attested_three_plane_set_groups_as_osc_and_stacks() {
+        attested_three_plane_case(true);
+    }
+
+    /// Review round 2: with the debayer OFF the three-plane attested lights
+    /// stay `osc` (not `cfa`), Prepare expects three planes for an `osc__`
+    /// group and excludes nothing.
+    #[test]
+    fn an_attested_three_plane_set_stays_osc_with_the_debayer_off() {
+        attested_three_plane_case(false);
+    }
+
+    fn attested_three_plane_case(debayer_osc: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
@@ -21604,7 +21622,8 @@ mod tests {
             seed_star_group(&db_path, SET_NAME, &shifts, &[0.0f32; 4]);
         make_lights_three_plane(&fixture, &shifts, &[0, 1, 2, 3]);
         let subject = StackSubject::FrameSet(fixture.set_id);
-        let cfg = StackingConfig::default();
+        let mut cfg = StackingConfig::default();
+        cfg.calibration.debayer_osc = debayer_osc;
 
         // The unattested twin: catalog rule only, `mono__`.
         let (plain, _) = frame_source(&fixture.conn, &subject, &cfg).unwrap();
@@ -21627,7 +21646,7 @@ mod tests {
             &crate::settings::SettingsManager::new(),
             &PathPolicy::AllowAll,
             &subject,
-            None,
+            Some(cfg.clone()),
         )
         .unwrap();
         let plan_keys: Vec<&str> = plan.groups.iter().map(|g| g.key.as_str()).collect();
@@ -21643,7 +21662,7 @@ mod tests {
             &PathPolicy::AllowAll,
             "test".to_string(),
             subject.clone(),
-            None,
+            Some(cfg.clone()),
             None,
         )
         .expect("an attested set starts");
@@ -21655,7 +21674,7 @@ mod tests {
         let calibrated =
             crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some("calibrated"))
                 .unwrap();
-        assert_eq!(calibrated.len(), light_ids.len());
+        assert_eq!(calibrated.len(), light_ids.len(), "Prepare excluded nothing");
         for a in &calibrated {
             let p: String = fixture
                 .conn
