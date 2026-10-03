@@ -1119,7 +1119,10 @@ pub fn integrate_group(
         None,
         recipe,
         input.integration.write_rejection_maps,
-        CoverageOptions { count: input.coverage_map, empty_as_nan: false },
+        CoverageOptions {
+            count: input.coverage_map,
+            empty_as_nan: false,
+        },
         pool,
         cancel,
         &progress_pass1,
@@ -1225,7 +1228,10 @@ pub fn integrate_group(
                         Some(&forced),
                         recipe,
                         input.integration.write_rejection_maps,
-                        CoverageOptions { count: input.coverage_map, empty_as_nan: false },
+                        CoverageOptions {
+                            count: input.coverage_map,
+                            empty_as_nan: false,
+                        },
                         pool,
                         cancel,
                         &progress_pass2,
@@ -2049,6 +2055,9 @@ mod tests {
         }
     }
 
+    const SHIFTED_EXPOSURES: [f64; 3] = [60.0, 90.0, 120.0];
+    const SHIFTED_WEIGHTS: [f64; 3] = [1.0, 0.8, 0.6];
+
     /// The three shifted frames of the level test: (0,0), (2.4,-1.3) and a
     /// (-5,3)-shifted frame at twice the level, 400x300, written to `dir`.
     fn three_shifted_frames(dir: &std::path::Path) -> Vec<StackFrame> {
@@ -2093,8 +2102,7 @@ mod tests {
         };
         let (m0meas, m1meas, m2meas) = (meas(&p0), meas(&p1), meas(&p2));
 
-        let exposures = [60.0, 90.0, 120.0];
-        let weights = [1.0, 0.8, 0.6];
+        let (exposures, weights) = (SHIFTED_EXPOSURES, SHIFTED_WEIGHTS);
         let frames = vec![
             StackFrame {
                 path: p0,
@@ -2150,8 +2158,7 @@ mod tests {
             .collect();
         let dir = tempfile::tempdir().unwrap();
         let frames = three_shifted_frames(dir.path());
-        let exposures = [60.0, 90.0, 120.0];
-        let weights = [1.0, 0.8, 0.6];
+        let (exposures, weights) = (SHIFTED_EXPOSURES, SHIFTED_WEIGHTS);
 
         let integration = IntegrationConfig::default();
         let normalization = NormalizationConfig::default();
@@ -2296,7 +2303,10 @@ mod tests {
         let on_band = nop_band();
         let progress = GroupProgress {
             on_plane: &on_plane,
-            engine: EngineProgress { on_band: &on_band, on_combine: &on_band },
+            engine: EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
         };
         let pool = pool();
         let off = integrate_group(
@@ -2323,8 +2333,14 @@ mod tests {
         }
         let cov = on.coverage.expect("the coverage plane");
         assert_eq!(cov.len(), FW * FH);
-        assert!(cov.iter().all(|&c| c == c.trunc() && (0.0..=3.0).contains(&c)));
-        assert_eq!(cov[(FH / 2) * FW + FW / 2], 3.0, "the centre is covered by every frame");
+        assert!(cov
+            .iter()
+            .all(|&c| c == c.trunc() && (0.0..=3.0).contains(&c)));
+        assert_eq!(
+            cov[(FH / 2) * FW + FW / 2],
+            3.0,
+            "the centre is covered by every frame"
+        );
         assert!(cov[0] < 3.0, "the (-5, 3)-shifted frame leaves the corner");
     }
 
@@ -2851,7 +2867,6 @@ mod tests {
             // This pin reads the second pass's own set, which is what a
             // drizzle-consuming run asks for.
             second_pass_bitmaps: true,
-            coverage_map: false,
             ..input_off
         };
         let on = integrate_group(

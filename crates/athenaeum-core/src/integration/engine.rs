@@ -1613,8 +1613,11 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
     // could only come out of the combiner itself — unreachable by
     // construction (same guard as the unweighted path) — except a pixel
     // `empty_as_nan` left NaN on purpose.
-    let uncovered = |k: usize| params.empty_as_nan && coverage.as_ref().is_some_and(|c| c[k] == 0.0);
-    if let Some((_, bad)) = out.iter().enumerate().find(|(k, v)| !v.is_finite() && !uncovered(*k)) {
+    let uncovered =
+        |k: usize| params.empty_as_nan && coverage.as_ref().is_some_and(|c| c[k] == 0.0);
+    if let Some((_, bad)) =
+        out.iter().enumerate().find(|(k, v)| !v.is_finite() && !uncovered(*k))
+    {
         return Err(IntegrationError::Decode(format!(
             "internal: non-finite value {bad} survived input filtering"
         )));
@@ -2858,8 +2861,15 @@ mod tests {
         for (a, b) in off.rejection_low.as_ref().unwrap().iter().zip(on.rejection_low.as_ref().unwrap()) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+        for (a, b) in off.rejection_high.as_ref().unwrap().iter().zip(on.rejection_high.as_ref().unwrap()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
         assert_eq!(off.samples_per_frame, on.samples_per_frame);
         assert_eq!(off.rejected_per_frame, on.rejected_per_frame);
+        assert_eq!((off.rejected_low, off.rejected_high), (on.rejected_low, on.rejected_high));
+        assert_eq!(off.base.rejected_fraction.to_bits(), on.base.rejected_fraction.to_bits());
+        assert_eq!(off.base.bad_samples_per_frame, on.base.bad_samples_per_frame);
+        assert_eq!(off.base.all_bad_pixels, on.base.all_bad_pixels);
         let cov = on.coverage.unwrap();
         for y in 0..h {
             for x in 0..w {
@@ -2921,6 +2931,48 @@ mod tests {
         }
         assert_eq!(nan.base.data[3], 0.0, "all samples range-rejected: covered, so 0.0");
         assert!(nan.coverage.is_some(), "empty_as_nan counts");
+    }
+
+    /// Plan 6b-3 D4: the count is filled band by band at the band's own row
+    /// offset. A tiny band budget forces several bands, and the NaN
+    /// footprint varies along y, so a wrong `y0` in the post-pass fails.
+    #[test]
+    fn coverage_is_correct_across_several_bands() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 40usize);
+        let paths: Vec<_> = (0..4usize)
+            .map(|i| {
+                write(dir.path(), &format!("f{i}.fits"), w, h, move |x, y| {
+                    // Frame i covers rows y >= 3 * i and columns x >= i.
+                    if y < 3 * i || x < i {
+                        f32::NAN
+                    } else {
+                        0.2 + 0.01 * ((x + y + i) % 5) as f32
+                    }
+                })
+            })
+            .collect();
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 4];
+        let params = StackParams {
+            rejection: &ident, output: &ident, weights: &[1.0; 4],
+            range_low: None, range_high: None, rejection_maps: false,
+            local: None, local_for_rejection: false, local_for_output: false,
+            rejection_bits: None, forced_rejection: None,
+            coverage: true, empty_as_nan: true,
+        };
+        let out = integrate_stack(&src, &params, IntegrationRecipe::average(Rejection::None), &pool(),
+            &AtomicBool::new(false), EngineProgress { on_band: &nop(), on_combine: &nop() }, io(4096)).unwrap();
+        assert!(out.base.bands >= 2, "the budget must force several bands, got {}", out.base.bands);
+        let cov = out.coverage.unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                let expected = (0..4usize).filter(|&i| y >= 3 * i && x >= i).count() as f32;
+                assert_eq!(cov[y * w + x], expected, "({x}, {y})");
+                let v = out.base.data[y * w + x];
+                assert_eq!(v.is_nan(), expected == 0.0, "({x}, {y})");
+            }
+        }
     }
 
     #[test]
@@ -3708,8 +3760,6 @@ mod tests {
         let forced = ListSource::new(3, w, h, &[(1, 5, 5)]);
         let params = StackParams {
             forced_rejection: Some(&forced),
-            coverage: false,
-            empty_as_nan: false,
             ..params_none
         };
         let out = integrate_stack(

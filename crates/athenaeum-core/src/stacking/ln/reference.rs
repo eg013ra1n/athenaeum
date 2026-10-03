@@ -203,7 +203,10 @@ pub fn build_reference(
         None,
         recipe,
         write_maps,
-        CoverageOptions { count: false, empty_as_nan },
+        CoverageOptions {
+            count: false,
+            empty_as_nan,
+        },
         pool,
         cancel,
         &progress,

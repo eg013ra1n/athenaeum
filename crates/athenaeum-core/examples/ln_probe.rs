@@ -529,11 +529,20 @@ registration row for each — run stacking through Register first); found {}",
     let on_progress = |plane: usize, total: usize| eprintln!("reference: plane {plane}/{total}");
 
     let included: Vec<usize> = (0..stack_frames.len()).collect();
-    let reference = build_reference(&group_input, &included, n, &pool, &cancel, io, &on_progress, false)
-        .unwrap_or_else(|e| {
-            eprintln!("building the LN reference: {e}");
-            std::process::exit(1);
-        });
+    let reference = build_reference(
+        &group_input,
+        &included,
+        n,
+        &pool,
+        &cancel,
+        io,
+        &on_progress,
+        false,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("building the LN reference: {e}");
+        std::process::exit(1);
+    });
     eprintln!(
         "reference: {} of {} candidates, {}x{}, {channels} channel(s)",
         reference.frames_used.len(),
