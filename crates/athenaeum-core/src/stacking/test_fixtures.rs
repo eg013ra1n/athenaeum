@@ -656,13 +656,38 @@ fn write_light_fits_field(
     write_fits_i16(path, w, h, &data, &cards);
 }
 
+/// A FITS whose primary HDU holds no image (`NAXIS = 0`) — what a
+/// tile-compressed file or an extension image looks like to the plane
+/// reader (plan 6b-2 C12: "unsupported file").
+pub(crate) fn write_empty_primary_fits(path: &Path) {
+    let cards = [
+        "SIMPLE  =                    T",
+        "BITPIX  =                    8",
+        "NAXIS   =                    0",
+        "EXTEND  =                    T",
+        "END",
+    ];
+    let mut bytes: Vec<u8> = cards
+        .iter()
+        .flat_map(|c| format!("{c:<80}").into_bytes())
+        .collect();
+    bytes.resize(2880, b' ');
+    std::fs::write(path, bytes).expect("write the empty-primary fixture");
+}
+
 /// Hand-rolled 16-bit FITS primary-HDU writer (there is no `write_fits_i16`
 /// in `fits_writer` — only the float32 `write_fits_f32`): structural cards
 /// (`SIMPLE`/`BITPIX`/`NAXIS`/`NAXIS1`/`NAXIS2`/`BZERO`/`BSCALE`) via
 /// `Card::structural` the same way `fits_writer::writer` builds its own
 /// header, then the caller's cards, `END`, header padded to a 2880-byte
 /// block, then big-endian `i16` data padded to a 2880-byte block.
-fn write_fits_i16(path: &Path, width: usize, height: usize, data: &[i16], cards: &[Card]) {
+pub(crate) fn write_fits_i16(
+    path: &Path,
+    width: usize,
+    height: usize,
+    data: &[i16],
+    cards: &[Card],
+) {
     fn push(records: &mut Vec<[u8; CARD_SIZE]>, c: Card) {
         records.extend(format_card(&c).expect("valid fixture header card"));
     }
@@ -862,6 +887,8 @@ pub(crate) enum ProjectFile {
     Xisf32,
     /// Nothing on disk: the manifest row is never landed.
     Missing,
+    /// A primary HDU with no image (`NAXIS = 0`): an unsupported file.
+    EmptyPrimary,
 }
 
 /// One project frame to seed via [`add_project_frame`].
@@ -995,6 +1022,7 @@ pub(crate) fn add_project_frame(
         }
         ProjectFile::Xisf32 => write_xisf_f32(&path, w, h, 1, &plane, &cards).unwrap(),
         ProjectFile::Missing => {}
+        ProjectFile::EmptyPrimary => write_empty_primary_fits(&path),
     }
 
     let mut meta = serde_json::Map::new();

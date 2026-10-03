@@ -376,7 +376,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::rustafits_processor::AnnotationSettings,
         ]))),
         ("stacking.ts", js_safe_ints(format!(
-            "{HEADER}import type {{ ExportReadiness, FlatNormMode, LightCalParams, PathSetting }} from './models';\n\n{}",
+            "{HEADER}import type {{ CanonicalGrid, ExportReadiness, FlatNormMode, LightCalParams, PathSetting }} from './models';\n\n{}",
             decls![
             crate::resample::Interpolation,
             crate::stacking::prefilter::SeedPrefilter,
@@ -423,6 +423,9 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::stacking::plan::PlanBlocker,
             crate::stacking::plan::PlanGroup,
             crate::stacking::plan::PlanReference,
+            crate::stacking::plan::GridState,
+            crate::stacking::plan::PlanGrid,
+            crate::stacking::plan::PlanProjectFrame,
             crate::stacking::plan::StackingPlan,
             crate::db::stacking::StackingRunRow,
             crate::db::stacking::StackingRunGroupRow,

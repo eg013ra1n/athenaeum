@@ -1,7 +1,7 @@
 // AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
 // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
-import type { ExportReadiness, FlatNormMode, LightCalParams, PathSetting } from './models';
+import type { CanonicalGrid, ExportReadiness, FlatNormMode, LightCalParams, PathSetting } from './models';
 
 export type Interpolation = "nearest" | "bilinear" | "bicubicSpline" | "bicubicBSpline" | "lanczos3" | "lanczos4" | "mitchellNetravali";
 
@@ -372,6 +372,12 @@ scaleSource: ScaleSource | null, };
 
 export type PlanReference = { mode: ReferenceMode, frameId: number | null, filename: string | null, onDisk: boolean, };
 
+export type GridState = "unset" | "proposed" | "confirmed";
+
+export type PlanGrid = { state: GridState, current: CanonicalGrid | null, proposal: CanonicalGrid | null, framesInside: number, canEdit: boolean, };
+
+export type PlanProjectFrame = { handle: number | null, frameUuid: string, fileName: string, publisher: string, filterCanonical: string, exptimeSec: number, colorMode: ColorMode, hasWcs: boolean, onDisk: boolean, reason: string | null, };
+
 export type StackingPlan = { setId: number | null, projectId: string | null, setName: string, config: StackingConfig, configHash: string, groups: Array<PlanGroup>, blockers: Array<PlanBlocker>, warnings: Array<string>, readiness: ExportReadiness, 
 /**
  * Stage 0.5's work list (spec §2 row 0.5, owner requirement 2026-09-09):
@@ -381,7 +387,7 @@ export type StackingPlan = { setId: number | null, projectId: string | null, set
  * `start_master_builds_batch` submits a manual batch in, so a flat
  * built by stage 0.5 sees its own precal master already on disk.
  */
-mastersToBuild: Array<PlanMaster>, reference: PlanReference, frameCount: number, includedCount: number, excludedFrameIds: Array<number>, estimateBytes: number, freeBytes: number | null, workingDir: string | null, outputDir: string | null, staleStages: Array<Stage>, activeRunId: number | null, };
+mastersToBuild: Array<PlanMaster>, reference: PlanReference, frameCount: number, includedCount: number, excludedFrameIds: Array<number>, estimateBytes: number, freeBytes: number | null, workingDir: string | null, outputDir: string | null, staleStages: Array<Stage>, activeRunId: number | null, grid: PlanGrid | null, projectFrames: Array<PlanProjectFrame>, };
 
 export type StackingRunRow = { id: number, framesSetId: number | null, projectId: string | null, status: string, startedAt: string, finishedAt: string | null, configJson: string, configHash: string, referenceFrameId: number | null, referenceMode: string, workingDir: string, outputDir: string, summaryJson: string | null, error: string | null, };
 

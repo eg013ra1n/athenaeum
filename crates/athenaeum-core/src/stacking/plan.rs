@@ -223,6 +223,52 @@ pub struct PlanReference {
     pub on_disk: bool,
 }
 
+/// A project plan's grid state (spec §7): `unset` — no confirmed grid and
+/// no proposal (no accepted frame has a pixel scale); `proposed` — a
+/// proposal, not confirmed; `confirmed` — the hub has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum GridState {
+    Unset,
+    Proposed,
+    Confirmed,
+}
+
+/// A project plan's grid (spec §6, §7).
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanGrid {
+    pub state: GridState,
+    pub current: Option<crate::collab::grid::CanonicalGrid>,
+    pub proposal: Option<crate::collab::grid::CanonicalGrid>,
+    // Stackable frames with a WCS at least half inside the grid in use
+    // (the confirmed one, else the proposal).
+    pub frames_inside: usize,
+    pub can_edit: bool,
+}
+
+/// One row of a project plan's Frames table (spec §7): every published,
+/// accepted frame of the project, stackable on this device or not.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanProjectFrame {
+    // The frame's handle — `None` for a frame not stackable here (a handle
+    // is minted only when a plan includes the frame).
+    pub handle: Option<i64>,
+    pub frame_uuid: String,
+    pub file_name: String,
+    pub publisher: String,
+    pub filter_canonical: String,
+    pub exptime_sec: f64,
+    pub color_mode: ColorMode,
+    // The manifest carries a WCS (else the run plate-solves the frame).
+    pub has_wcs: bool,
+    // Stackable on this device.
+    pub on_disk: bool,
+    // Why the frame is not stacked here; `None` when it is.
+    pub reason: Option<String>,
+}
+
 /// What a stacking run would do for a frame set right now: its groups, the
 /// resolved config and its hash, every blocking/informational reason
 /// (`blockers`/`warnings`), the export-readiness tally the masters/links
@@ -260,6 +306,10 @@ pub struct StackingPlan {
     pub output_dir: Option<String>,
     pub stale_stages: Vec<Stage>,
     pub active_run_id: Option<i64>,
+    // A project plan's grid (spec §7); `None` for a frame set.
+    pub grid: Option<PlanGrid>,
+    // A project plan's Frames rows (spec §7); empty for a frame set.
+    pub project_frames: Vec<PlanProjectFrame>,
 }
 
 // ── config-hash helpers (spec §9.3) ─────────────────────────────────────────
@@ -1733,24 +1783,52 @@ fn dropped_masters_blocker(dropped: &[(i64, String)]) -> Option<PlanBlocker> {
     })
 }
 
-/// Build the plan for a frame set: its groups, the resolved config, every
-/// gate blocker (spec §2, checked in a fixed order so the first blocker a
-/// user sees is always the most fundamental one), and which of the three
-/// cacheable per-frame stages a run would still have to redo. Pure DB reads
-/// plus cheap filesystem probes — never starts a run, never touches
-/// [`crate::services::ServiceContext`].
-pub fn build_plan(
+/// What a subject's own arm resolves before the shared gates (plan 6b-2 C10).
+struct SubjectInputs {
+    cfg: StackingConfig,
+    hash: String,
+    groups: Vec<IntegrationGroup>,
+    origins: FrameOrigins,
+    excluded_frame_ids: Vec<i64>,
+    readiness: ExportReadiness,
+    masters_to_build: Vec<PlanMaster>,
+    /// Blockers ahead of every shared gate: a frame set's gate 1
+    /// (masters / links / masterFiles), a project's `grid`.
+    blockers: Vec<PlanBlocker>,
+    /// A project's own warnings (spec §7); empty for a frame set.
+    warnings: Vec<String>,
+    project: Option<ProjectInputs>,
+}
+
+/// What only a project's plan carries.
+struct ProjectInputs {
+    grid: PlanGrid,
+    frames: Vec<PlanProjectFrame>,
+    /// The scale the M4b spread is measured against (spec §7): the
+    /// confirmed grid's, else the proposal's.
+    grid_scale: Option<f64>,
+    /// The size of the grid in use — the space estimate's registered and
+    /// master geometry. `None` when there is neither grid nor proposal.
+    grid_dims: Option<(u64, u64)>,
+    /// What Prepare writes (conversions and debayers).
+    prepared_bytes: u64,
+    /// The handles of the frames Prepare cannot read (review I1): they leave
+    /// the plan's included counts and the ≥ 3 rule, not `excluded_frame_ids`.
+    unsupported_ids: HashSet<i64>,
+}
+
+/// The frame-set arm of [`build_plan`] — today's code, moved: the stored or
+/// global config, the catalog frame source, export readiness (over the
+/// frames a run will touch), the masters to build and gate 1. Read-only.
+/// An attested set (spec §13, R3) is prepared, never calibrated: it needs
+/// no master, so it gets no gate 1 and builds nothing.
+fn frame_set_inputs(
     conn: &Connection,
     settings: &SettingsManager,
-    policy: &PathPolicy,
     subject: &StackSubject,
+    frames_set_id: i64,
     config_override: Option<StackingConfig>,
-) -> Result<StackingPlan, ApiError> {
-    let StackSubject::FrameSet(frames_set_id) = subject else {
-        return Err(ApiError::Invalid(PROJECT_STACKING_UNAVAILABLE.into()));
-    };
-    let frames_set_id = *frames_set_id;
-    let set_name = subject_label(conn, subject)?;
+) -> Result<SubjectInputs, ApiError> {
     let (cfg, excluded_frame_ids) =
         resolve_config_and_exclusions(conn, settings, frames_set_id, config_override)?;
     let hash = config_hash(&cfg);
@@ -1775,9 +1853,380 @@ pub fn build_plan(
         .filter(|id| !excluded_set.contains(id))
         .collect();
     let readiness = compute_export_readiness_for_frames(conn, frames_set_id, &light_frame_ids)?;
-    let (masters_to_build, dropped_masters) = collect_masters_to_build(conn, &readiness);
 
     let mut blockers: Vec<PlanBlocker> = Vec::new();
+    let masters_to_build = if readiness.attested {
+        Vec::new()
+    } else {
+        let (masters_to_build, dropped_masters) = collect_masters_to_build(conn, &readiness);
+
+        // Gate 1: masters/links/masterFiles — reinterpreted 2026-09-09 (owner
+        // requirement — "the pipeline should build the calibration masters
+        // itself when they are missing"). The export-v2 gate
+        // (`check_mode_ready`'s CalibratedLights arms) blocked on
+        // `raw_sets_without_master`/`missing_master_files` outright; the
+        // stacking gate instead blocks ONLY the subset the readiness split says
+        // cannot be built/rebuilt (`raw_sets_unbuildable`/`masters_unrebuildable`)
+        // — everything else became `masters_to_build` above, planned work for
+        // stage 0.5 rather than a blocker. Same relative priority as the export
+        // gate's own arms (masters, then links, then masterFiles) and the same
+        // sentence style, just re-derived from the split fields instead of
+        // calling `check_mode_ready` directly.
+        if !readiness.raw_sets_unbuildable.is_empty() {
+            let n = readiness.raw_sets_unbuildable.len();
+            let first_reason = readiness.raw_sets_unbuildable[0].1.as_str();
+            blockers.push(PlanBlocker {
+                code: "masters".to_string(),
+                message: format!(
+                    "Build masters first — {n} set{} cannot be built: {first_reason}",
+                    if n == 1 { "" } else { "s" }
+                ),
+            });
+        }
+        if let Some(blocker) = dropped_masters_blocker(&dropped_masters) {
+            blockers.push(blocker);
+        }
+        if readiness.unlinked_lights > 0 {
+            let n = readiness.unlinked_lights;
+            blockers.push(PlanBlocker {
+                code: "links".to_string(),
+                message: format!(
+                    "{n} light{} {} no calibration links",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "has" } else { "have" }
+                ),
+            });
+        }
+        if !readiness.masters_unrebuildable.is_empty() {
+            let n = readiness.masters_unrebuildable.len();
+            // Every unrebuildable reason is archival ("archived — restore
+            // first") -> the export gate's own C-2 sentence; a mix (or a
+            // "no provenance"/missing-not-archived reason) names the first
+            // reason instead, since "restore from archive" would be actively
+            // wrong advice for those.
+            let all_archival = readiness
+                .masters_unrebuildable
+                .iter()
+                .all(|(_, reason)| reason.contains("archived"));
+            let message = if all_archival {
+                format!("{n} master file(s) missing on disk — restore from archive first")
+            } else {
+                format!(
+                    "{n} master file(s) missing on disk and cannot be rebuilt: {}",
+                    readiness.masters_unrebuildable[0].1
+                )
+            };
+            blockers.push(PlanBlocker {
+                code: "masterFiles".to_string(),
+                message,
+            });
+        }
+        masters_to_build
+    };
+    Ok(SubjectInputs {
+        cfg,
+        hash,
+        groups,
+        origins,
+        excluded_frame_ids,
+        readiness,
+        masters_to_build,
+        blockers,
+        warnings: Vec::new(),
+        project: None,
+    })
+}
+
+/// The project arm of [`build_plan`] (spec §7, plan 6b-2 C10). It WRITES —
+/// a documented exception to "the plan reads only": the config seed
+/// (`resolve_project_config_and_exclusions`) and the handle mint (the
+/// project frame source), each one IMMEDIATE transaction; never call it with
+/// a transaction open on `conn`. The masters / links / masterFiles gate never
+/// applies to a project (spec §5.0): readiness is empty, nothing is built.
+fn project_inputs(
+    conn: &Connection,
+    settings: &SettingsManager,
+    project_id: &str,
+    config_override: Option<StackingConfig>,
+) -> Result<SubjectInputs, ApiError> {
+    use crate::collab::grid_geometry::{
+        count_inside, fraction_inside, grid_input_of, propose_grid, GridInput, GridTarget,
+    };
+    use crate::db::collab_frames::NotStackable;
+    use crate::stacking::prepare::{prepare_action, prepared_bytes, probe_file, PrepareAction};
+
+    // A project this device lost (left, removed) fails readably here, before
+    // the config seed could hit the foreign key.
+    let project = crate::api::collab_exchange::live_project(conn, project_id)?;
+    let (cfg, excluded_uuids) =
+        resolve_project_config_and_exclusions(conn, settings, project_id, config_override)?;
+    let hash = config_hash(&cfg);
+    let source = crate::stacking::project_source::project_frame_source(conn, project_id, &cfg)?;
+    let handle_of: HashMap<&str, i64> = source
+        .frames
+        .iter()
+        .filter_map(|f| f.handle.map(|h| (f.frame_uuid.as_str(), h)))
+        .collect();
+    let excluded_frame_ids: Vec<i64> = excluded_uuids
+        .iter()
+        .filter_map(|u| handle_of.get(u.as_str()).copied())
+        .collect();
+    let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
+    let in_scope = |f: &&crate::stacking::project_source::SourceFrame| {
+        f.handle.is_some_and(|h| !excluded_set.contains(&h))
+    };
+
+    // The grid (spec §6.2, §6.3).
+    let can_edit = crate::api::collab::has_cap(
+        project.is_coordinator,
+        &project.gov_caps_json,
+        "project.edit",
+    );
+    let current = crate::api::collab_grid::stored_grid(conn, project_id)?;
+    let all_inputs: Vec<GridInput> = source
+        .frames
+        .iter()
+        .filter_map(|f| f.meta.as_ref())
+        .map(grid_input_of)
+        .collect();
+    let target = GridTarget {
+        ra_deg: project.target_ra_deg,
+        dec_deg: project.target_dec_deg,
+        radius_deg: project.target_radius_deg,
+    };
+    let proposal = propose_grid(&all_inputs, &target);
+    let state = match (&current, &proposal) {
+        (Some(_), _) => GridState::Confirmed,
+        (None, Some(_)) => GridState::Proposed,
+        (None, None) => GridState::Unset,
+    };
+    let in_use = current.or(proposal);
+    let in_scope_inputs: Vec<GridInput> = source
+        .frames
+        .iter()
+        .filter(in_scope)
+        .filter_map(|f| f.meta.as_ref())
+        .map(grid_input_of)
+        .collect();
+    let frames_inside = in_use
+        .as_ref()
+        .map(|g| count_inside(&in_scope_inputs, g))
+        .unwrap_or(0);
+
+    let mut blockers = Vec::new();
+    if state != GridState::Confirmed {
+        blockers.push(PlanBlocker {
+            code: "grid".to_string(),
+            message: if can_edit {
+                "Confirm the project's grid in the Stacking tab".to_string()
+            } else {
+                "Waiting for the coordinator to confirm the grid".to_string()
+            },
+        });
+    }
+
+    let mut warnings = Vec::new();
+    // Spec §7: frames of the project not on this device, per canonical filter.
+    let mut missing: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for f in source
+        .frames
+        .iter()
+        .filter(|f| f.not_stackable.as_deref() == Some(NotStackable::NotOnDevice.reason()))
+    {
+        *missing.entry(f.filter_canonical.as_str()).or_default() += 1;
+    }
+    let n_missing: usize = missing.values().sum();
+    if n_missing > 0 {
+        let list = missing
+            .iter()
+            .map(|(filter, n)| format!("{filter}: {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(if n_missing == 1 {
+            format!("1 frame of the project is not on this device and is left out ({list})")
+        } else {
+            format!("{n_missing} frames of the project are not on this device and are left out ({list})")
+        });
+    }
+    // Every other reason a frame is left out (re-staged, a new version on
+    // its way, unreadable metadata), one line per reason.
+    let mut others: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for reason in source
+        .frames
+        .iter()
+        .filter_map(|f| f.not_stackable.as_deref())
+        .filter(|r| *r != NotStackable::NotOnDevice.reason())
+    {
+        *others.entry(reason).or_default() += 1;
+    }
+    for (reason, n) in others {
+        warnings.push(format!(
+            "{n} frame{} left out: {reason}",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    // Spec §5.2: an in-scope frame without a manifest WCS is solved locally.
+    let unsolved = source
+        .frames
+        .iter()
+        .filter(in_scope)
+        .filter(|f| f.meta.as_ref().is_some_and(|m| m.wcs.is_none()))
+        .count();
+    if unsolved > 0 {
+        warnings.push(format!(
+            "{unsolved} frame{} no WCS in the manifest and will be plate-solved locally",
+            if unsolved == 1 { " has" } else { "s have" }
+        ));
+    }
+    // Spec §6.3: in-scope frames a confirmed grid leaves outside.
+    if let Some(grid) = &current {
+        let outside = source
+            .frames
+            .iter()
+            .filter(in_scope)
+            .filter_map(|f| f.meta.as_ref())
+            .filter_map(|m| grid_input_of(m).footprint)
+            .filter(|fp| fraction_inside(fp, grid) < 0.5)
+            .count();
+        if outside > 0 {
+            warnings.push(format!(
+                "{outside} frame{} outside the grid",
+                if outside == 1 { " lies" } else { "s lie" }
+            ));
+        }
+    }
+    // Spec §5.1 / §7: what Prepare will write, and the files it cannot read.
+    let mut prepared = 0u64;
+    let mut unsupported: Vec<&str> = Vec::new();
+    let mut unsupported_ids: HashSet<i64> = HashSet::new();
+    for g in &source.groups {
+        for f in g
+            .frames
+            .iter()
+            .filter(|f| !excluded_set.contains(&f.frame_id))
+        {
+            let shape = probe_file(Path::new(&f.path));
+            match prepare_action(&shape, cfg.calibration.debayer_osc) {
+                PrepareAction::Unsupported(_) => {
+                    unsupported.push(f.filename.as_str());
+                    unsupported_ids.insert(f.frame_id);
+                }
+                action => prepared += prepared_bytes(&shape, &action),
+            }
+        }
+    }
+    if !unsupported.is_empty() {
+        const NAME_CAP: usize = 5;
+        let shown = unsupported
+            .iter()
+            .take(NAME_CAP)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = unsupported.len().saturating_sub(NAME_CAP);
+        let suffix = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        let n = unsupported.len();
+        warnings.push(format!(
+            "{n} file{} cannot be read and {} left out (unsupported file): {shown}{suffix}",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "is" } else { "are" },
+        ));
+    }
+
+    let frames: Vec<PlanProjectFrame> = source
+        .frames
+        .iter()
+        .map(|f| PlanProjectFrame {
+            handle: f.handle,
+            frame_uuid: f.frame_uuid.clone(),
+            file_name: f.file_name.clone(),
+            publisher: f.publisher.clone(),
+            filter_canonical: f.filter_canonical.clone(),
+            exptime_sec: f.exptime_sec,
+            color_mode: f.color_mode,
+            has_wcs: f.meta.as_ref().is_some_and(|m| m.wcs.is_some()),
+            on_disk: f.not_stackable.is_none(),
+            reason: f.not_stackable.clone(),
+        })
+        .collect();
+
+    Ok(SubjectInputs {
+        cfg,
+        hash,
+        groups: source.groups,
+        origins: source.origins,
+        excluded_frame_ids,
+        readiness: ExportReadiness::default(),
+        masters_to_build: Vec::new(),
+        blockers,
+        warnings,
+        project: Some(ProjectInputs {
+            grid: PlanGrid {
+                state,
+                current,
+                proposal,
+                frames_inside,
+                can_edit,
+            },
+            frames,
+            grid_scale: in_use.map(|g| g.scale_arcsec),
+            grid_dims: in_use.map(|g| (g.width_px as u64, g.height_px as u64)),
+            prepared_bytes: prepared,
+            unsupported_ids,
+        }),
+    })
+}
+/// Build the plan for a subject (a frame set or a project): its groups, the resolved config, every
+/// gate blocker (spec §2, checked in a fixed order so the first blocker a
+/// user sees is always the most fundamental one), and which of the three
+/// cacheable per-frame stages a run would still have to redo. Pure DB reads
+/// plus cheap filesystem probes for a frame set — a project's plan also seeds
+/// its config and mints frame handles (plan 6b-2 C10) — never starts a run, never touches
+/// [`crate::services::ServiceContext`].
+pub fn build_plan(
+    conn: &Connection,
+    settings: &SettingsManager,
+    policy: &PathPolicy,
+    subject: &StackSubject,
+    config_override: Option<StackingConfig>,
+) -> Result<StackingPlan, ApiError> {
+    let set_name = subject_label(conn, subject)?;
+    let SubjectInputs {
+        cfg,
+        hash,
+        groups,
+        origins,
+        excluded_frame_ids,
+        readiness,
+        masters_to_build,
+        blockers: arm_blockers,
+        warnings: arm_warnings,
+        project,
+    } = match subject {
+        StackSubject::FrameSet(frames_set_id) => {
+            frame_set_inputs(conn, settings, subject, *frames_set_id, config_override)?
+        }
+        StackSubject::Project(project_id) => {
+            project_inputs(conn, settings, project_id, config_override)?
+        }
+    };
+    // Review I1: a project's unsupported files leave the included counts
+    // and the ≥ 3 rule (Prepare would exclude them), but not
+    // `excluded_frame_ids`, which stays the user's manual list.
+    let excluded_set: HashSet<i64> = excluded_frame_ids
+        .iter()
+        .copied()
+        .chain(
+            project
+                .iter()
+                .flat_map(|p| p.unsupported_ids.iter().copied()),
+        )
+        .collect();
+    let mut blockers: Vec<PlanBlocker> = arm_blockers;
     let mut warnings: Vec<String> = Vec::new();
 
     // Owner decision 2026-09-10: exposure always splits a group now, and a
@@ -1829,67 +2278,7 @@ pub fn build_plan(
         }
     }
 
-    // Gate 1: masters/links/masterFiles — reinterpreted 2026-09-09 (owner
-    // requirement — "the pipeline should build the calibration masters
-    // itself when they are missing"). The export-v2 gate
-    // (`check_mode_ready`'s CalibratedLights arms) blocked on
-    // `raw_sets_without_master`/`missing_master_files` outright; the
-    // stacking gate instead blocks ONLY the subset the readiness split says
-    // cannot be built/rebuilt (`raw_sets_unbuildable`/`masters_unrebuildable`)
-    // — everything else became `masters_to_build` above, planned work for
-    // stage 0.5 rather than a blocker. Same relative priority as the export
-    // gate's own arms (masters, then links, then masterFiles) and the same
-    // sentence style, just re-derived from the split fields instead of
-    // calling `check_mode_ready` directly.
-    if !readiness.raw_sets_unbuildable.is_empty() {
-        let n = readiness.raw_sets_unbuildable.len();
-        let first_reason = readiness.raw_sets_unbuildable[0].1.as_str();
-        blockers.push(PlanBlocker {
-            code: "masters".to_string(),
-            message: format!(
-                "Build masters first — {n} set{} cannot be built: {first_reason}",
-                if n == 1 { "" } else { "s" }
-            ),
-        });
-    }
-    if let Some(blocker) = dropped_masters_blocker(&dropped_masters) {
-        blockers.push(blocker);
-    }
-    if readiness.unlinked_lights > 0 {
-        let n = readiness.unlinked_lights;
-        blockers.push(PlanBlocker {
-            code: "links".to_string(),
-            message: format!(
-                "{n} light{} {} no calibration links",
-                if n == 1 { "" } else { "s" },
-                if n == 1 { "has" } else { "have" }
-            ),
-        });
-    }
-    if !readiness.masters_unrebuildable.is_empty() {
-        let n = readiness.masters_unrebuildable.len();
-        // Every unrebuildable reason is archival ("archived — restore
-        // first") -> the export gate's own C-2 sentence; a mix (or a
-        // "no provenance"/missing-not-archived reason) names the first
-        // reason instead, since "restore from archive" would be actively
-        // wrong advice for those.
-        let all_archival = readiness
-            .masters_unrebuildable
-            .iter()
-            .all(|(_, reason)| reason.contains("archived"));
-        let message = if all_archival {
-            format!("{n} master file(s) missing on disk — restore from archive first")
-        } else {
-            format!(
-                "{n} master file(s) missing on disk and cannot be rebuilt: {}",
-                readiness.masters_unrebuildable[0].1
-            )
-        };
-        blockers.push(PlanBlocker {
-            code: "masterFiles".to_string(),
-            message,
-        });
-    }
+    warnings.extend(arm_warnings);
 
     // Gate 2: reference.
     let reference = resolve_reference(conn, subject, &origins, &cfg, &mut blockers)?;
@@ -1913,9 +2302,10 @@ pub fn build_plan(
     // reference resolves (the earliest point both warnings' inputs are
     // available), alongside the EXPTIME warning above as this build's other
     // purely-informational, never-blocking group note.
-    let reference_scale: Option<f64> = match reference.frame_id {
-        Some(id) => find_group_frame(&groups, id).and_then(|gf| gf.pixel_scale_arcsec),
-        None => last_run_reference_scale(conn, subject, &groups)?
+    let reference_scale: Option<f64> = match (&project, reference.frame_id) {
+        (Some(p), _) => p.grid_scale,
+        (None, Some(id)) => find_group_frame(&groups, id).and_then(|gf| gf.pixel_scale_arcsec),
+        (None, None) => last_run_reference_scale(conn, subject, &groups)?
             .or_else(|| largest_group_scale(&groups, &excluded_set)),
     };
     // Fix round 1: the ratio is computed ONCE per group here and reused
@@ -1939,10 +2329,17 @@ pub fn build_plan(
             // member with a scale of its own — a fully excluded group's
             // all-member fallback describes frames the run will never read.
             if from_included && (ratio > SCALE_TOLERANCE || ratio < 1.0 / SCALE_TOLERANCE) {
-                warnings.push(format!(
-                    "group `{}` is at {group_scale:.2} \"/px — \u{d7}{ratio:.1} the reference's {ref_scale:.2} \"/px; co-registered mode resamples it into the reference geometry, native mode keeps its own",
-                    g.key
-                ));
+                warnings.push(if project.is_some() {
+                    format!(
+                        "group `{}` is at {group_scale:.2} \"/px — \u{d7}{ratio:.1} the grid's {ref_scale:.2} \"/px; it is resampled onto the grid",
+                        g.key
+                    )
+                } else {
+                    format!(
+                        "group `{}` is at {group_scale:.2} \"/px — \u{d7}{ratio:.1} the reference's {ref_scale:.2} \"/px; co-registered mode resamples it into the reference geometry, native mode keeps its own",
+                        g.key
+                    )
+                });
             }
             tracing::debug!(
                 group_key = %g.key,
@@ -1994,6 +2391,19 @@ pub fn build_plan(
                     if free_bytes.is_none() {
                         warnings.push("free space could not be determined".to_string());
                     }
+                    // Plan 6b-2 C6: a project's working root must not overlap
+                    // any scan root (the Collaboration root is one).
+                    if project.is_some() {
+                        let root = paths::subject_layout(conn, &validated.working, subject)
+                            .map_err(|e| ApiError::Internal(format!("{e:#}")))?
+                            .root;
+                        if let Some(message) = paths::project_root_overlap(conn, &root)? {
+                            blockers.push(PlanBlocker {
+                                code: "folders".to_string(),
+                                message,
+                            });
+                        }
+                    }
                 }
                 Err(error) => {
                     blockers.push(PlanBlocker {
@@ -2030,7 +2440,7 @@ pub fn build_plan(
             g
         })
         .collect();
-    let estimate_bytes = paths::estimate_bytes(&EstimateInputs {
+    let estimate_inputs = EstimateInputs {
         groups: &estimate_groups,
         // Perf tier A Task 6a: the registered artifact is now the run's
         // REQUIRED per-frame artifact (Normalize/Integrate always read it),
@@ -2054,7 +2464,14 @@ pub fn build_plan(
         // test, which `estimate_bytes` makes itself (fix round 1, I1: with
         // the debayer off no mosaic is kept, so the term must not be added).
         drizzle_bayer: cfg.drizzle.bayer && cfg.calibration.debayer_osc,
-    });
+    };
+    let estimate_bytes = match project
+        .as_ref()
+        .and_then(|p| p.grid_dims.map(|d| (d, p.prepared_bytes)))
+    {
+        Some((grid, prepared)) => paths::estimate_project_bytes(&estimate_inputs, grid, prepared),
+        None => paths::estimate_bytes(&estimate_inputs),
+    };
 
     // Gate 4: space.
     if let Some(free) = free_bytes {
@@ -2456,7 +2873,11 @@ pub fn build_plan(
     if !any_group_has_three_included {
         blockers.push(PlanBlocker {
             code: "frames".to_string(),
-            message: "At least 3 included frames in one group".to_string(),
+            message: if project.is_some() && groups.is_empty() {
+                "No frame of this project is on this device yet".to_string()
+            } else {
+                "At least 3 included frames in one group".to_string()
+            },
         });
     }
 
@@ -2503,15 +2924,26 @@ pub fn build_plan(
     let included_count: usize = plan_groups.iter().map(|g| g.included_count).sum();
     let active_run_id = active_run_for_subject(conn, subject)?;
 
-    tracing::debug!(
-        set_id = frames_set_id,
-        groups = plan_groups.len(),
-        frame_count,
-        included_count,
-        blockers = blockers.len(),
-        stale_stages = stale_stages.len(),
-        "stacking plan built"
-    );
+    match subject {
+        StackSubject::FrameSet(id) => tracing::debug!(
+            set_id = *id,
+            groups = plan_groups.len(),
+            frame_count,
+            included_count,
+            blockers = blockers.len(),
+            stale_stages = stale_stages.len(),
+            "stacking plan built"
+        ),
+        StackSubject::Project(id) => tracing::debug!(
+            project_id = %id,
+            groups = plan_groups.len(),
+            frame_count,
+            included_count,
+            blockers = blockers.len(),
+            stale_stages = stale_stages.len(),
+            "stacking plan built"
+        ),
+    }
 
     let (set_id, project_id) = crate::stacking::run::wire_subject(subject);
     Ok(StackingPlan {
@@ -2535,6 +2967,8 @@ pub fn build_plan(
         output_dir,
         stale_stages,
         active_run_id,
+        grid: project.as_ref().map(|p| p.grid.clone()),
+        project_frames: project.map(|p| p.frames).unwrap_or_default(),
     })
 }
 
@@ -6543,25 +6977,6 @@ mod tests {
     }
 
     #[test]
-    fn a_project_plan_is_refused_until_6b2() {
-        let f = test_fixtures::frame_set("LDN 1272");
-        crate::db::stacking::insert_test_project(&f.conn, "p1");
-        let settings = SettingsManager::new();
-        let err = build_plan(
-            &f.conn,
-            &settings,
-            &PathPolicy::AllowAll,
-            &StackSubject::Project("p1".into()),
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, ApiError::Invalid(ref m) if m == PROJECT_STACKING_UNAVAILABLE),
-            "{err:?}"
-        );
-    }
-
-    #[test]
     fn subject_label_and_stored_reference_by_subject() {
         // Frame set: the frames_set name and the frame_set_reference row.
         let f = test_fixtures::frame_set("LDN 1272");
@@ -6878,6 +7293,404 @@ mod tests {
         assert_eq!(
             stored.config_json, r#"{"grouping":{"exposureMode":"none"}}"#,
             "an override is never stored"
+        );
+    }
+
+    /// A project `p1` on `f.conn` (target 83.8, −5.4, radius 1°; not
+    /// coordinator, no caps):
+    /// - `r1..r3`: filter R, WCS;
+    /// - `g1, g2`: filter G, WCS, plus `g3`, which never landed;
+    /// - `o1`: filter L, an OSC mosaic with no WCS;
+    /// - `x1`: coordinator-excluded.
+    /// Returns the working and output folders a test may use.
+    fn seed_project(f: &test_fixtures::Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
+        use crate::stacking::test_fixtures::{
+            add_project_frame, manifest_wcs_json, project_frame_spec, ProjectFile,
+        };
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        let wcs = || Some(manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+        for (uuid, filter) in [
+            ("r1", "R"),
+            ("r2", "R"),
+            ("r3", "R"),
+            ("g1", "G"),
+            ("g2", "G"),
+        ] {
+            let mut spec = project_frame_spec(uuid);
+            spec.filter = filter;
+            spec.wcs = wcs();
+            add_project_frame(&f.conn, &landed, "p1", &spec);
+        }
+        let mut g3 = project_frame_spec("g3");
+        g3.filter = "G";
+        g3.file = ProjectFile::Missing;
+        add_project_frame(&f.conn, &landed, "p1", &g3);
+        let mut o1 = project_frame_spec("o1");
+        o1.file = ProjectFile::Mosaic32;
+        o1.bayerpat = Some("RGGB");
+        add_project_frame(&f.conn, &landed, "p1", &o1);
+        let mut x1 = project_frame_spec("x1");
+        x1.accepted = false;
+        add_project_frame(&f.conn, &landed, "p1", &x1);
+        (f.dir.path().join("work"), f.dir.path().join("out"))
+    }
+
+    fn with_folders(working: &std::path::Path, output: &std::path::Path) -> StackingConfig {
+        let mut cfg = StackingConfig::default();
+        cfg.paths.working_dir = Some(working.to_string_lossy().into_owned());
+        cfg.paths.output_dir = Some(output.to_string_lossy().into_owned());
+        cfg
+    }
+
+    /// Spec §7: the project plan — groups by colour × canonical filter ×
+    /// class (no binning), the grid blocker for a member who cannot edit it,
+    /// the not-on-this-device and solved-locally warnings, the Frames rows
+    /// (a coordinator-excluded frame absent), empty readiness and no masters.
+    #[test]
+    fn a_project_plan_reports_its_groups_frames_grid_and_warnings() {
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            Some(with_folders(&working, &output)),
+        )
+        .unwrap();
+        assert_eq!(
+            (plan.set_id, plan.project_id.as_deref()),
+            (None, Some("p1"))
+        );
+        // `insert_test_project` sets `title = project_id` (review M6).
+        assert_eq!(plan.set_name, "p1");
+        let mut keys: Vec<(&str, usize)> = plan
+            .groups
+            .iter()
+            .map(|g| (g.key.as_str(), g.frame_count))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                ("mono__G__300s", 2),
+                ("mono__R__300s", 3),
+                ("osc__L__300s", 1)
+            ]
+        );
+        let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
+        assert_eq!(codes, vec!["grid"], "{:?}", plan.blockers);
+        assert_eq!(
+            plan.blockers[0].message,
+            "Waiting for the coordinator to confirm the grid"
+        );
+        for expected in [
+            "1 frame of the project is not on this device and is left out (G: 1)",
+            "1 frame has no WCS in the manifest and will be plate-solved locally",
+        ] {
+            assert!(
+                plan.warnings.iter().any(|w| w == expected),
+                "{expected} not in {:?}",
+                plan.warnings
+            );
+        }
+        let grid = plan.grid.as_ref().unwrap();
+        assert_eq!(grid.state, GridState::Proposed);
+        assert!(!grid.can_edit);
+        assert_eq!(grid.proposal.unwrap().scale_arcsec, 1.5);
+        assert_eq!(grid.frames_inside, 5);
+        assert_eq!(
+            plan.project_frames.len(),
+            7,
+            "x1 is excluded by the coordinator, so absent"
+        );
+        let g3 = plan
+            .project_frames
+            .iter()
+            .find(|r| r.frame_uuid == "g3")
+            .unwrap();
+        assert!(!g3.on_disk && g3.handle.is_none());
+        assert_eq!(g3.reason.as_deref(), Some("not on this device"));
+        let o1 = plan
+            .project_frames
+            .iter()
+            .find(|r| r.frame_uuid == "o1")
+            .unwrap();
+        assert!(!o1.has_wcs && o1.on_disk && o1.handle.is_some());
+        assert_eq!(o1.color_mode, ColorMode::Osc);
+        assert!(plan.masters_to_build.is_empty());
+        assert_eq!(plan.readiness.total, 0);
+    }
+
+    /// Spec §6.3: a confirmed grid lifts the blocker; frames it leaves
+    /// outside are counted.
+    #[test]
+    fn a_confirmed_grid_lifts_the_blocker_and_counts_frames_outside() {
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        let far = crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.5,
+            width_px: 128,
+            height_px: 128,
+            crval1: 93.8,
+            crval2: -5.4,
+            rotation_deg: 0.0,
+        };
+        crate::db::collab::set_canonical_grid(&f.conn, "p1", Some(&far.canonical_json())).unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            Some(with_folders(&working, &output)),
+        )
+        .unwrap();
+        assert!(
+            plan.blockers.iter().all(|b| b.code != "grid"),
+            "{:?}",
+            plan.blockers
+        );
+        let grid = plan.grid.as_ref().unwrap();
+        assert_eq!(
+            (grid.state, grid.current),
+            (GridState::Confirmed, Some(far))
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w == "5 frames lie outside the grid"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// Spec §9.4: the first plan seeds the config (`stops`), and the stored
+    /// exclusions (uuids) become handles.
+    #[test]
+    fn a_project_plan_seeds_its_config_and_maps_exclusions_to_handles() {
+        let f = test_fixtures::frame_set("unused");
+        seed_project(&f);
+        let plan = |f: &test_fixtures::Fixture| {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::Project("p1".into()),
+                None,
+            )
+            .unwrap()
+        };
+        let first = plan(&f);
+        assert_eq!(
+            first.config.grouping.exposure_mode,
+            crate::stacking::config::ExposureMode::Stops
+        );
+        assert!(
+            first.groups.iter().any(|g| g.key == "mono__R__st300"),
+            "{:?}",
+            first.groups
+        );
+        let stored = crate::db::stacking::get_project_config(&f.conn, "p1")
+            .unwrap()
+            .unwrap();
+        crate::db::stacking::set_project_config(
+            &f.conn,
+            "p1",
+            &stored.config_json,
+            &["r1".to_string()],
+            None,
+        )
+        .unwrap();
+        let second = plan(&f);
+        let r1 = second
+            .project_frames
+            .iter()
+            .find(|r| r.frame_uuid == "r1")
+            .unwrap()
+            .handle
+            .unwrap();
+        assert_eq!(second.excluded_frame_ids, vec![r1]);
+        let r = second
+            .groups
+            .iter()
+            .find(|g| g.key == "mono__R__st300")
+            .unwrap();
+        assert_eq!((r.frame_count, r.included_count), (3, 2));
+        let again = plan(&f);
+        assert_eq!(
+            again
+                .project_frames
+                .iter()
+                .find(|r| r.frame_uuid == "r1")
+                .unwrap()
+                .handle,
+            Some(r1),
+            "the handle is stable across plans"
+        );
+    }
+
+    /// Plan 6b-2 C6: a project working root inside a scan root is a
+    /// `folders` blocker (for a frame set the overlap only warns, at save).
+    #[test]
+    fn a_project_working_folder_inside_a_scan_root_is_blocked() {
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        std::fs::create_dir_all(&working).unwrap();
+        f.conn
+            .execute(
+                "INSERT INTO scan_roots (path) VALUES (?1)",
+                [working.to_str().unwrap()],
+            )
+            .unwrap();
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            Some(with_folders(&working, &output)),
+        )
+        .unwrap();
+        let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
+        assert_eq!(codes, vec!["grid", "folders"], "{:?}", plan.blockers);
+        assert!(plan.blockers[1]
+            .message
+            .contains("overlaps a monitored folder"));
+    }
+
+    /// Plan 6b-2 C10: a project's blockers come in a fixed order.
+    #[test]
+    fn a_projects_blocker_order_is_stable() {
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec, ProjectFile};
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let mut gone = project_frame_spec("a");
+        gone.file = ProjectFile::Missing;
+        add_project_frame(&f.conn, f.dir.path(), "p1", &gone);
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            Some(cfg),
+        )
+        .unwrap();
+        let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            vec!["grid", "reference", "folders", "folders", "frames"]
+        );
+        assert_eq!(
+            plan.blockers[4].message,
+            "No frame of this project is on this device yet"
+        );
+    }
+
+    /// Review I1 (plan 6b-2 C10): an unsupported file leaves the plan's
+    /// included counts, so a group that Prepare would leave under three frames
+    /// is blocked at plan time, not at run time. The file is not a manual
+    /// exclusion.
+    #[test]
+    fn an_unsupported_file_does_not_count_toward_three_frames() {
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec, ProjectFile};
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        for uuid in ["a", "b"] {
+            add_project_frame(&f.conn, &landed, "p1", &project_frame_spec(uuid));
+        }
+        let mut tile = project_frame_spec("t");
+        tile.file = ProjectFile::EmptyPrimary;
+        add_project_frame(&f.conn, &landed, "p1", &tile);
+        let plan = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.groups.len(), 1, "{:?}", plan.groups);
+        let g = &plan.groups[0];
+        assert_eq!((g.frame_count, g.included_count), (3, 2));
+        assert!(
+            plan.excluded_frame_ids.is_empty(),
+            "an unsupported file is not a manual exclusion"
+        );
+        assert!(
+            plan.blockers.iter().any(|b| b.code == "frames"),
+            "{:?}",
+            plan.blockers
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.ends_with("(unsupported file): c_t.fits")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    /// Spec §13 (R3): an attested set needs no masters — no masters / links
+    /// / masterFiles blocker and nothing to build; its unattested twin does.
+    #[test]
+    fn an_attested_set_plans_without_masters() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            test_fixtures::add_light(&f, &light_spec(&format!("l{i}"), t));
+        }
+        let plan = |f: &test_fixtures::Fixture| {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(f.set_id),
+                None,
+            )
+            .unwrap()
+        };
+        let calibration_codes = ["masters", "links", "masterFiles"];
+        assert!(plan(&f)
+            .blockers
+            .iter()
+            .any(|b| calibration_codes.contains(&b.code.as_str())));
+        f.conn
+            .execute(
+                "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                [f.set_id],
+            )
+            .unwrap();
+        let attested = plan(&f);
+        assert!(attested.readiness.attested);
+        assert!(attested.masters_to_build.is_empty());
+        assert!(
+            attested
+                .blockers
+                .iter()
+                .all(|b| !calibration_codes.contains(&b.code.as_str())),
+            "{:?}",
+            attested.blockers
+        );
+    }
+
+    /// A project this device does not know fails readably, never as a raw
+    /// foreign-key error from the config seed.
+    #[test]
+    fn an_unknown_project_plan_fails_readably() {
+        let f = test_fixtures::frame_set("unused");
+        let err = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("nope".into()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::NotFound(ref m) if m.contains("nope")),
+            "{err:?}"
         );
     }
 }

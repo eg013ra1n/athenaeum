@@ -71,6 +71,7 @@ pub mod origin;
 pub mod paths;
 pub mod plan;
 pub mod prefilter;
+pub mod prepare;
 pub mod project_source;
 pub mod provenance;
 pub mod psf_signal;

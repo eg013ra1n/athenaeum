@@ -688,7 +688,28 @@ pub struct EstimateInputs<'a> {
 /// calibrated/master terms above already make — the real min-weight drop
 /// only happens inside a run, not at plan time.
 pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
-    let mut total = 0u64;
+    estimate_bytes_with(i, None, None)
+}
+
+/// [`estimate_bytes`] for a project run (spec §7, plan 6b-2 C10): every
+/// registered artifact, master, rejection bitmap and drizzle output at the
+/// GRID's size — the geometry a project run delivers — and the calibrated
+/// term replaced by what Prepare writes (`prepared_bytes`; a file used in
+/// place costs nothing, a Bayer mosaic kept for drizzle is one of them).
+pub fn estimate_project_bytes(
+    i: &EstimateInputs<'_>,
+    grid: (u64, u64),
+    prepared_bytes: u64,
+) -> u64 {
+    estimate_bytes_with(i, Some(grid), Some(prepared_bytes))
+}
+
+fn estimate_bytes_with(
+    i: &EstimateInputs<'_>,
+    geometry: Option<(u64, u64)>,
+    calibrated_override: Option<u64>,
+) -> u64 {
+    let mut total = calibrated_override.unwrap_or(0);
     for g in i.groups {
         let planes: u64 = if g.color_mode == ColorMode::Osc { 3 } else { 1 };
 
@@ -697,7 +718,9 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
             .iter()
             .map(|f| planes * f.width.max(0) as u64 * f.height.max(0) as u64 * 4)
             .sum();
-        total += calibrated_bytes;
+        if calibrated_override.is_none() {
+            total += calibrated_bytes;
+        }
 
         // Tier C Task 1: one `.athf` file per (frame, plane), a small flat
         // constant against a star-count-independent budget — the spec's own
@@ -718,19 +741,20 @@ pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
         // between a frame's native size and the reference whenever they
         // differ, which M4b's mixed-pixel-scale and native-geometry groups
         // make an ordinary case, not an edge one.
-        let (max_w, max_h) = g
-            .frames
-            .iter()
-            .map(|f| (f.width.max(0) as u64, f.height.max(0) as u64))
-            .max_by_key(|&(w, h)| w * h)
-            .unwrap_or((0, 0));
+        let (max_w, max_h) = geometry.unwrap_or_else(|| {
+            g.frames
+                .iter()
+                .map(|f| (f.width.max(0) as u64, f.height.max(0) as u64))
+                .max_by_key(|&(w, h)| w * h)
+                .unwrap_or((0, 0))
+        });
         if i.write_registered {
             total += g.frames.len() as u64 * planes * max_w * max_h * 4;
         }
         // M4d Task 1: Bayer drizzle keeps the single-plane CFA mosaic beside
         // each debayered OSC frame — one plane where the calibrated frame
         // above counted three. A mono group keeps none.
-        if i.drizzle_bayer && i.drizzle.is_some() && planes == 3 {
+        if calibrated_override.is_none() && i.drizzle_bayer && i.drizzle.is_some() && planes == 3 {
             total += g
                 .frames
                 .iter()
@@ -2030,5 +2054,30 @@ mod tests {
         );
         let apart = tmp.path().join("elsewhere").join(PROJECTS_DIR).join("m31");
         assert_eq!(project_root_overlap(&c, &apart).unwrap(), None);
+    }
+
+    /// Plan 6b-2 C10: a project's estimate puts every registered artifact,
+    /// master and drizzle output at the grid's size and counts only what
+    /// Prepare writes; a frame set's estimate does not move.
+    #[test]
+    fn a_project_estimate_uses_the_grid_and_the_prepared_bytes() {
+        let groups = vec![group(ColorMode::Mono, 3, 64, 48)];
+        let inputs = EstimateInputs {
+            groups: &groups,
+            write_registered: true,
+            write_maps: false,
+            drizzle: None,
+            large_scale: false,
+            drizzle_bayer: false,
+        };
+        let expected: u64 =
+            12_345 + 3 * FITS_ARTIFACT_ESTIMATE_BYTES + 3 * 1000 * 1000 * 4 + 1000 * 1000 * 4;
+        assert_eq!(
+            estimate_project_bytes(&inputs, (1000, 1000), 12_345),
+            expected
+        );
+        let frame_set: u64 =
+            3 * 64 * 48 * 4 + 3 * FITS_ARTIFACT_ESTIMATE_BYTES + 3 * 64 * 48 * 4 + 64 * 48 * 4;
+        assert_eq!(estimate_bytes(&inputs), frame_set);
     }
 }

@@ -58,7 +58,7 @@ pub use crate::calibration_library::light_cal::{BiasFallback, FlatNormMode, Ligh
 /// `total` = in-scope LIGHT members; `raw_sets_without_master` (with the ids
 /// behind it, for the Coverage link) gates BOTH strict modes; `file_counts` is
 /// what each mode would place. The gate itself is [`check_mode_ready`].
-#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportReadiness {
     pub total: i64,
