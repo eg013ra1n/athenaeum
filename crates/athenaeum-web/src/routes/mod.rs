@@ -353,6 +353,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_collab_filter_buckets", post(collab::get_collab_filter_buckets))
         .route("/api/remap_collab_filter", post(collab::remap_collab_filter))
         .route("/api/cancel_collab_remap", post(collab::cancel_collab_remap))
+        .route("/api/get_collab_grid_proposal", post(collab::get_collab_grid_proposal))
+        .route("/api/set_collab_project_grid", post(collab::set_collab_project_grid))
         .route("/api/list_collab_receive_sessions", post(collab::list_collab_receive_sessions))
         .route("/api/set_project_auto_replicate", post(collab::set_project_auto_replicate))
         .route("/api/set_project_publish_mode", post(collab::set_project_publish_mode))

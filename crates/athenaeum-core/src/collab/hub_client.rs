@@ -94,6 +94,12 @@ pub struct ProjectWire {
     /// field.
     #[serde(default)]
     pub goals: Option<serde_json::Value>,
+    /// The project's canonical grid (spec 2026-10-02 §6.1) as the hub stores
+    /// it — jsonb, so its key order is the database's; parse it through
+    /// `collab::grid::CanonicalGrid::from_value`, never hash it raw. `None`
+    /// when unset or on a hub that predates it.
+    #[serde(default)]
+    pub canonical_grid: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -734,6 +740,30 @@ impl CollabClient {
             return Ok(());
         }
         Err(classify(status, resp, "remap frame filter").await)
+    }
+
+    /// `PUT /projects/{id}/grid` — the project's canonical grid (requires
+    /// `project.edit`; the hub validates the bounds `CanonicalGrid::validate`
+    /// mirrors). The hub answers 204 with no body; 200 is accepted too.
+    pub async fn put_grid(
+        &self,
+        token: &str,
+        project_id: &str,
+        grid: &crate::collab::grid::CanonicalGrid,
+    ) -> Result<(), AccountClientError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/projects/{project_id}/grid")))
+            .bearer_auth(token)
+            .json(grid)
+            .send()
+            .await
+            .map_err(net)?;
+        let status = resp.status();
+        if status == StatusCode::OK || status == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        Err(classify(status, resp, "put project grid").await)
     }
 
     /// `GET /projects/{id}/dictionary` — the project's current filter/channel

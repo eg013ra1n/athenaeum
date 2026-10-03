@@ -152,6 +152,10 @@ pub struct ProjectCard {
     /// True for the coordinator, or for an account holding `project.edit` —
     /// the grid-editing surface checks this.
     pub can_edit_grid: bool,
+    // The project's canonical grid as last cached (spec §6.1); `None` until
+    // the coordinator confirms one. Plain comment: a doc comment would leak
+    // into the generated TS.
+    pub canonical_grid: Option<crate::collab::grid::CanonicalGrid>,
     pub require_approval: bool,
     pub pending_frames: i64,
     pub project_status: String,
@@ -2060,7 +2064,7 @@ pub const COLLAB_API_OUTDATED_MSG: &str = crate::account::client::COLLAB_API_OUT
 /// `AccountClientError → ApiError`, a local copy of the private
 /// `api::account::map_client_err` (keep the two in sync). A `401` surfaces as
 /// [`ApiError::SignedOut`] so the frontend re-shows the sign-in flow.
-fn client_err(e: crate::account::AccountClientError) -> ApiError {
+pub(crate) fn client_err(e: crate::account::AccountClientError) -> ApiError {
     use crate::account::AccountClientError as E;
     match e {
         E::RateLimited => {
@@ -2151,7 +2155,7 @@ fn card_from_row(
     row: CollabProjectRow,
     me: Option<&str>,
 ) -> Result<ProjectCard, ApiError> {
-    let (linked_sets, publishing) = {
+    let (linked_sets, publishing, canonical_grid) = {
         let db = db(ctx)?;
         let conn = db.conn();
         (
@@ -2159,6 +2163,10 @@ fn card_from_row(
                 .map_err(internal)?
                 .len() as i64,
             crate::db::collab::publishing_device(&conn, &row.project_id).map_err(internal)?,
+            crate::api::collab_grid::stored_grid(&conn, &row.project_id).unwrap_or_else(|e| {
+                tracing::warn!(project_id = %row.project_id, error = %e, "cached canonical grid unreadable; card shows none");
+                None
+            }),
         )
     };
     let publishing_here = match (&publishing, me) {
@@ -2179,6 +2187,7 @@ fn card_from_row(
         can_moderate,
         can_remap,
         can_edit_grid,
+        canonical_grid,
         require_approval: row.require_approval,
         pending_frames: row.pending_frames,
         project_status: row.project_status,
@@ -2337,6 +2346,7 @@ async fn fetch_one_project(
         .await
         .map_err(|e| FetchError::Transport(e.into()))?;
     let (goals_json, members_seen_json) = page_extras_of(&page);
+    let canonical_grid = grid_echo_of(&page);
     let snapshot_wire = client
         .membership_snapshot(token, &p.id)
         .await
@@ -2444,6 +2454,7 @@ async fn fetch_one_project(
         dictionary,
         goals_json,
         members_seen_json,
+        canonical_grid,
     })
 }
 
@@ -2456,6 +2467,7 @@ struct FetchedProject {
     dictionary: Option<(Option<i32>, Option<String>)>,
     goals_json: Option<String>,
     members_seen_json: String,
+    canonical_grid: GridEcho,
 }
 
 /// One member's last-seen as the hub reported it on the project page.
@@ -2490,6 +2502,37 @@ pub fn page_extras_of(
         goals,
         serde_json::to_string(&seen).unwrap_or_else(|_| "[]".into()),
     )
+}
+
+/// The grid a project page carries (plan 6b-2 C16): absent, a parsed and
+/// normalized grid as its canonical JSON, or a value this build cannot read
+/// — then the cached grid is kept, and the reason logged. `Absent` clears
+/// the cached grid on purpose: the hub omits the key, or sends null, exactly
+/// when no grid is set. A hub predating `canonicalGrid` would clear it too;
+/// that is unreachable today, and keeping a grid the hub no longer has would
+/// be the worse error (review M10).
+pub(crate) enum GridEcho {
+    Absent,
+    Grid(String),
+    Malformed,
+}
+
+pub(crate) fn grid_echo_of(page: &crate::collab::hub_client::ProjectPageWire) -> GridEcho {
+    match page
+        .project
+        .canonical_grid
+        .as_ref()
+        .filter(|v| !v.is_null())
+    {
+        None => GridEcho::Absent,
+        Some(v) => match crate::collab::grid::CanonicalGrid::from_value(v) {
+            Ok(grid) => GridEcho::Grid(grid.canonical_json()),
+            Err(e) => {
+                tracing::warn!(project_id = %page.project.id, error = %e, "project page carries a grid this build cannot read; the cached grid is kept");
+                GridEcho::Malformed
+            }
+        },
+    }
 }
 
 /// This member's caps as the caps rule (P9) compares them: the hub's
@@ -2571,6 +2614,10 @@ pub(crate) struct RefreshReport {
     pub gate_moved: Vec<String>,
     /// Ids marked lost by this refresh.
     pub lost: Vec<String>,
+    /// Ids whose cached canonical grid this refresh moved (a first sight
+    /// counts). Every live-feed refresh site emits `collab-grid-changed`
+    /// for each.
+    pub grid_moved: Vec<String>,
 }
 
 /// THE one entry point for "a project's thresholds or dictionary moved"
@@ -2659,6 +2706,7 @@ pub(crate) async fn refresh_projects_reporting(
                 dictionary,
                 goals_json,
                 members_seen_json,
+                canonical_grid,
             }) => {
                 if !previous_ids.contains(&row.project_id) {
                     new_targets.push((
@@ -2688,6 +2736,19 @@ pub(crate) async fn refresh_projects_reporting(
                     &members_seen_json,
                 )
                 .map_err(internal)?;
+                let grid_changed = match &canonical_grid {
+                    GridEcho::Absent => {
+                        crate::db::collab::set_canonical_grid(&conn, &row.project_id, None)
+                    }
+                    GridEcho::Grid(json) => {
+                        crate::db::collab::set_canonical_grid(&conn, &row.project_id, Some(json))
+                    }
+                    GridEcho::Malformed => Ok(false),
+                }
+                .map_err(internal)?;
+                if grid_changed {
+                    report.grid_moved.push(row.project_id.clone());
+                }
                 if let Some((version, entries)) = dictionary {
                     crate::db::collab::set_dictionary(
                         &conn,

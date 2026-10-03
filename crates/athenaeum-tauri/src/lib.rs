@@ -520,6 +520,8 @@ pub fn run() {
             commands::get_collab_filter_buckets,
             commands::remap_collab_filter,
             commands::cancel_collab_remap,
+            commands::get_collab_grid_proposal,
+            commands::set_collab_project_grid,
             commands::list_collab_receive_sessions,
             commands::set_project_auto_replicate,
             commands::set_project_publish_mode,

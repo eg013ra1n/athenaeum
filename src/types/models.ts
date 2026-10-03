@@ -1566,7 +1566,7 @@ canRemap: boolean,
  * True for the coordinator, or for an account holding `project.edit` —
  * the grid-editing surface checks this.
  */
-canEditGrid: boolean, requireApproval: boolean, pendingFrames: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
+canEditGrid: boolean, canonicalGrid: CanonicalGrid | null, requireApproval: boolean, pendingFrames: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
 /**
  * D3 §3.3: this device auto-downloads the project's published contributions
  * (default ON). Local preference — `set_project_auto_replicate` writes it.
@@ -1598,6 +1598,12 @@ publishingDevice: PublishingDeviceView | null,
  * for an unbound project.
  */
 publishingHere: boolean, };
+
+export type CanonicalGrid = { scaleArcsec: number, widthPx: number, heightPx: number, crval1: number, crval2: number, rotationDeg: number, };
+
+export type GridProposal = { current: CanonicalGrid | null, proposal: CanonicalGrid | null, framesInside: number, canEdit: boolean, };
+
+export type CollabGridChanged = { projectId: string, };
 
 export type ProjectDetail = { card: ProjectCard, members: Array<ProjectMemberView>, thresholdsVersion: number | null, thresholds: Array<ThresholdRuleView>, links: Array<LinkedSetView>, portalBase: string, 
 /**

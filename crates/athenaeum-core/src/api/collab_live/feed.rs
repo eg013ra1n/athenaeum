@@ -27,13 +27,14 @@ use crate::services::ServiceContext;
 /// Every kind a `project` event can carry, in the wire's canonical order. A
 /// gap (`Step::CatchUp`) never knows which kinds it missed, so every catch-up
 /// caused by a gap passes this instead of the event's own (necessarily
-/// incomplete) `kinds` list.
-const ALL_KINDS: [ChangeKind; 5] = [
+/// incomplete) `kinds` list — so a gap catches up on the grid too.
+const ALL_KINDS: [ChangeKind; 6] = [
     ChangeKind::Frames,
     ChangeKind::Meta,
     ChangeKind::Members,
     ChangeKind::Thresholds,
     ChangeKind::Dictionary,
+    ChangeKind::Grid,
 ];
 
 /// One observable consequence of applying a feed event or a catch-up, for a
@@ -250,11 +251,33 @@ impl FeedApplier {
     /// thresholds or dictionary move (`gate_moved`) — marks its next
     /// report's `card` (spec 2026-10-01 §6.1; members are reported on their
     /// own).
+    /// Plan 6b-2 C16: `collab-grid-changed` for every project whose cached
+    /// grid a refresh just moved — driven by the refresh's own report, so a
+    /// manual refresh, a gap catch-up and an epoch reload each emit once and
+    /// an unchanged echo emits nothing.
+    fn emit_grid_moves(&self, report: &crate::api::collab::RefreshReport) {
+        for project_id in &report.grid_moved {
+            tracing::debug!(project_id = %project_id, "project grid changed on the hub");
+            if let Some(em) = self.emitter.as_deref() {
+                crate::events::emit_event(
+                    em,
+                    crate::api::collab_grid::COLLAB_GRID_CHANGED_EVENT,
+                    &crate::api::collab_grid::CollabGridChanged {
+                        project_id: project_id.clone(),
+                    },
+                );
+            }
+        }
+    }
+
     fn note_card(&mut self, project_id: &str, kinds: &[ChangeKind], gate_moved: bool) {
         let snapshot_kind = kinds.iter().any(|k| {
             matches!(
                 k,
-                ChangeKind::Meta | ChangeKind::Thresholds | ChangeKind::Dictionary
+                ChangeKind::Meta
+                    | ChangeKind::Thresholds
+                    | ChangeKind::Dictionary
+                    | ChangeKind::Grid
             )
         });
         if snapshot_kind || gate_moved {
@@ -551,7 +574,8 @@ impl FeedApplier {
             if self.stored_cursor(pid)?.is_none() {
                 let only: HashSet<String> = [pid.clone()].into_iter().collect();
                 match crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await {
-                    Ok(_) => {
+                    Ok(report) => {
+                        self.emit_grid_moves(&report);
                         let joined = FeedEffect::ProjectJoined(pid.clone());
                         self.report(pid, Ok(std::slice::from_ref(&joined)));
                         effects.push(joined);
@@ -737,12 +761,14 @@ impl FeedApplier {
                     | ChangeKind::Members
                     | ChangeKind::Thresholds
                     | ChangeKind::Dictionary
+                    | ChangeKind::Grid
             )
         });
         if small_docs {
             let only: HashSet<String> = [pid.clone()].into_iter().collect();
             let report =
                 crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await?;
+            self.emit_grid_moves(&report);
             for moved in &report.gate_moved {
                 crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
             }
@@ -750,9 +776,6 @@ impl FeedApplier {
             if ev.kinds.contains(&ChangeKind::Members) {
                 effects.push(FeedEffect::MembersChanged(pid.clone()));
             }
-        }
-        if ev.kinds.contains(&ChangeKind::Grid) {
-            tracing::debug!(project_id = %pid, version = ev.version, "grid change seen; no consumer in this wave");
         }
 
         // I4 fix round: a caps change — possibly just surfaced by the
@@ -926,6 +949,7 @@ impl FeedApplier {
                     | ChangeKind::Members
                     | ChangeKind::Thresholds
                     | ChangeKind::Dictionary
+                    | ChangeKind::Grid
             )
         });
 
@@ -962,6 +986,7 @@ impl FeedApplier {
                     tracing::warn!(project_id, error = %e, "catch-up small-document refresh failed; cursor stays put for a retry");
                     e
                 })?;
+            self.emit_grid_moves(&report);
             for moved in &report.gate_moved {
                 crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
             }
@@ -1162,6 +1187,7 @@ impl FeedApplier {
                 let only: HashSet<String> = [ev.project_id.clone()].into_iter().collect();
                 let report =
                     crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await?;
+                self.emit_grid_moves(&report);
                 for moved in &report.gate_moved {
                     crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
                 }
@@ -1174,7 +1200,9 @@ impl FeedApplier {
             }
             AccountKind::Left => {
                 let only: HashSet<String> = [ev.project_id.clone()].into_iter().collect();
-                crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await?;
+                let report =
+                    crate::api::collab::refresh_projects_reporting(&self.ctx, Some(&only)).await?;
+                self.emit_grid_moves(&report);
                 {
                     let database = db(&self.ctx)?;
                     let conn = database.conn();
@@ -1404,6 +1432,7 @@ impl FeedApplier {
                     tracing::warn!(project_id = pid, epoch = new_epoch, error = %e, "epoch-reload small-document refresh failed");
                     e
                 })?;
+            self.emit_grid_moves(&report);
             for moved in &report.gate_moved {
                 crate::api::collab::on_thresholds_or_dictionary_moved(&self.ctx, moved);
             }
@@ -3701,5 +3730,65 @@ mod tests {
         let p1 = report_for(&r, PID);
         assert!(!p1.ok && p1.error.is_some(), "{p1:?}");
         assert_eq!(p1.changes.manifest_rows, 2, "{p1:?}");
+    }
+
+    struct GridRec(std::sync::Mutex<Vec<(String, serde_json::Value)>>);
+    impl ProgressEmitter for GridRec {
+        fn emit_json(&self, name: &str, payload: serde_json::Value) {
+            self.0.lock().unwrap().push((name.to_string(), payload));
+        }
+    }
+    impl GridRec {
+        fn grid_events(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| n == crate::api::collab_grid::COLLAB_GRID_CHANGED_EVENT)
+                .map(|(_, v)| v["projectId"].as_str().unwrap().to_string())
+                .collect()
+        }
+    }
+
+    /// Plan 6b-2 C16: a grid saved on the hub reaches this device through
+    /// the feed — the cached copy moves and `collab-grid-changed` is emitted
+    /// once; a members-only event that follows emits no grid event.
+    #[tokio::test]
+    async fn a_grid_event_refreshes_the_cached_grid_and_emits_once() {
+        let (_t, ctx, hub, _) = rig().await;
+        let rec = Arc::new(GridRec(std::sync::Mutex::new(Vec::new())));
+        let client = CollabClient::new(hub.uri()).unwrap();
+        let mut f = FeedApplier::new(Arc::clone(&ctx), client, "tok".into(), Some(rec.clone()));
+        let mut h = NoHolders(vec![]);
+        f.apply(LiveEvent::Hello(hello(&hub, "e1")), &mut h)
+            .await
+            .unwrap();
+        let grid = crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.87,
+            width_px: 3072,
+            height_px: 2048,
+            crval1: 10.5,
+            crval2: 41.25,
+            rotation_deg: 0.0,
+        };
+        hub.set_grid(PID, &grid);
+        let ev = project_event_from_hub(&hub, PID);
+        assert_eq!(ev.kinds, vec![ChangeKind::Grid]);
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        let stored = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::collab::canonical_grid(&conn, PID).unwrap()
+        };
+        assert_eq!(stored.as_deref(), Some(grid.canonical_json().as_str()));
+        assert_eq!(rec.grid_events(), vec![PID.to_string()]);
+
+        hub.add_member(PID, "acc-x", "send_receive", false);
+        let ev = project_event_from_hub(&hub, PID);
+        f.apply(LiveEvent::Project(ev), &mut h).await.unwrap();
+        assert_eq!(
+            rec.grid_events().len(),
+            1,
+            "an unchanged grid emits nothing"
+        );
     }
 }

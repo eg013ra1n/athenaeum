@@ -37,6 +37,7 @@ function projectCard(overrides: Partial<ProjectCard>): ProjectCard {
     canModerate: false,
     canRemap: false,
     canEditGrid: false,
+    canonicalGrid: null,
     requireApproval: false,
     pendingFrames: 0,
     projectStatus: 'open',

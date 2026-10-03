@@ -678,6 +678,40 @@ pub async fn cancel_collab_remap(
         .map_err(|e| e.to_string())
 }
 
+/// The grid proposal for a project (spec §6.2): the confirmed grid, the
+/// proposal from the manifest, how many frames lie inside it, and whether
+/// this account may save one.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_collab_grid_proposal(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<athenaeum_core::api::collab_grid::GridProposal, String> {
+    athenaeum_core::api::collab_grid::get_collab_grid_proposal(&state.ctx, &project_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Save the project's canonical grid on the hub (`project.edit`); returns
+/// the normalized grid it saved and emits `collab-grid-changed`.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_collab_project_grid(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+    grid: athenaeum_core::collab::grid::CanonicalGrid,
+) -> Result<athenaeum_core::collab::grid::CanonicalGrid, String> {
+    let emitter = TauriProgressEmitter(app);
+    athenaeum_core::api::collab_grid::set_collab_project_grid(
+        &state.ctx,
+        &project_id,
+        grid,
+        Some(&emitter),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Blink's view of a project's frames (spec 2026-10-01 §9.1). Every path is
 /// resolved from the DB in core; fired per Blink open, so `debug`.
 #[tauri::command]

@@ -1108,3 +1108,84 @@ mod remap_args_tests {
         );
     }
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCollabProjectGridArgs {
+    project_id: String,
+    grid: athenaeum_core::collab::grid::CanonicalGrid,
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_collab_grid_proposal(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<athenaeum_core::api::collab_grid::GridProposal>, (axum::http::StatusCode, String)>
+{
+    athenaeum_core::api::collab_grid::get_collab_grid_proposal(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_collab_project_grid(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetCollabProjectGridArgs>,
+) -> Result<Json<athenaeum_core::collab::grid::CanonicalGrid>, (axum::http::StatusCode, String)> {
+    let emitter = SseProgressEmitter::new(state.event_tx.clone());
+    athenaeum_core::api::collab_grid::set_collab_project_grid(
+        &state.ctx,
+        &args.project_id,
+        args.grid,
+        Some(&emitter),
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
+}
+
+#[cfg(test)]
+mod grid_route_tests {
+    use super::*;
+    use crate::routes::tests::test_state;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[test]
+    fn set_grid_args_are_camel_case() {
+        let a: SetCollabProjectGridArgs = serde_json::from_value(serde_json::json!({
+            "projectId": "p",
+            "grid": {"scaleArcsec": 1.5, "widthPx": 64, "heightPx": 64, "crval1": 1.0, "crval2": 2.0, "rotationDeg": 0.0},
+        }))
+        .unwrap();
+        assert_eq!((a.project_id.as_str(), a.grid.width_px), ("p", 64));
+    }
+
+    /// Both routes are registered (a DB-less state fails inside the handler,
+    /// never with 404).
+    #[tokio::test]
+    async fn the_grid_routes_are_registered() {
+        for (uri, body) in [
+            ("/api/get_collab_grid_proposal", r#"{"projectId":"p1"}"#),
+            (
+                "/api/set_collab_project_grid",
+                r#"{"projectId":"p1","grid":{"scaleArcsec":1.5,"widthPx":64,"heightPx":64,"crval1":1.0,"crval2":2.0,"rotationDeg":0.0}}"#,
+            ),
+        ] {
+            let router = crate::routes::build_router(test_state(None), None);
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+}

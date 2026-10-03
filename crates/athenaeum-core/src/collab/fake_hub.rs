@@ -227,6 +227,12 @@ pub struct FakeProject {
     /// that is out of service (revoked/retired — [`FakeHubState::revoked`]) reads as
     /// unbound everywhere.
     pub publishers: HashMap<String, String>,
+    /// The hub's `projects.canonical_grid` (plan 6b-2): `None` until a
+    /// `project.edit` member PUTs one.
+    pub canonical_grid: Option<Value>,
+    /// The project target the page reports: `(name, raDeg, decDeg,
+    /// radiusDeg)`. M31 by default; `set_target` changes it.
+    pub target: (String, f64, f64, f64),
 }
 
 impl FakeProject {
@@ -974,6 +980,8 @@ impl FakeHub {
                 next_frame_seq: 1,
                 report_hwm: HashMap::new(),
                 publishers: HashMap::new(),
+                canonical_grid: None,
+                target: ("M31".to_string(), 10.68, 41.27, 1.5),
             },
         );
     }
@@ -1127,6 +1135,31 @@ impl FakeHub {
             prev
         };
         st.publish_bump(project_id, prev, &["dictionary"], &[]);
+    }
+
+    /// Change the project target the page reports (no bump, no event).
+    pub fn set_target(&self, pid: &str, name: &str, ra: f64, dec: f64, radius: f64) {
+        let mut st = self.lock();
+        let p = st.projects.get_mut(pid).expect("fake hub: no such project");
+        p.target = (name.to_string(), ra, dec, radius);
+    }
+
+    /// Store a grid as a coordinator's PUT would: bump, publish `grid`.
+    pub fn set_grid(&self, pid: &str, grid: &crate::collab::grid::CanonicalGrid) {
+        let mut st = self.lock();
+        let p = st.projects.get_mut(pid).expect("fake hub: no such project");
+        p.canonical_grid = Some(serde_json::to_value(grid).expect("a grid serializes"));
+        let prev = p.version;
+        p.bump();
+        st.publish_bump(pid, prev, &["grid"], &[]);
+    }
+
+    /// The grid the hub holds for a project.
+    pub fn project_grid(&self, pid: &str) -> Option<Value> {
+        self.lock()
+            .projects
+            .get(pid)
+            .and_then(|p| p.canonical_grid.clone())
     }
 
     /// Set (or clear, `Value::Null`) a project's integration goals (spec
@@ -2102,6 +2135,7 @@ fn route(st: &mut FakeHubState, key: &SigningKey, req: &Request) -> ResponseTemp
         ("GET", ["projects", pid, "manifest"]) => manifest(st, &acct, pid, req),
         ("POST", ["projects", pid, "frames"]) => announce(st, &acct, pid, req),
         ("PUT", ["projects", pid, "publishing-device"]) => put_publishing_device(st, &acct, pid),
+        ("PUT", ["projects", pid, "grid"]) => put_grid(st, &acct, pid, req),
         ("POST", ["projects", pid, "frames", uuid, "version"]) => {
             new_version(st, &acct, pid, uuid, req)
         }
@@ -2155,9 +2189,10 @@ fn project_page(st: &FakeHubState, pid: &str, caller: Option<&FakeAccount>) -> R
             "title": p.title,
             "status": p.status,
             "requireApproval": p.require_approval,
-            "target": {"name": "M31", "raDeg": 10.68, "decDeg": 41.27, "radiusDeg": 1.5},
+            "target": {"name": p.target.0, "raDeg": p.target.1, "decDeg": p.target.2, "radiusDeg": p.target.3},
             "version": p.version,
             "goals": st.goals.get(pid),
+            "canonicalGrid": p.canonical_grid,
         },
         "members": members,
     }))
@@ -2711,6 +2746,38 @@ fn put_publishing_device(st: &mut FakeHubState, acct: &FakeAccount, pid: &str) -
     let version = p.bump();
     st.publish_bump(pid, prev, &["members"], &[]);
     ok(json!({ "deviceId": device, "name": name, "projectVersion": version, "changed": true }))
+}
+
+/// `PUT /projects/{id}/grid` (plan 6b-2): store the canonical grid. A
+/// non-member or a member without `project.edit` → 403; out-of-bounds → 400
+/// with the hub's text; success bumps the project with kind `grid`, 204.
+fn put_grid(
+    st: &mut FakeHubState,
+    acct: &FakeAccount,
+    pid: &str,
+    req: &Request,
+) -> ResponseTemplate {
+    let grid: crate::collab::grid::CanonicalGrid = match req.body_json() {
+        Ok(g) => g,
+        Err(e) => return error(422, format!("bad grid body: {e}")),
+    };
+    let Some(p) = st.projects.get_mut(pid) else {
+        return not_found_project();
+    };
+    let Some(member) = p.member(&acct.account_id).cloned() else {
+        return empty(403);
+    };
+    if !member.has_cap("project.edit") {
+        return empty(403);
+    }
+    if grid.validate().is_err() {
+        return error(400, crate::collab::grid::GRID_INVALID_MSG);
+    }
+    p.canonical_grid = Some(serde_json::to_value(grid).expect("a grid serializes"));
+    let prev = p.version;
+    p.bump();
+    st.publish_bump(pid, prev, &["grid"], &[]);
+    empty(204)
 }
 
 #[derive(serde::Deserialize)]

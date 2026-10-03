@@ -70,6 +70,10 @@ pub mod collab;
 // Coordinator filter remap (wave 6a, Task 9): calls the gated `api::collab`.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod collab_remap;
+// Canonical grid commands (wave 6b-2, Task 8b): the proposal, the coordinator's
+// save and `collab-grid-changed`. Gated like `api::collab`, which it calls.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod collab_grid;
 
 // The collab v3 wave-3 live exchange (Task 5): the feed applier that drives
 // the hub's `/me/events` stream — cursors, catch-up, resync, the versions
