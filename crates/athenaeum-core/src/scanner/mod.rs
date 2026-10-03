@@ -4162,6 +4162,34 @@ mod calibrated_light_scan_tests {
                 files_total, 0,
                 "parallel={parallel}: a prepared file is never cataloged"
             );
+
+            // Positive control: the same file WITHOUT `ATH_STK` IS cataloged,
+            // so the zero above is the marker's doing, not an empty scan.
+            let plain_root = TempDir::new().unwrap();
+            let plain = plain_root.path().join("plain.fits");
+            let plain_cards = prepare_cards(&source_cards_of(&src).unwrap(), None, "converted")
+                .unwrap()
+                .into_iter()
+                .filter(|c| !c.keyword.starts_with("ATH_ST"))
+                .collect::<Vec<_>>();
+            convert_to_float_fits(
+                &src,
+                &plain,
+                &PrepareRead::InPlaceFits,
+                &plain_cards,
+                crate::fits_writer::Durability::Durable,
+            )
+            .unwrap();
+            let conn = fresh_db(plain_root.path(), 1);
+            let result = run_scan(parallel, plain_root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            let plain_total: i64 = conn
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                plain_total, 1,
+                "parallel={parallel}: without ATH_STK the file is cataloged"
+            );
         }
     }
 }

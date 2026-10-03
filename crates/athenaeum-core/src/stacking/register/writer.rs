@@ -60,14 +60,24 @@ pub struct RegisteredCards<'a> {
 pub fn source_cards_from_file(path: &Path) -> anyhow::Result<Vec<Card>> {
     let header = FitsHeader::from_path(path)
         .with_context(|| format!("reading header of {}", path.display()))?;
-    let keys = parse_stored_header_keys(FileFormat::FITS, &header.to_header_text());
+    Ok(copy_through_cards(
+        FileFormat::FITS,
+        &header.to_header_text(),
+    ))
+}
+
+/// The copy-through cards of a stored header text (FITS cards or XISF XML):
+/// the case-insensitive [`REGISTERED_COPY_THROUGH`] filter, then sorted by
+/// keyword. Shared by the registered-frame and Prepare writers.
+pub(crate) fn copy_through_cards(format: FileFormat, header_text: &str) -> Vec<Card> {
+    let keys = parse_stored_header_keys(format, header_text);
     let mut cards: Vec<Card> = keys
         .iter()
         .filter(|(k, _)| REGISTERED_COPY_THROUGH.contains(&k.to_ascii_uppercase().as_str()))
         .filter_map(|(k, v)| card_from_kv(k, v))
         .collect();
     cards.sort_by(|a, b| a.keyword.cmp(&b.keyword));
-    Ok(cards)
+    cards
 }
 
 /// Copy-through cards filtered once more, then `IMAGETYP` and the

@@ -348,10 +348,6 @@ fn master_identity(path: &Path) -> String {
     }
 }
 
-/// Stage 1's hash for a prepared PROJECT frame (spec §5.1, plan 6b-2 C12):
-/// the Prepare subtree, the frame's content (`blake3`) and byte size —
-/// never a catalog identity. Every later stage hash chains on it exactly as
-/// on a calibration hash.
 /// Stage 1's hash for an ATTESTED light (spec §13, plan 6b-2 C11): the
 /// Prepare subtree and the light's own `files` identity, with no master
 /// upstream, because an attested light is never calibrated.
@@ -367,6 +363,10 @@ pub(crate) fn prepare_hash_for_catalog(cfg: &StackingConfig, frame: &GroupFrame)
     )
 }
 
+/// Stage 1's hash for a prepared PROJECT frame (spec §5.1, plan 6b-2 C12):
+/// the Prepare subtree, the frame's content (`blake3`) and byte size —
+/// never a catalog identity. Every later stage hash chains on it exactly as
+/// on a calibration hash.
 pub(crate) fn prepare_hash_for_project(
     cfg: &StackingConfig,
     blake3: &str,

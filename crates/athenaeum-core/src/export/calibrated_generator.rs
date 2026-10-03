@@ -642,11 +642,7 @@ pub fn execute_generation(
     // `Volatile` only for the stacking run's own regenerable intermediates
     // (`opts.skip_fsync`, set nowhere else), `Durable` for every export/send
     // caller.
-    let durability = if opts.skip_fsync {
-        Durability::Volatile
-    } else {
-        Durability::Durable
-    };
+    let durability = if opts.skip_fsync { Durability::Volatile } else { Durability::Durable };
 
     // ── The calibrated CFA mosaic (M4d Task 1, ruling R-M4d-1) ──────────────
     // A SECOND output of this same generation, written BEFORE the debayer
@@ -1930,6 +1926,21 @@ mod tests {
                 .zip(&rgb)
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "the extracted debayer must reproduce the generator's pixels exactly"
+        );
+
+        // Independent reference: RGGB with XBAYROFF = YBAYROFF = 1 is BGGR
+        // (one column shift: GRBG, one row shift: BGGR), folded BY HAND and
+        // run straight through the VNG call, never through `bayer_for` or
+        // `debayer_plane`. `mosaic` is the calibrated mosaic the generator
+        // itself debayers.
+        let by_hand = vng_debayer_f32(&mosaic, W, H, BayerPattern::Bggr);
+        assert_eq!(by_hand.len(), rgb.len());
+        assert!(
+            by_hand
+                .iter()
+                .zip(&rgb)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the generator's debayer-on output must equal a hand-folded BGGR VNG of its mosaic"
         );
 
         let mut cards = vec![

@@ -14,9 +14,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
-use crate::calibration_library::light_resolve::card_from_kv;
 use crate::export::calibrated_generator::{debayer_plane, debayered_cards};
-use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::{write_fits_f32_with, Card, CardValue, Durability};
 use crate::integration::cfa::CfaGeometry;
 use crate::integration::plane_reader::PlaneReader;
@@ -25,7 +23,9 @@ use crate::models::FileFormat;
 use crate::stacking::master_cards::ATH_STK_VERSION;
 use crate::stacking::origin::cfa_geometry_of_file;
 use crate::stacking::project_source::{is_xisf, xisf_geometry};
-use crate::stacking::register::writer::{source_cards_from_file, REGISTERED_COPY_THROUGH};
+use crate::stacking::register::writer::{
+    copy_through_cards, source_cards_from_file, REGISTERED_COPY_THROUGH,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileKind {
@@ -211,14 +211,10 @@ pub fn source_cards_of(path: &Path) -> anyhow::Result<Vec<Card>> {
     }
     let raw = crate::fits_parser::read_xisf_header(path)
         .with_context(|| format!("reading the XISF header of {}", path.display()))?;
-    let keys = parse_stored_header_keys(FileFormat::XISF, &String::from_utf8_lossy(&raw));
-    let mut cards: Vec<Card> = keys
-        .iter()
-        .filter(|(k, _)| REGISTERED_COPY_THROUGH.contains(&k.to_ascii_uppercase().as_str()))
-        .filter_map(|(k, v)| card_from_kv(k, v))
-        .collect();
-    cards.sort_by(|a, b| a.keyword.cmp(&b.keyword));
-    Ok(cards)
+    Ok(copy_through_cards(
+        FileFormat::XISF,
+        &String::from_utf8_lossy(&raw),
+    ))
 }
 
 /// The header of a file Prepare writes (plan 6b-2 C12):
@@ -323,7 +319,8 @@ pub fn convert_to_float_fits(
 ) -> anyhow::Result<(usize, usize, usize)> {
     let (w, h, c, data) = read_unit_planes(src, read)?;
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     write_fits_f32_with(dest, w, h, c, &data, cards, durability)
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest.display()))?;
@@ -365,11 +362,14 @@ pub fn debayer_file(
     }
     let rgb = debayer_plane(&mosaic, w, h, geom, pool);
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     write_fits_f32_with(dest, w, h, 3, &rgb, cards, durability)
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest.display()))?;
-    Ok(std::fs::metadata(dest)?.len())
+    Ok(std::fs::metadata(dest)
+        .with_context(|| format!("reading the size of {}", dest.display()))?
+        .len())
 }
 
 /// One frame's Prepare work, resolved on the run thread: no catalog, no
@@ -420,6 +420,18 @@ pub fn execute_prepare(
         }),
         PrepareAction::Unsupported(why) => anyhow::bail!("unsupported file: {why}"),
         PrepareAction::Write { read, debayer } => {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(IntegrationError::Cancelled.into());
+            }
+            if *read == PrepareRead::InPlaceFits && debayer.is_none() {
+                // `prepare_action` never builds this (a float FITS needing
+                // nothing is `InPlace`); writing nothing under a "converted"
+                // label would be a lie.
+                anyhow::bail!(
+                    "internal error: a Write action with an in-place read and no debayer ({})",
+                    job.src.display()
+                );
+            }
             let source = source_cards_of(&job.src)?;
             let base = if *read == PrepareRead::InPlaceFits {
                 job.src.clone()
@@ -633,6 +645,88 @@ mod tests {
         assert_eq!(h.get_str("ATH_PREP").as_deref(), Some("converted"));
     }
 
+    /// Raw big-endian primary-HDU FITS with no BZERO/BSCALE, for value-scaling
+    /// pins that need a plain signed or 8/32-bit file.
+    fn write_raw_fits(path: &Path, bitpix: i32, w: usize, h: usize, data: &[u8]) {
+        let cards = [
+            "SIMPLE  =                    T".to_string(),
+            format!("BITPIX  = {bitpix:>20}"),
+            "NAXIS   =                    2".to_string(),
+            format!("NAXIS1  = {w:>20}"),
+            format!("NAXIS2  = {h:>20}"),
+            "END".to_string(),
+        ];
+        let mut bytes: Vec<u8> = cards
+            .iter()
+            .flat_map(|c| format!("{c:<80}").into_bytes())
+            .collect();
+        bytes.resize(bytes.len().div_ceil(2880) * 2880, b' ');
+        bytes.extend_from_slice(data);
+        bytes.resize(bytes.len().div_ceil(2880) * 2880, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn convert_one(src: &Path, dest: &Path) -> Vec<f32> {
+        let shape = probe_file(src);
+        let PrepareAction::Write { read, .. } = prepare_action(&shape, false) else {
+            panic!("an integer file is converted");
+        };
+        let cards = prepare_cards(&source_cards_of(src).unwrap(), None, "converted").unwrap();
+        convert_to_float_fits(src, dest, &read, &cards, Durability::Volatile).unwrap();
+        PlaneReader::open(dest).unwrap().read_plane(0).unwrap()
+    }
+
+    /// Review 9a #5: the divisor per BITPIX, full scale, and a signed file
+    /// with no BZERO (the reader's physical value is divided as it is).
+    #[test]
+    fn integer_scaling_covers_full_scale_and_every_bitpix() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n);
+
+        // 16-bit unsigned via BZERO: full scale 65535 lands on exactly 1.0.
+        crate::stacking::test_fixtures::write_fits_i16(
+            &p("full.fits"),
+            2,
+            2,
+            &[32767, -32768, 0, 100],
+            &[],
+        );
+        let got = convert_one(&p("full.fits"), &p("o_full.fits"));
+        assert_eq!(got[0].to_bits(), 1.0f32.to_bits(), "65535 -> 1.0");
+        assert_eq!(got[1], 0.0);
+        assert_eq!(got[2].to_bits(), ((32768.0f64 / 65535.0) as f32).to_bits());
+
+        // Signed 16-bit WITHOUT BZERO: physical -100 and 32767.
+        let mut raw = Vec::new();
+        for v in [-100i16, 32767, 0, 1] {
+            raw.extend_from_slice(&v.to_be_bytes());
+        }
+        write_raw_fits(&p("s16.fits"), 16, 2, 2, &raw);
+        let got = convert_one(&p("s16.fits"), &p("o_s16.fits"));
+        for (g, v) in got.iter().zip([-100.0f64, 32767.0, 0.0, 1.0]) {
+            assert_eq!(g.to_bits(), ((v / 65535.0) as f32).to_bits());
+        }
+
+        // BITPIX 8: 255 -> 1.0.
+        write_raw_fits(&p("u8.fits"), 8, 2, 2, &[0, 51, 128, 255]);
+        let got = convert_one(&p("u8.fits"), &p("o_u8.fits"));
+        for (g, v) in got.iter().zip([0.0f64, 51.0, 128.0, 255.0]) {
+            assert_eq!(g.to_bits(), ((v / 255.0) as f32).to_bits());
+        }
+        assert_eq!(got[3].to_bits(), 1.0f32.to_bits());
+
+        // BITPIX 32: ÷ 2^32 - 1.
+        let mut raw = Vec::new();
+        for v in [0i32, 1_000_000, 2_000_000_000, 7] {
+            raw.extend_from_slice(&v.to_be_bytes());
+        }
+        write_raw_fits(&p("i32.fits"), 32, 2, 2, &raw);
+        let got = convert_one(&p("i32.fits"), &p("o_i32.fits"));
+        for (g, v) in got.iter().zip([0.0f64, 1_000_000.0, 2_000_000_000.0, 7.0]) {
+            assert_eq!(g.to_bits(), ((v / 4294967295.0) as f32).to_bits());
+        }
+    }
+
     /// Plan 6b-2 C12: an XISF is read through `read_raw` (×65535 by
     /// contract) and divided back, so every sample lands within one ulp of the
     /// value stored; its copy-through cards come from the XISF header.
@@ -751,5 +845,25 @@ mod tests {
             Some(IntegrationError::Cancelled)
         ));
         assert!(!out.join("never.fits").exists());
+
+        // Review 9a #6: a convert-only job honours an already-set cancel.
+        let mut convert_only = job("adu_mosaic.fits");
+        convert_only.action = prepare_action(&convert_only.shape, false);
+        convert_only.converted_out = out.join("never_converted.fits");
+        let err = execute_prepare(&convert_only, None, &stop).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<IntegrationError>(),
+            Some(IntegrationError::Cancelled)
+        ));
+        assert!(!out.join("never_converted.fits").exists());
+
+        // Review 9a #8: the mislabelled combination is refused.
+        let mut bogus = job("mosaic.fits");
+        bogus.action = PrepareAction::Write {
+            read: PrepareRead::InPlaceFits,
+            debayer: None,
+        };
+        let err = execute_prepare(&bogus, None, &go).unwrap_err();
+        assert!(format!("{err:#}").starts_with("internal error"), "{err:#}");
     }
 }
