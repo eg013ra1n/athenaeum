@@ -44,6 +44,8 @@ const SELECT_COLS: &str = "project_id, frame_uuid, content_version, origin, publ
 
 /// Whether a `project_frames_local` row is a frame I published, or a peer's
 /// that I've pulled down. Stored as `'own'` / `'replica'` (schema CHECK).
+/// Not `stacking::origin::FrameOrigin` (where a stacking run reads a frame
+/// from); never import both unqualified in one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameOrigin {
     Own,

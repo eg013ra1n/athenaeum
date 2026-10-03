@@ -298,6 +298,26 @@ fn master_identity(path: &Path) -> String {
     }
 }
 
+/// Stage 1's hash for a prepared PROJECT frame (spec §5.1, plan 6b-2 C12):
+/// the Prepare subtree, the frame's content (`blake3`) and byte size —
+/// never a catalog identity. Every later stage hash chains on it exactly as
+/// on a calibration hash.
+pub(crate) fn prepare_hash_for_project(
+    cfg: &StackingConfig,
+    blake3: &str,
+    byte_size: i64,
+) -> String {
+    stage_hash(
+        &crate::stacking::config::prepare_subtree(cfg),
+        &[&format!("blake3:{blake3}")],
+        &[SourceIdentity {
+            file_id: 0,
+            size: byte_size,
+            modified_at: String::new(),
+        }],
+    )
+}
+
 /// Stage 1 (calibration) config-hash for one LIGHT frame (spec §9.3):
 /// `calibration_subtree(cfg)` + the identity of every resolved master path
 /// this frame would actually apply ([`resolved_master_paths`]) + the light's
@@ -389,9 +409,14 @@ impl HashMemo {
         frame: &GroupFrame,
     ) -> Result<String, ApiError> {
         match origin_of(&self.origins, frame.frame_id)? {
+            // An attested set keeps today's generation hash until the Prepare
+            // stage lands (Task 9a splits this arm).
             FrameOrigin::Catalog { .. } => {
                 calibration_hash_for(conn, cfg, frame, &mut self.divisors)
             }
+            FrameOrigin::Project {
+                blake3, byte_size, ..
+            } => Ok(prepare_hash_for_project(cfg, blake3, *byte_size)),
         }
     }
 
@@ -1045,7 +1070,7 @@ fn resolve_reference(
 
     // A manual reference whose frame is not in the plan's groups has no
     // origin and stays "no reference chosen", as before. The match has no
-    // wildcard arm: a project origin must get its own lookup (6b-2).
+    // wildcard arm: every origin gets its own lookup.
     let file_row: Option<(String, String)> = match origins.get(&reference_frame_id) {
         Some(FrameOrigin::Catalog { .. }) => conn
             .query_row(
@@ -1055,6 +1080,15 @@ fn resolve_reference(
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?,
+        // A project frame's file is its landed replica; the landing writes
+        // `<publisher folder>/<file name>`, so the base name is the file name.
+        Some(FrameOrigin::Project { landed_path, .. }) => Some((
+            Path::new(landed_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| landed_path.clone()),
+            landed_path.clone(),
+        )),
         None => None,
     };
 
@@ -1110,13 +1144,10 @@ fn find_group_of<'a>(
 /// (deleted/re-typed since), or it carries no scale of its own.
 fn last_run_reference_scale(
     conn: &Connection,
-    frames_set_id: i64,
+    subject: &StackSubject,
     groups: &[IntegrationGroup],
 ) -> Result<Option<f64>, ApiError> {
-    let Some(last_run) = list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
-        .into_iter()
-        .next()
-    else {
+    let Some(last_run) = list_runs(conn, subject, 1)?.into_iter().next() else {
         return Ok(None);
     };
     Ok(last_run
@@ -1245,7 +1276,7 @@ pub(crate) fn registration_row_is_fresh(
 /// assumed, because a set cleaned by v0.6.2 lost them too.
 fn cleanup_stale_note(
     conn: &Connection,
-    frames_set_id: i64,
+    subject: &StackSubject,
     plan_groups: &[PlanGroup],
     stale_stages: &[Stage],
 ) -> Result<Option<String>, ApiError> {
@@ -1254,10 +1285,7 @@ fn cleanup_stale_note(
     if !calibrate_stale && !register_stale {
         return Ok(None);
     }
-    let Some(last) = list_runs(conn, &StackSubject::FrameSet(frames_set_id), 1)?
-        .into_iter()
-        .next()
-    else {
+    let Some(last) = list_runs(conn, subject, 1)?.into_iter().next() else {
         return Ok(None);
     };
     if last.status != "done" {
@@ -1727,7 +1755,7 @@ pub fn build_plan(
         resolve_config_and_exclusions(conn, settings, frames_set_id, config_override)?;
     let hash = config_hash(&cfg);
 
-    let (groups, origins) = frame_source(conn, subject, &cfg.grouping)?;
+    let (groups, origins) = frame_source(conn, subject, &cfg)?;
 
     // M4b (ruling R-T6-6, real-data finding on set 195 "Ghost Nebula"):
     // readiness must be judged over the frames a run will actually touch —
@@ -1887,7 +1915,7 @@ pub fn build_plan(
     // purely-informational, never-blocking group note.
     let reference_scale: Option<f64> = match reference.frame_id {
         Some(id) => find_group_frame(&groups, id).and_then(|gf| gf.pixel_scale_arcsec),
-        None => last_run_reference_scale(conn, frames_set_id, &groups)?
+        None => last_run_reference_scale(conn, subject, &groups)?
             .or_else(|| largest_group_scale(&groups, &excluded_set)),
     };
     // Fix round 1: the ratio is computed ONCE per group here and reused
@@ -2451,7 +2479,7 @@ pub fn build_plan(
     // v0.6.3: when the caches a re-run would reuse are gone because the LAST
     // run's own cleanup policy removed them, say so — a "Re-run from
     // Integrate" that silently starts at Calibrate was the owner's report.
-    if let Some(note) = cleanup_stale_note(conn, frames_set_id, &plan_groups, &stale_stages)? {
+    if let Some(note) = cleanup_stale_note(conn, subject, &plan_groups, &stale_stages)? {
         warnings.push(note);
     }
 
@@ -6618,6 +6646,7 @@ mod tests {
                 frame.frame_id,
                 crate::stacking::origin::FrameOrigin::Catalog {
                     file_id: frame.file_id,
+                    attested: false,
                 },
             )]
             .into_iter()
@@ -6648,7 +6677,7 @@ mod tests {
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
         let subject = StackSubject::FrameSet(f.set_id);
-        let (_, origins) = frame_source(&f.conn, &subject, &cfg.grouping).unwrap();
+        let (_, origins) = frame_source(&f.conn, &subject, &cfg).unwrap();
 
         // A frame with an origin resolves its filename and path.
         set_frame_set_reference(&f.conn, f.set_id, ids[0]).unwrap();
@@ -6683,7 +6712,7 @@ mod tests {
         }
         let cfg = StackingConfig::default();
         let (groups, origins) =
-            frame_source(&f.conn, &StackSubject::FrameSet(f.set_id), &cfg.grouping).unwrap();
+            frame_source(&f.conn, &StackSubject::FrameSet(f.set_id), &cfg).unwrap();
         let direct = group_frames(&f.conn, f.set_id, &cfg.grouping).unwrap();
         assert_eq!(format!("{groups:?}"), format!("{direct:?}"));
 
@@ -6694,18 +6723,85 @@ mod tests {
             assert_eq!(
                 origins.get(&fr.frame_id),
                 Some(&FrameOrigin::Catalog {
-                    file_id: fr.file_id
+                    file_id: fr.file_id,
+                    attested: false
                 })
             );
         }
 
         crate::db::stacking::insert_test_project(&f.conn, "p1");
-        let err =
-            frame_source(&f.conn, &StackSubject::Project("p1".into()), &cfg.grouping).unwrap_err();
+        let (groups, origins) =
+            frame_source(&f.conn, &StackSubject::Project("p1".into()), &cfg).unwrap();
         assert!(
-            matches!(err, ApiError::Invalid(ref m) if m == PROJECT_STACKING_UNAVAILABLE),
-            "{err:?}"
+            groups.is_empty() && origins.is_empty(),
+            "a project with no landed frame"
         );
+
+        // Spec §13 (R3): an attested set's origins carry the flag.
+        f.conn
+            .execute(
+                "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                [f.set_id],
+            )
+            .unwrap();
+        let (_, origins) = frame_source(&f.conn, &StackSubject::FrameSet(f.set_id), &cfg).unwrap();
+        assert!(origins
+            .values()
+            .all(|o| matches!(o, FrameOrigin::Catalog { attested: true, .. })));
+    }
+
+    /// Plan 6b-2 C12: the Prepare subtree's exact shape, and the project
+    /// stage-1 hash `HashMemo` gives a project frame — content and size,
+    /// never a catalog identity; the debayer toggle moves it, an unrelated
+    /// stage's config does not.
+    #[test]
+    fn the_prepare_subtree_and_the_project_hash_are_pinned() {
+        use crate::stacking::config::{prepare_subtree, stage_hash, SourceIdentity};
+        let cfg = StackingConfig::default();
+        assert_eq!(
+            serde_json::to_string(&prepare_subtree(&cfg)).unwrap(),
+            r#"{"debayerMethod":"VNG","debayerOsc":true,"prepareVersion":1}"#
+        );
+        let blake3 = "ab".repeat(32);
+        let expected = stage_hash(
+            &prepare_subtree(&cfg),
+            &[&format!("blake3:{blake3}")],
+            &[SourceIdentity {
+                file_id: 0,
+                size: 4096,
+                modified_at: String::new(),
+            }],
+        );
+        assert_eq!(prepare_hash_for_project(&cfg, &blake3, 4096), expected);
+        let mut other = cfg.clone();
+        other.registration.distortion = crate::stacking::register::DistortionChoice::Tps;
+        assert_eq!(prepare_hash_for_project(&other, &blake3, 4096), expected);
+        other.calibration.debayer_osc = false;
+        assert_ne!(prepare_hash_for_project(&other, &blake3, 4096), expected);
+    }
+
+    /// Plan 6b-2 C7: a project frame's manual reference resolves its file
+    /// name and landed path from the origin, never the catalog.
+    #[test]
+    fn a_projects_manual_reference_resolves_from_its_origin() {
+        use crate::stacking::groups::frame_source;
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec};
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        for uuid in ["r1", "r2", "r3"] {
+            add_project_frame(&f.conn, f.dir.path(), "p1", &project_frame_spec(uuid));
+        }
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let subject = StackSubject::Project("p1".into());
+        let (_, origins) = frame_source(&f.conn, &subject, &cfg).unwrap();
+        crate::db::stacking::set_project_config(&f.conn, "p1", "{}", &[], Some("r2")).unwrap();
+        let mut blockers = Vec::new();
+        let reference =
+            resolve_reference(&f.conn, &subject, &origins, &cfg, &mut blockers).unwrap();
+        assert!(blockers.is_empty(), "{blockers:?}");
+        assert_eq!(reference.filename.as_deref(), Some("c_r2.fits"));
+        assert!(reference.on_disk);
     }
 
     /// Spec §9.4 / plan 6b-2 C10: the first plan of a project stores the

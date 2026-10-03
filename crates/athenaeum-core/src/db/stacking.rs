@@ -1041,6 +1041,11 @@ pub fn project_frame_handles(
     project_id: &str,
     frame_uuids: &[&str],
 ) -> Result<std::collections::HashMap<String, i64>> {
+    // No frame, no write lock: an empty project, or one with nothing
+    // stackable on this device, must not make the live-exchange writer wait.
+    if frame_uuids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut out = std::collections::HashMap::with_capacity(frame_uuids.len());
     {
@@ -2043,5 +2048,21 @@ mod tests {
         assert_eq!(row.config_json, "{}");
         assert_eq!(row.excluded_frame_uuids, vec!["u1".to_string()]);
         assert_eq!(row.reference_frame_uuid.as_deref(), Some("u2"));
+    }
+
+    /// Review M2: an empty handle list mints nothing and returns at once,
+    /// without the IMMEDIATE transaction (an empty project's plan must not
+    /// make the live-exchange writer wait for the write lock).
+    #[test]
+    fn an_empty_handle_list_writes_nothing() {
+        let c = conn();
+        insert_test_project(&c, "p1");
+        assert!(project_frame_handles(&c, "p1", &[]).unwrap().is_empty());
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM stack_project_frames", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

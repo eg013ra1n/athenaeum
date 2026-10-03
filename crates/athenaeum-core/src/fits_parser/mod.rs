@@ -15,7 +15,7 @@ use std::path::Path;
 /// Read the XISF XML header bytes from a file.
 /// Parses the 16-byte binary header (8-byte signature + 4-byte header length + 4 reserved)
 /// to determine exactly how many bytes to read.
-fn read_xisf_header(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_xisf_header(path: &Path) -> Result<Vec<u8>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open XISF file: {}", path.display()))?;
     let mut buf_reader = BufReader::new(file);

@@ -819,7 +819,7 @@ pub fn start_stacking(
     let working_dir = validated_dirs.working.to_string_lossy().into_owned();
     let output_dir_str = validated_dirs.output.to_string_lossy().into_owned();
 
-    let (plan_groups, origins) = frame_source(&conn, &subject, &plan.config.grouping)?;
+    let (plan_groups, origins) = frame_source(&conn, &subject, &plan.config)?;
 
     let config_json = serde_json::to_string(&plan.config)
         .map_err(|e| ApiError::Internal(format!("failed to serialize stacking config: {e}")))?;
@@ -1709,6 +1709,10 @@ fn resolve_calibrate_job(
                 rc.memo.divisors_mut(),
             )
             .map_err(|e| format!("{e:#}")),
+            // A project frame is prepared, never calibrated (spec §5.1).
+            Ok(FrameOrigin::Project { .. }) => {
+                Err("a project frame is prepared, never calibrated".to_string())
+            }
             Err(e) => Err(e.to_string()),
         }
     };
@@ -9903,7 +9907,10 @@ pub(crate) fn test_context(
             .map(|f| {
                 (
                     f.frame_id,
-                    crate::stacking::origin::FrameOrigin::Catalog { file_id: f.file_id },
+                    crate::stacking::origin::FrameOrigin::Catalog {
+                        file_id: f.file_id,
+                        attested: false,
+                    },
                 )
             })
             .collect(),
@@ -20155,7 +20162,10 @@ mod tests {
         let with_origin: FrameOrigins = Arc::new(
             [(
                 frame_id,
-                crate::stacking::origin::FrameOrigin::Catalog { file_id: 0 },
+                crate::stacking::origin::FrameOrigin::Catalog {
+                    file_id: 0,
+                    attested: false,
+                },
             )]
             .into_iter()
             .collect(),

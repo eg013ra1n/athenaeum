@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
 
+use crate::collab::hub_client::FrameViewWire;
 use crate::db::schema::init_db;
 use crate::fits_writer::card::{format_card, Card, CardValue, BLOCK_SIZE, CARD_SIZE};
-use crate::fits_writer::write_fits_f32;
+use crate::fits_writer::{write_fits_f32, write_xisf_f32};
 use crate::test_support::{add_noise, gaussian_field};
 
 /// One fixture's whole catalog: an in-memory `Connection` seeded with a
@@ -841,4 +842,218 @@ mod tests {
             "OSC light with a resolvable Bayer pattern must debayer"
         );
     }
+}
+
+// ── Project frames (plan 6b-2) ──────────────────────────────────────────────
+
+/// What lands on disk for one fixture project frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectFile {
+    /// One-plane float32 FITS in the unit domain — a calibrated replica.
+    Mono32,
+    /// Three-plane float32 FITS — a debayered OSC replica.
+    Rgb32,
+    /// One-plane float32 CFA mosaic carrying BAYERPAT/XBAYROFF/YBAYROFF.
+    Mosaic32,
+    /// One-plane 16-bit FITS in ADU (BZERO 32768) — an attested original.
+    #[allow(dead_code)] // Task 9 consumes it
+    Mono16,
+    /// One-plane float32 XISF in the unit domain.
+    Xisf32,
+    /// Nothing on disk: the manifest row is never landed.
+    Missing,
+}
+
+/// One project frame to seed via [`add_project_frame`].
+pub(crate) struct ProjectFrameSpec<'a> {
+    pub uuid: &'a str,
+    pub publisher: &'a str,
+    pub filter: &'a str,
+    pub exptime_sec: f64,
+    pub date_obs: &'a str,
+    pub width: usize,
+    pub height: usize,
+    pub file: ProjectFile,
+    pub bayerpat: Option<&'a str>,
+    pub pixel_scale_arcsec: Option<f64>,
+    pub wcs: Option<serde_json::Value>,
+    pub focal_len: Option<f64>,
+    pub aperture: Option<f64>,
+    pub accepted: bool,
+}
+
+/// A mono, landed, accepted 64×48 frame: filter `L`, 300 s, 1.5″/px, no
+/// WCS. A case overrides what it needs.
+pub(crate) fn project_frame_spec(uuid: &str) -> ProjectFrameSpec<'_> {
+    ProjectFrameSpec {
+        uuid,
+        publisher: "ann",
+        filter: "L",
+        exptime_sec: 300.0,
+        date_obs: "2026-01-10T21:00:00",
+        width: 64,
+        height: 48,
+        file: ProjectFile::Mono32,
+        bayerpat: None,
+        pixel_scale_arcsec: Some(1.5),
+        wcs: None,
+        focal_len: None,
+        aperture: None,
+        accepted: true,
+    }
+}
+
+/// `meta.wcs` of a `width × height` frame centred on `(ra, dec)` at
+/// `scale_arcsec` ″/px, unrotated, in the parity every solve in the owner's
+/// catalog has (`det CD > 0`); `crpix` 1-BASED, as the manifest stores it.
+pub(crate) fn manifest_wcs_json(
+    width: usize,
+    height: usize,
+    ra: f64,
+    dec: f64,
+    scale_arcsec: f64,
+) -> serde_json::Value {
+    let s = scale_arcsec / 3600.0;
+    serde_json::json!({
+        "crval1": ra,
+        "crval2": dec,
+        "crpix1": (width as f64 + 1.0) / 2.0,
+        "crpix2": (height as f64 + 1.0) / 2.0,
+        "cd": [s, 0.0, 0.0, s],
+    })
+}
+
+/// Seed one project frame the way the exchange would leave it.
+/// - The manifest row goes through the real applier (`upsert_from_manifest`).
+/// - The file is written under `dir/<publisher>/`, the landing's own layout. It
+///   carries a real replica's cards, `CALSTAT`/`ATH_CSRC`/`ATH_PRJ` included, so
+///   a test can prove nothing the run writes copies them.
+/// - Unless the file is `Missing`, the frame is landed (`set_landed`, with the
+///   file's real `size:mtime`).
+/// Returns the landed path, or where the file would have landed. The project row
+/// must exist (`db::stacking::insert_test_project`).
+pub(crate) fn add_project_frame(
+    conn: &Connection,
+    dir: &Path,
+    project_id: &str,
+    spec: &ProjectFrameSpec<'_>,
+) -> PathBuf {
+    let ext = if spec.file == ProjectFile::Xisf32 {
+        "xisf"
+    } else {
+        "fits"
+    };
+    let file_name = format!("c_{}.{ext}", spec.uuid);
+    let folder = dir.join(spec.publisher);
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join(&file_name);
+    let (w, h) = (spec.width, spec.height);
+    let stars = [
+        (w as f64 * 0.3, h as f64 * 0.35, 0.5),
+        (w as f64 * 0.62, h as f64 * 0.55, 0.8),
+        (w as f64 * 0.45, h as f64 * 0.72, 0.3),
+    ];
+    let plane = synthetic_star_field(w, h, &stars, 3.0, 0.0, 0);
+    let mut cards = vec![
+        Card::new("IMAGETYP", CardValue::Str("Light".into())).unwrap(),
+        Card::new("FILTER", CardValue::Str(spec.filter.to_string())).unwrap(),
+        Card::new("EXPTIME", CardValue::Real(spec.exptime_sec)).unwrap(),
+        Card::new("DATE-OBS", CardValue::Str(spec.date_obs.to_string())).unwrap(),
+        Card::new("INSTRUME", CardValue::Str("cam".into())).unwrap(),
+        Card::new("ROWORDER", CardValue::Str(FIXTURE_ROW_ORDER.into())).unwrap(),
+        Card::new("CALSTAT", CardValue::Str("BDF".into())).unwrap(),
+        Card::new("ATH_CSRC", CardValue::Str(spec.uuid.to_string())).unwrap(),
+        Card::new("ATH_PRJ", CardValue::Str(project_id.to_string())).unwrap(),
+    ];
+    match spec.file {
+        ProjectFile::Mono32 => write_fits_f32(&path, w, h, 1, &plane, &cards).unwrap(),
+        ProjectFile::Rgb32 => {
+            let rgb: Vec<f32> = [1.0f32, 0.8, 0.6]
+                .iter()
+                .flat_map(|k| plane.iter().map(move |v| v * k))
+                .collect();
+            write_fits_f32(&path, w, h, 3, &rgb, &cards).unwrap();
+        }
+        ProjectFile::Mosaic32 => {
+            cards.push(
+                Card::new(
+                    "BAYERPAT",
+                    CardValue::Str(spec.bayerpat.unwrap_or("RGGB").into()),
+                )
+                .unwrap(),
+            );
+            cards.push(Card::new("XBAYROFF", CardValue::Integer(0)).unwrap());
+            cards.push(Card::new("YBAYROFF", CardValue::Integer(0)).unwrap());
+            write_fits_f32(&path, w, h, 1, &plane, &cards).unwrap();
+        }
+        ProjectFile::Mono16 => {
+            let data: Vec<i16> = plane
+                .iter()
+                .map(|&v| ((v * 65535.0).round().clamp(0.0, 65535.0) as i32 - 32768) as i16)
+                .collect();
+            write_fits_i16(&path, w, h, &data, &cards);
+        }
+        ProjectFile::Xisf32 => write_xisf_f32(&path, w, h, 1, &plane, &cards).unwrap(),
+        ProjectFile::Missing => {}
+    }
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("naxis1".into(), serde_json::json!(w));
+    meta.insert("naxis2".into(), serde_json::json!(h));
+    meta.insert("instrume".into(), serde_json::json!("cam"));
+    if let Some(s) = spec.pixel_scale_arcsec {
+        meta.insert("pixelScaleArcsec".into(), serde_json::json!(s));
+    }
+    if let Some(b) = spec.bayerpat {
+        meta.insert("bayerpat".into(), serde_json::json!(b));
+    }
+    if let Some(v) = spec.focal_len {
+        meta.insert("focalLen".into(), serde_json::json!(v));
+    }
+    if let Some(v) = spec.aperture {
+        meta.insert("aperture".into(), serde_json::json!(v));
+    }
+    if let Some(wcs) = &spec.wcs {
+        meta.insert("wcs".into(), wcs.clone());
+    }
+    let (byte_size, blake3) = if spec.file == ProjectFile::Missing {
+        (1000i64, "b".repeat(64))
+    } else {
+        let bytes = std::fs::read(&path).unwrap();
+        (
+            bytes.len() as i64,
+            blake3::hash(&bytes).to_hex().to_string(),
+        )
+    };
+    let seq: i64 = conn
+        .query_row("SELECT COUNT(*) FROM project_frames_local", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let view: FrameViewWire = serde_json::from_value(serde_json::json!({
+        "frameUuid": spec.uuid, "frameSeq": seq + 1,
+        "publisherAccountId": spec.publisher, "publisherDisplayName": spec.publisher, "own": false,
+        "fileName": file_name, "contentVersion": 1, "blake3": blake3, "byteSize": byte_size,
+        "xxh3": "0123456789abcdef", "filterRaw": spec.filter, "filterCanonical": spec.filter,
+        "channel": if spec.bayerpat.is_some() { "osc" } else { "mono" },
+        "exptimeSec": spec.exptime_sec, "dateObs": spec.date_obs,
+        "meta": serde_json::Value::Object(meta), "gateVersion": 0,
+        "accepted": spec.accepted, "acceptedReason": null, "state": "published",
+        "rejectReason": null, "manifestVersion": seq + 1, "createdAt": "2026-10-01T00:00:00Z",
+    }))
+    .unwrap();
+    crate::db::collab_frames::upsert_from_manifest(conn, project_id, &view).unwrap();
+    if spec.file != ProjectFile::Missing {
+        let stamp =
+            crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(&path).unwrap()).encode();
+        crate::db::collab_frames::set_landed(
+            conn,
+            project_id,
+            spec.uuid,
+            path.to_str().unwrap(),
+            &stamp,
+        )
+        .unwrap();
+    }
+    path
 }

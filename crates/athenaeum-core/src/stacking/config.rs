@@ -695,6 +695,23 @@ pub fn stage_hash(
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(json.as_bytes()))
 }
 
+/// Bumped when Prepare's output for an unchanged input changes — the
+/// in-place rule, a conversion's value domain, the debayer (plan 6b-2 C12).
+pub const PREPARE_VERSION: u32 = 1;
+
+/// Stage 1's subtree for a PREPARED frame (spec §5.1, plan 6b-2 C12): of
+/// the calibration options only `debayerOsc` applies (a prepared frame is
+/// never calibrated), plus the debayer method — VNG, the only one — and
+/// [`PREPARE_VERSION`]. Deliberately not `calibration_subtree`, whose
+/// golden literals a frame set's caches rest on.
+pub fn prepare_subtree(cfg: &StackingConfig) -> serde_json::Value {
+    serde_json::json!({
+        "debayerOsc": cfg.calibration.debayer_osc,
+        "debayerMethod": "VNG",
+        "prepareVersion": PREPARE_VERSION,
+    })
+}
+
 /// Stage 1 (calibration) config subtree (spec §9.3): the frame's
 /// calibration options plus the grouping rule that decided which frames
 /// share a group.

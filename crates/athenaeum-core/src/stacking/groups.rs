@@ -22,9 +22,8 @@ use crate::api::ApiError;
 use crate::archive::path_layout::sanitize_for_filename;
 use crate::calibration_library::paths::fmt_num;
 use crate::db::stacking::StackSubject;
-use crate::stacking::config::{ExposureMode, GroupingConfig};
+use crate::stacking::config::{ExposureMode, GroupingConfig, StackingConfig};
 use crate::stacking::origin::{FrameOrigin, FrameOrigins};
-use crate::stacking::plan::PROJECT_STACKING_UNAVAILABLE;
 
 /// Mono vs colour (CFA) sensor, decided from `frames.bayerpat` (spec §2:
 /// "colour mode ... from the Bayer cards"). A non-empty, trimmed `bayerpat`
@@ -786,23 +785,40 @@ pub fn group_frames(
 }
 
 /// The frame source of a stacking subject: its integration groups plus the
-/// origin of every frame in them (wave 6 spec section 4.3). A frame set reads
-/// the catalog through [`group_frames`]; a project is refused until 6b-2.
+/// origin of every frame in them (wave 6 spec §4.3). A frame set reads the
+/// catalog through [`group_frames`] (its `calibrated_externally` flag rides
+/// every origin, spec §13); a project reads its manifest mirror through
+/// [`crate::stacking::project_source::project_frame_source`].
 pub(crate) fn frame_source(
     conn: &Connection,
     subject: &StackSubject,
-    grouping: &GroupingConfig,
+    cfg: &StackingConfig,
 ) -> Result<(Vec<IntegrationGroup>, FrameOrigins), ApiError> {
-    let StackSubject::FrameSet(frames_set_id) = subject else {
-        return Err(ApiError::Invalid(PROJECT_STACKING_UNAVAILABLE.into()));
-    };
-    let groups = group_frames(conn, *frames_set_id, grouping)?;
-    let origins = groups
-        .iter()
-        .flat_map(|g| g.frames.iter())
-        .map(|f| (f.frame_id, FrameOrigin::Catalog { file_id: f.file_id }))
-        .collect();
-    Ok((groups, Arc::new(origins)))
+    match subject {
+        StackSubject::FrameSet(frames_set_id) => {
+            let groups = group_frames(conn, *frames_set_id, &cfg.grouping)?;
+            let attested = crate::db::collab::frames_set_attested(conn, *frames_set_id)?;
+            let origins = groups
+                .iter()
+                .flat_map(|g| g.frames.iter())
+                .map(|f| {
+                    (
+                        f.frame_id,
+                        FrameOrigin::Catalog {
+                            file_id: f.file_id,
+                            attested,
+                        },
+                    )
+                })
+                .collect();
+            Ok((groups, Arc::new(origins)))
+        }
+        StackSubject::Project(project_id) => {
+            let source =
+                crate::stacking::project_source::project_frame_source(conn, project_id, cfg)?;
+            Ok((source.groups, source.origins))
+        }
+    }
 }
 
 #[cfg(test)]
