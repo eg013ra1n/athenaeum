@@ -3018,6 +3018,7 @@ mod tests {
                 updated_at: String::new(),
                 local_state: LocalState::OwnHeld,
                 frame_seq: None,
+                own_staged: false,
             }
         }
     }

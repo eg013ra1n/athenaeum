@@ -7075,6 +7075,7 @@ async fn run_publish(
                 updated_at: String::new(),
                 local_state: frames_db::LocalState::OwnHeld,
                 frame_seq: None,
+                own_staged: false,
             }
         };
         let adopt = |conn: &Connection, f: &SeededFrame| -> anyhow::Result<()> {
@@ -8875,6 +8876,7 @@ pub(crate) mod tests {
             updated_at: String::new(),
             local_state: crate::db::collab_frames::LocalState::OwnHeld,
             frame_seq: Some(1),
+            own_staged: false,
         };
         crate::db::collab_frames::record_own(conn, &row).unwrap();
     }
@@ -9280,6 +9282,7 @@ pub(crate) mod tests {
             updated_at: String::new(),
             local_state: crate::db::collab_frames::LocalState::OwnHeld,
             frame_seq: Some(1),
+            own_staged: false,
         };
         crate::db::collab_frames::record_own(conn, &row).unwrap();
     }

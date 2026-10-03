@@ -71,7 +71,7 @@ pub fn collect_project_export_data(
         get_project(conn, project_id)?.ok_or_else(|| anyhow!("project not in the local cache"))?;
     let mut rows: Vec<LocalFrameRow> = list_for_project(conn, project_id)?
         .into_iter()
-        .filter(exportable)
+        .filter(crate::db::collab_frames::exportable)
         .collect();
     // Own first (stable: the table's order within each origin is kept).
     rows.sort_by_key(|r| r.origin != FrameOrigin::Own);
@@ -138,13 +138,6 @@ pub fn collect_project_export_data(
         publishers,
         warnings,
     })
-}
-
-/// Is a frame part of the project export (R31)? Published by the project
-/// (never an own pending or rejected frame), accepted by the gate, on disk at
-/// a recorded path, and not waiting for store GC.
-fn exportable(r: &LocalFrameRow) -> bool {
-    r.state == "published" && r.accepted && r.on_disk && !r.awaiting_gc && r.landed_path.is_some()
 }
 
 /// The trailing path component of `path`, or the whole string when it has none.
@@ -258,6 +251,7 @@ mod tests {
                 (FrameOrigin::Replica, false) => LocalState::Wanted,
             },
             frame_seq: None,
+            own_staged: false,
         };
         record_own(conn, &row).unwrap();
         row

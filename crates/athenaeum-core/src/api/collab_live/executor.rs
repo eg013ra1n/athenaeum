@@ -2243,6 +2243,7 @@ mod tests {
             updated_at: String::new(),
             local_state: LocalState::Wanted,
             frame_seq: None,
+            own_staged: false,
         }
     }
 

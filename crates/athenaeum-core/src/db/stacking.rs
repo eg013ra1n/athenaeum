@@ -1125,6 +1125,98 @@ pub fn set_set_config(
     Ok(())
 }
 
+/// One project's stored stacking document (spec §9.1/§9.4): the whole
+/// config, the manual exclusions and the manual reference, both by frame
+/// uuid — a handle is minted only when a plan includes the frame.
+pub struct ProjectConfigRow {
+    pub config_json: String,
+    pub excluded_frame_uuids: Vec<String>,
+    pub reference_frame_uuid: Option<String>,
+    pub updated_at: String,
+}
+
+pub fn get_project_config(conn: &Connection, project_id: &str) -> Result<Option<ProjectConfigRow>> {
+    let row = conn
+        .query_row(
+            "SELECT config_json, excluded_frame_uuids_json, reference_frame_uuid, updated_at
+             FROM stacking_project_config WHERE project_id = ?1",
+            params![project_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((config_json, excluded_json, reference_frame_uuid, updated_at)) => {
+            let excluded_frame_uuids: Vec<String> = serde_json::from_str(&excluded_json)?;
+            Ok(Some(ProjectConfigRow {
+                config_json,
+                excluded_frame_uuids,
+                reference_frame_uuid,
+                updated_at,
+            }))
+        }
+    }
+}
+
+pub fn set_project_config(
+    conn: &Connection,
+    project_id: &str,
+    config_json: &str,
+    excluded_frame_uuids: &[String],
+    reference_frame_uuid: Option<&str>,
+) -> Result<()> {
+    let excluded_json = serde_json::to_string(excluded_frame_uuids)?;
+    conn.execute(
+        "INSERT INTO stacking_project_config
+           (project_id, config_json, excluded_frame_uuids_json, reference_frame_uuid, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project_id) DO UPDATE SET
+           config_json = excluded.config_json,
+           excluded_frame_uuids_json = excluded.excluded_frame_uuids_json,
+           reference_frame_uuid = excluded.reference_frame_uuid,
+           updated_at = excluded.updated_at",
+        params![
+            project_id,
+            config_json,
+            excluded_json,
+            reference_frame_uuid,
+            now()
+        ],
+    )?;
+    Ok(())
+}
+
+/// The project's stored document, seeding `seed_json` first when it has
+/// none (spec §9.4: the first plan stores the seeded default). One IMMEDIATE
+/// transaction (read-then-write, CLAUDE.md), so two first plans racing on
+/// one project store one document and both read it back; a stored document
+/// is never overwritten. Never call with a transaction already open on
+/// `conn`.
+pub fn seed_project_config(
+    conn: &Connection,
+    project_id: &str,
+    seed_json: &str,
+) -> Result<ProjectConfigRow> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT INTO stacking_project_config (project_id, config_json, updated_at)
+         VALUES (?1, ?2, ?3) ON CONFLICT(project_id) DO NOTHING",
+        params![project_id, seed_json, now()],
+    )?;
+    let row = get_project_config(&tx, project_id)?.ok_or_else(|| {
+        anyhow::anyhow!("project {project_id} has no stacking config after seeding")
+    })?;
+    tx.commit()?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1929,5 +2021,27 @@ mod tests {
                 .any(|d| d.starts_with("SEARCH") && d.contains("stacking_artifacts_subject_key")),
             "{plan:?}"
         );
+    }
+
+    /// Plan 6b-2 C10: the seed is stored once; a second seed (another first
+    /// plan racing) reads the stored document back and never overwrites it.
+    #[test]
+    fn a_project_config_is_seeded_once_and_never_overwritten() {
+        let c = conn();
+        insert_test_project(&c, "p1");
+        assert!(get_project_config(&c, "p1").unwrap().is_none());
+        let first = seed_project_config(&c, "p1", r#"{"version":1}"#).unwrap();
+        assert_eq!(first.config_json, r#"{"version":1}"#);
+        assert!(first.excluded_frame_uuids.is_empty());
+        let again = seed_project_config(&c, "p1", r#"{"version":2}"#).unwrap();
+        assert_eq!(
+            again.config_json, r#"{"version":1}"#,
+            "a stored document wins"
+        );
+        set_project_config(&c, "p1", "{}", &["u1".to_string()], Some("u2")).unwrap();
+        let row = get_project_config(&c, "p1").unwrap().unwrap();
+        assert_eq!(row.config_json, "{}");
+        assert_eq!(row.excluded_frame_uuids, vec!["u1".to_string()]);
+        assert_eq!(row.reference_frame_uuid.as_deref(), Some("u2"));
     }
 }

@@ -20009,7 +20009,7 @@ mod tests {
 
         let project_rej = working
             .path()
-            .join("projects")
+            .join(crate::stacking::paths::PROJECTS_DIR)
             .join("p1")
             .join("rej")
             .join(format!("run-{project_run}"));
@@ -20059,7 +20059,7 @@ mod tests {
         std::fs::write(set_group.join("x.bin"), vec![0u8; 1024]).unwrap();
         let project_group = working
             .path()
-            .join("projects")
+            .join(crate::stacking::paths::PROJECTS_DIR)
             .join("p1")
             .join("calibrated")
             .join("g");

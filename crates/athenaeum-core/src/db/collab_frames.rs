@@ -40,7 +40,7 @@ const SELECT_COLS: &str = "project_id, frame_uuid, content_version, origin, publ
     publisher_display, file_name, filter_canonical, state, accepted, byte_size, xxh3, blake3, \
     manifest_version, manifest_json, landed_path, size_mtime_seen, on_disk, \
     awaiting_gc, source_frame_id, recipe_hash, last_error, updated_at, \
-    local_state, frame_seq";
+    local_state, frame_seq, own_staged";
 
 /// Whether a `project_frames_local` row is a frame I published, or a peer's
 /// that I've pulled down. Stored as `'own'` / `'replica'` (schema CHECK).
@@ -207,6 +207,11 @@ pub struct LocalFrameRow {
     /// [`upsert_from_manifest`] and [`set_frame_seq`], and carried through by
     /// [`record_own`].
     pub frame_seq: Option<i32>,
+    /// Own only (plan 6b-2 C5): set between `stage_own_file` and
+    /// `set_own_version` — the row's bytes are the new version's while its
+    /// `blake3` is still the old one's. Read here, never written by
+    /// `record_own` (its `INSERT OR REPLACE` resets it, as before).
+    pub own_staged: bool,
 }
 
 fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LocalFrameRow> {
@@ -238,7 +243,64 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LocalFrameRow> {
             &row.get::<_, Option<String>>(23)?.unwrap_or_default(),
         ),
         frame_seq: row.get(24)?,
+        own_staged: row.get::<_, i64>(25)? != 0,
     })
+}
+
+/// Is a frame part of the project's published, accepted set (R31)? An own
+/// pending frame is not; a coordinator-excluded one is not.
+pub fn part_of_project(r: &LocalFrameRow) -> bool {
+    r.state == "published" && r.accepted
+}
+
+/// Is a frame part of the project export (R31)? Published and accepted, on
+/// disk at a recorded path, and not waiting for store GC. Moved here from
+/// `export::project_collector` so export and stacking share one definition.
+pub fn exportable(r: &LocalFrameRow) -> bool {
+    part_of_project(r) && r.on_disk && !r.awaiting_gc && r.landed_path.is_some()
+}
+
+/// Why a project frame cannot be stacked on this device (plan 6b-2 C5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotStackable {
+    NotInProject,
+    NotOnDevice,
+    BeingRestaged,
+    WaitingForNewVersion,
+}
+
+impl NotStackable {
+    pub fn reason(self) -> &'static str {
+        match self {
+            NotStackable::NotInProject => "not published or excluded",
+            NotStackable::NotOnDevice => "not on this device",
+            NotStackable::BeingRestaged => "being re-staged",
+            NotStackable::WaitingForNewVersion => "waiting for its new version",
+        }
+    }
+}
+
+/// Can a stacking run read this frame (plan 6b-2 C5, spec §7)? Exportable,
+/// servable (`held | own_held` — kept equal to `on_disk` by every writer,
+/// belt and braces against a stale row), not an own row being re-staged
+/// (its bytes changed under the old `blake3`), and with a recorded
+/// `size:mtime` — a NULL stamp means the landed file is not verified as
+/// this version (a version bump clears it), and the run's identity check
+/// (`stacking::origin::landed_unchanged`) needs it as its baseline.
+pub fn stackable(r: &LocalFrameRow) -> Result<(), NotStackable> {
+    if !part_of_project(r) {
+        return Err(NotStackable::NotInProject);
+    }
+    if !exportable(r) || !r.local_state.servable() {
+        return Err(NotStackable::NotOnDevice);
+    }
+    if r.own_staged {
+        return Err(NotStackable::BeingRestaged);
+    }
+    if r.size_mtime_seen.is_none() {
+        return Err(NotStackable::WaitingForNewVersion);
+    }
+    Ok(())
 }
 
 /// Apply one manifest row (mine or a peer's) to the local cache: insert it if
@@ -3135,5 +3197,75 @@ mod tests {
         reset(&c);
         set_local_state(&c, "p1", "u1", LocalState::NotKept).unwrap();
         assert_ne!(stamp(&c).as_deref(), Some("old"), "missing → not_kept");
+    }
+
+    /// Plan 6b-2 C5: stackable = exportable ∧ servable ∧ ¬own_staged, and a
+    /// recorded `size:mtime` — one case per leg.
+    #[test]
+    fn stackable_is_exportable_servable_not_restaged_and_stamped() {
+        let c = conn();
+        let land =
+            |uuid: &str| set_landed(&c, "p1", uuid, &format!("/c/{uuid}.fits"), "100:1").unwrap();
+        let verdict = |uuid: &str| stackable(&get(&c, "p1", uuid).unwrap().unwrap());
+
+        upsert_from_manifest(&c, "p1", &view("held", 1)).unwrap();
+        land("held");
+        assert_eq!(verdict("held"), Ok(()));
+
+        upsert_from_manifest(&c, "p1", &view("wanted", 2)).unwrap();
+        assert_eq!(verdict("wanted"), Err(NotStackable::NotOnDevice));
+
+        let mut excluded = view("excluded", 3);
+        excluded.accepted = false;
+        upsert_from_manifest(&c, "p1", &excluded).unwrap();
+        land("excluded");
+        assert_eq!(verdict("excluded"), Err(NotStackable::NotInProject));
+
+        let mut pending = view("pending", 4);
+        pending.own = true;
+        pending.state = "pending".into();
+        upsert_from_manifest(&c, "p1", &pending).unwrap();
+        land("pending");
+        assert_eq!(verdict("pending"), Err(NotStackable::NotInProject));
+
+        let mut own = view("own", 5);
+        own.own = true;
+        upsert_from_manifest(&c, "p1", &own).unwrap();
+        land("own");
+        assert_eq!(verdict("own"), Ok(()), "own_held is stackable");
+        c.execute(
+            "UPDATE project_frames_local SET own_staged = 1 WHERE frame_uuid = 'own'",
+            [],
+        )
+        .unwrap();
+        assert!(get(&c, "p1", "own").unwrap().unwrap().own_staged);
+        assert_eq!(verdict("own"), Err(NotStackable::BeingRestaged));
+
+        upsert_from_manifest(&c, "p1", &view("unstamped", 6)).unwrap();
+        land("unstamped");
+        c.execute(
+            "UPDATE project_frames_local SET size_mtime_seen = NULL WHERE frame_uuid = 'unstamped'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            verdict("unstamped"),
+            Err(NotStackable::WaitingForNewVersion)
+        );
+
+        upsert_from_manifest(&c, "p1", &view("gc", 7)).unwrap();
+        land("gc");
+        c.execute(
+            "UPDATE project_frames_local SET awaiting_gc = 1 WHERE frame_uuid = 'gc'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(verdict("gc"), Err(NotStackable::NotOnDevice));
+
+        assert_eq!(NotStackable::BeingRestaged.reason(), "being re-staged");
+        assert!(
+            exportable(&get(&c, "p1", "own").unwrap().unwrap()),
+            "export ignores own_staged"
+        );
     }
 }

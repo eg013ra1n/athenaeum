@@ -19,6 +19,11 @@ use crate::db::stacking::StackSubject;
 use crate::settings::{keys, SettingsManager};
 use crate::stacking::groups::{ColorMode, IntegrationGroup};
 
+/// The folder every project's working tree lives under (plan 6b-2 C6):
+/// `<working>/_projects/<slug>`. No frame-set slug can start with `_`
+/// (`sanitize_for_filename` trims it), so a frame set never lays out here.
+pub const PROJECTS_DIR: &str = "_projects";
+
 /// The on-disk layout a stacking run stages its working-folder artifacts
 /// into: `<working_dir>/<set_slug>/{calibrated,registered,ln,runs}/…`. One
 /// `WorkingLayout` per frame set (the slug — [`crate::stacking::groups::set_slug`]
@@ -30,7 +35,7 @@ pub struct WorkingLayout {
 
 /// The working layout of one stacking subject: a frame set's lives at
 /// `<working>/<set_slug(name)>`, a project's at
-/// `<working>/projects/<set_slug(slug)>` (spec section 9.3).
+/// `<working>/_projects/<set_slug(slug)>` (spec section 9.3).
 pub(crate) fn subject_layout(
     conn: &Connection,
     working_dir: &Path,
@@ -52,11 +57,60 @@ pub(crate) fn subject_layout(
                 .optional()?;
             let slug = slug.ok_or_else(|| anyhow::anyhow!("project {id} not found"))?;
             Ok(WorkingLayout::new(
-                &working_dir.join("projects"),
+                &working_dir.join(PROJECTS_DIR),
                 &set_slug(&slug),
             ))
         }
     }
+}
+
+/// Plan 6b-2 C6: a project's working root must not overlap any scan root —
+/// the Collaboration root is one — because cleanup removes whole subtrees
+/// under it, and a landed replica must never be in one. `Some(sentence)` is
+/// the plan's `folders` blocker. Reuses the transfer folders' overlap check
+/// (`api::scan_roots::check_scan_root_overlap`); reads the filesystem only
+/// to canonicalize the scan roots.
+pub fn project_root_overlap(
+    conn: &Connection,
+    project_root: &Path,
+) -> Result<Option<String>, ApiError> {
+    let root = crate::api::scan_roots::normalize_path(&canonical_or_nearest(project_root));
+    match crate::api::scan_roots::check_scan_root_overlap(conn, &root) {
+        Ok(()) => Ok(None),
+        Err(ApiError::Conflict(msg)) => {
+            tracing::warn!(path = %root.display(), error = %msg, "project working folder overlaps a scan root");
+            Ok(Some(format!(
+                "The project's working folder {} overlaps a monitored folder ({msg}); choose a working folder outside every scan root and the Collaboration folder",
+                root.display()
+            )))
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// `path` with its nearest existing ancestor canonicalized and the missing
+/// tail re-appended — a project root usually does not exist yet, while the
+/// scan roots it is compared against are canonicalized (`/var` vs
+/// `/private/var` on macOS would otherwise never match).
+fn canonical_or_nearest(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+    let mut out = existing
+        .canonicalize()
+        .unwrap_or_else(|_| existing.to_path_buf());
+    for name in tail.iter().rev() {
+        out.push(name);
+    }
+    out
 }
 
 impl WorkingLayout {
@@ -1886,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn subject_layout_puts_a_project_under_projects_slug() {
+    fn subject_layout_puts_a_project_under_the_projects_folder() {
         let c = conn();
         c.execute("INSERT INTO frames_set (name) VALUES ('M42 2026')", [])
             .unwrap();
@@ -1909,9 +1963,60 @@ mod tests {
             subject_layout(&c, working, &StackSubject::Project("p1".into())).unwrap();
         assert_eq!(
             project_layout.root,
-            working.join("projects").join("orion-mosaic")
+            working.join(PROJECTS_DIR).join("orion-mosaic")
         );
 
         assert!(subject_layout(&c, working, &StackSubject::Project("nope".into())).is_err());
+    }
+
+    /// Plan 6b-2 C6: no frame-set slug can start with `_`, so no frame set
+    /// can ever lay out at (or under) the projects folder.
+    #[test]
+    fn no_frame_set_slug_reaches_the_projects_folder() {
+        for name in [
+            "_projects",
+            "__projects",
+            "_",
+            " _x",
+            "projects",
+            "Projects",
+            "_ _",
+            "/_projects",
+            "..",
+            "_projects_",
+            "CON",
+            "  _  ",
+            "\t_tab",
+            ":_colon",
+            "_.",
+            "._a",
+        ] {
+            let slug = crate::stacking::groups::set_slug(name);
+            assert!(!slug.starts_with('_'), "{name:?} -> {slug:?}");
+            assert_ne!(slug, PROJECTS_DIR);
+        }
+    }
+
+    /// Plan 6b-2 C6: a project working root inside (or containing) any scan
+    /// root — the Collaboration root is one — is refused with a sentence.
+    #[test]
+    fn a_project_root_overlapping_a_scan_root_is_reported() {
+        let c = conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let collab = tmp.path().join("work");
+        std::fs::create_dir_all(&collab).unwrap();
+        c.execute(
+            "INSERT INTO scan_roots (path, kind) VALUES (?1, 'collaboration')",
+            [collab.to_str().unwrap()],
+        )
+        .unwrap();
+        let inside = collab.join(PROJECTS_DIR).join("m31");
+        let sentence = project_root_overlap(&c, &inside).unwrap().expect("overlap");
+        assert!(
+            sentence.contains("overlaps a monitored folder"),
+            "{sentence}"
+        );
+        let apart = tmp.path().join("elsewhere").join(PROJECTS_DIR).join("m31");
+        assert_eq!(project_root_overlap(&c, &apart).unwrap(), None);
     }
 }

@@ -3647,6 +3647,7 @@ mod calibrated_light_scan_tests {
                 FrameOrigin::Replica => crate::db::collab_frames::LocalState::Held,
             },
             frame_seq: None,
+            own_staged: false,
         };
         frames_db::record_own(conn, &row).unwrap();
     }

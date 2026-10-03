@@ -968,6 +968,35 @@ fn resolve_config_and_exclusions(
     Ok((config, excluded_frame_ids))
 }
 
+/// A project's effective config and manual exclusions (frame uuids) — plan
+/// 6b-2 C10, spec §9.4. Seeds the stored document on the first plan (a
+/// documented exception to "the plan reads only"; `seed_project_config` is
+/// one IMMEDIATE transaction), then resolves whole-config like a frame set:
+/// an override wins outright and is never stored, else the stored document
+/// IS the config. `pub` so the lib build carries it before the project plan
+/// arm (Task 7) and 6b-3's `get_project_stacking_config` call it.
+pub fn resolve_project_config_and_exclusions(
+    conn: &Connection,
+    settings: &SettingsManager,
+    project_id: &str,
+    config_override: Option<StackingConfig>,
+) -> Result<(StackingConfig, Vec<String>), ApiError> {
+    let global_json = read_global_config_json(conn, settings);
+    let global = resolve_config(None, global_json.as_deref())
+        .map_err(|e| ApiError::Invalid(format!("invalid stacking config: {e}")))?;
+    let seed = serde_json::to_string(&crate::stacking::config::project_seed_config(global))
+        .map_err(|e| {
+            ApiError::Internal(format!("failed to serialize the project seed config: {e}"))
+        })?;
+    let row = crate::db::stacking::seed_project_config(conn, project_id, &seed)?;
+    let config = match config_override {
+        Some(cfg) => cfg,
+        None => resolve_config(Some(&row.config_json), None)
+            .map_err(|e| ApiError::Invalid(format!("invalid stacking config: {e}")))?,
+    };
+    Ok((config, row.excluded_frame_uuids))
+}
+
 /// Resolve the plan's reference frame (gate step 2). `Auto` never blocks.
 /// `Manual` requires a `frame_set_reference` row whose frame still resolves
 /// to an on-disk file; either miss pushes a `reference` blocker and returns
@@ -6667,6 +6696,58 @@ mod tests {
         assert!(
             matches!(err, ApiError::Invalid(ref m) if m == PROJECT_STACKING_UNAVAILABLE),
             "{err:?}"
+        );
+    }
+
+    /// Spec §9.4 / plan 6b-2 C10: the first plan of a project stores the
+    /// global default with `stops` and the coverage map on; a stored document
+    /// is whole-config; an override wins without being stored.
+    #[test]
+    fn a_project_config_is_seeded_then_resolved_whole() {
+        use crate::stacking::config::ExposureMode;
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let settings = SettingsManager::new();
+        let (cfg, excluded) =
+            resolve_project_config_and_exclusions(&f.conn, &settings, "p1", None).unwrap();
+        assert_eq!(cfg.grouping.exposure_mode, ExposureMode::Stops);
+        assert!(cfg.output.coverage_map);
+        assert!(excluded.is_empty());
+        let stored = crate::db::stacking::get_project_config(&f.conn, "p1")
+            .unwrap()
+            .unwrap();
+        let stored_cfg: StackingConfig = serde_json::from_str(&stored.config_json).unwrap();
+        assert_eq!(stored_cfg, cfg, "the seed is what was stored");
+
+        crate::db::stacking::set_project_config(
+            &f.conn,
+            "p1",
+            r#"{"grouping":{"exposureMode":"none"}}"#,
+            &["u7".to_string()],
+            None,
+        )
+        .unwrap();
+        let (cfg, excluded) =
+            resolve_project_config_and_exclusions(&f.conn, &settings, "p1", None).unwrap();
+        assert_eq!(cfg.grouping.exposure_mode, ExposureMode::NoSplit);
+        assert!(
+            !cfg.output.coverage_map,
+            "whole-config: no field-level merge with the seed"
+        );
+        assert_eq!(excluded, vec!["u7".to_string()]);
+
+        let mut over = StackingConfig::default();
+        over.output.crop_to_coverage = 5;
+        let (cfg, _) =
+            resolve_project_config_and_exclusions(&f.conn, &settings, "p1", Some(over.clone()))
+                .unwrap();
+        assert_eq!(cfg, over);
+        let stored = crate::db::stacking::get_project_config(&f.conn, "p1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.config_json, r#"{"grouping":{"exposureMode":"none"}}"#,
+            "an override is never stored"
         );
     }
 }

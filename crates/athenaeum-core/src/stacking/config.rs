@@ -811,6 +811,15 @@ fn normalization_subtree_with_fit_version(
     })
 }
 
+/// The document a project's first plan stores (spec §9.4): the global
+/// default with `grouping.exposureMode = stops` and `output.coverageMap = true`.
+pub fn project_seed_config(global: StackingConfig) -> StackingConfig {
+    let mut config = global;
+    config.grouping.exposure_mode = ExposureMode::Stops;
+    config.output.coverage_map = true;
+    config
+}
+
 #[cfg(test)]
 mod tests {
 
