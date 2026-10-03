@@ -286,6 +286,9 @@ pub(crate) struct RunContext {
     /// Where each frame of this run comes from (see [`crate::stacking::origin`]):
     /// every per-frame catalog read after the frame source dispatches on it.
     pub(crate) origins: FrameOrigins,
+    /// The Solve sub-step's solver (plan 6b-2 C14): the installed catalog,
+    /// opened on first use. Tests inject a fake.
+    pub(crate) solver: Arc<dyn crate::stacking::solve::FrameSolver>,
     /// This run's ONE hot-pixel-map cache, keyed by resolved master dark path
     /// (decision 4) — a dark shared by every frame in a group pays the
     /// measurement once.
@@ -976,6 +979,7 @@ pub fn start_stacking(
         rerun_from,
         memo: HashMemo::new(origins.clone()),
         origins,
+        solver: Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone())),
         hot_maps: HashMap::new(),
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
@@ -3371,6 +3375,175 @@ impl FanOutTicker {
     }
 }
 
+/// The Solve sub-step (spec §5.2, plan 6b-2 C14), the first thing Measure
+/// does. Every project frame still in the run whose manifest carries no WCS,
+/// and that has a stage-1 file, is solved once per content version, solver
+/// config and catalog (and once more per app version after a failure,
+/// review I7). It is solved through `rc.solver`, on the file stage 1 handed
+/// on, and its outcome (solved, failed or refused) is cached as a `solve`
+/// artifact under group key `""`, so a regroup never re-solves. A failed or
+/// refused solve leaves the frame in the run, without a WCS. A frame without
+/// a stage-1 file is skipped with a `debug!` and left to Measure, which
+/// excludes it (review I9). Nothing here writes `plate_solves` or `frames`.
+/// A frame set has no such frame, and reads and logs nothing.
+fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
+    use crate::stacking::solve::{solve_hash, write_outcome, SolveOutcome, SolveRequest};
+    let excluded: HashSet<i64> = rc.excluded.iter().copied().collect();
+    let failed: HashSet<i64> = rc.runtime_exclusions.iter().map(|(id, _)| *id).collect();
+    let mut wanted = Vec::new();
+    for g in &rc.plan_groups {
+        for f in g
+            .frames
+            .iter()
+            .filter(|f| !excluded.contains(&f.frame_id) && !failed.contains(&f.frame_id))
+        {
+            // A frame with no origin is left to Measure, which reports it as
+            // it always has.
+            let Some(origin) = rc.origins.get(&f.frame_id) else {
+                continue;
+            };
+            if let Some(plan) = crate::stacking::origin::solve_plan(origin) {
+                wanted.push((g.key.clone(), f.frame_id, plan));
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let identity = match rc.solver.identity() {
+        Ok(identity) => identity,
+        Err(e) => {
+            tracing::warn!(
+                run_id = rc.run_id,
+                count = wanted.len(),
+                error = %e,
+                "plate solving unavailable; frames without a manifest wcs stay unsolved"
+            );
+            rc.warnings.push(format!(
+                "{} frame(s) without a WCS in the manifest could not be plate-solved: {e}",
+                wanted.len()
+            ));
+            return Ok(());
+        }
+    };
+    let project_id = wanted[0].2.project_id.clone();
+    let target = {
+        let conn = db(&rc.ctx)?.conn();
+        crate::db::collab::get_project(&conn, &project_id)?
+            .map(|p| (p.target_ra_deg, p.target_dec_deg))
+    };
+
+    let mut jobs = Vec::new();
+    for (key, frame_id, plan) in wanted {
+        // Plan 6b-2 C9: the Solve boundary of the landed-file identity check.
+        if let Some(reason) = changed_during_run(rc, frame_id)? {
+            tracing::warn!(run_id = rc.run_id, frame_id, reason = %reason, "frame excluded");
+            rc.runtime_exclusions.push((frame_id, reason));
+            continue;
+        }
+        let hash = solve_hash(&plan.blake3, &identity);
+        let conn = db(&rc.ctx)?.conn();
+        let cached =
+            crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(frame_id))?
+                .is_some_and(|row| crate::stacking::solve::cached_outcome_holds(&row, &hash));
+        if cached {
+            continue;
+        }
+        let calibrated = crate::db::stacking::find_artifact(
+            &conn,
+            &rc.subject,
+            &key,
+            "calibrated",
+            Some(frame_id),
+        )?
+        .and_then(|a| a.path);
+        // No stage-1 file (its artifact row is gone): Measure reports and
+        // excludes the frame (review I9).
+        let Some(path) = calibrated else {
+            tracing::debug!(
+                run_id = rc.run_id,
+                frame_id,
+                "no stage-1 file; solve skipped"
+            );
+            continue;
+        };
+        jobs.push((frame_id, hash, plan, PathBuf::from(path)));
+    }
+
+    let total = jobs.len();
+    let mut solved = 0usize;
+    for (done, (frame_id, hash, plan, path)) in jobs.into_iter().enumerate() {
+        rc.check_cancel()?;
+        rc.progress(
+            Stage::Measure,
+            None,
+            done,
+            total,
+            0,
+            0,
+            Some(frame_id),
+            Some("solving".to_string()),
+        );
+        let request = SolveRequest::for_frame(frame_id, &path, &plan.meta, target);
+        let solver = rc.solver.clone();
+        let cancel = rc.cancel.clone();
+        let started = Instant::now();
+        let outcome = rc
+            .ctx
+            .image_pool
+            .install(|| solver.solve(&request, &cancel));
+        rc.check_cancel()?;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match &outcome {
+            SolveOutcome::Solved(_) => {
+                solved += 1;
+                tracing::debug!(
+                    run_id = rc.run_id,
+                    frame_id,
+                    frame_uuid = %plan.frame_uuid,
+                    outcome = outcome.label(),
+                    duration_ms,
+                    "project frame solved"
+                );
+            }
+            SolveOutcome::Failed(reason) | SolveOutcome::Refused(reason) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    frame_id,
+                    frame_uuid = %plan.frame_uuid,
+                    outcome = outcome.label(),
+                    reason = %reason,
+                    duration_ms,
+                    "project frame could not be plate-solved"
+                );
+            }
+        }
+        let conn = db(&rc.ctx)?.conn();
+        write_outcome(
+            &conn,
+            &plan.project_id,
+            frame_id,
+            &plan.blake3,
+            &hash,
+            outcome,
+        )?;
+    }
+    if total > 0 {
+        rc.progress(
+            Stage::Measure,
+            None,
+            total,
+            total,
+            0,
+            0,
+            None,
+            Some("solving".to_string()),
+        );
+    }
+    tracing::info!(run_id = rc.run_id, project_id = %project_id, count = total, solved, "project frames solved");
+    Ok(())
+}
+
 /// Stage 3 (measure & select, spec §4.1-4.3): per group, measure every
 /// frame that reached calibration (manually- and stage-1-excluded frames
 /// never do — Task 6's calibrate never wrote them a file), reusing a fresh
@@ -3382,6 +3555,9 @@ impl FanOutTicker {
 /// with no viable group fails outright.
 fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
     let stage_start = Instant::now();
+    // Plan 6b-2 C14: a project's frames without a manifest WCS are solved
+    // first; the Solve boundary's exclusions reach `stage1_failed` below.
+    solve_project_frames(rc)?;
     let cfg = rc.config.clone();
     let opts = cfg
         .measurement
@@ -10485,6 +10661,8 @@ pub(crate) fn test_context(
     group_ids: HashMap<String, i64>,
 ) -> RunContext {
     let hash = config_hash(&config);
+    let solver: Arc<dyn crate::stacking::solve::FrameSolver> =
+        Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone()));
     let origins: FrameOrigins = Arc::new(
         plan_groups
             .iter()
@@ -10552,6 +10730,7 @@ pub(crate) fn test_context(
         rerun_from: None,
         memo: HashMemo::new(origins.clone()),
         origins,
+        solver,
         hot_maps: HashMap::new(),
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
@@ -21966,5 +22145,365 @@ mod tests {
             matches!(err, RunError::Other(ref m) if m.contains("reference frame changed during the run")),
             "{err:?}"
         );
+    }
+
+    fn handle_of(rc: &RunContext, file_name: &str) -> i64 {
+        rc.plan_groups
+            .iter()
+            .flat_map(|g| g.frames.iter())
+            .find(|f| f.filename == file_name)
+            .unwrap()
+            .frame_id
+    }
+
+    /// R frames `r1..=r{n_r}` with no WCS and G frames `g1..=g{n_g}` with a
+    /// manifest WCS, all landed under `landed`.
+    fn seed_r_and_g(
+        conn: &rusqlite::Connection,
+        landed: &Path,
+        project_id: &str,
+        n_r: usize,
+        n_g: usize,
+    ) {
+        for i in 1..=n_r {
+            let uuid = format!("r{i}");
+            let mut spec = test_fixtures::project_frame_spec(&uuid);
+            spec.filter = "R";
+            test_fixtures::add_project_frame(conn, landed, project_id, &spec);
+        }
+        for i in 1..=n_g {
+            let uuid = format!("g{i}");
+            let mut spec = test_fixtures::project_frame_spec(&uuid);
+            spec.filter = "G";
+            spec.wcs = Some(test_fixtures::manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+            test_fixtures::add_project_frame(conn, landed, project_id, &spec);
+        }
+    }
+
+    fn blake3_of(conn: &rusqlite::Connection, project_id: &str, uuid: &str) -> String {
+        conn.query_row(
+            "SELECT blake3 FROM project_frames_local WHERE project_id = ?1 AND frame_uuid = ?2",
+            [project_id, uuid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn use_solver(rc: &mut RunContext, fake: &Arc<crate::stacking::solve::FakeSolver>) {
+        let solver: Arc<dyn crate::stacking::solve::FrameSolver> = fake.clone();
+        rc.solver = solver;
+    }
+
+    /// Spec §5.2, §15.1 (Review Focus 2), plan 6b-2 C14: the Solve sub-step
+    /// solves each project frame without a manifest WCS once, through the
+    /// run's solver and on the file stage 1 handed on, and caches the
+    /// outcome as a `solve` artifact. It never writes `plate_solves` or
+    /// `frames`, not even a `frames` row whose id equals a handle. A second
+    /// pass solves nothing, and `stored_solve` then serves the local WCS.
+    #[test]
+    fn the_solve_sub_step_never_writes_plate_solves_or_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let handles: Vec<i64> = rc.origins.keys().copied().collect();
+        for (i, h) in handles.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 'decoy.fits', 7, '2020-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![h, format!("/decoy/{i}.fits")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, filter, exptime, naxis1, naxis2)
+                 VALUES (?1, ?1, 'Light', 'Z', 999.0, 7, 7)",
+                [h],
+            )
+            .unwrap();
+            test_fixtures::seed_plate_solve_scale(&conn, *h, 9.9);
+        }
+        let snapshot = |c: &rusqlite::Connection| -> (i64, i64, String) {
+            c.query_row(
+                "SELECT (SELECT COUNT(*) FROM plate_solves), (SELECT COUNT(*) FROM frames),
+                        (SELECT group_concat(filter || ':' || exptime || ':' || IFNULL(ra, ''), ',') FROM frames)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        let before = snapshot(&conn);
+        let fake = Arc::new(crate::stacking::solve::FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 3);
+        assert_eq!(
+            snapshot(&conn),
+            before,
+            "plate_solves and frames are never written"
+        );
+        let solves =
+            crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve")).unwrap();
+        assert_eq!(solves.len(), 3);
+        assert!(solves
+            .iter()
+            .all(|a| a.group_key.is_empty() && a.path.is_none()));
+
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 3, "a cached outcome is never solved again");
+        let h = handles[0];
+        let record = crate::stacking::origin::stored_solve(&conn, &rc.origins[&h], h)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (record.crval1, record.crval2, record.frame_id),
+            (83.8, -5.4, 0)
+        );
+    }
+
+    /// Plan 6b-2 C14: a failed or refused solve is cached like a solved one,
+    /// so it is not retried every run, and the frame stays in the run
+    /// without a WCS.
+    #[test]
+    fn a_failed_or_refused_solve_is_cached_and_the_frame_stays() {
+        use crate::stacking::solve::{FakeSolver, SolveOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(
+            FakeSolver::solving_all()
+                .with("c_r1.fits", SolveOutcome::Failed("no match".into()))
+                .with(
+                    "c_r2.fits",
+                    SolveOutcome::Refused(
+                        "Rejected: low confidence (6 inliers, ratio 0.01, 1.50\"/px)".into(),
+                    ),
+                ),
+        );
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        solve_project_frames(&mut rc).unwrap();
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 3, "every outcome is cached");
+        assert!(
+            rc.runtime_exclusions.is_empty(),
+            "{:?}",
+            rc.runtime_exclusions
+        );
+        for (name, solved) in [
+            ("c_r1.fits", false),
+            ("c_r2.fits", false),
+            ("c_r3.fits", true),
+        ] {
+            let h = handle_of(&rc, name);
+            assert_eq!(
+                crate::stacking::origin::stored_solve(&conn, &rc.origins[&h], h)
+                    .unwrap()
+                    .is_some(),
+                solved,
+                "{name}"
+            );
+        }
+    }
+
+    /// Review I7: a failure or refusal cached by ANOTHER app version is tried
+    /// once more (a release may carry a solver that rescues the frame); a solve
+    /// cached by another version is kept; this version's new outcomes then hold.
+    #[test]
+    fn a_failure_cached_by_another_app_version_is_solved_again() {
+        use crate::stacking::solve::{
+            solve_hash, write_artifact, FakeSolver, SolveArtifact, SolveOutcome,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        for (uuid, outcome) in [
+            ("r1", SolveOutcome::Failed("no match".into())),
+            ("r2", SolveOutcome::Refused("refused".into())),
+            ("r3", SolveOutcome::Solved(FakeSolver::fixture_record())),
+        ] {
+            let blake3 = blake3_of(&conn, "p1", uuid);
+            write_artifact(
+                &conn,
+                "p1",
+                handle_of(&rc, &format!("c_{uuid}.fits")),
+                &solve_hash(&blake3, "fake:1"),
+                &SolveArtifact {
+                    blake3,
+                    app_version: "0.0.0-older".into(),
+                    outcome,
+                },
+            )
+            .unwrap();
+        }
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(
+            fake.calls(),
+            2,
+            "the two failures are tried again; the solve is kept"
+        );
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 2, "now cached by this version");
+    }
+
+    /// Plan 6b-2 C9 (the Solve boundary): a landed file that changed since
+    /// the frame source read it is excluded "changed during the run" and is
+    /// never handed to the solver.
+    #[test]
+    fn the_solve_sub_step_excludes_a_frame_whose_landed_file_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(crate::stacking::solve::FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        let r2 = handle_of(&rc, "c_r2.fits");
+        let r2_path = rc.plan_groups[0]
+            .frames
+            .iter()
+            .find(|f| f.frame_id == r2)
+            .unwrap()
+            .path
+            .clone();
+        std::fs::write(&r2_path, vec![0u8; 5000]).unwrap();
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 2);
+        let reasons: HashMap<i64, String> = rc.runtime_exclusions.iter().cloned().collect();
+        assert_eq!(
+            reasons.get(&r2).map(String::as_str),
+            Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
+        );
+        assert!(
+            crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(r2))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Plan 6b-2 C14: with no solver (no catalog installed) nothing is
+    /// solved or cached, and the run says why.
+    #[test]
+    fn without_a_solver_nothing_is_solved_and_the_run_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(crate::stacking::solve::FakeSolver::unavailable(
+            "no star catalog",
+        ));
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 0);
+        assert!(
+            crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            rc.warnings,
+            vec!["3 frame(s) without a WCS in the manifest could not be plate-solved: no star catalog".to_string()]
+        );
+    }
+
+    /// Review Focus 1: a frame-set run has nothing to solve. The sub-step
+    /// never asks the solver anything, the run gains no warning, and stage 4
+    /// has no WCS rule.
+    #[test]
+    fn the_solve_sub_step_is_a_no_op_for_a_frame_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _ids, working, output) = seed_star_group(
+            &db_path,
+            SET_NAME,
+            &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+            &[5.0f32; 3],
+        );
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            WorkingLayout::new(working.path(), &set_slug(SET_NAME)),
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        let fake = Arc::new(crate::stacking::solve::FakeSolver::unavailable(
+            "never asked",
+        ));
+        use_solver(&mut rc, &fake);
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 0);
+        assert!(rc.warnings.is_empty(), "{:?}", rc.warnings);
     }
 }

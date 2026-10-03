@@ -79,6 +79,7 @@ pub mod register;
 pub mod rej;
 pub mod robust;
 pub mod run;
+pub mod solve;
 pub mod structure;
 #[cfg(test)]
 pub(crate) mod test_fixtures;

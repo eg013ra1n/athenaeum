@@ -2106,17 +2106,41 @@ fn project_inputs(
             if n == 1 { "" } else { "s" }
         ));
     }
-    // Spec §5.2: an in-scope frame without a manifest WCS is solved locally.
-    let unsolved = source
+    // Spec §5.2: an in-scope frame without a manifest WCS is solved by the
+    // run. The last cached outcome for its content (plan 6b-2 Task 10b) says
+    // which frames are still to solve and which could not be solved. The plan
+    // reads the outcome, not its hash: after a solver or catalog change the
+    // run re-solves, and the plan learns the new outcome only then.
+    let (mut to_solve, mut unsolvable) = (0usize, 0usize);
+    for f in source
         .frames
         .iter()
         .filter(in_scope)
         .filter(|f| f.meta.as_ref().is_some_and(|m| m.wcs.is_none()))
-        .count();
-    if unsolved > 0 {
+    {
+        let Some(handle) = f.handle else { continue };
+        let outcome = crate::stacking::origin::local_solve_outcome(
+            conn,
+            origin_of(&source.origins, handle)?,
+            handle,
+        )
+        .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+        match outcome {
+            None => to_solve += 1,
+            Some(crate::stacking::solve::SolveOutcome::Solved(_)) => {}
+            Some(_) => unsolvable += 1,
+        }
+    }
+    if to_solve > 0 {
         warnings.push(format!(
-            "{unsolved} frame{} no WCS in the manifest and will be plate-solved locally",
-            if unsolved == 1 { " has" } else { "s have" }
+            "{to_solve} frame{} no WCS in the manifest and will be plate-solved locally",
+            if to_solve == 1 { " has" } else { "s have" }
+        ));
+    }
+    if unsolvable > 0 {
+        warnings.push(format!(
+            "{unsolvable} frame{} could not be plate-solved and cannot anchor the grid",
+            if unsolvable == 1 { "" } else { "s" }
         ));
     }
     // Spec §6.3: in-scope frames a confirmed grid leaves outside.
@@ -7813,6 +7837,67 @@ mod tests {
         assert!(
             matches!(err, ApiError::NotFound(ref m) if m.contains("nope")),
             "{err:?}"
+        );
+    }
+
+    /// Plan 6b-2 C14: the plan reads the run's last cached solve outcome, so
+    /// a frame that could not be solved is reported as such, not as "will
+    /// be plate-solved".
+    #[test]
+    fn a_project_plan_reports_frames_that_could_not_be_solved() {
+        let f = test_fixtures::frame_set("unused");
+        let (working, output) = seed_project(&f);
+        let plan = |f: &test_fixtures::Fixture| {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::Project("p1".into()),
+                Some(with_folders(&working, &output)),
+            )
+            .unwrap()
+        };
+        let first = plan(&f);
+        let o1 = first
+            .project_frames
+            .iter()
+            .find(|r| r.frame_uuid == "o1")
+            .unwrap()
+            .handle
+            .unwrap();
+        let blake3: String = f
+            .conn
+            .query_row(
+                "SELECT blake3 FROM project_frames_local WHERE project_id = 'p1' AND frame_uuid = 'o1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::stacking::solve::write_outcome(
+            &f.conn,
+            "p1",
+            o1,
+            &blake3,
+            "h",
+            crate::stacking::solve::SolveOutcome::Failed("no match".into()),
+        )
+        .unwrap();
+        let second = plan(&f);
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|w| w == "1 frame could not be plate-solved and cannot anchor the grid"),
+            "{:?}",
+            second.warnings
+        );
+        assert!(
+            second
+                .warnings
+                .iter()
+                .all(|w| !w.contains("will be plate-solved locally")),
+            "{:?}",
+            second.warnings
         );
     }
 }

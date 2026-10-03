@@ -21,6 +21,7 @@ use crate::collab::frame_meta::ProjectFrameMeta;
 use crate::integration::cfa::CfaGeometry;
 use crate::plate_solve::storage::PlateSolveRecord;
 use crate::stacking::groups::GroupFrame;
+use crate::stacking::solve::{stored_outcome, SolveOutcome};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrameOrigin {
@@ -191,11 +192,66 @@ pub(crate) fn stored_solve(
 ) -> anyhow::Result<Option<PlateSolveRecord>> {
     match origin {
         FrameOrigin::Catalog { .. } => crate::plate_solve::storage::get_plate_solve(conn, frame_id),
-        // The manifest WCS (spec §5.2); Task 10b adds the run's local solve.
-        FrameOrigin::Project { meta, .. } => Ok(meta
-            .wcs
-            .as_ref()
-            .map(|w| w.to_record(meta.pixel_scale_arcsec))),
+        // Spec §5.2: the manifest's WCS first, then the run's own cached
+        // solve of this content.
+        FrameOrigin::Project {
+            project_id,
+            blake3,
+            meta,
+            ..
+        } => match &meta.wcs {
+            Some(wcs) => Ok(Some(wcs.to_record(meta.pixel_scale_arcsec))),
+            None => Ok(match stored_outcome(conn, project_id, frame_id, blake3)? {
+                Some(SolveOutcome::Solved(record)) => Some(record),
+                _ => None,
+            }),
+        },
+    }
+}
+
+/// What the Solve sub-step needs about a frame it must solve: a project
+/// frame whose manifest carries no WCS (spec §5.2).
+pub(crate) struct SolvePlan {
+    pub(crate) project_id: String,
+    pub(crate) frame_uuid: String,
+    pub(crate) blake3: String,
+    pub(crate) meta: ProjectFrameMeta,
+}
+
+/// `Some` only for a project frame without a manifest WCS. A run never
+/// solves a catalog frame.
+pub(crate) fn solve_plan(origin: &FrameOrigin) -> Option<SolvePlan> {
+    match origin {
+        FrameOrigin::Catalog { .. } => None,
+        FrameOrigin::Project { meta, .. } if meta.wcs.is_some() => None,
+        FrameOrigin::Project {
+            project_id,
+            frame_uuid,
+            blake3,
+            meta,
+            ..
+        } => Some(SolvePlan {
+            project_id: project_id.clone(),
+            frame_uuid: frame_uuid.clone(),
+            blake3: blake3.clone(),
+            meta: meta.clone(),
+        }),
+    }
+}
+
+/// The run's cached solve outcome for a frame's current content, which the
+/// plan's "will be solved" and "could not be solved" warnings read. `None`
+/// for a catalog frame, and for a frame never solved.
+pub(crate) fn local_solve_outcome(
+    conn: &Connection,
+    origin: &FrameOrigin,
+    frame_id: i64,
+) -> anyhow::Result<Option<SolveOutcome>> {
+    match origin {
+        FrameOrigin::Catalog { .. } => Ok(None),
+        FrameOrigin::Project {
+            project_id, blake3, ..
+        } => stored_outcome(conn, project_id, frame_id, blake3),
     }
 }
 
@@ -500,5 +556,90 @@ mod tests {
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
         (!name.is_empty()).then_some(name)
+    }
+
+    /// Plan 6b-2 C14: a project frame's WCS. The manifest's comes first, then
+    /// the run's own cached solve of THIS content (a solve of other content is
+    /// never served). The test also covers which frames the Solve sub-step
+    /// takes, and the outcome the plan reads.
+    #[test]
+    fn a_project_frames_wcs_is_the_manifests_then_the_runs_own_solve() {
+        use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let dir = tempfile::tempdir().unwrap();
+        test_fixtures::add_project_frame(
+            &conn,
+            dir.path(),
+            "p1",
+            &test_fixtures::project_frame_spec("a"),
+        );
+        let mut with_wcs = test_fixtures::project_frame_spec("m");
+        with_wcs.wcs = Some(test_fixtures::manifest_wcs_json(64, 48, 10.0, 20.0, 1.5));
+        test_fixtures::add_project_frame(&conn, dir.path(), "p1", &with_wcs);
+        let source = crate::stacking::project_source::project_frame_source(
+            &conn,
+            "p1",
+            &crate::stacking::config::StackingConfig::default(),
+        )
+        .unwrap();
+        let of = |uuid: &str| -> (i64, FrameOrigin, String) {
+            source
+                .origins
+                .iter()
+                .find_map(|(id, o)| match o {
+                    FrameOrigin::Project {
+                        frame_uuid, blake3, ..
+                    } if frame_uuid == uuid => Some((*id, o.clone(), blake3.clone())),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let (a_id, a, a_blake3) = of("a");
+        let (m_id, m, _) = of("m");
+
+        assert!(stored_solve(&conn, &a, a_id).unwrap().is_none());
+        assert!(solve_plan(&a).is_some_and(|p| p.frame_uuid == "a" && p.blake3 == a_blake3));
+        assert!(local_solve_outcome(&conn, &a, a_id).unwrap().is_none());
+
+        write_outcome(
+            &conn,
+            "p1",
+            a_id,
+            &a_blake3,
+            "h",
+            SolveOutcome::Solved(FakeSolver::fixture_record()),
+        )
+        .unwrap();
+        assert_eq!(stored_solve(&conn, &a, a_id).unwrap().unwrap().crval1, 83.8);
+        assert!(matches!(
+            local_solve_outcome(&conn, &a, a_id).unwrap(),
+            Some(SolveOutcome::Solved(_))
+        ));
+
+        write_outcome(
+            &conn,
+            "p1",
+            a_id,
+            "other-content",
+            "h",
+            SolveOutcome::Solved(FakeSolver::fixture_record()),
+        )
+        .unwrap();
+        assert!(
+            stored_solve(&conn, &a, a_id).unwrap().is_none(),
+            "a solve of other content is not served"
+        );
+
+        assert_eq!(stored_solve(&conn, &m, m_id).unwrap().unwrap().crval1, 10.0);
+        assert!(solve_plan(&m).is_none());
+
+        let catalog = FrameOrigin::Catalog {
+            file_id: 1,
+            attested: false,
+        };
+        assert!(solve_plan(&catalog).is_none());
+        assert!(local_solve_outcome(&conn, &catalog, 1).unwrap().is_none());
     }
 }
