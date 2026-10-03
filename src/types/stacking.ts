@@ -192,12 +192,14 @@ debayerOsc: boolean,
  */
 format: OutputFormat, };
 
+export type ExposureMode = "seconds" | "stops" | "equivalent" | "none";
+
 export type GroupingConfig = { 
 /**
  * Clamped to a floor of [`MIN_EXPOSURE_TOLERANCE_SEC`] by
  * [`resolve_config`] — never trusted raw from a stored document.
  */
-exposureToleranceSec: number, };
+exposureToleranceSec: number, exposureMode: ExposureMode, stopsWidth: number, };
 
 export type MeasurementConfig = { weightMode: WeightMode, psfModel: PsfModel, 
 /**
@@ -292,7 +294,7 @@ export type OutputFormat = "fits" | "xisf";
 
 export type CleanupPolicy = "keepAll" | "deleteRegistered" | "deleteIntermediates";
 
-export type OutputConfig = { format: OutputFormat, cleanup: CleanupPolicy, };
+export type OutputConfig = { format: OutputFormat, cleanup: CleanupPolicy, coverageMap: boolean, cropToCoverage: number, };
 
 export type PathsConfig = { workingDir: string | null, outputDir: string | null, };
 

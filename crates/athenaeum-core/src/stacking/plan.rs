@@ -6281,7 +6281,7 @@ mod tests {
     #[test]
     fn stage_hashes_are_pinned_to_golden_literals() {
         use crate::stacking::config::{
-            calibration_subtree, preset, stage_hash, SourceIdentity, StackingPreset,
+            calibration_subtree, preset, stage_hash, ExposureMode, SourceIdentity, StackingPreset,
         };
         let mut custom = StackingConfig::default();
         custom.grouping.exposure_tolerance_sec = 5.0;
@@ -6308,8 +6308,7 @@ mod tests {
             frame_ids: vec![11, 22],
             k: vec![0.994],
         };
-        let mut got = Vec::new();
-        for (name, cfg) in &configs {
+        let line = |name: &str, cfg: &StackingConfig| {
             let calib = stage_hash(&calibration_subtree(cfg), &masters, &src());
             let meas = measurement_hash_for(cfg, &calib);
             let reg = registration_hash_for(cfg, 7, "ref-calib", &calib, &meas);
@@ -6330,10 +6329,9 @@ mod tests {
                 &[(11, "r1", "m1"), (22, "r2", "m2")],
                 Some(1.5),
             );
-            got.push(format!(
-                "{name}: calib={calib} meas={meas} reg={reg} ln_ref={ln_ref} ln={ln} ln_cal={ln_cal}"
-            ));
-        }
+            format!("{name}: calib={calib} meas={meas} reg={reg} ln_ref={ln_ref} ln={ln} ln_cal={ln_cal}")
+        };
+        let got: Vec<String> = configs.iter().map(|(name, cfg)| line(name, cfg)).collect();
         // GOLDEN: recorded on main 17e2e96e before the Task 1 edit.
         assert_eq!(
             got,
@@ -6344,6 +6342,20 @@ mod tests {
                 "custom: calib=2b725e5e99c87f49 meas=ba5d1831b34dccf8 reg=ed7dc06cf6f32c9b ln_ref=75c6f0835d9d9cab ln=3d958bff2ee0136e ln_cal=60a1d2b69a0b80f9",
             ]
         );
+        // Plan 6b-2 C2: the four wave-6 fields at non-default values move no
+        // stage hash — an existing frame set keeps every cache.
+        let with_wave6_fields: Vec<String> = configs
+            .iter()
+            .map(|(name, cfg)| {
+                let mut cfg = cfg.clone();
+                cfg.grouping.exposure_mode = ExposureMode::Stops;
+                cfg.grouping.stops_width = 2.0;
+                cfg.output.coverage_map = true;
+                cfg.output.crop_to_coverage = 3;
+                line(name, &cfg)
+            })
+            .collect();
+        assert_eq!(with_wave6_fields, got);
         assert_eq!(
             serde_json::to_string(&calibration_subtree(&StackingConfig::default())["grouping"])
                 .unwrap(),

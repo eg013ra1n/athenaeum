@@ -733,6 +733,7 @@ mod tests {
     fn exposure_outside_the_tolerance_splits() {
         let cfg = GroupingConfig {
             exposure_tolerance_sec: 2.0,
+            ..GroupingConfig::default()
         };
 
         let apart = test_fixtures::frame_set("s");
@@ -958,10 +959,7 @@ mod tests {
             header_pixel_scale_arcsec(Some(f64::NEG_INFINITY), Some(1000.0)),
             None
         );
-        assert_eq!(
-            header_pixel_scale_arcsec(Some(3.76), Some(f64::NAN)),
-            None
-        );
+        assert_eq!(header_pixel_scale_arcsec(Some(3.76), Some(f64::NAN)), None);
         assert_eq!(
             header_pixel_scale_arcsec(Some(3.76), Some(f64::INFINITY)),
             None

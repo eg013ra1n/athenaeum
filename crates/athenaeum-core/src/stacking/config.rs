@@ -16,9 +16,9 @@ use crate::resample::Interpolation;
 use crate::stacking::integrate::RejectionChoice;
 use crate::stacking::measure::MeasureOptions;
 use crate::stacking::prefilter::SeedPrefilter;
-use crate::stacking::structure::SeedDetector;
 use crate::stacking::psf_signal::{PsfModel, PSF_FIT_VERSION};
 use crate::stacking::register::DistortionChoice;
+use crate::stacking::structure::SeedDetector;
 use crate::stacking::weights::{FormulaWeights, WeightMode};
 
 /// Bumped only when the `StackingConfig` shape changes in a way an old
@@ -89,6 +89,31 @@ pub const MAX_DETECTION_SIGMA: f64 = 100.0;
 pub const MIN_TPS_SMOOTHING: f64 = 0.0;
 pub const MAX_TPS_SMOOTHING: f64 = 10.0;
 
+/// spec 2026-10-02 §8 (plan 6b-2 C2/C3): how a group's exposure classes
+/// are formed. `seconds` is today's tolerance clustering — the frame-set
+/// default, so an existing stack regroups nothing; `stops` takes every
+/// exposure within `stopsWidth` stops of the class's shortest; `equivalent`
+/// does the same on `t / N²` (`N = FOCALLEN / APTDIA`); `none` puts every
+/// exposure of a colour × filter into one class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ExposureMode {
+    #[default]
+    Seconds,
+    Stops,
+    Equivalent,
+    // `none` on the wire; `NoSplit` in Rust so it never reads as `Option::None`.
+    #[serde(rename = "none")]
+    NoSplit,
+}
+
+/// The floor `resolve_config` clamps [`GroupingConfig::stops_width`] to
+/// (plan 6b-2 C2). Below it two `stops`/`equivalent` class anchors could sit
+/// so close that their tokens print the same (`groups::class_token_num` is
+/// collision-safe only for anchors more than `2^MIN_STOPS_WIDTH` apart), and
+/// a non-positive width would make a class exclude its own anchor.
+pub const MIN_STOPS_WIDTH: f64 = 0.1;
+
 /// spec §9.2 `grouping:` (owner decision 2026-09-10: groups are
 /// camera-agnostic — colour mode, filter, binning and exposure form the
 /// key; exposure ALWAYS splits a group now, so there is no toggle for it
@@ -103,12 +128,20 @@ pub struct GroupingConfig {
     /// Clamped to a floor of [`MIN_EXPOSURE_TOLERANCE_SEC`] by
     /// [`resolve_config`] — never trusted raw from a stored document.
     pub exposure_tolerance_sec: f64,
+    // How exposure classes are formed (spec 2026-10-02 §8). Enters no stage
+    // hash: `calibration_subtree` writes only `exposureToleranceSec`.
+    pub exposure_mode: ExposureMode,
+    // The class width of `stops` / `equivalent`, in stops. Clamped to
+    // `MIN_STOPS_WIDTH` by `resolve_config`.
+    pub stops_width: f64,
 }
 
 impl Default for GroupingConfig {
     fn default() -> Self {
         GroupingConfig {
             exposure_tolerance_sec: 2.0,
+            exposure_mode: ExposureMode::Seconds,
+            stops_width: 1.0,
         }
     }
 }
@@ -312,6 +345,12 @@ pub enum DrizzleKernel {
 pub struct OutputConfig {
     pub format: OutputFormat,
     pub cleanup: CleanupPolicy,
+    // Write the per-pixel frame count beside each master (spec §5.7): off for
+    // a frame set, seeded on for a project. Enters no stage hash.
+    pub coverage_map: bool,
+    // Crop every output to the rectangle at least this many frames cover
+    // (spec §5.9); 0 = no crop. Enters no stage hash.
+    pub crop_to_coverage: u32,
 }
 
 /// The container the master, the drizzled master and the drizzle weight map
@@ -435,6 +474,14 @@ pub fn resolve_config(
             "stacking config: exposureToleranceSec below the minimum; clamped"
         );
         config.grouping.exposure_tolerance_sec = MIN_EXPOSURE_TOLERANCE_SEC;
+    }
+    if !(config.grouping.stops_width >= MIN_STOPS_WIDTH) {
+        warn!(
+            value = config.grouping.stops_width,
+            min = MIN_STOPS_WIDTH,
+            "stacking config: stopsWidth below the minimum; clamped"
+        );
+        config.grouping.stops_width = MIN_STOPS_WIDTH;
     }
     config.measurement.detection_sigma = clamp_detection_sigma(config.measurement.detection_sigma);
     config.registration.tps_smoothing = clamp_tps_smoothing(config.registration.tps_smoothing);
@@ -658,8 +705,8 @@ pub fn calibration_subtree(cfg: &StackingConfig) -> serde_json::Value {
     // the field can never change a cached calibrated artifact and must not
     // move this hash — otherwise every set would recalibrate once for a
     // field it ignores. Pinned by `format_moves_the_run_fingerprint_but_no_stage_hash`.
-    let mut calibration = serde_json::to_value(&cfg.calibration)
-        .expect("CalibratedLightOptions serializes");
+    let mut calibration =
+        serde_json::to_value(&cfg.calibration).expect("CalibratedLightOptions serializes");
     if let Some(obj) = calibration.as_object_mut() {
         obj.remove("format");
     }
@@ -766,6 +813,49 @@ fn normalization_subtree_with_fit_version(
 
 #[cfg(test)]
 mod tests {
+
+    /// Plan 6b-2 C2: the four modes' wire names are the spec's.
+    #[test]
+    fn exposure_modes_use_the_spec_names() {
+        for (mode, name) in [
+            (ExposureMode::Seconds, "\"seconds\""),
+            (ExposureMode::Stops, "\"stops\""),
+            (ExposureMode::Equivalent, "\"equivalent\""),
+            (ExposureMode::NoSplit, "\"none\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), name);
+            assert_eq!(serde_json::from_str::<ExposureMode>(name).unwrap(), mode);
+        }
+    }
+
+    /// Plan 6b-2 C2: a document written before the fields existed decodes to
+    /// their defaults — a frame set's stored config regroups nothing.
+    #[test]
+    fn a_document_without_the_wave6_fields_decodes_to_their_defaults() {
+        let cfg = resolve_config(
+            Some(r#"{"grouping":{"exposureToleranceSec":3.0},"output":{"format":"fits"}}"#),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.grouping.exposure_tolerance_sec, 3.0);
+        assert_eq!(cfg.grouping.exposure_mode, ExposureMode::Seconds);
+        assert_eq!(cfg.grouping.stops_width, 1.0);
+        assert!(!cfg.output.coverage_map);
+        assert_eq!(cfg.output.crop_to_coverage, 0);
+    }
+
+    /// Plan 6b-2 C2/C3: `stopsWidth` at or below zero would make a class
+    /// exclude its own anchor; it is clamped to `MIN_STOPS_WIDTH`.
+    #[test]
+    fn stops_width_is_clamped_to_its_floor() {
+        for raw in ["0", "-1", "0.05"] {
+            let json = format!(r#"{{"grouping":{{"stopsWidth":{raw}}}}}"#);
+            let cfg = resolve_config(Some(&json), None).unwrap();
+            assert_eq!(cfg.grouping.stops_width, MIN_STOPS_WIDTH, "{raw}");
+        }
+        let cfg = resolve_config(Some(r#"{"grouping":{"stopsWidth":2.0}}"#), None).unwrap();
+        assert_eq!(cfg.grouping.stops_width, 2.0);
+    }
     use super::*;
 
     #[test]
@@ -879,8 +969,7 @@ mod tests {
         for other in [
             {
                 let mut c = cfg.clone();
-                c.registration.distortion =
-                    crate::stacking::register::DistortionChoice::Tps;
+                c.registration.distortion = crate::stacking::register::DistortionChoice::Tps;
                 c
             },
             {
@@ -989,7 +1078,9 @@ mod tests {
             "calibration.format must not invalidate a calibrated frame"
         );
         assert!(
-            calibration_subtree(&cfg)["calibration"].get("format").is_none(),
+            calibration_subtree(&cfg)["calibration"]
+                .get("format")
+                .is_none(),
             "the subtree must not carry the field at all"
         );
     }
@@ -1003,6 +1094,10 @@ mod tests {
         );
         for needle in [
             "\"exposureToleranceSec\":2.0",
+            "\"exposureMode\":\"seconds\"",
+            "\"stopsWidth\":1.0",
+            "\"coverageMap\":false",
+            "\"cropToCoverage\":0",
             "\"weightMode\":\"psfSignalWeight\"",
             "\"detectionSigma\":20.0",
             "\"seedPrefilter\":\"none\"",
@@ -1234,7 +1329,10 @@ mod tests {
             "the measurement stage hash must follow seedDetector"
         );
         assert_eq!(
-            structure.measurement.measure_options(ScaleEstimator::Bwmv).seed_detector,
+            structure
+                .measurement
+                .measure_options(ScaleEstimator::Bwmv)
+                .seed_detector,
             SeedDetector::Structure,
             "and the resolved measure options carry it"
         );
@@ -1288,7 +1386,12 @@ mod tests {
     /// its own width on the way).
     #[test]
     fn the_large_scale_integers_are_clamped_to_their_ranges() {
-        let large = |doc: &str| resolve_config(Some(doc), None).unwrap().integration.large_scale;
+        let large = |doc: &str| {
+            resolve_config(Some(doc), None)
+                .unwrap()
+                .integration
+                .large_scale
+        };
         assert_eq!(
             large("{\"integration\":{\"largeScale\":{\"protectedLayers\":0}}}").protected_layers,
             MIN_PROTECTED_LAYERS
@@ -1355,7 +1458,10 @@ mod tests {
         // The shipped default (ruling R-T7-1) is inside the range and must
         // not move without a deliberate re-measurement.
         assert_eq!(
-            resolve_config(None, None).unwrap().registration.tps_smoothing,
+            resolve_config(None, None)
+                .unwrap()
+                .registration
+                .tps_smoothing,
             0.5
         );
     }
@@ -1578,7 +1684,15 @@ mod tests {
         // fingerprint is what says so. The one non-artifact consequence,
         // the plan gate's LN-exclusion memory emptying for one plan, is
         // written out on `DRIZZLE_KERNEL_VERSION`'s own doc.
-        assert_eq!(default_hash, "b3240460a4cec0de");
+        // And here (collab v3 wave 6b-2 Task 2, plan ruling C2):
+        // `grouping.exposureMode`/`stopsWidth` and `output.coverageMap`/
+        // `cropToCoverage` join the config, all `#[serde(default)]` with no
+        // version bump. No stage subtree folds them in —
+        // `stage_hashes_are_pinned_to_golden_literals` proves it with every
+        // field at a non-default value — so not one cached artifact goes
+        // stale; only this whole-config fingerprint moves (and, once, the
+        // plan gate's LN-exclusion memory, see `DRIZZLE_KERNEL_VERSION`).
+        assert_eq!(default_hash, "36fe3e28e9191643");
     }
 
     /// Tier C item C2 (ruling C-3): the drizzle kernel generation is part
