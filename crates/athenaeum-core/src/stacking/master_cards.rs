@@ -556,6 +556,41 @@ pub struct WrittenMaster {
     pub master: PathBuf,
     pub rejection_low: Option<PathBuf>,
     pub rejection_high: Option<PathBuf>,
+    /// The coverage map beside the master (plan 6b-3 D9); `None` unless the
+    /// group's output carried one.
+    pub coverage: Option<PathBuf>,
+}
+
+/// Header cards for a coverage map (spec §5.7, plan 6b-3 D9): `IMAGETYP =
+/// 'Coverage Map'`, `ATH_STK`/`ATH_STKV` (the scanner's skip marker),
+/// `BUNIT = 'frames'`, the master's own WCS block (the map IS the master's
+/// grid, pixel for pixel), and the trace cards a reader needs without the
+/// master: `ROWORDER`, `ATH_STKI`, `ATH_STKG`, `ATH_RGEO`, `ATH_GRID`,
+/// `ATH_SPRJ`, each only when the master carries it (a frame-set master
+/// may carry no `ROWORDER`: the orientation default, `orientation.rs`).
+/// Never `FILTER` and never `ATH_PRJ`. The cards are copied as they stand,
+/// so the master's own comment-length rule for caller text carries over.
+pub fn coverage_map_cards(master_cards: &[Card]) -> Result<Vec<Card>, FitsWriteError> {
+    let mut cards = vec![
+        Card::new("IMAGETYP", CardValue::Str("Coverage Map".into()))?,
+        Card::new("ATH_STK", CardValue::Logical(true))?
+            .with_comment("stacked by Athenaeum; never cataloged"),
+        Card::new("ATH_STKV", CardValue::Integer(ATH_STK_VERSION))?
+            .with_comment("stacking header version"),
+        Card::new("BUNIT", CardValue::Str("frames".into()))?
+            .with_comment("frames with a sample here"),
+    ];
+    for c in master_cards.iter().filter(|c| is_wcs_keyword(&c.keyword)) {
+        cards.push(c.clone());
+    }
+    for kw in [
+        "ROWORDER", "ATH_STKI", "ATH_STKG", ATH_RGEO, ATH_GRID, ATH_SPRJ,
+    ] {
+        if let Some(c) = master_cards.iter().find(|c| c.keyword == kw) {
+            cards.push(c.clone());
+        }
+    }
+    Ok(cards)
 }
 
 /// Header cards for one rejection map: `IMAGETYP` `Rejection Map Low`/`High`
@@ -810,10 +845,25 @@ pub fn write_master_light(
         .map(|data| write_map("rejhigh", "High", data))
         .transpose()?;
 
+    // Plan 6b-3 D9 (spec §5.7): the coverage map — always FITS, one plane,
+    // the master's WCS — named from the master's resolved stem.
+    let coverage = output
+        .coverage
+        .as_deref()
+        .map(|data| -> anyhow::Result<PathBuf> {
+            let path = resolve_collision(&dir.join(format!("{stem}_coverage.fits")));
+            let map_cards = coverage_map_cards(cards)?;
+            write_fits_f32(&path, output.width, output.height, 1, data, &map_cards)
+                .with_context(|| format!("writing {}", path.display()))?;
+            Ok(path)
+        })
+        .transpose()?;
+
     Ok(WrittenMaster {
         master: master_path,
         rejection_low,
         rejection_high,
+        coverage,
     })
 }
 
@@ -1940,5 +1990,40 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// Spec §5.7, plan 6b-3 D9: the coverage map counts frames, carries the
+    /// master's WCS and its trace cards (grid ones included), and never a
+    /// card that would make it read as a light (`FILTER`) or a replica
+    /// (`ATH_PRJ`).
+    #[test]
+    fn the_coverage_map_carries_the_masters_wcs_and_counts_frames() {
+        let master = vec![
+            Card::new("FILTER", CardValue::Str("L".into())).unwrap(),
+            Card::new("ROWORDER", CardValue::Str("BOTTOM-UP".into())).unwrap(),
+            Card::new("CRVAL1", CardValue::Real(10.0)).unwrap(),
+            Card::new("CD1_1", CardValue::Real(-1e-4)).unwrap(),
+            Card::new("ATH_STKI", CardValue::Str("7".into())).unwrap(),
+            Card::new("ATH_STKG", CardValue::Str("mono__L__st300".into())).unwrap(),
+            Card::new(ATH_RGEO, CardValue::Str(RGEO_GRID.into())).unwrap(),
+            Card::new(ATH_GRID, CardValue::Str("0123456789abcdef".into())).unwrap(),
+            Card::new(ATH_SPRJ, CardValue::Str("p1".into())).unwrap(),
+        ];
+        let cards = coverage_map_cards(&master).unwrap();
+        let get = |k: &str| {
+            cards
+                .iter()
+                .find(|c| c.keyword == k)
+                .and_then(|c| c.value.clone())
+        };
+        assert_eq!(get("IMAGETYP"), Some(CardValue::Str("Coverage Map".into())));
+        assert_eq!(get("BUNIT"), Some(CardValue::Str("frames".into())));
+        assert_eq!(get("ATH_STK"), Some(CardValue::Logical(true)));
+        assert_eq!(get("CRVAL1"), Some(CardValue::Real(10.0)));
+        assert_eq!(get("CD1_1"), Some(CardValue::Real(-1e-4)));
+        for k in ["ROWORDER", "ATH_STKI", "ATH_STKG", ATH_RGEO, ATH_GRID, ATH_SPRJ] {
+            assert!(get(k).is_some(), "{k} is copied");
+        }
+        assert!(get("FILTER").is_none() && get("ATH_PRJ").is_none());
     }
 }

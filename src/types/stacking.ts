@@ -496,7 +496,7 @@ drizzlePath: string | null,
  * `DrizzleConfig::write_weight_map` was on for this run — `None`
  * whenever `drizzle_path` is `None` too, or the toggle was off.
  */
-weightMapPath: string | null, 
+weightMapPath: string | null, coveragePath: string | null, 
 /**
  * The drizzle stage's own per-group stats, `Some` exactly when
  * `drizzle_path` is.
@@ -661,5 +661,5 @@ fwhmPx: Array<number>, eccentricity: Array<number>, noise: Array<number>,
  */
 coverage: Array<number>, readMs: number, depositMs: number, bytesRead: number, };
 
-export type MasterLightKind = "master" | "drizzle" | "weightMap";
+export type MasterLightKind = "master" | "drizzle" | "weightMap" | "coverage";
 

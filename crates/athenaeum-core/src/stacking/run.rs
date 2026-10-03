@@ -7560,6 +7560,7 @@ fn push_summary_group(
     drizzle_path: Option<String>,
     weight_map_path: Option<String>,
     drizzle: Option<DrizzleStats>,
+    coverage_path: Option<String>,
 ) {
     let frames = rc
         .measured
@@ -7623,6 +7624,7 @@ fn push_summary_group(
         ln_reference_path,
         drizzle_path,
         weight_map_path,
+        coverage_path,
         drizzle,
         beta,
         seeds_calibration,
@@ -7667,6 +7669,7 @@ fn skip_group(
         None,
         None,
         &HashMap::new(),
+        None,
         None,
         None,
         None,
@@ -7721,6 +7724,7 @@ fn fail_group(
         None,
         None,
         &HashMap::new(),
+        None,
         None,
         None,
         None,
@@ -8469,6 +8473,7 @@ fn process_group_output(
         rej: None,
         second_pass_bitmaps: false,
         coverage_map: false,
+        stats_on_covered: false,
     };
 
     let paths: Vec<PathBuf> = members.iter().map(|m| m.calibrated.clone()).collect();
@@ -8748,7 +8753,8 @@ fn process_group_output(
         // standalone large-scale run writes two sets per frame instead of
         // three and nothing downstream misses the third.
         second_pass_bitmaps: bitmaps_for_drizzle,
-        coverage_map: false,
+        coverage_map: rc.config.output.coverage_map,
+        stats_on_covered: rc.grid.is_some(),
     };
 
     // Progress plumbing: `on_plane`/`on_band`/`on_combine` are `Sync`
@@ -9183,6 +9189,7 @@ fn process_group_output(
         .rejection_high
         .as_ref()
         .map(|p| p.display().to_string());
+    let coverage_path_str = written.coverage.as_ref().map(|p| p.display().to_string());
 
     // M4d Task 3 (ruling R-M4d-4): the `master_lights` row's own facts.
     // `frames` is the group's included count — the SAME number the group row
@@ -9237,6 +9244,26 @@ fn process_group_output(
                 total_exposure_s,
             },
         )?;
+        // Plan 6b-3 D9: the coverage map's own row, in the same transaction
+        // block as the master's.
+        if let Some(coverage) = coverage_path_str.as_deref() {
+            insert_master_light(
+                &conn,
+                &NewMasterLight {
+                    subject: &rc.subject,
+                    run_id: rc.run_id,
+                    group_key: &group.key,
+                    kind: MasterLightKind::Coverage.as_db_str(),
+                    path: coverage,
+                    format: "fits",
+                    width: width as i64,
+                    height: height as i64,
+                    channels: 1,
+                    frames: output.stats.included as i64,
+                    total_exposure_s,
+                },
+            )?;
+        }
 
         for (k, &idx) in output.included.iter().enumerate() {
             if let Some(frac) = output.stats.rejected_fraction_per_frame.get(k).copied() {
@@ -9773,6 +9800,7 @@ fn process_group_output(
         drizzle_path,
         weight_map_path,
         drizzle_stats,
+        coverage_path_str,
     );
 
     // B2 (M3 final fix wave, I2): `output_start` was taken BEFORE the
@@ -19977,6 +20005,180 @@ mod tests {
         }
     }
 
+    /// Spec §5.7, plan 6b-3 D9: the coverage map is a side output — a frame
+    /// set's master is bit-identical with it on and off — written as
+    /// `<stem>_coverage.fits` (one plane, `BUNIT = 'frames'`) whose counts are
+    /// the shift geometry, with its own `master_lights` row and summary path.
+    #[test]
+    fn a_frame_sets_master_is_bit_identical_with_the_coverage_map_on_and_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
+        let run_with = |cfg: Option<StackingConfig>| -> (i64, String) {
+            let started = start_stacking(
+                ctx.clone(),
+                Arc::new(NullEmitter),
+                &PathPolicy::AllowAll,
+                "test".to_string(),
+                StackSubject::FrameSet(fixture.set_id),
+                cfg,
+                None,
+            )
+            .expect("the run starts");
+            wait_for_run(&ctx, started.run_id);
+            let row = crate::db::stacking::get_run(&fixture.conn, started.run_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, "done", "{row:?}");
+            let groups = crate::db::stacking::list_groups(&fixture.conn, started.run_id).unwrap();
+            (
+                started.run_id,
+                groups[0].master_path.clone().expect("a master"),
+            )
+        };
+        let (off_run, master_off) = run_with(None);
+        let mut cfg_on = StackingConfig::default();
+        cfg_on.output.coverage_map = true;
+        let (on_run, master_on) = run_with(Some(cfg_on));
+
+        let (reader_off, reader_on) = (
+            PlaneReader::open(Path::new(&master_off)).unwrap(),
+            PlaneReader::open(Path::new(&master_on)).unwrap(),
+        );
+        for p in 0..reader_off.channels() {
+            let (a, b) = (
+                reader_off.read_plane(p).unwrap(),
+                reader_on.read_plane(p).unwrap(),
+            );
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "plane {p} pixel {i}");
+            }
+        }
+        assert!(
+            crate::db::stacking::list_master_lights(&fixture.conn, off_run)
+                .unwrap()
+                .iter()
+                .all(|m| m.kind != "coverage"),
+            "no map when it is off"
+        );
+        let lights = crate::db::stacking::list_master_lights(&fixture.conn, on_run).unwrap();
+        let row = lights
+            .iter()
+            .find(|m| m.kind == "coverage")
+            .expect("a coverage row");
+        assert_eq!((row.channels, row.format.as_str()), (1, "fits"));
+        let path = PathBuf::from(&row.path);
+        assert!(
+            path.to_str().unwrap().ends_with("_coverage.fits"),
+            "{}",
+            row.path
+        );
+        let header = crate::fits_parser::FitsHeader::from_path(&path).unwrap();
+        assert_eq!(header.get_str("BUNIT").as_deref(), Some("frames"));
+        let reader = PlaneReader::open(&path).unwrap();
+        assert_eq!(reader.channels(), 1);
+        let (w, h) = (reader.width(), reader.height());
+        let cov = reader.read_plane(0).unwrap();
+        assert_eq!(cov[(h / 2) * w + w / 2], 4.0, "every frame covers the centre");
+        assert!(cov[0] < 4.0, "the shifted frames leave the corner");
+        let run_row = crate::db::stacking::get_run(&fixture.conn, on_run)
+            .unwrap()
+            .unwrap();
+        let summary: RunSummary =
+            serde_json::from_str(run_row.summary_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            summary.groups[0].coverage_path.as_deref(),
+            Some(row.path.as_str())
+        );
+    }
+
+    /// Plan 6b-3 D4 refinement (review I1): a grid master's statistics are
+    /// measured over covered pixels only, coverage map or not. On a grid
+    /// three times the frames' area, three quarters of the plane are the
+    /// uncovered 0.0; the master's location still reads the frames' sky
+    /// level and its noise about theirs over √4 (resampling lowers it
+    /// further), and with `coverageMap` off no map is written although
+    /// the count was taken.
+    #[test]
+    fn a_grid_masters_statistics_ignore_uncovered_pixels() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+        let wide = crate::collab::grid::CanonicalGrid {
+            width_px: 768,
+            height_px: 576,
+            ..grid
+        };
+        let mut cfg = sky_config(&conn);
+        cfg.output.coverage_map = false;
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(wide)));
+        run_pipeline(&mut rc).unwrap();
+
+        let group = &rc.summary.groups[0];
+        let stats = group.stats.as_ref().expect("the group's stats");
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let frames: Vec<&crate::stacking::measure::ChannelMeasurement> = rc.measured[&group.key]
+            .iter()
+            .filter(|e| e.included)
+            .filter_map(|e| e.measurement.as_ref())
+            .map(|m| &m.channels[0])
+            .collect();
+        let frame_location = median(frames.iter().map(|c| c.location).collect());
+        let frame_noise = median(frames.iter().map(|c| c.noise).collect());
+        assert!(
+            (stats.master_location[0] - frame_location).abs() < 0.1 * frame_location.abs(),
+            "master location {} vs the frames' {frame_location}",
+            stats.master_location[0]
+        );
+        let ratio = stats.master_noise[0] / frame_noise;
+        // √4 would give 0.5; the sub-pixel resampling onto the grid smooths
+        // the noise further (measured 0.18). Whole-plane statistics would
+        // read the uncovered 0.0 and fail the location check above.
+        assert!(
+            (0.1..0.8).contains(&ratio),
+            "master noise / frame noise = {ratio}"
+        );
+        assert!(
+            crate::db::stacking::list_master_lights(&conn, rc.run_id)
+                .unwrap()
+                .iter()
+                .all(|m| m.kind != "coverage"),
+            "the count taken for the statistics writes no map"
+        );
+    }
+
     /// Brief test (e): a cancel raised during the drizzle stage (via a
     /// `stacking-progress` listener flipping the run's cancel flag on the
     /// first `stage == "drizzle"` event, same mechanism
@@ -24864,11 +25066,13 @@ mod tests {
             );
             fits.push(p.to_path_buf());
         }
-        // 4 registered frames, the master, the drizzled master, its weight map.
-        assert_eq!(fits.len(), 7, "{fits:?}");
+        // 4 registered frames, the master, its coverage map (the project seed
+        // turns `coverageMap` on), the drizzled master, its weight map.
+        assert_eq!(fits.len(), 8, "{fits:?}");
         let out = tmp.path().join("out").join("p1");
         for name in [
             "p1_Lum_mono_300s_4x.fits",
+            "p1_Lum_mono_300s_4x_coverage.fits",
             "p1_Lum_mono_300s_4x_drizzle2x.fits",
             "p1_Lum_mono_300s_4x_drizzle2x_weight.fits",
         ] {

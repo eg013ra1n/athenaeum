@@ -898,6 +898,8 @@ pub enum MasterLightKind {
     Master,
     Drizzle,
     WeightMap,
+    // The per-pixel coverage map beside a master (plan 6b-3 D9, spec §5.7).
+    Coverage,
 }
 
 impl MasterLightKind {
@@ -907,6 +909,7 @@ impl MasterLightKind {
             MasterLightKind::Master => "master",
             MasterLightKind::Drizzle => "drizzle",
             MasterLightKind::WeightMap => "weight_map",
+            MasterLightKind::Coverage => "coverage",
         }
     }
 
@@ -917,6 +920,7 @@ impl MasterLightKind {
             "master" => Some(MasterLightKind::Master),
             "drizzle" => Some(MasterLightKind::Drizzle),
             "weight_map" => Some(MasterLightKind::WeightMap),
+            "coverage" => Some(MasterLightKind::Coverage),
             _ => None,
         }
     }
@@ -1838,12 +1842,14 @@ mod tests {
             MasterLightKind::Master,
             MasterLightKind::Drizzle,
             MasterLightKind::WeightMap,
+            MasterLightKind::Coverage,
         ] {
             assert_eq!(MasterLightKind::from_db_str(kind.as_db_str()), Some(kind));
         }
         assert_eq!(MasterLightKind::Master.as_db_str(), "master");
         assert_eq!(MasterLightKind::Drizzle.as_db_str(), "drizzle");
         assert_eq!(MasterLightKind::WeightMap.as_db_str(), "weight_map");
+        assert_eq!(MasterLightKind::Coverage.as_db_str(), "coverage");
         assert_eq!(MasterLightKind::from_db_str("nope"), None);
 
         // The wire form is camelCase and is NOT the column's spelling.

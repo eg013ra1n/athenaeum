@@ -184,6 +184,11 @@ pub struct SummaryGroup {
     /// whenever `drizzle_path` is `None` too, or the toggle was off.
     #[serde(default)]
     pub weight_map_path: Option<String>,
+    // The group's coverage map beside its master (spec §5.7, plan 6b-3 D9);
+    // `None` when `output.coverageMap` is off and on a summary written before
+    // 6b-3.
+    #[serde(default)]
+    pub coverage_path: Option<String>,
     /// The drizzle stage's own per-group stats, `Some` exactly when
     /// `drizzle_path` is.
     #[serde(default)]

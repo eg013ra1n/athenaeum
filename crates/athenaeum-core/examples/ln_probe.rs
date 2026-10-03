@@ -511,6 +511,7 @@ registration row for each — run stacking through Register first); found {}",
         rej: None,
         second_pass_bitmaps: false,
         coverage_map: false,
+        stats_on_covered: false,
     };
 
     let n = (args.frames as usize).min(stack_frames.len());

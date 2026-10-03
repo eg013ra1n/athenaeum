@@ -448,6 +448,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -502,6 +503,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -554,6 +556,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -716,6 +719,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);

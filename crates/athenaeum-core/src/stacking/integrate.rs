@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::geometry::PixelMap;
 use crate::integration::combine::{Combination, IntegrationRecipe, Rejection};
@@ -369,6 +369,12 @@ pub struct GroupInput<'a> {
     /// [`GroupOutput::coverage`] — the coverage map, and the crop's
     /// rectangle. `false` for every caller that wants neither.
     pub coverage_map: bool,
+    /// Plan 6b-3 D4 refinement (review I1): measure the master's statistics
+    /// (`master_location`, `_scale`, `_noise`, `_psf_snr`, `snr_gain`, FWHM,
+    /// eccentricity) on covered pixels only — a grid master's uncovered
+    /// pixels are 0.0 and would read as data. Implies the plane-0 count.
+    /// `false` for a frame set, whose statistics never move.
+    pub stats_on_covered: bool,
 }
 
 // `Clone, Serialize, Deserialize, ts_rs::TS` pulled forward from Task 9's own
@@ -1121,7 +1127,7 @@ pub fn integrate_group(
         recipe,
         input.integration.write_rejection_maps,
         CoverageOptions {
-            count: input.coverage_map,
+            count: input.coverage_map || input.stats_on_covered,
             empty_as_nan: false,
         },
         pool,
@@ -1230,7 +1236,7 @@ pub fn integrate_group(
                         recipe,
                         input.integration.write_rejection_maps,
                         CoverageOptions {
-                            count: input.coverage_map,
+                            count: input.coverage_map || input.stats_on_covered,
                             empty_as_nan: false,
                         },
                         pool,
@@ -1275,6 +1281,7 @@ pub fn integrate_group(
     bytes_read_total += pass_one_cost.2;
 
     let mut coverage: Option<Vec<f32>> = None;
+    let mut measure_rect: Option<crate::stacking::crop::CropRect> = None;
     for (p, mut out) in outputs.into_iter().enumerate() {
         if p == 0 {
             coverage = out.coverage.take();
@@ -1334,9 +1341,42 @@ pub fn integrate_group(
         // `&rayon::ThreadPool` can't supply — run it inside `pool.install`
         // instead so its own parallel work still lands on the caller's
         // pool, and pass `None` for the explicit handle.
+        // Plan 6b-3 D4 refinement (review I1): on a grid the statistics come
+        // from the largest rectangle every pixel of which at least one frame
+        // covers (plane 0's count; the planes share the footprint). No such
+        // rectangle (no covered pixel, or a count of the wrong length) fails
+        // the group: whole-plane statistics would read the uncovered 0.0 as
+        // data.
+        if p == 0 && input.stats_on_covered {
+            measure_rect = coverage.as_deref().and_then(|c| {
+                crate::stacking::crop::largest_covered_rect(c, input.width, input.height, 1)
+            });
+            match measure_rect {
+                Some(r) => debug!(
+                    crop_x0 = r.x0,
+                    crop_y0 = r.y0,
+                    crop_width = r.width,
+                    crop_height = r.height,
+                    "master statistics on the covered rectangle"
+                ),
+                None => {
+                    error!("no covered rectangle for the master statistics");
+                    return Err(IntegrationError::BadInput(
+                        "no covered pixel to measure the grid master's statistics on".to_string(),
+                    ));
+                }
+            }
+        }
         let plane_data = &out.base.data;
-        let cm =
-            pool.install(|| measure_plane(plane_data, input.width, input.height, measure, None));
+        let cm = match measure_rect {
+            Some(r) if !r.is_full(input.width, input.height) => {
+                let sub = crate::stacking::crop::crop_plane(plane_data, input.width, r);
+                pool.install(|| measure_plane(&sub, r.width, r.height, measure, None))
+            }
+            _ => {
+                pool.install(|| measure_plane(plane_data, input.width, input.height, measure, None))
+            }
+        };
         master_noise.push(cm.noise);
         master_location.push(cm.location);
         master_scale.push(cm.scale);
@@ -1438,7 +1478,8 @@ pub fn integrate_group(
         included,
         output_pairs,
         second_pass_rej_ok,
-        coverage,
+        // The count taken only for the statistics is never a coverage map.
+        coverage: if input.coverage_map { coverage } else { None },
         stats: GroupStats {
             frames: frames.len(),
             included: included_count,
@@ -1818,6 +1859,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -1893,6 +1935,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         // Frame 1's grid is built for a 10x10 reference geometry — the
         // group above declares 20x20.
@@ -2021,6 +2064,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         let out = integrate_group(
             &input,
@@ -2177,6 +2221,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -2299,6 +2344,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map,
+            stats_on_covered: false,
         };
         let on_plane = nop_plane();
         let on_band = nop_band();
@@ -2397,6 +2443,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         let pool = pool();
         let planes_seen = std::sync::Mutex::new(Vec::new());
@@ -2511,6 +2558,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
 
         // The engine's own raw rejected count, from a bitmap-less
@@ -2657,6 +2705,7 @@ mod tests {
             rej: Some(&set),
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -2836,6 +2885,7 @@ mod tests {
             rej: None,
             second_pass_bitmaps: false,
             coverage_map: false,
+            stats_on_covered: false,
         };
 
         let off = integrate_group(
