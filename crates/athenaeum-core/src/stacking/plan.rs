@@ -1955,8 +1955,8 @@ fn project_inputs(
     use crate::db::collab_frames::NotStackable;
     use crate::stacking::prepare::{prepare_action, prepared_bytes, probe_file, PrepareAction};
 
-    // A project this device lost (left, removed) fails readably here, before
-    // the config seed could hit the foreign key.
+    // A project this device left fails readably here, before the config
+    // seed: no stray seed row is written for a project this device left.
     let project = crate::api::collab_exchange::live_project(conn, project_id)?;
     let (cfg, excluded_uuids) =
         resolve_project_config_and_exclusions(conn, settings, project_id, config_override)?;
@@ -1972,8 +1972,34 @@ fn project_inputs(
         .filter_map(|u| handle_of.get(u.as_str()).copied())
         .collect();
     let excluded_set: HashSet<i64> = excluded_frame_ids.iter().copied().collect();
+    // Spec §5.1 / §7: what Prepare will write, and the files it cannot read.
+    // Probed before anything is counted: an unsupported frame is out of the
+    // plan (review I1), so it must leave every count below too.
+    let mut prepared = 0u64;
+    let mut unsupported: Vec<&str> = Vec::new();
+    let mut unsupported_ids: HashSet<i64> = HashSet::new();
+    let mut unsupported_why: HashMap<i64, String> = HashMap::new();
+    for g in &source.groups {
+        for f in g
+            .frames
+            .iter()
+            .filter(|f| !excluded_set.contains(&f.frame_id))
+        {
+            let shape = probe_file(Path::new(&f.path));
+            match prepare_action(&shape, cfg.calibration.debayer_osc) {
+                PrepareAction::Unsupported(why) => {
+                    tracing::warn!(project_id = %project_id, frame_id = f.frame_id, path = %f.path, error = %why, "project frame unsupported; left out of the plan");
+                    unsupported.push(f.filename.as_str());
+                    unsupported_ids.insert(f.frame_id);
+                    unsupported_why.insert(f.frame_id, why);
+                }
+                action => prepared += prepared_bytes(&shape, &action),
+            }
+        }
+    }
     let in_scope = |f: &&crate::stacking::project_source::SourceFrame| {
-        f.handle.is_some_and(|h| !excluded_set.contains(&h))
+        f.handle
+            .is_some_and(|h| !excluded_set.contains(&h) && !unsupported_ids.contains(&h))
     };
 
     // The grid (spec §6.2, §6.3).
@@ -2095,26 +2121,7 @@ fn project_inputs(
             ));
         }
     }
-    // Spec §5.1 / §7: what Prepare will write, and the files it cannot read.
-    let mut prepared = 0u64;
-    let mut unsupported: Vec<&str> = Vec::new();
-    let mut unsupported_ids: HashSet<i64> = HashSet::new();
-    for g in &source.groups {
-        for f in g
-            .frames
-            .iter()
-            .filter(|f| !excluded_set.contains(&f.frame_id))
-        {
-            let shape = probe_file(Path::new(&f.path));
-            match prepare_action(&shape, cfg.calibration.debayer_osc) {
-                PrepareAction::Unsupported(_) => {
-                    unsupported.push(f.filename.as_str());
-                    unsupported_ids.insert(f.frame_id);
-                }
-                action => prepared += prepared_bytes(&shape, &action),
-            }
-        }
-    }
+    // Spec §5.1 / §7: the files Prepare cannot read.
     if !unsupported.is_empty() {
         const NAME_CAP: usize = 5;
         let shown = unsupported
@@ -2150,7 +2157,11 @@ fn project_inputs(
             color_mode: f.color_mode,
             has_wcs: f.meta.as_ref().is_some_and(|m| m.wcs.is_some()),
             on_disk: f.not_stackable.is_none(),
-            reason: f.not_stackable.clone(),
+            reason: f.not_stackable.clone().or_else(|| {
+                f.handle
+                    .and_then(|h| unsupported_why.get(&h))
+                    .map(|w| format!("unsupported file: {w}"))
+            }),
         })
         .collect();
 
@@ -2180,8 +2191,9 @@ fn project_inputs(
         }),
     })
 }
-/// Build the plan for a subject (a frame set or a project): its groups, the resolved config, every
-/// gate blocker (spec §2, checked in a fixed order so the first blocker a
+
+/// Build the plan for a subject (a frame set or a project): its groups, the
+/// resolved config, every gate blocker (spec §2, checked in a fixed order so the first blocker a
 /// user sees is always the most fundamental one), and which of the three
 /// cacheable per-frame stages a run would still have to redo. Pure DB reads
 /// plus cheap filesystem probes for a frame set — a project's plan also seeds
@@ -7569,6 +7581,8 @@ mod tests {
         add_project_frame(&f.conn, f.dir.path(), "p1", &gone);
         let mut cfg = StackingConfig::default();
         cfg.reference.mode = ReferenceMode::Manual;
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.scale = 4;
         let plan = build_plan(
             &f.conn,
             &SettingsManager::new(),
@@ -7580,7 +7594,14 @@ mod tests {
         let codes: Vec<&str> = plan.blockers.iter().map(|b| b.code.as_str()).collect();
         assert_eq!(
             codes,
-            vec!["grid", "reference", "folders", "folders", "frames"]
+            vec![
+                "grid",
+                "reference",
+                "folders",
+                "folders",
+                "frames",
+                "unsupported"
+            ]
         );
         assert_eq!(
             plan.blockers[4].message,
@@ -7618,6 +7639,18 @@ mod tests {
         assert!(
             plan.excluded_frame_ids.is_empty(),
             "an unsupported file is not a manual exclusion"
+        );
+        let row = plan
+            .project_frames
+            .iter()
+            .find(|r| r.frame_uuid == "t")
+            .unwrap();
+        assert!(
+            row.reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("unsupported file: ")),
+            "{:?}",
+            row.reason
         );
         assert!(
             plan.blockers.iter().any(|b| b.code == "frames"),
@@ -7673,6 +7706,30 @@ mod tests {
             "{:?}",
             attested.blockers
         );
+    }
+
+    /// A project this device left fails readably and the plan writes no seed
+    /// row for it.
+    #[test]
+    fn a_left_project_plan_fails_readably_and_seeds_nothing() {
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        crate::db::collab::mark_lost(&f.conn, "p1").unwrap();
+        let err = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::NotFound(ref m) if m == "project no longer joined"),
+            "{err:?}"
+        );
+        assert!(crate::db::stacking::get_project_config(&f.conn, "p1")
+            .unwrap()
+            .is_none());
     }
 
     /// A project this device does not know fails readably, never as a raw

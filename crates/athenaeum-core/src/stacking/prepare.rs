@@ -91,7 +91,11 @@ pub fn probe_file(path: &Path) -> FileShape {
             Ok(raw) => String::from_utf8_lossy(&raw).into_owned(),
             Err(e) => return unsupported(format!("unreadable XISF header: {e:#}")),
         };
-        if xml.contains("location=\"path(") || xml.contains("location=\"url(") {
+        let distributed = ["path(", "url("].iter().any(|scheme| {
+            xml.contains(&format!("location=\"{scheme}"))
+                || xml.contains(&format!("location='{scheme}"))
+        });
+        if distributed {
             return unsupported("distributed XISF".to_string());
         }
         let Some((w, h, c)) = xisf_geometry(&xml) else {
@@ -222,6 +226,12 @@ mod tests {
         write_xisf_f32(&p("x.xisf"), 8, 8, 1, &[0.1; 64], &[]).unwrap();
         write_empty_primary(&p("tile.fits"));
         write_distributed_xisf(&p("dist.xisf"));
+        let single = "<?xml version='1.0'?><xisf version='1.0'><Image geometry='8:8:1' sampleFormat='Float32' location='url(http://x/y)'/></xisf>";
+        let mut single_bytes = b"XISF0100".to_vec();
+        single_bytes.extend_from_slice(&(single.len() as u32).to_le_bytes());
+        single_bytes.extend_from_slice(&[0u8; 4]);
+        single_bytes.extend_from_slice(single.as_bytes());
+        std::fs::write(p("dist1.xisf"), single_bytes).unwrap();
 
         let action = |n: &str, debayer| prepare_action(&probe_file(&p(n)), debayer);
         assert_eq!(action("mono.fits", true), PrepareAction::InPlace);
@@ -257,6 +267,11 @@ mod tests {
         assert_eq!(
             action("dist.xisf", true),
             PrepareAction::Unsupported("distributed XISF".into())
+        );
+        assert_eq!(
+            action("dist1.xisf", true),
+            PrepareAction::Unsupported("distributed XISF".into()),
+            "single-quoted attributes"
         );
         // Review I10: a file that cannot be opened says so.
         assert!(
