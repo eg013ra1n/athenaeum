@@ -212,6 +212,53 @@ fn trimmed_or_none(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The median `pixel_scale_arcsec` of whichever frames have one (Solve or
+/// Header, see `GroupFrame::scale_source`); `None` when none do. Shared by
+/// the frame-set and project group assembly.
+pub(crate) fn median_frame_scale(frames: &[GroupFrame]) -> Option<f64> {
+    let mut scales: Vec<f64> = frames.iter().filter_map(|f| f.pixel_scale_arcsec).collect();
+    if scales.is_empty() {
+        None
+    } else {
+        Some(median_f64(&mut scales))
+    }
+}
+
+/// A group's display camera and camera list from its members' `INSTRUME`
+/// values, in member order: the first member's trimmed camera (the
+/// reference anchor, `None` when blank), and every distinct trimmed label,
+/// sorted. A group whose members carry none lists `"unknown"` so `ATH_STKC`
+/// and the Camera cell say something honest instead of an empty list.
+pub(crate) fn camera_summary<'a>(
+    instrumes: impl Iterator<Item = Option<&'a str>>,
+) -> (Option<String>, Vec<String>) {
+    let all: Vec<Option<String>> = instrumes.map(trimmed_or_none).collect();
+    let instrume = all.first().cloned().flatten();
+    let mut cameras: Vec<String> = all.into_iter().flatten().collect();
+    cameras.sort();
+    cameras.dedup();
+    if cameras.is_empty() {
+        cameras.push("unknown".to_string());
+    }
+    (instrume, cameras)
+}
+
+/// The group order of a plan: most frames first, then total exposure, then
+/// key. Shared by the frame-set and project group assembly.
+pub(crate) fn sort_groups(groups: &mut [IntegrationGroup]) {
+    groups.sort_by(|a, b| {
+        b.frames
+            .len()
+            .cmp(&a.frames.len())
+            .then_with(|| {
+                b.total_exposure_s
+                    .partial_cmp(&a.total_exposure_s)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.key.cmp(&b.key))
+    });
+}
+
 /// Sluggify a frame set's name for use in stacking working/output paths.
 /// `sanitize_for_filename`, `"set"` when that sanitizes away to nothing (an
 /// all-whitespace or empty name).
@@ -717,33 +764,13 @@ pub fn group_frames(
             // The group's own pixel scale: the median of whichever members
             // have one (Solve or Header — see `GroupFrame::scale_source`);
             // `None` when none do.
-            let mut member_scales: Vec<f64> =
-                frames.iter().filter_map(|f| f.pixel_scale_arcsec).collect();
-            let pixel_scale_arcsec = if member_scales.is_empty() {
-                None
-            } else {
-                Some(median_f64(&mut member_scales))
-            };
+            let pixel_scale_arcsec = median_frame_scale(&frames);
 
             // The reference-anchor member is the cluster's own first member
             // (idxs is already restored to date_obs/id order — see
             // `seconds_classes`); a cluster is never empty by construction.
-            let instrume = idxs
-                .first()
-                .and_then(|&i| trimmed_or_none(bucket.members[i].instrume.as_deref()));
-            let mut cameras: Vec<String> = idxs
-                .iter()
-                .filter_map(|&i| trimmed_or_none(bucket.members[i].instrume.as_deref()))
-                .collect();
-            cameras.sort();
-            cameras.dedup();
-            // Fix round 1, minor 6: every member of this cluster carries no
-            // usable INSTRUME (NULL/blank) — the same "unknown" fallback
-            // the key itself used before camera left it, so `ATH_STKC` and
-            // the Camera cell say something honest instead of an empty list.
-            if cameras.is_empty() {
-                cameras.push("unknown".to_string());
-            }
+            let (instrume, cameras) =
+                camera_summary(idxs.iter().map(|&i| bucket.members[i].instrume.as_deref()));
 
             let key = compose_key(color, &filter_token, binning, &class.token);
             groups.push(IntegrationGroup {
@@ -762,17 +789,7 @@ pub fn group_frames(
         }
     }
 
-    groups.sort_by(|a, b| {
-        b.frames
-            .len()
-            .cmp(&a.frames.len())
-            .then_with(|| {
-                b.total_exposure_s
-                    .partial_cmp(&a.total_exposure_s)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.key.cmp(&b.key))
-    });
+    sort_groups(&mut groups);
 
     tracing::debug!(
         frame_set_id = frames_set_id,

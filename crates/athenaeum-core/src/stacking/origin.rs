@@ -205,6 +205,33 @@ mod tests {
         assert_eq!(cfa_geometry_of_file(&mono).unwrap(), None);
     }
 
+    /// The XISF branch of `cfa_geometry_of_file`: the same header fields,
+    /// read through the scanner's own XISF reader.
+    #[test]
+    fn cfa_geometry_of_an_xisf_file_reads_its_keywords() {
+        use crate::fits_writer::keywords::Bayer;
+        use crate::fits_writer::{write_xisf_f32, Card, CardValue};
+        let dir = tempfile::tempdir().unwrap();
+        let mosaic = dir.path().join("m.xisf");
+        let cards = vec![
+            Card::new("BAYERPAT", CardValue::Str("GRBG".into())).unwrap(),
+            Card::new("XBAYROFF", CardValue::Integer(1)).unwrap(),
+            Card::new("YBAYROFF", CardValue::Integer(0)).unwrap(),
+        ];
+        write_xisf_f32(&mosaic, 8, 8, 1, &vec![0.1; 64], &cards).unwrap();
+        assert_eq!(
+            cfa_geometry_of_file(&mosaic).unwrap(),
+            Some(CfaGeometry {
+                pattern: Bayer::Grbg,
+                xoff: 1,
+                yoff: 0
+            })
+        );
+        let mono = dir.path().join("n.xisf");
+        write_xisf_f32(&mono, 8, 8, 1, &vec![0.1; 64], &[]).unwrap();
+        assert_eq!(cfa_geometry_of_file(&mono).unwrap(), None);
+    }
+
     /// Plan 6b-2 C8: no function in the production half of `run.rs` or
     /// `plan.rs` names a `StackSubject` or `FrameOrigin` variant outside the
     /// named funnels and the allowlist — so a third subject, or a later
@@ -255,34 +282,87 @@ mod tests {
                 .split("\nmod tests {")
                 .next()
                 .expect("split yields a first part");
-            let mut current_fn = String::new();
-            for (n, line) in production.lines().enumerate() {
-                if let Some(name) = fn_name(line) {
-                    current_fn = name;
-                }
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                if line.contains("StackSubject::") || line.contains("FrameOrigin::") {
-                    let allowed = FUNNELS.contains(&current_fn.as_str())
-                        || ALLOWLIST.iter().any(|(f, _)| *f == current_fn);
-                    assert!(
-                        allowed,
-                        "{file}:{}: `{current_fn}` names a subject/origin variant outside the funnels: {}",
-                        n + 1,
-                        line.trim()
-                    );
-                }
-            }
+            let allowed: Vec<&str> = FUNNELS
+                .iter()
+                .copied()
+                .chain(ALLOWLIST.iter().map(|(f, _)| *f))
+                .collect();
+            let violations = variant_violations(production, &allowed);
+            assert!(
+                violations.is_empty(),
+                "{file}: a function names a subject/origin variant outside the funnels: {violations:?}"
+            );
         }
     }
 
+    /// The scanner behind the funnel test: `(line number, enclosing fn, line)`
+    /// for every non-comment line naming a `StackSubject::` or
+    /// `FrameOrigin::` variant whose enclosing function is not in `allowed`.
+    /// A column-0 `}` ends the enclosing function (an item between two
+    /// functions has none).
+    fn variant_violations(source: &str, allowed: &[&str]) -> Vec<(usize, String, String)> {
+        let mut out = Vec::new();
+        let mut current_fn = String::new();
+        for (n, line) in source.lines().enumerate() {
+            if line.starts_with('}') {
+                current_fn.clear();
+            }
+            if let Some(name) = fn_name(line) {
+                current_fn = name;
+            }
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if (line.contains("StackSubject::") || line.contains("FrameOrigin::"))
+                && !allowed.contains(&current_fn.as_str())
+            {
+                out.push((n + 1, current_fn.clone(), line.trim().to_string()));
+            }
+        }
+        out
+    }
+
+    /// The funnel scanner catches the three shapes a naive scan misses.
+    #[test]
+    fn the_funnel_scanner_catches_its_three_blind_spots() {
+        let allowed = ["funnel"];
+        // 1. A use after the funnel closed at column 0, outside any fn.
+        let after_close =
+            "fn funnel() {\n    let a = 1;\n}\nconst X: () = { let _ = FrameOrigin::Project; };\n";
+        assert_eq!(variant_violations(after_close, &allowed).len(), 1);
+        // 2. A restricted-visibility fn.
+        let restricted = "pub(super) fn stray() {\n    let _ = StackSubject::Project;\n}\n";
+        assert_eq!(variant_violations(restricted, &allowed)[0].1, "stray");
+        let in_path = "pub(in crate::stacking) fn stray2() {\n    FrameOrigin::Catalog;\n}\n";
+        assert_eq!(variant_violations(in_path, &allowed)[0].1, "stray2");
+        // 3. An attribute on the same line as `fn`.
+        let attr = "#[inline] fn stray3() {\n    FrameOrigin::Catalog;\n}\n";
+        assert_eq!(variant_violations(attr, &allowed)[0].1, "stray3");
+        // And the allowed shapes stay quiet.
+        let ok = "pub(crate) fn funnel() {\n    FrameOrigin::Catalog;\n}\n";
+        assert!(variant_violations(ok, &allowed).is_empty());
+    }
+
     /// The name of the function a source line declares, if it declares one.
+    /// Leading attributes (`#[...]`), any `pub(...)` visibility and the
+    /// `async`/`const`/`unsafe` qualifiers are skipped.
     fn fn_name(line: &str) -> Option<String> {
         let mut t = line.trim_start();
-        for prefix in ["pub(crate) ", "pub ", "async ", "const ", "unsafe "] {
-            if let Some(rest) = t.strip_prefix(prefix) {
-                t = rest;
+        loop {
+            let before = t;
+            if t.starts_with("#[") {
+                t = t[t.find(']')? + 1..].trim_start();
+            }
+            if let Some(rest) = t.strip_prefix("pub(") {
+                t = rest[rest.find(')')? + 1..].trim_start();
+            }
+            for prefix in ["pub ", "async ", "const ", "unsafe "] {
+                if let Some(rest) = t.strip_prefix(prefix) {
+                    t = rest;
+                }
+            }
+            if t == before {
+                break;
             }
         }
         let rest = t.strip_prefix("fn ")?;

@@ -6745,15 +6745,17 @@ mod tests {
             )
             .unwrap();
         let (_, origins) = frame_source(&f.conn, &StackSubject::FrameSet(f.set_id), &cfg).unwrap();
+        assert_eq!(origins.len(), 3, "the set's three lights");
         assert!(origins
             .values()
             .all(|o| matches!(o, FrameOrigin::Catalog { attested: true, .. })));
     }
 
-    /// Plan 6b-2 C12: the Prepare subtree's exact shape, and the project
-    /// stage-1 hash `HashMemo` gives a project frame — content and size,
-    /// never a catalog identity; the debayer toggle moves it, an unrelated
-    /// stage's config does not.
+    /// Plan 6b-2 C12: the Prepare subtree's exact shape, and the formula of
+    /// the project stage-1 hash — content and size, never a catalog identity;
+    /// the debayer toggle moves it, an unrelated stage's config does not. The
+    /// dispatch through `HashMemo` is covered by the project frame source's
+    /// decoy test.
     #[test]
     fn the_prepare_subtree_and_the_project_hash_are_pinned() {
         use crate::stacking::config::{prepare_subtree, stage_hash, SourceIdentity};

@@ -19,8 +19,8 @@ use crate::collab::storage::sweep::Stamp;
 use crate::db::collab_frames::{self as collab_frames, LocalFrameRow};
 use crate::stacking::config::StackingConfig;
 use crate::stacking::groups::{
-    classify_exposures, f_ratio, median_f64, sanitized_or, ClassInput, ColorMode, GroupFrame,
-    IntegrationGroup, ScaleSource,
+    camera_summary, classify_exposures, f_ratio, median_frame_scale, sanitized_or, sort_groups,
+    ClassInput, ColorMode, GroupFrame, IntegrationGroup, ScaleSource,
 };
 use crate::stacking::origin::{FrameOrigin, FrameOrigins};
 
@@ -85,7 +85,13 @@ pub fn xisf_geometry(xml: &str) -> Option<(usize, usize, usize)> {
 /// neither reader can tell.
 pub fn file_shape_quick(path: &Path) -> Option<(usize, usize, usize)> {
     if is_xisf(path) {
-        let raw = crate::fits_parser::read_xisf_header(path).ok()?;
+        let raw = match crate::fits_parser::read_xisf_header(path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "xisf header unreadable");
+                return None;
+            }
+        };
         xisf_geometry(&String::from_utf8_lossy(&raw))
     } else {
         crate::integration::banded::probe_fits(path)
@@ -98,7 +104,13 @@ pub fn file_shape_quick(path: &Path) -> Option<(usize, usize, usize)> {
 /// that stays a one-plane mosaic (`debayerOsc` off and the file a mosaic).
 /// The manifest's `bayerpat` decides colour vs mono (spec §5.1); the file is
 /// probed only when `debayerOsc` is off.
-fn color_token(meta: &ProjectFrameMeta, landed: &Path, debayer_osc: bool) -> &'static str {
+fn color_token(
+    project_id: &str,
+    frame_uuid: &str,
+    meta: &ProjectFrameMeta,
+    landed: &Path,
+    debayer_osc: bool,
+) -> &'static str {
     if meta.bayerpat.is_none() {
         return "mono";
     }
@@ -107,7 +119,11 @@ fn color_token(meta: &ProjectFrameMeta, landed: &Path, debayer_osc: bool) -> &'s
     }
     match file_shape_quick(landed) {
         Some((_, _, 3)) => "osc",
-        _ => "cfa",
+        Some(_) => "cfa",
+        None => {
+            tracing::warn!(project_id, frame_uuid, path = %landed.display(), "file shape unreadable; colour token assumed cfa");
+            "cfa"
+        }
     }
 }
 
@@ -201,11 +217,21 @@ pub fn project_frame_source(
         })?;
         let (width, height) = match (meta.naxis1, meta.naxis2) {
             (Some(w), Some(h)) => (w, h),
-            _ => file_shape_quick(Path::new(&landed))
-                .map(|(w, h, _)| (w as i64, h as i64))
-                .unwrap_or((0, 0)),
+            _ => match file_shape_quick(Path::new(&landed)) {
+                Some((w, h, _)) => (w as i64, h as i64),
+                None => {
+                    tracing::warn!(project_id, frame_uuid = %row.frame_uuid, path = %landed, "file shape unreadable; dimensions recorded as 0x0");
+                    (0, 0)
+                }
+            },
         };
-        let token = color_token(&meta, Path::new(&landed), cfg.calibration.debayer_osc);
+        let token = color_token(
+            project_id,
+            &row.frame_uuid,
+            &meta,
+            Path::new(&landed),
+            cfg.calibration.debayer_osc,
+        );
         let frame = GroupFrame {
             frame_id: handle,
             file_id: 0,
@@ -282,27 +308,17 @@ pub fn project_frame_source(
                 .iter()
                 .map(|f| f.exposure_s.unwrap_or(0.0))
                 .sum();
-            let mut scales: Vec<f64> = group_frames
-                .iter()
-                .filter_map(|f| f.pixel_scale_arcsec)
-                .collect();
-            let pixel_scale_arcsec = (!scales.is_empty()).then(|| median_f64(&mut scales));
+            let pixel_scale_arcsec = median_frame_scale(&group_frames);
             let first = &members[class.members[0]];
-            let mut cameras: Vec<String> = class
-                .members
-                .iter()
-                .filter_map(|&i| members[i].instrume.as_deref().map(str::trim))
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
-            cameras.sort();
-            cameras.dedup();
-            if cameras.is_empty() {
-                cameras.push("unknown".to_string());
-            }
+            let (instrume, cameras) = camera_summary(
+                class
+                    .members
+                    .iter()
+                    .map(|&i| members[i].instrume.as_deref()),
+            );
             groups.push(IntegrationGroup {
                 key: project_group_key(token, &first.canonical, &class.token),
-                instrume: first.instrume.clone(),
+                instrume,
                 color_mode: first.color,
                 filter: Some(first.canonical.clone()),
                 binning: 1,
@@ -315,17 +331,7 @@ pub fn project_frame_source(
             });
         }
     }
-    groups.sort_by(|a, b| {
-        b.frames
-            .len()
-            .cmp(&a.frames.len())
-            .then_with(|| {
-                b.total_exposure_s
-                    .partial_cmp(&a.total_exposure_s)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.key.cmp(&b.key))
-    });
+    sort_groups(&mut groups);
 
     let stackable_count = origins.len();
     tracing::debug!(
@@ -393,6 +399,7 @@ mod tests {
         let source = project_frame_source(&conn, "p1", &cfg).unwrap();
         assert_eq!(source.groups.len(), 1, "{:?}", source.groups);
         let g = &source.groups[0];
+        assert_eq!(g.frames.len(), 3);
         assert_eq!(g.key, "mono__R__300s");
         assert_eq!(
             (g.filter.as_deref(), g.binning, g.color_mode),
@@ -418,6 +425,31 @@ mod tests {
                 }
                 other => panic!("{other:?}"),
             }
+        }
+
+        // The dispatchers a run reads through never touch the decoy rows.
+        let mut memo = crate::stacking::plan::HashMemo::new(source.origins.clone());
+        for f in &g.frames {
+            let origin = source.origins.get(&f.frame_id).unwrap();
+            assert_eq!(
+                crate::stacking::origin::cfa_geometry(&conn, origin, f.frame_id).unwrap(),
+                None,
+                "the decoy row says RGGB; the landed file is mono"
+            );
+            let solve = crate::stacking::origin::stored_solve(&conn, origin, f.frame_id)
+                .unwrap()
+                .expect("the manifest WCS yields a record");
+            assert_eq!(solve.pixel_scale_arcsec, 1.5, "never the decoy 9.9");
+            let FrameOrigin::Project {
+                blake3, byte_size, ..
+            } = origin
+            else {
+                panic!("{origin:?}")
+            };
+            assert_eq!(
+                memo.calibration_hash_checked(&conn, &cfg, f).unwrap(),
+                crate::stacking::plan::prepare_hash_for_project(&cfg, blake3, *byte_size)
+            );
         }
         let again = project_frame_source(&conn, "p1", &cfg).unwrap();
         let ids = |s: &ProjectSource| {
