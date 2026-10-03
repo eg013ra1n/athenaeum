@@ -251,6 +251,12 @@ pub trait FrameSolver: Send + Sync {
     /// The solver's identity for the cache key: its config and the installed
     /// catalog. `Err` when it cannot solve at all (no catalog).
     fn identity(&self) -> Result<String, String>;
+    /// Make the solver ready to solve (open the catalog). Called once the run
+    /// has a frame that actually needs solving; an `Err` is never cached as a
+    /// frame's outcome. Defaults to ready.
+    fn ready(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// Solve one file. Never panics, and never writes the catalog.
     fn solve(&self, request: &SolveRequest, cancel: &AtomicBool) -> SolveOutcome;
 }
@@ -399,9 +405,26 @@ impl CatalogSolver {
     }
 }
 
+impl CatalogSolver {
+    fn layers_open(&self) -> Result<&Vec<Arc<solvemyastro::StarCache>>, String> {
+        let prepared = self.prepared()?;
+        self.layers
+            .get_or_init(|| {
+                crate::plate_solve::open_catalog_layers(&prepared.app_data)
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
+
 impl FrameSolver for CatalogSolver {
     fn identity(&self) -> Result<String, String> {
         self.prepared().map(|p| p.identity.clone())
+    }
+
+    fn ready(&self) -> Result<(), String> {
+        self.layers_open().map(|_| ())
     }
 
     fn solve(&self, request: &SolveRequest, cancel: &AtomicBool) -> SolveOutcome {
@@ -409,11 +432,11 @@ impl FrameSolver for CatalogSolver {
             Ok(p) => p,
             Err(e) => return SolveOutcome::Failed(e),
         };
-        let layers = match self.layers.get_or_init(|| {
-            crate::plate_solve::open_catalog_layers(&prepared.app_data).map_err(|e| e.to_string())
-        }) {
+        // A safety net: the Solve sub-step calls `ready` first and never gets
+        // here after a failure.
+        let layers = match self.layers_open() {
             Ok(l) => l,
-            Err(e) => return SolveOutcome::Failed(e.clone()),
+            Err(e) => return SolveOutcome::Failed(e),
         };
         let refs: Vec<&solvemyastro::StarCache> = layers.iter().map(|l| l.as_ref()).collect();
         let caches = solvemyastro::Caches::layered(&refs);
@@ -430,6 +453,8 @@ pub(crate) struct FakeSolver {
     calls: std::sync::atomic::AtomicUsize,
     paths: std::sync::Mutex<Vec<PathBuf>>,
     cancels: bool,
+    ready_error: Option<String>,
+    ready_calls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -441,7 +466,21 @@ impl FakeSolver {
             calls: std::sync::atomic::AtomicUsize::new(0),
             paths: std::sync::Mutex::new(Vec::new()),
             cancels: false,
+            ready_error: None,
+            ready_calls: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// A solver whose identity is fine but whose catalog does not open.
+    pub(crate) fn not_ready(reason: &str) -> Self {
+        FakeSolver {
+            ready_error: Some(reason.to_string()),
+            ..Self::solving_all()
+        }
+    }
+
+    pub(crate) fn ready_calls(&self) -> usize {
+        self.ready_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// A solver that raises the run's cancel flag and reports a failure.
@@ -489,6 +528,12 @@ impl FakeSolver {
 impl FrameSolver for FakeSolver {
     fn identity(&self) -> Result<String, String> {
         self.identity.clone()
+    }
+
+    fn ready(&self) -> Result<(), String> {
+        self.ready_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.ready_error.clone().map_or(Ok(()), Err)
     }
 
     fn solve(&self, request: &SolveRequest, cancel: &AtomicBool) -> SolveOutcome {

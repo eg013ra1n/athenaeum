@@ -3375,6 +3375,53 @@ impl FanOutTicker {
     }
 }
 
+/// `(project_id, frame_id, blake3)` of every frame the Solve sub-step was
+/// asked about.
+fn unsolved_candidates(
+    wanted: &[(String, i64, crate::stacking::origin::SolvePlan)],
+) -> Vec<(String, i64, String)> {
+    wanted
+        .iter()
+        .map(|(_, id, p)| (p.project_id.clone(), *id, p.blake3.clone()))
+        .collect()
+}
+
+/// The solver cannot run (no catalog, or one that does not open): warn once,
+/// count only the frames without a cached solved outcome (a cached solve is
+/// still served by `stored_solve`), and cache NOTHING.
+fn solve_unavailable(
+    rc: &mut RunContext,
+    frames: &[(String, i64, String)],
+    error: &str,
+) -> Result<(), RunError> {
+    let mut unsolved = 0usize;
+    {
+        let conn = db(&rc.ctx)?.conn();
+        for (project_id, frame_id, blake3) in frames {
+            let outcome =
+                crate::stacking::solve::stored_outcome(&conn, project_id, *frame_id, blake3)?;
+            if !matches!(
+                outcome,
+                Some(crate::stacking::solve::SolveOutcome::Solved(_))
+            ) {
+                unsolved += 1;
+            }
+        }
+    }
+    tracing::warn!(
+        run_id = rc.run_id,
+        count = unsolved,
+        error = %error,
+        "plate solving unavailable; frames without a manifest wcs stay unsolved"
+    );
+    if unsolved > 0 {
+        rc.warnings.push(format!(
+            "{unsolved} frame(s) without a WCS in the manifest could not be plate-solved: {error}"
+        ));
+    }
+    Ok(())
+}
+
 /// The Solve sub-step (spec §5.2, plan 6b-2 C14), the first thing Measure
 /// does. Every project frame still in the run whose manifest carries no WCS,
 /// and that has a stage-1 file, is solved once per content version, solver
@@ -3413,38 +3460,8 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
     let identity = match rc.solver.identity() {
         Ok(identity) => identity,
         Err(e) => {
-            // A cached solved outcome is still served by `stored_solve`; only
-            // the frames with none cannot be solved now.
-            let mut unsolved = 0usize;
-            {
-                let conn = db(&rc.ctx)?.conn();
-                for (_, frame_id, plan) in &wanted {
-                    let outcome = crate::stacking::solve::stored_outcome(
-                        &conn,
-                        &plan.project_id,
-                        *frame_id,
-                        &plan.blake3,
-                    )?;
-                    if !matches!(
-                        outcome,
-                        Some(crate::stacking::solve::SolveOutcome::Solved(_))
-                    ) {
-                        unsolved += 1;
-                    }
-                }
-            }
-            tracing::warn!(
-                run_id = rc.run_id,
-                count = unsolved,
-                error = %e,
-                "plate solving unavailable; frames without a manifest wcs stay unsolved"
-            );
-            if unsolved > 0 {
-                rc.warnings.push(format!(
-                    "{unsolved} frame(s) without a WCS in the manifest could not be plate-solved: {e}"
-                ));
-            }
-            return Ok(());
+            let frames = unsolved_candidates(&wanted);
+            return solve_unavailable(rc, &frames, &e);
         }
     };
     let project_id = wanted[0].2.project_id.clone();
@@ -3454,6 +3471,7 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
             .map(|p| (p.target_ra_deg, p.target_dec_deg))
     };
 
+    let frames = unsolved_candidates(&wanted);
     let mut jobs = Vec::new();
     for (key, frame_id, plan) in wanted {
         // Plan 6b-2 C9: the Solve boundary of the landed-file identity check.
@@ -3489,6 +3507,14 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
             continue;
         };
         jobs.push((frame_id, hash, plan, PathBuf::from(path)));
+    }
+
+    // The solver's catalog opens only now that a frame needs it; an open
+    // failure says nothing about a frame, so it is never cached as an outcome.
+    if !jobs.is_empty() {
+        if let Err(e) = rc.solver.ready() {
+            return solve_unavailable(rc, &frames, &e);
+        }
     }
 
     let total = jobs.len();
@@ -22688,5 +22714,60 @@ mod tests {
             vec!["2 frame(s) without a WCS in the manifest could not be plate-solved: no star catalog"
                 .to_string()]
         );
+    }
+
+    /// A catalog that does not open says nothing about a frame: the run warns
+    /// (counting only unsolved frames), asks the solver nothing and caches
+    /// nothing. A run whose frames are all cached never asks `ready`.
+    #[test]
+    fn a_catalog_that_does_not_open_is_never_cached_and_a_cached_run_never_opens_it() {
+        use crate::stacking::solve::{solve_hash, write_outcome, FakeSolver, SolveOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let broken = Arc::new(FakeSolver::not_ready("tier_500: cannot open"));
+        use_solver(&mut rc, &broken);
+        seed_in_place_calibrated(&conn, &mut rc);
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(broken.ready_calls(), 1);
+        assert_eq!(broken.calls(), 0);
+        assert!(
+            crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            rc.warnings,
+            vec!["3 frame(s) without a WCS in the manifest could not be plate-solved: tier_500: cannot open".to_string()]
+        );
+
+        // Every frame cached under the working solver's identity: no ready().
+        let fake = Arc::new(FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        for uuid in ["r1", "r2", "r3"] {
+            let blake3 = blake3_of(&conn, "p1", uuid);
+            write_outcome(
+                &conn,
+                "p1",
+                handle_of(&rc, &format!("c_{uuid}.fits")),
+                &blake3,
+                &solve_hash(&blake3, "fake:1"),
+                SolveOutcome::Failed("no match".into()),
+            )
+            .unwrap();
+        }
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!((fake.ready_calls(), fake.calls()), (0, 0));
     }
 }
