@@ -1701,6 +1701,10 @@ fn resolve_calibrate_job(
         // Dispatched by origin like the stage-1 hash above: a frame whose id
         // is not a catalog `frames.id` must never reach this catalog read.
         match origin_of(&rc.origins, frame.frame_id) {
+            // An attested light is prepared, never calibrated (spec §13).
+            Ok(FrameOrigin::Catalog { attested: true, .. }) => {
+                Err("an attested frame is prepared, never calibrated".to_string())
+            }
             Ok(FrameOrigin::Catalog { .. }) => resolve_generation_cached(
                 &conn,
                 frame.frame_id,
@@ -1968,6 +1972,344 @@ fn commit_calibrated(
     Ok(size as u64)
 }
 
+/// The plane count every member of `group` has after stage 1 (plan 6b-2
+/// C13, review I12): one for mono; three for OSC with the debayer on; with
+/// it off, three for a project's `osc` group (its members are three-plane
+/// files) and one otherwise (a frame set's OSC group or a project's `cfa`
+/// group: mosaics kept as mosaics).
+fn expected_stage_one_planes(cfg: &StackingConfig, subject: &StackSubject, group: &IntegrationGroup) -> usize {
+    match group.color_mode {
+        ColorMode::Mono => 1,
+        ColorMode::Osc if cfg.calibration.debayer_osc => 3,
+        ColorMode::Osc if subject.project_id().is_some() && group.key.starts_with("osc__") => 3,
+        ColorMode::Osc => 1,
+    }
+}
+
+/// One frame's Prepare RESOLVE outcome (plan 6b-2 C12), the twin of
+/// [`CalibrateResolved`].
+enum PrepareResolved {
+    Reused { bytes: u64 },
+    Excluded { reason: String },
+    Job(Box<PrepareRunJob>),
+}
+
+/// One frame's resolved Prepare work: the pure job plus what the commit
+/// writes back.
+struct PrepareRunJob {
+    frame_id: i64,
+    group_key: String,
+    hash: String,
+    /// Bayer drizzle wants this frame's pre-debayer mosaic kept.
+    keep_mosaic: bool,
+    frame_uuid: Option<String>,
+    job: crate::stacking::prepare::PrepareJob,
+}
+
+/// Prepare's per-frame RESOLVE phase, on the run thread:
+/// - the identity check (C9's Prepare boundary);
+/// - the stage-1 hash through `rc.memo`;
+/// - the header-only classification;
+/// - the plane-count check against the group's colour (review I12);
+/// - the freshness lookup.
+/// A frame whose file no reader decodes, or whose planes contradict its
+/// group, is excluded here.
+fn resolve_prepare_job(
+    rc: &mut RunContext,
+    cfg: &StackingConfig,
+    group: &IntegrationGroup,
+    frame: &GroupFrame,
+) -> Result<PrepareResolved, RunError> {
+    use crate::stacking::prepare::{prepare_action, probe_file, PrepareAction, PrepareJob};
+    if let Some(reason) = changed_during_run(rc, frame.frame_id)? {
+        return Ok(PrepareResolved::Excluded { reason });
+    }
+    let hash = {
+        let conn = db(&rc.ctx)?.conn();
+        match rc.memo.calibration_hash_checked(&conn, cfg, frame) {
+            Ok(hash) => hash,
+            Err(e) => {
+                return Ok(PrepareResolved::Excluded {
+                    reason: format!("preparation failed: {e}"),
+                })
+            }
+        }
+    };
+    let input = crate::stacking::origin::prepare_input(origin_of(&rc.origins, frame.frame_id)?, frame);
+    let shape = probe_file(&input.path);
+    let action = prepare_action(&shape, cfg.calibration.debayer_osc);
+    if let PrepareAction::Unsupported(why) = &action {
+        return Ok(PrepareResolved::Excluded {
+            reason: format!("unsupported file: {why}"),
+        });
+    }
+    // Review I12 (C13): the group's colour comes from the manifest (or the
+    // catalog), Prepare's debayer from the file's own header. A file whose
+    // post-Prepare plane count contradicts its group never reaches Measure.
+    let planes = match &action {
+        PrepareAction::Write { debayer: Some(_), .. } => 3,
+        _ => shape.planes,
+    };
+    if planes != expected_stage_one_planes(cfg, &rc.subject, group) {
+        return Ok(PrepareResolved::Excluded {
+            reason: format!("plane count {planes} disagrees with the group's colour mode"),
+        });
+    }
+    let keep_mosaic = wants_cfa_mosaic(cfg, group)
+        && matches!(action, PrepareAction::Write { debayer: Some(_), .. });
+
+    if rc.rerun_from != Some(Stage::Calibrate) {
+        let conn = db(&rc.ctx)?.conn();
+        let existing = crate::db::stacking::find_artifact(&conn, &rc.subject, &group.key, "calibrated", Some(frame.frame_id))?;
+        let mosaic_fresh = !keep_mosaic
+            || crate::db::stacking::find_artifact(&conn, &rc.subject, &group.key, "calibrated_mosaic", Some(frame.frame_id))?
+                .is_some_and(|row| is_fresh(&row, &hash));
+        if let Some(row) = existing {
+            if is_fresh(&row, &hash) && mosaic_fresh {
+                return Ok(PrepareResolved::Reused {
+                    bytes: row.size.unwrap_or(0) as u64,
+                });
+            }
+        }
+    }
+
+    let stem = calibrated_file_stem(group, frame);
+    let dir = rc.layout.prepared_dir(&group.key);
+    let converted_out = dir.join(format!("p_{stem}.fits"));
+    let debayered_out = dir.join(format!("p_{stem}_d.fits"));
+    // The replica is sacred: a write destination is never the file Prepare
+    // reads. The names live under `prepared/` so this cannot happen; the
+    // check is the guard if a layout change ever breaks that.
+    if converted_out == input.path || debayered_out == input.path {
+        tracing::error!(
+            run_id = rc.run_id,
+            frame_id = frame.frame_id,
+            path = %input.path.display(),
+            "prepare output would overwrite its source; frame excluded"
+        );
+        debug_assert!(false, "a prepare output equals its source");
+        return Ok(PrepareResolved::Excluded {
+            reason: "preparation failed: the output path equals the source".to_string(),
+        });
+    }
+    Ok(PrepareResolved::Job(Box::new(PrepareRunJob {
+        frame_id: frame.frame_id,
+        group_key: group.key.clone(),
+        hash,
+        keep_mosaic,
+        frame_uuid: input.frame_uuid,
+        job: PrepareJob {
+            src: input.path,
+            shape,
+            action,
+            converted_out,
+            debayered_out,
+            // Regenerable intermediates, like Calibrate's (perf tier 1 Task 6).
+            durability: crate::fits_writer::Durability::Volatile,
+        },
+    })))
+}
+
+/// Write one prepared frame's artifact rows (`calibrated`, plus
+/// `calibrated_mosaic` when kept) in one transaction; returns the bytes the
+/// frame's `calibrated` file holds.
+fn commit_prepared(
+    rc: &mut RunContext,
+    job: &PrepareRunJob,
+    files: crate::stacking::prepare::PreparedFiles,
+) -> Result<u64, RunError> {
+    let (size, modified_at) =
+        file_identity(&files.calibrated).map_err(|e| RunError::Other(format!("{e:#}")))?;
+    let mosaic = match (&files.mosaic, job.keep_mosaic) {
+        (Some(path), true) => Some((
+            path.clone(),
+            file_identity(path).map_err(|e| RunError::Other(format!("{e:#}")))?,
+        )),
+        _ => None,
+    };
+    tracing::debug!(
+        run_id = rc.run_id,
+        frame_id = job.frame_id,
+        frame_uuid = job.frame_uuid.as_deref(),
+        group_key = %job.group_key,
+        prepared = files.prepared,
+        "frame prepared"
+    );
+    // A deferred transaction on purpose, as `commit_calibrated` does: these
+    // are write-only upserts, so the `BEGIN IMMEDIATE` rule for
+    // read-then-write does not apply (review M20).
+    let mut conn = db(&rc.ctx)?.conn();
+    let tx = conn
+        .transaction()
+        .map_err(|e| RunError::Other(format!("opening the artifact transaction: {e}")))?;
+    upsert_artifact(
+        &tx,
+        &NewArtifact {
+            subject: &rc.subject,
+            frame_id: Some(job.frame_id),
+            group_key: &job.group_key,
+            kind: "calibrated",
+            path: files.calibrated.to_str(),
+            config_hash: &job.hash,
+            size: Some(size),
+            modified_at: Some(&modified_at),
+            payload_json: None,
+        },
+    )?;
+    if let Some((path, (mosaic_size, mosaic_modified))) = &mosaic {
+        upsert_artifact(
+            &tx,
+            &NewArtifact {
+                subject: &rc.subject,
+                frame_id: Some(job.frame_id),
+                group_key: &job.group_key,
+                kind: "calibrated_mosaic",
+                path: path.to_str(),
+                config_hash: &job.hash,
+                size: Some(*mosaic_size),
+                modified_at: Some(mosaic_modified),
+                payload_json: None,
+            },
+        )?;
+    }
+    tx.commit()
+        .map_err(|e| RunError::Other(format!("committing the artifact rows: {e}")))?;
+    Ok(size as u64)
+}
+
+/// Stage 1 for a project or an attested set (spec §5.1, §13; plan 6b-2 C12).
+/// Calibrate's shape:
+/// - per group, a resolve pass on the run thread ([`resolve_prepare_job`]);
+/// - a fan-out of the pixel work across the image pool ([`execute_prepare`]:
+///   nothing for a file used in place, a conversion, or a debayer);
+/// - commits in frame order ([`commit_prepared`]).
+/// A per-frame failure excludes that frame; a cancel unwinds as
+/// [`RunError::Cancelled`]. Progress and timing report under
+/// `Stage::Calibrate`, the stage-1 slot.
+///
+/// [`execute_prepare`]: crate::stacking::prepare::execute_prepare
+fn stage_prepare(rc: &mut RunContext) -> Result<(), RunError> {
+    let stage_start = Instant::now();
+    let excluded_set: HashSet<i64> = rc.excluded.iter().copied().collect();
+    let groups = rc.plan_groups.clone();
+    let cfg = rc.config.clone();
+    let total: usize = groups
+        .iter()
+        .flat_map(|g| g.frames.iter())
+        .filter(|f| !excluded_set.contains(&f.frame_id))
+        .count();
+    let bytes_total = calibrate_bytes_total(&groups, &excluded_set);
+
+    tracing::info!(
+        run_id = rc.run_id,
+        set_id = rc.subject.frame_set_id(),
+        project_id = rc.subject.project_id(),
+        count = total,
+        groups = groups.len(),
+        config_hash = %rc.hash,
+        "stacking run started"
+    );
+    if cfg.drizzle.enabled
+        && cfg.drizzle.bayer
+        && !cfg.calibration.debayer_osc
+        && groups.iter().any(|g| g.color_mode == ColorMode::Osc)
+    {
+        tracing::warn!(
+            run_id = rc.run_id,
+            set_id = rc.subject.frame_set_id(),
+            project_id = rc.subject.project_id(),
+            "bayer drizzle ignored: the osc debayer is off for this run"
+        );
+        rc.warnings.push(
+            "Bayer drizzle is ignored: the OSC debayer is off for this run, so no calibrated CFA \
+             mosaic is kept and drizzle deposits each frame's calibrated planes as they are."
+                .to_string(),
+        );
+    }
+
+    let mut current = 0usize;
+    let mut bytes_done = 0u64;
+    rc.progress(Stage::Calibrate, None, current, total, bytes_done, bytes_total, None, None);
+
+    for group in &groups {
+        rc.check_cancel()?;
+        let group_max_w = group.frames.iter().map(|f| f.width.max(0) as u64).max().unwrap_or(0);
+        let group_max_h = group.frames.iter().map(|f| f.height.max(0) as u64).max().unwrap_or(0);
+
+        let mut jobs: Vec<PrepareRunJob> = Vec::new();
+        for frame in &group.frames {
+            if excluded_set.contains(&frame.frame_id) {
+                continue;
+            }
+            rc.check_cancel()?;
+            match resolve_prepare_job(rc, &cfg, group, frame)? {
+                PrepareResolved::Reused { bytes } => {
+                    bytes_done += bytes;
+                    rc.cached_calibrated.insert(frame.frame_id, true);
+                    current += 1;
+                    rc.progress(Stage::Calibrate, Some(group.key.clone()), current, total, bytes_done, bytes_total, Some(frame.frame_id), None);
+                }
+                PrepareResolved::Excluded { reason } => {
+                    tracing::warn!(run_id = rc.run_id, frame_id = frame.frame_id, error = %reason, "preparation failed; frame excluded");
+                    rc.runtime_exclusions.push((frame.frame_id, reason));
+                    current += 1;
+                    rc.progress(Stage::Calibrate, Some(group.key.clone()), current, total, bytes_done, bytes_total, Some(frame.frame_id), None);
+                }
+                PrepareResolved::Job(job) => jobs.push(*job),
+            }
+        }
+        if jobs.is_empty() {
+            continue;
+        }
+
+        let working_set_bytes = calibrate_working_set_bytes(group_max_w, group_max_h);
+        let admission_n = admission(working_set_bytes, rc.ctx.image_pool.current_num_threads());
+        log_admission(rc, Stage::Calibrate, &group.key, working_set_bytes, 0, admission_n);
+        let ticker = FanOutTicker::new(rc, Stage::Calibrate, Some(group.key.clone()), current, total, bytes_done, bytes_total);
+        let ticker_ref = &ticker;
+        let cancel_ref: &AtomicBool = &rc.cancel;
+        let pool_ref: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
+        let job_refs: Vec<&PrepareRunJob> = jobs.iter().collect();
+        let results = fan_out(job_refs, admission_n, cancel_ref, move |job: &PrepareRunJob| {
+            let out = crate::stacking::prepare::execute_prepare(&job.job, Some(pool_ref), cancel_ref)
+                .map_err(|e| {
+                    if matches!(e.downcast_ref::<IntegrationError>(), Some(IntegrationError::Cancelled)) {
+                        CANCELLED_MARKER.to_string()
+                    } else {
+                        format!("preparation failed: {e:#}")
+                    }
+                });
+            ticker_ref.tick(Some(job.frame_id));
+            out
+        });
+        rc.check_cancel()?;
+        current = ticker.done();
+
+        for (pos, res) in results.into_iter().enumerate() {
+            let job = &jobs[pos];
+            match res {
+                None => return Err(RunError::Cancelled),
+                Some(Err(msg)) if msg == CANCELLED_MARKER => return Err(RunError::Cancelled),
+                Some(Err(msg)) => {
+                    tracing::warn!(run_id = rc.run_id, frame_id = job.frame_id, error = %msg, "preparation failed; frame excluded");
+                    rc.runtime_exclusions.push((job.frame_id, msg));
+                }
+                Some(Ok(files)) => {
+                    bytes_done += commit_prepared(rc, job, files)?;
+                    rc.cached_calibrated.insert(job.frame_id, false);
+                }
+            }
+        }
+        rc.progress(Stage::Calibrate, Some(group.key.clone()), current, total, bytes_done, bytes_total, None, None);
+    }
+
+    rc.timings.push(crate::stacking::provenance::StageTiming {
+        stage: Stage::Calibrate,
+        duration_ms: stage_start.elapsed().as_millis() as u64,
+    });
+    Ok(())
+}
+
 /// Planes of one w×h channel resident while a fan-out worker calibrates one
 /// frame (perf tier 1 Task 4): the light band, the `out` plane, a 3-plane
 /// VNG debayer output and the calibration formula's own band scratch — one
@@ -1989,6 +2331,39 @@ pub(crate) const CALIBRATE_PLANES_RESIDENT: u64 = 8;
 /// this string, since [`RunError::Cancelled`] is handled before it would be
 /// formatted.
 const CANCELLED_MARKER: &str = "__cancelled__";
+
+/// Which stage 1 a run takes (plan 6b-2 C11, C12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageOneKind {
+    Calibrate,
+    Prepare,
+}
+
+/// Stage 1's kind for this run: Prepare for a project and for an attested
+/// frame set, Calibrate otherwise. One stage-1 path per run: frames that
+/// disagree refuse the run before any file is read. A frame with no origin
+/// counts for neither; the stage that reads it excludes it, exactly as
+/// before this dispatch existed (6b-1: a per-frame exclusion in Calibrate).
+fn stage_one_kind(rc: &RunContext) -> Result<StageOneKind, RunError> {
+    let (mut prepare, mut calibrate) = (0usize, 0usize);
+    for f in rc.plan_groups.iter().flat_map(|g| g.frames.iter()) {
+        match rc.origins.get(&f.frame_id) {
+            Some(origin) if crate::stacking::origin::needs_prepare(origin) => prepare += 1,
+            Some(_) => calibrate += 1,
+            None => {}
+        }
+    }
+    if prepare > 0 && calibrate > 0 {
+        return Err(RunError::Other(format!(
+            "a run cannot mix prepared and calibrated frames ({prepare} prepared, {calibrate} calibrated)"
+        )));
+    }
+    Ok(if prepare > 0 || rc.subject.project_id().is_some() {
+        StageOneKind::Prepare
+    } else {
+        StageOneKind::Calibrate
+    })
+}
 
 /// Stage 1: calibrate every non-manually-excluded LIGHT frame, reusing a
 /// fresh `calibrated` artifact when one exists. Ruling 4's "sequentially,
@@ -2016,7 +2391,14 @@ const CANCELLED_MARKER: &str = "__cancelled__";
 /// (`runtime_exclusions` + a `warn!`) rather than failing the run; only
 /// `IntegrationError::Cancelled` (surfaced by a worker as
 /// [`CANCELLED_MARKER`]) propagates as [`RunError::Cancelled`].
+///
+/// A project or an attested set takes [`stage_prepare`] instead (plan 6b-2
+/// C11, C12).
 fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
+    // Plan 6b-2 C11, C12: a project, or an attested set, prepares instead.
+    if stage_one_kind(rc)? == StageOneKind::Prepare {
+        return stage_prepare(rc);
+    }
     // Calibrate only ever runs for a frame set; the id feeds the log lines.
     let Some(set_id) = rc.subject.frame_set_id() else {
         return Err(RunError::Other(PROJECT_STACKING_UNAVAILABLE.into()));
@@ -20408,6 +20790,441 @@ mod tests {
                 .unwrap();
             }
         }
+    }
+
+    /// Plan 6b-2 C12 (Review Focus 3): a unit-domain float replica, mono or
+    /// three-plane, is used IN PLACE. Its `calibrated` artifact is the landed
+    /// file, whose bytes and mtime never change. A second pass reuses it, and
+    /// `CleanupWhat::All` leaves it on disk.
+    #[test]
+    fn prepare_uses_a_float_replica_in_place_and_never_touches_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        let mut paths = Vec::new();
+        for u in ["m1", "m2", "m3"] {
+            paths.push(test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u)));
+        }
+        for u in ["o1", "o2", "o3"] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = test_fixtures::ProjectFile::Rgb32;
+            spec.bayerpat = Some("RGGB");
+            paths.push(test_fixtures::add_project_frame(&conn, &landed, "p1", &spec));
+        }
+        let before: Vec<(Vec<u8>, std::time::SystemTime)> = paths
+            .iter()
+            .map(|p| (std::fs::read(p).unwrap(), std::fs::metadata(p).unwrap().modified().unwrap()))
+            .collect();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let mut keys: Vec<&str> = rc.plan_groups.iter().map(|g| g.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["mono__L__300s", "osc__L__300s"]);
+
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        let artifacts =
+            crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("calibrated")).unwrap();
+        assert_eq!(artifacts.len(), 6);
+        for a in &artifacts {
+            let path = PathBuf::from(a.path.as_deref().unwrap());
+            assert!(paths.contains(&path), "used in place: {path:?}");
+        }
+        assert!(!rc.layout.prepared_root().exists(), "nothing was written");
+        assert!(rc.cached_calibrated.values().all(|cached| !cached));
+
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.cached_calibrated.values().all(|cached| *cached), "the second pass reuses every frame");
+
+        crate::stacking::paths::cleanup_work(
+            &conn,
+            &rc.subject,
+            &rc.layout,
+            crate::stacking::paths::CleanupWhat::All,
+        )
+        .unwrap();
+        for (p, (bytes, mtime)) in paths.iter().zip(&before) {
+            assert_eq!(&std::fs::read(p).unwrap(), bytes, "{p:?} was rewritten");
+            assert_eq!(&std::fs::metadata(p).unwrap().modified().unwrap(), mtime, "{p:?} was touched");
+        }
+    }
+
+    /// Plan 6b-2 C12, C13: a CFA mosaic replica is debayered into `prepared/`
+    /// when `debayerOsc` is on:
+    /// - the generator's own VNG;
+    /// - the mosaic cards are gone and `ATH_PREP = 'debayered'`;
+    /// - no project or calibration stamp;
+    /// - the landed mosaic itself is kept for Bayer drizzle.
+    /// With `debayerOsc` off it is used in place, as a `cfa` group.
+    #[test]
+    fn prepare_debayers_a_mosaic_and_keeps_the_landed_mosaic_for_bayer_drizzle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for u in ["o1", "o2", "o3"] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = test_fixtures::ProjectFile::Mosaic32;
+            spec.bayerpat = Some("RGGB");
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+        }
+        let mut cfg = StackingConfig::default();
+        cfg.drizzle.enabled = true;
+        cfg.drizzle.bayer = true;
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.path().join("work"), &tmp.path().join("out"));
+        assert_eq!(rc.plan_groups[0].key, "osc__L__300s");
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        let key = "osc__L__300s";
+        for f in rc.plan_groups[0].frames.clone() {
+            let row = |kind: &str| {
+                crate::db::stacking::find_artifact(&conn, &rc.subject, key, kind, Some(f.frame_id))
+                    .unwrap()
+                    .and_then(|a| a.path)
+                    .unwrap()
+            };
+            let stem = Path::new(&f.filename).file_stem().unwrap().to_str().unwrap().to_string();
+            let calibrated = PathBuf::from(row("calibrated"));
+            assert_eq!(calibrated, rc.layout.prepared_dir(key).join(format!("p_{stem}_d.fits")));
+            assert_eq!(row("calibrated_mosaic"), f.path, "the landed mosaic itself");
+            let h = FitsHeader::from_path(&calibrated).unwrap();
+            assert_eq!(h.get_i32("NAXIS3"), Some(3));
+            assert_eq!(h.get_str("ATH_PREP").as_deref(), Some("debayered"));
+            assert_eq!(h.get_str("ATH_CDBM").as_deref(), Some("VNG"));
+            for absent in ["BAYERPAT", "CALSTAT", "ATH_CSRC", "ATH_PRJ"] {
+                assert_eq!(h.get_str(absent), None, "{absent}");
+            }
+        }
+
+        let mut off = StackingConfig::default();
+        off.calibration.debayer_osc = false;
+        let mut rc = project_rc(&ctx, &conn, "p1", off, &tmp.path().join("work2"), &tmp.path().join("out"));
+        assert_eq!(rc.plan_groups[0].key, "cfa__L__300s");
+        stage_calibrate(&mut rc).unwrap();
+        for f in rc.plan_groups[0].frames.clone() {
+            let a = crate::db::stacking::find_artifact(&conn, &rc.subject, "cfa__L__300s", "calibrated", Some(f.frame_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(a.path.as_deref(), Some(f.path.as_str()), "a mosaic kept as a mosaic is used in place");
+        }
+    }
+
+    /// Plan 6b-2 C12: an XISF replica and a 16-bit FITS are converted into
+    /// float32 FITS under `prepared/`, in the unit domain. The 16-bit file
+    /// becomes exactly its physical values ÷ 65535. A float FITS beside them
+    /// stays in place.
+    #[test]
+    fn prepare_converts_xisf_and_integer_files_into_the_unit_domain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        let mut landed_of = HashMap::new();
+        for (u, file) in [
+            ("m1", test_fixtures::ProjectFile::Mono32),
+            ("x1", test_fixtures::ProjectFile::Xisf32),
+            ("i1", test_fixtures::ProjectFile::Mono16),
+        ] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = file;
+            landed_of.insert(u, test_fixtures::add_project_frame(&conn, &landed, "p1", &spec));
+        }
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &tmp.path().join("work"), &tmp.path().join("out"));
+        let key = "mono__L__300s";
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        let calibrated_of = |uuid: &str| -> PathBuf {
+            let f = rc.plan_groups[0]
+                .frames
+                .iter()
+                .find(|f| f.path == landed_of[uuid].to_str().unwrap())
+                .unwrap();
+            PathBuf::from(
+                crate::db::stacking::find_artifact(&conn, &rc.subject, key, "calibrated", Some(f.frame_id))
+                    .unwrap()
+                    .and_then(|a| a.path)
+                    .unwrap(),
+            )
+        };
+        assert_eq!(calibrated_of("m1"), landed_of["m1"]);
+        for uuid in ["x1", "i1"] {
+            let p = calibrated_of(uuid);
+            assert_eq!(p, rc.layout.prepared_dir(key).join(format!("p_c_{uuid}.fits")));
+            let h = FitsHeader::from_path(&p).unwrap();
+            assert_eq!(h.get_str("ATH_PREP").as_deref(), Some("converted"));
+            assert_eq!((h.get_str("CALSTAT"), h.get_str("ATH_PRJ")), (None, None));
+            let plane = PlaneReader::open(&p).unwrap().read_plane(0).unwrap();
+            assert!(plane.iter().all(|v| (0.0..=1.0).contains(v)), "{uuid}: unit domain");
+        }
+        let physical = PlaneReader::open(&landed_of["i1"]).unwrap().read_plane(0).unwrap();
+        let converted = PlaneReader::open(&calibrated_of("i1")).unwrap().read_plane(0).unwrap();
+        for (p, c) in physical.iter().zip(&converted) {
+            assert_eq!(c.to_bits(), ((*p as f64 / 65535.0) as f32).to_bits());
+        }
+    }
+
+    /// Plan 6b-2 C12: a file no reader here can decode is excluded
+    /// "unsupported file: …"; its neighbours are prepared.
+    #[test]
+    fn prepare_excludes_an_unsupported_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for u in ["m1", "m2", "m3"] {
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u));
+        }
+        let mut tile = test_fixtures::project_frame_spec("t1");
+        tile.file = test_fixtures::ProjectFile::EmptyPrimary;
+        test_fixtures::add_project_frame(&conn, &landed, "p1", &tile);
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &tmp.path().join("work"), &tmp.path().join("out"));
+        stage_calibrate(&mut rc).unwrap();
+        let t1 = rc.plan_groups[0].frames.iter().find(|f| f.filename == "c_t1.fits").unwrap().frame_id;
+        let reasons: HashMap<i64, String> = rc.runtime_exclusions.iter().cloned().collect();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert_eq!(
+            reasons[&t1],
+            "unsupported file: not a 1- or 3-plane 8/16/32-bit or float primary image"
+        );
+    }
+
+    /// Review I12 (plan 6b-2 C13): the group's colour comes from the manifest,
+    /// Prepare's debayer from the file's own header. A file whose post-Prepare
+    /// plane count contradicts its group is excluded, never fed to Measure.
+    /// Here the manifest has no `bayerpat` (a `mono` group) while the file
+    /// declares a mosaic, which Prepare would debayer to three planes.
+    #[test]
+    fn prepare_excludes_a_file_whose_planes_contradict_its_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for u in ["m1", "m2", "m3"] {
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u));
+        }
+        // `Mosaic32` writes BAYERPAT RGGB into the file; `bayerpat: None`
+        // keeps it out of the manifest.
+        let mut odd = test_fixtures::project_frame_spec("x1");
+        odd.file = test_fixtures::ProjectFile::Mosaic32;
+        test_fixtures::add_project_frame(&conn, &landed, "p1", &odd);
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &tmp.path().join("work"), &tmp.path().join("out"));
+        assert_eq!(rc.plan_groups.len(), 1, "every frame is in the mono group");
+        assert_eq!(rc.plan_groups[0].key, "mono__L__300s");
+        stage_calibrate(&mut rc).unwrap();
+        let x1 = rc.plan_groups[0].frames.iter().find(|f| f.filename == "c_x1.fits").unwrap().frame_id;
+        let reasons: HashMap<i64, String> = rc.runtime_exclusions.iter().cloned().collect();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert_eq!(reasons[&x1], "plane count 3 disagrees with the group's colour mode");
+        assert!(!rc.layout.prepared_root().exists(), "nothing was written for it");
+    }
+
+    /// Plan 6b-2 C9 (the Prepare boundary): a landed file the exchange
+    /// rewrote after the frame source read its row is excluded "changed
+    /// during the run" before Prepare reads it.
+    #[test]
+    fn prepare_excludes_a_project_frame_whose_landed_file_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        let paths: Vec<PathBuf> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|u| test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u)))
+            .collect();
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &tmp.path().join("work"), &tmp.path().join("out"));
+        std::fs::write(&paths[1], vec![0u8; 5000]).unwrap();
+        stage_calibrate(&mut rc).unwrap();
+        let b = rc.plan_groups[0].frames.iter().find(|f| f.filename == "c_b.fits").unwrap().frame_id;
+        let reasons: HashMap<i64, String> = rc.runtime_exclusions.iter().cloned().collect();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert_eq!(reasons[&b], crate::stacking::origin::CHANGED_DURING_THE_RUN);
+        assert!(crate::db::stacking::find_artifact(&conn, &rc.subject, "mono__L__300s", "calibrated", Some(b))
+            .unwrap()
+            .is_none());
+    }
+
+    /// Spec §15.1 "Seam" (Review Focus 2): Prepare never reads the catalog
+    /// for a project frame. `files`/`frames` rows whose ids equal the
+    /// handles, pointing at nothing, are never followed, and the stage-1
+    /// hash is the Prepare hash over the manifest's content identity.
+    #[test]
+    fn prepare_never_reads_the_catalog_for_a_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for u in ["a", "b", "c"] {
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &test_fixtures::project_frame_spec(u));
+        }
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &tmp.path().join("work"), &tmp.path().join("out"));
+        let handles: Vec<i64> = rc.origins.keys().copied().collect();
+        for (i, h) in handles.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 'decoy.fits', 7, '2020-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![h, format!("/decoy/{i}.fits")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, filter, exptime, naxis1, naxis2, bayerpat)
+                 VALUES (?1, ?1, 'Light', 'Z', 999.0, 7, 7, 'RGGB')",
+                [h],
+            )
+            .unwrap();
+        }
+        stage_calibrate(&mut rc).unwrap();
+        assert!(rc.runtime_exclusions.is_empty(), "{:?}", rc.runtime_exclusions);
+        for f in rc.plan_groups[0].frames.clone() {
+            let a = crate::db::stacking::find_artifact(&conn, &rc.subject, "mono__L__300s", "calibrated", Some(f.frame_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(a.path.as_deref(), Some(f.path.as_str()));
+            let (blake3, size): (String, i64) = conn
+                .query_row(
+                    "SELECT blake3, byte_size FROM project_frames_local WHERE project_id = 'p1' AND landed_path = ?1",
+                    [&f.path],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(a.config_hash, crate::stacking::plan::prepare_hash_for_project(&rc.config, &blake3, size));
+        }
+        let decoys: i64 = conn
+            .query_row("SELECT COUNT(*) FROM frames WHERE filter = 'Z' AND exptime = 999.0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(decoys, 3, "the decoy rows are untouched");
+    }
+
+    /// Spec §13 (R3), plan 6b-2 C11: an attested set (externally calibrated
+    /// lights, no masters at all) runs end to end:
+    /// - its plan asks for no master;
+    /// - stage 1 prepares, converting the 16-bit lights into the unit domain
+    ///   under `prepared/`, and reports in the stage-1 slot;
+    /// - nothing is calibrated;
+    /// - the run builds no master (review I11: read from the run's summary,
+    ///   not from a catalog count that is zero either way).
+    #[test]
+    fn an_attested_set_stacks_without_masters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let (fixture, light_ids, working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+        fixture
+            .conn
+            .execute("UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1", [fixture.set_id])
+            .unwrap();
+        let plan = crate::stacking::plan::build_plan(
+            &fixture.conn,
+            &crate::settings::SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(fixture.set_id),
+            None,
+        )
+        .unwrap();
+        assert!(plan.masters_to_build.is_empty(), "{:?}", plan.masters_to_build);
+        let recorder = Arc::new(Recording::new());
+        let started = start_stacking(
+            ctx.clone(),
+            recorder.clone(),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            StackSubject::FrameSet(fixture.set_id),
+            None,
+            None,
+        )
+        .expect("an attested set needs no masters to start");
+        wait_for_run(&ctx, started.run_id);
+        let run_row = crate::db::stacking::get_run(&fixture.conn, started.run_id).unwrap().unwrap();
+        assert_eq!(run_row.status, "done", "{run_row:?}");
+
+        let subject = StackSubject::FrameSet(fixture.set_id);
+        let layout = crate::stacking::paths::subject_layout(&fixture.conn, working.path(), &subject).unwrap();
+        let calibrated = crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some("calibrated")).unwrap();
+        assert_eq!(calibrated.len(), light_ids.len());
+        for a in &calibrated {
+            let p = PathBuf::from(a.path.as_deref().unwrap());
+            // The run canonicalizes its working folder (macOS `/var` is
+            // `/private/var`), so compare resolved paths.
+            assert!(
+                crate::test_support::canonical_path(&p)
+                    .starts_with(crate::test_support::canonical_path(&layout.prepared_root())),
+                "{p:?}"
+            );
+            let h = FitsHeader::from_path(&p).unwrap();
+            assert_eq!(h.get_str("ATH_PREP").as_deref(), Some("converted"));
+            assert_eq!(h.get_str("CALSTAT"), None);
+        }
+        assert!(!layout.calibrated_root().exists(), "nothing was calibrated");
+        let summary: RunSummary =
+            serde_json::from_str(run_row.summary_json.as_deref().expect("summary_json set")).unwrap();
+        assert!(summary.masters_built.is_empty(), "{:?}", summary.masters_built);
+        assert!(
+            summary.stages.iter().any(|t| t.stage == Stage::Calibrate),
+            "Prepare reports in the stage-1 slot: {:?}",
+            summary.stages
+        );
+    }
+
+    /// Plan 6b-2 C11: one stage-1 path per run. A run whose frames mix
+    /// attested and calibrated origins is refused before any file is read.
+    #[test]
+    fn a_run_mixing_prepared_and_calibrated_frames_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _ids, working, output) =
+            seed_star_group(&db_path, SET_NAME, &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], &[5.0f32; 3]);
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) =
+            seed_run_and_groups(&fixture.conn, fixture.set_id, &plan_groups, working.path(), output.path());
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        let first = rc.plan_groups[0].frames[0].clone();
+        let mut origins: HashMap<i64, FrameOrigin> = (*rc.origins).clone();
+        origins.insert(first.frame_id, FrameOrigin::Catalog { file_id: first.file_id, attested: true });
+        rc.origins = Arc::new(origins);
+        rc.memo = HashMemo::new(rc.origins.clone());
+        let err = stage_calibrate(&mut rc).unwrap_err();
+        assert!(
+            matches!(err, RunError::Other(ref m) if m.contains("cannot mix prepared and calibrated frames")),
+            "{err:?}"
+        );
+        assert!(!rc.layout.calibrated_root().exists() && !rc.layout.prepared_root().exists());
     }
 
     /// Plan 6b-2 C9 (the Measure boundary): a landed file the exchange

@@ -881,7 +881,6 @@ pub(crate) enum ProjectFile {
     /// One-plane float32 CFA mosaic carrying BAYERPAT/XBAYROFF/YBAYROFF.
     Mosaic32,
     /// One-plane 16-bit FITS in ADU (BZERO 32768) — an attested original.
-    #[allow(dead_code)] // Task 9 consumes it
     Mono16,
     /// One-plane float32 XISF in the unit domain.
     Xisf32,

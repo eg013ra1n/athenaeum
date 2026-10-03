@@ -11,7 +11,7 @@
 //! `FrameOrigin`; never import both unqualified in one file.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::Connection;
@@ -20,6 +20,7 @@ use crate::api::ApiError;
 use crate::collab::frame_meta::ProjectFrameMeta;
 use crate::integration::cfa::CfaGeometry;
 use crate::plate_solve::storage::PlateSolveRecord;
+use crate::stacking::groups::GroupFrame;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrameOrigin {
@@ -44,6 +45,40 @@ pub enum FrameOrigin {
         size_mtime: String,
         meta: ProjectFrameMeta,
     },
+}
+
+/// Whether stage 1 PREPARES this frame instead of calibrating it (spec
+/// §5.1, §13): every project frame, and an attested set's lights.
+pub(crate) fn needs_prepare(origin: &FrameOrigin) -> bool {
+    match origin {
+        FrameOrigin::Catalog { attested, .. } => *attested,
+        FrameOrigin::Project { .. } => true,
+    }
+}
+
+/// What Prepare reads for one frame, and the uuid its log line carries.
+pub(crate) struct PrepareInput {
+    pub(crate) path: PathBuf,
+    pub(crate) frame_uuid: Option<String>,
+}
+
+/// The file Prepare reads: an attested light's catalog file (the frame
+/// source's `GroupFrame.path`), or a project frame's landed replica.
+pub(crate) fn prepare_input(origin: &FrameOrigin, frame: &GroupFrame) -> PrepareInput {
+    match origin {
+        FrameOrigin::Catalog { .. } => PrepareInput {
+            path: PathBuf::from(&frame.path),
+            frame_uuid: None,
+        },
+        FrameOrigin::Project {
+            landed_path,
+            frame_uuid,
+            ..
+        } => PrepareInput {
+            path: PathBuf::from(landed_path),
+            frame_uuid: Some(frame_uuid.clone()),
+        },
+    }
 }
 
 /// The CFA mosaic geometry a FILE's own header declares (plan 6b-2 C12):
