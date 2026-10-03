@@ -67,8 +67,9 @@ pub fn card_with_optional_comment(
 ) -> Result<Card, FitsWriteError> {
     let with = Card::new(keyword, CardValue::Str(value.to_string()))?.with_comment(comment);
     match crate::fits_writer::card::format_card(&with) {
-        Ok(_) => Ok(with),
-        Err(FitsWriteError::CommentTooLong(_)) => {
+        // A value that continues over several records keeps no comment.
+        Ok(records) if records.len() == 1 => Ok(with),
+        Ok(_) | Err(FitsWriteError::CommentTooLong(_)) => {
             Card::new(keyword, CardValue::Str(value.to_string()))
         }
         Err(e) => Err(e),
@@ -833,6 +834,7 @@ mod tests {
             Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap(),
             Card::new("PLTSOLVD", CardValue::Logical(true)).unwrap(),
             Card::new(ATH_RGEO, CardValue::Str("coRegistered".into())).unwrap(),
+            Card::new("ATH_PRJ", CardValue::Str("replica-project".into())).unwrap(),
         ];
         let project_id = "p".repeat(60);
         let filter = "Optolong L-eXtreme dual narrowband, an unusually long canonical filter name";
@@ -876,6 +878,10 @@ mod tests {
             get("PLTSOLVD").is_empty(),
             "a grid TAN is not a plate solve"
         );
+        assert!(
+            get("ATH_PRJ").is_empty(),
+            "a stacked master is never a replica"
+        );
         let tmp = tempfile::tempdir().unwrap();
         crate::fits_writer::write_fits_f32(&tmp.path().join("g.fits"), 2, 2, 1, &[0.0; 4], &cards)
             .unwrap();
@@ -903,6 +909,14 @@ mod tests {
             short.iter().all(|c| c.keyword != "FILTER"),
             "no canonical filter, no FILTER card"
         );
+
+        // 69 characters: the value alone fills a record and continues, so the
+        // comment goes, and the chain still formats.
+        let id69 = "q".repeat(69);
+        let card = card_with_optional_comment(ATH_SPRJ, &id69, "collaboration project").unwrap();
+        assert!(card.comment.is_none(), "a continued card keeps no comment");
+        assert!(crate::fits_writer::card::format_card(&card).unwrap().len() > 1);
+        assert_eq!(card.value, Some(CardValue::Str(id69)));
     }
 
     fn dummy_stats() -> GroupStats {

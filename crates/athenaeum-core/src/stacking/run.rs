@@ -24458,13 +24458,26 @@ mod tests {
         RunContext,
         crate::collab::grid::CanonicalGrid,
     ) {
+        run_sky_project_filter(tmp, "Lum", tweak)
+    }
+
+    fn run_sky_project_filter(
+        tmp: &Path,
+        canonical: &str,
+        tweak: impl FnOnce(&mut StackingConfig),
+    ) -> (
+        Arc<ServiceContext>,
+        rusqlite::Connection,
+        RunContext,
+        crate::collab::grid::CanonicalGrid,
+    ) {
         let db_path = tmp.join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
         let conn = project_conn(&db_path);
         let grid = seed_sky_project(&conn, &tmp.join("collab"), 4);
         conn.execute(
-            "UPDATE project_frames_local SET filter_canonical = 'Lum' WHERE project_id = 'p1'",
-            [],
+            "UPDATE project_frames_local SET filter_canonical = ?1 WHERE project_id = 'p1'",
+            [canonical],
         )
         .unwrap();
         let mut cfg = sky_config(&conn);
@@ -24558,6 +24571,18 @@ mod tests {
             (header.get_f64("CRPIX1").unwrap() - 256.5).abs() < 1e-9,
             "1-based centre of 512 px"
         );
+        assert!((header.get_f64("CRPIX2").unwrap() - 192.5).abs() < 1e-9);
+        let dh = crate::fits_parser::FitsHeader::from_path(Path::new(&drizzled.path)).unwrap();
+        assert!(
+            (dh.get_f64("CRPIX1").unwrap() - 512.5).abs() < 1e-9,
+            "{:?}",
+            dh.get_f64("CRPIX1")
+        );
+        assert!(
+            (dh.get_f64("CRPIX2").unwrap() - 384.5).abs() < 1e-9,
+            "{:?}",
+            dh.get_f64("CRPIX2")
+        );
         assert!(
             !rc.warnings
                 .iter()
@@ -24579,30 +24604,72 @@ mod tests {
             // The weight map is off by default; the test's count names it.
             cfg.drizzle.write_weight_map = true;
         });
-        let mut seen = 0usize;
-        for root in [tmp.path().join("work"), tmp.path().join("out")] {
-            for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(Result::ok) {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) != Some("fits") {
-                    continue;
-                }
-                let header = crate::fits_parser::FitsHeader::from_path(p).unwrap();
-                assert!(
-                    header.get_str("ATH_PRJ").is_none(),
-                    "{} carries ATH_PRJ",
-                    p.display()
-                );
-                assert!(
-                    header.get_str("ATH_STK").is_some() || header.get_str("ATH_REG").is_some(),
-                    "{} would be cataloged",
-                    p.display()
-                );
-                seen += 1;
+        let mut fits: Vec<PathBuf> = Vec::new();
+        for entry in walkdir::WalkDir::new(tmp.path())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+        {
+            let p = entry.path();
+            // The seeded replicas and the catalog are the test's inputs.
+            if p.starts_with(tmp.path().join("collab"))
+                || p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("catalog.db"))
+            {
+                continue;
             }
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            assert!(
+                ["fits", "athf", "rej", "athln", "json", "png", "jpg"].contains(&ext),
+                "an unexpected output {}",
+                p.display()
+            );
+            if ext != "fits" {
+                continue;
+            }
+            let header = crate::fits_parser::FitsHeader::from_path(p).unwrap();
+            assert!(
+                header.get_str("ATH_PRJ").is_none(),
+                "{} carries ATH_PRJ",
+                p.display()
+            );
+            assert!(
+                header.get_str("ATH_STK").is_some() || header.get_str("ATH_REG").is_some(),
+                "{} would be cataloged",
+                p.display()
+            );
+            fits.push(p.to_path_buf());
         }
-        assert!(
-            seen >= 7,
-            "4 registered frames, the master, the drizzled master, its weight map: {seen}"
-        );
+        // 4 registered frames, the master, the drizzled master, its weight map.
+        assert_eq!(fits.len(), 7, "{fits:?}");
+        let out = tmp.path().join("out").join("p1");
+        for name in [
+            "p1_Lum_mono_300s_4x.fits",
+            "p1_Lum_mono_300s_4x_drizzle2x.fits",
+            "p1_Lum_mono_300s_4x_drizzle2x_weight.fits",
+        ] {
+            assert!(fits.contains(&out.join(name)), "{name} missing in {fits:?}");
+        }
+    }
+
+    /// Review M4: a group whose canonical filter is empty writes no `FILTER`
+    /// card (the reference's raw name never leaks) and the run warns once.
+    #[test]
+    fn an_empty_canonical_filter_writes_no_filter_card_and_warns_once() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ctx, conn, rc, _grid) = run_sky_project_filter(tmp.path(), "", |_| {});
+        let masters = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
+        let master = masters.iter().find(|m| m.kind == "master").expect("a master");
+        let header = crate::fits_parser::FitsHeader::from_path(Path::new(&master.path)).unwrap();
+        assert!(header.get_str("FILTER").is_none(), "no FILTER card");
+        assert_eq!(header.get_str("ATH_RGEO").as_deref(), Some("grid"));
+        let warned = rc
+            .warnings
+            .iter()
+            .filter(|w| w.contains("canonical filter is empty"))
+            .count();
+        assert_eq!(warned, 1, "{:?}", rc.warnings);
     }
 }

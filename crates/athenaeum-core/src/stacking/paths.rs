@@ -1041,6 +1041,11 @@ pub fn subject_output_dir(output_root: &Path, subject: &StackSubject, label: &st
 mod tests {
     use super::*;
 
+    use crate::db::schema::init_db;
+    use crate::db::stacking::{delete_artifacts, list_artifacts, NewArtifact};
+    use crate::stacking::config::PathsConfig;
+    use crate::stacking::groups::GroupFrame;
+
     /// Spec §5.9: a project's masters land in `<output>/<title>/`; a frame
     /// set's stay at the output root.
     #[test]
@@ -1066,11 +1071,6 @@ mod tests {
             "a title that sanitizes to nothing still gets a folder"
         );
     }
-
-    use crate::db::schema::init_db;
-    use crate::db::stacking::{delete_artifacts, list_artifacts, NewArtifact};
-    use crate::stacking::config::PathsConfig;
-    use crate::stacking::groups::GroupFrame;
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
