@@ -3262,6 +3262,17 @@ mod tests {
         .unwrap();
         assert_eq!(verdict("gc"), Err(NotStackable::NotOnDevice));
 
+        upsert_from_manifest(&c, "p1", &view("lost", 8)).unwrap();
+        land("lost");
+        c.execute(
+            "UPDATE project_frames_local SET local_state = 'missing' WHERE frame_uuid = 'lost'",
+            [],
+        )
+        .unwrap();
+        let lost = get(&c, "p1", "lost").unwrap().unwrap();
+        assert!(exportable(&lost) && !lost.local_state.servable());
+        assert_eq!(verdict("lost"), Err(NotStackable::NotOnDevice));
+
         assert_eq!(NotStackable::BeingRestaged.reason(), "being re-staged");
         assert!(
             exportable(&get(&c, "p1", "own").unwrap().unwrap()),

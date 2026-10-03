@@ -981,14 +981,23 @@ pub fn resolve_project_config_and_exclusions(
     project_id: &str,
     config_override: Option<StackingConfig>,
 ) -> Result<(StackingConfig, Vec<String>), ApiError> {
-    let global_json = read_global_config_json(conn, settings);
-    let global = resolve_config(None, global_json.as_deref())
-        .map_err(|e| ApiError::Invalid(format!("invalid stacking config: {e}")))?;
-    let seed = serde_json::to_string(&crate::stacking::config::project_seed_config(global))
-        .map_err(|e| {
-            ApiError::Internal(format!("failed to serialize the project seed config: {e}"))
-        })?;
-    let row = crate::db::stacking::seed_project_config(conn, project_id, &seed)?;
+    // Read first: a stored document needs neither the global defaults nor
+    // the write lock. Only a first plan builds the seed (the one place that
+    // needs the global); a racing first plan loses to `DO NOTHING` and reads
+    // the winner's document back.
+    let row = match crate::db::stacking::get_project_config(conn, project_id)? {
+        Some(row) => row,
+        None => {
+            let global_json = read_global_config_json(conn, settings);
+            let global = resolve_config(None, global_json.as_deref())
+                .map_err(|e| ApiError::Invalid(format!("invalid stacking config: {e}")))?;
+            let seed = serde_json::to_string(&crate::stacking::config::project_seed_config(global))
+                .map_err(|e| {
+                    ApiError::Internal(format!("failed to serialize the project seed config: {e}"))
+                })?;
+            crate::db::stacking::seed_project_config(conn, project_id, &seed)?
+        }
+    };
     let config = match config_override {
         Some(cfg) => cfg,
         None => resolve_config(Some(&row.config_json), None)
@@ -6735,6 +6744,29 @@ mod tests {
             "whole-config: no field-level merge with the seed"
         );
         assert_eq!(excluded, vec!["u7".to_string()]);
+
+        // A stored document is returned without the global being read: a
+        // corrupt global default does not matter once a project has its own.
+        f.conn
+            .execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?1, 'not json', '')",
+                [crate::settings::keys::STACKING_DEFAULTS],
+            )
+            .unwrap();
+        let (cfg, _) =
+            resolve_project_config_and_exclusions(&f.conn, &settings, "p1", None).unwrap();
+        assert_eq!(cfg.grouping.exposure_mode, ExposureMode::NoSplit);
+        crate::db::stacking::insert_test_project(&f.conn, "p2");
+        assert!(
+            resolve_project_config_and_exclusions(&f.conn, &settings, "p2", None).is_err(),
+            "a first plan does read the (corrupt) global"
+        );
+        f.conn
+            .execute(
+                "DELETE FROM settings WHERE key = ?1",
+                [crate::settings::keys::STACKING_DEFAULTS],
+            )
+            .unwrap();
 
         let mut over = StackingConfig::default();
         over.output.crop_to_coverage = 5;

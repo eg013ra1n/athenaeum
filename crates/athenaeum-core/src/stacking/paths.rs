@@ -68,8 +68,9 @@ pub(crate) fn subject_layout(
 /// the Collaboration root is one — because cleanup removes whole subtrees
 /// under it, and a landed replica must never be in one. `Some(sentence)` is
 /// the plan's `folders` blocker. Reuses the transfer folders' overlap check
-/// (`api::scan_roots::check_scan_root_overlap`); reads the filesystem only
-/// to canonicalize the scan roots.
+/// (`api::scan_roots::check_scan_root_overlap`); reads the filesystem to
+/// canonicalize the scan roots and to stat and canonicalize the project
+/// root's nearest existing ancestor.
 pub fn project_root_overlap(
     conn: &Connection,
     project_root: &Path,
@@ -78,7 +79,7 @@ pub fn project_root_overlap(
     match crate::api::scan_roots::check_scan_root_overlap(conn, &root) {
         Ok(()) => Ok(None),
         Err(ApiError::Conflict(msg)) => {
-            tracing::warn!(path = %root.display(), error = %msg, "project working folder overlaps a scan root");
+            tracing::debug!(path = %root.display(), error = %msg, "project working folder overlaps a scan root");
             Ok(Some(format!(
                 "The project's working folder {} overlaps a monitored folder ({msg}); choose a working folder outside every scan root and the Collaboration folder",
                 root.display()
@@ -95,7 +96,14 @@ pub fn project_root_overlap(
 fn canonical_or_nearest(path: &Path) -> PathBuf {
     let mut existing = path;
     let mut tail = Vec::new();
-    while !existing.exists() {
+    loop {
+        match existing.try_exists() {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(path = %existing.display(), error = %e, "project working folder not inspectable; treating it as missing");
+            }
+        }
         match (existing.parent(), existing.file_name()) {
             (Some(parent), Some(name)) => {
                 tail.push(name.to_os_string());
@@ -104,9 +112,13 @@ fn canonical_or_nearest(path: &Path) -> PathBuf {
             _ => return path.to_path_buf(),
         }
     }
-    let mut out = existing
-        .canonicalize()
-        .unwrap_or_else(|_| existing.to_path_buf());
+    let mut out = match existing.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(path = %existing.display(), error = %e, "project working folder not resolvable; comparing by its stated path");
+            existing.to_path_buf()
+        }
+    };
     for name in tail.iter().rev() {
         out.push(name);
     }
