@@ -16,14 +16,15 @@
 //! resolved spec's own master fields) or, for an attested light, in place of
 //! generation (`external: true`, the other three `false`).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::collab::gate::header_pixel_scale_arcsec;
 use crate::db::analysis::get_frame_analyses_by_ids;
 use crate::fits_writer::keywords::Bayer;
-use crate::plate_solve::storage::get_plate_solve;
+use crate::plate_solve::storage::{get_plate_solve, PlateSolveRecord};
 
 /// The manifest-relevant facts about one LIGHT frame: the top-level
 /// `FrameIn` fields this module can answer (`filterRaw`/`channel`/
@@ -120,6 +121,9 @@ pub fn build_frame_meta(conn: &Connection, frame_id: i64) -> Result<FrameMeta> {
     if let Some(v) = frow.focallen {
         meta.insert("focalLen".into(), json!(v));
     }
+    if let Some(a) = aperture_mm_of_frame(conn, frame_id)? {
+        meta.insert("aperture".into(), json!(a));
+    }
     if let Some(a) = &analysis {
         if let Some(scale) = pixel_scale_arcsec {
             meta.insert("fwhmArcsec".into(), json!(a.median_fwhm * scale));
@@ -164,6 +168,165 @@ pub fn build_frame_meta(conn: &Connection, frame_id: i64) -> Result<FrameMeta> {
         date_obs: frow.date_obs,
         meta: Value::Object(meta),
     })
+}
+
+/// What a stacking run reads from one project frame's manifest row (plan
+/// 6b-2 C4, spec 4.3), parsed once from `project_frames_local.manifest_json`
+/// (an own row's `FrameInWire` shape or a replica's `FrameViewWire`; the
+/// keys read here are the same in both). `exptimeSec` and `dateObs` are
+/// top-level fields; everything else lives under `meta`, which is frozen at
+/// announce, so an older frame simply lacks the newer keys (`aperture`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProjectFrameMeta {
+    pub exptime_sec: f64,
+    pub date_obs: Option<String>,
+    pub naxis1: Option<i64>,
+    pub naxis2: Option<i64>,
+    pub pixel_scale_arcsec: Option<f64>,
+    pub bayerpat: Option<String>,
+    pub focal_len: Option<f64>,
+    pub aperture: Option<f64>,
+    pub instrume: Option<String>,
+    pub wcs: Option<ManifestWcs>,
+}
+
+/// `meta.wcs` as [`build_frame_meta`] writes it: TAN (no CTYPE), `crpix`
+/// FITS 1-BASED, the CD matrix row-major, optional SIP tables.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestWcs {
+    pub crval1: f64,
+    pub crval2: f64,
+    pub crpix1: f64,
+    pub crpix2: f64,
+    pub cd: [f64; 4],
+    #[serde(default)]
+    pub sip: Option<ManifestSip>,
+}
+
+/// `meta.wcs.sip`: the stored tables verbatim (square or triangular).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ManifestSip {
+    pub order: i32,
+    pub a: Vec<Vec<f64>>,
+    pub b: Vec<Vec<f64>>,
+    #[serde(default)]
+    pub ap: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
+    pub bp: Option<Vec<Vec<f64>>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestRowWire {
+    exptime_sec: f64,
+    #[serde(default)]
+    date_obs: Option<String>,
+    #[serde(default)]
+    meta: Option<MetaWire>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct MetaWire {
+    naxis1: Option<i64>,
+    naxis2: Option<i64>,
+    pixel_scale_arcsec: Option<f64>,
+    bayerpat: Option<String>,
+    focal_len: Option<f64>,
+    aperture: Option<f64>,
+    instrume: Option<String>,
+    wcs: Option<ManifestWcs>,
+}
+
+/// Parse one manifest row (plan 6b-2 C4). A missing exposure or a malformed
+/// key is an error: the caller leaves the frame out with a reason, never a
+/// guess. Unknown keys are ignored.
+pub fn parse_project_frame_meta(manifest_json: &str) -> Result<ProjectFrameMeta> {
+    let row: ManifestRowWire =
+        serde_json::from_str(manifest_json).context("manifest row is not a frame row")?;
+    let meta = row.meta.unwrap_or_default();
+    Ok(ProjectFrameMeta {
+        exptime_sec: row.exptime_sec,
+        date_obs: row.date_obs,
+        naxis1: meta.naxis1,
+        naxis2: meta.naxis2,
+        pixel_scale_arcsec: meta.pixel_scale_arcsec,
+        bayerpat: meta.bayerpat,
+        focal_len: meta.focal_len,
+        aperture: meta.aperture,
+        instrume: meta.instrume,
+        wcs: meta.wcs,
+    })
+}
+
+impl ManifestWcs {
+    /// The `PlateSolveRecord` this WCS is (plan 6b-2 C4): `crpix` back to
+    /// 0-based (the record's convention, `fits_writer::wcs` adds the 1),
+    /// the SIP tables re-encoded as the JSON strings the catalog stores,
+    /// `frame_id = 0` (a project frame has no catalog row), the scale from
+    /// the manifest when it has one (else `sqrt|det CD|`), the rotation as
+    /// `WcsSolution::field_rotation_deg` reports it, counts zero.
+    pub fn to_record(&self, pixel_scale_arcsec: Option<f64>) -> PlateSolveRecord {
+        let [cd1_1, cd1_2, cd2_1, cd2_2] = self.cd;
+        let scale = pixel_scale_arcsec
+            .unwrap_or_else(|| (cd1_1 * cd2_2 - cd1_2 * cd2_1).abs().sqrt() * 3600.0);
+        let rotation = (-cd1_2).atan2(cd2_2).to_degrees().rem_euclid(360.0);
+        let table =
+            |t: &Vec<Vec<f64>>| serde_json::to_string(t).expect("a table of numbers serializes");
+        PlateSolveRecord {
+            id: None,
+            frame_id: 0,
+            crpix1: self.crpix1 - 1.0,
+            crpix2: self.crpix2 - 1.0,
+            crval1: self.crval1,
+            crval2: self.crval2,
+            cd1_1,
+            cd1_2,
+            cd2_1,
+            cd2_2,
+            sip_order: self.sip.as_ref().map(|s| s.order),
+            sip_a_coeffs: self.sip.as_ref().map(|s| table(&s.a)),
+            sip_b_coeffs: self.sip.as_ref().map(|s| table(&s.b)),
+            sip_ap_coeffs: self.sip.as_ref().and_then(|s| s.ap.as_ref().map(table)),
+            sip_bp_coeffs: self.sip.as_ref().and_then(|s| s.bp.as_ref().map(table)),
+            matched_stars: 0,
+            total_detected: 0,
+            rms_residual_px: 0.0,
+            rms_residual_arcsec: 0.0,
+            pixel_scale_arcsec: scale,
+            field_rotation_deg: rotation,
+            solve_time_ms: 0,
+            catalog_used: "manifest".to_string(),
+            algorithm_used: "manifest".to_string(),
+            solved_at: String::new(),
+            expected_catalog_stars_in_fov: None,
+            inlier_ratio: None,
+        }
+    }
+}
+
+/// `APTDIA` (mm) from the frame's stored header blob (spec 8: `frames` has
+/// no aperture column). The first `fits_header` row that carries one wins.
+fn aperture_mm_of_frame(conn: &Connection, frame_id: i64) -> Result<Option<f64>> {
+    let mut stmt = conn.prepare(
+        "SELECT fi.format, fh.header FROM frames f
+         JOIN files fi ON fi.id = f.file_id
+         JOIN fits_header fh ON fh.file_id = f.file_id
+         WHERE f.id = ?1 ORDER BY fh.id",
+    )?;
+    let rows = stmt.query_map([frame_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (format, header) = row?;
+        if let Some(a) =
+            crate::fits_parser::stored_header::aperture_mm_from_stored_header(&format, &header)
+        {
+            return Ok(Some(a));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -349,5 +512,118 @@ mod tests {
             bytes.len()
         );
         assert!(m.meta.get("wcs").unwrap().get("sip").is_some());
+    }
+
+    /// Plan 6b-2 C4: the round trip publish -> manifest -> stacking returns the
+    /// catalog's own solve: crpix back to 0-based, CD and SIP tables equal,
+    /// and the same pixel -> sky mapping.
+    #[test]
+    fn a_published_wcs_reads_back_as_the_catalog_record() {
+        let conn = seed_db();
+        let frame_id = seed_frame(&conn, Some("L"), None);
+        seed_solve(&conn, frame_id, Some(3));
+        let original = crate::plate_solve::storage::get_plate_solve(&conn, frame_id)
+            .unwrap()
+            .unwrap();
+        let m = build_frame_meta(&conn, frame_id).unwrap();
+        let row = serde_json::json!({
+            "exptimeSec": m.exptime_sec,
+            "dateObs": m.date_obs,
+            "meta": m.meta,
+        });
+        let parsed = parse_project_frame_meta(&row.to_string()).unwrap();
+        assert_eq!(parsed.exptime_sec, 300.0);
+        assert_eq!((parsed.naxis1, parsed.naxis2), (Some(6248), Some(4176)));
+        assert_eq!(parsed.pixel_scale_arcsec, Some(2.0));
+        let record = parsed
+            .wcs
+            .as_ref()
+            .unwrap()
+            .to_record(parsed.pixel_scale_arcsec);
+        assert_eq!(record.frame_id, 0);
+        assert_eq!(
+            (record.crpix1, record.crpix2),
+            (original.crpix1, original.crpix2)
+        );
+        assert_eq!(
+            (record.cd1_1, record.cd1_2, record.cd2_1, record.cd2_2),
+            (
+                original.cd1_1,
+                original.cd1_2,
+                original.cd2_1,
+                original.cd2_2
+            )
+        );
+        assert_eq!(record.sip_order, original.sip_order);
+        assert_eq!(record.sip_a_coeffs, original.sip_a_coeffs);
+        assert_eq!(record.sip_bp_coeffs, original.sip_bp_coeffs);
+        let (a, b) = (
+            original.to_solution().unwrap(),
+            record.to_solution().unwrap(),
+        );
+        for (x, y) in [(0.0, 0.0), (3123.5, 2087.5), (6000.0, 100.0)] {
+            let (ra0, dec0) = a.pixel_to_sky(x, y);
+            let (ra1, dec1) = b.pixel_to_sky(x, y);
+            assert!((ra0 - ra1).abs() < 1e-12 && (dec0 - dec1).abs() < 1e-12);
+        }
+    }
+
+    /// Plan 6b-2 C4: an own row (the `FrameInWire` shape, no `dateObs` when
+    /// unknown), a replica row with every key, and a row with `meta: null`.
+    #[test]
+    fn the_manifest_parser_reads_own_replica_and_bare_rows() {
+        let own = r#"{"frameUuid":"u1","fileName":"c.fits","blake3":"b","byteSize":1,"xxh3":"x",
+            "filterRaw":"Red","filterCanonical":"R","channel":"osc","exptimeSec":120.0,"gateVersion":0,
+            "meta":{"bayerpat":"RGGB","focalLen":400.0,"aperture":80.0,"instrume":"ASI2600MC"}}"#;
+        let m = parse_project_frame_meta(own).unwrap();
+        assert_eq!(m.exptime_sec, 120.0);
+        assert_eq!(m.date_obs, None);
+        assert_eq!(m.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!((m.focal_len, m.aperture), (Some(400.0), Some(80.0)));
+        assert_eq!(m.wcs, None);
+        let bare = parse_project_frame_meta(r#"{"exptimeSec":60.0,"meta":null}"#).unwrap();
+        assert_eq!(
+            bare,
+            ProjectFrameMeta {
+                exptime_sec: 60.0,
+                ..ProjectFrameMeta::default()
+            }
+        );
+        assert!(
+            parse_project_frame_meta(r#"{"meta":{}}"#).is_err(),
+            "no exposure is an error"
+        );
+        assert!(
+            parse_project_frame_meta(r#"{"exptimeSec":1.0,"meta":{"wcs":{"cd":[1,2]}}}"#).is_err(),
+            "a malformed WCS is an error, never a guess"
+        );
+    }
+
+    /// Plan 6b-2 C4 / spec section 8: publication carries the aperture from the
+    /// stored header blob; without one the key is omitted.
+    #[test]
+    fn meta_carries_the_aperture_from_the_stored_header() {
+        let conn = seed_db();
+        let with = seed_frame(&conn, Some("L"), None);
+        let without = seed_frame(&conn, Some("L"), None);
+        let card_text = format!(
+            "{:<80}{:<80}",
+            "APTDIA  =                200.0 / aperture diameter (mm)", "END"
+        );
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header)
+             VALUES ((SELECT file_id FROM frames WHERE id = ?1), ?2)",
+            params![with, card_text],
+        )
+        .unwrap();
+        assert_eq!(
+            build_frame_meta(&conn, with).unwrap().meta["aperture"],
+            200.0
+        );
+        assert!(build_frame_meta(&conn, without)
+            .unwrap()
+            .meta
+            .get("aperture")
+            .is_none());
     }
 }
