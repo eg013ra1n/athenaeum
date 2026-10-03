@@ -1201,7 +1201,16 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     accepted frame is a Frames row with its reason.
   - Groups are colour × canonical filter × class, keyed
     `<mono|osc|cfa>__<filter>__<class>`, with no binning and no camera. `cfa`
-    appears only when `debayerOsc` is off and the file is a one-plane mosaic.
+    appears only when `debayerOsc` is off and the file is a one-plane mosaic,
+    or when its shape cannot be read (a warning is logged; Prepare then
+    excludes the unreadable file).
+  - **The colour rule** (`project_source::color_token`), the same as the
+    attested rule below: the manifest's `bayerpat` decides colour when it is
+    present; otherwise the file's own plane count decides (three planes →
+    `osc`, anything else → `mono`; an unreadable file is `mono`, with a
+    warning). An externally debayered contributor light has no `bayerpat` and
+    three planes, so it groups as `osc` and Prepare uses it in place. A
+    Frames row's colour mode comes from the same token as its group.
   - Handles are minted in one IMMEDIATE transaction.
 - **Funnels.** `origin::tests::subject_and_origin_variants_stay_in_their_funnels`
   keeps every `StackSubject::` / `FrameOrigin::` path in the production half of
@@ -1218,7 +1227,9 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   excludes the frame "changed during the run"; one that cannot be read excludes
   it with "landed file unreadable: …" (more specific than spec §5.1's single
   reason). A changed reference fails the run ("the reference frame changed
-  during the run").
+  during the run"); Register checks the reference BEFORE its star read (the
+  co-registered path once, the native path per group), so that read never sees
+  new bytes. A catalog origin always passes with no I/O.
 - **The plan** (`build_plan`'s project arm).
   - It seeds the config and mints handles: the documented exception to "the plan
     reads only". Readiness is empty and there are no masters.
@@ -1298,14 +1309,25 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     solved as is, with no copy. With no scratch folder the original is solved
     once. The copy is deleted right after the first call. Two failures report
     "<first>; on the unscaled pixels: <second>".
-  - **`SolveOutcome::Unavailable`**: a catalog that cannot open, a scratch folder
-    that cannot be created or a copy that cannot be written. It is never
-    cached (`write_outcome` refuses it, and it serializes to an error), a run
-    warning counts only the frames without a cached `Solved`, and the frames
-    are retried next run.
+  - **Nothing is attempted, nothing cached** in two cases, both through
+    `solve_unavailable` (one run warning counting only the frames without a
+    cached `Solved`, frames retried next run):
+    - the solver's catalog cannot open: `ready()` fails, and it is called only
+      once a frame actually needs a solve (a run whose frames are all cached
+      never asks), so an open failure cannot reach a frame's outcome;
+    - the scratch folder cannot be created.
+  - **`SolveOutcome::Unavailable`** is the per-frame case: the ADU copy cannot
+    be written. It is never cached (`write_outcome` refuses it, and it
+    serializes to an error), and the frame is retried next run.
   - Every other outcome (solved, failed, refused) is a `solve` artifact: group
     key `""`, payload `{blake3, app_version, outcome}`, hash over blake3 and
-    the solver identity (`solver_config_hash:catalog_identity`).
+    the solver identity (`solver_config_hash:catalog_identity`). This departs
+    from spec §5.2: the payload is `{blake3, app_version, outcome}`, failures
+    are cached per app version, and the first attempt is the ADU-scaled one.
+  - A frame whose manifest has no `pixelScaleArcsec` is solved with no scale
+    hint and no scale check in the acceptance gate; the run logs a warning
+    per frame before solving it. A missing project row is a warning too (the
+    frames are solved without a position hint), never a silent blind solve.
   - **What is not in the key.** Per-frame hints (project target, manifest scale)
     are not hashed: a Solved outcome is hint-independent and the manifest scale
     is frozen per content, so only a Failed/Refused cached under an older
