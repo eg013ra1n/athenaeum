@@ -37,8 +37,16 @@ pub const COMPOSE_SAMPLE_PX: usize = 32;
 pub const COMPOSE_VERSION: u32 = 1;
 
 /// Newton iterations of the inverse chain, and its convergence tolerance.
+/// 1e-8 px is reachable at every pixel scale (the chain's own rounding is
+/// ~1e-10 px at 2000 px coordinates), so a converging point stops after a
+/// few steps instead of spending all [`INVERSE_MAX_ITER`].
 const INVERSE_MAX_ITER: usize = 30;
-const INVERSE_TOL_PX: f64 = 1e-9;
+const INVERSE_TOL_PX: f64 = 1e-8;
+
+/// A point whose Newton iteration ends above this residual (px) did not
+/// converge: it is off the footprint (`NaN`), never an unconverged iterate
+/// that would map a grid pixel outside the frame into it.
+const INVERSE_FAIL_PX: f64 = 1e-6;
 
 /// How far (px) the sampled domain reaches beyond the footprint: enough
 /// for any interpolation kernel's support at the frame's edge.
@@ -120,11 +128,16 @@ pub fn wcs_record_hash(r: &PlateSolveRecord) -> String {
 /// The exact chain subject → grid, as a [`DisplacementField`] around the
 /// fitted affine `linear`.
 ///
-/// Where the star map is a spline, its exact path clamps at the spline's
-/// domain, so the field has a derivative kink there: the one 8-px cell
-/// straddling a frame edge carries up to ≈ 0.012 px of bilinear error. Every
-/// consumer reads NaN outside the frame, so the 0.01 px pin is a statement
-/// about the frame's interior; do not tighten it at the edge.
+/// Wherever the star map clamps its query at a domain edge (a spline's
+/// domain, or a polynomial's `fitted_domain`: the star bounding box plus
+/// 10 %), the field has a derivative kink on that edge's image. The edge
+/// can lie INSIDE the frame, so the kink is not confined to the frame's
+/// rim: the one 8-px bilinear cell straddling it carries up to about
+/// `h · |Δslope| / 4` of error (`h` = [`TPS_GRID_PX`], `Δslope` the jump of
+/// the field's derivative across the edge). The 0.01 px pin is a statement
+/// about everywhere else; the kink line has its own, documented bound
+/// (`a_clamp_kink_inside_the_frame_stays_within_its_documented_bound`).
+/// Do not tighten the pin at the kink.
 #[derive(Debug)]
 pub struct ComposedField {
     star: PixelMap,
@@ -145,21 +158,28 @@ impl ComposedField {
     /// The subject pixel whose chain lands on `(gx, gy)`: Newton steps from
     /// the affine's own inverse, with the affine's Jacobian. The residual
     /// the affine leaves is a smooth few-pixel field, so this contracts by
-    /// orders of magnitude per step. `NaN` when the chain is undefined.
+    /// orders of magnitude per step. `NaN` when the chain is undefined, and
+    /// `NaN` when the iteration ends above [`INVERSE_FAIL_PX`]: a point that
+    /// does not converge is off the footprint.
     pub fn chain_inverse(&self, gx: f64, gy: f64) -> (f64, f64) {
         let (mut sx, mut sy) = self.linear_inv.apply(gx, gy);
         let m = &self.linear_inv.m;
-        for _ in 0..INVERSE_MAX_ITER {
+        let mut residual = f64::INFINITY;
+        for iter in 0..=INVERSE_MAX_ITER {
             let (cx, cy) = self.chain(sx, sy);
             let (rx, ry) = (gx - cx, gy - cy);
             if !(rx.is_finite() && ry.is_finite()) {
                 return (f64::NAN, f64::NAN);
             }
-            if rx.abs().max(ry.abs()) <= INVERSE_TOL_PX {
+            residual = rx.abs().max(ry.abs());
+            if residual <= INVERSE_TOL_PX || iter == INVERSE_MAX_ITER {
                 break;
             }
             sx += m[0][0] * rx + m[0][1] * ry;
             sy += m[1][0] * rx + m[1][1] * ry;
+        }
+        if residual > INVERSE_FAIL_PX {
+            return (f64::NAN, f64::NAN);
         }
         (sx, sy)
     }
@@ -228,9 +248,25 @@ pub fn compose_to_grid(
     reference: &ReferenceWcs,
     grid: &GridRun,
 ) -> Result<PixelMap, String> {
+    let (field, domain) = compose_field(star, subject_dims, reference, grid)?;
+    let linear = field.linear;
+    PixelMap::with_distortion_model(linear, DistortionModel::sampled(Arc::new(field), domain))
+        .ok_or_else(|| "the grid affine is singular".to_string())
+}
+
+/// The field and the sampled domain behind [`compose_to_grid`].
+fn compose_field(
+    star: &PixelMap,
+    subject_dims: (usize, usize),
+    reference: &ReferenceWcs,
+    grid: &GridRun,
+) -> Result<(ComposedField, [f64; 4]), String> {
     let (w, h) = subject_dims;
     if w == 0 || h == 0 {
         return Err("the frame has no pixels".to_string());
+    }
+    if matches!(star.distortion, Some(DistortionModel::Sampled { .. })) {
+        return Err("a composed map cannot be composed again".to_string());
     }
     let (xs, ys) = (lattice(w), lattice(h));
     let mut pairs: Vec<Pair> = Vec::with_capacity(xs.len() * ys.len());
@@ -304,8 +340,7 @@ pub fn compose_to_grid(
             ));
         }
     }
-    PixelMap::with_distortion_model(linear, DistortionModel::sampled(Arc::new(field), domain))
-        .ok_or_else(|| "the grid affine is singular".to_string())
+    Ok((field, domain))
 }
 
 /// The hash a grid-registered frame's `registered` artifact is cached under
@@ -669,5 +704,158 @@ mod tests {
             (64, 48)
         );
         assert!(subject_dims(0, 48, Path::new("/nowhere/x.fits")).is_err());
+    }
+
+    /// A cubic star-map distortion on the frame's own centre and scale, with
+    /// the given clamp domain (normalized coordinates).
+    fn cubic_star(domain: Option<[f64; 4]>) -> PixelMap {
+        let mut ax = vec![0.0; 7];
+        let mut ay = vec![0.0; 7];
+        ax[3] = 0.6;
+        ay[6] = -0.4;
+        PixelMap::with_distortion(
+            Linear::identity(),
+            Distortion {
+                order: 3,
+                center: (W as f64 / 2.0, H as f64 / 2.0),
+                scale: W as f64 / 2.0,
+                domain,
+                forward: Polynomial2D {
+                    order: 3,
+                    ax: ax.clone(),
+                    ay: ay.clone(),
+                },
+                inverse: Polynomial2D {
+                    order: 3,
+                    ax: ax.iter().map(|v| -v).collect(),
+                    ay: ay.iter().map(|v| -v).collect(),
+                },
+            },
+        )
+        .unwrap()
+    }
+
+    fn test_grid(rotation_deg: f64) -> GridRun {
+        GridRun::new(CanonicalGrid {
+            scale_arcsec: SCALE,
+            width_px: 2048,
+            height_px: 1600,
+            crval1: 83.8,
+            crval2: -5.4,
+            rotation_deg,
+        })
+    }
+
+    /// Fix round 1 (M4): a composed map is not a star map.
+    #[test]
+    fn a_composed_map_cannot_be_composed_again() {
+        let _quiet = grid_counters::exclusive();
+        let reference = ReferenceWcs::from_record(&reference_record(83.8, -5.4)).unwrap();
+        let grid = test_grid(0.0);
+        let identity = PixelMap::linear(Linear::identity()).unwrap();
+        let composed = compose_to_grid(&identity, (W, H), &reference, &grid).unwrap();
+        let err = compose_to_grid(&composed, (W, H), &reference, &grid).unwrap_err();
+        assert_eq!(err, "a composed map cannot be composed again");
+    }
+
+    /// Fix round 1 (M2): the inverse chain never returns an unconverged
+    /// iterate. Far outside the frame, with an unbounded cubic star map, a
+    /// grid pixel either has a subject pixel whose chain lands on it, or it
+    /// is `NaN` (off the footprint) — never a ghost point inside the frame.
+    #[test]
+    fn an_unconverged_inverse_is_off_the_footprint() {
+        let _quiet = grid_counters::exclusive();
+        let reference = ReferenceWcs::from_record(&reference_record(83.8, -5.4)).unwrap();
+        let grid = test_grid(30.0);
+        let (field, _) = compose_field(&cubic_star(None), (W, H), &reference, &grid).unwrap();
+        let mut nan = 0;
+        let mut converged = 0;
+        for i in -12..=12 {
+            for j in -12..=12 {
+                let (gx, gy) = (1024.0 + i as f64 * 900.0, 800.0 + j as f64 * 900.0);
+                let (sx, sy) = field.chain_inverse(gx, gy);
+                if sx.is_nan() || sy.is_nan() {
+                    nan += 1;
+                    continue;
+                }
+                let (cx, cy) = field.chain(sx, sy);
+                assert!(
+                    (cx - gx).abs().max((cy - gy).abs()) <= 1e-6,
+                    "an unconverged iterate escaped at ({gx}, {gy})"
+                );
+                converged += 1;
+            }
+        }
+        assert!(nan > 0, "the sweep never left the footprint");
+        assert!(converged > 0, "the sweep never converged");
+    }
+
+    /// Fix round 1 (M3): a star map's clamp domain can lie INSIDE the frame,
+    /// and the composed field then has a derivative kink on its image.
+    /// The bilinear grid errs by at most about `h · |Δslope| / 4` in the one
+    /// cell straddling it; the pin everywhere else is unchanged (0.01 px).
+    #[test]
+    fn a_clamp_kink_inside_the_frame_stays_within_its_documented_bound() {
+        let _quiet = grid_counters::exclusive();
+        let reference = ReferenceWcs::from_record(&reference_record(83.8, -5.4)).unwrap();
+        let grid = test_grid(30.0);
+        // Normalized domain ±0.5 around the centre: x in [400, 1200],
+        // y in [200, 1000] in frame pixels.
+        let star = cubic_star(Some([-0.5, -0.5, 0.5, 0.5]));
+        let map = compose_to_grid(&star, (W, H), &reference, &grid).unwrap();
+        let mut worst_kink = 0f64;
+        let mut worst_slope = 0f64;
+        for (vertical, edge) in [
+            (true, 400.0),
+            (true, 1200.0),
+            (false, 200.0),
+            (false, 1000.0),
+        ] {
+            let at = |t: f64, along: f64| {
+                if vertical {
+                    (t, along)
+                } else {
+                    (along, t)
+                }
+            };
+            for k in 0..40 {
+                let along = if vertical {
+                    300.0 + k as f64 * 17.3
+                } else {
+                    450.0 + k as f64 * 17.3
+                };
+                for d in -80..=80 {
+                    let (x, y) = at(edge + d as f64 * 0.1, along);
+                    let exact = exact_chain(&star, &reference, &grid, x, y);
+                    let (gx, gy) = map.forward(x, y);
+                    worst_kink = worst_kink.max((gx - exact.0).hypot(gy - exact.1));
+                }
+                let (xa, ya) = at(edge - 0.01, along);
+                let (xb, yb) = at(edge - 0.02, along);
+                let (xc, yc) = at(edge + 0.02, along);
+                let (xd, yd) = at(edge + 0.01, along);
+                let left = {
+                    let (a, b) = (
+                        exact_chain(&star, &reference, &grid, xa, ya),
+                        exact_chain(&star, &reference, &grid, xb, yb),
+                    );
+                    ((a.0 - b.0) / 0.01, (a.1 - b.1) / 0.01)
+                };
+                let right = {
+                    let (a, b) = (
+                        exact_chain(&star, &reference, &grid, xc, yc),
+                        exact_chain(&star, &reference, &grid, xd, yd),
+                    );
+                    ((a.0 - b.0) / 0.01, (a.1 - b.1) / 0.01)
+                };
+                worst_slope = worst_slope.max((left.0 - right.0).hypot(left.1 - right.1));
+            }
+        }
+        let bound = crate::geometry::TPS_GRID_PX as f64 * worst_slope / 4.0;
+        assert!(
+            worst_kink <= bound * 1.25,
+            "kink line: {worst_kink} px exceeds 1.25 * h*|dslope|/4 = {bound}"
+        );
+        map.release_grids();
     }
 }

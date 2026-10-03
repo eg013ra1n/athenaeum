@@ -58,8 +58,8 @@ pub trait DisplacementField: Send + Sync + std::fmt::Debug {
 }
 
 /// A bilinear displacement grid over ONE direction of a
-/// [`DistortionModel::Tps`] map's domain, sampled every [`TPS_GRID_PX`]
-/// pixels (ruling R-M4c-5).
+/// [`DistortionModel::Tps`] or [`DistortionModel::Sampled`] map's domain,
+/// sampled every [`TPS_GRID_PX`] pixels (ruling R-M4c-5).
 ///
 /// Evaluating the spline itself costs one `ln` per node per pixel — at
 /// the 600-node cap that is 600 logarithms for every one of a 26 Mpx
@@ -76,7 +76,8 @@ pub trait DisplacementField: Send + Sync + std::fmt::Debug {
 /// magnitude more than answering them directly (fix round 1, ruling
 /// R-T4-3).
 ///
-/// Never serialized: `transform_json` stores the splines, and the grid is
+/// Never serialized: `transform_json` stores the splines (a sampled layer
+/// is re-derived from the star map it was composed from), and the grid is
 /// rebuilt lazily on first use.
 ///
 /// NOT `Clone`, deliberately: the whole point of the cache is that one
@@ -201,8 +202,9 @@ pub(crate) mod grid_counters {
     /// test that takes it is short, and the one long holder (the 20-frame
     /// run pin) is the only thing that needs the quiet.
     ///
-    /// **A new test that builds a `tps` grid must take this too**, or it
-    /// will make the run pin flaky rather than itself.
+    /// **A new test that builds a `tps` grid or a sampled layer's grid must
+    /// take this too**, or it will make the run pin flaky rather than
+    /// itself.
     static EXCLUSIVE: Mutex<()> = Mutex::new(());
 
     pub fn exclusive() -> MutexGuard<'static, ()> {
@@ -257,7 +259,8 @@ impl Drop for TpsGrid {
 /// burst's own handle keeps its grid alive to the end.
 type GridSlot = RwLock<Option<Arc<TpsGrid>>>;
 
-/// The two lazily-built displacement grids of one spline pair, shared by
+/// The two lazily-built displacement grids of one spline pair (or one
+/// sampled field), shared by
 /// every clone of the [`PixelMap`] that owns them (fix round 1, ruling
 /// R-T4-3b/c) and releasable through any of them (fix round 2, ruling
 /// R-T4-6).
@@ -309,7 +312,7 @@ enum Direction {
 /// One direction's distortion, resolved once for a burst of pixel
 /// queries (ruling R-T4-6b).
 ///
-/// The spline arm holds an `Arc<TpsGrid>`: taken once when the evaluator
+/// The grid arm (spline or sampled layer) holds an `Arc<TpsGrid>`: taken once when the evaluator
 /// is built, so the per-pixel path is a bounds-checked slice read and
 /// nothing else — and so a [`PixelMap::release_grids`] on another thread
 /// cannot free the grid this burst is reading.
@@ -331,7 +334,7 @@ impl<'a> EvalLayer<'a> {
                 };
                 match grid {
                     Some(g) => EvalLayer::Grid(g),
-                    // Unreachable: the spline arm always returns a grid.
+                    // Unreachable: the spline and sampled arms always return a grid.
                     None => EvalLayer::None,
                 }
             }
@@ -454,8 +457,9 @@ pub enum DistortionModel {
     },
 }
 
-/// The cached grids are a pure function of the two splines and the domain,
-/// so two models that agree on those three ARE equal — a map that has
+/// The cached grids are a pure function of the two splines and the domain
+/// (of the field's key and the domain for a sampled layer),
+/// so two models that agree on those ARE equal — a map that has
 /// already been evaluated must compare equal to a freshly deserialized
 /// one, and a clone that shares its parent's grids must compare equal to
 /// one that has none.
@@ -590,7 +594,7 @@ impl DistortionModel {
         }
     }
 
-    /// `"polynomial<order>"` / `"tps"` — the suffix
+    /// `"polynomial<order>"` / `"tps"` / `"sampled"` — the suffix
     /// `registration_results.model` carries.
     pub fn label(&self) -> String {
         match self {
@@ -1286,6 +1290,17 @@ mod tests {
         }
         assert!(worst < 1e-3, "pixel path vs exact path: {worst} px");
         assert_eq!(layer.grids_built(), (true, false), "only the forward grid");
+        let inverse_only = PixelMap::with_distortion_model(
+            Linear::identity(),
+            DistortionModel::sampled(Arc::new(Wobble), [0.0, 0.0, TW, TH]),
+        )
+        .unwrap();
+        let _ = inverse_only.inverse(10.0, 10.0);
+        assert_eq!(
+            inverse_only.distortion.as_ref().unwrap().grids_built(),
+            (false, true),
+            "only the inverse grid"
+        );
         let clone = map.clone();
         assert_eq!(clone, map, "equal by key and domain");
         assert!(
