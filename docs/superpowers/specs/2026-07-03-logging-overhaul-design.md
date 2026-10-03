@@ -278,6 +278,30 @@ Disabled levels cost ~an atomic load per call site (tracing callsite caching); f
 
 **Dictionary extension (collab v3 wave 6a, `export::project_organizer` + `api::{collab_exchange, collab_remap, collab_live::workers}`, 2026-10-02):** the names the project export, the filter remap and feed coalescing log. **`linked`** / **`copied`** / **`rewritten`** / **`failed`** (i32; the project export's four placement counts — symlinked, plain-copied, FILTER-patched copies, frames that could not be placed — on `"project export organized"` and `"project export finished"`; `failed` is also the frames whose remap request failed, u32, on `"filter remap stopped"`/`"filter remap finished"`) and **`files_organized`** (i32; linked + copied + rewritten, on `"project export finished"`). **`cancelled`** (bool; the run stopped early because the user cancelled — on `"project export organized"` and `"filter remap finished"`, where it means frames were left unsent). **`done`** (u32; frames a remap changed on the hub, beside `failed`, on the two remap outcome lines). **`canonical`** (string; the canonical filter a remap writes, on `"filter remap started"`). **`merged`** (usize; queued `project` events absorbed into one manifest pull, on the debug `"feed: pull-needing events merged"`, beside `project_id` and `version`). **`output_dir`** (string; the output folder a refused project export was given, on `"project export refused: path has . or .. components"`, which logs `output_dir` alone; only the overlap warning, `"project export refused: export folder overlaps a root"`, carries `path` = the overlapped root beside it). The remap's 429 retry reuses **`attempt`** (u32, 1-based) on `"remap: rate limited, waiting"`. Reused unchanged: `project_id`, `frame_uuid`, `count`, `duration_ms`, `error`, `path`, `outcome`, `frame_set_id`.
 
+**Dictionary extension (collab v3 wave 6b-2, `stacking::{project_source, origin, prepare, run, solve, plan}` + `collab::grid` + `api::{collab, collab_grid, collab_live::feed}` + `plate_solve::layers`, 2026-10-03):** the names the project path logs.
+
+- **`not_stackable`** (usize): published, accepted project frames the frame source leaves out on this device. It appears beside `count` (the stackable ones) and `groups` on the debug `"project frame source built"`.
+- **`prepared`** (`"in_place"` | `"converted"` | `"debayered"`): what Prepare did with one frame, on the debug `"frame prepared"`. It appears beside `run_id`, `frame_id`, `group_key`, and `frame_uuid` for a project frame.
+- **`solved`** (usize): frames the Solve sub-step solved in this run, beside `count` (the frames it tried), on the info `"project frames solved"`.
+- **`grid_hash`** (16-hex XXH3 of a canonical grid's canonical JSON) on the info `"grid saved"`.
+- **`frames_inside`** (usize): frames at least half inside a proposed grid, on the debug `"grid proposed"`.
+- **`bayerpat`** (string): a CFA pattern a file's own header declared that no reader recognizes, on the warn `"unrecognized bayer pattern in the file's header; treated as no mosaic"`.
+- **`stamp`** (debug-formatted `Option<String>`): a landed frame's recorded `size:mtime` stamp that does not parse, on the warn `"landed stamp unreadable; frame left out"`.
+
+Messages the stacking project path added, with their fields (all names above or reused below):
+- Prepare: info `"stacking run started"` (`run_id`, `set_id`, `project_id`, `count`, `groups`, `config_hash`); debug `"frame prepared"`; warn `"frame excluded"` (`run_id`, `frame_id`, `reason`, a resolve-time exclusion); warn `"preparation failed; frame excluded"` (`run_id`, `frame_id`, `error`); error `"prepare output would overwrite its source; frame excluded"` (`run_id`, `frame_id`, `path`); warn `"bayer drizzle ignored: the osc debayer is off for this run"` (`run_id`, `set_id`, `project_id`).
+- Attested grouping: warn `"file shape unreadable; colour token assumed cfa"` and `"file shape unreadable; colour token falls back to the catalog (mono)"` (`set_id`, `frame_id`, `path`; the project variant carries `project_id` and `frame_uuid`).
+- Identity check: warn `"landed project frame changed during the run"` (`project_id`, `frame_uuid`, `path`, `outcome` = `"missing"` | `"drifted"`).
+- Solve: debug `"project frame solved"` (`run_id`, `frame_id`, `frame_uuid`, `outcome`, `duration_ms`); warn `"project frame could not be plate-solved"` (plus `reason`); warn `"plate solving unavailable; frames without a manifest wcs stay unsolved"` (`run_id`, `count`, `error`); debug `"no stage-1 file; solve skipped"` (`run_id`, `frame_id`); warn `"solve artifact without a payload; solving again"` / `"solve artifact unreadable; solving again"` (`frame_id` or `project_id` + `frame_uuid`, `error`); error `"the plate solver panicked"` (`path`). The first failed attempt of a unit-domain frame is logged at warn with `error`, and a copy that cannot be made or removed logs once with the copy's `path`.
+
+Reused in their existing senses:
+- `project_id`, `run_id`, `group_key`, `count`, `groups`, `path`, `error`, `duration_ms` and `config_hash`;
+- `frame_uuid`;
+- `frame_id`: a stacking frame id, which is a catalog `frames.id`, or a `stack_project_frames` handle on a project run (also on the solver's `"solve"` span for a project frame; the real-data probe, which runs outside a run, records 0);
+- `reason`: an exclusion reason, `"changed during the run"` among them;
+- `outcome`: a solve's `solved` / `failed` / `refused`, or the stat verdict on `"landed project frame changed during the run"`;
+- `set_id`: stacking's own sense, a run's frame set. It is an `Option` now, recorded exactly as before for a frame set and absent on a project run.
+
 ## Rollout shape
 
 Phased (detail in the implementation plan): (1) infra — deps, subscriber, files, reload, settings plumbing; (2) command boundary both backends; (3) core sweep module-by-module; (4) submodules (usual branch + bump); (5) Settings UI; (6) MCP crate. Next version branch per the version-branch rule. Docker image and uninstall scripts updated where touched.

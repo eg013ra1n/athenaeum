@@ -1073,7 +1073,7 @@ reverted with its numbers. Harness: `tier1-compare.py --numeric`, the
 `2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §18 steps 0-2): the
 behaviour-preserving seam under project stacking. Nothing a frame-set user can
 see moved; the wire shapes (`StackingRunRow.framesSetId`, events, `RunSummary`,
-`StackingPlan.setId`, filled by `run::wire_set_id`) are unchanged.
+`StackingPlan.setId`, filled by `run::wire_set_id`) are unchanged (6b-2 changed them; see below).
 
 - **`StackSubject::{FrameSet(i64), Project(String)}`** (`db::stacking`,
   ungated, re-exported as `stacking::StackSubject`; its `Display` prints
@@ -1131,7 +1131,7 @@ see moved; the wire shapes (`StackingRunRow.framesSetId`, events, `RunSummary`,
   `stacking_project_config`, `collab_projects.canonical_grid_json`,
   `stacking_run_groups.exposure_class`.
 - **Per-frame catalog reads go through `stacking::origin`.** `FrameOrigin`
-  has one variant, `Catalog { file_id }`; `origin_of` refuses a frame with no
+  had one variant in 6b-1, `Catalog { file_id }` (6b-2's two are below); `origin_of` refuses a frame with no
   origin (an error, never a silent catalog read); `stored_solve` and
   `cfa_geometry` are the dispatchers. `HashMemo` is built with the run's
   origin map and dispatches the stage-1 hash by origin, so its callers did not
@@ -1140,7 +1140,7 @@ see moved; the wire shapes (`StackingRunRow.framesSetId`, events, `RunSummary`,
   stages. 6b-2 adds `Project { .. }` and every `match` then fails to compile at
   exactly the sites that need a project arm. Subject-level reads have a
   dispatcher too: `paths::subject_layout` (`<working>/<set_slug(name)>` for a
-  frame set, `<working>/projects/<set_slug(slug)>` for a project).
+  frame set, `<working>/_projects/<set_slug(slug)>` for a project; 6b-1 wrote `projects/`).
 - **The config pin.** `calibration_subtree` writes grouping as
   `{"exposureToleranceSec": x}` only, pinned by
   `stage_hashes_are_pinned_to_golden_literals` (pure helpers, literal inputs).
@@ -1150,18 +1150,213 @@ see moved; the wire shapes (`StackingRunRow.framesSetId`, events, `RunSummary`,
 - **For future editors**: ts-rs copies `///` docs of exported fields into
   `src/types`; exported fields carry `//` comments so the generated files stay
   byte-identical (`git diff --exit-code src/types`).
-- **Next (plan 6b-2, the project path).** Project stacking itself is not
-  here: every project entry point answers `PROJECT_STACKING_UNAVAILABLE`, and
-  no code path opens a project file or runs a project stage. Open for 6b-2:
-  (1) the working-folder namespace overlap, a frame set slugged `projects`
-  against project slugs equal to a fixed subtree name; (2) the
-  `RegistrationRecord` shape for a project (the registration store's Project
-  arm stores and reads nothing; `stored_registrations` returns the
-  catalog-shaped record, so 6b-2 either maps the registered artifacts'
-  payloads into it or changes its consumers); (3) confining all subject/origin
-  dispatch to the named funnels, with a grep test (the funnels include
-  `plan::last_run_reference_scale` and `plan::cleanup_stale_note`, which still
-  take `frames_set_id` and wrap it into a subject).
+- **Resolved by 6b-2.**
+  - (1) The namespace overlap: a project lives under `<working>/_projects/`, and no frame-set slug can start with `_`.
+  - (3) The funnels: a grep test now enforces them, and `last_run_reference_scale` / `cleanup_stale_note` take `&StackSubject`.
+  - (2), the project's `RegistrationRecord` shape, belongs to registration onto the grid (6b-3).
+
+**The project path (wave 6b-2, 2026-10-03)** (plan
+`2026-10-03-collab-v3-wave6b2-project-path-plan.md`, spec
+`2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §18 steps 3-7 and 13).
+A collaboration project is a stacking subject up to, but not including,
+registration onto its canonical grid. `start_stacking` still refuses a project
+(`PROJECT_STACKING_UNAVAILABLE`). Project stages run only through
+`run::project_test_context` in tests until 6b-3.
+
+- **The wire is subject-aware.** The two events, `RunSummary`, `StackingRunRow`
+  and `StackingPlan` carry `setId | projectId`, exactly one set
+  (`run::wire_subject`). `RunSummary.projectId` is `#[serde(default)]`.
+  `useStackingRuns` drops an event without a `setId` until 6c.
+- **Four config fields.**
+  - `grouping.exposureMode` (`seconds | stops | equivalent | none`, default `seconds`).
+  - `grouping.stopsWidth` (default 1, clamped to `MIN_STOPS_WIDTH` = 0.1).
+  - `output.coverageMap` and `output.cropToCoverage`.
+
+  No stage hash moved: the golden literals hold with non-default values.
+  `config_hash` was re-pinned once. A project's first plan seeds its stored
+  document (`stacking_project_config`) with `exposureMode = stops`.
+- **Exposure classes** (`groups::classify_exposures`, pure, shared by both frame sources).
+  - `seconds` is the old clustering, byte for byte.
+  - `stops` and `equivalent` anchor at the shortest remaining exposure and take
+    everything within ×2^W. `equivalent` works on t/N², N = `meta.focalLen` /
+    `meta.aperture`; without both it falls back to seconds, with a warning.
+  - `none` is one class, `all`.
+  - Frames without EXPTIME keep their own `unknown` class in every mode.
+  - Tokens are `<t>s`, `st<num>`, `eq<num>`, `all` and `unknown`. The number has
+    four significant digits, so two anchors (at least ×1.07 apart at the
+    `stopsWidth` floor) never print alike.
+  - `stacking_run_groups.exposure_class` holds the token; `exposure` stays seconds.
+  - In the equivalent and none modes two classes may share the shortest member's
+    seconds, so their masters differ only by a `_2` suffix (`resolve_collision`).
+- **`FrameOrigin`** is `Catalog { file_id, attested }` or `Project { project_id,
+  frame_uuid, publisher, landed_path, blake3, byte_size, size_mtime, meta }`.
+  `meta` is the manifest's `collab::frame_meta::ProjectFrameMeta`, parsed once;
+  `meta.wcs` becomes a `PlateSolveRecord` with crpix − 1. This is not
+  `db::collab_frames::FrameOrigin` (`own | replica`).
+- **The project frame source** (`stacking::project_source`) reads
+  `project_frames_local` and the landed files' headers, never the catalog.
+  - A frame is stackable when it is exportable, servable, not `own_staged`, and
+    has a recorded `size_mtime_seen` that parses (one that does not is
+    "unreadable size:mtime stamp", never "waiting"). Every other published,
+    accepted frame is a Frames row with its reason.
+  - Groups are colour × canonical filter × class, keyed
+    `<mono|osc|cfa>__<filter>__<class>`, with no binning and no camera. `cfa`
+    appears only when `debayerOsc` is off and the file is a one-plane mosaic.
+  - Handles are minted in one IMMEDIATE transaction.
+- **Funnels.** `origin::tests::subject_and_origin_variants_stay_in_their_funnels`
+  keeps every `StackSubject::` / `FrameOrigin::` path in the production half of
+  `run.rs` and `plan.rs` inside the named funnels, or in an allowlist where each
+  entry has its reason. The per-frame dispatch points the run calls live in
+  `stacking::origin`, which the test does not scan: `stored_solve`,
+  `cfa_geometry`, `landed_unchanged`, `needs_prepare`, `prepare_input`,
+  `prepare_stem_needs_frame_id`, `solve_plan`, `wcs_tier` and
+  `local_solve_outcome`. A third subject or origin touches exactly these and the
+  named funnels.
+- **The identity check.** `origin::landed_unchanged` compares a landed file with
+  its row's `size:mtime` (2 s tolerance). It runs at Prepare, Solve, Measure,
+  the Register candidates and the Output member snapshot. A changed file
+  excludes the frame "changed during the run"; one that cannot be read excludes
+  it with "landed file unreadable: …" (more specific than spec §5.1's single
+  reason). A changed reference fails the run ("the reference frame changed
+  during the run").
+- **The plan** (`build_plan`'s project arm).
+  - It seeds the config and mints handles: the documented exception to "the plan
+    reads only". Readiness is empty and there are no masters.
+  - Blockers, in order: `grid`, `reference`, `folders`, `space`, `frames`,
+    `unsupported`. `folders` also fires when the project's working root
+    (`<working>/_projects/<slug>`) overlaps any scan root; the Collaboration root
+    is one.
+  - Warnings (spec §7): frames not on this device, other reasons a frame is left
+    out, frames to be solved locally or that could not be, frames outside the
+    grid, unsupported files, and unknown exposure equivalence.
+  - Unsupported files also leave every group's included count and the ≥ 3
+    rule, so a group Prepare would leave short is blocked by `frames` at plan
+    time; they are not manual exclusions.
+  - It carries `grid` (state, current, proposal, framesInside, canEdit) and
+    `projectFrames`.
+  - It does not yet know the WCS reference rule (below): a manual pin without
+    any WCS passes the plan and fails at the Reference stage (a note for
+    6b-3/6c).
+- **R3 (attested sets), live for frame sets in 6b-2.** A frame set with
+  `calibrated_externally` needs no masters: no masters / links / masterFiles
+  gate and nothing to build, so `start_stacking` runs it with no master at all.
+  Its lights are prepared, never calibrated; the stage-1 hash is
+  `prepare_hash_for_catalog`.
+  - The colour token follows the project rule (`project_source::attested_color_token`):
+    the catalog `BAYERPAT` when present, otherwise a header-only plane probe
+    (three planes → `osc`, else `mono`; an unreadable file falls back to the
+    catalog rule, with a warning). `groups::group_frames_with` takes this only
+    for an attested set; a non-attested set is grouped exactly as before, with
+    no probe. The plan and the run share `frame_source`, so their group keys
+    cannot differ.
+- **Prepare** is stage 1 for a project and for an attested set. It reports under
+  `Stage::Calibrate`, the stage-1 slot. A run never mixes prepared and
+  calibrated frames: `stage_one_kind` refuses it.
+  - **In place:** a float FITS (BITPIX −32/−64) that needs no debayer is used as it
+    is. The `calibrated` artifact is the landed file, which no cleanup removes.
+  - **Converted:** an integer FITS (÷ `scale_divisor_for_bitpix`) or an XISF
+    (`read_raw` ÷ 65535) becomes float32 FITS `prepared/<group>/p_<stem>.fits`.
+    An integer FITS is never used in place, although spec §5.1 row 1 allows
+    it (narrowed to float, review I2): converting gives an attested set's 16-bit
+    lights and a published replica the calibrated-light generator's one unit
+    domain.
+  - **Debayered:** a CFA mosaic, when `debayerOsc` is on, goes through the
+    generator's own VNG (`debayer_plane`) into `p_<stem>_d.fits`. The
+    pre-debayer mosaic is the `calibrated_mosaic` for Bayer drizzle.
+  - **Names:** a project frame keeps the replica's stem (`p_c_<uuid>.fits`); an
+    attested light's prepared name carries its catalog id
+    (`p_<stem>_f<frame_id>.fits`, decided by `origin::prepare_stem_needs_frame_id`),
+    because two files of one set may share a stem. A prepared output equal to
+    its source is refused (error log, frame excluded).
+  - **Excluded:** a tile-compressed FITS, an extension image, a distributed
+    XISF or a file that cannot be opened, as "unsupported file: …" (the
+    decoder's reason reads "not a 1- or 3-plane 8/16/32-bit or float primary
+    image"); and a frame whose plane count after Prepare contradicts its
+    group's colour, as "plane count {n} disagrees with the group's colour
+    mode" (the group's colour comes from the manifest or the attested rule, the
+    debayer from the file's own header).
+  - Prepared files carry the copy-through cards, `ATH_STK`, `ATH_STKV` and
+    `ATH_PREP`, and never `CALSTAT`, `ATH_CSRC`, `ATH_PRJ` or `ATH_FILT`, so the
+    scanner never catalogs one.
+  - The hash is `prepare_subtree` (`debayerOsc`, `debayerMethod: "VNG"`,
+    `prepareVersion`) over `blake3` and byte size (a project) or the catalog
+    identity (an attested light).
+  - `prepared/` counts as calibrated bytes and goes with `Intermediates`.
+- **Solve** is the first thing Measure does. A project frame without `meta.wcs`
+  is solved by `rc.solver`:
+  - `stacking::solve::FrameSolver`; `CatalogSolver` opens the catalog lazily
+    through `plate_solve::open_catalog_layers`, the opener both hosts now call
+    (`ready()` opens it once, before the first uncached solve).
+  - It solves the prepared file, with the project target and the manifest scale
+    as hints, through `solve_frame_with_hints` and the extracted gate
+    `acceptance_refusal` at the manifest scale.
+  - **Domain order** (`solve::solve_in_domains`, the one attempt sequence, also
+    used by the probe). A unit-domain frame (the median of a strided sample of
+    at most 65,536 finite values is ≤ 1.5) is solved on an ADU-scaled copy
+    (× 65535, `<scratch>/adu_<handle>.fits`) FIRST, and on the original only
+    after a `Failed`, never after a `Refused`. A float file already in ADU is
+    solved as is, with no copy. With no scratch folder the original is solved
+    once. The copy is deleted right after the first call. Two failures report
+    "<first>; on the unscaled pixels: <second>".
+  - **`SolveOutcome::Unavailable`**: a catalog that cannot open, a scratch folder
+    that cannot be created or a copy that cannot be written. It is never
+    cached (`write_outcome` refuses it, and it serializes to an error), a run
+    warning counts only the frames without a cached `Solved`, and the frames
+    are retried next run.
+  - Every other outcome (solved, failed, refused) is a `solve` artifact: group
+    key `""`, payload `{blake3, app_version, outcome}`, hash over blake3 and
+    the solver identity (`solver_config_hash:catalog_identity`).
+  - **What is not in the key.** Per-frame hints (project target, manifest scale)
+    are not hashed: a Solved outcome is hint-independent and the manifest scale
+    is frozen per content, so only a Failed/Refused cached under an older
+    project target misses a retry. A cached Failed/Refused from another app
+    version is tried once more (review I7); a cached solve stays. Bump
+    `plate_solve::config::SOLVE_RECIPE_VERSION` when a solver change should
+    re-solve frames cached as solved. `rerun_from = Measure` does not force a
+    re-solve.
+  - `solve` is not an intermediate: `CleanupWhat::Intermediates` keeps it, and
+    only `CleanupWhat::All` (every artifact row) deletes the solve cache.
+  - `plate_solves` and `frames` are never written. `stored_solve`'s project arm
+    reads the manifest WCS, then the run's solve of this content.
+  - For 6c: the sub-step's own progress runs `Measure` to 100 % with the
+    message `"solving"`, and Measure then restarts at 0, so a project run's
+    Measure bar goes back once.
+  - **Real-data probe** on the `.dev` LDN1272-test replicas, 2026-10-03
+    (mono and OSC sub-rates, 10 frames each). Before the domain order was
+    flipped: 0/20 solved on unit-domain pixels ("too few stars detected"), and
+    the ADU-scaled copy rescued 20/20. After: `solve probe: mono 10/10 solved on
+    the first attempt, 0 needed the fallback; osc 10/10 solved on the first
+    attempt, 0 needed the fallback; unsupported 0, not on disk 0, unreadable
+    manifests 0, with a manifest wcs 20; wall 187.2s` (≈ 221 s before).
+- **The reference rule** (spec §5.4). On a project run the reference must carry a WCS.
+  - Candidates are the manifest-WCS frames, or the locally solved ones only when
+    no included frame has a manifest WCS.
+  - Auto takes the largest group that holds a candidate, and first looks at
+    groups with ≥ 3 included frames, then any group. A native group without a
+    candidate takes the run reference (`group_can_switch`).
+  - The two-pass re-pick never lets a non-candidate win (`two_pass_pick_among`).
+  - A manual pin without any WCS (manifest or local) fails the stage; a pin that
+    stage 1 excluded fails with its own reason ("the manual reference frame is
+    excluded: …").
+  - With no candidate, the stage fails with "no frame of this project could be
+    plate-solved; the grid needs one".
+- **The canonical grid** is described in `docs/transfers/README.md` (wave 6b-2).
+  **Orientation:** the grid is sky-standard (north up, east left, det(CD) < 0).
+  Every solve in the owner's catalog has det(CD) > 0, so a master on the grid is
+  the mirror image of a raw frame, which is correct on the sky. 6b-3 must not
+  copy the reference's `ROWORDER` onto a grid master.
+- **Open for 6b-3:**
+  - registration onto the grid through one composed map (with 6b-1's
+    `RegistrationRecord` question);
+  - LN on overlap, then coverage and crop;
+  - drizzle and output on the grid;
+  - the seven project commands (command count 299 → 306);
+  - the fake-hub e2e and acceptance runs A and B;
+  - `plan::expected_ln_channels` and the stage-one plane rule disagree for an
+    `osc__` Prepare-path group with the debayer off (project or attested): the
+    plan under-reports the LN cache. Reconcile when LN runs for projects.
+
+  `start_stacking` lifts its project guard then.
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
@@ -1169,6 +1364,9 @@ integrate,master_cards}.rs`,
 `stacking/register/{mod,detect,align,frame,wcs_seed,local_loop,writer}.rs`,
 `stacking/ln/{mod,grid,background,scale,reference}.rs`,
 `stacking/drizzle/{mod,geom}.rs`, `stacking/rej.rs`,
+`stacking/{origin,project_source,prepare,solve}.rs`,
+`collab/{grid,grid_geometry,frame_meta}.rs`, `api/collab_grid.rs`,
+`plate_solve/{service,layers}.rs`,
 `crates/athenaeum-core/src/integration/student_t.rs`,
 `crates/athenaeum-core/src/geometry/tps.rs`,
 `crates/athenaeum-core/src/api/stacking.rs` (also `list_stacking_presets`/

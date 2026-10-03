@@ -702,6 +702,12 @@ These items are explicitly out of scope for the current blind solver and are pla
 
 ## Changelog
 
+### 2026-10 — Shared acceptance gate and catalog opener (stacking project path)
+
+- The acceptance gate is the pure `plate_solve::service::acceptance_refusal`, shared by `store_result` and the stacking solve (`stacking::solve`), so a project frame is judged exactly as a catalog frame.
+- `plate_solve::config::SOLVE_RECIPE_VERSION` is bumped whenever the recipe constants, the gate or the catalog layering change in a way that could change an outcome; it re-solves cached stacking outcomes (review I7).
+- One catalog opener in core, `plate_solve::open_catalog_layers` / `catalog_identity` (`plate_solve/layers.rs`), is used by both hosts and the stacking solver. See `docs/stacking/README.md` (The project path, wave 6b-2) for the solve order and cache.
+
 ### 2026-06 — Catalog audit + bright-vs-deep FOV guidance (docs only)
 
 No code change — documented the *verified on-disk reality* of the shipped caches

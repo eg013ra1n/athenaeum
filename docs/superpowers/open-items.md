@@ -264,6 +264,27 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Collab wave 6b-2 — the project path up to the geometry (2026-10-03)
+
+Code-complete with green gates:
+- the subject-aware wire and the four config fields;
+- exposure classes;
+- the project frame source and plan;
+- Prepare, and Solve with the WCS reference rule;
+- the canonical grid end to end (two commands);
+- R3's stacking half.
+
+Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §5–§9 and §13; plan `docs/superpowers/plans/2026-10-03-collab-v3-wave6b2-project-path-plan.md`. Reference: `docs/stacking/README.md` (The project path, wave 6b-2) and `docs/transfers/README.md` (wave 6b-2). No project run starts until 6b-3, so there is no project UI to smoke. Owed:
+
+- **Real-data acceptance (controller).** The frame-set regression against main and the attested real set run of this plan. Results are filled in by the controller; no claims here yet.
+- **Unit-domain solving on real data, mono and OSC.** Task 10c's probe on the `.dev` LDN1272-test replicas (2026-10-03): unit-domain (0..1) prepared files solved 0/20 ("too few stars detected"), and the ADU-scaled copy solved 20/20 (mono 10/10, OSC 10/10). The solve order now tries the ADU-scaled copy first: `solve probe: mono 10/10 solved on the first attempt, 0 needed the fallback; osc 10/10 solved on the first attempt, 0 needed the fallback; unsupported 0, not on disk 0, unreadable manifests 0, with a manifest wcs 20; wall 187.2s`. Re-check both sub-rates on the first real project run.
+- **An attested set end to end on real data.** Mark a real externally calibrated set attested and stack it. Check that it runs without masters, that integer lights are converted under `prepared/` (names end `_f<frame_id>`), that an already-debayered set groups as colour, and that the master looks right.
+- **Unsupported files are excluded, not read.** A tile-compressed FITS, an image in an extension HDU and a distributed XISF leave a project run as "unsupported file", and the plan names them and counts them out of the ≥ 3 rule. Nothing in the owner's data needs them today. A reader for any of them is its own cycle.
+- **A float file in the ADU domain is used in place as if it were 0..1.** Prepare does not look at pixel values, so a float FITS another tool wrote in ADU (0..65535) would be measured and stacked in ADU. Every replica a member publishes is 0..1 by construction; an attested set's float lights are the open case. Check the first real attested float set. If it is in ADU, add a value-range probe to `prepare_action`, in its own cycle.
+- **The 25 % LN-overlap threshold cannot be re-measured on the acceptance set (6b-3).** LDN1272-test's two rigs are two groups whose members share their framing, so nothing falls under 25 %. The fallback is reachable only in synthetic fixtures and the fake-hub e2e. The owner's option is to publish set 195 "Ghost Nebula QHY" (~60 % overlap) into a test-hub project; that exercises partial overlap, not the < 25 % fallback.
+- **The grid's orientation (6b-3).** A master on the grid will be the mirror image of a raw frame: the grid is sky-standard (det CD < 0), while every solve in the owner's catalog has det CD > 0. That is correct on the sky. Check the first grid master against a sky chart, and never copy `ROWORDER` onto it.
+- **Flaky collab-live tests seen in this cycle's full runs (not touched by this branch):** `api::collab_v3_live_e2e_tests::edited_touched_and_deleted_replicas` (failed once even alone, then 5/5), `a_publishing_switch_returns_at_once_while_the_reannounce_retries`, plus the known `landing_free_bytes_is_bounded_by_the_collaboration_root`.
+
 ### Collab wave 6a — owner smoke (2026-10-02)
 
 Project export (FILTER-patched copies, mixed symlink/copy, export record), the coordinator filter
@@ -2165,6 +2186,7 @@ the cache limit, the plate-solve gate controls, the master-deletion un-supersede
 scan-error reveal and **Check again** at v0.5.6; the **Lights + calibration sets** raw
 originals and the role-folder missing files at v0.6.0. Nothing is owed after v0.6.2.)
 
+- **Externally calibrated frame sets stack without masters.** A frame set marked as calibrated elsewhere is now stacked as it is: its lights are used, or converted to the app's unit domain, instead of being calibrated, and no master is asked for or built. Already-debayered attested lights group as colour.
 - **Publishing now has a review step: Calibrate → review in Blink → Publish.** Auto-publish is off for every project (migrated to Manual); Auto-calibrate and Fully automatic are opt-in per project.
 - **Scanning: the master-verification step is visible and the content index
   yields.** A scan that ingests masters used to spend minutes under
