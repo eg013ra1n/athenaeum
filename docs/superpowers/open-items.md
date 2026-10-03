@@ -215,6 +215,10 @@ contain forward slashes.
 
 ## Known flaky test
 
+- `collab_v3_live_e2e_tests::unmapped_filter_then_mapped_and_an_attested_set`
+  failed once at the plain mono light's live landing (plan 6b-2 acceptance
+  run); it passed alone and on a full re-run, so it is load-timing, like the
+  other collab live tests.
 - `stacking::run::tests::local_normalization_sidecars_are_cached_on_the_second_run`
   failed once in a full `cargo test -p athenaeum-core --lib` on the dev Mac
   (2026-09-18, 2431 passed alongside it) and passed twice in isolation and in

@@ -1175,6 +1175,15 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   No stage hash moved: the golden literals hold with non-default values.
   `config_hash` was re-pinned once. A project's first plan seeds its stored
   document (`stacking_project_config`) with `exposureMode = stops`.
+- **Registered frames** (post-acceptance fix, plan 6b-2). The `ATH_REGR` card
+  carries the reference frame's file stem and keeps its " / reference frame"
+  comment only when the whole card fits in 80 columns (`register::writer::
+  reference_card`); a long stem (an attested Prepare stem, or a long
+  frame-set calibrated stem of about 47 characters or more) is written whole
+  and without the comment. `fits_writer::card` stays strict. A failed
+  registered-frame write keeps its per-frame `warn!` and adds ONE run warning
+  per group ("registered frames could not be written for N frames of <group>:
+  <first error>; they are warped on the fly").
 - **Exposure classes** (`groups::classify_exposures`, pure, shared by both frame sources).
   - `seconds` is the old clustering, byte for byte.
   - `stops` and `equivalent` anchor at the shortest remaining exposure and take
@@ -1211,7 +1220,8 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     warning). An externally debayered contributor light has no `bayerpat` and
     three planes, so it groups as `osc` and Prepare uses it in place. A
     Frames row's colour mode comes from the same token as its group.
-  - Handles are minted in one IMMEDIATE transaction.
+  - Handles are read first and take no write lock; one IMMEDIATE transaction
+    mints only the missing uuids.
 - **Funnels.** `origin::tests::subject_and_origin_variants_stay_in_their_funnels`
   keeps every `StackSubject::` / `FrameOrigin::` path in the production half of
   `run.rs` and `plan.rs` inside the named funnels, or in an allowlist where each
@@ -1284,8 +1294,9 @@ registration onto its canonical grid. `start_stacking` still refuses a project
     decoder's reason reads "not a 1- or 3-plane 8/16/32-bit or float primary
     image"); and a frame whose plane count after Prepare contradicts its
     group's colour, as "plane count {n} disagrees with the group's colour
-    mode" (the group's colour comes from the manifest or the attested rule, the
-    debayer from the file's own header).
+    mode" (the group's colour comes from the manifest `bayerpat`, or, without one, the
+    file's own plane count (an attested set follows the catalog BAYERPAT or the
+    same plane-count rule); the debayer comes from the file's own header).
   - Prepared files carry the copy-through cards, `ATH_STK`, `ATH_STKV` and
     `ATH_PREP`, and never `CALSTAT`, `ATH_CSRC`, `ATH_PRJ` or `ATH_FILT`, so the
     scanner never catalogs one.
@@ -1327,7 +1338,8 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   - A frame whose manifest has no `pixelScaleArcsec` is solved with no scale
     hint and no scale check in the acceptance gate; the run logs a warning
     per frame before solving it. A missing project row is a warning too (the
-    frames are solved without a position hint), never a silent blind solve.
+    frames are solved without a position hint), never a silent blind solve; the
+    cache write then fails on the artifact foreign key and nothing is cached.
   - **What is not in the key.** Per-frame hints (project target, manifest scale)
     are not hashed: a Solved outcome is hint-independent and the manifest scale
     is frozen per content, so only a Failed/Refused cached under an older

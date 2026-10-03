@@ -102,8 +102,10 @@ pub fn file_shape_quick(path: &Path) -> Option<(usize, usize, usize)> {
 /// The colour token of a project group key (plan 6b-2 C13): `mono`; `osc`
 /// for a colour frame that is three-plane after Prepare; `cfa` for one
 /// that stays a one-plane mosaic (`debayerOsc` off and the file a mosaic).
-/// The manifest's `bayerpat` decides colour vs mono (spec §5.1); the file is
-/// probed only when `debayerOsc` is off.
+/// With a manifest `bayerpat` the frame is colour, and the file is probed
+/// only when `debayerOsc` is off (`osc_or_cfa`); without one the file's own
+/// plane count decides (three planes are `osc`, anything else `mono`), so the
+/// file is always probed.
 fn color_token(
     project_id: &str,
     frame_uuid: &str,

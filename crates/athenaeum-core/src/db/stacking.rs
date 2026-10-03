@@ -1041,8 +1041,10 @@ pub fn find_master_light(
 /// as long as their project (`collab_projects` cascade) and are never
 /// deleted otherwise.
 ///
-/// One IMMEDIATE transaction (read-then-write, CLAUDE.md): never call this
-/// with a transaction already open on `conn`.
+/// Every handle is read first and takes no write lock; only when some uuid is
+/// missing does one IMMEDIATE transaction (read-then-write, CLAUDE.md) mint
+/// the missing ones. Never call this with a transaction already open on
+/// `conn`.
 pub fn project_frame_handles(
     conn: &Connection,
     project_id: &str,

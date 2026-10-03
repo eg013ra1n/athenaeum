@@ -2070,8 +2070,10 @@ fn resolve_prepare_job(
             reason: format!("unsupported file: {why}"),
         });
     }
-    // Review I12 (C13): the group's colour comes from the manifest (or the
-    // catalog), Prepare's debayer from the file's own header. A file whose
+    // Review I12 (C13): the group's colour comes from the manifest bayerpat
+    // (or, without one, the file's plane count; a frame set uses the catalog
+    // BAYERPAT or the attested rule), Prepare's debayer from the file's own
+    // header. A file whose
     // post-Prepare plane count contradicts its group never reaches Measure.
     let planes = match &action {
         PrepareAction::Write {
@@ -4932,6 +4934,45 @@ struct RegisteredWrite {
     /// artifact row, and every downstream reader falls back to the
     /// on-the-fly warp for this frame).
     written: Option<PathBuf>,
+    /// The write's error text when `written` is `None`; folded into the
+    /// group's one "registered frames could not be written" run warning.
+    write_error: Option<String>,
+}
+
+/// Failed registered-frame writes of one group's pass. The registered frame
+/// is a required artifact, so a failed write must not leave the run
+/// silently warping on the fly: each failure keeps its per-frame `warn!`,
+/// and the pass pushes ONE run warning per group (the count and the first
+/// error) from [`RegisteredWriteFailures::flush`].
+#[derive(Default)]
+struct RegisteredWriteFailures {
+    count: usize,
+    first_error: Option<String>,
+}
+
+impl RegisteredWriteFailures {
+    fn note(&mut self, error: String) {
+        self.count += 1;
+        self.first_error.get_or_insert(error);
+    }
+
+    fn flush(self, rc: &mut RunContext, group: &IntegrationGroup) {
+        let Some(first) = self.first_error else {
+            return;
+        };
+        let count = self.count;
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            count,
+            error = %first,
+            "registered frames could not be written"
+        );
+        rc.warnings.push(format!(
+            "registered frames could not be written for {count} frames of {}: {first}; they are warped on the fly",
+            group.key
+        ));
+    }
 }
 
 /// Perf tier A Task 6a fix round 1 (ruling R-TA-5): a CACHED registration
@@ -5253,6 +5294,7 @@ fn register_group_pass(
 ) -> Result<Vec<PassResult>, RunError> {
     let cfg = rc.config.clone();
     let mut pass: Vec<PassResult> = Vec::new();
+    let mut write_failures = RegisteredWriteFailures::default();
 
     if included_count_of(rc, &group.key) < 3 {
         return Ok(pass);
@@ -5555,7 +5597,7 @@ fn register_group_pass(
             needs_artifact_rewrite,
             admission_n,
             cancel_ref,
-            move |item: ArtifactRewriteItem| -> Result<(i64, RegistrationRecord, Option<PathBuf>), String> {
+            move |item: ArtifactRewriteItem| -> Result<(i64, RegistrationRecord, Result<PathBuf, String>), String> {
                 let frame_id = item.frame_id;
                 let stem = calibrated_file_stem(group_ref, &item.frame);
                 let out = out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
@@ -5572,7 +5614,7 @@ fn register_group_pass(
                     &out,
                 );
                 let result = match written {
-                    Ok(()) => Ok((item.frame_id, item.rec, Some(out))),
+                    Ok(()) => Ok((item.frame_id, item.rec, Ok(out))),
                     Err(e) => {
                         tracing::warn!(
                             run_id,
@@ -5580,7 +5622,7 @@ fn register_group_pass(
                             error = ?e,
                             "failed to write registered frame"
                         );
-                        Ok((item.frame_id, item.rec, None))
+                        Ok((item.frame_id, item.rec, Err(format!("{e:#}"))))
                     }
                 };
                 rewrite_ticker_ref.tick(Some(frame_id));
@@ -5592,7 +5634,7 @@ fn register_group_pass(
         for res in rewrite_results {
             match res {
                 None => return Err(RunError::Cancelled),
-                Some(Ok((frame_id, rec, Some(out_path)))) => {
+                Some(Ok((frame_id, rec, Ok(out_path)))) => {
                     if let Err(e) =
                         record_registered_artifact(rc, &group.key, frame_id, &rec, &out_path)
                     {
@@ -5607,12 +5649,14 @@ fn register_group_pass(
                 // Write failed (already warned above) or a hard error the
                 // closure never actually constructs — either way, nothing
                 // to record; the frame falls back to the on-the-fly warp.
-                Some(Ok((_, _, None))) | Some(Err(_)) => {}
+                Some(Ok((_, _, Err(error)))) => write_failures.note(error),
+                Some(Err(_)) => {}
             }
         }
     }
 
     if to_register.is_empty() {
+        write_failures.flush(rc, group);
         return Ok(pass);
     }
 
@@ -5782,7 +5826,7 @@ fn register_group_pass(
                         let stem = calibrated_file_stem(group, &item.frame);
                         let out_path =
                             out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
-                        let written = match write_one_registered_frame(
+                        let (written, write_error) = match write_one_registered_frame(
                             &item.path,
                             &alignment.map,
                             ref_w,
@@ -5794,7 +5838,7 @@ fn register_group_pass(
                             Some(pool_ref),
                             &out_path,
                         ) {
-                            Ok(()) => Some(out_path),
+                            Ok(()) => (Some(out_path), None),
                             Err(e) => {
                                 tracing::warn!(
                                     run_id,
@@ -5802,10 +5846,14 @@ fn register_group_pass(
                                     error = ?e,
                                     "failed to write registered frame"
                                 );
-                                None
+                                (None, Some(format!("{e:#}")))
                             }
                         };
-                        Some(RegisteredWrite { rec, written })
+                        Some(RegisteredWrite {
+                            rec,
+                            written,
+                            write_error,
+                        })
                     }
                     Err(_) => None,
                 }
@@ -5911,7 +5959,11 @@ fn register_group_pass(
                             // write succeeded, the `registered` artifact
                             // row — stay here: `rusqlite` connections are
                             // not `Send` across `fan_out`'s plain threads.
-                            let RegisteredWrite { rec, written } = persisted.expect(
+                            let RegisteredWrite {
+                                rec,
+                                written,
+                                write_error,
+                            } = persisted.expect(
                                 "a persisting, successfully-aligned item always carries a RegisteredWrite",
                             );
                             let map = alignment.map.clone();
@@ -5923,6 +5975,9 @@ fn register_group_pass(
                                         ..rec.clone()
                                     }
                                 })?;
+                            }
+                            if let Some(error) = write_error {
+                                write_failures.note(error);
                             }
                             if let Some(out_path) = &written {
                                 if let Err(e) = record_registered_artifact(
@@ -6010,6 +6065,7 @@ fn register_group_pass(
         None,
     );
 
+    write_failures.flush(rc, group);
     Ok(pass)
 }
 
@@ -11435,7 +11491,11 @@ mod tests {
         assert_eq!(completes[0]["cancelled"].as_bool(), Some(true));
         assert_eq!(completes[0]["success"].as_bool(), Some(false));
         assert_eq!(completes[0]["setId"], serde_json::json!(fixture.set_id));
-        assert!(completes[0]["projectId"].is_null(), "{:?}", completes[0]);
+        assert!(
+            completes[0].get("projectId") == Some(&serde_json::Value::Null),
+            "{:?}",
+            completes[0]
+        );
 
         // Never even reached "running" — the queue wait handles it before
         // `run_pipeline` gets that far.
@@ -12293,6 +12353,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A failed registered-frame write is visible: ONE run warning per group
+    /// (count + first error), never one per frame, and a run whose writes
+    /// succeed emits none. The failure is injected with a read-only
+    /// `registered/<group>` directory.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_registered_dir_pushes_one_warning_per_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let noise = [5.0f32; 4];
+        let run_once = |unwritable: bool| -> Vec<String> {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let (fixture, light_ids, working, output) =
+                seed_star_group(&db_path, SET_NAME, &shifts, &noise);
+            test_fixtures::add_master_dark_and_flat(
+                &fixture,
+                &light_ids,
+                STAR_FIELD_WIDTH,
+                STAR_FIELD_HEIGHT,
+            );
+            let cfg = StackingConfig::default();
+            let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+            let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+            let (run_id, group_ids) = seed_run_and_groups(
+                &fixture.conn,
+                fixture.set_id,
+                &plan_groups,
+                working.path(),
+                output.path(),
+            );
+            let reg_dirs: Vec<PathBuf> = plan_groups
+                .iter()
+                .map(|g| layout.registered_dir(&g.key))
+                .collect();
+            if unwritable {
+                for d in &reg_dirs {
+                    std::fs::create_dir_all(d).unwrap();
+                    std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
+                }
+            }
+            let mut rc = test_context(
+                ctx.clone(),
+                Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+                run_id,
+                fixture.set_id,
+                SET_NAME,
+                cfg,
+                plan_groups.clone(),
+                layout,
+                output.path().to_path_buf(),
+                group_ids,
+            );
+            let res = run_stages_for_test(&mut rc, Stage::Register);
+            // Let the tempdir clean up.
+            for d in &reg_dirs {
+                let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755));
+            }
+            res.unwrap();
+            rc.warnings
+                .iter()
+                .filter(|w| w.contains("registered frames could not be written"))
+                .cloned()
+                .collect()
+        };
+
+        assert!(run_once(false).is_empty(), "a clean write emits no warning");
+        let warnings = run_once(true);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("for 4 frames of")
+                && warnings[0].contains("; they are warped on the fly"),
+            "{}",
+            warnings[0]
+        );
     }
 
     /// Fix round 2, ruling R-TA-6 I2: a `registered` artifact deleted AFTER

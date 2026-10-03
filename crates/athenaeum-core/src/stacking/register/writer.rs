@@ -20,6 +20,7 @@ use anyhow::Context;
 use crate::calibration_library::light_resolve::card_from_kv;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_parser::FitsHeader;
+use crate::fits_writer::card::format_card;
 use crate::fits_writer::{
     write_fits_f32_streaming_with, Card, CardValue, Durability, FitsWriteError,
 };
@@ -80,6 +81,24 @@ pub(crate) fn copy_through_cards(format: FileFormat, header_text: &str) -> Vec<C
     cards
 }
 
+/// The `ATH_REGR` card: the reference frame's file stem, with the
+/// " / reference frame" comment only when the whole card fits in 80 columns.
+/// A long stem (an attested Prepare stem `p_<stem>_f<id>_d`, or a long
+/// frame-set calibrated stem) would otherwise make `fits_writer::card`
+/// refuse the comment and fail every registered-frame write. The value is
+/// never shortened; names that fit keep the exact old card.
+fn reference_card(name: &str) -> anyhow::Result<Card> {
+    let with_comment =
+        Card::new("ATH_REGR", CardValue::Str(name.to_string()))?.with_comment("reference frame");
+    match format_card(&with_comment) {
+        Ok(_) => Ok(with_comment),
+        Err(FitsWriteError::CommentTooLong(_)) => {
+            Ok(Card::new("ATH_REGR", CardValue::Str(name.to_string()))?)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Copy-through cards filtered once more, then `IMAGETYP` and the
 /// `ATH_REG*` provenance.
 pub fn build_registered_cards(source: &[Card], reg: &RegisteredCards) -> anyhow::Result<Vec<Card>> {
@@ -110,10 +129,7 @@ pub fn build_registered_cards(source: &[Card], reg: &RegisteredCards) -> anyhow:
         Card::new("ATH_REGV", CardValue::Integer(ATH_REG_VERSION))?
             .with_comment("registered-frame format version"),
     );
-    cards.push(
-        Card::new("ATH_REGR", CardValue::Str(reg.reference_name.to_string()))?
-            .with_comment("reference frame"),
-    );
+    cards.push(reference_card(reg.reference_name)?);
     cards.push(
         Card::new("ATH_REGM", CardValue::Str(reg.model.to_string()))?
             .with_comment("registration model"),
@@ -405,6 +421,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn regr_cards(name: &str) -> Vec<Card> {
+        let reg = RegisteredCards {
+            reference_name: name,
+            model: "homography",
+            transform_json: "{}",
+            interpolation: Interpolation::BicubicBSpline,
+            clamping: 0.3,
+            rms_px: 0.42,
+            reference_roworder: None,
+        };
+        build_registered_cards(&[], &reg).unwrap()
+    }
+
+    #[test]
+    fn a_long_reference_stem_keeps_the_name_and_drops_the_comment() {
+        // 60 chars: value + " / reference frame" overflows 80 columns.
+        let name = format!("p_{}_f1234_d", "x".repeat(51));
+        assert!(name.len() >= 60);
+        let cards = regr_cards(&name);
+        let c = cards.iter().find(|c| c.keyword == "ATH_REGR").unwrap();
+        assert_eq!(c.comment, None);
+        assert!(crate::fits_writer::card::format_card(c).is_ok());
+        // And it survives a real write + read-back.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("r.fits");
+        write_fits_f32(&out, 8, 8, 1, &vec![0.5; 64], &cards).unwrap();
+        let header = FitsHeader::from_path(&out).unwrap();
+        assert_eq!(header.get_str("ATH_REGR").as_deref(), Some(name.as_str()));
+    }
+
+    #[test]
+    fn a_short_reference_stem_keeps_the_old_card_bytes() {
+        let cards = regr_cards("c_ref");
+        let c = cards.iter().find(|c| c.keyword == "ATH_REGR").unwrap();
+        assert_eq!(c.comment.as_deref(), Some("reference frame"));
+        let rec = crate::fits_writer::card::format_card(c).unwrap();
+        let text = String::from_utf8(rec[0].to_vec()).unwrap();
+        assert_eq!(text.trim_end(), "ATH_REGR= 'c_ref    ' / reference frame");
     }
 
     #[test]
