@@ -93,14 +93,14 @@ fn plane_matches(coverage: &[f32], width: usize, height: usize) -> bool {
         len = coverage.len(),
         width,
         height,
-        "crop_coverage_length_mismatch"
+        "coverage plane length does not match the image"
     );
     false
 }
 
 /// The bounding box of the pixels at least `k` frames cover; `None` when no
 /// pixel reaches `k`. A count is a whole number stored as f32, so `>=` is
-/// exact; a NaN never qualifies.
+/// exact; a NaN never qualifies, and neither does an infinity.
 pub fn coverage_rect(coverage: &[f32], width: usize, height: usize, k: u32) -> Option<CropRect> {
     if !plane_matches(coverage, width, height) {
         return None;
@@ -223,6 +223,11 @@ pub fn crop_file(
     cards: &[Card],
     format: OutputFormat,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        src != dst,
+        "the crop must not overwrite its source {}",
+        src.display()
+    );
     let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
     let (width, height, channels) = (reader.width(), reader.height(), reader.channels());
     anyhow::ensure!(
@@ -524,6 +529,11 @@ mod tests {
         for k in ["CRPIX1", "CRPIX2"] {
             assert_eq!(value(&cards, k), value(&expected, k), "{k}");
         }
+        assert_ne!(
+            value(&cards, "CRPIX1"),
+            value(&original, "CRPIX1"),
+            "CRPIX1 must move"
+        );
         for c in &cards {
             if c.keyword != "CRPIX1" && c.keyword != "CRPIX2" {
                 assert_eq!(c.value, value(&original, &c.keyword), "{} moved", c.keyword);
@@ -577,5 +587,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("does not fit"), "{err:#}");
+        let err = crop_file(&src, &src, rect, &cards, OutputFormat::Fits).unwrap_err();
+        assert!(format!("{err:#}").contains("must not overwrite"), "{err:#}");
     }
 }
