@@ -6136,8 +6136,13 @@ fn exclude_changed_members(
             continue;
         };
         if references.contains(&frame_id) {
+            let cause = if reason == crate::stacking::origin::CHANGED_DURING_THE_RUN {
+                String::new()
+            } else {
+                format!(" ({reason})")
+            };
             return Err(RunError::Other(format!(
-                "the reference frame changed during the run (frame {frame_id})"
+                "the reference frame changed during the run (frame {frame_id}){cause}"
             )));
         }
         tracing::warn!(run_id = rc.run_id, frame_id, reason = %reason, "frame excluded");
@@ -9852,8 +9857,11 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
         // Fix round 1 (m2): a group `process_group_output` is about to skip
         // never writes a master, so neither the solve lookup nor the
         // missing-WCS warning belongs to it. `included_count_of` is the
-        // SAME first gate that function applies (its own `included_count <
-        // 3` early return), read here rather than re-derived.
+        // same count that function's `included_count < 3` early return
+        // reads, but it is read BEFORE the Output boundary's landed-file
+        // check (`exclude_changed_members`) can lower it, so a project group
+        // may still skip after passing this gate (the solve lookup is then
+        // merely wasted, never wrong).
         let wcs = if included_count_of(rc, &group.key) >= 3 {
             if let std::collections::hash_map::Entry::Vacant(slot) =
                 solves.entry(reference_frame_id)
@@ -20437,8 +20445,10 @@ mod tests {
 
         // The synthetic frames may or may not measure well enough for a
         // viable group; the exclusion is recorded either way.
-        if let Err(e) = stage_measure(&mut rc) {
-            eprintln!("stage_measure ended with {e:?} (expected on tiny synthetic frames)");
+        match stage_measure(&mut rc) {
+            Ok(()) => {}
+            Err(RunError::Other(ref m)) if m.contains("no group has 3 included frames") => {}
+            Err(e) => panic!("stage_measure failed unexpectedly: {e:?}"),
         }
         let b = rc.plan_groups[0]
             .frames
@@ -20508,7 +20518,25 @@ mod tests {
         rc.measured.insert(group.key.clone(), entries);
 
         std::fs::write(&group.frames[1].path, vec![0u8; 5000]).unwrap();
+        assert!(
+            rc.group_ids.contains_key(&group.key),
+            "the persist path needs the group's row"
+        );
         assert_eq!(exclude_changed_members(&mut rc, &group).unwrap(), 1);
+        let changed_id = group.frames[1].frame_id;
+        let (included, reason): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT included, exclusion_reason FROM stacking_run_frames
+                 WHERE run_id = ?1 AND COALESCE(frame_id, project_frame) = ?2",
+                rusqlite::params![rc.run_id, changed_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(included, 0);
+        assert_eq!(
+            reason.as_deref(),
+            Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
+        );
         let entry = &rc.measured[&group.key][1];
         assert!(!entry.included);
         assert_eq!(

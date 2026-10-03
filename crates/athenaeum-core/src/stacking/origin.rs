@@ -116,7 +116,11 @@ pub(crate) fn landed_unchanged(origin: &FrameOrigin) -> Result<(), ExclusionReas
                 Err(ExclusionReason(format!("landed file unreadable: {e}")))
             }
             verdict => {
-                tracing::warn!(project_id = %project_id, frame_uuid = %frame_uuid, path = %landed_path, outcome = ?verdict, "landed project frame changed during the run");
+                let outcome = match verdict {
+                    StatVerdict::Missing => "missing",
+                    _ => "drifted",
+                };
+                tracing::warn!(project_id = %project_id, frame_uuid = %frame_uuid, path = %landed_path, outcome, "landed project frame changed during the run");
                 Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
             }
         },
