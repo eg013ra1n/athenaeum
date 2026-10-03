@@ -49,9 +49,9 @@ pub struct SolveRequest {
     pub focal_len: Option<f64>,
     pub instrume: Option<String>,
     pub naxis: Option<(i64, i64)>,
-    /// Where a failed unit-domain solve may write its ADU-scaled retry copy
+    /// Where a unit-domain file's ADU-scaled copy is written for the solve
     /// (plan 6b-2 Task 10c: real calibrated 0..1 frames detect no stars until
-    /// scaled). `None` means no retry.
+    /// scaled). `None` solves the file as it is.
     pub scratch_dir: Option<PathBuf>,
 }
 
@@ -107,6 +107,11 @@ pub enum SolveOutcome {
     Failed(String),
     /// The solver answered, and the acceptance gate refused it.
     Refused(String),
+    /// The solve could not be attempted for a reason that says nothing about
+    /// the frame (a scratch copy that could not be written). It is never
+    /// cached: it cannot be serialized, and [`write_outcome`] refuses it.
+    #[serde(skip)]
+    Unavailable(String),
 }
 
 impl SolveOutcome {
@@ -116,6 +121,7 @@ impl SolveOutcome {
             SolveOutcome::Solved(_) => "solved",
             SolveOutcome::Failed(_) => "failed",
             SolveOutcome::Refused(_) => "refused",
+            SolveOutcome::Unavailable(_) => "unavailable",
         }
     }
 }
@@ -210,6 +216,9 @@ pub(crate) fn write_outcome(
     hash: &str,
     outcome: SolveOutcome,
 ) -> anyhow::Result<()> {
+    if let SolveOutcome::Unavailable(reason) = &outcome {
+        anyhow::bail!("an unavailable solve is never cached: {reason}");
+    }
     write_artifact(
         conn,
         project_id,
@@ -318,11 +327,24 @@ pub fn solve_with(
     }
 }
 
+/// The largest finite pixel value of a plane at or below which a float file
+/// counts as unit-domain (0..1, calibrated by this app).
+const UNIT_DOMAIN_MAX: f32 = 1.5;
+
 /// An ADU-scaled (×65535) float32 copy of a unit-domain FITS, with its
-/// copy-through cards. It is the real-data probe's comparison input and the
-/// input of [`CatalogSolver`]'s retry (plan 6b-2 Task 10c). It never touches
-/// `src`.
+/// copy-through cards. It never touches `src`.
 pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    write_scaled(src, dest, false).map(|_| ())
+}
+
+/// [`adu_scaled_copy`], but only when `src` is in the unit domain (its
+/// largest finite value is at most [`UNIT_DOMAIN_MAX`]). `Ok(false)` means
+/// `src` is already in ADU and nothing was written.
+fn adu_copy_if_unit(src: &Path, dest: &Path) -> anyhow::Result<bool> {
+    write_scaled(src, dest, true)
+}
+
+fn write_scaled(src: &Path, dest: &Path, only_if_unit: bool) -> anyhow::Result<bool> {
     if src == dest {
         anyhow::bail!(
             "the ADU-scaled copy must not overwrite its source {}",
@@ -336,7 +358,20 @@ pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
         let values = reader
             .read_plane(plane)
             .with_context(|| format!("reading {}", src.display()))?;
-        data.extend(values.into_iter().map(|v| v * 65535.0));
+        data.extend(values);
+    }
+    if only_if_unit {
+        let max = data
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f32::MIN, f32::max);
+        if max > UNIT_DOMAIN_MAX {
+            return Ok(false);
+        }
+    }
+    for v in data.iter_mut() {
+        *v *= 65535.0;
     }
     let mut cards = crate::stacking::prepare::source_cards_of(src)?;
     // The scanner never catalogs a stacking intermediate (as `prepare_cards`).
@@ -350,7 +385,91 @@ pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
     }
     write_fits_f32_with(dest, w, h, c, &data, &cards, Durability::Volatile)
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest.display()))?;
-    Ok(())
+    Ok(true)
+}
+
+/// Solve a project frame in the right pixel domain (plan 6b-2 Task 10c). The
+/// real-data probe found that calibrated 0..1 frames detect no stars until
+/// scaled to ADU (0 of 20 solved as prepared, 20 of 20 scaled), so:
+/// - a unit-domain file is solved FIRST on an ADU-scaled copy
+///   (`scratch/adu_<handle>.fits`), and only a `Failed` falls back to the
+///   original; a `Solved` or a `Refused` ends it (a refusal is the acceptance
+///   gate's verdict on a found solution, another domain would not fix it);
+/// - a float file already in ADU is solved as is, with no copy;
+/// - without a `scratch` dir the original is solved, once;
+/// - a copy that cannot be written is [`SolveOutcome::Unavailable`], never a
+///   cacheable failure, and a partial copy is removed.
+///
+/// `solve` is the one-file solve (the real solver, or a recording closure).
+pub(crate) fn solve_in_domains(
+    request: &SolveRequest,
+    scratch: Option<&Path>,
+    cancel: &AtomicBool,
+    solve: &mut dyn FnMut(&SolveRequest) -> SolveOutcome,
+) -> SolveOutcome {
+    let Some(dir) = scratch else {
+        return solve(request);
+    };
+    let copy = dir.join(format!("adu_{}.fits", request.handle));
+    let scaled = match adu_copy_if_unit(&request.path, &copy) {
+        Ok(scaled) => scaled,
+        Err(e) => {
+            let reason = format!("{e:#}");
+            tracing::warn!(
+                frame_id = request.handle,
+                path = %request.path.display(),
+                error = %reason,
+                "adu-scaled solve copy failed; the frame is not solved and nothing is cached"
+            );
+            remove_copy(&copy);
+            return SolveOutcome::Unavailable(format!(
+                "the ADU-scaled copy could not be written: {reason}"
+            ));
+        }
+    };
+    if !scaled {
+        return solve(request);
+    }
+    let first = solve(&SolveRequest {
+        path: copy.clone(),
+        ..request.clone()
+    });
+    remove_copy(&copy);
+    let first_reason = match &first {
+        SolveOutcome::Failed(reason) => reason.clone(),
+        _ => return first,
+    };
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return first;
+    }
+    tracing::warn!(
+        frame_id = request.handle,
+        error = %first_reason,
+        "solve on the adu-scaled copy failed; trying the original pixels"
+    );
+    match solve(request) {
+        SolveOutcome::Failed(second) => {
+            SolveOutcome::Failed(format!("{first_reason}; on the unscaled pixels: {second}"))
+        }
+        other => {
+            tracing::debug!(
+                frame_id = request.handle,
+                outcome = other.label(),
+                "solved on the original pixels after the adu-scaled attempt failed"
+            );
+            other
+        }
+    }
+}
+
+fn remove_copy(copy: &Path) {
+    match std::fs::remove_file(copy) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(path = %copy.display(), error = %e, "removing the adu-scaled solve copy failed");
+        }
+    }
 }
 
 /// The production solver. Its identity (the stored plate-solve config and the
@@ -445,52 +564,9 @@ impl FrameSolver for CatalogSolver {
         };
         let refs: Vec<&solvemyastro::StarCache> = layers.iter().map(|l| l.as_ref()).collect();
         let caches = solvemyastro::Caches::layered(&refs);
-        let first = solve_with(request, &caches, &prepared.config, cancel);
-        // Calibrated frames are in the 0..1 unit domain, where the detector
-        // finds no stars on real data; a failure is retried once on an
-        // ADU-scaled copy (the real-data probe's finding).
-        let retry_dir = match (&first, &request.scratch_dir) {
-            (SolveOutcome::Failed(_), Some(dir)) => Some(dir.clone()),
-            _ => None,
-        };
-        let Some(dir) = retry_dir else {
-            return first;
-        };
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return first;
-        }
-        let stem = request
-            .path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let copy = dir.join(format!("adu_{stem}.fits"));
-        if let Err(e) = adu_scaled_copy(&request.path, &copy) {
-            tracing::warn!(
-                path = %request.path.display(),
-                error = %format!("{e:#}"),
-                "adu-scaled solve copy failed; keeping the first outcome"
-            );
-            return first;
-        }
-        let second = solve_with(
-            &SolveRequest {
-                path: copy.clone(),
-                ..request.clone()
-            },
-            &caches,
-            &prepared.config,
-            cancel,
-        );
-        if let Err(e) = std::fs::remove_file(&copy) {
-            tracing::warn!(path = %copy.display(), error = %e, "removing the adu-scaled solve copy failed");
-        }
-        tracing::debug!(
-            path = %request.path.display(),
-            outcome = second.label(),
-            "retried the solve on an adu-scaled copy"
-        );
-        second
+        solve_in_domains(request, request.scratch_dir.as_deref(), cancel, &mut |r| {
+            solve_with(r, &caches, &prepared.config, cancel)
+        })
     }
 }
 
@@ -775,6 +851,7 @@ mod tests {
             ),
             SolveOutcome::Failed(e) => format!("failed: {e}"),
             SolveOutcome::Refused(e) => format!("refused: {e}"),
+            SolveOutcome::Unavailable(e) => format!("unavailable: {e}"),
         }
     }
 
@@ -782,19 +859,22 @@ mod tests {
     #[derive(Default)]
     struct Tally {
         tried: usize,
-        unit_ok: usize,
-        adu_ok: usize,
+        /// Solved by the first attempt (the ADU-scaled copy of a unit-domain
+        /// file, or the file itself when it is already in ADU).
+        first_ok: usize,
+        /// Solved only by the fallback (the original pixels).
+        fallback_ok: usize,
     }
 
     /// Plan 6b-2 C14, "real data first": the real solver and the real catalog
     /// on the landed project replicas of a COPY of the `.dev` catalog. These
-    /// files are calibrated to 0..1, which no production solve has seen. It
-    /// reports per frame and in total how many solve on their prepared pixels,
-    /// and for the rest whether an ADU-scaled (×65535) copy would.
+    /// files are calibrated to 0..1. The probe runs the very function the
+    /// solver ships ([`solve_in_domains`]) and reports per frame and in total
+    /// how many solved on the first attempt and how many needed the fallback.
     /// - The sample is stratified (review I8): up to `limit / 2` frames with a
     ///   manifest `bayerpat` (OSC, debayered by Prepare into a three-plane file)
     ///   and up to `limit / 2` without; the summary prints both sub-rates.
-    /// - A probe that solves nothing in either domain fails (review M16).
+    /// - A probe that solves nothing fails (review M16).
     /// - It is read-only on the catalog copy and on every landed file; prepared
     ///   and scaled copies go to a temp dir.
     #[test]
@@ -803,6 +883,7 @@ mod tests {
         use crate::stacking::prepare::{
             execute_prepare, prepare_action, probe_file, PrepareAction, PrepareJob,
         };
+        let started = std::time::Instant::now();
         let db = std::env::var("ATHENAEUM_SOLVE_PROBE_DB").expect("ATHENAEUM_SOLVE_PROBE_DB");
         let app_data = std::env::var("ATHENAEUM_SOLVE_PROBE_APP_DATA")
             .expect("ATHENAEUM_SOLVE_PROBE_APP_DATA");
@@ -832,13 +913,17 @@ mod tests {
                 .unwrap()
         };
         let (mut osc_rows, mut mono_rows) = (Vec::new(), Vec::new());
+        let mut unreadable = 0usize;
         for (project_id, uuid, landed, manifest_json) in rows {
             match crate::collab::frame_meta::parse_project_frame_meta(&manifest_json) {
                 Ok(meta) if meta.bayerpat.is_some() => {
                     osc_rows.push((project_id, uuid, landed, meta))
                 }
                 Ok(meta) => mono_rows.push((project_id, uuid, landed, meta)),
-                Err(e) => println!("{uuid}: manifest unreadable: {e:#}"),
+                Err(e) => {
+                    unreadable += 1;
+                    println!("{uuid}: manifest unreadable: {e:#}");
+                }
             }
         }
         let half = limit / 2;
@@ -850,15 +935,18 @@ mod tests {
             .collect();
         let (mut mono, mut osc) = (Tally::default(), Tally::default());
         let (mut unsupported, mut absent, mut manifest_wcs) = (0usize, 0usize, 0usize);
-        for (is_osc, (project_id, uuid, landed, meta)) in sample {
+        for (handle, (is_osc, (project_id, uuid, landed, meta))) in sample.into_iter().enumerate() {
             let tally = if is_osc { &mut osc } else { &mut mono };
             if meta.wcs.is_some() {
                 manifest_wcs += 1;
             }
-            let target = crate::db::collab::get_project(&conn, &project_id)
-                .ok()
-                .flatten()
-                .map(|p| (p.target_ra_deg, p.target_dec_deg));
+            let target = match crate::db::collab::get_project(&conn, &project_id) {
+                Ok(p) => p.map(|p| (p.target_ra_deg, p.target_dec_deg)),
+                Err(e) => {
+                    println!("{uuid}: project {project_id} unreadable: {e:#}");
+                    None
+                }
+            };
             let landed = PathBuf::from(landed);
             if !landed.exists() {
                 absent += 1;
@@ -892,46 +980,46 @@ mod tests {
                 }
             };
             tally.tried += 1;
-            // No stacking handle exists outside a run; 0 names the span.
-            let request = SolveRequest::for_frame(0, &path, &meta, target);
-            let unit = solve_with(&request, &caches, &config, &go);
-            let unit_solved = matches!(unit, SolveOutcome::Solved(_));
-            if unit_solved {
-                tally.unit_ok += 1;
-            }
-            let adu_note = if unit_solved {
-                String::new()
-            } else {
-                let adu = scratch.path().join(format!("adu_{uuid}.fits"));
-                adu_scaled_copy(&path, &adu).expect("adu-scaled copy");
-                let rescued = solve_with(
-                    &SolveRequest {
-                        path: adu,
-                        ..request.clone()
-                    },
-                    &caches,
-                    &config,
-                    &go,
-                );
-                if matches!(rescued, SolveOutcome::Solved(_)) {
-                    tally.adu_ok += 1;
+            // Handles are 1-based here: the scratch copy is named by it.
+            let request = SolveRequest::for_frame(handle as i64 + 1, &path, &meta, target);
+            let mut attempts: Vec<String> = Vec::new();
+            let outcome = solve_in_domains(&request, Some(scratch.path()), &go, &mut |r| {
+                let o = solve_with(r, &caches, &config, &go);
+                let which = if r.path == path {
+                    "original"
+                } else {
+                    "adu-scaled"
+                };
+                attempts.push(format!("{which}: {}", describe(&o)));
+                o
+            });
+            if matches!(outcome, SolveOutcome::Solved(_)) {
+                if attempts.len() == 1 {
+                    tally.first_ok += 1;
+                } else {
+                    tally.fallback_ok += 1;
                 }
-                format!(" | adu-scaled: {}", describe(&rescued))
-            };
+            }
             println!(
-                "{uuid} ({}, {}): {}{adu_note}",
+                "{uuid} ({}, {}): {}",
                 if is_osc { "osc" } else { "mono" },
                 if meta.wcs.is_some() {
                     "manifest wcs"
                 } else {
                     "no manifest wcs"
                 },
-                describe(&unit)
+                attempts.join(" | ")
             );
         }
         println!(
-            "solve probe: mono {}/{} solved on unit-domain pixels, {} rescued by the adu-scaled copy; osc {}/{} solved on unit-domain pixels, {} rescued by the adu-scaled copy; unsupported {unsupported}, not on disk {absent}, with a manifest wcs {manifest_wcs}",
-            mono.unit_ok, mono.tried, mono.adu_ok, osc.unit_ok, osc.tried, osc.adu_ok
+            "solve probe: mono {}/{} solved on the first attempt, {} needed the fallback; osc {}/{} solved on the first attempt, {} needed the fallback; unsupported {unsupported}, not on disk {absent}, unreadable manifests {unreadable}, with a manifest wcs {manifest_wcs}; wall {:.1}s",
+            mono.first_ok,
+            mono.tried,
+            mono.fallback_ok,
+            osc.first_ok,
+            osc.tried,
+            osc.fallback_ok,
+            started.elapsed().as_secs_f64()
         );
         assert!(
             mono.tried + osc.tried > 0,
@@ -939,8 +1027,264 @@ mod tests {
         );
         // Review M16: a probe that solved nothing is a red run, not a line to read.
         assert!(
-            mono.unit_ok + mono.adu_ok + osc.unit_ok + osc.adu_ok > 0,
-            "no frame solved, in either domain"
+            mono.first_ok + mono.fallback_ok + osc.first_ok + osc.fallback_ok > 0,
+            "no frame solved"
         );
+    }
+
+    // ---- solve_in_domains (plan 6b-2 Task 10c, review fix round 1) ----
+
+    fn plain_request(handle: i64, path: &Path) -> SolveRequest {
+        SolveRequest {
+            handle,
+            path: path.to_path_buf(),
+            hints: SolveHints::default(),
+            expected_scale_arcsec: None,
+            date_obs: None,
+            focal_len: None,
+            instrume: None,
+            naxis: None,
+            scratch_dir: None,
+        }
+    }
+
+    fn write_plane(path: &Path, values: &[f32]) {
+        crate::fits_writer::write_fits_f32(path, 4, 2, 1, values, &[]).unwrap();
+    }
+
+    fn read_plane0(path: &Path) -> Vec<f32> {
+        PlaneReader::open(path).unwrap().read_plane(0).unwrap()
+    }
+
+    fn solved() -> SolveOutcome {
+        SolveOutcome::Solved(FakeSolver::fixture_record())
+    }
+
+    /// Everything `warn!` and below writes while `f` runs on this thread.
+    fn captured_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// (a) A unit-domain file is solved first on `adu_<handle>.fits`, whose
+    /// pixels are the source times 65535; the original is the fallback and
+    /// the copy is gone afterwards. (b) A first `Solved` is one call.
+    #[test]
+    fn a_unit_domain_file_is_solved_scaled_first_then_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c_light.fits");
+        let values = [0.0f32, 0.25, 0.5, 1.0, 0.1, 0.2, 0.3, 0.4];
+        write_plane(&src, &values);
+        let scratch = dir.path().join("tmp");
+        let go = AtomicBool::new(false);
+
+        let mut calls: Vec<PathBuf> = Vec::new();
+        let mut seen_pixels: Vec<f32> = Vec::new();
+        let mut existed = false;
+        let outcome = solve_in_domains(&plain_request(7, &src), Some(&scratch), &go, &mut |r| {
+            calls.push(r.path.clone());
+            if calls.len() == 1 {
+                existed = r.path.exists();
+                seen_pixels = read_plane0(&r.path);
+                SolveOutcome::Failed("no stars".into())
+            } else {
+                solved()
+            }
+        });
+        assert!(matches!(outcome, SolveOutcome::Solved(_)));
+        assert_eq!(calls, vec![scratch.join("adu_7.fits"), src.clone()]);
+        assert!(existed, "the copy exists during the first call");
+        let want: Vec<f32> = values.iter().map(|v| v * 65535.0).collect();
+        assert_eq!(seen_pixels, want);
+        assert!(!scratch.join("adu_7.fits").exists(), "the copy is removed");
+        assert_eq!(
+            read_plane0(&src),
+            values.to_vec(),
+            "the source is untouched"
+        );
+
+        // (b) a first success is the only call.
+        let mut n = 0;
+        let outcome = solve_in_domains(&plain_request(7, &src), Some(&scratch), &go, &mut |_| {
+            n += 1;
+            solved()
+        });
+        assert!(matches!(outcome, SolveOutcome::Solved(_)));
+        assert_eq!(n, 1);
+        assert!(!scratch.join("adu_7.fits").exists());
+    }
+
+    /// Both attempts failing reports both reasons; the first is logged.
+    #[test]
+    fn both_failed_attempts_are_reported_and_the_first_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.fits");
+        write_plane(&src, &[0.5; 8]);
+        let go = AtomicBool::new(false);
+        let mut n = 0;
+        let mut outcome = None;
+        let logs = captured_logs(|| {
+            outcome = Some(solve_in_domains(
+                &plain_request(3, &src),
+                Some(&dir.path().join("tmp")),
+                &go,
+                &mut |_| {
+                    n += 1;
+                    SolveOutcome::Failed(format!("reason {n}"))
+                },
+            ));
+        });
+        match outcome.unwrap() {
+            SolveOutcome::Failed(text) => {
+                assert!(
+                    text.contains("reason 1") && text.contains("reason 2"),
+                    "{text}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(logs.contains("WARN") && logs.contains("reason 1"), "{logs}");
+    }
+
+    /// (c) A cancel raised inside the first call stops the fallback.
+    #[test]
+    fn a_cancel_inside_the_first_call_skips_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.fits");
+        write_plane(&src, &[0.5; 8]);
+        let go = AtomicBool::new(false);
+        let mut n = 0;
+        let outcome = solve_in_domains(
+            &plain_request(1, &src),
+            Some(&dir.path().join("tmp")),
+            &go,
+            &mut |_| {
+                n += 1;
+                go.store(true, std::sync::atomic::Ordering::Relaxed);
+                SolveOutcome::Failed("cancelled".into())
+            },
+        );
+        assert_eq!(n, 1);
+        assert!(matches!(outcome, SolveOutcome::Failed(_)));
+    }
+
+    /// (d) Without a scratch dir the original is solved, once.
+    #[test]
+    fn without_a_scratch_dir_the_original_is_solved_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.fits");
+        write_plane(&src, &[0.5; 8]);
+        let go = AtomicBool::new(false);
+        let mut calls = Vec::new();
+        let outcome = solve_in_domains(&plain_request(1, &src), None, &go, &mut |r| {
+            calls.push(r.path.clone());
+            SolveOutcome::Failed("x".into())
+        });
+        assert_eq!(calls, vec![src]);
+        assert!(matches!(outcome, SolveOutcome::Failed(ref t) if t == "x"));
+    }
+
+    /// (e) A scratch path that cannot be created is not a cacheable failure:
+    /// it is `Unavailable`, it is logged, no solve ran, and `write_outcome`
+    /// refuses it.
+    #[test]
+    fn an_unwritable_scratch_is_unavailable_and_never_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.fits");
+        write_plane(&src, &[0.5; 8]);
+        let blocker = dir.path().join("tmp");
+        std::fs::write(&blocker, b"a file, not a directory").unwrap();
+        let go = AtomicBool::new(false);
+        let mut n = 0;
+        let mut outcome = None;
+        let logs = captured_logs(|| {
+            outcome = Some(solve_in_domains(
+                &plain_request(1, &src),
+                Some(&blocker),
+                &go,
+                &mut |_| {
+                    n += 1;
+                    solved()
+                },
+            ));
+        });
+        let outcome = outcome.unwrap();
+        assert_eq!(n, 0);
+        assert!(
+            matches!(outcome, SolveOutcome::Unavailable(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            logs.contains("WARN") && logs.contains("adu-scaled solve copy failed"),
+            "{logs}"
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        assert!(write_outcome(&conn, "p1", 1, "b", "h", outcome.clone()).is_err());
+        assert!(serde_json::to_string(&outcome).is_err());
+    }
+
+    /// (f) A float file already in ADU is solved as is, with no copy.
+    #[test]
+    fn an_adu_domain_float_file_is_solved_as_is_without_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.fits");
+        write_plane(&src, &[0.0, 1000.0, 20000.0, 65535.0, 5.0, 6.0, 7.0, 8.0]);
+        let scratch = dir.path().join("tmp");
+        let go = AtomicBool::new(false);
+        let mut calls = Vec::new();
+        let outcome = solve_in_domains(&plain_request(1, &src), Some(&scratch), &go, &mut |r| {
+            calls.push(r.path.clone());
+            SolveOutcome::Failed("x".into())
+        });
+        assert_eq!(calls, vec![src]);
+        assert!(matches!(outcome, SolveOutcome::Failed(_)));
+        assert!(!scratch.join("adu_1.fits").exists());
+    }
+
+    /// (g) A first `Refused` is final: no fallback.
+    #[test]
+    fn a_refused_first_attempt_has_no_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.fits");
+        write_plane(&src, &[0.5; 8]);
+        let go = AtomicBool::new(false);
+        let mut n = 0;
+        let outcome = solve_in_domains(
+            &plain_request(1, &src),
+            Some(&dir.path().join("tmp")),
+            &go,
+            &mut |_| {
+                n += 1;
+                SolveOutcome::Refused("wrong scale".into())
+            },
+        );
+        assert_eq!(n, 1);
+        assert!(matches!(outcome, SolveOutcome::Refused(_)));
     }
 }

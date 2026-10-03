@@ -3587,6 +3587,21 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
                     "project frame could not be plate-solved"
                 );
             }
+            SolveOutcome::Unavailable(reason) => {
+                // Says nothing about the frame: not cached, solved again next run.
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    frame_id,
+                    frame_uuid = %plan.frame_uuid,
+                    reason = %reason,
+                    duration_ms,
+                    "project frame solve unavailable; not cached"
+                );
+                rc.warnings.push(format!(
+                    "frame {frame_id} could not be plate-solved this run: {reason}"
+                ));
+                continue;
+            }
         }
         let conn = db(&rc.ctx)?.conn();
         write_outcome(
@@ -4305,6 +4320,9 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
 /// Factored out of [`stage_reference`]'s `Auto` branch by M4b Task 3: in
 /// native mode the SAME pick runs once per group, not once per run
 /// (ruling R-M4b-4), and the two must not be two different rules.
+///
+/// `keep` narrows the pick (plan 6b-2 C15: a project's WCS candidates). It
+/// is applied on top of `included`: an entry that is not included never wins.
 fn best_included_idx_where(
     entries: &[MeasuredFrame],
     keep: impl Fn(&MeasuredFrame) -> bool,
@@ -4373,11 +4391,17 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
             WcsTier::Missing | WcsTier::NotApplicable => {}
         }
     }
-    let manifest_included = rc
-        .measured
-        .values()
-        .flatten()
-        .any(|e| e.included && manifest.contains(&e.frame.frame_id));
+    // The stored manual pin is forced included later in this stage, so the
+    // tier decision counts it as included now.
+    let pinned = if rc.config.reference.mode == ReferenceMode::Manual {
+        let conn = db(&rc.ctx)?.conn();
+        stored_reference_frame(&conn, &rc.subject)?
+    } else {
+        None
+    };
+    let manifest_included = rc.measured.values().flatten().any(|e| {
+        (e.included || pinned == Some(e.frame.frame_id)) && manifest.contains(&e.frame.frame_id)
+    });
     let with_wcs: HashSet<i64> = manifest.union(&local).copied().collect();
     let candidates = if manifest_included { manifest } else { local };
     tracing::debug!(
@@ -4514,7 +4538,9 @@ fn frame_calibration_hash(
 /// Which entry of one group is that group's own registration reference in
 /// native mode (ruling R-M4b-4): the run's MANUAL pin when it is a member
 /// of this very group — a pin applies to its own group only — and the
-/// group's best-weighted included member otherwise.
+/// group's best-weighted included member otherwise. On a project run (a WCS
+/// rule is set) that member is the best included WCS CANDIDATE, and a group
+/// with none gets `None` and takes the run's geometry (plan 6b-2 C15).
 fn group_reference_idx(
     rc: &RunContext,
     key: &str,
@@ -4540,6 +4566,12 @@ fn group_reference_idx(
 /// total exposure). Stores the choice (`set_run_reference`,
 /// `rc.summary.reference`, `rc.reference_frame_id`/`reference_calibrated`)
 /// and emits a single `Reference 1/1` progress event.
+///
+/// Plan 6b-2 C15 (spec §5.4): on a project run the reference must carry a
+/// WCS. [`wcs_tiers`] sets `rc.wcs_rule`; `Auto` takes the best candidate of
+/// the largest group that holds one (preferring a group that will be
+/// integrated), `Manual` fails when the pin has no WCS, and no candidate at
+/// all fails the stage. A frame set has no rule and picks exactly as before.
 ///
 /// M4b (ruling R-M4b-4): the run-wide pick above is unchanged in BOTH
 /// geometry modes — it is what `stacking_runs.reference_frame_id`, the
@@ -4636,35 +4668,49 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
         ReferenceMode::Auto => {
             let mut best_group: Option<&IntegrationGroup> = None;
             let mut best_included = 0usize;
-            for g in &rc.plan_groups {
-                let included = rc
-                    .measured
-                    .get(&g.key)
-                    .map(|v| v.iter().filter(|e| e.included).count())
-                    .unwrap_or(0);
-                if included == 0 {
-                    continue;
-                }
-                if let Some(rule) = &rc.wcs_rule {
-                    let holds_candidate = rc.measured.get(&g.key).is_some_and(|v| {
-                        v.iter()
-                            .any(|e| e.included && rule.candidates.contains(&e.frame.frame_id))
-                    });
-                    if !holds_candidate {
+            // A project's reference comes from a group that will be
+            // integrated (>= 3 included) when one holds a candidate, else
+            // from any group that does (plan 6b-2 C15). A frame set has one
+            // pass, as always.
+            let passes: &[bool] = if rc.wcs_rule.is_some() {
+                &[true, false]
+            } else {
+                &[false]
+            };
+            for &integrated_only in passes {
+                for g in &rc.plan_groups {
+                    let included = rc
+                        .measured
+                        .get(&g.key)
+                        .map(|v| v.iter().filter(|e| e.included).count())
+                        .unwrap_or(0);
+                    if included == 0 || (integrated_only && included < 3) {
                         continue;
                     }
-                }
-                let take = match best_group {
-                    None => true,
-                    Some(b) => {
-                        included > best_included
-                            || (included == best_included
-                                && g.total_exposure_s > b.total_exposure_s)
+                    if let Some(rule) = &rc.wcs_rule {
+                        let holds_candidate = rc.measured.get(&g.key).is_some_and(|v| {
+                            v.iter()
+                                .any(|e| e.included && rule.candidates.contains(&e.frame.frame_id))
+                        });
+                        if !holds_candidate {
+                            continue;
+                        }
                     }
-                };
-                if take {
-                    best_group = Some(g);
-                    best_included = included;
+                    let take = match best_group {
+                        None => true,
+                        Some(b) => {
+                            included > best_included
+                                || (included == best_included
+                                    && g.total_exposure_s > b.total_exposure_s)
+                        }
+                    };
+                    if take {
+                        best_group = Some(g);
+                        best_included = included;
+                    }
+                }
+                if best_group.is_some() {
+                    break;
                 }
             }
             let group = match best_group {
@@ -6273,6 +6319,25 @@ fn group_two_pass_wanted(
     cfg.reference.two_pass && manual_reference_frame_id != Some(group_reference_frame_id)
 }
 
+/// Whether a group's two-pass re-pick can move anything (plan 6b-2 C15).
+/// Without a WCS rule (a frame set) it always can, as before. On a project
+/// run only a WCS candidate may win, so a group that holds no included
+/// candidate other than its current reference has nothing to switch to, and
+/// a dry pass (on a borrowed foreign reference, for a group with no
+/// candidate) would only cost time and log a false warning.
+fn group_can_switch(rc: &RunContext, key: &str, reference_frame_id: i64) -> bool {
+    let Some(rule) = &rc.wcs_rule else {
+        return true;
+    };
+    rc.measured.get(key).is_some_and(|v| {
+        v.iter().any(|e| {
+            e.included
+                && e.frame.frame_id != reference_frame_id
+                && rule.candidates.contains(&e.frame.frame_id)
+        })
+    })
+}
+
 /// Stage 5 in `native` geometry mode (M4b rulings R-M4b-4/5): every group
 /// registers onto ITS OWN reference, in its own geometry, with no
 /// cross-group registration at all.
@@ -6320,11 +6385,10 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
             continue;
         }
         total += included;
-        if group_two_pass_wanted(
-            &cfg,
-            rc.geometry_of(&g.key).reference_frame_id,
-            manual_reference_frame_id,
-        ) {
+        let group_reference = rc.geometry_of(&g.key).reference_frame_id;
+        if group_two_pass_wanted(&cfg, group_reference, manual_reference_frame_id)
+            && group_can_switch(rc, &g.key, group_reference)
+        {
             total += included;
         }
     }
@@ -6381,7 +6445,9 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
             solve_of(&mut solves, &conn, &origins, reference_frame_id);
         }
 
-        if group_two_pass_wanted(&cfg, reference_frame_id, manual_reference_frame_id) {
+        if group_two_pass_wanted(&cfg, reference_frame_id, manual_reference_frame_id)
+            && group_can_switch(rc, &group.key, reference_frame_id)
+        {
             if let Some(switch) = two_pass_refine(
                 rc,
                 group,
@@ -6595,6 +6661,7 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
                 .find(|g| {
                     g.frames.iter().any(|f| f.frame_id == reference_frame_id)
                         && included_count_of(rc, &g.key) >= 3
+                        && group_can_switch(rc, &g.key, reference_frame_id)
                 })
                 .cloned()
         } else {
@@ -22593,11 +22660,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let (fixture, _ids, working, output) = seed_star_group(
+        let (fixture, ids, working, output) = seed_star_group(
             &db_path,
             SET_NAME,
             &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
             &[5.0f32; 3],
+        );
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
         );
         let cfg = StackingConfig::default();
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
@@ -22622,6 +22695,184 @@ mod tests {
         );
         assert!(wcs_tiers(&rc).unwrap().is_none());
         assert!(rc.wcs_rule.is_none());
+
+        // The Reference stage itself leaves no rule behind, and every group
+        // may switch (the two-pass predicate is today's answer).
+        let mut rc = rc;
+        run_stages_for_test(&mut rc, Stage::Reference).unwrap();
+        assert!(rc.wcs_rule.is_none());
+        let reference = rc.reference_frame_id.unwrap();
+        for g in rc.plan_groups.clone() {
+            assert!(group_can_switch(&rc, &g.key, reference));
+        }
+    }
+
+    /// Review round 1, B1: a native project group with no WCS candidate
+    /// borrows the run reference and has nothing to switch to, so it gets no
+    /// dry pass; a group holding another candidate may switch.
+    #[test]
+    fn a_native_project_group_without_a_candidate_cannot_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 4, 3);
+        let mut native = StackingConfig::default();
+        native.registration.geometry = RegistrationGeometry::Native;
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            native,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        measure_all(&mut rc, &HashMap::new());
+        stage_reference(&mut rc).unwrap();
+        let reference = rc.reference_frame_id.unwrap();
+        let r_ref = rc.group_geometry["mono__R__300s"].reference_frame_id;
+        assert_eq!(r_ref, reference, "the R group borrows the run reference");
+        assert!(!group_can_switch(&rc, "mono__R__300s", r_ref));
+        assert!(group_can_switch(&rc, "mono__G__300s", reference));
+    }
+
+    /// Review round 1, item 5: a group that will be integrated (>= 3 included)
+    /// supplies the reference, not a skipped group's better-weighted candidate.
+    #[test]
+    fn an_integrated_groups_candidate_wins_over_a_skipped_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for (filter, n) in [("R", 3usize), ("G", 2usize)] {
+            for i in 1..=n {
+                let uuid = format!("{}{i}", filter.to_lowercase());
+                let mut spec = test_fixtures::project_frame_spec(&uuid);
+                spec.filter = filter;
+                spec.wcs = Some(test_fixtures::manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+                test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+            }
+        }
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let weights: HashMap<&str, f64> = [("c_g1.fits", 0.99), ("c_g2.fits", 0.98)]
+            .into_iter()
+            .collect();
+        measure_all(&mut rc, &weights);
+        stage_reference(&mut rc).unwrap();
+        let reference = rc.reference_frame_id.unwrap();
+        let r: HashSet<i64> = ["c_r1.fits", "c_r2.fits", "c_r3.fits"]
+            .iter()
+            .map(|n| handle_of(&rc, n))
+            .collect();
+        assert!(r.contains(&reference), "the integrated R group supplies it");
+    }
+
+    /// Review round 1, item 7 (I6): an excluded pin without a WCS fails with
+    /// the exclusion message, not the WCS one.
+    #[test]
+    fn an_excluded_manual_pin_reports_the_exclusion_before_the_wcs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 3);
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        crate::db::stacking::set_project_config(&conn, "p1", "{}", &[], Some("r1")).unwrap();
+        measure_all(&mut rc, &HashMap::new());
+        let r1 = handle_of(&rc, "c_r1.fits");
+        for entry in rc.measured.values_mut().flatten() {
+            if entry.frame.frame_id == r1 {
+                entry.calibrated = None;
+                entry.included = false;
+                entry.reason = Some("calibration failed".to_string());
+            }
+        }
+        let err = stage_reference(&mut rc).unwrap_err();
+        assert!(
+            matches!(err, RunError::Other(ref m) if m == "the manual reference frame is excluded: calibration failed"),
+            "{err:?}"
+        );
+    }
+
+    /// Review round 1, item 7: a manual pin with only a LOCAL WCS qualifies
+    /// even while manifest frames exist (`with_wcs` is manifest plus local;
+    /// only the Auto candidates prefer the manifest). And a pin that stage 3
+    /// excluded still counts as included for the tier decision.
+    #[test]
+    fn a_manual_pin_with_a_local_wcs_qualifies_and_an_excluded_pin_counts_as_included() {
+        use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 3);
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
+
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg.clone(), &work, &out);
+        let r1 = handle_of(&rc, "c_r1.fits");
+        write_outcome(
+            &conn,
+            "p1",
+            r1,
+            &blake3_of(&conn, "p1", "r1"),
+            "h",
+            SolveOutcome::Solved(FakeSolver::fixture_record()),
+        )
+        .unwrap();
+        crate::db::stacking::set_project_config(&conn, "p1", "{}", &[], Some("r1")).unwrap();
+        measure_all(&mut rc, &HashMap::new());
+        stage_reference(&mut rc).unwrap();
+        assert_eq!(rc.reference_frame_id, Some(r1));
+
+        // Only the pinned manifest frame is a manifest frame that is not
+        // included: it still makes the manifest tier the candidate tier.
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg, &work, &out);
+        crate::db::stacking::set_project_config(&conn, "p1", "{}", &[], Some("g2")).unwrap();
+        measure_all(&mut rc, &HashMap::new());
+        let g2 = handle_of(&rc, "c_g2.fits");
+        for g in ["c_g1.fits", "c_g3.fits"] {
+            let id = handle_of(&rc, g);
+            for entry in rc.measured.values_mut().flatten() {
+                if entry.frame.frame_id == id {
+                    entry.included = false;
+                }
+            }
+        }
+        for entry in rc.measured.values_mut().flatten() {
+            if entry.frame.frame_id == g2 {
+                entry.included = false;
+            }
+        }
+        stage_reference(&mut rc).unwrap();
+        let rule = rc.wcs_rule.as_ref().unwrap();
+        assert!(rule.candidates.contains(&g2), "{rule:?}");
+        assert!(
+            !rule.candidates.contains(&r1),
+            "the manifest tier wins: {rule:?}"
+        );
     }
 
     fn use_solver(rc: &mut RunContext, fake: &Arc<crate::stacking::solve::FakeSolver>) {

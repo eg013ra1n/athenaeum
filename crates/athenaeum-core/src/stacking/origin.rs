@@ -281,6 +281,10 @@ pub(crate) enum WcsTier {
     Missing,
 }
 
+/// The [`WcsTier`] of one frame: a catalog frame has no rule, a project frame
+/// with a manifest WCS is `Manifest`, one whose cached solve of the current
+/// content succeeded is `Local`, and anything else (no solve, a failed or a
+/// refused one, a solve of other content) is `Missing`.
 pub(crate) fn wcs_tier(
     conn: &Connection,
     origin: &FrameOrigin,
@@ -725,6 +729,20 @@ mod tests {
             wcs_tier(&conn, &a, a_id).unwrap(),
             WcsTier::Missing,
             "a failure is no WCS"
+        );
+        write_outcome(
+            &conn,
+            "p1",
+            a_id,
+            &a_blake3,
+            "h",
+            SolveOutcome::Refused("wrong scale".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            wcs_tier(&conn, &a, a_id).unwrap(),
+            WcsTier::Missing,
+            "a refusal is no WCS"
         );
         write_outcome(
             &conn,
