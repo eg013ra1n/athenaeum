@@ -5415,7 +5415,9 @@ fn register_group_pass(
                                 None => Ok((star, registration_hash)),
                                 Some((grid, reference)) => {
                                     subject_dims(frame.width, frame.height, &path)
-                                        .and_then(|dims| compose_to_grid(&star, dims, reference, grid))
+                                        .and_then(|dims| {
+                                            compose_to_grid(&star, dims, reference, grid)
+                                        })
                                         .map(|map| {
                                             let hash = grid_registered_hash(
                                                 &registration_hash,
@@ -5590,16 +5592,17 @@ fn register_group_pass(
     // (already resolved by the caller — the run-wide one in co-registered
     // mode, the group's own in native) — the OUTPUT buffer size, and a
     // more accurate admission bound than any per-frame native geometry
-    // would be. `reference_name` is the registered artifact's own
+    // would be. On a project's grid the group geometry is already the
+    // grid's (`set_group_geometry` stores the delivered dimensions).
+    // `reference_name` is the registered artifact's own
     // `ATH_REGR` card value (perf tier A Task 6a fix round 1: hoisted here,
     // once per group, instead of once per frame inside the old
     // `write_registered_artifact`).
     let (ref_w, ref_h, reference_name) = {
         let geometry = rc.geometry_of(&group.key);
-        let (width, height) = delivered_dims(rc, (geometry.width, geometry.height));
         (
-            width,
-            height,
+            geometry.width,
+            geometry.height,
             geometry
                 .calibrated
                 .file_stem()
@@ -24181,6 +24184,29 @@ mod tests {
                 "{}: star at ({mx}, {my}), grid says ({gx}, {gy})",
                 e.frame.filename
             );
+            // A star 100 px or more from the grid centre pins rotation and
+            // scale, not just translation and parity.
+            let far = stars
+                .iter()
+                .map(|s| (s, run.tan.sky_to_pixel(s.0, s.1)))
+                .filter(|(_, (x, y))| {
+                    (x - 256.0).hypot(y - 192.0) >= 100.0
+                        && (20.0..492.0).contains(x)
+                        && (20.0..364.0).contains(y)
+                })
+                .min_by(|a, b| {
+                    let da = (a.1 .0 - 256.0).hypot(a.1 .1 - 192.0);
+                    let db = (b.1 .0 - 256.0).hypot(b.1 .1 - 192.0);
+                    da.total_cmp(&db)
+                })
+                .expect("a sky star at least 100 px from the grid centre");
+            let (fx, fy) = far.1;
+            let (mx, my) = centroid_near(&plane, 512, fx, fy);
+            assert!(
+                (mx - fx).hypot(my - fy) < 0.5,
+                "{}: far star at ({mx}, {my}), grid says ({fx}, {fy})",
+                e.frame.filename
+            );
         }
         let stars_cached = crate::stacking::plan::stored_registrations(&conn, &rc.subject).unwrap();
         assert_eq!(stars_cached.len(), 4);
@@ -24237,7 +24263,8 @@ mod tests {
             crval2: grid.crval2 + 0.005,
             ..grid
         };
-        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(moved)));
+        let moved_run = Arc::new(crate::stacking::grid_map::GridRun::new(moved));
+        rc.grid = Some(Arc::clone(&moved_run));
         let detected = |dir: &Path| {
             crate::stacking::register::frame::DETECT_FRAME_STARS_LOG
                 .lock()
@@ -24270,6 +24297,14 @@ mod tests {
             assert_ne!(
                 row.config_hash, before[&e.frame.frame_id],
                 "the registered frame is rewritten"
+            );
+            let header =
+                crate::fits_parser::FitsHeader::from_path(&PathBuf::from(row.path.unwrap()))
+                    .unwrap();
+            assert_eq!(
+                header.get_str("ATH_GRID").as_deref(),
+                Some(moved_run.hash.as_str()),
+                "the frame was rewritten for the moved grid"
             );
         }
     }
