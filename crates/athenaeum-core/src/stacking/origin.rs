@@ -86,6 +86,43 @@ pub(crate) fn cfa_geometry_of_file(path: &Path) -> anyhow::Result<Option<CfaGeom
 /// A run's frame id to origin map, shared by the plan, `HashMemo` and the run.
 pub type FrameOrigins = Arc<HashMap<i64, FrameOrigin>>;
 
+/// Why a frame leaves a stacking run — stored verbatim as its
+/// `stacking_run_frames.exclusion_reason`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExclusionReason(pub(crate) String);
+
+/// Spec §5.1: the live exchange landed a new version (or removed the file)
+/// while the run was reading it.
+pub(crate) const CHANGED_DURING_THE_RUN: &str = "changed during the run";
+
+/// The landed-file identity check (plan 6b-2 C9): a project frame's landed
+/// file must still match the `size:mtime` its row recorded (2 s mtime
+/// tolerance, `collab::storage::sweep`). Called at every stage boundary
+/// that reads it; reads never hold a file open across stages.
+pub(crate) fn landed_unchanged(origin: &FrameOrigin) -> Result<(), ExclusionReason> {
+    use crate::collab::storage::sweep::{stat_verdict, Stamp, StatVerdict};
+    match origin {
+        FrameOrigin::Catalog { .. } => Ok(()),
+        FrameOrigin::Project {
+            project_id,
+            frame_uuid,
+            landed_path,
+            size_mtime,
+            ..
+        } => match stat_verdict(Path::new(landed_path), Stamp::parse(size_mtime)) {
+            StatVerdict::Same => Ok(()),
+            StatVerdict::Unreadable(e) => {
+                tracing::warn!(project_id = %project_id, frame_uuid = %frame_uuid, path = %landed_path, error = %e, "landed project frame unreadable");
+                Err(ExclusionReason(format!("landed file unreadable: {e}")))
+            }
+            verdict => {
+                tracing::warn!(project_id = %project_id, frame_uuid = %frame_uuid, path = %landed_path, outcome = ?verdict, "landed project frame changed during the run");
+                Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
+            }
+        },
+    }
+}
+
 /// The origin of one frame of the run. A frame without one is an error: it
 /// is never read as a catalog frame by default.
 pub(crate) fn origin_of(origins: &FrameOrigins, frame_id: i64) -> Result<&FrameOrigin, ApiError> {
@@ -251,6 +288,7 @@ mod tests {
             "stored_registrations",
             "store_registration",
             "stage_one_kind",
+            "landed_unchanged",
         ];
         const ALLOWLIST: &[(&str, &str)] = &[
             (
@@ -293,6 +331,47 @@ mod tests {
                 "{file}: a function names a subject/origin variant outside the funnels: {violations:?}"
             );
         }
+    }
+
+    /// Plan 6b-2 C9: a catalog frame always passes; a project frame passes
+    /// while its landed file matches the recorded stamp, and is excluded
+    /// "changed during the run" once rewritten or removed.
+    #[test]
+    fn landed_unchanged_follows_the_recorded_stamp() {
+        let catalog = FrameOrigin::Catalog {
+            file_id: 1,
+            attested: false,
+        };
+        assert_eq!(landed_unchanged(&catalog), Ok(()));
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = test_fixtures::add_project_frame(
+            &conn,
+            dir.path(),
+            "p1",
+            &test_fixtures::project_frame_spec("a"),
+        );
+        let source = crate::stacking::project_source::project_frame_source(
+            &conn,
+            "p1",
+            &crate::stacking::config::StackingConfig::default(),
+        )
+        .unwrap();
+        let origin = source.origins.values().next().unwrap().clone();
+        assert_eq!(landed_unchanged(&origin), Ok(()));
+        std::fs::write(&path, vec![0u8; 4321]).unwrap();
+        assert_eq!(
+            landed_unchanged(&origin),
+            Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            landed_unchanged(&origin),
+            Err(ExclusionReason(CHANGED_DURING_THE_RUN.to_string()))
+        );
     }
 
     /// The scanner behind the funnel test: `(line number, enclosing fn, line)`

@@ -3000,6 +3000,28 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
                 continue;
             };
 
+            // Plan 6b-2 C9: a project frame whose landed file changed since
+            // the frame source read it leaves the run here.
+            if let Some(reason) = changed_during_run(rc, frame.frame_id)? {
+                tracing::warn!(run_id = rc.run_id, frame_id = frame.frame_id, reason = %reason, "frame excluded");
+                rc.runtime_exclusions.push((frame.frame_id, reason.clone()));
+                entries.push(MeasuredFrame {
+                    frame: frame.clone(),
+                    calibrated: None,
+                    planes: 0,
+                    measurement: None,
+                    weight: None,
+                    included: false,
+                    reason: Some(reason),
+                    registration: None,
+                    cached_calibrated: false,
+                    cached_metrics: false,
+                    ln_scale: None,
+                    cached_ln: false,
+                });
+                continue;
+            }
+
             let planes = match PlaneReader::open(&calibrated_path) {
                 Ok(r) => Ok(r.channels()),
                 Err(e) => Err(format!("calibrated frame unreadable: {e}")),
@@ -4323,6 +4345,11 @@ fn register_group_pass(
     let mut pass: Vec<PassResult> = Vec::new();
 
     if included_count_of(rc, &group.key) < 3 {
+        return Ok(pass);
+    }
+
+    // Plan 6b-2 C9: the Register boundary of the landed-file identity check.
+    if exclude_changed_members(rc, group)? > 0 && included_count_of(rc, &group.key) < 3 {
         return Ok(pass);
     }
 
@@ -6067,6 +6094,60 @@ fn exclude_frame_and_persist(
     Ok(())
 }
 
+/// The run-thread side of the landed-file identity check (plan 6b-2 C9):
+/// the exclusion reason when this frame's landed file changed since the
+/// frame source read its row; `None` when it did not, and for every catalog
+/// frame.
+fn changed_during_run(rc: &RunContext, frame_id: i64) -> Result<Option<String>, RunError> {
+    let origin = origin_of(&rc.origins, frame_id)?;
+    Ok(crate::stacking::origin::landed_unchanged(origin)
+        .err()
+        .map(|reason| reason.0))
+}
+
+/// The Register and Output boundaries of the identity check (plan 6b-2
+/// C9): every still-included member of `group` whose landed file changed is
+/// excluded, and its frame row persisted, with the check's reason. A
+/// changed group or run reference fails the run instead — a reference
+/// cannot leave its own group. Returns how many frames it excluded.
+fn exclude_changed_members(
+    rc: &mut RunContext,
+    group: &IntegrationGroup,
+) -> Result<usize, RunError> {
+    let included: Vec<i64> = rc
+        .measured
+        .get(&group.key)
+        .map(|v| {
+            v.iter()
+                .filter(|e| e.included)
+                .map(|e| e.frame.frame_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let references: HashSet<i64> = rc
+        .group_geometry
+        .values()
+        .map(|g| g.reference_frame_id)
+        .chain(rc.reference_frame_id)
+        .collect();
+    let mut excluded = 0usize;
+    for frame_id in included {
+        let Some(reason) = changed_during_run(rc, frame_id)? else {
+            continue;
+        };
+        if references.contains(&frame_id) {
+            return Err(RunError::Other(format!(
+                "the reference frame changed during the run (frame {frame_id})"
+            )));
+        }
+        tracing::warn!(run_id = rc.run_id, frame_id, reason = %reason, "frame excluded");
+        rc.runtime_exclusions.push((frame_id, reason.clone()));
+        exclude_frame_and_persist(rc, group, frame_id, reason)?;
+        excluded += 1;
+    }
+    Ok(excluded)
+}
+
 // ── Stages 6/7/9 (Task 8): normalize, integrate, output ────────────────────
 
 /// One process, one writer: `master_file_name`/`write_master_light`
@@ -6825,6 +6906,10 @@ fn process_group_output(
             Duration::ZERO,
         )
     };
+
+    // Plan 6b-2 C9: the Output boundary — the member snapshot below reads
+    // the files Normalize, Integrate and Drizzle work from.
+    exclude_changed_members(rc, group)?;
 
     let included_count = rc
         .measured
@@ -9982,6 +10067,44 @@ pub(crate) fn test_context(
         dry_pass_stars: HashMap::new(),
         fail_after_stage: None,
     }
+}
+
+/// [`test_context`] for a project subject (plan 6b-2): the project frame
+/// source's own groups and origins, the project's handle namespace, a
+/// summary carrying the project id. Project stages run only through this
+/// until 6b-3 lets `start_stacking` start one.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_test_context(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    run_id: i64,
+    project_id: &str,
+    config: StackingConfig,
+    plan_groups: Vec<IntegrationGroup>,
+    origins: FrameOrigins,
+    layout: WorkingLayout,
+    output_dir: PathBuf,
+    group_ids: HashMap<String, i64>,
+) -> RunContext {
+    let mut rc = test_context(
+        ctx,
+        emitter,
+        run_id,
+        0,
+        project_id,
+        config,
+        plan_groups,
+        layout,
+        output_dir,
+        group_ids,
+    );
+    rc.subject = StackSubject::Project(project_id.to_string());
+    rc.memo = HashMemo::new(origins.clone());
+    rc.origins = origins;
+    rc.summary.set_id = None;
+    rc.summary.project_id = Some(project_id.to_string());
+    rc
 }
 
 #[cfg(test)]
@@ -20177,5 +20300,233 @@ mod tests {
         let none: FrameOrigins = Arc::new(HashMap::new());
         let mut solves = SolveCache::new();
         assert!(solve_of(&mut solves, &f.conn, &none, frame_id).is_none());
+    }
+
+    fn project_conn(db_path: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        crate::db::SqliteConnectionManager::setup_connection(&conn).unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn
+    }
+
+    /// A project run's context over the project's own frame source (plan
+    /// 6b-2): a real run row and group rows, so stages can persist.
+    fn project_rc(
+        ctx: &Arc<ServiceContext>,
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        cfg: StackingConfig,
+        working: &Path,
+        output: &Path,
+    ) -> RunContext {
+        let source =
+            crate::stacking::project_source::project_frame_source(conn, project_id, &cfg).unwrap();
+        let subject = StackSubject::Project(project_id.to_string());
+        let run_id = insert_run(
+            conn,
+            &NewRun {
+                subject: &subject,
+                config_json: &serde_json::to_string(&cfg).unwrap(),
+                config_hash: &config_hash(&cfg),
+                reference_frame_id: None,
+                reference_mode: "auto",
+                working_dir: working.to_str().unwrap(),
+                output_dir: output.to_str().unwrap(),
+            },
+        )
+        .unwrap();
+        let mut group_ids = HashMap::new();
+        for g in &source.groups {
+            let id = insert_group(
+                conn,
+                &NewGroup {
+                    run_id,
+                    group_key: &g.key,
+                    instrume: g.instrume.as_deref(),
+                    color_mode: color_mode_wire(g.color_mode),
+                    filter: g.filter.as_deref(),
+                    binning: Some(g.binning),
+                    width: None,
+                    height: None,
+                    exposure: g.exposure_s,
+                    exposure_class: Some(&g.exposure_class),
+                    frame_count: g.frames.len() as i64,
+                    included_count: g.frames.len() as i64,
+                },
+            )
+            .unwrap();
+            group_ids.insert(g.key.clone(), id);
+        }
+        let layout = subject_layout(conn, working, &subject).unwrap();
+        project_test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            run_id,
+            project_id,
+            cfg,
+            source.groups,
+            source.origins,
+            layout,
+            output.to_path_buf(),
+            group_ids,
+        )
+    }
+
+    /// `calibrated` rows pointing at each project frame's landed file — what
+    /// Prepare writes for a float replica used in place (Task 9b) — so
+    /// Measure can run without Prepare.
+    fn seed_in_place_calibrated(conn: &rusqlite::Connection, rc: &mut RunContext) {
+        for g in rc.plan_groups.clone() {
+            for f in &g.frames {
+                let hash = rc
+                    .memo
+                    .calibration_hash_checked(conn, &rc.config, f)
+                    .unwrap();
+                let (size, modified_at) = file_identity(Path::new(&f.path)).unwrap();
+                upsert_artifact(
+                    conn,
+                    &NewArtifact {
+                        subject: &rc.subject,
+                        frame_id: Some(f.frame_id),
+                        group_key: &g.key,
+                        kind: "calibrated",
+                        path: Some(&f.path),
+                        config_hash: &hash,
+                        size: Some(size),
+                        modified_at: Some(&modified_at),
+                        payload_json: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Plan 6b-2 C9 (the Measure boundary): a landed file the exchange
+    /// rewrote after the frame source read its row is excluded "changed
+    /// during the run"; its neighbours are not.
+    #[test]
+    fn measure_excludes_a_project_frame_whose_landed_file_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        let paths: Vec<PathBuf> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|u| {
+                test_fixtures::add_project_frame(
+                    &conn,
+                    &landed,
+                    "p1",
+                    &test_fixtures::project_frame_spec(u),
+                )
+            })
+            .collect();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        seed_in_place_calibrated(&conn, &mut rc);
+        std::fs::write(&paths[1], vec![0u8; 5000]).unwrap();
+
+        // The synthetic frames may or may not measure well enough for a
+        // viable group; the exclusion is recorded either way.
+        if let Err(e) = stage_measure(&mut rc) {
+            eprintln!("stage_measure ended with {e:?} (expected on tiny synthetic frames)");
+        }
+        let b = rc.plan_groups[0]
+            .frames
+            .iter()
+            .find(|f| f.filename == "c_b.fits")
+            .unwrap()
+            .frame_id;
+        let reasons: HashMap<i64, String> = rc.runtime_exclusions.iter().cloned().collect();
+        assert_eq!(
+            reasons.get(&b).map(String::as_str),
+            Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
+        );
+        for f in rc.plan_groups[0].frames.iter().filter(|f| f.frame_id != b) {
+            assert_ne!(
+                reasons.get(&f.frame_id).map(String::as_str),
+                Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
+            );
+        }
+    }
+
+    /// Plan 6b-2 C9 (the Register and Output boundaries): a still-included
+    /// member whose landed file changed is excluded and persisted; a changed
+    /// reference fails the run.
+    #[test]
+    fn exclude_changed_members_excludes_and_fails_on_a_changed_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for u in ["a", "b", "c"] {
+            test_fixtures::add_project_frame(
+                &conn,
+                &landed,
+                "p1",
+                &test_fixtures::project_frame_spec(u),
+            );
+        }
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let group = rc.plan_groups[0].clone();
+        let entries: Vec<MeasuredFrame> = group
+            .frames
+            .iter()
+            .map(|f| MeasuredFrame {
+                frame: f.clone(),
+                calibrated: Some(PathBuf::from(&f.path)),
+                planes: 1,
+                measurement: None,
+                weight: None,
+                included: true,
+                reason: None,
+                registration: None,
+                cached_calibrated: true,
+                cached_metrics: false,
+                ln_scale: None,
+                cached_ln: false,
+            })
+            .collect();
+        rc.measured.insert(group.key.clone(), entries);
+
+        std::fs::write(&group.frames[1].path, vec![0u8; 5000]).unwrap();
+        assert_eq!(exclude_changed_members(&mut rc, &group).unwrap(), 1);
+        let entry = &rc.measured[&group.key][1];
+        assert!(!entry.included);
+        assert_eq!(
+            entry.reason.as_deref(),
+            Some(crate::stacking::origin::CHANGED_DURING_THE_RUN)
+        );
+        assert_eq!(
+            exclude_changed_members(&mut rc, &group).unwrap(),
+            0,
+            "an excluded frame is not checked again"
+        );
+
+        rc.reference_frame_id = Some(group.frames[0].frame_id);
+        std::fs::write(&group.frames[0].path, vec![0u8; 6000]).unwrap();
+        let err = exclude_changed_members(&mut rc, &group).unwrap_err();
+        assert!(
+            matches!(err, RunError::Other(ref m) if m.contains("reference frame changed during the run")),
+            "{err:?}"
+        );
     }
 }
