@@ -258,8 +258,10 @@ pub fn solver_config_value(cfg: &PlateSolveConfig) -> serde_json::Value {
     })
 }
 
-/// [`solver_config_value`]'s canonical JSON (sorted keys) as XXH3-64, 16 hex
-/// digits.
+/// [`solver_config_value`]'s canonical JSON as XXH3-64, 16 hex digits. The
+/// keys come out sorted because no dependency enables serde_json's
+/// `preserve_order`, the same convention `stacking/config.rs` documents for
+/// its stage hashes.
 pub fn solver_config_hash(cfg: &PlateSolveConfig) -> String {
     let json = serde_json::to_string(&solver_config_value(cfg))
         .expect("a solver config value always serializes");
@@ -332,10 +334,14 @@ mod tests {
         );
         let h = solver_config_hash(&cfg);
         assert_eq!(h.len(), 16);
+        assert_eq!(h, "b1516bcd97659ab0");
         let mut same = cfg.clone();
         same.batch_concurrency = 4;
         same.autofind_tolerance_deg = 2.0;
         same.input_gate_enabled = false;
+        same.input_max_eccentricity = 0.5;
+        same.input_min_trail_r2 = 0.5;
+        same.bright_cache_path = Some("/x/bright".into());
         same.camera_defaults.insert("cam".into(), 3.76);
         assert_eq!(solver_config_hash(&same), h);
         let mut sip = cfg.clone();

@@ -156,6 +156,7 @@ pub fn solve_frame_with_hints(
         epoch: Some(observation_epoch(frame)),
     };
 
+    // Changing any of these: bump config::SOLVE_RECIPE_VERSION.
     let sma_cfg = SolveConfig {
         quad_tolerance: 0.007,
         catalog_mag_limit: 19.0,
@@ -246,6 +247,7 @@ pub fn solve_frame_with_hints(
     // matched_stars / bright-catalog-in-fov; we also expose the raw cone
     // count for the density-aware gate in `store_result`.
     let obs_epoch = observation_epoch(frame);
+    // Changing any of these: bump config::SOLVE_RECIPE_VERSION.
     let fov_radius_deg = {
         // If we have a pixel scale and total_detected, reconstruct the FOV.
         // Fall back to a reasonable default if not available.
@@ -264,6 +266,7 @@ pub fn solve_frame_with_hints(
             1.5
         }
     };
+    // Changing any of these: bump config::SOLVE_RECIPE_VERSION.
     let bright_mag_limit = 12.0_f32; // mirrors VERIFY_MAG_LIMIT in orchestrate.rs
                                      // Representative catalog for the bright-star FOV count: the legacy deep
                                      // cache, or — for an additive tier stack — the base layer (all bright stars
@@ -532,7 +535,8 @@ pub(crate) enum GateStage {
     // strict while a scale-recovered-near-hint solve can tolerate defocused
     // inlier counts (the 2026-05 defocus fix lowered the floor globally —
     // the per-stage split is the finer follow-up). Production currently
-    // labels every blind solve ScaleCleared (store_result), so this is
+    // labels every blind solve ScaleCleared (acceptance_refusal, which
+    // store_result calls), so this is
     // constructed only by the blind_gate_ok tests until that work lands.
     #[allow(dead_code)]
     FullBlind,

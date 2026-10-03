@@ -118,11 +118,17 @@ pub fn catalog_identity(app_data_dir: &Path) -> Result<String, CatalogOpenError>
                 dir: dir.clone(),
                 error: e.to_string(),
             })?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
+        let mtime = match meta.modified().map(|t| t.duration_since(UNIX_EPOCH)) {
+            Ok(Ok(d)) => d.as_secs(),
+            Ok(Err(e)) => {
+                tracing::warn!(path = %dir.join("stars.smac").display(), error = %e, "catalog tier mtime unavailable");
+                0
+            }
+            Err(e) => {
+                tracing::warn!(path = %dir.join("stars.smac").display(), error = %e, "catalog tier mtime unavailable");
+                0
+            }
+        };
         let name = if *dir == root {
             "legacy".to_string()
         } else {
@@ -194,5 +200,44 @@ mod tests {
         let moved = catalog_identity(app.path()).unwrap();
         assert_ne!(moved, id, "a replaced tier moves the identity");
         assert!(moved.starts_with("tier_500:3:"), "{moved}");
+    }
+
+    /// Plan 6b-2 C14 (fix round 1): a replaced tier file with the same size
+    /// still moves the identity (mtime only), and a bare root cache is named
+    /// `legacy`.
+    #[test]
+    fn the_catalog_identity_follows_mtime_and_names_a_legacy_layer() {
+        let app = tempfile::tempdir().unwrap();
+        let root = catalog_root(app.path());
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("stars.smac");
+        std::fs::write(&file, b"abc").unwrap();
+        let id = catalog_identity(app.path()).unwrap();
+        assert!(id.starts_with("legacy:3:"), "{id}");
+        let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        let later = std::fs::metadata(&file).unwrap().modified().unwrap()
+            + std::time::Duration::from_secs(120);
+        f.set_modified(later).unwrap();
+        drop(f);
+        let moved = catalog_identity(app.path()).unwrap();
+        assert!(moved.starts_with("legacy:3:"), "size unchanged: {moved}");
+        assert_ne!(moved, id, "an mtime-only change moves the identity");
+    }
+
+    /// Plan 6b-2 C14 (fix round 1): a tier that cannot be opened is an `Open`
+    /// error naming the first tier in order.
+    #[test]
+    fn open_catalog_layers_names_the_first_unopenable_tier() {
+        let app = tempfile::tempdir().unwrap();
+        let root = catalog_root(app.path());
+        for tier in ["tier_2000", "tier_500"] {
+            std::fs::create_dir_all(root.join(tier)).unwrap();
+            std::fs::write(root.join(tier).join("stars.smac"), b"x").unwrap();
+        }
+        match open_catalog_layers(app.path()) {
+            Err(CatalogOpenError::Open { dir, .. }) => assert_eq!(dir, root.join("tier_500")),
+            Err(e) => panic!("expected Open, got {e:?}"),
+            Ok(_) => panic!("a one-byte stars.smac must not open"),
+        }
     }
 }
