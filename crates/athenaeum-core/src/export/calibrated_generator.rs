@@ -210,6 +210,33 @@ pub fn bayer_for(geom: CfaGeometry) -> BayerPattern {
     }
 }
 
+/// The VNG debayer of one CFA plane, its `XBAYROFF`/`YBAYROFF` phase folded
+/// in through [`bayer_for`] — the one debayer the generator and the stacking
+/// run's Prepare share (plan 6b-2 C12). Full resolution, three planes,
+/// planar RGB.
+pub fn debayer_plane(
+    data: &[f32],
+    width: usize,
+    height: usize,
+    geom: CfaGeometry,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<f32> {
+    let pattern = bayer_for(geom);
+    match pool {
+        Some(p) => p.install(|| vng_debayer_f32(data, width, height, pattern)),
+        None => vng_debayer_f32(data, width, height, pattern),
+    }
+}
+
+/// A debayered file's header (plan 6b-2 C12): the mosaic keywords removed
+/// (they describe a mosaic that no longer exists in the file) and
+/// `ATH_CDBM = 'VNG'` added.
+pub fn debayered_cards(cards: &mut Vec<Card>) -> Result<(), crate::fits_writer::FitsWriteError> {
+    cards.retain(|c| !MOSAIC_KEYWORDS.contains(&c.keyword.as_str()));
+    cards.push(Card::new("ATH_CDBM", CardValue::Str("VNG".into()))?);
+    Ok(())
+}
+
 /// Cache key for one resolved flat-normalization divisor: the master flat's
 /// path plus the LIGHT's mosaic phase, folded the way
 /// [`CfaGeometry::same_phase`] folds it — pattern plus offsets MODULO 2,
@@ -615,7 +642,11 @@ pub fn execute_generation(
     // `Volatile` only for the stacking run's own regenerable intermediates
     // (`opts.skip_fsync`, set nowhere else), `Durable` for every export/send
     // caller.
-    let durability = if opts.skip_fsync { Durability::Volatile } else { Durability::Durable };
+    let durability = if opts.skip_fsync {
+        Durability::Volatile
+    } else {
+        Durability::Durable
+    };
 
     // ── The calibrated CFA mosaic (M4d Task 1, ruling R-M4d-1) ──────────────
     // A SECOND output of this same generation, written BEFORE the debayer
@@ -693,16 +724,10 @@ pub fn execute_generation(
     // it ever did it would leave the mosaic intact rather than guess a phase.
     let t = Instant::now();
     let (data, channels) = match (spec.debayer, spec.cfa_geometry) {
-        (true, Some(geom)) => {
-            let pattern = bayer_for(geom);
-            let rgb = match pool {
-                Some(p) => {
-                    p.install(|| vng_debayer_f32(&frame.data, frame.width, frame.height, pattern))
-                }
-                None => vng_debayer_f32(&frame.data, frame.width, frame.height, pattern),
-            };
-            (rgb, 3usize)
-        }
+        (true, Some(geom)) => (
+            debayer_plane(&frame.data, frame.width, frame.height, geom, pool),
+            3usize,
+        ),
         _ => (frame.data, 1usize),
     };
     let debayered = channels == 3;
@@ -715,8 +740,7 @@ pub fn execute_generation(
     // ── Final header ────────────────────────────────────────────────────────
     let mut cards = spec.cards.clone();
     if debayered {
-        cards.retain(|c| !MOSAIC_KEYWORDS.contains(&c.keyword.as_str()));
-        cards.push(Card::new("ATH_CDBM", CardValue::Str("VNG".into()))?);
+        debayered_cards(&mut cards)?;
     }
     if let Some(card) = hot_card {
         cards.push(card);
@@ -1839,5 +1863,118 @@ mod tests {
             "a mono frame has no mosaic to keep beside its own plane"
         );
         assert!(mono_out.exists());
+    }
+
+    /// An RGGB catalog light whose mosaic phase is ODD in both axes
+    /// (`XBAYROFF = YBAYROFF = 1`), so the phase fold is exercised.
+    fn seed_osc_odd_phase(dir: &Path) -> Connection {
+        let light = write_plane(&dir.join("light_o.fits"), rggb_light);
+        let dark = write_plane(&dir.join("dark.fits"), spiky_dark);
+        let flat = write_plane(&dir.join("flat.fits"), |_, _| 2000.0);
+        let conn = seed_db();
+        seed_light(&conn, 1, &light, Some("RGGB"), Some(1));
+        seed_master_set(&conn, 10, "Dark", &dark);
+        seed_master_set(&conn, 11, "Flat", &flat);
+        add_link(&conn, 1, 10, "Dark");
+        add_link(&conn, 1, 11, "Flat");
+        conn
+    }
+
+    /// Generate frame 1 of `conn` with the debayer on or off; the written path.
+    fn generate(conn: &Connection, dir: &Path, debayer_osc: bool) -> PathBuf {
+        let opts = CalibratedLightOptions {
+            debayer_osc,
+            ..CalibratedLightOptions::default()
+        };
+        let spec = resolve_generation(conn, 1, &opts, dir).unwrap();
+        let out = dir.join(spec.output_filename("light_o.fits"));
+        execute_generation(
+            &spec,
+            &out,
+            None,
+            dir,
+            &opts,
+            &mut HashMap::new(),
+            None,
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        out
+    }
+
+    /// Plan 6b-2 C12 (Review Focus 1): the extracted debayer IS the
+    /// generator's. The debayer-off output is the corrected mosaic; the
+    /// extracted `debayer_plane` on it, with the frame's odd phase, equals the
+    /// debayer-on output bit for bit. `debayered_cards` drops the mosaic and
+    /// names the method.
+    #[test]
+    fn debayer_plane_is_the_generators_own_debayer() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = seed_osc_odd_phase(dir.path());
+        let mosaic_path = generate(&conn, dir.path(), false);
+        let rgb_path = generate(&conn, dir.path(), true);
+        let (w, h, ch, mosaic) = read_written(&mosaic_path);
+        assert_eq!((w, h, ch), (W, H, 1));
+        let (_, _, ch, rgb) = read_written(&rgb_path);
+        assert_eq!(ch, 3);
+        let geom = CfaGeometry {
+            pattern: Bayer::Rggb,
+            xoff: 1,
+            yoff: 1,
+        };
+        let ours = debayer_plane(&mosaic, W, H, geom, None);
+        assert_eq!(ours.len(), rgb.len());
+        assert!(
+            ours.iter()
+                .zip(&rgb)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the extracted debayer must reproduce the generator's pixels exactly"
+        );
+
+        let mut cards = vec![
+            Card::new("BAYERPAT", CardValue::Str("RGGB".into())).unwrap(),
+            Card::new("XBAYROFF", CardValue::Integer(1)).unwrap(),
+            Card::new("YBAYROFF", CardValue::Integer(1)).unwrap(),
+            Card::new("FILTER", CardValue::Str("L".into())).unwrap(),
+        ];
+        debayered_cards(&mut cards).unwrap();
+        let keys: Vec<&str> = cards.iter().map(|c| c.keyword.as_str()).collect();
+        assert_eq!(keys, vec!["FILTER", "ATH_CDBM"]);
+        assert_eq!(cards[1].value, Some(CardValue::Str("VNG".into())));
+    }
+
+    /// Plan 6b-2 C12: Prepare's `debayer_file`, run on the generator's own
+    /// debayer-off output, writes exactly the generator's debayer-on pixels.
+    #[cfg(feature = "solver")]
+    #[test]
+    fn debayer_file_reproduces_the_generators_debayer() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = seed_osc_odd_phase(dir.path());
+        let mosaic_path = generate(&conn, dir.path(), false);
+        let rgb_path = generate(&conn, dir.path(), true);
+        let dest = dir.path().join("p_light_o_d.fits");
+        let geom = CfaGeometry {
+            pattern: Bayer::Rggb,
+            xoff: 1,
+            yoff: 1,
+        };
+        crate::stacking::prepare::debayer_file(
+            &mosaic_path,
+            &dest,
+            geom,
+            &[],
+            Durability::Durable,
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let (_, _, ch, ours) = read_written(&dest);
+        let (_, _, _, theirs) = read_written(&rgb_path);
+        assert_eq!(ch, 3);
+        assert!(ours
+            .iter()
+            .zip(&theirs)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 }

@@ -172,6 +172,18 @@ impl WorkingLayout {
         self.calibrated_root().join(group_key)
     }
 
+    /// `root/prepared` — Prepare's converted and debayered copies (plan
+    /// 6b-2 C12). A file used in place is never here: its artifact points at
+    /// the landed file, which no cleanup ever removes.
+    pub fn prepared_root(&self) -> PathBuf {
+        self.root.join("prepared")
+    }
+
+    /// `root/prepared/<group_key>`.
+    pub fn prepared_dir(&self, group_key: &str) -> PathBuf {
+        self.prepared_root().join(group_key)
+    }
+
     /// `root/registered/<group_key>` — stage-5 registered frames for one
     /// integration group.
     pub fn registered_dir(&self, group_key: &str) -> PathBuf {
@@ -827,9 +839,11 @@ pub struct WorkUsage {
 /// recursive walker — `std::fs::read_dir` + `Path::is_dir` follows symlinks,
 /// so a symlink-to-directory under e.g. `calibrated/` would recurse forever
 /// on a cyclic link and double-count real files reachable both directly and
-/// through the link.
+/// through the link. Prepare's copies count as calibrated bytes, because they
+/// fill stage 1's slot.
 pub fn work_usage(layout: &WorkingLayout) -> WorkUsage {
-    let calibrated_bytes = crate::api::sync::dir_size_bytes(&layout.calibrated_root());
+    let calibrated_bytes = crate::api::sync::dir_size_bytes(&layout.calibrated_root())
+        + crate::api::sync::dir_size_bytes(&layout.prepared_root());
     let registered_bytes = crate::api::sync::dir_size_bytes(&layout.registered_root());
     let ln_bytes = crate::api::sync::dir_size_bytes(&layout.ln_root());
     let fits_bytes = crate::api::sync::dir_size_bytes(&layout.fits_root());
@@ -926,7 +940,8 @@ const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
 /// temporaries, not cached artifacts — see `stacking::rej`'s own doc), so it
 /// is added to the removed DIRECTORIES on the same levels as `calibrated`/
 /// `ln` without touching `INTERMEDIATE_ARTIFACT_KINDS` or the DB delete
-/// calls below.
+/// calls below. `prepared/` goes with `calibrated/`; a `calibrated` row
+/// pointing at a file used in place loses its row, never its file.
 pub fn cleanup_work(
     conn: &Connection,
     subject: &StackSubject,
@@ -938,11 +953,13 @@ pub fn cleanup_work(
         CleanupWhat::Registered => {}
         CleanupWhat::Intermediates => {
             dirs.push(layout.calibrated_root());
+            dirs.push(layout.prepared_root());
             dirs.push(layout.ln_root());
             dirs.push(layout.rej_root());
         }
         CleanupWhat::All => {
             dirs.push(layout.calibrated_root());
+            dirs.push(layout.prepared_root());
             dirs.push(layout.ln_root());
             dirs.push(layout.rej_root());
             dirs.push(layout.runs_root());
@@ -1693,6 +1710,41 @@ mod tests {
     fn write_bytes(path: &Path, n: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, vec![0u8; n]).unwrap();
+    }
+
+    /// Plan 6b-2 C12: Prepare's copies live in `prepared/`, count as
+    /// calibrated bytes (the Calibrate slot's counter, so the TS does not
+    /// move) and go with the intermediates.
+    #[test]
+    fn prepared_copies_count_as_calibrated_and_go_with_the_intermediates() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (1, 'S')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+        assert_eq!(
+            layout.prepared_root(),
+            tmp.path().join("set").join("prepared")
+        );
+        assert_eq!(
+            layout.prepared_dir("g"),
+            tmp.path().join("set").join("prepared").join("g")
+        );
+        write_bytes(&layout.calibrated_dir("g").join("c_a.fits"), 100);
+        write_bytes(&layout.prepared_dir("g").join("p_b.fits"), 50);
+        let usage = work_usage(&layout);
+        assert_eq!(usage.calibrated_bytes, 150);
+        assert_eq!(usage.total_bytes, 150);
+        let freed = cleanup_work(
+            &c,
+            &StackSubject::FrameSet(1),
+            &layout,
+            CleanupWhat::Intermediates,
+        )
+        .unwrap();
+        assert_eq!(freed, 150);
+        assert!(!layout.prepared_root().exists());
+        assert!(layout.root.exists());
     }
 
     fn seed_artifact(c: &Connection, frames_set_id: i64, kind: &str, path: &str, size: i64) {

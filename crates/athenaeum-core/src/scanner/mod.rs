@@ -4119,6 +4119,51 @@ mod calibrated_light_scan_tests {
             assert_eq!(files_count(&conn, &s(&now)), 0, "parallel={parallel}");
         }
     }
+
+    /// Plan 6b-2 C12 (Review Focus 3): a file Prepare writes from a calibrated
+    /// replica carries `ATH_STK` and neither `CALSTAT` nor `ATH_CSRC`, and the
+    /// scanner never catalogs it — through both scan entry points.
+    #[cfg(all(feature = "render", feature = "solver"))]
+    #[test]
+    fn scan_never_catalogs_a_prepared_file() {
+        use crate::stacking::prepare::{
+            convert_to_float_fits, prepare_cards, source_cards_of, PrepareRead,
+        };
+        for parallel in [false, true] {
+            let outside = TempDir::new().unwrap();
+            let src = outside.path().join("c_x.fits");
+            write_calibrated_light(&src, "uuid-1", "x.fits", "BDF");
+            let root = TempDir::new().unwrap();
+            let dest = root.path().join("prepared").join("g").join("p_c_x.fits");
+            let cards = prepare_cards(&source_cards_of(&src).unwrap(), None, "converted").unwrap();
+            convert_to_float_fits(
+                &src,
+                &dest,
+                &PrepareRead::InPlaceFits,
+                &cards,
+                crate::fits_writer::Durability::Durable,
+            )
+            .unwrap();
+            let h = crate::fits_parser::FitsHeader::from_path(&dest).unwrap();
+            assert_eq!((h.get_str("CALSTAT"), h.get_str("ATH_CSRC")), (None, None));
+            assert_eq!(h.get_str("ATH_STK").as_deref(), Some("T"));
+
+            let conn = fresh_db(root.path(), 1);
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(
+                result.errors.is_empty(),
+                "parallel={parallel}: {:?}",
+                result.errors
+            );
+            let files_total: i64 = conn
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                files_total, 0,
+                "parallel={parallel}: a prepared file is never cataloged"
+            );
+        }
+    }
 }
 
 /// P23: the collab blob store lives at `<Collaboration root>/.athenaeum/blobs`,

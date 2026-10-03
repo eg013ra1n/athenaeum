@@ -352,6 +352,21 @@ fn master_identity(path: &Path) -> String {
 /// the Prepare subtree, the frame's content (`blake3`) and byte size —
 /// never a catalog identity. Every later stage hash chains on it exactly as
 /// on a calibration hash.
+/// Stage 1's hash for an ATTESTED light (spec §13, plan 6b-2 C11): the
+/// Prepare subtree and the light's own `files` identity, with no master
+/// upstream, because an attested light is never calibrated.
+pub(crate) fn prepare_hash_for_catalog(cfg: &StackingConfig, frame: &GroupFrame) -> String {
+    stage_hash(
+        &crate::stacking::config::prepare_subtree(cfg),
+        &[],
+        &[SourceIdentity {
+            file_id: frame.file_id,
+            size: frame.size,
+            modified_at: frame.modified_at.clone(),
+        }],
+    )
+}
+
 pub(crate) fn prepare_hash_for_project(
     cfg: &StackingConfig,
     blake3: &str,
@@ -459,11 +474,11 @@ impl HashMemo {
         frame: &GroupFrame,
     ) -> Result<String, ApiError> {
         match origin_of(&self.origins, frame.frame_id)? {
-            // An attested set keeps today's generation hash until the Prepare
-            // stage lands (Task 9a splits this arm).
-            FrameOrigin::Catalog { .. } => {
-                calibration_hash_for(conn, cfg, frame, &mut self.divisors)
-            }
+            FrameOrigin::Catalog {
+                attested: false, ..
+            } => calibration_hash_for(conn, cfg, frame, &mut self.divisors),
+            // Spec §13 (R3): an attested light is prepared, never calibrated.
+            FrameOrigin::Catalog { attested: true, .. } => Ok(prepare_hash_for_catalog(cfg, frame)),
             FrameOrigin::Project {
                 blake3, byte_size, ..
             } => Ok(prepare_hash_for_project(cfg, blake3, *byte_size)),
@@ -7176,6 +7191,45 @@ mod tests {
         assert!(origins
             .values()
             .all(|o| matches!(o, FrameOrigin::Catalog { attested: true, .. })));
+    }
+
+    /// Spec §13 (R3), plan 6b-2 C11: an attested light's stage-1 hash is the
+    /// Prepare hash over its catalog identity. No master is resolved, so a
+    /// light with no calibration link still hashes.
+    #[test]
+    fn an_attested_lights_hash_is_the_prepare_hash_over_its_catalog_identity() {
+        use crate::stacking::config::{prepare_subtree, stage_hash, SourceIdentity};
+        use crate::stacking::groups::frame_source;
+        let f = test_fixtures::frame_set("LDN 1272");
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            test_fixtures::add_light(&f, &light_spec(&format!("l{i}"), t));
+        }
+        f.conn
+            .execute(
+                "UPDATE frames_set SET calibrated_externally = 1 WHERE id = ?1",
+                [f.set_id],
+            )
+            .unwrap();
+        let cfg = StackingConfig::default();
+        let (groups, origins) =
+            frame_source(&f.conn, &StackSubject::FrameSet(f.set_id), &cfg).unwrap();
+        let frame = groups[0].frames[0].clone();
+        let expected = stage_hash(
+            &prepare_subtree(&cfg),
+            &[],
+            &[SourceIdentity {
+                file_id: frame.file_id,
+                size: frame.size,
+                modified_at: frame.modified_at.clone(),
+            }],
+        );
+        assert_eq!(prepare_hash_for_catalog(&cfg, &frame), expected);
+        let mut memo = HashMemo::new(origins);
+        assert_eq!(
+            memo.calibration_hash_checked(&f.conn, &cfg, &frame)
+                .unwrap(),
+            expected
+        );
     }
 
     /// Plan 6b-2 C12: the Prepare subtree's exact shape, and the formula of
