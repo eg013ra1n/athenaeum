@@ -2110,7 +2110,9 @@ fn project_inputs(
     // run. The last cached outcome for its content (plan 6b-2 Task 10b) says
     // which frames are still to solve and which could not be solved. The plan
     // reads the outcome, not its hash: after a solver or catalog change the
-    // run re-solves, and the plan learns the new outcome only then.
+    // run re-solves, and the plan learns the new outcome only then. A
+    // `Failed`/`Refused` written by an older app version is retried by the
+    // next run (review I7), so it is still reported as unsolved until then.
     let (mut to_solve, mut unsolvable) = (0usize, 0usize);
     for f in source
         .frames

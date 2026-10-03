@@ -3413,16 +3413,37 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
     let identity = match rc.solver.identity() {
         Ok(identity) => identity,
         Err(e) => {
+            // A cached solved outcome is still served by `stored_solve`; only
+            // the frames with none cannot be solved now.
+            let mut unsolved = 0usize;
+            {
+                let conn = db(&rc.ctx)?.conn();
+                for (_, frame_id, plan) in &wanted {
+                    let outcome = crate::stacking::solve::stored_outcome(
+                        &conn,
+                        &plan.project_id,
+                        *frame_id,
+                        &plan.blake3,
+                    )?;
+                    if !matches!(
+                        outcome,
+                        Some(crate::stacking::solve::SolveOutcome::Solved(_))
+                    ) {
+                        unsolved += 1;
+                    }
+                }
+            }
             tracing::warn!(
                 run_id = rc.run_id,
-                count = wanted.len(),
+                count = unsolved,
                 error = %e,
                 "plate solving unavailable; frames without a manifest wcs stay unsolved"
             );
-            rc.warnings.push(format!(
-                "{} frame(s) without a WCS in the manifest could not be plate-solved: {e}",
-                wanted.len()
-            ));
+            if unsolved > 0 {
+                rc.warnings.push(format!(
+                    "{unsolved} frame(s) without a WCS in the manifest could not be plate-solved: {e}"
+                ));
+            }
             return Ok(());
         }
     };
@@ -22232,12 +22253,17 @@ mod tests {
             .unwrap();
             test_fixtures::seed_plate_solve_scale(&conn, *h, 9.9);
         }
-        let snapshot = |c: &rusqlite::Connection| -> (i64, i64, String) {
+        // `frame_id` is UNIQUE and `insert_plate_solve` is INSERT OR REPLACE,
+        // so a handle-keyed write over a decoy keeps the count: the snapshot
+        // also carries every plate_solves row's content.
+        let snapshot = |c: &rusqlite::Connection| -> (i64, i64, String, String) {
             c.query_row(
                 "SELECT (SELECT COUNT(*) FROM plate_solves), (SELECT COUNT(*) FROM frames),
-                        (SELECT group_concat(filter || ':' || exptime || ':' || IFNULL(ra, ''), ',') FROM frames)",
+                        (SELECT group_concat(filter || ':' || exptime || ':' || IFNULL(ra, ''), ',') FROM frames),
+                        IFNULL((SELECT group_concat(id || ':' || frame_id || ':' || pixel_scale_arcsec, ',')
+                                FROM (SELECT * FROM plate_solves ORDER BY id)), '')",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap()
         };
@@ -22464,8 +22490,7 @@ mod tests {
     }
 
     /// Review Focus 1: a frame-set run has nothing to solve. The sub-step
-    /// never asks the solver anything, the run gains no warning, and stage 4
-    /// has no WCS rule.
+    /// never asks the solver anything and the run gains no warning.
     #[test]
     fn the_solve_sub_step_is_a_no_op_for_a_frame_set() {
         let tmp = tempfile::tempdir().unwrap();
@@ -22505,5 +22530,163 @@ mod tests {
         solve_project_frames(&mut rc).unwrap();
         assert_eq!(fake.calls(), 0);
         assert!(rc.warnings.is_empty(), "{:?}", rc.warnings);
+    }
+
+    /// Plan 6b-2 C14: a cached outcome whose hash differs (another solver
+    /// config or catalog), even one written by this app version, is a miss: the
+    /// frame is solved again and the row carries the current hash.
+    #[test]
+    fn a_cached_outcome_under_another_hash_is_solved_again() {
+        use crate::stacking::solve::{solve_hash, write_outcome, FakeSolver, SolveOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 1, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        let h = handle_of(&rc, "c_r1.fits");
+        let blake3 = blake3_of(&conn, "p1", "r1");
+        write_outcome(
+            &conn,
+            "p1",
+            h,
+            &blake3,
+            "stale",
+            SolveOutcome::Solved(FakeSolver::fixture_record()),
+        )
+        .unwrap();
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 1);
+        let row = crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(h))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.config_hash, solve_hash(&blake3, "fake:1"));
+    }
+
+    /// A cancel raised during a solve ends the sub-step Cancelled and caches
+    /// nothing, not even the failure the solver returned.
+    #[test]
+    fn a_cancel_during_a_solve_caches_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(crate::stacking::solve::FakeSolver::cancelling());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        let err = solve_project_frames(&mut rc).unwrap_err();
+        assert!(matches!(err, RunError::Cancelled), "{err:?}");
+        assert_eq!(fake.calls(), 1);
+        assert!(
+            crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The solver gets the file stage 1 handed on (the `calibrated`
+    /// artifact's path), never the landed replica.
+    #[test]
+    fn the_solver_receives_the_prepared_file_not_the_replica() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 2, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(crate::stacking::solve::FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        let h = handle_of(&rc, "c_r1.fits");
+        let landed = rc.plan_groups[0]
+            .frames
+            .iter()
+            .find(|f| f.frame_id == h)
+            .unwrap()
+            .path
+            .clone();
+        let prepared = tmp.path().join("work").join("prepared").join("c_r1.fits");
+        std::fs::create_dir_all(prepared.parent().unwrap()).unwrap();
+        std::fs::copy(&landed, &prepared).unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE stacking_artifacts SET path = ?1 WHERE kind = 'calibrated' AND project_frame = ?2",
+                rusqlite::params![prepared.to_string_lossy(), h],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        solve_project_frames(&mut rc).unwrap();
+        let paths = fake.paths();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&prepared), "{paths:?}");
+        assert!(!paths.contains(&PathBuf::from(&landed)), "{paths:?}");
+    }
+
+    /// With no solver, a frame whose solved outcome is cached is still served
+    /// and is not counted in the warning.
+    #[test]
+    fn the_unavailable_warning_counts_only_frames_without_a_solved_outcome() {
+        use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(FakeSolver::unavailable("no star catalog"));
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        write_outcome(
+            &conn,
+            "p1",
+            handle_of(&rc, "c_r1.fits"),
+            &blake3_of(&conn, "p1", "r1"),
+            "h",
+            SolveOutcome::Solved(FakeSolver::fixture_record()),
+        )
+        .unwrap();
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(
+            rc.warnings,
+            vec!["2 frame(s) without a WCS in the manifest could not be plate-solved: no star catalog"
+                .to_string()]
+        );
     }
 }

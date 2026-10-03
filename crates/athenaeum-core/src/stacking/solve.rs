@@ -26,7 +26,7 @@ use crate::collab::frame_meta::ProjectFrameMeta;
 use crate::db::stacking::{
     find_artifact, upsert_artifact, NewArtifact, StackSubject, StackingArtifactRow,
 };
-use crate::fits_writer::{write_fits_f32_with, Durability};
+use crate::fits_writer::{write_fits_f32_with, Card, CardValue, Durability};
 use crate::integration::plane_reader::PlaneReader;
 use crate::models::Frame;
 use crate::plate_solve::config::PlateSolveConfig;
@@ -312,6 +312,12 @@ pub fn solve_with(
 /// fallback a probe result may call for (plan 6b-2 Task 10c Step 8). It
 /// never touches `src`.
 pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    if src == dest {
+        anyhow::bail!(
+            "the ADU-scaled copy must not overwrite its source {}",
+            src.display()
+        );
+    }
     let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
     let (w, h, c) = (reader.width(), reader.height(), reader.channels());
     let mut data = Vec::with_capacity(w * h * c);
@@ -321,7 +327,13 @@ pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
             .with_context(|| format!("reading {}", src.display()))?;
         data.extend(values.into_iter().map(|v| v * 65535.0));
     }
-    let cards = crate::stacking::prepare::source_cards_of(src)?;
+    let mut cards = crate::stacking::prepare::source_cards_of(src)?;
+    // The scanner never catalogs a stacking intermediate (as `prepare_cards`).
+    cards.retain(|c| c.keyword != "ATH_STK");
+    cards.push(
+        Card::new("ATH_STK", CardValue::Logical(true))?
+            .with_comment("stacking intermediate; never cataloged"),
+    );
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -330,16 +342,19 @@ pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The production solver. It uses the installed catalog, opened on first use
-/// (a run that solves nothing never opens it), and the stored plate-solve
-/// config.
+/// The production solver. Its identity (the stored plate-solve config and the
+/// installed catalog's stat-only identity) is computed on first use without
+/// opening any tier; the catalog layers are mapped lazily, only by the first
+/// `solve`, so a run whose frames are all cached never opens them (and an
+/// unopenable tier cannot block it).
 pub struct CatalogSolver {
     ctx: Arc<ServiceContext>,
-    opened: OnceLock<Result<OpenedCatalog, String>>,
+    prepared: OnceLock<Result<Prepared, String>>,
+    layers: OnceLock<Result<Vec<Arc<solvemyastro::StarCache>>, String>>,
 }
 
-struct OpenedCatalog {
-    layers: Vec<Arc<solvemyastro::StarCache>>,
+struct Prepared {
+    app_data: PathBuf,
     config: PlateSolveConfig,
     identity: String,
 }
@@ -348,12 +363,13 @@ impl CatalogSolver {
     pub fn new(ctx: Arc<ServiceContext>) -> Self {
         CatalogSolver {
             ctx,
-            opened: OnceLock::new(),
+            prepared: OnceLock::new(),
+            layers: OnceLock::new(),
         }
     }
 
-    fn opened(&self) -> Result<&OpenedCatalog, String> {
-        self.opened
+    fn prepared(&self) -> Result<&Prepared, String> {
+        self.prepared
             .get_or_init(|| {
                 let db = self
                     .ctx
@@ -363,18 +379,17 @@ impl CatalogSolver {
                 let db_path = db.path().to_path_buf();
                 let app_data = db_path
                     .parent()
-                    .ok_or_else(|| "cannot determine the app data directory".to_string())?;
+                    .ok_or_else(|| "cannot determine the app data directory".to_string())?
+                    .to_path_buf();
                 let config = crate::plate_solve::config::load_config(&db.conn());
-                let layers =
-                    crate::plate_solve::open_catalog_layers(app_data).map_err(|e| e.to_string())?;
                 let catalog =
-                    crate::plate_solve::catalog_identity(app_data).map_err(|e| e.to_string())?;
+                    crate::plate_solve::catalog_identity(&app_data).map_err(|e| e.to_string())?;
                 let identity = format!(
                     "{}:{catalog}",
                     crate::plate_solve::config::solver_config_hash(&config)
                 );
-                Ok(OpenedCatalog {
-                    layers,
+                Ok(Prepared {
+                    app_data,
                     config,
                     identity,
                 })
@@ -386,18 +401,23 @@ impl CatalogSolver {
 
 impl FrameSolver for CatalogSolver {
     fn identity(&self) -> Result<String, String> {
-        self.opened().map(|o| o.identity.clone())
+        self.prepared().map(|p| p.identity.clone())
     }
 
     fn solve(&self, request: &SolveRequest, cancel: &AtomicBool) -> SolveOutcome {
-        let opened = match self.opened() {
-            Ok(o) => o,
+        let prepared = match self.prepared() {
+            Ok(p) => p,
             Err(e) => return SolveOutcome::Failed(e),
         };
-        let refs: Vec<&solvemyastro::StarCache> =
-            opened.layers.iter().map(|l| l.as_ref()).collect();
+        let layers = match self.layers.get_or_init(|| {
+            crate::plate_solve::open_catalog_layers(&prepared.app_data).map_err(|e| e.to_string())
+        }) {
+            Ok(l) => l,
+            Err(e) => return SolveOutcome::Failed(e.clone()),
+        };
+        let refs: Vec<&solvemyastro::StarCache> = layers.iter().map(|l| l.as_ref()).collect();
         let caches = solvemyastro::Caches::layered(&refs);
-        solve_with(request, &caches, &opened.config, cancel)
+        solve_with(request, &caches, &prepared.config, cancel)
     }
 }
 
@@ -408,6 +428,8 @@ pub(crate) struct FakeSolver {
     identity: Result<String, String>,
     by_file: std::collections::HashMap<String, SolveOutcome>,
     calls: std::sync::atomic::AtomicUsize,
+    paths: std::sync::Mutex<Vec<PathBuf>>,
+    cancels: bool,
 }
 
 #[cfg(test)]
@@ -417,7 +439,22 @@ impl FakeSolver {
             identity: Ok("fake:1".to_string()),
             by_file: std::collections::HashMap::new(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            paths: std::sync::Mutex::new(Vec::new()),
+            cancels: false,
         }
+    }
+
+    /// A solver that raises the run's cancel flag and reports a failure.
+    pub(crate) fn cancelling() -> Self {
+        FakeSolver {
+            cancels: true,
+            ..Self::solving_all()
+        }
+    }
+
+    /// The paths of every request it received, in order.
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        self.paths.lock().unwrap().clone()
     }
 
     /// Answer `outcome` for the file named `file_name`.
@@ -454,8 +491,13 @@ impl FrameSolver for FakeSolver {
         self.identity.clone()
     }
 
-    fn solve(&self, request: &SolveRequest, _cancel: &AtomicBool) -> SolveOutcome {
+    fn solve(&self, request: &SolveRequest, cancel: &AtomicBool) -> SolveOutcome {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.paths.lock().unwrap().push(request.path.clone());
+        if self.cancels {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            return SolveOutcome::Failed("cancelled".to_string());
+        }
         let name = request
             .path
             .file_name()
@@ -598,6 +640,35 @@ mod tests {
         );
         assert!(
             matches!(solver.solve(&request, &AtomicBool::new(false)), SolveOutcome::Failed(ref e) if *e == err)
+        );
+    }
+
+    /// The ADU-scaled copy multiplies every value by 65535, carries the
+    /// `ATH_STK` marker so the scanner never catalogs it, and refuses to
+    /// overwrite its source.
+    #[test]
+    fn the_adu_scaled_copy_scales_marks_and_refuses_its_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.fits");
+        let data: Vec<f32> = (0..12).map(|i| i as f32 / 16.0).collect();
+        crate::fits_writer::write_fits_f32(&src, 4, 3, 1, &data, &[]).unwrap();
+        let before = std::fs::read(&src).unwrap();
+        let dest = tmp.path().join("out").join("copy.fits");
+        adu_scaled_copy(&src, &dest).unwrap();
+        let reader = PlaneReader::open(&dest).unwrap();
+        let plane = reader.read_plane(0).unwrap();
+        assert_eq!(plane.len(), 12);
+        for (got, want) in plane.iter().zip(&data) {
+            assert!((got - want * 65535.0).abs() < 0.01, "{got} vs {want}");
+        }
+        let bytes = std::fs::read(&dest).unwrap();
+        let header = String::from_utf8_lossy(&bytes[..2880]);
+        assert!(header.contains("ATH_STK = "), "{header}");
+        assert!(adu_scaled_copy(&src, &src).is_err());
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            before,
+            "the source is untouched"
         );
     }
 }
