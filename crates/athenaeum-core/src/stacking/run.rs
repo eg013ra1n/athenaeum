@@ -3539,6 +3539,19 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
         }
     }
 
+    // The scratch dir is made once, here: a failure is one warning and no
+    // frame is attempted or cached, like a catalog that will not open.
+    let scratch = rc.layout.root.join("tmp");
+    if !jobs.is_empty() {
+        if let Err(e) = std::fs::create_dir_all(&scratch) {
+            let reason = format!(
+                "the solve scratch folder {} cannot be created: {e}",
+                scratch.display()
+            );
+            return solve_unavailable(rc, &frames, &reason);
+        }
+    }
+
     let total = jobs.len();
     let mut solved = 0usize;
     for (done, (frame_id, hash, plan, path)) in jobs.into_iter().enumerate() {
@@ -3554,7 +3567,7 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
             Some("solving".to_string()),
         );
         let mut request = SolveRequest::for_frame(frame_id, &path, &plan.meta, target);
-        request.scratch_dir = Some(rc.layout.root.join("tmp"));
+        request.scratch_dir = Some(scratch.clone());
         let solver = rc.solver.clone();
         let cancel = rc.cancel.clone();
         let started = Instant::now();
@@ -4394,7 +4407,6 @@ fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
     // The stored manual pin is forced included later in this stage, so the
     // tier decision counts it as included now.
     let pinned = if rc.config.reference.mode == ReferenceMode::Manual {
-        let conn = db(&rc.ctx)?.conn();
         stored_reference_frame(&conn, &rc.subject)?
     } else {
         None
@@ -23015,6 +23027,97 @@ mod tests {
                     .is_some(),
                 solved,
                 "{name}"
+            );
+        }
+    }
+
+    /// Review round 2: an `Unavailable` outcome is never cached, adds a run
+    /// warning and lets the run go on with the other frames.
+    #[test]
+    fn an_unavailable_solve_is_not_cached_and_the_run_continues() {
+        use crate::stacking::solve::{FakeSolver, SolveOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(FakeSolver::solving_all().with(
+            "c_r1.fits",
+            SolveOutcome::Unavailable("copy unwritable".into()),
+        ));
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        solve_project_frames(&mut rc).unwrap();
+        let r1 = handle_of(&rc, "c_r1.fits");
+        assert!(
+            crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(r1))
+                .unwrap()
+                .is_none()
+        );
+        for n in ["c_r2.fits", "c_r3.fits"] {
+            let h = handle_of(&rc, n);
+            assert!(
+                crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(h))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            rc.warnings.iter().any(|w| w.contains("copy unwritable")),
+            "{:?}",
+            rc.warnings
+        );
+        assert!(rc.runtime_exclusions.is_empty());
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(
+            fake.calls(),
+            4,
+            "r1 is attempted again next time, the others are cached"
+        );
+    }
+
+    /// Review round 2: a scratch folder that cannot be created is one warning
+    /// and no attempt and no cached outcome.
+    #[test]
+    fn a_scratch_folder_that_cannot_be_created_skips_solving_uncached() {
+        use crate::stacking::solve::FakeSolver;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        std::fs::create_dir_all(&rc.layout.root).unwrap();
+        std::fs::write(rc.layout.root.join("tmp"), b"a file").unwrap();
+        solve_project_frames(&mut rc).unwrap();
+        assert_eq!(fake.calls(), 0);
+        assert_eq!(rc.warnings.len(), 1, "{:?}", rc.warnings);
+        for n in ["c_r1.fits", "c_r2.fits", "c_r3.fits"] {
+            let h = handle_of(&rc, n);
+            assert!(
+                crate::db::stacking::find_artifact(&conn, &rc.subject, "", "solve", Some(h))
+                    .unwrap()
+                    .is_none()
             );
         }
     }

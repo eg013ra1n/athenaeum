@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -327,9 +326,33 @@ pub fn solve_with(
     }
 }
 
-/// The largest finite pixel value of a plane at or below which a float file
-/// counts as unit-domain (0..1, calibrated by this app).
-const UNIT_DOMAIN_MAX: f32 = 1.5;
+/// A float file counts as unit-domain (0..1, calibrated by this app) when the
+/// MEDIAN of its finite values is at most this. The median, not the maximum:
+/// this app's calibration does not clamp, so a dead master-flat pixel (divided
+/// by `FLAT_DENOM_FLOOR`, 2e-5) or a saturated star under a weak flat corner
+/// reaches the hundreds in an otherwise 0..1 frame. The two domains differ by
+/// about four orders of magnitude, so the median is far from the threshold.
+const UNIT_DOMAIN_MEDIAN_MAX: f32 = 1.5;
+
+/// The most values [`is_unit_domain`] sorts.
+const DOMAIN_SAMPLE: usize = 65_536;
+
+/// Whether `data` (all planes) is unit-domain: the median of a strided sample
+/// of its finite values is at most [`UNIT_DOMAIN_MEDIAN_MAX`].
+fn is_unit_domain(data: &[f32]) -> bool {
+    let step = (data.len() / DOMAIN_SAMPLE).max(1);
+    let mut sample: Vec<f32> = data
+        .iter()
+        .step_by(step)
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    if sample.is_empty() {
+        return false;
+    }
+    sample.sort_unstable_by(|a, b| a.total_cmp(b));
+    sample[sample.len() / 2] <= UNIT_DOMAIN_MEDIAN_MAX
+}
 
 /// An ADU-scaled (×65535) float32 copy of a unit-domain FITS, with its
 /// copy-through cards. It never touches `src`.
@@ -337,8 +360,7 @@ pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
     write_scaled(src, dest, false).map(|_| ())
 }
 
-/// [`adu_scaled_copy`], but only when `src` is in the unit domain (its
-/// largest finite value is at most [`UNIT_DOMAIN_MAX`]). `Ok(false)` means
+/// [`adu_scaled_copy`], but only when `src` is in the unit domain ([`is_unit_domain`]). `Ok(false)` means
 /// `src` is already in ADU and nothing was written.
 fn adu_copy_if_unit(src: &Path, dest: &Path) -> anyhow::Result<bool> {
     write_scaled(src, dest, true)
@@ -351,29 +373,22 @@ fn write_scaled(src: &Path, dest: &Path, only_if_unit: bool) -> anyhow::Result<b
             src.display()
         );
     }
-    let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
+    let unreadable =
+        |e: &dyn std::fmt::Display| anyhow::anyhow!("source unreadable: {} ({e})", src.display());
+    let reader = PlaneReader::open(src).map_err(|e| unreadable(&e))?;
     let (w, h, c) = (reader.width(), reader.height(), reader.channels());
     let mut data = Vec::with_capacity(w * h * c);
     for plane in 0..c {
-        let values = reader
-            .read_plane(plane)
-            .with_context(|| format!("reading {}", src.display()))?;
-        data.extend(values);
+        data.extend(reader.read_plane(plane).map_err(|e| unreadable(&e))?);
     }
-    if only_if_unit {
-        let max = data
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .fold(f32::MIN, f32::max);
-        if max > UNIT_DOMAIN_MAX {
-            return Ok(false);
-        }
+    if only_if_unit && !is_unit_domain(&data) {
+        return Ok(false);
     }
     for v in data.iter_mut() {
         *v *= 65535.0;
     }
-    let mut cards = crate::stacking::prepare::source_cards_of(src)?;
+    let mut cards = crate::stacking::prepare::source_cards_of(src)
+        .map_err(|e| unreadable(&format_args!("{e:#}")))?;
     // The scanner never catalogs a stacking intermediate (as `prepare_cards`).
     cards.retain(|c| c.keyword != "ATH_STK");
     cards.push(
@@ -381,10 +396,11 @@ fn write_scaled(src: &Path, dest: &Path, only_if_unit: bool) -> anyhow::Result<b
             .with_comment("stacking intermediate; never cataloged"),
     );
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("copy unwritable: creating {} ({e})", parent.display()))?;
     }
     write_fits_f32_with(dest, w, h, c, &data, &cards, Durability::Volatile)
-        .map_err(|e| anyhow::anyhow!("writing {}: {e}", dest.display()))?;
+        .map_err(|e| anyhow::anyhow!("copy unwritable: writing {} ({e})", dest.display()))?;
     Ok(true)
 }
 
@@ -423,7 +439,7 @@ pub(crate) fn solve_in_domains(
             );
             remove_copy(&copy);
             return SolveOutcome::Unavailable(format!(
-                "the ADU-scaled copy could not be written: {reason}"
+                "the ADU-scaled solve copy could not be made, {reason}"
             ));
         }
     };
@@ -462,13 +478,15 @@ pub(crate) fn solve_in_domains(
     }
 }
 
+/// Remove a scratch copy. Nothing to do (and nothing to log) when it was never
+/// created or its path is blocked; a warning only for a copy that exists and
+/// cannot be removed.
 fn remove_copy(copy: &Path) {
-    match std::fs::remove_file(copy) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            tracing::warn!(path = %copy.display(), error = %e, "removing the adu-scaled solve copy failed");
-        }
+    if !matches!(copy.try_exists(), Ok(true)) {
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(copy) {
+        tracing::warn!(path = %copy.display(), error = %e, "removing the adu-scaled solve copy failed");
     }
 }
 
@@ -1286,5 +1304,65 @@ mod tests {
         );
         assert_eq!(n, 1);
         assert!(matches!(outcome, SolveOutcome::Refused(_)));
+    }
+
+    /// Review round 2: one dead-flat pixel at 400 and a few at 2.0 in a 0..1
+    /// frame do not make it an ADU frame (median, not max), and an unreadable
+    /// source / blocked scratch warn once, not twice.
+    #[test]
+    fn a_unit_frame_with_outlier_pixels_is_still_solved_scaled_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.fits");
+        let mut values = vec![0.4f32; 16 * 16];
+        values[0] = 400.0;
+        values[1] = 2.0;
+        values[2] = 2.0;
+        values[3] = 2.0;
+        crate::fits_writer::write_fits_f32(&src, 16, 16, 1, &values, &[]).unwrap();
+        let scratch = dir.path().join("tmp");
+        let go = AtomicBool::new(false);
+        let mut calls = Vec::new();
+        solve_in_domains(&plain_request(5, &src), Some(&scratch), &go, &mut |r| {
+            calls.push(r.path.clone());
+            solved()
+        });
+        assert_eq!(calls, vec![scratch.join("adu_5.fits")]);
+        assert!(is_unit_domain(&values));
+        assert!(!is_unit_domain(&[900.0, 1000.0, 20000.0]));
+    }
+
+    #[test]
+    fn a_blocked_scratch_logs_one_warning_and_names_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("c.fits");
+        write_plane(&src, &[0.5; 8]);
+        let blocker = dir.path().join("tmp");
+        std::fs::write(&blocker, b"x").unwrap();
+        let go = AtomicBool::new(false);
+        let mut outcome = None;
+        let logs = captured_logs(|| {
+            outcome = Some(solve_in_domains(
+                &plain_request(1, &src),
+                Some(&blocker),
+                &go,
+                &mut |_| solved(),
+            ));
+        });
+        assert_eq!(logs.matches("WARN").count(), 1, "{logs}");
+        match outcome.unwrap() {
+            SolveOutcome::Unavailable(t) => assert!(t.contains("copy unwritable"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+        let missing = dir.path().join("missing.fits");
+        let outcome = solve_in_domains(
+            &plain_request(1, &missing),
+            Some(&dir.path().join("t2")),
+            &go,
+            &mut |_| solved(),
+        );
+        match outcome {
+            SolveOutcome::Unavailable(t) => assert!(t.contains("source unreadable"), "{t}"),
+            other => panic!("{other:?}"),
+        }
     }
 }
