@@ -172,7 +172,7 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
 /// A refresh of a project marked lost ([`mark_lost`]) is a re-join: it clears
 /// `lost_at`.
 ///
-/// Eleven columns are deliberately NOT in the list, each written only by
+/// Twelve columns are deliberately NOT in the list, each written only by
 /// dedicated setters so a wholesale poll refresh can never clobber it:
 /// `auto_replicate`/`policy_json`/`replication_paused`/`publish_mode` are LOCAL
 /// preferences; `manifest_cursor`/`synced_caps_json` are the manifest-sync
@@ -182,7 +182,8 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
 /// `dictionary_json` are the filter dictionary ([`set_dictionary`]);
 /// `feed_epoch`/`holder_seq` are the wave-3 live-feed cursor
 /// ([`set_feed_version`], [`set_holder_seq`], [`set_holder_seq_only`],
-/// [`reset_holder_seq`]). [`mark_lost`] resets the cursor columns. A freshly
+/// [`reset_holder_seq`]); `canonical_grid_json` is the cached canonical grid
+/// ([`set_canonical_grid`]). [`mark_lost`] resets the cursor columns. A freshly
 /// inserted row takes each column's schema default.
 pub fn upsert_project(conn: &Connection, row: &CollabProjectRow) -> Result<()> {
     conn.execute(
@@ -381,6 +382,36 @@ pub fn set_dictionary(
         params![project_id, version, entries_json],
     )?;
     Ok(())
+}
+
+/// The hub's canonical grid as last cached (spec §6.1, plan 6b-2 C16): the
+/// canonical JSON of the normalized typed grid, never the hub's own text.
+/// Written only here (`upsert_project` leaves the column alone). Returns
+/// whether the stored value changed, which is what the refresh reports as a
+/// grid move.
+pub fn set_canonical_grid(
+    conn: &Connection,
+    project_id: &str,
+    grid_json: Option<&str>,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE collab_projects SET canonical_grid_json = ?2
+         WHERE project_id = ?1 AND canonical_grid_json IS NOT ?2",
+        params![project_id, grid_json],
+    )?;
+    Ok(n > 0)
+}
+
+/// The cached canonical grid JSON (`None` when the hub has none).
+pub fn canonical_grid(conn: &Connection, project_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT canonical_grid_json FROM collab_projects WHERE project_id = ?1",
+            params![project_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// Hub project-page extras (spec 2026-09-29 §5.5/§5.6): the goals JSON and
@@ -1009,6 +1040,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn set_canonical_grid_reports_whether_it_changed() {
+        let conn = test_conn();
+        upsert_project(&conn, &sample_row("p-1")).unwrap();
+        assert_eq!(canonical_grid(&conn, "p-1").unwrap(), None);
+        assert!(set_canonical_grid(&conn, "p-1", Some("a")).unwrap());
+        assert!(
+            !set_canonical_grid(&conn, "p-1", Some("a")).unwrap(),
+            "same value: no change"
+        );
+        assert!(set_canonical_grid(&conn, "p-1", None).unwrap());
+        assert!(!set_canonical_grid(&conn, "p-1", None).unwrap());
+    }
+
+    #[test]
     fn upsert_project_preserves_local_columns() {
         let conn = test_conn();
         upsert_project(&conn, &sample_row("p-1")).unwrap();
@@ -1018,6 +1063,7 @@ pub(crate) mod tests {
         set_replication_paused(&conn, "p-1", true).unwrap();
         set_feed_version(&conn, "p-1", "epoch-1", 9).unwrap();
         set_holder_seq(&conn, "p-1", "epoch-1", 3).unwrap();
+        set_canonical_grid(&conn, "p-1", Some("{\"x\":1}")).unwrap();
 
         // A poll re-upserts every hub-mirrored column.
         let mut refreshed = sample_row("p-1");
@@ -1038,6 +1084,11 @@ pub(crate) mod tests {
         assert!(
             row.replication_paused,
             "replication_paused must survive the poll"
+        );
+        assert_eq!(
+            canonical_grid(&conn, "p-1").unwrap().as_deref(),
+            Some("{\"x\":1}"),
+            "the grid must survive the poll"
         );
         assert_eq!(
             (row.feed_epoch.as_deref(), row.holder_seq),

@@ -20,6 +20,12 @@ pub mod filters;
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod frame_meta;
 pub mod gate;
+// The project's canonical grid (plan 6b-2 C16): type, hash, normalization.
+// Pure and ungated.
+pub mod grid;
+// The grid's proposal geometry; needs the solver's WCS.
+#[cfg(all(feature = "render", feature = "solver"))]
+pub mod grid_geometry;
 pub mod hub_client;
 // The live exchange (wave 3): retry back-off, the claim digest, and the REST
 // wire shapes for holders/versions/presence. Pure and ungated.
