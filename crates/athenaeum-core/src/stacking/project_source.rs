@@ -112,7 +112,17 @@ fn color_token(
     debayer_osc: bool,
 ) -> &'static str {
     if meta.bayerpat.is_none() {
-        return "mono";
+        // No manifest bayerpat: the file's own plane count decides, as for an
+        // attested frame set (`attested_color_token`). An externally
+        // debayered replica is three-plane and must group as `osc`.
+        return match file_shape_quick(landed) {
+            Some((_, _, 3)) => "osc",
+            Some(_) => "mono",
+            None => {
+                tracing::warn!(project_id, frame_uuid, path = %landed.display(), "file shape unreadable; colour token falls back to the manifest (mono)");
+                "mono"
+            }
+        };
     }
     match osc_or_cfa(landed, debayer_osc) {
         Some(token) => token,
@@ -282,6 +292,12 @@ pub fn project_frame_source(
             Path::new(&landed),
             cfg.calibration.debayer_osc,
         );
+        // The Frames row agrees with the group's colour token.
+        frames[idx].color_mode = if token == "mono" {
+            ColorMode::Mono
+        } else {
+            ColorMode::Osc
+        };
         let frame = GroupFrame {
             frame_id: handle,
             file_id: 0,
@@ -588,6 +604,11 @@ mod tests {
         rgb.file = ProjectFile::Rgb32;
         rgb.bayerpat = Some("RGGB");
         add_project_frame(&conn, dir.path(), "p1", &rgb);
+        // An externally debayered replica: three planes, no manifest bayerpat.
+        let mut ext = project_frame_spec("o3");
+        ext.file = ProjectFile::Rgb32;
+        ext.bayerpat = None;
+        add_project_frame(&conn, dir.path(), "p1", &ext);
 
         let keys = |debayer_osc: bool| {
             let mut cfg = StackingConfig::default();
@@ -603,16 +624,20 @@ mod tests {
         };
         assert_eq!(
             keys(true),
-            vec![("mono__L__300s".into(), 1), ("osc__L__300s".into(), 2)]
+            vec![("mono__L__300s".into(), 1), ("osc__L__300s".into(), 3)]
         );
         assert_eq!(
             keys(false),
             vec![
                 ("cfa__L__300s".into(), 1),
                 ("mono__L__300s".into(), 1),
-                ("osc__L__300s".into(), 1)
+                ("osc__L__300s".into(), 2)
             ]
         );
+        // The Frames row agrees with the group.
+        let src = project_frame_source(&conn, "p1", &StackingConfig::default()).unwrap();
+        let row = src.frames.iter().find(|f| f.frame_uuid == "o3").unwrap();
+        assert_eq!(row.color_mode, ColorMode::Osc);
     }
 
     #[test]

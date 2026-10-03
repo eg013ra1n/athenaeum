@@ -839,6 +839,7 @@ pub fn project_seed_config(global: StackingConfig) -> StackingConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// Plan 6b-2 C2: the four modes' wire names are the spec's.
     #[test]
@@ -882,7 +883,6 @@ mod tests {
         let cfg = resolve_config(Some(r#"{"grouping":{"stopsWidth":2.0}}"#), None).unwrap();
         assert_eq!(cfg.grouping.stops_width, 2.0);
     }
-    use super::*;
 
     #[test]
     fn empty_json_is_the_default_config() {

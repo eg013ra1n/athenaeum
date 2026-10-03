@@ -265,16 +265,18 @@ impl ManifestWcs {
     /// 0-based (the record's convention, `fits_writer::wcs` adds the 1),
     /// the SIP tables re-encoded as the JSON strings the catalog stores,
     /// `frame_id = 0` (a project frame has no catalog row), the scale from
-    /// the manifest when it has one (else `sqrt|det CD|`), the rotation as
+    /// the manifest when it has one (else `WcsSolution::pixel_scale_arcsec`), the rotation as
     /// `WcsSolution::field_rotation_deg` reports it, counts zero.
     pub fn to_record(&self, pixel_scale_arcsec: Option<f64>) -> PlateSolveRecord {
         let [cd1_1, cd1_2, cd2_1, cd2_2] = self.cd;
-        let scale = pixel_scale_arcsec
-            .unwrap_or_else(|| (cd1_1 * cd2_2 - cd1_2 * cd2_1).abs().sqrt() * 3600.0);
+        // Without a manifest scale the WCS's own: `WcsSolution` is the one
+        // definition of a solve's pixel scale. The determinant form is only
+        // the fallback for a SIP table that cannot be read.
+        let det_scale = (cd1_1 * cd2_2 - cd1_2 * cd2_1).abs().sqrt() * 3600.0;
         let rotation = (-cd1_2).atan2(cd2_2).to_degrees().rem_euclid(360.0);
         let table =
             |t: &Vec<Vec<f64>>| serde_json::to_string(t).expect("a table of numbers serializes");
-        PlateSolveRecord {
+        let mut record = PlateSolveRecord {
             id: None,
             frame_id: 0,
             crpix1: self.crpix1 - 1.0,
@@ -294,7 +296,7 @@ impl ManifestWcs {
             total_detected: 0,
             rms_residual_px: 0.0,
             rms_residual_arcsec: 0.0,
-            pixel_scale_arcsec: scale,
+            pixel_scale_arcsec: pixel_scale_arcsec.unwrap_or(det_scale),
             field_rotation_deg: rotation,
             solve_time_ms: 0,
             catalog_used: "manifest".to_string(),
@@ -302,7 +304,13 @@ impl ManifestWcs {
             solved_at: String::new(),
             expected_catalog_stars_in_fov: None,
             inlier_ratio: None,
+        };
+        if pixel_scale_arcsec.is_none() {
+            if let Some(solution) = record.to_solution() {
+                record.pixel_scale_arcsec = solution.pixel_scale_arcsec();
+            }
         }
+        record
     }
 }
 
@@ -625,5 +633,31 @@ mod tests {
             .meta
             .get("aperture")
             .is_none());
+    }
+
+    /// Parked from Task 4: with no manifest scale the record's scale is the
+    /// WCS's own (`WcsSolution::pixel_scale_arcsec`, the geometric mean of
+    /// the column norms), not `sqrt|det CD|`; a manifest scale still wins.
+    #[test]
+    fn a_manifest_wcs_without_a_scale_uses_the_solutions_own_scale() {
+        let s = 1.5 / 3600.0;
+        // A sheared CD, where the two definitions differ.
+        let wcs = ManifestWcs {
+            crval1: 83.8,
+            crval2: -5.4,
+            crpix1: 32.5,
+            crpix2: 24.5,
+            cd: [s, s, 0.0, s],
+            sip: None,
+        };
+        let record = wcs.to_record(None);
+        let expected = record.to_solution().unwrap().pixel_scale_arcsec();
+        assert_eq!(record.pixel_scale_arcsec, expected);
+        let det = (s * s).abs().sqrt() * 3600.0;
+        assert!(
+            (record.pixel_scale_arcsec - det).abs() > 1e-6,
+            "the determinant form would have given {det}"
+        );
+        assert_eq!(wcs.to_record(Some(2.0)).pixel_scale_arcsec, 2.0);
     }
 }

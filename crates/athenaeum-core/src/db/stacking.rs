@@ -121,7 +121,14 @@ impl StackingRunRow {
             (None, Some(id)) => StackSubject::FrameSet(id),
             // Unreachable for a row read from the database: the table's
             // CHECK guarantees exactly one of the pair.
-            (None, None) => StackSubject::FrameSet(0),
+            (None, None) => {
+                tracing::error!(
+                    run_id = self.id,
+                    "run row carries neither a frame set nor a project"
+                );
+                debug_assert!(false, "run {} has no subject", self.id);
+                StackSubject::FrameSet(0)
+            }
         }
     }
 }
@@ -1046,8 +1053,31 @@ pub fn project_frame_handles(
     if frame_uuids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Steady state: every handle exists, so read them first and take no write
+    // lock (a plan refresh must not make the live-exchange writer wait).
     let mut out = std::collections::HashMap::with_capacity(frame_uuids.len());
+    {
+        let mut select = conn.prepare_cached(
+            "SELECT id FROM stack_project_frames WHERE project_id = ?1 AND frame_uuid = ?2",
+        )?;
+        for uuid in frame_uuids {
+            if let Some(id) = select
+                .query_row(params![project_id, uuid], |r| r.get::<_, i64>(0))
+                .optional()?
+            {
+                out.insert((*uuid).to_string(), id);
+            }
+        }
+    }
+    if out.len()
+        == frame_uuids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    {
+        return Ok(out);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     {
         let mut insert = tx.prepare_cached(
             "INSERT OR IGNORE INTO stack_project_frames (project_id, frame_uuid) VALUES (?1, ?2)",
@@ -1720,6 +1750,28 @@ mod tests {
             next > minted,
             "{next} must be greater than the deleted {minted}"
         );
+    }
+
+    #[test]
+    fn existing_handles_are_read_without_a_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.db");
+        let writer = Connection::open(&path).unwrap();
+        init_db(&writer).unwrap();
+        insert_test_project(&writer, "p1");
+        let first = project_frame_handles(&writer, "p1", &["u-a", "u-b"]).unwrap();
+
+        // Another connection holds the write lock; a call whose handles all
+        // exist must neither wait for it nor fail.
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let again = project_frame_handles(&reader, "p1", &["u-b", "u-a", "u-a"]).unwrap();
+        assert_eq!(again, first, "the same map, no write lock taken");
+        // A missing uuid still needs the lock and says so.
+        assert!(project_frame_handles(&reader, "p1", &["u-new"]).is_err());
+        holder.execute_batch("ROLLBACK").unwrap();
     }
 
     fn new_run<'a>(subject: &'a StackSubject) -> NewRun<'a> {

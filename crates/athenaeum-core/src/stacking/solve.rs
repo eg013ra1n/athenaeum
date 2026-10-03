@@ -700,7 +700,7 @@ impl FrameSolver for FakeSolver {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Plan 6b-2 C14: the `solve` artifact's payload (the content, the app
@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     /// Everything `warn!` and below writes while `f` runs on this thread.
-    fn captured_logs(f: impl FnOnce()) -> String {
+    pub(crate) fn captured_logs(f: impl FnOnce()) -> String {
         #[derive(Clone)]
         struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {

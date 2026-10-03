@@ -1637,4 +1637,76 @@ mod tests {
         assert_eq!(g[0].frames[0].scale_source, None);
         assert_eq!(g[0].pixel_scale_arcsec, None);
     }
+
+    /// Plan 6b-2 C3 (parked from Task 3): the f-ratio needs both lengths
+    /// finite and positive.
+    #[test]
+    fn f_ratio_needs_two_finite_positive_lengths() {
+        assert_eq!(f_ratio(Some(800.0), Some(200.0)), Some(4.0));
+        assert_eq!(f_ratio(None, Some(200.0)), None);
+        assert_eq!(f_ratio(Some(800.0), None), None);
+        assert_eq!(f_ratio(Some(0.0), Some(200.0)), None);
+        assert_eq!(f_ratio(Some(800.0), Some(0.0)), None);
+        assert_eq!(f_ratio(Some(-800.0), Some(200.0)), None);
+        assert_eq!(f_ratio(Some(800.0), Some(-1.0)), None);
+        assert_eq!(f_ratio(Some(f64::NAN), Some(200.0)), None);
+        assert_eq!(f_ratio(Some(800.0), Some(f64::INFINITY)), None);
+        assert_eq!(f_ratio(Some(f64::INFINITY), Some(200.0)), None);
+    }
+
+    /// Parked from Task 3: "the first `fits_header` row of a frame that
+    /// carries an `APTDIA` wins"; a row without one is skipped, a frame with
+    /// none is absent.
+    #[test]
+    fn load_apertures_takes_the_first_row_carrying_aptdia() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let header = |cards: &[&str]| -> String {
+            let mut out = String::new();
+            for c in cards {
+                out.push_str(&format!("{c:<80}"));
+            }
+            out.push_str(&format!("{:<80}", "END"));
+            out
+        };
+        let apt = |v: &str| format!("APTDIA  = {v:>20} / aperture");
+        let mut ids = Vec::new();
+        for (n, rows) in [
+            // Frame 1: no APTDIA in the first row, then 150, then 200.
+            (
+                1,
+                vec![
+                    header(&[]),
+                    header(&[&apt("150.0")]),
+                    header(&[&apt("200.0")]),
+                ],
+            ),
+            // Frame 2: one row with 80.
+            (2, vec![header(&[&apt("80.0")])]),
+            // Frame 3: rows but no usable APTDIA.
+            (3, vec![header(&[&apt("0")])]),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?1, 1, '2026-01-01T00:00:00Z', 'FITS')",
+                [format!("/f{n}.fits")],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO frames (file_id) VALUES (?1)", [file_id])
+                .unwrap();
+            ids.push(conn.last_insert_rowid());
+            for h in rows {
+                conn.execute(
+                    "INSERT INTO fits_header (file_id, header) VALUES (?1, ?2)",
+                    rusqlite::params![file_id, h],
+                )
+                .unwrap();
+            }
+        }
+        let out = load_apertures(&conn, &ids).unwrap();
+        assert_eq!(out.get(&ids[0]), Some(&150.0), "the first row carrying one");
+        assert_eq!(out.get(&ids[1]), Some(&80.0));
+        assert_eq!(out.get(&ids[2]), None);
+    }
 }

@@ -3489,8 +3489,20 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
     let project_id = wanted[0].2.project_id.clone();
     let target = {
         let conn = db(&rc.ctx)?.conn();
-        crate::db::collab::get_project(&conn, &project_id)?
-            .map(|p| (p.target_ra_deg, p.target_dec_deg))
+        match crate::db::collab::get_project(&conn, &project_id)? {
+            Some(p) => Some((p.target_ra_deg, p.target_dec_deg)),
+            None => {
+                // Unreachable behind the plan's live-project gate, but never a
+                // silent blind solve: the hint keeps the acceptance gate's
+                // "near the hint" leniency honest.
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    project_id = %project_id,
+                    "project row missing; solving without a position hint"
+                );
+                None
+            }
+        }
     };
 
     let frames = unsolved_candidates(&wanted);
@@ -3566,6 +3578,13 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
             Some(frame_id),
             Some("solving".to_string()),
         );
+        if plan.meta.pixel_scale_arcsec.is_none() {
+            tracing::warn!(
+                run_id = rc.run_id,
+                frame_id,
+                "manifest has no pixel scale; solving without a scale hint or scale check"
+            );
+        }
         let mut request = SolveRequest::for_frame(frame_id, &path, &plan.meta, target);
         request.scratch_dir = Some(scratch.clone());
         let solver = rc.solver.clone();
@@ -4594,6 +4613,9 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
     let cfg = rc.config.clone();
     // Spec §5.4, plan 6b-2 C15: a project's reference must carry a WCS.
     rc.wcs_rule = wcs_tiers(rc)?;
+    // Check order below is deliberate (review I6): an excluded manual pin
+    // reports its exclusion before the WCS rule, because a pin stage 1
+    // excluded is absent from `with_wcs` and would otherwise read "no WCS".
 
     let (reference_frame_id, filename, weight_val, calibrated) = match cfg.reference.mode {
         ReferenceMode::Manual => {
@@ -6429,6 +6451,7 @@ fn register_native_groups(rc: &mut RunContext) -> Result<(), RunError> {
         // reference's own stage-1 hash already — no extra lookup needed to
         // resolve its `fits` artifact, unlike the co-registered path above.
         let reference_fits = resolve_reference_fits(rc, reference_frame_id, &reference_hash);
+        fail_if_reference_changed(rc, reference_frame_id)?;
         let mut ref_stars = {
             let pool_ref = &rc.ctx.image_pool;
             reference_stars(
@@ -6616,6 +6639,9 @@ fn stage_register(rc: &mut RunContext) -> Result<(), RunError> {
     };
     let reference_fits = resolve_reference_fits(rc, reference_frame_id, &reference_hash);
 
+    // The identity check comes before the reference's star read, so that
+    // read never sees a changed landed file.
+    fail_if_reference_changed(rc, reference_frame_id)?;
     let mut ref_stars = {
         let pool_ref = &rc.ctx.image_pool;
         reference_stars(
@@ -7038,6 +7064,29 @@ fn changed_during_run(rc: &RunContext, frame_id: i64) -> Result<Option<String>, 
         .map(|reason| reason.0))
 }
 
+/// The failure of a run whose reference's landed file changed (plan 6b-2
+/// C9): a reference cannot leave its own group.
+fn reference_changed_error(frame_id: i64, reason: &str) -> RunError {
+    let cause = if reason == crate::stacking::origin::CHANGED_DURING_THE_RUN {
+        String::new()
+    } else {
+        format!(" ({reason})")
+    };
+    RunError::Other(format!(
+        "the reference frame changed during the run (frame {frame_id}){cause}"
+    ))
+}
+
+/// Fail the run when this reference frame's landed file changed. Called
+/// before a reference's star read so the read never touches new bytes; a
+/// catalog origin always passes (no I/O, no log).
+fn fail_if_reference_changed(rc: &RunContext, frame_id: i64) -> Result<(), RunError> {
+    match changed_during_run(rc, frame_id)? {
+        Some(reason) => Err(reference_changed_error(frame_id, &reason)),
+        None => Ok(()),
+    }
+}
+
 /// The Register and Output boundaries of the identity check (plan 6b-2
 /// C9): every still-included member of `group` whose landed file changed is
 /// excluded, and its frame row persisted, with the check's reason. A
@@ -7069,14 +7118,7 @@ fn exclude_changed_members(
             continue;
         };
         if references.contains(&frame_id) {
-            let cause = if reason == crate::stacking::origin::CHANGED_DURING_THE_RUN {
-                String::new()
-            } else {
-                format!(" ({reason})")
-            };
-            return Err(RunError::Other(format!(
-                "the reference frame changed during the run (frame {frame_id}){cause}"
-            )));
+            return Err(reference_changed_error(frame_id, &reason));
         }
         tracing::warn!(run_id = rc.run_id, frame_id, reason = %reason, "frame excluded");
         rc.runtime_exclusions.push((frame_id, reason.clone()));
@@ -7586,7 +7628,6 @@ fn emit_integrate_tick(
     force: bool,
     message: Option<String>,
 ) {
-    let (set_id, project_id) = wire_subject(subject);
     let now = Instant::now();
     let percent = 100.0 * (plane as f64 + frac) / channels.max(1) as f64;
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -7617,6 +7658,8 @@ fn emit_integrate_tick(
     s.last_emit = now;
     s.last_percent = percent;
     s.last_bytes_done = bytes_done;
+    // After the throttle: a dropped tick never builds the subject pair.
+    let (set_id, project_id) = wire_subject(subject);
     // `s` (the `MutexGuard`) stays alive through the emit below — fix round
     // 1's own point still holds: the watermark update above only decides
     // WHICH tick is allowed to claim the next slot, not what order two
@@ -7739,7 +7782,6 @@ fn emit_drizzle_tick(
     frame_id: Option<i64>,
     force: bool,
 ) {
-    let (set_id, project_id) = wire_subject(subject);
     let now = Instant::now();
     let percent = if total == 0 {
         100.0
@@ -7751,6 +7793,7 @@ fn emit_drizzle_tick(
         return;
     }
     s.last_emit = now;
+    let (set_id, project_id) = wire_subject(subject);
     emit_event(
         emitter,
         STACKING_PROGRESS_EVENT,
@@ -9156,7 +9199,7 @@ fn process_group_output(
                     // `DrizzleTickState`'s own doc), so a throttled
                     // `emit_drizzle_tick` reaches the SAME `stacking-progress`
                     // channel `rc.progress` uses, via cloned-out plain
-                    // values (`emitter`/`run_id`/`set_id`/`group_key`) since
+                    // values (`emitter`/`run_id`/`subject`/`group_key`) since
                     // the closure cannot hold `&mut rc`. `frame_id` is the
                     // k-th drizzled frame's own id — `done` is 1-based
                     // (incremented before the call, `drizzle/mod.rs`), so
@@ -15281,8 +15324,9 @@ mod tests {
                 .events(STACKING_PROGRESS_EVENT)
                 .pop()
                 .expect("the first tick is always emitted");
-            assert_eq!(last["setId"], set_id, "{last}");
-            assert_eq!(last["projectId"], project_id, "{last}");
+            // `.get`, so a missing key cannot pass for a null one.
+            assert_eq!(last.get("setId"), Some(&set_id), "{last}");
+            assert_eq!(last.get("projectId"), Some(&project_id), "{last}");
         }
     }
 
@@ -22719,6 +22763,93 @@ mod tests {
         }
     }
 
+    /// Plan 6b-2 final review I1: a three-plane replica without a manifest
+    /// `bayerpat` (an externally debayered contributor light) groups as
+    /// `osc`, is used in place by Prepare and is excluded nowhere.
+    #[test]
+    fn prepare_uses_a_three_plane_replica_without_a_manifest_bayerpat_in_an_osc_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        let mut paths = Vec::new();
+        for u in ["e1", "e2", "e3"] {
+            let mut spec = test_fixtures::project_frame_spec(u);
+            spec.file = test_fixtures::ProjectFile::Rgb32;
+            spec.bayerpat = None;
+            paths.push(test_fixtures::add_project_frame(
+                &conn, &landed, "p1", &spec,
+            ));
+        }
+        for debayer_osc in [true, false] {
+            let mut cfg = StackingConfig::default();
+            cfg.calibration.debayer_osc = debayer_osc;
+            let work = tmp.path().join(format!("work-{debayer_osc}"));
+            let mut rc = project_rc(&ctx, &conn, "p1", cfg, &work, &tmp.path().join("out"));
+            let keys: Vec<&str> = rc.plan_groups.iter().map(|g| g.key.as_str()).collect();
+            assert_eq!(keys, vec!["osc__L__300s"], "debayer_osc={debayer_osc}");
+            stage_calibrate(&mut rc).unwrap();
+            assert!(
+                rc.runtime_exclusions.is_empty(),
+                "{:?}",
+                rc.runtime_exclusions
+            );
+            let artifacts =
+                crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("calibrated"))
+                    .unwrap();
+            assert_eq!(artifacts.len(), 3);
+            for a in &artifacts {
+                let path = PathBuf::from(a.path.as_deref().unwrap());
+                assert!(paths.contains(&path), "used in place: {path:?}");
+            }
+        }
+    }
+
+    /// Plan 6b-2 final review M1: the identity check precedes the
+    /// reference's star read, so a reference whose landed file changed
+    /// between Measure and Register fails the run before that read, in both
+    /// geometry modes.
+    #[test]
+    fn register_fails_on_a_changed_reference_before_reading_its_stars() {
+        for native in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let conn = project_conn(&db_path);
+            crate::db::stacking::insert_test_project(&conn, "p1");
+            seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 4, 3);
+            let mut cfg = StackingConfig::default();
+            if native {
+                cfg.registration.geometry = RegistrationGeometry::Native;
+            }
+            let mut rc = project_rc(
+                &ctx,
+                &conn,
+                "p1",
+                cfg,
+                &tmp.path().join("work"),
+                &tmp.path().join("out"),
+            );
+            measure_all(&mut rc, &HashMap::new());
+            stage_reference(&mut rc).unwrap();
+            let reference = rc.reference_frame_id.unwrap();
+            let path = match origin_of(&rc.origins, reference).unwrap() {
+                FrameOrigin::Project { landed_path, .. } => landed_path.clone(),
+                other => panic!("not a project origin: {other:?}"),
+            };
+            // Make the reference's calibrated file unreadable as stars, so a
+            // read before the check would fail with a different message.
+            std::fs::write(&path, vec![0u8; 7000]).unwrap();
+            let err = stage_register(&mut rc).unwrap_err();
+            assert!(
+                matches!(err, RunError::Other(ref m) if m.contains("the reference frame changed during the run")),
+                "native={native}: {err:?}"
+            );
+        }
+    }
+
     /// Review round 1, B1: a native project group with no WCS candidate
     /// borrows the run reference and has nothing to switch to, so it gets no
     /// dry pass; a group holding another candidate may switch.
@@ -23029,6 +23160,95 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Plan 6b-2 final review M4: a frame whose manifest has no pixel scale
+    /// is solved with no scale hint and no scale check, so the run says so,
+    /// once per frame, and still solves it.
+    #[test]
+    fn a_frame_without_a_manifest_scale_is_warned_about_before_solving() {
+        use crate::stacking::solve::FakeSolver;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let landed = tmp.path().join("collab");
+        for (uuid, scale) in [("r1", None), ("r2", Some(1.5)), ("r3", Some(1.5))] {
+            let mut spec = test_fixtures::project_frame_spec(uuid);
+            spec.pixel_scale_arcsec = scale;
+            test_fixtures::add_project_frame(&conn, &landed, "p1", &spec);
+        }
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            solve_project_frames(&mut rc).unwrap();
+        });
+        assert_eq!(fake.calls(), 3, "the frame is still solved");
+        assert_eq!(
+            logs.matches("manifest has no pixel scale").count(),
+            1,
+            "{logs}"
+        );
+        let r1 = handle_of(&rc, "c_r1.fits");
+        assert!(logs.contains(&format!("frame_id={r1}")), "{logs}");
+    }
+
+    /// Plan 6b-2 final review M7: a project row that vanished is a warning,
+    /// never a silent blind solve; the frames are still solved, with no hint.
+    #[test]
+    fn a_missing_project_row_is_logged_and_nothing_is_cached() {
+        use crate::stacking::solve::FakeSolver;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let fake = Arc::new(FakeSolver::solving_all());
+        use_solver(&mut rc, &fake);
+        seed_in_place_calibrated(&conn, &mut rc);
+        // No cascade: the run and its artifacts stay, only the row goes.
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute("DELETE FROM collab_projects WHERE project_id = 'p1'", [])
+            .unwrap();
+        // The solve itself runs (without a hint), but its cache write then
+        // fails on the artifact's foreign key to the project, so the run
+        // reports the failure and nothing is cached.
+        let mut result = None;
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            result = Some(solve_project_frames(&mut rc));
+        });
+        assert!(
+            logs.contains("project row missing; solving without a position hint"),
+            "{logs}"
+        );
+        assert!(
+            matches!(result, Some(Err(RunError::Other(ref m))) if m.contains("FOREIGN KEY")),
+            "{result:?}"
+        );
+        assert!(
+            crate::db::stacking::list_artifacts(&conn, &rc.subject, Some("solve"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Review round 2: an `Unavailable` outcome is never cached, adds a run

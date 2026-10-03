@@ -513,6 +513,31 @@ mod tests {
         );
     }
 
+    /// Parked from Task 6b: a landed path whose metadata cannot be read (a
+    /// NUL byte is refused by every platform's stat) is excluded "landed
+    /// file unreadable", and is not the "changed during the run" reason.
+    #[test]
+    fn landed_unchanged_reports_an_unreadable_landed_file() {
+        let origin = FrameOrigin::Project {
+            project_id: "p1".into(),
+            frame_uuid: "u1".into(),
+            publisher: "ann".into(),
+            landed_path: "/landed/bad\0name.fits".into(),
+            blake3: "b".into(),
+            byte_size: 1,
+            size_mtime: "1:1".into(),
+            meta: crate::collab::frame_meta::parse_project_frame_meta(r#"{"exptimeSec": 300.0}"#)
+                .unwrap(),
+        };
+        let reason = landed_unchanged(&origin).unwrap_err();
+        assert!(
+            reason.0.starts_with("landed file unreadable: "),
+            "{}",
+            reason.0
+        );
+        assert_ne!(reason.0, CHANGED_DURING_THE_RUN);
+    }
+
     /// The scanner behind the funnel test: `(line number, enclosing fn, line)`
     /// for every non-comment line naming a `StackSubject::` or
     /// `FrameOrigin::` variant whose enclosing function is not in `allowed`.
