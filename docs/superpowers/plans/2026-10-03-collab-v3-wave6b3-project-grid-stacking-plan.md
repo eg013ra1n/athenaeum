@@ -16,7 +16,9 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` (owner-approved). Read §2, §4.2, §5.5–§5.9, §6, §7, §9, §14–§16 and §18 before any task. This plan implements §18 plan 6b steps **8, 9, 10, 11, 12 and 14**, and prepares the §15.3 acceptance runs A and B. The frontend is plan 6c. The wire types 6c reads are finished here.
 
-**Execution order:** Task 0, 1, 2a, 2b, 3, 4, 5a, 5b, 6a, 6b, 7a, 7b, 8a, 8b, 8c, 9, 10, 11, then the acceptance runs (the controller's own agent). Tasks appear in this document in execution order. Each task leaves every gate green on its own.
+**Execution order:** Task 0, 1, 2a, 2b1, 2b2, 3, 4, 5a, 5b, 7a, 6a, 6b, 7b1, 7b2, 8a, 8b, 8c, 9, 10, 11, then the acceptance runs (the controller's own agent). Tasks appear in this document in execution order. Each task leaves every gate green on its own. Task 7a runs before 6a because 6a measures grid-master statistics through 7a's `largest_covered_rect` (review I1); 2b and 7b are split at the review's cut points.
+
+**Review folded in:** `.superpowers/sdd/6b3-planning/plan-review-fable.md` (0 Critical, 7 Important, 18 Minor) under the controller's rulings `.superpowers/sdd/6b3-planning/plan-review-rulings.md`. Changed rulings carry **Refinement (review)**; every fix names its finding (I1–I7, M1–M18) where it lands.
 
 **What 6b-1 and 6b-2 built** (read before Task 1):
 - `docs/stacking/README.md`: "Run subjects (wave 6b-1)" and "The project path, wave 6b-2", including its "Open for 6b-3" list.
@@ -42,7 +44,8 @@
     - `a_project_start_is_refused_until_6b2` (`run.rs:~21195`), which is deleted, with `PROJECT_STACKING_UNAVAILABLE` (Task 8a);
     - the funnel test's `start_stacking` allowlist entry (`origin.rs:438`), which is removed (Task 8a);
     - any test that pins `INTERMEDIATE_ARTIFACT_KINDS` (Task 5b adds `ln_global`) or the cleanup directory list (Task 8a adds `tmp/`).
-  - Mechanical edits are allowed anywhere the compiler demands them: a new field in a struct literal (`StackParams`, `GroupInput`, `GroupOutput`, `RegisteredCards`, `DrizzleInput`, `DrizzleOutput`, `RunContext`, `RunSummary`, `SummaryGroup`, `RegisteredFrameOutcome::Aligned`, `MeasuredFrame` is NOT touched), a new argument at a call site (`build_reference`, `integrate_planes`, `record_registered_artifact`, `write_one_registered_frame`, `compute_register_stale`).
+  - The one deliberate frame-set behaviour change is D17's: `Intermediates` and `All` cleanup now remove `tmp/` for a frame set too (a directory of crash leftovers with no artifact rows). No written output moves.
+  - Mechanical edits are allowed anywhere the compiler demands them: a new field in a struct literal (`StackParams`, `GroupInput` (`coverage_map`, `stats_on_covered`), `GroupOutput`, `RegisteredCards`, `DrizzleInput`, `DrizzleOutput`, `RunContext`, `RunSummary`, `SummaryGroup`, `RegisteredFrameOutcome::Aligned`, `EstimateInputs` (`crop_scratch`); `MeasuredFrame` is NOT touched), a new argument at a call site (`build_reference`, `integrate_planes`, `record_registered_artifact`, `write_one_registered_frame`, `compute_register_stale`).
   - No new `StackingConfig` field and no `STACKING_CONFIG_VERSION` bump: `config_hash_is_canonical_and_pinned` and `stage_hashes_are_pinned_to_golden_literals` keep their literals in every task.
   - Frame-set group keys, every stage hash, frame-set log messages and fields, error strings and every written byte stay identical. The set-204 regression of the acceptance runs (last section) proves it on real data.
 - **The funnels.** `origin::tests::subject_and_origin_variants_stay_in_their_funnels` scans the production halves of `run.rs` and `plan.rs`. New code there never names `StackSubject::…` or `FrameOrigin::…`; it calls `subject.project_id()` / `subject.frame_set_id()` or a function in `stacking::origin`, `stacking::paths` or the new `stacking::grid_map` (none of which the test scans).
@@ -86,21 +89,24 @@
    - Task 4: the engine's coverage pass is off by default (`coverage_off_leaves_the_stack_bit_identical`);
    - Task 6a: `a_frame_sets_master_is_bit_identical_with_the_coverage_map_on_and_off`;
    - Task 6b: `drizzle_output_is_bit_identical_with_coverage_on_and_off`;
-   - Task 7b: `a_zero_crop_keeps_todays_output_path`;
+   - Task 6a: a frame set's statistics are untouched (`stats_on_covered` is `false` for a set);
+   - Task 7b1: `a_full_rectangle_crop_writes_what_the_master_writer_writes` (review I7);
+   - Task 7b2: `a_zero_crop_keeps_todays_output_path`, `a_full_rectangle_crop_writes_what_the_zero_crop_path_writes` (review I7);
    - every task's full core gate, and the acceptance runs' set-204 real-data regression against `main`.
 2. **The composed map.** One `PixelMap` meets the exact chain within 0.01 px in both directions, for an identity, a homography, a polynomial and a spline star map, at 0° and 4° from the tangent point, with the owner's parity (det CD > 0) mirrored onto the grid's (det CD < 0). It is never serialized.
-   Pinned in Task 1 (`the_composed_map_meets_the_chain_within_a_hundredth`), Task 2b (`a_project_frame_registers_onto_the_grid`).
-3. **Caches.** The star map survives `Intermediates`; a grid change re-composes and rewrites with no star detection; the plan and the run agree on "Register cached" and on the LN hash.
-   Pinned in Task 2a (`the_star_map_cache_survives_intermediates_cleanup`), Task 2b (`a_grid_change_recomposes_without_star_detection`, `a_project_plan_reports_register_cached_then_stale_on_a_grid_change`).
+   Pinned in Task 1 (`the_composed_map_meets_the_chain_within_a_hundredth`), Task 2b1 (`a_sky_frame_puts_its_stars_where_its_wcs_says`, the fixture), Task 2b2 (`a_project_frame_registers_onto_the_grid`).
+3. **Caches.** The star map survives `Intermediates`; a grid change re-composes and rewrites with no star detection; the plan and the run agree on "Register cached" and on the LN hash, including when the LN field moves (review I6: the plan twins the field).
+   Pinned in Task 2a (`the_star_map_cache_survives_intermediates_cleanup`), Task 2b2 (`a_grid_change_recomposes_without_star_detection`, `a_project_plan_reports_register_cached_then_stale_on_a_grid_change`), Task 5b (the field twin at the end of `a_member_under_a_quarter_overlap_keeps_global_normalization`).
 4. **LN on the overlap is project-only numerics.** Legacy LN is untouched for frame sets (every LN pin). Masked LN recovers the true scale on a half-covered member where the legacy path is biased; a member under 25 % keeps global normalization with no sidecar and a cache marker.
-   Pinned in Task 5a (`masked_ln_recovers_a_half_covered_members_scale`), Task 5b (`a_member_under_a_quarter_overlap_keeps_global_normalization`).
-5. **Coverage and crop.** Counts equal footprints; a crop never loses a master; one rectangle per co-registered run, one per group in native; CRPIX shifts exactly.
-   Pinned in Tasks 4, 6a, 6b, 7a, 7b.
+   Pinned in Task 5a (`masked_ln_recovers_a_half_covered_members_scale`, asserted on the eroded overlap only, review I2), Task 5b (`a_member_under_a_quarter_overlap_keeps_global_normalization`, which also registers the east pair's strip before the e2e does, review I5; `a_wide_grid_keeps_the_coverage_filter_on_the_groups_own_field`, `the_ln_field_forgives_one_lost_probe`, review I6).
+5. **Coverage, statistics and crop.** Counts equal footprints; a grid master's statistics come from covered pixels only (review I1); a crop never loses a master; one rectangle per co-registered run, one per group in native; CRPIX shifts exactly; a full-rectangle finalization is the K = 0 writer's output (review I7).
+   Pinned in Tasks 4, 7a, 6a (`a_grid_masters_statistics_ignore_uncovered_pixels`), 6b, 7b1, 7b2.
 6. **Cards.** No written file carries `ATH_PRJ`. A grid output carries `ROWORDER = 'BOTTOM-UP'`, the canonical `FILTER`, `ATH_SPRJ`, `ATH_GRID`, `ATH_RGEO = 'grid'`, and no `PLTSOLVD`. A long project id or canonical filter never fails a write.
    Pinned in Task 3 (`a_project_run_writes_grid_masters_with_the_grid_wcs`, `no_file_a_project_run_writes_carries_ath_prj`, `grid_cards_survive_long_values`).
 7. **Commands.** Seven on both hosts (306), `get_project_stacking_config` writes nothing, cleanup sweeps rows of frames that left the project, a steady-state plan takes no write lock.
    Pinned in Tasks 8a, 8b and 8c.
 8. **The e2e** (Task 9) runs the whole path through the fake hub.
+9. **Run A cannot measure the wrong thing silently** (reviews I3, I4): the procedure refuses without set 204's stacking config, prints and checks both references, and reads no row before the WCS probe passes; `--pairs` refuses differing pixel grids.
 
 ## Plan rulings (the controller's skeleton)
 
@@ -116,9 +122,11 @@ Numbered D1–D23. Each gives the decision and the evidence. Where a ruling depa
   - The geometry module stays ungated: the trait names no WCS type. The chain (`ComposedField`) lives in the gated `stacking::grid_map`.
   - Never serialized: the variant is `#[serde(skip)]`. `to_record` serializes the star alignment's map before composition (`register/frame.rs:477`), and the composed map is re-derived from (star map, reference WCS, grid) whenever a cached star map is reused.
   - No per-frame runtime self-check against 0.01 px (it would build both grids per frame): the bound is pinned in tests; the run checks only that the inverse chain converges at the corners and the centre, and a frame that fails is excluded "grid composition failed: …".
+  - **Refinement (review M1, M2):** `TpsGrid::sample`'s doc states its real arithmetic (two samples past `ceil(extent / step)` on the far side); `ComposedField`'s doc names the one edge cell of a spline star map, where the domain clamp leaves up to ≈ 0.012 px of bilinear error that no consumer reads (NaN outside the frame). The review also notes the degree argument: an order-3 star map composed with an order-3 SIP is degree 9, so no order-5 polynomial follows ANY star map with a distortion layer.
 - **D2 — The star map is a payload-only `registration` artifact.** One row per handle, `group_key = ""`, `config_hash` = today's registration hash, `payload_json` = the `RegistrationRecord` (with `frames_set_id = 0`). `stored_registrations` / `store_registration` read and write it for a project; it stays out of `INTERMEDIATE_ARTIFACT_KINDS`, so only `CleanupWhat::All` drops it (research finding 5: cleanup erases the `registered` rows the spec meant to hold the star map). The `registered` artifact's hash is `grid_registered_hash(registration hash, reference WCS hash, grid hash)`, folding `COMPOSE_VERSION`. The reference's WCS is hashed because a local re-solve changes it independently of content.
-- **D3 — Grid outputs state `ROWORDER = 'BOTTOM-UP'`.** The owner ruling forbids copying the reference's `ROWORDER` onto a grid master. A grid is sky-standard (north up when row 0 is at the bottom), so registered frames, masters, coverage and drizzle outputs on the grid write `BOTTOM-UP` explicitly: `RegisteredCards::reference_roworder` already replaces the card (`register/writer.rs:44-55, 102-108`), and the master gets the same through `stamp_grid_cards`. A missing card would read the same (`orientation.rs:93`), but the XISF writer states the effective order, so explicit is clearer. An XISF grid master therefore fires the existing "XISF keeps the bottom-up row order" warning, which is true.
+- **D3 — Grid outputs state `ROWORDER = 'BOTTOM-UP'`.** The owner ruling forbids copying the reference's `ROWORDER` onto a grid master. A grid is sky-standard (north up when row 0 is at the bottom), so registered frames, masters, coverage and drizzle outputs on the grid write `BOTTOM-UP` explicitly: `RegisteredCards::reference_roworder` already replaces the card (`register/writer.rs:44-55, 102-108`), and the master gets the same through `stamp_grid_cards`. A missing card would read the same (`orientation.rs:93`), but the XISF writer states the effective order, so explicit is clearer. An XISF grid master therefore fires the existing "XISF keeps the bottom-up row order" warning, which is true. **Refinement (review M3):** the registered frame's `ROWORDER` comment reads "row order of the output grid", true for both kinds of grid; production passes `reference_roworder: None` for every frame set (`run.rs:6892`), so no frame-set byte moves.
 - **D4 — The coverage count is a post-pass, not a change to the combine loop.** When asked, each band counts per pixel the frames whose raw sample is finite (geometric coverage before range and algorithm rejection), from the band planes already in memory, after the band's combine. With `empty_as_nan` a pixel whose count is 0 becomes NaN, and the engine's non-finite guard (`engine.rs:1576-1580`) skips exactly those pixels. The per-pixel loop (`engine.rs:1196-1416`) is textually untouched, so no timing bracket is owed. Research fact 1 is honoured: "empty" keys on the count, never on `work.is_empty()` (an all-range-rejected pixel stays 0.0).
+  - **Refinement (review I1):** on a grid, every master's statistics (`GroupStats`: location, scale, noise, PSF SNR, SNR gain, FWHM, eccentricity) are measured over covered pixels only — the largest rectangle every pixel of which at least one frame covers (`crop::largest_covered_rect`, Task 7a) — for every grid master, coverage map or not. `GroupInput.stats_on_covered` (`rc.grid.is_some()`) implies the plane-0 count; the count taken only for the statistics is never written as a map. Frame sets are unchanged (`false`). Pinned by `a_grid_masters_statistics_ignore_uncovered_pixels` (Task 6a).
 - **D5 — Seam 1 lands with seam 2.** Task 4 adds the `empty_as_nan` option with every caller passing `false`. Task 5a switches it on for a project's LN reference in the same commit that lands masked LN (research fact 2: NaN alone makes reference-side detection worse).
 - **D6 — Masked LN is carried by `LnReferenceForDetection`.**
   - `LnOverlap::{Legacy, Masked}` is a field of `LnReferenceForDetection` (built once per group), so `normalize_frame` and the seeds calibration follow it with no signature change.
@@ -128,8 +136,10 @@ Numbered D1–D23. Each gives the decision and the evidence. Where a ruling depa
     - the target background and a per-member reference background are both computed on the overlap.
   - The overlap fraction is measured on channel 0; under 25 % the frame returns `LnError::LowOverlap`.
   - Frame sets build `Legacy` and change nothing (every LN pin). A project's LN hashes fold the token `lnmask:1` through `plan::ln_registration_upstream`, never the frame-set formula.
+  - **Refinement (review I2):** the masked fit defines the model on the overlap only. `masked_ln_recovers_a_half_covered_members_scale` asserts the additive term on the grid nodes inside the overlap eroded by the 48 px margin, and `normalize_frame`'s masked branch says what a node outside carries (`background_grid`'s extrapolation into masked cells), so nobody "fixes" it.
 - **D7 — The < 25 % fallback.** The member keeps its global pair (`GroupInput.ln[i] = None`; the engine already handles it, `engine.rs:~950-976`), gets no sidecar, and a payload-only `ln_global` marker (hash = its LN hash) so the run and the plan count it as cached. One `warn!` and one run warning per group name the count. `TooFewMatches` keeps today's policy (excluded when LN drives output); only the spec's < 25 % rule falls back. `ln_global` joins `INTERMEDIATE_ARTIFACT_KINDS`.
 - **D8 — Grid-mode admissibility uses the group's median footprint.** On a grid, the anchor pick and the LN member list measure each member against the cells at least ⌈n/2⌉ of the group's members cover (32 × 32 probes), not against `[0, grid_w) × [0, grid_h)`. Research finding 7: on a wide grid almost no member reaches `MIN_REFERENCE_COVERAGE = 0.97` of the grid, so the filter would drop for every group. The run reference's own footprint would fail a group shot at another field. Frame sets keep `reference_coverage` unchanged.
+  - **Refinement (review I6):** the field is built from the group's IN-SCOPE frames' WCS footprints (manifest WCS, else the cached solve of the current content; `origin::ln_footprint`) on a lattice in FRAME units — 32 probes per median frame side measured on the grid (`weights::LN_FIELD_PROBES_PER_FRAME_SIDE`), so a wide grid or a second rig never coarsens it — and a member's coverage forgives one lost probe. One function, `origin::group_ln_field`, builds it for the run and for the plan (the twin); its hash, the frames that pass the 0.97 rule against it, folds into every member's LN hash (`plan::ln_upstream_on_field`), so a field change re-keys the group's LN in the plan and the run at once, never a run later. A frame with no WCS footprint never qualifies as an LN reference member or the anchor (it is still stacked).
 - **D9 — Coverage outputs.**
   - Master: `<stem>_coverage.fits`, plane 0's count, always FITS, `BUNIT = 'frames'`, the master's WCS; kind `coverage`.
   - Drizzle: `<drizzle stem>_coverage.fits`, one plane per channel, counting frames whose deposited weight raised `W`. It is computed by a per-band snapshot of `W` around each frame's deposit, so `deposit_band`/`deposit_cell` do not change. A drop below `W`'s f32 resolution is not counted (documented). Kind `drizzle_coverage` (the `master_lights` unique key forbids reusing `coverage`).
@@ -141,26 +151,28 @@ Numbered D1–D23. Each gives the decision and the evidence. Where a ruling depa
   - A group whose crop fails is finalized uncropped, with a warning; a master is never lost.
   - `K = 0` keeps today's code path literally.
   - Research facts 6/§4: XISF masters cannot be re-read, and the union is known only after the last group.
+  - **Refinement (review I7, M6, M13):** a full-rectangle finalization is pinned against the K = 0 writer (Task 7b1's unit test, Task 7b2's run test: same pixels, same keywords but the run id); every fallback warning says the outputs were "written uncropped"; the plan's space estimate counts the scratch copies (`EstimateInputs.crop_scratch`); the drizzle WCS rescale repeats the first write's `scale_plate_solve` on the same record, documented as unable to fail there.
 - **D11 — Output on the grid.**
   - The WCS is `grid_plate_solve`: `crpix` 0-based `((W−1)/2, (H−1)/2)` (spec §5.9 says "1-based"; `PlateSolveRecord.crpix` is 0-based and `wcs_cards` adds 1, `fits_writer/wcs.rs:206`), `catalog_used = algorithm_used = "grid"`, no SIP.
   - `stamp_grid_cards` sets the canonical `FILTER`, `ROWORDER = 'BOTTOM-UP'`, `ATH_RGEO = 'grid'`, `ATH_SPRJ`, `ATH_GRID`, and removes `PLTSOLVD` (a grid TAN is not a plate solve). It runs on the master's cards and again on the drizzle cards, because `build_drizzle_cards` re-stamps `ATH_RGEO` and the WCS block.
   - Masters land in `<output>/<sanitize_for_filename(title)>/`; names keep `master_file_name` (title, canonical filter, no binning token since a project group's binning is 1).
+  - **Refinement (review M4):** an empty canonical filter writes no `FILTER` at all (the reference's raw card must not leak), said in `stamp_grid_cards`' doc, with one run warning per such group.
 - **D12 — The seven commands.**
   - `get_project_stacking_config` is read-only: with no stored document it returns the seed it would store, `isDefault: true`.
   - `set_project_stacking_config` refuses a project this device left (`live_project`), stores sorted, de-duplicated exclusions, and an absent `referenceFrameUuid` clears the manual pin (Tauri cannot tell absent from null).
-  - `cleanup_project_stacking_work` first sweeps the artifact rows of handles whose `(project, uuid)` left `project_frames_local` (one `DELETE`, every level, before the "no working folder" return), then refuses while a run is active (`Conflict`), then cleans the layout.
+  - `cleanup_project_stacking_work` heals and refuses while a run is active (`Conflict`), then sweeps the artifact rows of handles whose `(project, uuid)` left `project_frames_local` (one `DELETE`, every level, before the "no working folder" return), then cleans the layout. **Refinement (review M5):** the sweep moved after the `Conflict` check, so a refused cleanup touches nothing.
   - Plan, start, usage and cleanup run under `spawn_blocking` on both hosts.
 - **D13 — `start_stacking` starts a project.** The guard and `PROJECT_STACKING_UNAVAILABLE` go. A project run's `RunContext.grid` is `plan.grid.current` (the plan's `grid` blocker guarantees it), its `output_dir` is `<output>/<title>`, and `RunSummary.grid` records the grid. `stage_calibrate`'s project branch keeps its own message. A crate-internal `start_stacking_with_solver` is the test seam the e2e needs (spec §15.2: synthetic stars cannot be solved against a catalog).
 - **D14 — The plan learns the WCS rule.** A `reference` blocker when the manual pin has no manifest WCS and its cached local solve failed or was refused, or when no in-scope frame has a manifest WCS and every in-scope frame's cached solve failed or was refused. A warning when the pin has no manifest WCS and no cached solve yet ("will be plate-solved; the run fails at Reference if it cannot be"). "Failed" is judged as the run's Solve sub-step judges it: the plan computes the installed solver's identity (`solve::installed_solver_identity`, the string `CatalogSolver` uses) and the same `solve_hash`, so a failure cached under another catalog, solver config or app version is retried by the run and blocks nothing. With no catalog installed, a frame without a manifest WCS or a cached solve can get none, and counts as unsolvable.
 - **D15 — One plane rule for stage 1 and LN.** `plan::stage_one_planes(cfg, group, prepare_path)` replaces both `run::expected_stage_one_planes` and `plan::expected_ln_channels`. The plan passes `prepare_path = project || attested`, so an `osc__` Prepare group with the debayer off counts three LN channels, as the run writes.
 - **D16 — A steady-state plan writes nothing.** Verified at HEAD: the only per-plan writes are the first plan's config seed (`plan.rs:1080-1089`, read first) and the mint of missing handles (`db/stacking.rs:1048-1100`, read first). Pinned by a test that runs a second plan while another connection holds `BEGIN IMMEDIATE` with `busy_timeout(0)`.
-- **D17 — `tmp/` is swept** by `Intermediates` and `All`, for every subject (6b-2 final review M3). It holds no artifact rows, only crash leftovers (the solve's ADU copy, Calibrate's scratch); cleanup refuses while the subject has an active run.
+- **D17 — `tmp/` is swept** by `Intermediates` and `All`, for every subject (6b-2 final review M3). It holds no artifact rows, only crash leftovers (the solve's ADU copy, Calibrate's scratch); cleanup refuses while the subject has an active run. **Refinement (review, writer's note 3):** this IS a behaviour change for frame sets — a frame set's `Intermediates` cleanup now removes a directory it did not before — stated in Global Constraints; no written output moves. The 6b-2 open-items bullet it closes becomes one line of the 6b-3 entry.
 - **D18 — Wire additions for 6c.** `RunSummary.grid` (the grid a project run used), `StackingRunFrameRow.frameUuid` (a project row's uuid, read through `stack_project_frames`, so run history maps a handle after the frame left the plan), `SummaryGroup.coveragePath` / `drizzleCoveragePath`, `MasterLightKind` `coverage` / `drizzleCoverage`, `StackingProjectConfig`.
-- **D19 — The 25 % threshold is covered synthetically.** LDN1272-test's two rigs are two groups whose members share their framing, so nothing there falls under 25 % (open-items 6b-2). The threshold is pinned by `normalize_frame` unit tests, a run-level project test and the fake-hub e2e; acceptance run B reports each member's overlap; re-measuring it on real partial overlap needs the owner's set 195 published into a test project (open-items).
+- **D19 — The 25 % threshold is covered synthetically.** LDN1272-test's two rigs are two groups whose members share their framing, so nothing there falls under 25 % (open-items 6b-2). The threshold is pinned by `normalize_frame` unit tests, a run-level project test and the fake-hub e2e; acceptance run B reports each member's overlap; re-measuring it on real partial overlap needs the owner's set 195 published into a test project (open-items). **Refinement (review I5):** the east-pair geometry (offset, star spacing, seed) is one set of constants in `test_fixtures` that Task 5b's run test and Task 9's e2e share, so the strip registration is tried first in the cheaper test, which also asserts that the pair registered.
 - **D20 — No hub change, no new event.** Grid moves picked up by `refresh_projects` still emit nothing (6b-2 note; 6c re-reads on a card refresh). The Measure progress restart after Solve stays (a 6c note). `get_collab_grid_proposal.framesInside` (vs the proposal) and `PlanGrid.framesInside` (vs current-or-proposal) are documented for 6c.
 - **D21 — The acceptance drivers are code, the runs are not.** Task 10 adds `tier1/project-run.sh`, `tier1-compare.py --pairs`, `grid-report.py` and `run-a-grid.py` to the harness (reuse, never rebuild). The runs themselves are the last section, for the controller's own agent.
 - **D22 — Runtime composition cost.** A cached star map is re-composed on the run thread (an affine fit over ≈ 25 k chain samples, tens of ms per frame); the grids build lazily in the consumers' own fan-outs. A spline star map makes each grid ≈ 1–2 s per frame (opt-in setting).
-- **D23 — Run B's "noise per arcsec²" is σ_px · scale.** The research left the term undefined (6b-2 LN/coverage research §6). Master pixels are intensities (a mean of normalized frames, resampled intensity-preserving), so the mean over A arcsec² of white noise has σ = σ_px · scale / √A; at A = 1 it is σ_px · scale (value · arcsec). It compares grids of different scales; σ_px is printed beside it. Measured on the master cropped to the group's `coverage ≥ ⌈n/2⌉` rectangle (D8's median footprint), because `measure_probe` has no mask and the uncovered 0.0 pixels would enter its statistics.
+- **D23 — Run B's "noise per arcsec²" is σ_px · scale.** The research left the term undefined (6b-2 LN/coverage research §6). Master pixels are intensities (a mean of normalized frames, resampled intensity-preserving), so the mean over A arcsec² of white noise has σ = σ_px · scale / √A; at A = 1 it is σ_px · scale (value · arcsec). It compares grids of different scales; σ_px is printed beside it. Measured on the master cropped to the group's `coverage ≥ ⌈n/2⌉` rectangle (D8's median footprint), because `measure_probe` has no mask and the uncovered 0.0 pixels would enter its statistics. **Refinement (review caveat on note 7):** it is a WHITE-NOISE EQUIVALENT — resampling, and more so drizzle, correlates a stack's pixels, so it understates the true per-area noise by a scale-dependent factor; the report's header says so, beside σ_px.
 
 ## File map
 
@@ -169,23 +181,24 @@ Numbered D1–D23. Each gives the decision and the evidence. Where a ruling depa
 | `crates/athenaeum-core/src/geometry/pixel_map.rs` | `DisplacementField`, `DistortionModel::Sampled`, `TpsGrid::sample` (T1) |
 | `crates/athenaeum-core/src/stacking/grid_map.rs` | **new** — `GridRun`, `ReferenceWcs`, `ComposedField`, `compose_to_grid`, hashes, `grid_plate_solve`, `crop_plate_solve`, `subject_dims` (T1); `reference_wcs_hash_of` (T2a) |
 | `crates/athenaeum-core/src/stacking/mod.rs` | `pub mod grid_map;` (T1), `pub mod crop;` (T7a) |
-| `crates/athenaeum-core/src/stacking/plan.rs` | project arms of `stored_registrations`/`store_registration`, `registered_hash_for`, grid-aware `compute_register_stale` and LN upstream (T2a); `ln_registration_upstream` token (T5a); `ln_global` cache rule, `stage_one_planes` (T5b); WCS-rule blockers, `PROJECT_STACKING_UNAVAILABLE` removed (T8a); `read_project_config` (T8b) |
-| `crates/athenaeum-core/src/stacking/run.rs` | `RunContext.grid`, `delivered_dims`, `Aligned.registered_hash`, `record_registered_artifact(hash)` (T2a); composition in Register (T2b); grid WCS + `stamp_grid_cards` in Output and Drizzle (T3); masked LN switch + `LowOverlap` handling + median-footprint coverage (T5a, T5b); coverage file + drizzle coverage (T6a, T6b); crop deferral + `finish_crop` (T7b); start guard lifted, `start_stacking_with_solver`, project output folder (T8a) |
-| `crates/athenaeum-core/src/stacking/register/writer.rs` | `RegisteredCards.grid_hash` → `ATH_GRID` (T2a) |
-| `crates/athenaeum-core/src/stacking/master_cards.rs` | `stamp_grid_cards`, `card_with_optional_comment` (T3); `coverage_map_cards`, coverage in `write_master_light` (T6a); drizzle coverage in `write_drizzled_master` (T6b); `write_cropped_master`, `write_cropped_drizzle` (T7b) |
-| `crates/athenaeum-core/src/stacking/paths.rs` | `subject_output_dir` (T3); `uncropped_dir` (T7b); `tmp_root`, `tmp/` in cleanup, `ln_global` in `INTERMEDIATE_ARTIFACT_KINDS` (T5b, T8a) |
+| `crates/athenaeum-core/src/stacking/plan.rs` | project arms of `stored_registrations`/`store_registration`, `registered_hash_for`, grid-aware `compute_register_stale` and LN upstream (T2a); `ln_registration_upstream` token (T5a); `ln_global` cache rule, `stage_one_planes`, `ln_upstream_on_field` and the per-group field hash (T5b); `EstimateInputs.crop_scratch` (T7b1); WCS-rule blockers, `PROJECT_STACKING_UNAVAILABLE` removed (T8a); `read_project_config` (T8b) |
+| `crates/athenaeum-core/src/stacking/run.rs` | `RunContext.grid`, `delivered_dims`, `Aligned.registered_hash`, `record_registered_artifact(hash)` (T2a); test helpers and the first grid test (T2b1); composition in Register (T2b2); grid WCS + `stamp_grid_cards` in Output and Drizzle (T3); masked LN switch + `LowOverlap` handling + the LN field (T5a, T5b); coverage file, `stats_on_covered` + drizzle coverage (T6a, T6b); crop deferral + `finish_crop` (T7b2); start guard lifted, `start_stacking_with_solver`, project output folder (T8a) |
+| `crates/athenaeum-core/src/stacking/register/writer.rs` | `RegisteredCards.grid_hash` → `ATH_GRID`; the `ROWORDER` comment "row order of the output grid" (T2a, review M3) |
+| `crates/athenaeum-core/src/stacking/master_cards.rs` | `stamp_grid_cards`, `card_with_optional_comment` (T3); `coverage_map_cards`, coverage in `write_master_light` (T6a); drizzle coverage in `write_drizzled_master` (T6b); `write_cropped_master`, `write_cropped_drizzle` (T7b1) |
+| `crates/athenaeum-core/src/stacking/paths.rs` | `subject_output_dir` (T3); `ln_global` in `INTERMEDIATE_ARTIFACT_KINDS` (T5b); `uncropped_dir`, `EstimateInputs.crop_scratch` (T7b1); `tmp_root`, `tmp/` in cleanup (T8a) |
 | `crates/athenaeum-core/src/integration/engine.rs` | `StackParams.{coverage, empty_as_nan}`, `StackOutput.coverage`, the post-pass (T4) |
-| `crates/athenaeum-core/src/stacking/integrate.rs` | `Coverage` option on `integrate_planes`, `GroupInput.coverage_map`, `GroupOutput.coverage` (T4) |
+| `crates/athenaeum-core/src/stacking/integrate.rs` | `Coverage` option on `integrate_planes`, `GroupInput.coverage_map`, `GroupOutput.coverage` (T4); `GroupInput.stats_on_covered`, statistics on the covered rectangle (T6a) |
 | `crates/athenaeum-core/src/stacking/ln/{mod,reference,scale}.rs` | `build_reference(empty_as_nan)` (T4); `LnOverlap`, masked detection/background/seeds, `LnError::LowOverlap`, `eroded_mask` (T5a) |
-| `crates/athenaeum-core/src/stacking/weights.rs` | `median_footprint_coverage` (T5b) |
+| `crates/athenaeum-core/src/stacking/weights.rs` | `LN_FIELD_PROBES_PER_FRAME_SIDE`, `LnField`, `ln_field` (T5b) |
 | `crates/athenaeum-core/src/stacking/drizzle/mod.rs` | `DrizzleInput.write_coverage`, `DrizzleOutput.coverage`, the W snapshot, the memory term (T6b) |
-| `crates/athenaeum-core/src/stacking/crop.rs` | **new** — rectangle, union, plane and file crop, `restate_crpix` (T7a) |
+| `crates/athenaeum-core/src/stacking/crop.rs` | **new** — rectangle, `largest_covered_rect`, union, plane and file crop, `restate_crpix` (T7a) |
 | `crates/athenaeum-core/src/stacking/provenance.rs` | `RunSummary.grid` (T2a); `SummaryGroup.coverage_path` (T6a), `drizzle_coverage_path` (T6b) |
 | `crates/athenaeum-core/src/api/stacking.rs` | `MasterLightKind::{Coverage, DrizzleCoverage}` (T6a, T6b); seven project functions, `StackingProjectConfig` (T8b) |
 | `crates/athenaeum-core/src/db/stacking.rs` | `StackingRunFrameRow.frame_uuid`, `sweep_departed_project_artifacts` (T8b) |
-| `crates/athenaeum-core/src/stacking/origin.rs` | `WcsOutlook`, `wcs_outlook`, `reference_wcs_check`; funnel allowlist: `start_stacking` entry removed (T8a) |
+| `crates/athenaeum-core/src/stacking/origin.rs` | `ln_footprint`, `GroupLnField`, `group_ln_field` (T5b); `WcsOutlook`, `wcs_outlook`, `reference_wcs_check`; funnel allowlist: `start_stacking` entry removed (T8a) |
 | `crates/athenaeum-core/src/stacking/solve.rs` | ignored real-data probe `real_data_grid_master_wcs_probe` (T3); `solver_identity`, `installed_solver_identity` (T8a) |
-| `crates/athenaeum-core/src/stacking/test_fixtures.rs` | sky-field project frames (T2b) |
+| `crates/athenaeum-core/src/stacking/test_fixtures.rs` | sky-field project frames, the east-pair constants, a fixture test (T2b1) |
+| `crates/athenaeum-core/src/stacking/ln/reference.rs`, `examples/{integrate,ln}_probe.rs` | `build_reference(empty_as_nan)` and `coverage_map` literals (T4); `stats_on_covered` literals (T6a) |
 | `crates/athenaeum-core/src/api/stacking_project_e2e.rs` | **new**, `#[cfg(test)]` — the fake-hub e2e (T9) |
 | `crates/athenaeum-core/src/api/mod.rs` | `mod stacking_project_e2e;` (T9) |
 | `crates/athenaeum-core/src/ts_export.rs` | `StackingProjectConfig` (T8b) |
@@ -253,7 +266,7 @@ pub fn grid_plate_solve(grid: &CanonicalGrid, solved_at: &str) -> PlateSolveReco
 pub fn crop_plate_solve(record: &PlateSolveRecord, x0: usize, y0: usize) -> PlateSolveRecord;
 pub fn subject_dims(width: i64, height: i64, path: &Path) -> Result<(usize, usize), String>;
 ```
-Consumed by: Task 2a (`GridRun`, `ReferenceWcs`, `grid_registered_hash`, `wcs_record_hash`), Task 2b (`compose_to_grid`, `subject_dims`), Task 3 (`grid_plate_solve`), Task 7b (`crop_plate_solve`).
+Consumed by: Task 2a (`GridRun`, `ReferenceWcs`, `grid_registered_hash`, `wcs_record_hash`), Task 2b2 (`compose_to_grid`, `subject_dims`), Task 3 (`grid_plate_solve`), Tasks 7a, 7b1 and 7b2 (`crop_plate_solve`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -606,9 +619,11 @@ pub trait DisplacementField: Send + Sync + std::fmt::Debug {
 
 Replace `TpsGrid::build`'s body with a call to a new `sample` (the arithmetic is unchanged, so every spline grid stays bit-identical):
 ```rust
-    /// Samples `f` over `domain` at [`TPS_GRID_PX`] spacing, plus one margin
-    /// cell each way so the last cell is complete. Rows are independent, so
-    /// the build runs over `rayon`; it is a pure function of its inputs.
+    /// Samples `f` over `domain` at [`TPS_GRID_PX`] spacing, starting at the
+    /// domain's lower corner and running two samples past `ceil(extent /
+    /// step)` on the far side (the `+ 2` below, as `build` has always done),
+    /// so the last cell is complete. Rows are independent, so the build runs
+    /// over `rayon`; it is a pure function of its inputs.
     pub fn sample(domain: [f64; 4], f: impl Fn(f64, f64) -> (f64, f64) + Sync) -> TpsGrid {
         let step = TPS_GRID_PX as f64;
         let [x0, y0, x1, y1] = domain;
@@ -824,6 +839,12 @@ pub fn wcs_record_hash(r: &PlateSolveRecord) -> String {
 
 /// The exact chain subject → grid, as a [`DisplacementField`] around the
 /// fitted affine `linear`.
+///
+/// Where the star map is a spline, its exact path clamps at the spline's
+/// domain, so the field has a derivative kink there: the one 8-px cell
+/// straddling a frame edge carries up to ≈ 0.012 px of bilinear error. Every
+/// consumer reads NaN outside the frame, so the 0.01 px pin is a statement
+/// about the frame's interior; do not tighten it at the edge.
 #[derive(Debug)]
 pub struct ComposedField {
     star: PixelMap,
@@ -1083,7 +1104,7 @@ $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Sess
 
 ### Task 2a: The star-map cache, the grid in the run context, registered hashes (D2, D3, D18; spec §4.2, §5.5)
 
-Nothing composes yet: `RunContext.grid` is `None` on every run until Task 2b's tests and Task 8a's `start_stacking` set it. This task lands the caches and the plumbing so Task 2b only adds the composition.
+Nothing composes yet: `RunContext.grid` is `None` on every run until Task 2b1's test helpers and Task 8a's `start_stacking` set it. This task lands the caches and the plumbing so Task 2b2 only adds the composition.
 
 **Files:**
 - Modify `crates/athenaeum-core/src/stacking/plan.rs`:
@@ -1126,7 +1147,7 @@ pub struct RegisteredCards<'a> { /* … */ pub reference_roworder: Option<&'a st
 // provenance.rs
 pub struct RunSummary { /* … */ pub grid: Option<crate::collab::grid::CanonicalGrid> }
 ```
-Consumed by: Task 2b (everything above), Task 3 (`RunContext.grid`), Task 5a (`ln_registration_by_frame`), Task 8a (`RunSummary.grid`, `RunContext.grid`).
+Consumed by: Task 2b2 (everything above), Task 3 (`RunContext.grid`), Task 5a (`ln_registration_by_frame`), Task 8a (`RunSummary.grid`, `RunContext.grid`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1304,13 +1325,13 @@ pub(crate) fn stored_registrations(
                     Some(Ok(record)) => out.push(record),
                     Some(Err(e)) => tracing::warn!(
                         project_id = %project_id,
-                        frame_id = row.frame_id,
+                        frame_id = ?row.frame_id,
                         error = %e,
                         "stored star map unreadable; the frame registers again"
                     ),
                     None => tracing::warn!(
                         project_id = %project_id,
-                        frame_id = row.frame_id,
+                        frame_id = ?row.frame_id,
                         "stored star map has no payload; the frame registers again"
                     ),
                 }
@@ -1453,7 +1474,7 @@ At the call in `build_plan`: `compute_register_stale(conn, &cfg, subject, &group
     /// (plan 6b-3 D2) — stamped as `ATH_GRID`; `None` for a frame set.
     pub grid_hash: Option<&'a str>,
 ```
-and in `build_registered_cards`, right after the `ATH_REGS` push (before `ATH_REGT`):
+and in `build_registered_cards`, the `ROWORDER` card's comment becomes `"row order of the output grid"` (review M3: it reads true for a frame set's reference grid and for a project's canonical grid; production passes `reference_roworder: None` for every frame set today, `run.rs:6892`, so no frame-set byte moves), and right after the `ATH_REGS` push (before `ATH_REGT`):
 ```rust
     if let Some(grid) = reg.grid_hash {
         cards.push(
@@ -1498,7 +1519,7 @@ fn delivered_dims(rc: &RunContext, native: (usize, usize)) -> (usize, usize) {
   ```
   The reused branch (`~5366`): `registered_hash: row.config_hash.clone().unwrap_or_default(),`. The freshness check below it destructures `RegisteredFrameOutcome::Aligned { map, record, registered_hash, .. }` and passes `registered_hash` to `registered_artifact_is_fresh` and into the `ArtifactRewriteItem`. The persisting results loop (`~5999`): `registered_hash` from the `RegisteredWrite`. `process_group_output` (`~7976`): `Some(RegisteredFrameOutcome::Aligned { map, registered_hash, .. }) => (map.clone(), registered_hash.clone()),`.
 - `ArtifactRewriteItem` gains `registered_hash: String`; the rewrite fan-out returns `(item.frame_id, item.registered_hash.clone(), Result<PathBuf, String>)` instead of the record, and the results loop calls `record_registered_artifact(rc, &group.key, frame_id, &registered_hash, &out_path)`.
-- `RegisteredWrite` gains `registered_hash: String`, filled with `item.expected_hash.clone()` in the main fan-out (Task 2b composes it on a grid); the results loop calls `record_registered_artifact(rc, &group.key, frame.frame_id, &registered_hash, out_path)` and builds the outcome with it.
+- `RegisteredWrite` gains `registered_hash: String`, filled with `item.expected_hash.clone()` in the main fan-out (Task 2b2 composes it on a grid); the results loop calls `record_registered_artifact(rc, &group.key, frame.frame_id, &registered_hash, out_path)` and builds the outcome with it.
 - `write_one_registered_frame`: new parameter `grid_hash: Option<&str>` after `rec`; `RegisteredCards { …, reference_roworder: grid_hash.map(|_| "BOTTOM-UP"), grid_hash }` (D3: a grid frame states the grid's own row order, never the reference's). Both callers pass `None` in this task.
 - `record_registered_artifact`: replace `rec: &RegistrationRecord` with `registered_hash: &str` and use it as `config_hash`; its doc names D2.
 
@@ -1519,21 +1540,19 @@ $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Sess
 
 ---
 
-### Task 2b: Registration onto the grid (D1, D2, D22; spec §5.5)
+### Task 2b1: The sky-field project fixture (D1, D22; first half of the review's registration split)
 
 **Files:**
-- Modify `crates/athenaeum-core/src/stacking/run.rs`, `register_group_pass` (`~5283-6077`):
-  - the compose context, resolved once per persisting pass;
-  - the reused branch composes the cached star map (`~5360-5380`);
-  - the main fan-out composes after `to_record` and writes with the composed map (`~5790-5870`);
-  - `RegisteredWrite` gains `map`; the results loop stores it (`~5995-6003`);
-  - both `write_one_registered_frame` calls pass the grid hash;
-  - tests.
-- Modify `crates/athenaeum-core/src/stacking/test_fixtures.rs`: the sky-field project frames; `add_project_frame`'s manifest-and-landing tail moves into a shared helper (a pure move).
+- Modify `crates/athenaeum-core/src/stacking/test_fixtures.rs`: `add_project_frame`'s manifest-and-landing tail moves into a shared helper (a pure move); the sky-field project frames; the east-pair constants (review I5); one fixture test.
+- Modify `crates/athenaeum-core/src/stacking/run.rs`, `mod tests` only: the 6b-3 run-test helpers (`seed_sky_project`, `sky_config`, `run_to_register`, `centroid_near`) and `a_project_frame_registers_onto_the_grid`, committed `#[ignore]`d with its reason.
+
+No production code changes: an implementer who breaks the fixture never also holds a half-edited registration fan-out.
 
 **Interfaces:**
 ```rust
 // stacking/test_fixtures.rs (#[cfg(test)])
+pub(crate) struct ManifestSeed<'a> { /* the manifest row and the landing of one fixture frame */ }
+pub(crate) fn seed_manifest_and_land(conn: &Connection, project_id: &str, s: &ManifestSeed<'_>);
 pub(crate) struct SkyFrame<'a> { pub uuid: &'a str, pub publisher: &'a str, pub filter: &'a str, pub width: usize, pub height: usize, pub scale_arcsec: f64, pub centre: (f64, f64), pub file: ProjectFile, pub bayerpat: Option<&'a str>, pub manifest_wcs: bool, pub noise_seed: u64, pub accepted: bool }
 pub(crate) fn sky_frame(uuid: &str, centre: (f64, f64)) -> SkyFrame<'_>;
 pub(crate) fn sky_stars(centre: (f64, f64), half_deg: f64, spacing_arcsec: f64, seed: u64) -> Vec<(f64, f64, f64)>;
@@ -1541,8 +1560,16 @@ pub(crate) fn sky_frame_record(f: &SkyFrame<'_>) -> PlateSolveRecord;
 pub(crate) struct RenderedSkyFrame { pub path: PathBuf, pub file_name: String, pub meta: serde_json::Value, pub byte_size: i64, pub blake3: String }
 pub(crate) fn render_sky_frame(dir: &Path, project_id: &str, f: &SkyFrame<'_>, stars: &[(f64, f64, f64)]) -> RenderedSkyFrame;
 pub(crate) fn add_project_sky_frame(conn: &Connection, dir: &Path, project_id: &str, f: &SkyFrame<'_>, stars: &[(f64, f64, f64)]) -> PathBuf;
+pub(crate) const EAST_PAIR_OFFSET_WIDTHS: f64 = 0.85;
+pub(crate) const EAST_PAIR_SPACING_ARCSEC: f64 = 40.0;
+pub(crate) const EAST_PAIR_STAR_SEED: u64 = 9;
+// stacking/run.rs, mod tests
+fn seed_sky_project(conn: &rusqlite::Connection, landed: &Path, n: usize) -> crate::collab::grid::CanonicalGrid;
+fn sky_config(conn: &rusqlite::Connection) -> StackingConfig;
+fn run_to_register(rc: &mut RunContext);
+fn centroid_near(plane: &[f32], w: usize, x: f64, y: f64) -> (f64, f64);
 ```
-Consumed by: Tasks 3, 5b, 6a, 7b (run-level project tests), Task 9 (`render_sky_frame`, `sky_frame_record`, `sky_stars`).
+Consumed by: Task 2b2 (the helpers, the ignored test), Tasks 3, 5b, 6a, 7b2, 8a (run-level project tests), Task 9 (`render_sky_frame`, `sky_frame_record`, `sky_stars`, the east-pair constants).
 
 - [ ] **Step 1: Add the sky-field fixture**
 
@@ -1819,11 +1846,68 @@ pub(crate) fn add_project_sky_frame(
     r.path
 }
 ```
-(`ProjectFile` derives `Debug`; add the derive if it does not.)
+(`ProjectFile` derives `Debug`, `test_fixtures.rs:875`.)
 
-- [ ] **Step 2: Write the failing tests**
+Then, beside the sky fixture, the east-pair geometry Task 5b's run test and Task 9's e2e share (review I5):
+```rust
+/// How far east of the main field the low-overlap pair sits, in frame
+/// widths (plan 6b-3 D7, review I5): each of the two frames overlaps the
+/// main field on ≈ 15 % of its own footprint, under the 25 % LN rule.
+pub(crate) const EAST_PAIR_OFFSET_WIDTHS: f64 = 0.85;
+/// The star spacing of that field. The pair registers over its ≈ 15 %
+/// strip (≈ 86″ × 432″ at 1.5″/px): 40″ puts ≈ 23 stars there, 50″ ≈ 15.
+/// Task 5b's run test registers the strip first; Task 9's e2e reuses it.
+pub(crate) const EAST_PAIR_SPACING_ARCSEC: f64 = 40.0;
+/// The star-field seed of that geometry, shared for the same reason.
+pub(crate) const EAST_PAIR_STAR_SEED: u64 = 9;
+```
+and one fixture test in `test_fixtures.rs`'s own `mod tests` (`~789`), so a rendering fault shows here and not as a registration failure later:
+```rust
+    /// Plan 6b-3 Task 2b1: a rendered sky frame puts each star where its own
+    /// WCS says — the brightest pixel within 2 px of the predicted position
+    /// is within 1 px of it — and its manifest `meta.wcs` carries the 1-based
+    /// `crpix` the exchange writes.
+    #[test]
+    fn a_sky_frame_puts_its_stars_where_its_wcs_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = sky_frame("s0", (83.8, -5.4));
+        let stars = sky_stars((83.8, -5.4), 0.12, 50.0, 7);
+        let r = render_sky_frame(dir.path(), "p1", &f, &stars);
+        let wcs = sky_frame_record(&f).to_solution().unwrap();
+        let plane = crate::integration::plane_reader::PlaneReader::open(&r.path).unwrap().read_plane(0).unwrap();
+        let (w, h) = (f.width as i64, f.height as i64);
+        let mut checked = 0usize;
+        for &(ra, dec, _) in &stars {
+            let (x, y) = wcs.sky_to_pixel(ra, dec);
+            if x < 10.0 || y < 10.0 || x > (w - 11) as f64 || y > (h - 11) as f64 {
+                continue;
+            }
+            let (cx, cy) = (x.round() as i64, y.round() as i64);
+            let mut best = (f32::MIN, 0i64, 0i64);
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let v = plane[((cy + dy) * w + (cx + dx)) as usize];
+                    if v > best.0 {
+                        best = (v, cx + dx, cy + dy);
+                    }
+                }
+            }
+            assert!(
+                (best.1 as f64 - x).hypot(best.2 as f64 - y) <= 1.0,
+                "star at ({x:.2}, {y:.2}) peaks at ({}, {})",
+                best.1,
+                best.2
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20, "{checked} stars inside the frame");
+        assert_eq!(r.meta["wcs"]["crpix1"], serde_json::json!(f.width as f64 / 2.0 + 0.5));
+    }
+```
 
-`stacking/run.rs`, `mod tests`, after the 6b-2 project tests:
+- [ ] **Step 2: Write the run-test helpers and the first grid test, ignored**
+
+`stacking/run.rs`, `mod tests`, after the 6b-2 project tests (Task 2b2 removes the `#[ignore]`):
 ```rust
     /// The project fixture of the 6b-3 run tests: `n` mono L frames dithered
     /// around the fixture target (83.8, −5.4), every one with a manifest
@@ -1834,7 +1918,11 @@ pub(crate) fn add_project_sky_frame(
         let stars = test_fixtures::sky_stars(target, 0.12, 50.0, 7);
         let uuids: Vec<String> = (0..n).map(|i| format!("l{i}")).collect();
         for (i, uuid) in uuids.iter().enumerate() {
-            let dither = ((i as f64 - 1.5) * 0.002, (i % 2) as f64 * 0.001);
+            // Dithers of ±3.6 / ±1.2 px (RA) and 1.2 px (Dec): the LN field's
+            // frame-unit lattice (D8, review I6) resolves a dither, and the
+            // 0.97 rule fails a member that misses over 3 % of the field —
+            // as it fails a frame set's member against the reference.
+            let dither = ((i as f64 - 1.5) * 0.001, (i % 2) as f64 * 0.0005);
             let mut f = test_fixtures::sky_frame(uuid, (target.0 + dither.0, target.1 + dither.1));
             f.noise_seed = 100 + i as u64;
             test_fixtures::add_project_sky_frame(conn, landed, "p1", &f, &stars);
@@ -1896,6 +1984,7 @@ pub(crate) fn add_project_sky_frame(
     /// row order. The star map is cached as a `registration` artifact, never
     /// in `registration_results`.
     #[test]
+    #[ignore = "plan 6b-3 Task 2b2: registration composes onto the grid"]
     fn a_project_frame_registers_onto_the_grid() {
         let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
         let tmp = tempfile::tempdir().unwrap();
@@ -1949,7 +2038,43 @@ pub(crate) fn add_project_sky_frame(
         let catalog_rows: i64 = conn.query_row("SELECT COUNT(*) FROM registration_results", [], |r| r.get(0)).unwrap();
         assert_eq!(catalog_rows, 0, "a project never writes registration_results");
     }
+```
 
+- [ ] **Step 3: Confirm the ignored test fails for the right reason, and the fixture test passes**
+
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- a_sky_frame_puts_its_stars registers_onto_the_grid --include-ignored --test-threads=4 2>&1 | tail -30`
+Expected: `a_sky_frame_puts_its_stars_where_its_wcs_says` passes. `a_project_frame_registers_onto_the_grid` FAILS at `assert!(map.is_flipped(), …)`: every frame registered, but its map is still its star map onto the reference (same parity), not the composed, mirrored map Task 2b2 builds. Record the output. Any earlier failure (a frame that did not register, a missing artifact, a fixture panic) is a fixture fault: fix it in this task.
+
+- [ ] **Step 4: Run the gates.** The ignored test does not run in them. `git diff --exit-code src/types`.
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/athenaeum-core/src/stacking/test_fixtures.rs crates/athenaeum-core/src/stacking/run.rs
+git commit -m "test(stacking): sky-field project fixture and the first grid registration test (ignored until the composition lands)
+
+$(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01YEaoHWL2V7MEXaXHgsiVwK')"
+```
+
+---
+
+### Task 2b2: Registration onto the grid (D1, D2, D22; spec §5.5)
+
+**Files:**
+- Modify `crates/athenaeum-core/src/stacking/run.rs`, `register_group_pass` (`~5283-6077`):
+  - the compose context, resolved once per persisting pass;
+  - the reused branch composes the cached star map (`~5360-5380`);
+  - the main fan-out composes after `to_record` and writes with the composed map (`~5790-5870`);
+  - `RegisteredWrite` gains `map`; the results loop stores it (`~5995-6003`);
+  - both `write_one_registered_frame` calls pass the grid hash;
+  - tests: `a_project_frame_registers_onto_the_grid` loses its `#[ignore]`; two more.
+
+**Interfaces:** nothing new — the seam is Task 1's `compose_to_grid`/`grid_registered_hash`/`subject_dims`, Task 2a's `RunContext.grid`/`Aligned.registered_hash`/`write_one_registered_frame(.., grid_hash)`, and Task 2b1's fixture.
+Consumed by: Task 3 (grid-registered frames), Task 5a (`GroupMember.registration_hash` is the registered hash on a grid).
+
+- [ ] **Step 1: Write the two remaining failing tests, and un-ignore the first**
+
+In `stacking/run.rs`, `mod tests`, delete the `#[ignore = …]` line above `a_project_frame_registers_onto_the_grid` (Task 2b1), then add after it:
+```rust
     /// Spec §5.5, plan 6b-3 D2: moving the grid re-composes the cached star
     /// maps and rewrites every registered frame — no star detection runs.
     #[test]
@@ -2036,12 +2161,12 @@ pub(crate) fn add_project_sky_frame(
     }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- registers_onto_the_grid recomposes_without_star_detection register_cached_then_stale --test-threads=4 2>&1 | tail -20`
-Expected: the first test FAILS (registered frames are 384 × 288 reference geometry, no `ATH_GRID`), the second and third fail for the same reason. Record the output.
+Expected: the first test FAILS at `map.is_flipped()` (as recorded in Task 2b1), the second and third fail because nothing composes onto the grid yet (no composed, mirrored map; registered hashes without the grid). Record the output.
 
-- [ ] **Step 4: Implement the composition in `register_group_pass`**
+- [ ] **Step 3: Implement the composition in `register_group_pass`**
 
 Imports at the top of `run.rs`: `use crate::stacking::grid_map::{compose_to_grid, grid_registered_hash, subject_dims, GridRun, ReferenceWcs};`
 
@@ -2124,16 +2249,16 @@ then write with `&map` (not `&alignment.map`), passing `compose_ref.as_ref().map
 
 The cache-hit rewrite batch passes `compose.as_ref().map(|(g, _)| g.hash.as_str())` as `grid_hash` (its items already carry the composed map and hash from the reused branch).
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- registers_onto_the_grid recomposes_without_star_detection register_cached_then_stale stacking::run::tests --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
-Expected: all pass. If a sky frame fails to register (its exclusion reason says so), raise the star density (`sky_stars` spacing 40″) — never weaken an assertion — and report it.
+Expected: all pass. If a sky frame fails to register (its exclusion reason says so), raise the star density of `seed_sky_project` (`sky_stars` spacing 40″) — never weaken an assertion — and report it.
 
-- [ ] **Step 6: Run the gates.** `git diff --stat src/types` empty.
+- [ ] **Step 5: Run the gates.** `git diff --stat src/types` empty.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 ```bash
-git add crates/athenaeum-core/src/stacking/run.rs crates/athenaeum-core/src/stacking/test_fixtures.rs
+git add crates/athenaeum-core/src/stacking/run.rs
 git commit -m "feat(stacking): register project frames onto the canonical grid through one composed map
 
 $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01YEaoHWL2V7MEXaXHgsiVwK')"
@@ -2148,7 +2273,7 @@ $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Sess
 - Modify `crates/athenaeum-core/src/stacking/paths.rs`: `subject_output_dir`; one test.
 - Modify `crates/athenaeum-core/src/stacking/run.rs`:
   - `stage_output` (`~10826-10916`): the grid's synthetic WCS replaces the reference's solve on a grid run;
-  - `process_group_output`: `stamp_grid_cards` on the master's cards (after `build_master_light_cards`, `~8825-8848`) and on the drizzle cards (after `build_drizzle_cards`, `~9330-9340`);
+  - `process_group_output`: `stamp_grid_cards` on the master's cards (after `build_master_light_cards`, `~8825-8848`) and on the drizzle cards (after `build_drizzle_cards`, `~9330-9340`); one warning for a grid group with an empty canonical filter (review M4);
   - `start_stacking` (`~935`): `output_dir` through `subject_output_dir` (a frame set's is unchanged; the project branch is reached from Task 8a);
   - tests: `project_rc` (test helper) puts the output under `subject_output_dir`; two run tests.
 - Modify `crates/athenaeum-core/src/stacking/solve.rs`: the ignored real-data probe `real_data_grid_master_wcs_probe` (run by the acceptance agent).
@@ -2165,7 +2290,7 @@ pub fn card_with_optional_comment(keyword: &str, value: &str, comment: &str) -> 
 // stacking/paths.rs
 pub fn subject_output_dir(output_root: &Path, subject: &StackSubject, label: &str) -> PathBuf;
 ```
-Consumed by: Task 6a (`coverage_map_cards` copies `ATH_GRID`/`ATH_SPRJ`), Task 7b (crop restates `CRPIX` on these cards), Task 8a (`subject_output_dir`).
+Consumed by: Task 6a (`coverage_map_cards` copies `ATH_GRID`/`ATH_SPRJ`), Tasks 7b1 and 7b2 (crop restates `CRPIX` on these cards), Task 8a (`subject_output_dir`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2507,6 +2632,9 @@ pub fn card_with_optional_comment(
 /// no `PLTSOLVD` (a grid TAN is not a plate solve). Every earlier card of
 /// those keys is dropped first, and `ATH_PRJ` defensively too, so each
 /// appears once. Variable-length values carry no comment unless it fits.
+/// An empty canonical filter writes no `FILTER` at all (review M4): the
+/// reference's card is a publisher's raw name and must not leak; the run
+/// warns once for such a group.
 pub fn stamp_grid_cards(cards: &mut Vec<Card>, stamp: &GridStamp<'_>) -> Result<(), FitsWriteError> {
     cards.retain(|c| {
         !matches!(
@@ -2577,6 +2705,18 @@ pub fn subject_output_dir(output_root: &Path, subject: &StackSubject, label: &st
   ```
   make `let cards = match build_master_light_cards(…)` `let mut cards`, and after it:
   ```rust
+    if grid_stamp.is_some() && group.filter.as_deref().map(str::trim).is_none_or(str::is_empty) {
+        // Review M4: a grid master never carries the reference's raw FILTER.
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            "the group's canonical filter is empty; the grid master carries no FILTER"
+        );
+        rc.warnings.push(format!(
+            "group {}: its canonical filter is empty, so the master carries no FILTER card",
+            group.key
+        ));
+    }
     if let Some((grid, project_id)) = &grid_stamp {
         if let Err(e) = stamp_grid_cards(
             &mut cards,
@@ -2628,7 +2768,7 @@ $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Sess
 
 ### Task 4: The engine's coverage count and the "empty → NaN" option (D4, D5; spec §5.6 seam 1, §5.7)
 
-Every caller passes `empty_as_nan = false` in this task; Task 5a switches it on for a project's LN reference together with masked LN (D5). The coverage count is consumed by Tasks 6a (the map) and 7b (the crop).
+Every caller passes `empty_as_nan = false` in this task; Task 5a switches it on for a project's LN reference together with masked LN (D5). The coverage count is consumed by Tasks 6a (the map, and the covered rectangle grid statistics are measured on) and 7b2 (the crop).
 
 **Files:**
 - Modify `crates/athenaeum-core/src/integration/engine.rs`:
@@ -2659,7 +2799,7 @@ pub struct GroupOutput { /* … */ pub coverage: Option<Vec<f32>> }
 // stacking/ln/reference.rs
 pub fn build_reference(input: &GroupInput<'_>, included: &[usize], n: usize, pool: &Arc<rayon::ThreadPool>, cancel: &AtomicBool, io: IoPolicy, on_progress: &(dyn Fn(usize, usize) + Sync), empty_as_nan: bool) -> Result<LnReference, IntegrationError>;
 ```
-Consumed by: Task 5a (`build_reference(…, true)` on a grid), Task 6a (`GroupInput.coverage_map`, `GroupOutput.coverage`), Task 7b (the coverage plane in crop mode).
+Consumed by: Task 5a (`build_reference(…, true)` on a grid), Task 6a (`GroupInput.coverage_map`, `GroupOutput.coverage`), Task 7b2 (the coverage plane in crop mode).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3011,9 +3151,12 @@ Consumed by: Task 5b (`LnError::LowOverlap`, `ln_registration_upstream`).
     /// Plan 6b-3 D6, spec §5.6: a member that covers only part of the LN
     /// reference — and a reference that covers only part of the member — is
     /// normalized on their overlap and recovers the truth `R = 1.25·T + 0.03`:
-    /// the relative scale within 1 % and the additive term everywhere within
-    /// 0.002. Under a quarter of overlap the frame is refused `LowOverlap`
-    /// before any fit.
+    /// the relative scale within 1 % and the additive term within 0.002 on
+    /// every grid node inside the overlap eroded by the 48 px seed margin
+    /// (review I2: what a node outside the overlap holds is
+    /// `background_grid`'s extrapolation into masked cells, which the method
+    /// does not define). Under a quarter of overlap the frame is refused
+    /// `LowOverlap` before any fit.
     #[test]
     fn masked_ln_recovers_a_half_covered_members_scale() {
         use crate::fits_writer::write_fits_f32;
@@ -3120,9 +3263,23 @@ Consumed by: Task 5b (`LnError::LowOverlap`, `ln_registration_upstream`).
 
         let (outcome, grids) = run(100, "half").expect("a 78 % overlap normalizes");
         assert!((outcome.scale - 1.25).abs() < 0.0125, "scale {}", outcome.scale);
-        for b in &grids.channels[0].b {
-            assert!((b - 0.03).abs() < 0.002, "B node {b}");
+        // The overlap is x in 100..420; eroded by LN_MASK_MARGIN_PX (48) it is
+        // x in 148..372, y in 48..336. Node (i, j) sits at pixel (i, j)·stride.
+        let g = &grids.channels[0];
+        let stride = g.stride();
+        let mut checked = 0usize;
+        for j in 0..g.gh {
+            for i in 0..g.gw {
+                let (x, y) = (i * stride, j * stride);
+                if !(148..372).contains(&x) || !(48..336).contains(&y) {
+                    continue;
+                }
+                let b = g.b[j * g.gw + i];
+                assert!((b - 0.03).abs() < 0.002, "B node at ({x}, {y}): {b}");
+                checked += 1;
+            }
         }
+        assert!(checked >= 40, "{checked} nodes inside the eroded overlap");
 
         match run(400, "sliver") {
             Err(LnError::LowOverlap { fraction }) => {
@@ -3132,7 +3289,7 @@ Consumed by: Task 5b (`LnError::LowOverlap`, `ln_registration_upstream`).
         }
     }
 ```
-(If `LnFrameOutcome` does not derive `Debug`, `panic!` on `other` with `{:?}` needs it — add `#[derive(Debug)]` if missing; `LnFrameGrids`/`LnGrid` already round-trip through `read`.)
+(`LnFrameOutcome` derives `Debug`, `ln/mod.rs:219`, which the `panic!` on `other` needs; `LnFrameGrids`/`LnGrid` already round-trip through `read`.)
 
 `stacking/plan.rs`, `mod tests`:
 ```rust
@@ -3292,6 +3449,10 @@ with `Display` `"local normalization: the frame overlaps the LN reference on {:.
 ```rust
         // Plan 6b-3 D6 (spec §5.6 seam 2): on a grid, the member's models are
         // fitted on its overlap with the LN reference, never on sanitized NaN.
+        // Only the overlap's grid nodes are defined by the fit: a node outside
+        // it carries whatever `background_grid` extrapolates into masked
+        // cells (on both sides, so it may or may not cancel). Integration
+        // never reads it — the member is NaN there — so do not "fix" it.
         let masked = reference_for_detection.overlap == LnOverlap::Masked;
         let mut member_ref_bg: Option<BackgroundGrid> = None;
         let mut allowed: Option<Vec<bool>> = None;
@@ -3374,7 +3535,8 @@ In the per-frame LN check: `let frame_registration_hash = ln_registration_upstre
 - beside `ln_working_set_bytes`:
   ```rust
 /// Plan 6b-3 D6: masked LN also holds, per worker, the overlap and eroded
-/// masks and a masked copy of the reference plane — three planes' worth.
+/// masks (a byte per pixel each) and a masked copy of the reference plane
+/// (four bytes): counted as three f32 planes, rounded up from 1.5.
 pub(crate) const LN_MASKED_EXTRA_PLANES: u64 = 3;
 
 pub(crate) fn ln_working_set_bytes_masked(w: u64, h: u64) -> u64 {
@@ -3409,27 +3571,38 @@ $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Sess
 
 ---
 
-### Task 5b: The low-overlap fallback, grid-mode admissibility, one plane rule (D7, D8, D15, D19; spec §5.6)
+### Task 5b: The low-overlap fallback, the LN field and its plan twin, one plane rule (D7, D8, D15, D19; spec §5.6)
 
 **Files:**
 - Modify `crates/athenaeum-core/src/stacking/run.rs`:
   - `run_group_normalization`: `LN_GLOBAL_ARTIFACT_KIND`; read each member's marker beside `existing_ln_rows` (`~10017-10040`); `anything_stale` (`~10106-10111`) and the freshness loop (`~10146-10212`) treat a fresh marker as cached; the fan-out keeps the typed `LnError` (`~10306-10360`); the results loop turns `LowOverlap` into the fallback (`~10427-10510`); one warning per group;
-  - `member_coverages` (new), used by `process_group_output`'s `pick_reference_idx` (`~8150-8170`) and `run_group_normalization`'s coverage mask (`~9688-9698`);
+  - `group_ln_field_for` and `member_coverages` (new): the group's LN field on the grid, used by `process_group_output`'s `pick_reference_idx` (`~8086-8105`) and `run_group_normalization`'s coverage mask (`~9688-9698`), whose member LN upstreams also fold the field's hash;
   - `expected_stage_one_planes` (`~2006-2013`) delegates to `plan::stage_one_planes(cfg, group, true)`;
   - one test.
-- Modify `crates/athenaeum-core/src/stacking/weights.rs`: `median_footprint_coverage`; one test.
-- Modify `crates/athenaeum-core/src/stacking/plan.rs`: `stage_one_planes` replaces `expected_ln_channels` (`~907-925`), called with `prepare_path = project.is_some() || readiness.attested` (`~2674`); the per-frame LN check also accepts a fresh marker (`~2796-2840`); one test.
+- Modify `crates/athenaeum-core/src/stacking/weights.rs`: `LN_FIELD_PROBES_PER_FRAME_SIDE`, `LnField`, `ln_field`; two tests.
+- Modify `crates/athenaeum-core/src/stacking/origin.rs`: `ln_footprint`, `GroupLnField`, `group_ln_field` — the one function the run and the plan both call (review I6).
+- Modify `crates/athenaeum-core/src/stacking/plan.rs`: `stage_one_planes` replaces `expected_ln_channels` (`~907-925`), called with `prepare_path = project.is_some() || readiness.attested` (`~2674`); `ln_upstream_on_field`; the per-group field hash, and the per-frame LN check folds it and also accepts a fresh marker (`~2796-2840`); one test.
 - Modify `crates/athenaeum-core/src/stacking/paths.rs`: `"ln_global"` joins `INTERMEDIATE_ARTIFACT_KINDS` (`~907-915`), with a doc line; update any test that pins the list.
 
 **Interfaces:**
 ```rust
 // stacking/run.rs
 pub(crate) const LN_GLOBAL_ARTIFACT_KIND: &str = "ln_global";
-fn member_coverages(grid_mode: bool, members: &[GroupMember], ref_w: usize, ref_h: usize) -> Vec<f64>;
+fn group_ln_field_for(rc: &RunContext, group: &IntegrationGroup) -> Result<Option<GroupLnField>, RunError>;
+fn member_coverages(field: Option<&GroupLnField>, members: &[GroupMember], ref_w: usize, ref_h: usize) -> Vec<f64>;
 // stacking/weights.rs
-pub(crate) fn median_footprint_coverage(members: &[(&PixelMap, usize, usize)], grid_w: usize, grid_h: usize) -> Vec<f64>;
+pub(crate) const LN_FIELD_PROBES_PER_FRAME_SIDE: f64 = 32.0;
+pub(crate) struct LnField { /* private */ }
+pub(crate) fn ln_field(footprints: &[&FrameFootprint], grid: &CanonicalGrid) -> LnField;
+impl LnField { pub(crate) fn is_empty(&self) -> bool; pub(crate) fn coverage(&self, fp: Option<&FrameFootprint>) -> f64; }
+// stacking/origin.rs
+pub(crate) fn ln_footprint(conn: &Connection, origin: &FrameOrigin, frame_id: i64) -> anyhow::Result<Option<FrameFootprint>>;
+pub(crate) struct GroupLnField { pub(crate) hash: String, /* private */ }
+impl GroupLnField { pub(crate) fn coverage_of(&self, frame_id: i64) -> f64; }
+pub(crate) fn group_ln_field(conn: &Connection, origins: &FrameOrigins, in_scope: &[i64], grid: &CanonicalGrid) -> anyhow::Result<GroupLnField>;
 // stacking/plan.rs
 pub(crate) fn stage_one_planes(cfg: &StackingConfig, group: &IntegrationGroup, prepare_path: bool) -> usize;
+pub(crate) fn ln_upstream_on_field(registration_hash: &str, field_hash: &str) -> String;
 ```
 Consumed by: Task 9 (the e2e's fallback assertion).
 
@@ -3437,32 +3610,68 @@ Consumed by: Task 9 (the e2e's fallback assertion).
 
 `stacking/weights.rs`, `mod tests`:
 ```rust
-    /// Plan 6b-3 D8: on a grid wider than every frame, the 0.97 rule is
-    /// measured against the group's own field — the probes at least half the
-    /// members cover — so the members that share it pass and an offset one
-    /// fails; against the whole grid every member would fail.
+    /// A TAN footprint of `w × h` px at 1.5″/px centred `dx` grid pixels east
+    /// of (83.8, −5.4) (east is −x on a north-up grid).
+    fn footprint_east(dx: f64, w: f64, h: f64) -> crate::collab::grid_geometry::FrameFootprint {
+        let s = 1.5 / 3600.0;
+        crate::collab::grid_geometry::FrameFootprint {
+            wcs: solvemyastro::wcs::WcsSolution {
+                crpix: ((w - 1.0) / 2.0, (h - 1.0) / 2.0),
+                crval: (83.8 + dx * s / (-5.4f64).to_radians().cos(), -5.4),
+                cd: [[-s, 0.0], [0.0, s]],
+                sip_forward: None,
+                sip_reverse: None,
+            },
+            width: w,
+            height: h,
+        }
+    }
+
+    /// Plan 6b-3 D8 (refined by review I6): on a grid wider than every frame
+    /// the 0.97 rule is measured against the group's own field — the
+    /// lattice probes at least half the members cover, spaced in FRAME units
+    /// (a 300-px frame side over 32 ≈ 9.4 px here, whatever the grid's
+    /// size) — so the members that share it pass and an offset one fails;
+    /// against the whole grid every member would fail.
     #[test]
     fn a_wide_grid_keeps_the_coverage_filter_on_the_groups_own_field() {
-        use crate::geometry::{Linear, LinearKind, PixelMap};
-        let shift = |dx: f64| {
-            PixelMap::linear(Linear {
-                kind: LinearKind::Affine,
-                m: [[1.0, 0.0, dx], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            })
-            .unwrap()
+        let grid = crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.5,
+            width_px: 1000,
+            height_px: 400,
+            crval1: 83.8,
+            crval2: -5.4,
+            rotation_deg: 0.0,
         };
-        let maps: Vec<PixelMap> = [0.0, 5.0, 10.0, 15.0, 200.0].iter().map(|&d| shift(d)).collect();
-        let members: Vec<(&PixelMap, usize, usize)> = maps.iter().map(|m| (m, 300, 400)).collect();
-        let cov = median_footprint_coverage(&members, 1000, 400);
-        for (i, c) in cov.iter().enumerate().take(4) {
-            assert!(*c >= MIN_REFERENCE_COVERAGE, "member {i}: {c}");
+        let fps: Vec<_> = [0.0, 2.0, 4.0, 6.0, 200.0].iter().map(|&d| footprint_east(d, 300.0, 400.0)).collect();
+        let refs: Vec<&crate::collab::grid_geometry::FrameFootprint> = fps.iter().collect();
+        let field = ln_field(&refs, &grid);
+        assert!(!field.is_empty());
+        for (i, fp) in fps.iter().enumerate().take(4) {
+            let c = field.coverage(Some(fp));
+            assert!(c >= MIN_REFERENCE_COVERAGE, "member {i}: {c}");
         }
-        assert!(cov[4] < MIN_REFERENCE_COVERAGE, "the offset member: {}", cov[4]);
-        assert!(
-            reference_coverage(&maps[0], 300, 400, 1000, 400) < MIN_REFERENCE_COVERAGE,
-            "the grid rectangle is out of every member's reach"
-        );
-        assert_eq!(median_footprint_coverage(&[], 1000, 400), Vec::<f64>::new());
+        let offset = field.coverage(Some(&fps[4]));
+        assert!(offset < MIN_REFERENCE_COVERAGE, "the offset member: {offset}");
+        assert_eq!(field.coverage(None), 0.0, "a frame with no WCS footprint never qualifies");
+        assert!(ln_field(&[], &grid).is_empty());
+    }
+
+    /// Review I6: one lost probe never fails a member — a footprint that
+    /// misses exactly one of a four-probe field still reads 1.0; missing two
+    /// reads 0.75.
+    #[test]
+    fn the_ln_field_forgives_one_lost_probe() {
+        let probe = |dra_deg: f64| (83.8 + dra_deg, -5.4);
+        let field = LnField {
+            sky: vec![probe(0.0), probe(0.004), probe(0.008), probe(0.03)],
+            in_field: vec![true; 4],
+            n_field: 4,
+        };
+        // 100 px at 1.5″/px reaches ±0.0208° in RA: three probes inside.
+        assert_eq!(field.coverage(Some(&footprint_east(0.0, 100.0, 100.0))), 1.0);
+        // 30 px reaches ±0.0063°: two probes inside.
+        assert_eq!(field.coverage(Some(&footprint_east(0.0, 30.0, 30.0))), 0.75);
     }
 ```
 
@@ -3501,16 +3710,24 @@ Consumed by: Task 9 (the e2e's fallback assertion).
 `stacking/run.rs`, `mod tests`:
 ```rust
     /// The fallback fixture: one `L` group of four frames on one field and
-    /// two frames 0.85 of a frame width east — their overlap with the other
-    /// four is about 15 % of their own footprint — on a grid wide enough for
-    /// both, with LN on.
+    /// two frames `EAST_PAIR_OFFSET_WIDTHS` (0.85) of a frame width east —
+    /// their overlap with the other four is about 15 % of their own
+    /// footprint — on a grid wide enough for both, with LN on. The star
+    /// field is the e2e's own (review I5: the same spacing and seed, so the
+    /// strip registration is tried here first, far cheaper than in Task 9).
     fn seed_two_field_project(conn: &rusqlite::Connection, landed: &Path) -> crate::collab::grid::CanonicalGrid {
         crate::db::stacking::insert_test_project(conn, "p1");
         let target = (83.8, -5.4);
-        let east = 0.85 * 384.0 * 1.5 / 3600.0 / target.1.to_radians().cos();
-        let stars = test_fixtures::sky_stars((target.0 + east / 2.0, target.1), 0.2, 50.0, 9);
+        let east = test_fixtures::EAST_PAIR_OFFSET_WIDTHS * 384.0 * 1.5 / 3600.0 / target.1.to_radians().cos();
+        let stars = test_fixtures::sky_stars(
+            (target.0 + east / 2.0, target.1),
+            0.2,
+            test_fixtures::EAST_PAIR_SPACING_ARCSEC,
+            test_fixtures::EAST_PAIR_STAR_SEED,
+        );
         let mut uuids: Vec<(String, (f64, f64))> = (0..4)
-            .map(|i| (format!("a{i}"), (target.0 + (i as f64 - 1.5) * 0.002, target.1 + (i % 2) as f64 * 0.001)))
+            // seed_sky_project's dithers, for the same reason (D8, review I6).
+            .map(|i| (format!("a{i}"), (target.0 + (i as f64 - 1.5) * 0.001, target.1 + (i % 2) as f64 * 0.0005)))
             .collect();
         uuids.extend((0..2).map(|i| (format!("b{i}"), (target.0 + east + i as f64 * 0.002, target.1))));
         for (i, (uuid, centre)) in uuids.iter().enumerate() {
@@ -3531,7 +3748,10 @@ Consumed by: Task 9 (the e2e's fallback assertion).
     /// Spec §5.6, plan 6b-3 D7, D8: a member whose overlap with the LN
     /// reference is under 25 % keeps global normalization — no sidecar, a
     /// marker, still included — with one warning naming the count; a second
-    /// run counts it as cached, and so does the plan.
+    /// run counts it as cached, and so does the plan. The east pair
+    /// registers over its ≈ 15 % strip (review I5: a failure names itself
+    /// here, never as a missing warning in Task 9). The plan's Normalize view
+    /// moves with the LN field before any run does (review I6: the twin).
     #[test]
     fn a_member_under_a_quarter_overlap_keeps_global_normalization() {
         let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
@@ -3560,6 +3780,17 @@ Consumed by: Task 9 (the e2e's fallback assertion).
         let rc = run(cfg.clone());
         let group = rc.plan_groups[0].key.clone();
         let entries = &rc.measured[&group];
+        for e in entries.iter().filter(|e| e.frame.filename.starts_with("c_b")) {
+            let Some(RegisteredFrameOutcome::Aligned { record, .. }) = &e.registration else {
+                panic!("{} did not register over its ≈ 15 % strip: {:?}", e.frame.filename, e.reason);
+            };
+            assert!(
+                record.matched_stars >= 4,
+                "{} registered on {} matched stars",
+                e.frame.filename,
+                record.matched_stars
+            );
+        }
         for e in entries {
             assert!(e.included, "{} stays in the stack: {:?}", e.frame.filename, e.reason);
             let ln = crate::db::stacking::find_artifact(&conn, &rc.subject, &group, "ln", Some(e.frame.frame_id)).unwrap();
@@ -3582,61 +3813,208 @@ Consumed by: Task 9 (the e2e's fallback assertion).
         }
         let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &StackSubject::Project("p1".into()), None).unwrap();
         assert!(!plan.stale_stages.contains(&Stage::Normalize), "{:?}", plan.stale_stages);
+
+        // The twin: excluding a central member moves the field (five frames
+        // in scope, three needed), so every LN hash moves — and the plan says
+        // so now, not after the next run has re-derived the member list.
+        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &["a1".to_string()], None)
+            .unwrap();
+        let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &StackSubject::Project("p1".into()), None).unwrap();
+        assert!(plan.stale_stages.contains(&Stage::Normalize), "{:?}", plan.stale_stages);
     }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- wide_grid_keeps_the_coverage stage_one_planes_follow under_a_quarter_overlap --test-threads=4 2>&1 | tail -20`
-Expected: compile errors (`median_footprint_coverage`, `stage_one_planes`, `LN_GLOBAL_ARTIFACT_KIND`).
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- wide_grid_keeps_the_coverage forgives_one_lost_probe stage_one_planes_follow under_a_quarter_overlap --test-threads=4 2>&1 | tail -20`
+Expected: compile errors (`ln_field`, `LnField`, `stage_one_planes`, `LN_GLOBAL_ARTIFACT_KIND`).
 
 - [ ] **Step 3: Implement**
 
 `stacking/weights.rs`:
 ```rust
-/// Plan 6b-3 D8: each member's coverage of its GROUP's common field on a
-/// project's grid — the 32 × 32 grid probes at least ⌈n/2⌉ members cover —
-/// instead of the grid rectangle (`reference_coverage`), which a grid
-/// wider than every frame puts out of reach of all of them. A member covers
-/// a probe when its map's exact inverse lands inside its own extent (the
-/// exact path builds no displacement grid). No probe so covered: every
-/// member reads 0.0, and the caller drops the filter as it does today.
-pub(crate) fn median_footprint_coverage(
-    members: &[(&PixelMap, usize, usize)],
-    grid_w: usize,
-    grid_h: usize,
-) -> Vec<f64> {
-    const GRID: usize = 32;
-    let n = members.len();
-    if n == 0 || grid_w == 0 || grid_h == 0 {
-        return vec![0.0; n];
-    }
-    let mut inside = vec![vec![false; GRID * GRID]; n];
-    let mut count = vec![0usize; GRID * GRID];
-    for (i, (map, src_w, src_h)) in members.iter().enumerate() {
-        for gy in 0..GRID {
-            let ry = (gy as f64 + 0.5) * grid_h as f64 / GRID as f64;
-            for gx in 0..GRID {
-                let rx = (gx as f64 + 0.5) * grid_w as f64 / GRID as f64;
-                let (sx, sy) = map.inverse_exact(rx, ry);
-                if sx >= 0.0 && sx < *src_w as f64 && sy >= 0.0 && sy < *src_h as f64 {
-                    inside[i][gy * GRID + gx] = true;
-                    count[gy * GRID + gx] += 1;
-                }
-            }
+/// Probes per frame side on the LN field's lattice (plan 6b-3 D8, review
+/// I6): the lattice step is the group's median frame short side, measured
+/// on the grid, over this — so a wide grid probes each frame as finely as a
+/// narrow one, and a second rig does not coarsen the first.
+pub(crate) const LN_FIELD_PROBES_PER_FRAME_SIDE: f64 = 32.0;
+
+/// A group's common field on a project's grid (plan 6b-3 D8, refined by
+/// review I6): the lattice probes at least ⌈n/2⌉ of the group's in-scope
+/// frames cover, judged from their WCS footprints — data the plan has too,
+/// so it can compute the same field ([`crate::stacking::origin::group_ln_field`]).
+pub(crate) struct LnField {
+    /// Each probe's sky position (degrees).
+    sky: Vec<(f64, f64)>,
+    in_field: Vec<bool>,
+    n_field: usize,
+}
+
+/// Whether `fp` covers the sky position `p` (pixel centres at integers, so
+/// the frame spans `[-0.5, w - 0.5)`).
+fn footprint_covers(fp: &crate::collab::grid_geometry::FrameFootprint, p: (f64, f64)) -> bool {
+    let (x, y) = fp.wcs.sky_to_pixel(p.0, p.1);
+    x >= -0.5 && x < fp.width - 0.5 && y >= -0.5 && y < fp.height - 0.5
+}
+
+/// The field of `footprints` on `grid`. With no footprint, or no probe at
+/// least half of them cover, the field is empty: every frame reads 0.0 and
+/// the callers drop the filter as they do today.
+pub(crate) fn ln_field(
+    footprints: &[&crate::collab::grid_geometry::FrameFootprint],
+    grid: &crate::collab::grid::CanonicalGrid,
+) -> LnField {
+    let g = grid.normalized();
+    let tan = crate::collab::grid_geometry::grid_wcs(&g);
+    let grid_deg = g.scale_arcsec / 3600.0;
+    let mut sides: Vec<f64> = footprints
+        .iter()
+        .map(|fp| {
+            let cd = fp.wcs.cd;
+            let scale_deg = (cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0]).abs().sqrt();
+            fp.width.min(fp.height) * scale_deg / grid_deg
+        })
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    sides.sort_by(f64::total_cmp);
+    let step = sides
+        .get(sides.len() / 2)
+        .map_or(1.0, |m| (m / LN_FIELD_PROBES_PER_FRAME_SIDE).max(1.0));
+    let (gw, gh) = (g.width_px as f64, g.height_px as f64);
+    let cols = (gw / step).ceil().max(1.0) as usize;
+    let rows = (gh / step).ceil().max(1.0) as usize;
+    let mut sky = Vec::with_capacity(cols * rows);
+    for r in 0..rows {
+        let y = ((r as f64 + 0.5) * step).min(gh - 0.5);
+        for c in 0..cols {
+            let x = ((c as f64 + 0.5) * step).min(gw - 0.5);
+            sky.push(tan.pixel_to_sky(x, y));
         }
     }
-    let need = n.div_ceil(2);
-    let field: Vec<usize> = (0..GRID * GRID).filter(|&k| count[k] >= need).collect();
-    if field.is_empty() {
-        return vec![0.0; n];
-    }
-    inside
+    let need = footprints.len().div_ceil(2);
+    let in_field: Vec<bool> = sky
         .iter()
-        .map(|mask| field.iter().filter(|&&k| mask[k]).count() as f64 / field.len() as f64)
-        .collect()
+        .map(|&p| need > 0 && footprints.iter().filter(|fp| footprint_covers(fp, p)).count() >= need)
+        .collect();
+    let n_field = in_field.iter().filter(|&&f| f).count();
+    LnField { sky, in_field, n_field }
+}
+
+impl LnField {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.n_field == 0
+    }
+
+    /// The share of the field `fp` covers, with one probe of grace (review
+    /// I6): a frame whose edge cuts one probe of the field still reads full,
+    /// so the 0.97 rule never turns on a single probe. 0.0 for a frame with
+    /// no footprint, or when the field is empty.
+    pub(crate) fn coverage(&self, fp: Option<&crate::collab::grid_geometry::FrameFootprint>) -> f64 {
+        let Some(fp) = fp else { return 0.0 };
+        if self.n_field == 0 {
+            return 0.0;
+        }
+        let covered = self
+            .sky
+            .iter()
+            .zip(&self.in_field)
+            .filter(|(&p, &f)| f && footprint_covers(fp, p))
+            .count();
+        (covered + 1).min(self.n_field) as f64 / self.n_field as f64
+    }
 }
 ```
+
+`stacking/origin.rs`, after `wcs_tier`:
+```rust
+/// A project frame's footprint for the LN field (plan 6b-3 D8, review I6):
+/// its manifest WCS, else the cached solve of its current content, at its
+/// manifest size. `None` for a catalog frame, for a frame with neither, and
+/// for a manifest without a size.
+pub(crate) fn ln_footprint(
+    conn: &Connection,
+    origin: &FrameOrigin,
+    frame_id: i64,
+) -> anyhow::Result<Option<crate::collab::grid_geometry::FrameFootprint>> {
+    let FrameOrigin::Project { project_id, blake3, meta, .. } = origin else {
+        return Ok(None);
+    };
+    if let Some(fp) = crate::collab::grid_geometry::grid_input_of(meta).footprint {
+        return Ok(Some(fp));
+    }
+    let (Some(w), Some(h)) = (meta.naxis1, meta.naxis2) else {
+        return Ok(None);
+    };
+    if w <= 0 || h <= 0 {
+        return Ok(None);
+    }
+    Ok(match stored_outcome(conn, project_id, frame_id, blake3)? {
+        Some(SolveOutcome::Solved(record)) => record.to_solution().map(|wcs| {
+            crate::collab::grid_geometry::FrameFootprint {
+                wcs,
+                width: w as f64,
+                height: h as f64,
+            }
+        }),
+        _ => None,
+    })
+}
+
+/// One group's LN field on a project's grid and its hash (plan 6b-3 D8,
+/// review I6). The run and the plan both call this with the group's
+/// IN-SCOPE frames — not manually excluded, not unsupported — so the plan
+/// computes the field the run will use. Its hash names the frames that pass
+/// the 0.97 rule against it, and every member's LN hash folds it
+/// (`plan::ln_upstream_on_field`): a field change re-keys the group's LN in
+/// the plan and in the run alike, never a run later.
+pub(crate) struct GroupLnField {
+    pub(crate) hash: String,
+    field: crate::stacking::weights::LnField,
+    footprints: HashMap<i64, crate::collab::grid_geometry::FrameFootprint>,
+}
+
+impl GroupLnField {
+    /// A frame's coverage of the field (0.0 for a frame with no footprint).
+    pub(crate) fn coverage_of(&self, frame_id: i64) -> f64 {
+        self.field.coverage(self.footprints.get(&frame_id))
+    }
+}
+
+pub(crate) fn group_ln_field(
+    conn: &Connection,
+    origins: &FrameOrigins,
+    in_scope: &[i64],
+    grid: &crate::collab::grid::CanonicalGrid,
+) -> anyhow::Result<GroupLnField> {
+    let mut ids: Vec<i64> = in_scope.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut footprints = HashMap::new();
+    for &id in &ids {
+        let Some(origin) = origins.get(&id) else { continue };
+        if let Some(fp) = ln_footprint(conn, origin, id)? {
+            footprints.insert(id, fp);
+        }
+    }
+    let refs: Vec<&crate::collab::grid_geometry::FrameFootprint> =
+        ids.iter().filter_map(|id| footprints.get(id)).collect();
+    let field = crate::stacking::weights::ln_field(&refs, grid);
+    let text = if field.is_empty() {
+        "lnfield:1;none".to_string()
+    } else {
+        let eligible: Vec<String> = ids
+            .iter()
+            .filter(|id| field.coverage(footprints.get(id)) >= crate::stacking::weights::MIN_REFERENCE_COVERAGE)
+            .map(|id| id.to_string())
+            .collect();
+        format!("lnfield:1;{}", eligible.join(","))
+    };
+    let hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(text.as_bytes()));
+    tracing::debug!(count = footprints.len(), "ln field built");
+    Ok(GroupLnField { hash, field, footprints })
+}
+```
+(`HashMap`, `Connection`, `stored_outcome`, `SolveOutcome` are imported in `origin.rs` and `FrameOrigins` is defined there, `origin.rs:13-24`; `MIN_REFERENCE_COVERAGE` is `pub(crate)` in `weights.rs:659`.)
 
 `stacking/plan.rs` — replace `expected_ln_channels` with:
 ```rust
@@ -3662,15 +4040,46 @@ pub(crate) fn stage_one_planes(
 }
 ```
 At `~2674`: `let ln_channels = stage_one_planes(&cfg, g, project.is_some() || readiness.attested);` (both bindings are in scope there; borrow `project` as `project.is_some()` before it is moved at the end of `build_plan`).
+
+Beside `ln_registration_upstream`:
+```rust
+/// A grid member's LN upstream with its group's field hash folded in (plan
+/// 6b-3 D8, review I6): the masked-LN token, then `lnfield:<hash>`. The plan
+/// and the run both build the field with `origin::group_ln_field`, so a
+/// field change moves every member's LN hash on both sides at once.
+pub(crate) fn ln_upstream_on_field(registration_hash: &str, field_hash: &str) -> String {
+    format!("{}+lnfield:{field_hash}", ln_registration_upstream(registration_hash, true))
+}
+```
+In the per-group loop, beside `ln_reference_info`, the group's field hash when LN runs on a grid (`excluded_set` is the manual list plus the unsupported files, exactly the run's in-scope rule):
+```rust
+        let ln_field_hash: Option<String> = match project_grid.as_ref() {
+            Some(grid) if local_normalization_active => {
+                let in_scope: Vec<i64> = g
+                    .frames
+                    .iter()
+                    .map(|f| f.frame_id)
+                    .filter(|id| !excluded_set.contains(id))
+                    .collect();
+                Some(
+                    crate::stacking::origin::group_ln_field(conn, &origins, &in_scope, grid)
+                        .map_err(|e| ApiError::Internal(format!("{e:#}")))?
+                        .hash,
+                )
+            }
+            _ => None,
+        };
+```
 The per-frame LN check: compute the expected hash once and accept either a fresh sidecar or a fresh marker:
 ```rust
             if local_normalization_active {
                 let expected_ln: Option<String> = match (&ln_reference_info, ln_registration_by_frame.get(&f.frame_id)) {
                     (Some(ref_info), Some(hash_opt)) => {
-                        let frame_registration_hash = ln_registration_upstream(
-                            &hash_opt.clone().unwrap_or_default(),
-                            project_grid.is_some(),
-                        );
+                        let registration = hash_opt.clone().unwrap_or_default();
+                        let frame_registration_hash = match &ln_field_hash {
+                            Some(field) => ln_upstream_on_field(&registration, field),
+                            None => ln_registration_upstream(&registration, project_grid.is_some()),
+                        };
                         let frame_measurement_hash = expected_measurement_hash.clone().unwrap_or_default();
                         Some(normalization_hash_for(
                             &cfg,
@@ -3713,25 +4122,64 @@ The per-frame LN check: compute the expected hash once and accept either a fresh
 /// moves; payload `{"overlap": <fraction>}`.
 pub(crate) const LN_GLOBAL_ARTIFACT_KIND: &str = "ln_global";
 
+/// The group's LN field on a project's grid (plan 6b-3 D8, review I6), over
+/// the frames the plan counts in scope — not manually excluded, not
+/// unsupported (Prepare's `"unsupported file: …"` exclusion, `~2070`) — so
+/// the plan builds the same field and the same hash. `None` for a frame set.
+fn group_ln_field_for(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+) -> Result<Option<crate::stacking::origin::GroupLnField>, RunError> {
+    let Some(grid) = &rc.grid else {
+        return Ok(None);
+    };
+    let manual: HashSet<i64> = rc.excluded.iter().copied().collect();
+    let unsupported: HashSet<i64> = rc
+        .runtime_exclusions
+        .iter()
+        .filter(|(_, why)| why.starts_with("unsupported file: "))
+        .map(|(id, _)| *id)
+        .collect();
+    let in_scope: Vec<i64> = group
+        .frames
+        .iter()
+        .map(|f| f.frame_id)
+        .filter(|id| !manual.contains(id) && !unsupported.contains(id))
+        .collect();
+    let conn = db(&rc.ctx)?.conn();
+    crate::stacking::origin::group_ln_field(&conn, &rc.origins, &in_scope, &grid.grid)
+        .map(Some)
+        .map_err(|e| RunError::Other(format!("{e:#}")))
+}
+
 /// Each member's coverage for the anchor pick and the LN member list:
 /// against the reference rectangle for a frame set (unchanged), against the
 /// group's own field on a project's grid (plan 6b-3 D8).
-fn member_coverages(grid_mode: bool, members: &[GroupMember], ref_w: usize, ref_h: usize) -> Vec<f64> {
-    if grid_mode {
-        let inputs: Vec<(&PixelMap, usize, usize)> = members
-            .iter()
-            .map(|m| (&m.map, m.measurement.width, m.measurement.height))
-            .collect();
-        crate::stacking::weights::median_footprint_coverage(&inputs, ref_w, ref_h)
-    } else {
-        members
+fn member_coverages(
+    field: Option<&crate::stacking::origin::GroupLnField>,
+    members: &[GroupMember],
+    ref_w: usize,
+    ref_h: usize,
+) -> Vec<f64> {
+    match field {
+        Some(field) => members.iter().map(|m| field.coverage_of(m.frame_id)).collect(),
+        None => members
             .iter()
             .map(|m| reference_coverage(&m.map, m.measurement.width, m.measurement.height, ref_w, ref_h))
-            .collect()
+            .collect(),
     }
 }
   ```
-  In `process_group_output`, take `let grid_mode = rc.grid.is_some();` beside `run_id`, and in `pick_reference_idx` replace the `coverage` computation with `let coverage = member_coverages(grid_mode, members, ref_width, ref_height);`. In `run_group_normalization`, replace its `coverage` computation the same way (`grid_mode` already exists there from Task 5a).
+  In `process_group_output`, before the `pick_reference_idx` closure: `let ln_field = group_ln_field_for(rc, group)?;` (the closure captures it by reference), and in the closure replace the `coverage` computation with `let coverage = member_coverages(ln_field.as_ref(), members, ref_width, ref_height);`. In `run_group_normalization`, right after `grid_mode`: `let ln_field = group_ln_field_for(rc, group)?;`; replace its `coverage` computation the same way, and Task 5a's `member_ln_upstreams` becomes
+  ```rust
+    let member_ln_upstreams: Vec<String> = members
+        .iter()
+        .map(|m| match &ln_field {
+            Some(field) => crate::stacking::plan::ln_upstream_on_field(&m.registration_hash, &field.hash),
+            None => crate::stacking::plan::ln_registration_upstream(&m.registration_hash, grid_mode),
+        })
+        .collect();
+  ```
 - `run_group_normalization`:
   - beside `existing_ln_rows`, build `existing_global_rows: Vec<Option<StackingArtifactRow>>` with `find_artifact(…, LN_GLOBAL_ARTIFACT_KIND, Some(m.frame_id))` in the same loop;
   - `anything_stale` becomes `force_fresh || (0..members.len()).any(|i| !(existing_ln_rows[i].as_ref().is_some_and(|row| is_fresh(row, &per_member_hash[i])) || existing_global_rows[i].as_ref().is_some_and(|row| row.config_hash == per_member_hash[i])))`;
@@ -3806,32 +4254,430 @@ fn member_coverages(grid_mode: bool, members: &[GroupMember], ref_w: usize, ref_
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- wide_grid_keeps_the_coverage stage_one_planes_follow under_a_quarter_overlap stacking::ln stacking::plan stacking::paths stacking::run::tests --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
-Expected: all pass. If the two east frames fail to register (their exclusion reason says so), add stars to their overlap strip by lowering `sky_stars`' spacing to 40″ — never move them closer (under 25 % is the point) and never weaken an assertion; report it.
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- wide_grid_keeps_the_coverage forgives_one_lost_probe stage_one_planes_follow under_a_quarter_overlap stacking::ln stacking::plan stacking::paths stacking::origin stacking::run::tests --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
+Expected: all pass. If the east pair fails to register (the test's panic names it and its reason), lower `test_fixtures::EAST_PAIR_SPACING_ARCSEC` to 32″ — it is shared with Task 9's e2e, so the e2e inherits the fix — never move the pair closer (under 25 % is the point) and never weaken an assertion; report it.
 
 - [ ] **Step 5: Run the gates.** `git diff --stat src/types` empty.
 
 - [ ] **Step 6: Commit**
 ```bash
-git add crates/athenaeum-core/src/stacking/run.rs crates/athenaeum-core/src/stacking/weights.rs crates/athenaeum-core/src/stacking/plan.rs crates/athenaeum-core/src/stacking/paths.rs
-git commit -m "feat(stacking): low-overlap members keep global normalization; grid admissibility on the group's own field
+git add crates/athenaeum-core/src/stacking/run.rs crates/athenaeum-core/src/stacking/weights.rs crates/athenaeum-core/src/stacking/origin.rs crates/athenaeum-core/src/stacking/plan.rs crates/athenaeum-core/src/stacking/paths.rs
+git commit -m "feat(stacking): low-overlap members keep global normalization; the LN field on the grid, twinned in the plan
 
 $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01YEaoHWL2V7MEXaXHgsiVwK')"
 ```
 
 ---
 
-### Task 6a: The coverage map beside the master (D9, D18; spec §5.7)
+### Task 7a: Crop helpers (D10, D4 refinement; spec §5.9)
+
+Runs before Task 6a (review I1): 6a measures a grid master's statistics on `largest_covered_rect`. Nothing here depends on 6a or 6b.
 
 **Files:**
+- Create `crates/athenaeum-core/src/stacking/crop.rs`: `CropRect`, `coverage_rect`, `largest_covered_rect`, `union_rects`, `crop_plane`, `restate_crpix`, `crop_file`; tests.
+- Modify `crates/athenaeum-core/src/stacking/mod.rs`: `pub mod crop;` (alphabetical, after `pub mod config;`).
+
+No run code changes here: Task 6a uses `largest_covered_rect`, Task 7b2 wires the crop pass.
+
+**Interfaces:**
+```rust
+// stacking/crop.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CropRect { pub x0: usize, pub y0: usize, pub width: usize, pub height: usize }
+impl CropRect {
+    pub fn full(width: usize, height: usize) -> Self;
+    pub fn is_full(&self, width: usize, height: usize) -> bool;
+    pub fn fits_within(&self, width: usize, height: usize) -> bool;
+    pub fn union(self, other: CropRect) -> CropRect;
+    pub fn scaled(self, s: u32) -> CropRect;
+}
+pub fn coverage_rect(coverage: &[f32], width: usize, height: usize, k: u32) -> Option<CropRect>;
+pub fn largest_covered_rect(coverage: &[f32], width: usize, height: usize, k: u32) -> Option<CropRect>;
+pub fn union_rects(rects: impl IntoIterator<Item = CropRect>) -> Option<CropRect>;
+pub fn crop_plane(plane: &[f32], width: usize, rect: CropRect) -> Vec<f32>;
+pub fn restate_crpix(cards: &mut [Card], cropped: &PlateSolveRecord);
+pub fn crop_file(src: &Path, dst: &Path, rect: CropRect, cards: &[Card], format: OutputFormat) -> anyhow::Result<()>;
+```
+Consumed by: Task 6a (`largest_covered_rect`, `crop_plane`), Tasks 7b1 and 7b2 (the rest).
+
+- [ ] **Step 1: Write the module with its tests**
+
+`crates/athenaeum-core/src/stacking/crop.rs`:
+```rust
+//! Crop to coverage (spec §5.9, plan 6b-3 D10): the rectangle a run keeps,
+//! and the pure operations that apply it to a plane, a header and a file.
+//!
+//! The rectangle is in array pixels of the master (the grid, for a
+//! project). A drizzled output uses the same rectangle `scale` times finer
+//! ([`CropRect::scaled`]): every master pixel is `s × s` drizzle pixels, and
+//! the drizzle WCS (`scale_plate_solve`) is defined on exactly that lattice.
+//! Cropping moves only `CRPIX`: SIP terms are polynomials in
+//! `(u, v) = p − CRPIX`, so they hold unchanged, and the WCS refers to array
+//! coordinates, so the row order needs no special case.
+
+use std::path::Path;
+
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
+
+use crate::fits_writer::{Card, CardValue, OutputFormat, XisfBounds};
+use crate::integration::plane_reader::PlaneReader;
+use crate::plate_solve::storage::PlateSolveRecord;
+
+/// Columns `x0 .. x0 + width`, rows `y0 .. y0 + height`, in array pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CropRect {
+    pub x0: usize,
+    pub y0: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl CropRect {
+    /// The whole `width × height` image — what an uncropped finalization
+    /// "crops" to.
+    pub fn full(width: usize, height: usize) -> Self {
+        Self { x0: 0, y0: 0, width, height }
+    }
+
+    pub fn is_full(&self, width: usize, height: usize) -> bool {
+        *self == Self::full(width, height)
+    }
+
+    /// Non-empty and inside a `width × height` image.
+    pub fn fits_within(&self, width: usize, height: usize) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.x0 + self.width <= width
+            && self.y0 + self.height <= height
+    }
+
+    /// The smallest rectangle holding both.
+    pub fn union(self, other: CropRect) -> CropRect {
+        let x0 = self.x0.min(other.x0);
+        let y0 = self.y0.min(other.y0);
+        let x1 = (self.x0 + self.width).max(other.x0 + other.width);
+        let y1 = (self.y0 + self.height).max(other.y0 + other.height);
+        CropRect { x0, y0, width: x1 - x0, height: y1 - y0 }
+    }
+
+    /// The same rectangle on an output `s` times finer (drizzle).
+    pub fn scaled(self, s: u32) -> CropRect {
+        let s = s as usize;
+        CropRect {
+            x0: self.x0 * s,
+            y0: self.y0 * s,
+            width: self.width * s,
+            height: self.height * s,
+        }
+    }
+}
+
+/// The bounding box of the pixels at least `k` frames cover; `None` when no
+/// pixel reaches `k`. A count is a whole number stored as f32, so `>=` is
+/// exact; a NaN never qualifies.
+pub fn coverage_rect(coverage: &[f32], width: usize, height: usize, k: u32) -> Option<CropRect> {
+    debug_assert_eq!(coverage.len(), width * height);
+    let k = k as f32;
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for y in 0..height {
+        let row = &coverage[y * width..(y + 1) * width];
+        let first = row.iter().position(|&c| c >= k);
+        let Some(first) = first else { continue };
+        let last = row.iter().rposition(|&c| c >= k).unwrap_or(first);
+        x0 = x0.min(first);
+        x1 = x1.max(last);
+        y0 = y0.min(y);
+        y1 = y1.max(y);
+    }
+    (x0 != usize::MAX).then(|| CropRect { x0, y0, width: x1 - x0 + 1, height: y1 - y0 + 1 })
+}
+
+/// The largest-area rectangle whose EVERY pixel at least `k` frames cover
+/// (plan 6b-3 review I1: a grid master's statistics are measured on covered
+/// pixels only, and `measure_plane` takes a rectangle). The histogram
+/// method, one pass per row, `O(width · height)`; of equal areas the first
+/// found in row order wins. `None` when no pixel reaches `k` (NaN never
+/// does).
+pub fn largest_covered_rect(coverage: &[f32], width: usize, height: usize, k: u32) -> Option<CropRect> {
+    debug_assert_eq!(coverage.len(), width * height);
+    let k = k as f32;
+    let mut heights = vec![0usize; width];
+    let mut stack: Vec<usize> = Vec::with_capacity(width + 1);
+    let mut best: Option<(usize, CropRect)> = None;
+    for y in 0..height {
+        let row = &coverage[y * width..(y + 1) * width];
+        for (x, h) in heights.iter_mut().enumerate() {
+            *h = if row[x] >= k { *h + 1 } else { 0 };
+        }
+        stack.clear();
+        for x in 0..=width {
+            let current = if x < width { heights[x] } else { 0 };
+            while let Some(&top) = stack.last() {
+                if heights[top] <= current {
+                    break;
+                }
+                stack.pop();
+                let h = heights[top];
+                let left = stack.last().map_or(0, |&l| l + 1);
+                let area = h * (x - left);
+                if best.is_none_or(|(a, _)| area > a) {
+                    best = Some((area, CropRect { x0: left, y0: y + 1 - h, width: x - left, height: h }));
+                }
+            }
+            if x < width {
+                stack.push(x);
+            }
+        }
+    }
+    best.map(|(_, r)| r)
+}
+
+/// The union of every rectangle; `None` for none.
+pub fn union_rects(rects: impl IntoIterator<Item = CropRect>) -> Option<CropRect> {
+    rects.into_iter().reduce(CropRect::union)
+}
+
+/// One plane's `rect`, row by row. `rect` must fit the plane.
+pub fn crop_plane(plane: &[f32], width: usize, rect: CropRect) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rect.width * rect.height);
+    for y in rect.y0..rect.y0 + rect.height {
+        let start = y * width + rect.x0;
+        out.extend_from_slice(&plane[start..start + rect.width]);
+    }
+    out
+}
+
+/// Re-states `CRPIX1`/`CRPIX2` in `cards` from `cropped`
+/// ([`crate::stacking::grid_map::crop_plate_solve`] of the record the cards
+/// were written from), as exactly the values `wcs_cards` writes for it
+/// (1-based). Every other card, its comment and the presence or absence of
+/// `PLTSOLVD` (a grid master has none) stay as they were. Cards with no WCS
+/// are left alone.
+pub fn restate_crpix(cards: &mut [Card], cropped: &PlateSolveRecord) {
+    for card in cards.iter_mut() {
+        let value = match card.keyword.as_str() {
+            "CRPIX1" => cropped.crpix1 + 1.0,
+            "CRPIX2" => cropped.crpix2 + 1.0,
+            _ => continue,
+        };
+        card.value = Some(CardValue::Real(value));
+    }
+}
+
+/// Reads the uncompressed float FITS at `src` (a scratch output), crops
+/// every plane to `rect` and writes `dst` in `format` with `cards` — the
+/// master writers' own call (`XisfBounds::Unit`). Refuses a rectangle that
+/// does not fit the file.
+pub fn crop_file(
+    src: &Path,
+    dst: &Path,
+    rect: CropRect,
+    cards: &[Card],
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
+    let (width, height, channels) = (reader.width(), reader.height(), reader.channels());
+    anyhow::ensure!(
+        rect.fits_within(width, height),
+        "crop {rect:?} does not fit {} ({width} x {height})",
+        src.display()
+    );
+    let mut data = Vec::with_capacity(rect.width * rect.height * channels);
+    for plane in 0..channels {
+        let full = reader
+            .read_plane(plane)
+            .with_context(|| format!("reading plane {plane} of {}", src.display()))?;
+        data.extend(crop_plane(&full, width, rect));
+    }
+    crate::fits_writer::write_image_f32(
+        dst,
+        rect.width,
+        rect.height,
+        channels,
+        &data,
+        cards,
+        format,
+        XisfBounds::Unit,
+    )
+    .with_context(|| format!("writing {}", dst.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fits_writer::wcs::wcs_cards;
+    use crate::stacking::grid_map::crop_plate_solve;
+
+    /// Plan 6b-3 D10: the rectangle bounds exactly the pixels at or above
+    /// `k`, ignores NaN, and is `None` when nothing reaches `k`.
+    #[test]
+    fn coverage_rect_bounds_the_pixels_at_or_above_k() {
+        let (w, h) = (8, 6);
+        let mut cov = vec![0.0f32; w * h];
+        for y in 1..5 {
+            for x in 2..7 {
+                cov[y * w + x] = 2.0;
+            }
+        }
+        cov[2 * w + 3] = 3.0;
+        cov[4 * w + 6] = 3.0;
+        cov[5 * w + 7] = f32::NAN;
+        assert_eq!(coverage_rect(&cov, w, h, 1), Some(CropRect { x0: 2, y0: 1, width: 5, height: 4 }));
+        assert_eq!(coverage_rect(&cov, w, h, 2), Some(CropRect { x0: 2, y0: 1, width: 5, height: 4 }));
+        assert_eq!(coverage_rect(&cov, w, h, 3), Some(CropRect { x0: 3, y0: 2, width: 4, height: 3 }));
+        assert_eq!(coverage_rect(&cov, w, h, 4), None);
+    }
+
+    /// Plan 6b-3 D10: the run-wide rectangle is the union; a drizzle
+    /// rectangle is the master's `s` times finer; fit checks both edges.
+    #[test]
+    fn rectangles_unite_scale_and_fit() {
+        let a = CropRect { x0: 2, y0: 1, width: 5, height: 4 };
+        let b = CropRect { x0: 4, y0: 0, width: 6, height: 2 };
+        assert_eq!(union_rects([a, b]), Some(CropRect { x0: 2, y0: 0, width: 8, height: 5 }));
+        assert_eq!(union_rects(std::iter::empty()), None);
+        assert_eq!(a.scaled(2), CropRect { x0: 4, y0: 2, width: 10, height: 8 });
+        assert!(a.fits_within(7, 5) && !a.fits_within(6, 5) && !a.fits_within(7, 4));
+        assert!(!CropRect { x0: 0, y0: 0, width: 0, height: 3 }.fits_within(4, 4));
+        assert!(CropRect::full(7, 5).is_full(7, 5) && !a.is_full(7, 5));
+    }
+
+    /// Review I1: the largest fully covered rectangle holds covered pixels
+    /// only — of an L-shaped coverage it keeps the bigger arm, never a corner
+    /// nothing covers — and there is none without a covered pixel.
+    #[test]
+    fn the_largest_covered_rectangle_holds_covered_pixels_only() {
+        let (w, h) = (10usize, 8usize);
+        let mut cov = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..6 {
+                cov[y * w + x] = 2.0;
+            }
+        }
+        for y in 5..8 {
+            for x in 6..10 {
+                cov[y * w + x] = 1.0;
+            }
+        }
+        let r = largest_covered_rect(&cov, w, h, 1).unwrap();
+        assert_eq!(r, CropRect { x0: 0, y0: 0, width: 6, height: 8 }, "48 px beats the 10 × 3 strip");
+        for y in r.y0..r.y0 + r.height {
+            for x in r.x0..r.x0 + r.width {
+                assert!(cov[y * w + x] >= 1.0, "({x}, {y}) is uncovered");
+            }
+        }
+        cov[3 * w + 2] = 0.0;
+        let holed = largest_covered_rect(&cov, w, h, 1).unwrap();
+        assert!(holed.width * holed.height < 48 && holed.width * holed.height >= 24, "{holed:?}");
+        assert_eq!(largest_covered_rect(&vec![0.0; w * h], w, h, 1), None);
+        assert_eq!(largest_covered_rect(&vec![f32::NAN; w * h], w, h, 1), None);
+    }
+
+    #[test]
+    fn crop_plane_takes_the_rectangle_row_by_row() {
+        let (w, h) = (5, 4);
+        let plane: Vec<f32> = (0..w * h).map(|i| i as f32).collect();
+        let out = crop_plane(&plane, w, CropRect { x0: 1, y0: 2, width: 3, height: 2 });
+        assert_eq!(out, vec![11.0, 12.0, 13.0, 16.0, 17.0, 18.0]);
+    }
+
+    /// Spec §5.9 "CRPIX shifts by the crop origin", plan 6b-3 D10: the
+    /// restated header carries exactly the `CRPIX` a header written from the
+    /// cropped record carries, with SIP and every other card untouched —
+    /// and, on a grid header, still no `PLTSOLVD`.
+    #[test]
+    fn restate_crpix_moves_only_the_reference_pixel() {
+        let mut rec = crate::stacking::test_fixtures::sky_frame_record(
+            &crate::stacking::test_fixtures::sky_frame("a", (83.8, -5.4)),
+        );
+        rec.sip_order = Some(2);
+        rec.sip_a_coeffs = Some("[[0.0, 0.0, 1e-6], [0.0, 2e-6, 0.0], [3e-6, 0.0, 0.0]]".into());
+        rec.sip_b_coeffs = Some("[[0.0, 0.0, -1e-6], [0.0, 1e-6, 0.0], [2e-6, 0.0, 0.0]]".into());
+        let original = wcs_cards(&rec).unwrap();
+        let mut cards: Vec<Card> = original.iter().filter(|c| c.keyword != "PLTSOLVD").cloned().collect();
+        let cropped = crop_plate_solve(&rec, 40, 25);
+        restate_crpix(&mut cards, &cropped);
+        let expected = wcs_cards(&cropped).unwrap();
+        let value = |cs: &[Card], k: &str| cs.iter().find(|c| c.keyword == k).and_then(|c| c.value.clone());
+        for k in ["CRPIX1", "CRPIX2"] {
+            assert_eq!(value(&cards, k), value(&expected, k), "{k}");
+        }
+        for c in &cards {
+            if c.keyword != "CRPIX1" && c.keyword != "CRPIX2" {
+                assert_eq!(c.value, value(&original, &c.keyword), "{} moved", c.keyword);
+            }
+        }
+        assert!(cards.iter().all(|c| c.keyword != "PLTSOLVD"));
+    }
+
+    /// Plan 6b-3 D10: a three-plane scratch FITS crops plane by plane, to
+    /// FITS and to XISF.
+    #[test]
+    fn crop_file_crops_every_plane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (w, h) = (6, 5);
+        let data: Vec<f32> = (0..3 * w * h).map(|i| i as f32 * 0.01).collect();
+        let src = tmp.path().join("scratch.fits");
+        crate::fits_writer::write_fits_f32(&src, w, h, 3, &data, &[]).unwrap();
+        let rect = CropRect { x0: 1, y0: 2, width: 3, height: 2 };
+        let cards = vec![Card::new("BUNIT", CardValue::Str("x".into())).unwrap()];
+        let fits = tmp.path().join("out.fits");
+        crop_file(&src, &fits, rect, &cards, OutputFormat::Fits).unwrap();
+        let reader = PlaneReader::open(&fits).unwrap();
+        assert_eq!((reader.width(), reader.height(), reader.channels()), (3, 2, 3));
+        for p in 0..3 {
+            let expected = crop_plane(&data[p * w * h..(p + 1) * w * h], w, rect);
+            assert_eq!(reader.read_plane(p).unwrap(), expected, "plane {p}");
+        }
+        let xisf = tmp.path().join("out.xisf");
+        crop_file(&src, &xisf, rect, &cards, OutputFormat::Xisf).unwrap();
+        let (meta, _) = astroimage::ImageConverter::read_raw(&xisf).unwrap();
+        assert_eq!((meta.width, meta.height, meta.channels), (3, 2, 3));
+        let err = crop_file(&src, &tmp.path().join("bad.fits"), CropRect { x0: 4, y0: 0, width: 3, height: 1 }, &cards, OutputFormat::Fits)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("does not fit"), "{err:#}");
+    }
+}
+```
+
+Verified at `20c7c1ef`: `crate::integration::plane_reader::PlaneReader` is public (`run.rs:54` imports it); `OutputFormat` and `XisfBounds` are public in `crate::fits_writer` (`fits_writer/mod.rs:43, 74`); a SIP table is the JSON `Vec<Vec<f64>>` of `order + 1` rows (`fits_writer/wcs.rs:15-30`).
+
+`stacking/mod.rs`: `pub mod crop;`.
+
+- [ ] **Step 2: Run the tests**
+
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- stacking::crop --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
+Expected: 6 passed.
+
+- [ ] **Step 3: Run the gates.** `git diff --exit-code src/types`.
+
+- [ ] **Step 4: Commit**
+```bash
+git add crates/athenaeum-core/src/stacking/crop.rs crates/athenaeum-core/src/stacking/mod.rs
+git commit -m "feat(stacking): crop helpers — the coverage and largest covered rectangles, the union, plane and file crop, CRPIX restated
+
+$(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01YEaoHWL2V7MEXaXHgsiVwK')"
+```
+
+---
+
+### Task 6a: The coverage map beside the master, and grid statistics on covered pixels (D9, D18, D4 refinement; spec §5.7)
+
+**Files:**
+- Modify `crates/athenaeum-core/src/stacking/integrate.rs` (review I1):
+  - `GroupInput` gains `stats_on_covered`;
+  - `integrate_group` counts plane 0 when `coverage_map || stats_on_covered`, measures every plane's master statistics on `crop::largest_covered_rect(count, w, h, 1)` when `stats_on_covered`, and returns `GroupOutput.coverage` only when `coverage_map` was asked;
+  - every `GroupInput` literal Task 4 touched gets `stats_on_covered: false` (the 12 in `integrate.rs`'s tests, the 3 in `ln/reference.rs`'s tests, the one each in `examples/integrate_probe.rs` and `examples/ln_probe.rs`, and `run.rs`'s LN-pass literal at `~8257`).
 - Modify `crates/athenaeum-core/src/stacking/master_cards.rs`: `coverage_map_cards`; `WrittenMaster.coverage` (`~477-481`); `write_master_light` (`~680-740`) writes `<stem>_coverage.fits` when `output.coverage` is `Some`; one test.
 - Modify `crates/athenaeum-core/src/api/stacking.rs`: `MasterLightKind::Coverage` ↔ `"coverage"` (`~897-923`); add it to the kind round-trip test (`~1838`).
 - Modify `crates/athenaeum-core/src/stacking/provenance.rs`: `SummaryGroup.coverage_path` (`~142-205`).
 - Modify `crates/athenaeum-core/src/stacking/run.rs`:
-  - the integration `GroupInput` (`~8523`) sets `coverage_map: rc.config.output.coverage_map` (the LN pass's `GroupInput` at `~8257` keeps `false`);
+  - the integration `GroupInput` (`~8523`) sets `coverage_map: rc.config.output.coverage_map` and `stats_on_covered: rc.grid.is_some()` (the LN pass's `GroupInput` at `~8257` keeps `false` for both);
   - after `write_master_light`, the `coverage` `master_lights` row (`~8969-8983`, in the same DB block as the master's row);
   - `push_summary_group` (`~7343`) gains `coverage_path: Option<String>`; its three calls (`skip_group`, `fail_group`: `None`; `process_group_output`: the written path);
-  - one test.
+  - two tests.
 - `src/types/stacking.ts`: regenerated — `MasterLightKind` gains `"coverage"`, `SummaryGroup` gains `coveragePath: string | null`.
 
 **Interfaces:**
@@ -3843,8 +4689,10 @@ pub struct WrittenMaster { pub master: PathBuf, pub rejection_low: Option<PathBu
 pub enum MasterLightKind { Master, Drizzle, WeightMap, Coverage }
 // stacking/provenance.rs
 pub struct SummaryGroup { /* … */ pub coverage_path: Option<String> }
+// stacking/integrate.rs
+pub struct GroupInput<'a> { /* … */ pub stats_on_covered: bool }
 ```
-Consumed by: Task 6b (`SummaryGroup`, `MasterLightKind`), Task 7b (the coverage plane and its cards).
+Consumed by: Task 6b (`SummaryGroup`, `MasterLightKind`), Tasks 7b1 and 7b2 (the coverage plane and its cards).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3952,12 +4800,66 @@ Consumed by: Task 6b (`SummaryGroup`, `MasterLightKind`), Task 7b (the coverage 
         let summary: RunSummary = serde_json::from_str(run_row.summary_json.as_deref().unwrap()).unwrap();
         assert_eq!(summary.groups[0].coverage_path.as_deref(), Some(row.path.as_str()));
     }
+
+    /// Plan 6b-3 D4 refinement (review I1): a grid master's statistics are
+    /// measured over covered pixels only, coverage map or not. On a grid
+    /// three times the frames' area, three quarters of the plane are the
+    /// uncovered 0.0; the master's location still reads the frames' sky
+    /// level and its noise about theirs over √4 (resampling lowers it a
+    /// little more), and with `coverageMap` off no map is written although
+    /// the count was taken.
+    #[test]
+    fn a_grid_masters_statistics_ignore_uncovered_pixels() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+        let wide = crate::collab::grid::CanonicalGrid { width_px: 768, height_px: 576, ..grid };
+        let mut cfg = sky_config(&conn);
+        cfg.output.coverage_map = false;
+        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &[], None)
+            .unwrap();
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.path().join("work"), &tmp.path().join("out"));
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(wide)));
+        run_pipeline(&mut rc).unwrap();
+
+        let group = &rc.summary.groups[0];
+        let stats = group.stats.as_ref().expect("the group's stats");
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let frames: Vec<&crate::stacking::measure::ChannelMeasurement> = rc.measured[&group.key]
+            .iter()
+            .filter(|e| e.included)
+            .filter_map(|e| e.measurement.as_ref())
+            .map(|m| &m.channels[0])
+            .collect();
+        let frame_location = median(frames.iter().map(|c| c.location).collect());
+        let frame_noise = median(frames.iter().map(|c| c.noise).collect());
+        assert!(
+            (stats.master_location[0] - frame_location).abs() < 0.1 * frame_location.abs(),
+            "master location {} vs the frames' {frame_location}",
+            stats.master_location[0]
+        );
+        let ratio = stats.master_noise[0] / frame_noise;
+        assert!((0.2..0.8).contains(&ratio), "master noise / frame noise = {ratio}");
+        assert!(
+            crate::db::stacking::list_master_lights(&conn, rc.run_id)
+                .unwrap()
+                .iter()
+                .all(|m| m.kind != "coverage"),
+            "the count taken for the statistics writes no map"
+        );
+    }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- coverage_map_carries bit_identical_with_the_coverage_map --test-threads=4 2>&1 | tail -20`
-Expected: compile errors (`coverage_map_cards`, `coverage_path`).
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- coverage_map_carries bit_identical_with_the_coverage_map grid_masters_statistics_ignore --test-threads=4 2>&1 | tail -20`
+Expected: compile errors (`coverage_map_cards`, `coverage_path`, `stats_on_covered`).
 
 - [ ] **Step 3: Implement**
 
@@ -3968,7 +4870,9 @@ Expected: compile errors (`coverage_map_cards`, `coverage_path`).
 /// `BUNIT = 'frames'`, the master's own WCS block (the map IS the master's
 /// grid, pixel for pixel), and the trace cards a reader needs without the
 /// master: `ROWORDER`, `ATH_STKI`, `ATH_STKG`, `ATH_RGEO`, `ATH_GRID`,
-/// `ATH_SPRJ`. Never `FILTER` and never `ATH_PRJ`.
+/// `ATH_SPRJ`, each only when the master carries it (a frame-set master
+/// may carry no `ROWORDER`: the orientation default, `orientation.rs`).
+/// Never `FILTER` and never `ATH_PRJ`.
 pub fn coverage_map_cards(master_cards: &[Card]) -> Result<Vec<Card>, FitsWriteError> {
     let mut cards = vec![
         Card::new("IMAGETYP", CardValue::Str("Coverage Map".into()))?,
@@ -4019,8 +4923,50 @@ and return it in `WrittenMaster`. Update the `WrittenMaster` literals in its tes
     pub coverage_path: Option<String>,
 ```
 
+`stacking/integrate.rs` (review I1):
+- `GroupInput`, after `coverage_map`:
+  ```rust
+    /// Plan 6b-3 D4 refinement (review I1): measure the master's statistics
+    /// (`master_location`, `_scale`, `_noise`, `_psf_snr`, `snr_gain`, FWHM,
+    /// eccentricity) on covered pixels only — a grid master's uncovered
+    /// pixels are 0.0 and would read as data. Implies the plane-0 count.
+    /// `false` for a frame set, whose statistics never move.
+    pub stats_on_covered: bool,
+  ```
+- `integrate_group`: both `integrate_planes` calls pass `CoverageOptions { count: input.coverage_map || input.stats_on_covered, empty_as_nan: false }`; before the tail loop, beside Task 4's `let mut coverage`, `let mut measure_rect: Option<crate::stacking::crop::CropRect> = None;`; in the loop, replace the master measurement (`let plane_data = &out.base.data; let cm = pool.install(|| measure_plane(plane_data, …));`) with
+  ```rust
+        // Plan 6b-3 D4 refinement (review I1): on a grid the statistics come
+        // from the largest rectangle every pixel of which at least one frame
+        // covers (plane 0's count; the planes share the footprint).
+        if p == 0 && input.stats_on_covered {
+            measure_rect = coverage
+                .as_deref()
+                .and_then(|c| crate::stacking::crop::largest_covered_rect(c, input.width, input.height, 1));
+            match measure_rect {
+                Some(r) => debug!(
+                    crop_x0 = r.x0,
+                    crop_y0 = r.y0,
+                    crop_width = r.width,
+                    crop_height = r.height,
+                    "master statistics on the covered rectangle"
+                ),
+                None => warn!("no covered pixel; master statistics on the whole plane"),
+            }
+        }
+        let plane_data = &out.base.data;
+        let cm = match measure_rect {
+            Some(r) if !r.is_full(input.width, input.height) => {
+                let sub = crate::stacking::crop::crop_plane(plane_data, input.width, r);
+                pool.install(|| measure_plane(&sub, r.width, r.height, measure, None))
+            }
+            _ => pool.install(|| measure_plane(plane_data, input.width, input.height, measure, None)),
+        };
+  ```
+  (`debug!`/`warn!` are the `tracing` macros the file already imports.) `GroupOutput { …, coverage: if input.coverage_map { coverage } else { None } }`: the count taken only for the statistics is never a coverage map.
+- every `GroupInput` literal listed under **Files** gets `stats_on_covered: false`.
+
 `stacking/run.rs`:
-- the integration `GroupInput` (the one handed to `integrate_group`): `coverage_map: rc.config.output.coverage_map,`;
+- the integration `GroupInput` (the one handed to `integrate_group`): `coverage_map: rc.config.output.coverage_map,` and `stats_on_covered: rc.grid.is_some(),`;
 - in the DB block after `write_master_light` (where the master's row is inserted):
   ```rust
         let coverage_path_str = written.coverage.as_ref().map(|p| p.display().to_string());
@@ -4048,15 +4994,15 @@ and return it in `WrittenMaster`. Update the `WrittenMaster` literals in its tes
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- coverage_map_carries bit_identical_with_the_coverage_map api::stacking stacking::master_cards stacking::run::tests --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
-Expected: all pass.
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- coverage_map_carries bit_identical_with_the_coverage_map grid_masters_statistics_ignore api::stacking stacking::master_cards stacking::integrate stacking::run::tests --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
+Expected: all pass; every frame-set statistics pin unchanged (`stats_on_covered` is `false` for a frame set).
 
 - [ ] **Step 5: Run the gates.** `git diff --stat src/types` shows only `src/types/stacking.ts` (`MasterLightKind`, `SummaryGroup.coveragePath`); `npx tsc --noEmit -p .` stays clean (no frontend switch is exhaustive over `MasterLightKind`).
 
 - [ ] **Step 6: Commit**
 ```bash
-git add crates/athenaeum-core/src/stacking/master_cards.rs crates/athenaeum-core/src/api/stacking.rs crates/athenaeum-core/src/stacking/provenance.rs crates/athenaeum-core/src/stacking/run.rs src/types/stacking.ts
-git commit -m "feat(stacking): the per-pixel coverage map beside each master
+git add crates/athenaeum-core/src/stacking/master_cards.rs crates/athenaeum-core/src/api/stacking.rs crates/athenaeum-core/src/stacking/provenance.rs crates/athenaeum-core/src/stacking/run.rs crates/athenaeum-core/src/stacking/integrate.rs crates/athenaeum-core/src/stacking/ln/reference.rs crates/athenaeum-core/examples/integrate_probe.rs crates/athenaeum-core/examples/ln_probe.rs src/types/stacking.ts
+git commit -m "feat(stacking): the per-pixel coverage map beside each master; grid-master statistics on covered pixels only
 
 $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01YEaoHWL2V7MEXaXHgsiVwK')"
 ```
@@ -4091,7 +5037,7 @@ pub enum MasterLightKind { Master, Drizzle, WeightMap, Coverage, DrizzleCoverage
 // stacking/provenance.rs
 pub struct SummaryGroup { /* … */ pub drizzle_coverage_path: Option<String> }
 ```
-Consumed by: Task 7b (the drizzle coverage file in crop mode).
+Consumed by: Tasks 7b1 and 7b2 (the drizzle coverage file in crop mode).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4228,6 +5174,10 @@ Expected: compile errors (`write_coverage`, `coverage`).
                         .zip(cov_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
                         .enumerate()
                         .for_each(|(band_idx, ((ib, wb), cb))| {
+                            // One band-sized copy per (band, frame, plane) while the
+                            // map is asked for (review M18): opt-in, so left as is;
+                            // a per-worker buffer is the lever if a profile ever
+                            // shows it.
                             let before = wb.to_vec();
                             deposit_band(ib, wb, band_idx, out_w, &ctx);
                             for ((c, &after), &prior) in cb.iter_mut().zip(wb.iter()).zip(&before) {
@@ -4321,344 +5271,348 @@ $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Sess
 
 ---
 
-### Task 7a: Crop helpers (D10; spec §5.9)
+### Task 7b1: The crop writers (D10; spec §5.9; first half of the review's crop split)
 
 **Files:**
-- Create `crates/athenaeum-core/src/stacking/crop.rs`: `CropRect`, `coverage_rect`, `union_rects`, `crop_plane`, `restate_crpix`, `crop_file`; tests.
-- Modify `crates/athenaeum-core/src/stacking/mod.rs`: `pub mod crop;` (alphabetical, after `pub mod config;`).
+- Modify `crates/athenaeum-core/src/stacking/paths.rs`: `WorkingLayout::uncropped_dir(run_id)`; `EstimateInputs.crop_scratch` and the estimate's doubled output terms (review M6); one test.
+- Modify `crates/athenaeum-core/src/stacking/plan.rs`: `build_plan`'s `EstimateInputs` literal (`~2496`) sets `crop_scratch`.
+- Modify `crates/athenaeum-core/src/stacking/master_cards.rs`: `#[derive(Debug, Clone)]` on `WrittenMaster` and `WrittenDrizzle`; `write_cropped_master`, `write_cropped_drizzle` and their private helpers; one test (review I7: the full-rectangle finalization against the K = 0 writer).
 
-No run code changes here: Task 7b wires the pass.
+No run code changes: `pub fn`s in a `pub mod` raise no dead-code warning, so the lib check stays clean until Task 7b2 calls them.
 
 **Interfaces:**
 ```rust
-// stacking/crop.rs
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CropRect { pub x0: usize, pub y0: usize, pub width: usize, pub height: usize }
-impl CropRect {
-    pub fn full(width: usize, height: usize) -> Self;
-    pub fn is_full(&self, width: usize, height: usize) -> bool;
-    pub fn fits_within(&self, width: usize, height: usize) -> bool;
-    pub fn union(self, other: CropRect) -> CropRect;
-    pub fn scaled(self, s: u32) -> CropRect;
-}
-pub fn coverage_rect(coverage: &[f32], width: usize, height: usize, k: u32) -> Option<CropRect>;
-pub fn union_rects(rects: impl IntoIterator<Item = CropRect>) -> Option<CropRect>;
-pub fn crop_plane(plane: &[f32], width: usize, rect: CropRect) -> Vec<f32>;
-pub fn restate_crpix(cards: &mut [Card], cropped: &PlateSolveRecord);
-pub fn crop_file(src: &Path, dst: &Path, rect: CropRect, cards: &[Card], format: OutputFormat) -> anyhow::Result<()>;
+// stacking/paths.rs
+impl WorkingLayout { pub fn uncropped_dir(&self, run_id: i64) -> PathBuf; } // root/runs/run-<id>-uncropped
+pub struct EstimateInputs<'a> { /* … */ pub crop_scratch: bool }
+// stacking/master_cards.rs
+pub fn write_cropped_master(dir: &Path, scratch: &WrittenMaster, rect: CropRect, cards: &[Card], format: OutputFormat) -> anyhow::Result<WrittenMaster>;
+pub fn write_cropped_drizzle(dir: &Path, master_stem: &str, scale: u32, scratch: &WrittenDrizzle, rect: CropRect, cards: &[Card], format: OutputFormat) -> anyhow::Result<WrittenDrizzle>;
 ```
-Consumed by: Task 7b.
+Consumed by: Task 7b2 (the run's crop pass).
 
-- [ ] **Step 1: Write the module with its tests**
+- [ ] **Step 1: Write the failing tests**
 
-`crates/athenaeum-core/src/stacking/crop.rs`:
+`stacking/master_cards.rs`, `mod tests`:
 ```rust
-//! Crop to coverage (spec §5.9, plan 6b-3 D10): the rectangle a run keeps,
-//! and the pure operations that apply it to a plane, a header and a file.
-//!
-//! The rectangle is in array pixels of the master (the grid, for a
-//! project). A drizzled output uses the same rectangle `scale` times finer
-//! ([`CropRect::scaled`]): every master pixel is `s × s` drizzle pixels, and
-//! the drizzle WCS (`scale_plate_solve`) is defined on exactly that lattice.
-//! Cropping moves only `CRPIX`: SIP terms are polynomials in
-//! `(u, v) = p − CRPIX`, so they hold unchanged, and the WCS refers to array
-//! coordinates, so the row order needs no special case.
-
-use std::path::Path;
-
-use anyhow::Context;
-use serde::{Deserialize, Serialize};
-
-use crate::fits_writer::{Card, CardValue, OutputFormat, XisfBounds};
-use crate::integration::plane_reader::PlaneReader;
-use crate::plate_solve::storage::PlateSolveRecord;
-
-/// Columns `x0 .. x0 + width`, rows `y0 .. y0 + height`, in array pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CropRect {
-    pub x0: usize,
-    pub y0: usize,
-    pub width: usize,
-    pub height: usize,
-}
-
-impl CropRect {
-    /// The whole `width × height` image — what an uncropped finalization
-    /// "crops" to.
-    pub fn full(width: usize, height: usize) -> Self {
-        Self { x0: 0, y0: 0, width, height }
-    }
-
-    pub fn is_full(&self, width: usize, height: usize) -> bool {
-        *self == Self::full(width, height)
-    }
-
-    /// Non-empty and inside a `width × height` image.
-    pub fn fits_within(&self, width: usize, height: usize) -> bool {
-        self.width > 0
-            && self.height > 0
-            && self.x0 + self.width <= width
-            && self.y0 + self.height <= height
-    }
-
-    /// The smallest rectangle holding both.
-    pub fn union(self, other: CropRect) -> CropRect {
-        let x0 = self.x0.min(other.x0);
-        let y0 = self.y0.min(other.y0);
-        let x1 = (self.x0 + self.width).max(other.x0 + other.width);
-        let y1 = (self.y0 + self.height).max(other.y0 + other.height);
-        CropRect { x0, y0, width: x1 - x0, height: y1 - y0 }
-    }
-
-    /// The same rectangle on an output `s` times finer (drizzle).
-    pub fn scaled(self, s: u32) -> CropRect {
-        let s = s as usize;
-        CropRect {
-            x0: self.x0 * s,
-            y0: self.y0 * s,
-            width: self.width * s,
-            height: self.height * s,
-        }
-    }
-}
-
-/// The bounding box of the pixels at least `k` frames cover; `None` when no
-/// pixel reaches `k`. A count is a whole number stored as f32, so `>=` is
-/// exact; a NaN never qualifies.
-pub fn coverage_rect(coverage: &[f32], width: usize, height: usize, k: u32) -> Option<CropRect> {
-    debug_assert_eq!(coverage.len(), width * height);
-    let k = k as f32;
-    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
-    for y in 0..height {
-        let row = &coverage[y * width..(y + 1) * width];
-        let first = row.iter().position(|&c| c >= k);
-        let Some(first) = first else { continue };
-        let last = row.iter().rposition(|&c| c >= k).unwrap_or(first);
-        x0 = x0.min(first);
-        x1 = x1.max(last);
-        y0 = y0.min(y);
-        y1 = y1.max(y);
-    }
-    (x0 != usize::MAX).then(|| CropRect { x0, y0, width: x1 - x0 + 1, height: y1 - y0 + 1 })
-}
-
-/// The union of every rectangle; `None` for none.
-pub fn union_rects(rects: impl IntoIterator<Item = CropRect>) -> Option<CropRect> {
-    rects.into_iter().reduce(CropRect::union)
-}
-
-/// One plane's `rect`, row by row. `rect` must fit the plane.
-pub fn crop_plane(plane: &[f32], width: usize, rect: CropRect) -> Vec<f32> {
-    let mut out = Vec::with_capacity(rect.width * rect.height);
-    for y in rect.y0..rect.y0 + rect.height {
-        let start = y * width + rect.x0;
-        out.extend_from_slice(&plane[start..start + rect.width]);
-    }
-    out
-}
-
-/// Re-states `CRPIX1`/`CRPIX2` in `cards` from `cropped`
-/// ([`crate::stacking::grid_map::crop_plate_solve`] of the record the cards
-/// were written from), as exactly the values `wcs_cards` writes for it
-/// (1-based). Every other card, its comment and the presence or absence of
-/// `PLTSOLVD` (a grid master has none) stay as they were. Cards with no WCS
-/// are left alone.
-pub fn restate_crpix(cards: &mut [Card], cropped: &PlateSolveRecord) {
-    for card in cards.iter_mut() {
-        let value = match card.keyword.as_str() {
-            "CRPIX1" => cropped.crpix1 + 1.0,
-            "CRPIX2" => cropped.crpix2 + 1.0,
-            _ => continue,
+    /// Plan 6b-3 D10, review I7: finalizing a scratch family with the FULL
+    /// rectangle writes what the K = 0 writer writes — the same name, the
+    /// same pixels and keywords (XISF is not byte-reproducible: it stamps its
+    /// creation time) and byte-identical FITS maps — and a real crop takes
+    /// every member of the family to the rectangle, its `CRPIX` moved.
+    #[test]
+    fn a_full_rectangle_crop_writes_what_the_master_writer_writes() {
+        let (w, h, ch) = (8usize, 6usize, 3usize);
+        let plane = w * h;
+        let mut cards = HeaderBuilder::new(FrameKind::MasterLight).build().unwrap();
+        cards.push(Card::new("ATH_STKI", CardValue::Str("run-7".into())).unwrap());
+        cards.extend(wcs_cards(&record(false)).unwrap());
+        let output = GroupOutput {
+            width: w,
+            height: h,
+            channels: ch,
+            data: (0..plane * ch).map(|i| i as f32 / 1000.0).collect(),
+            rejection_low: Some(vec![1.0f32; plane * ch]),
+            rejection_high: Some(vec![2.0f32; plane * ch]),
+            coverage: Some((0..plane).map(|i| (i % 4) as f32).collect()),
+            included: vec![0, 1, 2],
+            output_pairs: vec![Vec::new(); ch],
+            second_pass_rej_ok: false,
+            stats: dummy_stats(),
         };
-        card.value = Some(CardValue::Real(value));
-    }
-}
+        let (direct, scratch, finals, cut) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let k0 = write_master_light(direct.path(), "master", &output, &cards, OutputFormat::Xisf).unwrap();
+        let staged = write_master_light(scratch.path(), "master", &output, &cards, OutputFormat::Fits).unwrap();
+        let full = write_cropped_master(finals.path(), &staged, CropRect::full(w, h), &cards, OutputFormat::Xisf).unwrap();
+        let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name(&full.master), name(&k0.master));
+        let (ma, pa) = astroimage::ImageConverter::read_raw(&k0.master).unwrap();
+        let (mb, pb) = astroimage::ImageConverter::read_raw(&full.master).unwrap();
+        assert_eq!((ma.width, ma.height, ma.channels), (mb.width, mb.height, mb.channels));
+        match (pa, pb) {
+            (astroimage::PixelData::Float32(a), astroimage::PixelData::Float32(b)) => {
+                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "the same pixels");
+            }
+            _ => panic!("expected Float32 samples"),
+        }
+        let keys = |p: &Path| {
+            crate::fits_parser::stored_header::parse_stored_header_keys(
+                crate::models::FileFormat::XISF,
+                &crate::fits_parser::extract_xisf_header(p).unwrap(),
+            )
+        };
+        assert_eq!(keys(&full.master), keys(&k0.master), "the same keywords");
+        for (a, b) in [
+            (&k0.rejection_low, &full.rejection_low),
+            (&k0.rejection_high, &full.rejection_high),
+            (&k0.coverage, &full.coverage),
+        ] {
+            let (a, b) = (a.as_ref().unwrap(), b.as_ref().unwrap());
+            assert_eq!(name(a), name(b));
+            assert_eq!(std::fs::read(a).unwrap(), std::fs::read(b).unwrap(), "{} differs", name(a));
+        }
 
-/// Reads the uncompressed float FITS at `src` (a scratch output), crops
-/// every plane to `rect` and writes `dst` in `format` with `cards` — the
-/// master writers' own call (`XisfBounds::Unit`). Refuses a rectangle that
-/// does not fit the file.
-pub fn crop_file(
-    src: &Path,
-    dst: &Path,
+        let rect = CropRect { x0: 2, y0: 1, width: 4, height: 3 };
+        let mut cropped_cards = cards.clone();
+        crate::stacking::crop::restate_crpix(
+            &mut cropped_cards,
+            &crate::stacking::grid_map::crop_plate_solve(&record(false), 2, 1),
+        );
+        let c = write_cropped_master(cut.path(), &staged, rect, &cropped_cards, OutputFormat::Fits).unwrap();
+        let reader = crate::integration::plane_reader::PlaneReader::open(&c.master).unwrap();
+        assert_eq!((reader.width(), reader.height(), reader.channels()), (4, 3, 3));
+        assert_eq!(
+            reader.read_plane(1).unwrap(),
+            crate::stacking::crop::crop_plane(&output.data[plane..2 * plane], w, rect)
+        );
+        let cov = crate::integration::plane_reader::PlaneReader::open(c.coverage.as_ref().unwrap()).unwrap();
+        assert_eq!((cov.width(), cov.height(), cov.channels()), (4, 3, 1));
+        let moved = crate::fits_parser::FitsHeader::from_path(c.coverage.as_ref().unwrap()).unwrap();
+        let before = crate::fits_parser::FitsHeader::from_path(k0.coverage.as_ref().unwrap()).unwrap();
+        assert!((moved.get_f64("CRPIX1").unwrap() - (before.get_f64("CRPIX1").unwrap() - 2.0)).abs() < 1e-9);
+        assert!((moved.get_f64("CRPIX2").unwrap() - (before.get_f64("CRPIX2").unwrap() - 1.0)).abs() < 1e-9);
+    }
+```
+
+`stacking/paths.rs`, `mod tests` (review M6):
+```rust
+    /// Review M6: a crop run holds every output twice for a moment — the
+    /// scratch FITS, then the final file — so the estimate counts the master
+    /// family and the drizzle family once more. The coverage maps (one f32
+    /// plane each) stay uncounted, as before.
+    #[test]
+    fn a_crop_run_counts_its_scratch_outputs() {
+        let groups = vec![group(ColorMode::Mono, 3, 10, 10)];
+        let inputs = |crop_scratch: bool| EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: true,
+            drizzle: Some((2, true, false)),
+            large_scale: false,
+            drizzle_bayer: false,
+            crop_scratch,
+        };
+        let plain = estimate_bytes(&inputs(false));
+        let crop = estimate_bytes(&inputs(true));
+        // The master 400 B with its two maps, the drizzled master 1600 B and
+        // its weight map 1600 B.
+        assert_eq!(crop - plain, 3 * 400 + 2 * 1600);
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- full_rectangle_crop_writes_what_the_master_writer crop_run_counts_its_scratch --test-threads=4 2>&1 | tail -20`
+Expected: compile errors (`write_cropped_master`, `crop_scratch`).
+
+- [ ] **Step 3: Implement**
+
+`stacking/paths.rs`, after `run_json`:
+```rust
+    /// `root/runs/run-<run_id>-uncropped` — plan 6b-3 D10: a crop run's
+    /// outputs, written as FITS and held here until the run's crop rectangle
+    /// is known; removed by the crop pass once every group is finalized,
+    /// kept (and named in the run's warnings) when one could not be.
+    pub fn uncropped_dir(&self, run_id: i64) -> PathBuf {
+        self.runs_dir().join(format!("run-{run_id}-uncropped"))
+    }
+```
+
+`stacking/paths.rs`, `EstimateInputs`, last field (review M6):
+```rust
+    /// Plan 6b-3 D10, review M6: `output.cropToCoverage > 0` — every output
+    /// is written twice for a moment (the scratch FITS, then the final file),
+    /// so the master and drizzle families count twice.
+    pub crop_scratch: bool,
+```
+In `estimate_bytes_with`, beside `master_multiplier`: `let copies: u64 = if i.crop_scratch { 2 } else { 1 };`; the master term becomes `total += master_per_frame_bytes * master_multiplier * copies;` and the drizzle terms `total += drizzle_output_bytes * copies;` (both lines). Every `EstimateInputs { … }` literal in `paths.rs`'s tests (15) gets `crop_scratch: false`; `build_plan`'s (`plan.rs:~2496`) gets `crop_scratch: cfg.output.crop_to_coverage > 0,`.
+
+`stacking/master_cards.rs`: `#[derive(Debug, Clone)]` on `WrittenMaster` and `WrittenDrizzle`; import `crate::stacking::crop::{crop_file, CropRect}`; then:
+```rust
+/// Plan 6b-3 D10 (spec §5.9): one group's master family — the master, its
+/// rejection maps and its coverage map, written uncropped as FITS into the
+/// run's scratch folder by [`write_master_light`] — re-read, cropped to
+/// `rect` and written into `dir` in `format`, named as
+/// [`write_master_light`] names them (the maps stay FITS). `cards` are the
+/// master's with the cropped `CRPIX` ([`crate::stacking::crop::restate_crpix`]);
+/// the maps' cards derive from them exactly as at the first write. On an
+/// error every file this call wrote is removed; the scratch is never
+/// touched.
+pub fn write_cropped_master(
+    dir: &Path,
+    scratch: &WrittenMaster,
     rect: CropRect,
     cards: &[Card],
     format: OutputFormat,
-) -> anyhow::Result<()> {
-    let reader = PlaneReader::open(src).with_context(|| format!("opening {}", src.display()))?;
-    let (width, height, channels) = (reader.width(), reader.height(), reader.channels());
-    anyhow::ensure!(
-        rect.fits_within(width, height),
-        "crop {rect:?} does not fit {} ({width} x {height})",
-        src.display()
-    );
-    let mut data = Vec::with_capacity(rect.width * rect.height * channels);
-    for plane in 0..channels {
-        let full = reader
-            .read_plane(plane)
-            .with_context(|| format!("reading plane {plane} of {}", src.display()))?;
-        data.extend(crop_plane(&full, width, rect));
+) -> anyhow::Result<WrittenMaster> {
+    let mut made = Vec::new();
+    let result = crop_master_family(dir, scratch, rect, cards, format, &mut made);
+    if result.is_err() {
+        remove_partial_outputs(&made);
     }
-    crate::fits_writer::write_image_f32(
-        dst,
-        rect.width,
-        rect.height,
-        channels,
-        &data,
-        cards,
-        format,
-        XisfBounds::Unit,
-    )
-    .with_context(|| format!("writing {}", dst.display()))?;
-    Ok(())
+    result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fits_writer::wcs::wcs_cards;
-    use crate::stacking::grid_map::crop_plate_solve;
-
-    /// Plan 6b-3 D10: the rectangle bounds exactly the pixels at or above
-    /// `k`, ignores NaN, and is `None` when nothing reaches `k`.
-    #[test]
-    fn coverage_rect_bounds_the_pixels_at_or_above_k() {
-        let (w, h) = (8, 6);
-        let mut cov = vec![0.0f32; w * h];
-        for y in 1..5 {
-            for x in 2..7 {
-                cov[y * w + x] = 2.0;
-            }
-        }
-        cov[2 * w + 3] = 3.0;
-        cov[4 * w + 6] = 3.0;
-        cov[5 * w + 7] = f32::NAN;
-        assert_eq!(coverage_rect(&cov, w, h, 1), Some(CropRect { x0: 2, y0: 1, width: 5, height: 4 }));
-        assert_eq!(coverage_rect(&cov, w, h, 2), Some(CropRect { x0: 2, y0: 1, width: 5, height: 4 }));
-        assert_eq!(coverage_rect(&cov, w, h, 3), Some(CropRect { x0: 3, y0: 2, width: 4, height: 3 }));
-        assert_eq!(coverage_rect(&cov, w, h, 4), None);
+fn crop_master_family(
+    dir: &Path,
+    scratch: &WrittenMaster,
+    rect: CropRect,
+    cards: &[Card],
+    format: OutputFormat,
+    made: &mut Vec<PathBuf>,
+) -> anyhow::Result<WrittenMaster> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let scratch_stem = scratch
+        .master
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("master");
+    let master = resolve_collision(&dir.join(scratch_stem).with_extension(output_extension(format)));
+    crop_file(&scratch.master, &master, rect, cards, format)?;
+    made.push(master.clone());
+    let stem = master
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("master")
+        .to_string();
+    // The maps stay FITS, named from the final master's stem, their cards
+    // derived from the master's exactly as `write_master_light` derives them.
+    let maps = [
+        (&scratch.rejection_low, "rejlow", rejection_map_cards("Low", cards)?),
+        (&scratch.rejection_high, "rejhigh", rejection_map_cards("High", cards)?),
+        (&scratch.coverage, "coverage", coverage_map_cards(cards)?),
+    ];
+    let mut written: [Option<PathBuf>; 3] = [None, None, None];
+    for (slot, (src, suffix, map_cards)) in written.iter_mut().zip(maps.iter()) {
+        let Some(src) = src else { continue };
+        let path = resolve_collision(&dir.join(format!("{stem}_{suffix}.fits")));
+        crop_file(src, &path, rect, map_cards, OutputFormat::Fits)?;
+        made.push(path.clone());
+        *slot = Some(path);
     }
+    let [rejection_low, rejection_high, coverage] = written;
+    Ok(WrittenMaster {
+        master,
+        rejection_low,
+        rejection_high,
+        coverage,
+    })
+}
 
-    /// Plan 6b-3 D10: the run-wide rectangle is the union; a drizzle
-    /// rectangle is the master's `s` times finer; fit checks both edges.
-    #[test]
-    fn rectangles_unite_scale_and_fit() {
-        let a = CropRect { x0: 2, y0: 1, width: 5, height: 4 };
-        let b = CropRect { x0: 4, y0: 0, width: 6, height: 2 };
-        assert_eq!(union_rects([a, b]), Some(CropRect { x0: 2, y0: 0, width: 8, height: 5 }));
-        assert_eq!(union_rects(std::iter::empty()), None);
-        assert_eq!(a.scaled(2), CropRect { x0: 4, y0: 2, width: 10, height: 8 });
-        assert!(a.fits_within(7, 5) && !a.fits_within(6, 5) && !a.fits_within(7, 4));
-        assert!(!CropRect { x0: 0, y0: 0, width: 0, height: 3 }.fits_within(4, 4));
-        assert!(CropRect::full(7, 5).is_full(7, 5) && !a.is_full(7, 5));
+/// Plan 6b-3 D10: the drizzle family — the drizzled master, its weight map
+/// and its coverage — re-read from the scratch folder, cropped to `rect`
+/// (already `scale` times the master's, [`CropRect::scaled`]) and written
+/// into `dir` in `format`, named from the FINAL master's stem as
+/// [`write_drizzled_master`] names them. `cards` are the drizzle cards with
+/// the cropped, scaled `CRPIX`. On an error every file this call wrote is
+/// removed.
+pub fn write_cropped_drizzle(
+    dir: &Path,
+    master_stem: &str,
+    scale: u32,
+    scratch: &WrittenDrizzle,
+    rect: CropRect,
+    cards: &[Card],
+    format: OutputFormat,
+) -> anyhow::Result<WrittenDrizzle> {
+    let mut made = Vec::new();
+    let result = crop_drizzle_family(dir, master_stem, scale, scratch, rect, cards, format, &mut made);
+    if result.is_err() {
+        remove_partial_outputs(&made);
     }
+    result
+}
 
-    #[test]
-    fn crop_plane_takes_the_rectangle_row_by_row() {
-        let (w, h) = (5, 4);
-        let plane: Vec<f32> = (0..w * h).map(|i| i as f32).collect();
-        let out = crop_plane(&plane, w, CropRect { x0: 1, y0: 2, width: 3, height: 2 });
-        assert_eq!(out, vec![11.0, 12.0, 13.0, 16.0, 17.0, 18.0]);
-    }
+#[allow(clippy::too_many_arguments)]
+fn crop_drizzle_family(
+    dir: &Path,
+    master_stem: &str,
+    scale: u32,
+    scratch: &WrittenDrizzle,
+    rect: CropRect,
+    cards: &[Card],
+    format: OutputFormat,
+    made: &mut Vec<PathBuf>,
+) -> anyhow::Result<WrittenDrizzle> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let ext = output_extension(format);
+    let (drizzle_name, _) = drizzle_file_names(master_stem, scale);
+    let drizzle = resolve_collision(&dir.join(&drizzle_name).with_extension(ext));
+    crop_file(&scratch.drizzle, &drizzle, rect, cards, format)?;
+    made.push(drizzle.clone());
+    let stem = drizzle
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("drizzle")
+        .to_string();
+    let weight_map = match &scratch.weight_map {
+        Some(src) => {
+            let path = resolve_collision(&dir.join(format!("{stem}_weight.{ext}")));
+            crop_file(src, &path, rect, &weight_map_cards(cards)?, format)?;
+            made.push(path.clone());
+            Some(path)
+        }
+        None => None,
+    };
+    let coverage = match &scratch.coverage {
+        Some(src) => {
+            let path = resolve_collision(&dir.join(format!("{stem}_coverage.fits")));
+            crop_file(src, &path, rect, &coverage_map_cards(cards)?, OutputFormat::Fits)?;
+            made.push(path.clone());
+            Some(path)
+        }
+        None => None,
+    };
+    Ok(WrittenDrizzle {
+        drizzle,
+        weight_map,
+        coverage,
+    })
+}
 
-    /// Spec §5.9 "CRPIX shifts by the crop origin", plan 6b-3 D10: the
-    /// restated header carries exactly the `CRPIX` a header written from the
-    /// cropped record carries, with SIP and every other card untouched —
-    /// and, on a grid header, still no `PLTSOLVD`.
-    #[test]
-    fn restate_crpix_moves_only_the_reference_pixel() {
-        let mut rec = crate::stacking::test_fixtures::sky_frame_record(
-            &crate::stacking::test_fixtures::sky_frame("a", (83.8, -5.4)),
-        );
-        rec.sip_order = Some(2);
-        rec.sip_a_coeffs = Some("[[0.0, 0.0, 1e-6], [0.0, 2e-6, 0.0], [3e-6, 0.0, 0.0]]".into());
-        rec.sip_b_coeffs = Some("[[0.0, 0.0, -1e-6], [0.0, 1e-6, 0.0], [2e-6, 0.0, 0.0]]".into());
-        let original = wcs_cards(&rec).unwrap();
-        let mut cards: Vec<Card> = original.iter().filter(|c| c.keyword != "PLTSOLVD").cloned().collect();
-        let cropped = crop_plate_solve(&rec, 40, 25);
-        restate_crpix(&mut cards, &cropped);
-        let expected = wcs_cards(&cropped).unwrap();
-        let value = |cs: &[Card], k: &str| cs.iter().find(|c| c.keyword == k).and_then(|c| c.value.clone());
-        for k in ["CRPIX1", "CRPIX2"] {
-            assert_eq!(value(&cards, k), value(&expected, k), "{k}");
+/// Removes the files a failed crop wrote, logging each one it cannot.
+fn remove_partial_outputs(made: &[PathBuf]) {
+    for path in made {
+        if let Err(error) = std::fs::remove_file(path) {
+            tracing::warn!(path = %path.display(), error = %error, "removing a partial crop output failed");
         }
-        for c in &cards {
-            if c.keyword != "CRPIX1" && c.keyword != "CRPIX2" {
-                assert_eq!(c.value, value(&original, &c.keyword), "{} moved", c.keyword);
-            }
-        }
-        assert!(cards.iter().all(|c| c.keyword != "PLTSOLVD"));
-    }
-
-    /// Plan 6b-3 D10: a three-plane scratch FITS crops plane by plane, to
-    /// FITS and to XISF.
-    #[test]
-    fn crop_file_crops_every_plane() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (w, h) = (6, 5);
-        let data: Vec<f32> = (0..3 * w * h).map(|i| i as f32 * 0.01).collect();
-        let src = tmp.path().join("scratch.fits");
-        crate::fits_writer::write_fits_f32(&src, w, h, 3, &data, &[]).unwrap();
-        let rect = CropRect { x0: 1, y0: 2, width: 3, height: 2 };
-        let cards = vec![Card::new("BUNIT", CardValue::Str("x".into())).unwrap()];
-        let fits = tmp.path().join("out.fits");
-        crop_file(&src, &fits, rect, &cards, OutputFormat::Fits).unwrap();
-        let reader = PlaneReader::open(&fits).unwrap();
-        assert_eq!((reader.width(), reader.height(), reader.channels()), (3, 2, 3));
-        for p in 0..3 {
-            let expected = crop_plane(&data[p * w * h..(p + 1) * w * h], w, rect);
-            assert_eq!(reader.read_plane(p).unwrap(), expected, "plane {p}");
-        }
-        let xisf = tmp.path().join("out.xisf");
-        crop_file(&src, &xisf, rect, &cards, OutputFormat::Xisf).unwrap();
-        let (meta, _) = astroimage::ImageConverter::read_raw(&xisf).unwrap();
-        assert_eq!((meta.width, meta.height, meta.channels), (3, 2, 3));
-        let err = crop_file(&src, &tmp.path().join("bad.fits"), CropRect { x0: 4, y0: 0, width: 3, height: 1 }, &cards, OutputFormat::Fits)
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("does not fit"), "{err:#}");
     }
 }
 ```
 
-Verified at `20c7c1ef`: `crate::integration::plane_reader::PlaneReader` is public (`run.rs:54` imports it); `OutputFormat` and `XisfBounds` are public in `crate::fits_writer` (`fits_writer/mod.rs:43, 74`); a SIP table is the JSON `Vec<Vec<f64>>` of `order + 1` rows (`fits_writer/wcs.rs:15-30`).
+- [ ] **Step 4: Run the tests to verify they pass**
 
-`stacking/mod.rs`: `pub mod crop;`.
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- full_rectangle_crop_writes_what_the_master_writer crop_run_counts_its_scratch stacking::master_cards stacking::paths stacking::plan --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
+Expected: all pass; every existing estimate pin unchanged (`crop_scratch: false` adds nothing).
 
-- [ ] **Step 2: Run the tests**
+- [ ] **Step 5: Run the gates.** `git diff --exit-code src/types`.
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- stacking::crop --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
-Expected: 5 passed.
-
-- [ ] **Step 3: Run the gates.** `git diff --exit-code src/types`.
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 ```bash
-git add crates/athenaeum-core/src/stacking/crop.rs crates/athenaeum-core/src/stacking/mod.rs
-git commit -m "feat(stacking): crop helpers — the coverage rectangle, the union, plane and file crop, CRPIX restated
+git add crates/athenaeum-core/src/stacking/paths.rs crates/athenaeum-core/src/stacking/plan.rs crates/athenaeum-core/src/stacking/master_cards.rs
+git commit -m "feat(stacking): crop writers that finalize a scratch family, and a space estimate that counts the scratch
 
 $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01YEaoHWL2V7MEXaXHgsiVwK')"
 ```
 
 ---
 
-### Task 7b: The deferred crop pass (D10; spec §5.9)
+### Task 7b2: The deferred crop pass (D10; spec §5.9)
 
 **Files:**
-- Modify `crates/athenaeum-core/src/stacking/paths.rs`: `WorkingLayout::uncropped_dir(run_id)`.
-- Modify `crates/athenaeum-core/src/stacking/master_cards.rs`: `#[derive(Debug, Clone)]` on `WrittenMaster` and `WrittenDrizzle`; `write_cropped_master`, `write_cropped_drizzle` and their private helpers.
 - Modify `crates/athenaeum-core/src/stacking/run.rs`:
   - `CropItem`, `CropDrizzle`, `CropOutputs`; `RunContext.crop_items` (two literals: `start_stacking` `~980`, `test_context` `~11074`);
   - `process_group_output`: the integration `GroupInput`'s `coverage_map`; `let mut output`; the crop block before `output_start`; the scratch folder and FITS for every write in crop mode; the drizzle outcome carries its cards; the `CropItem` push before the last `push_summary_group`;
   - `finish_crop`, `write_crop_item`, `record_crop_item`; `stage_output` calls `finish_crop` after the group loop;
-  - four tests.
+  - five tests.
 
 **Interfaces:**
 ```rust
-// stacking/paths.rs
-impl WorkingLayout { pub fn uncropped_dir(&self, run_id: i64) -> PathBuf; } // root/runs/run-<id>-uncropped
-// stacking/master_cards.rs
-pub fn write_cropped_master(dir: &Path, scratch: &WrittenMaster, rect: CropRect, cards: &[Card], format: OutputFormat) -> anyhow::Result<WrittenMaster>;
-pub fn write_cropped_drizzle(dir: &Path, master_stem: &str, scale: u32, scratch: &WrittenDrizzle, rect: CropRect, cards: &[Card], format: OutputFormat) -> anyhow::Result<WrittenDrizzle>;
 // stacking/run.rs (crate-internal)
 pub(crate) struct CropItem { /* private fields */ }
 pub(crate) struct CropDrizzle { /* private fields */ }
@@ -4899,173 +5853,75 @@ Consumed by: Task 9 (the e2e crops), Task 10 (run B reports the rectangle).
             rc.warnings
         );
     }
+
+    /// Review I7: a crop whose rectangle is the whole master finalizes
+    /// through the writer the K = 0 path uses — an XISF master with the same
+    /// pixels and keywords (all but the run id) — and says nothing about
+    /// cropping.
+    #[test]
+    fn a_full_rectangle_crop_writes_what_the_zero_crop_path_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let (fixture, light_ids, _working, _output) = seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+        test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
+        let run_with = |crop: u32| -> (String, RunSummary) {
+            let mut cfg = StackingConfig::default();
+            cfg.output.format = crate::stacking::config::OutputFormat::Xisf;
+            cfg.output.crop_to_coverage = crop;
+            let started = start_stacking(
+                ctx.clone(),
+                Arc::new(NullEmitter),
+                &PathPolicy::AllowAll,
+                "test".to_string(),
+                StackSubject::FrameSet(fixture.set_id),
+                Some(cfg),
+                None,
+            )
+            .unwrap();
+            wait_for_run(&ctx, started.run_id);
+            let row = crate::db::stacking::get_run(&fixture.conn, started.run_id).unwrap().unwrap();
+            assert_eq!(row.status, "done", "{row:?}");
+            let summary: RunSummary = serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+            let rows = crate::db::stacking::list_master_lights(&fixture.conn, started.run_id).unwrap();
+            (master_row(&rows, "master").path.clone(), summary)
+        };
+        let (k0, _) = run_with(0);
+        let (k1, summary) = run_with(1);
+        assert!(k1.ends_with(".xisf") && !k1.contains("-uncropped"), "{k1}");
+        let read = |p: &str| astroimage::ImageConverter::read_raw(Path::new(p)).unwrap();
+        let ((ma, pa), (mb, pb)) = (read(&k0), read(&k1));
+        assert_eq!((ma.width, ma.height, ma.channels), (mb.width, mb.height, mb.channels));
+        match (pa, pb) {
+            (astroimage::PixelData::Float32(a), astroimage::PixelData::Float32(b)) => {
+                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "the same pixels");
+            }
+            _ => panic!("expected Float32 samples"),
+        }
+        let keys = |p: &str| {
+            let mut k = crate::fits_parser::stored_header::parse_stored_header_keys(
+                crate::models::FileFormat::XISF,
+                &crate::fits_parser::extract_xisf_header(Path::new(p)).unwrap(),
+            );
+            k.remove("ATH_STKI");
+            k
+        };
+        assert_eq!(keys(&k1), keys(&k0), "the same keywords but the run id");
+        assert!(
+            summary.warnings.iter().all(|w| !w.contains("crop") && !w.contains("uncropped")),
+            "{:?}",
+            summary.warnings
+        );
+    }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- a_zero_crop_keeps a_co_registered_run_crops native_mode_crops a_failed_crop_keeps --test-threads=4 2>&1 | tail -20`
-Expected: compile errors (`uncropped_dir`); `a_zero_crop_keeps_todays_output_path` passes once it compiles (it pins today's path).
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- a_zero_crop_keeps a_co_registered_run_crops native_mode_crops a_failed_crop_keeps full_rectangle_crop_writes_what_the_zero_crop --test-threads=4 2>&1 | tail -20`
+Expected: the crop tests fail (no crop pass yet: masters land uncropped, no scratch folder); `a_zero_crop_keeps_todays_output_path` passes (it pins today's path).
 
 - [ ] **Step 3: Implement**
-
-`stacking/paths.rs`, after `run_json`:
-```rust
-    /// `root/runs/run-<run_id>-uncropped` — plan 6b-3 D10: a crop run's
-    /// outputs, written as FITS and held here until the run's crop rectangle
-    /// is known; removed by the crop pass once every group is finalized,
-    /// kept (and named in the run's warnings) when one could not be.
-    pub fn uncropped_dir(&self, run_id: i64) -> PathBuf {
-        self.runs_dir().join(format!("run-{run_id}-uncropped"))
-    }
-```
-
-`stacking/master_cards.rs`: `#[derive(Debug, Clone)]` on `WrittenMaster` and `WrittenDrizzle`; import `crate::stacking::crop::{crop_file, CropRect}`; then:
-```rust
-/// Plan 6b-3 D10 (spec §5.9): one group's master family — the master, its
-/// rejection maps and its coverage map, written uncropped as FITS into the
-/// run's scratch folder by [`write_master_light`] — re-read, cropped to
-/// `rect` and written into `dir` in `format`, named as
-/// [`write_master_light`] names them (the maps stay FITS). `cards` are the
-/// master's with the cropped `CRPIX` ([`crate::stacking::crop::restate_crpix`]);
-/// the maps' cards derive from them exactly as at the first write. On an
-/// error every file this call wrote is removed; the scratch is never
-/// touched.
-pub fn write_cropped_master(
-    dir: &Path,
-    scratch: &WrittenMaster,
-    rect: CropRect,
-    cards: &[Card],
-    format: OutputFormat,
-) -> anyhow::Result<WrittenMaster> {
-    let mut made = Vec::new();
-    let result = crop_master_family(dir, scratch, rect, cards, format, &mut made);
-    if result.is_err() {
-        remove_partial_outputs(&made);
-    }
-    result
-}
-
-fn crop_master_family(
-    dir: &Path,
-    scratch: &WrittenMaster,
-    rect: CropRect,
-    cards: &[Card],
-    format: OutputFormat,
-    made: &mut Vec<PathBuf>,
-) -> anyhow::Result<WrittenMaster> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let scratch_stem = scratch
-        .master
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("master");
-    let master = resolve_collision(&dir.join(scratch_stem).with_extension(output_extension(format)));
-    crop_file(&scratch.master, &master, rect, cards, format)?;
-    made.push(master.clone());
-    let stem = master
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("master")
-        .to_string();
-    let mut map = |src: &Option<PathBuf>, suffix: &str, map_cards: Vec<Card>| -> anyhow::Result<Option<PathBuf>> {
-        let Some(src) = src else { return Ok(None) };
-        let path = resolve_collision(&dir.join(format!("{stem}_{suffix}.fits")));
-        crop_file(src, &path, rect, &map_cards, OutputFormat::Fits)?;
-        made.push(path.clone());
-        Ok(Some(path))
-    };
-    let rejection_low = map(&scratch.rejection_low, "rejlow", rejection_map_cards("Low", cards)?)?;
-    let rejection_high = map(&scratch.rejection_high, "rejhigh", rejection_map_cards("High", cards)?)?;
-    let coverage = map(&scratch.coverage, "coverage", coverage_map_cards(cards)?)?;
-    Ok(WrittenMaster {
-        master,
-        rejection_low,
-        rejection_high,
-        coverage,
-    })
-}
-
-/// Plan 6b-3 D10: the drizzle family — the drizzled master, its weight map
-/// and its coverage — re-read from the scratch folder, cropped to `rect`
-/// (already `scale` times the master's, [`CropRect::scaled`]) and written
-/// into `dir` in `format`, named from the FINAL master's stem as
-/// [`write_drizzled_master`] names them. `cards` are the drizzle cards with
-/// the cropped, scaled `CRPIX`. On an error every file this call wrote is
-/// removed.
-pub fn write_cropped_drizzle(
-    dir: &Path,
-    master_stem: &str,
-    scale: u32,
-    scratch: &WrittenDrizzle,
-    rect: CropRect,
-    cards: &[Card],
-    format: OutputFormat,
-) -> anyhow::Result<WrittenDrizzle> {
-    let mut made = Vec::new();
-    let result = crop_drizzle_family(dir, master_stem, scale, scratch, rect, cards, format, &mut made);
-    if result.is_err() {
-        remove_partial_outputs(&made);
-    }
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-fn crop_drizzle_family(
-    dir: &Path,
-    master_stem: &str,
-    scale: u32,
-    scratch: &WrittenDrizzle,
-    rect: CropRect,
-    cards: &[Card],
-    format: OutputFormat,
-    made: &mut Vec<PathBuf>,
-) -> anyhow::Result<WrittenDrizzle> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let ext = output_extension(format);
-    let (drizzle_name, _) = drizzle_file_names(master_stem, scale);
-    let drizzle = resolve_collision(&dir.join(&drizzle_name).with_extension(ext));
-    crop_file(&scratch.drizzle, &drizzle, rect, cards, format)?;
-    made.push(drizzle.clone());
-    let stem = drizzle
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("drizzle")
-        .to_string();
-    let weight_map = match &scratch.weight_map {
-        Some(src) => {
-            let path = resolve_collision(&dir.join(format!("{stem}_weight.{ext}")));
-            crop_file(src, &path, rect, &weight_map_cards(cards)?, format)?;
-            made.push(path.clone());
-            Some(path)
-        }
-        None => None,
-    };
-    let coverage = match &scratch.coverage {
-        Some(src) => {
-            let path = resolve_collision(&dir.join(format!("{stem}_coverage.fits")));
-            crop_file(src, &path, rect, &coverage_map_cards(cards)?, OutputFormat::Fits)?;
-            made.push(path.clone());
-            Some(path)
-        }
-        None => None,
-    };
-    Ok(WrittenDrizzle {
-        drizzle,
-        weight_map,
-        coverage,
-    })
-}
-
-/// Removes the files a failed crop wrote, logging each one it cannot.
-fn remove_partial_outputs(made: &[PathBuf]) {
-    for path in made {
-        if let Err(error) = std::fs::remove_file(path) {
-            tracing::warn!(path = %path.display(), error = %error, "removing a partial crop output failed");
-        }
-    }
-}
-```
-If the borrow checker refuses the `map` closure capturing `made` mutably while `master` was pushed before it, that is fine as written (the push happens before the closure is created); if it refuses `rejection_map_cards(…)?` evaluated inside the call while `map` is borrowed, hoist the three card vectors into locals first.
 
 `stacking/run.rs`:
 
@@ -5120,7 +5976,7 @@ struct CropOutputs {
 and `crop_items: Vec::new(),` in both literals.
 
 4. `process_group_output`:
-- the integration `GroupInput` (Task 6a's line) becomes `coverage_map: rc.config.output.coverage_map || rc.config.output.crop_to_coverage > 0,` (the count is needed for the rectangle even when the map is not written);
+- the integration `GroupInput` (Task 6a's line) becomes `coverage_map: rc.config.output.coverage_map || rc.config.output.crop_to_coverage > 0,` (the count is needed for the rectangle even when the map is not written; `stats_on_covered` stays `rc.grid.is_some()`);
 - `let output = match integrate_group(` becomes `let mut output = match integrate_group(`;
 - immediately before `let output_start = Instant::now();`:
   ```rust
@@ -5224,10 +6080,10 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
                     crop_y0 = r.y0,
                     crop_width = r.width,
                     crop_height = r.height,
-                    "crop rectangle outside the group's master; outputs not cropped"
+                    "crop rectangle outside the group's master; outputs written uncropped"
                 );
                 rc.warnings.push(format!(
-                    "group {}: the run's crop rectangle does not fit its master; its outputs are not cropped",
+                    "group {}: the run's crop rectangle does not fit its master; its outputs are written uncropped",
                     item.group_key
                 ));
                 full
@@ -5237,10 +6093,10 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
                     run_id = rc.run_id,
                     group_key = %item.group_key,
                     count = k,
-                    "no pixel reached the crop coverage; outputs not cropped"
+                    "no pixel reached the crop coverage; outputs written uncropped"
                 );
                 rc.warnings.push(format!(
-                    "group {}: no pixel is covered by {k} frames; its outputs are not cropped",
+                    "group {}: no pixel is covered by {k} frames; its outputs are written uncropped",
                     item.group_key
                 ));
                 full
@@ -5297,7 +6153,12 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
 
 /// The file half of one group's crop: the master family, then the drizzle
 /// family, each into the output folder; a drizzle failure removes the master
-/// family this call wrote, so a retry starts clean.
+/// family this call wrote, so a retry starts clean. `rect` may be the full
+/// master: that finalization writes exactly what the K = 0 path writes, the
+/// same writer on the same pixels and cards (review I7). The drizzle WCS is
+/// `scale_plate_solve` of the master's record again (review M13): the first
+/// write already scaled the same record, so it does not fail here; if it
+/// ever did, the group would be finalized uncropped, or keep its scratch.
 fn write_crop_item(rc: &RunContext, item: &CropItem, rect: CropRect) -> anyhow::Result<CropOutputs> {
     let format = rc.config.output.format;
     let mut cards = item.cards.clone();
@@ -5440,14 +6301,14 @@ New log fields: `crop_x0`, `crop_y0`, `crop_width`, `crop_height` (Task 11 adds 
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- a_zero_crop_keeps a_co_registered_run_crops native_mode_crops a_failed_crop_keeps stacking::crop stacking::master_cards stacking::run::tests --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
+Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- a_zero_crop_keeps a_co_registered_run_crops native_mode_crops a_failed_crop_keeps full_rectangle_crop_writes_what_the_zero_crop stacking::crop stacking::master_cards stacking::run::tests --test-threads=4 2>&1 | grep -E '^test result|FAILED|panicked' | head`
 Expected: all pass. If `native_mode_crops_each_group_to_its_own_rectangle` finds one master, the `R` frames were grouped with the `L` ones: print `rc.plan_groups` and check the `filter_canonical` update reached `project_frames_local` (the grouping keys on it, `project_source.rs:339`). Never loosen an assertion.
 
 - [ ] **Step 5: Run the gates.** `git diff --exit-code src/types`.
 
 - [ ] **Step 6: Commit**
 ```bash
-git add crates/athenaeum-core/src/stacking/paths.rs crates/athenaeum-core/src/stacking/master_cards.rs crates/athenaeum-core/src/stacking/run.rs
+git add crates/athenaeum-core/src/stacking/run.rs
 git commit -m "feat(stacking): crop to coverage — one rectangle per co-registered run, one per group in native, a master is never lost
 
 $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01YEaoHWL2V7MEXaXHgsiVwK')"
@@ -5476,7 +6337,7 @@ pub(crate) fn start_stacking_with_solver(ctx: Arc<ServiceContext>, emitter: Arc<
 pub(crate) fn solver_identity(app_data: &Path, config: &PlateSolveConfig) -> Result<String, String>;
 pub(crate) fn installed_solver_identity(conn: &Connection) -> Result<String, String>;
 // stacking/origin.rs
-pub(crate) enum WcsOutlook { Manifest, Solved, ToSolve, Unsolvable }
+pub(crate) enum WcsOutlook { NotApplicable, Manifest, Solved, ToSolve, Unsolvable }
 pub(crate) fn wcs_outlook(conn: &Connection, origin: &FrameOrigin, frame_id: i64, identity: Option<&str>) -> anyhow::Result<WcsOutlook>;
 pub(crate) struct ReferenceWcsCheck { pub blocker: Option<String>, pub warning: Option<String> }
 pub(crate) fn reference_wcs_check(conn: &Connection, origins: &FrameOrigins, in_scope: &[i64], pinned: Option<i64>, identity: Option<&str>) -> anyhow::Result<ReferenceWcsCheck>;
@@ -5493,6 +6354,8 @@ Consumed by: Task 8b (`start_project_stacking`), Task 9 (`start_stacking_with_so
     /// connection alone, and it is the identity the run's solver reports —
     /// so the plan and the run agree on which cached failures stand. A
     /// database with no file has none.
+    // `use super::*` brings the `FrameSolver` trait in for `identity()`
+    // (review M15): keep the import if this test moves.
     #[test]
     fn the_installed_identity_is_the_runs_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -5671,7 +6534,7 @@ Consumed by: Task 8b (`start_project_stacking`), Task 9 (`start_stacking_with_so
     }
 ```
 
-`stacking/run.rs`, `mod tests` — delete `a_project_start_is_refused_until_6b2`; add after the Task 7b tests:
+`stacking/run.rs`, `mod tests` — delete `a_project_start_is_refused_until_6b2`; add after the Task 7b2 tests:
 ```rust
     /// Spec §2, plan 6b-3 D13: `start_stacking` starts a project. The run
     /// queues as "Stacking · <title>", stacks onto the confirmed grid,
@@ -5771,6 +6634,8 @@ and in `CatalogSolver::prepared`, replace the `catalog`/`identity` lines with `l
 /// judged as the run's Solve sub-step will judge it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WcsOutlook {
+    /// A catalog frame: the reference WCS rule does not apply (review M16).
+    NotApplicable,
     /// The manifest carries one.
     Manifest,
     /// A cached solve of this content, which the run reuses.
@@ -5785,7 +6650,7 @@ pub(crate) enum WcsOutlook {
 /// The [`WcsOutlook`] of one frame. `identity` is the installed solver's
 /// ([`crate::stacking::solve::installed_solver_identity`]); `None` means no
 /// solver can run, so only a cached solve helps. A catalog frame has no rule
-/// and reads as `Manifest`.
+/// and reads as `NotApplicable`.
 pub(crate) fn wcs_outlook(
     conn: &Connection,
     origin: &FrameOrigin,
@@ -5794,7 +6659,7 @@ pub(crate) fn wcs_outlook(
 ) -> anyhow::Result<WcsOutlook> {
     use crate::stacking::solve::{cached_outcome_holds, solve_hash, SolveArtifact};
     let (project_id, blake3) = match origin {
-        FrameOrigin::Catalog { .. } => return Ok(WcsOutlook::Manifest),
+        FrameOrigin::Catalog { .. } => return Ok(WcsOutlook::NotApplicable),
         FrameOrigin::Project { meta, .. } if meta.wcs.is_some() => return Ok(WcsOutlook::Manifest),
         FrameOrigin::Project { project_id, blake3, .. } => (project_id, blake3),
     };
@@ -5863,7 +6728,7 @@ pub(crate) fn reference_wcs_check(
                 return Ok(check);
             }
             WcsOutlook::ToSolve => check.warning = Some(PIN_TO_SOLVE.to_string()),
-            WcsOutlook::Manifest | WcsOutlook::Solved => {}
+            WcsOutlook::NotApplicable | WcsOutlook::Manifest | WcsOutlook::Solved => {}
         }
     }
     if in_scope.is_empty() {
@@ -6171,9 +7036,9 @@ Verified with `sqlite3 :memory:` at plan time on the schema's own columns: the s
     }
 
     /// Spec §9.3, plan 6b-3 D12: project cleanup sweeps the rows of frames
-    /// that left the project before anything else — with no working folder
-    /// at all — then honours the project's own folder for usage and cleanup,
-    /// and refuses while a project run is active.
+    /// that left the project — even with no working folder at all — then
+    /// honours the project's own folder for usage and cleanup, and refuses
+    /// while a project run is active (before the sweep, review M5).
     #[test]
     fn project_cleanup_sweeps_departed_frames_then_cleans_its_folder() {
         let (_tmp, ctx) = test_ctx();
@@ -6529,13 +7394,15 @@ pub fn get_project_stacking_work_usage(
     Ok(work_usage(&layout))
 }
 
-/// Clean a project's working layout (plan 6b-3 D12, spec §9.3). First, at
-/// every level and even with no working folder, the artifact rows of frames
-/// that left the project are swept (rows only). Then, as for a set: heal,
-/// `Conflict` while a project run is active, `Ok(0)` with no working folder.
-/// A layout root that overlaps a scan root (the Collaboration root is one)
-/// is refused, as the plan's `folders` blocker refuses it (6b-2 C6) —
-/// cleanup removes whole subtrees and a landed replica must never be in one.
+/// Clean a project's working layout (plan 6b-3 D12, spec §9.3). As for a
+/// set: heal, then `Conflict` while a project run is active. Then, at every
+/// level and even with no working folder, the artifact rows of frames that
+/// left the project are swept (rows only; review M5 put the sweep after the
+/// `Conflict` check, so a refused cleanup touches nothing). Then `Ok(0)`
+/// with no working folder. A layout root that overlaps a scan root (the
+/// Collaboration root is one) is refused, as the plan's `folders` blocker
+/// refuses it (6b-2 C6) — cleanup removes whole subtrees and a landed
+/// replica must never be in one.
 pub fn cleanup_project_stacking_work(
     ctx: &ServiceContext,
     project_id: &str,
@@ -6545,13 +7412,13 @@ pub fn cleanup_project_stacking_work(
     let conn = db_handle.conn();
     let subject = StackSubject::Project(project_id.to_string());
     subject_label(&conn, &subject)?;
-    crate::db::stacking::sweep_departed_project_artifacts(&conn, project_id)?;
     run::heal_interrupted_runs(ctx, &conn)?;
     if let Some(run_id) = active_run_for_subject(&conn, &subject)? {
         return Err(ApiError::Conflict(format!(
             "a stacking run (id {run_id}) is active for project {project_id}"
         )));
     }
+    crate::db::stacking::sweep_departed_project_artifacts(&conn, project_id)?;
     let Some(working) = project_working_dir(&conn, &ctx.settings, project_id)? else {
         return Ok(0);
     };
@@ -6833,8 +7700,8 @@ pub async fn get_project_stacking_work_usage(
         .map_err(|e| e.to_string())
 }
 
-/// Clean a project's working layout; first sweeps the rows of frames that
-/// left the project. Refuses while a project run is active.
+/// Clean a project's working layout. Refuses while a project run is active;
+/// otherwise sweeps the rows of frames that left the project first.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn cleanup_project_stacking_work(
@@ -7071,7 +7938,7 @@ $(printf 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Sess
 - Create `crates/athenaeum-core/src/api/stacking_project_e2e.rs` (test-only).
 - Modify `crates/athenaeum-core/src/api/mod.rs`: register it beside `pub mod stacking;` (`~113`).
 
-The lighter harness of `api/collab_grid.rs`'s tests (`FakeHub` + `collab_exchange::test_support::{test_ctx, wire_hub}` + `refresh_projects` + `sync_manifest`), no iroh, no live runtime. Frames are rendered by Task 2b's `render_sky_frame` and landed with `set_landed`, as the exchange leaves them. The solve goes through `start_stacking_with_solver` with a `FakeSolver` answering the one frame without a manifest WCS with its true record (spec §15.2: a synthetic field cannot be solved against a real catalog).
+The lighter harness of `api/collab_grid.rs`'s tests (`FakeHub` + `collab_exchange::test_support::{test_ctx, wire_hub}` + `refresh_projects` + `sync_manifest`), no iroh, no live runtime. Frames are rendered by Task 2b1's `render_sky_frame` and landed with `set_landed`, as the exchange leaves them. The solve goes through `start_stacking_with_solver` with a `FakeSolver` answering the one frame without a manifest WCS with its true record (spec §15.2: a synthetic field cannot be solved against a real catalog).
 
 The project (canonical names differ from every raw name, so the masters' `FILTER` proves the canonical stamp):
 
@@ -7116,7 +7983,10 @@ use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
 use crate::stacking::config::StackingConfig;
 use crate::stacking::solve::{FakeSolver, SolveOutcome};
-use crate::stacking::test_fixtures::{render_sky_frame, sky_frame, sky_frame_record, sky_stars};
+use crate::stacking::test_fixtures::{
+    render_sky_frame, sky_frame, sky_frame_record, sky_stars, EAST_PAIR_OFFSET_WIDTHS,
+    EAST_PAIR_SPACING_ARCSEC, EAST_PAIR_STAR_SEED,
+};
 
 const TARGET: (f64, f64) = (83.8, -5.4);
 
@@ -7144,7 +8014,9 @@ fn catalog_rows(ctx: &ServiceContext) -> (i64, i64, i64) {
 
 /// Waits for the run's terminal row and for its handle to leave.
 async fn finished(ctx: &ServiceContext, run_id: i64) -> StackingRunRow {
-    let deadline = Instant::now() + Duration::from_secs(300);
+    // Two runs on the test context's one image-pool thread under full-suite
+    // load (review M11): generous, never the expected duration.
+    let deadline = Instant::now() + Duration::from_secs(600);
     loop {
         let row = crate::db::stacking::get_run(&db_conn(ctx), run_id).unwrap().unwrap();
         let live = ctx.active_stacks.lock().unwrap().contains_key(&run_id);
@@ -7201,8 +8073,10 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
     );
     hub.set_target("p1", "M42", TARGET.0, TARGET.1, 1.0);
 
-    let east = 0.85 * 384.0 * 1.5 / 3600.0 / TARGET.1.to_radians().cos();
-    let near = |i: f64| (TARGET.0 + (i - 1.5) * 0.002, TARGET.1 + (i % 2.0) * 0.001);
+    let east = EAST_PAIR_OFFSET_WIDTHS * 384.0 * 1.5 / 3600.0 / TARGET.1.to_radians().cos();
+    // The run tests' dithers (±3.6 px at most): the LN field's 0.97 rule
+    // must keep every central L member (D8, review I6).
+    let near = |i: f64| (TARGET.0 + (i - 1.5) * 0.001, TARGET.1 + (i % 2.0) * 0.0005);
     let frame = |uuid, account, publisher, raw, canonical, centre, manifest_wcs| Planned {
         uuid,
         account,
@@ -7226,8 +8100,9 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
         frame("e0", "acc-b", "Bob", "Lum", "L", (TARGET.0 + east, TARGET.1), true),
         frame("e1", "acc-b", "Bob", "Lum", "L", (TARGET.0 + east + 0.002, TARGET.1 + 0.001), true),
     ];
-    // 40″ spacing: the east members register over a ≈ 15 % strip.
-    let stars = sky_stars((TARGET.0 + east / 2.0, TARGET.1), 0.2, 40.0, 11);
+    // Task 5b's star field, constant for constant (review I5): the east pair
+    // registers over its ≈ 15 % strip there first, a hundred times cheaper.
+    let stars = sky_stars((TARGET.0 + east / 2.0, TARGET.1), 0.2, EAST_PAIR_SPACING_ARCSEC, EAST_PAIR_STAR_SEED);
     let collab = tmp.path().join("collab");
     let mut b2_record = None;
     let mut rendered = Vec::new();
@@ -7417,7 +8292,7 @@ Verified at `20c7c1ef`: `crate::api::db` returns `&Database`, whose `conn()` is 
 Run: `CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib -- stacking_project_e2e --test-threads=1 2>&1 | tail -30`
 Expected: PASS within a few minutes (the test context's image pool has one thread).
 If it fails, find the cause; never loosen an assertion:
-- the east pair excluded at Register (`detail.frames` reasons): lower the star spacing to 32″ and re-run;
+- the east pair excluded at Register (`detail.frames` reasons): Task 5b's `a_member_under_a_quarter_overlap_keeps_global_normalization` registers the same strip with the same field and should have failed first; lower `test_fixtures::EAST_PAIR_SPACING_ARCSEC` to 32″ (both tests follow) and re-run both;
 - `L coverage` off by one at the target: print `x, y` and the 3 × 3 neighbourhood — a dither landing a frame edge on the target pixel means the fixture's dither, not the count, is wrong; move `near()`'s step to 0.0015;
 - `ready.blockers` not empty: print them; a `folders` blocker means the working folder overlaps the collab folder — keep `work/` and `collab/` siblings.
 
@@ -7499,11 +8374,17 @@ if ! printf '%s' "$RESP" | grep -q '"runId"'; then
   exit 1
 fi
 RUN_ID=$(printf '%s' "$RESP" | sed -E 's/.*"runId":([0-9]+).*/\1/')
+FINISHED=0
 for i in $(seq 1 480); do
-  if grep -A1 'stacking-complete' "$W/events-project.log" 2>/dev/null | grep -q "\"runId\":$RUN_ID[,}]"; then break; fi
+  if grep -A1 'stacking-complete' "$W/events-project.log" 2>/dev/null | grep -q "\"runId\":$RUN_ID[,}]"; then FINISHED=1; break; fi
   sleep 30
 done
 T1=$(date +%s); echo "end $(date -u +%FT%TZ) epoch=$T1 wall_s=$((T1-T0)) run_id=$RUN_ID" >> "$W/run-project.txt"
+if [ "$FINISHED" != "1" ]; then
+  # Review M10: a 4-hour wait that ends without the event is a timeout,
+  # never a finished run.
+  echo "TIMED OUT after 4 h waiting for stacking-complete of run $RUN_ID" | tee -a "$W/run-project.txt" >&2
+fi
 grep -A1 'stacking-complete' "$W/events-project.log" | grep "\"runId\":$RUN_ID[,}]" >> "$W/run-project.txt"
 kill $SSE_PID 2>/dev/null
 pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
@@ -7520,8 +8401,19 @@ cat "$W/run-project.txt"
           ...  # the moved block, unchanged
   ```
   and call it from `report_masters` where the loop was — the `--numeric` output is byte-identical;
-- add the pairs mode:
+- add the pairs mode, with a dimensions reader (FITS from its header; anything else through `imgcmp.read`, which `weight_map_coverage` already imports):
   ```python
+  def plane_dims(path):
+      """-> (width, height) of a master: NAXIS1/NAXIS2 of a FITS header, else the array shape."""
+      if path.lower().endswith((".fits", ".fit")):
+          cards, _, _ = fits_split(path)
+          keys = {c[:8].strip(): c[10:].split("/")[0].strip() for c in cards if c[8:10] == "= "}
+          return int(keys["NAXIS1"]), int(keys["NAXIS2"])
+      from imgcmp import read
+      shape = read(path).shape
+      return shape[-1], shape[-2]
+
+
   def run_pairs(pairs):
       """Plan 6b-3 run A (spec §15.3): the first four rows of the Tier C §8 table on explicit
       (head, base) master pairs — a project's grid master against the personal master of the
@@ -7531,9 +8423,16 @@ cat "$W/run-project.txt"
       gate = {"median_mad": [], "noise": [], "fwhm": []}
       print("=== run A: project masters (head) vs personal masters (base) ===")
       for head, base in pairs:
-          h_ch, b_ch = measure_master(head), measure_master(base)
           print(f"  head {head}")
           print(f"  base {base}")
+          # Review I4: the rows compare two planes of the same pixel grid only.
+          h_dims, b_dims = plane_dims(head), plane_dims(base)
+          if h_dims != b_dims:
+              print(f"    FAIL pixel grids differ: head {h_dims} base {b_dims} — not comparable")
+              for k in gate:
+                  gate[k].append(False)
+              continue
+          h_ch, b_ch = measure_master(head), measure_master(base)
           if len(h_ch) != len(b_ch):
               print(f"    FAIL channel count differs: head={len(h_ch)} base={len(b_ch)}")
               for k in gate:
@@ -7634,12 +8533,14 @@ def normalized(g):
         rot += 360.0
     elif rot > 180.0:
         rot -= 360.0
+    # `+ 0.0` turns -0.0 into 0.0 on every float, as `CanonicalGrid::normalized`
+    # does (review M9).
     return {
-        "crval1": g["crval1"] % 360.0,
-        "crval2": g["crval2"],
+        "crval1": (g["crval1"] % 360.0) + 0.0,
+        "crval2": g["crval2"] + 0.0,
         "heightPx": int(g["heightPx"]),
         "rotationDeg": rot + 0.0,
-        "scaleArcsec": g["scaleArcsec"],
+        "scaleArcsec": g["scaleArcsec"] + 0.0,
         "widthPx": int(g["widthPx"]),
     }
 
@@ -7660,6 +8561,17 @@ def grid_of_reference(db, pid, uuid):
     ra, dec = pixel_to_sky(wcs, (w + 1) / 2.0, (h + 1) / 2.0)
     rot = math.degrees(math.atan2(-cd[1], cd[3])) % 360.0
     scale = math.sqrt(abs(cd[0] * cd[3] - cd[1] * cd[2])) * 3600.0
+    # Review I4: the grid's pixels are square and unskewed; the reference's
+    # are only to the extent its CD is. Print how far, so run A's report says
+    # how much of a row difference geometry could explain.
+    col1, col2 = math.hypot(cd[0], cd[2]), math.hypot(cd[1], cd[3])
+    aspect = col1 / col2 if col2 else float("nan")
+    skew = abs(cd[0] * cd[1] + cd[2] * cd[3]) / (col1 * col2) if col1 and col2 else float("nan")
+    print(
+        f"reference {uuid}: scale {scale:.6f}\"/px, rotation {rot:.4f} deg, "
+        f"pixel aspect {aspect:.6f}, skew {skew:.2e}, det CD {'>' if cd[0] * cd[3] - cd[1] * cd[2] > 0 else '<'} 0",
+        file=sys.stderr,
+    )
     return {"scaleArcsec": scale, "widthPx": w, "heightPx": h, "crval1": ra, "crval2": dec, "rotationDeg": rot}
 
 
@@ -7711,7 +8623,11 @@ latest finished run of a project in an acceptance copy — the grid; the
 coverage map (min, max, histogram, the coverage >= K rectangle); and, on the
 master cropped to that rectangle, FWHM in px and arcsec, eccentricity, the
 noise per pixel and per arcsec² (D23: sigma_px * scale, the noise of a
-one-arcsec² mean). No tolerance: the geometry differs from every baseline.
+one-arcsec² mean of WHITE noise — a stack's pixels are correlated by
+resampling, more so by drizzle, so this is a white-noise equivalent that
+understates the true per-area noise by a scale-dependent factor; the
+review's caveat on D23). No tolerance: the geometry differs from every
+baseline.
 
     grid-report.py <work-dir> <project-id> [--k K] [--overlap]
 
@@ -7777,6 +8693,7 @@ def main():
     run_id, summary = row[0], json.loads(row[1])
     grid = summary["grid"]
     scale = grid["scaleArcsec"]
+    print("noise per arcsec^2 below is the white-noise equivalent sigma_px * scale (plan 6b-3 D23)")
     print(f"run {run_id}  grid {grid['widthPx']}x{grid['heightPx']} @ {scale:.4f}\"/px  "
           f"centre ({grid['crval1']:.5f}, {grid['crval2']:.5f})  rotation {grid['rotationDeg']:.3f} deg")
     out = work / "grid-report"
@@ -7794,7 +8711,7 @@ def main():
             print(f"\n== {key}: no master or no coverage map (coverageMap off?) — skipped")
             continue
         cov = plane0(rows["coverage"])
-        k = k_arg or max(1, math.ceil(included / 2))
+        k = k_arg if k_arg is not None else max(1, math.ceil(included / 2))
         counts = np.bincount(np.nan_to_num(cov).astype(np.int64).ravel())
         ys, xs = np.nonzero(cov >= k)
         print(f"\n== {key}  ({included} frames, K = {k})")
@@ -7862,10 +8779,11 @@ if __name__ == "__main__":
    feed would otherwise replace the local grid), and never call
    `account_sign_out` on a copy — the token store is shared with the real app.
 9. `tier1/tier1-compare.py --pairs <head>=<base> …` — the first four Tier C
-   rows on explicit master pairs (run A); `grid-report.py <work-dir>
+   rows on explicit master pairs (run A), refusing a pair whose pixel grids
+   differ; `grid-report.py <work-dir>
    <project-id> [--k K] [--overlap]` — run B's per-group report (FWHM in
-   arcsec, eccentricity, noise per arcsec² = σ_px·scale, coverage, member
-   overlap with the LN reference).
+   arcsec, eccentricity, the white-noise-equivalent noise per arcsec² =
+   σ_px·scale, coverage, member overlap with the LN reference).
 
 A catalog copy is made with `sqlite3 -readonly <live db> ".backup <copy>"`,
 never by reading the live catalog any other way, and `prepare-catalog.sh` is
@@ -7928,7 +8846,12 @@ In `docs/stacking/README.md`, replace the whole `- **Open for 6b-3:**` bullet (i
 ```markdown
 - **Open for 6b-3:** all landed; see "The project path on the grid" below.
   The `expected_ln_channels` disagreement is gone: `plan::stage_one_planes`
-  is the one plane rule for stage 1 and LN.
+  is the one plane rule for stage 1 and LN. An attested frame set of raw
+  mosaics with the debayer off is keyed `osc__…` and counted as three planes
+  by the plan and the run alike, while Prepare keeps its files as one-plane
+  mosaics: both exclude such frames at stage 1, consistently. Mosaics stay
+  mosaics only under `cfa__` keys, which frame sets never produce (review
+  M7).
 ```
 and add, right after it (before `**Key files**`):
 ```markdown
@@ -7964,7 +8887,11 @@ group onto the coordinator-confirmed grid and writes grid masters.
   `coverage`) and drizzle's own `<drizzle stem>_coverage.fits` (kind
   `drizzle_coverage`, counted from a `W` snapshot around each deposit; a drop
   below `W`'s f32 resolution is not counted). A frame set's master is
-  bit-identical with the map on and off. A project's seed turns it on.
+  bit-identical with the map on and off. A project's seed turns it on. On
+  a grid every master's statistics (`GroupStats`: location, scale, noise,
+  PSF SNR, SNR gain, FWHM, eccentricity) are measured on the largest
+  rectangle every pixel of which a frame covers, coverage map or not
+  (review I1): the uncovered 0.0 pixels of a wide grid never read as data.
 - **LN on the overlap (D5–D8).** A project's LN reference leaves uncovered
   pixels NaN, and each member is fitted on member ∩ reference: detection
   planes fill the rest with 0.0 (the detector ignores it), seeds stay 48 px
@@ -7973,7 +8900,12 @@ group onto the coordinator-confirmed grid and writes grid masters.
   `ln_global` marker (a cache hit on the next run and in the plan), and the
   group warns once with the count. Admissibility on a grid uses the group's
   median footprint, not the whole grid. Frame sets keep the legacy LN; a
-  project's LN hash folds `lnmask:1`.
+  project's LN hash folds `lnmask:1`. The field (review I6) is built from
+  the in-scope frames' WCS footprints on a lattice of 32 probes per median
+  frame side, forgives one lost probe, and its hash (the frames that pass
+  against it) folds into every member's LN hash; the plan builds the same
+  field (`origin::group_ln_field`), so its Normalize view moves with the
+  field, never a run later.
 - **Crop (D10).** With `output.cropToCoverage = K > 0` every output is
   written as FITS into `runs/run-<id>-uncropped/`; after the last group,
   `finish_crop` crops a co-registered run to ONE rectangle (the union of the
@@ -7982,8 +8914,10 @@ group onto the coordinator-confirmed grid and writes grid masters.
   onto them, and removes the scratch. CRPIX moves by the crop origin (× the
   scale for drizzle outputs). A group with no rectangle, or whose crop fails,
   is finalized uncropped with a warning; one that cannot be finalized keeps
-  its scratch files, which its rows name. `K = 0` is the old path.
-  `GroupStats` describe the uncropped integration.
+  its scratch files, which its rows name. `K = 0` is the old path; a
+  full-rectangle finalization writes exactly what it writes (review I7). A
+  crop does not re-measure `GroupStats`, and the plan's space estimate
+  counts the scratch (review M6).
 - **Output on the grid (D11).** The master's WCS is the grid's TAN
   (`grid_plate_solve`: the 0-based centre as `crpix`, no SIP).
   `stamp_grid_cards` writes the canonical `FILTER`, `ROWORDER`, `ATH_RGEO =
@@ -8002,9 +8936,9 @@ group onto the coordinator-confirmed grid and writes grid masters.
   `get_project_stacking_runs`, `get_project_stacking_config` (read only: the
   seed, `isDefault`, while nothing is stored), `set_project_stacking_config`
   (sorted unique exclusions; an absent `referenceFrameUuid` clears the pin),
-  `get_project_stacking_work_usage`, `cleanup_project_stacking_work` (first
-  sweeps the rows of frames that left the project, refuses a layout that
-  overlaps a scan root). Run-history frame rows carry `frameUuid`.
+  `get_project_stacking_work_usage`, `cleanup_project_stacking_work` (after
+  the active-run check, sweeps the rows of frames that left the project;
+  refuses a layout that overlaps a scan root). Run-history frame rows carry `frameUuid`.
 - **Tests.** `api/stacking_project_e2e.rs` stacks a fake-hub project — two
   publishers, two canonical filters, a coordinator exclusion, a frame the run
   solves, a pair under 25 % overlap — twice. Every project run test holds
@@ -8024,7 +8958,7 @@ In `docs/transfers/README.md`, after the 6b-2 section:
 The stacking side is in `docs/stacking/README.md` (The project path on the grid, wave 6b-3).
 
 - Seven project-stacking commands on both hosts (strict count 299 → 306).
-- `cleanup_project_stacking_work` first sweeps the stacking artifact rows of every handle whose `(project, uuid)` left `project_frames_local`: rows only, never a file. A coordinator-excluded frame is still local, so its cache survives a restore.
+- `cleanup_project_stacking_work`, once no project run is active, sweeps the stacking artifact rows of every handle whose `(project, uuid)` left `project_frames_local`: rows only, never a file. A coordinator-excluded frame is still local, so its cache survives a restore.
 - A project run reads the replicas in place and writes nothing under the Collaboration root; no file it writes carries `ATH_PRJ`.
 - An acceptance catalog copy that stacks a project runs signed out (its `account.hub_url` points at an unreachable address), so the feed never replaces its local grid. `account_sign_out` is never called on a copy: the token store is shared with the real app.
 ```
@@ -8037,13 +8971,13 @@ In `docs/superpowers/specs/2026-07-03-logging-overhaul-design.md`, after the wav
 **Dictionary extension (collab v3 wave 6b-3, `stacking::{run, ln, crop}`, 2026-10-03):** five new names.
 
 - **`overlap`** (f64 in [0, 1]): the fraction of a member's footprint its group's LN reference covers, measured on channel 0, on the debug `"ln: frame keeps global normalization (little overlap with the LN reference)"`.
-- **`crop_x0`**, **`crop_y0`**, **`crop_width`**, **`crop_height`** (usize): a crop rectangle in the master's array pixels, on the info `"outputs cropped"` and the warn `"crop rectangle outside the group's master; outputs not cropped"`.
+- **`crop_x0`**, **`crop_y0`**, **`crop_width`**, **`crop_height`** (usize): a rectangle in the master's array pixels — the crop's, on the info `"outputs cropped"` and the warn `"crop rectangle outside the group's master; outputs written uncropped"`; the covered rectangle a grid master's statistics are measured on, on the debug `"master statistics on the covered rectangle"`.
 ```
 
 - [ ] **Step 4: Open items**
 
 In `docs/superpowers/open-items.md`:
-- delete the 6b-2 bullet "The solve's ADU copy survives a process death" (D17 sweeps `tmp/` now);
+- move the 6b-2 bullet "The solve's ADU copy survives a process death" into the new entry as its closing line (below; writer's note 3, corrected by the review);
 - delete the 6b-2 bullet "The grid's orientation (6b-3)" (it moves into the new entry);
 - add, as the first entry under "## Unverified by hand":
 ```markdown
@@ -8055,8 +8989,9 @@ Code-complete with green gates: the composed map, both caches, LN on the overlap
 - **The grid's orientation.** A grid master is the mirror image of a raw frame from the owner's rigs: the grid is sky-standard (det CD < 0) and every solve in the owner's catalog has det CD > 0. Check the first real grid master against a sky chart. `ROWORDER` on the grid is always `BOTTOM-UP`.
 - **The 25 % LN-overlap threshold is still synthetic** (see the 6b-2 entry): run B reports each member's overlap, but LDN1272-test has no member under 25 %.
 - **Drizzle coverage resolution.** A drop whose weight is below `W`'s f32 resolution at a pixel is not counted (D9). Expected to be invisible at real weights; look at it if a drizzle coverage map shows holes where the drizzled master has signal.
-- **Crop disk use.** A crop run holds every output twice for a moment (scratch FITS, then the final file); the plan's space estimate does not count the scratch. A failed finalization leaves `runs/run-<id>-uncropped/` in place on purpose.
-- **Run B's "noise per arcsec²"** is σ_px · scale (D23), measured on the master cropped to `coverage ≥ ⌈n/2⌉`. Owner ruling owed if another definition is wanted.
+- **Crop disk use.** A crop run holds every output twice for a moment (scratch FITS, then the final file); the plan's space estimate counts it (review M6). A failed finalization leaves `runs/run-<id>-uncropped/` in place on purpose.
+- **Run B's "noise per arcsec²"** is σ_px · scale (D23), measured on the master cropped to `coverage ≥ ⌈n/2⌉`. It is a white-noise equivalent: resampling (and more so drizzle) correlates a stack's pixels, so it understates the true per-area noise by a factor that depends on the scale. Owner ruling owed if another definition is wanted.
+- **Closed from 6b-2: the solve's ADU copy surviving a process death.** `Intermediates` and `All` now sweep `tmp/` for every subject (D17). That is a behaviour change for frame sets too: a frame set's `Intermediates` cleanup removes a directory it did not remove before (it holds no artifact rows, only crash leftovers).
 ```
 
 - [ ] **Step 5: CLAUDE.md**
@@ -8141,8 +9076,14 @@ The base is a fresh run of `main` at the branch point (`20c7c1ef`, with 6b-2), b
    ```zsh
    python3 $ACC/run-a-grid.py "$W/athenaeum.db" "$PID" --reference-uuid "$UUID" --apply
    ```
-   The grid's x axis is mirrored relative to X (D3); no run-A row reads orientation.
-4. The same frames, config and reference on both sides. The personal run excludes the set-204 lights the project does not stack (13 at plan time: 9 mono, 4 OSC). The project document is set 204's own config with the manual reference and the coverage map on:
+   The grid's x axis is mirrored relative to X (D3); no run-A row reads orientation. The script also prints X's scale, rotation, pixel aspect and skew (review I4): the grid's pixels are square and unskewed, X's only as far as its CD is. Record the line in the report; an aspect off 1 by more than 1e-3, or a skew above 1e-3, means the two masters are two resamplings, and the WCS probe of step 8 decides whether the rows may be read.
+4. The same frames, config and reference on both sides. The personal run excludes the set-204 lights the project does not stack (13 at plan time: 9 mono, 4 OSC). The project document is set 204's own config with the manual reference and the coverage map on. First, refuse to go on without set 204's stacking config (review I3: without it the statements below change nothing and both runs would start on defaults, silently):
+   ```zsh
+   if [ "$(sqlite3 "$W/athenaeum.db" "SELECT COUNT(*) FROM stacking_set_config WHERE frames_set_id = 204")" != "1" ]; then
+     echo "STOP: set 204 has no stacking_set_config row in this snapshot (and set 109 none to copy) — report it; do not invent one" >&2
+   fi
+   ```
+   On `STOP`, stop and report. Otherwise:
    ```zsh
    sqlite3 "$W/athenaeum.db" <<SQL
    UPDATE stacking_set_config
@@ -8169,7 +9110,15 @@ The base is a fresh run of `main` at the branch point (`20c7c1ef`, with 6b-2), b
      reference_frame_uuid = excluded.reference_frame_uuid,
      updated_at = excluded.updated_at;
    SQL
+   sqlite3 "$W/athenaeum.db" "
+     SELECT 'set', json_extract(config_json, '\$.reference.mode'), json_array_length(excluded_frame_ids_json)
+       FROM stacking_set_config WHERE frames_set_id = 204;
+     SELECT 'set pin', reference_frame_id FROM frame_set_reference WHERE frames_set_id = 204;
+     SELECT 'project', json_extract(config_json, '\$.reference.mode'), reference_frame_uuid,
+            json_extract(config_json, '\$.output.coverageMap')
+       FROM stacking_project_config WHERE project_id = '$PID';"
    ```
+   Expected, verbatim: `set|manual|13`, `set pin|$X`, `project|manual|$UUID|1`. Anything else: stop and report.
 5. Both plans before either run (the drivers start their own server; this one is for the check only):
    ```zsh
    zsh $ACC/server.sh "$W" 8960 > "$W/server-check.out" 2>&1 &
@@ -8178,15 +9127,25 @@ The base is a fresh run of `main` at the branch point (`20c7c1ef`, with 6b-2), b
    zsh $ACC/api.sh get_stacking_plan '{"setId":204}' 8960 > "$W/plan-set.json"
    zsh $ACC/api.sh get_project_stacking_plan "{\"projectId\":\"$PID\"}" 8960 > "$W/plan-project.json"
    pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web"
-   python3 - "$W" <<'PY'
-   import json, sys
-   w = sys.argv[1]
+   python3 - "$W" "$PID" "$UUID" "$X" <<'PY'
+   import json, sqlite3, sys
+   w, pid, uuid, x = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
    s, p = (json.load(open(f"{w}/{n}.json")) for n in ("plan-set", "plan-project"))
+   handle = sqlite3.connect(f"{w}/athenaeum.db").execute(
+       "SELECT id FROM stack_project_frames WHERE project_id = ? AND frame_uuid = ?", (pid, uuid)
+   ).fetchone()
    print("set blockers", s["blockers"], "included", s["includedCount"], "estimate GB", s["estimateBytes"] / 1e9)
+   print("set reference", s["reference"])
    print("project blockers", p["blockers"], "included", p["includedCount"], "grid", p["grid"]["state"], "estimate GB", p["estimateBytes"] / 1e9)
+   print("project reference", p["reference"], "pin handle", handle)
+   ok = (
+       s["reference"]["mode"] == "manual" and s["reference"]["frameId"] == x
+       and p["reference"]["mode"] == "manual" and handle is not None and p["reference"]["frameId"] == handle[0]
+   )
+   print("REFERENCE OK" if ok else "STOP: the two runs would not share the reference")
    PY
    ```
-   Expected: `"signedIn":false`; no blockers on either; the grid `confirmed`; equal included counts (184 at plan time). Anything else: stop and report.
+   Expected: `"signedIn":false`; no blockers on either; the grid `confirmed`; equal included counts (184 at plan time); both references manual on X (the project's on X's handle), `REFERENCE OK`. Anything else: stop and report (review I3).
 6. The personal run, then the project run:
    ```zsh
    zsh $ACC/tier1/tier1-run.sh "$REPO" "$W" 8960 204
@@ -8205,7 +9164,15 @@ The base is a fresh run of `main` at the branch point (`20c7c1ef`, with 6b-2), b
       ORDER BY s.frame_id LIMIT 200" > "$W/calibrated-pairs.txt"
    ```
    Pick three rows whose personal file has no `_d` (mono) and three with `_d` (OSC), and run `python3 $ACC/imgcmp.py <personal> <project>` on each. Equal to float rounding (max |Δ| ≤ 1e-5): go on. Larger: stop before step 8 and report the six outputs — a calibration difference would read as a grid or LN difference.
-8. The rows:
+8. **WCS first (spec §15.3, review I4).** Before any row is read, for each project master:
+   ```zsh
+   cd $REPO && ATHENAEUM_GRID_PROBE_MASTER=<project master path> \
+     ATHENAEUM_SOLVE_PROBE_APP_DATA="$HOME/Library/Application Support/com.vsharifov.athenaeum.dev" \
+     CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib real_data_grid_master_wcs_probe -- --ignored --nocapture
+   ```
+   Expected: the independent solve agrees with the written WCS within 0.5 px. A master past 0.5 px: stop before step 9 and report — its rows would compare two geometries.
+
+9. The rows (after step 8 passed):
    ```zsh
    sqlite3 "$W/athenaeum.db" "SELECT m.run_id, COALESCE(r.frames_set_id, r.project_id), m.group_key, m.kind, m.channels, m.path
      FROM master_lights m JOIN stacking_runs r ON r.id = m.run_id
@@ -8213,16 +9180,8 @@ The base is a fresh run of `main` at the branch point (`20c7c1ef`, with 6b-2), b
    python3 $ACC/tier1/tier1-compare.py --pairs "<project mono master>=<personal mono master>" "<project OSC master>=<personal OSC master>" > "$W/pairs.txt"
    python3 $ACC/tier1/tier1-compare.py --pairs "<project mono drizzle>=<personal mono drizzle>" "<project OSC drizzle>=<personal OSC drizzle>" > "$W/pairs-drizzle.txt"
    ```
-   Run A's verdict is `pairs.txt` (masters: median ± 0.1 %, MAD ± 1 %, noise ± 2 %, FWHM ± 1 %). The drizzle pairs are reported for information only.
-9. **WCS (spec §15.3).** For each project master:
-   ```zsh
-   cd $REPO && ATHENAEUM_GRID_PROBE_MASTER=<project master path> \
-     ATHENAEUM_SOLVE_PROBE_APP_DATA="$HOME/Library/Application Support/com.vsharifov.athenaeum.dev" \
-     CARGO_BUILD_JOBS=4 cargo test -p athenaeum-core --lib real_data_grid_master_wcs_probe -- --ignored --nocapture
-   ```
-   Expected: the independent solve agrees with the written WCS within 0.5 px.
-
-Report for run A: `pairs.txt` and `pairs-drizzle.txt` verbatim; the two `run*.txt` walls; the calibration-equivalence numbers; the WCS offsets; X and the grid JSON.
+   Run A's verdict is `pairs.txt` (masters: median ± 0.1 %, MAD ± 1 %, noise ± 2 %, FWHM ± 1 %). `--pairs` refuses a pair whose pixel grids differ (review I4). The drizzle pairs are reported for information only.
+Report for run A: `pairs.txt` and `pairs-drizzle.txt` verbatim; the two `run*.txt` walls; the calibration-equivalence numbers; the WCS offsets; X, its scale/rotation/aspect/skew line, and the grid JSON; the step-4 and step-5 reference checks.
 
 **Run B — the proposed grid (spec §15.3, D23).** The same project on the grid the app proposes (median scale, north up, target centre). No tolerance: the report goes to the owner.
 
@@ -8236,14 +9195,14 @@ Report for run A: `pairs.txt` and `pairs-drizzle.txt` verbatim; the two `run*.tx
    pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web"
    python3 $ACC/run-a-grid.py "$WB/athenaeum.db" "$PID" --grid-json "$PROP" --apply
    ```
-3. The project document of run A step 4 (only its `INSERT INTO stacking_project_config …` statement, against `$WB/athenaeum.db`): the same config and reference, so only the grid differs.
+3. The project document of run A step 4 (its set-204 refusal check, then only its `INSERT INTO stacking_project_config …` statement and the `project` line of its check, against `$WB/athenaeum.db`): the same config and reference, so only the grid differs.
 4. The plan check of run A step 5 for the project only (port 8961): no blockers, the grid `confirmed`, and the estimate under the free space. A `space` blocker: stop and report the estimate.
 5. The run and the report:
    ```zsh
    zsh $ACC/tier1/project-run.sh "$REPO" "$WB" 8961 "$PID"
    python3 $ACC/grid-report.py "$WB" "$PID" --overlap > "$WB/grid-report.txt"
    ```
-6. The WCS probe of run A step 9 on each run-B master.
+6. The WCS probe of run A step 8 on each run-B master.
 
 Report for run B: `grid-report.txt` verbatim (per group: the grid, the coverage histogram and its `coverage ≥ ⌈n/2⌉` rectangle, FWHM in px and arcsec, eccentricity, noise per pixel and per arcsec², each member's overlap with the LN reference and the count under 25 %), the wall, the WCS offsets, and the warnings of the run (`summary.warnings` in `stacking_runs.summary_json`).
 
@@ -8251,22 +9210,24 @@ Report for run B: `grid-report.txt` verbatim (per group: the grid, the coverage 
 
 ## Writer's notes for the controller
 
-- D1 departs from the research's polynomial-order-5 option: the composed map is a sampled displacement layer, because a polynomial cannot follow a spline star map and needs the order cap raised for every registration.
+- D1 departs from the research's polynomial-order-5 option: the composed map is a sampled displacement layer, because a polynomial cannot follow a spline star map and needs the order cap raised for every registration (the review adds: an order-3 star map composed with an order-3 SIP is degree 9, so no order-5 polynomial follows any star map with a distortion layer).
 - D2 departs from spec §4.2 (the star map in the `registered` rows): those rows are erased by `Intermediates`, so the star map is its own payload-only `registration` artifact that only `All` drops.
-- D17 changes frame-set cleanup too: `Intermediates` and `All` now remove `tmp/` for every subject (6b-2 left it out for exactly that reason; it holds no artifact rows, only crash leftovers).
-- D8 and D10 fill spec gaps (grid-mode admissibility on the median footprint; crop as a deferred scratch-FITS pass because an XISF master cannot be re-read and the union is known only after the last group).
-- Risk carried into Task 9: the e2e's east pair registers over a ≈ 15 % strip; the fixture uses 40″ star spacing and the step names the next lever (32″), never a weaker assertion.
+- D17 changes frame-set cleanup too: `Intermediates` and `All` now remove `tmp/` for every subject (6b-2 left it out for exactly that reason; it holds no artifact rows, only crash leftovers). Corrected per the review: this is a behaviour change for frame sets, now stated in Global Constraints beside "every written byte stays identical" (true of outputs only), and the 6b-2 open-items bullet it closes becomes one line of the 6b-3 entry (Task 11).
+- D8 and D10 fill spec gaps (grid-mode admissibility on the median footprint; crop as a deferred scratch-FITS pass because an XISF master cannot be re-read and the union is known only after the last group). D8 is refined by review I6: a WCS-footprint field on a frame-unit lattice with one probe of grace, built by one function the run and the plan both call and folded into every LN hash.
+- The e2e's east pair registers over a ≈ 15 % strip. Its geometry (offset, 40″ spacing, seed) is one set of `test_fixtures` constants that Task 5b's run test shares and tries first, a hundred times cheaper; the next lever is 32″ on the shared constant, never a weaker assertion (review I5).
 - Task 8 is split three ways: 8a (a project run starts; the plan's WCS rule), 8b (the seven core commands; the only TS change of the three), 8c (the hosts, 299 → 306). The header, Global Constraints, Review Focus and File map follow the split.
-- D23 is new (run B's "noise per arcsec²" = σ_px · scale on the `coverage ≥ ⌈n/2⌉` crop); the research left the term undefined, and an owner ruling is owed if another definition is wanted.
+- D23 is new (run B's "noise per arcsec²" = σ_px · scale on the `coverage ≥ ⌈n/2⌉` crop); the research left the term undefined, and an owner ruling is owed if another definition is wanted. With the review's caveat: it is a white-noise equivalent — resampling, and more so drizzle, correlates a stack's pixels, so it understates the true per-area noise by a scale-dependent factor; the report says so in its header, beside σ_px.
 - D14 judges a cached solve with the installed solver's identity (`solve::installed_solver_identity`, shared with `CatalogSolver`), so a failure cached under another catalog never blocks a run that would retry it; the plan still reads only.
 - Crop restates `CRPIX` on the written cards (`crop::restate_crpix`) instead of rebuilding the WCS block, which would bring `PLTSOLVD` back onto grid masters; `crop_plate_solve` supplies the values.
-- Every project run test now holds `grid_counters::exclusive()` (a composed map is a sampled layer that builds grids); the guard was inserted into the Task 2b, 3, 5a and 5b tests and stated in Global Constraints.
-- `cleanup_project_stacking_work` also refuses a layout root that overlaps a scan root (`Invalid`), mirroring the plan's 6b-2 `folders` blocker (research §3.3); the spec text does not say it.
+- Every project run test now holds `grid_counters::exclusive()` (a composed map is a sampled layer that builds grids); the guard was inserted into the Task 2b1/2b2, 3, 5a and 5b tests and stated in Global Constraints.
+- `cleanup_project_stacking_work` also refuses a layout root that overlaps a scan root (`Invalid`), mirroring the plan's 6b-2 `folders` blocker (research §3.3); the spec text does not say it. After review M5 it sweeps departed frames' rows only once no project run is active.
 - Spec §5.9's "crpix 1-based" is read as the card (1-based) over a 0-based `PlateSolveRecord.crpix` (D11), as every other writer does.
+- Rewritten per the review (I1): every grid master's statistics are measured over covered pixels only — the largest rectangle every pixel of which a frame covers — coverage map or not; the defect was the uncovered zeros of every grid master, not the crop. A crop does not re-measure them, and the plan's space estimate now counts the crop scratch (review M6).
 - The e2e answers its one unsolved frame with that frame's true record through `FakeSolver::with(file name)`; a float FITS is used in place, so the request's file name is the rendered one.
-- `GroupStats` of a cropped run describe the uncropped integration, and the plan's space estimate does not count the crop scratch; both are written down in the stacking reference and open-items rather than changed.
 - Acceptance work dirs are on `/Volumes/BigMac` per the brief (the research proposed bigbase3); the copies run signed out through an unreachable `account.hub_url`, never `account_sign_out`.
 - The set-204 regression's base is a fresh `rerun-build.sh 20c7c1ef` run back to back with the branch checkpoint, not the older `tierA-main6b2` checkpoint.
-- Run A's reference comes from Tier A's own pick when the project holds it with a manifest WCS, else the first OSC frame with one; the grid is that frame's manifest WCS, so the project master is mirrored in x (no run-A row reads it).
+- Run A's reference comes from Tier A's own pick when the project holds it with a manifest WCS, else the first OSC frame with one; the grid is that frame's manifest WCS, so the project master is mirrored in x (no run-A row reads it). Per reviews I3 and I4, the procedure refuses without set 204's stacking config, prints and checks both references (mode and pin), prints X's pixel aspect and skew, runs the WCS probe before any row, and `--pairs` refuses differing pixel grids.
 - The 25 % LN threshold stays synthetic on real data (D19); run B reports each member's overlap so the owner sees how far LDN1272-test is from it.
+- The review fold: tasks 2b and 7b are split at the review's cut points (2b1 fixture with the first grid test ignored, 2b2 the composition; 7b1 the crop writers and the estimate, 7b2 the run's pass); Task 7a now runs before 6a (6a's I1 fix needs `largest_covered_rect`); Tasks 1 and 5a stay whole; I1–I7 and M1–M18 are applied where named, and every changed ruling is marked **Refinement (review)**.
+- Every minor is applied as the review proposes; M3's comment change moves no frame-set byte because no frame set passes a reference row order today (`run.rs:6892`). Nothing was skipped.
 - No task names a third-party program; the plan was written without running cargo, and the SQL it adds (the departed-frame sweep, the run-frame uuid sub-select, the test inserts, the run-A exclusion list) was checked with `sqlite3 :memory:` or `sqlite3 -readonly` on the live schema.
