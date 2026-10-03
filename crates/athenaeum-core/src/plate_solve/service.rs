@@ -400,29 +400,13 @@ pub fn store_result(
     // (real solves >= ~0.08, noise alignments <= ~0.001); sparse fields are
     // exempted inside blind_gate_ok exactly as during acceptance.
     if config.blind_gate_enabled {
-        let m = BlindGateMetrics {
-            inliers: result.matched_stars,
-            expected_in_fov: result.expected_catalog_stars_in_fov,
-            rms_px: result.rms_residual_px,
-            adaptive_tol_px: adaptive_tol_px(
-                result.pixel_scale_arcsec,
-                config.base_verification_tolerance_arcsec,
-            ),
-            inlier_ratio: result.inlier_ratio,
-            recovered_scale_arcsec: result.pixel_scale_arcsec,
-            // The frame's own optics, when it declares them. `blind_gate_ok`
-            // has always compared against this — it was simply never given
-            // the number, which left its sharpest test dead: on wind-shaken
-            // frames the solver walks its autoFOV ladder and returns a
-            // confident-looking solve at 16–193× the header's scale, and
-            // every other bar in the gate passes it (2026-09-05).
-            header_scale_arcsec: header_pixel_scale_arcsec(conn, frame_id),
-        };
-        if !blind_gate_ok(GateStage::ScaleCleared, &m, config) {
-            let reason = format!(
-                "Rejected: low confidence ({} inliers, ratio {:.2}, {:.2}\"/px)",
-                result.matched_stars, result.inlier_ratio, result.pixel_scale_arcsec
-            );
+        // The frame's own optics, when it declares them (2026-09-05: on
+        // wind-shaken frames the solver walks its autoFOV ladder and returns a
+        // confident-looking solve at 16-193x the header's scale). Read only
+        // while the gate is on, as before.
+        if let Some(reason) =
+            acceptance_refusal(result, header_pixel_scale_arcsec(conn, frame_id), config)
+        {
             tracing::warn!(
                 frame_id,
                 stage = "store",
@@ -436,38 +420,7 @@ pub fn store_result(
         }
     }
 
-    let record = PlateSolveRecord {
-        id: None,
-        frame_id,
-        crpix1: result.wcs.crpix.0,
-        crpix2: result.wcs.crpix.1,
-        crval1: result.wcs.crval.0,
-        crval2: result.wcs.crval.1,
-        cd1_1: result.wcs.cd[0][0],
-        cd1_2: result.wcs.cd[0][1],
-        cd2_1: result.wcs.cd[1][0],
-        cd2_2: result.wcs.cd[1][1],
-        // SIP coefficients — populated from solvemyastro when fit_sip=true.
-        // The DB columns already exist (schema unchanged); legacy solves wrote
-        // NULL, now we write real values.
-        sip_order: result.sip_order.map(|o| o as i32),
-        sip_a_coeffs: result.sip_a_coeffs.clone(),
-        sip_b_coeffs: result.sip_b_coeffs.clone(),
-        sip_ap_coeffs: result.sip_ap_coeffs.clone(),
-        sip_bp_coeffs: result.sip_bp_coeffs.clone(),
-        matched_stars: result.matched_stars as i32,
-        total_detected: result.total_detected as i32,
-        rms_residual_px: result.rms_residual_px,
-        rms_residual_arcsec: result.rms_residual_arcsec,
-        pixel_scale_arcsec: result.pixel_scale_arcsec,
-        field_rotation_deg: result.field_rotation_deg,
-        solve_time_ms: result.solve_time_ms as i64,
-        catalog_used: result.catalog_used.clone(),
-        algorithm_used: result.algorithm_used.clone(),
-        solved_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        expected_catalog_stars_in_fov: Some(result.expected_catalog_stars_in_fov as i32),
-        inlier_ratio: Some(result.inlier_ratio),
-    };
+    let record = record_from_result(frame_id, result);
     insert_plate_solve(conn, &record)?;
     update_frame_from_solve(
         conn,
@@ -499,6 +452,76 @@ pub fn store_result(
     }
 
     Ok(StoreOutcome::Persisted)
+}
+
+/// The persist gate as a pure check (plan 6b-2 C14): `Some(user-facing
+/// reason)` when `config` refuses `result`, given the scale the frame's own
+/// optics, or its manifest, imply. [`store_result`] and a stacking run's
+/// local solve share it.
+pub(crate) fn acceptance_refusal(
+    result: &SolveResult,
+    expected_scale_arcsec: Option<f64>,
+    config: &PlateSolveConfig,
+) -> Option<String> {
+    if !config.blind_gate_enabled {
+        return None;
+    }
+    let m = BlindGateMetrics {
+        inliers: result.matched_stars,
+        expected_in_fov: result.expected_catalog_stars_in_fov,
+        rms_px: result.rms_residual_px,
+        adaptive_tol_px: adaptive_tol_px(
+            result.pixel_scale_arcsec,
+            config.base_verification_tolerance_arcsec,
+        ),
+        inlier_ratio: result.inlier_ratio,
+        recovered_scale_arcsec: result.pixel_scale_arcsec,
+        header_scale_arcsec: expected_scale_arcsec,
+    };
+    if blind_gate_ok(GateStage::ScaleCleared, &m, config) {
+        None
+    } else {
+        Some(format!(
+            "Rejected: low confidence ({} inliers, ratio {:.2}, {:.2}\"/px)",
+            result.matched_stars, result.inlier_ratio, result.pixel_scale_arcsec
+        ))
+    }
+}
+
+/// The `plate_solves` row a solve becomes (pure; `solved_at` is now).
+pub(crate) fn record_from_result(frame_id: i64, result: &SolveResult) -> PlateSolveRecord {
+    PlateSolveRecord {
+        id: None,
+        frame_id,
+        crpix1: result.wcs.crpix.0,
+        crpix2: result.wcs.crpix.1,
+        crval1: result.wcs.crval.0,
+        crval2: result.wcs.crval.1,
+        cd1_1: result.wcs.cd[0][0],
+        cd1_2: result.wcs.cd[0][1],
+        cd2_1: result.wcs.cd[1][0],
+        cd2_2: result.wcs.cd[1][1],
+        // SIP coefficients — populated from solvemyastro when fit_sip=true.
+        // The DB columns already exist (schema unchanged); legacy solves wrote
+        // NULL, now we write real values.
+        sip_order: result.sip_order.map(|o| o as i32),
+        sip_a_coeffs: result.sip_a_coeffs.clone(),
+        sip_b_coeffs: result.sip_b_coeffs.clone(),
+        sip_ap_coeffs: result.sip_ap_coeffs.clone(),
+        sip_bp_coeffs: result.sip_bp_coeffs.clone(),
+        matched_stars: result.matched_stars as i32,
+        total_detected: result.total_detected as i32,
+        rms_residual_px: result.rms_residual_px,
+        rms_residual_arcsec: result.rms_residual_arcsec,
+        pixel_scale_arcsec: result.pixel_scale_arcsec,
+        field_rotation_deg: result.field_rotation_deg,
+        solve_time_ms: result.solve_time_ms as i64,
+        catalog_used: result.catalog_used.clone(),
+        algorithm_used: result.algorithm_used.clone(),
+        solved_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        expected_catalog_stars_in_fov: Some(result.expected_catalog_stars_in_fov as i32),
+        inlier_ratio: Some(result.inlier_ratio),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1407,5 +1430,49 @@ mod tests {
             !focallen_corrected(Some(1750.0), Some(1750.0)),
             "exact match → keep"
         );
+    }
+
+    /// Plan 6b-2 C14: the extracted gate is `store_result`'s own. It refuses
+    /// a solve 16x off the expected scale, passes the same confidence at that
+    /// scale, has nothing to compare without an expected scale, and refuses
+    /// nothing with the gate off.
+    #[test]
+    fn acceptance_refusal_is_store_results_gate() {
+        let cfg = PlateSolveConfig::default();
+        let wrong = mk_result(120, 800, 0.15, 29.6, 1.0);
+        assert_eq!(
+            acceptance_refusal(&wrong, Some(1.873), &cfg).as_deref(),
+            Some("Rejected: low confidence (120 inliers, ratio 0.15, 29.60\"/px)")
+        );
+        assert_eq!(
+            acceptance_refusal(&mk_result(120, 800, 0.15, 1.9, 1.0), Some(1.873), &cfg),
+            None
+        );
+        assert_eq!(acceptance_refusal(&wrong, None, &cfg), None);
+        let off = PlateSolveConfig {
+            blind_gate_enabled: false,
+            ..PlateSolveConfig::default()
+        };
+        assert_eq!(acceptance_refusal(&wrong, Some(1.873), &off), None);
+    }
+
+    /// Plan 6b-2 C14: the row a solve becomes, the same for `store_result`
+    /// and for a stacking run's cached solve.
+    #[test]
+    fn record_from_result_is_the_stored_row() {
+        let r = record_from_result(7, &mk_result(120, 800, 0.15, 1.9, 1.0));
+        assert_eq!((r.id, r.frame_id), (None, 7));
+        assert_eq!((r.crval1, r.crval2), (123.45, 67.89));
+        assert_eq!((r.cd1_1, r.cd1_2, r.cd2_1, r.cd2_2), (1e-4, 0.0, 0.0, 1e-4));
+        assert_eq!((r.matched_stars, r.total_detected), (120, 600));
+        assert_eq!(
+            (r.expected_catalog_stars_in_fov, r.inlier_ratio),
+            (Some(800), Some(0.15))
+        );
+        assert_eq!(
+            (r.catalog_used.as_str(), r.algorithm_used.as_str()),
+            ("smac_gaia", "blind_index")
+        );
+        assert_eq!(r.pixel_scale_arcsec, 1.9);
     }
 }

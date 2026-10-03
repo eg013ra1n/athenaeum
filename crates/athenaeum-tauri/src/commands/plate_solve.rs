@@ -8,6 +8,7 @@ use athenaeum_core::db::load_frame_with_path;
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
 use athenaeum_core::plate_solve::dso_lookup::{DsoCatalog, ResolvedObject};
 use athenaeum_core::plate_solve::hints::extract_hints;
+use athenaeum_core::plate_solve::CatalogOpenError;
 use athenaeum_core::plate_solve::service::{self, SolveResult};
 use athenaeum_core::plate_solve::{describe_solve_failure, storage, SolveHints, StoreOutcome};
 use athenaeum_core::services::PlateSolveHandle;
@@ -27,23 +28,16 @@ pub(super) fn resolve_layer_caches(
     let parent = db_path
         .parent()
         .ok_or("Cannot determine app data directory")?;
-    let catalog_root = parent.join("catalogs").join("smac_gaia");
-    let layer_dirs = athenaeum_core::plate_solve::discover_layers(&catalog_root);
-    if layer_dirs.is_empty() {
-        return Err(format!(
+    athenaeum_core::plate_solve::open_catalog_layers(parent).map_err(|e| match e {
+        CatalogOpenError::NotInstalled { root } => format!(
             "solvemyastro star catalog not found under {}. \
              Please download the Gaia DR3 prebuilt catalog from Settings → Plate Solving.",
-            catalog_root.display()
-        ));
-    }
-    let mut layers = Vec::with_capacity(layer_dirs.len());
-    for dir in &layer_dirs {
-        let sc = solvemyastro::StarCache::open(dir)
-            .map_err(|e| format!("Failed to open star cache at {}: {e}", dir.display()))?;
-        layers.push(Arc::new(sc));
-    }
-    tracing::debug!(count = layers.len(), path = %catalog_root.display(), "opened catalog layers");
-    Ok(layers)
+            root.display()
+        ),
+        CatalogOpenError::Open { dir, error } => {
+            format!("Failed to open star cache at {}: {error}", dir.display())
+        }
+    })
 }
 
 /// Lazy-load the DSO catalog once and cache it in the ServiceContext.

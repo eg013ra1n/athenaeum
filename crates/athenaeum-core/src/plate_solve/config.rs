@@ -230,6 +230,42 @@ pub fn save_config(conn: &Connection, config: &PlateSolveConfig) -> Result<()> {
     Ok(())
 }
 
+/// Bumped when the solver recipe hard-coded in
+/// [`crate::plate_solve::service::solve_frame_with_hints`] changes (quad
+/// tolerance, catalog magnitude limit, SIP fitting), and whenever a solver
+/// upgrade should re-solve frames a stacking run cached as SOLVED: bumping it
+/// moves every cached solve's hash. A cached failure or refusal needs no
+/// bump: one written by another app version is tried once more anyway
+/// (review I7, `stacking::solve::cached_outcome_holds`).
+pub const SOLVE_RECIPE_VERSION: u32 = 1;
+
+/// What a cached solve depends on (plan 6b-2 C14): the recipe, the SIP
+/// order, and every acceptance-gate field. Not the batch concurrency, the
+/// autofind tolerance, the input gate (a run applies none) or the camera
+/// defaults (they only back-fill a catalog row's focal length).
+pub fn solver_config_value(cfg: &PlateSolveConfig) -> serde_json::Value {
+    serde_json::json!({
+        "recipe": SOLVE_RECIPE_VERSION,
+        "sipOrder": cfg.sip_order,
+        "baseVerificationToleranceArcsec": cfg.base_verification_tolerance_arcsec,
+        "blindGateEnabled": cfg.blind_gate_enabled,
+        "blindRmsMaxPxMult": cfg.blind_rms_max_px_mult,
+        "blindMinInlierRatio": cfg.blind_min_inlier_ratio,
+        "blindInlierFloor": cfg.blind_inlier_floor,
+        "blindScaleSanityMin": cfg.blind_scale_sanity_min,
+        "blindScaleSanityMax": cfg.blind_scale_sanity_max,
+        "blindScaleHeaderTol": cfg.blind_scale_header_tol,
+    })
+}
+
+/// [`solver_config_value`]'s canonical JSON (sorted keys) as XXH3-64, 16 hex
+/// digits.
+pub fn solver_config_hash(cfg: &PlateSolveConfig) -> String {
+    let json = serde_json::to_string(&solver_config_value(cfg))
+        .expect("a solver config value always serializes");
+    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(json.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +319,30 @@ mod tests {
             20,
             "non-stale floors must be preserved"
         );
+    }
+
+    /// Plan 6b-2 C14: a cached solve depends on the recipe and on every field
+    /// that shapes a solve or its acceptance, and on nothing else.
+    #[test]
+    fn the_solver_config_hash_covers_what_shapes_a_solve() {
+        let cfg = PlateSolveConfig::default();
+        assert_eq!(
+            serde_json::to_string(&solver_config_value(&cfg)).unwrap(),
+            r#"{"baseVerificationToleranceArcsec":8.0,"blindGateEnabled":true,"blindInlierFloor":6,"blindMinInlierRatio":0.04,"blindRmsMaxPxMult":2.5,"blindScaleHeaderTol":8.0,"blindScaleSanityMax":60.0,"blindScaleSanityMin":0.05,"recipe":1,"sipOrder":3}"#
+        );
+        let h = solver_config_hash(&cfg);
+        assert_eq!(h.len(), 16);
+        let mut same = cfg.clone();
+        same.batch_concurrency = 4;
+        same.autofind_tolerance_deg = 2.0;
+        same.input_gate_enabled = false;
+        same.camera_defaults.insert("cam".into(), 3.76);
+        assert_eq!(solver_config_hash(&same), h);
+        let mut sip = cfg.clone();
+        sip.sip_order = 2;
+        assert_ne!(solver_config_hash(&sip), h);
+        let mut tol = cfg.clone();
+        tol.blind_scale_header_tol = 4.0;
+        assert_ne!(solver_config_hash(&tol), h);
     }
 }
