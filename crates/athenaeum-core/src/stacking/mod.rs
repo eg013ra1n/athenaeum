@@ -60,6 +60,7 @@
 pub use crate::db::stacking::StackSubject;
 
 pub mod config;
+pub mod crop;
 pub mod drizzle;
 pub mod fits_artifact;
 pub mod grid_map;
