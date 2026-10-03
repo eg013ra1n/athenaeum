@@ -52,7 +52,7 @@ impl CanonicalGrid {
     }
 
     /// One spelling per grid, applied before the PUT and before hashing:
-    /// `-0.0` becomes `0.0` (Postgres `numeric` loses the sign), the rotation
+    /// `-0.0` becomes `0.0` (the hub's jsonb store keeps no signed zero), the rotation
     /// goes into `(-180, 180]` (the hub only checks it is finite), `crval1`
     /// into `[0, 360)`.
     pub fn normalized(&self) -> CanonicalGrid {
@@ -76,12 +76,22 @@ impl CanonicalGrid {
         }
     }
 
-    /// The canonical JSON: the typed struct through `serde_json::Value`, so
-    /// keys come out sorted (this workspace's `serde_json` has no
-    /// `preserve_order`) and numbers in their shortest round-trip form.
+    /// The canonical JSON of the NORMALIZED grid (one grid, one hash, inside
+    /// the type): keys sorted by construction, numbers in their shortest
+    /// round-trip form.
     pub fn canonical_json(&self) -> String {
-        let value = serde_json::to_value(self).expect("a grid serializes");
-        serde_json::to_string(&value).expect("a json value serializes")
+        use std::collections::BTreeMap;
+        let g = self.normalized();
+        // An explicit sorted map: key order must not depend on whether some
+        // dependency enables serde_json's `preserve_order`.
+        let mut m: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+        m.insert("scaleArcsec", serde_json::json!(g.scale_arcsec));
+        m.insert("widthPx", serde_json::json!(g.width_px));
+        m.insert("heightPx", serde_json::json!(g.height_px));
+        m.insert("crval1", serde_json::json!(g.crval1));
+        m.insert("crval2", serde_json::json!(g.crval2));
+        m.insert("rotationDeg", serde_json::json!(g.rotation_deg));
+        serde_json::to_string(&m).expect("a json map serializes")
     }
 
     /// `ATH_GRID`: XXH3-64 of [`Self::canonical_json`], 16 hex digits.
@@ -147,7 +157,7 @@ mod tests {
         );
     }
 
-    /// Postgres `numeric` drops the sign of −0.0; normalization drops it first.
+    /// The hub's jsonb store keeps no signed zero; normalization drops it first.
     #[test]
     fn negative_zero_hashes_like_zero() {
         let negative = CanonicalGrid {
@@ -180,7 +190,13 @@ mod tests {
             .normalized();
             assert_eq!(g.rotation_deg, expected, "{rotation}");
         }
-        for (crval1, expected) in [(360.0, 0.0), (-10.0, 350.0), (370.5, 10.5), (0.0, 0.0)] {
+        for (crval1, expected) in [
+            (360.0, 0.0),
+            (-10.0, 350.0),
+            (370.5, 10.5),
+            (0.0, 0.0),
+            (-1e-15, 0.0),
+        ] {
             let g = CanonicalGrid { crval1, ..grid() }.normalized();
             assert_eq!(g.crval1, expected, "{crval1}");
         }
@@ -238,6 +254,30 @@ mod tests {
             },
         ] {
             assert_eq!(ok.validate(), Ok(()), "{ok:?}");
+        }
+    }
+
+    /// The hash normalizes inside the type: a raw grid hashes as its
+    /// normalized form.
+    #[test]
+    fn hashing_normalizes_first() {
+        for raw in [
+            CanonicalGrid {
+                rotation_deg: -0.0,
+                ..grid()
+            },
+            CanonicalGrid {
+                crval1: -1e-15,
+                ..grid()
+            },
+            CanonicalGrid {
+                rotation_deg: 540.0,
+                crval1: 370.68,
+                ..grid()
+            },
+        ] {
+            assert_eq!(raw.hash(), raw.normalized().hash(), "{raw:?}");
+            assert_eq!(raw.canonical_json(), raw.normalized().canonical_json());
         }
     }
 }

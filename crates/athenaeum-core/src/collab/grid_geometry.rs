@@ -166,6 +166,15 @@ pub fn fraction_inside(fp: &FrameFootprint, grid: &CanonicalGrid) -> f64 {
             let x = (i as f64 + 0.5) * fp.width / N as f64 - 0.5;
             let y = (j as f64 + 0.5) * fp.height / N as f64 - 0.5;
             let (ra, dec) = fp.wcs.pixel_to_sky(x, y);
+            // The far hemisphere (separation >= 90 degrees from the grid
+            // centre) has no TAN image; the projection would fold it back.
+            let cos_sep = dec.to_radians().sin() * grid.crval2.to_radians().sin()
+                + dec.to_radians().cos()
+                    * grid.crval2.to_radians().cos()
+                    * (ra - grid.crval1).to_radians().cos();
+            if cos_sep <= 0.0 {
+                continue;
+            }
             let (gx, gy) = g.sky_to_pixel(ra, dec);
             if gx >= -0.5 && gx < w - 0.5 && gy >= -0.5 && gy < h - 0.5 {
                 inside += 1;
@@ -339,5 +348,51 @@ mod tests {
             );
             assert_eq!(wcs.crpix, (63.5, 31.5));
         }
+    }
+
+    #[test]
+    fn a_rounded_scale_outside_the_hubs_range_proposes_nothing() {
+        let inputs = vec![grid_input_of(&scale_only(0.004))];
+        assert_eq!(propose_grid(&inputs, &TARGET), None);
+        let huge = vec![grid_input_of(&scale_only(100.006))];
+        assert_eq!(propose_grid(&huge, &TARGET), None);
+    }
+
+    /// A frame shifted north by half its height covers exactly 8 of 16 rows,
+    /// so it counts as inside: the comparison is `>= 0.5`, not `> 0.5`.
+    #[test]
+    fn exactly_half_inside_counts_as_inside() {
+        let grid = CanonicalGrid {
+            scale_arcsec: 2.0,
+            width_px: 64,
+            height_px: 64,
+            crval1: 10.5,
+            crval2: 41.25,
+            rotation_deg: 0.0,
+        };
+        let half = grid_input_of(&meta(10.5, 41.25 + 64.0 / 3600.0, 64, 64, Some(2.0)));
+        assert_eq!(
+            fraction_inside(half.footprint.as_ref().unwrap(), &grid),
+            0.5
+        );
+        assert_eq!(count_inside(&[half], &grid), 1);
+    }
+
+    #[test]
+    fn a_frame_at_the_antipode_is_not_inside() {
+        let grid = CanonicalGrid {
+            scale_arcsec: 2.0,
+            width_px: 128,
+            height_px: 128,
+            crval1: 10.5,
+            crval2: 41.25,
+            rotation_deg: 0.0,
+        };
+        let anti = grid_input_of(&meta(190.5, -41.25, 100, 80, Some(2.0)));
+        assert_eq!(
+            fraction_inside(anti.footprint.as_ref().unwrap(), &grid),
+            0.0
+        );
+        assert_eq!(count_inside(&[anti], &grid), 0);
     }
 }
