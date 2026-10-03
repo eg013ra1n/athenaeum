@@ -8413,6 +8413,7 @@ fn process_group_output(
         // further down is the one a `RejBitmapSet` (Task 5) will attach to.
         rej: None,
         second_pass_bitmaps: false,
+        coverage_map: false,
     };
 
     let paths: Vec<PathBuf> = members.iter().map(|m| m.calibrated.clone()).collect();
@@ -8683,6 +8684,7 @@ fn process_group_output(
         // standalone large-scale run writes two sets per frame instead of
         // three and nothing downstream misses the third.
         second_pass_bitmaps: bitmaps_for_drizzle,
+        coverage_map: false,
     };
 
     // Progress plumbing: `on_plane`/`on_band`/`on_combine` are `Sync`
@@ -10950,7 +10952,7 @@ fn build_and_write_ln_reference(
     let cancel: &AtomicBool = &rc.cancel;
     let pool: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
 
-    let built = build_ln_reference(input, included, n, pool, cancel, io, &on_build_progress)
+    let built = build_ln_reference(input, included, n, pool, cancel, io, &on_build_progress, false)
         .map_err(|e| {
             if matches!(e, IntegrationError::Cancelled) {
                 RunError::Cancelled

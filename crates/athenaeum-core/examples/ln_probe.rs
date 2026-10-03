@@ -510,6 +510,7 @@ registration row for each — run stacking through Register first); found {}",
         ln: None,
         rej: None,
         second_pass_bitmaps: false,
+        coverage_map: false,
     };
 
     let n = (args.frames as usize).min(stack_frames.len());
@@ -528,7 +529,7 @@ registration row for each — run stacking through Register first); found {}",
     let on_progress = |plane: usize, total: usize| eprintln!("reference: plane {plane}/{total}");
 
     let included: Vec<usize> = (0..stack_frames.len()).collect();
-    let reference = build_reference(&group_input, &included, n, &pool, &cancel, io, &on_progress)
+    let reference = build_reference(&group_input, &included, n, &pool, &cancel, io, &on_progress, false)
         .unwrap_or_else(|e| {
             eprintln!("building the LN reference: {e}");
             std::process::exit(1);

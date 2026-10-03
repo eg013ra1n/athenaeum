@@ -1358,6 +1358,7 @@ mod tests {
             included: vec![0, 1, 2],
             output_pairs: vec![Vec::new(); ch],
             second_pass_rej_ok: false,
+            coverage: None,
             stats: dummy_stats(),
         };
 
@@ -1462,6 +1463,7 @@ mod tests {
             included: vec![0, 1, 2],
             output_pairs: vec![Vec::new(); ch],
             second_pass_rej_ok: false,
+            coverage: None,
             stats: dummy_stats(),
         };
 

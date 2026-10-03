@@ -33,7 +33,7 @@ use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::{OutputNormalization, RejectionNormalization};
 use crate::integration::IntegrationError;
 use crate::stacking::integrate::{
-    integrate_planes, validate_group_input, GroupInput, GroupProgress,
+    integrate_planes, validate_group_input, CoverageOptions, GroupInput, GroupProgress,
 };
 use crate::stacking::master_cards::ATH_STK_VERSION;
 
@@ -108,6 +108,10 @@ pub struct LnReference {
 /// [`GroupProgress::on_plane`] — band/combine-level progress inside the
 /// engine is not surfaced (a no-op is passed through internally), since a
 /// reference build is a small, second-order piece of a group's work.
+///
+/// `empty_as_nan` (plan 6b-3 D4/D5): a pixel no member frame covers comes
+/// out NaN instead of 0.0 — set by a project's LN reference on its grid,
+/// `false` for every frame-set caller.
 #[allow(clippy::too_many_arguments)]
 pub fn build_reference(
     input: &GroupInput<'_>,
@@ -120,6 +124,9 @@ pub fn build_reference(
     cancel: &AtomicBool,
     io: IoPolicy,
     on_progress: &(dyn Fn(usize, usize) + Sync),
+    // Plan 6b-3 D4/D5: a project's LN reference marks the pixels no member
+    // covers NaN, so they are never data.
+    empty_as_nan: bool,
 ) -> Result<LnReference, IntegrationError> {
     validate_group_input(input)?;
     if included.len() < 3 {
@@ -196,6 +203,7 @@ pub fn build_reference(
         None,
         recipe,
         write_maps,
+        CoverageOptions { count: false, empty_as_nan },
         pool,
         cancel,
         &progress,
@@ -436,6 +444,7 @@ mod tests {
             ln: None,
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -450,6 +459,7 @@ mod tests {
             &cancel,
             io(20_000_000),
             &on_progress,
+            false,
         )
         .unwrap();
 
@@ -488,6 +498,7 @@ mod tests {
             ln: None,
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -500,6 +511,7 @@ mod tests {
             &cancel,
             io(20_000_000),
             &on_progress,
+            false,
         )
         .unwrap_err();
         match err {
@@ -538,6 +550,7 @@ mod tests {
             ln: None,
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
         let pool = pool();
         let cancel = AtomicBool::new(false);
@@ -550,6 +563,7 @@ mod tests {
             &cancel,
             io(20_000_000),
             &on_progress,
+            false,
         )
         .unwrap_err();
         match err {

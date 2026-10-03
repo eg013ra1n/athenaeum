@@ -809,6 +809,17 @@ pub struct StackParams<'a, 'f> {
     /// byte-identical: the forced test is a `bool && …` over a local the
     /// compiler proves false.
     pub forced_rejection: Option<&'a (dyn RejectionBitSource + 'a)>,
+    /// Plan 6b-3 D4: count, per output pixel, the frames whose RAW sample is
+    /// finite — geometric coverage, before range and algorithm rejection —
+    /// into [`StackOutput::coverage`]. A post-pass over each band's
+    /// already-read planes after its combine: the per-pixel combine loop
+    /// never sees it, so `false` executes exactly what it did before.
+    pub coverage: bool,
+    /// Plan 6b-3 D4: a pixel no frame covers is NaN instead of 0.0 (a
+    /// project's LN reference on its grid, spec §5.6). Implies the count. A
+    /// pixel whose finite samples were all range-rejected is covered and
+    /// stays 0.0.
+    pub empty_as_nan: bool,
 }
 
 /// `base.rejected_fraction` counts ALGORITHM rejections only, exactly like
@@ -830,6 +841,10 @@ pub struct StackOutput {
     pub samples_per_frame: Vec<u64>,
     pub rejected_low: u64,
     pub rejected_high: u64,
+    /// Per output pixel, the frames whose raw sample was finite (`Some`
+    /// when [`StackParams::coverage`] or [`StackParams::empty_as_nan`] was
+    /// set).
+    pub coverage: Option<Vec<f32>>,
 }
 
 /// Weighted, normalized banded integration with survivor accounting (spec
@@ -1035,6 +1050,11 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
     let band_bits_buf: Option<std::sync::Mutex<Vec<u64>>> = params
         .rejection_bits
         .map(|_| std::sync::Mutex::new(vec![0u64; band_rows_cap * n * bit_words]));
+    // Plan 6b-3 D4: the coverage plane, full-image, filled one band at a time
+    // under one lock per band (the rejection maps' own pattern).
+    let count_coverage = params.coverage || params.empty_as_nan;
+    let coverage_buf =
+        std::sync::Mutex::new(if count_coverage { vec![0f32; w * h] } else { Vec::new() });
 
     let stats = band_loop(src, pool, cancel, &progress, io, &mut out, &|job, tick| {
         let BandJob { planes, out_band, y0, rows, width } = job;
@@ -1567,13 +1587,34 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
                     });
             }
         }
+        if count_coverage {
+            let mut guard = coverage_buf.lock().unwrap();
+            let cov_band = &mut guard[y0 * width..(y0 + rows) * width];
+            out_band
+                .par_chunks_mut(width)
+                .zip(cov_band.par_chunks_mut(width))
+                .enumerate()
+                .for_each(|(row_in_band, (out_row, cov_row))| {
+                    for x in 0..width {
+                        let idx = row_in_band * width + x;
+                        let covered = (0..n).filter(|&i| planes.sample(i, idx).is_finite()).count();
+                        cov_row[x] = covered as f32;
+                        if params.empty_as_nan && covered == 0 {
+                            out_row[x] = f32::NAN;
+                        }
+                    }
+                });
+        }
         Ok(())
     })?;
 
+    let coverage = count_coverage.then(|| coverage_buf.into_inner().unwrap());
     // Every input sample was finiteness-checked above, so a non-finite OUTPUT
     // could only come out of the combiner itself — unreachable by
-    // construction (same guard as the unweighted path).
-    if let Some(bad) = out.iter().find(|v| !v.is_finite()) {
+    // construction (same guard as the unweighted path) — except a pixel
+    // `empty_as_nan` left NaN on purpose.
+    let uncovered = |k: usize| params.empty_as_nan && coverage.as_ref().is_some_and(|c| c[k] == 0.0);
+    if let Some((_, bad)) = out.iter().enumerate().find(|(k, v)| !v.is_finite() && !uncovered(*k)) {
         return Err(IntegrationError::Decode(format!(
             "internal: non-finite value {bad} survived input filtering"
         )));
@@ -1608,6 +1649,7 @@ pub fn integrate_stack<'p, 'f, S: FrameSource + ?Sized>(
         samples_per_frame: samples_per_frame.into_iter().map(|a| a.into_inner()).collect(),
         rejected_low: rejected_low.into_inner(),
         rejected_high: rejected_high.into_inner(),
+        coverage,
     })
 }
 
@@ -1640,6 +1682,8 @@ pub fn integrate_registered(
         local_for_output: false,
         rejection_bits: None,
         forced_rejection: None,
+        coverage: false,
+        empty_as_nan: false,
     };
     Ok(integrate_stack(src, &params, recipe, pool, cancel, progress, io)?.base)
 }
@@ -2690,6 +2734,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let progress = EngineProgress { on_band: &nop(), on_combine: &nop() };
         // sigma_high 1.0, not the brief's 2.0 (measured deviation, Task 3):
@@ -2755,6 +2801,8 @@ mod tests {
             local: None, local_for_rejection: false, local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let stack = integrate_stack(&src, &params, recipe, &pool(), &AtomicBool::new(false),
             EngineProgress { on_band: &nop(), on_combine: &nop() }, io(1 << 20)).unwrap();
@@ -2764,6 +2812,115 @@ mod tests {
         }
         assert_eq!(master.rejected_fraction, stack.base.rejected_fraction);
         assert!(stack.rejection_low.is_none() && stack.rejection_high.is_none());
+    }
+
+    /// Plan 6b-3 D4: the coverage count is the number of frames whose RAW
+    /// sample is finite — a range-rejected sample still covers its pixel —
+    /// and asking for it changes nothing else: data, maps and per-frame
+    /// tallies are bit-identical with it off.
+    #[test]
+    fn coverage_off_leaves_the_stack_bit_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (24usize, 10usize);
+        let paths: Vec<_> = (0..5usize)
+            .map(|i| {
+                write(dir.path(), &format!("f{i}.fits"), w, h, move |x, y| {
+                    if x < 2 * i {
+                        f32::NAN
+                    } else if (x, y, i) == (20, 5, 0) {
+                        0.0
+                    } else {
+                        0.1 + 0.01 * ((x + y + i) % 7) as f32
+                    }
+                })
+            })
+            .collect();
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 5];
+        let recipe = IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 4.0, sigma_high: 3.0 });
+        let run = |coverage: bool| {
+            let params = StackParams {
+                rejection: &ident, output: &ident, weights: &[1.0; 5],
+                range_low: Some(0.0), range_high: None, rejection_maps: true,
+                local: None, local_for_rejection: false, local_for_output: false,
+                rejection_bits: None, forced_rejection: None,
+                coverage, empty_as_nan: false,
+            };
+            integrate_stack(&src, &params, recipe, &pool(), &AtomicBool::new(false),
+                EngineProgress { on_band: &nop(), on_combine: &nop() }, io(1 << 20)).unwrap()
+        };
+        let off = run(false);
+        let on = run(true);
+        assert!(off.coverage.is_none());
+        for (a, b) in off.base.data.iter().zip(&on.base.data) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        for (a, b) in off.rejection_low.as_ref().unwrap().iter().zip(on.rejection_low.as_ref().unwrap()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        assert_eq!(off.samples_per_frame, on.samples_per_frame);
+        assert_eq!(off.rejected_per_frame, on.rejected_per_frame);
+        let cov = on.coverage.unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                let expected = (0..5usize).filter(|&i| x >= 2 * i).count() as f32;
+                assert_eq!(cov[y * w + x], expected, "({x}, {y})");
+            }
+        }
+        assert_eq!(cov[5 * w + 20], 5.0, "a range-rejected sample still covers its pixel");
+    }
+
+    /// Plan 6b-3 D4 (research fact 1): with `empty_as_nan`, exactly the
+    /// pixels no frame covers are NaN; a pixel whose samples were all
+    /// range-rejected is covered and stays 0.0; every other pixel is
+    /// bit-identical to the run without it.
+    #[test]
+    fn empty_as_nan_marks_only_uncovered_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (12usize, 6usize);
+        let paths: Vec<_> = (0..3usize)
+            .map(|i| {
+                write(dir.path(), &format!("f{i}.fits"), w, h, move |x, y| {
+                    if x < 3 {
+                        f32::NAN
+                    } else if x == 3 {
+                        0.0
+                    } else {
+                        0.2 + 0.01 * ((x + y + i) % 5) as f32
+                    }
+                })
+            })
+            .collect();
+        let src = BandSource::open(&paths, dir.path(), 1).unwrap();
+        let ident = vec![NormalizationPair::IDENTITY; 3];
+        let recipe = IntegrationRecipe::average(Rejection::None);
+        let run = |empty_as_nan: bool| {
+            let params = StackParams {
+                rejection: &ident, output: &ident, weights: &[1.0; 3],
+                range_low: Some(0.0), range_high: None, rejection_maps: false,
+                local: None, local_for_rejection: false, local_for_output: false,
+                rejection_bits: None, forced_rejection: None,
+                coverage: false, empty_as_nan,
+            };
+            integrate_stack(&src, &params, recipe, &pool(), &AtomicBool::new(false),
+                EngineProgress { on_band: &nop(), on_combine: &nop() }, io(1 << 20)).unwrap()
+        };
+        let plain = run(false);
+        let nan = run(true);
+        for y in 0..h {
+            for x in 0..w {
+                let k = y * w + x;
+                let (a, b) = (plain.base.data[k], nan.base.data[k]);
+                if x < 3 {
+                    assert_eq!(a, 0.0);
+                    assert!(b.is_nan(), "({x}, {y}) is covered by no frame");
+                } else {
+                    assert_eq!(a.to_bits(), b.to_bits(), "({x}, {y})");
+                }
+            }
+        }
+        assert_eq!(nan.base.data[3], 0.0, "all samples range-rejected: covered, so 0.0");
+        assert!(nan.coverage.is_some(), "empty_as_nan counts");
     }
 
     #[test]
@@ -2795,6 +2952,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let out = integrate_stack(
             &src,
@@ -2845,6 +3004,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let out = integrate_stack(
             &src,
@@ -2929,6 +3090,8 @@ mod tests {
             local_for_output: true,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         // budget: `per_row_bytes` for 2 f32 frames at width 16 is
         // 2*16*4 + 16*8 = 256; 2_000 / 256 -> 7-row bands, so 12 rows run
@@ -2984,6 +3147,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let worker_pool = pool();
         let threads = worker_pool.current_num_threads() as u32;
@@ -3072,6 +3237,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let out_global = integrate_stack(
             &src,
@@ -3121,6 +3288,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let out_local = integrate_stack(
             &src,
@@ -3232,6 +3401,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let out_none = integrate_stack(
             &src,
@@ -3391,6 +3562,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: Some(&sink),
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let out = integrate_stack(
             &src,
@@ -3510,6 +3683,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let out_none = integrate_stack(
             &src,
@@ -3533,6 +3708,8 @@ mod tests {
         let forced = ListSource::new(3, w, h, &[(1, 5, 5)]);
         let params = StackParams {
             forced_rejection: Some(&forced),
+            coverage: false,
+            empty_as_nan: false,
             ..params_none
         };
         let out = integrate_stack(
@@ -3609,6 +3786,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: Some(&forced),
+            coverage: false,
+            empty_as_nan: false,
         };
         let out = integrate_stack(
             &src,
@@ -3721,6 +3900,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: Some(&sink),
             forced_rejection: Some(&forced),
+            coverage: false,
+            empty_as_nan: false,
         };
         integrate_stack(
             &src,
@@ -3765,6 +3946,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: Some(&forced),
+            coverage: false,
+            empty_as_nan: false,
         };
         let out = integrate_stack(
             &src,
@@ -3810,6 +3993,8 @@ mod tests {
             local_for_output: false,
             rejection_bits: None,
             forced_rejection: None,
+            coverage: false,
+            empty_as_nan: false,
         };
         let run = |params: &StackParams<'_, '_>| {
             integrate_stack(

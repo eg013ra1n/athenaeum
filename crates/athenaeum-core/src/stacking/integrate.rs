@@ -364,6 +364,10 @@ pub struct GroupInput<'a> {
     /// and the tests never pass a `rej` set at all, so the flag has nothing
     /// to gate.
     pub second_pass_bitmaps: bool,
+    /// Plan 6b-3 D4, spec §5.7: keep plane 0's geometric coverage in
+    /// [`GroupOutput::coverage`] — the coverage map, and the crop's
+    /// rectangle. `false` for every caller that wants neither.
+    pub coverage_map: bool,
 }
 
 // `Clone, Serialize, Deserialize, ts_rs::TS` pulled forward from Task 9's own
@@ -460,6 +464,11 @@ pub struct GroupOutput {
     /// incomplete", which the run turns into a drizzle skip rather than
     /// letting drizzle trust bits that describe a different integration.
     pub second_pass_rej_ok: bool,
+    /// Plane 0's per-pixel count of frames with a finite registered sample
+    /// (`Some` when [`GroupInput::coverage_map`] was set). The pass whose
+    /// output the master is (the second, when large-scale rejection ran)
+    /// supplies it; both passes see the same geometry.
+    pub coverage: Option<Vec<f32>>,
 }
 
 pub struct GroupProgress<'a> {
@@ -516,6 +525,16 @@ fn local_norm_row_factory<'g>(grid: &'g LnGrid) -> impl Fn() -> Box<LocalNormRow
             grid.evaluate_row_into(y, a_row, b_row, &mut scratch);
         })
     }
+}
+
+/// What [`integrate_planes`] counts per output pixel (plan 6b-3 D4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CoverageOptions {
+    /// Count plane 0's geometric coverage (one plane: debayered planes share
+    /// the footprint; a Bayer mosaic is one plane).
+    pub count: bool,
+    /// Leave every plane's uncovered pixels NaN (a project's LN reference).
+    pub empty_as_nan: bool,
 }
 
 /// The per-plane engine loop shared by [`integrate_group`] and the LN
@@ -579,6 +598,7 @@ pub(crate) fn integrate_planes<'g>(
     forced: Option<&RejForcedSource>,
     recipe: IntegrationRecipe,
     write_maps: bool,
+    coverage: CoverageOptions,
     // An owned `Arc`, not a bare `&rayon::ThreadPool` (perf tier 1 Task 2):
     // this is the one place a `RegisteredSource` gets built for group
     // integration, and `RegisteredSource::with_pool` needs a clonable
@@ -741,6 +761,8 @@ pub(crate) fn integrate_planes<'g>(
             // M4c Task 3: the second pass's forced bits, bound to this
             // plane the same way the sink above is.
             forced_rejection: forced_plane.as_ref().map(|f| f as &dyn RejectionBitSource),
+            coverage: coverage.count && p == 0,
+            empty_as_nan: coverage.empty_as_nan,
         };
         // `EngineProgress` itself is not `Copy` — only its two `&dyn Fn`
         // fields are — so it must be rebuilt (not read) from
@@ -1097,6 +1119,7 @@ pub fn integrate_group(
         None,
         recipe,
         input.integration.write_rejection_maps,
+        CoverageOptions { count: input.coverage_map, empty_as_nan: false },
         pool,
         cancel,
         &progress_pass1,
@@ -1202,6 +1225,7 @@ pub fn integrate_group(
                         Some(&forced),
                         recipe,
                         input.integration.write_rejection_maps,
+                        CoverageOptions { count: input.coverage_map, empty_as_nan: false },
                         pool,
                         cancel,
                         &progress_pass2,
@@ -1243,7 +1267,11 @@ pub fn integrate_group(
     combine_ms_total += pass_one_cost.1;
     bytes_read_total += pass_one_cost.2;
 
-    for (p, out) in outputs.into_iter().enumerate() {
+    let mut coverage: Option<Vec<f32>> = None;
+    for (p, mut out) in outputs.into_iter().enumerate() {
+        if p == 0 {
+            coverage = out.coverage.take();
+        }
         // `integrate_planes` already checks `cancel` before each plane's own
         // engine work, but the tail below runs a real (non-trivial) master
         // measurement per plane — without this check here, a cancel raised
@@ -1403,6 +1431,7 @@ pub fn integrate_group(
         included,
         output_pairs,
         second_pass_rej_ok,
+        coverage,
         stats: GroupStats {
             frames: frames.len(),
             included: included_count,
@@ -1781,6 +1810,7 @@ mod tests {
             ln: Some(&grids),
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -1855,6 +1885,7 @@ mod tests {
             ln: None,
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
         // Frame 1's grid is built for a 10x10 reference geometry — the
         // group above declares 20x20.
@@ -1887,6 +1918,7 @@ mod tests {
             None,
             IntegrationRecipe::average(Rejection::None),
             false,
+            CoverageOptions::default(),
             &pool,
             &AtomicBool::new(false),
             &progress,
@@ -1981,6 +2013,7 @@ mod tests {
             ln: None,
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
         let out = integrate_group(
             &input,
@@ -2016,16 +2049,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn integrating_a_shifted_brighter_frame_lands_on_the_reference_level() {
-        // Fixture bounds picked for this test: 400x300 (the 200x150 size
-        // used by the registered-source tests is too small for the
-        // background-mesh model's 128px cell to say much), 12 stars on a
-        // 4x3 grid, amplitude 0.25 against a noise sigma of 0.003 — SNR far
-        // above the detector's default `min_snr` of 5.0, so all three
-        // frames and the master fit reliably. "twice the level" (spec
-        // sketch) is background 0.08 -> 0.16 with amplitude scaled the same
-        // way, not literally "100" — the brief's number was illustrative.
+    /// The three shifted frames of the level test: (0,0), (2.4,-1.3) and a
+    /// (-5,3)-shifted frame at twice the level, 400x300, written to `dir`.
+    fn three_shifted_frames(dir: &std::path::Path) -> Vec<StackFrame> {
         const FW: usize = 400;
         const FH: usize = 300;
         const BG: f32 = 0.08;
@@ -2036,8 +2062,6 @@ mod tests {
                 (0..4).map(move |i| (50.0 + i as f64 * 100.0, 50.0 + j as f64 * 100.0, 0.25))
             })
             .collect();
-        let dir = tempfile::tempdir().unwrap();
-
         let write_frame =
             |name: &str, dx: f64, dy: f64, scale: f64, seed: u64| -> (PathBuf, PixelMap) {
                 let shifted: Vec<(f64, f64, f64)> = stars
@@ -2050,7 +2074,7 @@ mod tests {
                 // end, which is what actually exercises the
                 // AdditiveWithScaling pair's scale term below.
                 add_noise(&mut data, NOISE * scale as f32, seed);
-                let path = dir.path().join(name);
+                let path = dir.join(name);
                 write_fits_f32(&path, FW, FH, 1, &data, &[]).unwrap();
                 let map = if dx == 0.0 && dy == 0.0 {
                     identity_map()
@@ -2103,6 +2127,31 @@ mod tests {
                 registered_path: None,
             },
         ];
+        frames
+    }
+
+    #[test]
+    fn integrating_a_shifted_brighter_frame_lands_on_the_reference_level() {
+        // Fixture bounds picked for this test: 400x300 (the 200x150 size
+        // used by the registered-source tests is too small for the
+        // background-mesh model's 128px cell to say much), 12 stars on a
+        // 4x3 grid, amplitude 0.25 against a noise sigma of 0.003 — SNR far
+        // above the detector's default `min_snr` of 5.0, so all three
+        // frames and the master fit reliably. "twice the level" (spec
+        // sketch) is background 0.08 -> 0.16 with amplitude scaled the same
+        // way, not literally "100" — the brief's number was illustrative.
+        const FW: usize = 400;
+        const FH: usize = 300;
+        const BG: f32 = 0.08;
+        let stars: Vec<(f64, f64, f64)> = (0..3)
+            .flat_map(|j| {
+                (0..4).map(move |i| (50.0 + i as f64 * 100.0, 50.0 + j as f64 * 100.0, 0.25))
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let frames = three_shifted_frames(dir.path());
+        let exposures = [60.0, 90.0, 120.0];
+        let weights = [1.0, 0.8, 0.6];
 
         let integration = IntegrationConfig::default();
         let normalization = NormalizationConfig::default();
@@ -2119,6 +2168,7 @@ mod tests {
             ln: None,
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -2215,6 +2265,69 @@ mod tests {
         assert!((out.stats.total_exposure_s - exposures.iter().sum::<f64>()).abs() < 1e-9);
     }
 
+    /// Plan 6b-3 D4, spec §5.7: `GroupInput.coverage_map` makes the group
+    /// carry plane 0's coverage — whole frames covered everywhere inside,
+    /// fewer at a shifted frame's edge — and the master is bit-identical
+    /// with it off.
+    #[test]
+    fn the_group_coverage_is_a_side_output() {
+        const FW: usize = 400;
+        const FH: usize = 300;
+        let dir = tempfile::tempdir().unwrap();
+        let frames = three_shifted_frames(dir.path());
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let make_input = |coverage_map: bool| GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: FW,
+            height: FH,
+            channels: 1,
+            interpolation: Interpolation::BicubicBSpline,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+            second_pass_bitmaps: false,
+            coverage_map,
+        };
+        let on_plane = nop_plane();
+        let on_band = nop_band();
+        let progress = GroupProgress {
+            on_plane: &on_plane,
+            engine: EngineProgress { on_band: &on_band, on_combine: &on_band },
+        };
+        let pool = pool();
+        let off = integrate_group(
+            &make_input(false),
+            &MeasureOptions::default(),
+            &pool,
+            &AtomicBool::new(false),
+            &progress,
+            io(1 << 24),
+        )
+        .unwrap();
+        let on = integrate_group(
+            &make_input(true),
+            &MeasureOptions::default(),
+            &pool,
+            &AtomicBool::new(false),
+            &progress,
+            io(1 << 24),
+        )
+        .unwrap();
+        assert!(off.coverage.is_none());
+        for (a, b) in off.data.iter().zip(&on.data) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        let cov = on.coverage.expect("the coverage plane");
+        assert_eq!(cov.len(), FW * FH);
+        assert!(cov.iter().all(|&c| c == c.trunc() && (0.0..=3.0).contains(&c)));
+        assert_eq!(cov[(FH / 2) * FW + FW / 2], 3.0, "the centre is covered by every frame");
+        assert!(cov[0] < 3.0, "the (-5, 3)-shifted frame leaves the corner");
+    }
+
     #[test]
     fn a_three_plane_group_integrates_plane_by_plane_with_one_map_set_per_plane() {
         const W: usize = 48;
@@ -2266,6 +2379,7 @@ mod tests {
             ln: None,
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
         let pool = pool();
         let planes_seen = std::sync::Mutex::new(Vec::new());
@@ -2379,6 +2493,7 @@ mod tests {
             ln: None,
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
 
         // The engine's own raw rejected count, from a bitmap-less
@@ -2400,6 +2515,7 @@ mod tests {
             None,
             recipe,
             false,
+            CoverageOptions::default(),
             &pool,
             &AtomicBool::new(false),
             &progress,
@@ -2523,6 +2639,7 @@ mod tests {
             ln: None,
             rej: Some(&set),
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
         let pool = pool();
         let on_plane = nop_plane();
@@ -2701,6 +2818,7 @@ mod tests {
             ln: None,
             rej: None,
             second_pass_bitmaps: false,
+            coverage_map: false,
         };
 
         let off = integrate_group(
@@ -2733,6 +2851,7 @@ mod tests {
             // This pin reads the second pass's own set, which is what a
             // drizzle-consuming run asks for.
             second_pass_bitmaps: true,
+            coverage_map: false,
             ..input_off
         };
         let on = integrate_group(
