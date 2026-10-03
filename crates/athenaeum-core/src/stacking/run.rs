@@ -23921,4 +23921,194 @@ mod tests {
         solve_project_frames(&mut rc).unwrap();
         assert_eq!((fake.ready_calls(), fake.calls()), (0, 0));
     }
+
+    /// The project fixture of the 6b-3 run tests: `n` mono L frames dithered
+    /// around the fixture target (83.8, −5.4), every one with a manifest
+    /// WCS, and the grid they land on (1.5″/px, 512 × 384, north up).
+    fn seed_sky_project(
+        conn: &rusqlite::Connection,
+        landed: &Path,
+        n: usize,
+    ) -> crate::collab::grid::CanonicalGrid {
+        crate::db::stacking::insert_test_project(conn, "p1");
+        let target = (83.8, -5.4);
+        let stars = test_fixtures::sky_stars(target, 0.12, 50.0, 7);
+        let uuids: Vec<String> = (0..n).map(|i| format!("l{i}")).collect();
+        for (i, uuid) in uuids.iter().enumerate() {
+            // Dithers of ±3.6 / ±1.2 px (RA) and 1.2 px (Dec): the LN field's
+            // frame-unit lattice (D8, review I6) resolves a dither, and the
+            // 0.97 rule fails a member that misses over 3 % of the field —
+            // as it fails a frame set's member against the reference.
+            let dither = ((i as f64 - 1.5) * 0.001, (i % 2) as f64 * 0.0005);
+            let mut f = test_fixtures::sky_frame(uuid, (target.0 + dither.0, target.1 + dither.1));
+            f.noise_seed = 100 + i as u64;
+            test_fixtures::add_project_sky_frame(conn, landed, "p1", &f, &stars);
+        }
+        crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.5,
+            width_px: 512,
+            height_px: 384,
+            crval1: target.0,
+            crval2: target.1,
+            rotation_deg: 0.0,
+        }
+    }
+
+    /// The project config of the 6b-3 run tests, stored as the project's
+    /// document so a plan resolves the same groups and hashes: the seed,
+    /// with the two-pass re-pick off (its dry pass always detects afresh).
+    fn sky_config(conn: &rusqlite::Connection) -> StackingConfig {
+        let mut cfg = crate::stacking::config::project_seed_config(StackingConfig::default());
+        cfg.reference.two_pass = false;
+        crate::db::stacking::set_project_config(
+            conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        cfg
+    }
+
+    fn run_to_register(rc: &mut RunContext) {
+        stage_calibrate(rc).unwrap();
+        stage_measure(rc).unwrap();
+        stage_reference(rc).unwrap();
+        stage_register(rc).unwrap();
+    }
+
+    /// Background-subtracted centroid of the brightest blob within 3 px of
+    /// `(x, y)` (7 × 7 window).
+    fn centroid_near(plane: &[f32], w: usize, x: f64, y: f64) -> (f64, f64) {
+        let (cx, cy) = (x.round() as i64, y.round() as i64);
+        let mut vals = Vec::new();
+        for dy in -3..=3 {
+            for dx in -3..=3 {
+                vals.push((
+                    (cx + dx) as f64,
+                    (cy + dy) as f64,
+                    plane[((cy + dy) as usize) * w + (cx + dx) as usize] as f64,
+                ));
+            }
+        }
+        let mut sorted: Vec<f64> = vals.iter().map(|v| v.2).collect();
+        sorted.sort_by(f64::total_cmp);
+        let floor = sorted[sorted.len() / 2];
+        let (mut sx, mut sy, mut sw) = (0.0, 0.0, 0.0);
+        for (px, py, v) in vals {
+            let wgt = (v - floor).max(0.0);
+            sx += px * wgt;
+            sy += py * wgt;
+            sw += wgt;
+        }
+        (sx / sw, sy / sw)
+    }
+
+    /// Spec §5.5, plan 6b-3 D1, D2, D3: on a project's grid every registered
+    /// frame has the grid's size, NaN outside its footprint, its stars where
+    /// the grid's TAN puts their sky positions, `ATH_GRID` and the grid's own
+    /// row order. The star map is cached as a `registration` artifact, never
+    /// in `registration_results`.
+    #[test]
+    #[ignore = "plan 6b-3 Task 2b2: registration composes onto the grid"]
+    fn a_project_frame_registers_onto_the_grid() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+        let cfg = sky_config(&conn);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let run = Arc::new(crate::stacking::grid_map::GridRun::new(grid));
+        rc.grid = Some(run.clone());
+        run_to_register(&mut rc);
+
+        let group = rc.plan_groups[0].key.clone();
+        let entries = &rc.measured[&group];
+        assert_eq!(
+            entries.iter().filter(|e| e.included).count(),
+            4,
+            "{:?}",
+            entries.iter().map(|e| (&e.frame.filename, &e.reason)).collect::<Vec<_>>()
+        );
+        for e in entries {
+            let Some(RegisteredFrameOutcome::Aligned {
+                map,
+                registered_hash,
+                ..
+            }) = &e.registration
+            else {
+                panic!(
+                    "frame {} did not register: {:?}",
+                    e.frame.filename, e.reason
+                );
+            };
+            assert!(
+                map.is_flipped(),
+                "a det CD > 0 frame lands mirrored on the grid"
+            );
+            let row = crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                &group,
+                "registered",
+                Some(e.frame.frame_id),
+            )
+            .unwrap()
+            .expect("a registered artifact");
+            assert_eq!(&row.config_hash, registered_hash);
+            let path = PathBuf::from(row.path.unwrap());
+            let reader = crate::integration::plane_reader::PlaneReader::open(&path).unwrap();
+            assert_eq!((reader.width(), reader.height()), (512, 384));
+            let plane = reader.read_plane(0).unwrap();
+            assert!(
+                plane[0].is_nan() && plane[512 * 384 - 1].is_nan(),
+                "NaN outside the footprint"
+            );
+            let header = crate::fits_parser::FitsHeader::from_path(&path).unwrap();
+            assert_eq!(
+                header.get_str("ATH_GRID").as_deref(),
+                Some(run.hash.as_str())
+            );
+            assert_eq!(header.get_str("ROWORDER").as_deref(), Some("BOTTOM-UP"));
+            assert!(header.get_str("ATH_PRJ").is_none());
+            // The sky star nearest the target lands where the grid puts it.
+            let stars = test_fixtures::sky_stars((83.8, -5.4), 0.12, 50.0, 7);
+            let star = stars
+                .iter()
+                .min_by(|a, b| {
+                    let da = (a.0 - 83.8).hypot(a.1 + 5.4);
+                    let db = (b.0 - 83.8).hypot(b.1 + 5.4);
+                    da.total_cmp(&db)
+                })
+                .unwrap();
+            let (gx, gy) = run.tan.sky_to_pixel(star.0, star.1);
+            let (mx, my) = centroid_near(&plane, 512, gx, gy);
+            assert!(
+                (mx - gx).hypot(my - gy) < 0.5,
+                "{}: star at ({mx}, {my}), grid says ({gx}, {gy})",
+                e.frame.filename
+            );
+        }
+        let stars_cached = crate::stacking::plan::stored_registrations(&conn, &rc.subject).unwrap();
+        assert_eq!(stars_cached.len(), 4);
+        let catalog_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM registration_results", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            catalog_rows, 0,
+            "a project never writes registration_results"
+        );
+    }
 }

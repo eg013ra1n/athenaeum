@@ -867,6 +867,53 @@ mod tests {
             "OSC light with a resolvable Bayer pattern must debayer"
         );
     }
+
+    /// Plan 6b-3 Task 2b1: a rendered sky frame puts each star where its own
+    /// WCS says — the brightest pixel within 2 px of the predicted position
+    /// is within 1 px of it — and its manifest `meta.wcs` carries the 1-based
+    /// `crpix` the exchange writes.
+    #[test]
+    fn a_sky_frame_puts_its_stars_where_its_wcs_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = sky_frame("s0", (83.8, -5.4));
+        let stars = sky_stars((83.8, -5.4), 0.12, 50.0, 7);
+        let r = render_sky_frame(dir.path(), "p1", &f, &stars);
+        let wcs = sky_frame_record(&f).to_solution().unwrap();
+        let plane = crate::integration::plane_reader::PlaneReader::open(&r.path)
+            .unwrap()
+            .read_plane(0)
+            .unwrap();
+        let (w, h) = (f.width as i64, f.height as i64);
+        let mut checked = 0usize;
+        for &(ra, dec, _) in &stars {
+            let (x, y) = wcs.sky_to_pixel(ra, dec);
+            if x < 10.0 || y < 10.0 || x > (w - 11) as f64 || y > (h - 11) as f64 {
+                continue;
+            }
+            let (cx, cy) = (x.round() as i64, y.round() as i64);
+            let mut best = (f32::MIN, 0i64, 0i64);
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let v = plane[((cy + dy) * w + (cx + dx)) as usize];
+                    if v > best.0 {
+                        best = (v, cx + dx, cy + dy);
+                    }
+                }
+            }
+            assert!(
+                (best.1 as f64 - x).hypot(best.2 as f64 - y) <= 1.0,
+                "star at ({x:.2}, {y:.2}) peaks at ({}, {})",
+                best.1,
+                best.2
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20, "{checked} stars inside the frame");
+        assert_eq!(
+            r.meta["wcs"]["crpix1"],
+            serde_json::json!(f.width as f64 / 2.0 + 0.5)
+        );
+    }
 }
 
 // ── Project frames (plan 6b-2) ──────────────────────────────────────────────
@@ -1052,35 +1099,312 @@ pub(crate) fn add_project_frame(
             blake3::hash(&bytes).to_hex().to_string(),
         )
     };
+    seed_manifest_and_land(
+        conn,
+        project_id,
+        &ManifestSeed {
+            uuid: spec.uuid,
+            publisher: spec.publisher,
+            filter: spec.filter,
+            exptime_sec: spec.exptime_sec,
+            date_obs: spec.date_obs,
+            file_name: &file_name,
+            meta: serde_json::Value::Object(meta),
+            osc: spec.bayerpat.is_some(),
+            accepted: spec.accepted,
+            byte_size,
+            blake3,
+            landed: (spec.file != ProjectFile::Missing).then_some(path.as_path()),
+        },
+    );
+    path
+}
+
+/// The manifest row and the landing of one fixture project frame — what
+/// the exchange leaves behind — shared by [`add_project_frame`] and
+/// [`add_project_sky_frame`].
+pub(crate) struct ManifestSeed<'a> {
+    pub uuid: &'a str,
+    pub publisher: &'a str,
+    pub filter: &'a str,
+    pub exptime_sec: f64,
+    pub date_obs: &'a str,
+    pub file_name: &'a str,
+    pub meta: serde_json::Value,
+    pub osc: bool,
+    pub accepted: bool,
+    pub byte_size: i64,
+    pub blake3: String,
+    /// `Some(path)` lands the frame there with its real `size:mtime`.
+    pub landed: Option<&'a Path>,
+}
+
+pub(crate) fn seed_manifest_and_land(conn: &Connection, project_id: &str, s: &ManifestSeed<'_>) {
     let seq: i64 = conn
         .query_row("SELECT COUNT(*) FROM project_frames_local", [], |r| {
             r.get(0)
         })
         .unwrap();
     let view: FrameViewWire = serde_json::from_value(serde_json::json!({
-        "frameUuid": spec.uuid, "frameSeq": seq + 1,
-        "publisherAccountId": spec.publisher, "publisherDisplayName": spec.publisher, "own": false,
-        "fileName": file_name, "contentVersion": 1, "blake3": blake3, "byteSize": byte_size,
-        "xxh3": "0123456789abcdef", "filterRaw": spec.filter, "filterCanonical": spec.filter,
-        "channel": if spec.bayerpat.is_some() { "osc" } else { "mono" },
-        "exptimeSec": spec.exptime_sec, "dateObs": spec.date_obs,
-        "meta": serde_json::Value::Object(meta), "gateVersion": 0,
-        "accepted": spec.accepted, "acceptedReason": null, "state": "published",
+        "frameUuid": s.uuid, "frameSeq": seq + 1,
+        "publisherAccountId": s.publisher, "publisherDisplayName": s.publisher, "own": false,
+        "fileName": s.file_name, "contentVersion": 1, "blake3": s.blake3, "byteSize": s.byte_size,
+        "xxh3": "0123456789abcdef", "filterRaw": s.filter, "filterCanonical": s.filter,
+        "channel": if s.osc { "osc" } else { "mono" },
+        "exptimeSec": s.exptime_sec, "dateObs": s.date_obs,
+        "meta": s.meta.clone(), "gateVersion": 0,
+        "accepted": s.accepted, "acceptedReason": null, "state": "published",
         "rejectReason": null, "manifestVersion": seq + 1, "createdAt": "2026-10-01T00:00:00Z",
     }))
     .unwrap();
     crate::db::collab_frames::upsert_from_manifest(conn, project_id, &view).unwrap();
-    if spec.file != ProjectFile::Missing {
+    if let Some(path) = s.landed {
         let stamp =
-            crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(&path).unwrap()).encode();
+            crate::collab::storage::sweep::Stamp::of(&std::fs::metadata(path).unwrap()).encode();
         crate::db::collab_frames::set_landed(
             conn,
             project_id,
-            spec.uuid,
+            s.uuid,
             path.to_str().unwrap(),
             &stamp,
         )
         .unwrap();
     }
-    path
 }
+
+// ── Sky-field project frames (plan 6b-3) ─────────────────────────────────────
+
+/// One project frame rendered from a sky star list through its own WCS:
+/// stars land where the frame's WCS puts them, so registration, the
+/// composed map and the grid all have a ground truth. The WCS has the
+/// parity of every solve in the owner's catalog (det CD > 0), unrotated.
+pub(crate) struct SkyFrame<'a> {
+    pub uuid: &'a str,
+    pub publisher: &'a str,
+    pub filter: &'a str,
+    pub width: usize,
+    pub height: usize,
+    pub scale_arcsec: f64,
+    /// RA/Dec of the frame's centre pixel.
+    pub centre: (f64, f64),
+    /// `Mono32` or `Rgb32`.
+    pub file: ProjectFile,
+    pub bayerpat: Option<&'a str>,
+    /// `false` leaves `meta.wcs` out: the run plate-solves the frame.
+    pub manifest_wcs: bool,
+    pub noise_seed: u64,
+    pub accepted: bool,
+}
+
+/// A mono `L` frame, 384 × 288 at 1.5″/px, with a manifest WCS.
+pub(crate) fn sky_frame(uuid: &str, centre: (f64, f64)) -> SkyFrame<'_> {
+    SkyFrame {
+        uuid,
+        publisher: "ann",
+        filter: "L",
+        width: 384,
+        height: 288,
+        scale_arcsec: 1.5,
+        centre,
+        file: ProjectFile::Mono32,
+        bayerpat: None,
+        manifest_wcs: true,
+        noise_seed: uuid.bytes().map(u64::from).sum(),
+        accepted: true,
+    }
+}
+
+/// A deterministic star list `(ra, dec, amplitude)`: a lattice of
+/// `spacing_arcsec` over a `half_deg` box around `centre`, each star
+/// jittered by up to ±30 % of the spacing (a regular lattice would make
+/// quad matching ambiguous), amplitudes 0.05–0.20 over the field's 0.08
+/// background.
+pub(crate) fn sky_stars(
+    centre: (f64, f64),
+    half_deg: f64,
+    spacing_arcsec: f64,
+    seed: u64,
+) -> Vec<(f64, f64, f64)> {
+    let step = spacing_arcsec / 3600.0;
+    let n = (2.0 * half_deg / step).ceil() as i64;
+    let cos_dec = centre.1.to_radians().cos();
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut out = Vec::new();
+    for i in 0..=n {
+        for j in 0..=n {
+            let dx = (i as f64 - n as f64 / 2.0 + (next() - 0.5) * 0.6) * step;
+            let dy = (j as f64 - n as f64 / 2.0 + (next() - 0.5) * 0.6) * step;
+            let amplitude = 0.05 + 0.15 * next();
+            out.push((centre.0 + dx / cos_dec, centre.1 + dy, amplitude));
+        }
+    }
+    out
+}
+
+/// The frame's own solve: 0-based CRPIX at the centre pixel, det CD > 0.
+pub(crate) fn sky_frame_record(f: &SkyFrame<'_>) -> crate::plate_solve::storage::PlateSolveRecord {
+    let s = f.scale_arcsec / 3600.0;
+    crate::plate_solve::storage::PlateSolveRecord {
+        id: None,
+        frame_id: 0,
+        crpix1: (f.width as f64 - 1.0) / 2.0,
+        crpix2: (f.height as f64 - 1.0) / 2.0,
+        crval1: f.centre.0,
+        crval2: f.centre.1,
+        cd1_1: s,
+        cd1_2: 0.0,
+        cd2_1: 0.0,
+        cd2_2: s,
+        sip_order: None,
+        sip_a_coeffs: None,
+        sip_b_coeffs: None,
+        sip_ap_coeffs: None,
+        sip_bp_coeffs: None,
+        matched_stars: 50,
+        total_detected: 60,
+        rms_residual_px: 0.1,
+        rms_residual_arcsec: 0.1 * f.scale_arcsec,
+        pixel_scale_arcsec: f.scale_arcsec,
+        field_rotation_deg: 0.0,
+        solve_time_ms: 1,
+        catalog_used: "fixture".into(),
+        algorithm_used: "fixture".into(),
+        solved_at: "2026-10-03T00:00:00Z".into(),
+        expected_catalog_stars_in_fov: None,
+        inlier_ratio: None,
+    }
+}
+
+pub(crate) struct RenderedSkyFrame {
+    pub path: PathBuf,
+    pub file_name: String,
+    pub meta: serde_json::Value,
+    pub byte_size: i64,
+    pub blake3: String,
+}
+
+/// Writes the frame as a landed replica would look (unit-domain float32,
+/// a replica's cards including `CALSTAT`/`ATH_CSRC`/`ATH_PRJ`) under
+/// `dir/<publisher>/c_<uuid>.fits`, and returns its manifest `meta` (the
+/// WCS with a 1-BASED CRPIX, as the manifest stores it).
+pub(crate) fn render_sky_frame(
+    dir: &Path,
+    project_id: &str,
+    f: &SkyFrame<'_>,
+    stars: &[(f64, f64, f64)],
+) -> RenderedSkyFrame {
+    let record = sky_frame_record(f);
+    let wcs = record.to_solution().expect("a linear solve converts");
+    let (w, h) = (f.width, f.height);
+    let pixels: Vec<(f64, f64, f64)> = stars
+        .iter()
+        .filter_map(|&(ra, dec, amplitude)| {
+            let (x, y) = wcs.sky_to_pixel(ra, dec);
+            (x > -8.0 && y > -8.0 && x < w as f64 + 8.0 && y < h as f64 + 8.0)
+                .then_some((x, y, amplitude))
+        })
+        .collect();
+    let plane = synthetic_star_field(w, h, &pixels, 3.0, 0.002, f.noise_seed);
+    let file_name = format!("c_{}.fits", f.uuid);
+    let folder = dir.join(f.publisher);
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join(&file_name);
+    let cards = vec![
+        Card::new("IMAGETYP", CardValue::Str("Light".into())).unwrap(),
+        Card::new("FILTER", CardValue::Str(f.filter.to_string())).unwrap(),
+        Card::new("EXPTIME", CardValue::Real(300.0)).unwrap(),
+        Card::new("DATE-OBS", CardValue::Str("2026-01-10T21:00:00".into())).unwrap(),
+        Card::new("INSTRUME", CardValue::Str("cam".into())).unwrap(),
+        Card::new("ROWORDER", CardValue::Str(FIXTURE_ROW_ORDER.into())).unwrap(),
+        Card::new("CALSTAT", CardValue::Str("BDF".into())).unwrap(),
+        Card::new("ATH_CSRC", CardValue::Str(f.uuid.to_string())).unwrap(),
+        Card::new("ATH_PRJ", CardValue::Str(project_id.to_string())).unwrap(),
+    ];
+    match f.file {
+        ProjectFile::Mono32 => write_fits_f32(&path, w, h, 1, &plane, &cards).unwrap(),
+        ProjectFile::Rgb32 => {
+            let rgb: Vec<f32> = [1.0f32, 0.8, 0.6]
+                .iter()
+                .flat_map(|k| plane.iter().map(move |v| v * k))
+                .collect();
+            write_fits_f32(&path, w, h, 3, &rgb, &cards).unwrap();
+        }
+        other => panic!("a sky frame is Mono32 or Rgb32, not {other:?}"),
+    }
+    let mut meta = serde_json::json!({
+        "naxis1": w,
+        "naxis2": h,
+        "instrume": "cam",
+        "pixelScaleArcsec": f.scale_arcsec,
+    });
+    if let Some(b) = f.bayerpat {
+        meta["bayerpat"] = serde_json::json!(b);
+    }
+    if f.manifest_wcs {
+        meta["wcs"] = serde_json::json!({
+            "crval1": record.crval1,
+            "crval2": record.crval2,
+            "crpix1": record.crpix1 + 1.0,
+            "crpix2": record.crpix2 + 1.0,
+            "cd": [record.cd1_1, record.cd1_2, record.cd2_1, record.cd2_2],
+        });
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    RenderedSkyFrame {
+        path,
+        file_name,
+        meta,
+        byte_size: bytes.len() as i64,
+        blake3: blake3::hash(&bytes).to_hex().to_string(),
+    }
+}
+
+/// [`render_sky_frame`], then the manifest row and the landing.
+pub(crate) fn add_project_sky_frame(
+    conn: &Connection,
+    dir: &Path,
+    project_id: &str,
+    f: &SkyFrame<'_>,
+    stars: &[(f64, f64, f64)],
+) -> PathBuf {
+    let r = render_sky_frame(dir, project_id, f, stars);
+    seed_manifest_and_land(
+        conn,
+        project_id,
+        &ManifestSeed {
+            uuid: f.uuid,
+            publisher: f.publisher,
+            filter: f.filter,
+            exptime_sec: 300.0,
+            date_obs: "2026-01-10T21:00:00",
+            file_name: &r.file_name,
+            meta: r.meta.clone(),
+            osc: f.bayerpat.is_some(),
+            accepted: f.accepted,
+            byte_size: r.byte_size,
+            blake3: r.blake3.clone(),
+            landed: Some(&r.path),
+        },
+    );
+    r.path
+}
+
+/// How far east of the main field the low-overlap pair sits, in frame
+/// widths (plan 6b-3 D7, review I5): each of the two frames overlaps the
+/// main field on ≈ 15 % of its own footprint, under the 25 % LN rule.
+#[allow(dead_code)] // consumed by plan 6b-3 Tasks 5b and 9
+pub(crate) const EAST_PAIR_OFFSET_WIDTHS: f64 = 0.85;
+/// The star spacing of that field. The pair registers over its ≈ 15 %
+/// strip (≈ 86″ × 432″ at 1.5″/px): 40″ puts ≈ 23 stars there, 50″ ≈ 15.
+/// Task 5b's run test registers the strip first; Task 9's e2e reuses it.
+#[allow(dead_code)] // consumed by plan 6b-3 Tasks 5b and 9
+pub(crate) const EAST_PAIR_SPACING_ARCSEC: f64 = 40.0;
+/// The star-field seed of that geometry, shared for the same reason.
+#[allow(dead_code)] // consumed by plan 6b-3 Tasks 5b and 9
+pub(crate) const EAST_PAIR_STAR_SEED: u64 = 9;
