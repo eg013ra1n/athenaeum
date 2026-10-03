@@ -41,6 +41,22 @@ impl InverseMap for Linear {
     }
 }
 
+/// The exact displacement field behind a [`DistortionModel::Sampled`] layer
+/// (plan 6b-3 D1): a function the layer samples into its bilinear grids,
+/// with no fitted coefficients of its own. The project path's composed
+/// subject → grid map (`stacking::grid_map::ComposedField`) is its one
+/// implementor; `geometry` itself stays free of WCS types.
+pub trait DisplacementField: Send + Sync + std::fmt::Debug {
+    /// Forward displacement at `(x, y)` in the linear model's OUTPUT space,
+    /// exact: `forward(s) = L(s) + forward(L(s))`.
+    fn forward(&self, x: f64, y: f64) -> (f64, f64);
+    /// Inverse displacement at output pixel `(x, y)`, exact:
+    /// `inverse(g) = L⁻¹(g + inverse(g))`.
+    fn inverse(&self, x: f64, y: f64) -> (f64, f64);
+    /// A stable identity: two fields with one key describe one map.
+    fn key(&self) -> &str;
+}
+
 /// A bilinear displacement grid over ONE direction of a
 /// [`DistortionModel::Tps`] map's domain, sampled every [`TPS_GRID_PX`]
 /// pixels (ruling R-M4c-5).
@@ -85,22 +101,24 @@ pub struct TpsGrid {
 }
 
 impl TpsGrid {
-    /// Samples `spline` over `domain` at [`TPS_GRID_PX`] spacing, plus one
-    /// margin cell each way so the last cell is complete. Rows are
-    /// independent, so the build runs over `rayon`; it is a pure function
-    /// of its inputs either way.
-    pub fn build(spline: &ThinPlateSpline, domain: [f64; 4]) -> TpsGrid {
+    /// Samples `f` over `domain` at [`TPS_GRID_PX`] spacing, starting at the
+    /// domain's lower corner and running two samples past `ceil(extent /
+    /// step)` on the far side (the `+ 2` below, as `build` has always done),
+    /// so the last cell is complete. Rows are independent, so the build runs
+    /// over `rayon`; it is a pure function of its inputs.
+    pub fn sample(domain: [f64; 4], f: impl Fn(f64, f64) -> (f64, f64) + Sync) -> TpsGrid {
         let step = TPS_GRID_PX as f64;
         let [x0, y0, x1, y1] = domain;
         let nx = ((x1 - x0) / step).ceil().max(0.0) as usize + 2;
         let ny = ((y1 - y0) / step).ceil().max(0.0) as usize + 2;
+        let f = &f;
         let samples: Vec<(f32, f32)> = (0..ny)
             .into_par_iter()
             .flat_map_iter(|j| {
                 let y = y0 + j as f64 * step;
                 (0..nx).map(move |col| {
                     let x = x0 + col as f64 * step;
-                    let (dx, dy) = spline.displacement(x, y);
+                    let (dx, dy) = f(x, y);
                     (dx as f32, dy as f32)
                 })
             })
@@ -115,6 +133,12 @@ impl TpsGrid {
             ny,
             samples,
         }
+    }
+
+    /// Samples `spline` over `domain` — [`TpsGrid::sample`] of the spline's
+    /// own displacement.
+    pub fn build(spline: &ThinPlateSpline, domain: [f64; 4]) -> TpsGrid {
+        TpsGrid::sample(domain, |x, y| spline.displacement(x, y))
     }
 
     /// The displacement at `(x, y)`, bilinear between samples, the query
@@ -300,7 +324,7 @@ impl<'a> EvalLayer<'a> {
         match distortion {
             None => EvalLayer::None,
             Some(DistortionModel::Polynomial(d)) => EvalLayer::Polynomial(d, dir),
-            Some(model @ DistortionModel::Tps { .. }) => {
+            Some(model @ (DistortionModel::Tps { .. } | DistortionModel::Sampled { .. })) => {
                 let grid = match dir {
                     Direction::Forward => model.forward_grid(),
                     Direction::Inverse => model.inverse_grid(),
@@ -414,6 +438,20 @@ pub enum DistortionModel {
         #[serde(skip)]
         grids: Arc<TpsGrids>,
     },
+    /// Plan 6b-3 D1: a displacement field sampled on demand — a project
+    /// frame's composed subject → grid map. Its exact path is the field
+    /// itself; its pixel path reads bilinear grids built lazily from the
+    /// field, shared by every clone and released like a spline's. Never
+    /// serialized: a registration record stores the star map the layer was
+    /// composed from, and the layer is re-derived from it.
+    #[serde(skip)]
+    Sampled {
+        field: Arc<dyn DisplacementField>,
+        /// Output-space box `[x0, y0, x1, y1]` the field is sampled over;
+        /// queries clamp into it, as a spline's do.
+        domain: [f64; 4],
+        grids: Arc<TpsGrids>,
+    },
 }
 
 /// The cached grids are a pure function of the two splines and the domain,
@@ -439,6 +477,18 @@ impl PartialEq for DistortionModel {
                     ..
                 },
             ) => f1 == f2 && i1 == i2 && d1 == d2,
+            (
+                DistortionModel::Sampled {
+                    field: a,
+                    domain: d1,
+                    ..
+                },
+                DistortionModel::Sampled {
+                    field: b,
+                    domain: d2,
+                    ..
+                },
+            ) => a.key() == b.key() && d1 == d2,
             _ => false,
         }
     }
@@ -506,6 +556,15 @@ impl DistortionModel {
         }
     }
 
+    /// A sampled layer with an empty grid cache (plan 6b-3 D1).
+    pub fn sampled(field: Arc<dyn DisplacementField>, domain: [f64; 4]) -> DistortionModel {
+        DistortionModel::Sampled {
+            field,
+            domain,
+            grids: Arc::new(TpsGrids::default()),
+        }
+    }
+
     /// What [`PixelMap::from_json`] demands of a stored layer before it
     /// trusts it — see each arm's own `is_well_formed`.
     pub fn is_well_formed(&self) -> bool {
@@ -523,6 +582,11 @@ impl DistortionModel {
                     && domain[0] <= domain[2]
                     && domain[1] <= domain[3]
             }
+            DistortionModel::Sampled { domain, .. } => {
+                domain.iter().all(|v| v.is_finite())
+                    && domain[0] <= domain[2]
+                    && domain[1] <= domain[3]
+            }
         }
     }
 
@@ -532,6 +596,7 @@ impl DistortionModel {
         match self {
             DistortionModel::Polynomial(d) => format!("polynomial{}", d.order),
             DistortionModel::Tps { .. } => "tps".to_string(),
+            DistortionModel::Sampled { .. } => "sampled".to_string(),
         }
     }
 
@@ -562,6 +627,14 @@ impl DistortionModel {
             } => Some(TpsGrids::get_or_build(&grids.forward, || {
                 TpsGrid::build(forward, *domain)
             })),
+            DistortionModel::Sampled {
+                field,
+                domain,
+                grids,
+            } => Some(TpsGrids::get_or_build(&grids.forward, || {
+                let field = Arc::clone(field);
+                TpsGrid::sample(*domain, move |x, y| field.forward(x, y))
+            })),
         }
     }
 
@@ -578,6 +651,14 @@ impl DistortionModel {
             } => Some(TpsGrids::get_or_build(&grids.inverse, || {
                 TpsGrid::build(inverse, *domain)
             })),
+            DistortionModel::Sampled {
+                field,
+                domain,
+                grids,
+            } => Some(TpsGrids::get_or_build(&grids.inverse, || {
+                let field = Arc::clone(field);
+                TpsGrid::sample(*domain, move |x, y| field.inverse(x, y))
+            })),
         }
     }
 
@@ -590,8 +671,9 @@ impl DistortionModel {
     /// Returns the bytes freed — 0 when nothing was built, and 0 for the
     /// polynomial arm.
     pub fn release_grids(&self) -> usize {
-        let DistortionModel::Tps { grids, .. } = self else {
-            return 0;
+        let grids = match self {
+            DistortionModel::Polynomial(_) => return 0,
+            DistortionModel::Tps { grids, .. } | DistortionModel::Sampled { grids, .. } => grids,
         };
         let mut freed = 0;
         for slot in [&grids.forward, &grids.inverse] {
@@ -611,7 +693,7 @@ impl DistortionModel {
     pub fn forward_displacement(&self, x: f64, y: f64) -> (f64, f64) {
         match self {
             DistortionModel::Polynomial(d) => d.forward_displacement(x, y),
-            DistortionModel::Tps { .. } => self
+            DistortionModel::Tps { .. } | DistortionModel::Sampled { .. } => self
                 .forward_grid()
                 .map(|g| g.displacement_at(x, y))
                 .unwrap_or((0.0, 0.0)),
@@ -625,7 +707,7 @@ impl DistortionModel {
     pub fn inverse_displacement(&self, x: f64, y: f64) -> (f64, f64) {
         match self {
             DistortionModel::Polynomial(d) => d.inverse_displacement(x, y),
-            DistortionModel::Tps { .. } => self
+            DistortionModel::Tps { .. } | DistortionModel::Sampled { .. } => self
                 .inverse_grid()
                 .map(|g| g.displacement_at(x, y))
                 .unwrap_or((0.0, 0.0)),
@@ -650,6 +732,10 @@ impl DistortionModel {
                 let (x, y) = Self::clamp_to_domain(domain, x, y);
                 forward.displacement(x, y)
             }
+            DistortionModel::Sampled { field, domain, .. } => {
+                let (x, y) = Self::clamp_to_domain(domain, x, y);
+                field.forward(x, y)
+            }
         }
     }
 
@@ -665,6 +751,10 @@ impl DistortionModel {
                 let (x, y) = Self::clamp_to_domain(domain, x, y);
                 inverse.displacement(x, y)
             }
+            DistortionModel::Sampled { field, domain, .. } => {
+                let (x, y) = Self::clamp_to_domain(domain, x, y);
+                field.inverse(x, y)
+            }
         }
     }
 
@@ -675,7 +765,7 @@ impl DistortionModel {
     pub fn grids_built(&self) -> (bool, bool) {
         match self {
             DistortionModel::Polynomial(_) => (false, false),
-            DistortionModel::Tps { grids, .. } => {
+            DistortionModel::Tps { grids, .. } | DistortionModel::Sampled { grids, .. } => {
                 let built =
                     |slot: &GridSlot| slot.read().unwrap_or_else(|e| e.into_inner()).is_some();
                 (built(&grids.forward), built(&grids.inverse))
@@ -689,7 +779,9 @@ impl DistortionModel {
     pub fn grid_cache(&self) -> Option<&Arc<TpsGrids>> {
         match self {
             DistortionModel::Polynomial(_) => None,
-            DistortionModel::Tps { grids, .. } => Some(grids),
+            DistortionModel::Tps { grids, .. } | DistortionModel::Sampled { grids, .. } => {
+                Some(grids)
+            }
         }
     }
 }
@@ -837,8 +929,12 @@ impl PixelMap {
         self.linear.is_flipped()
     }
 
+    /// A map with a [`DistortionModel::Sampled`] layer is never serialized
+    /// (plan 6b-3 D1): its `expect` would fire, and no caller hands one in —
+    /// `to_record` serializes the star map before composition.
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("PixelMap is always serializable")
+        serde_json::to_string(self)
+            .expect("PixelMap is serializable unless it carries a sampled layer, which no caller serializes")
     }
 
     pub fn from_json(s: &str) -> Result<PixelMap, serde_json::Error> {
@@ -1144,6 +1240,60 @@ mod tests {
                 "outside the domain at ({x}, {y}): grid ({gx}, {gy}) vs exact ({ex}, {ey})"
             );
         }
+    }
+
+    /// Plan 6b-3 D1: a sampled layer reads its field exactly on the exact
+    /// path (no grid built) and through lazy bilinear grids on the pixel
+    /// path, each direction's grid built only by its own direction; it is
+    /// equal by key and domain, releasable, and never serialized.
+    #[test]
+    fn a_sampled_layer_reads_its_field_through_lazy_grids() {
+        let _quiet = grid_counters::exclusive();
+        #[derive(Debug)]
+        struct Wobble;
+        impl DisplacementField for Wobble {
+            fn forward(&self, x: f64, y: f64) -> (f64, f64) {
+                wobble(x, y)
+            }
+            fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+                let (a, b) = wobble(x, y);
+                (-a, -b)
+            }
+            fn key(&self) -> &str {
+                "wobble"
+            }
+        }
+        let model = DistortionModel::sampled(Arc::new(Wobble), [0.0, 0.0, TW, TH]);
+        let map = PixelMap::with_distortion_model(Linear::identity(), model).unwrap();
+        let layer = map.distortion.as_ref().unwrap();
+        assert!(layer.is_well_formed());
+        assert_eq!(layer.label(), "sampled");
+        let _ = map.forward_exact(10.0, 10.0);
+        let _ = map.inverse_exact(10.0, 10.0);
+        assert_eq!(
+            layer.grids_built(),
+            (false, false),
+            "the exact path builds nothing"
+        );
+        let mut worst = 0f64;
+        for i in 0..40 {
+            for j in 0..30 {
+                let (x, y) = (i as f64 * TW / 40.0 + 3.3, j as f64 * TH / 30.0 + 2.1);
+                let (ax, ay) = map.forward(x, y);
+                let (bx, by) = map.forward_exact(x, y);
+                worst = worst.max((ax - bx).hypot(ay - by));
+            }
+        }
+        assert!(worst < 1e-3, "pixel path vs exact path: {worst} px");
+        assert_eq!(layer.grids_built(), (true, false), "only the forward grid");
+        let clone = map.clone();
+        assert_eq!(clone, map, "equal by key and domain");
+        assert!(
+            serde_json::to_string(&map).is_err(),
+            "a sampled layer is never serialized"
+        );
+        assert!(map.release_grids() > 0);
+        assert_eq!(layer.grids_built(), (false, false));
     }
 
     /// Step 2: a `Tps` map's JSON keeps the splines (to `serde_json`'s own
