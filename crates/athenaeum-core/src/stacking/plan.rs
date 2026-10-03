@@ -904,23 +904,29 @@ pub(crate) fn wants_cfa_mosaic(cfg: &StackingConfig, group: &IntegrationGroup) -
         && group.color_mode == ColorMode::Osc
 }
 
-/// How many channels this group's calibrated frames — and therefore its LN
-/// reference and every `.athln` grid — will carry: three for a DEBAYERED
-/// OSC group, one otherwise (mono, or OSC with `calibration.debayerOsc`
-/// off, which keeps the CFA mosaic single-plane).
+/// The plane count every member of `group` has after stage 1, and so the
+/// channel count of its LN reference, `.athln` grids and seeds calibration
+/// (plan 6b-3 D15; one rule where 6b-2 had two that disagreed). Calibrate
+/// (a frame set): three for a debayered OSC group, one otherwise. Prepare
+/// (a project or an attested set, plan 6b-2 C13): one for mono; three for
+/// OSC with the debayer on; with it off, three for an `osc__` group
+/// (three-plane files used as they are) and one for a `cfa__` group
+/// (mosaics kept as mosaics).
 ///
 /// C-17: the plan gate needs this to apply the SAME `k.len()` filter the
 /// run applies to a stored `ln_calibration` payload (`run.rs` compares
 /// against `ln_reference.planes.len()`, which it has because it has the
-/// reference). Without it a payload of the wrong shape read as usable here
-/// and unusable there, so gate and run disagreed about "cached" for a group
-/// whose colour mode or debayer setting had changed under a stored
-/// calibration.
-pub(crate) fn expected_ln_channels(cfg: &StackingConfig, group: &IntegrationGroup) -> usize {
-    if group.color_mode == ColorMode::Osc && cfg.calibration.debayer_osc {
-        3
-    } else {
-        1
+/// reference).
+pub(crate) fn stage_one_planes(
+    cfg: &StackingConfig,
+    group: &IntegrationGroup,
+    prepare_path: bool,
+) -> usize {
+    match group.color_mode {
+        ColorMode::Mono => 1,
+        ColorMode::Osc if cfg.calibration.debayer_osc => 3,
+        ColorMode::Osc if prepare_path && group.key.starts_with("osc__") => 3,
+        ColorMode::Osc => 1,
     }
 }
 
@@ -2351,6 +2357,17 @@ pub(crate) fn ln_registration_upstream(registration_hash: &str, masked: bool) ->
     }
 }
 
+/// A grid member's LN upstream with its group's field hash folded in (plan
+/// 6b-3 D8, review I6): the masked-LN token, then `lnfield:<hash>`. The plan
+/// and the run both build the field with `origin::group_ln_field`, so a
+/// field change moves every member's LN hash on both sides at once.
+pub(crate) fn ln_upstream_on_field(registration_hash: &str, field_hash: &str) -> String {
+    format!(
+        "{}+lnfield:{field_hash}",
+        ln_registration_upstream(registration_hash, true)
+    )
+}
+
 /// Build the plan for a subject (a frame set or a project): its groups, the
 /// resolved config, every gate blocker (spec §2, checked in a fixed order so the first blocker a
 /// user sees is always the most fundamental one), and which of the three
@@ -2815,6 +2832,24 @@ pub fn build_plan(
         } else {
             None
         };
+        // Plan 6b-3 D8: the group's LN field hash on a grid — the in-scope
+        // rule is the run's own (manual list plus unsupported files).
+        let ln_field_hash: Option<String> = match project_grid.as_ref() {
+            Some(grid) if local_normalization_active => {
+                let in_scope: Vec<i64> = g
+                    .frames
+                    .iter()
+                    .map(|f| f.frame_id)
+                    .filter(|id| !excluded_set.contains(id))
+                    .collect();
+                Some(
+                    crate::stacking::origin::group_ln_field(conn, &origins, &in_scope, grid)
+                        .map_err(|e| ApiError::Internal(format!("{e:#}")))?
+                        .hash,
+                )
+            }
+            _ => None,
+        };
         // Perf tier C Task 2 fix round 4 (ruling C-14 item 2): the group's
         // measured seeds calibration is part of every member's own LN hash,
         // so this gate has to read the SAME stored value the run will use.
@@ -2828,7 +2863,7 @@ pub fn build_plan(
         // whatever the last run stored is what its sidecars were written
         // under, which is the question this gate is asking.
         let ln_calibration: Option<SeedsCalibration> = if local_normalization_active {
-            let ln_channels = expected_ln_channels(&cfg, g);
+            let ln_channels = stage_one_planes(&cfg, g, project.is_some() || readiness.attested);
             find_artifact(conn, subject, &g.key, "ln_calibration", None)?
                 .and_then(|row| row.payload_json)
                 .and_then(|s| serde_json::from_str::<SeedsCalibration>(&s).ok())
@@ -2954,52 +2989,66 @@ pub fn build_plan(
             // info/no registration row/an unparseable payload are all
             // "can't verify" → stale, never assumed fresh.
             if local_normalization_active {
-                let ln_artifact = find_artifact(conn, subject, &g.key, "ln", Some(f.frame_id))?;
-                let ln_fresh = match (&ln_reference_info, &ln_artifact) {
-                    (Some(ref_info), Some(row)) => {
-                        match ln_registration_by_frame.get(&f.frame_id) {
-                            // M12 (final fix wave): a `NULL` stored
-                            // `config_hash` must hash as `""` here, exactly
-                            // the way `run.rs` writes it
-                            // (`record.config_hash.clone().unwrap_or_default()`)
-                            // — without this, a frame whose registration row
-                            // genuinely has no `config_hash` would cache-hit
-                            // correctly inside a real run but be reported
-                            // permanently stale by this gate. Only the
-                            // ABSENCE of a registration row at all (no entry
-                            // in the map) stays "can't verify".
-                            Some(hash_opt) => {
-                                let frame_registration_hash = ln_registration_upstream(
-                                    &hash_opt.clone().unwrap_or_default(),
-                                    project_grid.is_some(),
-                                );
-                                // C-17: the same measurement hash the
-                                // Measure check above resolved for this
-                                // frame, and the same value `run.rs` folds
-                                // in. `None` (no group frame, no
-                                // calibration hash) hashes as "" on BOTH
-                                // sides, so the gate and the run still
-                                // agree.
-                                let frame_measurement_hash =
-                                    expected_measurement_hash.clone().unwrap_or_default();
-                                let expected = normalization_hash_for(
-                                    &cfg,
-                                    &frame_registration_hash,
-                                    &frame_measurement_hash,
-                                    &ref_info.reference_member_ids,
-                                    &ref_info.reference_hash,
-                                    ln_calibration.as_ref(),
-                                    // M1: the SAME value the run folds in
-                                    // — the last run's recorded β for THIS
-                                    // group, `None` when it has none.
-                                    ln_beta_by_group.get(&g.key).copied(),
-                                );
-                                is_fresh(row, &expected)
-                            }
-                            None => false,
-                        }
+                let expected_ln: Option<String> = match (
+                    &ln_reference_info,
+                    ln_registration_by_frame.get(&f.frame_id),
+                ) {
+                    (Some(ref_info), Some(hash_opt)) => {
+                        // M12 (final fix wave): a `NULL` stored
+                        // `config_hash` must hash as `""` here, exactly
+                        // the way `run.rs` writes it
+                        // (`record.config_hash.clone().unwrap_or_default()`)
+                        // — without this, a frame whose registration row
+                        // genuinely has no `config_hash` would cache-hit
+                        // correctly inside a real run but be reported
+                        // permanently stale by this gate. Only the
+                        // ABSENCE of a registration row at all (no entry
+                        // in the map) stays "can't verify".
+                        let registration = hash_opt.clone().unwrap_or_default();
+                        let frame_registration_hash = match &ln_field_hash {
+                            Some(field) => ln_upstream_on_field(&registration, field),
+                            None => ln_registration_upstream(&registration, project_grid.is_some()),
+                        };
+                        // C-17: the same measurement hash the Measure
+                        // check above resolved for this frame, and the
+                        // same value `run.rs` folds in. `None` (no group
+                        // frame, no calibration hash) hashes as "" on
+                        // BOTH sides, so the gate and the run still
+                        // agree.
+                        let frame_measurement_hash =
+                            expected_measurement_hash.clone().unwrap_or_default();
+                        Some(normalization_hash_for(
+                            &cfg,
+                            &frame_registration_hash,
+                            &frame_measurement_hash,
+                            &ref_info.reference_member_ids,
+                            &ref_info.reference_hash,
+                            ln_calibration.as_ref(),
+                            // M1: the SAME value the run folds in — the
+                            // last run's recorded β for THIS group,
+                            // `None` when it has none.
+                            ln_beta_by_group.get(&g.key).copied(),
+                        ))
                     }
-                    _ => false,
+                    _ => None,
+                };
+                let ln_fresh = match &expected_ln {
+                    None => false,
+                    Some(expected) => {
+                        find_artifact(conn, subject, &g.key, "ln", Some(f.frame_id))?
+                            .is_some_and(|row| is_fresh(&row, expected))
+                            // Plan 6b-3 D7: a member that keeps global
+                            // normalization (under 25 % overlap) is cached
+                            // through its payload-only marker.
+                            || find_artifact(
+                                conn,
+                                subject,
+                                &g.key,
+                                crate::stacking::run::LN_GLOBAL_ARTIFACT_KIND,
+                                Some(f.frame_id),
+                            )?
+                            .is_some_and(|row| row.config_hash == *expected)
+                    }
                 };
                 if ln_fresh {
                     ln_cached += 1;
@@ -8389,6 +8438,50 @@ mod tests {
                 .all(|w| !w.contains("will be plate-solved locally")),
             "{:?}",
             second.warnings
+        );
+    }
+
+    /// Plan 6b-3 D15 (the 6b-2 leftover): one rule for stage 1 and LN — an
+    /// `osc__` group on the Prepare path with the debayer off keeps three
+    /// planes (and three LN channels); on the Calibrate path a mosaic stays
+    /// one plane.
+    #[test]
+    fn stage_one_planes_follow_the_prepare_rule() {
+        let mut cfg = StackingConfig::default();
+        cfg.calibration.debayer_osc = false;
+        let group = |key: &str, color_mode| IntegrationGroup {
+            key: key.into(),
+            instrume: None,
+            color_mode,
+            filter: None,
+            binning: 1,
+            cameras: Vec::new(),
+            exposure_s: Some(300.0),
+            exposure_class: "st300".into(),
+            frames: Vec::new(),
+            total_exposure_s: 0.0,
+            pixel_scale_arcsec: None,
+        };
+        assert_eq!(
+            stage_one_planes(&cfg, &group("osc__None__st300", ColorMode::Osc), true),
+            3
+        );
+        assert_eq!(
+            stage_one_planes(&cfg, &group("cfa__None__st300", ColorMode::Osc), true),
+            1
+        );
+        assert_eq!(
+            stage_one_planes(&cfg, &group("osc__None__bin1__300s", ColorMode::Osc), false),
+            1
+        );
+        assert_eq!(
+            stage_one_planes(&cfg, &group("mono__L__st300", ColorMode::Mono), true),
+            1
+        );
+        cfg.calibration.debayer_osc = true;
+        assert_eq!(
+            stage_one_planes(&cfg, &group("osc__None__bin1__300s", ColorMode::Osc), false),
+            3
         );
     }
 }

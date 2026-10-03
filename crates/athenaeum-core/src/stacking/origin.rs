@@ -302,6 +302,110 @@ pub(crate) fn wcs_tier(
     }
 }
 
+/// A project frame's footprint for the LN field (plan 6b-3 D8, review I6):
+/// its manifest WCS, else the cached solve of its current content, at its
+/// manifest size. `None` for a catalog frame, for a frame with neither, and
+/// for a manifest without a size.
+pub(crate) fn ln_footprint(
+    conn: &Connection,
+    origin: &FrameOrigin,
+    frame_id: i64,
+) -> anyhow::Result<Option<crate::collab::grid_geometry::FrameFootprint>> {
+    let FrameOrigin::Project {
+        project_id,
+        blake3,
+        meta,
+        ..
+    } = origin
+    else {
+        return Ok(None);
+    };
+    if let Some(fp) = crate::collab::grid_geometry::grid_input_of(meta).footprint {
+        return Ok(Some(fp));
+    }
+    let (Some(w), Some(h)) = (meta.naxis1, meta.naxis2) else {
+        return Ok(None);
+    };
+    if w <= 0 || h <= 0 {
+        return Ok(None);
+    }
+    Ok(match stored_outcome(conn, project_id, frame_id, blake3)? {
+        Some(SolveOutcome::Solved(record)) => {
+            record
+                .to_solution()
+                .map(|wcs| crate::collab::grid_geometry::FrameFootprint {
+                    wcs,
+                    width: w as f64,
+                    height: h as f64,
+                })
+        }
+        _ => None,
+    })
+}
+
+/// One group's LN field on a project's grid and its hash (plan 6b-3 D8,
+/// review I6). The run and the plan both call this with the group's
+/// IN-SCOPE frames — not manually excluded, not unsupported — so the plan
+/// computes the field the run will use. Its hash names the frames that pass
+/// the 0.97 rule against it, and every member's LN hash folds it
+/// (`plan::ln_upstream_on_field`): a field change re-keys the group's LN in
+/// the plan and in the run alike, never a run later.
+pub(crate) struct GroupLnField {
+    pub(crate) hash: String,
+    field: crate::stacking::weights::LnField,
+    footprints: HashMap<i64, crate::collab::grid_geometry::FrameFootprint>,
+}
+
+impl GroupLnField {
+    /// A frame's coverage of the field (0.0 for a frame with no footprint).
+    pub(crate) fn coverage_of(&self, frame_id: i64) -> f64 {
+        self.field.coverage(self.footprints.get(&frame_id))
+    }
+}
+
+pub(crate) fn group_ln_field(
+    conn: &Connection,
+    origins: &FrameOrigins,
+    in_scope: &[i64],
+    grid: &crate::collab::grid::CanonicalGrid,
+) -> anyhow::Result<GroupLnField> {
+    let mut ids: Vec<i64> = in_scope.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut footprints = HashMap::new();
+    for &id in &ids {
+        let Some(origin) = origins.get(&id) else {
+            continue;
+        };
+        if let Some(fp) = ln_footprint(conn, origin, id)? {
+            footprints.insert(id, fp);
+        }
+    }
+    let refs: Vec<&crate::collab::grid_geometry::FrameFootprint> =
+        ids.iter().filter_map(|id| footprints.get(id)).collect();
+    let field = crate::stacking::weights::ln_field(&refs, grid);
+    let text = if field.is_empty() {
+        "lnfield:1;none".to_string()
+    } else {
+        let eligible: Vec<String> = ids
+            .iter()
+            .filter(|id| {
+                field.coverage(footprints.get(id))
+                    >= crate::stacking::weights::MIN_REFERENCE_COVERAGE
+            })
+            .map(|id| id.to_string())
+            .collect();
+        format!("lnfield:1;{}", eligible.join(","))
+    };
+    let hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(text.as_bytes()));
+    tracing::debug!(count = footprints.len(), "ln field built");
+    Ok(GroupLnField {
+        hash,
+        field,
+        footprints,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

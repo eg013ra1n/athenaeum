@@ -77,7 +77,7 @@ use crate::stacking::integrate::{
 use crate::stacking::ln::{
     self, background_grid, build_reference as build_ln_reference, normalize_frame, read_reference,
     write_reference, BackgroundGrid, BackgroundParams, LnFrameGrids, LnReference,
-    LnReferenceForDetection, LnScaleSeeds, DEFAULT_PARAMS,
+    LnError, LnReferenceForDetection, LnScaleSeeds, DEFAULT_PARAMS,
 };
 use crate::stacking::master_cards::{
     build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
@@ -2018,12 +2018,7 @@ fn commit_calibrated(
 /// files, in a project or an attested set) and one for a `cfa__` group
 /// (mosaics kept as mosaics).
 fn expected_stage_one_planes(cfg: &StackingConfig, group: &IntegrationGroup) -> usize {
-    match group.color_mode {
-        ColorMode::Mono => 1,
-        ColorMode::Osc if cfg.calibration.debayer_osc => 3,
-        ColorMode::Osc if group.key.starts_with("osc__") => 3,
-        ColorMode::Osc => 1,
-    }
+    crate::stacking::plan::stage_one_planes(cfg, group, true)
 }
 
 /// One frame's Prepare RESOLVE outcome (plan 6b-2 C12), the twin of
@@ -3085,6 +3080,61 @@ pub(crate) fn ln_working_set_bytes(w: u64, h: u64) -> u64 {
 /// rounded up from about 2.5.
 pub(crate) const LN_MASKED_EXTRA_PLANES: u64 = 3;
 
+/// The payload-only marker of a member that keeps global normalization
+/// because it overlaps the LN reference on under `ln::LN_MIN_OVERLAP` of
+/// its footprint (spec §5.6, plan 6b-3 D7): `config_hash` is the member's LN
+/// hash, so the run and the plan count it as cached while nothing upstream
+/// moves; payload `{"overlap": <fraction>}`.
+pub(crate) const LN_GLOBAL_ARTIFACT_KIND: &str = "ln_global";
+
+/// The group's LN field on a project's grid (plan 6b-3 D8, review I6), over
+/// the frames the plan counts in scope — not manually excluded, not
+/// unsupported (Prepare's `"unsupported file: …"` exclusion) — so the plan
+/// builds the same field and the same hash. `None` for a frame set.
+fn group_ln_field_for(
+    rc: &RunContext,
+    group: &IntegrationGroup,
+) -> Result<Option<crate::stacking::origin::GroupLnField>, RunError> {
+    let Some(grid) = &rc.grid else {
+        return Ok(None);
+    };
+    let manual: HashSet<i64> = rc.excluded.iter().copied().collect();
+    let unsupported: HashSet<i64> = rc
+        .runtime_exclusions
+        .iter()
+        .filter(|(_, why)| why.starts_with("unsupported file: "))
+        .map(|(id, _)| *id)
+        .collect();
+    let in_scope: Vec<i64> = group
+        .frames
+        .iter()
+        .map(|f| f.frame_id)
+        .filter(|id| !manual.contains(id) && !unsupported.contains(id))
+        .collect();
+    let conn = db(&rc.ctx)?.conn();
+    crate::stacking::origin::group_ln_field(&conn, &rc.origins, &in_scope, &grid.grid)
+        .map(Some)
+        .map_err(|e| RunError::Other(format!("{e:#}")))
+}
+
+/// Each member's coverage for the anchor pick and the LN member list:
+/// against the reference rectangle for a frame set (unchanged), against the
+/// group's own field on a project's grid (plan 6b-3 D8).
+fn member_coverages(
+    field: Option<&crate::stacking::origin::GroupLnField>,
+    members: &[GroupMember],
+    ref_w: usize,
+    ref_h: usize,
+) -> Vec<f64> {
+    match field {
+        Some(field) => members.iter().map(|m| field.coverage_of(m.frame_id)).collect(),
+        None => members
+            .iter()
+            .map(|m| reference_coverage(&m.map, m.measurement.width, m.measurement.height, ref_w, ref_h))
+            .collect(),
+    }
+}
+
 pub(crate) fn ln_working_set_bytes_masked(w: u64, h: u64) -> u64 {
     ln_working_set_bytes(w, h) + LN_MASKED_EXTRA_PLANES * w * h * 4
 }
@@ -3254,24 +3304,26 @@ fn log_admission(
 /// Results land at their item's ORIGINAL index in `items`; an index whose
 /// item was never started because `cancel` fired first is `None` —
 /// callers check `cancel` once, right after this returns, rather than
-/// inspecting every entry for that case.
-fn fan_out<T, R, F>(
+/// inspecting every entry for that case. The error type is the caller's
+/// (plan 6b-3 D7: Normalize keeps its typed `LnError`).
+fn fan_out<T, R, E, F>(
     items: Vec<T>,
     admission: usize,
     cancel: &AtomicBool,
     f: F,
-) -> Vec<Option<Result<R, String>>>
+) -> Vec<Option<Result<R, E>>>
 where
     T: Send,
     R: Send,
-    F: Fn(T) -> Result<R, String> + Sync,
+    E: Send,
+    F: Fn(T) -> Result<R, E> + Sync,
 {
     let n = items.len();
     if n == 0 {
         return Vec::new();
     }
     let queue: Mutex<VecDeque<(usize, T)>> = Mutex::new(items.into_iter().enumerate().collect());
-    let results: Mutex<Vec<Option<Result<R, String>>>> = Mutex::new((0..n).map(|_| None).collect());
+    let results: Mutex<Vec<Option<Result<R, E>>>> = Mutex::new((0..n).map(|_| None).collect());
 
     std::thread::scope(|scope| {
         for _ in 0..admission.min(n).max(1) {
@@ -8234,6 +8286,7 @@ fn process_group_output(
         let geometry = rc.geometry_of(&group.key);
         (geometry.width, geometry.height)
     };
+    let ln_field = group_ln_field_for(rc, group)?;
     let pick_reference_idx = |members: &[GroupMember]| -> Option<AnchorPick> {
         let weights: Vec<FrameWeight> = members.iter().map(|m| m.weight.clone()).collect();
         let star_counts: Vec<usize> = members.iter().map(|m| m.measurement.min_stars()).collect();
@@ -8242,18 +8295,7 @@ fn process_group_output(
             .map(|m| m.measurement.mean_median())
             .collect();
 
-        let coverage: Vec<f64> = members
-            .iter()
-            .map(|m| {
-                reference_coverage(
-                    &m.map,
-                    m.measurement.width,
-                    m.measurement.height,
-                    ref_width,
-                    ref_height,
-                )
-            })
-            .collect();
+        let coverage = member_coverages(ln_field.as_ref(), members, ref_width, ref_height);
         let coverage_mask: Vec<bool> = coverage
             .iter()
             .map(|&c| c >= MIN_REFERENCE_COVERAGE)
@@ -9853,6 +9895,7 @@ fn run_group_normalization(
     let ln_cfg = cfg.normalization.local;
     let ln_drives_output = ln_cfg.enabled;
     let grid_mode = rc.grid.is_some();
+    let ln_field = group_ln_field_for(rc, group)?;
 
     // Sky-penalized members first (spec §4.4/§5.2, ruling R-M3-17 v2 —
     // supersedes plain best-weighted-first): the SAME `sky_penalized_order`
@@ -9878,18 +9921,7 @@ fn run_group_normalization(
         let geometry = rc.geometry_of(&group.key);
         (geometry.width, geometry.height)
     };
-    let coverage: Vec<f64> = members
-        .iter()
-        .map(|m| {
-            reference_coverage(
-                &m.map,
-                m.measurement.width,
-                m.measurement.height,
-                ref_width,
-                ref_height,
-            )
-        })
-        .collect();
+    let coverage = member_coverages(ln_field.as_ref(), members, ref_width, ref_height);
     let coverage_mask: Vec<bool> = coverage
         .iter()
         .map(|&c| c >= MIN_REFERENCE_COVERAGE)
@@ -9945,7 +9977,10 @@ fn run_group_normalization(
     // Plan 6b-3 D6: what every LN hash folds as a member's registration.
     let member_ln_upstreams: Vec<String> = members
         .iter()
-        .map(|m| crate::stacking::plan::ln_registration_upstream(&m.registration_hash, grid_mode))
+        .map(|m| match &ln_field {
+            Some(field) => crate::stacking::plan::ln_upstream_on_field(&m.registration_hash, &field.hash),
+            None => crate::stacking::plan::ln_registration_upstream(&m.registration_hash, grid_mode),
+        })
         .collect();
     let mut member_reg_hashes: Vec<&str> = reference_members
         .iter()
@@ -10245,6 +10280,8 @@ fn run_group_normalization(
     // should hit the DB a second time for the same row.
     let mut existing_ln_rows: Vec<Option<crate::db::stacking::StackingArtifactRow>> =
         Vec::with_capacity(members.len());
+    let mut existing_global_rows: Vec<Option<crate::db::stacking::StackingArtifactRow>> =
+        Vec::with_capacity(members.len());
     for m in members.iter() {
         let stem = match group_frames_by_id.get(&m.frame_id).copied() {
             Some(gf) => calibrated_file_stem(group, gf),
@@ -10266,6 +10303,19 @@ fn run_group_normalization(
             )?
         };
         existing_ln_rows.push(existing);
+        // Plan 6b-3 D7: the member's global-normalization marker, fetched
+        // beside its sidecar row.
+        let marker = {
+            let conn = db(&rc.ctx)?.conn();
+            crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                &group.key,
+                LN_GLOBAL_ARTIFACT_KIND,
+                Some(m.frame_id),
+            )?
+        };
+        existing_global_rows.push(marker);
     }
 
     // The group's seeds calibration (ruling C-14). It has to be resolved
@@ -10334,9 +10384,12 @@ fn run_group_normalization(
     let mut per_member_hash: Vec<String> = member_hashes(seeds_calibration.as_ref());
     let anything_stale = force_fresh
         || (0..members.len()).any(|i| {
-            !existing_ln_rows[i]
+            !(existing_ln_rows[i]
                 .as_ref()
                 .is_some_and(|row| is_fresh(row, &per_member_hash[i]))
+                || existing_global_rows[i]
+                    .as_ref()
+                    .is_some_and(|row| row.config_hash == per_member_hash[i]))
         });
     if anything_stale && stored_calibration.is_none() {
         seeds_calibration = measure_ln_seeds_calibration(
@@ -10394,6 +10447,8 @@ fn run_group_normalization(
     // so `process_group_output` never has to read a file itself. A member
     // that fails or is never attempted is simply absent.
     let mut sidecar_grids: HashMap<i64, LnFrameGrids> = HashMap::with_capacity(members.len());
+    // Plan 6b-3 D7: members that keep global normalization (cached or new).
+    let mut low_overlap = 0usize;
 
     for (i, m) in members.iter().enumerate() {
         // Fix round 1, item 2: the hash folds in the group's OWN reference
@@ -10473,6 +10528,13 @@ fn run_group_normalization(
                     needs_normalize.push(i);
                 }
             }
+        } else if !force_fresh
+            && existing_global_rows[i]
+                .as_ref()
+                .is_some_and(|row| row.config_hash == *frame_hash)
+        {
+            set_ln_summary(rc, &group.key, m.frame_id, None, true);
+            low_overlap += 1;
         } else {
             needs_normalize.push(i);
         }
@@ -10584,8 +10646,7 @@ fn run_group_normalization(
                 seeds_calibration_ref,
                 Some(pool_ref),
                 cancel_ref,
-            )
-            .map_err(|e| e.to_string());
+            );
             ticker_ref.tick(member_ids_ref.get(i).copied());
             out
         },
@@ -10735,10 +10796,52 @@ fn run_group_normalization(
                     }
                 }
             }
-            Some(Err(msg)) => {
-                fail_ln_frame(rc, &mut excluded_frame_ids, frame_id, msg)?;
+            Some(Err(LnError::LowOverlap { fraction })) => {
+                let payload = serde_json::json!({ "overlap": fraction }).to_string();
+                {
+                    let conn = db(&rc.ctx)?.conn();
+                    upsert_artifact(
+                        &conn,
+                        &NewArtifact {
+                            subject: &rc.subject,
+                            frame_id: Some(frame_id),
+                            group_key: &group.key,
+                            kind: LN_GLOBAL_ARTIFACT_KIND,
+                            path: None,
+                            config_hash: &per_member_hash[member_idx],
+                            size: None,
+                            modified_at: None,
+                            payload_json: Some(&payload),
+                        },
+                    )?;
+                }
+                tracing::debug!(
+                    run_id = rc.run_id,
+                    frame_id,
+                    overlap = fraction,
+                    "ln: frame keeps global normalization (little overlap with the LN reference)"
+                );
+                set_ln_summary(rc, &group.key, frame_id, None, false);
+                low_overlap += 1;
+            }
+            Some(Err(e)) => {
+                fail_ln_frame(rc, &mut excluded_frame_ids, frame_id, e.to_string())?;
             }
         }
+    }
+
+    if low_overlap > 0 {
+        tracing::warn!(
+            run_id = rc.run_id,
+            group_key = %group.key,
+            count = low_overlap,
+            "local normalization kept frames with little overlap on global normalization"
+        );
+        rc.warnings.push(format!(
+            "group {}: local normalization kept {low_overlap} frame(s) on global normalization — under {:.0} % overlap with the LN reference",
+            group.key,
+            ln::LN_MIN_OVERLAP * 100.0
+        ));
     }
 
     if !needs_normalize.is_empty() {
@@ -24776,5 +24879,119 @@ mod tests {
             .filter(|w| w.contains("canonical filter is empty"))
             .count();
         assert_eq!(warned, 1, "{:?}", rc.warnings);
+    }
+
+    /// The fallback fixture: one `L` group of four frames on one field and
+    /// two frames `EAST_PAIR_OFFSET_WIDTHS` (0.85) of a frame width east —
+    /// their overlap with the other four is about 15 % of their own
+    /// footprint — on a grid wide enough for both, with LN on. The star
+    /// field is the e2e's own (review I5: the same spacing and seed, so the
+    /// strip registration is tried here first, far cheaper than in Task 9).
+    fn seed_two_field_project(conn: &rusqlite::Connection, landed: &Path) -> crate::collab::grid::CanonicalGrid {
+        crate::db::stacking::insert_test_project(conn, "p1");
+        let target: (f64, f64) = (83.8, -5.4);
+        let east = test_fixtures::EAST_PAIR_OFFSET_WIDTHS * 384.0 * 1.5 / 3600.0 / target.1.to_radians().cos();
+        let stars = test_fixtures::sky_stars(
+            (target.0 + east / 2.0, target.1),
+            0.2,
+            test_fixtures::EAST_PAIR_SPACING_ARCSEC,
+            test_fixtures::EAST_PAIR_STAR_SEED,
+        );
+        let mut uuids: Vec<(String, (f64, f64))> = (0..4)
+            // seed_sky_project's dithers, for the same reason (D8, review I6).
+            .map(|i| (format!("a{i}"), (target.0 + (i as f64 - 1.5) * 0.001, target.1 + (i % 2) as f64 * 0.0005)))
+            .collect();
+        uuids.extend((0..2).map(|i| (format!("b{i}"), (target.0 + east + i as f64 * 0.002, target.1))));
+        for (i, (uuid, centre)) in uuids.iter().enumerate() {
+            let mut f = test_fixtures::sky_frame(uuid, *centre);
+            f.noise_seed = 300 + i as u64;
+            test_fixtures::add_project_sky_frame(conn, landed, "p1", &f, &stars);
+        }
+        crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.5,
+            width_px: 768,
+            height_px: 320,
+            crval1: target.0 + east / 2.0,
+            crval2: target.1,
+            rotation_deg: 0.0,
+        }
+    }
+
+    /// Spec §5.6, plan 6b-3 D7, D8: a member whose overlap with the LN
+    /// reference is under 25 % keeps global normalization — no sidecar, a
+    /// marker, still included — with one warning naming the count; a second
+    /// run counts it as cached, and so does the plan. The east pair
+    /// registers over its ≈ 15 % strip (review I5: a failure names itself
+    /// here, never as a missing warning in Task 9). The plan's Normalize view
+    /// moves with the LN field before any run does (review I6: the twin).
+    #[test]
+    fn a_member_under_a_quarter_overlap_keeps_global_normalization() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_two_field_project(&conn, &tmp.path().join("collab"));
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, tmp.path().join("work")),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, tmp.path().join("out")),
+        ] {
+            crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        crate::db::collab::set_canonical_grid(&conn, "p1", Some(&grid.canonical_json())).unwrap();
+        let mut cfg = sky_config(&conn);
+        cfg.normalization.local.enabled = true;
+        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &[], None)
+            .unwrap();
+        let run = |cfg: StackingConfig| {
+            let mut rc = project_rc(&ctx, &conn, "p1", cfg, &tmp.path().join("work"), &tmp.path().join("out"));
+            rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+            run_pipeline(&mut rc).unwrap();
+            rc
+        };
+        let rc = run(cfg.clone());
+        let group = rc.plan_groups[0].key.clone();
+        let entries = &rc.measured[&group];
+        for e in entries.iter().filter(|e| e.frame.filename.starts_with("c_b")) {
+            let Some(RegisteredFrameOutcome::Aligned { record, .. }) = &e.registration else {
+                panic!("{} did not register over its ≈ 15 % strip: {:?}", e.frame.filename, e.reason);
+            };
+            assert!(
+                record.matched_stars >= 4,
+                "{} registered on {} matched stars",
+                e.frame.filename,
+                record.matched_stars
+            );
+        }
+        for e in entries {
+            assert!(e.included, "{} stays in the stack: {:?}", e.frame.filename, e.reason);
+            let ln = crate::db::stacking::find_artifact(&conn, &rc.subject, &group, "ln", Some(e.frame.frame_id)).unwrap();
+            let marker = crate::db::stacking::find_artifact(&conn, &rc.subject, &group, LN_GLOBAL_ARTIFACT_KIND, Some(e.frame.frame_id)).unwrap();
+            if e.frame.filename.starts_with("c_b") {
+                assert!(ln.is_none() && marker.is_some(), "{} falls back", e.frame.filename);
+            } else {
+                assert!(ln.is_some() && marker.is_none(), "{} is normalized locally", e.frame.filename);
+            }
+        }
+        assert!(
+            rc.warnings.iter().any(|w| w.contains("2 frame(s)") && w.contains("global normalization")),
+            "{:?}",
+            rc.warnings
+        );
+
+        let again = run(cfg.clone());
+        for e in again.measured[&group].iter().filter(|e| e.frame.filename.starts_with("c_b")) {
+            assert!(e.cached_ln, "{}: the marker is a cache hit", e.frame.filename);
+        }
+        let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &StackSubject::Project("p1".into()), None).unwrap();
+        assert!(!plan.stale_stages.contains(&Stage::Normalize), "{:?}", plan.stale_stages);
+
+        // The twin: excluding a central member moves the field (five frames
+        // in scope, three needed), so every LN hash moves — and the plan says
+        // so now, not after the next run has re-derived the member list.
+        crate::db::stacking::set_project_config(&conn, "p1", &serde_json::to_string(&cfg).unwrap(), &["a1".to_string()], None)
+            .unwrap();
+        let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &StackSubject::Project("p1".into()), None).unwrap();
+        assert!(plan.stale_stages.contains(&Stage::Normalize), "{:?}", plan.stale_stages);
     }
 }

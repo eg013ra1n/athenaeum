@@ -931,6 +931,9 @@ const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
     "calibrated_mosaic",
     "ln",
     "ln_reference",
+    // Plan 6b-3 D7: the payload-only marker of a member that keeps global
+    // normalization goes with the `.athln` sidecars it stands in for.
+    "ln_global",
 ];
 
 /// Remove a working layout's subtrees per `what` and the matching

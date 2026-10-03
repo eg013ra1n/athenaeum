@@ -1407,13 +1407,10 @@ pub(crate) fn add_project_sky_frame(
 /// How far east of the main field the low-overlap pair sits, in frame
 /// widths (plan 6b-3 D7, review I5): each of the two frames overlaps the
 /// main field on ≈ 15 % of its own footprint, under the 25 % LN rule.
-#[allow(dead_code)] // consumed by plan 6b-3 Tasks 5b and 9
 pub(crate) const EAST_PAIR_OFFSET_WIDTHS: f64 = 0.85;
 /// The star spacing of that field. The pair registers over its ≈ 15 %
 /// strip (≈ 86″ × 432″ at 1.5″/px): 40″ puts ≈ 23 stars there, 50″ ≈ 15.
 /// Task 5b's run test registers the strip first; Task 9's e2e reuses it.
-#[allow(dead_code)] // consumed by plan 6b-3 Tasks 5b and 9
 pub(crate) const EAST_PAIR_SPACING_ARCSEC: f64 = 40.0;
 /// The star-field seed of that geometry, shared for the same reason.
-#[allow(dead_code)] // consumed by plan 6b-3 Tasks 5b and 9
 pub(crate) const EAST_PAIR_STAR_SEED: u64 = 9;

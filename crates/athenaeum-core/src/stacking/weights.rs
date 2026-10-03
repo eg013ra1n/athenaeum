@@ -700,6 +700,111 @@ pub(crate) fn reference_coverage(
     covered as f64 / (GRID * GRID) as f64
 }
 
+/// Probes per frame side on the LN field's lattice (plan 6b-3 D8, review
+/// I6): the lattice step is the group's median frame short side, measured
+/// on the grid, over this — so a wide grid probes each frame as finely as a
+/// narrow one, and a second rig does not coarsen the first.
+pub(crate) const LN_FIELD_PROBES_PER_FRAME_SIDE: f64 = 32.0;
+
+/// A group's common field on a project's grid (plan 6b-3 D8, refined by
+/// review I6): the lattice probes at least ⌈n/2⌉ of the group's in-scope
+/// frames cover, judged from their WCS footprints — data the plan has too,
+/// so it can compute the same field ([`crate::stacking::origin::group_ln_field`]).
+pub(crate) struct LnField {
+    /// Each probe's sky position (degrees).
+    sky: Vec<(f64, f64)>,
+    in_field: Vec<bool>,
+    n_field: usize,
+}
+
+/// Whether `fp` covers the sky position `p` (pixel centres at integers, so
+/// the frame spans `[-0.5, w - 0.5)`).
+fn footprint_covers(fp: &crate::collab::grid_geometry::FrameFootprint, p: (f64, f64)) -> bool {
+    let (x, y) = fp.wcs.sky_to_pixel(p.0, p.1);
+    x >= -0.5 && x < fp.width - 0.5 && y >= -0.5 && y < fp.height - 0.5
+}
+
+/// The field of `footprints` on `grid`. With no footprint, or no probe at
+/// least half of them cover, the field is empty: every frame reads 0.0 and
+/// the callers drop the filter as they do today.
+pub(crate) fn ln_field(
+    footprints: &[&crate::collab::grid_geometry::FrameFootprint],
+    grid: &crate::collab::grid::CanonicalGrid,
+) -> LnField {
+    let g = grid.normalized();
+    let tan = crate::collab::grid_geometry::grid_wcs(&g);
+    let grid_deg = g.scale_arcsec / 3600.0;
+    let mut sides: Vec<f64> = footprints
+        .iter()
+        .map(|fp| {
+            let cd = fp.wcs.cd;
+            let scale_deg = (cd[0][0] * cd[1][1] - cd[0][1] * cd[1][0]).abs().sqrt();
+            fp.width.min(fp.height) * scale_deg / grid_deg
+        })
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    sides.sort_by(f64::total_cmp);
+    let step = sides
+        .get(sides.len() / 2)
+        .map_or(1.0, |m| (m / LN_FIELD_PROBES_PER_FRAME_SIDE).max(1.0));
+    let (gw, gh) = (g.width_px as f64, g.height_px as f64);
+    let cols = (gw / step).ceil().max(1.0) as usize;
+    let rows = (gh / step).ceil().max(1.0) as usize;
+    let mut sky = Vec::with_capacity(cols * rows);
+    for r in 0..rows {
+        let y = ((r as f64 + 0.5) * step).min(gh - 0.5);
+        for c in 0..cols {
+            let x = ((c as f64 + 0.5) * step).min(gw - 0.5);
+            sky.push(tan.pixel_to_sky(x, y));
+        }
+    }
+    let need = footprints.len().div_ceil(2);
+    let in_field: Vec<bool> = sky
+        .iter()
+        .map(|&p| {
+            need > 0
+                && footprints
+                    .iter()
+                    .filter(|fp| footprint_covers(fp, p))
+                    .count()
+                    >= need
+        })
+        .collect();
+    let n_field = in_field.iter().filter(|&&f| f).count();
+    LnField {
+        sky,
+        in_field,
+        n_field,
+    }
+}
+
+impl LnField {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.n_field == 0
+    }
+
+    /// The share of the field `fp` covers, with one probe of grace (review
+    /// I6): a frame whose edge cuts one probe of the field still reads full,
+    /// so the 0.97 rule never turns on a single probe. 0.0 for a frame with
+    /// no footprint, or when the field is empty.
+    pub(crate) fn coverage(
+        &self,
+        fp: Option<&crate::collab::grid_geometry::FrameFootprint>,
+    ) -> f64 {
+        let Some(fp) = fp else { return 0.0 };
+        if self.n_field == 0 {
+            return 0.0;
+        }
+        let covered = self
+            .sky
+            .iter()
+            .zip(&self.in_field)
+            .filter(|(&p, &f)| f && footprint_covers(fp, p))
+            .count();
+        (covered + 1).min(self.n_field) as f64 / self.n_field as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1605,5 +1710,82 @@ mod tests {
             Some(1)
         );
         assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|_| false), None);
+    }
+
+    /// A TAN footprint of `w × h` px at 1.5″/px centred `dx` grid pixels east
+    /// of (83.8, −5.4) (east is −x on a north-up grid).
+    fn footprint_east(dx: f64, w: f64, h: f64) -> crate::collab::grid_geometry::FrameFootprint {
+        let s = 1.5 / 3600.0;
+        crate::collab::grid_geometry::FrameFootprint {
+            wcs: solvemyastro::wcs::WcsSolution {
+                crpix: ((w - 1.0) / 2.0, (h - 1.0) / 2.0),
+                crval: (83.8 + dx * s / (-5.4f64).to_radians().cos(), -5.4),
+                cd: [[-s, 0.0], [0.0, s]],
+                sip_forward: None,
+                sip_reverse: None,
+            },
+            width: w,
+            height: h,
+        }
+    }
+
+    /// Plan 6b-3 D8 (refined by review I6): on a grid wider than every frame
+    /// the 0.97 rule is measured against the group's own field — the
+    /// lattice probes at least half the members cover, spaced in FRAME units
+    /// (a 300-px frame side over 32 ≈ 9.4 px here, whatever the grid's
+    /// size) — so the members that share it pass and an offset one fails;
+    /// against the whole grid every member would fail.
+    #[test]
+    fn a_wide_grid_keeps_the_coverage_filter_on_the_groups_own_field() {
+        let grid = crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.5,
+            width_px: 1000,
+            height_px: 400,
+            crval1: 83.8,
+            crval2: -5.4,
+            rotation_deg: 0.0,
+        };
+        let fps: Vec<_> = [0.0, 2.0, 4.0, 6.0, 200.0]
+            .iter()
+            .map(|&d| footprint_east(d, 300.0, 400.0))
+            .collect();
+        let refs: Vec<&crate::collab::grid_geometry::FrameFootprint> = fps.iter().collect();
+        let field = ln_field(&refs, &grid);
+        assert!(!field.is_empty());
+        for (i, fp) in fps.iter().enumerate().take(4) {
+            let c = field.coverage(Some(fp));
+            assert!(c >= MIN_REFERENCE_COVERAGE, "member {i}: {c}");
+        }
+        let offset = field.coverage(Some(&fps[4]));
+        assert!(
+            offset < MIN_REFERENCE_COVERAGE,
+            "the offset member: {offset}"
+        );
+        assert_eq!(
+            field.coverage(None),
+            0.0,
+            "a frame with no WCS footprint never qualifies"
+        );
+        assert!(ln_field(&[], &grid).is_empty());
+    }
+
+    /// Review I6: one lost probe never fails a member — a footprint that
+    /// misses exactly one of a four-probe field still reads 1.0; missing two
+    /// reads 0.75.
+    #[test]
+    fn the_ln_field_forgives_one_lost_probe() {
+        let probe = |dra_deg: f64| (83.8 + dra_deg, -5.4);
+        let field = LnField {
+            sky: vec![probe(0.0), probe(0.004), probe(0.008), probe(0.03)],
+            in_field: vec![true; 4],
+            n_field: 4,
+        };
+        // 100 px at 1.5″/px reaches ±0.0208° in RA: three probes inside.
+        assert_eq!(
+            field.coverage(Some(&footprint_east(0.0, 100.0, 100.0))),
+            1.0
+        );
+        // 30 px reaches ±0.0063°: two probes inside.
+        assert_eq!(field.coverage(Some(&footprint_east(0.0, 30.0, 30.0))), 0.75);
     }
 }
