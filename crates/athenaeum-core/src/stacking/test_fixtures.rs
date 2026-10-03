@@ -913,6 +913,15 @@ mod tests {
             r.meta["wcs"]["crpix1"],
             serde_json::json!(f.width as f64 / 2.0 + 0.5)
         );
+        assert_eq!(
+            r.meta["wcs"]["crpix2"],
+            serde_json::json!(f.height as f64 / 2.0 + 0.5)
+        );
+        let record = sky_frame_record(&f);
+        assert_eq!(
+            r.meta["wcs"]["cd"],
+            serde_json::json!([record.cd1_1, record.cd1_2, record.cd2_1, record.cd2_2])
+        );
     }
 }
 

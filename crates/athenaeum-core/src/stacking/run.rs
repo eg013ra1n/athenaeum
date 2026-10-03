@@ -66,6 +66,9 @@ use crate::stacking::drizzle::{
     drizzle_group, DrizzleError, DrizzleFrame, DrizzleInput, DrizzleProgress, DrizzleStats,
 };
 use crate::stacking::fits_artifact;
+use crate::stacking::grid_map::{
+    compose_to_grid, grid_registered_hash, subject_dims, GridRun, ReferenceWcs,
+};
 use crate::stacking::groups::{frame_source, ColorMode, GroupFrame, IntegrationGroup};
 use crate::stacking::integrate::{
     included_after_min_weight, integrate_group, large_scale_passes, GroupInput, GroupProgress,
@@ -4950,6 +4953,9 @@ struct RegisteredWrite {
     /// The write's error text when `written` is `None`; folded into the
     /// group's one "registered frames could not be written" run warning.
     write_error: Option<String>,
+    /// The map the registered artifact was written with: the star map, or
+    /// its composition onto the grid.
+    map: PixelMap,
 }
 
 /// Failed registered-frame writes of one group's pass. The registered frame
@@ -5349,6 +5355,29 @@ fn register_group_pass(
         .and_then(|f| f.pixel_scale_arcsec);
 
     let origins = rc.origins.clone();
+    // Spec §5.5, plan 6b-3 D1: on a project's grid every frame this pass
+    // writes is composed onto the grid through its reference's WCS. The WCS
+    // rule (stage 4) guarantees the reference has one; its absence here is a
+    // pipeline fault, so it fails the run rather than writing
+    // reference-geometry frames.
+    let compose: Option<(Arc<GridRun>, Arc<ReferenceWcs>)> = match (&rc.grid, persist) {
+        (Some(grid), true) => {
+            let record = {
+                let conn = db(&rc.ctx)?.conn();
+                solve_of(solves, &conn, &origins, reference_frame_id)
+            };
+            let wcs = record
+                .as_ref()
+                .and_then(ReferenceWcs::from_record)
+                .ok_or_else(|| {
+                    RunError::Other(format!(
+                        "the registration reference (frame {reference_frame_id}) has no usable WCS; the grid needs one"
+                    ))
+                })?;
+            Some((Arc::clone(grid), Arc::new(wcs)))
+        }
+        _ => None,
+    };
     let mut to_register: Vec<PendingRegistration> = Vec::new();
     // Perf tier A Task 6a fix round 1 (ruling R-TA-5): cache-hit
     // registrations whose artifact needs (re)writing — see the `reused`
@@ -5377,13 +5406,44 @@ fn register_group_pass(
             if let Some(row) = by_frame.get(&frame.frame_id) {
                 if registration_row_is_fresh(row, reference_frame_id, &expected_hash) {
                     match PixelMap::from_json(row.transform_json.as_deref().unwrap_or_default()) {
-                        Ok(map) => {
-                            reused = Some(RegisteredFrameOutcome::Aligned {
-                                map,
-                                record: row.clone(),
-                                cached: true,
-                                registered_hash: row.config_hash.clone().unwrap_or_default(),
-                            });
+                        Ok(star) => {
+                            let registration_hash = row.config_hash.clone().unwrap_or_default();
+                            // D22: a cached star map is recomposed on every
+                            // read, so a moved grid or reference WCS never
+                            // needs star detection again.
+                            let composed = match &compose {
+                                None => Ok((star, registration_hash)),
+                                Some((grid, reference)) => {
+                                    subject_dims(frame.width, frame.height, &path)
+                                        .and_then(|dims| compose_to_grid(&star, dims, reference, grid))
+                                        .map(|map| {
+                                            let hash = grid_registered_hash(
+                                                &registration_hash,
+                                                &reference.hash,
+                                                &grid.hash,
+                                            );
+                                            (map, hash)
+                                        })
+                                }
+                            };
+                            match composed {
+                                Ok((map, registered_hash)) => {
+                                    reused = Some(RegisteredFrameOutcome::Aligned {
+                                        map,
+                                        record: row.clone(),
+                                        cached: true,
+                                        registered_hash,
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        run_id = rc.run_id,
+                                        frame_id = frame.frame_id,
+                                        error = %e,
+                                        "grid composition of a cached star map failed; re-registering"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -5536,9 +5596,10 @@ fn register_group_pass(
     // `write_registered_artifact`).
     let (ref_w, ref_h, reference_name) = {
         let geometry = rc.geometry_of(&group.key);
+        let (width, height) = delivered_dims(rc, (geometry.width, geometry.height));
         (
-            geometry.width,
-            geometry.height,
+            width,
+            height,
             geometry
                 .calibrated
                 .file_stem()
@@ -5604,6 +5665,7 @@ fn register_group_pass(
         let pool_ref = &rc.ctx.image_pool;
         let out_dir_ref = &out_dir;
         let reference_name_ref = &reference_name;
+        let grid_hash_ref = compose.as_ref().map(|(g, _)| g.hash.as_str());
         let group_ref = group;
         let cancel_ref: &AtomicBool = &rc.cancel;
         let rewrite_ticker = FanOutTicker::new(
@@ -5633,7 +5695,7 @@ fn register_group_pass(
                     clamping,
                     reference_name_ref,
                     &item.rec,
-                    None,
+                    grid_hash_ref,
                     Some(pool_ref),
                     &out,
                 );
@@ -5760,6 +5822,7 @@ fn register_group_pass(
     // successful alignment — see `RegisteredWrite`'s own doc.
     let out_dir_ref = &out_dir;
     let reference_name_ref = &reference_name;
+    let compose_ref = &compose;
 
     let results = fan_out(items, admission_n, cancel_ref, move |item: RegisterItem| {
         let out = if item.is_reference {
@@ -5832,7 +5895,7 @@ fn register_group_pass(
         // parallelize. A dry pass, or an alignment failure, builds nothing
         // (`None`) — the sequential loop's existing handling for both is
         // unchanged.
-        let out = out.map(|(reg, dry_stars)| {
+        let out = out.and_then(|(reg, dry_stars)| -> Result<_, String> {
             let persisted = if persist {
                 match &reg.outcome {
                     Ok(alignment) => {
@@ -5851,19 +5914,39 @@ fn register_group_pass(
                             &item.expected_hash,
                             &now,
                         );
+                        // Plan 6b-3 D1: the composed map is what the
+                        // registered artifact is written with; `rec` keeps
+                        // the STAR map's JSON (a composed map never reaches
+                        // `to_record` or `to_json`).
+                        let (map, registered_hash) = match compose_ref {
+                            None => (alignment.map.clone(), item.expected_hash.clone()),
+                            Some((grid, reference)) => {
+                                let dims =
+                                    subject_dims(item.frame.width, item.frame.height, &item.path)
+                                        .map_err(|e| format!("grid composition failed: {e}"))?;
+                                let map = compose_to_grid(&alignment.map, dims, reference, grid)
+                                    .map_err(|e| format!("grid composition failed: {e}"))?;
+                                let hash = grid_registered_hash(
+                                    &item.expected_hash,
+                                    &reference.hash,
+                                    &grid.hash,
+                                );
+                                (map, hash)
+                            }
+                        };
                         let stem = calibrated_file_stem(group, &item.frame);
                         let out_path =
                             out_dir_ref.join(registered_file_name(&stem, item.planes == 3));
                         let (written, write_error) = match write_one_registered_frame(
                             &item.path,
-                            &alignment.map,
+                            &map,
                             ref_w,
                             ref_h,
                             interp,
                             clamping,
                             reference_name_ref,
                             &rec,
-                            None,
+                            compose_ref.as_ref().map(|(g, _)| g.hash.as_str()),
                             Some(pool_ref),
                             &out_path,
                         ) {
@@ -5880,9 +5963,10 @@ fn register_group_pass(
                         };
                         Some(RegisteredWrite {
                             rec,
-                            registered_hash: item.expected_hash.clone(),
+                            registered_hash,
                             written,
                             write_error,
+                            map,
                         })
                     }
                     Err(_) => None,
@@ -5890,7 +5974,7 @@ fn register_group_pass(
             } else {
                 None
             };
-            (reg, dry_stars, persisted)
+            Ok((reg, dry_stars, persisted))
         });
         ticker_ref.tick(Some(item.frame_id));
         out
@@ -5994,10 +6078,10 @@ fn register_group_pass(
                                 registered_hash,
                                 written,
                                 write_error,
+                                map,
                             } = persisted.expect(
                                 "a persisting, successfully-aligned item always carries a RegisteredWrite",
                             );
-                            let map = alignment.map.clone();
                             {
                                 let conn = db(&rc.ctx)?.conn();
                                 store_registration(&conn, &rc.subject, |set_id| {
@@ -24011,7 +24095,6 @@ mod tests {
     /// row order. The star map is cached as a `registration` artifact, never
     /// in `registration_results`.
     #[test]
-    #[ignore = "plan 6b-3 Task 2b2: registration composes onto the grid"]
     fn a_project_frame_registers_onto_the_grid() {
         let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
         let tmp = tempfile::tempdir().unwrap();
@@ -24109,6 +24192,141 @@ mod tests {
         assert_eq!(
             catalog_rows, 0,
             "a project never writes registration_results"
+        );
+    }
+
+    /// Spec §5.5, plan 6b-3 D2: moving the grid re-composes the cached star
+    /// maps and rewrites every registered frame — no star detection runs.
+    #[test]
+    fn a_grid_change_recomposes_without_star_detection() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+        let cfg = sky_config(&conn);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        run_to_register(&mut rc);
+        let group = rc.plan_groups[0].key.clone();
+        let before: HashMap<i64, String> = rc.measured[&group]
+            .iter()
+            .map(|e| {
+                let row = crate::db::stacking::find_artifact(
+                    &conn,
+                    &rc.subject,
+                    &group,
+                    "registered",
+                    Some(e.frame.frame_id),
+                )
+                .unwrap()
+                .unwrap();
+                (e.frame.frame_id, row.config_hash)
+            })
+            .collect();
+
+        let moved = crate::collab::grid::CanonicalGrid {
+            crval2: grid.crval2 + 0.005,
+            ..grid
+        };
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(moved)));
+        let detected = |dir: &Path| {
+            crate::stacking::register::frame::DETECT_FRAME_STARS_LOG
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.starts_with(dir))
+                .count()
+        };
+        let detected_before = detected(tmp.path());
+        stage_register(&mut rc).unwrap();
+        assert_eq!(
+            detected_before,
+            detected(tmp.path()),
+            "a grid move runs no star detection"
+        );
+        for e in &rc.measured[&group] {
+            let Some(RegisteredFrameOutcome::Aligned { cached, .. }) = &e.registration else {
+                panic!("{} lost its registration", e.frame.filename);
+            };
+            assert!(*cached, "the star map is reused");
+            let row = crate::db::stacking::find_artifact(
+                &conn,
+                &rc.subject,
+                &group,
+                "registered",
+                Some(e.frame.frame_id),
+            )
+            .unwrap()
+            .unwrap();
+            assert_ne!(
+                row.config_hash, before[&e.frame.frame_id],
+                "the registered frame is rewritten"
+            );
+        }
+    }
+
+    /// Plan 6b-3 D2: the plan and the run agree — after a run the plan reports
+    /// Register cached; a moved grid makes it stale.
+    #[test]
+    fn a_project_plan_reports_register_cached_then_stale_on_a_grid_change() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+        let cfg = sky_config(&conn);
+        for (key, dir) in [
+            (
+                crate::settings::keys::STACKING_WORKING_DIR,
+                tmp.path().join("work"),
+            ),
+            (
+                crate::settings::keys::STACKING_OUTPUT_DIR,
+                tmp.path().join("out"),
+            ),
+        ] {
+            crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        crate::db::collab::set_canonical_grid(&conn, "p1", Some(&grid.canonical_json())).unwrap();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        run_to_register(&mut rc);
+
+        let subject = StackSubject::Project("p1".into());
+        let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &subject, None).unwrap();
+        assert!(
+            !plan.stale_stages.contains(&Stage::Register),
+            "{:?}",
+            plan.stale_stages
+        );
+
+        let moved = crate::collab::grid::CanonicalGrid {
+            crval1: grid.crval1 + 0.01,
+            ..grid
+        };
+        crate::db::collab::set_canonical_grid(&conn, "p1", Some(&moved.canonical_json())).unwrap();
+        let plan = build_plan(&conn, &ctx.settings, &PathPolicy::AllowAll, &subject, None).unwrap();
+        assert!(
+            plan.stale_stages.contains(&Stage::Register),
+            "{:?}",
+            plan.stale_stages
         );
     }
 }
