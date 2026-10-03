@@ -49,6 +49,10 @@ pub struct SolveRequest {
     pub focal_len: Option<f64>,
     pub instrume: Option<String>,
     pub naxis: Option<(i64, i64)>,
+    /// Where a failed unit-domain solve may write its ADU-scaled retry copy
+    /// (plan 6b-2 Task 10c: real calibrated 0..1 frames detect no stars until
+    /// scaled). `None` means no retry.
+    pub scratch_dir: Option<PathBuf>,
 }
 
 impl SolveRequest {
@@ -86,6 +90,7 @@ impl SolveRequest {
             focal_len: meta.focal_len,
             instrume: meta.instrume.clone(),
             naxis: meta.naxis1.zip(meta.naxis2),
+            scratch_dir: None,
         }
     }
 }
@@ -314,9 +319,9 @@ pub fn solve_with(
 }
 
 /// An ADU-scaled (×65535) float32 copy of a unit-domain FITS, with its
-/// copy-through cards. It is the real-data probe's comparison input, and the
-/// fallback a probe result may call for (plan 6b-2 Task 10c Step 8). It
-/// never touches `src`.
+/// copy-through cards. It is the real-data probe's comparison input and the
+/// input of [`CatalogSolver`]'s retry (plan 6b-2 Task 10c). It never touches
+/// `src`.
 pub fn adu_scaled_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
     if src == dest {
         anyhow::bail!(
@@ -440,7 +445,52 @@ impl FrameSolver for CatalogSolver {
         };
         let refs: Vec<&solvemyastro::StarCache> = layers.iter().map(|l| l.as_ref()).collect();
         let caches = solvemyastro::Caches::layered(&refs);
-        solve_with(request, &caches, &prepared.config, cancel)
+        let first = solve_with(request, &caches, &prepared.config, cancel);
+        // Calibrated frames are in the 0..1 unit domain, where the detector
+        // finds no stars on real data; a failure is retried once on an
+        // ADU-scaled copy (the real-data probe's finding).
+        let retry_dir = match (&first, &request.scratch_dir) {
+            (SolveOutcome::Failed(_), Some(dir)) => Some(dir.clone()),
+            _ => None,
+        };
+        let Some(dir) = retry_dir else {
+            return first;
+        };
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return first;
+        }
+        let stem = request
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let copy = dir.join(format!("adu_{stem}.fits"));
+        if let Err(e) = adu_scaled_copy(&request.path, &copy) {
+            tracing::warn!(
+                path = %request.path.display(),
+                error = %format!("{e:#}"),
+                "adu-scaled solve copy failed; keeping the first outcome"
+            );
+            return first;
+        }
+        let second = solve_with(
+            &SolveRequest {
+                path: copy.clone(),
+                ..request.clone()
+            },
+            &caches,
+            &prepared.config,
+            cancel,
+        );
+        if let Err(e) = std::fs::remove_file(&copy) {
+            tracing::warn!(path = %copy.display(), error = %e, "removing the adu-scaled solve copy failed");
+        }
+        tracing::debug!(
+            path = %request.path.display(),
+            outcome = second.label(),
+            "retried the solve on an adu-scaled copy"
+        );
+        second
     }
 }
 
@@ -714,6 +764,183 @@ mod tests {
             std::fs::read(&src).unwrap(),
             before,
             "the source is untouched"
+        );
+    }
+
+    fn describe(o: &SolveOutcome) -> String {
+        match o {
+            SolveOutcome::Solved(r) => format!(
+                "solved {:.3}\"/px at ({:.4}, {:.4}), {} matched",
+                r.pixel_scale_arcsec, r.crval1, r.crval2, r.matched_stars
+            ),
+            SolveOutcome::Failed(e) => format!("failed: {e}"),
+            SolveOutcome::Refused(e) => format!("refused: {e}"),
+        }
+    }
+
+    /// One kind's counts in the probe: mono, or OSC by the manifest's `bayerpat`.
+    #[derive(Default)]
+    struct Tally {
+        tried: usize,
+        unit_ok: usize,
+        adu_ok: usize,
+    }
+
+    /// Plan 6b-2 C14, "real data first": the real solver and the real catalog
+    /// on the landed project replicas of a COPY of the `.dev` catalog. These
+    /// files are calibrated to 0..1, which no production solve has seen. It
+    /// reports per frame and in total how many solve on their prepared pixels,
+    /// and for the rest whether an ADU-scaled (×65535) copy would.
+    /// - The sample is stratified (review I8): up to `limit / 2` frames with a
+    ///   manifest `bayerpat` (OSC, debayered by Prepare into a three-plane file)
+    ///   and up to `limit / 2` without; the summary prints both sub-rates.
+    /// - A probe that solves nothing in either domain fails (review M16).
+    /// - It is read-only on the catalog copy and on every landed file; prepared
+    ///   and scaled copies go to a temp dir.
+    #[test]
+    #[ignore = "needs ATHENAEUM_SOLVE_PROBE_DB (a copy of the .dev catalog) and ATHENAEUM_SOLVE_PROBE_APP_DATA (the .dev app-data dir, for its star catalog)"]
+    fn real_data_solve_probe() {
+        use crate::stacking::prepare::{
+            execute_prepare, prepare_action, probe_file, PrepareAction, PrepareJob,
+        };
+        let db = std::env::var("ATHENAEUM_SOLVE_PROBE_DB").expect("ATHENAEUM_SOLVE_PROBE_DB");
+        let app_data = std::env::var("ATHENAEUM_SOLVE_PROBE_APP_DATA")
+            .expect("ATHENAEUM_SOLVE_PROBE_APP_DATA");
+        let limit: usize = std::env::var("ATHENAEUM_SOLVE_PROBE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let conn =
+            Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let config = crate::plate_solve::config::load_config(&conn);
+        let layers = crate::plate_solve::open_catalog_layers(Path::new(&app_data))
+            .expect("the .dev star catalog");
+        let refs: Vec<&solvemyastro::StarCache> = layers.iter().map(|l| l.as_ref()).collect();
+        let caches = solvemyastro::Caches::layered(&refs);
+        let scratch = tempfile::tempdir().unwrap();
+        let go = AtomicBool::new(false);
+        let rows: Vec<(String, String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT project_id, frame_uuid, landed_path, manifest_json FROM project_frames_local
+                     WHERE landed_path IS NOT NULL ORDER BY project_id, frame_uuid",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let (mut osc_rows, mut mono_rows) = (Vec::new(), Vec::new());
+        for (project_id, uuid, landed, manifest_json) in rows {
+            match crate::collab::frame_meta::parse_project_frame_meta(&manifest_json) {
+                Ok(meta) if meta.bayerpat.is_some() => {
+                    osc_rows.push((project_id, uuid, landed, meta))
+                }
+                Ok(meta) => mono_rows.push((project_id, uuid, landed, meta)),
+                Err(e) => println!("{uuid}: manifest unreadable: {e:#}"),
+            }
+        }
+        let half = limit / 2;
+        let sample: Vec<(bool, (String, String, String, ProjectFrameMeta))> = osc_rows
+            .into_iter()
+            .take(half)
+            .map(|r| (true, r))
+            .chain(mono_rows.into_iter().take(half).map(|r| (false, r)))
+            .collect();
+        let (mut mono, mut osc) = (Tally::default(), Tally::default());
+        let (mut unsupported, mut absent, mut manifest_wcs) = (0usize, 0usize, 0usize);
+        for (is_osc, (project_id, uuid, landed, meta)) in sample {
+            let tally = if is_osc { &mut osc } else { &mut mono };
+            if meta.wcs.is_some() {
+                manifest_wcs += 1;
+            }
+            let target = crate::db::collab::get_project(&conn, &project_id)
+                .ok()
+                .flatten()
+                .map(|p| (p.target_ra_deg, p.target_dec_deg));
+            let landed = PathBuf::from(landed);
+            if !landed.exists() {
+                absent += 1;
+                println!(
+                    "{uuid}: not on disk at {} (is its volume mounted?)",
+                    landed.display()
+                );
+                continue;
+            }
+            let shape = probe_file(&landed);
+            let action = prepare_action(&shape, true);
+            let path = match &action {
+                PrepareAction::Unsupported(why) => {
+                    unsupported += 1;
+                    println!("{uuid}: unsupported file: {why}");
+                    continue;
+                }
+                PrepareAction::InPlace => landed.clone(),
+                PrepareAction::Write { .. } => {
+                    let job = PrepareJob {
+                        src: landed.clone(),
+                        shape: shape.clone(),
+                        action: action.clone(),
+                        converted_out: scratch.path().join(format!("p_{uuid}.fits")),
+                        debayered_out: scratch.path().join(format!("p_{uuid}_d.fits")),
+                        durability: Durability::Volatile,
+                    };
+                    execute_prepare(&job, None, &go)
+                        .expect("prepare")
+                        .calibrated
+                }
+            };
+            tally.tried += 1;
+            // No stacking handle exists outside a run; 0 names the span.
+            let request = SolveRequest::for_frame(0, &path, &meta, target);
+            let unit = solve_with(&request, &caches, &config, &go);
+            let unit_solved = matches!(unit, SolveOutcome::Solved(_));
+            if unit_solved {
+                tally.unit_ok += 1;
+            }
+            let adu_note = if unit_solved {
+                String::new()
+            } else {
+                let adu = scratch.path().join(format!("adu_{uuid}.fits"));
+                adu_scaled_copy(&path, &adu).expect("adu-scaled copy");
+                let rescued = solve_with(
+                    &SolveRequest {
+                        path: adu,
+                        ..request.clone()
+                    },
+                    &caches,
+                    &config,
+                    &go,
+                );
+                if matches!(rescued, SolveOutcome::Solved(_)) {
+                    tally.adu_ok += 1;
+                }
+                format!(" | adu-scaled: {}", describe(&rescued))
+            };
+            println!(
+                "{uuid} ({}, {}): {}{adu_note}",
+                if is_osc { "osc" } else { "mono" },
+                if meta.wcs.is_some() {
+                    "manifest wcs"
+                } else {
+                    "no manifest wcs"
+                },
+                describe(&unit)
+            );
+        }
+        println!(
+            "solve probe: mono {}/{} solved on unit-domain pixels, {} rescued by the adu-scaled copy; osc {}/{} solved on unit-domain pixels, {} rescued by the adu-scaled copy; unsupported {unsupported}, not on disk {absent}, with a manifest wcs {manifest_wcs}",
+            mono.unit_ok, mono.tried, mono.adu_ok, osc.unit_ok, osc.tried, osc.adu_ok
+        );
+        assert!(
+            mono.tried + osc.tried > 0,
+            "no landed project frame in the catalog copy"
+        );
+        // Review M16: a probe that solved nothing is a red run, not a line to read.
+        assert!(
+            mono.unit_ok + mono.adu_ok + osc.unit_ok + osc.adu_ok > 0,
+            "no frame solved, in either domain"
         );
     }
 }

@@ -594,6 +594,22 @@ pub(crate) fn two_pass_pick(
     diagonal_px: f64,
     min_gain_px: f64,
 ) -> Option<usize> {
+    two_pass_pick_among(candidates, reference_idx, diagonal_px, min_gain_px, &|_| {
+        true
+    })
+}
+
+/// [`two_pass_pick`] restricted to the candidates `allowed` accepts (spec
+/// §5.4, plan 6b-2 C15). The median and the current reference's deviation
+/// still span every usable candidate, because where the set points does not
+/// depend on who may win. Only an allowed frame enters the top-N cut.
+pub(crate) fn two_pass_pick_among(
+    candidates: &[TwoPassCandidate],
+    reference_idx: usize,
+    diagonal_px: f64,
+    min_gain_px: f64,
+    allowed: &dyn Fn(usize) -> bool,
+) -> Option<usize> {
     if !diagonal_px.is_finite() || diagonal_px <= 0.0 {
         return None;
     }
@@ -604,6 +620,9 @@ pub(crate) fn two_pass_pick(
         .find(|c| c.idx == reference_idx)
         .map(|c| two_pass_deviation(c, median, diagonal_px))?;
 
+    // Plan 6b-2 C15: the median and the reference's own deviation span every
+    // usable frame; only an allowed one enters the top-N cut and can win.
+    usable.retain(|c| c.idx == reference_idx || allowed(c.idx));
     usable.sort_by(|a, b| b.weight.total_cmp(&a.weight).then(a.idx.cmp(&b.idx)));
     usable.truncate(TWO_PASS_CANDIDATES);
 
@@ -1033,11 +1052,19 @@ mod tests {
 
         let sky_nan = [f64::NAN, 4.0, 1.0];
         let order_nan = sky_penalized_order(&weights, &included, &star_counts, &sky_nan);
-        assert_eq!(order_nan, vec![2, 1], "a non-finite background is skipped too");
+        assert_eq!(
+            order_nan,
+            vec![2, 1],
+            "a non-finite background is skipped too"
+        );
 
         let sky_neg = [-3.0, 4.0, 1.0];
         let order_neg = sky_penalized_order(&weights, &included, &star_counts, &sky_neg);
-        assert_eq!(order_neg, vec![2, 1], "a negative background is skipped too");
+        assert_eq!(
+            order_neg,
+            vec![2, 1],
+            "a negative background is skipped too"
+        );
     }
 
     /// Fix round 1, Important 3: when EVERY admissible member's background
@@ -1543,5 +1570,40 @@ mod tests {
             None,
             "a zero diagonal makes the rotation term meaningless"
         );
+    }
+
+    /// Plan 6b-2 C15: the re-pick among WCS candidates. The median still
+    /// spans every usable frame; only an allowed frame can win; with nothing
+    /// allowed but the reference itself there is no switch.
+    #[test]
+    fn two_pass_pick_among_never_lets_a_non_candidate_win() {
+        let c = |idx: usize, weight: f64, tx: f64| TwoPassCandidate {
+            idx,
+            weight,
+            rotation_deg: 0.0,
+            translation: (tx, 0.0),
+        };
+        // Median translation x = (1 + 2) / 2 = 1.5; deviations 38.5, 1.5, 0.5, 0.5.
+        let set = [
+            c(0, 1.0, 40.0),
+            c(1, 0.9, 0.0),
+            c(2, 0.8, 1.0),
+            c(3, 0.7, 2.0),
+        ];
+        assert_eq!(
+            two_pass_pick(&set, 0, 100.0, 4.0),
+            Some(2),
+            "a tie at 0.5 goes to the lower idx"
+        );
+        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|_| true), Some(2));
+        assert_eq!(
+            two_pass_pick_among(&set, 0, 100.0, 4.0, &|i| i != 2),
+            Some(3)
+        );
+        assert_eq!(
+            two_pass_pick_among(&set, 0, 100.0, 4.0, &|i| i == 1),
+            Some(1)
+        );
+        assert_eq!(two_pass_pick_among(&set, 0, 100.0, 4.0, &|_| false), None);
     }
 }

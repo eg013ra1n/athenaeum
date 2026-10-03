@@ -108,8 +108,8 @@ use crate::stacking::register::{scale_gate_for, scale_ratio_for, RegistrationGeo
 use crate::stacking::rej::RejBitmapSet;
 use crate::stacking::weights::{
     best_by_weight, compute_weights, reference_coverage, select_frames, sky_penalized_order,
-    two_pass_deviation_px, two_pass_pick, FrameWeight, TwoPassCandidate, WeightInput, WeightMode,
-    MIN_REFERENCE_COVERAGE, TWO_PASS_MIN_GAIN_PX,
+    two_pass_deviation_px, two_pass_pick, two_pass_pick_among, FrameWeight, TwoPassCandidate,
+    WeightInput, WeightMode, MIN_REFERENCE_COVERAGE, TWO_PASS_MIN_GAIN_PX,
 };
 
 /// Every `fits` artifact path whose write DEGRADED (final fix wave, ruling
@@ -289,6 +289,9 @@ pub(crate) struct RunContext {
     /// The Solve sub-step's solver (plan 6b-2 C14): the installed catalog,
     /// opened on first use. Tests inject a fake.
     pub(crate) solver: Arc<dyn crate::stacking::solve::FrameSolver>,
+    /// A project run's reference candidates, set by stage 4 (spec §5.4).
+    /// `None` for a frame set, which has no WCS rule.
+    pub(crate) wcs_rule: Option<WcsRule>,
     /// This run's ONE hot-pixel-map cache, keyed by resolved master dark path
     /// (decision 4) — a dark shared by every frame in a group pays the
     /// measurement once.
@@ -393,6 +396,24 @@ pub(crate) struct RunContext {
     #[cfg(test)]
     pub(crate) fail_after_stage: Option<Stage>,
 }
+
+/// A project run's reference candidates (spec §5.4, plan 6b-2 C15).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WcsRule {
+    /// Frames that may be the reference: those with a manifest WCS or, only
+    /// when no included frame has one, those the run solved locally.
+    pub(crate) candidates: HashSet<i64>,
+    /// Every measured frame with any WCS (what a manual pin needs).
+    pub(crate) with_wcs: HashSet<i64>,
+}
+
+/// Spec §5.4: the grid needs a reference with a WCS.
+const NO_PROJECT_REFERENCE: &str =
+    "no frame of this project could be plate-solved; the grid needs one";
+
+/// Plan 6b-2 C15: a manual pin must carry a WCS.
+const MANUAL_REFERENCE_WITHOUT_WCS: &str =
+    "the manual reference frame has no WCS (none in the manifest, and the run could not plate-solve it); the grid needs one";
 
 /// One group's registration reference and the geometry everything from
 /// stage 5 on works in (M4b ruling R-M4b-5): the frame every member of the
@@ -980,6 +1001,7 @@ pub fn start_stacking(
         memo: HashMemo::new(origins.clone()),
         origins,
         solver: Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone())),
+        wcs_rule: None,
         hot_maps: HashMap::new(),
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
@@ -3531,7 +3553,8 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
             Some(frame_id),
             Some("solving".to_string()),
         );
-        let request = SolveRequest::for_frame(frame_id, &path, &plan.meta, target);
+        let mut request = SolveRequest::for_frame(frame_id, &path, &plan.meta, target);
+        request.scratch_dir = Some(rc.layout.root.join("tmp"));
         let solver = rc.solver.clone();
         let cancel = rc.cancel.clone();
         let started = Instant::now();
@@ -4282,7 +4305,10 @@ fn stage_measure(rc: &mut RunContext) -> Result<(), RunError> {
 /// Factored out of [`stage_reference`]'s `Auto` branch by M4b Task 3: in
 /// native mode the SAME pick runs once per group, not once per run
 /// (ruling R-M4b-4), and the two must not be two different rules.
-fn best_included_idx(entries: &[MeasuredFrame]) -> Option<usize> {
+fn best_included_idx_where(
+    entries: &[MeasuredFrame],
+    keep: impl Fn(&MeasuredFrame) -> bool,
+) -> Option<usize> {
     let weights: Vec<FrameWeight> = entries
         .iter()
         .map(|e| {
@@ -4295,12 +4321,74 @@ fn best_included_idx(entries: &[MeasuredFrame]) -> Option<usize> {
             })
         })
         .collect();
-    let included: Vec<bool> = entries.iter().map(|e| e.included).collect();
+    let included: Vec<bool> = entries.iter().map(|e| e.included && keep(e)).collect();
     let star_counts: Vec<usize> = entries
         .iter()
         .map(|e| e.measurement.as_ref().map(|m| m.min_stars()).unwrap_or(0))
         .collect();
     best_by_weight(&weights, &included, &star_counts)
+}
+
+/// [`best_included_idx_where`] with no restriction.
+fn best_included_idx(entries: &[MeasuredFrame]) -> Option<usize> {
+    best_included_idx_where(entries, |_| true)
+}
+
+/// The group's best reference candidate: [`best_included_idx`] when the run
+/// has no WCS rule, else the best included frame among `rule.candidates`.
+fn best_candidate_idx(entries: &[MeasuredFrame], rule: Option<&WcsRule>) -> Option<usize> {
+    match rule {
+        None => best_included_idx(entries),
+        Some(rule) => {
+            best_included_idx_where(entries, |e| rule.candidates.contains(&e.frame.frame_id))
+        }
+    }
+}
+
+/// The reference rule's candidates for this run (spec §5.4, plan 6b-2 C15).
+/// `None` for a frame set. For a project: the measured frames with a
+/// manifest WCS, or (only when no included frame has one) those the run
+/// solved locally; plus every measured frame with any WCS.
+fn wcs_tiers(rc: &RunContext) -> Result<Option<WcsRule>, RunError> {
+    use crate::stacking::origin::{wcs_tier, WcsTier};
+    if rc.subject.project_id().is_none() {
+        return Ok(None);
+    }
+    let conn = db(&rc.ctx)?.conn();
+    let (mut manifest, mut local) = (HashSet::new(), HashSet::new());
+    for entry in rc
+        .measured
+        .values()
+        .flatten()
+        .filter(|e| e.calibrated.is_some())
+    {
+        let id = entry.frame.frame_id;
+        match wcs_tier(&conn, origin_of(&rc.origins, id)?, id)? {
+            WcsTier::Manifest => {
+                manifest.insert(id);
+            }
+            WcsTier::Local => {
+                local.insert(id);
+            }
+            WcsTier::Missing | WcsTier::NotApplicable => {}
+        }
+    }
+    let manifest_included = rc
+        .measured
+        .values()
+        .flatten()
+        .any(|e| e.included && manifest.contains(&e.frame.frame_id));
+    let with_wcs: HashSet<i64> = manifest.union(&local).copied().collect();
+    let candidates = if manifest_included { manifest } else { local };
+    tracing::debug!(
+        run_id = rc.run_id,
+        count = candidates.len(),
+        "reference candidates with a wcs"
+    );
+    Ok(Some(WcsRule {
+        candidates,
+        with_wcs,
+    }))
 }
 
 /// One frame's measured pixel geometry, falling back to the catalog's own
@@ -4442,7 +4530,7 @@ fn group_reference_idx(
             return Some(idx);
         }
     }
-    best_included_idx(entries)
+    best_candidate_idx(entries, rc.wcs_rule.as_ref())
 }
 
 /// Stage 4 (reference, spec §4.4): pick the run's ONE reference frame.
@@ -4460,6 +4548,8 @@ fn group_reference_idx(
 fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
     let stage_start = Instant::now();
     let cfg = rc.config.clone();
+    // Spec §5.4, plan 6b-2 C15: a project's reference must carry a WCS.
+    rc.wcs_rule = wcs_tiers(rc)?;
 
     let (reference_frame_id, filename, weight_val, calibrated) = match cfg.reference.mode {
         ReferenceMode::Manual => {
@@ -4502,6 +4592,13 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
                 return Err(RunError::Other(format!(
                     "the manual reference frame is excluded: {reason}"
                 )));
+            }
+            if rc
+                .wcs_rule
+                .as_ref()
+                .is_some_and(|rule| !rule.with_wcs.contains(&frame_id))
+            {
+                return Err(RunError::Other(MANUAL_REFERENCE_WITHOUT_WCS.to_string()));
             }
 
             let already_included = rc.measured[&group_key][idx].included;
@@ -4548,6 +4645,15 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
                 if included == 0 {
                     continue;
                 }
+                if let Some(rule) = &rc.wcs_rule {
+                    let holds_candidate = rc.measured.get(&g.key).is_some_and(|v| {
+                        v.iter()
+                            .any(|e| e.included && rule.candidates.contains(&e.frame.frame_id))
+                    });
+                    if !holds_candidate {
+                        continue;
+                    }
+                }
                 let take = match best_group {
                     None => true,
                     Some(b) => {
@@ -4561,13 +4667,22 @@ fn stage_reference(rc: &mut RunContext) -> Result<(), RunError> {
                     best_included = included;
                 }
             }
-            let group = best_group
-                .ok_or_else(|| RunError::Other("no group has any included frame".to_string()))?;
+            let group = match best_group {
+                Some(g) => g,
+                None if rc.wcs_rule.is_some() => {
+                    return Err(RunError::Other(NO_PROJECT_REFERENCE.to_string()))
+                }
+                None => {
+                    return Err(RunError::Other(
+                        "no group has any included frame".to_string(),
+                    ))
+                }
+            };
             let entries = rc
                 .measured
                 .get(&group.key)
                 .expect("a group with an included frame has measured entries");
-            let idx = best_included_idx(entries).ok_or_else(|| {
+            let idx = best_candidate_idx(entries, rc.wcs_rule.as_ref()).ok_or_else(|| {
                 RunError::Other("no included frame in the largest group".to_string())
             })?;
             let entry = &entries[idx];
@@ -5927,12 +6042,36 @@ fn two_pass_refine(
         return Ok(None);
     };
 
-    let Some(new_idx) = two_pass_pick(
-        &candidates,
-        reference_idx,
-        diagonal_px,
-        TWO_PASS_MIN_GAIN_PX,
-    ) else {
+    // Plan 6b-2 C15: on a project run only a WCS candidate may win the
+    // re-pick; a frame set calls today's pick, unchanged.
+    let allowed: Option<HashSet<usize>> = rc.wcs_rule.as_ref().map(|rule| {
+        rc.measured
+            .get(&group.key)
+            .map(|v| {
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, e)| rule.candidates.contains(&e.frame.frame_id))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let pick = match &allowed {
+        None => two_pass_pick(
+            &candidates,
+            reference_idx,
+            diagonal_px,
+            TWO_PASS_MIN_GAIN_PX,
+        ),
+        Some(allowed) => two_pass_pick_among(
+            &candidates,
+            reference_idx,
+            diagonal_px,
+            TWO_PASS_MIN_GAIN_PX,
+            &|idx| allowed.contains(&idx),
+        ),
+    };
+    let Some(new_idx) = pick else {
         return Ok(None);
     };
 
@@ -10778,6 +10917,7 @@ pub(crate) fn test_context(
         memo: HashMemo::new(origins.clone()),
         origins,
         solver,
+        wcs_rule: None,
         hot_maps: HashMap::new(),
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
@@ -21900,7 +22040,11 @@ mod tests {
         let calibrated =
             crate::db::stacking::list_artifacts(&fixture.conn, &subject, Some("calibrated"))
                 .unwrap();
-        assert_eq!(calibrated.len(), light_ids.len(), "Prepare excluded nothing");
+        assert_eq!(
+            calibrated.len(),
+            light_ids.len(),
+            "Prepare excluded nothing"
+        );
         for a in &calibrated {
             let p: String = fixture
                 .conn
@@ -22234,6 +22378,250 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    /// Every frame of `rc` measured and included, its weight from `weights`
+    /// by file name (0.5 by default), its calibrated file its own landed path:
+    /// what stages 4 and 5 read, without running Measure.
+    fn measure_all(rc: &mut RunContext, weights: &HashMap<&str, f64>) {
+        for g in rc.plan_groups.clone() {
+            let entries: Vec<MeasuredFrame> = g
+                .frames
+                .iter()
+                .map(|f| {
+                    let w = weights.get(f.filename.as_str()).copied().unwrap_or(0.5);
+                    MeasuredFrame {
+                        frame: f.clone(),
+                        calibrated: Some(PathBuf::from(&f.path)),
+                        planes: 1,
+                        measurement: None,
+                        weight: Some(FrameWeight {
+                            channels: vec![w],
+                            normalized: vec![w],
+                            mean: w,
+                            normalized_mean: w,
+                            missing: None,
+                        }),
+                        included: true,
+                        reason: None,
+                        registration: None,
+                        cached_calibrated: true,
+                        cached_metrics: false,
+                        ln_scale: None,
+                        cached_ln: false,
+                    }
+                })
+                .collect();
+            rc.measured.insert(g.key.clone(), entries);
+        }
+    }
+
+    /// Spec §5.4, plan 6b-2 C15: a project's auto reference is the best frame
+    /// WITH a WCS, from the largest group that holds one. It is never taken
+    /// from a larger, better-weighted group without one. In native geometry,
+    /// a group with no candidate takes the run reference.
+    #[test]
+    fn a_projects_auto_reference_is_the_best_frame_with_a_wcs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 4, 3);
+        let weights: HashMap<&str, f64> = [
+            ("c_r1.fits", 0.9),
+            ("c_r2.fits", 0.9),
+            ("c_r3.fits", 0.9),
+            ("c_r4.fits", 0.9),
+            ("c_g1.fits", 0.4),
+            ("c_g2.fits", 0.7),
+            ("c_g3.fits", 0.6),
+        ]
+        .into_iter()
+        .collect();
+        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &work, &out);
+        measure_all(&mut rc, &weights);
+        stage_reference(&mut rc).unwrap();
+        let g2 = handle_of(&rc, "c_g2.fits");
+        assert_eq!(rc.reference_frame_id, Some(g2));
+        assert_eq!(rc.summary.reference.filename.as_deref(), Some("c_g2.fits"));
+        let rule = rc.wcs_rule.as_ref().unwrap();
+        assert_eq!(rule.candidates.len(), 3);
+        assert!(!rule.candidates.contains(&handle_of(&rc, "c_r1.fits")));
+
+        let mut native = StackingConfig::default();
+        native.registration.geometry = RegistrationGeometry::Native;
+        let mut rc = project_rc(&ctx, &conn, "p1", native, &work, &out);
+        measure_all(&mut rc, &weights);
+        stage_reference(&mut rc).unwrap();
+        assert_eq!(rc.group_geometry["mono__G__300s"].reference_frame_id, g2);
+        assert_eq!(
+            rc.group_geometry["mono__R__300s"].reference_frame_id, g2,
+            "a group with no candidate takes the run reference"
+        );
+    }
+
+    /// Spec §5.4, plan 6b-2 C15: a frame the run solved locally qualifies
+    /// only when no included frame has a manifest WCS.
+    #[test]
+    fn a_locally_solved_frame_qualifies_only_without_a_manifest_wcs() {
+        use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
+
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab1"), "p1", 3, 0);
+        let mut rc = project_rc(&ctx, &conn, "p1", StackingConfig::default(), &work, &out);
+        let r2 = handle_of(&rc, "c_r2.fits");
+        write_outcome(
+            &conn,
+            "p1",
+            r2,
+            &blake3_of(&conn, "p1", "r2"),
+            "h",
+            SolveOutcome::Solved(FakeSolver::fixture_record()),
+        )
+        .unwrap();
+        let weights: HashMap<&str, f64> =
+            [("c_r1.fits", 0.9), ("c_r2.fits", 0.5), ("c_r3.fits", 0.8)]
+                .into_iter()
+                .collect();
+        measure_all(&mut rc, &weights);
+        stage_reference(&mut rc).unwrap();
+        assert_eq!(
+            rc.reference_frame_id,
+            Some(r2),
+            "the one frame with a WCS, not the best-weighted"
+        );
+
+        crate::db::stacking::insert_test_project(&conn, "p2");
+        seed_r_and_g(&conn, &tmp.path().join("collab2"), "p2", 3, 3);
+        let mut rc = project_rc(&ctx, &conn, "p2", StackingConfig::default(), &work, &out);
+        let r2 = handle_of(&rc, "c_r2.fits");
+        write_outcome(
+            &conn,
+            "p2",
+            r2,
+            &blake3_of(&conn, "p2", "r2"),
+            "h",
+            SolveOutcome::Solved(FakeSolver::fixture_record()),
+        )
+        .unwrap();
+        measure_all(&mut rc, &[("c_r2.fits", 0.99)].into_iter().collect());
+        stage_reference(&mut rc).unwrap();
+        let rule = rc.wcs_rule.as_ref().unwrap();
+        assert!(
+            !rule.candidates.contains(&r2) && rule.with_wcs.contains(&r2),
+            "{rule:?}"
+        );
+        let g: HashSet<i64> = ["c_g1.fits", "c_g2.fits", "c_g3.fits"]
+            .iter()
+            .map(|n| handle_of(&rc, n))
+            .collect();
+        assert!(g.contains(&rc.reference_frame_id.unwrap()));
+    }
+
+    /// Spec §5.4: with no frame carrying a WCS the reference stage fails, in
+    /// the spec's words.
+    #[test]
+    fn with_no_frame_with_a_wcs_the_reference_stage_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 0);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            StackingConfig::default(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        measure_all(&mut rc, &HashMap::new());
+        let err = stage_reference(&mut rc).unwrap_err();
+        assert!(
+            matches!(err, RunError::Other(ref m) if m == NO_PROJECT_REFERENCE),
+            "{err:?}"
+        );
+        assert_eq!(
+            NO_PROJECT_REFERENCE,
+            "no frame of this project could be plate-solved; the grid needs one"
+        );
+    }
+
+    /// Plan 6b-2 C15: a manual pin without a WCS fails the stage; a pin with
+    /// one is the reference.
+    #[test]
+    fn a_manual_pin_without_a_wcs_fails_the_reference_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        seed_r_and_g(&conn, &tmp.path().join("collab"), "p1", 3, 3);
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        let (work, out) = (tmp.path().join("work"), tmp.path().join("out"));
+
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg.clone(), &work, &out);
+        crate::db::stacking::set_project_config(&conn, "p1", "{}", &[], Some("r1")).unwrap();
+        measure_all(&mut rc, &HashMap::new());
+        let err = stage_reference(&mut rc).unwrap_err();
+        assert!(
+            matches!(err, RunError::Other(ref m) if m == MANUAL_REFERENCE_WITHOUT_WCS),
+            "{err:?}"
+        );
+
+        let mut rc = project_rc(&ctx, &conn, "p1", cfg, &work, &out);
+        crate::db::stacking::set_project_config(&conn, "p1", "{}", &[], Some("g2")).unwrap();
+        measure_all(&mut rc, &HashMap::new());
+        stage_reference(&mut rc).unwrap();
+        assert_eq!(rc.reference_frame_id, Some(handle_of(&rc, "c_g2.fits")));
+    }
+
+    /// Review Focus 1, plan 6b-2 C15: a frame-set run has no WCS rule, so its
+    /// reference pick, its native groups and its two-pass re-pick take
+    /// today's paths unchanged.
+    #[test]
+    fn a_frame_set_run_has_no_wcs_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (fixture, _ids, working, output) = seed_star_group(
+            &db_path,
+            SET_NAME,
+            &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+            &[5.0f32; 3],
+        );
+        let cfg = StackingConfig::default();
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let (run_id, group_ids) = seed_run_and_groups(
+            &fixture.conn,
+            fixture.set_id,
+            &plan_groups,
+            working.path(),
+            output.path(),
+        );
+        let rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            run_id,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            WorkingLayout::new(working.path(), &set_slug(SET_NAME)),
+            output.path().to_path_buf(),
+            group_ids,
+        );
+        assert!(wcs_tiers(&rc).unwrap().is_none());
+        assert!(rc.wcs_rule.is_none());
     }
 
     fn use_solver(rc: &mut RunContext, fake: &Arc<crate::stacking::solve::FakeSolver>) {

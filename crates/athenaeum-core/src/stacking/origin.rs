@@ -269,6 +269,35 @@ pub(crate) fn cfa_geometry(
     }
 }
 
+/// Where a frame's WCS comes from, for the reference rule (spec §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WcsTier {
+    /// A catalog frame: the rule does not apply.
+    NotApplicable,
+    Manifest,
+    /// Solved by a run (the cached `solve` artifact of this content).
+    Local,
+    /// No WCS at all.
+    Missing,
+}
+
+pub(crate) fn wcs_tier(
+    conn: &Connection,
+    origin: &FrameOrigin,
+    frame_id: i64,
+) -> anyhow::Result<WcsTier> {
+    match origin {
+        FrameOrigin::Catalog { .. } => Ok(WcsTier::NotApplicable),
+        FrameOrigin::Project { meta, .. } if meta.wcs.is_some() => Ok(WcsTier::Manifest),
+        FrameOrigin::Project {
+            project_id, blake3, ..
+        } => Ok(match stored_outcome(conn, project_id, frame_id, blake3)? {
+            Some(SolveOutcome::Solved(_)) => WcsTier::Local,
+            _ => WcsTier::Missing,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +670,80 @@ mod tests {
         };
         assert!(solve_plan(&catalog).is_none());
         assert!(local_solve_outcome(&conn, &catalog, 1).unwrap().is_none());
+    }
+
+    /// Plan 6b-2 C15: the tier the reference rule reads. It is the manifest's
+    /// WCS, then the run's own solve of this content (a cached failure is no
+    /// WCS), else none; a catalog frame has no rule.
+    #[test]
+    fn the_wcs_tier_is_the_manifest_then_the_local_solve() {
+        use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let dir = tempfile::tempdir().unwrap();
+        test_fixtures::add_project_frame(
+            &conn,
+            dir.path(),
+            "p1",
+            &test_fixtures::project_frame_spec("a"),
+        );
+        let mut with_wcs = test_fixtures::project_frame_spec("m");
+        with_wcs.wcs = Some(test_fixtures::manifest_wcs_json(64, 48, 10.0, 20.0, 1.5));
+        test_fixtures::add_project_frame(&conn, dir.path(), "p1", &with_wcs);
+        let source = crate::stacking::project_source::project_frame_source(
+            &conn,
+            "p1",
+            &crate::stacking::config::StackingConfig::default(),
+        )
+        .unwrap();
+        let of = |uuid: &str| -> (i64, FrameOrigin, String) {
+            source
+                .origins
+                .iter()
+                .find_map(|(id, o)| match o {
+                    FrameOrigin::Project {
+                        frame_uuid, blake3, ..
+                    } if frame_uuid == uuid => Some((*id, o.clone(), blake3.clone())),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let (a_id, a, a_blake3) = of("a");
+        let (m_id, m, _) = of("m");
+        assert_eq!(wcs_tier(&conn, &a, a_id).unwrap(), WcsTier::Missing);
+        write_outcome(
+            &conn,
+            "p1",
+            a_id,
+            &a_blake3,
+            "h",
+            SolveOutcome::Failed("no match".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            wcs_tier(&conn, &a, a_id).unwrap(),
+            WcsTier::Missing,
+            "a failure is no WCS"
+        );
+        write_outcome(
+            &conn,
+            "p1",
+            a_id,
+            &a_blake3,
+            "h",
+            SolveOutcome::Solved(FakeSolver::fixture_record()),
+        )
+        .unwrap();
+        assert_eq!(wcs_tier(&conn, &a, a_id).unwrap(), WcsTier::Local);
+        assert_eq!(wcs_tier(&conn, &m, m_id).unwrap(), WcsTier::Manifest);
+        let catalog = FrameOrigin::Catalog {
+            file_id: 1,
+            attested: false,
+        };
+        assert_eq!(
+            wcs_tier(&conn, &catalog, 1).unwrap(),
+            WcsTier::NotApplicable
+        );
     }
 }
