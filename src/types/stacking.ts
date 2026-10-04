@@ -422,7 +422,7 @@ width: number | null, height: number | null, exposure: number | null, frameCount
  */
 beta: number | null, exposureClass: string | null, };
 
-export type StackingRunFrameRow = { id: number, runId: number, groupId: number, frameId: number, included: boolean, exclusionReason: string | null, weight: number | null, weightChannelsJson: string | null, metricsJson: string | null, regStatus: string | null, regModel: string | null, regRmsPx: number | null, regInliers: number | null, regInlierRatio: number | null, regFlipped: boolean | null, rejectedFraction: number | null, };
+export type StackingRunFrameRow = { id: number, runId: number, groupId: number, frameId: number, included: boolean, exclusionReason: string | null, weight: number | null, weightChannelsJson: string | null, metricsJson: string | null, regStatus: string | null, regModel: string | null, regRmsPx: number | null, regInliers: number | null, regInlierRatio: number | null, regFlipped: boolean | null, rejectedFraction: number | null, frameUuid: string | null, };
 
 export type StackingRunSummary = { run: StackingRunRow, groupCount: number, masterPaths: Array<string>, };
 
@@ -553,6 +553,8 @@ export type StackingSetConfig = { config: StackingConfig, excludedFrameIds: Arra
  * resolved config above is entirely the global default's.
  */
 isDefault: boolean, updatedAt: string | null, };
+
+export type StackingProjectConfig = { config: StackingConfig, excludedFrameUuids: Array<string>, referenceFrameUuid: string | null, isDefault: boolean, updatedAt: string | null, };
 
 export type StackingPaths = { working: PathSetting, output: PathSetting, };
 

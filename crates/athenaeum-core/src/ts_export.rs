@@ -444,6 +444,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::stacking::run::StartedStacking,
             crate::api::stacking::StackingRunDetail,
             crate::api::stacking::StackingSetConfig,
+        crate::api::stacking::StackingProjectConfig,
             crate::api::stacking::StackingPaths,
             crate::stacking::paths::WorkUsage,
             crate::stacking::paths::CleanupWhat,

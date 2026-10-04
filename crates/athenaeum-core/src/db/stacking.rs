@@ -259,6 +259,10 @@ pub struct StackingRunFrameRow {
     pub reg_inlier_ratio: Option<f64>,
     pub reg_flipped: Option<bool>,
     pub rejected_fraction: Option<f64>,
+    // A project row's frame uuid, read through its handle, so run history
+    // maps a handle after the frame left the plan (plan 6b-3 D18); `None`
+    // for a frame set's row.
+    pub frame_uuid: Option<String>,
 }
 
 fn row_to_frame(r: &Row) -> rusqlite::Result<StackingRunFrameRow> {
@@ -279,13 +283,15 @@ fn row_to_frame(r: &Row) -> rusqlite::Result<StackingRunFrameRow> {
         reg_inlier_ratio: r.get(13)?,
         reg_flipped: r.get(14)?,
         rejected_fraction: r.get(15)?,
+        frame_uuid: r.get(16)?,
     })
 }
 
 const FRAME_COLUMNS: &str =
     "id, run_id, group_id, COALESCE(frame_id, project_frame), included, exclusion_reason, weight, \
     weight_channels_json, metrics_json, reg_status, reg_model, reg_rms_px, reg_inliers, \
-    reg_inlier_ratio, reg_flipped, rejected_fraction";
+    reg_inlier_ratio, reg_flipped, rejected_fraction, \
+    (SELECT h.frame_uuid FROM stack_project_frames h WHERE h.id = stacking_run_frames.project_frame)";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1254,6 +1260,28 @@ pub fn seed_project_config(
     Ok(row)
 }
 
+/// Plan 6b-3 D12 (spec §9.3): drop the artifact rows of every handle whose
+/// `(project, uuid)` has left `project_frames_local` — every kind, rows
+/// only, never a file (the next directory-level cleanup takes those). A
+/// coordinator-excluded frame is still in `project_frames_local`, so its
+/// cache survives a restore; run history keeps its handles. One statement,
+/// so no read-then-write transaction.
+pub fn sweep_departed_project_artifacts(conn: &Connection, project_id: &str) -> Result<usize> {
+    let count = conn.execute(
+        "DELETE FROM stacking_artifacts
+          WHERE project_id = ?1
+            AND project_frame IN (
+              SELECT h.id FROM stack_project_frames h
+               WHERE h.project_id = ?1
+                 AND NOT EXISTS (SELECT 1 FROM project_frames_local l
+                                  WHERE l.project_id = h.project_id
+                                    AND l.frame_uuid = h.frame_uuid))",
+        params![project_id],
+    )?;
+    tracing::debug!(project_id, count, "stale project-frame artifacts swept");
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2118,5 +2146,117 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// Plan 6b-3 D18: a project run's frame row names its uuid through its
+    /// handle — even after the frame left `project_frames_local` — and a
+    /// frame set's row names none.
+    #[test]
+    fn a_run_frame_row_names_its_project_uuid() {
+        let c = conn();
+        insert_test_project(&c, "p1");
+        let handles = project_frame_handles(&c, "p1", &["u1"]).unwrap();
+        let project = StackSubject::Project("p1".into());
+        let run = insert_run(&c, &new_run(&project)).unwrap();
+        let group = insert_group(&c, &new_group(run)).unwrap();
+        upsert_frame_row(
+            &c,
+            &project,
+            &new_frame_row(run, group, handles["u1"], true),
+        )
+        .unwrap();
+        let rows = list_frame_rows(&c, run).unwrap();
+        assert_eq!(rows[0].frame_id, handles["u1"]);
+        assert_eq!(rows[0].frame_uuid.as_deref(), Some("u1"));
+
+        let set = seed_set(&c);
+        seed_frame(&c, 41);
+        let set_subject = StackSubject::FrameSet(set);
+        let set_run = insert_run(&c, &new_run(&set_subject)).unwrap();
+        let set_group = insert_group(&c, &new_group(set_run)).unwrap();
+        upsert_frame_row(
+            &c,
+            &set_subject,
+            &new_frame_row(set_run, set_group, 41, true),
+        )
+        .unwrap();
+        assert_eq!(list_frame_rows(&c, set_run).unwrap()[0].frame_uuid, None);
+    }
+
+    /// Spec §9.3, plan 6b-3 D12: the sweep drops the artifact rows of a
+    /// handle whose uuid left `project_frames_local` — every kind, rows only
+    /// — and keeps a present frame's, a coordinator-excluded frame's, a
+    /// group-level row and another project's.
+    #[test]
+    fn the_sweep_drops_only_departed_frames_rows() {
+        let c = conn();
+        insert_test_project(&c, "p1");
+        insert_test_project(&c, "p2");
+        let h = project_frame_handles(&c, "p1", &["kept", "excluded", "gone"]).unwrap();
+        let other = project_frame_handles(&c, "p2", &["gone"]).unwrap();
+        for (uuid, accepted) in [("kept", 1), ("excluded", 0)] {
+            c.execute(
+                "INSERT INTO project_frames_local (project_id, frame_uuid, content_version, origin,
+                   publisher_account_id, publisher_display, file_name, filter_canonical, state,
+                   accepted, byte_size, xxh3, blake3)
+                 VALUES ('p1', ?1, 1, 'replica', 'a', 'Ann', 'f.fits', 'L', 'published', ?2, 1, 'x', 'b')",
+                params![uuid, accepted],
+            )
+            .unwrap();
+        }
+        let p1 = StackSubject::Project("p1".into());
+        let p2 = StackSubject::Project("p2".into());
+        let row = |subject: &StackSubject, frame: Option<i64>, group: &str, kind: &str| {
+            upsert_artifact(
+                &c,
+                &NewArtifact {
+                    subject,
+                    frame_id: frame,
+                    group_key: group,
+                    kind,
+                    path: None,
+                    config_hash: "h",
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some("{}"),
+                },
+            )
+            .unwrap();
+        };
+        for uuid in ["kept", "excluded", "gone"] {
+            row(&p1, Some(h[uuid]), "", "solve");
+            row(&p1, Some(h[uuid]), "g", "registered");
+        }
+        row(&p1, None, "g", "ln_reference");
+        row(&p2, Some(other["gone"]), "g", "registered");
+
+        assert_eq!(sweep_departed_project_artifacts(&c, "p1").unwrap(), 2);
+        assert!(find_artifact(&c, &p1, "", "solve", Some(h["gone"]))
+            .unwrap()
+            .is_none());
+        assert!(find_artifact(&c, &p1, "g", "registered", Some(h["gone"]))
+            .unwrap()
+            .is_none());
+        for uuid in ["kept", "excluded"] {
+            assert!(
+                find_artifact(&c, &p1, "", "solve", Some(h[uuid]))
+                    .unwrap()
+                    .is_some(),
+                "{uuid}"
+            );
+        }
+        assert!(find_artifact(&c, &p1, "g", "ln_reference", None)
+            .unwrap()
+            .is_some());
+        assert!(
+            find_artifact(&c, &p2, "g", "registered", Some(other["gone"]))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            sweep_departed_project_artifacts(&c, "p1").unwrap(),
+            0,
+            "idempotent"
+        );
     }
 }

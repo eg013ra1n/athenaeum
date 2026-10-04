@@ -1123,6 +1123,34 @@ fn resolve_config_and_exclusions(
     Ok((config, excluded_frame_ids))
 }
 
+/// The document a project's first plan stores (spec §9.4): the global
+/// default with the project seed applied.
+fn project_seed(conn: &Connection, settings: &SettingsManager) -> Result<StackingConfig, ApiError> {
+    let global_json = read_global_config_json(conn, settings);
+    let global = resolve_config(None, global_json.as_deref())
+        .map_err(|e| ApiError::Invalid(format!("invalid stacking config: {e}")))?;
+    Ok(crate::stacking::config::project_seed_config(global))
+}
+
+/// A project's stacking document, read only (plan 6b-3 D12): the stored one,
+/// resolved whole, or — with no stored row — the seed the first plan would
+/// store. Never writes. The config view, usage and cleanup read through
+/// here; only a plan seeds.
+pub(crate) fn read_project_config(
+    conn: &Connection,
+    settings: &SettingsManager,
+    project_id: &str,
+) -> Result<(StackingConfig, Option<crate::db::stacking::ProjectConfigRow>), ApiError> {
+    match crate::db::stacking::get_project_config(conn, project_id)? {
+        Some(row) => {
+            let config = resolve_config(Some(&row.config_json), None)
+                .map_err(|e| ApiError::Invalid(format!("invalid stacking config: {e}")))?;
+            Ok((config, Some(row)))
+        }
+        None => Ok((project_seed(conn, settings)?, None)),
+    }
+}
+
 /// A project's effective config and manual exclusions (frame uuids) — plan
 /// 6b-2 C10, spec §9.4. Seeds the stored document on the first plan (a
 /// documented exception to "the plan reads only"; `seed_project_config` is
@@ -1143,13 +1171,9 @@ pub fn resolve_project_config_and_exclusions(
     let row = match crate::db::stacking::get_project_config(conn, project_id)? {
         Some(row) => row,
         None => {
-            let global_json = read_global_config_json(conn, settings);
-            let global = resolve_config(None, global_json.as_deref())
-                .map_err(|e| ApiError::Invalid(format!("invalid stacking config: {e}")))?;
-            let seed = serde_json::to_string(&crate::stacking::config::project_seed_config(global))
-                .map_err(|e| {
-                    ApiError::Internal(format!("failed to serialize the project seed config: {e}"))
-                })?;
+            let seed = serde_json::to_string(&project_seed(conn, settings)?).map_err(|e| {
+                ApiError::Internal(format!("failed to serialize the project seed config: {e}"))
+            })?;
             crate::db::stacking::seed_project_config(conn, project_id, &seed)?
         }
     };

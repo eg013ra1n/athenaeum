@@ -81,6 +81,20 @@ pub struct StackingSetConfig {
     pub updated_at: Option<String>,
 }
 
+/// A project's stacking document (spec §9.1, plan 6b-3 D12): the whole
+/// config, the manual exclusions and the manual reference by frame uuid.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct StackingProjectConfig {
+    pub config: StackingConfig,
+    pub excluded_frame_uuids: Vec<String>,
+    pub reference_frame_uuid: Option<String>,
+    // `true` while the project has no stored document: `config` is then the
+    // seed its first plan stores.
+    pub is_default: bool,
+    pub updated_at: Option<String>,
+}
+
 /// The two configurable stacking folders (spec §9.6), in the same shape
 /// Settings → Transfers already uses for its own pair
 /// ([`crate::api::sync::PathSetting`]/[`crate::api::sync::TransferPaths`]).
@@ -238,13 +252,22 @@ pub fn get_stacking_runs(
     set_id: i64,
     limit: Option<usize>,
 ) -> Result<Vec<StackingRunSummary>, ApiError> {
+    runs_for_subject(ctx, &StackSubject::FrameSet(set_id), limit)
+}
+
+/// The history both subjects share (default limit 20).
+fn runs_for_subject(
+    ctx: &ServiceContext,
+    subject: &StackSubject,
+    limit: Option<usize>,
+) -> Result<Vec<StackingRunSummary>, ApiError> {
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
     // Critical fix, item 1: heal any interrupted row before listing — a run
     // history the user reads should never show a `running` row that is
     // actually dead.
     run::heal_interrupted_runs(ctx, &conn)?;
-    let runs = list_runs(&conn, &StackSubject::FrameSet(set_id), limit.unwrap_or(20))?;
+    let runs = list_runs(&conn, subject, limit.unwrap_or(20))?;
     let mut out = Vec::with_capacity(runs.len());
     for run_row in runs {
         let groups = list_groups(&conn, run_row.id)?;
@@ -881,6 +904,204 @@ pub fn cleanup_stacking_work(
     let layout = layout_for(&conn, Path::new(&working), &subject)?;
     let freed = cleanup_work(&conn, &subject, &layout, what)?;
     Ok(freed)
+}
+
+// ── Project stacking (spec §9.1, plan 6b-3 D12) ──────────────────────────
+
+/// A project's plan, [`get_stacking_plan`]'s twin. The first plan seeds the
+/// project's config and a plan mints handles for new frames (both read
+/// first, so a steady-state plan writes nothing — D16); the hosts run it on
+/// a blocking thread.
+pub fn get_project_stacking_plan(
+    ctx: &ServiceContext,
+    policy: &PathPolicy,
+    project_id: &str,
+    config: Option<StackingConfig>,
+) -> Result<StackingPlan, ApiError> {
+    let db_handle = db(ctx)?;
+    let conn = db_handle.conn();
+    run::heal_interrupted_runs(ctx, &conn)?;
+    build_plan(
+        &conn,
+        &ctx.settings,
+        policy,
+        &StackSubject::Project(project_id.to_string()),
+        config,
+    )
+}
+
+/// Start a project run, [`start_stacking`]'s twin (the same drizzle clamp).
+pub fn start_project_stacking(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    policy: &PathPolicy,
+    app_version: String,
+    project_id: &str,
+    config: Option<StackingConfig>,
+    rerun_from: Option<Stage>,
+) -> Result<StartedStacking, ApiError> {
+    let was_drizzle = rerun_from == Some(Stage::Drizzle);
+    let rerun_from = clamp_rerun_from(rerun_from);
+    if was_drizzle {
+        tracing::debug!(project_id, "rerun from drizzle clamped to integrate");
+    }
+    run::start_stacking(
+        ctx,
+        emitter,
+        policy,
+        app_version,
+        StackSubject::Project(project_id.to_string()),
+        config,
+        rerun_from,
+    )
+}
+
+/// A project's run history, newest first (default limit 20).
+pub fn get_project_stacking_runs(
+    ctx: &ServiceContext,
+    project_id: &str,
+    limit: Option<usize>,
+) -> Result<Vec<StackingRunSummary>, ApiError> {
+    runs_for_subject(ctx, &StackSubject::Project(project_id.to_string()), limit)
+}
+
+/// The view of a project's document: the stored one, or the seed.
+fn project_config_view(
+    conn: &Connection,
+    settings: &SettingsManager,
+    project_id: &str,
+) -> Result<StackingProjectConfig, ApiError> {
+    let (config, row) = crate::stacking::plan::read_project_config(conn, settings, project_id)?;
+    Ok(match row {
+        Some(row) => StackingProjectConfig {
+            config,
+            excluded_frame_uuids: row.excluded_frame_uuids,
+            reference_frame_uuid: row.reference_frame_uuid,
+            is_default: false,
+            updated_at: Some(row.updated_at),
+        },
+        None => StackingProjectConfig {
+            config,
+            excluded_frame_uuids: Vec::new(),
+            reference_frame_uuid: None,
+            is_default: true,
+            updated_at: None,
+        },
+    })
+}
+
+/// A project's stacking document (plan 6b-3 D12). Read only: with no stored
+/// document it returns the seed the first plan would store, `isDefault`.
+pub fn get_project_stacking_config(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<StackingProjectConfig, ApiError> {
+    let db_handle = db(ctx)?;
+    let conn = db_handle.conn();
+    subject_label(&conn, &StackSubject::Project(project_id.to_string()))?;
+    project_config_view(&conn, &ctx.settings, project_id)
+}
+
+/// Store a project's whole stacking document (plan 6b-3 D12) and return its
+/// view. Refuses a project this device left. Exclusions are stored sorted
+/// and de-duplicated. `reference_frame_uuid = None` CLEARS the manual pin:
+/// Tauri cannot tell an absent argument from `null`, so a caller that keeps
+/// the pin sends it back (the exclusions, by contrast, are required).
+pub fn set_project_stacking_config(
+    ctx: &ServiceContext,
+    project_id: &str,
+    config: StackingConfig,
+    mut excluded_frame_uuids: Vec<String>,
+    reference_frame_uuid: Option<String>,
+) -> Result<StackingProjectConfig, ApiError> {
+    let db_handle = db(ctx)?;
+    let conn = db_handle.conn();
+    crate::api::collab_exchange::live_project(&conn, project_id)?;
+    excluded_frame_uuids.sort();
+    excluded_frame_uuids.dedup();
+    let reference = reference_frame_uuid
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+    let json = serde_json::to_string(&config)
+        .map_err(|e| ApiError::Internal(format!("failed to serialize stacking config: {e}")))?;
+    crate::db::stacking::set_project_config(
+        &conn,
+        project_id,
+        &json,
+        &excluded_frame_uuids,
+        reference,
+    )?;
+    tracing::info!(
+        project_id,
+        count = excluded_frame_uuids.len(),
+        "project stacking config saved"
+    );
+    project_config_view(&conn, &ctx.settings, project_id)
+}
+
+/// The working folder a project's plan resolves: its document's
+/// `paths.workingDir`, else the global setting. Reads only.
+fn project_working_dir(
+    conn: &Connection,
+    settings: &SettingsManager,
+    project_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let (cfg, _) = crate::stacking::plan::read_project_config(conn, settings, project_id)?;
+    Ok(resolve_dirs(conn, settings, &cfg.paths).working)
+}
+
+/// A project's working-layout byte usage, as for a set. No working folder
+/// reads as all zeros.
+pub fn get_project_stacking_work_usage(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<WorkUsage, ApiError> {
+    let db_handle = db(ctx)?;
+    let conn = db_handle.conn();
+    let subject = StackSubject::Project(project_id.to_string());
+    subject_label(&conn, &subject)?;
+    let Some(working) = project_working_dir(&conn, &ctx.settings, project_id)? else {
+        return Ok(WorkUsage::default());
+    };
+    let layout = layout_for(&conn, Path::new(&working), &subject)?;
+    Ok(work_usage(&layout))
+}
+
+/// Clean a project's working layout (plan 6b-3 D12, spec §9.3). As for a
+/// set: heal, then `Conflict` while a project run is active. Then, at every
+/// level and even with no working folder, the artifact rows of frames that
+/// left the project are swept (rows only; review M5 put the sweep after the
+/// `Conflict` check, so a refused cleanup touches nothing). Then `Ok(0)`
+/// with no working folder. A layout root that overlaps a scan root (the
+/// Collaboration root is one) is refused, as the plan's `folders` blocker
+/// refuses it (6b-2 C6) — cleanup removes whole subtrees and a landed
+/// replica must never be in one.
+pub fn cleanup_project_stacking_work(
+    ctx: &ServiceContext,
+    project_id: &str,
+    what: CleanupWhat,
+) -> Result<u64, ApiError> {
+    let db_handle = db(ctx)?;
+    let conn = db_handle.conn();
+    let subject = StackSubject::Project(project_id.to_string());
+    subject_label(&conn, &subject)?;
+    run::heal_interrupted_runs(ctx, &conn)?;
+    if let Some(run_id) = active_run_for_subject(&conn, &subject)? {
+        return Err(ApiError::Conflict(format!(
+            "a stacking run (id {run_id}) is active for project {project_id}"
+        )));
+    }
+    crate::db::stacking::sweep_departed_project_artifacts(&conn, project_id)?;
+    let Some(working) = project_working_dir(&conn, &ctx.settings, project_id)? else {
+        return Ok(0);
+    };
+    let layout = layout_for(&conn, Path::new(&working), &subject)?;
+    if let Some(why) = crate::stacking::paths::project_root_overlap(&conn, &layout.root)? {
+        tracing::warn!(project_id, path = %layout.root.display(), "project cleanup refused: the working folder overlaps a scan root");
+        return Err(ApiError::Invalid(why));
+    }
+    Ok(cleanup_work(&conn, &subject, &layout, what)?)
 }
 
 // ── Master lights (M4d Task 3, rulings R-M4d-4/5) ───────────────────────
@@ -2576,5 +2797,196 @@ mod tests {
         );
         assert_eq!(after[0].name, "Ålesund", "the new spelling wins");
         assert_eq!(after[0].config, preset(StackingPreset::FastPreview));
+    }
+
+    /// Plan 6b-3 D12: a project's config reads without writing — the seed it
+    /// would store, `isDefault` — and an unknown project is `NotFound`. A
+    /// save stores sorted, de-duplicated exclusions; an absent reference
+    /// clears the pin; a project this device left is refused.
+    #[test]
+    fn a_project_config_reads_without_writing_and_saves_whole() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let handle = db(&ctx).unwrap();
+            crate::db::stacking::insert_test_project(&handle.conn(), "p1");
+        }
+        let view = get_project_stacking_config(&ctx, "p1").unwrap();
+        assert!(view.is_default && view.updated_at.is_none());
+        assert_eq!(
+            view.config,
+            crate::stacking::config::project_seed_config(StackingConfig::default())
+        );
+        assert!(
+            crate::db::stacking::get_project_config(&db(&ctx).unwrap().conn(), "p1")
+                .unwrap()
+                .is_none(),
+            "a read stores nothing"
+        );
+        assert!(matches!(
+            get_project_stacking_config(&ctx, "nope"),
+            Err(ApiError::NotFound(_))
+        ));
+
+        let saved = set_project_stacking_config(
+            &ctx,
+            "p1",
+            view.config.clone(),
+            vec!["b".into(), "a".into(), "b".into()],
+            Some("r".into()),
+        )
+        .unwrap();
+        assert!(!saved.is_default && saved.updated_at.is_some());
+        assert_eq!(
+            saved.excluded_frame_uuids,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(saved.reference_frame_uuid.as_deref(), Some("r"));
+        let cleared =
+            set_project_stacking_config(&ctx, "p1", view.config.clone(), Vec::new(), None).unwrap();
+        assert_eq!(cleared.reference_frame_uuid, None);
+        assert!(cleared.excluded_frame_uuids.is_empty());
+
+        crate::db::collab::mark_lost(&db(&ctx).unwrap().conn(), "p1").unwrap();
+        let err =
+            set_project_stacking_config(&ctx, "p1", view.config, Vec::new(), None).unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+    }
+
+    /// Spec §9.3, plan 6b-3 D12: project cleanup sweeps the rows of frames
+    /// that left the project — even with no working folder at all — then
+    /// honours the project's own folder for usage and cleanup, and refuses
+    /// while a project run is active (before the sweep, review M5).
+    #[test]
+    fn project_cleanup_sweeps_departed_frames_then_cleans_its_folder() {
+        let (_tmp, ctx) = test_ctx();
+        let subject = StackSubject::Project("p1".into());
+        let gone = {
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            crate::db::stacking::insert_test_project(&conn, "p1");
+            let h = crate::db::stacking::project_frame_handles(&conn, "p1", &["gone"]).unwrap();
+            crate::db::stacking::upsert_artifact(
+                &conn,
+                &crate::db::stacking::NewArtifact {
+                    subject: &subject,
+                    frame_id: Some(h["gone"]),
+                    group_key: "",
+                    kind: "solve",
+                    path: None,
+                    config_hash: "h",
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some("{}"),
+                },
+            )
+            .unwrap();
+            h["gone"]
+        };
+        assert_eq!(
+            cleanup_project_stacking_work(&ctx, "p1", CleanupWhat::Registered).unwrap(),
+            0
+        );
+        assert!(
+            crate::db::stacking::find_artifact(
+                &db(&ctx).unwrap().conn(),
+                &subject,
+                "",
+                "solve",
+                Some(gone)
+            )
+            .unwrap()
+            .is_none(),
+            "swept with no working folder"
+        );
+
+        let work = tempfile::tempdir().unwrap();
+        let group_dir = work
+            .path()
+            .join("_projects")
+            .join("p1")
+            .join("registered")
+            .join("g");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(group_dir.join("x.fits"), vec![0u8; 1024]).unwrap();
+        let mut cfg = crate::stacking::config::project_seed_config(StackingConfig::default());
+        cfg.paths.working_dir = Some(work.path().to_string_lossy().into_owned());
+        set_project_stacking_config(&ctx, "p1", cfg, Vec::new(), None).unwrap();
+        assert_eq!(
+            get_project_stacking_work_usage(&ctx, "p1")
+                .unwrap()
+                .registered_bytes,
+            1024
+        );
+        assert_eq!(
+            cleanup_project_stacking_work(&ctx, "p1", CleanupWhat::Registered).unwrap(),
+            1024
+        );
+        assert!(!group_dir.join("x.fits").exists());
+
+        let run_id = {
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            let run_id = crate::db::stacking::insert_run(
+                &conn,
+                &crate::db::stacking::NewRun {
+                    subject: &subject,
+                    config_json: "{}",
+                    config_hash: "h",
+                    reference_frame_id: None,
+                    reference_mode: "auto",
+                    working_dir: "/w",
+                    output_dir: "/o",
+                },
+            )
+            .unwrap();
+            crate::db::stacking::set_run_status(&conn, run_id, "running").unwrap();
+            run_id
+        };
+        ctx.active_stacks.lock().unwrap().insert(
+            run_id,
+            crate::services::StackHandle {
+                cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                subject: subject.clone(),
+            },
+        );
+        let err = cleanup_project_stacking_work(&ctx, "p1", CleanupWhat::All).unwrap_err();
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+        let runs = get_project_stacking_runs(&ctx, "p1", None).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run.id, run_id);
+    }
+
+    /// Plan 6b-3 D12: a project plan heals an interrupted project run first,
+    /// as a frame set's does.
+    #[test]
+    fn a_project_plan_heals_an_interrupted_project_run() {
+        let (_tmp, ctx) = test_ctx();
+        let run_id = {
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            crate::db::stacking::insert_test_project(&conn, "p1");
+            let run_id = crate::db::stacking::insert_run(
+                &conn,
+                &crate::db::stacking::NewRun {
+                    subject: &StackSubject::Project("p1".into()),
+                    config_json: "{}",
+                    config_hash: "h",
+                    reference_frame_id: None,
+                    reference_mode: "auto",
+                    working_dir: "/w",
+                    output_dir: "/o",
+                },
+            )
+            .unwrap();
+            crate::db::stacking::set_run_status(&conn, run_id, "running").unwrap();
+            run_id
+        };
+        let plan = get_project_stacking_plan(&ctx, &PathPolicy::AllowAll, "p1", None).unwrap();
+        assert_eq!(plan.active_run_id, None);
+        assert_eq!(plan.project_id.as_deref(), Some("p1"));
+        let row = crate::db::stacking::get_run(&db(&ctx).unwrap().conn(), run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "failed");
     }
 }
