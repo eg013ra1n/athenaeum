@@ -20,6 +20,40 @@ not rebuilt per cycle (owner request 2026-09-18).
    with a `checkpoint.sh` run back to back whenever a tier's TOTAL is being
    read: this machine drifts ±10–15 % across a build-heavy session, so only
    an interleaved bracket is comparable (ruling R-TA-9).
+7. `tier1/project-run.sh <repo> <work-dir> <port> <project-id>` — one
+   project run (wave 6b-3): `start_project_stacking`, waits for that run's
+   `stacking-complete`, writes `run-project.txt` beside `run.txt`. Same
+   refusals as `checkpoint.sh`.
+8. `run-a-grid.py <copy.db> <project-id> (--reference-uuid U | --grid-json J) [--apply]`
+   — the grid of a reference frame's manifest WCS (acceptance run A) or any
+   grid (run B), stored in a catalog COPY only; it refuses the live catalogs.
+   An acceptance copy that stacks a project runs signed out: set its
+   `account.hub_url` to `http://127.0.0.1:9` before the server starts (the
+   feed would otherwise replace the local grid), and never call
+   `account_sign_out` on a copy — the token store is shared with the real app.
+9. `tier1/tier1-compare.py --pairs <head>=<base> …` — the first four Tier C
+   rows on explicit master pairs (run A), refusing a pair whose pixel grids
+   differ; `grid-report.py <work-dir>
+   <project-id> [--k K] [--overlap] [--ln-truth]` — run B's per-group report
+   (FWHM in arcsec, eccentricity, the white-noise-equivalent noise per arcsec²
+   = σ_px·scale, coverage, member overlap with the LN reference, and for every
+   master its pixel dims, the crop rectangle when the run cropped, the drizzle
+   master's dims). A large grid × k² drizzle with the coverage map on may be
+   refused for memory: record such a refusal with its numbers; do not shrink
+   the run on your own initiative. `--ln-truth` prints each member's
+   local-normalization scale (from the run's debug log events) next to the
+   median reference/member flux ratio of 30–60 bright isolated stars measured
+   on the registered artifacts: a frame's LN scale depends on its PSF width
+   (+1/3 px² of PSF variance moves it by about 2.6 %) and a project's members
+   come from different instruments, so it shows the scale beside a photometric
+   truth, per instrument, with no tolerance. `grid-report.py --self-check`
+   runs the synthetic check of the ratio and the log parser (no real data).
+
+A catalog copy is made with `sqlite3 -readonly <live db> ".backup <copy>"`,
+never by reading the live catalog any other way, and `prepare-catalog.sh` is
+fed that copy through `ATH_ACC_DB`. Working folders live on
+`/Volumes/BigMac` (`$HOME/.athenaeum-acc/…`); `/Volumes/bigbase3` is a slow
+HDD.
 
 `<work-dir>` should be the session scratchpad or any folder outside the repo
 and outside every scan root — never the real library, and never a folder a

@@ -14,6 +14,10 @@ compatibility with `checkpoint.sh`'s existing default call). `--set-id` defaults
 (`LDN1272-test`, the Tier A/Tier C reduced set); it selects which `stacking_runs` row (the latest
 `status='done'` for that `frames_set_id`) each side's DB numbers come from.
 
+--pairs mode (plan 6b-3 run A): the first four rows on explicit master pairs.
+
+    tier1-compare.py --pairs <head_master>=<base_master> [...]
+
 What's compared and where every number is read from — the spec §8 table, verbatim:
 
     | Metric                                              | Tolerance                              |
@@ -429,6 +433,30 @@ def pct(ratio):
 # --- report sections ----------------------------------------------------------
 
 
+def compare_planes(h_ch, b_ch, gate):
+    """Rows 1-3 for one pair of masters, plane by plane (median/MAD, noise, FWHM)."""
+    for i, (hc, bc) in enumerate(zip(h_ch, b_ch)):
+        m_ratio = hc["median"] / bc["median"] if bc["median"] else float("nan")
+        d_ratio = hc["mad"] / bc["mad"] if bc["mad"] else float("nan")
+        n_ratio = hc["noise"] / bc["noise"] if bc["noise"] else float("nan")
+        f_ratio = hc["fwhmPx"] / bc["fwhmPx"] if bc["fwhmPx"] else float("nan")
+        m_ok = abs(pct(m_ratio)) <= MEDIAN_TOL * 100
+        d_ok = abs(pct(d_ratio)) <= MAD_TOL * 100
+        n_ok = abs(pct(n_ratio)) <= NOISE_TOL * 100
+        f_ok = abs(pct(f_ratio)) <= FWHM_TOL * 100
+        gate["median_mad"].append(m_ok and d_ok)
+        gate["noise"].append(n_ok)
+        gate["fwhm"].append(f_ok)
+        print(
+            f"    plane {i}: median ratio={m_ratio:.6f} ({pct(m_ratio):+.4f}%) {verdict(m_ok)}  "
+            f"mad ratio={d_ratio:.6f} ({pct(d_ratio):+.4f}%) {verdict(d_ok)}"
+        )
+        print(
+            f"             noise  ratio={n_ratio:.6f} ({pct(n_ratio):+.4f}%) {verdict(n_ok)}  "
+            f"fwhmPx ratio={f_ratio:.6f} ({pct(f_ratio):+.4f}%) {verdict(f_ok)}"
+        )
+
+
 def report_masters(head_dir, base_dir, gate):
     """Rows 1-3 (median/MAD/noise/FWHM) and the head side of rows 7-8 (drizzle level/coverage).
     Returns {base_key: {"plain": [...channels...], "drizzle": [...] or None}} for HEAD, used by
@@ -462,26 +490,7 @@ def report_masters(head_dir, base_dir, gate):
             gate["noise"].append(False)
             gate["fwhm"].append(False)
         else:
-            for i, (hc, bc) in enumerate(zip(h_ch, b_ch)):
-                m_ratio = hc["median"] / bc["median"] if bc["median"] else float("nan")
-                d_ratio = hc["mad"] / bc["mad"] if bc["mad"] else float("nan")
-                n_ratio = hc["noise"] / bc["noise"] if bc["noise"] else float("nan")
-                f_ratio = hc["fwhmPx"] / bc["fwhmPx"] if bc["fwhmPx"] else float("nan")
-                m_ok = abs(pct(m_ratio)) <= MEDIAN_TOL * 100
-                d_ok = abs(pct(d_ratio)) <= MAD_TOL * 100
-                n_ok = abs(pct(n_ratio)) <= NOISE_TOL * 100
-                f_ok = abs(pct(f_ratio)) <= FWHM_TOL * 100
-                gate["median_mad"].append(m_ok and d_ok)
-                gate["noise"].append(n_ok)
-                gate["fwhm"].append(f_ok)
-                print(
-                    f"    plane {i}: median ratio={m_ratio:.6f} ({pct(m_ratio):+.4f}%) {verdict(m_ok)}  "
-                    f"mad ratio={d_ratio:.6f} ({pct(d_ratio):+.4f}%) {verdict(d_ok)}"
-                )
-                print(
-                    f"             noise  ratio={n_ratio:.6f} ({pct(n_ratio):+.4f}%) {verdict(n_ok)}  "
-                    f"fwhmPx ratio={f_ratio:.6f} ({pct(f_ratio):+.4f}%) {verdict(f_ok)}"
-                )
+            compare_planes(h_ch, b_ch, gate)
         # Drizzle level (row 7, a property of HEAD alone) + coverage (row 8) — independent of
         # the plain-master median/MAD/noise/FWHM block above, always evaluated.
         if key in hd:
@@ -708,8 +717,70 @@ def run_numeric(head_dir, base_dir, set_id):
     return 0 if overall_ok else 1
 
 
+def plane_dims(path):
+    """-> (width, height) of a master: NAXIS1/NAXIS2 of a FITS header, else the array shape."""
+    if path.lower().endswith((".fits", ".fit")):
+        cards, _, _ = fits_split(path)
+        keys = {c[:8].strip(): c[10:].split("/")[0].strip() for c in cards if c[8:10] == "= "}
+        return int(keys["NAXIS1"]), int(keys["NAXIS2"])
+    from imgcmp import read
+    shape = read(path).shape
+    return shape[-1], shape[-2]
+
+
+def run_pairs(pairs):
+    """Plan 6b-3 run A (spec §15.3): the first four rows of the Tier C §8 table on explicit
+    (head, base) master pairs — a project's grid master against the personal master of the
+    same frames on the same reference. Whole-plane statistics: run A's grid is the
+    reference's own footprint, so both planes hold the same sky (the grid master is the
+    mirror image in x, which none of the four rows reads). Exits 0 on PASS, 1 on FAIL."""
+    gate = {"median_mad": [], "noise": [], "fwhm": []}
+    print("=== run A: project masters (head) vs personal masters (base) ===")
+    for head, base in pairs:
+        print(f"  head {head}")
+        print(f"  base {base}")
+        # Review I4: the rows compare two planes of the same pixel grid only.
+        h_dims, b_dims = plane_dims(head), plane_dims(base)
+        if h_dims != b_dims:
+            print(f"    FAIL pixel grids differ: head {h_dims} base {b_dims} — not comparable")
+            for k in gate:
+                gate[k].append(False)
+            continue
+        h_ch, b_ch = measure_master(head), measure_master(base)
+        if len(h_ch) != len(b_ch):
+            print(f"    FAIL channel count differs: head={len(h_ch)} base={len(b_ch)}")
+            for k in gate:
+                gate[k].append(False)
+            continue
+        compare_planes(h_ch, b_ch, gate)
+    print()
+    print("=== summary (Tier C §8, rows run A names) ===")
+    labels = {
+        "Master pixel median / MAD vs tierA-baseline": gate["median_mad"],
+        "Master noise (MRS sigma) vs baseline": gate["noise"],
+        "FWHM (mono, OSC per plane) vs baseline": gate["fwhm"],
+    }
+    ok_all = True
+    for label, tol in TOLERANCE_TABLE:
+        if label not in labels:
+            continue
+        checks = labels[label]
+        ok = bool(checks) and all(checks)
+        ok_all = ok_all and ok
+        print(f"  {label}: [{tol}]  {verdict(ok)} ({sum(checks)}/{len(checks)} sub-checks)")
+    print()
+    print("PAIRS:", "PASS" if ok_all else "FAIL")
+    return 0 if ok_all else 1
+
+
 def main():
     args = sys.argv[1:]
+    if "--pairs" in args:
+        rest = [a for a in args if a != "--pairs"]
+        if not rest or any("=" not in a for a in rest):
+            print("usage: tier1-compare.py --pairs <head_master>=<base_master> [...]", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(run_pairs([tuple(a.split("=", 1)) for a in rest]))
     numeric = "--numeric" in args
     args = [a for a in args if a != "--numeric"]
     set_id = 204
