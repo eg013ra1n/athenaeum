@@ -797,6 +797,12 @@ pub fn normalize_frame(
     warp_ms += t.elapsed().as_millis() as u64;
 
     for p in 0..channels {
+        // The span names the frame and plane for every event of this
+        // iteration: scale.rs's "ln relative scale" debug event carries no
+        // identity of its own (`frame_id` is the catalog id of a frame-set
+        // frame, the `stack_project_frames` handle of a project frame).
+        let _ln_span =
+            tracing::debug_span!("ln_scale", frame_id = frame.frame_id, plane = p).entered();
         if cancel.load(Ordering::Relaxed) {
             return Err(LnError::Other("cancelled".to_string()));
         }
