@@ -28,15 +28,26 @@ if pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1; then
   echo "refusing to start: a cargo/rustc process is alive on this machine" >&2
   exit 1
 fi
-SRV_PID=""; SSE_PID=""
+SRV_PID=""; SSE_PID=""; CLEANED=0
 cleanup() {
+  # Idempotent: the explicit call at the end and the EXIT trap must not both act.
+  [ "$CLEANED" = "1" ] && return 0
+  CLEANED=1
   [ -n "$SSE_PID" ] && kill "$SSE_PID" 2>/dev/null
-  [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
-  # Fallback only: the recorded PIDs above are the primary stop (server.sh execs the server, so
-  # SRV_PID is the server itself).
-  pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
+  if [ -n "$SRV_PID" ]; then
+    # server.sh execs the server, so SRV_PID is the server itself.
+    kill "$SRV_PID" 2>/dev/null
+  else
+    # Fallback only when no PID was ever recorded; never after one was, so a late
+    # cleanup cannot kill the server of the NEXT run.
+    pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
+  fi
+  return 0
 }
-trap cleanup EXIT INT TERM
+# zsh resumes after a trapped signal, so INT/TERM must exit explicitly.
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap cleanup EXIT
 SRV="$REPO/docs/superpowers/research/scripts/acceptance/server.sh"
 export ATHENAEUM_LOG="info,athenaeum_core::stacking=debug,athenaeum_core::integration=debug"
 zsh "$SRV" "$W" "$PORT" > "$W/server-project.out" 2>&1 &

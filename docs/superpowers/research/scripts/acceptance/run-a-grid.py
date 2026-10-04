@@ -23,6 +23,7 @@ import math
 import os
 import sqlite3
 import sys
+import urllib.parse
 
 LIVE = [
     os.path.realpath(os.path.expanduser(p))
@@ -112,7 +113,7 @@ def main():
         sys.exit("refusing: that is a live catalog — work on an acceptance copy")
     try:
         # mode=rw: a typo in the path must never create an empty database.
-        db = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=rw", uri=True)
+        db = sqlite3.connect(f"file:{urllib.parse.quote(os.path.abspath(db_path))}?mode=rw", uri=True)
     except sqlite3.Error as e:
         sys.exit(f"cannot open {db_path} read-write: {e}")
     if mode == "--reference-uuid":

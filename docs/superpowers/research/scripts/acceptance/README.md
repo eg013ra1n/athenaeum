@@ -52,7 +52,9 @@ not rebuilt per cycle (owner request 2026-09-18).
    curve-of-growth correction, isolated and unsaturated stars in both frames),
    reported per instrument with no tolerance. The acceptance build must
    include the `ln_plane` / `ln_seeds_calibration` span commits, or the log
-   carries no frame identity. `grid-report.py --self-check` runs the
+   carries no frame identity. `--ln-truth` may give no ratio for a coarse member on a
+   crowded field (too few isolated stars at its PSF width): that is a
+   refusal, not a failure, and an empty column is reported as is. `grid-report.py --self-check` runs the
    synthetic check of the photometry and the log parser (no real data).
 
 A catalog copy is made with `sqlite3 -readonly <live db> ".backup <copy>"`,

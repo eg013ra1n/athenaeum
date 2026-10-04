@@ -21,9 +21,10 @@ on plane 0 (finite in both / finite in the member), the number D7's 25 %
 rule reads; it reads every registered frame once.
 
 Every master of the run also prints its pixel dims, the crop rectangle when the
-run cropped (`stacking_runs.summary_json` carries no rectangle: it is read from
-the master's CRPIX1/2 against the uncropped grid centre (W+1)/2, (H+1)/2 — FITS
-masters only) and the drizzle master's dims.
+run cropped (`stacking_runs.summary_json` carries no rectangle: it comes from the
+run's "outputs cropped" info event, cross-checked against the FITS master's
+CRPIX1/2 and the uncropped grid centre (W+1)/2, (H+1)/2) and the drizzle
+master's dims.
 
 --ln-truth (plan 6b-3 ruling R1): per group and per member, the local
 normalization scale next to a photometric truth. The LN scale of a frame can
@@ -306,11 +307,18 @@ class Neighbours:
         return int((((self.y[lo:hi] - y) ** 2 + (self.x[lo:hi] - x) ** 2) <= r * r).sum())
 
 
-def is_saturated(img, y, x):
-    """The 3x3 core holds >= 3 pixels within 2 % of its maximum (a flat top)."""
-    core = img[y - 1:y + 2, x - 1:x + 2]
-    m = core.max()
-    return int((core >= m - 0.02 * abs(m)).sum()) >= 3
+def is_saturated(img, y, x, bg, fwhm):
+    """A flat top: the 3x3 core holds >= 3 pixels at or above (1 - 1.4 / FWHM^2) of the peak ABOVE THE
+    SKY (`bg`, this frame's). The sky is subtracted because a pedestal makes every core pixel look
+    equal; the tolerance follows the PSF because a broad unsaturated star really is that flat
+    (a Gaussian's 4 core pixels of a half-pixel-centred star fall short of the peak by about 1.4/FWHM^2
+    per pixel^2 of offset). `fwhm` is this frame's, F0 before it is known."""
+    core = img[y - 1:y + 2, x - 1:x + 2] - bg
+    m = float(core.max())
+    if not m > 0:
+        return False
+    tol = 1.0 - 1.4 / max(float(fwhm), 2.0) ** 2
+    return int((core >= tol * m).sum()) >= 3
 
 
 def half_max_fwhm(win, f0):
@@ -347,6 +355,7 @@ def frame_fwhm(img, cand, zero_is_uncovered, f0=8.0, want=100):
     half = int(math.ceil(4 * f0))
     if len(cand) == 0:
         return float("nan"), 0
+    bg_frame, _ = sky_stats(img, zero_is_uncovered)
     pos = cand[:, :2]
     peaks = cand[:, 2]
     nb = Neighbours(pos)
@@ -358,7 +367,7 @@ def frame_fwhm(img, cand, zero_is_uncovered, f0=8.0, want=100):
         if nb.count(y, x, 30.0) > 1:
             continue
         win = img[y - half:y + half + 1, x - half:x + half + 1]
-        if not covered(win, zero_is_uncovered) or is_saturated(img, y, x):
+        if not covered(win, zero_is_uncovered) or is_saturated(img, y, x, bg_frame, f0):
             continue
         if peaks[i] > 0.5 * float(np.nanmax(peaks)):
             continue
@@ -397,6 +406,7 @@ def photometry(ref, mem, cand_info=None, f_ref=None):
         res["note"] = f"FWHM not measurable (reference {fr[1]} stars, member {'ok' if fm == fm else 'none'})"
         return res
     big_f = max(fr[0], fm)
+    cut_log = []
     mem_peak_max = float(np.nanmax(mpk) - bg_m)
     ref_peak_max = float(cand[:, 2].max())
     for mode in ("normal", "crowded"):
@@ -413,37 +423,48 @@ def photometry(ref, mem, cand_info=None, f_ref=None):
         beyond = (rr > 3 * big_f) & (rr <= r_iso)
         nb = Neighbours(cand[:, :2])
         stars = []
+        cuts = {"edge": 0, "candidate isolation": 0, "brightness": 0, "coverage": 0, "flat top": 0,
+                "pixel isolation": 0}
         for i in range(len(cand)):
             y, x, pk = int(cand[i, 0]), int(cand[i, 1]), cand[i, 2]
-            if y < half or x < half or y >= ref.shape[0] - half or x >= ref.shape[1] - half:
-                continue
-            if y >= mem.shape[0] - half or x >= mem.shape[1] - half:
+            if (y < half or x < half or y >= ref.shape[0] - half or x >= ref.shape[1] - half
+                    or y >= mem.shape[0] - half or x >= mem.shape[1] - half):
+                cuts["edge"] += 1
                 continue
             if nb.count(y, x, r_iso) > 1:
+                cuts["candidate isolation"] += 1
                 continue
             if pk > 0.5 * ref_peak_max or (mpk[i] - bg_m) > 0.5 * mem_peak_max:
+                cuts["brightness"] += 1
                 continue
             wr = ref[y - half:y + half + 1, x - half:x + half + 1]
             wm = mem[y - half:y + half + 1, x - half:x + half + 1]
             if not covered(wr, True) or not covered(wm, False):
+                cuts["coverage"] += 1
                 continue
-            if is_saturated(ref, y, x) or is_saturated(mem, y, x):
+            if is_saturated(ref, y, x, bg_r, fr[0]) or is_saturated(mem, y, x, bg_m, fm):
+                cuts["flat top"] += 1
                 continue
-            if (wr[beyond] > bg_r + max(5 * sig_r, 0.02 * pk)).any():
-                continue
-            if (wm[beyond] > bg_m + max(5 * sig_m, 0.02 * (mpk[i] - bg_m))).any():
+            if ((wr[beyond] > bg_r + max(5 * sig_r, 0.02 * pk)).any()
+                    or (wm[beyond] > bg_m + max(5 * sig_m, 0.02 * (mpk[i] - bg_m))).any()):
+                cuts["pixel isolation"] += 1
                 continue
             stars.append((y, x, wr, wm))
             if len(stars) >= 60:
                 break
+        cut_text = f"{mode}: " + ", ".join(f"{k} {v}" for k, v in cuts.items()) + f"; kept {len(stars)}"
+        cut_log.append(cut_text)
         if len(stars) >= 10:
             break
     res["mode"], res["r_ap"], res["ann"], res["n"] = mode, r_ap, (a_in, a_out), len(stars)
     if len(stars) < 10:
         res["note"] = (f"only {len(stars)} usable stars (>= 10 needed) even in the crowded fallback "
-                       f"[5F, 7F]: no ratio (F = {big_f:.2f} px)")
+                       f"[5F, 7F]: no ratio (F = {big_f:.2f} px; rejected per cut, of {len(cand)} candidates: "
+                       + " | ".join(cut_log) + ")")
         return res
-    radii = {"3F": r_ap, "5F": 5 * big_f, "8F": 8 * big_f}
+    # Normal: apertures at 3F (r_ap), 5F, 8F. Crowded: the annulus starts at 5F, so only r_ap = 5F exists.
+    k_ap = "3F" if mode == "normal" else "5F"
+    radii = ({"3F": r_ap, "5F": 5 * big_f, "8F": 8 * big_f} if mode == "normal" else {"5F": r_ap})
     fl = {"ref": {k: [] for k in radii}, "mem": {k: [] for k in radii}}
     for _, _, wr, wm in stars:
         for name, w in (("ref", wr), ("mem", wm)):
@@ -456,13 +477,14 @@ def photometry(ref, mem, cand_info=None, f_ref=None):
         for k in radii:
             good &= fl[n][k] > 0
     if good.sum() < 10:
-        res["note"] = f"only {int(good.sum())} stars with positive fluxes: no ratio"
+        res["note"] = (f"only {int(good.sum())} stars with positive fluxes: no ratio (rejected per cut: "
+                       + " | ".join(cut_log) + ")")
         res["n"] = int(good.sum())
         return res
     res["n"] = int(good.sum())
     for k in radii:
         res["unc"][k] = float(np.median(fl["ref"][k][good] / fl["mem"][k][good]))
-    per = fl["ref"]["3F"][good] / fl["mem"]["3F"][good]
+    per = fl["ref"][k_ap][good] / fl["mem"][k_ap][good]
     med = float(np.median(per))
     sig = 1.4826 * float(np.median(np.abs(per - med)))
     res["se"] = 1.2533 * sig / math.sqrt(res["n"])
@@ -473,7 +495,9 @@ def photometry(ref, mem, cand_info=None, f_ref=None):
         res["note"] = f"curve of growth c_ref {c_ref:.4f} c_mem {c_mem:.4f}"
     else:
         res["ratio"] = med
-        res["note"] = "crowded fallback: isolation 9F, annulus [5F, 7F], r_ap = 5F, no curve-of-growth correction"
+        res["note"] = ("crowded fallback: isolation 9F, annulus [5F, 7F], r_ap = 5F, no curve-of-growth correction; "
+                       "systematic about +0.2 % at beta 3, +0.6 to +0.8 % at beta 2.5 (uncorrected, the aperture "
+                       "loses the wings); rejected per cut: " + " | ".join(cut_log))
     return res
 
 
@@ -491,7 +515,7 @@ def finite_pos(x):
 
 def ln_truth_group(db, pid, key, summary, log):
     """One group: every member of the run's own summary, the cause when it has no LN scale, and for
-    the members with one the scale next to the photometric ratio. Returns (instrument, cause, diff)."""
+    the members with one the scale next to the photometric ratio. Returns tagged rows: ("member", instrument, cause) and ("plane", instrument, outcome, diff, mode)."""
     group = next((g for g in summary.get("groups", []) if g.get("key") == key), None)
     if group is None:
         print("  ln truth: the run summary has no such group")
@@ -542,27 +566,26 @@ def ln_truth_group(db, pid, key, summary, log):
         meta = (json.loads(r[0]).get("meta") or {}) if r else {}
         instr = meta.get("instrume") or meta.get("INSTRUME") or "unknown"
         if not fr.get("included", False):
-            cause = "excluded"
             print(f"    handle {handle} [{instr}]: excluded ({fr.get('exclusionReason')})")
-            rows.append((instr, cause, float("nan")))
+            rows.append(("member", instr, "excluded"))
+            continue
+        if fr.get("lnScale") is None and handle in globals_:
+            # Checked before the cached branch: a cached member on global normalization is a global one.
+            ov = globals_[handle]
+            print(f"    handle {handle} [{instr}]: global normalization{' (cached)' if fr.get('cachedLn') else ''}, "
+                  f"overlap {('%.2f' % ov) if isinstance(ov, (int, float)) else '?'} < 0.25")
+            rows.append(("member", instr, "global"))
             continue
         if fr.get("cachedLn"):
-            cause = "cached"
             print(f"    handle {handle} [{instr}]: LN cached from an earlier run (no event in this run); "
                   f"summary lnScale {fr.get('lnScale')}")
-            rows.append((instr, cause, float("nan")))
+            rows.append(("member", instr, "cached"))
             continue
         if fr.get("lnScale") is None:
-            if handle in globals_:
-                cause = "global"
-                ov = globals_[handle]
-                print(f"    handle {handle} [{instr}]: global normalization, overlap "
-                      f"{('%.2f' % ov) if isinstance(ov, (int, float)) else '?'} < 0.25")
-            else:
-                cause = "failed"
-                print(f"    handle {handle} [{instr}]: LN FAILED (included, not cached, no lnScale, no global marker)")
-            rows.append((instr, cause, float("nan")))
+            print(f"    handle {handle} [{instr}]: LN FAILED (included, not cached, no lnScale, no global marker)")
+            rows.append(("member", instr, "failed"))
             continue
+        rows.append(("member", instr, "scaled"))
         path = registered.get(handle)
         applied = []
         for p in range(len(ref_planes)):
@@ -589,7 +612,7 @@ def ln_truth_group(db, pid, key, summary, log):
             mem_planes = planes_of(path)
         except Exception as e:  # noqa: BLE001 - one member's failure is a line of the report
             print(f"    handle {handle} [{instr}]: registered artifact unreadable: {e}")
-            rows.append((instr, "unreadable", float("nan")))
+            rows.append(("plane", instr, "unreadable", float("nan"), ""))
             continue
         for p, mp in enumerate(mem_planes[:len(ref_planes)]):
             ph = photometry(ref_planes[p], mp, cand[p], fref[p])
@@ -597,12 +620,12 @@ def ln_truth_group(db, pid, key, summary, log):
             head = f"    handle {handle} plane {p} [{instr}]: "
             if a is None:
                 print(head + "no ln_plane event in the run's log window")
-                rows.append((instr, "noevent", float("nan")))
+                rows.append(("plane", instr, "no event", float("nan"), ""))
                 continue
             raw, k, source, app = a
             if ph["ratio"] != ph["ratio"]:
                 print(head + f"ln_scale {raw:.5f} x k {k:.5f} = {app:.5f} ({source}); photometry: {ph['note']}")
-                rows.append((instr, "nophot", float("nan")))
+                rows.append(("plane", instr, "no photometry", float("nan"), ph["mode"]))
                 continue
             diff = app / ph["ratio"] - 1.0
             unc = " ".join(f"{k_}:{v:.4f}" for k_, v in ph["unc"].items())
@@ -610,25 +633,31 @@ def ln_truth_group(db, pid, key, summary, log):
                   f"+- {ph['se']:.5f} (n {ph['n']}, {ph['mode']}, FWHM ref {ph['fwhm_ref']:.2f} mem {ph['fwhm_mem']:.2f} px, "
                   f"r_ap {ph['r_ap']:.1f} annulus {ph['ann'][0]:.1f}-{ph['ann'][1]:.1f}; uncorrected {unc})  "
                   f"rel diff {diff * 100:+.3f} %")
-            rows.append((instr, "ok", diff))
+            rows.append(("plane", instr, "ok", diff, ph["mode"]))
     return rows
 
 
 def ln_truth_summary(rows):
     by = {}
-    for instr, cause, d in rows:
-        e = by.setdefault(instr, {"diffs": [], "causes": {}})
-        e["causes"][cause] = e["causes"].get(cause, 0) + 1
-        if d == d:
-            e["diffs"].append(abs(d))
+    for row in rows:
+        e = by.setdefault(row[1], {"member": {}, "plane": {}, "normal": [], "crowded": []})
+        if row[0] == "member":
+            e["member"][row[2]] = e["member"].get(row[2], 0) + 1
+        else:
+            e["plane"][row[2]] = e["plane"].get(row[2], 0) + 1
+            if row[3] == row[3]:
+                e["crowded" if row[4] == "crowded" else "normal"].append(abs(row[3]))
     print("\n== ln truth: |ln_scale / photometric - 1| per instrument (no tolerance, no verdict)")
     for instr, e in sorted(by.items()):
-        causes = ", ".join(f"{c} {n}" for c, n in sorted(e["causes"].items()))
-        if e["diffs"]:
-            print(f"  {instr}: n {len(e['diffs'])}  median {np.median(e['diffs']) * 100:.3f} %  "
-                  f"max {max(e['diffs']) * 100:.3f} %   [members/planes by cause: {causes}]")
-        else:
-            print(f"  {instr}: no member with both a scale and a photometric ratio   [{causes}]")
+        fmt = lambda d: ", ".join(f"{c} {n}" for c, n in sorted(d.items())) or "none"  # noqa: E731
+        print(f"  {instr}:")
+        print(f"    members by cause (member level): {fmt(e['member'])}")
+        print(f"    planes by outcome (plane level): {fmt(e['plane'])}")
+        for label, v in (("normal rows", e["normal"]), ("crowded-fallback rows (carry a small uncorrected systematic)", e["crowded"])):
+            if v:
+                print(f"    {label}: n {len(v)}  median {np.median(v) * 100:.3f} %  max {max(v) * 100:.3f} %")
+        if not e["normal"] and not e["crowded"]:
+            print("    no plane with both a scale and a photometric ratio (a refusal, not a failure)")
     if not by:
         print("  no member in the run summary")
 
@@ -797,6 +826,28 @@ def self_check():
               f"uncorrected {unc}; truth 1.25000")
         assert ph["n"] >= 10 and ph["ratio"] == ph["ratio"], ph["note"]
         assert abs(ph["ratio"] / 1.25 - 1) < 0.003, (kr, fr, km, fm, ph["ratio"])
+    # Saturation test: a broad, unsaturated star on a bright sky pedestal is NOT a flat top; a clipped one is.
+    sat_rng = np.random.default_rng(3)
+    pedestal, peak = 8000.0, 3000.0
+    sigma_px = 6.5 / 2.3548
+    broad = psf_image(201, [(100.3, 100.2)], [peak * 2 * math.pi * sigma_px ** 2], "gauss", 6.5, sat_rng,
+                      bg=pedestal, noise=2.0)
+    by, bx = np.unravel_index(int(np.argmax(broad[90:111, 90:111])), (21, 21))
+    by, bx = by + 90, bx + 90
+    bg_est, _ = sky_stats(broad)
+    flagged = is_saturated(broad, by, bx, bg_est, 6.5)
+    print(f"broad star (FWHM 6.5 px, peak {peak:.0f} on sky {pedestal:.0f}): flagged = {flagged}")
+    assert not flagged
+    clipped = np.minimum(broad, pedestal + 0.6 * peak)
+    flagged_clip = is_saturated(clipped, by, bx, bg_est, 6.5)
+    print(f"clipped star (flat top at 60 % of the peak): flagged = {flagged_clip}")
+    assert flagged_clip
+    # A refusal prints its rejection counts per cut: too few stars on a crowded field.
+    dense = [(margin + i * 35.0, margin + j * 35.0) for i in range(8) for j in range(8)]
+    d_ref = psf_image(size, dense, rng.uniform(5e4, 3e5, len(dense)), "gauss", 4.0, rng)
+    ph = photometry(d_ref, d_ref.copy())
+    print(f"crowded field refusal: ratio {ph['ratio']}; note: {ph['note'][:230]}")
+    assert ph["ratio"] != ph["ratio"] and "candidate isolation" in ph["note"], ph["note"]
     # OSC: three planes with three different scales through a (3, h, w) file.
     scales = (1.25, 1.6, 2.0)
     refs = [psf_image(size, centres, fluxes, "gauss", 4.0, rng) for _ in scales]
