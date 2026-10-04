@@ -151,9 +151,11 @@ each on the **intersection** of the two accepted sample sets: the tiles both fin
   intersection) and one Cholesky factorization with two right-hand sides. That is one extra
   ≈ 80-coefficient solve per member.
 - There is no rejection round in this step.
-- The floor of step 6 applies to the intersection. When no knot cell is supported on it, the frame
-  is refused ("no background sample in common with the LN reference"), with the target-side
-  consequences of step 6.
+- The floor of step 6 applies to the intersection. When no knot cell is supported on it, the pair
+  keeps its two own-threshold surfaces (steps 4–6, both already valid) and the run records one
+  `warn!` per such frame ("no background sample in common with the LN reference; own-threshold
+  backgrounds kept"). The frame is never refused for this: the refit is a refinement, and both
+  inputs to `B` are sound without it (controller ruling on the spec writer's proposal).
 - The reference's own-threshold fit is built once per group (once per member on a project grid,
   §1.3); the refit is built per member.
 
