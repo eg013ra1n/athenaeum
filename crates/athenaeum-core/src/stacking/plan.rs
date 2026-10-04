@@ -5333,6 +5333,32 @@ mod tests {
         );
     }
 
+    /// Plan 6b-3 D10, review M6: a crop config's estimate is larger than the
+    /// K = 0 one — `build_plan` sets `EstimateInputs.crop_scratch`.
+    #[test]
+    fn a_crop_config_enlarges_the_estimate() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        for (i, t) in ["2025-01-01T00:00:00", "2025-01-01T00:05:00"].iter().enumerate() {
+            test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
+        }
+        let settings = SettingsManager::new();
+        let estimate = || {
+            build_plan(
+                &f.conn,
+                &settings,
+                &PathPolicy::AllowAll,
+                &StackSubject::FrameSet(f.set_id),
+                None,
+            )
+            .unwrap()
+            .estimate_bytes
+        };
+        let plain = estimate();
+        set_set_config(&f.conn, f.set_id, r#"{"output":{"cropToCoverage":3}}"#, &[]).unwrap();
+        let crop = estimate();
+        assert!(crop > plain, "{crop} vs {plain}");
+    }
+
     /// M2 fix round 1, item 1(a): `build_plan` no longer refuses a plan with
     /// `normalization.local.enabled` (or `rejection == "local"`, checked
     /// below too) as `"unsupported"` — the M1-era Gate 6 predates

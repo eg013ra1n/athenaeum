@@ -711,6 +711,11 @@ pub struct EstimateInputs<'a> {
 /// group's own frame count (`g.frames.len()`), the same approximation the
 /// calibrated/master terms above already make — the real min-weight drop
 /// only happens inside a run, not at plan time.
+///
+/// Plan 6b-3 D10 (review M6): with `i.crop_scratch` the master family and the
+/// drizzle family (the drizzled master and its weight map) count TWICE — a
+/// crop run holds the scratch FITS and the final file for a moment. The
+/// coverage maps (one plane each) stay uncounted.
 pub fn estimate_bytes(i: &EstimateInputs<'_>) -> u64 {
     estimate_bytes_with(i, None, None)
 }

@@ -960,17 +960,20 @@ fn crop_master_family(
     made: &mut Vec<PathBuf>,
 ) -> anyhow::Result<WrittenMaster> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let scratch_stem = scratch
+    // The scratch's FULL file name: a stem would lose everything after a dot
+    // inside it (`..._0.39s_3x`) once `with_extension` swaps the extension.
+    let scratch_name = scratch
         .master
-        .file_stem()
+        .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("master");
+        .unwrap_or("master.fits");
     let master = resolve_collision(
-        &dir.join(scratch_stem)
+        &dir.join(scratch_name)
             .with_extension(output_extension(format)),
     );
     crop_file(&scratch.master, &master, rect, cards, format)?;
     made.push(master.clone());
+    log_cropped("cropped master", &master);
     let stem = master
         .file_stem()
         .and_then(|s| s.to_str())
@@ -997,6 +1000,7 @@ fn crop_master_family(
         let path = resolve_collision(&dir.join(format!("{stem}_{suffix}.fits")));
         crop_file(src, &path, rect, map_cards, OutputFormat::Fits)?;
         made.push(path.clone());
+        log_cropped("cropped master map", &path);
         *slot = Some(path);
     }
     let [rejection_low, rejection_high, coverage] = written;
@@ -1058,6 +1062,7 @@ fn crop_drizzle_family(
     let drizzle = resolve_collision(&dir.join(&drizzle_name).with_extension(ext));
     crop_file(&scratch.drizzle, &drizzle, rect, cards, format)?;
     made.push(drizzle.clone());
+    log_cropped("cropped drizzled master", &drizzle);
     let stem = drizzle
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1068,6 +1073,7 @@ fn crop_drizzle_family(
             let path = resolve_collision(&dir.join(format!("{stem}_weight.{ext}")));
             crop_file(src, &path, rect, &weight_map_cards(cards)?, format)?;
             made.push(path.clone());
+            log_cropped("cropped drizzle weight map", &path);
             Some(path)
         }
         None => None,
@@ -1079,10 +1085,11 @@ fn crop_drizzle_family(
                 src,
                 &path,
                 rect,
-                &coverage_map_cards(cards)?,
+                &drizzle_coverage_cards(cards)?,
                 OutputFormat::Fits,
             )?;
             made.push(path.clone());
+            log_cropped("cropped drizzle coverage map", &path);
             Some(path)
         }
         None => None,
@@ -1092,6 +1099,17 @@ fn crop_drizzle_family(
         weight_map,
         coverage,
     })
+}
+
+/// One `info!` per final file a crop writer lands, mirroring the K = 0
+/// writers' lines; a size that cannot be read is logged, never skipped.
+fn log_cropped(message: &'static str, path: &Path) {
+    match std::fs::metadata(path) {
+        Ok(m) => info!(path = %path.display(), bytes = m.len(), "{}", message),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), error = %error, "sizing a cropped output failed")
+        }
+    }
 }
 
 /// Removes the files a failed crop wrote, logging each one it cannot.
@@ -2340,6 +2358,15 @@ mod tests {
         let mut cards = HeaderBuilder::new(FrameKind::MasterLight).build().unwrap();
         cards.push(Card::new("ATH_STKI", CardValue::Str("run-7".into())).unwrap());
         cards.extend(wcs_cards(&record(false)).unwrap());
+        // The shape `stamp_grid_cards` leaves on a grid master.
+        for (k, v) in [
+            ("ROWORDER", "BOTTOM-UP"),
+            (ATH_RGEO, "grid"),
+            (ATH_GRID, "0123456789abcdef"),
+            (ATH_SPRJ, "project-9"),
+        ] {
+            cards.push(Card::new(k, CardValue::Str(v.into())).unwrap());
+        }
         let output = GroupOutput {
             width: w,
             height: h,
@@ -2354,22 +2381,18 @@ mod tests {
             stats: dummy_stats(),
             measure_rect: None,
         };
+        const DOTTED: &str = "LDN_1272_L_mono_0.39s_3x.fits";
         let (direct, scratch, finals, cut) = (
             tempfile::tempdir().unwrap(),
             tempfile::tempdir().unwrap(),
             tempfile::tempdir().unwrap(),
             tempfile::tempdir().unwrap(),
         );
-        let k0 = write_master_light(direct.path(), "master", &output, &cards, OutputFormat::Xisf)
-            .unwrap();
-        let staged = write_master_light(
-            scratch.path(),
-            "master",
-            &output,
-            &cards,
-            OutputFormat::Fits,
-        )
-        .unwrap();
+        let k0 =
+            write_master_light(direct.path(), DOTTED, &output, &cards, OutputFormat::Xisf).unwrap();
+        let staged =
+            write_master_light(scratch.path(), DOTTED, &output, &cards, OutputFormat::Fits)
+                .unwrap();
         let full = write_cropped_master(
             finals.path(),
             &staged,
@@ -2380,6 +2403,7 @@ mod tests {
         .unwrap();
         let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(name(&full.master), name(&k0.master));
+        assert_eq!(name(&full.master), "LDN_1272_L_mono_0.39s_3x.xisf");
         let (ma, pa) = astroimage::ImageConverter::read_raw(&k0.master).unwrap();
         let (mb, pb) = astroimage::ImageConverter::read_raw(&full.master).unwrap();
         assert_eq!(
@@ -2448,6 +2472,23 @@ mod tests {
         let cov = crate::integration::plane_reader::PlaneReader::open(c.coverage.as_ref().unwrap())
             .unwrap();
         assert_eq!((cov.width(), cov.height(), cov.channels()), (4, 3, 1));
+        for map in [&c.rejection_low, &c.rejection_high] {
+            let r =
+                crate::integration::plane_reader::PlaneReader::open(map.as_ref().unwrap()).unwrap();
+            assert_eq!((r.width(), r.height(), r.channels()), (4, 3, 3));
+        }
+        let master_hdr = crate::fits_parser::FitsHeader::from_path(&c.master).unwrap();
+        let master_before = crate::fits_parser::FitsHeader::from_path(&staged.master).unwrap();
+        assert!(
+            (master_hdr.get_f64("CRPIX1").unwrap()
+                - (master_before.get_f64("CRPIX1").unwrap() - 2.0))
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(
+            master_hdr.get_str("ATH_GRID").as_deref(),
+            Some("0123456789abcdef")
+        );
         let moved =
             crate::fits_parser::FitsHeader::from_path(c.coverage.as_ref().unwrap()).unwrap();
         let before =
@@ -2460,5 +2501,112 @@ mod tests {
             (moved.get_f64("CRPIX2").unwrap() - (before.get_f64("CRPIX2").unwrap() - 1.0)).abs()
                 < 1e-9
         );
+    }
+
+    /// Plan 6b-3 D10, review I7 (drizzle half): a full-rectangle finalization
+    /// of a FITS scratch drizzle family writes what `write_drizzled_master`
+    /// writes — the same names (dotted stem kept), pixels, a byte-identical
+    /// weight map and drizzle coverage (`ATH_DRZ` kept) — and a real crop
+    /// takes every member to the rectangle.
+    #[test]
+    fn a_full_rectangle_crop_writes_what_the_drizzle_writer_writes() {
+        let (w, h, ch) = (8usize, 6usize, 3usize);
+        let plane = w * h;
+        let cards = vec![
+            Card::new("IMAGETYP", CardValue::Str("Master Light".into())).unwrap(),
+            Card::new(ATH_DRZ, CardValue::Integer(2)).unwrap(),
+            Card::new("ATH_STKI", CardValue::Str("run-1".into())).unwrap(),
+            Card::new(ATH_GRID, CardValue::Str("0123456789abcdef".into())).unwrap(),
+            Card::new(ATH_SPRJ, CardValue::Str("project-9".into())).unwrap(),
+        ];
+        let output = DrizzleOutput {
+            width: w,
+            height: h,
+            channels: ch,
+            data: (0..plane * ch).map(|i| i as f32 / 100.0).collect(),
+            weight: Some(vec![0.75f32; plane * ch]),
+            coverage: Some((0..plane * ch).map(|i| (i % 5) as f32).collect()),
+            stats: dummy_drizzle_stats(2, ch, w, h),
+        };
+        let stem = "LDN_1272_L_mono_0.39s_3x";
+        let (direct, scratch, finals, cut) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let k0 = write_drizzled_master(direct.path(), stem, &output, &cards, OutputFormat::Fits)
+            .unwrap();
+        let staged =
+            write_drizzled_master(scratch.path(), stem, &output, &cards, OutputFormat::Fits)
+                .unwrap();
+        let full = write_cropped_drizzle(
+            finals.path(),
+            stem,
+            2,
+            &staged,
+            CropRect::full(w, h),
+            &cards,
+            OutputFormat::Fits,
+        )
+        .unwrap();
+        let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            name(&full.drizzle),
+            "LDN_1272_L_mono_0.39s_3x_drizzle2x.fits"
+        );
+        assert_eq!(name(&full.drizzle), name(&k0.drizzle));
+        for (a, b) in [
+            (&k0.drizzle, &full.drizzle),
+            (
+                k0.weight_map.as_ref().unwrap(),
+                full.weight_map.as_ref().unwrap(),
+            ),
+            (
+                k0.coverage.as_ref().unwrap(),
+                full.coverage.as_ref().unwrap(),
+            ),
+        ] {
+            assert_eq!(name(a), name(b));
+            assert_eq!(
+                std::fs::read(a).unwrap(),
+                std::fs::read(b).unwrap(),
+                "{} differs",
+                name(a)
+            );
+        }
+        let drz =
+            crate::fits_parser::FitsHeader::from_path(full.coverage.as_ref().unwrap()).unwrap();
+        assert_eq!(drz.get_i32(ATH_DRZ), Some(2));
+
+        let rect = CropRect {
+            x0: 2,
+            y0: 2,
+            width: 4,
+            height: 2,
+        };
+        let c = write_cropped_drizzle(
+            cut.path(),
+            stem,
+            2,
+            &staged,
+            rect,
+            &cards,
+            OutputFormat::Fits,
+        )
+        .unwrap();
+        for p in [
+            &c.drizzle,
+            c.weight_map.as_ref().unwrap(),
+            c.coverage.as_ref().unwrap(),
+        ] {
+            let r = crate::integration::plane_reader::PlaneReader::open(p).unwrap();
+            assert_eq!(
+                (r.width(), r.height(), r.channels()),
+                (4, 2, 3),
+                "{}",
+                name(p)
+            );
+        }
     }
 }
