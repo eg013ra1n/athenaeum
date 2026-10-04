@@ -483,6 +483,12 @@ pub struct GroupOutput {
     /// output the master is (the second, when large-scale rejection ran)
     /// supplies it; both passes see the same geometry.
     pub coverage: Option<Vec<f32>>,
+    /// The rectangle the master's statistics were measured on, `Some` only
+    /// when [`GroupInput::stats_on_covered`] was set (a grid master): the
+    /// largest rectangle every pixel of which a frame covers, already past
+    /// [`MIN_STATS_RECT_PX`]. A grid drizzle measures its own statistics on
+    /// this rectangle scaled by the drizzle factor (plan 6b-3 ruling (b)).
+    pub measure_rect: Option<crate::stacking::crop::CropRect>,
 }
 
 pub struct GroupProgress<'a> {
@@ -1496,6 +1502,7 @@ pub fn integrate_group(
         second_pass_rej_ok,
         // The count taken only for the statistics is never a coverage map.
         coverage: if input.coverage_map { coverage } else { None },
+        measure_rect,
         stats: GroupStats {
             frames: frames.len(),
             included: included_count,

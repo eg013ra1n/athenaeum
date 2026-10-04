@@ -7537,6 +7537,31 @@ fn summary_frame_for(entry: &MeasuredFrame, rejected_fraction: Option<f64>) -> S
     }
 }
 
+/// Test hook (plan 6b-3 fix round 1): hand a grid drizzle no covered
+/// rectangle, to reach its defensive arm — otherwise unreachable once the
+/// master passed its own floor. Only project runs read the rectangle, and
+/// those tests hold the grid-counters lock.
+#[cfg(test)]
+static FORCE_NO_DRIZZLE_STATS_RECT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn drizzle_stats_rect(
+    rect: Option<crate::stacking::crop::CropRect>,
+) -> Option<crate::stacking::crop::CropRect> {
+    if FORCE_NO_DRIZZLE_STATS_RECT.load(Ordering::SeqCst) {
+        None
+    } else {
+        rect
+    }
+}
+
+#[cfg(not(test))]
+fn drizzle_stats_rect(
+    rect: Option<crate::stacking::crop::CropRect>,
+) -> Option<crate::stacking::crop::CropRect> {
+    rect
+}
+
 /// Push one [`SummaryGroup`] for `group` onto `rc.summary.groups` — called
 /// exactly once per plan group, whatever its outcome (skipped/failed/
 /// written), so the run's provenance document always accounts for every
@@ -9529,7 +9554,11 @@ fn process_group_output(
                         use_local_normalization: drizzle_cfg.use_local_normalization,
                         write_weight_map: drizzle_cfg.write_weight_map,
                         write_coverage: rc.config.output.coverage_map,
+                        // Plan 6b-3 ruling (b): a grid drizzle's statistics ride
+                        // the master's own covered rectangle; `None` there is
+                        // the defensive arm (the drizzle fails, the master stays).
                         stats_on_covered: rc.grid.is_some(),
+                        stats_rect: drizzle_stats_rect(output.measure_rect),
                         measure: measure_opts,
                         ram_total_bytes: None,
                         // Tier C item C2: the run always drizzles through
@@ -20143,8 +20172,14 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
         let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
-        let (fixture, light_ids, _working, _output) = seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
-        test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
+        let (fixture, light_ids, _working, _output) =
+            seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+        test_fixtures::add_master_dark_and_flat(
+            &fixture,
+            &light_ids,
+            STAR_FIELD_WIDTH,
+            STAR_FIELD_HEIGHT,
+        );
         let run_with = |coverage_map: bool| -> i64 {
             let mut cfg = StackingConfig::default();
             cfg.drizzle.enabled = true;
@@ -20164,20 +20199,166 @@ mod tests {
             started.run_id
         };
         let (off, on) = (run_with(false), run_with(true));
-        let lights = |run: i64| crate::db::stacking::list_master_lights(&fixture.conn, run).unwrap();
-        let drizzled = |run: i64| lights(run).into_iter().find(|m| m.kind == "drizzle").unwrap();
+        let lights =
+            |run: i64| crate::db::stacking::list_master_lights(&fixture.conn, run).unwrap();
+        let drizzled = |run: i64| {
+            lights(run)
+                .into_iter()
+                .find(|m| m.kind == "drizzle")
+                .unwrap()
+        };
+        let plane = |path: &str| {
+            PlaneReader::open(Path::new(path))
+                .unwrap()
+                .read_plane(0)
+                .unwrap()
+        };
         let (a, b) = (
-            PlaneReader::open(Path::new(&drizzled(off).path)).unwrap().read_plane(0).unwrap(),
-            PlaneReader::open(Path::new(&drizzled(on).path)).unwrap().read_plane(0).unwrap(),
+            plane(&drizzled(off).path),
+            plane(&drizzled(on).path),
         );
         assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
         assert!(lights(off).iter().all(|m| m.kind != "drizzle_coverage"));
-        let row = lights(on).into_iter().find(|m| m.kind == "drizzle_coverage").expect("a drizzle coverage row");
+        let row = lights(on)
+            .into_iter()
+            .find(|m| m.kind == "drizzle_coverage")
+            .expect("a drizzle coverage row");
         let d = drizzled(on);
-        assert_eq!((row.width, row.height, row.channels), (d.width, d.height, d.channels));
+        assert_eq!(
+            (row.width, row.height, row.channels),
+            (d.width, d.height, d.channels)
+        );
         assert!(row.path.ends_with("_coverage.fits"), "{}", row.path);
-        let cov = PlaneReader::open(Path::new(&row.path)).unwrap().read_plane(0).unwrap();
-        assert!(cov.iter().any(|&c| c == 4.0), "the interior is under every frame");
+        let cov = plane(&row.path);
+        assert!(
+            cov.iter().any(|&c| c == 4.0),
+            "the interior is under every frame"
+        );
+        // The two adjacent summary paths cannot be swapped unseen.
+        let run_row = crate::db::stacking::get_run(&fixture.conn, on)
+            .unwrap()
+            .unwrap();
+        let summary: RunSummary =
+            serde_json::from_str(run_row.summary_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            summary.groups[0].drizzle_coverage_path.as_deref(),
+            Some(row.path.as_str())
+        );
+        let master_cov = lights(on)
+            .into_iter()
+            .find(|m| m.kind == "coverage")
+            .expect("the master coverage row");
+        assert_eq!(
+            summary.groups[0].coverage_path.as_deref(),
+            Some(master_cov.path.as_str())
+        );
+        let header = crate::fits_parser::FitsHeader::from_path(Path::new(&row.path)).unwrap();
+        assert_eq!(
+            header.get_i32("ATH_DRZ"),
+            Some(2),
+            "told apart from a master coverage"
+        );
+    }
+
+    /// Plan 6b-3 ruling (b), fix round 1: a grid drizzle measures its
+    /// statistics on the master's covered rectangle times the drizzle factor
+    /// — `summary.groups[0].drizzle` is bit-equal to `measure_plane` on that
+    /// crop of the written drizzled master and differs from the whole
+    /// plane's. The defensive arm (no rectangle handed over) fails the
+    /// drizzle visibly and keeps the master: one warning, no drizzle rows.
+    #[test]
+    fn a_grid_drizzles_statistics_ride_the_masters_covered_rectangle() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        for defensive in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let db_path = tmp.path().join("catalog.db");
+            let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+            let conn = project_conn(&db_path);
+            let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+            let wide = crate::collab::grid::CanonicalGrid {
+                width_px: 768,
+                height_px: 576,
+                ..grid
+            };
+            let mut cfg = sky_config(&conn);
+            cfg.output.coverage_map = true;
+            drizzle_2x(&mut cfg);
+            crate::db::stacking::set_project_config(
+                &conn,
+                "p1",
+                &serde_json::to_string(&cfg).unwrap(),
+                &[],
+                None,
+            )
+            .unwrap();
+            let mut rc = project_rc(
+                &ctx,
+                &conn,
+                "p1",
+                cfg.clone(),
+                &tmp.path().join("work"),
+                &tmp.path().join("out"),
+            );
+            rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(wide)));
+            FORCE_NO_DRIZZLE_STATS_RECT.store(defensive, Ordering::SeqCst);
+            let ran = run_pipeline(&mut rc);
+            FORCE_NO_DRIZZLE_STATS_RECT.store(false, Ordering::SeqCst);
+            ran.unwrap();
+
+            let group = &rc.summary.groups[0];
+            assert!(group.master_path.is_some(), "the master is kept");
+            if defensive {
+                assert!(group.drizzle_path.is_none() && group.drizzle.is_none());
+                let rows = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
+                assert!(
+                    rows.iter()
+                        .all(|m| m.kind != "drizzle" && m.kind != "drizzle_coverage"),
+                    "no drizzle rows"
+                );
+                let warned = rc
+                    .warnings
+                    .iter()
+                    .filter(|w| w.contains("drizzle failed"))
+                    .count();
+                assert_eq!(warned, 1, "{:?}", rc.warnings);
+                continue;
+            }
+            let dstats = group.drizzle.as_ref().expect("the drizzle's stats");
+            let master =
+                PlaneReader::open(Path::new(group.master_path.as_deref().unwrap())).unwrap();
+            let (w, h) = (master.width(), master.height());
+            let count = PlaneReader::open(Path::new(group.coverage_path.as_deref().unwrap()))
+                .unwrap()
+                .read_plane(0)
+                .unwrap();
+            let rect = crate::stacking::crop::largest_covered_rect(&count, w, h, 1)
+                .expect("a rect")
+                .scaled(2);
+            let drz =
+                PlaneReader::open(Path::new(group.drizzle_path.as_deref().unwrap())).unwrap();
+            let (dw, dh) = (drz.width(), drz.height());
+            assert_eq!((dw, dh), (w * 2, h * 2));
+            let plane = drz.read_plane(0).unwrap();
+            let opts = cfg
+                .measurement
+                .measure_options(cfg.normalization.scale_estimator);
+            let sub = crate::stacking::crop::crop_plane(&plane, dw, rect);
+            let on_rect = crate::stacking::measure::measure_plane(
+                &sub,
+                rect.width,
+                rect.height,
+                &opts,
+                None,
+            );
+            assert_eq!(dstats.noise[0].to_bits(), on_rect.noise.to_bits());
+            assert_eq!(dstats.fwhm_px[0].to_bits(), on_rect.fwhm_px.to_bits());
+            let whole = crate::stacking::measure::measure_plane(&plane, dw, dh, &opts, None);
+            assert!(
+                whole.noise.to_bits() != on_rect.noise.to_bits()
+                    || whole.fwhm_px.to_bits() != on_rect.fwhm_px.to_bits(),
+                "the fixture tells the crop from the whole plane"
+            );
+        }
     }
 
     /// Plan 6b-3 D4 refinement (review I1): a grid master's statistics are

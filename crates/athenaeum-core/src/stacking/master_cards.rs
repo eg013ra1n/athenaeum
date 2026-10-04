@@ -671,6 +671,23 @@ pub fn weight_map_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsWriteEr
     Ok(cards)
 }
 
+/// Header cards for drizzle's own coverage map (plan 6b-3 D9, spec §5.8):
+/// [`coverage_map_cards`] of the drizzle's cards, plus `ATH_DRZ` (so the map
+/// can be told apart from a master's coverage map) and a `BUNIT` comment
+/// that says what is counted: drop contributions that survived rejection,
+/// per output pixel, not frames.
+pub fn drizzle_coverage_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsWriteError> {
+    let mut cards = coverage_map_cards(drizzle_cards)?;
+    for c in cards.iter_mut().filter(|c| c.keyword == "BUNIT") {
+        *c = Card::new("BUNIT", CardValue::Str("frames".into()))?
+            .with_comment("frames whose drops reached the pixel");
+    }
+    if let Some(c) = drizzle_cards.iter().find(|c| c.keyword == ATH_DRZ) {
+        cards.push(c.clone());
+    }
+    Ok(cards)
+}
+
 pub struct WrittenDrizzle {
     pub drizzle: PathBuf,
     pub weight_map: Option<PathBuf>,
@@ -688,11 +705,12 @@ pub struct WrittenDrizzle {
 /// same two-step pattern [`write_master_light`] uses for its rejection
 /// maps.
 ///
-/// Not atomic as a pair (fix round 1, review M4 — the same property
-/// [`write_master_light`] documents for its own master/map pair): the
-/// drizzle output lands before the weight map, so a failed weight-map write
-/// leaves the drizzle output on disk with no weight map (re-running never
-/// overwrites it — `resolve_collision` suffixes the retry). Two runs
+/// Not atomic as a set (fix round 1, review M4 — the same property
+/// [`write_master_light`] documents for its own master/map set): the
+/// drizzle output lands first, then the weight map, then the coverage map
+/// (plan 6b-3 D9), so a failed later write leaves the earlier files on disk
+/// without it (re-running never overwrites them — `resolve_collision`
+/// suffixes the retry). Two runs
 /// writing into one folder concurrently can resolve the same free name
 /// (`resolve_collision` is check-then-write); the orchestrator serializes
 /// group writes.
@@ -703,10 +721,10 @@ pub struct WrittenDrizzle {
 /// `ATH_DRZ` for another, which would otherwise ship a drizzled master
 /// whose file name and header silently disagree.
 ///
-/// M4d Task 2: `format` picks the container for BOTH outputs — a drizzled
-/// master and its weight map always share the master's own format (ruling
-/// R-M4d-3), so a run never leaves one of the pair behind in the other
-/// container.
+/// M4d Task 2: `format` picks the container for the drizzled master and its
+/// weight map — they always share the master's own format (ruling R-M4d-3),
+/// so a run never leaves one of the pair behind in the other container. The
+/// coverage map (plan 6b-3 D9) is always FITS, like the rejection maps.
 pub fn write_drizzled_master(
     dir: &Path,
     master_stem: &str,
@@ -786,7 +804,7 @@ pub fn write_drizzled_master(
                 .unwrap_or("drizzle")
                 .to_string();
             let path = resolve_collision(&dir.join(format!("{resolved_stem}_coverage.fits")));
-            let map_cards = coverage_map_cards(cards)?;
+            let map_cards = drizzle_coverage_cards(cards)?;
             write_fits_f32(
                 &path,
                 output.width,
@@ -1449,6 +1467,7 @@ mod tests {
             output_pairs: vec![Vec::new(); ch],
             second_pass_rej_ok: false,
             coverage: None,
+            measure_rect: None,
             stats: dummy_stats(),
         };
 
@@ -1554,6 +1573,7 @@ mod tests {
             output_pairs: vec![Vec::new(); ch],
             second_pass_rej_ok: false,
             coverage: None,
+            measure_rect: None,
             stats: dummy_stats(),
         };
 
@@ -1772,6 +1792,32 @@ mod tests {
             cards.iter().find(|c| c.keyword == ATH_DRZK).unwrap().value,
             Some(CardValue::Str("circle".into()))
         );
+    }
+
+    /// Plan 6b-3 fix round 1: the drizzle's coverage map carries `ATH_DRZ`
+    /// (so it can be told from a master's coverage map) and a `BUNIT`
+    /// comment that does not claim samples.
+    #[test]
+    fn the_drizzle_coverage_map_carries_ath_drz() {
+        let drizzle = vec![
+            Card::new(ATH_DRZ, CardValue::Integer(2)).unwrap(),
+            Card::new("ATH_STKI", CardValue::Str("run-1".into())).unwrap(),
+        ];
+        let cards = drizzle_coverage_cards(&drizzle).unwrap();
+        let drz = cards
+            .iter()
+            .find(|c| c.keyword == ATH_DRZ)
+            .expect("ATH_DRZ");
+        assert_eq!(drz.value, Some(CardValue::Integer(2)));
+        let bunit = cards.iter().find(|c| c.keyword == "BUNIT").unwrap();
+        assert_eq!(
+            bunit.comment.as_deref(),
+            Some("frames whose drops reached the pixel")
+        );
+        assert!(coverage_map_cards(&drizzle)
+            .unwrap()
+            .iter()
+            .all(|c| c.keyword != ATH_DRZ));
     }
 
     /// Plan 6b-3 ruling (a): the drizzle weight map copies `ATH_SPRJ` and

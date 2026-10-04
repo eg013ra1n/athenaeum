@@ -414,6 +414,7 @@ fn main() {
                 write_weight_map: want_coverage,
                 write_coverage: false,
                 stats_on_covered: false,
+                stats_rect: None,
                 measure: &measure,
                 ram_total_bytes: None,
                 force_exact_overlap_for_measurement: force_exact,

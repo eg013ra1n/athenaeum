@@ -140,12 +140,20 @@ pub struct DrizzleInput<'a> {
     /// deposit, so `deposit_band` is untouched; a drop whose weight is below
     /// `W`'s f32 resolution at that pixel is not counted.
     pub write_coverage: bool,
-    /// Plan 6b-3 ruling (b): a grid drizzle measures its [`DrizzleStats`] on
-    /// the largest rectangle every pixel of which has `W > 0`, as 6a's
-    /// `GroupStats` do on the master, and fails with
-    /// [`DrizzleError::BadInput`] under [`MIN_STATS_RECT_PX`] on a side
-    /// (the caller keeps the master). Off: whole-plane statistics, as ever.
+    /// Plan 6b-3 ruling (b), fix round 1: a grid drizzle. When set, every
+    /// plane's [`DrizzleStats`] fwhm/eccentricity/noise are measured on
+    /// [`Self::stats_rect`] scaled by the drizzle factor (the master's own,
+    /// already-validated covered rectangle: the same sky as the master's
+    /// statistics, `CropRect::scaled`'s lattice model). Set with no
+    /// `stats_rect` it is the DEFENSIVE arm — unreachable on a grid once the
+    /// master passed its own floor — and fails with
+    /// [`DrizzleError::BadInput`] (the caller keeps the master). Off:
+    /// whole-plane statistics, as ever (a frame set).
     pub stats_on_covered: bool,
+    /// The master's covered rectangle in MASTER pixels
+    /// ([`crate::stacking::integrate::GroupOutput::measure_rect`]); read only
+    /// when [`Self::stats_on_covered`] is set.
+    pub stats_rect: Option<crate::stacking::crop::CropRect>,
     pub measure: &'a MeasureOptions,
     /// Injected total system RAM for the memory refusal (ruling R-M3-7,
     /// ruling R-M3-12): `None` probes
@@ -289,7 +297,15 @@ impl From<IntegrationError> for DrizzleError {
 /// reference-geometry planes for the per-frame `A`/`B` grids
 /// (`2 * width * height * 4`); and, when `use_rejection` is set, one
 /// reference-geometry `RejBitmap`
-/// (`channels * height * ceil(width / 64) * 8`).
+/// (`channels * height * ceil(width / 64) * 8`); and, when `write_coverage`
+/// is set, `(channels + 1)` count planes (`(channels + 1) * out_w * out_h * 4`:
+/// the kept planes plus the one being counted).
+///
+/// Not counted (plan 6b-3, in the C-22 manner): the crop copy a grid drizzle
+/// makes while measuring a plane on the covered rectangle (at most one
+/// `out_w * out_h * 4` plane, alive only inside `measure_plane`, which
+/// already holds two such copies), and the coverage-on band snapshots (one
+/// `DRIZZLE_BAND_ROWS * out_w * 4` buffer per worker thread).
 pub fn estimate_memory_bytes(
     width: usize,
     height: usize,
@@ -991,19 +1007,23 @@ pub fn drizzle_group(
                         .zip(w_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
                         .zip(cov_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
                         .enumerate()
-                        .for_each(|(band_idx, ((ib, wb), cb))| {
-                            // One band-sized copy per (band, frame, plane) while the
-                            // map is asked for (review M18): opt-in, so left as is;
-                            // a per-worker buffer is the lever if a profile ever
-                            // shows it.
-                            let before = wb.to_vec();
-                            deposit_band(ib, wb, band_idx, out_w, &ctx);
-                            for ((c, &after), &prior) in cb.iter_mut().zip(wb.iter()).zip(&before) {
-                                if after > prior {
-                                    *c += 1.0;
+                        .for_each_init(
+                            // A per-worker snapshot buffer, reused across bands,
+                            // frames and planes (fix round 1).
+                            Vec::<f32>::new,
+                            |before, (band_idx, ((ib, wb), cb))| {
+                                before.clear();
+                                before.extend_from_slice(wb);
+                                deposit_band(ib, wb, band_idx, out_w, &ctx);
+                                for ((count, &after), &prior) in
+                                    cb.iter_mut().zip(wb.iter()).zip(before.iter())
+                                {
+                                    if after > prior {
+                                        *count += 1.0;
+                                    }
                                 }
-                            }
-                        });
+                            },
+                        );
                 } else {
                     i_buf
                         .par_chunks_mut(DRIZZLE_BAND_ROWS * out_w)
@@ -1054,45 +1074,39 @@ pub fn drizzle_group(
 
         let plane_data = &data[c * plane_out_pixels..(c + 1) * plane_out_pixels];
         let cm = if input.stats_on_covered {
-            // Plan 6b-3 ruling (b): `W > 0` is the covered footprint (the
-            // same test `coverage` above uses); one transient plane.
-            let mask: Vec<f32> = w_buf
-                .iter()
-                .map(|&v| if v > 0.0 { 1.0 } else { 0.0 })
-                .collect();
-            let rect = crate::stacking::crop::largest_covered_rect(&mask, out_w, out_h, 1);
-            drop(mask);
-            match rect {
-                Some(r) if r.width >= MIN_STATS_RECT_PX && r.height >= MIN_STATS_RECT_PX => {
-                    debug!(
-                        plane = c,
-                        crop_x0 = r.x0,
-                        crop_y0 = r.y0,
-                        crop_width = r.width,
-                        crop_height = r.height,
-                        "drizzle statistics on the covered rectangle"
-                    );
-                    if r.is_full(out_w, out_h) {
-                        pool.install(|| {
-                            measure_plane(plane_data, out_w, out_h, input.measure, None)
-                        })
-                    } else {
-                        let sub = crate::stacking::crop::crop_plane(plane_data, out_w, r);
-                        pool.install(|| measure_plane(&sub, r.width, r.height, input.measure, None))
-                    }
-                }
-                Some(r) => {
-                    return Err(DrizzleError::BadInput(format!(
-                        "the covered part of the drizzle grid is only {} x {} px, below the {} x {} px \
-                         minimum for the drizzle's statistics",
-                        r.width, r.height, MIN_STATS_RECT_PX, MIN_STATS_RECT_PX
-                    )));
-                }
-                None => {
-                    return Err(DrizzleError::BadInput(
-                        "no frame of this group covers the drizzle grid".to_string(),
-                    ));
-                }
+            // Plan 6b-3 ruling (b), fix round 1: the master's own covered
+            // rectangle (already past `MIN_STATS_RECT_PX`) scaled to the
+            // drizzle grid, for every plane.
+            let Some(master_rect) = input.stats_rect else {
+                return Err(DrizzleError::BadInput(
+                    "a grid drizzle was given no covered rectangle for its statistics".to_string(),
+                ));
+            };
+            let r = master_rect.scaled(input.scale);
+            if r.width < MIN_STATS_RECT_PX
+                || r.height < MIN_STATS_RECT_PX
+                || r.x0 + r.width > out_w
+                || r.y0 + r.height > out_h
+            {
+                return Err(DrizzleError::BadInput(format!(
+                    "the master's covered rectangle {} x {} at ({}, {}) does not fit the {} x {} \
+                     drizzle grid or is under {} px",
+                    r.width, r.height, r.x0, r.y0, out_w, out_h, MIN_STATS_RECT_PX
+                )));
+            }
+            debug!(
+                plane = c,
+                crop_x0 = r.x0,
+                crop_y0 = r.y0,
+                crop_width = r.width,
+                crop_height = r.height,
+                "drizzle statistics on the master's covered rectangle"
+            );
+            if r.is_full(out_w, out_h) {
+                pool.install(|| measure_plane(plane_data, out_w, out_h, input.measure, None))
+            } else {
+                let sub = crate::stacking::crop::crop_plane(plane_data, out_w, r);
+                pool.install(|| measure_plane(&sub, r.width, r.height, input.measure, None))
             }
         } else {
             pool.install(|| measure_plane(plane_data, out_w, out_h, input.measure, None))
@@ -1705,6 +1719,7 @@ mod tests {
             write_weight_map: true,
             write_coverage: false,
             stats_on_covered: false,
+            stats_rect: None,
             measure,
             ram_total_bytes: None,
             force_exact_overlap_for_measurement: false,
@@ -2559,52 +2574,154 @@ mod tests {
         );
     }
 
-    /// Plan 6b-3 ruling (b): on a grid the drizzle's statistics are measured
-    /// on the covered rectangle; a sliver under `MIN_STATS_RECT_PX` fails
-    /// the drizzle with `BadInput` (never a panic, the caller keeps the
-    /// master), and a frame set (`stats_on_covered` off) is unchanged.
+    /// A deterministic noisy star field: a flat background, noise whose
+    /// amplitude rises across x (so a crop and the whole plane disagree),
+    /// and a grid of Gaussian stars.
+    fn noisy_star_field(seed: u64) -> Vec<f32> {
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+        let mut v = vec![0f32; W * H];
+        for y in 0..H {
+            for x in 0..W {
+                v[y * W + x] = 0.1 + next() * 0.002 * (1.0 + x as f32 / 8.0);
+            }
+        }
+        for sy in (8..H - 6).step_by(14) {
+            for sx in (8..W - 6).step_by(14) {
+                for dy in -5i32..=5 {
+                    for dx in -5i32..=5 {
+                        let (x, y) = ((sx as i32 + dx) as usize, (sy as i32 + dy) as usize);
+                        let r2 = (dx * dx + dy * dy) as f32;
+                        v[y * W + x] += 0.4 * (-r2 / (2.0 * 1.5 * 1.5)).exp();
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// Plan 6b-3 ruling (b), fix round 1: on a grid the drizzle's statistics
+    /// are measured, every plane, on the MASTER's covered rectangle scaled
+    /// by the drizzle factor — bit-equal to `measure_plane` on the crop of
+    /// the drizzled plane, and different from the whole plane's (the
+    /// uncovered zeros and the noise gradient enter it). A frame set
+    /// (`stats_on_covered` off) is the whole-plane measurement as ever; a
+    /// grid with no rectangle, a too-small one or one off the grid fails
+    /// with `BadInput` (the caller keeps the master).
     #[test]
-    fn grid_drizzle_statistics_use_the_covered_rectangle_and_refuse_a_sliver() {
+    fn grid_drizzle_statistics_use_the_masters_covered_rectangle() {
+        use crate::stacking::crop::{crop_plane, largest_covered_rect, CropRect};
         let dir = tempfile::tempdir().unwrap();
-        let data = uniform(W, H, 0.25);
         let paths: Vec<PathBuf> = (0..3)
-            .map(|i| write_mono(dir.path(), &format!("f{i}.fits"), W, H, &data))
+            .map(|i| {
+                write_mono(
+                    dir.path(),
+                    &format!("f{i}.fits"),
+                    W,
+                    H,
+                    &noisy_star_field(11 + i as u64),
+                )
+            })
             .collect();
         let weight = [1.0f64];
         let pair = identity_pair();
         let measure = MeasureOptions::default();
-
-        // Moved 20 px: the covered rectangle is the 44 x 48 source columns,
-        // 88 x 96 output pixels.
         let moved = translation_map(20.0, 0.0);
         let frames: Vec<_> = paths
             .iter()
             .map(|p| frame(p, &moved, &weight, &pair))
             .collect();
-        let mut input = base_input(&frames, &measure);
-        input.stats_on_covered = true;
-        let ok = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
-        assert_eq!(ok.stats.coverage.len(), 1);
-        assert!(ok.stats.coverage[0] < 1.0, "part of the grid is uncovered");
+        let (out_w, out_h) = (W * 2, H * 2);
 
-        // Moved 58 px: 6 source columns are left, 12 output pixels < 16.
-        let sliver = translation_map(58.0, 0.0);
-        let frames: Vec<_> = paths
-            .iter()
-            .map(|p| frame(p, &sliver, &weight, &pair))
-            .collect();
+        // The frame-set path first: whole-plane statistics, unchanged. Its
+        // coverage plane also yields the master rectangle for the grid run.
         let mut input = base_input(&frames, &measure);
+        input.write_coverage = true;
+        let whole =
+            drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        let whole_ref = measure_plane(&whole.data[..out_w * out_h], out_w, out_h, &measure, None);
+        assert_eq!(whole.stats.noise[0].to_bits(), whole_ref.noise.to_bits());
+        assert_eq!(
+            whole.stats.fwhm_px[0].to_bits(),
+            whole_ref.fwhm_px.to_bits()
+        );
+
+        // The master rectangle: the drizzle's covered rectangle in master
+        // pixels, rounded inward.
+        let cov = whole.coverage.as_ref().unwrap();
+        let d = largest_covered_rect(&cov[..out_w * out_h], out_w, out_h, 1).unwrap();
+        let x0 = d.x0.div_ceil(2);
+        let y0 = d.y0.div_ceil(2);
+        let master_rect = CropRect {
+            x0,
+            y0,
+            width: (d.x0 + d.width) / 2 - x0,
+            height: (d.y0 + d.height) / 2 - y0,
+        };
+        assert!(!master_rect.is_full(W, H) && master_rect.width >= MIN_STATS_RECT_PX);
+
         input.stats_on_covered = true;
-        match drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()) {
-            Err(DrizzleError::BadInput(m)) => assert!(m.contains("covered part"), "{m}"),
-            other => panic!(
-                "expected a BadInput, got {:?}",
-                other.map(|o| o.stats.coverage)
-            ),
-        }
-        // The frame-set path keeps whole-plane statistics.
-        input.stats_on_covered = false;
-        drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        input.stats_rect = Some(master_rect);
+        let grid = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        assert!(grid
+            .data
+            .iter()
+            .zip(&whole.data)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+        let sub = crop_plane(&grid.data[..out_w * out_h], out_w, master_rect.scaled(2));
+        let r = master_rect.scaled(2);
+        let want = measure_plane(&sub, r.width, r.height, &measure, None);
+        assert_eq!(grid.stats.noise[0].to_bits(), want.noise.to_bits());
+        assert_eq!(grid.stats.fwhm_px[0].to_bits(), want.fwhm_px.to_bits());
+        assert_eq!(
+            grid.stats.eccentricity[0].to_bits(),
+            want.eccentricity.to_bits()
+        );
+        assert_ne!(
+            grid.stats.noise[0].to_bits(),
+            whole_ref.noise.to_bits(),
+            "the whole plane must read differently"
+        );
+
+        // The defensive arm, a too-small rectangle and one off the grid.
+        let refuse = |rect: Option<CropRect>, what: &str| {
+            let mut i = base_input(&frames, &measure);
+            i.stats_on_covered = true;
+            i.stats_rect = rect;
+            match drizzle_group(&i, &pool(), &AtomicBool::new(false), &no_progress()) {
+                Err(DrizzleError::BadInput(_)) => {}
+                other => panic!(
+                    "{what}: expected BadInput, got {:?}",
+                    other.map(|o| o.width)
+                ),
+            }
+        };
+        refuse(None, "no rectangle");
+        refuse(
+            Some(CropRect {
+                x0: 20,
+                y0: 10,
+                width: 6,
+                height: 6,
+            }),
+            "under the floor",
+        );
+        refuse(
+            Some(CropRect {
+                x0: W - 4,
+                y0: 0,
+                width: 20,
+                height: 20,
+            }),
+            "off the grid",
+        );
     }
 
     #[test]
@@ -2625,6 +2742,16 @@ mod tests {
         let ln_planes = 2 * width as u64 * height as u64 * 4;
         let words = (width as u64).div_ceil(64);
         let rej_bitmap = channels as u64 * height as u64 * words * 8;
+        // Plan 6b-3 D9: `channels + 1` count planes; at 3 channels this is
+        // distinguishable from a flat `2` or `channels`.
+        let coverage_planes = (channels as u64 + 1) * out_w * out_h * 4;
+        assert_eq!(coverage_planes, 4 * out_w * out_h * 4);
+        for &cov in &[false, true] {
+            let off =
+                estimate_memory_bytes(width, height, channels, scale, false, true, false, false);
+            let on = estimate_memory_bytes(width, height, channels, scale, false, true, false, cov);
+            assert_eq!(on - off, if cov { coverage_planes } else { 0 });
+        }
 
         for &ln in &[false, true] {
             for &wwm in &[false, true] {
@@ -2673,6 +2800,7 @@ mod tests {
             write_weight_map: false,
             write_coverage: false,
             stats_on_covered: false,
+            stats_rect: None,
             measure: &measure,
             ram_total_bytes: Some(1024),
             force_exact_overlap_for_measurement: false,
@@ -2720,6 +2848,7 @@ mod tests {
             write_weight_map: true,
             write_coverage: false,
             stats_on_covered: false,
+            stats_rect: None,
             measure: &measure,
             ram_total_bytes: None,
             force_exact_overlap_for_measurement: false,
@@ -3171,6 +3300,7 @@ mod tests {
                 write_weight_map: true,
                 write_coverage: false,
                 stats_on_covered: false,
+                stats_rect: None,
                 measure: &measure,
                 ram_total_bytes: None,
                 force_exact_overlap_for_measurement: false,
@@ -3290,6 +3420,7 @@ mod tests {
             write_weight_map: true,
             write_coverage: false,
             stats_on_covered: false,
+            stats_rect: None,
             measure: &measure,
             ram_total_bytes: None,
             force_exact_overlap_for_measurement: false,
@@ -3390,6 +3521,7 @@ mod tests {
             write_weight_map: true,
             write_coverage: false,
             stats_on_covered: false,
+            stats_rect: None,
             measure,
             ram_total_bytes: None,
             force_exact_overlap_for_measurement: false,
