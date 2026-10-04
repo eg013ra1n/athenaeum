@@ -1215,6 +1215,16 @@ pub(crate) mod tests {
                 self.clone()
             }
         }
+        // tracing-core caches each callsite's interest. While only ONE
+        // dispatcher is registered it takes a shortcut and asks the
+        // registering thread's own default instead of every dispatcher, so a
+        // callsite first hit by a concurrent test on another thread (with no
+        // subscriber) is cached as "never" and this capture misses it. A
+        // second, permanently registered no-op dispatcher turns the shortcut
+        // off for the whole test binary.
+        static SECOND_DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SECOND_DISPATCH
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         let buf = Buf(Arc::new(std::sync::Mutex::new(Vec::new())));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
