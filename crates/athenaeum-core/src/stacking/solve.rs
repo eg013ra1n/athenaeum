@@ -504,6 +504,13 @@ pub(crate) fn solver_identity(
     ))
 }
 
+/// Whether a [`solver_identity`] error says no catalog is installed (the
+/// error is a plain string; the text is pinned by a test), as opposed to a
+/// catalog that exists but cannot be read.
+pub(crate) fn is_not_installed(error: &str) -> bool {
+    error.contains("star catalog is not installed")
+}
+
 /// [`solver_identity`] read from a catalog connection alone (the app-data
 /// folder is the database file's own folder, as for [`CatalogSolver`]), so
 /// the plan computes the hash the run's cache check compares. `Err` for a
@@ -1481,9 +1488,25 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&catalog).unwrap();
         std::fs::write(catalog.join("stars.smac"), b"").unwrap();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let default_identity = installed_solver_identity(&conn).expect("a catalog is installed");
+        // A stored non-default config moves the identity, and the run's
+        // solver and the plan still agree on it.
+        crate::db::schema::init_db(&conn).unwrap();
+        let mut config = crate::plate_solve::config::load_config(&conn);
+        config.sip_order = if config.sip_order == 2 { 3 } else { 2 };
+        crate::plate_solve::config::save_config(&conn, &config).unwrap();
         let installed = installed_solver_identity(&conn).expect("a catalog is installed");
+        assert_ne!(
+            installed, default_identity,
+            "the config half is discriminated"
+        );
         assert_eq!(CatalogSolver::new(ctx).identity().unwrap(), installed);
         let memory = rusqlite::Connection::open_in_memory().unwrap();
-        assert!(installed_solver_identity(&memory).is_err());
+        let err = installed_solver_identity(&memory).unwrap_err();
+        assert!(!is_not_installed(&err), "{err}");
+        let empty = tempfile::tempdir().unwrap();
+        let bare = rusqlite::Connection::open(empty.path().join("catalog.db")).unwrap();
+        let err = installed_solver_identity(&bare).unwrap_err();
+        assert!(is_not_installed(&err), "{err}");
     }
 }

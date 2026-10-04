@@ -242,6 +242,7 @@ pub(crate) fn solve_plan(origin: &FrameOrigin) -> Option<SolvePlan> {
 /// The run's cached solve outcome for a frame's current content, which the
 /// plan's "will be solved" and "could not be solved" warnings read. `None`
 /// for a catalog frame, and for a frame never solved.
+#[cfg(test)]
 pub(crate) fn local_solve_outcome(
     conn: &Connection,
     origin: &FrameOrigin,
@@ -281,10 +282,26 @@ pub(crate) enum WcsTier {
     Missing,
 }
 
+/// Whether a registration reference can be built on this record: the one
+/// rule the run (`wcs_tier`) and the plan (`wcs_outlook`) share.
+/// `ReferenceWcs::from_record` refuses a record whose SIP tables cannot be
+/// read, and the run would then fail with "no usable WCS".
+fn usable_reference_wcs(record: &PlateSolveRecord) -> bool {
+    crate::stacking::grid_map::ReferenceWcs::from_record(record).is_some()
+}
+
+/// Whether a project frame's manifest WCS is a usable reference.
+fn manifest_wcs_usable(meta: &ProjectFrameMeta) -> bool {
+    meta.wcs
+        .as_ref()
+        .is_some_and(|wcs| usable_reference_wcs(&wcs.to_record(meta.pixel_scale_arcsec)))
+}
+
 /// The [`WcsTier`] of one frame: a catalog frame has no rule, a project frame
-/// with a manifest WCS is `Manifest`, one whose cached solve of the current
-/// content succeeded is `Local`, and anything else (no solve, a failed or a
-/// refused one, a solve of other content) is `Missing`.
+/// with a usable manifest WCS is `Manifest`, one whose cached solve of the
+/// current content succeeded with a usable WCS is `Local`, and anything else
+/// (no solve, a failed or a refused one, a solve of other content, a WCS
+/// whose SIP tables cannot be read) is `Missing`.
 pub(crate) fn wcs_tier(
     conn: &Connection,
     origin: &FrameOrigin,
@@ -292,11 +309,17 @@ pub(crate) fn wcs_tier(
 ) -> anyhow::Result<WcsTier> {
     match origin {
         FrameOrigin::Catalog { .. } => Ok(WcsTier::NotApplicable),
-        FrameOrigin::Project { meta, .. } if meta.wcs.is_some() => Ok(WcsTier::Manifest),
+        FrameOrigin::Project { meta, .. } if meta.wcs.is_some() => {
+            Ok(if manifest_wcs_usable(meta) {
+                WcsTier::Manifest
+            } else {
+                WcsTier::Missing
+            })
+        }
         FrameOrigin::Project {
             project_id, blake3, ..
         } => Ok(match stored_outcome(conn, project_id, frame_id, blake3)? {
-            Some(SolveOutcome::Solved(_)) => WcsTier::Local,
+            Some(SolveOutcome::Solved(record)) if usable_reference_wcs(&record) => WcsTier::Local,
             _ => WcsTier::Missing,
         }),
     }
@@ -335,15 +358,7 @@ pub(crate) fn wcs_outlook(
     let (project_id, blake3) = match origin {
         FrameOrigin::Catalog { .. } => return Ok(WcsOutlook::NotApplicable),
         FrameOrigin::Project { meta, .. } if meta.wcs.is_some() => {
-            // `ReferenceWcs::from_record` refuses a record with unreadable
-            // SIP; the plan must not let such a reference through.
-            let usable = meta.wcs.as_ref().is_some_and(|wcs| {
-                crate::stacking::grid_map::ReferenceWcs::from_record(
-                    &wcs.to_record(meta.pixel_scale_arcsec),
-                )
-                .is_some()
-            });
-            return Ok(if usable {
+            return Ok(if manifest_wcs_usable(meta) {
                 WcsOutlook::Manifest
             } else {
                 WcsOutlook::Unsolvable
@@ -354,13 +369,7 @@ pub(crate) fn wcs_outlook(
         } => (project_id, blake3),
     };
     let usable_solve = |outcome: SolveOutcome| match outcome {
-        SolveOutcome::Solved(record) => {
-            if crate::stacking::grid_map::ReferenceWcs::from_record(&record).is_some() {
-                WcsOutlook::Solved
-            } else {
-                WcsOutlook::Unsolvable
-            }
-        }
+        SolveOutcome::Solved(record) if usable_reference_wcs(&record) => WcsOutlook::Solved,
         _ => WcsOutlook::Unsolvable,
     };
     let Some(identity) = identity else {
@@ -953,6 +962,98 @@ mod tests {
         };
         assert!(solve_plan(&catalog).is_none());
         assert!(local_solve_outcome(&conn, &catalog, 1).unwrap().is_none());
+    }
+
+    /// Plan 6b-3 D14 (fix round 1): a WCS `ReferenceWcs::from_record` refuses
+    /// (a half-stored reverse SIP pair) is no WCS for the run's tier and the
+    /// plan's outlook alike, whether it comes from the manifest or from a
+    /// cached solve.
+    #[test]
+    fn an_unusable_wcs_is_no_wcs_for_the_tier_and_the_outlook() {
+        use crate::stacking::solve::{write_outcome, FakeSolver, SolveOutcome};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let dir = tempfile::tempdir().unwrap();
+        let mut bad = test_fixtures::project_frame_spec("bad");
+        let mut wcs = test_fixtures::manifest_wcs_json(64, 48, 10.0, 20.0, 1.5);
+        wcs["sip"] = serde_json::json!({
+            "order": 2,
+            "a": [[0.0, 0.0, 1e-6], [0.0, 2e-6], [3e-6]],
+            "b": [[0.0, 0.0, 1e-6], [0.0, 2e-6], [3e-6]],
+            "ap": [[0.0]],
+        });
+        bad.wcs = Some(wcs);
+        test_fixtures::add_project_frame(&conn, dir.path(), "p1", &bad);
+        test_fixtures::add_project_frame(
+            &conn,
+            dir.path(),
+            "p1",
+            &test_fixtures::project_frame_spec("solved"),
+        );
+        let source = crate::stacking::project_source::project_frame_source(
+            &conn,
+            "p1",
+            &crate::stacking::config::StackingConfig::default(),
+        )
+        .unwrap();
+        let of = |uuid: &str| -> (i64, FrameOrigin, String) {
+            source
+                .origins
+                .iter()
+                .find_map(|(id, o)| match o {
+                    FrameOrigin::Project {
+                        frame_uuid, blake3, ..
+                    } if frame_uuid == uuid => Some((*id, o.clone(), blake3.clone())),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let (bad_id, bad, _) = of("bad");
+        assert_eq!(wcs_tier(&conn, &bad, bad_id).unwrap(), WcsTier::Missing);
+        for identity in [None, Some("any")] {
+            assert_eq!(
+                wcs_outlook(&conn, &bad, bad_id, identity).unwrap(),
+                WcsOutlook::Unsolvable
+            );
+        }
+
+        let (id, frame, blake3) = of("solved");
+        let mut record = FakeSolver::fixture_record();
+        record.sip_order = Some(2);
+        record.sip_a_coeffs = Some("not json".into());
+        record.sip_b_coeffs = Some("not json".into());
+        let hash = crate::stacking::solve::solve_hash(&blake3, "any");
+        write_outcome(
+            &conn,
+            "p1",
+            id,
+            &blake3,
+            &hash,
+            SolveOutcome::Solved(record),
+        )
+        .unwrap();
+        assert_eq!(wcs_tier(&conn, &frame, id).unwrap(), WcsTier::Missing);
+        for identity in [None, Some("any")] {
+            assert_eq!(
+                wcs_outlook(&conn, &frame, id, identity).unwrap(),
+                WcsOutlook::Unsolvable
+            );
+        }
+        write_outcome(
+            &conn,
+            "p1",
+            id,
+            &blake3,
+            &hash,
+            SolveOutcome::Solved(FakeSolver::fixture_record()),
+        )
+        .unwrap();
+        assert_eq!(wcs_tier(&conn, &frame, id).unwrap(), WcsTier::Local);
+        assert_eq!(
+            wcs_outlook(&conn, &frame, id, Some("any")).unwrap(),
+            WcsOutlook::Solved
+        );
     }
 
     /// Plan 6b-2 C15: the tier the reference rule reads. It is the manifest's

@@ -2655,7 +2655,9 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
     }
     // Calibrate only ever runs for a frame set; the id feeds the log lines.
     let Some(set_id) = rc.subject.frame_set_id() else {
-        return Err(RunError::Other("stage 1 calibrates a frame set only; a project prepares".into()));
+        return Err(RunError::Other(
+            "stage 1 calibrates a frame set only; a project prepares".into(),
+        ));
     };
     let stage_start = Instant::now();
     let excluded_set: HashSet<i64> = rc.excluded.iter().copied().collect();
@@ -25756,15 +25758,14 @@ mod tests {
         }
     }
 
-    /// Starts the seeded sky project through the production entry point with
-    /// its folders and confirmed grid configured, and waits for the run.
-    fn start_sky_project(
+    /// Seeds the sky project with its folders and confirmed grid configured,
+    /// without starting anything.
+    fn seed_startable_sky_project(
         tmp: &Path,
         tweak: impl FnOnce(&mut StackingConfig),
     ) -> (
         Arc<ServiceContext>,
         rusqlite::Connection,
-        StartedStacking,
         crate::collab::grid::CanonicalGrid,
     ) {
         let db_path = tmp.join("catalog.db");
@@ -25788,7 +25789,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let started = start_stacking(
+        (ctx, conn, grid)
+    }
+
+    /// Starts the seeded project through the production entry point.
+    fn start_seeded_project(ctx: &Arc<ServiceContext>) -> Result<StartedStacking, ApiError> {
+        start_stacking(
             ctx.clone(),
             Arc::new(NullEmitter),
             &PathPolicy::AllowAll,
@@ -25797,7 +25803,20 @@ mod tests {
             None,
             None,
         )
-        .expect("a project run starts");
+    }
+
+    /// [`seed_startable_sky_project`], started, and waited for.
+    fn start_sky_project(
+        tmp: &Path,
+        tweak: impl FnOnce(&mut StackingConfig),
+    ) -> (
+        Arc<ServiceContext>,
+        rusqlite::Connection,
+        StartedStacking,
+        crate::collab::grid::CanonicalGrid,
+    ) {
+        let (ctx, conn, grid) = seed_startable_sky_project(tmp, tweak);
+        let started = start_seeded_project(&ctx).expect("a project run starts");
         wait_for_run(&ctx, started.run_id);
         (ctx, conn, started, grid)
     }
@@ -25810,34 +25829,14 @@ mod tests {
     fn a_project_run_starts_on_its_confirmed_grid() {
         let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
         let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
-        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let conn = project_conn(&db_path);
-        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
-        for (key, dir) in [
-            (crate::settings::keys::STACKING_WORKING_DIR, tmp.path().join("work")),
-            (crate::settings::keys::STACKING_OUTPUT_DIR, tmp.path().join("out")),
-        ] {
-            crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
-        }
-        crate::db::collab::set_canonical_grid(&conn, "p1", Some(&grid.canonical_json())).unwrap();
-        sky_config(&conn);
+        let (ctx, conn, grid) = seed_startable_sky_project(tmp.path(), |_| {});
 
         let hold_flag = Arc::new(AtomicBool::new(false));
         let (hold, _hold_job) = ctx
             .compute_queue
             .acquire(ComputeJobKind::Analysis, "hold", hold_flag)
             .unwrap();
-        let started = start_stacking(
-            ctx.clone(),
-            Arc::new(NullEmitter),
-            &PathPolicy::AllowAll,
-            "test".to_string(),
-            StackSubject::Project("p1".into()),
-            None,
-            None,
-        )
-        .expect("a project run starts");
+        let started = start_seeded_project(&ctx).expect("a project run starts");
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ctx.compute_queue.snapshot().iter().any(|e| e.label == "Stacking · p1") {
             assert!(Instant::now() < deadline, "{:?}", ctx.compute_queue.snapshot());
@@ -25868,6 +25867,107 @@ mod tests {
         assert_eq!((master.width, master.height), (512, 384));
     }
 
+    /// Plan 6b-3 D14 (fix round 1): the plan and the run's reference rule
+    /// agree on a WCS the reference cannot be built on. One frame's manifest
+    /// WCS carries a half-stored reverse SIP pair (`from_record` refuses it):
+    /// the plan has no `reference` blocker, and the run's candidates are the
+    /// three other frames, never that one.
+    #[test]
+    fn an_unusable_manifest_wcs_is_never_a_reference_candidate() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+        let sip = serde_json::json!({
+            "order": 2,
+            "a": [[0.0, 0.0, 1e-6], [0.0, 2e-6], [3e-6]],
+            "b": [[0.0, 0.0, 1e-6], [0.0, 2e-6], [3e-6]],
+            "ap": [[0.0]],
+        });
+        let changed = conn
+            .execute(
+                "UPDATE project_frames_local \
+                 SET manifest_json = json_set(manifest_json, '$.meta.wcs.sip', json(?1)) \
+                 WHERE project_id = 'p1' AND frame_uuid = 'l0'",
+                [sip.to_string()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let cfg = sky_config(&conn);
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg.clone(),
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        let uuid_of = |rc: &RunContext, id: i64| match &rc.origins[&id] {
+            FrameOrigin::Project { frame_uuid, .. } => frame_uuid.clone(),
+            _ => unreachable!(),
+        };
+        let bad_id = *rc
+            .origins
+            .keys()
+            .find(|id| uuid_of(&rc, **id) == "l0")
+            .unwrap();
+        let good_ids: HashSet<i64> = rc
+            .origins
+            .keys()
+            .copied()
+            .filter(|id| *id != bad_id)
+            .collect();
+        assert_eq!(good_ids.len(), 3);
+
+        let plan = build_plan(
+            &conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            Some(cfg),
+        )
+        .unwrap();
+        assert!(
+            plan.blockers.iter().all(|b| b.code != "reference"),
+            "{:?}",
+            plan.blockers
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("a WCS that cannot be used")),
+            "{:?}",
+            plan.warnings
+        );
+
+        stage_calibrate(&mut rc).unwrap();
+        stage_measure(&mut rc).unwrap();
+        let rule = wcs_tiers(&rc).unwrap().expect("a project has a rule");
+        assert_eq!(rule.candidates, good_ids);
+        assert_eq!(rule.with_wcs, good_ids);
+    }
+
+    /// Plan 6b-3 D13: a project whose grid is not confirmed is refused at the
+    /// plan's `grid` blocker, before anything is written: no run row and no
+    /// cancel handle are left.
+    #[test]
+    fn a_project_without_a_confirmed_grid_is_refused_and_writes_nothing() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, conn, _grid) = seed_startable_sky_project(tmp.path(), |_| {});
+        crate::db::collab::set_canonical_grid(&conn, "p1", None).unwrap();
+        let err = start_seeded_project(&ctx).expect_err("an unconfirmed grid refuses the start");
+        assert!(
+            matches!(&err, ApiError::Invalid(m) if m.contains("grid")),
+            "{err:?}"
+        );
+        let runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stacking_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs, 0, "no stacking_runs row is written");
+        assert!(ctx.active_stacks.lock().unwrap().is_empty());
+    }
+
     /// Plan 6b-3 D13 (review): a run started through the production entry
     /// point carries the plan's confirmed grid in `RunContext.grid`, so its
     /// master is on the grid (`ATH_GRID`, `ATH_SPRJ`, the canonical filter),
@@ -25888,6 +25988,14 @@ mod tests {
         assert_eq!(header.get_str("ATH_GRID").as_deref(), Some(grid.hash().as_str()));
         assert_eq!(header.get_str("ATH_SPRJ").as_deref(), Some("p1"));
         assert_eq!(header.get_str("ATH_RGEO").as_deref(), Some("grid"));
+        let canonical: String = conn
+            .query_row(
+                "SELECT DISTINCT filter_canonical FROM project_frames_local WHERE project_id = 'p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(header.get_str("FILTER").as_deref(), Some(canonical.as_str()));
         let plan = build_plan(
             &conn,
             &ctx.settings,

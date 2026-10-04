@@ -2209,31 +2209,51 @@ fn project_inputs(
             if n == 1 { "" } else { "s" }
         ));
     }
-    // Spec §5.2: an in-scope frame without a manifest WCS is solved by the
-    // run. The last cached outcome for its content (plan 6b-2 Task 10b) says
-    // which frames are still to solve and which could not be solved. The plan
-    // reads the outcome, not its hash: after a solver or catalog change the
-    // run re-solves, and the plan learns the new outcome only then. A
-    // `Failed`/`Refused` written by an older app version is retried by the
-    // next run (review I7), so it is still reported as unsolved until then.
-    let (mut to_solve, mut unsolvable) = (0usize, 0usize);
+    // Spec §5.2, plan 6b-3 D14: the solver identity is read once, so every
+    // verdict below is the one the run's Solve sub-step will reach. A cached
+    // failure or refusal counts as unsolvable only while it stands for this
+    // solver and catalog (a release may carry a solver that rescues it, so
+    // one from another app version is tried again, review I7), and a
+    // manifest or cached WCS the run cannot build a reference on counts as
+    // one with no usable WCS.
+    let identity = match crate::stacking::solve::installed_solver_identity(conn) {
+        Ok(identity) => Some(identity),
+        Err(why) if crate::stacking::solve::is_not_installed(&why) => {
+            tracing::debug!(project_id = %project_id, error = %why, "no solver identity for the reference rule");
+            None
+        }
+        Err(why) => {
+            tracing::warn!(project_id = %project_id, error = %why, "solver identity unavailable for the reference rule");
+            None
+        }
+    };
+    let (mut to_solve, mut unsolvable, mut unusable) = (0usize, 0usize, 0usize);
     for f in source
         .frames
         .iter()
         .filter(in_scope)
-        .filter(|f| f.meta.as_ref().is_some_and(|m| m.wcs.is_none()))
+        .filter(|f| f.meta.is_some())
     {
         let Some(handle) = f.handle else { continue };
-        let outcome = crate::stacking::origin::local_solve_outcome(
+        match crate::stacking::origin::wcs_outlook(
             conn,
             origin_of(&source.origins, handle)?,
             handle,
+            identity.as_deref(),
         )
-        .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
-        match outcome {
-            None => to_solve += 1,
-            Some(crate::stacking::solve::SolveOutcome::Solved(_)) => {}
-            Some(_) => unsolvable += 1,
+        .map_err(|e| ApiError::Internal(format!("{e:#}")))?
+        {
+            crate::stacking::origin::WcsOutlook::ToSolve => to_solve += 1,
+            crate::stacking::origin::WcsOutlook::Unsolvable => {
+                if f.meta.as_ref().is_some_and(|m| m.wcs.is_some()) {
+                    unusable += 1;
+                } else {
+                    unsolvable += 1;
+                }
+            }
+            crate::stacking::origin::WcsOutlook::NotApplicable
+            | crate::stacking::origin::WcsOutlook::Manifest
+            | crate::stacking::origin::WcsOutlook::Solved => {}
         }
     }
     if to_solve > 0 {
@@ -2248,16 +2268,13 @@ fn project_inputs(
             if unsolvable == 1 { "" } else { "s" }
         ));
     }
+    if unusable > 0 {
+        warnings.push(format!(
+            "{unusable} frame{} a WCS that cannot be used and cannot anchor the grid",
+            if unusable == 1 { " has" } else { "s have" }
+        ));
+    }
     // Plan 6b-3 D14 (spec §5.4): the grid needs a reference with a WCS.
-    // Judged as the run's Solve sub-step will judge it (the installed
-    // solver's identity), so a cached failure blocks only while it stands.
-    let identity = match crate::stacking::solve::installed_solver_identity(conn) {
-        Ok(identity) => Some(identity),
-        Err(why) => {
-            tracing::debug!(project_id = %project_id, error = %why, "no solver identity for the reference rule");
-            None
-        }
-    };
     let pinned = if cfg.reference.mode == ReferenceMode::Manual {
         stored_reference_frame(conn, subject).map_err(|e| ApiError::Internal(format!("{e:#}")))?
     } else {
@@ -5301,10 +5318,7 @@ mod tests {
     #[test]
     fn too_few_frames_is_a_blocker() {
         let f = test_fixtures::frame_set("LDN 1272");
-        for (i, t) in ["2025-01-01T00:00:00", "2025-01-01T00:05:00"]
-            .iter()
-            .enumerate()
-        {
+        for (i, t) in ["2025-01-01T00:00:00", "2025-01-01T00:05:00"].iter().enumerate() {
             test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
         }
 
@@ -5378,7 +5392,10 @@ mod tests {
     #[test]
     fn a_crop_config_enlarges_the_estimate() {
         let f = test_fixtures::frame_set("LDN 1272");
-        for (i, t) in ["2025-01-01T00:00:00", "2025-01-01T00:05:00"].iter().enumerate() {
+        for (i, t) in ["2025-01-01T00:00:00", "2025-01-01T00:05:00"]
+            .iter()
+            .enumerate()
+        {
             test_fixtures::add_light(&f, &light_spec(&format!("f{i}"), t));
         }
         let settings = SettingsManager::new();
@@ -8083,7 +8100,9 @@ mod tests {
         );
         for expected in [
             "1 frame of the project is not on this device and is left out (G: 1)",
-            "1 frame has no WCS in the manifest and will be plate-solved locally",
+            // No catalog is installed here, so nothing can be solved (plan
+            // 6b-3 D14: the plan judges with the installed solver).
+            "1 frame could not be plate-solved and cannot anchor the grid",
         ] {
             assert!(
                 plan.warnings.iter().any(|w| w == expected),
