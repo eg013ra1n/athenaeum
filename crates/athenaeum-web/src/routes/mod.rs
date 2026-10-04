@@ -254,6 +254,13 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_stacking_paths", post(stacking::set_stacking_paths))
         .route("/api/get_stacking_work_usage", post(stacking::get_stacking_work_usage))
         .route("/api/cleanup_stacking_work", post(stacking::cleanup_stacking_work))
+        .route("/api/get_project_stacking_plan", post(stacking::get_project_stacking_plan))
+        .route("/api/start_project_stacking", post(stacking::start_project_stacking))
+        .route("/api/get_project_stacking_runs", post(stacking::get_project_stacking_runs))
+        .route("/api/get_project_stacking_config", post(stacking::get_project_stacking_config))
+        .route("/api/set_project_stacking_config", post(stacking::set_project_stacking_config))
+        .route("/api/get_project_stacking_work_usage", post(stacking::get_project_stacking_work_usage))
+        .route("/api/cleanup_project_stacking_work", post(stacking::cleanup_project_stacking_work))
         // M4d Task 3 (ruling R-M4d-5): one handler, two entry points — the
         // browser-friendly GET the Results card can point an `<img>` at, and
         // the POST that mirrors the Tauri command name so `api.invoke`

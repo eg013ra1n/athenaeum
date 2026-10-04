@@ -25,8 +25,8 @@ use crate::routes::scan_roots::allowed_roots_policy;
 use crate::WebAppState;
 
 pub use athenaeum_core::api::stacking::{
-    NamedPreset, StackingPaths, StackingPresets, StackingRunDetail, StackingRunSummary,
-    StackingSetConfig,
+    NamedPreset, StackingPaths, StackingPresets, StackingProjectConfig, StackingRunDetail,
+    StackingRunSummary, StackingSetConfig,
 };
 
 // ── Request structs ───────────────────────────────────────────────────────
@@ -125,6 +125,59 @@ pub struct GetStackingWorkUsageArgs {
 #[serde(rename_all = "camelCase")]
 pub struct CleanupStackingWorkArgs {
     pub set_id: i64,
+    pub what: CleanupWhat,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetProjectStackingPlanArgs {
+    pub project_id: String,
+    #[serde(default)]
+    pub config: Option<StackingConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartProjectStackingArgs {
+    pub project_id: String,
+    #[serde(default)]
+    pub config: Option<StackingConfig>,
+    #[serde(default)]
+    pub rerun_from: Option<Stage>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetProjectStackingRunsArgs {
+    pub project_id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `get_project_stacking_config` and `get_project_stacking_work_usage`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectStackingArgs {
+    pub project_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProjectStackingConfigArgs {
+    pub project_id: String,
+    pub config: StackingConfig,
+    // REQUIRED, as for a set: an omitting caller must not wipe the
+    // project's manual exclusions.
+    pub excluded_frame_uuids: Vec<String>,
+    // Absent clears the manual reference, exactly as on desktop.
+    #[serde(default)]
+    pub reference_frame_uuid: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupProjectStackingWorkArgs {
+    pub project_id: String,
     pub what: CleanupWhat,
 }
 
@@ -407,6 +460,142 @@ pub async fn cleanup_stacking_work(
     })?
     .map_err(api_err)?;
 
+    Ok(Json(result))
+}
+
+// ── Project stacking (collab wave 6b-3, spec §9.1) ───────────────────────
+
+/// POST /api/get_project_stacking_plan
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_project_stacking_plan(
+    State(state): State<WebAppState>,
+    Json(args): Json<GetProjectStackingPlanArgs>,
+) -> Result<Json<StackingPlan>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    let ctx = state.ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        api::get_project_stacking_plan(&ctx, &policy, &args.project_id, args.config)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Plan task panicked: {}", e),
+        )
+    })?
+    .map_err(api_err)?;
+    Ok(Json(result))
+}
+
+/// POST /api/start_project_stacking
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn start_project_stacking(
+    State(state): State<WebAppState>,
+    Json(args): Json<StartProjectStackingArgs>,
+) -> Result<Json<StartedStacking>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    let ctx = state.ctx.clone();
+    let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    let result = tokio::task::spawn_blocking(move || {
+        api::start_project_stacking(
+            ctx,
+            emitter,
+            &policy,
+            env!("CARGO_PKG_VERSION").to_string(),
+            &args.project_id,
+            args.config,
+            args.rerun_from,
+        )
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Start task panicked: {}", e),
+        )
+    })?
+    .map_err(api_err)?;
+    Ok(Json(result))
+}
+
+/// POST /api/get_project_stacking_runs
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_project_stacking_runs(
+    State(state): State<WebAppState>,
+    Json(args): Json<GetProjectStackingRunsArgs>,
+) -> Result<Json<Vec<StackingRunSummary>>, (StatusCode, String)> {
+    api::get_project_stacking_runs(&state.ctx, &args.project_id, args.limit)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/get_project_stacking_config
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_project_stacking_config(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectStackingArgs>,
+) -> Result<Json<StackingProjectConfig>, (StatusCode, String)> {
+    api::get_project_stacking_config(&state.ctx, &args.project_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/set_project_stacking_config
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_project_stacking_config(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetProjectStackingConfigArgs>,
+) -> Result<Json<StackingProjectConfig>, (StatusCode, String)> {
+    api::set_project_stacking_config(
+        &state.ctx,
+        &args.project_id,
+        args.config,
+        args.excluded_frame_uuids,
+        args.reference_frame_uuid,
+    )
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// POST /api/get_project_stacking_work_usage
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_project_stacking_work_usage(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectStackingArgs>,
+) -> Result<Json<WorkUsage>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        api::get_project_stacking_work_usage(&ctx, &args.project_id)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Work-usage task panicked: {}", e),
+        )
+    })?
+    .map_err(api_err)?;
+    Ok(Json(result))
+}
+
+/// POST /api/cleanup_project_stacking_work
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn cleanup_project_stacking_work(
+    State(state): State<WebAppState>,
+    Json(args): Json<CleanupProjectStackingWorkArgs>,
+) -> Result<Json<u64>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        api::cleanup_project_stacking_work(&ctx, &args.project_id, args.what)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cleanup task panicked: {}", e),
+        )
+    })?
+    .map_err(api_err)?;
     Ok(Json(result))
 }
 
@@ -1021,5 +1210,131 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Plan 6b-3 Task 8c: every project route is registered past the auth
+    /// layer — with no DB behind `test_state(None)` each handler's own DB
+    /// lookup fails as 500, never 404 or 401.
+    #[tokio::test]
+    async fn project_stacking_routes_are_registered() {
+        for (uri, body) in [
+            ("/api/get_project_stacking_plan", r#"{"projectId":"p1"}"#),
+            ("/api/start_project_stacking", r#"{"projectId":"p1"}"#),
+            ("/api/get_project_stacking_runs", r#"{"projectId":"p1"}"#),
+            ("/api/get_project_stacking_config", r#"{"projectId":"p1"}"#),
+            (
+                "/api/get_project_stacking_work_usage",
+                r#"{"projectId":"p1"}"#,
+            ),
+            (
+                "/api/cleanup_project_stacking_work",
+                r#"{"projectId":"p1","what":"registered"}"#,
+            ),
+        ] {
+            let router = crate::routes::build_router(test_state(None), None);
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{uri}"
+            );
+        }
+    }
+
+    /// Plan 6b-3 D12: the project args are camelCase; `excludedFrameUuids`
+    /// is required (an omitting caller must not wipe the exclusions) while
+    /// `referenceFrameUuid`, `config`, `rerunFrom` and `limit` may be absent.
+    #[test]
+    fn project_stacking_args_are_camel_case() {
+        let cfg = serde_json::to_value(StackingConfig::default()).unwrap();
+        let set: SetProjectStackingConfigArgs = serde_json::from_value(serde_json::json!({
+            "projectId": "p1",
+            "config": cfg,
+            "excludedFrameUuids": ["a"],
+            "referenceFrameUuid": "r",
+        }))
+        .unwrap();
+        assert_eq!(set.excluded_frame_uuids, vec!["a".to_string()]);
+        assert_eq!(set.reference_frame_uuid.as_deref(), Some("r"));
+        let no_pin: SetProjectStackingConfigArgs = serde_json::from_value(serde_json::json!({
+            "projectId": "p1",
+            "config": cfg,
+            "excludedFrameUuids": [],
+        }))
+        .unwrap();
+        assert_eq!(no_pin.reference_frame_uuid, None);
+        assert!(
+            serde_json::from_value::<SetProjectStackingConfigArgs>(serde_json::json!({
+                "projectId": "p1",
+                "config": cfg,
+            }))
+            .is_err()
+        );
+        let start: StartProjectStackingArgs = serde_json::from_value(
+            serde_json::json!({"projectId": "p1", "rerunFrom": "integrate"}),
+        )
+        .unwrap();
+        assert_eq!(start.rerun_from, Some(Stage::Integrate));
+        assert!(start.config.is_none());
+        let runs: GetProjectStackingRunsArgs =
+            serde_json::from_value(serde_json::json!({"projectId": "p1"})).unwrap();
+        assert_eq!((runs.project_id.as_str(), runs.limit), ("p1", None));
+    }
+
+    /// Plan 6b-3 D12: on a real catalog the config route reads the seed
+    /// (`isDefault`, coverage on) and stores nothing; a save without
+    /// `excludedFrameUuids` is a 422.
+    #[tokio::test]
+    async fn project_config_routes_read_the_seed_and_require_exclusions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = athenaeum_core::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO collab_projects (project_id, slug, title, data_role, target_name,
+                   target_ra_deg, target_dec_deg, target_radius_deg, membership_version,
+                   snapshot_payload_b64, snapshot_signature_b64, members_json)
+                 VALUES ('p1', 'p1', 'p1', 'processor', 'M42', 83.8, -5.4, 1.0, 1, '', '', '[]')",
+                [],
+            )
+            .unwrap();
+        let state = db_test_state(db);
+        let (status, body) = post_json(
+            state.clone(),
+            "/api/get_project_stacking_config",
+            r#"{"projectId":"p1"}"#.into(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["isDefault"], true);
+        assert_eq!(body["config"]["output"]["coverageMap"], true);
+        assert_eq!(body["excludedFrameUuids"], serde_json::json!([]));
+
+        let cfg = serde_json::to_string(&body["config"]).unwrap();
+        let (status, _) = post_json(
+            state.clone(),
+            "/api/set_project_stacking_config",
+            format!(r#"{{"projectId":"p1","config":{cfg}}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, body) = post_json(
+            state,
+            "/api/set_project_stacking_config",
+            format!(r#"{{"projectId":"p1","config":{cfg},"excludedFrameUuids":["b","a"]}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["isDefault"], false);
+        assert_eq!(body["excludedFrameUuids"], serde_json::json!(["a", "b"]));
     }
 }

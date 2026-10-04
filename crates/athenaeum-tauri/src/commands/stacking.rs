@@ -17,8 +17,8 @@ use crate::tauri_events::TauriProgressEmitter;
 use super::AppState;
 
 pub use athenaeum_core::api::stacking::{
-    NamedPreset, StackingPaths, StackingPresets, StackingRunDetail, StackingRunSummary,
-    StackingSetConfig,
+    NamedPreset, StackingPaths, StackingPresets, StackingProjectConfig, StackingRunDetail,
+    StackingRunSummary, StackingSetConfig,
 };
 
 /// Desktop has no path sandbox — every stacking folder handler uses
@@ -241,6 +241,127 @@ pub async fn cleanup_stacking_work(
 ) -> Result<u64, String> {
     let ctx = state.ctx.clone();
     tokio::task::spawn_blocking(move || api::cleanup_stacking_work(&ctx, set_id, what))
+        .await
+        .map_err(|e| format!("Cleanup task panicked: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+// ── Project stacking (collab wave 6b-3, spec §9.1) ───────────────────────
+
+/// A project's plan. A project plan can seed its config and mint frame
+/// handles, so it runs on a blocking thread like the set's.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_project_stacking_plan(
+    state: State<'_, AppState>,
+    project_id: String,
+    config: Option<StackingConfig>,
+) -> Result<StackingPlan, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        api::get_project_stacking_plan(&ctx, &POLICY, &project_id, config)
+    })
+    .await
+    .map_err(|e| format!("Plan task panicked: {e}"))?
+    .map_err(|e| e.to_string())
+}
+
+/// Start a project run; events arrive as for a set.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn start_project_stacking(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    project_id: String,
+    config: Option<StackingConfig>,
+    rerun_from: Option<Stage>,
+) -> Result<StartedStacking, String> {
+    let ctx = state.ctx.clone();
+    let emitter = Arc::new(TauriProgressEmitter(app_handle));
+    tokio::task::spawn_blocking(move || {
+        api::start_project_stacking(
+            ctx,
+            emitter,
+            &POLICY,
+            env!("CARGO_PKG_VERSION").to_string(),
+            &project_id,
+            config,
+            rerun_from,
+        )
+    })
+    .await
+    .map_err(|e| format!("Start task panicked: {e}"))?
+    .map_err(|e| e.to_string())
+}
+
+/// A project's run history, newest first.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_project_stacking_runs(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<StackingRunSummary>, String> {
+    api::get_project_stacking_runs(&state.ctx, &project_id, limit).map_err(|e| e.to_string())
+}
+
+/// A project's stacking document; with none stored, the seed (read only).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_project_stacking_config(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<StackingProjectConfig, String> {
+    api::get_project_stacking_config(&state.ctx, &project_id).map_err(|e| e.to_string())
+}
+
+/// Store a project's whole stacking document. An absent
+/// `referenceFrameUuid` clears the manual reference (Tauri cannot tell
+/// absent from `null`); `excludedFrameUuids` is required.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_project_stacking_config(
+    state: State<'_, AppState>,
+    project_id: String,
+    config: StackingConfig,
+    excluded_frame_uuids: Vec<String>,
+    reference_frame_uuid: Option<String>,
+) -> Result<StackingProjectConfig, String> {
+    api::set_project_stacking_config(
+        &state.ctx,
+        &project_id,
+        config,
+        excluded_frame_uuids,
+        reference_frame_uuid,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// A project's working-layout byte usage.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_project_stacking_work_usage(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<WorkUsage, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || api::get_project_stacking_work_usage(&ctx, &project_id))
+        .await
+        .map_err(|e| format!("Work-usage task panicked: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// Clean a project's working layout. Refuses while a project run is active;
+/// otherwise sweeps the rows of frames that left the project first.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn cleanup_project_stacking_work(
+    state: State<'_, AppState>,
+    project_id: String,
+    what: CleanupWhat,
+) -> Result<u64, String> {
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || api::cleanup_project_stacking_work(&ctx, &project_id, what))
         .await
         .map_err(|e| format!("Cleanup task panicked: {e}"))?
         .map_err(|e| e.to_string())
