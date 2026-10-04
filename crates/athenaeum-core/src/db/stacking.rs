@@ -2244,6 +2244,12 @@ mod tests {
                     .is_some(),
                 "{uuid}"
             );
+            assert!(
+                find_artifact(&c, &p1, "g", "registered", Some(h[uuid]))
+                    .unwrap()
+                    .is_some(),
+                "{uuid} registered"
+            );
         }
         assert!(find_artifact(&c, &p1, "g", "ln_reference", None)
             .unwrap()

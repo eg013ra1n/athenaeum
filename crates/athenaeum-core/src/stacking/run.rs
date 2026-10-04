@@ -589,9 +589,12 @@ pub(crate) fn wire_subject(subject: &StackSubject) -> (Option<i64>, Option<Strin
 /// [`crate::api::sync_prepare::heal_interrupted_preparations`], which the
 /// two hosts call once at boot): a stuck stacking run only ever matters to a
 /// caller about to read or act on its frame set, and every such caller
-/// already goes through one of the five `api::stacking` handlers this is
-/// wired into (`get_stacking_plan`, `start_stacking`, `get_stacking_runs`,
-/// `get_stacking_run`, `cleanup_stacking_work`) — a sixth process-wide wire-up
+/// already goes through one of the `api::stacking` handlers this is wired
+/// into (the frame-set ones: `get_stacking_plan`, `start_stacking`,
+/// `get_stacking_runs`, `get_stacking_run`, `cleanup_stacking_work`; and the
+/// project ones: `get_project_stacking_plan`, `start_project_stacking`,
+/// `get_project_stacking_runs`, `cleanup_project_stacking_work`) — a
+/// process-wide wire-up
 /// would heal rows nobody is about to look at, for no benefit over healing
 /// on demand.
 ///

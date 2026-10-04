@@ -962,7 +962,13 @@ pub fn get_project_stacking_runs(
     project_id: &str,
     limit: Option<usize>,
 ) -> Result<Vec<StackingRunSummary>, ApiError> {
-    runs_for_subject(ctx, &StackSubject::Project(project_id.to_string()), limit)
+    let subject = StackSubject::Project(project_id.to_string());
+    {
+        // An unknown or mistyped id is `NotFound`, not an empty history.
+        let db_handle = db(ctx)?;
+        subject_label(&db_handle.conn(), &subject)?;
+    }
+    runs_for_subject(ctx, &subject, limit)
 }
 
 /// The view of a project's document: the stored one, or the seed.
@@ -1017,6 +1023,11 @@ pub fn set_project_stacking_config(
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
     crate::api::collab_exchange::live_project(&conn, project_id)?;
+    excluded_frame_uuids = excluded_frame_uuids
+        .into_iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
     excluded_frame_uuids.sort();
     excluded_frame_uuids.dedup();
     let reference = reference_frame_uuid
@@ -1069,14 +1080,15 @@ pub fn get_project_stacking_work_usage(
 }
 
 /// Clean a project's working layout (plan 6b-3 D12, spec §9.3). As for a
-/// set: heal, then `Conflict` while a project run is active. Then, at every
-/// level and even with no working folder, the artifact rows of frames that
-/// left the project are swept (rows only; review M5 put the sweep after the
-/// `Conflict` check, so a refused cleanup touches nothing). Then `Ok(0)`
-/// with no working folder. A layout root that overlaps a scan root (the
-/// Collaboration root is one) is refused, as the plan's `folders` blocker
-/// refuses it (6b-2 C6) — cleanup removes whole subtrees and a landed
-/// replica must never be in one.
+/// set: heal, then `Conflict` while a project run is active. Every refusal
+/// precedes every write: the stored config is read next (an invalid one
+/// fails here), and a layout root that overlaps a scan root (the
+/// Collaboration root is one) is refused with `Invalid`, as the plan's
+/// `folders` blocker refuses it (6b-2 C6) — cleanup removes whole subtrees
+/// and a landed replica must never be in one. Only then are the artifact
+/// rows of frames that left the project swept (rows only; this runs at every
+/// level and even with no working folder), and with no working folder the
+/// result is `Ok(0)`.
 pub fn cleanup_project_stacking_work(
     ctx: &ServiceContext,
     project_id: &str,
@@ -1092,15 +1104,21 @@ pub fn cleanup_project_stacking_work(
             "a stacking run (id {run_id}) is active for project {project_id}"
         )));
     }
+    let layout = match project_working_dir(&conn, &ctx.settings, project_id)? {
+        Some(working) => {
+            let layout = layout_for(&conn, Path::new(&working), &subject)?;
+            if let Some(why) = crate::stacking::paths::project_root_overlap(&conn, &layout.root)? {
+                tracing::warn!(project_id, path = %layout.root.display(), "project cleanup refused: the working folder overlaps a scan root");
+                return Err(ApiError::Invalid(why));
+            }
+            Some(layout)
+        }
+        None => None,
+    };
     crate::db::stacking::sweep_departed_project_artifacts(&conn, project_id)?;
-    let Some(working) = project_working_dir(&conn, &ctx.settings, project_id)? else {
+    let Some(layout) = layout else {
         return Ok(0);
     };
-    let layout = layout_for(&conn, Path::new(&working), &subject)?;
-    if let Some(why) = crate::stacking::paths::project_root_overlap(&conn, &layout.root)? {
-        tracing::warn!(project_id, path = %layout.root.display(), "project cleanup refused: the working folder overlaps a scan root");
-        return Err(ApiError::Invalid(why));
-    }
     Ok(cleanup_work(&conn, &subject, &layout, what)?)
 }
 
@@ -2826,12 +2844,22 @@ mod tests {
             get_project_stacking_config(&ctx, "nope"),
             Err(ApiError::NotFound(_))
         ));
+        assert!(matches!(
+            get_project_stacking_runs(&ctx, "nope", None),
+            Err(ApiError::NotFound(_))
+        ));
 
         let saved = set_project_stacking_config(
             &ctx,
             "p1",
             view.config.clone(),
-            vec!["b".into(), "a".into(), "b".into()],
+            vec![
+                "b".into(),
+                " a ".into(),
+                "b".into(),
+                "  ".into(),
+                String::new(),
+            ],
             Some("r".into()),
         )
         .unwrap();
@@ -2942,6 +2970,29 @@ mod tests {
             crate::db::stacking::set_run_status(&conn, run_id, "running").unwrap();
             run_id
         };
+        // A departed handle's row must SURVIVE a refused cleanup (nothing is
+        // touched before a refusal).
+        let late = {
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            let h = crate::db::stacking::project_frame_handles(&conn, "p1", &["late"]).unwrap();
+            crate::db::stacking::upsert_artifact(
+                &conn,
+                &crate::db::stacking::NewArtifact {
+                    subject: &subject,
+                    frame_id: Some(h["late"]),
+                    group_key: "",
+                    kind: "solve",
+                    path: None,
+                    config_hash: "h",
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some("{}"),
+                },
+            )
+            .unwrap();
+            h["late"]
+        };
         ctx.active_stacks.lock().unwrap().insert(
             run_id,
             crate::services::StackHandle {
@@ -2951,6 +3002,18 @@ mod tests {
         );
         let err = cleanup_project_stacking_work(&ctx, "p1", CleanupWhat::All).unwrap_err();
         assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+        assert!(
+            crate::db::stacking::find_artifact(
+                &db(&ctx).unwrap().conn(),
+                &subject,
+                "",
+                "solve",
+                Some(late)
+            )
+            .unwrap()
+            .is_some(),
+            "a refused cleanup sweeps nothing"
+        );
         let runs = get_project_stacking_runs(&ctx, "p1", None).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run.id, run_id);
@@ -2988,5 +3051,69 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, "failed");
+    }
+
+    /// Plan 6b-3 D12 (review fix 1): a working folder inside a scan root is
+    /// refused with `Invalid` and nothing is touched — no file removed, no
+    /// departed row swept.
+    #[test]
+    fn project_cleanup_refuses_an_overlapping_scan_root_and_touches_nothing() {
+        let (_tmp, ctx) = test_ctx();
+        let subject = StackSubject::Project("p1".into());
+        let scan = tempfile::tempdir().unwrap();
+        let work = scan.path().join("work");
+        let file = work
+            .join("_projects")
+            .join("p1")
+            .join("registered")
+            .join("g")
+            .join("x.fits");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, vec![0u8; 16]).unwrap();
+        let gone = {
+            let handle = db(&ctx).unwrap();
+            let conn = handle.conn();
+            crate::db::stacking::insert_test_project(&conn, "p1");
+            conn.execute(
+                "INSERT INTO scan_roots (path, kind) VALUES (?1, 'collaboration')",
+                rusqlite::params![scan.path().to_string_lossy()],
+            )
+            .unwrap();
+            let h = crate::db::stacking::project_frame_handles(&conn, "p1", &["gone"]).unwrap();
+            crate::db::stacking::upsert_artifact(
+                &conn,
+                &crate::db::stacking::NewArtifact {
+                    subject: &subject,
+                    frame_id: Some(h["gone"]),
+                    group_key: "",
+                    kind: "solve",
+                    path: None,
+                    config_hash: "h",
+                    size: None,
+                    modified_at: None,
+                    payload_json: Some("{}"),
+                },
+            )
+            .unwrap();
+            h["gone"]
+        };
+        let mut cfg = crate::stacking::config::project_seed_config(StackingConfig::default());
+        cfg.paths.working_dir = Some(work.to_string_lossy().into_owned());
+        set_project_stacking_config(&ctx, "p1", cfg, Vec::new(), None).unwrap();
+        let err = cleanup_project_stacking_work(&ctx, "p1", CleanupWhat::All).unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "{err:?}");
+        assert!(file.exists(), "the file survives the refusal");
+        assert!(
+            crate::db::stacking::find_artifact(
+                &db(&ctx).unwrap().conn(),
+                &subject,
+                "",
+                "solve",
+                Some(gone)
+            )
+            .unwrap()
+            .is_some(),
+            "the departed row survives the refusal"
+        );
     }
 }

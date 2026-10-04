@@ -1157,7 +1157,8 @@ pub(crate) fn read_project_config(
 /// one IMMEDIATE transaction), then resolves whole-config like a frame set:
 /// an override wins outright and is never stored, else the stored document
 /// IS the config. `pub` so the lib build carries it before the project plan
-/// arm (Task 7) and 6b-3's `get_project_stacking_config` call it.
+/// arm (Task 7); the read-only config view, usage and cleanup read through
+/// [`read_project_config`] instead.
 pub fn resolve_project_config_and_exclusions(
     conn: &Connection,
     settings: &SettingsManager,
