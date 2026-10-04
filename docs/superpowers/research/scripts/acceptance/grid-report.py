@@ -43,7 +43,8 @@ the run's [startedAt, finishedAt] window, and never under `ln_seeds_calibration`
 came from the seeds path (`ln_scale_source`), cross-checked per member against
 the main pass's "ln frame normalized" event (its mean over planes) and the
 summary's `lnScale`. Every member of the run summary is listed with the cause
-when it has no scale (excluded, cached, global normalization, LN failed).
+when it has no scale (excluded, cached, global normalization, LN failed), or
+with "artifact unreadable" when it has one but its registered frame cannot be read.
 
 The photometric truth is adaptive, per (member, plane), the same radii in both
 frames: FWHM per frame from the half-maximum area of ~100 isolated stars (the
@@ -56,10 +57,14 @@ max(bg + 5 sigma, 2 % of the peak) between 3F and 14F in either frame (the
 brief says "outside 1.5F" — a bright star's own wings exceed 5 sigma there),
 the window finite in both frames (and non-zero in the LN reference), no
 saturation in either frame (3x3 core with >= 5 pixels at (1 - 1.4/FWHM^2) of its peak above the sky, or
-a peak above half of that frame's brightest candidate). n >= 10 is required;
+a peak above half of that frame's THIRD-brightest candidate peak, so one hot pixel or cosmic ray on a
+candidate cannot disable the rule). n >= 10 is required;
 with fewer, the crowded fallback (annulus [5F, 7F], r_ap = 5F, no correction,
-isolation 9F) is tried and said so. --self-check runs synthetic checks of the
-photometry (Gaussian and Moffat, different widths) and the log parser.
+isolation 9F) is tried and said so. The printed "+- SE" (labelled "bootstrap SE") is the sd of the WHOLE ratio
+(the 3F median times the two curve-of-growth medians; the plain 5F median in the crowded fallback)
+over 400 resamples of the kept stars with a fixed generator seed, so a report is reproducible.
+--self-check runs synthetic checks of the photometry (Gaussian and Moffat, different widths), the
+bootstrap SE against the seed-to-seed scatter, the saturation rules and the log parser.
 """
 import json
 import math
@@ -313,14 +318,26 @@ def is_saturated(img, y, x, bg, fwhm):
     equal; the tolerance follows the PSF because a broad unsaturated star really is that flat. Five, not
     three: a star centred on a pixel corner has FOUR equal core pixels (a threshold of 3 flagged 26-35 % of
     unsaturated stars at random sub-pixel positions), and at most four can be that equal without a clip.
-    Hard saturation is also caught by the "> 50 % of the brightest candidate peak" rule in `photometry`
-    and `frame_fwhm`. `fwhm` is this frame's, F0 before it is known."""
+    Hard saturation is also caught by the "> 50 % of the third-brightest candidate peak" rule
+    (`peak_yardstick`) in `photometry` and `frame_fwhm`. `fwhm` is this frame's, F0 before it is known."""
     core = img[y - 1:y + 2, x - 1:x + 2] - bg
     m = float(core.max())
     if not m > 0:
         return False
     tol = 1.0 - 1.4 / max(float(fwhm), 2.0) ** 2
     return int((core >= tol * m).sum()) >= 5
+
+
+def peak_yardstick(peaks):
+    """The saturation yardstick of the "> 50 %" brightness rule: the THIRD-brightest finite candidate
+    peak above the sky (the brightest when fewer than three are finite; NaN when none is). Not the
+    brightest: one outlier pixel (cosmic ray, hot pixel) sitting on a candidate would raise the
+    yardstick past every clipped star and disable the rule."""
+    v = np.sort(np.asarray(peaks, dtype=np.float64))
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return float("nan")
+    return float(v[-3] if v.size >= 3 else v[-1])
 
 
 def half_max_fwhm(win, f0):
@@ -360,6 +377,7 @@ def frame_fwhm(img, cand, zero_is_uncovered, f0=8.0, want=100):
     bg_frame, _ = sky_stats(img, zero_is_uncovered)
     pos = cand[:, :2]
     peaks = cand[:, 2]
+    yard = peak_yardstick(peaks)
     nb = Neighbours(pos)
     out = []
     for i in range(len(cand)):
@@ -371,7 +389,7 @@ def frame_fwhm(img, cand, zero_is_uncovered, f0=8.0, want=100):
         win = img[y - half:y + half + 1, x - half:x + half + 1]
         if not covered(win, zero_is_uncovered) or is_saturated(img, y, x, bg_frame, f0):
             continue
-        if peaks[i] > 0.5 * float(np.nanmax(peaks)):
+        if peaks[i] > 0.5 * yard:
             continue
         fw = half_max_fwhm(win, f0)
         if fw == fw:
@@ -388,13 +406,18 @@ def aperture_flux(win, rr, r, ann_mask):
     return float((win[rr <= r] - bg).sum())
 
 
+BOOT_RESAMPLES = 400
+BOOT_SEED = 61003  # fixed: the same frames always print the same SE
+
+
 def photometry(ref, mem, cand_info=None, f_ref=None):
     """Adaptive ratio ref/member for one plane (fix round 1, ruling set): see the module doc.
-    Returns a dict with fwhm_ref, fwhm_mem, mode, r_ap, ann, n, ratio, se, unc {3F, 5F, 8F}, note."""
+    Returns a dict with fwhm_ref, fwhm_mem, mode, r_ap, ann, n, ratio, se (bootstrap sd of the whole
+    ratio over the kept stars), unc {3F, 5F, 8F}, stars [(y, x) of the stars used], note."""
     cand, bg_r, sig_r = cand_info if cand_info is not None else reference_candidates(ref)
     res = {"fwhm_ref": float("nan"), "fwhm_mem": float("nan"), "mode": "", "r_ap": float("nan"),
            "ann": (float("nan"), float("nan")), "n": 0, "ratio": float("nan"), "se": float("nan"),
-           "unc": {}, "note": ""}
+           "unc": {}, "stars": [], "note": ""}
     if len(cand) == 0:
         res["note"] = "no candidate star above 20 sigma in the LN reference"
         return res
@@ -409,8 +432,8 @@ def photometry(ref, mem, cand_info=None, f_ref=None):
         return res
     big_f = max(fr[0], fm)
     cut_log = []
-    mem_peak_max = float(np.nanmax(mpk) - bg_m)
-    ref_peak_max = float(cand[:, 2].max())
+    mem_peak_max = peak_yardstick(mpk - bg_m)
+    ref_peak_max = peak_yardstick(cand[:, 2])
     for mode in ("normal", "crowded"):
         if mode == "normal":
             r_ap, a_in, a_out, r_iso = max(3 * big_f, 5.0), 10 * big_f, 12 * big_f, 14 * big_f
@@ -484,22 +507,30 @@ def photometry(ref, mem, cand_info=None, f_ref=None):
         res["n"] = int(good.sum())
         return res
     res["n"] = int(good.sum())
+    res["stars"] = [(y, x) for (y, x, _, _), g in zip(stars, good) if g]
     for k in radii:
         res["unc"][k] = float(np.median(fl["ref"][k][good] / fl["mem"][k][good]))
     per = fl["ref"][k_ap][good] / fl["mem"][k_ap][good]
     med = float(np.median(per))
-    sig = 1.4826 * float(np.median(np.abs(per - med)))
-    res["se"] = 1.2533 * sig / math.sqrt(res["n"])
+    # The SE is a bootstrap over the kept stars of the WHOLE estimator: in normal mode the 3F median AND
+    # the two curve-of-growth medians move together on each resampled star set (their noise is most of
+    # the total; an SE of the 3F median alone was about 4x too small against the seed-to-seed scatter).
+    idx = np.random.default_rng(BOOT_SEED).integers(0, res["n"], size=(BOOT_RESAMPLES, res["n"]))
     if mode == "normal":
-        c_ref = float(np.median(fl["ref"]["3F"][good] / fl["ref"]["8F"][good]))
-        c_mem = float(np.median(fl["mem"]["3F"][good] / fl["mem"]["8F"][good]))
+        cog_ref = fl["ref"]["3F"][good] / fl["ref"]["8F"][good]
+        cog_mem = fl["mem"]["3F"][good] / fl["mem"]["8F"][good]
+        c_ref, c_mem = float(np.median(cog_ref)), float(np.median(cog_mem))
         res["ratio"] = med * c_mem / c_ref
+        boot = (np.median(per[idx], axis=1) * np.median(cog_mem[idx], axis=1)
+                / np.median(cog_ref[idx], axis=1))
         res["note"] = f"curve of growth c_ref {c_ref:.4f} c_mem {c_mem:.4f}"
     else:
         res["ratio"] = med
+        boot = np.median(per[idx], axis=1)
         res["note"] = ("crowded fallback: isolation 9F, annulus [5F, 7F], r_ap = 5F, no curve-of-growth correction; "
                        "systematic about +0.2 % at beta 3, +0.6 to +0.8 % at beta 2.5 (uncorrected, the aperture "
                        "loses the wings); rejected per cut: " + " | ".join(cut_log))
+    res["se"] = float(np.std(boot, ddof=1))
     return res
 
 
@@ -517,7 +548,8 @@ def finite_pos(x):
 
 def ln_truth_group(db, pid, key, summary, log):
     """One group: every member of the run's own summary, the cause when it has no LN scale, and for
-    the members with one the scale next to the photometric ratio. Returns tagged rows: ("member", instrument, cause) and ("plane", instrument, outcome, diff, mode)."""
+    the members with one the scale next to the photometric ratio. Returns tagged rows: ("member", instrument, cause), one per member (scaled,
+    excluded, global, cached, failed or artifact unreadable), and ("plane", instrument, outcome, diff, mode)."""
     group = next((g for g in summary.get("groups", []) if g.get("key") == key), None)
     if group is None:
         print("  ln truth: the run summary has no such group")
@@ -587,7 +619,6 @@ def ln_truth_group(db, pid, key, summary, log):
             print(f"    handle {handle} [{instr}]: LN FAILED (included, not cached, no lnScale, no global marker)")
             rows.append(("member", instr, "failed"))
             continue
-        rows.append(("member", instr, "scaled"))
         path = registered.get(handle)
         applied = []
         for p in range(len(ref_planes)):
@@ -613,9 +644,11 @@ def ln_truth_group(db, pid, key, summary, log):
                 raise ValueError("no registered artifact path")
             mem_planes = planes_of(path)
         except Exception as e:  # noqa: BLE001 - one member's failure is a line of the report
-            print(f"    handle {handle} [{instr}]: registered artifact unreadable: {e}")
-            rows.append(("plane", instr, "unreadable", float("nan"), ""))
+            # A member-level cause (no plane of it was measured), in place of "scaled".
+            print(f"    handle {handle} [{instr}]: scaled, but the registered artifact is unreadable: {e}")
+            rows.append(("member", instr, "artifact unreadable"))
             continue
+        rows.append(("member", instr, "scaled"))
         for p, mp in enumerate(mem_planes[:len(ref_planes)]):
             ph = photometry(ref_planes[p], mp, cand[p], fref[p])
             a = applied[p]
@@ -632,7 +665,7 @@ def ln_truth_group(db, pid, key, summary, log):
             diff = app / ph["ratio"] - 1.0
             unc = " ".join(f"{k_}:{v:.4f}" for k_, v in ph["unc"].items())
             print(head + f"ln_scale {raw:.5f} x k {k:.5f} = {app:.5f} ({source})  photometric {ph['ratio']:.5f} "
-                  f"+- {ph['se']:.5f} (n {ph['n']}, {ph['mode']}, FWHM ref {ph['fwhm_ref']:.2f} mem {ph['fwhm_mem']:.2f} px, "
+                  f"+- {ph['se']:.5f} (bootstrap SE, n {ph['n']}, {ph['mode']}, FWHM ref {ph['fwhm_ref']:.2f} mem {ph['fwhm_mem']:.2f} px, "
                   f"r_ap {ph['r_ap']:.1f} annulus {ph['ann'][0]:.1f}-{ph['ann'][1]:.1f}; uncorrected {unc})  "
                   f"rel diff {diff * 100:+.3f} %")
             rows.append(("plane", instr, "ok", diff, ph["mode"]))
@@ -823,11 +856,35 @@ def self_check():
             a, b = plane0(str(Path(d) / "a.fits")), plane0(str(Path(d) / "b.fits"))
         ph = photometry(a, b)
         unc = " ".join(f"{k}:{v:.4f}" for k, v in ph["unc"].items())
-        print(f"{kr} FWHM {fr} vs {km} FWHM {fm}: ratio {ph['ratio']:.5f} +- {ph['se']:.5f} (n {ph['n']}, {ph['mode']}, "
+        print(f"{kr} FWHM {fr} vs {km} FWHM {fm}: ratio {ph['ratio']:.5f} +- {ph['se']:.5f} (bootstrap SE, n {ph['n']}, {ph['mode']}, "
               f"measured FWHM {ph['fwhm_ref']:.2f}/{ph['fwhm_mem']:.2f}, r_ap {ph['r_ap']:.1f}); "
               f"uncorrected {unc}; truth 1.25000")
         assert ph["n"] >= 10 and ph["ratio"] == ph["ratio"], ph["note"]
         assert abs(ph["ratio"] / 1.25 - 1) < 0.003, (kr, fr, km, fm, ph["ratio"])
+    # The bootstrap SE against the seed-to-seed scatter (fix round 4): Gaussian FWHM 4 vs 6.5 px at noise 10.
+    # One field (positions and fluxes fixed), a new noise realisation per seed. The rms of the per-seed
+    # bootstrap SEs must sit within a factor 1.5 of the sd of the per-seed ratios. 40 seeds, not 6: the sd
+    # of 6 ratios itself scatters by about 30 %, which would make a factor-1.5 test a coin toss.
+    se_rng = np.random.default_rng(21)
+    se_fluxes = se_rng.uniform(5e4, 3e5, len(centres))
+    se_ref = psf_image(size, centres, se_fluxes, "gauss", 4.0, se_rng, noise=0.0)
+    se_mem = psf_image(size, centres, se_fluxes / 1.25, "gauss", 6.5, se_rng, noise=0.0)
+    seed_ratios, seed_ses, seed_ns = [], [], []
+    for seed in range(40):
+        nrng = np.random.default_rng(1000 + seed)
+        ph = photometry(se_ref + nrng.normal(0, 10.0, se_ref.shape).astype(np.float32),
+                        se_mem + nrng.normal(0, 10.0, se_mem.shape).astype(np.float32))
+        assert ph["ratio"] == ph["ratio"], (seed, ph["note"])
+        seed_ratios.append(ph["ratio"])
+        seed_ses.append(ph["se"])
+        seed_ns.append(ph["n"])
+    seed_sd = float(np.std(seed_ratios, ddof=1))
+    boot_se = math.sqrt(float(np.mean(np.square(seed_ses))))
+    print(f"gauss FWHM 4.0 vs gauss FWHM 6.5 at noise 10, 40 seeds (n {min(seed_ns)}-{max(seed_ns)}): mean ratio "
+          f"{np.mean(seed_ratios):.5f} (truth 1.25000); seed-to-seed sd {seed_sd:.5f} ({seed_sd / 1.25 * 100:.3f} %), "
+          f"bootstrap SE rms {boot_se:.5f} ({boot_se / 1.25 * 100:.3f} %, per seed {min(seed_ses):.5f}-{max(seed_ses):.5f}); "
+          f"SE / sd {boot_se / seed_sd:.3f} (must be within 1/1.5 .. 1.5)")
+    assert 1 / 1.5 <= boot_se / seed_sd <= 1.5, (boot_se, seed_sd)
     # Saturation test: a broad, unsaturated star on a bright sky pedestal is NOT a flat top; a clipped one is.
     sat_rng = np.random.default_rng(3)
     pedestal, peak = 8000.0, 3000.0
@@ -863,6 +920,30 @@ def self_check():
     img = np.minimum(8000.0 + 3000.0 * np.exp(-((yy - 7) ** 2 + (xx - 7) ** 2) / (2 * sg * sg)), 8000.0 + 1500.0)
     assert is_saturated(img, 7, 7, 8000.0, 6.5)
     print("star clipped at 0.5 of its peak (FWHM 6.5, pixel-centred): flagged = True")
+    # (c) One outlier pixel does not disable the brightness rule (fix round 4): a member whose stars are
+    # clipped at 0.3 of its brightest peak above the sky, plus ONE hot pixel (50x the clip) on a candidate's
+    # peak. Keyed on the brightest peak, the hot pixel raised the yardstick past every clipped star and
+    # lightly clipped stars (a pixel or two at the clip, no flat top) were used; keyed on the third-brightest
+    # it must be a refusal, or at least no clipped star may be used.
+    clip_rng = np.random.default_rng(5)
+    clip_ref = psf_image(size, centres, fluxes, "gauss", 4.0, clip_rng)
+    clip_mem = psf_image(size, centres, fluxes / 1.25, "gauss", 4.0, clip_rng)
+    level = 100.0 + 0.3 * (float(clip_mem.max()) - 100.0)
+    was_clipped = clip_mem >= level
+    n_clipped = sum(bool(was_clipped[round(cy) - 3:round(cy) + 4, round(cx) - 3:round(cx) + 4].any())
+                    for cy, cx in centres)
+    clip_mem = np.minimum(clip_mem, np.float32(level))
+    c_info = reference_candidates(clip_ref)
+    hy, hx = int(c_info[0][len(c_info[0]) // 2, 0]), int(c_info[0][len(c_info[0]) // 2, 1])
+    clip_mem[hy, hx] = 100.0 + 50.0 * (level - 100.0)
+    ph = photometry(clip_ref, clip_mem, c_info)
+    used = sum(bool(was_clipped[y - 3:y + 4, x - 3:x + 4].any()) for y, x in ph["stars"])
+    print(f"member clipped at 0.3 of its brightest peak ({n_clipped} of {len(centres)} stars clipped) plus one hot "
+          f"pixel on the candidate at ({hy}, {hx}): ratio {ph['ratio']:.5f}, n {ph['n']}, clipped stars used {used}; "
+          f"{ph['note'][:110]}")
+    assert ph["ratio"] != ph["ratio"] or used == 0, (ph["ratio"], used)
+    assert peak_yardstick(np.array([1.0, np.nan, 5.0, 1e9, 3.0])) == 3.0
+    assert peak_yardstick(np.array([2.0, np.nan, 7.0])) == 7.0 and math.isnan(peak_yardstick(np.array([np.nan])))
     # A refusal prints its rejection counts per cut: too few stars on a crowded field.
     dense = [(margin + i * 35.0, margin + j * 35.0) for i in range(8) for j in range(8)]
     d_ref = psf_image(size, dense, rng.uniform(5e4, 3e5, len(dense)), "gauss", 4.0, rng)
