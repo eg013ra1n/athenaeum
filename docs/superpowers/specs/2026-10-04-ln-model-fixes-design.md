@@ -1,7 +1,14 @@
 # Local normalization model fixes and a calibration pedestal warning — design
 
 **Status:** owner decision 2026-10-04 — one cycle, five items ("делаем все пункты одним циклом").
-Push stays on the owner's word.
+Written spec APPROVED by the owner 2026-10-04 (fable review "ready after fixes", fix round 1 folded,
+§15 points 1–17 accepted — see §15). Push stays on the owner's word.
+
+**No migration (owner, 2026-10-04).** Existing runs, run rows, provenance and `master_lights` are
+left exactly as they are. Nothing rewrites stored history. The new model reaches existing sets only
+through the normal cache invalidation of §7 (the version bump makes the Normalize stage stale; the
+next run re-normalizes). The legacy config rule of L-9 is a read-time resolution in
+`resolve_config`, not a stored-data rewrite. No migration code, no one-off scripts.
 
 **Branch:** `ln-model-fixes`, cut from `main` 60df59c4.
 
@@ -16,8 +23,8 @@ Push stays on the owner's word.
   `2026-09-20-stacking-compute-tierC-design.md` (§8 tolerance table, rulings C-1…C-30) and the math
   reference `2026-09-08-stacking-math-reference.md` §4.
 
-Rulings this spec makes are numbered **L-1 … L-22** and collected in §14. §15 lists the points the
-owner has not ruled on yet.
+Rulings this spec makes are numbered **L-1 … L-22** and collected in §14. §15 lists the points put to
+the owner; all were accepted on 2026-10-04.
 
 ## 0. Verdict and scope
 
@@ -992,8 +999,14 @@ The full core suite (`cargo test -p athenaeum-core`, all targets) runs before an
 
 ## 15. Open points for the owner
 
-Seventeen points. Each was decided above, by this spec or by the controller's fix round, so the
-plan can proceed. Each can be reversed without touching the rest.
+Seventeen points. Each was decided above, by this spec or by the controller's fix round.
+
+**Owner ruling 2026-10-04: all accepted.** Explicitly confirmed: point 2 (the symmetric
+shared-acceptance refit), point 8 (only `scale: 1024` becomes auto), point 7 (`gridSize` visible,
+2–8, default 4), point 14 (the F1 default rule as written, decided in advance) and point 11 resolved:
+if the brightest stars show a trend above 1 % across terciles, raise `maxStars`; never cap the top.
+The rest (technical points 1, 3–6, 9, 10, 12, 13, 15–17) were accepted as presented. Also ruled:
+no migration of existing runs (see the header).
 
 1. Thresholds `k_t = k_s = 3.0` (the old reference value), in each image's own noise (L-1).
 2. The symmetric shared-acceptance refit as the background model's final step (L-6), with the plain
