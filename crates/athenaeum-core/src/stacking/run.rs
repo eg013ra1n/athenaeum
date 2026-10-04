@@ -1161,6 +1161,20 @@ fn run_thread(mut rc: RunContext) {
                     .unwrap_or_else(|| "unknown".to_string());
                 let msg = format!("stacking run panicked: {detail}");
                 tracing::error!(run_id, error = %msg, "stacking run thread panicked");
+                // The panic skipped `stage_output`'s wrapper: name a crop
+                // scratch folder it may have left holding masters.
+                let scratch = rc.layout.uncropped_dir(run_id);
+                if scratch.exists() {
+                    tracing::warn!(
+                        run_id,
+                        path = %scratch.display(),
+                        "panicked crop run left masters in its scratch folder"
+                    );
+                    rc.warnings.push(format!(
+                        "the run panicked; masters may remain in {}",
+                        scratch.display()
+                    ));
+                }
                 Err(RunError::Other(msg))
             }
         };
@@ -7591,6 +7605,12 @@ static FORCE_NO_DRIZZLE_STATS_RECT: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static FORCE_CROP_FAILURE: AtomicBool = AtomicBool::new(false);
 
+/// Test hook (plan 6b-3 D10 fix round 2): the next `record_crop_item` call
+/// fails once, as a database error would. One-shot, project runs only (see
+/// [`FORCE_CROP_FAILURE`]).
+#[cfg(test)]
+static FORCE_RECORD_FAILURE: AtomicBool = AtomicBool::new(false);
+
 /// Test hook (plan 6b-3 D10 fix round 1): raise the run's cancel flag after
 /// the next group has written, to cancel between two groups. One-shot, project
 /// runs only (see [`FORCE_CROP_FAILURE`]).
@@ -11630,8 +11650,9 @@ fn stage_output_groups(rc: &mut RunContext) -> Result<(), RunError> {
 /// action does. The pass deliberately ignores a cancel — stopping between
 /// groups would strand the rest in the scratch folder — so a large drizzle
 /// family adds cancel latency. Database errors fail the run, as everywhere in
-/// Output; the groups not yet finalized stay in `rc.crop_items` for
-/// [`finalize_unfinished_crop`].
+/// Output, but only after every group has been tried: a group whose rows
+/// could not be updated counts as kept, so the scratch folder (which its rows
+/// may still name) survives, and a warning names it.
 fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
     let items = std::mem::take(&mut rc.crop_items);
     if items.is_empty() {
@@ -11646,8 +11667,8 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
         RegistrationGeometry::Native => None,
     };
     let mut kept = 0usize;
-    let mut pending = items.into_iter();
-    while let Some(item) = pending.next() {
+    let mut record_error: Option<RunError> = None;
+    for item in items {
         let full = CropRect::full(item.width, item.height);
         let wanted = run_rect.unwrap_or(item.rect);
         let (target, note) = match wanted {
@@ -11711,8 +11732,25 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
         match result {
             Ok((o, note)) => {
                 if let Err(e) = record_crop_item(rc, &item, &o) {
-                    rc.crop_items = pending.collect();
-                    return Err(e);
+                    // Its files are final but its rows may still name the
+                    // scratch folder: the folder stays, whatever the other
+                    // groups do, and the pass goes on with them.
+                    kept += 1;
+                    tracing::error!(
+                        run_id = rc.run_id,
+                        group_key = %item.group_key,
+                        path = %scratch.display(),
+                        error = ?e,
+                        "crop outputs written but their rows could not be updated; scratch kept"
+                    );
+                    rc.warnings.push(format!(
+                        "group {}: its rows could not be updated after the crop; \
+                         the scratch folder {} is kept",
+                        item.group_key,
+                        scratch.display()
+                    ));
+                    record_error.get_or_insert(e);
+                    continue;
                 }
                 if let Some(note) = note {
                     rc.warnings.push(note);
@@ -11752,7 +11790,10 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
         }
     }
     remove_scratch_unless_kept(rc, &scratch, kept);
-    Ok(())
+    match record_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn remove_scratch_unless_kept(rc: &RunContext, scratch: &Path, kept: usize) {
@@ -11913,6 +11954,10 @@ fn record_crop_item(
     item: &CropItem,
     out: &CropOutputs,
 ) -> Result<(), RunError> {
+    #[cfg(test)]
+    if rc.subject.project_id().is_some() && FORCE_RECORD_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(RunError::Other("forced record failure".to_string()));
+    }
     let show = |p: &Path| p.display().to_string();
     let format_str = enum_serde_name(&rc.config.output.format)?;
     let master_path = show(&out.master.master);
@@ -26529,5 +26574,61 @@ mod tests {
             .collect();
         assert_eq!(said.len(), 1, "{:?}", rc.warnings);
         assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
+    }
+
+    /// Plan 6b-3 D10 fix round 2: a database error while recording one
+    /// group's crop never deletes the scratch folder its rows may still name;
+    /// the warning names the folder and the group, and the other group is
+    /// finalized.
+    #[test]
+    fn a_record_failure_keeps_the_crop_scratch_folder() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, conn, grid) = seed_two_group_project(tmp.path());
+        let mut cfg = sky_config(&conn);
+        cfg.registration.geometry = RegistrationGeometry::Native;
+        cfg.output.crop_to_coverage = 3;
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        FORCE_RECORD_FAILURE.store(true, Ordering::SeqCst);
+        let result = run_pipeline(&mut rc);
+        FORCE_RECORD_FAILURE.store(false, Ordering::SeqCst);
+        assert!(result.is_err(), "a database error fails the run");
+
+        let scratch = rc.layout.uncropped_dir(rc.run_id);
+        assert!(scratch.exists(), "the scratch folder survives");
+        let rows = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
+        let masters: Vec<_> = rows.iter().filter(|m| m.kind == "master").collect();
+        assert_eq!(masters.len(), 2, "{rows:?}");
+        let (in_scratch, finalized): (Vec<&&crate::db::stacking::MasterLight>, Vec<_>) = masters
+            .iter()
+            .partition(|m| Path::new(&m.path).starts_with(&scratch));
+        assert_eq!(in_scratch.len(), 1, "the failed group's rows still name scratch");
+        assert_eq!(finalized.len(), 1, "the other group is finalized");
+        assert!(Path::new(&in_scratch[0].path).exists(), "its master survives");
+        assert!(Path::new(&finalized[0].path).starts_with(tmp.path().join("out")));
+        let named = in_scratch[0].group_key.as_str();
+        assert!(
+            rc.warnings
+                .iter()
+                .any(|w| w.contains(named) && w.contains(&scratch.display().to_string())),
+            "{:?}",
+            rc.warnings
+        );
     }
 }

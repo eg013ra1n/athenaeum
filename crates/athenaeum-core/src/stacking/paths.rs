@@ -954,19 +954,6 @@ const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
     "ln_global",
 ];
 
-/// Remove a working layout's subtrees per `what` and the matching
-/// `stacking_artifacts` rows, returning the bytes freed (summed by walking
-/// each subtree, symlink-safe via [`crate::api::sync::dir_size_bytes`],
-/// before it is removed). Only ever touches directories under `layout.root`
-/// that this task's layout owns (`registered/`, `calibrated/`, `ln/`,
-/// `runs/`, and — M3 Task 2 — `rej/`) — never `layout.root` itself, and
-/// never the output folder, which this function never sees a path for.
-/// `rej/` holds no `stacking_artifacts` rows (bitmaps are per-run
-/// temporaries, not cached artifacts — see `stacking::rej`'s own doc), so it
-/// is added to the removed DIRECTORIES on the same levels as `calibrated`/
-/// `ln` without touching `INTERMEDIATE_ARTIFACT_KINDS` or the DB delete
-/// calls below. `prepared/` goes with `calibrated/`; a `calibrated` row
-/// pointing at a file used in place loses its row, never its file.
 /// Whether `name` is a crop run's scratch folder (`run-<id>-uncropped`,
 /// [`WorkingLayout::uncropped_dir`]).
 fn is_uncropped_dir_name(name: &str) -> bool {
@@ -1014,6 +1001,21 @@ fn remove_runs_keeping_uncropped(runs: &Path) -> anyhow::Result<u64> {
     Ok(freed)
 }
 
+/// Remove a working layout's subtrees per `what` and the matching
+/// `stacking_artifacts` rows, returning the bytes freed (summed by walking
+/// each subtree, symlink-safe via [`crate::api::sync::dir_size_bytes`],
+/// before it is removed). Only ever touches directories under `layout.root`
+/// that this task's layout owns (`registered/`, `calibrated/`, `ln/`,
+/// `runs/`, and — M3 Task 2 — `rej/`) — never `layout.root` itself, and
+/// never the output folder, which this function never sees a path for.
+/// `rej/` holds no `stacking_artifacts` rows (bitmaps are per-run
+/// temporaries, not cached artifacts — see `stacking::rej`'s own doc), so it
+/// is added to the removed DIRECTORIES on the same levels as `calibrated`/
+/// `ln` without touching `INTERMEDIATE_ARTIFACT_KINDS` or the DB delete
+/// calls below. `prepared/` goes with `calibrated/`; a `calibrated` row
+/// pointing at a file used in place loses its row, never its file.
+/// `runs/run-<id>-uncropped` folders are never removed (see
+/// [`remove_runs_keeping_uncropped`]).
 pub fn cleanup_work(
     conn: &Connection,
     subject: &StackSubject,
