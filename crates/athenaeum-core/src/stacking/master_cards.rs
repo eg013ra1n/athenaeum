@@ -657,7 +657,13 @@ pub fn weight_map_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsWriteEr
     // synthesizes the astronomical default when the cards carry none, so
     // without this copy-through a weight map would claim `'BOTTOM-UP'`
     // beside a master that says `'TOP-DOWN'`.
-    for kw in ["ROWORDER", "ATH_STKI", "ATH_STKG", ATH_DRZ, ATH_RGEO] {
+    //
+    // Plan 6b-3 (ruling a): `ATH_SPRJ`/`ATH_GRID` too, so the weight map, the
+    // drizzle coverage and the master coverage agree; a frame-set drizzle's
+    // cards carry neither, so its bytes do not move.
+    for kw in [
+        "ROWORDER", "ATH_STKI", "ATH_STKG", ATH_DRZ, ATH_RGEO, ATH_SPRJ, ATH_GRID,
+    ] {
         if let Some(c) = drizzle_cards.iter().find(|c| c.keyword == kw) {
             cards.push(c.clone());
         }
@@ -668,6 +674,9 @@ pub fn weight_map_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsWriteEr
 pub struct WrittenDrizzle {
     pub drizzle: PathBuf,
     pub weight_map: Option<PathBuf>,
+    /// Drizzle's own coverage beside the weight map (plan 6b-3 D9); `None`
+    /// unless the output carried one.
+    pub coverage: Option<PathBuf>,
 }
 
 /// Writes `output.data` (planar `channels × w × h`) as `<dir>/<drizzle
@@ -767,9 +776,40 @@ pub fn write_drizzled_master(
         None => None,
     };
 
+    // Plan 6b-3 D9 (spec §5.8): drizzle's own coverage — always FITS, one
+    // plane per channel, the drizzled master's WCS.
+    let coverage = match output.coverage.as_deref() {
+        Some(data) => {
+            let resolved_stem = drizzle_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("drizzle")
+                .to_string();
+            let path = resolve_collision(&dir.join(format!("{resolved_stem}_coverage.fits")));
+            let map_cards = coverage_map_cards(cards)?;
+            write_fits_f32(
+                &path,
+                output.width,
+                output.height,
+                output.channels,
+                data,
+                &map_cards,
+            )
+            .with_context(|| format!("writing {}", path.display()))?;
+            info!(
+                path = %path.display(),
+                bytes = (data.len() * std::mem::size_of::<f32>()) as u64,
+                "wrote drizzle coverage map"
+            );
+            Some(path)
+        }
+        None => None,
+    };
+
     Ok(WrittenDrizzle {
         drizzle: drizzle_path,
         weight_map,
+        coverage,
     })
 }
 
@@ -1734,6 +1774,29 @@ mod tests {
         );
     }
 
+    /// Plan 6b-3 ruling (a): the drizzle weight map copies `ATH_SPRJ` and
+    /// `ATH_GRID` from the drizzle's cards when they carry them, and a
+    /// frame-set drizzle's cards (carrying neither) give a weight map with
+    /// neither, as before.
+    #[test]
+    fn weight_map_cards_copy_the_project_cards_and_a_frame_set_has_none() {
+        let base = vec![
+            Card::new(ATH_DRZ, CardValue::Integer(2)).unwrap(),
+            Card::new("ATH_STKI", CardValue::Str("run-1".into())).unwrap(),
+        ];
+        let frame_set = weight_map_cards(&base).unwrap();
+        assert!(frame_set
+            .iter()
+            .all(|c| c.keyword != ATH_SPRJ && c.keyword != ATH_GRID));
+        let mut grid = base.clone();
+        grid.push(Card::new(ATH_GRID, CardValue::Str("0123456789abcdef".into())).unwrap());
+        grid.push(Card::new(ATH_SPRJ, CardValue::Str("p1".into())).unwrap());
+        let cards = weight_map_cards(&grid).unwrap();
+        for k in [ATH_SPRJ, ATH_GRID] {
+            assert!(cards.iter().any(|c| c.keyword == k), "{k} copied");
+        }
+    }
+
     /// B11 (M3 final fix wave, M8): the weight map's own cards must carry
     /// the SAME scaled WCS block the drizzled master's cards do — every
     /// keyword `wcs_cards(&scaled)` emits, with the SAME value, exactly
@@ -1861,6 +1924,7 @@ mod tests {
             channels: ch,
             data: vec![0.25f32; plane * ch],
             weight: Some(vec![0.75f32; plane * ch]),
+            coverage: None,
             stats: dummy_drizzle_stats(2, ch, w, h),
         };
 
@@ -1951,6 +2015,7 @@ mod tests {
             channels: ch,
             data: vec![0.25f32; plane * ch],
             weight: Some(vec![0.75f32; plane * ch]),
+            coverage: None,
             stats: dummy_drizzle_stats(2, ch, w, h),
         };
 

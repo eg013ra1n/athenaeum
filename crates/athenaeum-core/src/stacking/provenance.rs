@@ -189,6 +189,9 @@ pub struct SummaryGroup {
     // 6b-3.
     #[serde(default)]
     pub coverage_path: Option<String>,
+    // Drizzle's own coverage beside its weight map (spec §5.8, plan 6b-3 D9).
+    #[serde(default)]
+    pub drizzle_coverage_path: Option<String>,
     /// The drizzle stage's own per-group stats, `Some` exactly when
     /// `drizzle_path` is.
     #[serde(default)]

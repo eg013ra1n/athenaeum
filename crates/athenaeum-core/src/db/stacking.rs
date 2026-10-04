@@ -336,7 +336,7 @@ pub struct MasterLight {
     pub subject: StackSubject,
     pub run_id: i64,
     pub group_key: String,
-    /// `master | drizzle | weight_map`.
+    /// `master | drizzle | weight_map | coverage | drizzle_coverage`.
     pub kind: String,
     pub path: String,
     /// `fits | xisf` — the run's own `output.format`.

@@ -39,6 +39,7 @@ use crate::integration::plane_reader::PlaneReader;
 use crate::integration::stats::NormalizationPair;
 use crate::integration::IntegrationError;
 use crate::stacking::drizzle::phase_table::PhaseTable;
+use crate::stacking::integrate::MIN_STATS_RECT_PX;
 use crate::stacking::ln::grid::LnScratch;
 use crate::stacking::ln::LnFrameGrids;
 use crate::stacking::measure::{measure_plane, MeasureOptions};
@@ -133,6 +134,18 @@ pub struct DrizzleInput<'a> {
     /// itself is always used for `coverage`, this only controls whether the
     /// normalized copy is kept.
     pub write_weight_map: bool,
+    /// Plan 6b-3 D9 (spec §5.8): count, per output pixel and plane, the
+    /// frames whose deposit raised `W` there, into [`DrizzleOutput::coverage`].
+    /// Counted by comparing each band's `W` before and after the frame's
+    /// deposit, so `deposit_band` is untouched; a drop whose weight is below
+    /// `W`'s f32 resolution at that pixel is not counted.
+    pub write_coverage: bool,
+    /// Plan 6b-3 ruling (b): a grid drizzle measures its [`DrizzleStats`] on
+    /// the largest rectangle every pixel of which has `W > 0`, as 6a's
+    /// `GroupStats` do on the master, and fails with
+    /// [`DrizzleError::BadInput`] under [`MIN_STATS_RECT_PX`] on a side
+    /// (the caller keeps the master). Off: whole-plane statistics, as ever.
+    pub stats_on_covered: bool,
     pub measure: &'a MeasureOptions,
     /// Injected total system RAM for the memory refusal (ruling R-M3-7,
     /// ruling R-M3-12): `None` probes
@@ -194,6 +207,9 @@ pub struct DrizzleOutput {
     /// Same layout as `data`, present only when
     /// [`DrizzleInput::write_weight_map`] was set.
     pub weight: Option<Vec<f32>>,
+    /// Same layout as `data`, present only when
+    /// [`DrizzleInput::write_coverage`] was set.
+    pub coverage: Option<Vec<f32>>,
     pub stats: DrizzleStats,
 }
 
@@ -282,6 +298,7 @@ pub fn estimate_memory_bytes(
     ln: bool,
     write_weight_map: bool,
     use_rejection: bool,
+    write_coverage: bool,
 ) -> u64 {
     let out_w = width as u64 * scale as u64;
     let out_h = height as u64 * scale as u64;
@@ -301,6 +318,10 @@ pub fn estimate_memory_bytes(
         // `channels * height * words` u64 words, `words = ceil(width / 64)`.
         let words = (width as u64).div_ceil(64);
         need += channels as u64 * height as u64 * words * 8;
+    }
+    if write_coverage {
+        // Plan 6b-3 D9: the kept count planes plus the one being counted.
+        need += (channels as u64 + 1) * out_w * out_h * 4;
     }
     need
 }
@@ -674,6 +695,7 @@ pub fn drizzle_group(
         input.use_local_normalization,
         input.write_weight_map,
         input.use_rejection,
+        input.write_coverage,
     );
     let total = input
         .ram_total_bytes
@@ -697,6 +719,9 @@ pub fn drizzle_group(
     let mut data = vec![0f32; plane_out_pixels * input.channels];
     let mut weight_all = input
         .write_weight_map
+        .then(|| vec![0f32; plane_out_pixels * input.channels]);
+    let mut coverage_all = input
+        .write_coverage
         .then(|| vec![0f32; plane_out_pixels * input.channels]);
 
     let mut fwhm_px = Vec::with_capacity(input.channels);
@@ -738,6 +763,11 @@ pub fn drizzle_group(
         let plane_start = Instant::now();
         let mut i_buf = vec![0f32; plane_out_pixels];
         let mut w_buf = vec![0f32; plane_out_pixels];
+        let mut cov_buf = if input.write_coverage {
+            vec![0f32; plane_out_pixels]
+        } else {
+            Vec::new()
+        };
         let mut plane_bytes_read = 0u64;
         // Per-plane mirrors of `read_duration_total`/`deposit_duration_total`
         // (perf tier 1 Task 0) — reset each iteration so the plane's own
@@ -955,13 +985,34 @@ pub fn drizzle_group(
 
             let deposit_start = Instant::now();
             pool.install(|| {
-                i_buf
-                    .par_chunks_mut(DRIZZLE_BAND_ROWS * out_w)
-                    .zip(w_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
-                    .enumerate()
-                    .for_each(|(band_idx, (ib, wb))| {
-                        deposit_band(ib, wb, band_idx, out_w, &ctx);
-                    });
+                if input.write_coverage {
+                    i_buf
+                        .par_chunks_mut(DRIZZLE_BAND_ROWS * out_w)
+                        .zip(w_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
+                        .zip(cov_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
+                        .enumerate()
+                        .for_each(|(band_idx, ((ib, wb), cb))| {
+                            // One band-sized copy per (band, frame, plane) while the
+                            // map is asked for (review M18): opt-in, so left as is;
+                            // a per-worker buffer is the lever if a profile ever
+                            // shows it.
+                            let before = wb.to_vec();
+                            deposit_band(ib, wb, band_idx, out_w, &ctx);
+                            for ((c, &after), &prior) in cb.iter_mut().zip(wb.iter()).zip(&before) {
+                                if after > prior {
+                                    *c += 1.0;
+                                }
+                            }
+                        });
+                } else {
+                    i_buf
+                        .par_chunks_mut(DRIZZLE_BAND_ROWS * out_w)
+                        .zip(w_buf.par_chunks_mut(DRIZZLE_BAND_ROWS * out_w))
+                        .enumerate()
+                        .for_each(|(band_idx, (ib, wb))| {
+                            deposit_band(ib, wb, band_idx, out_w, &ctx);
+                        });
+                }
             });
             let deposit_elapsed = deposit_start.elapsed();
             deposit_duration_total += deposit_elapsed;
@@ -988,6 +1039,9 @@ pub fn drizzle_group(
                 0.0
             };
         }
+        if let Some(all) = coverage_all.as_mut() {
+            all[c * plane_out_pixels..(c + 1) * plane_out_pixels].copy_from_slice(&cov_buf);
+        }
         let max_w = w_buf.iter().cloned().fold(0f32, f32::max);
         if let Some(weight_all) = weight_all.as_mut() {
             for idx in 0..plane_out_pixels {
@@ -999,7 +1053,50 @@ pub fn drizzle_group(
         coverage.push(covered as f64 / plane_out_pixels as f64);
 
         let plane_data = &data[c * plane_out_pixels..(c + 1) * plane_out_pixels];
-        let cm = pool.install(|| measure_plane(plane_data, out_w, out_h, input.measure, None));
+        let cm = if input.stats_on_covered {
+            // Plan 6b-3 ruling (b): `W > 0` is the covered footprint (the
+            // same test `coverage` above uses); one transient plane.
+            let mask: Vec<f32> = w_buf
+                .iter()
+                .map(|&v| if v > 0.0 { 1.0 } else { 0.0 })
+                .collect();
+            let rect = crate::stacking::crop::largest_covered_rect(&mask, out_w, out_h, 1);
+            drop(mask);
+            match rect {
+                Some(r) if r.width >= MIN_STATS_RECT_PX && r.height >= MIN_STATS_RECT_PX => {
+                    debug!(
+                        plane = c,
+                        crop_x0 = r.x0,
+                        crop_y0 = r.y0,
+                        crop_width = r.width,
+                        crop_height = r.height,
+                        "drizzle statistics on the covered rectangle"
+                    );
+                    if r.is_full(out_w, out_h) {
+                        pool.install(|| {
+                            measure_plane(plane_data, out_w, out_h, input.measure, None)
+                        })
+                    } else {
+                        let sub = crate::stacking::crop::crop_plane(plane_data, out_w, r);
+                        pool.install(|| measure_plane(&sub, r.width, r.height, input.measure, None))
+                    }
+                }
+                Some(r) => {
+                    return Err(DrizzleError::BadInput(format!(
+                        "the covered part of the drizzle grid is only {} x {} px, below the {} x {} px \
+                         minimum for the drizzle's statistics",
+                        r.width, r.height, MIN_STATS_RECT_PX, MIN_STATS_RECT_PX
+                    )));
+                }
+                None => {
+                    return Err(DrizzleError::BadInput(
+                        "no frame of this group covers the drizzle grid".to_string(),
+                    ));
+                }
+            }
+        } else {
+            pool.install(|| measure_plane(plane_data, out_w, out_h, input.measure, None))
+        };
         fwhm_px.push(cm.fwhm_px);
         eccentricity.push(cm.eccentricity);
         noise.push(cm.noise);
@@ -1065,6 +1162,7 @@ pub fn drizzle_group(
         channels: input.channels,
         data,
         weight: weight_all,
+        coverage: coverage_all,
         stats,
     })
 }
@@ -1605,6 +1703,8 @@ mod tests {
             use_rejection: false,
             use_local_normalization: false,
             write_weight_map: true,
+            write_coverage: false,
+            stats_on_covered: false,
             measure,
             ram_total_bytes: None,
             force_exact_overlap_for_measurement: false,
@@ -2402,6 +2502,111 @@ mod tests {
 
     // ── (i) memory ──
 
+    /// Spec §5.8, plan 6b-3 D9: drizzle's own coverage counts, per output
+    /// pixel, the frames whose deposit reached it — three frames, one moved
+    /// 10 px, leave a strip of 20 output pixels per row covered by two — and
+    /// asking for it changes no output byte; its memory is in the estimate.
+    #[test]
+    fn drizzle_output_is_bit_identical_with_coverage_on_and_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = uniform(W, H, 0.25);
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| write_mono(dir.path(), &format!("f{i}.fits"), W, H, &data))
+            .collect();
+        let still = identity_map();
+        let moved = translation_map(10.0, 0.0);
+        let weight = [1.0f64];
+        let pair = identity_pair();
+        let frames = [
+            frame(&paths[0], &still, &weight, &pair),
+            frame(&paths[1], &still, &weight, &pair),
+            frame(&paths[2], &moved, &weight, &pair),
+        ];
+        let measure = MeasureOptions::default();
+        let mut input = base_input(&frames, &measure);
+        let off = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        input.write_coverage = true;
+        let on = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        assert!(off.coverage.is_none());
+        for (a, b) in off.data.iter().zip(&on.data) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        for (a, b) in off
+            .weight
+            .as_ref()
+            .unwrap()
+            .iter()
+            .zip(on.weight.as_ref().unwrap())
+        {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        let cov = on.coverage.expect("the coverage plane");
+        let out_w = W * 2;
+        let row = &cov[H * out_w..(H + 1) * out_w];
+        assert_eq!(row[out_w / 2], 3.0, "the centre is under every frame");
+        let two = row.iter().filter(|&&c| c == 2.0).count();
+        assert!(
+            (16..=24).contains(&two),
+            "the moved frame's strip: {two} px"
+        );
+        assert!(row.iter().all(|&c| c <= 3.0));
+        let extra = estimate_memory_bytes(W, H, 1, 2, false, true, false, true)
+            - estimate_memory_bytes(W, H, 1, 2, false, true, false, false);
+        assert_eq!(
+            extra,
+            2 * (W as u64 * 2) * (H as u64 * 2) * 4,
+            "the kept planes and the counting plane"
+        );
+    }
+
+    /// Plan 6b-3 ruling (b): on a grid the drizzle's statistics are measured
+    /// on the covered rectangle; a sliver under `MIN_STATS_RECT_PX` fails
+    /// the drizzle with `BadInput` (never a panic, the caller keeps the
+    /// master), and a frame set (`stats_on_covered` off) is unchanged.
+    #[test]
+    fn grid_drizzle_statistics_use_the_covered_rectangle_and_refuse_a_sliver() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = uniform(W, H, 0.25);
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| write_mono(dir.path(), &format!("f{i}.fits"), W, H, &data))
+            .collect();
+        let weight = [1.0f64];
+        let pair = identity_pair();
+        let measure = MeasureOptions::default();
+
+        // Moved 20 px: the covered rectangle is the 44 x 48 source columns,
+        // 88 x 96 output pixels.
+        let moved = translation_map(20.0, 0.0);
+        let frames: Vec<_> = paths
+            .iter()
+            .map(|p| frame(p, &moved, &weight, &pair))
+            .collect();
+        let mut input = base_input(&frames, &measure);
+        input.stats_on_covered = true;
+        let ok = drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+        assert_eq!(ok.stats.coverage.len(), 1);
+        assert!(ok.stats.coverage[0] < 1.0, "part of the grid is uncovered");
+
+        // Moved 58 px: 6 source columns are left, 12 output pixels < 16.
+        let sliver = translation_map(58.0, 0.0);
+        let frames: Vec<_> = paths
+            .iter()
+            .map(|p| frame(p, &sliver, &weight, &pair))
+            .collect();
+        let mut input = base_input(&frames, &measure);
+        input.stats_on_covered = true;
+        match drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()) {
+            Err(DrizzleError::BadInput(m)) => assert!(m.contains("covered part"), "{m}"),
+            other => panic!(
+                "expected a BadInput, got {:?}",
+                other.map(|o| o.stats.coverage)
+            ),
+        }
+        // The frame-set path keeps whole-plane statistics.
+        input.stats_on_covered = false;
+        drizzle_group(&input, &pool(), &AtomicBool::new(false), &no_progress()).unwrap();
+    }
+
     #[test]
     fn estimate_memory_bytes_matches_the_r_m3_16_formula() {
         // R-M3-16 (B5, M3 final fix wave, was R-M3-15 through fix round 1,
@@ -2435,7 +2640,7 @@ mod tests {
                         expected += rej_bitmap;
                     }
                     assert_eq!(
-                        estimate_memory_bytes(width, height, channels, scale, ln, wwm, rej),
+                        estimate_memory_bytes(width, height, channels, scale, ln, wwm, rej, false),
                         expected,
                         "ln={ln} write_weight_map={wwm} use_rejection={rej}"
                     );
@@ -2466,6 +2671,8 @@ mod tests {
             use_rejection: false,
             use_local_normalization: false,
             write_weight_map: false,
+            write_coverage: false,
+            stats_on_covered: false,
             measure: &measure,
             ram_total_bytes: Some(1024),
             force_exact_overlap_for_measurement: false,
@@ -2511,6 +2718,8 @@ mod tests {
             // (I and W both doubled together, ratio unchanged) from a
             // correct one; the weight map can.
             write_weight_map: true,
+            write_coverage: false,
+            stats_on_covered: false,
             measure: &measure,
             ram_total_bytes: None,
             force_exact_overlap_for_measurement: false,
@@ -2960,6 +3169,8 @@ mod tests {
                 use_rejection: false,
                 use_local_normalization: false,
                 write_weight_map: true,
+                write_coverage: false,
+                stats_on_covered: false,
                 measure: &measure,
                 ram_total_bytes: None,
                 force_exact_overlap_for_measurement: false,
@@ -3077,6 +3288,8 @@ mod tests {
             use_rejection: false,
             use_local_normalization: true,
             write_weight_map: true,
+            write_coverage: false,
+            stats_on_covered: false,
             measure: &measure,
             ram_total_bytes: None,
             force_exact_overlap_for_measurement: false,
@@ -3175,6 +3388,8 @@ mod tests {
             use_rejection: false,
             use_local_normalization: false,
             write_weight_map: true,
+            write_coverage: false,
+            stats_on_covered: false,
             measure,
             ram_total_bytes: None,
             force_exact_overlap_for_measurement: false,

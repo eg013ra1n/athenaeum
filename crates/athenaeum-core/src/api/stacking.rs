@@ -900,6 +900,8 @@ pub enum MasterLightKind {
     WeightMap,
     // The per-pixel coverage map beside a master (plan 6b-3 D9, spec §5.7).
     Coverage,
+    // Drizzle's own coverage beside its weight map (plan 6b-3 D9, spec §5.8).
+    DrizzleCoverage,
 }
 
 impl MasterLightKind {
@@ -910,6 +912,7 @@ impl MasterLightKind {
             MasterLightKind::Drizzle => "drizzle",
             MasterLightKind::WeightMap => "weight_map",
             MasterLightKind::Coverage => "coverage",
+            MasterLightKind::DrizzleCoverage => "drizzle_coverage",
         }
     }
 
@@ -921,6 +924,7 @@ impl MasterLightKind {
             "drizzle" => Some(MasterLightKind::Drizzle),
             "weight_map" => Some(MasterLightKind::WeightMap),
             "coverage" => Some(MasterLightKind::Coverage),
+            "drizzle_coverage" => Some(MasterLightKind::DrizzleCoverage),
             _ => None,
         }
     }
@@ -1843,6 +1847,7 @@ mod tests {
             MasterLightKind::Drizzle,
             MasterLightKind::WeightMap,
             MasterLightKind::Coverage,
+            MasterLightKind::DrizzleCoverage,
         ] {
             assert_eq!(MasterLightKind::from_db_str(kind.as_db_str()), Some(kind));
         }
@@ -1850,6 +1855,14 @@ mod tests {
         assert_eq!(MasterLightKind::Drizzle.as_db_str(), "drizzle");
         assert_eq!(MasterLightKind::WeightMap.as_db_str(), "weight_map");
         assert_eq!(MasterLightKind::Coverage.as_db_str(), "coverage");
+        assert_eq!(
+            MasterLightKind::DrizzleCoverage.as_db_str(),
+            "drizzle_coverage"
+        );
+        assert_eq!(
+            serde_json::to_string(&MasterLightKind::DrizzleCoverage).unwrap(),
+            "\"drizzleCoverage\""
+        );
         assert_eq!(MasterLightKind::from_db_str("nope"), None);
 
         // The wire form is camelCase and is NOT the column's spelling.

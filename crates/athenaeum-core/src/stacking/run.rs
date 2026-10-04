@@ -7561,6 +7561,7 @@ fn push_summary_group(
     weight_map_path: Option<String>,
     drizzle: Option<DrizzleStats>,
     coverage_path: Option<String>,
+    drizzle_coverage_path: Option<String>,
 ) {
     let frames = rc
         .measured
@@ -7625,6 +7626,7 @@ fn push_summary_group(
         drizzle_path,
         weight_map_path,
         coverage_path,
+        drizzle_coverage_path,
         drizzle,
         beta,
         seeds_calibration,
@@ -7669,6 +7671,7 @@ fn skip_group(
         None,
         None,
         &HashMap::new(),
+        None,
         None,
         None,
         None,
@@ -7724,6 +7727,7 @@ fn fail_group(
         None,
         None,
         &HashMap::new(),
+        None,
         None,
         None,
         None,
@@ -9318,6 +9322,7 @@ fn process_group_output(
     let mut drizzle_dur = Duration::ZERO;
     let mut drizzle_path: Option<String> = None;
     let mut weight_map_path: Option<String> = None;
+    let mut drizzle_coverage_path: Option<String> = None;
     let mut drizzle_stats: Option<DrizzleStats> = None;
     if rc.config.drizzle.enabled {
         if let Some(reason) = &rej_set_failure {
@@ -9523,6 +9528,8 @@ fn process_group_output(
                         use_rejection: drizzle_cfg.use_rejection && rej_set.is_some(),
                         use_local_normalization: drizzle_cfg.use_local_normalization,
                         write_weight_map: drizzle_cfg.write_weight_map,
+                        write_coverage: rc.config.output.coverage_map,
+                        stats_on_covered: rc.grid.is_some(),
                         measure: measure_opts,
                         ram_total_bytes: None,
                         // Tier C item C2: the run always drizzles through
@@ -9667,6 +9674,8 @@ fn process_group_output(
                     let drizzle_path_str = wd.drizzle.display().to_string();
                     let weight_map_path_str =
                         wd.weight_map.as_ref().map(|p| p.display().to_string());
+                    let drizzle_coverage_path_str =
+                        wd.coverage.as_ref().map(|p| p.display().to_string());
                     {
                         let conn = db(&rc.ctx)?.conn();
                         update_group(
@@ -9722,6 +9731,26 @@ fn process_group_output(
                                 },
                             )?;
                         }
+                        // Plan 6b-3 D9 (spec §5.8): drizzle's own coverage —
+                        // always FITS, the drizzle's own grid.
+                        if let Some(coverage) = drizzle_coverage_path_str.as_deref() {
+                            insert_master_light(
+                                &conn,
+                                &NewMasterLight {
+                                    subject: &rc.subject,
+                                    run_id: rc.run_id,
+                                    group_key: &group.key,
+                                    kind: MasterLightKind::DrizzleCoverage.as_db_str(),
+                                    path: coverage,
+                                    format: "fits",
+                                    width: stats.out_width as i64,
+                                    height: stats.out_height as i64,
+                                    channels: channels as i64,
+                                    frames: output.stats.included as i64,
+                                    total_exposure_s,
+                                },
+                            )?;
+                        }
                     }
                     // Fix round 1, Important I1: the final, forced
                     // `current == total` tick — `rc.progress` is available
@@ -9752,6 +9781,7 @@ fn process_group_output(
                     );
                     drizzle_path = Some(drizzle_path_str);
                     weight_map_path = weight_map_path_str;
+                    drizzle_coverage_path = drizzle_coverage_path_str;
                     drizzle_stats = Some(stats);
                 }
                 Err(DrizzleFailure::Cancelled) => return Err(RunError::Cancelled),
@@ -9801,6 +9831,7 @@ fn process_group_output(
         weight_map_path,
         drizzle_stats,
         coverage_path_str,
+        drizzle_coverage_path,
     );
 
     // B2 (M3 final fix wave, I2): `output_start` was taken BEFORE the
@@ -20102,6 +20133,53 @@ mod tests {
         );
     }
 
+    /// Spec §5.8, plan 6b-3 D9: with the coverage map on, drizzle writes its
+    /// own coverage beside its weight map (kind `drizzle_coverage`, one plane
+    /// per channel, the drizzle's size), and the drizzled master is
+    /// bit-identical to the run without it.
+    #[test]
+    fn drizzle_writes_its_own_coverage_beside_the_weight_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let shifts = [(0.0, 0.0), (3.0, 0.0), (0.0, 3.0), (2.0, 2.0)];
+        let (fixture, light_ids, _working, _output) = seed_star_group(&db_path, SET_NAME, &shifts, &[5.0f32; 4]);
+        test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
+        let run_with = |coverage_map: bool| -> i64 {
+            let mut cfg = StackingConfig::default();
+            cfg.drizzle.enabled = true;
+            cfg.drizzle.scale = 2;
+            cfg.output.coverage_map = coverage_map;
+            let started = start_stacking(
+                ctx.clone(),
+                Arc::new(NullEmitter),
+                &PathPolicy::AllowAll,
+                "test".to_string(),
+                StackSubject::FrameSet(fixture.set_id),
+                Some(cfg),
+                None,
+            )
+            .unwrap();
+            wait_for_run(&ctx, started.run_id);
+            started.run_id
+        };
+        let (off, on) = (run_with(false), run_with(true));
+        let lights = |run: i64| crate::db::stacking::list_master_lights(&fixture.conn, run).unwrap();
+        let drizzled = |run: i64| lights(run).into_iter().find(|m| m.kind == "drizzle").unwrap();
+        let (a, b) = (
+            PlaneReader::open(Path::new(&drizzled(off).path)).unwrap().read_plane(0).unwrap(),
+            PlaneReader::open(Path::new(&drizzled(on).path)).unwrap().read_plane(0).unwrap(),
+        );
+        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
+        assert!(lights(off).iter().all(|m| m.kind != "drizzle_coverage"));
+        let row = lights(on).into_iter().find(|m| m.kind == "drizzle_coverage").expect("a drizzle coverage row");
+        let d = drizzled(on);
+        assert_eq!((row.width, row.height, row.channels), (d.width, d.height, d.channels));
+        assert!(row.path.ends_with("_coverage.fits"), "{}", row.path);
+        let cov = PlaneReader::open(Path::new(&row.path)).unwrap().read_plane(0).unwrap();
+        assert!(cov.iter().any(|&c| c == 4.0), "the interior is under every frame");
+    }
+
     /// Plan 6b-3 D4 refinement (review I1): a grid master's statistics are
     /// measured on its largest covered rectangle. On a grid three times the
     /// frames' area most of the plane is the uncovered 0.0, so the test reads
@@ -25066,16 +25144,35 @@ mod tests {
             fits.push(p.to_path_buf());
         }
         // 4 registered frames, the master, its coverage map (the project seed
-        // turns `coverageMap` on), the drizzled master, its weight map.
-        assert_eq!(fits.len(), 8, "{fits:?}");
+        // turns `coverageMap` on), the drizzled master, its weight map, and
+        // drizzle's own coverage (plan 6b-3 D9: the 9th file).
+        assert_eq!(fits.len(), 9, "{fits:?}");
         let out = tmp.path().join("out").join("p1");
         for name in [
             "p1_Lum_mono_300s_4x.fits",
             "p1_Lum_mono_300s_4x_coverage.fits",
             "p1_Lum_mono_300s_4x_drizzle2x.fits",
             "p1_Lum_mono_300s_4x_drizzle2x_weight.fits",
+            "p1_Lum_mono_300s_4x_drizzle2x_coverage.fits",
         ] {
             assert!(fits.contains(&out.join(name)), "{name} missing in {fits:?}");
+        }
+        // Plan 6b-3 ruling (a): the drizzle weight map and drizzle coverage
+        // agree with the drizzled master on the project and the grid.
+        let card = |name: &str, k: &str| {
+            crate::fits_parser::FitsHeader::from_path(&out.join(name))
+                .unwrap()
+                .get_str(k)
+        };
+        for k in ["ATH_SPRJ", "ATH_GRID"] {
+            let want = card("p1_Lum_mono_300s_4x_drizzle2x.fits", k);
+            assert!(want.is_some(), "the drizzled master carries {k}");
+            for name in [
+                "p1_Lum_mono_300s_4x_drizzle2x_weight.fits",
+                "p1_Lum_mono_300s_4x_drizzle2x_coverage.fits",
+            ] {
+                assert_eq!(card(name, k), want, "{name} {k}");
+            }
         }
     }
 

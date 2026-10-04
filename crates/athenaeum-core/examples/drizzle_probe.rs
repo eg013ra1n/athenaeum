@@ -412,6 +412,8 @@ fn main() {
                 // `CoverageMask::from_weight`); off otherwise so the
                 // timing runs allocate nothing extra.
                 write_weight_map: want_coverage,
+                write_coverage: false,
+                stats_on_covered: false,
                 measure: &measure,
                 ram_total_bytes: None,
                 force_exact_overlap_for_measurement: force_exact,
