@@ -70,7 +70,7 @@ fi
 RUN_ID=$(printf '%s' "$RESP" | sed -E 's/.*"runId":([0-9]+).*/\1/')
 FINISHED=0
 for i in $(seq 1 480); do
-  if grep -A1 'stacking-complete' "$W/events-project.log" 2>/dev/null | grep -q "\"runId\":$RUN_ID[,}]"; then FINISHED=1; break; fi
+  if grep -A1 'stacking-complete' "$W/events-project.log" 2>/dev/null | grep -q "\"runId\":${RUN_ID}[,}]"; then FINISHED=1; break; fi
   sleep 30
 done
 T1=$(date +%s); echo "end $(date -u +%FT%TZ) epoch=$T1 wall_s=$((T1-T0)) run_id=$RUN_ID" >> "$W/run-project.txt"
@@ -81,7 +81,7 @@ if [ "$FINISHED" != "1" ]; then
   echo "TIMED OUT after 4 h waiting for stacking-complete of run $RUN_ID" | tee -a "$W/run-project.txt" >&2
   STATUS=1
 fi
-COMPLETE=$(grep -A1 'stacking-complete' "$W/events-project.log" | grep "\"runId\":$RUN_ID[,}]")
+COMPLETE=$(grep -A1 'stacking-complete' "$W/events-project.log" | grep "\"runId\":${RUN_ID}[,}]")
 printf '%s\n' "$COMPLETE" >> "$W/run-project.txt"
 if [ "$FINISHED" = "1" ] && ! printf '%s' "$COMPLETE" | grep -q '"success":true'; then
   echo "run $RUN_ID finished WITHOUT success: $COMPLETE" | tee -a "$W/run-project.txt" >&2
