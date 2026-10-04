@@ -490,6 +490,35 @@ fn remove_copy(copy: &Path) {
     }
 }
 
+/// The production solver's identity (plan 6b-3 D14 shares it with the plan):
+/// the stored plate-solve config's hash and the installed catalog's stat-only
+/// identity under `app_data`. `Err` when no catalog is installed.
+pub(crate) fn solver_identity(
+    app_data: &Path,
+    config: &PlateSolveConfig,
+) -> Result<String, String> {
+    let catalog = crate::plate_solve::catalog_identity(app_data).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{}:{catalog}",
+        crate::plate_solve::config::solver_config_hash(config)
+    ))
+}
+
+/// [`solver_identity`] read from a catalog connection alone (the app-data
+/// folder is the database file's own folder, as for [`CatalogSolver`]), so
+/// the plan computes the hash the run's cache check compares. `Err` for a
+/// database with no file or no installed catalog.
+pub(crate) fn installed_solver_identity(conn: &Connection) -> Result<String, String> {
+    let db_path = conn
+        .path()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "the database has no file".to_string())?;
+    let app_data = Path::new(db_path)
+        .parent()
+        .ok_or_else(|| "cannot determine the app data directory".to_string())?;
+    solver_identity(app_data, &crate::plate_solve::config::load_config(conn))
+}
+
 /// The production solver. Its identity (the stored plate-solve config and the
 /// installed catalog's stat-only identity) is computed on first use without
 /// opening any tier; the catalog layers are mapped lazily, only by the first
@@ -530,12 +559,7 @@ impl CatalogSolver {
                     .ok_or_else(|| "cannot determine the app data directory".to_string())?
                     .to_path_buf();
                 let config = crate::plate_solve::config::load_config(&db.conn());
-                let catalog =
-                    crate::plate_solve::catalog_identity(&app_data).map_err(|e| e.to_string())?;
-                let identity = format!(
-                    "{}:{catalog}",
-                    crate::plate_solve::config::solver_config_hash(&config)
-                );
+                let identity = solver_identity(&app_data, &config)?;
                 Ok(Prepared {
                     app_data,
                     config,
@@ -1440,5 +1464,26 @@ pub(crate) mod tests {
             SolveOutcome::Unavailable(t) => assert!(t.contains("source unreadable"), "{t}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Plan 6b-3 D14: the plan reads the solver's identity from the catalog
+    /// connection alone, and it is the identity the run's solver reports —
+    /// so the plan and the run agree on which cached failures stand. A
+    /// database with no file has none.
+    // `use super::*` brings the `FrameSolver` trait in for `identity()`
+    // (review M15): keep the import if this test moves.
+    #[test]
+    fn the_installed_identity_is_the_runs_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let catalog = crate::plate_solve::catalog_root(dir.path());
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::write(catalog.join("stars.smac"), b"").unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let installed = installed_solver_identity(&conn).expect("a catalog is installed");
+        assert_eq!(CatalogSolver::new(ctx).identity().unwrap(), installed);
+        let memory = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(installed_solver_identity(&memory).is_err());
     }
 }

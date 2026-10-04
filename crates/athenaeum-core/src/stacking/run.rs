@@ -93,7 +93,6 @@ use crate::stacking::plan::{
     measurement_hash_for, normalization_hash_for, registration_hash_for, registration_row_is_fresh,
     seeds_calibration_hash_for, store_registration, stored_reference_frame, stored_registrations,
     wants_cfa_mosaic, HashMemo, LnReferencePayload, MasterWork, PlanMaster, Stage,
-    PROJECT_STACKING_UNAVAILABLE,
 };
 use crate::stacking::provenance::{
     MasterBuilt, RunSummary, SummaryFrame, SummaryGroup, SummaryMeasurement, SummaryReference,
@@ -822,11 +821,11 @@ impl Drop for StartStackingGuard<'_> {
     }
 }
 
-/// Start a stacking run for `frames_set_id`: build the plan, refuse on the
-/// first blocker or an already-active run, insert the run + its group rows,
-/// register a cancel handle, and spawn the dedicated thread. Returns as soon
-/// as the thread is spawned — the queue permit is acquired INSIDE the thread
-/// (ruling 2).
+/// Start a stacking run for a subject (a frame set or a project): build the
+/// plan, refuse on the first blocker or an already-active run, insert the
+/// run + its group rows, register a cancel handle, and spawn the dedicated
+/// thread. Returns as soon as the thread is spawned — the queue permit is
+/// acquired INSIDE the thread (ruling 2).
 pub fn start_stacking(
     ctx: Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
@@ -836,9 +835,35 @@ pub fn start_stacking(
     config: Option<StackingConfig>,
     rerun_from: Option<Stage>,
 ) -> Result<StartedStacking, ApiError> {
-    let StackSubject::FrameSet(_) = &subject else {
-        return Err(ApiError::Invalid(PROJECT_STACKING_UNAVAILABLE.into()));
-    };
+    let solver: Arc<dyn crate::stacking::solve::FrameSolver> =
+        Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone()));
+    start_stacking_with_solver(
+        ctx,
+        emitter,
+        policy,
+        app_version,
+        subject,
+        config,
+        rerun_from,
+        solver,
+    )
+}
+
+/// [`start_stacking`] with the Solve sub-step's solver given — the seam the
+/// fake-hub e2e uses (spec §15.2: a synthetic star field cannot be solved
+/// against a real catalog). Plan 6b-3 D13: a project starts like a frame
+/// set; its run stacks onto the plan's confirmed grid.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_stacking_with_solver(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    policy: &PathPolicy,
+    app_version: String,
+    subject: StackSubject,
+    config: Option<StackingConfig>,
+    rerun_from: Option<Stage>,
+    solver: Arc<dyn crate::stacking::solve::FrameSolver>,
+) -> Result<StartedStacking, ApiError> {
     let db_handle = db(&ctx)?;
     let conn = db_handle.conn();
 
@@ -892,6 +917,25 @@ pub fn start_stacking(
 
     let (plan_groups, origins) = frame_source(&conn, &subject, &plan.config)?;
 
+    // Plan 6b-3 D13: a project run stacks onto the confirmed grid. The plan's
+    // `grid` blocker guarantees one; a frame set has none.
+    let grid = plan.grid.as_ref().and_then(|g| g.current);
+    if subject.project_id().is_some() && grid.is_none() {
+        return Err(ApiError::Internal(
+            "the project plan reported no blockers but no confirmed grid".to_string(),
+        ));
+    }
+
+    // The folder the run writes its masters into: the output root for a
+    // frame set, `<output>/<title>` for a project. The run row names the
+    // same folder, so what the row says is what the run does.
+    let output_dir = crate::stacking::paths::subject_output_dir(
+        Path::new(&output_dir_str),
+        &subject,
+        &plan.set_name,
+    );
+    let output_dir_row = output_dir.to_string_lossy().into_owned();
+
     let config_json = serde_json::to_string(&plan.config)
         .map_err(|e| ApiError::Internal(format!("failed to serialize stacking config: {e}")))?;
 
@@ -919,7 +963,7 @@ pub fn start_stacking(
                 reference_frame_id: plan.reference.frame_id,
                 reference_mode: reference_mode_wire(plan.reference.mode),
                 working_dir: &working_dir,
-                output_dir: &output_dir_str,
+                output_dir: &output_dir_row,
             },
         )?;
         active.insert(
@@ -992,12 +1036,6 @@ pub fn start_stacking(
             return Err(e.into());
         }
     };
-    let output_dir = crate::stacking::paths::subject_output_dir(
-        Path::new(&output_dir_str),
-        &subject,
-        &plan.set_name,
-    );
-
     let (set_id, project_id) = wire_subject(&subject);
     let summary = RunSummary {
         run_id,
@@ -1010,7 +1048,7 @@ pub fn start_stacking(
         status: "planning".to_string(),
         config: plan.config.clone(),
         config_hash: plan.config_hash.clone(),
-        grid: None,
+        grid,
         reference: SummaryReference {
             frame_id: plan.reference.frame_id,
             filename: plan.reference.filename.clone(),
@@ -1052,9 +1090,9 @@ pub fn start_stacking(
         rerun_from,
         memo: HashMemo::new(origins.clone()),
         origins,
-        solver: Arc::new(crate::stacking::solve::CatalogSolver::new(ctx.clone())),
+        solver,
         wcs_rule: None,
-        grid: None,
+        grid: grid.map(|g| Arc::new(crate::stacking::grid_map::GridRun::new(g))),
         hot_maps: HashMap::new(),
         cached_calibrated: HashMap::new(),
         runtime_exclusions: Vec::new(),
@@ -2617,7 +2655,7 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
     }
     // Calibrate only ever runs for a frame set; the id feeds the log lines.
     let Some(set_id) = rc.subject.frame_set_id() else {
-        return Err(RunError::Other(PROJECT_STACKING_UNAVAILABLE.into()));
+        return Err(RunError::Other("stage 1 calibrates a frame set only; a project prepares".into()));
     };
     let stage_start = Instant::now();
     let excluded_set: HashSet<i64> = rc.excluded.iter().copied().collect();
@@ -2649,7 +2687,7 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
     // every plane is deposited exactly as it would have been without it.
     warn_bayer_drizzle_ignored(rc, &cfg, &groups);
 
-    let scratch = rc.layout.root.join("tmp");
+    let scratch = rc.layout.tmp_root();
     std::fs::create_dir_all(&scratch)
         .map_err(|e| RunError::Other(format!("failed to create scratch dir: {e}")))?;
 
@@ -3692,7 +3730,7 @@ fn solve_project_frames(rc: &mut RunContext) -> Result<(), RunError> {
 
     // The scratch dir is made once, here: a failure is one warning and no
     // frame is attempted or cached, like a catalog that will not open.
-    let scratch = rc.layout.root.join("tmp");
+    let scratch = rc.layout.tmp_root();
     if !jobs.is_empty() {
         if let Err(e) = std::fs::create_dir_all(&scratch) {
             let reason = format!(
@@ -22627,39 +22665,6 @@ mod tests {
         assert!(n >= 3, "admission would be {n}");
     }
 
-    #[test]
-    fn a_project_start_is_refused_until_6b2() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = Arc::new(ServiceContext::new_for_tests(tmp.path().join("catalog.db")));
-        {
-            let handle = db(&ctx).unwrap();
-            crate::db::stacking::insert_test_project(&handle.conn(), "p1");
-        }
-
-        let err = start_stacking(
-            ctx.clone(),
-            Arc::new(NullEmitter),
-            &PathPolicy::AllowAll,
-            "test".to_string(),
-            StackSubject::Project("p1".into()),
-            None,
-            None,
-        )
-        .expect_err("a project start is refused");
-        assert!(
-            matches!(err, ApiError::Invalid(ref m) if m == PROJECT_STACKING_UNAVAILABLE),
-            "{err:?}"
-        );
-
-        let handle = db(&ctx).unwrap();
-        let runs: i64 = handle
-            .conn()
-            .query_row("SELECT COUNT(*) FROM stacking_runs", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(runs, 0, "no stacking_runs row is written");
-        assert!(ctx.active_stacks.lock().unwrap().is_empty());
-    }
-
     /// Review Focus 5 (heal half).
     #[test]
     fn the_heal_marks_an_interrupted_project_run_failed_and_leaves_frame_sets_alone() {
@@ -24908,7 +24913,7 @@ mod tests {
         use_solver(&mut rc, &fake);
         seed_in_place_calibrated(&conn, &mut rc);
         std::fs::create_dir_all(&rc.layout.root).unwrap();
-        std::fs::write(rc.layout.root.join("tmp"), b"a file").unwrap();
+        std::fs::write(rc.layout.tmp_root(), b"a file").unwrap();
         solve_project_frames(&mut rc).unwrap();
         assert_eq!(fake.calls(), 0);
         assert_eq!(rc.warnings.len(), 1, "{:?}", rc.warnings);
@@ -25747,6 +25752,155 @@ mod tests {
                 .is_some(),
                 "{} has its sidecar",
                 f.filename
+            );
+        }
+    }
+
+    /// Starts the seeded sky project through the production entry point with
+    /// its folders and confirmed grid configured, and waits for the run.
+    fn start_sky_project(
+        tmp: &Path,
+        tweak: impl FnOnce(&mut StackingConfig),
+    ) -> (
+        Arc<ServiceContext>,
+        rusqlite::Connection,
+        StartedStacking,
+        crate::collab::grid::CanonicalGrid,
+    ) {
+        let db_path = tmp.join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.join("collab"), 4);
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, tmp.join("work")),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, tmp.join("out")),
+        ] {
+            crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        crate::db::collab::set_canonical_grid(&conn, "p1", Some(&grid.canonical_json())).unwrap();
+        let mut cfg = sky_config(&conn);
+        tweak(&mut cfg);
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            StackSubject::Project("p1".into()),
+            None,
+            None,
+        )
+        .expect("a project run starts");
+        wait_for_run(&ctx, started.run_id);
+        (ctx, conn, started, grid)
+    }
+
+    /// Spec §2, plan 6b-3 D13: `start_stacking` starts a project. The run
+    /// queues as "Stacking · <title>", stacks onto the confirmed grid,
+    /// records it in its summary, and writes into `<output>/<title>/`. Its
+    /// run row names that same folder.
+    #[test]
+    fn a_project_run_starts_on_its_confirmed_grid() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, tmp.path().join("work")),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, tmp.path().join("out")),
+        ] {
+            crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        crate::db::collab::set_canonical_grid(&conn, "p1", Some(&grid.canonical_json())).unwrap();
+        sky_config(&conn);
+
+        let hold_flag = Arc::new(AtomicBool::new(false));
+        let (hold, _hold_job) = ctx
+            .compute_queue
+            .acquire(ComputeJobKind::Analysis, "hold", hold_flag)
+            .unwrap();
+        let started = start_stacking(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            StackSubject::Project("p1".into()),
+            None,
+            None,
+        )
+        .expect("a project run starts");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ctx.compute_queue.snapshot().iter().any(|e| e.label == "Stacking · p1") {
+            assert!(Instant::now() < deadline, "{:?}", ctx.compute_queue.snapshot());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(hold);
+        wait_for_run(&ctx, started.run_id);
+
+        let row = crate::db::stacking::get_run(&conn, started.run_id).unwrap().unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        // The run validates its folders in Save mode, which canonicalizes.
+        let out = crate::test_support::canonical_path(&tmp.path().join("out")).join("p1");
+        assert_eq!(
+            Path::new(&row.output_dir),
+            out,
+            "the run row names the folder the run writes into"
+        );
+        let summary: RunSummary = serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        assert_eq!(summary.grid, Some(grid));
+        assert_eq!(summary.project_id.as_deref(), Some("p1"));
+        let masters = crate::db::stacking::list_master_lights(&conn, started.run_id).unwrap();
+        let master = master_row(&masters, "master");
+        assert!(
+            Path::new(&master.path).starts_with(&out),
+            "{}",
+            master.path
+        );
+        assert_eq!((master.width, master.height), (512, 384));
+    }
+
+    /// Plan 6b-3 D13 (review): a run started through the production entry
+    /// point carries the plan's confirmed grid in `RunContext.grid`, so its
+    /// master is on the grid (`ATH_GRID`, `ATH_SPRJ`, the canonical filter),
+    /// and the plan it started from agrees with it on Register and
+    /// Normalize: neither is stale after the run (the run folds the same
+    /// field-aware LN upstream the plan does).
+    #[test]
+    fn a_started_project_run_is_grid_consistent_with_its_plan() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, conn, started, grid) =
+            start_sky_project(tmp.path(), |cfg| cfg.normalization.local.enabled = true);
+        let row = crate::db::stacking::get_run(&conn, started.run_id).unwrap().unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        let masters = crate::db::stacking::list_master_lights(&conn, started.run_id).unwrap();
+        let master = master_row(&masters, "master");
+        let header = crate::fits_parser::FitsHeader::from_path(Path::new(&master.path)).unwrap();
+        assert_eq!(header.get_str("ATH_GRID").as_deref(), Some(grid.hash().as_str()));
+        assert_eq!(header.get_str("ATH_SPRJ").as_deref(), Some("p1"));
+        assert_eq!(header.get_str("ATH_RGEO").as_deref(), Some("grid"));
+        let plan = build_plan(
+            &conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            None,
+        )
+        .unwrap();
+        for stage in [Stage::Register, Stage::Normalize] {
+            assert!(
+                !plan.stale_stages.contains(&stage),
+                "{stage:?} stale after the run: {:?}",
+                plan.stale_stages
             );
         }
     }

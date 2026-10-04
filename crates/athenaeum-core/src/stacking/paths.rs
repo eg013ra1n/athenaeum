@@ -247,6 +247,13 @@ impl WorkingLayout {
         self.root.join("rej")
     }
 
+    /// `root/tmp` — scratch a stage writes and removes itself (the solve's
+    /// ADU copy, Calibrate's scratch); only a crash leaves anything here.
+    /// Plan 6b-3 D17: swept by `Intermediates` and `All`.
+    pub fn tmp_root(&self) -> PathBuf {
+        self.root.join("tmp")
+    }
+
     /// `root/rej/run-<run_id>` — one run's whole rejection-bitmap tree,
     /// removed at that run's single exit path unless the user asked to
     /// keep everything.
@@ -1015,7 +1022,8 @@ fn remove_runs_keeping_uncropped(runs: &Path) -> anyhow::Result<u64> {
 /// calls below. `prepared/` goes with `calibrated/`; a `calibrated` row
 /// pointing at a file used in place loses its row, never its file.
 /// `runs/run-<id>-uncropped` folders are never removed (see
-/// [`remove_runs_keeping_uncropped`]).
+/// [`remove_runs_keeping_uncropped`]). Plan 6b-3 D17: `tmp/` (crash
+/// leftovers, no artifact rows) goes with `Intermediates` and `All`.
 pub fn cleanup_work(
     conn: &Connection,
     subject: &StackSubject,
@@ -1030,12 +1038,14 @@ pub fn cleanup_work(
             dirs.push(layout.prepared_root());
             dirs.push(layout.ln_root());
             dirs.push(layout.rej_root());
+            dirs.push(layout.tmp_root());
         }
         CleanupWhat::All => {
             dirs.push(layout.calibrated_root());
             dirs.push(layout.prepared_root());
             dirs.push(layout.ln_root());
             dirs.push(layout.rej_root());
+            dirs.push(layout.tmp_root());
             // `runs/` goes through `remove_runs_keeping_uncropped` below,
             // never `remove_dir_all`: a crop run's scratch folder can hold
             // the only copy of a master.
@@ -2217,6 +2227,34 @@ mod tests {
             assert!(master.exists(), "{what:?} must keep the scratch master");
         }
         assert!(!json.exists() && !other.exists(), "the rest of runs/ goes under All");
+    }
+
+    /// Plan 6b-3 D17 (6b-2 final review M3): `tmp/` holds only crash
+    /// leftovers (the solve's ADU copy, Calibrate's scratch) and no artifact
+    /// rows, so `Intermediates` and `All` sweep it and `Registered` keeps it.
+    /// The sweep never reaches a crop run's `runs/run-<id>-uncropped` folder.
+    #[test]
+    fn cleanup_sweeps_the_tmp_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+        let leftover = layout.tmp_root().join("adu-copy.fits");
+        let scratch_master = layout.uncropped_dir(9).join("master.fits");
+        std::fs::create_dir_all(layout.uncropped_dir(9)).unwrap();
+        write_bytes(&scratch_master, 40);
+        let subject = StackSubject::FrameSet(1);
+        for (what, kept) in [
+            (CleanupWhat::Registered, true),
+            (CleanupWhat::Intermediates, false),
+            (CleanupWhat::All, false),
+        ] {
+            std::fs::create_dir_all(layout.tmp_root()).unwrap();
+            std::fs::write(&leftover, b"x").unwrap();
+            cleanup_work(&conn, &subject, &layout, what).unwrap();
+            assert_eq!(leftover.exists(), kept, "{what:?}");
+            assert!(scratch_master.exists(), "{what:?} keeps the crop scratch");
+        }
     }
 
     #[test]

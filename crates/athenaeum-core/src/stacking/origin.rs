@@ -302,6 +302,159 @@ pub(crate) fn wcs_tier(
     }
 }
 
+/// What a run will know about one project frame's WCS (plan 6b-3 D14),
+/// judged as the run's Solve sub-step will judge it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WcsOutlook {
+    /// A catalog frame: the reference WCS rule does not apply (review M16).
+    NotApplicable,
+    /// The manifest carries one.
+    Manifest,
+    /// A cached solve of this content, which the run reuses.
+    Solved,
+    /// The run will try to solve it.
+    ToSolve,
+    /// It will have none: a cached failure or refusal that stands for this
+    /// solver, catalog and app version, no solver that can run at all, or a
+    /// WCS whose SIP tables cannot be read (the reference would fail with
+    /// "no usable WCS").
+    Unsolvable,
+}
+
+/// The [`WcsOutlook`] of one frame. `identity` is the installed solver's
+/// ([`crate::stacking::solve::installed_solver_identity`]); `None` means no
+/// solver can run, so only a cached solve helps. A catalog frame has no rule
+/// and reads as `NotApplicable`.
+pub(crate) fn wcs_outlook(
+    conn: &Connection,
+    origin: &FrameOrigin,
+    frame_id: i64,
+    identity: Option<&str>,
+) -> anyhow::Result<WcsOutlook> {
+    use crate::stacking::solve::{cached_outcome_holds, solve_hash, SolveArtifact};
+    let (project_id, blake3) = match origin {
+        FrameOrigin::Catalog { .. } => return Ok(WcsOutlook::NotApplicable),
+        FrameOrigin::Project { meta, .. } if meta.wcs.is_some() => {
+            // `ReferenceWcs::from_record` refuses a record with unreadable
+            // SIP; the plan must not let such a reference through.
+            let usable = meta.wcs.as_ref().is_some_and(|wcs| {
+                crate::stacking::grid_map::ReferenceWcs::from_record(
+                    &wcs.to_record(meta.pixel_scale_arcsec),
+                )
+                .is_some()
+            });
+            return Ok(if usable {
+                WcsOutlook::Manifest
+            } else {
+                WcsOutlook::Unsolvable
+            });
+        }
+        FrameOrigin::Project {
+            project_id, blake3, ..
+        } => (project_id, blake3),
+    };
+    let usable_solve = |outcome: SolveOutcome| match outcome {
+        SolveOutcome::Solved(record) => {
+            if crate::stacking::grid_map::ReferenceWcs::from_record(&record).is_some() {
+                WcsOutlook::Solved
+            } else {
+                WcsOutlook::Unsolvable
+            }
+        }
+        _ => WcsOutlook::Unsolvable,
+    };
+    let Some(identity) = identity else {
+        return Ok(match stored_outcome(conn, project_id, frame_id, blake3)? {
+            Some(outcome) => usable_solve(outcome),
+            None => WcsOutlook::Unsolvable,
+        });
+    };
+    let subject = crate::db::stacking::StackSubject::Project(project_id.clone());
+    let Some(row) =
+        crate::db::stacking::find_artifact(conn, &subject, "", "solve", Some(frame_id))?
+    else {
+        return Ok(WcsOutlook::ToSolve);
+    };
+    if !cached_outcome_holds(&row, &solve_hash(blake3, identity)) {
+        return Ok(WcsOutlook::ToSolve);
+    }
+    let artifact: SolveArtifact =
+        serde_json::from_str(row.payload_json.as_deref().unwrap_or("null"))?;
+    Ok(usable_solve(artifact.outcome))
+}
+
+/// Plan 6b-3 D14 blocker: the manual pin will have no WCS.
+pub(crate) const PIN_WITHOUT_WCS: &str =
+    "The manual reference frame has no WCS and could not be plate-solved; choose another reference";
+/// … and no catalog is installed to try.
+pub(crate) const PIN_WITHOUT_WCS_NO_CATALOG: &str = "The manual reference frame has no WCS and the plate-solve star catalog is not installed; choose another reference";
+/// Plan 6b-3 D14 warning: the pin's WCS depends on a solve still to come.
+pub(crate) const PIN_TO_SOLVE: &str = "The manual reference frame has no WCS yet: the run plate-solves it first, and fails at Reference if it cannot";
+/// Plan 6b-3 D14 blocker: no in-scope frame will have a WCS.
+pub(crate) const NO_FRAME_WITH_WCS: &str =
+    "No frame of this project has a WCS and none could be plate-solved; the grid needs one";
+/// … and no catalog is installed to try.
+pub(crate) const NO_FRAME_WITH_WCS_NO_CATALOG: &str = "No frame of this project has a WCS and the plate-solve star catalog is not installed; the grid needs one";
+
+/// The plan's half of the reference WCS rule (spec §5.4, plan 6b-3 D14).
+#[derive(Debug, Default)]
+pub(crate) struct ReferenceWcsCheck {
+    /// A `reference` blocker: the run is certain to fail at Reference.
+    pub blocker: Option<String>,
+    pub warning: Option<String>,
+}
+
+/// Blocks a run certain to fail at Reference — a manual pin that will have no
+/// WCS, or no in-scope frame that will have one — and warns when the pin's
+/// WCS depends on a solve the run has yet to try. `pinned` is ignored when it
+/// is not among `origins` (the plan's own reference gate reports that).
+pub(crate) fn reference_wcs_check(
+    conn: &Connection,
+    origins: &FrameOrigins,
+    in_scope: &[i64],
+    pinned: Option<i64>,
+    identity: Option<&str>,
+) -> anyhow::Result<ReferenceWcsCheck> {
+    let mut check = ReferenceWcsCheck::default();
+    if let Some((pin, origin)) = pinned.and_then(|p| origins.get(&p).map(|o| (p, o))) {
+        match wcs_outlook(conn, origin, pin, identity)? {
+            WcsOutlook::Unsolvable => {
+                check.blocker = Some(
+                    if identity.is_some() {
+                        PIN_WITHOUT_WCS
+                    } else {
+                        PIN_WITHOUT_WCS_NO_CATALOG
+                    }
+                    .to_string(),
+                );
+                return Ok(check);
+            }
+            WcsOutlook::ToSolve => check.warning = Some(PIN_TO_SOLVE.to_string()),
+            WcsOutlook::NotApplicable | WcsOutlook::Manifest | WcsOutlook::Solved => {}
+        }
+    }
+    if in_scope.is_empty() {
+        return Ok(check);
+    }
+    for &id in in_scope {
+        let Some(origin) = origins.get(&id) else {
+            continue;
+        };
+        if wcs_outlook(conn, origin, id, identity)? != WcsOutlook::Unsolvable {
+            return Ok(check);
+        }
+    }
+    check.blocker = Some(
+        if identity.is_some() {
+            NO_FRAME_WITH_WCS
+        } else {
+            NO_FRAME_WITH_WCS_NO_CATALOG
+        }
+        .to_string(),
+    );
+    Ok(check)
+}
+
 /// A project frame's footprint for the LN field (plan 6b-3 D8, review I6):
 /// its manifest WCS, else the cached solve of its current content, at its
 /// manifest size. `None` for a catalog frame, for a frame with neither, and
@@ -538,10 +691,6 @@ mod tests {
             (
                 "heal_interrupted_runs",
                 "log-only: the frame-set and project heal lines carry different fields",
-            ),
-            (
-                "start_stacking",
-                "frame-set-only guard: a project start is refused until 6b-3",
             ),
             (
                 "build_plan",

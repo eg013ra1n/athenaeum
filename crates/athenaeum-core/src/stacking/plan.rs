@@ -942,11 +942,6 @@ pub(crate) fn frame_set_name(conn: &Connection, frames_set_id: i64) -> Result<St
     .ok_or_else(|| ApiError::NotFound(format!("frame set {frames_set_id} not found")))
 }
 
-/// Refusal text for every project entry point until plan 6b-2 lands the
-/// project path.
-pub const PROJECT_STACKING_UNAVAILABLE: &str =
-    "Stacking a collaboration project is not available yet.";
-
 /// The subject's display label: a frame set's name, a project's title.
 pub(crate) fn subject_label(conn: &Connection, subject: &StackSubject) -> Result<String, ApiError> {
     match subject {
@@ -2068,6 +2063,7 @@ fn frame_set_inputs(
 fn project_inputs(
     conn: &Connection,
     settings: &SettingsManager,
+    subject: &StackSubject,
     project_id: &str,
     config_override: Option<StackingConfig>,
 ) -> Result<SubjectInputs, ApiError> {
@@ -2252,6 +2248,44 @@ fn project_inputs(
             if unsolvable == 1 { "" } else { "s" }
         ));
     }
+    // Plan 6b-3 D14 (spec §5.4): the grid needs a reference with a WCS.
+    // Judged as the run's Solve sub-step will judge it (the installed
+    // solver's identity), so a cached failure blocks only while it stands.
+    let identity = match crate::stacking::solve::installed_solver_identity(conn) {
+        Ok(identity) => Some(identity),
+        Err(why) => {
+            tracing::debug!(project_id = %project_id, error = %why, "no solver identity for the reference rule");
+            None
+        }
+    };
+    let pinned = if cfg.reference.mode == ReferenceMode::Manual {
+        stored_reference_frame(conn, subject).map_err(|e| ApiError::Internal(format!("{e:#}")))?
+    } else {
+        None
+    };
+    let in_scope_handles: Vec<i64> = source
+        .frames
+        .iter()
+        .filter(in_scope)
+        .filter_map(|f| f.handle)
+        .collect();
+    let check = crate::stacking::origin::reference_wcs_check(
+        conn,
+        &source.origins,
+        &in_scope_handles,
+        pinned,
+        identity.as_deref(),
+    )
+    .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    if let Some(message) = check.blocker {
+        blockers.push(PlanBlocker {
+            code: "reference".to_string(),
+            message,
+        });
+    }
+    if let Some(note) = check.warning {
+        warnings.push(note);
+    }
     // Spec §6.3: in-scope frames a confirmed grid leaves outside.
     if let Some(grid) = &current {
         let outside = source
@@ -2399,7 +2433,7 @@ pub fn build_plan(
             frame_set_inputs(conn, settings, subject, *frames_set_id, config_override)?
         }
         StackSubject::Project(project_id) => {
-            project_inputs(conn, settings, project_id, config_override)?
+            project_inputs(conn, settings, subject, project_id, config_override)?
         }
     };
     let project_grid: Option<crate::collab::grid::CanonicalGrid> =
@@ -3399,8 +3433,14 @@ mod tests {
         };
         let subject = StackSubject::Project("p1".into());
         let cfg = with_folders(&working, &output);
-        let inputs =
-            project_inputs(&f.conn, &SettingsManager::new(), "p1", Some(cfg.clone())).unwrap();
+        let inputs = project_inputs(
+            &f.conn,
+            &SettingsManager::new(),
+            &StackSubject::Project("p1".into()),
+            "p1",
+            Some(cfg.clone()),
+        )
+        .unwrap();
         let groups = inputs.groups;
         let origins = inputs.origins;
         let handles =
@@ -8469,6 +8509,282 @@ mod tests {
             "{:?}",
             second.warnings
         );
+    }
+
+    /// Plan 6b-3 D14 (spec §5.4): with no installed catalog nothing can be
+    /// solved, so a project none of whose in-scope frames carries a manifest
+    /// WCS is blocked at plan time — the run would fail at Reference. One
+    /// frame with a manifest WCS lifts the block.
+    #[test]
+    fn a_project_with_no_possible_wcs_is_blocked_at_plan_time() {
+        use crate::stacking::test_fixtures::{
+            add_project_frame, manifest_wcs_json, project_frame_spec,
+        };
+        let f = test_fixtures::frame_set("unused");
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        for uuid in ["a", "b", "c"] {
+            add_project_frame(&f.conn, &landed, "p1", &project_frame_spec(uuid));
+        }
+        let plan = |f: &test_fixtures::Fixture| {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::Project("p1".into()),
+                None,
+            )
+            .unwrap()
+        };
+        let blocked = plan(&f);
+        let reference: Vec<&PlanBlocker> = blocked
+            .blockers
+            .iter()
+            .filter(|b| b.code == "reference")
+            .collect();
+        assert_eq!(reference.len(), 1, "{:?}", blocked.blockers);
+        assert_eq!(
+            reference[0].message,
+            crate::stacking::origin::NO_FRAME_WITH_WCS_NO_CATALOG
+        );
+
+        let mut d = project_frame_spec("d");
+        d.wcs = Some(manifest_wcs_json(64, 48, 83.8, -5.4, 1.5));
+        add_project_frame(&f.conn, &landed, "p1", &d);
+        let open = plan(&f);
+        assert!(
+            open.blockers.iter().all(|b| b.code != "reference"),
+            "{:?}",
+            open.blockers
+        );
+    }
+
+    /// Plan 6b-3 D14: a manual pin without a manifest WCS is a warning while
+    /// the run still has to try to solve it, and a `reference` blocker once
+    /// its cached failure stands for this very solver and catalog. A failure
+    /// cached under another solver identity is tried again, so it warns.
+    #[test]
+    fn a_pinned_frame_without_a_wcs_warns_then_blocks_on_a_standing_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("catalog.db");
+        let f = test_fixtures::frame_set_with_conn(
+            rusqlite::Connection::open(&db_path).unwrap(),
+            "unused",
+        );
+        let catalog = crate::plate_solve::catalog_root(dir.path());
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::write(catalog.join("stars.smac"), b"").unwrap();
+        let (working, output) = seed_project(&f);
+        let mut cfg = with_folders(&working, &output);
+        let first = build_plan(
+            &f.conn,
+            &SettingsManager::new(),
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            Some(cfg.clone()),
+        )
+        .unwrap();
+        let o1 = first
+            .project_frames
+            .iter()
+            .find(|r| r.frame_uuid == "o1")
+            .unwrap()
+            .handle
+            .unwrap();
+        cfg.reference.mode = ReferenceMode::Manual;
+        crate::db::stacking::set_project_config(
+            &f.conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            Some("o1"),
+        )
+        .unwrap();
+        let plan = |f: &test_fixtures::Fixture| {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::Project("p1".into()),
+                None,
+            )
+            .unwrap()
+        };
+        let pin_blocked = |p: &StackingPlan| {
+            p.blockers.iter().any(|b| {
+                b.code == "reference" && b.message == crate::stacking::origin::PIN_WITHOUT_WCS
+            })
+        };
+
+        let to_solve = plan(&f);
+        assert!(
+            to_solve
+                .warnings
+                .iter()
+                .any(|w| w == crate::stacking::origin::PIN_TO_SOLVE),
+            "{:?}",
+            to_solve.warnings
+        );
+        assert!(!pin_blocked(&to_solve), "{:?}", to_solve.blockers);
+
+        let blake3: String = f
+            .conn
+            .query_row(
+                "SELECT blake3 FROM project_frames_local WHERE project_id = 'p1' AND frame_uuid = 'o1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let identity = crate::stacking::solve::installed_solver_identity(&f.conn).unwrap();
+        let failed = crate::stacking::solve::SolveOutcome::Failed("no match".into());
+        crate::stacking::solve::write_outcome(
+            &f.conn,
+            "p1",
+            o1,
+            &blake3,
+            &crate::stacking::solve::solve_hash(&blake3, &identity),
+            failed.clone(),
+        )
+        .unwrap();
+        let blocked = plan(&f);
+        assert!(pin_blocked(&blocked), "{:?}", blocked.blockers);
+
+        crate::stacking::solve::write_outcome(&f.conn, "p1", o1, &blake3, "another-solver", failed)
+            .unwrap();
+        let retried = plan(&f);
+        assert!(!pin_blocked(&retried), "{:?}", retried.blockers);
+        assert!(retried
+            .warnings
+            .iter()
+            .any(|w| w == crate::stacking::origin::PIN_TO_SOLVE));
+    }
+
+    /// Plan 6b-3 D14 (review): a cached solve whose SIP tables cannot be read
+    /// is no WCS at all — `ReferenceWcs::from_record` refuses it, so the run
+    /// would fail at Reference with "no usable WCS". The plan keeps such a
+    /// reference out: as a pin, and as the only candidate.
+    #[test]
+    fn a_cached_solve_with_unreadable_sip_cannot_be_a_reference() {
+        use crate::stacking::test_fixtures::{add_project_frame, project_frame_spec};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("catalog.db");
+        let f = test_fixtures::frame_set_with_conn(
+            rusqlite::Connection::open(&db_path).unwrap(),
+            "unused",
+        );
+        let catalog = crate::plate_solve::catalog_root(dir.path());
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::write(catalog.join("stars.smac"), b"").unwrap();
+        crate::db::stacking::insert_test_project(&f.conn, "p1");
+        let landed = f.dir.path().join("collab");
+        for uuid in ["a", "b"] {
+            add_project_frame(&f.conn, &landed, "p1", &project_frame_spec(uuid));
+        }
+        let mut cfg = StackingConfig::default();
+        cfg.reference.mode = ReferenceMode::Manual;
+        crate::db::stacking::set_project_config(
+            &f.conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            Some("a"),
+        )
+        .unwrap();
+        let plan = |f: &test_fixtures::Fixture| {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::Project("p1".into()),
+                None,
+            )
+            .unwrap()
+        };
+        let reference_messages = |p: &StackingPlan| -> Vec<String> {
+            p.blockers
+                .iter()
+                .filter(|b| b.code == "reference")
+                .map(|b| b.message.clone())
+                .collect()
+        };
+        let identity = crate::stacking::solve::installed_solver_identity(&f.conn).unwrap();
+        let seeded = plan(&f);
+        let mut bad = crate::stacking::solve::FakeSolver::fixture_record();
+        bad.sip_order = Some(2);
+        bad.sip_a_coeffs = Some("not json".into());
+        bad.sip_b_coeffs = Some("not json".into());
+        assert!(bad.to_solution().is_none());
+        for row in &seeded.project_frames {
+            let blake3: String = f
+                .conn
+                .query_row(
+                    "SELECT blake3 FROM project_frames_local WHERE project_id = 'p1' AND frame_uuid = ?1",
+                    [&row.frame_uuid],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::stacking::solve::write_outcome(
+                &f.conn,
+                "p1",
+                row.handle.unwrap(),
+                &blake3,
+                &crate::stacking::solve::solve_hash(&blake3, &identity),
+                crate::stacking::solve::SolveOutcome::Solved(bad.clone()),
+            )
+            .unwrap();
+        }
+        let blocked = reference_messages(&plan(&f));
+        assert_eq!(
+            blocked,
+            vec![crate::stacking::origin::PIN_WITHOUT_WCS.to_string()]
+        );
+
+        // With the pin back on Auto, no candidate has a usable WCS either.
+        cfg.reference.mode = ReferenceMode::Auto;
+        crate::db::stacking::set_project_config(
+            &f.conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reference_messages(&plan(&f)),
+            vec![crate::stacking::origin::NO_FRAME_WITH_WCS.to_string()]
+        );
+    }
+
+    /// Plan 6b-3 D16: a project's steady-state plan writes nothing. With the
+    /// config seeded and every handle minted by a first plan, a second plan
+    /// succeeds while another connection holds the write lock and this one
+    /// will not wait for it.
+    #[test]
+    fn a_steady_state_project_plan_takes_no_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("catalog.db");
+        let f = test_fixtures::frame_set_with_conn(
+            rusqlite::Connection::open(&db_path).unwrap(),
+            "unused",
+        );
+        let (working, output) = seed_project(&f);
+        let plan = |f: &test_fixtures::Fixture| {
+            build_plan(
+                &f.conn,
+                &SettingsManager::new(),
+                &PathPolicy::AllowAll,
+                &StackSubject::Project("p1".into()),
+                Some(with_folders(&working, &output)),
+            )
+        };
+        let first = plan(&f).unwrap();
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        f.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let second = plan(&f).expect("a steady-state plan only reads");
+        assert_eq!(second.project_frames.len(), first.project_frames.len());
+        assert_eq!(second.config_hash, first.config_hash);
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 
     /// Plan 6b-3 D15 (the 6b-2 leftover): one rule for stage 1 and LN — an
