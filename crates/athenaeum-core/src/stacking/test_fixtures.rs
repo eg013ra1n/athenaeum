@@ -783,6 +783,19 @@ pub(crate) fn synthetic_star_field(
     data
 }
 
+/// Installs an empty stand-in star catalog under `app_data` (the folder of
+/// the catalog database), so the plan reads a solver identity, and returns
+/// that identity for the default plate-solve config (what the plan hashes
+/// while no config is stored). Real solves never run against it.
+pub(crate) fn install_stand_in_catalog(app_data: &Path) -> String {
+    let catalog = crate::plate_solve::catalog_root(app_data);
+    std::fs::create_dir_all(&catalog).unwrap();
+    std::fs::write(catalog.join("stars.smac"), b"").unwrap();
+    let config = crate::plate_solve::config::load_config(&Connection::open_in_memory().unwrap());
+    crate::stacking::solve::solver_identity(app_data, &config)
+        .expect("a stand-in catalog is installed")
+}
+
 // ── Fixture self-test ────────────────────────────────────────────────────
 
 #[cfg(test)]

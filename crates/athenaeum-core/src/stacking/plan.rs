@@ -8615,9 +8615,7 @@ mod tests {
             rusqlite::Connection::open(&db_path).unwrap(),
             "unused",
         );
-        let catalog = crate::plate_solve::catalog_root(dir.path());
-        std::fs::create_dir_all(&catalog).unwrap();
-        std::fs::write(catalog.join("stars.smac"), b"").unwrap();
+        test_fixtures::install_stand_in_catalog(dir.path());
         let (working, output) = seed_project(&f);
         let mut cfg = with_folders(&working, &output);
         let first = build_plan(
@@ -8716,9 +8714,7 @@ mod tests {
             rusqlite::Connection::open(&db_path).unwrap(),
             "unused",
         );
-        let catalog = crate::plate_solve::catalog_root(dir.path());
-        std::fs::create_dir_all(&catalog).unwrap();
-        std::fs::write(catalog.join("stars.smac"), b"").unwrap();
+        test_fixtures::install_stand_in_catalog(dir.path());
         crate::db::stacking::insert_test_project(&f.conn, "p1");
         let landed = f.dir.path().join("collab");
         for uuid in ["a", "b"] {

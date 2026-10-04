@@ -677,10 +677,12 @@ impl FakeSolver {
         self
     }
 
-    /// Report `identity` instead of the default `fake:1`: a test that also
-    /// builds plans installs a stand-in catalog and passes the identity the
-    /// plan reads ([`installed_solver_identity`]), so the plan finds the
-    /// run's cached solves.
+    /// Report `identity` instead of the default `fake:1`. A test that also
+    /// builds plans passes the identity the plan reads
+    /// ([`installed_solver_identity`], after
+    /// `test_fixtures::install_stand_in_catalog`), which keeps the plan's
+    /// identity verdict equal to the run's: the solves the run cached are
+    /// then the ones the plan finds.
     pub(crate) fn with_identity(mut self, identity: &str) -> Self {
         self.identity = Ok(identity.to_string());
         self
@@ -1493,9 +1495,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let catalog = crate::plate_solve::catalog_root(dir.path());
-        std::fs::create_dir_all(&catalog).unwrap();
-        std::fs::write(catalog.join("stars.smac"), b"").unwrap();
+        crate::stacking::test_fixtures::install_stand_in_catalog(dir.path());
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let default_identity = installed_solver_identity(&conn).expect("a catalog is installed");
         // A stored non-default config moves the identity, and the run's

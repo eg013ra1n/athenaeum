@@ -26034,22 +26034,20 @@ mod tests {
         let stars = test_fixtures::sky_stars(target, 0.12, 50.0, 7);
         // A stand-in catalog, so the plan reads an identity, and the fake
         // solver reports it: the run's cached solves are then the plan's.
-        let catalog = crate::plate_solve::catalog_root(tmp.path());
-        std::fs::create_dir_all(&catalog).unwrap();
-        std::fs::write(catalog.join("stars.smac"), b"").unwrap();
-        let identity = crate::stacking::solve::installed_solver_identity(&conn).unwrap();
+        let identity = test_fixtures::install_stand_in_catalog(tmp.path());
         let mut solver = FakeSolver::solving_all().with_identity(&identity);
-        let mut names = Vec::new();
         for i in 0..3usize {
             let uuid = format!("l{i}");
             let dither = ((i as f64 - 1.5) * 0.001, (i % 2) as f64 * 0.0005);
-            let mut f = test_fixtures::sky_frame(&uuid, (target.0 + dither.0, target.1 + dither.1));
+            let mut f =
+                test_fixtures::sky_frame(&uuid, (target.0 + dither.0, target.1 + dither.1));
             f.noise_seed = 100 + i as u64;
             f.manifest_wcs = false;
-            let path = test_fixtures::add_project_sky_frame(&conn, &tmp.path().join("collab"), "p1", &f, &stars);
+            let landed = tmp.path().join("collab");
+            let path = test_fixtures::add_project_sky_frame(&conn, &landed, "p1", &f, &stars);
             let name = path.file_name().unwrap().to_string_lossy().to_string();
-            solver = solver.with(&name, SolveOutcome::Solved(test_fixtures::sky_frame_record(&f)));
-            names.push(name);
+            let record = test_fixtures::sky_frame_record(&f);
+            solver = solver.with(&name, SolveOutcome::Solved(record));
         }
         let grid = crate::collab::grid::CanonicalGrid {
             scale_arcsec: 1.5,
@@ -26100,7 +26098,31 @@ mod tests {
         assert_eq!(header.get_str("ATH_GRID").as_deref(), Some(grid.hash().as_str()));
         let summary: RunSummary = serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
         let reference = summary.reference.filename.expect("a reference frame");
-        assert!(names.contains(&reference), "{reference} is not one of {names:?}");
+        let with_manifest_wcs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_frames_local \
+                 WHERE project_id = 'p1' AND manifest_json LIKE '%\"wcs\"%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(with_manifest_wcs, 0, "no frame carries a manifest WCS");
+        let uuid = reference
+            .strip_prefix("c_")
+            .and_then(|n| n.strip_suffix(".fits"))
+            .unwrap_or_else(|| panic!("unexpected reference name {reference}"));
+        let handle = summary.reference.frame_id.expect("a reference frame id");
+        let outcome = crate::stacking::solve::stored_outcome(
+            &conn,
+            "p1",
+            handle,
+            &blake3_of(&conn, "p1", uuid),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, Some(SolveOutcome::Solved(_))),
+            "the reference has a cached Solved outcome: {outcome:?}"
+        );
 
         let plan = build_plan(
             &conn,
@@ -26117,6 +26139,11 @@ mod tests {
                 plan.stale_stages
             );
         }
+        assert!(
+            plan.warnings.iter().all(|w| !w.contains("plate-solved locally")),
+            "the run's cached solves are the plan's: {:?}",
+            plan.warnings
+        );
     }
 
     /// Plan/run agreement (plan 6b-3 D6): after a project run with LN on, the

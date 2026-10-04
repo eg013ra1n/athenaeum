@@ -16,10 +16,11 @@ use crate::collab::fake_hub::FakeHub;
 use crate::db::stacking::{StackSubject, StackingRunRow};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
+use crate::stacking::plan::Stage;
 use crate::stacking::solve::{FakeSolver, SolveOutcome};
 use crate::stacking::test_fixtures::{
-    render_sky_frame, sky_frame, sky_frame_record, sky_stars, EAST_PAIR_OFFSET_WIDTHS,
-    EAST_PAIR_SPACING_ARCSEC, EAST_PAIR_STAR_SEED,
+    install_stand_in_catalog, render_sky_frame, sky_frame, sky_frame_record, sky_stars,
+    ProjectFile, EAST_PAIR_OFFSET_WIDTHS, EAST_PAIR_SPACING_ARCSEC, EAST_PAIR_STAR_SEED,
 };
 
 const TARGET: (f64, f64) = (83.8, -5.4);
@@ -93,6 +94,10 @@ struct Planned {
     canonical: &'static str,
     centre: (f64, f64),
     manifest_wcs: bool,
+    scale_arcsec: f64,
+    width: usize,
+    height: usize,
+    osc: bool,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -105,6 +110,7 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
     hub.add_account("tok", "acc-me", "Me", &b64.encode([7u8; 32]), None);
     hub.add_account("tok-a", "acc-a", "Ann", &b64.encode([8u8; 32]), None);
     hub.add_account("tok-b", "acc-b", "Bob", &b64.encode([9u8; 32]), None);
+    hub.add_account("tok-c", "acc-c", "Carol", &b64.encode([10u8; 32]), None);
     hub.add_project(
         "p1",
         "m42",
@@ -112,6 +118,7 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
             ("acc-me", "send_receive", true),
             ("acc-a", "send_receive", false),
             ("acc-b", "send_receive", false),
+            ("acc-c", "send_receive", false),
         ],
         false,
     );
@@ -129,6 +136,25 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
         canonical,
         centre,
         manifest_wcs,
+        scale_arcsec: 1.5,
+        width: 384,
+        height: 288,
+        osc: false,
+    };
+    // Carol shoots at 2.0"/px on a 320 x 240 sensor (a wider and a taller
+    // field than Ann's and Bob's): two mono frames join the L group, and
+    // three OSC replicas (debayered, RGGB) make a group of their own.
+    let coarse = |p: Planned| Planned {
+        scale_arcsec: 2.0,
+        width: 320,
+        height: 240,
+        ..p
+    };
+    let carol = |uuid, raw, canonical, centre, osc| {
+        coarse(Planned {
+            osc,
+            ..frame(uuid, "acc-c", "Carol", raw, canonical, centre, true)
+        })
     };
     let planned = vec![
         frame("a0", "acc-a", "Ann", "Luminance", "L", near(0.0), true),
@@ -159,6 +185,11 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
             (TARGET.0 + east + 0.002, TARGET.1 + 0.001),
             true,
         ),
+        carol("c0", "Lum", "L", near(1.0), false),
+        carol("c1", "Lum", "L", near(3.0), false),
+        carol("o0", "LPro", "LPRO", near(0.5), true),
+        carol("o1", "LPro", "LPRO", near(1.5), true),
+        carol("o2", "LPro", "LPRO", near(2.5), true),
     ];
     // Task 5b's star field, constant for constant (review I5): the east pair
     // registers over its ≈ 15 % strip there first, a hundred times cheaper.
@@ -176,6 +207,13 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
         f.publisher = p.publisher;
         f.filter = p.raw;
         f.manifest_wcs = p.manifest_wcs;
+        f.scale_arcsec = p.scale_arcsec;
+        f.width = p.width;
+        f.height = p.height;
+        if p.osc {
+            f.file = ProjectFile::Rgb32;
+            f.bayerpat = Some("RGGB");
+        }
         f.noise_seed = 500 + i as u64;
         let r = render_sky_frame(&collab, "p1", &f, &stars);
         if p.uuid == "b2" {
@@ -188,6 +226,7 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
             r.byte_size,
         );
         let (raw, canonical) = (p.raw.to_string(), p.canonical.to_string());
+        let channel = if p.osc { "osc" } else { "mono" };
         hub.seed_frames_with("p1", p.account, &[p.uuid], "published", move |w| {
             w.meta = meta.clone();
             w.file_name = file_name.clone();
@@ -196,7 +235,7 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
             w.xxh3 = "0123456789abcdef".to_string();
             w.filter_raw = raw.clone();
             w.filter_canonical = canonical.clone();
-            w.channel = "mono".to_string();
+            w.channel = channel.to_string();
             w.exptime_sec = 300.0;
             w.date_obs = Some("2026-01-10T21:00:00".to_string());
         });
@@ -241,10 +280,7 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
             .parent()
             .unwrap()
             .to_path_buf();
-        let catalog = crate::plate_solve::catalog_root(&app_data);
-        std::fs::create_dir_all(&catalog).unwrap();
-        std::fs::write(catalog.join("stars.smac"), b"").unwrap();
-        crate::stacking::solve::installed_solver_identity(&conn).unwrap()
+        install_stand_in_catalog(&app_data)
     };
     let ctx = Arc::new(ctx);
     let before = catalog_rows(&ctx);
@@ -318,6 +354,16 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
     let row = finished(&ctx, started.run_id).await;
     assert_eq!(row.status, "done", "{row:?}");
     assert_eq!(solver.calls(), 1, "the one frame without a WCS is solved");
+    let solved: Vec<_> = solver
+        .paths()
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        solved,
+        vec![b2_name.clone()],
+        "the solver was asked for b2 only"
+    );
 
     let summary: crate::stacking::provenance::RunSummary =
         serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
@@ -330,6 +376,23 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
         "{:?}",
         summary.warnings
     );
+    assert_eq!(
+        summary
+            .warnings
+            .iter()
+            .filter(|w| w.contains("global normalization"))
+            .count(),
+        1,
+        "one warning, for the L group only: {:?}",
+        summary.warnings
+    );
+    let globals = crate::db::stacking::list_artifacts(
+        &db_conn(&ctx),
+        &StackSubject::Project("p1".into()),
+        Some(crate::stacking::run::LN_GLOBAL_ARTIFACT_KIND),
+    )
+    .unwrap();
+    assert_eq!(globals.len(), 2, "one ln_global artifact per east frame");
     let completes: Vec<serde_json::Value> = events
         .0
         .lock()
@@ -343,13 +406,15 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
     assert!(completes[0]["setId"].is_null());
 
     // The masters: grid size, the canonical filter, coverage that counts the
-    // footprints (6 central L members cover the target, all 8 the strip the
-    // east pair shares with them; R: 3 everywhere they overlap).
+    // footprints. L: 6 central members of Ann and Bob plus Carol's 2 cover the
+    // target (8); the strip the east pair shares with them has all 10. R: 3
+    // everywhere they overlap. LPRO (OSC, 3 channels): 3.
     let lights = crate::db::stacking::list_master_lights(&db_conn(&ctx), started.run_id).unwrap();
     let masters: Vec<_> = lights.iter().filter(|m| m.kind == "master").collect();
-    assert_eq!(masters.len(), 2, "{lights:?}");
+    assert_eq!(masters.len(), 3, "{lights:?}");
     // A project run writes into `<output>/<project title>/` (the title is the
-    // hub's target name here), under the canonical spelling of the root.
+    // hub's slug `m42`, upper-cased, here), under the canonical spelling of
+    // the root.
     let out_dir = crate::test_support::canonical_path(&tmp.path().join("out")).join("M42");
     assert_eq!(Path::new(&row.output_dir), out_dir);
     let mut filters = Vec::new();
@@ -358,6 +423,15 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
         assert!(Path::new(&m.path).starts_with(&out_dir), "{}", m.path);
         let header = crate::fits_parser::FitsHeader::from_path(Path::new(&m.path)).unwrap();
         let filter = header.get_str("FILTER").unwrap();
+        assert_eq!(
+            header.get_str("ATH_GRID").as_deref(),
+            Some(grid.hash().as_str())
+        );
+        assert_eq!(header.get_str("ATH_SPRJ").as_deref(), Some("p1"));
+        assert_eq!(header.get_str("ATH_RGEO").as_deref(), Some("grid"));
+        let channels = crate::integration::plane_reader::PlaneReader::open(Path::new(&m.path))
+            .unwrap()
+            .channels();
         let coverage = lights
             .iter()
             .find(|c| c.kind == "coverage" && c.group_key == m.group_key)
@@ -369,28 +443,48 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
         let at_target = plane[(y.round() as usize) * reader.width() + x.round() as usize];
         let max = plane.iter().cloned().fold(0f32, f32::max);
         match filter.as_str() {
-            "L" => assert_eq!((at_target, max), (6.0, 8.0), "L coverage"),
-            "R" => assert_eq!((at_target, max), (3.0, 3.0), "R coverage"),
+            "L" => {
+                assert_eq!((at_target, max, channels), (8.0, 10.0, 1), "L coverage");
+            }
+            "R" => {
+                assert_eq!((at_target, max, channels), (3.0, 3.0, 1), "R coverage");
+            }
+            "LPRO" => {
+                assert_eq!((at_target, max, channels), (3.0, 3.0, 3), "LPRO coverage");
+            }
             other => panic!("a master with FILTER {other:?}: the raw name leaked"),
         }
         filters.push(filter);
     }
     filters.sort();
-    assert_eq!(filters, vec!["L".to_string(), "R".to_string()]);
+    assert_eq!(
+        filters,
+        vec!["L".to_string(), "LPRO".to_string(), "R".to_string()]
+    );
 
     // Run history names uuids and never the excluded frame; the catalog is
     // untouched; nothing written carries ATH_PRJ.
     let detail = crate::api::stacking::get_stacking_run(&ctx, started.run_id).unwrap();
     assert_eq!(
         detail.frames.len(),
-        11,
-        "12 published minus the excluded one"
+        16,
+        "17 published minus the excluded one"
     );
     assert!(detail
         .frames
         .iter()
         .all(|f| f.frame_uuid.as_deref() != Some("a3")));
     assert!(detail.frames.iter().all(|f| f.frame_uuid.is_some()));
+    assert!(
+        detail.frames.iter().all(|f| f.included),
+        "every frame registers and stacks: {:?}",
+        detail
+            .frames
+            .iter()
+            .filter(|f| !f.included)
+            .map(|f| (&f.frame_uuid, &f.exclusion_reason, &f.reg_status))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         catalog_rows(&ctx),
         before,
@@ -410,6 +504,27 @@ async fn a_project_stacks_end_to_end_through_the_fake_hub() {
                 );
             }
         }
+    }
+
+    // The plan between the runs agrees with the first run: nothing left to
+    // solve (the identity bridge holds) and no stage the run built is stale.
+    let between =
+        crate::api::stacking::get_project_stacking_plan(&ctx, &PathPolicy::AllowAll, "p1", None)
+            .unwrap();
+    assert!(
+        between
+            .warnings
+            .iter()
+            .all(|w| !w.contains("plate-solved locally")),
+        "{:?}",
+        between.warnings
+    );
+    for stage in [Stage::Register, Stage::Normalize] {
+        assert!(
+            !between.stale_stages.contains(&stage),
+            "{stage:?} stale after the run: {:?}",
+            between.stale_stages
+        );
     }
 
     // A second run solves nothing and finishes.
