@@ -7672,6 +7672,12 @@ static FORCE_CROP_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static FORCE_RECORD_FAILURE: AtomicBool = AtomicBool::new(false);
 
+/// Test hook (final review): the next `record_crop_item` call fails once AFTER
+/// `update_group` succeeded, inside its transaction. One-shot, project runs
+/// only (see [`FORCE_CROP_FAILURE`]).
+#[cfg(test)]
+static FORCE_RECORD_FAILURE_AFTER_GROUP: AtomicBool = AtomicBool::new(false);
+
 /// Test hook (plan 6b-3 D10 fix round 1): raise the run's cancel flag after
 /// the next group has written, to cancel between two groups. One-shot, project
 /// runs only (see [`FORCE_CROP_FAILURE`]).
@@ -12075,8 +12081,14 @@ fn record_crop_item(
         .and_then(|(d, _)| d.coverage.as_deref().map(show));
     {
         let conn = db(&rc.ctx)?.conn();
+        // One IMMEDIATE transaction: the group row and every `master_lights`
+        // row land together or not at all, so a failure never leaves the group
+        // naming a final file the caller then removes. Dropping `tx` on an
+        // early return rolls it back.
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(anyhow::Error::from)?;
         update_group(
-            &conn,
+            &tx,
             item.group_id,
             &GroupUpdate {
                 master_path: Some(&master_path),
@@ -12086,13 +12098,19 @@ fn record_crop_item(
                 ..Default::default()
             },
         )?;
+        #[cfg(test)]
+        if rc.subject.project_id().is_some()
+            && FORCE_RECORD_FAILURE_AFTER_GROUP.swap(false, Ordering::SeqCst)
+        {
+            return Err(RunError::Other("forced record failure after the group row".to_string()));
+        }
         let row = |kind: MasterLightKind,
                    path: &str,
                    format: &str,
                    rect: CropRect,
                    channels: usize| {
             insert_master_light(
-                &conn,
+                &tx,
                 &NewMasterLight {
                     subject: &rc.subject,
                     run_id: rc.run_id,
@@ -12121,6 +12139,7 @@ fn record_crop_item(
                 row(MasterLightKind::DrizzleCoverage, path, "fits", *drect, item.channels)?;
             }
         }
+        tx.commit().map_err(anyhow::Error::from)?;
     }
     if let Some(g) = rc.summary.groups.iter_mut().find(|g| g.key == item.group_key) {
         g.master_path = Some(master_path.clone());
@@ -27165,5 +27184,77 @@ mod tests {
             orphans.is_empty(),
             "every master file in the output folder is named by a row: {orphans:?}"
         );
+    }
+
+    /// Final review: a failure AFTER the group row was updated rolls the whole
+    /// item back, so no row names a final file the caller then removes.
+    #[test]
+    fn a_record_failure_after_the_group_row_rolls_the_item_back() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, conn, grid) = seed_two_group_project(tmp.path());
+        let mut cfg = sky_config(&conn);
+        cfg.registration.geometry = RegistrationGeometry::Native;
+        cfg.output.crop_to_coverage = 3;
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        FORCE_RECORD_FAILURE_AFTER_GROUP.store(true, Ordering::SeqCst);
+        let result = run_pipeline(&mut rc);
+        FORCE_RECORD_FAILURE_AFTER_GROUP.store(false, Ordering::SeqCst);
+        assert!(result.is_err(), "a database error fails the run");
+
+        let scratch = rc.layout.uncropped_dir(rc.run_id);
+        assert!(scratch.exists(), "the scratch folder survives");
+        let rows = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
+        let masters: Vec<_> = rows.iter().filter(|m| m.kind == "master").collect();
+        let failed = masters
+            .iter()
+            .find(|m| Path::new(&m.path).starts_with(&scratch))
+            .expect("the failed group's master row still names scratch");
+        // Every row names a file that exists (none names a removed final file).
+        for m in &rows {
+            assert!(Path::new(&m.path).exists(), "row names a missing file: {m:?}");
+        }
+        // The group rows agree: each group's master_path is a file on disk.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stacking_run_groups WHERE run_id = ?1 AND master_path IS NOT NULL",
+                [rc.run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT group_key, master_path FROM stacking_run_groups WHERE run_id = ?1 AND master_path IS NOT NULL")
+            .unwrap();
+        let groups: Vec<(String, String)> = stmt
+            .query_map([rc.run_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(groups.len() as i64, n);
+        for (key, p) in &groups {
+            assert!(Path::new(p).exists(), "group {key} names a missing file {p}");
+            if *key == failed.group_key {
+                assert!(
+                    Path::new(p).starts_with(&scratch),
+                    "the failed group still names scratch: {p}"
+                );
+            }
+        }
     }
 }
