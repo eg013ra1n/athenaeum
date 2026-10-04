@@ -582,7 +582,12 @@ pub fn coverage_map_cards(master_cards: &[Card]) -> Result<Vec<Card>, FitsWriteE
         Card::new("BUNIT", CardValue::Str("frames".into()))?
             .with_comment("frames with a sample here"),
     ];
-    for c in master_cards.iter().filter(|c| is_wcs_keyword(&c.keyword)) {
+    // `PLTSOLVD` stays behind: a count map is not a solved image (final
+    // review B6); its WCS block still lets a viewer place it.
+    for c in master_cards
+        .iter()
+        .filter(|c| is_wcs_keyword(&c.keyword) && c.keyword != "PLTSOLVD")
+    {
         cards.push(c.clone());
     }
     for kw in [
@@ -1113,7 +1118,7 @@ fn log_cropped(message: &'static str, path: &Path) {
 }
 
 /// Removes the files a failed crop wrote, logging each one it cannot.
-fn remove_partial_outputs(made: &[PathBuf]) {
+pub(crate) fn remove_partial_outputs(made: &[PathBuf]) {
     for path in made {
         if let Err(error) = std::fs::remove_file(path) {
             tracing::warn!(path = %path.display(), error = %error, "removing a partial crop output failed");
@@ -2320,6 +2325,7 @@ mod tests {
             Card::new("ROWORDER", CardValue::Str("BOTTOM-UP".into())).unwrap(),
             Card::new("CRVAL1", CardValue::Real(10.0)).unwrap(),
             Card::new("CD1_1", CardValue::Real(-1e-4)).unwrap(),
+            Card::new("PLTSOLVD", CardValue::Logical(true)).unwrap(),
             Card::new("ATH_STKI", CardValue::Str("7".into())).unwrap(),
             Card::new("ATH_STKG", CardValue::Str("mono__L__st300".into())).unwrap(),
             Card::new(ATH_RGEO, CardValue::Str(RGEO_GRID.into())).unwrap(),
@@ -2344,6 +2350,10 @@ mod tests {
             assert!(get(k).is_some(), "{k} is copied");
         }
         assert!(get("FILTER").is_none() && get("ATH_PRJ").is_none());
+        assert!(
+            get("PLTSOLVD").is_none(),
+            "a count map is not a solved image"
+        );
     }
 
     /// Plan 6b-3 D10, review I7: finalizing a scratch family with the FULL

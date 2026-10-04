@@ -83,7 +83,8 @@ use crate::stacking::ln::{
 use crate::stacking::master_cards::{
     build_drizzle_cards, build_master_light_cards, cards_row_order_is_bottom_up, master_file_name,
     stamp_grid_cards, write_cropped_drizzle, write_cropped_master, write_drizzled_master,
-    write_master_light, GridStamp, MasterCardInputs, WrittenDrizzle, WrittenMaster,
+    remove_partial_outputs, write_master_light, GridStamp, MasterCardInputs, WrittenDrizzle,
+    WrittenMaster,
 };
 use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
@@ -463,6 +464,23 @@ impl RunContext {
         } else {
             Ok(())
         }
+    }
+
+    /// One Output-stage tick of the crop pass (`current` of `total` groups
+    /// finalized; `group_key` empty on the closing tick). Same throttle as
+    /// every stage; the first and last always go out.
+    fn crop_progress(&mut self, group_key: &str, current: usize, total: usize) {
+        let key = (!group_key.is_empty()).then(|| group_key.to_string());
+        self.progress(
+            Stage::Output,
+            key,
+            current,
+            total,
+            0,
+            0,
+            None,
+            Some("cropping".to_string()),
+        );
     }
 
     /// Emit `stacking-progress`, throttled (decision 6): `current == 0`,
@@ -9065,7 +9083,13 @@ fn process_group_output(
     let integrate_start = Instant::now();
     let cancel: &AtomicBool = &rc.cancel;
     let pool: &Arc<rayon::ThreadPool> = &rc.ctx.image_pool;
-    let mut output = match integrate_group(&input, measure_opts, pool, cancel, &progress, io) {
+    // The span names the group on the integration's own events (the master
+    // statistics rectangle among them); logging only.
+    let integrated = {
+        let _span = tracing::debug_span!("integrate_group", group_key = %group.key).entered();
+        integrate_group(&input, measure_opts, pool, cancel, &progress, io)
+    };
+    let mut output = match integrated {
         Ok(o) => o,
         Err(IntegrationError::Cancelled) => return Err(RunError::Cancelled),
         Err(e) => {
@@ -11692,7 +11716,9 @@ fn stage_output_groups(rc: &mut RunContext) -> Result<(), RunError> {
 /// (`paths::cleanup_work`): it is the user's master data, and only a manual
 /// action does. The pass deliberately ignores a cancel — stopping between
 /// groups would strand the rest in the scratch folder — so a large drizzle
-/// family adds cancel latency. Database errors fail the run, as everywhere in
+/// family adds cancel latency; one Output-stage tick per group reports the
+/// pass (final review B2) and a cancel that arrived during it is logged once.
+/// Database errors fail the run, as everywhere in
 /// Output, but only after every group has been tried: a group whose rows
 /// could not be updated counts as kept, so the scratch folder (which its rows
 /// may still name) survives, and a warning names it.
@@ -11711,7 +11737,9 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
     };
     let mut kept = 0usize;
     let mut record_error: Option<RunError> = None;
-    for item in items {
+    let crop_total = items.len();
+    for (crop_done, item) in items.into_iter().enumerate() {
+        rc.crop_progress(&item.group_key, crop_done, crop_total);
         let full = CropRect::full(item.width, item.height);
         let wanted = run_rect.unwrap_or(item.rect);
         let (target, note) = match wanted {
@@ -11775,20 +11803,24 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
         match result {
             Ok((o, note)) => {
                 if let Err(e) = record_crop_item(rc, &item, &o) {
-                    // Its files are final but its rows may still name the
-                    // scratch folder: the folder stays, whatever the other
-                    // groups do, and the pass goes on with them.
+                    // Its rows may still name the scratch folder, so the
+                    // folder stays, whatever the other groups do, and the
+                    // pass goes on with them. The final files just written
+                    // are removed again: nothing names them, and a leftover
+                    // would only be an orphan beside a later successful run.
                     kept += 1;
+                    remove_partial_outputs(&crop_output_paths(&o));
                     tracing::error!(
                         run_id = rc.run_id,
                         group_key = %item.group_key,
                         path = %scratch.display(),
                         error = ?e,
-                        "crop outputs written but their rows could not be updated; scratch kept"
+                        "crop outputs written but their rows could not be updated; \
+                         final files removed, scratch kept"
                     );
                     rc.warnings.push(format!(
                         "group {}: its rows could not be updated after the crop; \
-                         the scratch folder {} is kept",
+                         its just-written final files were removed and the scratch folder {} is kept",
                         item.group_key,
                         scratch.display()
                     ));
@@ -11832,11 +11864,33 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
             }
         }
     }
+    rc.crop_progress("", crop_total, crop_total);
+    if rc.cancel.load(Ordering::SeqCst) {
+        tracing::info!(
+            run_id = rc.run_id,
+            "crop pass finished after a cancel; the outputs are final"
+        );
+    }
     remove_scratch_unless_kept(rc, &scratch, kept);
     match record_error {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Every final file one crop item wrote: the master family and, when it
+/// was written, the drizzle family.
+fn crop_output_paths(o: &CropOutputs) -> Vec<PathBuf> {
+    let mut paths = vec![o.master.master.clone()];
+    paths.extend(o.master.rejection_low.clone());
+    paths.extend(o.master.rejection_high.clone());
+    paths.extend(o.master.coverage.clone());
+    if let Some((d, _)) = &o.drizzle {
+        paths.push(d.drizzle.clone());
+        paths.extend(d.weight_map.clone());
+        paths.extend(d.coverage.clone());
+    }
+    paths
 }
 
 fn remove_scratch_unless_kept(rc: &RunContext, scratch: &Path, kept: usize) {
@@ -11867,7 +11921,9 @@ fn finalize_unfinished_crop(rc: &mut RunContext) {
     }
     let scratch = rc.layout.uncropped_dir(rc.run_id);
     let (mut kept, mut finalized) = (0usize, 0usize);
-    for item in &items {
+    let crop_total = items.len();
+    for (crop_done, item) in items.iter().enumerate() {
+        rc.crop_progress(&item.group_key, crop_done, crop_total);
         let full = CropRect::full(item.width, item.height);
         let result = write_crop_item(rc, item, full)
             .map_err(|e| format!("{e:#}"))
@@ -11912,6 +11968,7 @@ fn finalize_unfinished_crop(rc: &mut RunContext) {
             }
         }
     }
+    rc.crop_progress("", crop_total, crop_total);
     if finalized > 0 {
         tracing::warn!(
             run_id = rc.run_id,
@@ -20977,7 +21034,10 @@ mod tests {
                 .unwrap()
                 .read_plane(0)
                 .unwrap();
-            let rect = crate::stacking::crop::largest_covered_rect(&count, w, h, 1)
+            // Final review A1: the rectangle is the one at least half the
+            // group's frames cover.
+            let depth = group.included_count.div_ceil(2) as u32;
+            let rect = crate::stacking::crop::largest_covered_rect(&count, w, h, depth)
                 .expect("a rect")
                 .scaled(2);
             let drz =
@@ -21057,7 +21117,10 @@ mod tests {
         assert_eq!((w, h), (768, 576));
         let plane = master.read_plane(0).unwrap();
         let count = coverage.read_plane(0).unwrap();
-        let rect = crate::stacking::crop::largest_covered_rect(&count, w, h, 1).expect("a rect");
+        // Final review A1: the rectangle at least half the group's frames cover.
+        let depth = group.included_count.div_ceil(2) as u32;
+        let rect =
+            crate::stacking::crop::largest_covered_rect(&count, w, h, depth).expect("a rect");
         assert!(
             rect.width * 3 < w * 2 && rect.height * 3 < h * 2,
             "{rect:?} is a part of the grid"
@@ -26971,6 +27034,50 @@ mod tests {
         assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
     }
 
+    /// Final review B2: the crop pass emits an Output-stage tick per group
+    /// (the first and the closing one are never throttled).
+    #[test]
+    fn the_crop_pass_ticks_the_output_stage_per_group() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, conn, grid) = seed_two_group_project(tmp.path());
+        let mut cfg = sky_config(&conn);
+        cfg.registration.geometry = RegistrationGeometry::Native;
+        cfg.output.crop_to_coverage = 3;
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        let recording = Arc::new(Recording::new());
+        rc.emitter = recording.clone();
+        run_pipeline(&mut rc).unwrap();
+        let ticks: Vec<_> = recording
+            .events(STACKING_PROGRESS_EVENT)
+            .into_iter()
+            .filter(|e| e["message"] == "cropping")
+            .collect();
+        assert!(ticks.len() >= 2, "{ticks:?}");
+        assert_eq!(ticks[0]["current"], 0);
+        assert_eq!(ticks[0]["total"], 2);
+        assert!(ticks[0]["groupKey"].is_string(), "{:?}", ticks[0]);
+        let last = ticks.last().unwrap();
+        assert_eq!((last["current"].as_u64(), last["total"].as_u64()), (Some(2), Some(2)));
+        assert_eq!(last["percent"].as_f64(), Some(100.0));
+    }
+
     /// Plan 6b-3 D10 fix round 2: a database error while recording one
     /// group's crop never deletes the scratch folder its rows may still name;
     /// the warning names the folder and the group, and the other group is
@@ -27024,6 +27131,39 @@ mod tests {
                 .any(|w| w.contains(named) && w.contains(&scratch.display().to_string())),
             "{:?}",
             rc.warnings
+        );
+        // Final review B3: the failed group's just-written final files are
+        // gone again, so the output folder holds only the other group's.
+        assert!(
+            rc.warnings
+                .iter()
+                .any(|w| w.contains(named) && w.contains("final files were removed")),
+            "{:?}",
+            rc.warnings
+        );
+        let out_dir = tmp.path().join("out");
+        let mut left: Vec<PathBuf> = Vec::new();
+        let mut stack = vec![out_dir.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "fits" || x == "xisf") {
+                    left.push(p);
+                }
+            }
+        }
+        let owned: std::collections::HashSet<PathBuf> = rows
+            .iter()
+            .filter(|m| Path::new(&m.path).starts_with(&out_dir))
+            .map(|m| PathBuf::from(&m.path))
+            .collect();
+        assert!(!left.is_empty(), "the other group's files exist");
+        let orphans: Vec<_> = left.iter().filter(|p| !owned.contains(*p)).collect();
+        assert!(
+            orphans.is_empty(),
+            "every master file in the output folder is named by a row: {orphans:?}"
         );
     }
 }

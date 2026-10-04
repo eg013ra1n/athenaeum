@@ -287,7 +287,6 @@ Code-complete with green gates: the composed map, both caches, LN on the overlap
   - `api::collab_live` timing: `clean_exit_kill_and_restart` scenario 3 took 3.0 s against its 2 s limit (three re-gates), and `a_stop_is_observed_while_starting_and_while_the_stream_opens` took 1.89 s against 1 s. Both pass solo. Collab live is untouched by 6b-3.
   - `landing_free_bytes_is_bounded_by_the_collaboration_root` compares two `free_bytes` reads taken at different moments, so concurrent test writes break it. It passes solo: a test-design flaw, not a product bug.
   - `a5_a_redesignation_mid_run_refetches_into_the_new_folder` failed once in a full run (Task 2a); it passed alone and in the next full run.
-- **Closed from 6b-2: the solve's ADU copy surviving a process death.** `Intermediates` and `All` now sweep `tmp/` for every subject (D17). That is a behaviour change for frame sets too: a frame set's `Intermediates` cleanup removes a directory it did not remove before (it holds no artifact rows, only crash leftovers).
 
 ### Collab wave 6b-2 — the project path up to the geometry (2026-10-03)
 

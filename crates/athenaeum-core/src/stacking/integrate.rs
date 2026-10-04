@@ -373,6 +373,9 @@ pub struct GroupInput<'a> {
     /// (`master_location`, `_scale`, `_noise`, `_psf_snr`, `snr_gain`, FWHM,
     /// eccentricity) on covered pixels only — a grid master's uncovered
     /// pixels are 0.0 and would read as data. Implies the plane-0 count.
+    /// The rectangle is the largest one at least half the group's included
+    /// frames cover (`ceil(n / 2)`), falling back to one frame when that is
+    /// under [`MIN_STATS_RECT_PX`] (final review A1).
     /// `false` for a frame set, whose statistics never move.
     pub stats_on_covered: bool,
 }
@@ -485,7 +488,8 @@ pub struct GroupOutput {
     pub coverage: Option<Vec<f32>>,
     /// The rectangle the master's statistics were measured on, `Some` only
     /// when [`GroupInput::stats_on_covered`] was set (a grid master): the
-    /// largest rectangle every pixel of which a frame covers, already past
+    /// largest rectangle every pixel of which at least half the frames cover
+    /// (one frame when that is too small), already past
     /// [`MIN_STATS_RECT_PX`]. A grid drizzle measures its own statistics on
     /// this rectangle scaled by the drizzle factor (plan 6b-3 ruling (b)).
     pub measure_rect: Option<crate::stacking::crop::CropRect>,
@@ -1354,24 +1358,55 @@ pub fn integrate_group(
         // `&rayon::ThreadPool` can't supply — run it inside `pool.install`
         // instead so its own parallel work still lands on the caller's
         // pool, and pass `None` for the explicit handle.
-        // Plan 6b-3 D4 refinement (review I1): on a grid the statistics come
-        // from the largest rectangle every pixel of which at least one frame
-        // covers (plane 0's count; the planes share the footprint). The
-        // group fails, visibly, when no frame covers the grid (the master
-        // would be all zeros) or when that rectangle is under
-        // [`MIN_STATS_RECT_PX`] on a side: whole-plane statistics would read
-        // the uncovered 0.0 as data.
+        // Plan 6b-3 D4 refinement (review I1, final review A1): on a grid the
+        // statistics come from the largest rectangle every pixel of which at
+        // least half the group's frames cover (`k = ceil(n / 2)`; plane 0's
+        // count, the planes share the footprint), so the deep centre of the
+        // stack is what they describe and not the one-frame fringe a wide
+        // offset frame adds. When that rectangle is empty or under
+        // [`MIN_STATS_RECT_PX`] on a side the measurement falls back to
+        // `k = 1` (a `warn!` names both sizes). The group then fails,
+        // visibly, when no frame covers the grid (the master would be all
+        // zeros) or when the chosen rectangle is under [`MIN_STATS_RECT_PX`]:
+        // whole-plane statistics would read the uncovered 0.0 as data.
         if p == 0 && input.stats_on_covered {
-            measure_rect = coverage.as_deref().and_then(|c| {
-                crate::stacking::crop::largest_covered_rect(c, input.width, input.height, 1)
-            });
+            let big_enough = |r: &crate::stacking::crop::CropRect| {
+                r.width >= MIN_STATS_RECT_PX && r.height >= MIN_STATS_RECT_PX
+            };
+            let half = u32::try_from(included_count.div_ceil(2))
+                .unwrap_or(u32::MAX)
+                .max(1);
+            let rect_at = |k: u32| {
+                coverage.as_deref().and_then(|c| {
+                    crate::stacking::crop::largest_covered_rect(c, input.width, input.height, k)
+                })
+            };
+            let mut depth = half;
+            measure_rect = rect_at(half).filter(big_enough);
+            if measure_rect.is_none() {
+                let one = rect_at(1);
+                if let (true, Some(fallback)) = (half > 1, one) {
+                    let deep = rect_at(half);
+                    warn!(
+                        count = half,
+                        width = deep.map_or(0, |r| r.width),
+                        height = deep.map_or(0, |r| r.height),
+                        crop_width = fallback.width,
+                        crop_height = fallback.height,
+                        "statistics rectangle too small at half coverage; measured at one frame"
+                    );
+                }
+                depth = 1;
+                measure_rect = one;
+            }
             match measure_rect {
-                Some(r) if r.width >= MIN_STATS_RECT_PX && r.height >= MIN_STATS_RECT_PX => {
+                Some(r) if big_enough(&r) => {
                     debug!(
                         crop_x0 = r.x0,
                         crop_y0 = r.y0,
                         crop_width = r.width,
                         crop_height = r.height,
+                        count = depth,
                         "master statistics on the covered rectangle"
                     )
                 }
@@ -2500,6 +2535,160 @@ mod tests {
             out.stats.master_noise[0].to_bits(),
             whole.noise.to_bits(),
             "the fixture discriminates the rectangle from the whole plane"
+        );
+    }
+
+    /// `stats_on_covered` and a coverage map over one source file placed at
+    /// each of `shifts` (a frame per shift, so the group has `shifts.len()`
+    /// frames); returns the output and everything `warn!`/`debug!` wrote.
+    fn integrate_shifts(shifts: &[(f64, f64)]) -> (Result<GroupOutput, IntegrationError>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = three_shifted_frames(dir.path());
+        let frames: Vec<StackFrame> = shifts
+            .iter()
+            .enumerate()
+            .map(|(i, &(dx, dy))| StackFrame {
+                path: base[0].path.clone(),
+                map: shift_map(dx, dy),
+                measurement: base[0].measurement.clone(),
+                weight: weight(1.0, 1),
+                exposure_s: 30.0,
+                date_obs: None,
+                frame_id: 910000 + i as i64,
+                registered_path: None,
+            })
+            .collect();
+        let integration = IntegrationConfig::default();
+        let normalization = NormalizationConfig::default();
+        let input = GroupInput {
+            frames: &frames,
+            reference: 0,
+            width: 400,
+            height: 300,
+            channels: 1,
+            interpolation: Interpolation::BicubicBSpline,
+            clamping: 0.3,
+            integration: &integration,
+            normalization: &normalization,
+            ln: None,
+            rej: None,
+            second_pass_bitmaps: false,
+            coverage_map: true,
+            stats_on_covered: true,
+        };
+        let on_plane = nop_plane();
+        let on_band = nop_band();
+        let progress = GroupProgress {
+            on_plane: &on_plane,
+            engine: EngineProgress {
+                on_band: &on_band,
+                on_combine: &on_band,
+            },
+        };
+        let mut result = None;
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            result = Some(integrate_group(
+                &input,
+                &MeasureOptions::default(),
+                &pool(),
+                &AtomicBool::new(false),
+                &progress,
+                io(1 << 24),
+            ));
+        });
+        (result.unwrap(), logs)
+    }
+
+    /// Final review A1: many narrow central frames plus one wide offset
+    /// frame. The statistics describe the deep centre (the largest
+    /// rectangle at least half the frames cover), not the one-frame fringe
+    /// the offset frame adds to the footprint; the master's pixels are the
+    /// same either way.
+    #[test]
+    fn stats_rectangle_is_the_deep_centre_not_the_wide_footprint() {
+        // Four frames at +100 px cover columns 100.., one at -100 covers ..300.
+        let shifts = [(100.0, 0.0); 4]
+            .into_iter()
+            .chain([(-100.0, 0.0)])
+            .collect::<Vec<_>>();
+        let (out, logs) = integrate_shifts(&shifts);
+        let out = out.unwrap();
+        let cov = out.coverage.as_deref().expect("a coverage map");
+        let deep = crate::stacking::crop::largest_covered_rect(cov, 400, 300, 3).unwrap();
+        let wide = crate::stacking::crop::largest_covered_rect(cov, 400, 300, 1).unwrap();
+        assert!(
+            deep.width < wide.width,
+            "the fixture discriminates: deep {deep:?} vs wide {wide:?}"
+        );
+        assert_eq!(out.measure_rect, Some(deep), "k = ceil(5 / 2) = 3");
+        let sub = crate::stacking::crop::crop_plane(&out.data, 400, deep);
+        let expect = measure_plane(
+            &sub,
+            deep.width,
+            deep.height,
+            &MeasureOptions::default(),
+            None,
+        );
+        assert_eq!(out.stats.master_noise[0].to_bits(), expect.noise.to_bits());
+        let sub_wide = crate::stacking::crop::crop_plane(&out.data, 400, wide);
+        let on_wide = measure_plane(
+            &sub_wide,
+            wide.width,
+            wide.height,
+            &MeasureOptions::default(),
+            None,
+        );
+        assert_ne!(
+            out.stats.master_noise[0].to_bits(),
+            on_wide.noise.to_bits(),
+            "the wide footprint would have measured something else"
+        );
+        assert!(
+            !logs.contains("statistics rectangle too small"),
+            "no fallback here: {logs}"
+        );
+        assert!(
+            logs.contains("master statistics on the covered rectangle"),
+            "{logs}"
+        );
+    }
+
+    /// Final review A1: when the half-coverage rectangle is under
+    /// `MIN_STATS_RECT_PX` (or empty) the statistics fall back to one frame
+    /// of coverage with a warning naming both sizes (a group integrates from
+    /// three frames up, so `k >= 2` always; the no-fallback case is the deep
+    /// centre test above).
+    #[test]
+    fn stats_rectangle_falls_back_to_one_frame_with_a_warning() {
+        // Three frames, two of them sharing a 5-px strip: depth 2 is a sliver.
+        let (out, logs) = integrate_shifts(&[(0.0, 0.0), (395.0, 0.0), (395.0, 0.0)]);
+        let out = out.unwrap();
+        let cov = out.coverage.as_deref().expect("a coverage map");
+        let one = crate::stacking::crop::largest_covered_rect(cov, 400, 300, 1).unwrap();
+        assert_eq!(out.measure_rect, Some(one), "fell back to k = 1");
+        assert!(
+            logs.contains("statistics rectangle too small at half coverage"),
+            "{logs}"
+        );
+        assert!(logs.contains("count=2"), "names the depth: {logs}");
+
+        // Two disjoint 150-px footprints and one frame off the grid: no
+        // pixel reaches depth 2 at all, still a fallback and not an error.
+        let (out, logs) = integrate_shifts(&[(250.0, 0.0), (-250.0, 0.0), (450.0, 0.0)]);
+        let out = out.unwrap();
+        let cov = out.coverage.as_deref().unwrap();
+        assert!(crate::stacking::crop::largest_covered_rect(cov, 400, 300, 2).is_none());
+        assert_eq!(
+            out.measure_rect,
+            crate::stacking::crop::largest_covered_rect(cov, 400, 300, 1)
+        );
+        assert!(
+            logs.contains("width=0") && logs.contains("height=0"),
+            "the missing deep rectangle reads 0 x 0: {logs}"
+        );
+        assert!(
+            logs.contains("statistics rectangle too small at half coverage"),
+            "{logs}"
         );
     }
 

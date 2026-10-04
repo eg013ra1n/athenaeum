@@ -1422,15 +1422,24 @@ group onto the coordinator-confirmed grid and writes grid masters.
   `drizzle_coverage`, counted from a `W` snapshot around each deposit; a drop
   below `W`'s f32 resolution is not counted). A frame set's master is
   bit-identical with the map on and off. A project's seed turns it on.
-- **Statistics on the covered rectangle (review I1).** On a grid every
-  master's statistics (`GroupStats`: location, scale, noise, PSF SNR, SNR
-  gain, FWHM, eccentricity) are measured on `crop::largest_covered_rect`: the
-  largest rectangle every pixel of which a frame covers, with or without a
-  coverage map. The uncovered 0.0 pixels of a wide grid never read as data.
-  A rectangle under `MIN_STATS_RECT_PX` (16) on a side, or no covered pixel
-  at all, fails the group with a named error. A drizzle master's statistics
-  are measured on that same rectangle scaled by the drizzle factor. Frame
-  sets measure the whole plane, as before.
+- **Statistics on the covered rectangle (review I1, final review A1).** On a
+  grid every master's statistics (`GroupStats`: location, scale, noise, PSF
+  SNR, SNR gain, FWHM, eccentricity) are measured on
+  `crop::largest_covered_rect` at depth `k = ceil(n / 2)`, `n` the group's
+  included frames: the largest rectangle every pixel of which at least half
+  the frames cover, with or without a coverage map. The deep centre of a
+  stack is what the statistics describe, not the thin one-frame fringe a wide
+  offset frame adds (a one-frame rectangle would read mostly shallow, noisy
+  pixels and understate the master's depth). When no pixel reaches `k`, or
+  that rectangle is under `MIN_STATS_RECT_PX` (16) on a side, the statistics
+  fall back to `k = 1` with a warning naming both rectangles; then the 16 px
+  floor, and "no frame covers the grid", fail the group with a named error as
+  before. The masters themselves never change, only the measured rectangle.
+  A drizzle master's statistics are measured on the chosen rectangle scaled
+  by the drizzle factor. Frame sets measure the whole plane, as before. The
+  debug event `"master statistics on the covered rectangle"` (inside the
+  `integrate_group` span, with `group_key`) names the rectangle and its
+  depth; `grid-report.py` prints it beside each group's lines.
 - **LN on the overlap (D5–D8).** A project's LN reference leaves uncovered
   pixels NaN, and each member is fitted on member ∩ reference: detection
   planes fill the rest with 0.0 (the detector ignores it), seeds stay 48 px
@@ -1464,6 +1473,18 @@ group onto the coordinator-confirmed grid and writes grid masters.
     drizzle family whose finalization failed, keep their files in the
     scratch folder, named in a warning. A drizzle crop failure keeps only the
     drizzle family there.
+  - **Healed rows may name the scratch.** A run healed after a kill (or one
+    whose group could not be finalized) can leave `master_lights` rows that
+    name `runs/run-<id>-uncropped/` paths. That is the scratch kept on
+    purpose: it is the master's only copy until a manual action moves it.
+  - **The crop pass reports progress and ignores a cancel.** Each group's
+    finalization emits an Output-stage `stacking-progress` tick (throttled
+    like every stage); a cancel that arrives during the pass is logged once
+    (`"crop pass finished after a cancel"`) and the outputs are final.
+  - **A record failure never leaves an orphan.** When a group's rows cannot
+    be updated after its final files were written, those final files are
+    removed again (the warning says so); the scratch stays and the rows keep
+    naming it.
   - **The scratch folder is never cleaned.** `cleanup_work` removes every
     `runs/` entry under `All` except `run-*-uncropped`, and no level touches
     that folder. `heal_interrupted_runs` warns when a killed run left one.

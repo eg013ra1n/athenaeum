@@ -186,7 +186,9 @@ def parse_event(line):
       ("plane", ts, frame_id, plane, ln_scale, source)  an "ln relative scale" debug event inside an
           `ln_plane` span and NOT inside `ln_seeds_calibration` (the calibration's throwaway arms);
       ("frame", ts, run_id, frame_id, ln_scale)         the main pass's "ln frame normalized" event;
-      ("crop", ts, run_id, group_key, x0, y0, w, h, message)  "outputs cropped" / "outputs finalized uncropped"."""
+      ("crop", ts, run_id, group_key, x0, y0, w, h, message)  "outputs cropped" / "outputs finalized uncropped";
+      ("stats", ts, group_key, x0, y0, w, h, depth)     the debug "master statistics on the covered rectangle"
+          inside an `integrate_group` span (it carries the group key; no run_id, so it is windowed by time)."""
     try:
         o = json.loads(line)
     except ValueError:
@@ -208,6 +210,13 @@ def parse_event(line):
         if msg in ("outputs cropped", "outputs finalized uncropped") and "run_id" in f and "group_key" in f:
             return ("crop", ts, int(f["run_id"]), f["group_key"], int(f["crop_x0"]), int(f["crop_y0"]),
                     int(f["crop_width"]), int(f["crop_height"]), msg)
+        if msg == "master statistics on the covered rectangle" and "crop_x0" in f:
+            spans = o.get("spans") or [o.get("span") or {}]
+            sp = next((sp for sp in reversed(spans) if sp.get("name") == "integrate_group" and "group_key" in sp), None)
+            if sp is None:
+                return None
+            return ("stats", ts, sp["group_key"], int(f["crop_x0"]), int(f["crop_y0"]), int(f["crop_width"]),
+                    int(f["crop_height"]), int(f.get("count", 1)))
     except (KeyError, ValueError, TypeError):
         return None
     return None
@@ -215,15 +224,16 @@ def parse_event(line):
 
 def read_log(log_dir, t0, t1, run_id):
     """The run's events: {"plane": {(frame_id, plane): (scale, source)}, "frame": {frame_id: scale},
-    "crop": {group_key: (x0, y0, w, h, message)}, "seen": n}. Events carrying a run_id are filtered by it,
+    "crop": {group_key: (x0, y0, w, h, message)}, "stats": {group_key: (x0, y0, w, h, depth)}, "seen": n}. Events carrying a run_id are filtered by it,
     those that do not (the plane events) by the [t0, t1] window; the last one wins."""
-    out = {"plane": {}, "frame": {}, "crop": {}, "seen": 0}
+    out = {"plane": {}, "frame": {}, "crop": {}, "stats": {}, "seen": 0}
     for path in sorted(Path(log_dir).glob("*")):
         if not path.is_file():
             continue
         with open(path, errors="replace") as fh:
             for line in fh:
-                if "ln relative scale" not in line and "ln frame normalized" not in line and "outputs " not in line:
+                if "ln relative scale" not in line and "ln frame normalized" not in line and "outputs " not in line \
+                        and "master statistics on the covered" not in line:
                     continue
                 ev = parse_event(line)
                 if ev is None:
@@ -232,6 +242,10 @@ def read_log(log_dir, t0, t1, run_id):
                     if not (t0 <= ev[1] <= t1):
                         continue
                     out["plane"][(ev[2], ev[3])] = (ev[4], ev[5])
+                elif ev[0] == "stats":
+                    if not (t0 <= ev[1] <= t1):
+                        continue
+                    out["stats"][ev[2]] = (ev[3], ev[4], ev[5], ev[6], ev[7])
                 elif ev[0] == "frame":
                     if ev[2] != run_id:
                         continue
@@ -697,7 +711,7 @@ def ln_truth_summary(rows):
         print("  no member in the run summary")
 
 
-def report_group(db, pid, key, included, rows, run_id, k_arg, want_overlap, scale, out):
+def report_group(db, pid, key, included, rows, run_id, k_arg, want_overlap, scale, out, stats=None):
     cov = plane0(rows["coverage"])
     k = k_arg if k_arg is not None else max(1, math.ceil(included / 2))
     counts = np.bincount(np.nan_to_num(cov).astype(np.int64).ravel())
@@ -719,6 +733,12 @@ def report_group(db, pid, key, included, rows, run_id, k_arg, want_overlap, scal
         print(f"  measure_probe failed: {proc.stderr.strip()[-400:]}")
         return
     data = json.loads(proc.stdout)
+    if stats:
+        sx, sy, sw, sh, depth = stats
+        print(f"  master statistics rectangle (log, covered by >= {depth} frames): x0 {sx} y0 {sy} width {sw} height {sh}")
+    else:
+        print("  master statistics rectangle: no 'master statistics on the covered rectangle' event for this group "
+              "(a build before the final fix wave, a run below debug, or logs rotated away)")
     for i, c in enumerate(data if isinstance(data, list) else data["channels"]):
         print(
             f"  plane {i}: FWHM {c['fwhmPx']:.3f} px = {c['fwhmPx'] * scale:.3f}\"  "
@@ -810,7 +830,7 @@ def main():
         if "master" not in rows or "coverage" not in rows:
             print(f"\n== {key}: no master or no coverage map (coverageMap off?) — skipped")
         else:
-            report_group(db, pid, key, included, rows, run_id, k_arg, want_overlap, scale, out)
+            report_group(db, pid, key, included, rows, run_id, k_arg, want_overlap, scale, out, log["stats"].get(key))
         report_masters_dims(db, run_id, key, grid, summary, log["crop"])
         if want_truth:
             truth_rows += ln_truth_group(db, pid, key, summary, log)
@@ -991,6 +1011,18 @@ def self_check():
         assert got["crop"] == {"L": (10, 20, 300, 200, "outputs cropped")}, got
         got = read_log(d, parse_ts("2026-10-03T11:00:00Z"), parse_ts("2026-10-03T12:00:00Z"), 9)
         assert got["plane"] == {}, got
+    stats = ('{"timestamp":"2026-10-03T10:15:00Z","level":"DEBUG","fields":{"message":"master statistics on the covered '
+             'rectangle","crop_x0":100,"crop_y0":0,"crop_width":300,"crop_height":300,"count":3},'
+             '"target":"athenaeum_core::stacking::integrate","span":{"group_key":"L","name":"integrate_group"},'
+             '"spans":[{"name":"start_project_stacking"},{"group_key":"L","name":"integrate_group"}]}')
+    assert parse_event(stats)[2:] == ("L", 100, 0, 300, 300, 3), parse_event(stats)
+    assert parse_event(stats.replace('"name":"integrate_group"', '"name":"other"')) is None
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "athenaeum-web.2026-10-03").write_text(stats + "\n")
+        got = read_log(d, parse_ts("2026-10-03T10:00:00Z"), parse_ts("2026-10-03T11:00:00Z"), 9)
+        assert got["stats"] == {"L": (100, 0, 300, 300, 3)}, got
+        got = read_log(d, parse_ts("2026-10-03T11:00:00Z"), parse_ts("2026-10-03T12:00:00Z"), 9)
+        assert got["stats"] == {}, got
     print("grid-report self-check ok")
 
 

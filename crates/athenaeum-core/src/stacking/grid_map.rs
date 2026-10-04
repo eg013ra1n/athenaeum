@@ -357,6 +357,32 @@ fn compose_field(
             ));
         }
     }
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        // The sampled layer evaluates the inverse on a lattice over `domain`
+        // at the same spacing; a node where the Newton step does not
+        // converge is NaN there and reads as off-footprint. Said once per
+        // frame so a log reader sees a rotated or strongly distorted frame
+        // lose coverage at its edge (logging only, the map is unchanged).
+        let nx = (((domain[2] - domain[0]) / COMPOSE_SAMPLE_PX as f64).ceil() as usize) + 1;
+        let ny = (((domain[3] - domain[1]) / COMPOSE_SAMPLE_PX as f64).ceil() as usize) + 1;
+        let mut unconverged = 0usize;
+        for j in 0..ny {
+            for i in 0..nx {
+                let gx = domain[0] + (i * COMPOSE_SAMPLE_PX) as f64;
+                let gy = domain[1] + (j * COMPOSE_SAMPLE_PX) as f64;
+                let (sx, sy) = field.chain_inverse(gx, gy);
+                if !(sx.is_finite() && sy.is_finite()) {
+                    unconverged += 1;
+                }
+            }
+        }
+        if unconverged > 0 {
+            tracing::debug!(
+                count = unconverged,
+                "composed map has unconverged inverse nodes"
+            );
+        }
+    }
     Ok((field, domain))
 }
 
