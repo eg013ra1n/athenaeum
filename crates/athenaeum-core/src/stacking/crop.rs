@@ -262,6 +262,82 @@ mod tests {
     use crate::fits_writer::wcs::wcs_cards;
     use crate::stacking::grid_map::crop_plate_solve;
 
+    /// Mutation survivor (crop.rs `fits_within`): a rectangle ending exactly
+    /// on the plane edge fits; one more pixel on any side does not.
+    #[test]
+    fn fits_within_is_exact_at_the_plane_edge() {
+        let r = CropRect {
+            x0: 3,
+            y0: 2,
+            width: 5,
+            height: 4,
+        };
+        assert!(r.fits_within(8, 6), "ends exactly at the edge");
+        assert!(!r.fits_within(7, 6), "one column too many");
+        assert!(!r.fits_within(8, 5), "one row too many");
+        assert!(r.fits_within(9, 7));
+        assert!(!CropRect { width: 0, ..r }.fits_within(8, 6));
+        assert!(!CropRect { height: 0, ..r }.fits_within(8, 6));
+    }
+
+    /// Mutation survivors (crop.rs `union`): the far edge is `x0 + width`
+    /// and the union's size is `x1 - x0`, checked on inputs where sum,
+    /// product and difference all differ.
+    #[test]
+    fn union_is_the_exact_bounding_rectangle() {
+        let a = CropRect {
+            x0: 3,
+            y0: 4,
+            width: 5,
+            height: 6,
+        };
+        let b = CropRect {
+            x0: 7,
+            y0: 2,
+            width: 9,
+            height: 3,
+        };
+        // x: 3..8 and 7..16 -> 3..16; y: 4..10 and 2..5 -> 2..10.
+        let expect = CropRect {
+            x0: 3,
+            y0: 2,
+            width: 13,
+            height: 8,
+        };
+        assert_eq!(a.union(b), expect);
+        assert_eq!(b.union(a), expect);
+        // A rectangle that holds the other keeps its own size.
+        let inner = CropRect {
+            x0: 4,
+            y0: 5,
+            width: 2,
+            height: 3,
+        };
+        assert_eq!(a.union(inner), a);
+        assert_eq!(a.union(a), a);
+    }
+
+    /// Mutation survivor (crop.rs `scaled`): every field multiplies.
+    #[test]
+    fn scaled_multiplies_every_field() {
+        let r = CropRect {
+            x0: 5,
+            y0: 7,
+            width: 11,
+            height: 13,
+        };
+        assert_eq!(
+            r.scaled(3),
+            CropRect {
+                x0: 15,
+                y0: 21,
+                width: 33,
+                height: 39,
+            }
+        );
+        assert_eq!(r.scaled(1), r);
+    }
+
     /// Plan 6b-3 D10: the rectangle bounds exactly the pixels at or above
     /// `k`, ignores NaN, and is `None` when nothing reaches `k`.
     #[test]
