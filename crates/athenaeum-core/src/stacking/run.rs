@@ -62,12 +62,13 @@ use crate::services::{ServiceContext, StackHandle};
 #[cfg(test)]
 use crate::stacking::config::config_hash;
 use crate::stacking::config::{CleanupPolicy, ReferenceMode, StackingConfig};
+use crate::stacking::crop::{restate_crpix, union_rects, CropRect};
 use crate::stacking::drizzle::{
     drizzle_group, DrizzleError, DrizzleFrame, DrizzleInput, DrizzleProgress, DrizzleStats,
 };
 use crate::stacking::fits_artifact;
 use crate::stacking::grid_map::{
-    compose_to_grid, grid_registered_hash, subject_dims, GridRun, ReferenceWcs,
+    compose_to_grid, crop_plate_solve, grid_registered_hash, subject_dims, GridRun, ReferenceWcs,
 };
 use crate::stacking::groups::{frame_source, ColorMode, GroupFrame, IntegrationGroup};
 use crate::stacking::integrate::{
@@ -84,8 +85,6 @@ use crate::stacking::master_cards::{
     stamp_grid_cards, write_cropped_drizzle, write_cropped_master, write_drizzled_master,
     write_master_light, GridStamp, MasterCardInputs, WrittenDrizzle, WrittenMaster,
 };
-use crate::stacking::crop::{restate_crpix, union_rects, CropRect};
-use crate::stacking::grid_map::crop_plate_solve;
 use crate::stacking::measure::{measure_frame_with_fits, FrameMeasurement, MeasureOptions};
 use crate::stacking::origin::{cfa_geometry, origin_of, stored_solve, FrameOrigin, FrameOrigins};
 use crate::stacking::paths::{cleanup_work, subject_layout, CleanupWhat, WorkingLayout};
@@ -655,6 +654,7 @@ pub(crate) fn heal_interrupted_runs(
                 ),
             }
         }
+        warn_leftover_uncropped(conn, run_id, &subject);
         finish_run(
             conn,
             run_id,
@@ -665,6 +665,39 @@ pub(crate) fn heal_interrupted_runs(
         healed += 1;
     }
     Ok(healed)
+}
+
+/// Plan 6b-3 D10 (fix round 1): a run killed mid-crop can leave its
+/// `runs/run-<id>-uncropped` folder holding the only copy of a master. It is
+/// never removed (cleanup skips it): this names it so the user can find it.
+fn warn_leftover_uncropped(conn: &rusqlite::Connection, run_id: i64, subject: &StackSubject) {
+    let row = match crate::db::stacking::get_run(conn, run_id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(run_id, error = %error, "stacking run heal: reading the run failed");
+            return;
+        }
+    };
+    let layout = match subject_layout(conn, Path::new(&row.working_dir), subject) {
+        Ok(layout) => layout,
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "stacking run heal: resolving the layout failed"
+            );
+            return;
+        }
+    };
+    let dir = layout.uncropped_dir(run_id);
+    if dir.exists() {
+        tracing::warn!(
+            run_id,
+            path = %dir.display(),
+            "interrupted crop run left masters in its scratch folder; never removed automatically"
+        );
+    }
 }
 
 /// [`heal_interrupted_runs`]'s own rej-sweep for one stuck row: resolve the
@@ -7551,6 +7584,19 @@ fn summary_frame_for(entry: &MeasuredFrame, rejected_fraction: Option<f64>) -> S
 #[cfg(test)]
 static FORCE_NO_DRIZZLE_STATS_RECT: AtomicBool = AtomicBool::new(false);
 
+/// Test hook (plan 6b-3 D10 fix round 1): the next `write_crop_item` call
+/// fails once, to reach the crop pass's uncropped fallback. One-shot and read
+/// only by project runs: those tests hold the grid-counters lock, while
+/// concurrent frame-set runs never touch it.
+#[cfg(test)]
+static FORCE_CROP_FAILURE: AtomicBool = AtomicBool::new(false);
+
+/// Test hook (plan 6b-3 D10 fix round 1): raise the run's cancel flag after
+/// the next group has written, to cancel between two groups. One-shot, project
+/// runs only (see [`FORCE_CROP_FAILURE`]).
+#[cfg(test)]
+static CANCEL_AFTER_NEXT_GROUP: AtomicBool = AtomicBool::new(false);
+
 #[cfg(test)]
 fn drizzle_stats_rect(
     rect: Option<crate::stacking::crop::CropRect>,
@@ -8168,6 +8214,8 @@ struct CropOutputs {
     master: WrittenMaster,
     /// The drizzle family and its (scaled) rectangle.
     drizzle: Option<(WrittenDrizzle, CropRect)>,
+    /// Why the drizzle family was not written (the master family still is).
+    drizzle_error: Option<String>,
 }
 
 /// The result of one `pick_reference_idx` call (ruling R-M3-17 v2 + its
@@ -9750,7 +9798,7 @@ fn process_group_output(
                             &drz,
                             &drz_cards,
                             // A plain immutable read of `rc`, like
-                            // `rc.output_dir` above: the drizzled master
+                            // `out_dir` above: the drizzled master
                             // and its weight map land in the SAME
                             // container as the master (ruling R-M4d-3).
                             out_format,
@@ -11360,7 +11408,20 @@ fn build_and_write_ln_reference(
 /// whole run `failed` too — there is nothing to hand back either way. Once
 /// every group has been attempted and at least one wrote a master, the
 /// configured cleanup policy runs exactly once.
+///
+/// Plan 6b-3 D10 (fix round 1): when the stage ends in an error or a cancel
+/// with groups still waiting in a crop run's scratch folder, they are
+/// finalized uncropped ([`finalize_unfinished_crop`]) so no master is left
+/// only in scratch.
 fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
+    let result = stage_output_groups(rc);
+    if result.is_err() {
+        finalize_unfinished_crop(rc);
+    }
+    result
+}
+
+fn stage_output_groups(rc: &mut RunContext) -> Result<(), RunError> {
     let cfg = rc.config.clone();
     let measure_opts = cfg
         .measurement
@@ -11461,6 +11522,11 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
         integrate_total += i;
         drizzle_total += d;
         output_total += o;
+        #[cfg(test)]
+        if rc.subject.project_id().is_some() && CANCEL_AFTER_NEXT_GROUP.swap(false, Ordering::SeqCst)
+        {
+            rc.cancel.store(true, Ordering::SeqCst);
+        }
         if matches!(outcome, GroupOutcome::Written) {
             any_master = true;
             // … and the warning belongs to a master that was ACTUALLY
@@ -11553,10 +11619,19 @@ fn stage_output(rc: &mut RunContext) -> Result<(), RunError> {
 /// are re-read from the scratch folder, cropped and written in the
 /// configured format into the output folder, and its rows, group paths and
 /// summary paths move onto them. A group with no rectangle, or whose crop
-/// fails, is finalized uncropped with a warning; a group that cannot be
-/// finalized at all keeps its scratch files, which its rows already name —
-/// a master is never lost. The scratch folder goes when every group is
-/// final. Database errors fail the run, as everywhere in Output.
+/// fails, is finalized uncropped with a warning (said once the uncropped
+/// write has succeeded); a group that cannot be finalized at all keeps its
+/// scratch files, which its rows already name — a master is never lost. A
+/// drizzle family that cannot be cropped never costs the master (ruling
+/// R-M3-7): the master family is finalized and the drizzle family stays in
+/// the scratch folder, named in a warning. The scratch folder goes when every
+/// output is final; otherwise it stays, and no cleanup policy removes it
+/// (`paths::cleanup_work`): it is the user's master data, and only a manual
+/// action does. The pass deliberately ignores a cancel — stopping between
+/// groups would strand the rest in the scratch folder — so a large drizzle
+/// family adds cancel latency. Database errors fail the run, as everywhere in
+/// Output; the groups not yet finalized stay in `rc.crop_items` for
+/// [`finalize_unfinished_crop`].
 fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
     let items = std::mem::take(&mut rc.crop_items);
     if items.is_empty() {
@@ -11565,15 +11640,18 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
     let k = rc.config.output.crop_to_coverage;
     let scratch = rc.layout.uncropped_dir(rc.run_id);
     let run_rect = match rc.config.registration.geometry {
-        RegistrationGeometry::CoRegistered => Some(union_rects(items.iter().filter_map(|i| i.rect))),
+        RegistrationGeometry::CoRegistered => {
+            Some(union_rects(items.iter().filter_map(|i| i.rect)))
+        }
         RegistrationGeometry::Native => None,
     };
     let mut kept = 0usize;
-    for item in &items {
+    let mut pending = items.into_iter();
+    while let Some(item) = pending.next() {
         let full = CropRect::full(item.width, item.height);
         let wanted = run_rect.unwrap_or(item.rect);
-        let target = match wanted {
-            Some(r) if r.fits_within(item.width, item.height) => r,
+        let (target, note) = match wanted {
+            Some(r) if r.fits_within(item.width, item.height) => (r, None),
             Some(r) => {
                 tracing::warn!(
                     run_id = rc.run_id,
@@ -11584,11 +11662,12 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
                     crop_height = r.height,
                     "crop rectangle outside the group's master; outputs written uncropped"
                 );
-                rc.warnings.push(format!(
-                    "group {}: the run's crop rectangle does not fit its master; its outputs are written uncropped",
+                let note = format!(
+                    "group {}: the run's crop rectangle does not fit its master; \
+                     its outputs are written uncropped",
                     item.group_key
-                ));
-                full
+                );
+                (full, Some(note))
             }
             None => {
                 tracing::warn!(
@@ -11597,15 +11676,16 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
                     count = k,
                     "no pixel reached the crop coverage; outputs written uncropped"
                 );
-                rc.warnings.push(format!(
-                    "group {}: no pixel is covered by {k} frames; its outputs are written uncropped",
+                let note = format!(
+                    "group {}: no pixel is covered by {k} frames; \
+                     its outputs are written uncropped",
                     item.group_key
-                ));
-                full
+                );
+                (full, Some(note))
             }
         };
-        let outputs = match write_crop_item(rc, item, target) {
-            Ok(o) => Ok(o),
+        let result = match write_crop_item(rc, &item, target) {
+            Ok(o) => Ok((o, note)),
             Err(e) if target != full => {
                 tracing::warn!(
                     run_id = rc.run_id,
@@ -11613,16 +11693,47 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
                     error = %format!("{e:#}"),
                     "crop failed; writing the outputs uncropped"
                 );
-                rc.warnings.push(format!(
-                    "group {}: the crop failed ({e:#}); its outputs are written uncropped",
-                    item.group_key
-                ));
-                write_crop_item(rc, item, full)
+                match write_crop_item(rc, &item, full) {
+                    Ok(o) => {
+                        let note = format!(
+                            "group {}: the crop failed ({e:#}); its outputs are written uncropped",
+                            item.group_key
+                        );
+                        Ok((o, Some(note)))
+                    }
+                    Err(e2) => Err(anyhow::anyhow!(
+                        "the crop failed ({e:#}); the uncropped write failed too ({e2:#})"
+                    )),
+                }
             }
             Err(e) => Err(e),
         };
-        match outputs {
-            Ok(o) => record_crop_item(rc, item, &o)?,
+        match result {
+            Ok((o, note)) => {
+                if let Err(e) = record_crop_item(rc, &item, &o) {
+                    rc.crop_items = pending.collect();
+                    return Err(e);
+                }
+                if let Some(note) = note {
+                    rc.warnings.push(note);
+                }
+                if let Some(msg) = &o.drizzle_error {
+                    kept += 1;
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        group_key = %item.group_key,
+                        path = %scratch.display(),
+                        error = %msg,
+                        "drizzle outputs could not be cropped; kept in the scratch folder"
+                    );
+                    rc.warnings.push(format!(
+                        "group {}: its drizzle outputs could not be cropped ({msg}); \
+                         they stay in {}",
+                        item.group_key,
+                        scratch.display()
+                    ));
+                }
+            }
             Err(e) => {
                 kept += 1;
                 tracing::error!(
@@ -11640,34 +11751,115 @@ fn finish_crop(rc: &mut RunContext) -> Result<(), RunError> {
             }
         }
     }
-    if kept == 0 {
-        if let Err(error) = std::fs::remove_dir_all(&scratch) {
-            tracing::warn!(
-                run_id = rc.run_id,
-                path = %scratch.display(),
-                error = %error,
-                "removing the crop scratch folder failed"
-            );
-        }
-    }
+    remove_scratch_unless_kept(rc, &scratch, kept);
     Ok(())
 }
 
+fn remove_scratch_unless_kept(rc: &RunContext, scratch: &Path, kept: usize) {
+    if kept > 0 {
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(scratch) {
+        tracing::warn!(
+            run_id = rc.run_id,
+            path = %scratch.display(),
+            error = %error,
+            "removing the crop scratch folder failed"
+        );
+    }
+}
+
+/// Plan 6b-3 D10 (fix round 1): the exit path of a crop run that did not
+/// reach [`finish_crop`] — cancelled between groups, or failed. Every group
+/// already written to the scratch folder is finalized UNCROPPED (the full
+/// rectangle through the crop writer), so its master lands in the output
+/// folder as a K = 0 run's would. One run warning says so. A group that
+/// cannot be finalized keeps its scratch, named in a warning. Nothing here
+/// fails: the run is already ending.
+fn finalize_unfinished_crop(rc: &mut RunContext) {
+    let items = std::mem::take(&mut rc.crop_items);
+    if items.is_empty() {
+        return;
+    }
+    let scratch = rc.layout.uncropped_dir(rc.run_id);
+    let (mut kept, mut finalized) = (0usize, 0usize);
+    for item in &items {
+        let full = CropRect::full(item.width, item.height);
+        let result = write_crop_item(rc, item, full)
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|o| {
+                record_crop_item(rc, item, &o).map_err(|e| format!("{e:?}"))?;
+                Ok(o)
+            });
+        match result {
+            Ok(o) => {
+                finalized += 1;
+                if let Some(msg) = o.drizzle_error {
+                    kept += 1;
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        group_key = %item.group_key,
+                        path = %scratch.display(),
+                        error = %msg,
+                        "drizzle outputs could not be finalized; kept in the scratch folder"
+                    );
+                    rc.warnings.push(format!(
+                        "group {}: its drizzle outputs could not be finalized ({msg}); \
+                         they stay in {}",
+                        item.group_key,
+                        scratch.display()
+                    ));
+                }
+            }
+            Err(msg) => {
+                kept += 1;
+                tracing::error!(
+                    run_id = rc.run_id,
+                    group_key = %item.group_key,
+                    path = %scratch.display(),
+                    error = %msg,
+                    "crop outputs could not be finalized; kept in the scratch folder"
+                );
+                rc.warnings.push(format!(
+                    "group {}: its outputs could not be finalized ({msg}); they stay in {}",
+                    item.group_key,
+                    scratch.display()
+                ));
+            }
+        }
+    }
+    if finalized > 0 {
+        tracing::warn!(
+            run_id = rc.run_id,
+            count = finalized,
+            "run did not finish; written outputs finalized uncropped"
+        );
+        rc.warnings.push(format!(
+            "{finalized} group(s): outputs were written uncropped because the run did not finish"
+        ));
+    }
+    remove_scratch_unless_kept(rc, &scratch, kept);
+}
+
 /// The file half of one group's crop: the master family, then the drizzle
-/// family, each into the output folder; a drizzle failure removes the master
-/// family this call wrote, so a retry starts clean. `rect` may be the full
-/// master: that finalization writes exactly what the K = 0 path writes, the
-/// same writer on the same pixels and cards (review I7). The drizzle WCS is
+/// family, each into the output folder. `rect` may be the full master: that
+/// finalization writes exactly what the K = 0 path writes, the same writer
+/// on the same pixels and cards (review I7). A drizzle family that cannot be
+/// written never costs the master (ruling R-M3-7): the master family stays
+/// final and the failure is returned in `drizzle_error`. The drizzle WCS is
 /// `scale_plate_solve` of the master's record again (review M13): the first
-/// write already scaled the same record, so it does not fail here; if it
-/// ever did, the group would be finalized uncropped, or keep its scratch.
-/// Names come from the scratch files, so a name already taken in the output
-/// folder resolves as `_2`, `_2_2` where the K = 0 path would say `_2`, `_3`.
+/// write already scaled the same record, so it does not fail here. Names
+/// come from the scratch files, so a name already taken in the output folder
+/// resolves as `_2`, `_2_2` where the K = 0 path would say `_2`, `_3`.
 fn write_crop_item(
     rc: &RunContext,
     item: &CropItem,
     rect: CropRect,
 ) -> anyhow::Result<CropOutputs> {
+    #[cfg(test)]
+    if rc.subject.project_id().is_some() && FORCE_CROP_FAILURE.swap(false, Ordering::SeqCst) {
+        anyhow::bail!("forced crop failure");
+    }
     let format = rc.config.output.format;
     let mut cards = item.cards.clone();
     if let Some(wcs) = &item.wcs {
@@ -11675,52 +11867,41 @@ fn write_crop_item(
     }
     let _guard = OUTPUT_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let master = write_cropped_master(&rc.output_dir, &item.master, rect, &cards, format)?;
-    let drizzle = match &item.drizzle {
-        None => None,
-        Some(d) => {
-            let drect = rect.scaled(d.scale);
-            let attempt = (|| -> anyhow::Result<WrittenDrizzle> {
-                let mut dcards = d.cards.clone();
-                if let Some(wcs) = &item.wcs {
-                    let scaled = scale_plate_solve(wcs, d.scale)?;
-                    restate_crpix(&mut dcards, &crop_plate_solve(&scaled, drect.x0, drect.y0));
-                }
-                let stem = master
-                    .master
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("master");
-                write_cropped_drizzle(&rc.output_dir, stem, d.scale, &d.written, drect, &dcards, format)
-            })();
-            match attempt {
-                Ok(w) => Some((w, drect)),
-                Err(e) => {
-                    for path in [
-                        Some(&master.master),
-                        master.rejection_low.as_ref(),
-                        master.rejection_high.as_ref(),
-                        master.coverage.as_ref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        if let Err(error) = std::fs::remove_file(path) {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %error,
-                                "removing a partial crop output failed"
-                            );
-                        }
-                    }
-                    return Err(e);
-                }
+    let mut drizzle = None;
+    let mut drizzle_error = None;
+    if let Some(d) = &item.drizzle {
+        let drect = rect.scaled(d.scale);
+        let attempt = (|| -> anyhow::Result<WrittenDrizzle> {
+            let mut dcards = d.cards.clone();
+            if let Some(wcs) = &item.wcs {
+                let scaled = scale_plate_solve(wcs, d.scale)?;
+                restate_crpix(&mut dcards, &crop_plate_solve(&scaled, drect.x0, drect.y0));
             }
+            let stem = master
+                .master
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("master");
+            write_cropped_drizzle(
+                &rc.output_dir,
+                stem,
+                d.scale,
+                &d.written,
+                drect,
+                &dcards,
+                format,
+            )
+        })();
+        match attempt {
+            Ok(w) => drizzle = Some((w, drect)),
+            Err(e) => drizzle_error = Some(format!("{e:#}")),
         }
-    };
+    }
     Ok(CropOutputs {
         rect,
         master,
         drizzle,
+        drizzle_error,
     })
 }
 
@@ -11760,7 +11941,11 @@ fn record_crop_item(
                 ..Default::default()
             },
         )?;
-        let row = |kind: MasterLightKind, path: &str, format: &str, rect: CropRect, channels: usize| {
+        let row = |kind: MasterLightKind,
+                   path: &str,
+                   format: &str,
+                   rect: CropRect,
+                   channels: usize| {
             insert_master_light(
                 &conn,
                 &NewMasterLight {
@@ -11803,6 +11988,11 @@ fn record_crop_item(
             g.drizzle_coverage_path = drizzle_coverage;
         }
     }
+    let message = if out.rect.is_full(item.width, item.height) {
+        "outputs finalized uncropped"
+    } else {
+        "outputs cropped"
+    };
     tracing::info!(
         run_id = rc.run_id,
         group_key = %item.group_key,
@@ -11811,7 +12001,8 @@ fn record_crop_item(
         crop_width = out.rect.width,
         crop_height = out.rect.height,
         path = %master_path,
-        "outputs cropped"
+        "{}",
+        message
     );
     Ok(())
 }
@@ -25887,7 +26078,10 @@ mod tests {
         assert!(plan.stale_stages.contains(&Stage::Normalize), "{:?}", plan.stale_stages);
     }
 
-    fn master_row<'a>(rows: &'a [crate::db::stacking::MasterLight], kind: &str) -> &'a crate::db::stacking::MasterLight {
+    fn master_row<'a>(
+        rows: &'a [crate::db::stacking::MasterLight],
+        kind: &str,
+    ) -> &'a crate::db::stacking::MasterLight {
         rows.iter().find(|m| m.kind == kind).unwrap_or_else(|| panic!("no {kind} row in {rows:?}"))
     }
 
@@ -25922,9 +26116,12 @@ mod tests {
         let rows = crate::db::stacking::list_master_lights(&fixture.conn, started.run_id).unwrap();
         assert!(rows.len() >= 5, "master, coverage, drizzle, weight map, drizzle coverage: {rows:?}");
         for m in &rows {
-            // macOS temp dirs spell `/var` and `/private/var` for one place.
-            let bare = |p: &Path| PathBuf::from(p.to_string_lossy().trim_start_matches("/private"));
-            assert!(bare(Path::new(&m.path)).starts_with(bare(output.path())), "{}", m.path);
+            assert!(
+                crate::test_support::canonical_path(Path::new(&m.path))
+                    .starts_with(crate::test_support::canonical_path(output.path())),
+                "{}",
+                m.path
+            );
             let expected = if m.kind.ends_with("coverage") { "fits" } else { "xisf" };
             assert_eq!(m.format, expected, "{}", m.kind);
         }
@@ -26008,27 +26205,29 @@ mod tests {
         assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
     }
 
-    /// Spec §5.9, plan 6b-3 D10: in native mode each group crops to its own
-    /// `coverage ≥ K` box — two groups shot 40 px apart get two rectangles,
-    /// each tight (its border rows and columns reach `K`) — and in
-    /// co-registered mode both get the one, wider, union.
-    #[test]
-    fn native_mode_crops_each_group_to_its_own_rectangle() {
-        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("catalog.db");
+    /// The sky project with a second group: three `R` frames about 40 px east
+    /// of the four `Lum` ones (canonical filters `Red` and `Lum`).
+    fn seed_two_group_project(
+        tmp: &Path,
+    ) -> (
+        Arc<ServiceContext>,
+        rusqlite::Connection,
+        crate::collab::grid::CanonicalGrid,
+    ) {
+        let db_path = tmp.join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
         let conn = project_conn(&db_path);
-        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+        let grid = seed_sky_project(&conn, &tmp.join("collab"), 4);
         let target: (f64, f64) = (83.8, -5.4);
         let east = 40.0 * 1.5 / 3600.0 / target.1.to_radians().cos();
         let stars = test_fixtures::sky_stars(target, 0.12, 50.0, 7);
         for i in 0..3 {
             let uuid = format!("r{i}");
-            let mut f = test_fixtures::sky_frame(&uuid, (target.0 + east + i as f64 * 0.001, target.1));
+            let centre = (target.0 + east + i as f64 * 0.001, target.1);
+            let mut f = test_fixtures::sky_frame(&uuid, centre);
             f.filter = "R";
             f.noise_seed = 200 + i as u64;
-            test_fixtures::add_project_sky_frame(&conn, &tmp.path().join("collab"), "p1", &f, &stars);
+            test_fixtures::add_project_sky_frame(&conn, &tmp.join("collab"), "p1", &f, &stars);
         }
         conn.execute(
             "UPDATE project_frames_local
@@ -26037,6 +26236,18 @@ mod tests {
             [],
         )
         .unwrap();
+        (ctx, conn, grid)
+    }
+
+    /// Spec §5.9, plan 6b-3 D10: in native mode each group crops to its own
+    /// `coverage ≥ K` box — two groups shot 40 px apart get two rectangles,
+    /// each tight (its border rows and columns reach `K`) — and in
+    /// co-registered mode both get the one, wider, union.
+    #[test]
+    fn native_mode_crops_each_group_to_its_own_rectangle() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, conn, grid) = seed_two_group_project(tmp.path());
         let run = |geometry: RegistrationGeometry| -> RunContext {
             let mut cfg = sky_config(&conn);
             cfg.registration.geometry = geometry;
@@ -26183,5 +26394,140 @@ mod tests {
             "{:?}",
             summary.warnings
         );
+    }
+
+    /// Plan 6b-3 D10 fix round 1: a crop run cancelled between two groups
+    /// finalizes the group it already wrote UNCROPPED into the output folder
+    /// (as a K = 0 run's written master stays), rows and summary point there,
+    /// the scratch folder is gone and one warning says why.
+    #[test]
+    fn a_cancelled_crop_run_finalizes_its_written_groups_uncropped() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, conn, grid) = seed_two_group_project(tmp.path());
+        let mut cfg = sky_config(&conn);
+        cfg.registration.geometry = RegistrationGeometry::Native;
+        cfg.output.crop_to_coverage = 3;
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        CANCEL_AFTER_NEXT_GROUP.store(true, Ordering::SeqCst);
+        let result = run_pipeline(&mut rc);
+        CANCEL_AFTER_NEXT_GROUP.store(false, Ordering::SeqCst);
+        assert!(matches!(result, Err(RunError::Cancelled)), "{result:?}");
+
+        let rows = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
+        let masters: Vec<_> = rows.iter().filter(|m| m.kind == "master").collect();
+        assert_eq!(masters.len(), 1, "only the first group wrote: {rows:?}");
+        let master = masters[0];
+        assert!(Path::new(&master.path).exists(), "{}", master.path);
+        assert!(
+            Path::new(&master.path).starts_with(tmp.path().join("out")),
+            "the master is final, not in scratch: {}",
+            master.path
+        );
+        assert_eq!(master.format, "fits");
+        let written = rc.summary.groups.iter().find(|g| g.key == master.group_key).unwrap();
+        assert_eq!(written.master_path.as_deref(), Some(master.path.as_str()));
+        let groups = crate::db::stacking::list_groups(&conn, rc.run_id).unwrap();
+        let row = groups.iter().find(|g| g.group_key == master.group_key).unwrap();
+        assert_eq!(row.master_path.as_deref(), Some(master.path.as_str()));
+        assert_eq!(
+            rc.warnings.iter().filter(|w| w.contains("did not finish")).count(),
+            1,
+            "{:?}",
+            rc.warnings
+        );
+        assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
+    }
+
+    /// Plan 6b-3 D10 fix round 1: a crop that fails is finalized uncropped
+    /// through the crop writer — the master (full size) is in the output
+    /// folder, rows and summary point there, the scratch is removed and the
+    /// run says "written uncropped" exactly once.
+    #[test]
+    fn a_failed_crop_is_finalized_uncropped() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        let grid = seed_sky_project(&conn, &tmp.path().join("collab"), 4);
+        let mut cfg = sky_config(&conn);
+        cfg.output.crop_to_coverage = 2;
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut rc = project_rc(
+            &ctx,
+            &conn,
+            "p1",
+            cfg,
+            &tmp.path().join("work"),
+            &tmp.path().join("out"),
+        );
+        rc.grid = Some(Arc::new(crate::stacking::grid_map::GridRun::new(grid)));
+        FORCE_CROP_FAILURE.store(true, Ordering::SeqCst);
+        let result = run_pipeline(&mut rc);
+        FORCE_CROP_FAILURE.store(false, Ordering::SeqCst);
+        result.unwrap();
+
+        let rows = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
+        let master = master_row(&rows, "master");
+        assert!(Path::new(&master.path).starts_with(tmp.path().join("out")), "{}", master.path);
+        assert!(Path::new(&master.path).exists());
+        assert_eq!((master.width, master.height), (512, 384), "uncropped");
+        assert_eq!(rc.summary.groups[0].master_path.as_deref(), Some(master.path.as_str()));
+        assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
+        let said: Vec<_> = rc.warnings.iter().filter(|w| w.contains("written uncropped")).collect();
+        assert_eq!(said.len(), 1, "{:?}", rc.warnings);
+        assert!(rc.warnings.iter().all(|w| !w.contains("could not be finalized")));
+    }
+
+    /// Plan 6b-3 D10 fix round 1: a `K` no pixel reaches (more frames than
+    /// the group has) is the no-rectangle branch — the master is written
+    /// uncropped and the run says so once.
+    #[test]
+    fn a_crop_no_pixel_reaches_writes_the_master_uncropped() {
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let (_ctx, conn, rc, _grid) = run_sky_project(tmp.path(), |cfg| {
+            cfg.output.crop_to_coverage = 5;
+        });
+        let rows = crate::db::stacking::list_master_lights(&conn, rc.run_id).unwrap();
+        let master = master_row(&rows, "master");
+        assert_eq!((master.width, master.height), (512, 384), "uncropped");
+        assert!(Path::new(&master.path).exists());
+        assert!(
+            !Path::new(&master.path).starts_with(rc.layout.uncropped_dir(rc.run_id)),
+            "{}",
+            master.path
+        );
+        let said: Vec<_> = rc
+            .warnings
+            .iter()
+            .filter(|w| w.contains("no pixel is covered by 5 frames"))
+            .collect();
+        assert_eq!(said.len(), 1, "{:?}", rc.warnings);
+        assert!(!rc.layout.uncropped_dir(rc.run_id).exists(), "the scratch folder is removed");
     }
 }

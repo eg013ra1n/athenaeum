@@ -967,6 +967,53 @@ const INTERMEDIATE_ARTIFACT_KINDS: &[&str] = &[
 /// `ln` without touching `INTERMEDIATE_ARTIFACT_KINDS` or the DB delete
 /// calls below. `prepared/` goes with `calibrated/`; a `calibrated` row
 /// pointing at a file used in place loses its row, never its file.
+/// Whether `name` is a crop run's scratch folder (`run-<id>-uncropped`,
+/// [`WorkingLayout::uncropped_dir`]).
+fn is_uncropped_dir_name(name: &str) -> bool {
+    name.starts_with("run-") && name.ends_with("-uncropped")
+}
+
+/// Removes everything under `runs/` EXCEPT `run-<id>-uncropped` folders and
+/// returns the bytes freed. Plan 6b-3 D10 (fix round 1): such a folder holds
+/// a crop run's masters until the crop pass finalizes them, and the only copy
+/// of one when a group could not be finalized or the run was killed
+/// mid-crop. It is the user's master data: no cleanup policy removes it, and
+/// only a manual action does. Every failure is logged and returned.
+fn remove_runs_keeping_uncropped(runs: &Path) -> anyhow::Result<u64> {
+    if !runs.exists() {
+        return Ok(0);
+    }
+    let mut freed = 0u64;
+    let entries = std::fs::read_dir(runs).map_err(|e| {
+        tracing::warn!(path = %runs.display(), error = %e, "stacking cleanup: reading runs failed");
+        anyhow::anyhow!("failed to read {}: {e}", runs.display())
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            tracing::warn!(path = %runs.display(), error = %e, "stacking cleanup: reading runs failed");
+            anyhow::anyhow!("failed to read {}: {e}", runs.display())
+        })?;
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        if is_dir && is_uncropped_dir_name(&entry.file_name().to_string_lossy()) {
+            tracing::info!(path = %path.display(), "stacking cleanup: kept a crop scratch folder");
+            continue;
+        }
+        let result = if is_dir {
+            freed += crate::api::sync::dir_size_bytes(&path);
+            std::fs::remove_dir_all(&path)
+        } else {
+            freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            std::fs::remove_file(&path)
+        };
+        result.map_err(|e| {
+            tracing::warn!(path = %path.display(), error = %e, "stacking cleanup: remove failed");
+            anyhow::anyhow!("failed to remove {}: {e}", path.display())
+        })?;
+    }
+    Ok(freed)
+}
+
 pub fn cleanup_work(
     conn: &Connection,
     subject: &StackSubject,
@@ -987,7 +1034,9 @@ pub fn cleanup_work(
             dirs.push(layout.prepared_root());
             dirs.push(layout.ln_root());
             dirs.push(layout.rej_root());
-            dirs.push(layout.runs_root());
+            // `runs/` goes through `remove_runs_keeping_uncropped` below,
+            // never `remove_dir_all`: a crop run's scratch folder can hold
+            // the only copy of a master.
             // M4d Task 3: the master-light preview cache (ruling R-M4d-5).
             // Only under `All` — a preview describes a written master, not
             // an intermediate, so clearing intermediates must not throw the
@@ -1009,6 +1058,10 @@ pub fn cleanup_work(
                 anyhow::anyhow!("failed to remove {}: {e}", dir.display())
             })?;
         }
+    }
+
+    if what == CleanupWhat::All {
+        freed += remove_runs_keeping_uncropped(&layout.runs_root())?;
     }
 
     match what {
@@ -2131,6 +2184,37 @@ mod tests {
         .unwrap();
         assert_eq!(freed, 128);
         assert!(!layout.rej_root().exists());
+    }
+
+    /// Plan 6b-3 D10 (fix round 1): a crop run's scratch folder can hold the
+    /// only copy of a master, so no cleanup level removes it, while the rest
+    /// of `runs/` goes under `All`.
+    #[test]
+    fn an_all_cleanup_keeps_a_crop_scratch_folder() {
+        let c = conn();
+        c.execute("INSERT INTO frames_set (id, name) VALUES (5, 'Crop')", [])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = WorkingLayout::new(tmp.path(), "set");
+        let scratch = layout.uncropped_dir(9);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let master = scratch.join("master.fits");
+        write_bytes(&master, 40);
+        let json = layout.run_json(9);
+        write_bytes(&json, 8);
+        let other = layout.runs_dir().join("run-8");
+        std::fs::create_dir_all(&other).unwrap();
+        write_bytes(&other.join("x.bin"), 4);
+
+        for what in [
+            CleanupWhat::Registered,
+            CleanupWhat::Intermediates,
+            CleanupWhat::All,
+        ] {
+            cleanup_work(&c, &StackSubject::FrameSet(5), &layout, what).unwrap();
+            assert!(master.exists(), "{what:?} must keep the scratch master");
+        }
+        assert!(!json.exists() && !other.exists(), "the rest of runs/ goes under All");
     }
 
     #[test]
