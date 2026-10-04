@@ -802,7 +802,7 @@ pub fn normalize_frame(
         // identity of its own (`frame_id` is the catalog id of a frame-set
         // frame, the `stack_project_frames` handle of a project frame).
         let _ln_span =
-            tracing::debug_span!("ln_scale", frame_id = frame.frame_id, plane = p).entered();
+            tracing::debug_span!("ln_plane", frame_id = frame.frame_id, plane = p).entered();
         if cancel.load(Ordering::Relaxed) {
             return Err(LnError::Other("cancelled".to_string()));
         }
@@ -1588,6 +1588,150 @@ mod tests {
             fallback.iter().all(|&v| v == (TEST_SCALE * k) as f32),
             "the refused-surface fallback is the CALIBRATED constant"
         );
+    }
+
+    /// The acceptance report attributes every "ln relative scale" event to a
+    /// frame and plane by its span (`ln_plane{frame_id, plane}`), and tells
+    /// the seeds calibration's throwaway arms apart by `ln_seeds_calibration`.
+    #[test]
+    fn the_scale_event_carries_its_frame_and_plane_and_the_calibration_arm_is_tagged() {
+        use crate::fits_writer::write_fits_f32;
+        use crate::geometry::{Linear, PixelMap};
+        use crate::resample::Interpolation;
+        use crate::stacking::measure::FrameMeasurement;
+        use crate::stacking::test_fixtures::synthetic_star_field;
+        use crate::stacking::weights::FrameWeight;
+
+        const W: usize = 512;
+        const H: usize = 384;
+        let mut stars: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..6 {
+            for col in 0..10 {
+                let x = 26.0 + col as f64 * 46.0 + ((row * 7 + col) % 5) as f64;
+                let y = 24.0 + row as f64 * 58.0 + ((row * 3 + col) % 4) as f64;
+                stars.push((x, y, 0.10 + ((row * 10 + col) % 9) as f64 * 0.02));
+            }
+        }
+        let reference_plane = synthetic_star_field(W, H, &stars, 4.2, 0.002, 11);
+        let target_stars: Vec<(f64, f64, f64)> =
+            stars.iter().map(|&(x, y, a)| (x, y, a * 0.9)).collect();
+        let target_plane = synthetic_star_field(W, H, &target_stars, 4.2, 0.002, 12);
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("target.fits");
+        write_fits_f32(&target_path, W, H, 1, &target_plane, &[]).unwrap();
+
+        let reference = LnReference {
+            width: W,
+            height: H,
+            planes: vec![reference_plane],
+            frames_used: Vec::new(),
+        };
+        let cfg = LocalNormalizationConfig {
+            enabled: true,
+            scale: 256,
+            ..LocalNormalizationConfig::default()
+        };
+        let measure = crate::stacking::measure::MeasureOptions {
+            psf_model: PsfModel::Moffat4,
+            max_stars: 200,
+            ..Default::default()
+        };
+        let for_detection =
+            LnReferenceForDetection::build(&reference, PsfModel::Moffat4, measure.max_stars, None);
+        let ref_bg = vec![background_grid(
+            &reference.planes[0],
+            W,
+            H,
+            &BackgroundParams {
+                scale: cfg.scale,
+                ..DEFAULT_PARAMS
+            },
+            None,
+        )];
+        let frame = StackFrame {
+            path: target_path,
+            map: PixelMap::linear(Linear::identity()).unwrap(),
+            measurement: FrameMeasurement {
+                width: W,
+                height: H,
+                channels: vec![Default::default()],
+                duration_ms: 0,
+            },
+            weight: FrameWeight {
+                channels: vec![1.0],
+                normalized: vec![1.0],
+                mean: 1.0,
+                normalized_mean: 1.0,
+                missing: None,
+            },
+            exposure_s: 180.0,
+            date_obs: None,
+            frame_id: 7,
+            registered_path: None,
+        };
+        let cancel = AtomicBool::new(false);
+        let scale_lines = |logs: &str| -> Vec<String> {
+            logs.lines()
+                .filter(|l| l.contains("ln relative scale"))
+                .map(str::to_string)
+                .collect()
+        };
+
+        let sidecar = dir.path().join("main.athln");
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            normalize_frame(
+                &reference,
+                &for_detection,
+                &ref_bg,
+                &frame,
+                LnScaleSeeds::Measured(&[Vec::new()]),
+                &cfg,
+                &measure,
+                Interpolation::BicubicBSpline,
+                0.3,
+                &sidecar,
+                None,
+                None,
+                &cancel,
+            )
+            .expect("a clean synthetic field must normalize");
+        });
+        let lines = scale_lines(&logs);
+        assert!(!lines.is_empty(), "no scale event in:\n{logs}");
+        for l in &lines {
+            assert!(l.contains("ln_plane{frame_id=7 plane=0}"), "{l}");
+            assert!(!l.contains("ln_seeds_calibration"), "{l}");
+        }
+
+        let logs = crate::stacking::solve::tests::captured_logs(|| {
+            let _ = measure_seeds_calibration(
+                &reference,
+                &for_detection,
+                &ref_bg,
+                std::slice::from_ref(&frame),
+                &[0],
+                &|_| vec![Vec::new()],
+                &cfg,
+                &measure,
+                Interpolation::BicubicBSpline,
+                0.3,
+                &dir.path().join("cal"),
+                None,
+                &cancel,
+                &|_, _, _| {},
+            );
+        });
+        let lines = scale_lines(&logs);
+        assert!(
+            !lines.is_empty(),
+            "no scale event in the calibration arm:\n{logs}"
+        );
+        for l in &lines {
+            assert!(
+                l.contains("ln_seeds_calibration") && l.contains("ln_plane{frame_id=7 plane=0}"),
+                "{l}"
+            );
+        }
     }
 
     /// Ruling C-14 item 7: end to end through `normalize_frame`, the

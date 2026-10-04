@@ -354,6 +354,9 @@ pub fn measure_seeds_calibration(
     let mut ratios: Vec<Vec<f64>> = vec![Vec::with_capacity(indices.len()); channels];
     let mut frame_ids: Vec<i64> = Vec::with_capacity(indices.len());
     let total = indices.len();
+    // Tags every event of the throwaway arms, so a log reader can tell them from
+    // the main pass's own "ln relative scale" events.
+    let _span = tracing::debug_span!("ln_seeds_calibration").entered();
     for (done, &i) in indices.iter().enumerate() {
         if cancel.load(AtomicOrdering::Relaxed) {
             return None;
