@@ -1379,18 +1379,152 @@ registration onto its canonical grid. `start_stacking` still refuses a project
   Every solve in the owner's catalog has det(CD) > 0, so a master on the grid is
   the mirror image of a raw frame, which is correct on the sky. 6b-3 must not
   copy the reference's `ROWORDER` onto a grid master.
-- **Open for 6b-3:**
-  - registration onto the grid through one composed map (with 6b-1's
-    `RegistrationRecord` question);
-  - LN on overlap, then coverage and crop;
-  - drizzle and output on the grid;
-  - the seven project commands (command count 299 → 306);
-  - the fake-hub e2e and acceptance runs A and B;
-  - `plan::expected_ln_channels` and the stage-one plane rule disagree for an
-    `osc__` Prepare-path group with the debayer off (project or attested): the
-    plan under-reports the LN cache. Reconcile when LN runs for projects.
+- **Open for 6b-3:** all landed; see "The project path on the grid" below.
+  The `expected_ln_channels` disagreement is gone: `plan::stage_one_planes`
+  is the one plane rule for stage 1 and LN. An attested frame set of raw
+  mosaics with the debayer off is keyed `osc__…` and counted as three planes
+  by the plan and the run alike, while Prepare keeps its files as one-plane
+  mosaics: both exclude such frames at stage 1, consistently. Mosaics stay
+  mosaics only under `cfa__` keys, which frame sets never produce (review
+  M7).
 
-  `start_stacking` lifts its project guard then.
+**The project path on the grid (wave 6b-3, 2026-10-03)** (plan
+`docs/superpowers/plans/2026-10-03-collab-v3-wave6b3-project-grid-stacking-plan.md`,
+rulings D1–D23; spec §5.5–§5.9, §9, §15). A project run starts, stacks every
+group onto the coordinator-confirmed grid and writes grid masters.
+
+- **One composed map per frame (D1).** `stacking::grid_map::compose_to_grid`
+  fits an affine to the exact chain — star map, then the reference's WCS with
+  SIP, then the grid's TAN — over a 32-px lattice (`COMPOSE_SAMPLE_PX`), and
+  keeps the rest as a `DistortionModel::Sampled` layer: a `ComposedField`
+  evaluated exactly, read through lazy bilinear 8-px grids (`TpsGrids`, built
+  and released like a spline's). The inverse is Newton steps on the forward
+  chain; a point that does not converge reads NaN, never an unconverged
+  iterate. The map is never serialized; it is re-derived from (star map,
+  reference WCS, grid) whenever a cached star map is reused. Pinned within
+  0.01 px of the chain for identity, homography, polynomial and spline star
+  maps, at 0° and 4° from the tangent point.
+- **Two caches (D2).** The star map is a payload-only `registration` artifact
+  (group key `""`) outside `INTERMEDIATE_ARTIFACT_KINDS`, so only `All` drops
+  it. The registered frame's hash is `grid_registered_hash(registration
+  hash, reference WCS hash, grid hash)`: a grid change re-composes and
+  rewrites the registered frames with no star detection. A frame set's
+  registered hash is its registration hash, as before.
+- **Row order (D3).** Everything written on the grid states `ROWORDER =
+  'BOTTOM-UP'`: the grid is sky-standard (det CD < 0). A grid master is the
+  mirror image of a raw frame from the owner's rigs (det CD > 0) and is right
+  on the sky. An XISF grid master fires the existing bottom-up warning.
+- **Coverage (D4, D9).** The engine counts, per output pixel, the frames
+  whose sample is finite (before rejection), in a post-pass over the band
+  already in memory; the combine loop is untouched. `output.coverageMap`
+  writes `<stem>_coverage.fits` (`BUNIT = 'frames'`, the master's WCS, kind
+  `coverage`) and drizzle's own `<drizzle stem>_coverage.fits` (kind
+  `drizzle_coverage`, counted from a `W` snapshot around each deposit; a drop
+  below `W`'s f32 resolution is not counted). A frame set's master is
+  bit-identical with the map on and off. A project's seed turns it on.
+- **Statistics on the covered rectangle (review I1).** On a grid every
+  master's statistics (`GroupStats`: location, scale, noise, PSF SNR, SNR
+  gain, FWHM, eccentricity) are measured on `crop::largest_covered_rect`: the
+  largest rectangle every pixel of which a frame covers, with or without a
+  coverage map. The uncovered 0.0 pixels of a wide grid never read as data.
+  A rectangle under `MIN_STATS_RECT_PX` (16) on a side, or no covered pixel
+  at all, fails the group with a named error. A drizzle master's statistics
+  are measured on that same rectangle scaled by the drizzle factor. Frame
+  sets measure the whole plane, as before.
+- **LN on the overlap (D5–D8).** A project's LN reference leaves uncovered
+  pixels NaN, and each member is fitted on member ∩ reference: detection
+  planes fill the rest with 0.0 (the detector ignores it), seeds stay 48 px
+  (`LN_MASK_MARGIN_PX`) inside the eroded overlap, and both backgrounds come
+  from the overlap. A member under 25 % overlap (`LN_MIN_OVERLAP`, measured
+  on channel 0) keeps its global pair, gets no sidecar and an `ln_global`
+  marker (a cache hit on the next run and in the plan), and the group warns
+  once with the count. Admissibility on a grid uses the group's median
+  footprint, not the whole grid. Frame sets keep the legacy LN; a project's
+  LN hash folds `lnmask:1`. The field (review I6) is built from the in-scope
+  frames' WCS footprints on a lattice of 32 probes per median frame side,
+  forgives one lost probe, and its hash (the frames that pass the 0.97 rule
+  against it) folds into every member's LN hash; the plan builds the same
+  field (`origin::group_ln_field`), so its Normalize view moves with the
+  field, never a run later.
+- **Crop (D10).** With `output.cropToCoverage = K > 0` every output is
+  written as FITS into `runs/run-<id>-uncropped/`; after the last group,
+  `finish_crop` crops a co-registered run to ONE rectangle (the union of the
+  groups' `coverage ≥ K` boxes) and a native run per group, writes the final
+  files in the configured format, moves the rows, group paths and summary
+  onto them, and removes the scratch. CRPIX moves by the crop origin (× the
+  scale for drizzle outputs). A group with no rectangle, or whose crop fails,
+  is finalized uncropped with a warning; one that cannot be finalized keeps
+  its scratch files, which its rows name. `K = 0` is the old path; a
+  full-rectangle finalization writes exactly what it writes (review I7). A
+  crop does not re-measure `GroupStats`, and the plan's space estimate
+  counts the scratch (review M6).
+  - **A run that ends early.** On Cancelled or Err (including a panic) every
+    group already written is finalized uncropped into the output folder, like
+    a `K = 0` run, with one warning. A group that cannot be finalized, and a
+    drizzle family whose finalization failed, keep their files in the
+    scratch folder, named in a warning. A drizzle crop failure keeps only the
+    drizzle family there.
+  - **The scratch folder is never cleaned.** `cleanup_work` removes every
+    `runs/` entry under `All` except `run-*-uncropped`, and no level touches
+    that folder. `heal_interrupted_runs` warns when a killed run left one.
+    Only a manual delete removes it.
+- **Output on the grid (D11).** The master's WCS is the grid's TAN
+  (`grid_plate_solve`: the 0-based centre as `crpix`, no SIP).
+  `stamp_grid_cards` writes the canonical `FILTER` (no card at all for a
+  group whose canonical filter is empty: the reference's raw name must not
+  leak, and the run warns once), `ROWORDER`, `ATH_RGEO = 'grid'`, `ATH_SPRJ`
+  (with a comment only when it fits), `ATH_GRID` (16 hex), and drops
+  `PLTSOLVD`; `ATH_PRJ` is never written. Masters land in
+  `<output>/<sanitized title>/`. A project's output folder follows the
+  frame-set rule: the Save-time overlap warning only, and `resolve_collision`
+  means a master never overwrites a file. The plan's `folders` blocker covers
+  the working root, not the output folder, so a master may land inside the
+  Collaboration folder (a blocker can be added in 6c).
+- **Starting (D13, D14, D16, D17).** `start_stacking` takes a project. The
+  run's grid is the plan's confirmed one, recorded in `RunSummary.grid`.
+  - The plan blocks a run certain to fail at Reference — a manual pin, or
+    every in-scope frame, that will have no usable WCS — and warns when the
+    pin's WCS waits on a solve. A steady-state plan writes nothing.
+  - One predicate decides "usable WCS" for the plan and the run's tiers
+    alike: a WCS whose SIP `ReferenceWcs::from_record` refuses counts as
+    none, so a frame never reads as anchored in the plan and unanchored in
+    the run. A separate warning names a WCS that cannot be used.
+  - The plan reads the installed solver's identity ONCE and uses it for the
+    solve counters and for that predicate, so a cached failure blocks only
+    while it stands for this solver and catalog, and one plan never says
+    both "could not be plate-solved" and "will be plate-solved". With no
+    catalog installed an unsolved frame reads "could not be plate-solved".
+  - `Intermediates` and `All` sweep `tmp/` for every subject, frame sets
+    included (a directory of crash leftovers, no artifact rows). The
+    working-usage figure does not count `tmp/`, so a cleanup can free more
+    than the Settings readout shows (open-items).
+  - `heal_interrupted_runs` runs from every project entry point (plan, runs,
+    cleanup) as it does from the frame-set ones.
+- **Commands (D12).** Seven on both hosts (strict count 306):
+  `get_project_stacking_plan`, `start_project_stacking`,
+  `get_project_stacking_runs` (NotFound for an unknown project),
+  `get_project_stacking_config` (read only: the seed, `isDefault`, while
+  nothing is stored), `set_project_stacking_config` (sorted unique trimmed
+  exclusions; an absent `referenceFrameUuid` clears the pin; refuses a
+  project this device left), `get_project_stacking_work_usage`,
+  `cleanup_project_stacking_work`. Run-history frame rows carry `frameUuid`.
+  - Cleanup heals, refuses with Conflict while a run is active, reads the
+    stored config (an invalid one fails) and refuses a layout that overlaps a
+    scan root (the Collaboration root is one). Every refusal comes before
+    every write. Only then does it sweep the rows of frames that left the
+    project, at every level and even with no working folder (then `Ok(0)`).
+- **After a plate-solve or catalog change the plan is identity-blind.** The
+  plan cannot predict a re-solve's WCS: Register may re-run while the plan
+  shows it cached, and the "will be plate-solved" warning still appears.
+  Only the Reference check judges with the installed identity.
+- **Tests.** `api/stacking_project_e2e.rs` stacks a fake-hub project — two
+  publishers, two canonical filters, a coordinator exclusion, a frame the run
+  solves, a pair under 25 % overlap — twice. Every project run test holds
+  `grid_counters::exclusive()`.
+- **Open for 6c:** the project page's Stacking tab (the wire types are final),
+  `/projects/<id>?tab=stacking` for the completion notification. The 25 %
+  threshold stays synthetic until a real partial-overlap project exists
+  (open-items).
 
 **Key files**: `crates/athenaeum-core/src/stacking/{config,groups,paths,
 plan,run,provenance,measure,weights,psf_signal,prefilter,robust,structure,
@@ -1398,7 +1532,7 @@ integrate,master_cards}.rs`,
 `stacking/register/{mod,detect,align,frame,wcs_seed,local_loop,writer}.rs`,
 `stacking/ln/{mod,grid,background,scale,reference}.rs`,
 `stacking/drizzle/{mod,geom}.rs`, `stacking/rej.rs`,
-`stacking/{origin,project_source,prepare,solve}.rs`,
+`stacking/{origin,project_source,prepare,solve,grid_map,crop}.rs`,
 `collab/{grid,grid_geometry,frame_meta}.rs`, `api/collab_grid.rs`,
 `plate_solve/{service,layers}.rs`,
 `crates/athenaeum-core/src/integration/student_t.rs`,

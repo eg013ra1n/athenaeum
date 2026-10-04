@@ -522,7 +522,7 @@ Frame-set keys are unchanged.
 
 Eleven new commands, on both hosts, each a 3–5-line wrapper over
 `athenaeum-core/src/api/`. Each wears `#[tracing::instrument(skip_all, err)]`
-(the web mirror `err(Debug)` per its return type). The count goes 294 → 305.
+(the web mirror `err(Debug)` per its return type). The count goes 294 → 305. (Count note, 2026-10-03: plan 6a added three commands and plan 6b-2 two before this table's last seven landed, so the strict count went 297 → 299 → 306.)
 
 | Command | Args | Returns |
 | ---- | ---- | ---- |
@@ -952,7 +952,7 @@ the owner's word.
 - **Docs, in the last plan.** `docs/stacking/README.md` (project subject,
   grid, coverage, exposure modes); `docs/export/README.md` (the project
   export, the patchers); `docs/transfers/README.md` (remap, grid);
-  `CLAUDE.md` (command count 294 → 305, the Stacking and Transfers
+  `CLAUDE.md` (command count 294 → 305 (actual 306, see §9.1's count note), the Stacking and Transfers
   summaries, and the stale "collab publish of a device's own lights is
   deferred" line); the same stale claim in
   `docs/export/calibrated-lights.md`; v3 §16 A8; the logging dictionary;

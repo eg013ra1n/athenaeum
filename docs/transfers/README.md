@@ -320,3 +320,12 @@ Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-
   Plan 6b-3 adds the seven project-stacking commands (→ 306).
 - **Fake hub:** `PUT /projects/{id}/grid`, `canonicalGrid` on the project page, and a settable target.
 - **Orientation:** the grid is sky-standard (north up, east left, det CD < 0). See the stacking reference for what that means for masters.
+
+## Collab wave 6b-3 — project stacking (2026-10-03)
+
+The stacking side is in `docs/stacking/README.md` (The project path on the grid, wave 6b-3).
+
+- Seven project-stacking commands on both hosts (strict count 299 → 306).
+- `cleanup_project_stacking_work`, once no project run is active, sweeps the stacking artifact rows of every handle whose `(project, uuid)` left `project_frames_local`: rows only, never a file. A coordinator-excluded frame is still local, so its cache survives a restore. Every refusal (an active run, an invalid stored config, a layout that overlaps a scan root) comes before any write.
+- A project run reads the replicas in place and writes nothing under the Collaboration root; no file it writes carries `ATH_PRJ`.
+- An acceptance catalog copy that stacks a project runs signed out (its `account.hub_url` points at an unreachable address), so the feed never replaces its local grid. `account_sign_out` is never called on a copy: the token store is shared with the real app.

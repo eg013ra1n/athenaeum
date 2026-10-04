@@ -268,6 +268,27 @@ They read like bugs; they are not. Re-proposing them costs a cycle every time.
 Newest first. Every cycle below is code-complete with green gates and a clean final
 review; what is missing is a human running the flow on real data.
 
+### Collab wave 6b-3 — project stacking on the grid (2026-10-03)
+
+Code-complete with green gates: the composed map, both caches, LN on the overlap with the 25 % fallback, the coverage maps, crop, grid output, the seven commands on both hosts, `start_stacking` for a project, and the fake-hub e2e. Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-design.md` §5.5–§5.9, §9, §15; plan `docs/superpowers/plans/2026-10-03-collab-v3-wave6b3-project-grid-stacking-plan.md`. Reference: `docs/stacking/README.md` (The project path on the grid, wave 6b-3). There is no project UI before 6c. Owed:
+
+- **Before the merge:** one full-suite core run on `main` (20c7c1ef) to compare the collab-live timing flakes below.
+- **The acceptance runs** (the plan's last section): the set-204 frame-set regression against `main`, run A's four rows, run B's report and the WCS probe. Record each result here when it is run; a missed run-A row is reported with its numbers for an owner ruling, never tuned.
+- **The grid's orientation.** A grid master is the mirror image of a raw frame from the owner's rigs: the grid is sky-standard (det CD < 0) and every solve in the owner's catalog has det CD > 0. Check the first real grid master against a sky chart. `ROWORDER` on the grid is always `BOTTOM-UP`.
+- **The 25 % LN-overlap threshold is still synthetic** (see the 6b-2 entry): run B reports each member's overlap, but LDN1272-test has no member under 25 %.
+- **Run B's `--ln-truth` may give no ratio for a coarse member on a crowded field.** Isolation removes about 85 % of the candidate stars, and no crowding-tolerant variant met 0.3 %. An empty column is an owner call: a sparser sub-field, or a labelled indicative estimate.
+- **Drizzle coverage resolution.** A drop whose weight is below `W`'s f32 resolution at a pixel is not counted (D9). Expected to be invisible at real weights; look at it if a drizzle coverage map shows holes where the drizzled master has signal. Also watch for Memory refusals on a large grid x k^2 drizzle with coverage on.
+- **Crop disk use.** A crop run holds every output twice for a moment (scratch FITS, then the final file); the plan's space estimate counts it (review M6). A failed finalization leaves `runs/run-<id>-uncropped/` in place on purpose, and no cleanup level removes it.
+- **Run B's "noise per arcsec^2"** is sigma_px * scale (D23), measured on the master cropped to `coverage >= ceil(n/2)`. It is a white-noise equivalent: resampling (and more so drizzle) correlates a stack's pixels, so it understates the true per-area noise by a factor that depends on the scale. Owner ruling owed if another definition is wanted.
+- **LN's PSF-flux scale is PSF-width sensitive** (+1/3 px^2 of PSF width moves it about 2.6 %), so a per-member LN scale vs photometric truth across instruments carries that spread. Run B reports it; it is not a defect to tune.
+- **`work_usage` does not count `tmp/`.** `Intermediates` and `All` cleanup now remove it, so a cleanup can free more than the Settings readout showed. Showing it needs a TS change (a `tmpBytes` field); not done in this wave.
+- **The plan's stale stages are identity-blind.** After a catalog or plate-solve config change the plan cannot predict a re-solve: Register may re-run while the plan shows it cached, and the "will be plate-solved" warning still appears. Only the Reference check judges with the installed solver identity. A display mismatch only.
+- **Flaky tests under full-suite load (none touched by this branch).**
+  - `api::collab_live` timing: `clean_exit_kill_and_restart` scenario 3 took 3.0 s against its 2 s limit (three re-gates), and `a_stop_is_observed_while_starting_and_while_the_stream_opens` took 1.89 s against 1 s. Both pass solo. Collab live is untouched by 6b-3.
+  - `landing_free_bytes_is_bounded_by_the_collaboration_root` compares two `free_bytes` reads taken at different moments, so concurrent test writes break it. It passes solo: a test-design flaw, not a product bug.
+  - `a5_a_redesignation_mid_run_refetches_into_the_new_folder` failed once in a full run (Task 2a); it passed alone and in the next full run.
+- **Closed from 6b-2: the solve's ADU copy surviving a process death.** `Intermediates` and `All` now sweep `tmp/` for every subject (D17). That is a behaviour change for frame sets too: a frame set's `Intermediates` cleanup removes a directory it did not remove before (it holds no artifact rows, only crash leftovers).
+
 ### Collab wave 6b-2 — the project path up to the geometry (2026-10-03)
 
 Code-complete with green gates:
@@ -289,9 +310,7 @@ Spec `docs/superpowers/specs/2026-10-02-collab-v3-wave6-project-stacking-export-
 - **Unsupported files are excluded, not read.** A tile-compressed FITS, an image in an extension HDU and a distributed XISF leave a project run as "unsupported file", and the plan names them and counts them out of the ≥ 3 rule. Nothing in the owner's data needs them today. A reader for any of them is its own cycle.
 - **A float file in the ADU domain is used in place as if it were 0..1.** Prepare does not look at pixel values, so a float FITS another tool wrote in ADU (0..65535) would be measured and stacked in ADU. Every replica a member publishes is 0..1 by construction; an attested set's float lights are the open case. Check the first real attested float set. If it is in ADU, add a value-range probe to `prepare_action`, in its own cycle.
 - **The 25 % LN-overlap threshold cannot be re-measured on the acceptance set (6b-3).** LDN1272-test's two rigs are two groups whose members share their framing, so nothing falls under 25 %. The fallback is reachable only in synthetic fixtures and the fake-hub e2e. The owner's option is to publish set 195 "Ghost Nebula QHY" (~60 % overlap) into a test-hub project; that exercises partial overlap, not the < 25 % fallback.
-- **The grid's orientation (6b-3).** A master on the grid will be the mirror image of a raw frame: the grid is sky-standard (det CD < 0), while every solve in the owner's catalog has det CD > 0. That is correct on the sky. Check the first grid master against a sky chart, and never copy `ROWORDER` onto it.
 - **Flaky collab-live tests seen in this cycle's full runs (not touched by this branch):** `api::collab_v3_live_e2e_tests::edited_touched_and_deleted_replicas` (failed once even alone, then 5/5), `a_publishing_switch_returns_at_once_while_the_reannounce_retries`, `sharing::iroh::collab_pool::tests::concurrent_gets_for_an_unreachable_provider_share_one_dial`, plus the known `landing_free_bytes_is_bounded_by_the_collaboration_root`.
-- **The solve's ADU copy survives a process death (final review M3, left as is).** `<layout>/tmp/adu_<handle>.fits` is removed right after the first attempt, but a crash mid-solve leaves it, and `paths::cleanup_work` never lists `tmp/`. Calibrate's scratch has the same gap, and adding `tmp/` to the cleanup lists would change frame-set cleanup, so it is not done in this wave. If done: add `layout.root.join("tmp")` to the `Intermediates` and `All` directory lists (it holds no artifact rows).
 
 ### Collab wave 6a — owner smoke (2026-10-02)
 
