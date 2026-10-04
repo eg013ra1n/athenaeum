@@ -16,7 +16,7 @@ Push stays on the owner's word.
   `2026-09-20-stacking-compute-tierC-design.md` (§8 tolerance table, rulings C-1…C-30) and the math
   reference `2026-09-08-stacking-math-reference.md` §4.
 
-Rulings this spec makes are numbered **L-1 … L-30** and collected in §14. §15 lists the points the
+Rulings this spec makes are numbered **L-1 … L-22** and collected in §14. §15 lists the points the
 owner has not ruled on yet.
 
 ## 0. Verdict and scope
@@ -88,7 +88,8 @@ No command is added or removed. Every new field rides an existing payload on bot
 ### 1.2 The algorithm
 
 One procedure, run on the LN reference plane and on every target plane with the same constants
-(L-1). All coordinates are in the reference geometry.
+(L-1). Steps 1–6 run on each image alone; step 7 runs on each reference–target pair; step 8 writes
+the nodes. All coordinates are in the reference geometry.
 
 **Step 1 — tiles.** The plane is cut into non-overlapping tiles of `D = 32` px anchored at
 `(0, 0)` (L-2). Tile `(u, v)` covers `[32u, 32u + 32) × [32v, 32v + 32)`, clipped at the plane
@@ -119,9 +120,9 @@ clip. The plane maximum for §3 is the maximum over tiles (L-14).
   penalty runs over every pair of coefficients adjacent along x or along y (a first-difference,
   "membrane" penalty);
 - `λ = 1e-4 ×` the median of the non-zero diagonal entries of `BᵀB` for the current sample set;
-- samples are unweighted; the system is solved by Cholesky (dense or banded);
-- the normal matrix and right-hand side are accumulated in tile order (row-major), so the fit is
-  bit-identical with and without a pool and from run to run.
+- samples are unweighted; the normal matrix and right-hand side are accumulated in `f64`, in tile
+  order (row-major), so the fit is bit-identical with and without a pool and from run to run;
+- the system is solved by dense Cholesky (at most 1148 coefficients, §1.5).
 
 The scale is the surface's correlation length: at 1536 px a 9576 × 6388 plane has 10 × 8
 coefficients, about four to six degrees of freedom across the short side, as in the ERP.
@@ -132,10 +133,7 @@ with `|e_s| > k_s · σ_e`, `k_s = 3.0`, two-sided; refit on the survivors. Repe
 fit is final. Each round re-judges every sample against the latest fit, so a sample may return.
 When `σ_e ≤ 0` no sample is rejected.
 
-**Step 6 — nodes.** Each mesh node takes the final surface's value at its own (clamped) pixel.
-These values are what `BackgroundGrid.cells` held before, in the same row-major layout.
-
-**Step 7 — validity: a sample-count floor.** A knot cell (`h × h`) is *supported* when it holds at
+**Step 6 — validity: a sample-count floor.** A knot cell (`h × h`) is *supported* when it holds at
 least 8 accepted samples of the final fit (L-4). Unsupported cells are counted and logged; they are
 not an error. A plane is refused only when no knot cell is supported. Then the old consequences
 apply: a refused reference turns LN off for the group (global normalization, one warning); a
@@ -144,11 +142,44 @@ LN drives rejection only).
 
 There is no rejected-fraction gate anywhere (owner decision).
 
+**Step 7 — the symmetric shared-acceptance refit, per reference–target pair** (L-6). After both
+own-threshold fits (steps 4–6), the reference surface and the target surface are fitted once more,
+each on the **intersection** of the two accepted sample sets: the tiles both final fits kept.
+
+- Each side keeps its own sample values `y_s` from its own tile table. No tile is re-measured.
+- The two refits share their positions, hence one design matrix, one `λ` (step 4's rule on the
+  intersection) and one Cholesky factorization with two right-hand sides. That is one extra
+  ≈ 80-coefficient solve per member.
+- There is no rejection round in this step.
+- The floor of step 6 applies to the intersection. When no knot cell is supported on it, the frame
+  is refused ("no background sample in common with the LN reference"), with the target-side
+  consequences of step 6.
+- The reference's own-threshold fit is built once per group (once per member on a project grid,
+  §1.3); the refit is built per member.
+
+**This is not the rejected "one shared mask from the reference."** That proposal took the
+reference's mask alone and imposed it on every target. This step is symmetric: the accepted set is
+derived from both sides, for each reference–target pair, and it runs on top of the model at the
+scale, which remains the fix. Its job is to remove the last difference the two own-threshold fits
+can have: each image rejects in units of its own noise (§1.4), so a low-noise reference drops more
+of a faint extended feature than a noisy target does, and the two surfaces then differ under that
+feature.
+
+Measured (controller, 2026-10-04, IC 434 on Horse C11 G): the surface difference
+`S(one frame) − S(reference)` is 1.66 % of background against a 28-frame reference and 1.31 %
+against a 5-frame one with the own-threshold fits alone, and 0.23 % / 0.20 % with this step. The
+halo star's node is unchanged by it.
+
+**Step 8 — nodes.** Each mesh node takes the step-7 surface's value at its own (clamped) pixel. These
+values are what `BackgroundGrid.cells` held before, in the same row-major layout, and
+`B = B_R − A·B_T` is formed from the two refitted surfaces of the pair.
+
 **Why this removes the halo class.** A star with a 220-px halo is about 6 % of one 1536² patch,
 and the part above 3σ is about 1 %. Whether its samples are rejected on one side, the other or
 both, the surface moves by ≲ 0.1–0.5 % of background (math review §5.3). No statistic can swap one
 estimator for another (the old gate did), and a sample that flips between reference and target
-moves the surface by about one part in the ≈ 2300 samples of its knot cell.
+moves the surface by about one part in the ≈ 2300 samples of its knot cell. Step 7 then removes the
+flip itself: a sample enters both surfaces or neither.
 
 ### 1.3 Uncovered areas and the project grid's masked overlap
 
@@ -169,23 +200,34 @@ fitted ones around it, so the surface never overshoots them there. This covers t
 **Per-member reference model on the grid** (L-5). Today the masked path rebuilds the reference
 background per member. The new model reuses the group's reference tiles: a tile wholly inside the
 member's overlap takes the group reference's tile statistic bit for bit; a tile cut by the overlap
-edge is recomputed on its overlap pixels; a tile outside is absent. The fit (§1.2 steps 4–7) runs
-per member. The result is identical to recomputing every tile.
+edge is recomputed on its overlap pixels; a tile outside is absent. The fits (§1.2 steps 4–7,
+the shared refit included) run per member. The result is identical to recomputing every tile.
 
 `LN_MASK_MARGIN_PX = 48` (seed erosion) and `LN_MIN_OVERLAP = 25 %` are unchanged.
 
-### 1.4 One procedure, each image's own noise
+### 1.4 One procedure, each image's own noise, one shared acceptance
 
 The owner ruled the same procedure and the same thresholds for reference and target, so
-`k_t = k_s = 3.0` on both sides (L-1). Each threshold is in units of that image's own noise (its
-tiles' MAD and its residuals' MAD), as the ERP does with 3.0 σ_R / 3.2 σ_T. The reference model is
-therefore built once per group, as today.
+`k_t = k_s = 3.0` on both sides, and the procedure ends with the shared-acceptance refit of step 7
+(L-1). Each threshold is in units of that image's own noise (its tiles' MAD and its residuals' MAD),
+as the ERP does with 3.0 σ_R / 3.2 σ_T. The reference's own-threshold model is therefore built once
+per group, as today.
 
-A residual risk remains: a tile median near stars still depends a little on the image's noise
-(math review §5.2 measured −6 % of background at one 128-px node). The fit dilutes it by the sample
-count of a knot cell. The sky-truth row of §11.3 watches it. If that row fails, the fallback is the
-math review's consistency guard — reject the reference's tiles with each target's σ — at the cost of
-one reference model per member. It is not built in this cycle (L-6).
+Two noise-dependent effects remain, and each has its answer:
+
+- **Which samples each side rejects.** A faint extended feature is rejected more in the low-noise
+  reference than in a noisy target. Step 7 removes this: both surfaces are refitted on the samples
+  both kept (§1.2 step 7 has the measurement).
+- **The tile statistic itself.** The in-tile clip's bound scales with the tile's noise, so a tile
+  median under star wings still depends a little on the image's noise (math review §5.2 measured
+  −6 % of background at one 128-px node). The fit dilutes it by the sample count of a knot cell.
+
+The acceptance watches both on the IC 434 boxes and on the B-move read (`ln_probe --diag`), §11.3.
+The master median does not watch them: a sky that is right on average can still be wrong under the
+nebula.
+
+A second lever is recorded and not built: a plain tile median without the in-tile clip, which takes
+the noise-dependent bound out of the tile statistic. It is the next step if the IC 434 rows miss.
 
 ### 1.5 Cost on a 9576 × 6388 plane
 
@@ -194,12 +236,13 @@ one reference model per member. It is not built in this cycle (L-6).
 | Pixels read for statistics | 61.2 M (2×2-subsampled in cells: 15.3 M) | 61.2 M | 60 000 tiles of ≤ 1024 px |
 | Full-plane transient copy | 245 MB (`clean_plane`) | none | tile-local cleaning |
 | Tile table | — | ≈ 1.4 MB | position, value, σ, max, flags |
-| Fit | — | 80 coefficients at scale 1536; at most 41 × 28 = 1148 at scale 256 | < 50 ms banded |
-| `background_ms` per plane, 10-worker pool | ≈ 0.17 s (73 ms at 26 Mpx, scaled) | ≈ 0.4–0.6 s (estimate) | ≈ 3× the selection work: no subsampling |
+| Fits | — | 80 coefficients at scale 1536; at most 41 × 28 = 1148 at scale 256 | three own-threshold fits per image, one shared refit (two right-hand sides) per member; dense Cholesky, milliseconds |
+| `background_ms` per plane, 10-worker pool | ≈ 0.17 s (73 ms at 26 Mpx, scaled) | the same order (estimate) | more pixels per statistic (no subsampling), no full-plane copy |
 
 On set 204 (26 Mpx planes, 92 mono + 105 OSC frames) the Normalize stage is expected to grow by
-about 30–60 % (≈ +40–80 s on ≈ 2 min). Time is reported, not gated: the change is a correctness fix
-(owner rule: quality over speed). `LN_PLANES_RESIDENT` stays 8; the peak drops by one plane.
+about +10 s on ≈ 2 min. The figure is an estimate, measured at checkpoint A. Time is reported, not
+gated: the change is a correctness fix (owner rule: quality over speed). `LN_PLANES_RESIDENT` stays
+8; the peak drops by one plane.
 
 ### 1.6 What must stay bit-exact or a no-op
 
@@ -213,10 +256,15 @@ about 30–60 % (≈ +40–80 s on ≈ 2 min). Time is reported, not gated: the 
   touched. Their cache rows stay valid (565/565 registration rows, 302/302 calibrated frames on set
   204).
 - **The background model itself**: bit-identical with and without a pool, and run to run.
-- **Unit pins**: a constant plane gives constant nodes (to 1e-7 relative); a linear gradient is
-  reproduced at every node to 1e-5 of its amplitude; a plane with one planted 200-px halo star gives
-  reference and target nodes within 0.5 % of background of each other at three noise ratios
-  (1×, 5×, 28× deeper reference — the math review's §5.2 proxies).
+- **Unit pins**:
+  - a constant plane gives constant nodes (to 1e-7 relative);
+  - a linear gradient is reproduced at every node to 1e-5 of its amplitude;
+  - a plane with one planted 200-px halo star gives reference and target nodes within 0.5 % of
+    background of each other at three noise ratios (1×, 5×, 28× deeper reference — the math
+    review's §5.2 proxies);
+  - beside it, a broad extended feature (a 2000-px Gaussian at +30 % of background) at the same
+    three noise ratios, with the same 0.5 % bar. It fails without the step-7 refit and passes with
+    it; the pin asserts both.
 
 ### 1.7 Relation to measured-out work
 
@@ -270,8 +318,11 @@ field, so a user who chose 1024 cannot be told from one who never touched it. Th
 Why: the owner made the derived scale the default, and 1024 was the default. A non-default number
 was a deliberate choice, and it keeps its meaning (a larger number follows less structure). The
 number's effect does change — it was a 128-px cell model and is now a correlation length — but that
-change is item 1's, for every document. `resolve_config` writes the resolved mode, so every
-in-memory config carries one and the next save stores it.
+change is item 1's, for every document.
+
+How the absence is seen: the field decodes as `Option<LnScaleMode>` (`None` when the document has
+no `scaleMode`). `resolve_config` applies the rule above and sets `Some(..)`, so every in-memory
+config carries a mode, every consumer reads a resolved one, and the next save stores it.
 
 ### 2.3 The plan/run twin
 
@@ -307,18 +358,32 @@ only.
 `max(2, FWHM_fit)` px of the fitted centroid is compared with `saturation × plane maximum`
 (default 0.75). The plane maximum is the largest hot-pixel-corrected finite pixel (§1.2 step 3), so
 one hot pixel or cosmic ray does not set it. A pair fails if either side exceeds it. The existing
-absolute guard on the warped seed pixel (`SATURATION`, 0.95 native) stays.
+absolute guard on the warped seed pixel (`SATURATION`, 0.95 native) stays. A warped target's peaks
+are lowered by the interpolation kernel, so a star saturated in its native frame can pass the
+relative test on the warped plane; the absolute guard covers that case.
 
-**Step 2 — peak SNR.** On each side, `amplitude / σ_local ≥ minPeakSnr` (default 40), where
-`amplitude` is the Moffat fit's peak above its background and `σ_local` is the median `σ_t` of the
-accepted samples in the 3 × 3 tile block around the centroid's tile, or the plane's median `σ_t`
-when that block has none (L-12). The fitted amplitude has a noise of a fraction of one pixel σ, so
-selecting on the target's SNR adds no measurable selection bias.
+**Step 2 — peak SNR.** On each side, `(peak − b) / σ_local ≥ minPeakSnr` (default 40) (L-12):
+
+- `peak` is the mean of the five brightest finite pixels inside the fit's sampling region (the
+  adaptive square `fit_one` grew for that star). This follows the external reference pipeline's
+  detector definition of a peak, and it is the value recorded for the star. `fit_one` computes it
+  from the pixels it already gathered. It is not persisted in the `fits` artifact, so neither
+  `PSF_FIT_VERSION` nor the artifact's version moves.
+- `b` is the fit's own background.
+- `σ_local` is the median `σ_t` of the accepted samples in the 3 × 3 tile block around the
+  centroid's tile, or the plane's median `σ_t` when that block has none.
+
+A five-pixel mean carries a fraction of one pixel σ of noise, so selecting on the target's SNR
+adds no measurable selection bias.
 
 **Step 3 — the brightest.** Pairs passing steps 1–2 are ranked by the reference fit's `signal`
 (descending; ties by reference fit index). The deep reference sets the order, so the rank does not
 depend on the member's noise. The first `maxStars` (default 500) pairs whose flux measurement is
 valid are kept (§4.1 for F1; both signals > 0 for PSF signal).
+
+The cap counts **pairs**. The ERP caps each image's own detections at 500 before matching, which
+can leave a star in one image's 500 and out of the other's. Capping the matched pairs keeps up to
+500 usable ratios. This is a deliberate deviation (L-11).
 
 **Step 4 — fallback.** When fewer than `MIN_MATCHES` (20) pairs pass steps 1–2, the brightest
 `max(⌈n/4⌉, 20)` of the `n` pairs passing step 1 are taken, capped at `maxStars`, and logged as
@@ -391,7 +456,8 @@ full checkpoint confirms (L-15).
    on all of them: median |gap| ≤ 0.5 %, |slope| ≤ 0.5 %/px², no instrument offset (mono and OSC
    medians within 0.5 % of each other).
 2. Run `--stack-sim` on set 204 mono with each surviving variant's per-member scales. Pick the one
-   whose no-rejection master star flux is closest to the LN reference.
+   whose no-rejection master star flux is closest to the same run's truth-corrected no-rejection arm
+   (every member scaled by `truth / applied`, the audit's "corrected, no rejection" arm).
 3. Variants within 0.3 % of each other on step 2 are tied. A tie goes to the smaller median
    per-member RCR dispersion `σ_z` (precision), then to the smaller aperture.
 4. Checkpoint B (§11.1) runs the chosen variant in full. A runner-up within 0.3 % also runs in full
@@ -405,15 +471,19 @@ default when **all** of these hold (L-16):
 1. **Truth, per member.** The §4.3 step-1 bars pass for F1 on all four audited groups and on
    Horse C11 G, and PSF signal with selection fails at least one of them on a mono group.
 2. **Master level, scale only.** On `--stack-sim` set 204 mono, no-rejection arm: F1's master star
-   flux is within ±1 % of the LN reference, and PSF signal with selection is outside ±1 %.
+   flux is within ±0.5 % of the truth-corrected no-rejection arm of the same `--stack-sim` run
+   (L-22). Its ratio to the LN reference is reported beside it. (The ratio to the LN reference is
+   not the bar: in the audit's simulation even the truth-corrected arm reads 0.9918 of it without
+   rejection and 1.0213 with it.)
 3. **Master level, full runs** (set 204, run B):
-   - F1's master SNR (noise per unit of LN-reference-scale signal) is not below PSF signal's by
-     more than 1 %;
+   - F1's master SNR (§11.3's definition) is not below PSF signal's by more than 1 %;
    - rejected fraction within ±0.3 pp of the PSF-signal arm;
-   - MAD within ±1 % of the PSF-signal arm;
+   - MAD within ±1 % of the PSF-signal arm, judged on the scale-normalized read (L-21), with the
+     raw read reported beside it;
    - weights unchanged (ρ ≥ 0.99).
 4. **Margin.** F1 improves on PSF signal with selection by at least 1 point of median |gap| on a
-   mono group, and by at least 1 % of master star flux on `--stack-sim`.
+   mono group, and is closer to the truth-corrected `--stack-sim` arm by at least 1 % of master star
+   flux.
 
 When 1, 2 and 4 hold and 3 does not, the numbers go to the owner and PSF signal stays meanwhile.
 When 4 fails (the gain is within noise), PSF signal stays: it is the ERP-faithful estimator. Either
@@ -501,8 +571,8 @@ New fields under `normalization.local` are `#[serde(default)]`. There is no
 
 | Field | Type | Default | Range (clamped by `resolve_config`, `warn!` on a move) | Read when |
 | ---- | ---- | ---- | ---- | ---- |
-| `scaleMode` | `"auto" \| "fixed"` | `"auto"` (legacy rule §2.2) | — | always |
-| `gridSize` | u32 | 4 | 1–16 | `auto` |
+| `scaleMode` | `"auto" \| "fixed"`, decoded as `Option` | `"auto"` (legacy rule §2.2) | — | always |
+| `gridSize` | u32 | 4 | 2–8 | `auto` |
 | `scale` | u32 | 1024 (unchanged) | snapped to §2.1's list | `fixed` |
 | `fluxEstimator` | `"psfSignal" \| "commonAperture"` | `"psfSignal"` until §4.4 rules | — | always |
 | `aperture` | `"fwhm2" \| "fwhm3" \| "growthCurve"` | the §4.3 winner (`"fwhm3"` until then) | — | `commonAperture` |
@@ -525,24 +595,27 @@ new fields, so every preset carries the defaults above.
 
 - **`LN_MODEL_VERSION`** (L-19): a new constant folded into `normalization_subtree` as
   `"lnModelVersion"`. The background-model task sets it to 2; the star-selection task sets it to
-  3; any later task that changes what an existing config produces bumps it again. Through the subtree it moves the `ln`,
-  `ln_reference` and `ln_calibration` hashes together.
-- **The resolved scale** is folded as the upstream token `ln_scale_px:<n>` into
-  `normalization_hash_for` and `seeds_calibration_hash_for`. Plan and run pass the same value
-  (§2.3).
+  3; any later task that changes what an existing config produces bumps it again. Through the
+  subtree it moves the `ln`, `ln_reference` and `ln_calibration` hashes together.
+- **The resolved scale** is folded as the upstream token `ln_scale_px:<n>` into the per-frame `ln`
+  hash (`normalization_hash_for`) and the `ln_calibration` hash (`seeds_calibration_hash_for`).
+  Plan and run pass the same value (§2.3). The `ln_reference` hash call passes **no** scale token
+  (the token argument is empty there): the reference image does not depend on the scale, so a
+  `gridSize`, `scaleMode` or `scale` change never rebuilds it.
 - **The subtree is canonicalized:**
   - `scale`, `scaleMode` and `gridSize` leave `normalization_subtree`; the token carries their
-    effect, so switching auto ↔ fixed at the same resolved value invalidates nothing;
+    effect where it matters, so switching auto ↔ fixed at the same resolved value invalidates
+    nothing;
   - `aperture` is in the subtree only while `fluxEstimator = commonAperture`;
   - `fluxEstimator` and `starSelection` are always in it.
 - **`PSF_FIT_VERSION` stays 3.** The fitter does not change.
 - **The one-time recompute.** On the first LN run after the merge, every set rebuilds its LN
   reference, re-measures its seeds calibration (7 frames × 2 arms per group) and rewrites every
-  `.athln`. The plan reports Normalize stale until then. Rebuilding the reference image is not
-  strictly needed (it does not depend on the model); it is accepted for one hash rule instead of
-  two (L-19).
-- **`LnArtifactPayload`**: `cells_rejected` is replaced by `samples`, `samples_rejected` and
-  `cells_unsupported` (`#[serde(default)]`; an old payload is stale anyway).
+  `.athln`. The plan reports Normalize stale until then. Rebuilding the reference image this once
+  is not strictly needed (it does not depend on the model); it is accepted so that the version
+  lives in one place, the subtree (L-19). Later scale changes do not rebuild it (above).
+- **`LnArtifactPayload`**: `cells_rejected` is replaced by `samples`, `samples_rejected`,
+  `samples_shared` and `cells_unsupported` (`#[serde(default)]`; an old payload is stale anyway).
 
 ## 8. Plan, run and provenance
 
@@ -566,7 +639,7 @@ panel's existing "default X" help lines stay, as every stage panel does.
 | Control | Label | Help (one sentence) | Shown |
 | ---- | ---- | ---- | ---- |
 | select: `Auto`, 256 … 8192 px | Scale | The background model follows structures larger than this and treats smaller ones as signal. | always |
-| number 1–16 | Grid size | Auto scale is the frames' short side divided by this, snapped to a supported size. | `Auto` |
+| number 2–8 | Grid size | Auto scale is the frames' short side divided by this, snapped to a supported size. | `Auto` |
 | read-only line | Resolved scale | e.g. "1536 px (9576 × 6388)"; per group when they differ; "estimated — the run confirms it" when `lnScaleEstimated`. In Settings: "A frame set's Stacking tab shows the resolved value." | `Auto` |
 | select | Star flux | PSF signal measures each star inside its fitted profile; common aperture measures both frames in one circle sized to the broader star, independent of seeing. | always |
 | select: 2 × FWHM, 3 × FWHM, 2 × FWHM + growth curve | Aperture | The circle radius in units of the broader frame's FWHM; the growth curve adds the light beyond it from the brightest stars. | `commonAperture` |
@@ -600,9 +673,10 @@ prefix rule applies.
 | `ln_scale_px` | u32 | the resolved LN scale | `"ln scale resolved"` (info, per group), `"ln reference built"` |
 | `ln_scale_mode` | string `auto` \| `fixed` | how it was resolved | `"ln scale resolved"` |
 | `ln_flux_estimator` | string `psfSignal` \| `commonAperture` | the estimator | `"ln scale resolved"`, `"ln relative scale"` |
-| `ln_samples` | usize | background samples in the final fit, summed over channels | `"ln frame normalized"`, `"ln reference background modelled"` (debug, per channel) |
+| `ln_samples` | usize | background samples in the own-threshold final fit, summed over channels | `"ln frame normalized"`, `"ln reference background modelled"` (debug, per channel) |
 | `ln_samples_rejected` | usize | samples the two rejection rounds left out | same |
-| `ln_cells_unsupported` | usize | knot cells under the sample floor | same |
+| `ln_samples_shared` | usize | samples in the shared-acceptance refit (§1.2 step 7), summed over channels | `"ln frame normalized"` |
+| `ln_cells_unsupported` | usize | knot cells under the sample floor | same as `ln_samples` |
 | `ln_selected` | usize | pairs after the star selection, before RCR (`ln_matches` keeps "pairs before selection") | `"ln relative scale"` |
 | `ln_selection` | string `snr` \| `brightQuarter` | which selection rule held | `"ln relative scale"` |
 | `ln_aperture_px` | f64 | the common circle radius `a·F` | `"ln relative scale"` (common aperture) |
@@ -619,7 +693,8 @@ prefix rule applies.
   `count`.
 - The mismatch between the plan's estimate and the run's scale (§2.3) is a `warn!` carrying
   `ln_scale_px` and `expected`.
-- Every refusal (a plane with no supported cell) is logged before it returns. Never swallowed.
+- Every refusal (a plane with no supported cell, a pair with no shared supported cell) is logged
+  before it returns. Never swallowed.
 
 ## 11. Acceptance
 
@@ -629,21 +704,21 @@ prefix rule applies.
 | ---- | ---- | ---- |
 | **Set 204** (`LDN1272-test`, 92 mono + 105 OSC 180 s) | frame set, LN at 1024 | the `tierA-baseline` ruler plus a same-evening `main` re-run (R-TA-8/9) |
 | **Run B** | the 6b-3 project on the 4480 × 5760 grid, LN on | a same-evening `main` re-run of `project-run.sh` |
-| **Horse C11** | dev catalog `frames_set` 182, 9576 × 6388 ASI6200MM; the G group (30 lights, 28 used by both pipelines) | branch with LN off (the no-LN control), and `main` with LN on (reproduces run 8's halo) |
+| **Horse C11** | dev catalog `frames_set` 182, 9576 × 6388 ASI6200MM, prepared per §11.4: the L and G groups (R and B excluded), registration reference pinned to L frame 10666; the rows read the G master (30 lights, 28 included in run 8) | branch with LN off (the no-LN control), and `main` with LN on (reproduces run 8's ring deficit) |
 
 **Checkpoint A** (after tasks 1–2, PSF signal unchanged):
 
 - set 204: `tier1/checkpoint.sh lnA <main re-run> --numeric`, then `tier1-compare.py --numeric`;
 - run B: `project-run.sh`, then `grid-report.py`;
-- Horse C11: G group three ways — branch LN on, branch LN off, `main` LN on;
+- Horse C11: L + G three ways — branch LN on, branch LN off, `main` LN on;
 - optionally, Horse C11 branch at a fixed 1024, to separate item 1 from item 2.
 
 **Pre-checks for items 3–4:** the probe (§11.2) on every member, then `--stack-sim`, then the
 aperture choice (§4.3).
 
 **Checkpoint B** (after tasks 3–4): two arms each — PSF signal with selection, and F1 at the
-chosen aperture — on set 204, run B and Horse C11 G. Checkpoint A's tree is the baseline that
-isolates the selection's effect.
+chosen aperture — on set 204, run B and Horse C11 (L + G, rows on G). Checkpoint A's tree is the
+baseline that isolates the selection's effect.
 
 Each checkpoint tree needs about 135 GB free. Expect about 15–27 min per set-204 run and about
 13.5 min per run-B run. One compile at a time, nothing else heavy beside a run (memory note
@@ -654,12 +729,16 @@ Each checkpoint tree needs about 135 GB free. Expect about 15–27 min per set-2
 - `examples/ln_scale_probe.rs` calls the production selection and both production estimators
   (library functions, not re-implementations). It writes per-member scales for each estimator and
   aperture variant, and the gap by brightness tercile of the selected set.
-- `--stack-sim` reads those per-member scales as its "corrected" arm and keeps the no-rejection
-  variant.
+- `--stack-sim` takes those per-member scales as one arm per estimator and variant. It keeps the
+  truth-corrected arm (every member scaled by `truth / applied`) and the no-rejection variant of
+  every arm.
 - `ln_probe --diag` reports the B move between two trees: median and p99 node change in units of
   sky, and nodes past 1 %.
-- `docs/superpowers/research/scripts/ln-math/halo_profile.py` reads ring medians around a sky
-  position given by RA/Dec through each master's WCS. The pixel coordinate (7556, 3212) is run 8's.
+- `docs/superpowers/research/scripts/ln-math/halo_profile.py` finds the star by a local centroid
+  search around run 8's pixel (7556, 3212) in each master, then reads its ring medians. Run 8 has no
+  WCS; the pinned reference (§11.4) keeps its geometry.
+- `master_phot.py` gives each master's star flux in LN-reference units (`k`) and its MRS noise, for
+  the scale-normalized read and the SNR row (§11.3), one script for every arm.
 - A new `nebula_boxes.py` measures fixed boxes (below).
 - `scale_pairs.py` pairs the new runs' per-frame scales with the ERP log's pass-2 G block (the
   2026-10-04 log under the external run folder on `/Volumes/Universe/Development/`, lines
@@ -667,55 +746,90 @@ Each checkpoint tree needs about 135 GB free. Expect about 15–27 min per set-2
 
 ### 11.3 The rows (re-ruled, truth-based)
 
+**Two definitions used by the rows.**
+
+- **The scale-normalized read** (L-21). For a master `X`, `k_X` is its star flux over the LN
+  reference's star flux on the same stars (`master_phot.py`; the LN reference of the tree's LN-on
+  run). The read is taken on `X / k_X`:
+  - MAD is the MAD of `X / k_X`;
+  - a halo ring or IC 434 box excess is `(median(X / k_X) − background(X / k_X)) / background_0`,
+    where `background_0` is the no-LN control's raw background in the same annulus or boxes, one
+    fixed denominator for every master.
+
+  The raw read is the same with `k_X = 1` and each master's own background as the denominator (the
+  math review's definition). A pure signal-scale change moves the raw read but not the normalized
+  one. The normalized read decides; the raw read is reported beside it.
+- **Master SNR** = `k_X / σ_X`: the master's star flux in LN-reference units over its MRS noise σ.
+  One script computes both for every arm, on the same stars and the same rectangle.
+
 | Row | Checkpoint A (items 1–2) | Checkpoint B (items 3–4) |
 | ---- | ---- | ---- |
 | Master median (sky truth) | within ±0.1 % of the LN reference's own median, same rectangle; the baseline's value reported beside it | same |
-| Master MAD vs baseline | ±1 % | ±1 % vs the PSF-signal arm |
-| Master noise (MRS σ) vs baseline | ±2 % | replaced: master SNR (noise per unit of LN-reference-scale signal) not below baseline by more than 1 % |
+| Master MAD | ±1 % vs baseline, scale-normalized read (raw beside it) | ±1 % vs the PSF-signal arm, scale-normalized read (raw beside it) |
+| Master noise (MRS σ) vs baseline | ±2 % | replaced: master SNR not below the baseline's by more than 1 % |
 | FWHM vs baseline | ±1 % | within ±1 % of the signal-weighted variance-mixture prediction from the new per-member scales (audit §5.3 estimate +1.1 % on set 204 mono); baseline reported |
 | Rejected fraction vs baseline | ±0.3 pp | ±0.3 pp |
 | Per-frame weights | ρ ≥ 0.99, top-20 ≥ 18/20 | same |
 | `A` grids and `global_scale` | bit-identical to `main` on set 204 and run B | — |
 | Per-member scale vs truth (`--ln-truth`, probe) | reported | F1: median \|gap\| ≤ 0.5 %, \|slope\| ≤ 0.5 %/px², no instrument offset; PSF signal reported |
-| `--stack-sim` set 204 mono, no rejection | reported | F1: master star flux within ±1 % of the LN reference |
+| `--stack-sim` set 204 mono, no rejection | reported | F1: master star flux within ±0.5 % of the same run's truth-corrected no-rejection arm; the ratio to the LN reference reported beside it |
 | Seeds calibration `k` per channel | reported | reported (expected ≈ 1 under F1) |
 | Drizzle level and coverage | as before (C-20, C-23 data facts) | same |
 | B move vs baseline (`ln_probe --diag`) | reported (C-29 read) | — |
 | Wall | reported, against the same-evening re-run | reported |
 
-**Horse C11 rows** (G group; branch LN on vs branch LN off, same registration):
+**Horse C11 rows** (the G master; branch LN on vs branch LN off, same registration):
 
-- **Halo.** The star at run 8's (7556, 3212). Ring medians of `pixel/background − 1` at 60–70,
-  80–90 and 100–120 px must be within ±1 % of background of the no-LN control. Run 8 read
-  +15.5 / +4.1 / +1.1 % against +23.9 / +12.2 / +6.7 %; the ERP reads +24.9 / +12.9 / +7.0 %.
+- **Halo.** The star found near run 8's (7556, 3212) (§11.2). Ring excesses at 60–70, 80–90 and
+  100–120 px must be within ±1 % of background of the no-LN control, on the scale-normalized read
+  (raw beside it). Run 8 read +15.5 / +4.1 / +1.1 % against +23.9 / +12.2 / +6.7 %; the ERP reads
+  +24.9 / +12.9 / +7.0 %.
 - **B nodes.** No B node within 600 px of the star differs from the mean of its 8 neighbours by
   more than 2 % of background, on any member's sidecar.
 - **IC 434.** Three 100 × 100 px boxes on the bright rim of IC 434 and three background boxes off
   the nebula within 1500 px. They are chosen on the no-LN control and recorded in the acceptance
-  doc **before** the LN master is read. For each box, `median_box / median_background − 1` on the
-  LN master must be within ±1 point of background of the no-LN control.
+  doc **before** the LN master is read. Each box's excess on the LN master must be within ±1 point
+  of background of the no-LN control's, on the scale-normalized read (raw beside it). This row and
+  the B-move read are what watch the noise-dependent effects of §1.4.
 - **ERP slope.** Athenaeum's per-frame scale over the ERP's, against PSF variance: PSF signal with
   selection must reach within ±0.2 %/px² (from −0.49). The mean offset is explained by the
   reference choice (5 frames vs 10). F1 is reported. It is expected to show the ERP's own aperture
   term, so the bar does not apply to it (L-20).
-- **`main` reproduces the halo**, which confirms the acceptance copy matches run 8.
+- **`main` LN on reproduces run 8's ring deficit** (≈ −8 % of background at 60–90 px against the
+  no-LN control). That shows the acceptance copy is a fair stand-in for run 8.
 
-A halo or nebula row that misses is re-read after dividing both masters by their own master star
-flux ratio (`master_phot.py`). A miss explained by the scale is the estimator's, not the background
-model's. Rows are never re-sized and nothing is tuned toward a bar (owner rule): a miss stops the
-task and goes to the owner with its numbers.
+A miss that the raw read shows and the scale-normalized read does not is the estimator's, not the
+background model's. Rows are never re-sized and nothing is tuned toward a bar (owner rule): a miss
+stops the task and goes to the owner with its numbers.
 
 ### 11.4 Horse C11 preparation
 
+**Run 8** is the owner's record `/Volumes/Universe/Development/ath/runs/run-8.json` (app 0.6.4,
+2026-10-04 10:24):
+
+- LN on, scale 1024, `referenceFrames` 5;
+- output normalization `multiplicativeWithScaling`, rejection normalization `scaleZeroOffset`,
+  scale estimator `mad`;
+- G: 30 frames, 28 included.
+
+The dev catalog has no stacking rows for set 182. The prod catalog's own "run 8" is a different,
+LN-off run: never use it.
+
 1. `sqlite3 -readonly <dev app-data>/athenaeum.db ".backup <acc>/horse-c11/athenaeum.db"`.
-2. On the copy only, delete the Dark links of set 182's lights. In the dev catalog they point at
-   offset-50 darks; the owner's run 8 had flats only. Do not touch the flats' links.
-3. If the plan lists a master flat to build, its pre-calibration links follow the open-items
-   workaround (1.0 s → 1269, 0.5 s → 1297, bias → 1328). The geometry bug must not decide the
-   acceptance.
-4. Exclude every light outside the G group. Use run 8's stored config (`referenceFrames` 5). Its
-   stored `scale: 1024` reads as auto under L-9 and resolves to 1536.
-5. Raw data: `/Volumes/bigbase2/Astrobase/2024/horsehead11/`.
+2. Write run-8.json's `config` into the copy's `stacking_set_config` for set 182 through the API
+   (`set_stacking_config`), never by hand in SQL. Its stored `scale: 1024` reads as auto under L-9
+   and resolves to 1536. The optional fixed-1024 run (§11.1) sets `scaleMode: "fixed"`.
+3. On the copy only, delete the `calibration_set_to_frames` rows with `calibration_type = 'Dark'`
+   for set 182's lights (dark sets 1242 and 1315). In the dev catalog they point at offset-50 darks;
+   run 8 had flats only. Do not touch the flat links.
+4. The G lights link to raw Flat sets 786, 849, 1174 and 1205, so the plan builds master flats
+   (stage 0.5), and the L group's flats likewise. If the plan names an ROI pre-calibration master
+   for one of them, re-link it per the open-items workaround (1.0 s → 1269, 0.5 s → 1297,
+   bias → 1328). The geometry bug must not decide the acceptance.
+5. Keep run 8's geometry:
+   - keep the L group and exclude only the R and B lights;
+   - pin the registration reference manually to L frame 10666 (run 8's two-pass pick).
+6. Raw data: `/Volumes/bigbase2/Astrobase/2024/horsehead11/`.
 
 ### 11.5 Item 5
 
@@ -723,7 +837,8 @@ task and goes to the owner with its numbers.
   no warn. Excluded lights are not counted. The plan counts per group. Text formatting covers one
   value, a range and not recorded. Auto-link is unchanged (§5.4).
 - **Real data.** The Horse C11 copy (flats only) shows the warning in the plan, the Export tab and
-  the run summary. The run's corner ratio is computed from the G flat. Set 204 shows none.
+  the run summary. The run's corner ratio is computed from the L and G master flats. Set 204 shows
+  none.
 
 ## 12. Tasks and order (guidance for the plan)
 
@@ -731,17 +846,17 @@ Background model first, then the scale rule, then the selection, then F1. The wa
 independent and can land at any point. Each numeric task lands behind its own hash change (an
 `LN_MODEL_VERSION` bump, or the subtree change of §7) and fixture pins that record the delta.
 
-1. **Background model** (`ln/background.rs` rewrite; wiring in `normalize_frame` and
-   `run_group_normalization`; masked per-member tile reuse; `LnArtifactPayload` fields; logging;
-   unit pins of §1.6). Afterwards run `cargo check -p athenaeum-core --all-targets`, because the
+1. **Background model** (`ln/background.rs` rewrite: the own-threshold fit and the shared-acceptance
+   refit; wiring in `normalize_frame` and `run_group_normalization`; masked per-member tile reuse;
+   `LnArtifactPayload` fields; logging; the unit pins of §1.6, the extended-feature pin included). Afterwards run `cargo check -p athenaeum-core --all-targets`, because the
    probes use the old public API (`background_grid`, `DEFAULT_PARAMS`, `TARGET_DEVIATION_SIGMA`).
 2. **Scale rule** (`scaleMode`, `gridSize`, legacy decode, `resolve_scale`, hash token, plan twin
    and `PlanGroup` fields, `LnReferencePayload` dims, `SummaryGroup`, TS, the scale controls and
    resolved line in `NormalizePanel`, `stageSummary`, registry keywords).
 3. **Checkpoint A** (§11.1). Stop on a miss.
-4. **Star selection** (`σ_local` and the plane maximum from the model, the selection in both
-   paths and both calibration arms, `starSelection` config, logging, UI fields, the probe calling
-   it).
+4. **Star selection** (`σ_local` and the plane maximum from the model, the five-pixel peak from
+   `fit_one`, the selection in both paths and both calibration arms, `starSelection` config,
+   logging, UI fields, the probe calling it).
 5. **F1** (`fluxEstimator`, `aperture`, the finite mask, photometry with its validity rules, the
    growth curve, logging, UI fields, probe arms).
 6. **Pre-checks and the aperture choice** (§4.3), then **checkpoint B**.
@@ -761,8 +876,13 @@ The full core suite (`cargo test -p athenaeum-core`, all targets) runs before an
 
 ## 13. What changes for existing users
 
-- **Every set with LN on re-normalizes once** (reference, seeds calibration, every sidecar); the
-  plan shows Normalize stale until then. A set with LN off sees nothing but the warning.
+- **Every set with LN on re-normalizes once** (reference, seeds calibration, every sidecar). The
+  plan shows one "Normalize stale" pass after the upgrade, then reads cached again. A set with LN
+  off sees nothing but the warning.
+- **Normalize takes a little longer** (estimate ≈ +10 s on set 204's ≈ 2 min; reported, not
+  gated).
+- **The Normalize panel shows a "Resolved scale" line** in Auto mode, per group, marked as an
+  estimate until a run confirms it.
 - **The sky of every LN master changes.**
   - Halo and nebula "holes" near bright stars go.
   - Structures smaller than the scale are no longer followed by the background model: they are
@@ -787,27 +907,37 @@ The full core suite (`cargo test -p athenaeum-core`, all targets) runs before an
 **New (this spec):**
 
 - **L-1** One background procedure and one threshold for reference and target: `k_t = k_s = 3.0`,
-  in each image's own noise units. `TARGET_DEVIATION_SIGMA` retires.
+  in each image's own noise units, ending with the shared-acceptance refit of L-6.
+  `TARGET_DEVIATION_SIGMA` retires.
 - **L-2** Background samples are 32-px non-overlapping tiles, every pixel used, a tile needing 256
   present pixels.
 - **L-3** The surface is a penalized least-squares tensor cubic B-spline. The knot spacing is the
   scale, the penalty is a first-difference membrane, and `λ = 1e-4 ×` the median non-zero diagonal
-  of `BᵀB`. The fit is deterministic.
+  of `BᵀB`. It is accumulated in `f64` in tile order and solved by dense Cholesky, so it is
+  deterministic.
 - **L-4** Validity is a sample-count floor: a knot cell is supported at ≥ 8 accepted samples, and a
   plane is refused only with no supported cell. There is no rejected-fraction gate.
 - **L-5** A project member's reference model reuses the group reference's whole-overlap tiles and
   recomputes the edge tiles.
-- **L-6** The cross-noise consistency guard is the fallback if the sky-truth row fails; it is not
-  built now.
+- **L-6** The symmetric shared-acceptance refit (§1.2 step 7). After both own-threshold fits, the
+  reference and target surfaces are refitted on the intersection of their accepted samples, per
+  reference–target pair, with one factorization and no rejection round. It is not the rejected "one
+  shared mask from the reference": it is derived from both sides and sits on top of the model at
+  the scale. Measured on IC 434: 1.66 / 1.31 % → 0.23 / 0.20 % of background. It replaces the
+  earlier "consistency guard as a fallback". The plain tile median (no in-tile clip) is recorded as
+  a second lever, not built.
 - **L-7** The LN scale list is 256 … 8192.
 - **L-8** Snapping is to the nearest list value, ties to the smaller.
 - **L-9** A legacy document without `scaleMode` reads as auto at `scale == 1024`, fixed otherwise.
 - **L-10** `ln::resolve_scale` is the one function for plan and run. The plan's geometry is the
   grid, the stored LN reference's dims, or a marked estimate.
 - **L-11** The star selection applies to both estimators, both scale paths, both calibration arms
-  and the local-scale input, and runs on pairs.
-- **L-12** `σ_local` is the median tile σ of the accepted samples in the 3 × 3 tile block, else the
-  plane median. Peak SNR uses the fitted amplitude.
+  and the local-scale input, and runs on pairs. The `maxStars` cap counts matched pairs, a
+  deliberate deviation from the ERP's per-image cap.
+- **L-12** Peak SNR is `(peak − b) / σ_local`. `peak` is the mean of the five brightest finite pixels
+  in the fit's sampling region (the external reference pipeline's detector definition), recorded by
+  `fit_one` and not persisted. `b` is the fit background. `σ_local` is the median tile σ of the
+  accepted samples in the 3 × 3 tile block, else the plane median.
 - **L-13** F1's geometry: `F = max` of the two median fitted FWHMs; a whole-pixel circle at each
   frame's own centroid; an annulus `[6F, 8F]` median; validity rules as §4.1. The growth-curve
   variant is as defined there.
@@ -819,11 +949,17 @@ The full core suite (`cargo test -p athenaeum-core`, all targets) runs before an
 - **L-17** The pedestal warning's condition is link-based (Flat, no Dark, no Bias), per group, not
   for attested sets.
 - **L-18** The corner ratio is measured in the run only, from the flat's corner patches.
-- **L-19** `LN_MODEL_VERSION` lives in `normalization_subtree`. The resolved scale is a hash token,
-  and `scale`/`scaleMode`/`gridSize` leave the subtree. The LN reference image is rebuilt once with
-  the rest.
+- **L-19** `LN_MODEL_VERSION` lives in `normalization_subtree`, so the LN reference image is rebuilt
+  once with the rest. The resolved scale is a hash token on the per-frame `ln` and the
+  `ln_calibration` hashes only; the `ln_reference` hash carries none. `scale`/`scaleMode`/`gridSize`
+  leave the subtree, so a later scale change never rebuilds the reference image.
 - **L-20** The ERP-slope bar of math review §8 item 3 applies to PSF signal with selection, not to
   F1.
+- **L-21** MAD, the halo rings and the IC 434 boxes are judged on the scale-normalized read (the
+  master divided by its own star-flux ratio to the LN reference, §11.3), with the raw read reported
+  beside it.
+- **L-22** The `--stack-sim` bar for F1 is ±0.5 % of the same run's truth-corrected no-rejection
+  arm. The ratio to the LN reference is reported, not gated.
 
 **Overturned:**
 
@@ -854,26 +990,33 @@ The full core suite (`cargo test -p athenaeum-core`, all targets) runs before an
 
 ## 15. Open points for the owner
 
-Each was decided above so the plan can proceed. Each can be reversed without touching the rest.
+Seventeen points. Each was decided above, by this spec or by the controller's fix round, so the
+plan can proceed. Each can be reversed without touching the rest.
 
 1. Thresholds `k_t = k_s = 3.0` (the old reference value), in each image's own noise (L-1).
-2. Tile size 32 px with every pixel, not 64 px or decimated; Normalize about 30–60 % slower on set
-   204 (L-2, §1.5).
-3. The surface method and its constants: P-spline with knot spacing = scale, membrane penalty,
-   `λ = 1e-4` relative (L-3).
-4. The validity floor of 8 samples per knot cell (L-4).
-5. The LN scale floor of 256 and nearest-value snapping; the math review's "1536 on 6224×4168" is
+2. The symmetric shared-acceptance refit as the background model's final step (L-6), with the plain
+   tile median recorded as a second lever.
+3. Tile size 32 px with every pixel, not 64 px or decimated (L-2, §1.5).
+4. The surface method and its constants: P-spline with knot spacing = scale, membrane penalty,
+   `λ = 1e-4` relative, `f64`, dense Cholesky (L-3).
+5. The validity floor of 8 samples per knot cell (L-4).
+6. The LN scale floor of 256 and nearest-value snapping; the math review's "1536 on 6224×4168" is
    1024 under this rule (L-7, L-8).
-6. `gridSize` as a visible setting (1–16).
-7. The legacy rule: only `scale: 1024` becomes auto (L-9).
-8. The selection mechanics: pairs ranked by the reference's flux; SNR on both sides; saturation
-   radius `max(2, FWHM)`; the fallback `max(⌈n/4⌉, 20)` (L-11, L-12, L-14).
-9. The brightness trend of the 500 brightest (§3): if the acceptance shows more than 1 % across
-   terciles, whether to cap the top or raise `maxStars`.
-10. F1's annulus `[6F, 8F]` and the growth-curve definition (L-13).
-11. Choosing the aperture on `--stack-sim` plus the probe rather than three full checkpoints (L-15).
-12. The F1 default rule's margins (L-16).
-13. The ERP-slope bar moved from F1 to PSF signal with selection (L-20).
-14. The warning's numbers: counts, OFFSET/GAIN and flat ids in the plan and export; the measured
+7. `gridSize` as a visible setting (2–8, default 4).
+8. The legacy rule: only `scale: 1024` becomes auto (L-9).
+9. The selection mechanics: pairs ranked by the reference's flux; SNR on both sides; saturation
+   radius `max(2, FWHM)`; the fallback `max(⌈n/4⌉, 20)`; the 500 cap on pairs, not per image
+   (L-11, L-14).
+10. The peak definition for peak SNR: the mean of the five brightest pixels in the fit region minus
+    the fit background (L-12).
+11. The brightness trend of the 500 brightest (§3): if the acceptance shows more than 1 % across
+    terciles, whether to cap the top or raise `maxStars`.
+12. F1's annulus `[6F, 8F]` and the growth-curve definition (L-13).
+13. Choosing the aperture on `--stack-sim` plus the probe rather than three full checkpoints (L-15).
+14. The F1 default rule's margins, with the `--stack-sim` bar against the truth-corrected arm and
+    the scale-normalized reads (L-16, L-21, L-22).
+15. The ERP-slope bar moved from F1 to PSF signal with selection (L-20).
+16. The warning's numbers: counts, OFFSET/GAIN and flat ids in the plan and export; the measured
     corner ratio in the run only (L-17, L-18). Collab publish surfaces do not show it this cycle.
-15. Rebuilding the LN reference image once with the version bump (L-19).
+17. Rebuilding the LN reference image once with the version bump, and never for a scale change
+    (L-19).
