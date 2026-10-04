@@ -18,6 +18,7 @@ use crate::fits_writer::wcs::wcs_cards;
 use crate::fits_writer::{write_fits_f32, Card, CardValue, FitsWriteError};
 use crate::plate_solve::storage::PlateSolveRecord;
 use crate::stacking::config::OutputFormat;
+use crate::stacking::crop::{crop_file, CropRect};
 use crate::stacking::drizzle::{DrizzleKernel, DrizzleOutput};
 use crate::stacking::groups::ColorMode;
 use crate::stacking::integrate::GroupOutput;
@@ -146,7 +147,7 @@ pub struct MasterCardInputs<'a> {
     // `RunSummary.reference`, unaffected by which frame any one group
     // normalizes to.
     pub reference_id: &'a str,
-    pub group_key: &'a str,    // ATH_STKG
+    pub group_key: &'a str, // ATH_STKG
     /// Every distinct camera in the group (`IntegrationGroup.cameras`,
     /// already trimmed/sorted/deduped) — `ATH_STKC` (owner decision
     /// 2026-09-10: groups are camera-agnostic, so a master's own header
@@ -552,6 +553,7 @@ fn write_output(
     )
 }
 
+#[derive(Debug, Clone)]
 pub struct WrittenMaster {
     pub master: PathBuf,
     pub rejection_low: Option<PathBuf>,
@@ -688,6 +690,7 @@ pub fn drizzle_coverage_cards(drizzle_cards: &[Card]) -> Result<Vec<Card>, FitsW
     Ok(cards)
 }
 
+#[derive(Debug, Clone)]
 pub struct WrittenDrizzle {
     pub drizzle: PathBuf,
     pub weight_map: Option<PathBuf>,
@@ -771,8 +774,7 @@ pub fn write_drizzled_master(
                 .and_then(|s| s.to_str())
                 .unwrap_or("drizzle")
                 .to_string();
-            let weight_path =
-                resolve_collision(&dir.join(format!("{resolved_stem}_weight.{ext}")));
+            let weight_path = resolve_collision(&dir.join(format!("{resolved_stem}_weight.{ext}")));
             let weight_cards = weight_map_cards(cards)?;
             write_output(
                 &weight_path,
@@ -923,6 +925,182 @@ pub fn write_master_light(
         rejection_high,
         coverage,
     })
+}
+
+/// Plan 6b-3 D10 (spec §5.9): one group's master family — the master, its
+/// rejection maps and its coverage map, written uncropped as FITS into the
+/// run's scratch folder by [`write_master_light`] — re-read, cropped to
+/// `rect` and written into `dir` in `format`, named as
+/// [`write_master_light`] names them (the maps stay FITS). `cards` are the
+/// master's with the cropped `CRPIX` ([`crate::stacking::crop::restate_crpix`]);
+/// the maps' cards derive from them exactly as at the first write. On an
+/// error every file this call wrote is removed; the scratch is never
+/// touched.
+pub fn write_cropped_master(
+    dir: &Path,
+    scratch: &WrittenMaster,
+    rect: CropRect,
+    cards: &[Card],
+    format: OutputFormat,
+) -> anyhow::Result<WrittenMaster> {
+    let mut made = Vec::new();
+    let result = crop_master_family(dir, scratch, rect, cards, format, &mut made);
+    if result.is_err() {
+        remove_partial_outputs(&made);
+    }
+    result
+}
+
+fn crop_master_family(
+    dir: &Path,
+    scratch: &WrittenMaster,
+    rect: CropRect,
+    cards: &[Card],
+    format: OutputFormat,
+    made: &mut Vec<PathBuf>,
+) -> anyhow::Result<WrittenMaster> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let scratch_stem = scratch
+        .master
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("master");
+    let master = resolve_collision(
+        &dir.join(scratch_stem)
+            .with_extension(output_extension(format)),
+    );
+    crop_file(&scratch.master, &master, rect, cards, format)?;
+    made.push(master.clone());
+    let stem = master
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("master")
+        .to_string();
+    // The maps stay FITS, named from the final master's stem, their cards
+    // derived from the master's exactly as `write_master_light` derives them.
+    let maps = [
+        (
+            &scratch.rejection_low,
+            "rejlow",
+            rejection_map_cards("Low", cards)?,
+        ),
+        (
+            &scratch.rejection_high,
+            "rejhigh",
+            rejection_map_cards("High", cards)?,
+        ),
+        (&scratch.coverage, "coverage", coverage_map_cards(cards)?),
+    ];
+    let mut written: [Option<PathBuf>; 3] = [None, None, None];
+    for (slot, (src, suffix, map_cards)) in written.iter_mut().zip(maps.iter()) {
+        let Some(src) = src else { continue };
+        let path = resolve_collision(&dir.join(format!("{stem}_{suffix}.fits")));
+        crop_file(src, &path, rect, map_cards, OutputFormat::Fits)?;
+        made.push(path.clone());
+        *slot = Some(path);
+    }
+    let [rejection_low, rejection_high, coverage] = written;
+    Ok(WrittenMaster {
+        master,
+        rejection_low,
+        rejection_high,
+        coverage,
+    })
+}
+
+/// Plan 6b-3 D10: the drizzle family — the drizzled master, its weight map
+/// and its coverage — re-read from the scratch folder, cropped to `rect`
+/// (already `scale` times the master's, [`CropRect::scaled`]) and written
+/// into `dir` in `format`, named from the FINAL master's stem as
+/// [`write_drizzled_master`] names them. `cards` are the drizzle cards with
+/// the cropped, scaled `CRPIX`. On an error every file this call wrote is
+/// removed.
+pub fn write_cropped_drizzle(
+    dir: &Path,
+    master_stem: &str,
+    scale: u32,
+    scratch: &WrittenDrizzle,
+    rect: CropRect,
+    cards: &[Card],
+    format: OutputFormat,
+) -> anyhow::Result<WrittenDrizzle> {
+    let mut made = Vec::new();
+    let result = crop_drizzle_family(
+        dir,
+        master_stem,
+        scale,
+        scratch,
+        rect,
+        cards,
+        format,
+        &mut made,
+    );
+    if result.is_err() {
+        remove_partial_outputs(&made);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn crop_drizzle_family(
+    dir: &Path,
+    master_stem: &str,
+    scale: u32,
+    scratch: &WrittenDrizzle,
+    rect: CropRect,
+    cards: &[Card],
+    format: OutputFormat,
+    made: &mut Vec<PathBuf>,
+) -> anyhow::Result<WrittenDrizzle> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let ext = output_extension(format);
+    let (drizzle_name, _) = drizzle_file_names(master_stem, scale);
+    let drizzle = resolve_collision(&dir.join(&drizzle_name).with_extension(ext));
+    crop_file(&scratch.drizzle, &drizzle, rect, cards, format)?;
+    made.push(drizzle.clone());
+    let stem = drizzle
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("drizzle")
+        .to_string();
+    let weight_map = match &scratch.weight_map {
+        Some(src) => {
+            let path = resolve_collision(&dir.join(format!("{stem}_weight.{ext}")));
+            crop_file(src, &path, rect, &weight_map_cards(cards)?, format)?;
+            made.push(path.clone());
+            Some(path)
+        }
+        None => None,
+    };
+    let coverage = match &scratch.coverage {
+        Some(src) => {
+            let path = resolve_collision(&dir.join(format!("{stem}_coverage.fits")));
+            crop_file(
+                src,
+                &path,
+                rect,
+                &coverage_map_cards(cards)?,
+                OutputFormat::Fits,
+            )?;
+            made.push(path.clone());
+            Some(path)
+        }
+        None => None,
+    };
+    Ok(WrittenDrizzle {
+        drizzle,
+        weight_map,
+        coverage,
+    })
+}
+
+/// Removes the files a failed crop wrote, logging each one it cannot.
+fn remove_partial_outputs(made: &[PathBuf]) {
+    for path in made {
+        if let Err(error) = std::fs::remove_file(path) {
+            tracing::warn!(path = %path.display(), error = %error, "removing a partial crop output failed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1471,9 +1649,14 @@ mod tests {
             stats: dummy_stats(),
         };
 
-        let first =
-            write_master_light(dir.path(), "master.fits", &output, &cards, OutputFormat::Fits)
-                .unwrap();
+        let first = write_master_light(
+            dir.path(),
+            "master.fits",
+            &output,
+            &cards,
+            OutputFormat::Fits,
+        )
+        .unwrap();
         assert_eq!(
             first.master.file_name().and_then(|s| s.to_str()),
             Some("master.fits")
@@ -1520,9 +1703,14 @@ mod tests {
         assert_eq!(high_header.get_str("ATH_STK").as_deref(), Some("T"));
 
         // Write again with the same file name → collision-suffixed names, no overwrite.
-        let second =
-            write_master_light(dir.path(), "master.fits", &output, &cards, OutputFormat::Fits)
-                .unwrap();
+        let second = write_master_light(
+            dir.path(),
+            "master.fits",
+            &output,
+            &cards,
+            OutputFormat::Fits,
+        )
+        .unwrap();
         assert_eq!(
             second.master.file_name().and_then(|s| s.to_str()),
             Some("master_2.fits")
@@ -2132,9 +2320,145 @@ mod tests {
         assert_eq!(get("ATH_STK"), Some(CardValue::Logical(true)));
         assert_eq!(get("CRVAL1"), Some(CardValue::Real(10.0)));
         assert_eq!(get("CD1_1"), Some(CardValue::Real(-1e-4)));
-        for k in ["ROWORDER", "ATH_STKI", "ATH_STKG", ATH_RGEO, ATH_GRID, ATH_SPRJ] {
+        for k in [
+            "ROWORDER", "ATH_STKI", "ATH_STKG", ATH_RGEO, ATH_GRID, ATH_SPRJ,
+        ] {
             assert!(get(k).is_some(), "{k} is copied");
         }
         assert!(get("FILTER").is_none() && get("ATH_PRJ").is_none());
+    }
+
+    /// Plan 6b-3 D10, review I7: finalizing a scratch family with the FULL
+    /// rectangle writes what the K = 0 writer writes — the same name, the
+    /// same pixels and keywords (XISF is not byte-reproducible: it stamps its
+    /// creation time) and byte-identical FITS maps — and a real crop takes
+    /// every member of the family to the rectangle, its `CRPIX` moved.
+    #[test]
+    fn a_full_rectangle_crop_writes_what_the_master_writer_writes() {
+        let (w, h, ch) = (8usize, 6usize, 3usize);
+        let plane = w * h;
+        let mut cards = HeaderBuilder::new(FrameKind::MasterLight).build().unwrap();
+        cards.push(Card::new("ATH_STKI", CardValue::Str("run-7".into())).unwrap());
+        cards.extend(wcs_cards(&record(false)).unwrap());
+        let output = GroupOutput {
+            width: w,
+            height: h,
+            channels: ch,
+            data: (0..plane * ch).map(|i| i as f32 / 1000.0).collect(),
+            rejection_low: Some(vec![1.0f32; plane * ch]),
+            rejection_high: Some(vec![2.0f32; plane * ch]),
+            coverage: Some((0..plane).map(|i| (i % 4) as f32).collect()),
+            included: vec![0, 1, 2],
+            output_pairs: vec![Vec::new(); ch],
+            second_pass_rej_ok: false,
+            stats: dummy_stats(),
+            measure_rect: None,
+        };
+        let (direct, scratch, finals, cut) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let k0 = write_master_light(direct.path(), "master", &output, &cards, OutputFormat::Xisf)
+            .unwrap();
+        let staged = write_master_light(
+            scratch.path(),
+            "master",
+            &output,
+            &cards,
+            OutputFormat::Fits,
+        )
+        .unwrap();
+        let full = write_cropped_master(
+            finals.path(),
+            &staged,
+            CropRect::full(w, h),
+            &cards,
+            OutputFormat::Xisf,
+        )
+        .unwrap();
+        let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name(&full.master), name(&k0.master));
+        let (ma, pa) = astroimage::ImageConverter::read_raw(&k0.master).unwrap();
+        let (mb, pb) = astroimage::ImageConverter::read_raw(&full.master).unwrap();
+        assert_eq!(
+            (ma.width, ma.height, ma.channels),
+            (mb.width, mb.height, mb.channels)
+        );
+        match (pa, pb) {
+            (astroimage::PixelData::Float32(a), astroimage::PixelData::Float32(b)) => {
+                assert!(
+                    a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "the same pixels"
+                );
+            }
+            _ => panic!("expected Float32 samples"),
+        }
+        let keys = |p: &Path| {
+            crate::fits_parser::stored_header::parse_stored_header_keys(
+                crate::models::FileFormat::XISF,
+                &crate::fits_parser::extract_xisf_header(p).unwrap(),
+            )
+        };
+        assert_eq!(keys(&full.master), keys(&k0.master), "the same keywords");
+        for (a, b) in [
+            (&k0.rejection_low, &full.rejection_low),
+            (&k0.rejection_high, &full.rejection_high),
+            (&k0.coverage, &full.coverage),
+        ] {
+            let (a, b) = (a.as_ref().unwrap(), b.as_ref().unwrap());
+            assert_eq!(name(a), name(b));
+            assert_eq!(
+                std::fs::read(a).unwrap(),
+                std::fs::read(b).unwrap(),
+                "{} differs",
+                name(a)
+            );
+        }
+
+        let rect = CropRect {
+            x0: 2,
+            y0: 1,
+            width: 4,
+            height: 3,
+        };
+        let mut cropped_cards = cards.clone();
+        crate::stacking::crop::restate_crpix(
+            &mut cropped_cards,
+            &crate::stacking::grid_map::crop_plate_solve(&record(false), 2, 1),
+        );
+        let c = write_cropped_master(
+            cut.path(),
+            &staged,
+            rect,
+            &cropped_cards,
+            OutputFormat::Fits,
+        )
+        .unwrap();
+        let reader = crate::integration::plane_reader::PlaneReader::open(&c.master).unwrap();
+        assert_eq!(
+            (reader.width(), reader.height(), reader.channels()),
+            (4, 3, 3)
+        );
+        assert_eq!(
+            reader.read_plane(1).unwrap(),
+            crate::stacking::crop::crop_plane(&output.data[plane..2 * plane], w, rect)
+        );
+        let cov = crate::integration::plane_reader::PlaneReader::open(c.coverage.as_ref().unwrap())
+            .unwrap();
+        assert_eq!((cov.width(), cov.height(), cov.channels()), (4, 3, 1));
+        let moved =
+            crate::fits_parser::FitsHeader::from_path(c.coverage.as_ref().unwrap()).unwrap();
+        let before =
+            crate::fits_parser::FitsHeader::from_path(k0.coverage.as_ref().unwrap()).unwrap();
+        assert!(
+            (moved.get_f64("CRPIX1").unwrap() - (before.get_f64("CRPIX1").unwrap() - 2.0)).abs()
+                < 1e-9
+        );
+        assert!(
+            (moved.get_f64("CRPIX2").unwrap() - (before.get_f64("CRPIX2").unwrap() - 1.0)).abs()
+                < 1e-9
+        );
     }
 }

@@ -277,6 +277,14 @@ impl WorkingLayout {
         self.runs_dir().join(format!("run-{run_id}.json"))
     }
 
+    /// `root/runs/run-<run_id>-uncropped` — plan 6b-3 D10: a crop run's
+    /// outputs, written as FITS and held here until the run's crop rectangle
+    /// is known; removed by the crop pass once every group is finalized,
+    /// kept (and named in the run's warnings) when one could not be.
+    pub fn uncropped_dir(&self, run_id: i64) -> PathBuf {
+        self.runs_dir().join(format!("run-{run_id}-uncropped"))
+    }
+
     /// `root/previews` — the parent of every run's master-light preview
     /// cache (M4d Task 3, ruling R-M4d-5). Like `rej/`, these are per-RUN
     /// and nest one level deeper than the cached-artifact subtrees; unlike
@@ -664,6 +672,10 @@ pub struct EstimateInputs<'a> {
     /// which is a third of that group's calibrated footprint again. Nothing
     /// for a mono group, which has no mosaic to keep.
     pub drizzle_bayer: bool,
+    /// Plan 6b-3 D10, review M6: `output.cropToCoverage > 0` — every output
+    /// is written twice for a moment (the scratch FITS, then the final file),
+    /// so the master and drizzle families count twice.
+    pub crop_scratch: bool,
 }
 
 /// Rough byte estimate for a run's working+output footprint: every group
@@ -776,7 +788,8 @@ fn estimate_bytes_with(
 
         let master_per_frame_bytes = planes * max_w * max_h * 4;
         let master_multiplier: u64 = if i.write_maps { 1 + 2 } else { 1 };
-        total += master_per_frame_bytes * master_multiplier;
+        let copies: u64 = if i.crop_scratch { 2 } else { 1 };
+        total += master_per_frame_bytes * master_multiplier * copies;
 
         // Rejection-bitmap temporaries, all the same size: one `.rej` per
         // included frame when drizzle wants the survivor mask, and (M4c
@@ -801,9 +814,9 @@ fn estimate_bytes_with(
         if let Some((scale, write_weight_map, _use_rejection)) = i.drizzle {
             let s = scale as u64;
             let drizzle_output_bytes = planes * (max_w * s) * (max_h * s) * 4;
-            total += drizzle_output_bytes;
+            total += drizzle_output_bytes * copies;
             if write_weight_map {
-                total += drizzle_output_bytes;
+                total += drizzle_output_bytes * copies;
             }
         }
     }
@@ -1467,6 +1480,29 @@ mod tests {
         }
     }
 
+    /// Review M6: a crop run holds every output twice for a moment — the
+    /// scratch FITS, then the final file — so the estimate counts the master
+    /// family and the drizzle family once more. The coverage maps (one f32
+    /// plane each) stay uncounted, as before.
+    #[test]
+    fn a_crop_run_counts_its_scratch_outputs() {
+        let groups = vec![group(ColorMode::Mono, 3, 10, 10)];
+        let inputs = |crop_scratch: bool| EstimateInputs {
+            groups: &groups,
+            write_registered: false,
+            write_maps: true,
+            drizzle: Some((2, true, false)),
+            large_scale: false,
+            drizzle_bayer: false,
+            crop_scratch,
+        };
+        let plain = estimate_bytes(&inputs(false));
+        let crop = estimate_bytes(&inputs(true));
+        // The master 400 B with its two maps, the drizzled master 1600 B and
+        // its weight map 1600 B.
+        assert_eq!(crop - plain, 3 * 400 + 2 * 1600);
+    }
+
     fn group(color_mode: ColorMode, n_frames: i64, w: i64, h: i64) -> IntegrationGroup {
         IntegrationGroup {
             key: "g".to_string(),
@@ -1496,6 +1532,7 @@ mod tests {
             drizzle: None,
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         };
         // Tier C Task 1: the fits term is a flat per-(frame, plane) add-on,
         // unconditional and independent of every other toggle — 2 mono
@@ -1534,6 +1571,7 @@ mod tests {
                 drizzle: None,
                 large_scale: false,
                 drizzle_bayer: false,
+                crop_scratch: false,
             }
         }
         assert_eq!(
@@ -1566,6 +1604,7 @@ mod tests {
             drizzle: None,
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         let on = estimate_bytes(&EstimateInputs {
             groups: &groups,
@@ -1574,6 +1613,7 @@ mod tests {
             drizzle: None,
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         assert_eq!(
             on,
@@ -1603,6 +1643,7 @@ mod tests {
             drizzle: None,
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         let on = estimate_bytes(&EstimateInputs {
             groups: &groups,
@@ -1611,6 +1652,7 @@ mod tests {
             drizzle: None,
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         assert_eq!(
             on,
@@ -1636,6 +1678,7 @@ mod tests {
             drizzle: None,
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         let with_drizzle = estimate_bytes(&EstimateInputs {
             groups: &groups,
@@ -1644,6 +1687,7 @@ mod tests {
             drizzle: Some((2, true, true)),
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         assert_eq!(
             with_drizzle,
@@ -1659,6 +1703,7 @@ mod tests {
             drizzle: Some((2, false, true)),
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         assert_eq!(with_drizzle_no_weight_map, without_drizzle + 240 + 1600);
 
@@ -1670,6 +1715,7 @@ mod tests {
             drizzle: Some((2, true, false)),
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         assert_eq!(with_drizzle_no_rejection, without_drizzle + 3200);
     }
@@ -1690,6 +1736,7 @@ mod tests {
             drizzle: None,
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         let large_scale_only = estimate_bytes(&EstimateInputs {
             groups: &groups,
@@ -1698,6 +1745,7 @@ mod tests {
             drizzle: None,
             large_scale: true,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         assert_eq!(
             large_scale_only,
@@ -1712,6 +1760,7 @@ mod tests {
             drizzle: Some((2, true, true)),
             large_scale: true,
             drizzle_bayer: false,
+            crop_scratch: false,
         });
         assert_eq!(
             both,
@@ -1736,6 +1785,7 @@ mod tests {
                 drizzle: drizzle.then_some((2, false, false)),
                 large_scale: false,
                 drizzle_bayer: bayer,
+                crop_scratch: false,
             })
         };
 
@@ -2172,6 +2222,7 @@ mod tests {
             drizzle: None,
             large_scale: false,
             drizzle_bayer: false,
+            crop_scratch: false,
         };
         let expected: u64 =
             12_345 + 3 * FITS_ARTIFACT_ESTIMATE_BYTES + 3 * 1000 * 1000 * 4 + 1000 * 1000 * 4;

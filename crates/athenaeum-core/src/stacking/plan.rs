@@ -2654,6 +2654,7 @@ pub fn build_plan(
         // test, which `estimate_bytes` makes itself (fix round 1, I1: with
         // the debayer off no mosaic is kept, so the term must not be added).
         drizzle_bayer: cfg.drizzle.bayer && cfg.calibration.debayer_osc,
+        crop_scratch: cfg.output.crop_to_coverage > 0,
     };
     let estimate_bytes = match project
         .as_ref()
