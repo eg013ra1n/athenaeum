@@ -28,9 +28,19 @@ if pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1; then
   echo "refusing to start: a cargo/rustc process is alive on this machine" >&2
   exit 1
 fi
+SRV_PID=""; SSE_PID=""
+cleanup() {
+  [ -n "$SSE_PID" ] && kill "$SSE_PID" 2>/dev/null
+  [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
+  # Fallback only: the recorded PIDs above are the primary stop (server.sh execs the server, so
+  # SRV_PID is the server itself).
+  pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
 SRV="$REPO/docs/superpowers/research/scripts/acceptance/server.sh"
 export ATHENAEUM_LOG="info,athenaeum_core::stacking=debug,athenaeum_core::integration=debug"
 zsh "$SRV" "$W" "$PORT" > "$W/server-project.out" 2>&1 &
+SRV_PID=$!
 BODY="{\"projectId\":\"$PID\"}"
 for i in $(seq 1 240); do
   if curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/api/get_project_stacking_plan" -H 'content-type: application/json' -d "$BODY" 2>/dev/null | grep -q '^200$'; then break; fi
@@ -44,8 +54,6 @@ RESP=$(curl -sS -X POST "http://127.0.0.1:$PORT/api/start_project_stacking" -H '
 echo "$RESP" >> "$W/run-project.txt"; echo >> "$W/run-project.txt"
 if ! printf '%s' "$RESP" | grep -q '"runId"'; then
   echo "start_project_stacking refused for $PID: $RESP" >&2
-  kill $SSE_PID 2>/dev/null
-  pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
   exit 1
 fi
 RUN_ID=$(printf '%s' "$RESP" | sed -E 's/.*"runId":([0-9]+).*/\1/')
@@ -55,13 +63,20 @@ for i in $(seq 1 480); do
   sleep 30
 done
 T1=$(date +%s); echo "end $(date -u +%FT%TZ) epoch=$T1 wall_s=$((T1-T0)) run_id=$RUN_ID" >> "$W/run-project.txt"
+STATUS=0
 if [ "$FINISHED" != "1" ]; then
   # Review M10: a 4-hour wait that ends without the event is a timeout,
   # never a finished run.
   echo "TIMED OUT after 4 h waiting for stacking-complete of run $RUN_ID" | tee -a "$W/run-project.txt" >&2
+  STATUS=1
 fi
-grep -A1 'stacking-complete' "$W/events-project.log" | grep "\"runId\":$RUN_ID[,}]" >> "$W/run-project.txt"
-kill $SSE_PID 2>/dev/null
-pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
+COMPLETE=$(grep -A1 'stacking-complete' "$W/events-project.log" | grep "\"runId\":$RUN_ID[,}]")
+printf '%s\n' "$COMPLETE" >> "$W/run-project.txt"
+if [ "$FINISHED" = "1" ] && ! printf '%s' "$COMPLETE" | grep -q '"success":true'; then
+  echo "run $RUN_ID finished WITHOUT success: $COMPLETE" | tee -a "$W/run-project.txt" >&2
+  STATUS=1
+fi
+cleanup
 sleep 3
 cat "$W/run-project.txt"
+exit $STATUS

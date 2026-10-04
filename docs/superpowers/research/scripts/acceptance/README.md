@@ -40,14 +40,20 @@ not rebuilt per cycle (owner request 2026-09-18).
    master its pixel dims, the crop rectangle when the run cropped, the drizzle
    master's dims). A large grid × k² drizzle with the coverage map on may be
    refused for memory: record such a refusal with its numbers; do not shrink
-   the run on your own initiative. `--ln-truth` prints each member's
-   local-normalization scale (from the run's debug log events) next to the
-   median reference/member flux ratio of 30–60 bright isolated stars measured
-   on the registered artifacts: a frame's LN scale depends on its PSF width
-   (+1/3 px² of PSF variance moves it by about 2.6 %) and a project's members
-   come from different instruments, so it shows the scale beside a photometric
-   truth, per instrument, with no tolerance. `grid-report.py --self-check`
-   runs the synthetic check of the ratio and the log parser (no real data).
+   the run on your own initiative. Run B calls `grid-report.py <work-dir>
+   <project-id> --ln-truth`: it prints each summary member's
+   local-normalization scale (from the run's debug log events, matched by the
+   `ln_plane` span and the run's id and time window) next to a photometric
+   truth, with the cause for every member that has no scale (excluded, cached,
+   global normalization, LN failed). A frame's LN scale depends on its PSF
+   width (+1/3 px² of PSF variance moves it by about 2.6 %) and a project's
+   members come from different instruments, so the truth is an adaptive
+   aperture ratio (FWHM per frame, radii from 3F, sky annulus 10–12F,
+   curve-of-growth correction, isolated and unsaturated stars in both frames),
+   reported per instrument with no tolerance. The acceptance build must
+   include the `ln_plane` / `ln_seeds_calibration` span commits, or the log
+   carries no frame identity. `grid-report.py --self-check` runs the
+   synthetic check of the photometry and the log parser (no real data).
 
 A catalog copy is made with `sqlite3 -readonly <live db> ".backup <copy>"`,
 never by reading the live catalog any other way, and `prepare-catalog.sh` is

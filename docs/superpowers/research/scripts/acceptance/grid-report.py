@@ -35,15 +35,33 @@ artifacts (median of reference/member, the same direction as the scale: the
 sidecar applies v' = A*v + B, so A = reference/member). Per plane for OSC.
 No tolerance, no pass/fail: the numbers go to the owner. The scale comes from
 the "ln relative scale" debug events of <work-dir>/logs/*.jsonl, identified by
-the `ln_scale` span (fields `frame_id` = the project-frame handle, `plane`) and
-by the run's [started_at, finished_at] window; the applied scale is that event's
+the `ln_plane` span (fields `frame_id` = the project-frame handle, `plane`), by
+the run's [startedAt, finishedAt] window, and never under `ln_seeds_calibration`
+(the throwaway arms of the seeds calibration); the applied scale is that event's
 `ln_scale` times the group's seeds-calibration `k` for the plane when the event
-came from the seeds path (`ln_scale_source`). --self-check runs a synthetic
-check of the photometric ratio and the log parser, no real data.
+came from the seeds path (`ln_scale_source`), cross-checked per member against
+the main pass's "ln frame normalized" event (its mean over planes) and the
+summary's `lnScale`. Every member of the run summary is listed with the cause
+when it has no scale (excluded, cached, global normalization, LN failed).
+
+The photometric truth is adaptive, per (member, plane), the same radii in both
+frames: FWHM per frame from the half-maximum area of ~100 isolated stars (the
+connected region around the peak, so a neighbour inside the window cannot
+inflate it), F = max of the two; aperture radius max(3F, 5 px), sky annulus
+[10F, 12F] (3-sigma-clipped mean), curve-of-growth correction c = median
+flux(3F)/flux(8F) per frame, ratio = median(ref/member at 3F) * c_mem / c_ref.
+Stars: no other candidate peak within 14F, no pixel brighter than
+max(bg + 5 sigma, 2 % of the peak) between 3F and 14F in either frame (the
+brief says "outside 1.5F" — a bright star's own wings exceed 5 sigma there),
+the window finite in both frames (and non-zero in the LN reference), no
+saturation in either frame (3x3 core with >= 3 pixels within 2 % of its max, or
+a peak above half of that frame's brightest candidate). n >= 10 is required;
+with fewer, the crowded fallback (annulus [5F, 7F], r_ap = 5F, no correction,
+isolation 9F) is tried and said so. --self-check runs synthetic checks of the
+photometry (Gaussian and Moffat, different widths) and the log parser.
 """
 import json
 import math
-import os
 import re
 import sqlite3
 import subprocess
@@ -104,36 +122,46 @@ def fits_keys(path):
     return keys
 
 
-def report_masters_dims(db, run_id, key, grid, summary):
-    """R2: pixel dims of every master row of the group, the crop rectangle, the drizzle dims."""
+def report_masters_dims(db, run_id, key, grid, summary, crops):
+    """R2: pixel dims of every master row of the group, the crop rectangle, the drizzle dims.
+    The rectangle comes from the "outputs cropped" info event of the run's log (any format) and,
+    for a FITS master, from its CRPIX1/2 against the uncropped grid centre; a mismatch is flagged."""
     rows = db.execute(
         "SELECT kind, path, width, height, channels FROM master_lights WHERE run_id = ? AND group_key = ? ORDER BY kind",
         (run_id, key),
     ).fetchall()
     crop_k = ((summary.get("config") or {}).get("output") or {}).get("cropToCoverage", 0)
     gw, gh = grid["widthPx"], grid["heightPx"]
+    master_dims = next(((w, h) for kind, _, w, h, _ in rows if kind == "master"), (gw, gh))
     for kind, path, w, h, ch in rows:
         print(f"  {kind}: {w} x {h} px, {ch} plane(s)  (grid {gw} x {gh})")
         if kind == "master":
-            if not crop_k:
-                print(f"  crop: cropToCoverage off; master {'equals' if (w, h) == (gw, gh) else 'DIFFERS FROM'} the grid")
-                continue
+            ev = crops.get(key)
+            from_log = None
+            if ev:
+                x0, y0, cw, chh, message = ev
+                from_log = (x0, y0, cw, chh)
+                print(f"  crop (log event \"{message}\"): x0 {x0} y0 {y0} width {cw} height {chh}")
+            elif crop_k:
+                print("  crop: cropToCoverage is on but the log holds no 'outputs cropped' event for this group "
+                      "(run made below info, or logs rotated away)")
             keys = fits_keys(path)
-            if "CRPIX1" in keys and "CRPIX2" in keys:
+            if crop_k and "CRPIX1" in keys and "CRPIX2" in keys:
                 x0 = round((gw + 1) / 2.0 - float(keys["CRPIX1"]))
                 y0 = round((gh + 1) / 2.0 - float(keys["CRPIX2"]))
-                print(f"  crop (cropToCoverage = {crop_k}): x0 {x0} y0 {y0} width {w} height {h} "
-                      f"(from the master's CRPIX1/2 {keys['CRPIX1']}/{keys['CRPIX2']}; summary_json carries no rectangle)")
-            else:
-                print(f"  crop (cropToCoverage = {crop_k}): {w} x {h} of the {gw} x {gh} grid; the rectangle's offset is not "
-                      f"recoverable from a non-FITS master (no CRPIX read here)")
+                print(f"  crop (FITS CRPIX1/2 {keys['CRPIX1']}/{keys['CRPIX2']}): x0 {x0} y0 {y0} width {w} height {h}")
+                if from_log and from_log != (x0, y0, w, h):
+                    print(f"  CROP MISMATCH: log {from_log} vs master header {(x0, y0, w, h)}")
+            elif not crop_k:
+                print(f"  crop: cropToCoverage off; master {'equals' if (w, h) == (gw, gh) else 'DIFFERS FROM'} the grid")
         elif kind == "drizzle":
-            print(f"  drizzle master {w} x {h} px = {w / gw:.3f} x {h / gh:.3f} of the grid's own pixel count")
+            mw, mh = master_dims
+            print(f"  drizzle master {w} x {h} px = {w / mw:.3f} x {h / mh:.3f} of the master's own dims")
     if not any(r[0] == "drizzle" for r in rows):
         print("  drizzle master: none")
 
 
-# --- LN truth (R1) ----------------------------------------------------------------
+# --- the log (R1) ----------------------------------------------------------------------------
 
 
 def parse_ts(text):
@@ -147,111 +175,306 @@ def parse_ts(text):
     return datetime.fromisoformat(f"{base}{frac}{tz}")
 
 
-def parse_ln_line(line):
-    """One JSONL line -> (timestamp, frame_id, plane, ln_scale, source) for an "ln relative scale"
-    debug event inside an `ln_scale` span, else None. The span fields come from the innermost
-    `ln_scale` entry of `spans` (the log layer writes the whole chain)."""
+def parse_event(line):
+    """One JSONL line -> a tagged tuple, or None.
+      ("plane", ts, frame_id, plane, ln_scale, source)  an "ln relative scale" debug event inside an
+          `ln_plane` span and NOT inside `ln_seeds_calibration` (the calibration's throwaway arms);
+      ("frame", ts, run_id, frame_id, ln_scale)         the main pass's "ln frame normalized" event;
+      ("crop", ts, run_id, group_key, x0, y0, w, h, message)  "outputs cropped" / "outputs finalized uncropped"."""
     try:
         o = json.loads(line)
     except ValueError:
         return None
     f = o.get("fields") or {}
-    if f.get("message") != "ln relative scale" or "ln_scale" not in f:
+    msg = f.get("message")
+    try:
+        ts = parse_ts(o["timestamp"])
+        if msg == "ln relative scale" and "ln_scale" in f:
+            spans = o.get("spans") or [o.get("span") or {}]
+            if any(sp.get("name") == "ln_seeds_calibration" for sp in spans):
+                return None
+            sp = next((sp for sp in reversed(spans) if sp.get("name") == "ln_plane"), None)
+            if sp is None or "frame_id" not in sp or "plane" not in sp:
+                return None
+            return ("plane", ts, int(sp["frame_id"]), int(sp["plane"]), float(f["ln_scale"]), f.get("ln_scale_source", ""))
+        if msg == "ln frame normalized" and "run_id" in f and "frame_id" in f and "ln_scale" in f:
+            return ("frame", ts, int(f["run_id"]), int(f["frame_id"]), float(f["ln_scale"]))
+        if msg in ("outputs cropped", "outputs finalized uncropped") and "run_id" in f and "group_key" in f:
+            return ("crop", ts, int(f["run_id"]), f["group_key"], int(f["crop_x0"]), int(f["crop_y0"]),
+                    int(f["crop_width"]), int(f["crop_height"]), msg)
+    except (KeyError, ValueError, TypeError):
         return None
-    span = None
-    for sp in reversed(o.get("spans") or [o.get("span") or {}]):
-        if sp.get("name") == "ln_scale":
-            span = sp
-            break
-    if span is None or "frame_id" not in span or "plane" not in span:
-        return None
-    return (parse_ts(o["timestamp"]), int(span["frame_id"]), int(span["plane"]),
-            float(f["ln_scale"]), f.get("ln_scale_source", ""))
+    return None
 
 
-def read_ln_events(log_dir, t0, t1):
-    """{(frame_id, plane): (ln_scale, source)} of the last matching event inside [t0, t1]."""
-    out, seen = {}, 0
+def read_log(log_dir, t0, t1, run_id):
+    """The run's events: {"plane": {(frame_id, plane): (scale, source)}, "frame": {frame_id: scale},
+    "crop": {group_key: (x0, y0, w, h, message)}, "seen": n}. Events carrying a run_id are filtered by it,
+    those that do not (the plane events) by the [t0, t1] window; the last one wins."""
+    out = {"plane": {}, "frame": {}, "crop": {}, "seen": 0}
     for path in sorted(Path(log_dir).glob("*")):
         if not path.is_file():
             continue
         with open(path, errors="replace") as fh:
             for line in fh:
-                if "ln relative scale" not in line:
+                if "ln relative scale" not in line and "ln frame normalized" not in line and "outputs " not in line:
                     continue
-                ev = parse_ln_line(line)
-                if ev is None or not (t0 <= ev[0] <= t1):
+                ev = parse_event(line)
+                if ev is None:
                     continue
-                seen += 1
-                out[(ev[1], ev[2])] = (ev[3], ev[4])
-    return out, seen
+                if ev[0] == "plane":
+                    if not (t0 <= ev[1] <= t1):
+                        continue
+                    out["plane"][(ev[2], ev[3])] = (ev[4], ev[5])
+                elif ev[0] == "frame":
+                    if ev[2] != run_id:
+                        continue
+                    out["frame"][ev[3]] = ev[4]
+                else:
+                    if ev[2] != run_id:
+                        continue
+                    out["crop"][ev[3]] = (ev[4], ev[5], ev[6], ev[7], ev[8])
+                out["seen"] += 1
+    return out
 
 
-def pick_stars(ref, want=60, edge=15, half=14):
-    """Bright, isolated, unsaturated stars of one reference plane: (y, x) peak positions.
-    Local maxima well above the background, the brightest in a (2*half+1)^2 window, at least
-    `edge` px from the border, the whole window finite and nonzero (covered), and below the
-    saturated end (the top 10 % of candidates and anything within 2 % of the image maximum)."""
-    ok = np.isfinite(ref) & (ref != 0)
-    vals = ref[ok]
+# --- adaptive aperture photometry (R1, fix round 1) ----------------------------------------------
+
+
+def covered(win, zero_is_uncovered):
+    """True when a window holds no uncovered pixel: a non-finite one always, a zero one only for the
+    LN reference (registered artifacts of members are NaN-filled outside their footprint)."""
+    if not np.isfinite(win).all():
+        return False
+    return not (zero_is_uncovered and (win == 0).any())
+
+
+def sky_stats(img, zero_is_uncovered=False):
+    ok = np.isfinite(img)
+    if zero_is_uncovered:
+        ok &= img != 0
+    vals = img[ok]
     if vals.size == 0:
-        return []
+        return float("nan"), float("nan")
     bg = float(np.median(vals))
-    sigma = 1.4826 * float(np.median(np.abs(vals - bg)))
-    if sigma <= 0:
-        return []
-    hi = float(vals.max())
-    h, w = ref.shape
+    return bg, 1.4826 * float(np.median(np.abs(vals - bg)))
+
+
+def reference_candidates(ref):
+    """Local maxima (brightest in their 7x7 neighbourhood) more than 20 sigma above the sky of the
+    LN reference plane: rows (y, x, peak above the sky), brightest first, and the sky (bg, sigma)."""
+    bg, sigma = sky_stats(ref, True)
+    if not (sigma > 0):
+        return np.zeros((0, 3)), bg, sigma
+    ok = np.isfinite(ref) & (ref != 0)
     ys, xs = np.nonzero(np.where(ok, ref, bg) > bg + 20 * sigma)
     order = np.argsort(-ref[ys, xs])[:20000]
-    cands = []
-    taken = np.zeros(ref.shape, bool)
+    rows = []
     for j in order:
         y, x = int(ys[j]), int(xs[j])
-        if y < edge or x < edge or y >= h - edge or x >= w - edge or taken[y, x]:
+        if y < 3 or x < 3 or y >= ref.shape[0] - 3 or x >= ref.shape[1] - 3:
             continue
-        win = ref[y - half:y + half + 1, x - half:x + half + 1]
-        if not np.isfinite(win).all() or (win == 0).any():
+        w = ref[y - 3:y + 4, x - 3:x + 4]
+        if not np.isfinite(w).all() or ref[y, x] < w.max():
             continue
-        if ref[y, x] < win.max():
-            continue
-        taken[y - half:y + half + 1, x - half:x + half + 1] = True
-        cands.append((y, x, float(ref[y, x])))
-    if not cands:
-        return []
-    cands = [c for c in cands if c[2] < 0.98 * hi]
-    cands = cands[max(1, len(cands) // 10):] if len(cands) > 10 else cands
-    return [(c[0], c[1]) for c in cands[:want]]
+        rows.append((y, x, float(ref[y, x]) - bg))
+    return np.array(rows).reshape(-1, 3), bg, sigma
 
 
-def aperture_fluxes(img, stars, r_ap=7.0, r_in=10.0, r_out=14.0):
-    """Flux per star: sum of (pixel - annulus median) inside r_ap; NaN when the window holds a
-    non-finite or zero (uncovered) pixel or the flux is not positive."""
-    half = int(r_out)
+def clipped_mean(v, sigma=3.0, iters=6):
+    v = v[np.isfinite(v)]
+    for _ in range(iters):
+        if v.size < 4:
+            break
+        m, s = v.mean(), v.std()
+        keep = np.abs(v - m) <= sigma * s if s > 0 else np.ones(v.size, bool)
+        if keep.all():
+            break
+        v = v[keep]
+    return float(v.mean()) if v.size else float("nan")
+
+
+class Neighbours:
+    """Count of candidate peaks within r of (y, x), via a y-sorted index (a dense field holds thousands)."""
+
+    def __init__(self, pos):
+        order = np.argsort(pos[:, 0])
+        self.y, self.x = pos[order, 0], pos[order, 1]
+
+    def count(self, y, x, r):
+        lo, hi = np.searchsorted(self.y, y - r, side="left"), np.searchsorted(self.y, y + r, side="right")
+        return int((((self.y[lo:hi] - y) ** 2 + (self.x[lo:hi] - x) ** 2) <= r * r).sum())
+
+
+def is_saturated(img, y, x):
+    """The 3x3 core holds >= 3 pixels within 2 % of its maximum (a flat top)."""
+    core = img[y - 1:y + 2, x - 1:x + 2]
+    m = core.max()
+    return int((core >= m - 0.02 * abs(m)).sum()) >= 3
+
+
+def half_max_fwhm(win, f0):
+    """FWHM of the star at the centre of `win` (side 2*half+1): bg = median of the annulus
+    [3 f0, 4 f0]; peak = max of the 3x3 core - bg; N = size of the connected region (4-neighbours)
+    within 3 f0 of the centre with (v - bg) >= peak/2, containing the peak pixel; FWHM = 2 sqrt(N/pi).
+    The connected region is the choice that keeps a neighbour inside the window from inflating N."""
+    half = win.shape[0] // 2
     yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
     rr = np.hypot(yy, xx)
-    ap, ann = rr <= r_ap, (rr >= r_in) & (rr <= r_out)
+    ann = (rr >= 3 * f0) & (rr <= 4 * f0)
+    bg = float(np.median(win[ann]))
+    core = win[half - 1:half + 2, half - 1:half + 2] - bg
+    peak = float(core.max())
+    if peak <= 0:
+        return float("nan")
+    cy, cx = np.unravel_index(int(np.argmax(core)), core.shape)
+    start = (half - 1 + cy, half - 1 + cx)
+    mask = ((win - bg) >= 0.5 * peak) & (rr <= 3 * f0)
+    seen = {start}
+    stack = [start]
+    while stack:
+        y, x = stack.pop()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if (ny, nx) not in seen and 0 <= ny < win.shape[0] and 0 <= nx < win.shape[1] and mask[ny, nx]:
+                seen.add((ny, nx))
+                stack.append((ny, nx))
+    return 2.0 * math.sqrt(len(seen) / math.pi)
+
+
+def frame_fwhm(img, cand, zero_is_uncovered, f0=8.0, want=100):
+    """Median FWHM (px) of up to `want` isolated, unsaturated candidates of one frame, and how many
+    stars it came from. A star is isolated for this when no other candidate lies within 30 px."""
+    half = int(math.ceil(4 * f0))
+    if len(cand) == 0:
+        return float("nan"), 0
+    pos = cand[:, :2]
+    peaks = cand[:, 2]
+    nb = Neighbours(pos)
     out = []
-    for y, x in stars:
-        win = img[y - half:y + half + 1, x - half:x + half + 1]
-        if win.shape != rr.shape or not np.isfinite(win).all() or (win == 0).any():
-            out.append(float("nan"))
+    for i in range(len(cand)):
+        y, x = int(pos[i, 0]), int(pos[i, 1])
+        if y < half or x < half or y >= img.shape[0] - half or x >= img.shape[1] - half:
             continue
-        flux = float((win[ap] - np.median(win[ann])).sum())
-        out.append(flux if flux > 0 else float("nan"))
-    return np.array(out)
+        if nb.count(y, x, 30.0) > 1:
+            continue
+        win = img[y - half:y + half + 1, x - half:x + half + 1]
+        if not covered(win, zero_is_uncovered) or is_saturated(img, y, x):
+            continue
+        if peaks[i] > 0.5 * float(np.nanmax(peaks)):
+            continue
+        fw = half_max_fwhm(win, f0)
+        if fw == fw:
+            out.append(fw)
+        if len(out) >= want:
+            break
+    if not out:
+        return float("nan"), 0
+    return float(np.median(out)), len(out)
 
 
-def photometric_ratio(ref, mem, stars=None):
-    """(median of reference/member aperture flux, star count, scatter) for one plane."""
-    stars = pick_stars(ref) if stars is None else stars
-    fr, fm = aperture_fluxes(ref, stars), aperture_fluxes(mem, stars)
-    good = np.isfinite(fr) & np.isfinite(fm)
-    if good.sum() < 5:
-        return float("nan"), int(good.sum()), float("nan")
-    r = fr[good] / fm[good]
-    med = float(np.median(r))
-    return med, int(good.sum()), 1.4826 * float(np.median(np.abs(r - med)))
+def aperture_flux(win, rr, r, ann_mask):
+    bg = clipped_mean(win[ann_mask])
+    return float((win[rr <= r] - bg).sum())
+
+
+def photometry(ref, mem, cand_info=None, f_ref=None):
+    """Adaptive ratio ref/member for one plane (fix round 1, ruling set): see the module doc.
+    Returns a dict with fwhm_ref, fwhm_mem, mode, r_ap, ann, n, ratio, se, unc {3F, 5F, 8F}, note."""
+    cand, bg_r, sig_r = cand_info if cand_info is not None else reference_candidates(ref)
+    res = {"fwhm_ref": float("nan"), "fwhm_mem": float("nan"), "mode": "", "r_ap": float("nan"),
+           "ann": (float("nan"), float("nan")), "n": 0, "ratio": float("nan"), "se": float("nan"),
+           "unc": {}, "note": ""}
+    if len(cand) == 0:
+        res["note"] = "no candidate star above 20 sigma in the LN reference"
+        return res
+    fr = f_ref if f_ref is not None else frame_fwhm(ref, cand, True)
+    # The member's candidate peaks at the reference's own positions: its saturation yardstick.
+    mpk = np.array([float(mem[int(y), int(x)]) for y, x, _ in cand])
+    bg_m, sig_m = sky_stats(mem)
+    fm, _ = frame_fwhm(mem, np.column_stack([cand[:, :2], mpk - bg_m]), False)
+    res["fwhm_ref"], res["fwhm_mem"] = fr[0], fm
+    if not (fr[0] == fr[0] and fm == fm):
+        res["note"] = f"FWHM not measurable (reference {fr[1]} stars, member {'ok' if fm == fm else 'none'})"
+        return res
+    big_f = max(fr[0], fm)
+    mem_peak_max = float(np.nanmax(mpk) - bg_m)
+    ref_peak_max = float(cand[:, 2].max())
+    for mode in ("normal", "crowded"):
+        if mode == "normal":
+            r_ap, a_in, a_out, r_iso = max(3 * big_f, 5.0), 10 * big_f, 12 * big_f, 14 * big_f
+            a_out = max(a_out, a_in + 4.0)
+        else:
+            r_ap, a_in, a_out, r_iso = 5 * big_f, 5 * big_f, 7 * big_f, 9 * big_f
+            a_out = max(a_out, a_in + 4.0)
+        half = int(math.ceil(max(r_iso, a_out)))
+        yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
+        rr = np.hypot(yy, xx)
+        ann = (rr >= a_in) & (rr <= a_out)
+        beyond = (rr > 3 * big_f) & (rr <= r_iso)
+        nb = Neighbours(cand[:, :2])
+        stars = []
+        for i in range(len(cand)):
+            y, x, pk = int(cand[i, 0]), int(cand[i, 1]), cand[i, 2]
+            if y < half or x < half or y >= ref.shape[0] - half or x >= ref.shape[1] - half:
+                continue
+            if y >= mem.shape[0] - half or x >= mem.shape[1] - half:
+                continue
+            if nb.count(y, x, r_iso) > 1:
+                continue
+            if pk > 0.5 * ref_peak_max or (mpk[i] - bg_m) > 0.5 * mem_peak_max:
+                continue
+            wr = ref[y - half:y + half + 1, x - half:x + half + 1]
+            wm = mem[y - half:y + half + 1, x - half:x + half + 1]
+            if not covered(wr, True) or not covered(wm, False):
+                continue
+            if is_saturated(ref, y, x) or is_saturated(mem, y, x):
+                continue
+            if (wr[beyond] > bg_r + max(5 * sig_r, 0.02 * pk)).any():
+                continue
+            if (wm[beyond] > bg_m + max(5 * sig_m, 0.02 * (mpk[i] - bg_m))).any():
+                continue
+            stars.append((y, x, wr, wm))
+            if len(stars) >= 60:
+                break
+        if len(stars) >= 10:
+            break
+    res["mode"], res["r_ap"], res["ann"], res["n"] = mode, r_ap, (a_in, a_out), len(stars)
+    if len(stars) < 10:
+        res["note"] = (f"only {len(stars)} usable stars (>= 10 needed) even in the crowded fallback "
+                       f"[5F, 7F]: no ratio (F = {big_f:.2f} px)")
+        return res
+    radii = {"3F": r_ap, "5F": 5 * big_f, "8F": 8 * big_f}
+    fl = {"ref": {k: [] for k in radii}, "mem": {k: [] for k in radii}}
+    for _, _, wr, wm in stars:
+        for name, w in (("ref", wr), ("mem", wm)):
+            bgm = clipped_mean(w[ann])
+            for k, r in radii.items():
+                fl[name][k].append(float((w[rr <= r] - bgm).sum()))
+    fl = {n: {k: np.array(v) for k, v in d.items()} for n, d in fl.items()}
+    good = np.ones(len(stars), bool)
+    for n in fl:
+        for k in radii:
+            good &= fl[n][k] > 0
+    if good.sum() < 10:
+        res["note"] = f"only {int(good.sum())} stars with positive fluxes: no ratio"
+        res["n"] = int(good.sum())
+        return res
+    res["n"] = int(good.sum())
+    for k in radii:
+        res["unc"][k] = float(np.median(fl["ref"][k][good] / fl["mem"][k][good]))
+    per = fl["ref"]["3F"][good] / fl["mem"]["3F"][good]
+    med = float(np.median(per))
+    sig = 1.4826 * float(np.median(np.abs(per - med)))
+    res["se"] = 1.2533 * sig / math.sqrt(res["n"])
+    if mode == "normal":
+        c_ref = float(np.median(fl["ref"]["3F"][good] / fl["ref"]["8F"][good]))
+        c_mem = float(np.median(fl["mem"]["3F"][good] / fl["mem"]["8F"][good]))
+        res["ratio"] = med * c_mem / c_ref
+        res["note"] = f"curve of growth c_ref {c_ref:.4f} c_mem {c_mem:.4f}"
+    else:
+        res["ratio"] = med
+        res["note"] = "crowded fallback: isolation 9F, annulus [5F, 7F], r_ap = 5F, no curve-of-growth correction"
+    return res
 
 
 def planes_of(path):
@@ -259,7 +482,20 @@ def planes_of(path):
     return [a] if a.ndim == 2 else [a[i] for i in range(a.shape[0])]
 
 
-def ln_truth_group(db, work, pid, key, run_id, summary, window, events):
+# --- the LN truth section ---------------------------------------------------------------------------
+
+
+def finite_pos(x):
+    return isinstance(x, (int, float)) and math.isfinite(x) and x > 0
+
+
+def ln_truth_group(db, pid, key, summary, log):
+    """One group: every member of the run's own summary, the cause when it has no LN scale, and for
+    the members with one the scale next to the photometric ratio. Returns (instrument, cause, diff)."""
+    group = next((g for g in summary.get("groups", []) if g.get("key") == key), None)
+    if group is None:
+        print("  ln truth: the run summary has no such group")
+        return []
     ref = db.execute(
         "SELECT path FROM stacking_artifacts WHERE project_id = ? AND group_key = ? AND kind = 'ln_reference'",
         (pid, key),
@@ -267,21 +503,37 @@ def ln_truth_group(db, work, pid, key, run_id, summary, window, events):
     if not ref or not ref[0]:
         print("  ln truth: no LN reference for this group")
         return []
-    members = {}
+    registered = {}
     for handle, path in db.execute(
         "SELECT project_frame, path FROM stacking_artifacts WHERE project_id = ? AND group_key = ? "
         "AND kind = 'registered' AND project_frame IS NOT NULL ORDER BY id",
         (pid, key),
     ):
-        members[handle] = path
-    group = next((g for g in summary.get("groups", []) if g.get("key") == key), {})
+        registered[handle] = path
+    globals_ = {}
+    for handle, payload in db.execute(
+        "SELECT project_frame, payload_json FROM stacking_artifacts WHERE project_id = ? AND group_key = ? "
+        "AND kind = 'ln_global' AND project_frame IS NOT NULL ORDER BY id",
+        (pid, key),
+    ):
+        try:
+            globals_[handle] = json.loads(payload or "{}").get("overlap")
+        except ValueError:
+            globals_[handle] = None
     kcal = group.get("seedsCalibration") or []
-    ref_planes = planes_of(ref[0])
-    stars = [pick_stars(p) for p in ref_planes]
-    print(f"  ln truth: reference stars per plane {[len(s) for s in stars]} (aperture r 7 px, annulus 10-14 px); "
-          f"{len(members)} registered members; seeds calibration k {kcal or 'none'}")
+    try:
+        ref_planes = planes_of(ref[0])
+    except Exception as e:  # noqa: BLE001
+        print(f"  ln truth: the LN reference could not be read: {e}")
+        return []
+    cand = [reference_candidates(p) for p in ref_planes]
+    fref = [frame_fwhm(p, c[0], True) for p, c in zip(ref_planes, cand)]
+    print(f"  ln truth: LN reference FWHM per plane {[round(f[0], 3) for f in fref]} px "
+          f"({[f[1] for f in fref]} stars); {len(group.get('frames', []))} members in the summary; "
+          f"seeds calibration k {kcal or 'none'}")
     rows = []
-    for handle in sorted(members):
+    for fr in sorted(group.get("frames", []), key=lambda f: f["frameId"]):
+        handle = fr["frameId"]
         r = db.execute(
             "SELECT p.manifest_json FROM stack_project_frames s JOIN project_frames_local p "
             "ON p.project_id = s.project_id AND p.frame_uuid = s.frame_uuid WHERE s.id = ?",
@@ -289,39 +541,96 @@ def ln_truth_group(db, work, pid, key, run_id, summary, window, events):
         ).fetchone()
         meta = (json.loads(r[0]).get("meta") or {}) if r else {}
         instr = meta.get("instrume") or meta.get("INSTRUME") or "unknown"
-        mem_planes = planes_of(members[handle])
-        for p, mp in enumerate(mem_planes):
-            if p >= len(ref_planes):
-                break
-            phot, n, scat = photometric_ratio(ref_planes[p], mp, stars[p])
-            ev = events.get((handle, p))
+        if not fr.get("included", False):
+            cause = "excluded"
+            print(f"    handle {handle} [{instr}]: excluded ({fr.get('exclusionReason')})")
+            rows.append((instr, cause, float("nan")))
+            continue
+        if fr.get("cachedLn"):
+            cause = "cached"
+            print(f"    handle {handle} [{instr}]: LN cached from an earlier run (no event in this run); "
+                  f"summary lnScale {fr.get('lnScale')}")
+            rows.append((instr, cause, float("nan")))
+            continue
+        if fr.get("lnScale") is None:
+            if handle in globals_:
+                cause = "global"
+                ov = globals_[handle]
+                print(f"    handle {handle} [{instr}]: global normalization, overlap "
+                      f"{('%.2f' % ov) if isinstance(ov, (int, float)) else '?'} < 0.25")
+            else:
+                cause = "failed"
+                print(f"    handle {handle} [{instr}]: LN FAILED (included, not cached, no lnScale, no global marker)")
+            rows.append((instr, cause, float("nan")))
+            continue
+        path = registered.get(handle)
+        applied = []
+        for p in range(len(ref_planes)):
+            ev = log["plane"].get((handle, p))
             if ev is None:
-                print(f"    handle {handle} plane {p} [{instr}]: no ln event in the run window; photometric "
-                      f"{phot:.5f} ({n} stars, scatter {scat:.4f})")
+                applied.append(None)
                 continue
             raw, source = ev
-            k = kcal[p] if source == "seeds" and p < len(kcal) else 1.0
-            applied = raw * k
-            diff = applied / phot - 1.0 if phot == phot and phot > 0 else float("nan")
-            rows.append((instr, diff))
-            print(f"    handle {handle} plane {p} [{instr}]: ln_scale {raw:.5f} x k {k:.5f} = {applied:.5f} ({source})  "
-                  f"photometric {phot:.5f} ({n} stars, scatter {scat:.4f})  rel diff {diff * 100:+.3f} %")
+            k = kcal[p] if source == "seeds" and p < len(kcal) and finite_pos(kcal[p]) else 1.0
+            applied.append((raw, k, source, raw * k))
+        done = [a[3] for a in applied if a]
+        # cross-check against the main pass's event and the summary
+        frame_scale = log["frame"].get(handle)
+        if done and len(done) == len(ref_planes):
+            mean = sum(done) / len(done)
+            for label, want in (("'ln frame normalized' event", frame_scale), ("summary lnScale", fr.get("lnScale"))):
+                if want is not None and abs(mean - want) > 1e-9 * abs(want):
+                    print(f"    handle {handle}: MISMATCH applied mean {mean!r} vs {label} {want!r}")
+        elif frame_scale is None and fr.get("lnScale") is not None:
+            print(f"    handle {handle}: no 'ln frame normalized' event in this run's log")
+        try:
+            if not path:
+                raise ValueError("no registered artifact path")
+            mem_planes = planes_of(path)
+        except Exception as e:  # noqa: BLE001 - one member's failure is a line of the report
+            print(f"    handle {handle} [{instr}]: registered artifact unreadable: {e}")
+            rows.append((instr, "unreadable", float("nan")))
+            continue
+        for p, mp in enumerate(mem_planes[:len(ref_planes)]):
+            ph = photometry(ref_planes[p], mp, cand[p], fref[p])
+            a = applied[p]
+            head = f"    handle {handle} plane {p} [{instr}]: "
+            if a is None:
+                print(head + "no ln_plane event in the run's log window")
+                rows.append((instr, "noevent", float("nan")))
+                continue
+            raw, k, source, app = a
+            if ph["ratio"] != ph["ratio"]:
+                print(head + f"ln_scale {raw:.5f} x k {k:.5f} = {app:.5f} ({source}); photometry: {ph['note']}")
+                rows.append((instr, "nophot", float("nan")))
+                continue
+            diff = app / ph["ratio"] - 1.0
+            unc = " ".join(f"{k_}:{v:.4f}" for k_, v in ph["unc"].items())
+            print(head + f"ln_scale {raw:.5f} x k {k:.5f} = {app:.5f} ({source})  photometric {ph['ratio']:.5f} "
+                  f"+- {ph['se']:.5f} (n {ph['n']}, {ph['mode']}, FWHM ref {ph['fwhm_ref']:.2f} mem {ph['fwhm_mem']:.2f} px, "
+                  f"r_ap {ph['r_ap']:.1f} annulus {ph['ann'][0]:.1f}-{ph['ann'][1]:.1f}; uncorrected {unc})  "
+                  f"rel diff {diff * 100:+.3f} %")
+            rows.append((instr, "ok", diff))
     return rows
 
 
 def ln_truth_summary(rows):
     by = {}
-    for instr, d in rows:
+    for instr, cause, d in rows:
+        e = by.setdefault(instr, {"diffs": [], "causes": {}})
+        e["causes"][cause] = e["causes"].get(cause, 0) + 1
         if d == d:
-            by.setdefault(instr, []).append(abs(d))
+            e["diffs"].append(abs(d))
     print("\n== ln truth: |ln_scale / photometric - 1| per instrument (no tolerance, no verdict)")
-    for instr, v in sorted(by.items()):
-        print(f"  {instr}: n {len(v)}  median {np.median(v) * 100:.3f} %  max {max(v) * 100:.3f} %")
+    for instr, e in sorted(by.items()):
+        causes = ", ".join(f"{c} {n}" for c, n in sorted(e["causes"].items()))
+        if e["diffs"]:
+            print(f"  {instr}: n {len(e['diffs'])}  median {np.median(e['diffs']) * 100:.3f} %  "
+                  f"max {max(e['diffs']) * 100:.3f} %   [members/planes by cause: {causes}]")
+        else:
+            print(f"  {instr}: no member with both a scale and a photometric ratio   [{causes}]")
     if not by:
-        print("  no member with both a scale and a photometric ratio")
-
-
-# --- the report ----------------------------------------------------------------------
+        print("  no member in the run summary")
 
 
 def report_group(db, pid, key, included, rows, run_id, k_arg, want_overlap, scale, out):
@@ -366,8 +675,18 @@ def report_group(db, pid, key, included, rows, run_id, k_arg, want_overlap, scal
             "SELECT project_frame, path FROM stacking_artifacts WHERE project_id = ? AND group_key = ? AND kind = 'registered'",
             (pid, key),
         ):
-            m = np.isfinite(plane0(path))
+            try:
+                if not path:
+                    raise ValueError("the registered artifact row has no path")
+                m = np.isfinite(plane0(path))
+            except Exception as e:  # noqa: BLE001 - a member's failure is a line of the report, never a crash
+                print(f"    handle {handle}: overlap not computed: {e}", file=sys.stderr)
+                print(f"    handle {handle}: overlap not computed ({e})")
+                continue
             fractions.append((float((m & ref_ok).sum()) / max(1, int(m.sum())), handle))
+        if not fractions:
+            print("  overlap: no readable registered frame")
+            return
         fractions.sort()
         low = [f for f in fractions if f[0] < 0.25]
         print(f"  overlap with the LN reference: min {fractions[0][0]:.3f} median "
@@ -404,16 +723,17 @@ def main():
           f"centre ({grid['crval1']:.5f}, {grid['crval2']:.5f})  rotation {grid['rotationDeg']:.3f} deg")
     out = work / "grid-report"
     out.mkdir(exist_ok=True)
-    events, truth_rows, window = {}, [], None
-    if want_truth:
-        if not summary.get("finishedAt"):
-            sys.exit("the run's summary has no finishedAt: cannot window the log events")
-        window = (parse_ts(summary["startedAt"]), parse_ts(summary["finishedAt"]))
-        events, seen = read_ln_events(work / "logs", *window)
-        print(f"ln truth: {seen} 'ln relative scale' events in {work / 'logs'} inside the run window "
-              f"{window[0].isoformat()} .. {window[1].isoformat()} ({len(events)} distinct frame/plane)")
-        if not events:
-            print("  none found: was the run made at debug (project-run.sh sets ATHENAEUM_LOG), and does the build carry the ln_scale span?")
+    if not summary.get("finishedAt"):
+        sys.exit("the run's summary has no finishedAt: cannot window the log events")
+    window = (parse_ts(summary["startedAt"]), parse_ts(summary["finishedAt"]))
+    log = read_log(work / "logs", *window, run_id)
+    print(f"log: {log['seen']} relevant events in {work / 'logs'} inside the run window "
+          f"{window[0].isoformat()} .. {window[1].isoformat()} (run_id {run_id}); "
+          f"{len(log['plane'])} frame/plane scales, {len(log['frame'])} frame events, {len(log['crop'])} crop events")
+    if want_truth and not log["plane"]:
+        print("  no ln_plane scale events found: was the run made at debug (project-run.sh sets ATHENAEUM_LOG), "
+              "and does the build carry the ln_plane span commits?")
+    truth_rows = []
     groups = db.execute(
         "SELECT group_key, included_count FROM stacking_run_groups WHERE run_id = ? ORDER BY group_key", (run_id,)
     ).fetchall()
@@ -427,9 +747,9 @@ def main():
             print(f"\n== {key}: no master or no coverage map (coverageMap off?) — skipped")
         else:
             report_group(db, pid, key, included, rows, run_id, k_arg, want_overlap, scale, out)
-        report_masters_dims(db, run_id, key, grid, summary)
+        report_masters_dims(db, run_id, key, grid, summary, log["crop"])
         if want_truth:
-            truth_rows += ln_truth_group(db, work, pid, key, run_id, summary, window, events)
+            truth_rows += ln_truth_group(db, pid, key, summary, log)
     if want_truth:
         ln_truth_summary(truth_rows)
 
@@ -437,63 +757,87 @@ def main():
 # --- self-check (no real data) ------------------------------------------------------------
 
 
-def synthetic_frame(rng, size, stars, amp_scale=1.0, planes=1, extra=0):
-    yy, xx = np.mgrid[0:size, 0:size].astype(np.float64)
-    img = np.full((size, size), 100.0)
-    for (y, x, a) in stars:
-        img += a * np.exp(-((yy - y) ** 2 + (xx - x) ** 2) / (2 * 2.0 ** 2))
-    for _ in range(extra):  # stars only this frame has: must not move the ratio
-        y, x = rng.uniform(20, size - 20, 2)
-        img += 900.0 * np.exp(-((yy - y) ** 2 + (xx - x) ** 2) / (2 * 2.0 ** 2))
-    img += rng.normal(0, 1.0, img.shape)
-    return [(img - 100.0) * amp_scale + 100.0 for _ in range(planes)]
+def psf_image(size, centres, fluxes, kind, fwhm, rng, bg=100.0, noise=0.5, extra=()):
+    """A float image with unit-flux-normalised stars of the given shape: `gauss` or `moffat` (beta 3)."""
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    img = np.full((size, size), bg, np.float32)
+    if kind == "gauss":
+        s = fwhm / 2.3548
+        norm, alpha, beta = 1.0 / (2 * math.pi * s * s), None, None
+    else:
+        beta = 3.0
+        alpha = fwhm / (2 * math.sqrt(2 ** (1 / beta) - 1))
+        norm = (beta - 1) / (math.pi * alpha * alpha)
+    for (cy, cx), flux in list(zip(centres, fluxes)) + list(extra):
+        r2 = (yy - cy) ** 2 + (xx - cx) ** 2
+        img += flux * norm * (np.exp(-r2 / (2 * s * s)) if kind == "gauss" else (1 + r2 / (alpha * alpha)) ** -beta)
+    img += rng.normal(0, noise, img.shape).astype(np.float32)
+    return img
 
 
 def self_check():
     rng = np.random.default_rng(7)
-    size = 240
-    stars = [(float(rng.integers(20, size - 20)), float(rng.integers(20, size - 20)), float(rng.uniform(300, 3000)))
-             for _ in range(70)]
-    ref = synthetic_frame(rng, size, stars)[0]
-    # B = 0.8 * A + a few stars of its own: reference / member = 1.25.
-    base = synthetic_frame(rng, size, stars, 0.8, extra=5)[0]
+    # A 9 x 9 grid of stars 140 px apart: farther than 14F for F <= 7 (98 px), so every star is isolated.
+    size, margin, step = 1340, 110, 140
+    centres = [(margin + i * step + 0.3 * j, margin + j * step + 0.2 * i) for i in range(9) for j in range(9)]
+    fluxes = rng.uniform(5e4, 3e5, len(centres))
+    corner = [((30.0, 30.0), 4e4), ((size - 30.0, size - 30.0), 4e4)]  # member-only stars outside every window
+    cases = [("moffat", 4.0, "moffat", 6.0), ("gauss", 3.0, "gauss", 7.0), ("gauss", 4.0, "gauss", 4.0)]
+    for kr, fr, km, fm in cases:
+        ref = psf_image(size, centres, fluxes, kr, fr, rng)
+        mem = psf_image(size, centres, fluxes / 1.25, km, fm, rng, extra=corner)
+        with tempfile.TemporaryDirectory() as d:  # through the real file writer and reader
+            write_fits(Path(d) / "a.fits", ref)
+            write_fits(Path(d) / "b.fits", mem)
+            a, b = plane0(str(Path(d) / "a.fits")), plane0(str(Path(d) / "b.fits"))
+        ph = photometry(a, b)
+        unc = " ".join(f"{k}:{v:.4f}" for k, v in ph["unc"].items())
+        print(f"{kr} FWHM {fr} vs {km} FWHM {fm}: ratio {ph['ratio']:.5f} +- {ph['se']:.5f} (n {ph['n']}, {ph['mode']}, "
+              f"measured FWHM {ph['fwhm_ref']:.2f}/{ph['fwhm_mem']:.2f}, r_ap {ph['r_ap']:.1f}); "
+              f"uncorrected {unc}; truth 1.25000")
+        assert ph["n"] >= 10 and ph["ratio"] == ph["ratio"], ph["note"]
+        assert abs(ph["ratio"] / 1.25 - 1) < 0.003, (kr, fr, km, fm, ph["ratio"])
+    # OSC: three planes with three different scales through a (3, h, w) file.
+    scales = (1.25, 1.6, 2.0)
+    refs = [psf_image(size, centres, fluxes, "gauss", 4.0, rng) for _ in scales]
+    mems = [psf_image(size, centres, fluxes / s, "gauss", 4.0, rng) for s in scales]
     with tempfile.TemporaryDirectory() as d:
-        write_fits(Path(d) / "a.fits", ref)
-        write_fits(Path(d) / "b.fits", base)
-        a, b = plane0(str(Path(d) / "a.fits")), plane0(str(Path(d) / "b.fits"))
-        ratio, n, scatter = photometric_ratio(a, b)
-        print(f"photometric ratio {ratio:.5f} from {n} stars (scatter {scatter:.5f}); truth 1.25000")
-        assert n >= 20, n
-        assert abs(ratio / 1.25 - 1) < 0.01, ratio
-        # OSC: three planes with three different scales, a (3, h, w) file.
-        planes = [synthetic_frame(rng, size, stars, s)[0] for s in (0.9, 0.8, 0.5)]
-        write_fits(Path(d) / "c.fits", np.stack([ref] * 3))
-        write_fits(Path(d) / "d.fits", np.stack(planes))
+        write_fits(Path(d) / "c.fits", np.stack(refs))
+        write_fits(Path(d) / "d.fits", np.stack(mems))
         ra, rb = planes_of(str(Path(d) / "c.fits")), planes_of(str(Path(d) / "d.fits"))
-        for p, s in enumerate((0.9, 0.8, 0.5)):
-            r, n, _ = photometric_ratio(ra[p], rb[p])
-            print(f"  osc plane {p}: ratio {r:.5f} truth {1 / s:.5f}")
-            assert abs(r * s - 1) < 0.01, (p, r)
-    # The real event shape: tracing-subscriber's JSON layer, the `ln_scale` span of normalize_frame.
-    line = ('{"timestamp":"2026-10-03T10:11:12.345678Z","level":"DEBUG","fields":{"message":"ln relative scale",'
-            '"ln_scale":0.8123,"sigma":0.004,"ln_matches":120,"rejected":3,"ln_pass":1,"ln_local_nodes":0,'
-            '"ln_scale_source":"seeds"},"target":"athenaeum_core::stacking::ln::scale",'
-            '"span":{"frame_id":42,"plane":1,"name":"ln_scale"},'
-            '"spans":[{"name":"start_project_stacking"},{"frame_id":42,"plane":1,"name":"ln_scale"}]}')
-    ev = parse_ln_line(line)
-    assert ev is not None
-    ts, frame, plane, scale, source = ev
-    assert (frame, plane, scale, source) == (42, 1, 0.8123, "seeds"), ev
-    assert ts == datetime(2026, 10, 3, 10, 11, 12, 345678, tzinfo=timezone.utc), ts
-    assert parse_ln_line(line.replace('"ln relative scale"', '"something else"')) is None
-    assert parse_ln_line(line.replace('"name":"ln_scale"', '"name":"other"')) is None
+    for p, s in enumerate(scales):
+        ph = photometry(ra[p], rb[p])
+        print(f"  osc plane {p}: ratio {ph['ratio']:.5f} truth {s:.5f}")
+        assert abs(ph["ratio"] / s - 1) < 0.003, (p, ph["ratio"])
+    # The events: the shapes tracing-subscriber's JSON layer writes for the three the report reads.
+    plane = ('{"timestamp":"2026-10-03T10:11:12.345678Z","level":"DEBUG","fields":{"message":"ln relative scale",'
+             '"ln_scale":0.8123,"sigma":0.004,"ln_matches":120,"rejected":3,"ln_pass":1,"ln_local_nodes":0,'
+             '"ln_scale_source":"seeds"},"target":"athenaeum_core::stacking::ln::scale",'
+             '"span":{"frame_id":42,"plane":1,"name":"ln_plane"},'
+             '"spans":[{"name":"start_project_stacking"},{"frame_id":42,"plane":1,"name":"ln_plane"}]}')
+    ev = parse_event(plane)
+    assert ev == ("plane", datetime(2026, 10, 3, 10, 11, 12, 345678, tzinfo=timezone.utc), 42, 1, 0.8123, "seeds"), ev
+    in_cal = plane.replace('"spans":[{"name":"start_project_stacking"},',
+                           '"spans":[{"name":"ln_seeds_calibration"},')
+    assert parse_event(in_cal) is None, "an event under ln_seeds_calibration must be skipped"
+    assert parse_event(plane.replace('"ln relative scale"', '"something else"')) is None
+    assert parse_event(plane.replace('"name":"ln_plane"', '"name":"other"')) is None
+    frame = ('{"timestamp":"2026-10-03T10:11:13.000001Z","level":"DEBUG","fields":{"message":"ln frame normalized",'
+             '"run_id":9,"frame_id":42,"ln_scale":0.8123,"ln_matches":120},"target":"athenaeum_core::stacking::run"}')
+    assert parse_event(frame)[0:1] + parse_event(frame)[2:] == ("frame", 9, 42, 0.8123), parse_event(frame)
+    crop = ('{"timestamp":"2026-10-03T10:20:00Z","level":"INFO","fields":{"message":"outputs cropped","run_id":9,'
+            '"group_key":"L","crop_x0":10,"crop_y0":20,"crop_width":300,"crop_height":200,"path":"/x/m.fits"},'
+            '"target":"athenaeum_core::stacking::run"}')
+    assert parse_event(crop)[2:] == (9, "L", 10, 20, 300, 200, "outputs cropped"), parse_event(crop)
     assert parse_ts("2026-10-03T10:11:12.123456789+00:00") == datetime(2026, 10, 3, 10, 11, 12, 123456, tzinfo=timezone.utc)
     with tempfile.TemporaryDirectory() as d:
-        (Path(d) / "athenaeum-web.2026-10-03").write_text(line + "\n" + "not json\n")
-        got, seen = read_ln_events(d, parse_ts("2026-10-03T10:00:00Z"), parse_ts("2026-10-03T11:00:00Z"))
-        assert got == {(42, 1): (0.8123, "seeds")} and seen == 1, (got, seen)
-        got, _ = read_ln_events(d, parse_ts("2026-10-03T11:00:00Z"), parse_ts("2026-10-03T12:00:00Z"))
-        assert got == {}
+        (Path(d) / "athenaeum-web.2026-10-03").write_text(
+            "\n".join([plane, in_cal.replace("0.8123", "0.5"), frame, frame.replace('"run_id":9', '"run_id":8'), crop, "not json"]) + "\n")
+        got = read_log(d, parse_ts("2026-10-03T10:00:00Z"), parse_ts("2026-10-03T11:00:00Z"), 9)
+        assert got["plane"] == {(42, 1): (0.8123, "seeds")} and got["frame"] == {42: 0.8123}, got
+        assert got["crop"] == {"L": (10, 20, 300, 200, "outputs cropped")}, got
+        got = read_log(d, parse_ts("2026-10-03T11:00:00Z"), parse_ts("2026-10-03T12:00:00Z"), 9)
+        assert got["plane"] == {}, got
     print("grid-report self-check ok")
 
 

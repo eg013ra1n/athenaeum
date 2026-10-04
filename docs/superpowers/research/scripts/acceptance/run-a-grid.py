@@ -110,16 +110,32 @@ def main():
     apply = "--apply" in args[4:]
     if os.path.realpath(db_path) in LIVE:
         sys.exit("refusing: that is a live catalog — work on an acceptance copy")
-    db = sqlite3.connect(db_path)
+    try:
+        # mode=rw: a typo in the path must never create an empty database.
+        db = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=rw", uri=True)
+    except sqlite3.Error as e:
+        sys.exit(f"cannot open {db_path} read-write: {e}")
     if mode == "--reference-uuid":
         grid = grid_of_reference(db, pid, value)
     elif mode == "--grid-json":
         grid = json.loads(value)
+        if isinstance(grid, dict) and "proposal" in grid:
+            # The whole `get_collab_grid_proposal` answer is accepted; a null proposal is the
+            # command saying there is nothing to propose (no solved frame to build one from).
+            if grid["proposal"] is None:
+                sys.exit("the grid proposal is null: the project has no proposal to apply")
+            grid = grid["proposal"]
+        if not isinstance(grid, dict) or not all(
+            k in grid for k in ("crval1", "crval2", "heightPx", "rotationDeg", "scaleArcsec", "widthPx")
+        ):
+            sys.exit(f"--grid-json is not a grid (crval1, crval2, heightPx, rotationDeg, scaleArcsec, widthPx): {value}")
     else:
         sys.exit(__doc__)
     grid = normalized(grid)
     ok = (
-        0 < grid["scaleArcsec"] <= 100
+        all(math.isfinite(grid[k]) for k in ("crval1", "crval2", "rotationDeg", "scaleArcsec"))
+        and 0.0 <= grid["crval1"] < 360.0
+        and 0 < grid["scaleArcsec"] <= 100
         and 64 <= grid["widthPx"] <= 65536
         and 64 <= grid["heightPx"] <= 65536
         and -90 <= grid["crval2"] <= 90

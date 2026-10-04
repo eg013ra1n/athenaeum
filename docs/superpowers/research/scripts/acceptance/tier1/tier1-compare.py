@@ -720,8 +720,22 @@ def run_numeric(head_dir, base_dir, set_id):
 def plane_dims(path):
     """-> (width, height) of a master: NAXIS1/NAXIS2 of a FITS header, else the array shape."""
     if path.lower().endswith((".fits", ".fit")):
-        cards, _, _ = fits_split(path)
-        keys = {c[:8].strip(): c[10:].split("/")[0].strip() for c in cards if c[8:10] == "= "}
+        keys = {}
+        with open(path, "rb") as f:  # header blocks only: no pixel read, no hash
+            while "NAXIS2" not in keys:
+                block = f.read(2880)
+                if not block:
+                    break
+                ended = False
+                for i in range(0, len(block), 80):
+                    c = block[i : i + 80].decode("latin1")
+                    if c.strip() == "END":
+                        ended = True
+                        break
+                    if c[8:10] == "= ":
+                        keys[c[:8].strip()] = c[10:].split("/")[0].strip()
+                if ended:
+                    break
         return int(keys["NAXIS1"]), int(keys["NAXIS2"])
     from imgcmp import read
     shape = read(path).shape
