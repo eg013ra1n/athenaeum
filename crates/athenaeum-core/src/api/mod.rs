@@ -112,6 +112,10 @@ pub mod plate_solve;
 // already are — the module doesn't exist at all in a headless build.
 #[cfg(all(feature = "render", feature = "solver"))]
 pub mod stacking;
+// Plan 6b-3 Task 9: a collaboration project stacked end to end through the
+// fake hub (spec §15.2). In-crate because the fake hub is `#[cfg(test)]`.
+#[cfg(all(test, feature = "render", feature = "solver"))]
+mod stacking_project_e2e;
 
 // The Settings page's one source of defaults (Settings redesign spec §6):
 // `SettingsDefaults` bundles every KV default with the typed defaults of

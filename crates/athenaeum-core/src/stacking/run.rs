@@ -26016,6 +26016,109 @@ mod tests {
         }
     }
 
+    /// Plan 6b-3 Task 9 ruling: the composed registered hash when the
+    /// reference WCS comes from a LOCAL SOLVE. No frame carries a manifest
+    /// WCS; a fake solver answers each with its true record. After the run
+    /// the plan agrees on Register and Normalize, the master states the grid,
+    /// and the reference is one of the solved frames.
+    #[test]
+    fn a_project_run_on_locally_solved_wcs_is_grid_consistent_with_its_plan() {
+        use crate::stacking::solve::{FakeSolver, SolveOutcome};
+        let _quiet = crate::geometry::pixel_map::grid_counters::exclusive();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let conn = project_conn(&db_path);
+        crate::db::stacking::insert_test_project(&conn, "p1");
+        let target = (83.8, -5.4);
+        let stars = test_fixtures::sky_stars(target, 0.12, 50.0, 7);
+        // A stand-in catalog, so the plan reads an identity, and the fake
+        // solver reports it: the run's cached solves are then the plan's.
+        let catalog = crate::plate_solve::catalog_root(tmp.path());
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::fs::write(catalog.join("stars.smac"), b"").unwrap();
+        let identity = crate::stacking::solve::installed_solver_identity(&conn).unwrap();
+        let mut solver = FakeSolver::solving_all().with_identity(&identity);
+        let mut names = Vec::new();
+        for i in 0..3usize {
+            let uuid = format!("l{i}");
+            let dither = ((i as f64 - 1.5) * 0.001, (i % 2) as f64 * 0.0005);
+            let mut f = test_fixtures::sky_frame(&uuid, (target.0 + dither.0, target.1 + dither.1));
+            f.noise_seed = 100 + i as u64;
+            f.manifest_wcs = false;
+            let path = test_fixtures::add_project_sky_frame(&conn, &tmp.path().join("collab"), "p1", &f, &stars);
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            solver = solver.with(&name, SolveOutcome::Solved(test_fixtures::sky_frame_record(&f)));
+            names.push(name);
+        }
+        let grid = crate::collab::grid::CanonicalGrid {
+            scale_arcsec: 1.5,
+            width_px: 512,
+            height_px: 384,
+            crval1: target.0,
+            crval2: target.1,
+            rotation_deg: 0.0,
+        };
+        for (key, dir) in [
+            (crate::settings::keys::STACKING_WORKING_DIR, tmp.path().join("work")),
+            (crate::settings::keys::STACKING_OUTPUT_DIR, tmp.path().join("out")),
+        ] {
+            crate::db::set_setting(&conn, key, dir.to_str().unwrap()).unwrap();
+        }
+        crate::db::collab::set_canonical_grid(&conn, "p1", Some(&grid.canonical_json())).unwrap();
+        let mut cfg = sky_config(&conn);
+        cfg.normalization.local.enabled = true;
+        crate::db::stacking::set_project_config(
+            &conn,
+            "p1",
+            &serde_json::to_string(&cfg).unwrap(),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let solver = Arc::new(solver);
+        let started = start_stacking_with_solver(
+            ctx.clone(),
+            Arc::new(NullEmitter),
+            &PathPolicy::AllowAll,
+            "test".to_string(),
+            StackSubject::Project("p1".into()),
+            None,
+            None,
+            solver.clone(),
+        )
+        .expect("a project run starts");
+        wait_for_run(&ctx, started.run_id);
+        let row = crate::db::stacking::get_run(&conn, started.run_id).unwrap().unwrap();
+        assert_eq!(row.status, "done", "{row:?}");
+        assert_eq!(solver.calls(), 3, "every frame is solved locally");
+
+        let masters = crate::db::stacking::list_master_lights(&conn, started.run_id).unwrap();
+        let master = master_row(&masters, "master");
+        let header = crate::fits_parser::FitsHeader::from_path(Path::new(&master.path)).unwrap();
+        assert_eq!(header.get_str("ATH_GRID").as_deref(), Some(grid.hash().as_str()));
+        let summary: RunSummary = serde_json::from_str(row.summary_json.as_deref().unwrap()).unwrap();
+        let reference = summary.reference.filename.expect("a reference frame");
+        assert!(names.contains(&reference), "{reference} is not one of {names:?}");
+
+        let plan = build_plan(
+            &conn,
+            &ctx.settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::Project("p1".into()),
+            None,
+        )
+        .unwrap();
+        for stage in [Stage::Register, Stage::Normalize] {
+            assert!(
+                !plan.stale_stages.contains(&stage),
+                "{stage:?} stale after the run: {:?}",
+                plan.stale_stages
+            );
+        }
+    }
+
     /// Plan/run agreement (plan 6b-3 D6): after a project run with LN on, the
     /// plan gate recomputes the masked LN hashes (registration upstream +
     /// `lnmask:1`) and does not list Normalize as stale.

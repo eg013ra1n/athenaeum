@@ -677,6 +677,15 @@ impl FakeSolver {
         self
     }
 
+    /// Report `identity` instead of the default `fake:1`: a test that also
+    /// builds plans installs a stand-in catalog and passes the identity the
+    /// plan reads ([`installed_solver_identity`]), so the plan finds the
+    /// run's cached solves.
+    pub(crate) fn with_identity(mut self, identity: &str) -> Self {
+        self.identity = Ok(identity.to_string());
+        self
+    }
+
     /// A solver that cannot run at all.
     pub(crate) fn unavailable(reason: &str) -> Self {
         FakeSolver {
