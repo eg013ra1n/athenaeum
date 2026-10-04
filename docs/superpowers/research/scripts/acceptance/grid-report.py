@@ -55,7 +55,7 @@ Stars: no other candidate peak within 14F, no pixel brighter than
 max(bg + 5 sigma, 2 % of the peak) between 3F and 14F in either frame (the
 brief says "outside 1.5F" — a bright star's own wings exceed 5 sigma there),
 the window finite in both frames (and non-zero in the LN reference), no
-saturation in either frame (3x3 core with >= 3 pixels within 2 % of its max, or
+saturation in either frame (3x3 core with >= 5 pixels at (1 - 1.4/FWHM^2) of its peak above the sky, or
 a peak above half of that frame's brightest candidate). n >= 10 is required;
 with fewer, the crowded fallback (annulus [5F, 7F], r_ap = 5F, no correction,
 isolation 9F) is tried and said so. --self-check runs synthetic checks of the
@@ -308,17 +308,19 @@ class Neighbours:
 
 
 def is_saturated(img, y, x, bg, fwhm):
-    """A flat top: the 3x3 core holds >= 3 pixels at or above (1 - 1.4 / FWHM^2) of the peak ABOVE THE
-    SKY (`bg`, this frame's). The sky is subtracted because a pedestal makes every core pixel look
-    equal; the tolerance follows the PSF because a broad unsaturated star really is that flat
-    (a Gaussian's 4 core pixels of a half-pixel-centred star fall short of the peak by about 1.4/FWHM^2
-    per pixel^2 of offset). `fwhm` is this frame's, F0 before it is known."""
+    """A flat top: the 3x3 core holds >= 5 of its 9 pixels at or above (1 - 1.4 / FWHM^2) of the peak ABOVE
+    THE SKY (`bg`, this frame's). The sky is subtracted because a pedestal makes every core pixel look
+    equal; the tolerance follows the PSF because a broad unsaturated star really is that flat. Five, not
+    three: a star centred on a pixel corner has FOUR equal core pixels (a threshold of 3 flagged 26-35 % of
+    unsaturated stars at random sub-pixel positions), and at most four can be that equal without a clip.
+    Hard saturation is also caught by the "> 50 % of the brightest candidate peak" rule in `photometry`
+    and `frame_fwhm`. `fwhm` is this frame's, F0 before it is known."""
     core = img[y - 1:y + 2, x - 1:x + 2] - bg
     m = float(core.max())
     if not m > 0:
         return False
     tol = 1.0 - 1.4 / max(float(fwhm), 2.0) ** 2
-    return int((core >= tol * m).sum()) >= 3
+    return int((core >= tol * m).sum()) >= 5
 
 
 def half_max_fwhm(win, f0):
@@ -842,6 +844,25 @@ def self_check():
     flagged_clip = is_saturated(clipped, by, bx, bg_est, 6.5)
     print(f"clipped star (flat top at 60 % of the peak): flagged = {flagged_clip}")
     assert flagged_clip
+    # (a) No unsaturated star is flagged, at any sub-pixel position and any width.
+    flag_rng = np.random.default_rng(11)
+    for fw in (2.2, 4.0, 6.5):
+        sg = fw / 2.3548
+        flagged_n = 0
+        yy, xx = np.mgrid[0:15, 0:15].astype(np.float64)
+        for _ in range(2000):
+            cy, cx = 7 + flag_rng.uniform(-0.5, 0.5, 2)
+            img = 8000.0 + 3000.0 * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * sg * sg))
+            py, px = np.unravel_index(int(np.argmax(img)), img.shape)
+            flagged_n += is_saturated(img, py, px, 8000.0, fw)
+        print(f"2000 unsaturated Gaussians at FWHM {fw} px, random sub-pixel centres: flagged {flagged_n}")
+        assert flagged_n == 0, (fw, flagged_n)
+    # (b) A star clipped at half its peak, FWHM 6.5, centred on a pixel: flagged.
+    yy, xx = np.mgrid[0:15, 0:15].astype(np.float64)
+    sg = 6.5 / 2.3548
+    img = np.minimum(8000.0 + 3000.0 * np.exp(-((yy - 7) ** 2 + (xx - 7) ** 2) / (2 * sg * sg)), 8000.0 + 1500.0)
+    assert is_saturated(img, 7, 7, 8000.0, 6.5)
+    print("star clipped at 0.5 of its peak (FWHM 6.5, pixel-centred): flagged = True")
     # A refusal prints its rejection counts per cut: too few stars on a crowded field.
     dense = [(margin + i * 35.0, margin + j * 35.0) for i in range(8) for j in range(8)]
     d_ref = psf_image(size, dense, rng.uniform(5e4, 3e5, len(dense)), "gauss", 4.0, rng)
