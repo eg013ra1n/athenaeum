@@ -27,6 +27,9 @@ not rebuilt per cycle (owner request 2026-09-18).
 8. `run-a-grid.py <copy.db> <project-id> (--reference-uuid U | --grid-json J) [--apply]`
    — the grid of a reference frame's manifest WCS (acceptance run A) or any
    grid (run B), stored in a catalog COPY only; it refuses the live catalogs.
+   A copy made from a catalog older than the branch lacks the grid columns
+   until the branch's server has started on it once (the schema migrates at
+   start): start `server.sh` on the copy, stop it, then run this script.
    An acceptance copy that stacks a project runs signed out: set its
    `account.hub_url` to `http://127.0.0.1:9` before the server starts (the
    feed would otherwise replace the local grid), and never call
