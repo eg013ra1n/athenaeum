@@ -1041,6 +1041,39 @@ pub fn relative_scale_against_with_diag(
     )
 }
 
+/// [`relative_scale_against_masked`] with the per-match [`ScaleMatchDiag`]
+/// records, the masked twin of [`relative_scale_against_with_diag`] (one
+/// shared body). Acceptance probes only (the project-member arm); never
+/// called by `normalize_frame`.
+#[allow(clippy::too_many_arguments)]
+pub fn relative_scale_against_masked_with_diag(
+    prepared: &PreparedReferenceChannel,
+    target: &[f32],
+    width: usize,
+    height: usize,
+    max_stars: usize,
+    match_radius_px: f64,
+    rcr_limit: f64,
+    local_scale: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    allowed: &[bool],
+    inputs: &ScaleInputs<'_>,
+) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
+    relative_scale_against_core(
+        prepared,
+        target,
+        width,
+        height,
+        max_stars,
+        match_radius_px,
+        rcr_limit,
+        local_scale,
+        pool,
+        Some(allowed),
+        inputs,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn relative_scale_against_core(
     prepared: &PreparedReferenceChannel,
@@ -3294,6 +3327,35 @@ mod tests {
             from_seeds.scale,
             det.scale
         );
+    }
+
+    /// The masked diag wrapper is the masked call plus the diag: on the
+    /// selection fixture, restricted to its left half, both give one result.
+    #[test]
+    fn the_masked_diag_wrapper_equals_the_masked_call() {
+        let (reference, target) = saturated_pair(41);
+        let (rn, tn) = (noise_of(&reference), noise_of(&target));
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
+        let allowed: Vec<bool> = (0..WIDTH * HEIGHT).map(|i| i % WIDTH < WIDTH / 2).collect();
+        let inputs = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::default());
+        let plain = relative_scale_against_masked(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &allowed, &inputs,
+        )
+        .expect("the masked call must match");
+        let (with_diag, diag) = relative_scale_against_masked_with_diag(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &allowed, &inputs,
+        )
+        .expect("the masked diag call must match");
+        assert_eq!(with_diag, plain);
+        assert_eq!(diag.len(), plain.selected);
+        assert!(diag.iter().all(|d| d.ref_x < WIDTH as f64 / 2.0 + 4.0));
     }
 
     #[test]

@@ -11,6 +11,12 @@
 # and stops the server. Refuses to start while Time Machine is backing up or
 # another cargo/rustc is alive, as checkpoint.sh does: a refusal is answered
 # by stopping the backup or waiting for the build, never by editing this file.
+#
+# ATH_ACC_PROJECT_CONFIG, if set, names a file holding the `set_project_stacking_config`
+# argument document ({"projectId": ..., "config": {...}, "excludedFrameUuids": [...],
+# "referenceFrameUuid": ...}); once the server answers and before `start_project_stacking` it is
+# sent with api.sh, the response is echoed and recorded in run-project.txt, and anything but the
+# command's JSON object refuses the run (checkpoint B's F1 arm on the same template).
 if [ -z "${ZSH_VERSION:-}" ]; then
   exec zsh "$0" "$@"
 fi
@@ -60,7 +66,21 @@ done
 curl -sN "http://127.0.0.1:$PORT/api/events" > "$W/events-project.log" 2>/dev/null &
 SSE_PID=$!
 sleep 2
+if [ -n "${ATH_ACC_PROJECT_CONFIG:-}" ]; then
+  if [ ! -r "$ATH_ACC_PROJECT_CONFIG" ]; then
+    echo "ATH_ACC_PROJECT_CONFIG=$ATH_ACC_PROJECT_CONFIG is not a readable file" >&2
+    exit 1
+  fi
+  CFG_RESP=$(zsh "$REPO/docs/superpowers/research/scripts/acceptance/api.sh" set_project_stacking_config "$(cat "$ATH_ACC_PROJECT_CONFIG")" "$PORT")
+  echo "set_project_stacking_config ($ATH_ACC_PROJECT_CONFIG): $CFG_RESP"
+  # Success answers the stored project config, a JSON object; an error answers with its text.
+  case "$CFG_RESP" in
+    '{'*) ;;
+    *) echo "set_project_stacking_config refused for $PID: $CFG_RESP" >&2; exit 1 ;;
+  esac
+fi
 T0=$(date +%s); echo "start $(date -u +%FT%TZ) epoch=$T0 project=$PID" > "$W/run-project.txt"
+if [ -n "${ATH_ACC_PROJECT_CONFIG:-}" ]; then echo "set_project_stacking_config $ATH_ACC_PROJECT_CONFIG: $CFG_RESP" >> "$W/run-project.txt"; fi
 RESP=$(curl -sS -X POST "http://127.0.0.1:$PORT/api/start_project_stacking" -H 'content-type: application/json' -d "{\"projectId\":\"$PID\",\"rerunFrom\":\"calibrate\"}")
 echo "$RESP" >> "$W/run-project.txt"; echo >> "$W/run-project.txt"
 if ! printf '%s' "$RESP" | grep -q '"runId"'; then

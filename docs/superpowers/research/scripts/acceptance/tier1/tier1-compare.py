@@ -488,6 +488,16 @@ def compare_planes(h_ch, b_ch, gate):
             f"             noise  ratio={n_ratio:.6f} ({pct(n_ratio):+.4f}%) {verdict(n_ok)}  "
             f"fwhmPx ratio={f_ratio:.6f} ({pct(f_ratio):+.4f}%) {verdict(f_ok)}"
         )
+        # beta beside the FWHM: a flipped PSF model (Auto picks per master) moves fwhmPx
+        # without any pixel changing meaning. Display only; the FWHM verdict is unchanged.
+        h_beta, b_beta = hc.get("beta"), bc.get("beta")
+        if h_beta is not None and b_beta is not None:
+            differs = (
+                " (\u03b2 differs: the FWHM row compares two PSF models)"
+                if h_beta != b_beta
+                else ""
+            )
+            print(f"             beta head={h_beta:g} base={b_beta:g}{differs}")
 
 
 def report_masters(head_dir, base_dir, gate):

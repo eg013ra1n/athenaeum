@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Nebula-box excess of masters against a no-LN control, raw and scale-normalized (spec §11.3).
 
-    nebula_boxes.py <boxes.json> <control.fits> <master>... [--k K ...] [--size 100]
+    nebula_boxes.py <boxes.json> <control.fits> <master>... [--k K ...] [--control-k K] [--size 100]
 
 boxes.json is {"nebula": [[x, y], ...], "background": [[x, y], ...]} (box top-left corners,
 `--size` px square). It is written and committed BEFORE the LN master is read.
@@ -10,7 +10,10 @@ For each master X (flux scale k, default 1; pass one --k per master, in order):
   raw        (median(box of X) - bg(X)) / bg(X)
   normalized (median(box of X/k) - bg(X/k)) / bg0,   bg0 = bg(control), one fixed denominator
 bg(X) is the median over the background boxes' pixels. Each line also prints the difference
-from the control's excess, in points of background. numpy only; reader is imgcmp.read.
+from the control's excess, in points of background: d_raw = raw - control raw, and
+d_norm = norm - control norm, where the control's normalized read uses the control's OWN flux
+scale (`--control-k`, default 1: a control read at its LN-reference scale k is normalized by that k,
+exactly as a master is; the checkpoint-A tables are norm - norm). numpy only; reader is imgcmp.read.
 """
 import json
 import os
@@ -53,6 +56,11 @@ def main():
     args = sys.argv[1:]
     size = 100
     ks = []
+    control_k = 1.0
+    while "--control-k" in args:
+        i = args.index("--control-k")
+        control_k = float(args[i + 1])
+        del args[i:i + 2]
     while "--size" in args:
         i = args.index("--size")
         size = int(args[i + 1])
@@ -72,9 +80,11 @@ def main():
     ks = ks or [1.0] * len(masters)
     ctl = plane(control)
     bg0 = background(ctl, bg_box, size)
-    ctl_reads = reads(ctl, 1.0, bg_box, nebula, size, bg0)
-    print(f"control {os.path.basename(control)}: bg0 = {bg0:.6g}, {len(nebula)} nebula boxes, "
+    ctl_reads = reads(ctl, control_k, bg_box, nebula, size, bg0)
+    print(f"control {os.path.basename(control)}: bg0 = {bg0:.6g}, k = {control_k:g}, {len(nebula)} nebula boxes, "
           f"{len(bg_box)} background boxes, size {size}")
+    print("control reads  raw%: " + " / ".join(f"{r * 100:.3f}" for r, _ in ctl_reads)
+          + "   norm%: " + " / ".join(f"{n * 100:.3f}" for _, n in ctl_reads))
     print("master                          box  (x, y)         k        raw%      norm%   d_raw(pts)  d_norm(pts)")
     for path, k in zip(masters, ks):
         a = plane(path)

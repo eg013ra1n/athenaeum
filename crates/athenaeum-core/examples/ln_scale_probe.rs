@@ -26,6 +26,20 @@
 //! writes each member plane as FITS for the acceptance harness's truth
 //! photometry.
 //!
+//! The line's `"arms"` key holds the PRODUCTION scale call, one arm per
+//! estimator and aperture, each with the production pairing constants
+//! (4.0 px, RCR 0.3) and the background models `normalize_frame` builds (the
+//! reference side restricted to the overlap under `--masked`, P-7; the
+//! presence masks of P-8): `psfOff` (PSF signal, no star selection),
+//! `psfSel` (PSF signal, the default selection), `f1_2`/`f1_3`/`f1_gc` (the
+//! default selection, common aperture at 2F / 3F / growth curve). Each arm
+//! reports `s`, `sigma`, `matches`, `selected`, `rule`, `aperturePx`,
+//! `commonFwhmPx`, `growth` and `terciles` (the RCR location of the ratios of
+//! the bright / middle / faint third by reference flux). `--ln-scale N`
+//! sets the LN scale of the models (default: `ln::resolve_scale` of the
+//! default config on the plane); `--max-stars-sel N` overrides the selection's
+//! own `maxStars` (the detection cap `--max-stars` is a different thing).
+//!
 //! Two modes need no reference/members:
 //! - `--estimators <stars.csv>...` reads per-star CSVs written by
 //!   `--stars-dir` and prints the RCR location (limit 0.3, the production
@@ -34,11 +48,13 @@
 //! - `--stack-sim <config.json>` combines the whole group's LN-normalized
 //!   pixel stacks in windows around stars with the production per-pixel
 //!   combiner, once as the run did (checked against the real master's
-//!   pixels) and once with each member's scale corrected (see `stack_sim`).
+//!   pixels), once with each member's scale corrected to the photometric
+//!   truth, and once per estimator arm a member carries (see `stack_sim`).
 //!
 //! cargo run --release -p athenaeum-core --example ln_scale_probe -- \
 //!   --ref <reference.fits> --plane P --beta <b|auto> [--masked] \
 //!   [--max-stars 24576] [--stars-dir DIR] [--tgt-beta <b|auto>] \
+//!   [--ln-scale N] [--max-stars-sel N] \
 //!   [--interpolation bicubicBSpline] [--clamping 0.3] [--dump-warped DIR] \
 //!   (--member LABEL=<registered.fits> | --warp LABEL=<calibrated.fits>@<map.json>)...
 //! cargo run --release -p athenaeum-core --example ln_scale_probe -- --estimators <stars.csv>...
@@ -58,13 +74,16 @@ use athenaeum_core::integration::registered_source::{RegisteredFrame, Registered
 use athenaeum_core::integration::source::FrameSource;
 use athenaeum_core::integration::stats::median_in_place;
 use athenaeum_core::resample::Interpolation;
-use athenaeum_core::stacking::integrate::{LnAperture, LnFluxEstimator, LnStarSelection};
+use athenaeum_core::stacking::integrate::{
+    LnAperture, LnFluxEstimator, LnStarSelection, LocalNormalizationConfig,
+};
 use athenaeum_core::stacking::ln::scale::{
-    relative_scale_against, relative_scale_against_masked, PreparedReferenceChannel,
+    relative_scale_against, relative_scale_against_masked, relative_scale_against_masked_with_diag,
+    relative_scale_against_with_diag, PreparedReferenceChannel, ScaleMatchDiag,
 };
 use athenaeum_core::stacking::ln::{
-    eroded_mask, FiniteMask, ScaleInputs, SelectionSide, TileNoise, TileTable, CLEANING,
-    LN_MASK_MARGIN_PX,
+    eroded_mask, resolve_scale, BackgroundModel, FiniteMask, ScaleInputs, SelectionSide, TileNoise,
+    TileTable, CLEANING, LN_MASK_MARGIN_PX,
 };
 use athenaeum_core::stacking::psf_signal::{
     fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
@@ -87,8 +106,11 @@ const SKY_OUT: f64 = 8.0;
 fn usage() -> ! {
     eprintln!(
         "usage: ln_scale_probe --ref <reference.fits> --plane P --beta <b|auto> [--masked] \
-[--max-stars N] [--stars-dir DIR] [--tgt-beta <b|auto>] [--interpolation name] [--clamping c] \
-(--member LABEL=<registered.fits> | --warp LABEL=<calibrated.fits>@<map.json>)..."
+[--max-stars N] [--stars-dir DIR] [--tgt-beta <b|auto>] [--ln-scale N] [--max-stars-sel N] \
+[--interpolation name] [--clamping c] [--dump-warped DIR] \
+(--member LABEL=<registered.fits> | --warp LABEL=<calibrated.fits>@<map.json>)...
+       ln_scale_probe --estimators <stars.csv>...
+       ln_scale_probe --stack-sim <config.json>"
     );
     std::process::exit(2);
 }
@@ -106,6 +128,11 @@ struct Args {
     masked: bool,
     max_stars: usize,
     stars_dir: Option<PathBuf>,
+    /// `--ln-scale N`: the LN scale of the arms' background models.
+    ln_scale: Option<u32>,
+    /// `--max-stars-sel N`: the selection's own `maxStars` (matched pairs
+    /// kept), unlike `max_stars`, the detection cap.
+    max_stars_sel: Option<u32>,
     interpolation: Interpolation,
     clamping: f32,
     members: Vec<(String, Source)>,
@@ -138,6 +165,8 @@ fn parse_args() -> Args {
         masked: false,
         max_stars: 24576,
         stars_dir: None,
+        ln_scale: None,
+        max_stars_sel: None,
         interpolation: Interpolation::BicubicBSpline,
         clamping: 0.3,
         members: Vec::new(),
@@ -156,6 +185,8 @@ fn parse_args() -> Args {
             "--masked" => a.masked = true,
             "--max-stars" => a.max_stars = val().parse().unwrap_or_else(|_| usage()),
             "--stars-dir" => a.stars_dir = Some(PathBuf::from(val())),
+            "--ln-scale" => a.ln_scale = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--max-stars-sel" => a.max_stars_sel = Some(val().parse().unwrap_or_else(|_| usage())),
             "--clamping" => a.clamping = val().parse().unwrap_or_else(|_| usage()),
             "--interpolation" => {
                 let v = val();
@@ -572,6 +603,7 @@ fn main() {
 
         // ---- normalize_frame's own preparation of the target plane ----
         let mut allowed: Option<Vec<bool>> = None;
+        let mut overlap_mask: Option<Vec<bool>> = None;
         if args.masked {
             let mut overlap = vec![false; tgt_raw.len()];
             for (k, o) in overlap.iter_mut().enumerate() {
@@ -583,6 +615,7 @@ fn main() {
                 }
             }
             allowed = Some(eroded_mask(&overlap, w, h, LN_MASK_MARGIN_PX));
+            overlap_mask = Some(overlap);
         }
         let fill = if args.masked {
             0.0f32
@@ -649,6 +682,20 @@ fn main() {
                 &inputs,
             ),
         };
+        // ---- 1b. the arms: the production scale call per estimator ----
+        let arms = scale_arms(
+            &args,
+            &prepared,
+            &ref_raw,
+            &ref_sane,
+            &tgt_raw,
+            &tgt_sane,
+            (w, h),
+            overlap_mask.as_deref(),
+            allowed.as_deref(),
+            &pool,
+        );
+
         let (s_lib, lib_pass, lib_matches) = match &lib {
             Ok(r) => (r.scale, r.pass, r.matches),
             Err(e) => {
@@ -851,12 +898,213 @@ fn main() {
             "sCircle3F": loc(&z_c3),
             "sCircle5F": loc(&z_c5),
             "nPhot": z_c5.len(),
+            "arms": arms,
             "alt": alt.map(|(b, s, n, fw)| serde_json::json!({"beta": b, "s": s, "n": n, "fwhm": fw})),
             "ms": t.elapsed().as_millis() as u64,
         });
         println!("{line}");
         std::io::stdout().flush().ok();
     }
+}
+
+/// One arm of the production scale call (see the module doc).
+struct Arm {
+    name: &'static str,
+    /// `false`: no selection (`LnStarSelection::OFF`); `true`: the default
+    /// selection (with `--max-stars-sel` applied).
+    selected: bool,
+    estimator: LnFluxEstimator,
+    aperture: LnAperture,
+}
+
+const ARMS: [Arm; 5] = [
+    Arm {
+        name: "psfOff",
+        selected: false,
+        estimator: LnFluxEstimator::PsfSignal,
+        aperture: LnAperture::Fwhm3,
+    },
+    Arm {
+        name: "psfSel",
+        selected: true,
+        estimator: LnFluxEstimator::PsfSignal,
+        aperture: LnAperture::Fwhm3,
+    },
+    Arm {
+        name: "f1_2",
+        selected: true,
+        estimator: LnFluxEstimator::CommonAperture,
+        aperture: LnAperture::Fwhm2,
+    },
+    Arm {
+        name: "f1_3",
+        selected: true,
+        estimator: LnFluxEstimator::CommonAperture,
+        aperture: LnAperture::Fwhm3,
+    },
+    Arm {
+        name: "f1_gc",
+        selected: true,
+        estimator: LnFluxEstimator::CommonAperture,
+        aperture: LnAperture::GrowthCurve,
+    },
+];
+
+/// RCR location (limit 0.3) of the ratios of the bright / middle / faint
+/// third of `diag` by reference flux (equal-count groups, descending).
+fn terciles(diag: &[ScaleMatchDiag]) -> [f64; 3] {
+    let mut order: Vec<usize> = (0..diag.len()).collect();
+    order.sort_by(|&a, &b| diag[b].ref_signal.total_cmp(&diag[a].ref_signal));
+    let n = order.len();
+    let mut out = [f64::NAN; 3];
+    for (g, o) in out.iter_mut().enumerate() {
+        let ratios: Vec<f64> = order[g * n / 3..(g + 1) * n / 3]
+            .iter()
+            .map(|&i| diag[i].ratio)
+            .collect();
+        if ratios.len() >= 3 {
+            *o = rcr(&ratios, RCR_LIMIT).location;
+        }
+    }
+    out
+}
+
+/// Every arm of [`ARMS`] on one member, through the production scale call
+/// with the background models and presence masks `ln::normalize_frame`
+/// builds (P-7, P-8). `overlap` is the masked-mode overlap (`None` in legacy
+/// mode), `tgt_raw` the member plane after the overlap mask and before
+/// sanitizing, `*_sane` the sanitized planes the detector reads.
+#[allow(clippy::too_many_arguments)]
+fn scale_arms(
+    args: &Args,
+    prepared: &PreparedReferenceChannel,
+    ref_raw: &[f32],
+    ref_sane: &[f32],
+    tgt_raw: &[f32],
+    tgt_sane: &[f32],
+    (w, h): (usize, usize),
+    overlap: Option<&[bool]>,
+    allowed: Option<&[bool]>,
+    pool: &Arc<rayon::ThreadPool>,
+) -> serde_json::Value {
+    let scale = args
+        .ln_scale
+        .unwrap_or_else(|| resolve_scale(&LocalNormalizationConfig::default(), w, h));
+    // The reference's model: the whole plane (a frame set), or restricted to
+    // the member's overlap (a project member, P-7).
+    let ref_table = TileTable::measure(ref_raw, w, h, &CLEANING, Some(pool));
+    let ref_table = match overlap {
+        Some(o) => ref_table.restricted(ref_raw, o, &CLEANING, Some(pool)),
+        None => ref_table,
+    };
+    let ref_model = match BackgroundModel::fit(ref_table, scale) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("arms: reference background model refused at scale {scale}: {e}");
+            return serde_json::json!({"error": format!("reference model: {e}")});
+        }
+    };
+    let tgt_model = match BackgroundModel::fit(
+        TileTable::measure(tgt_raw, w, h, &CLEANING, Some(pool)),
+        scale,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("arms: target background model refused at scale {scale}: {e}");
+            return serde_json::json!({"error": format!("target model: {e}")});
+        }
+    };
+    let (ref_noise, tgt_noise) = (
+        TileNoise::from_model(&ref_model),
+        TileNoise::from_model(&tgt_model),
+    );
+    // P-8: the target's presence is its finite pixels before sanitizing;
+    // masked mode reads the overlap as the reference's too, legacy the raw
+    // reference plane's finite pixels.
+    let tgt_present = FiniteMask::from_plane(tgt_raw, w, h);
+    let ref_present_own;
+    let ref_present = if overlap.is_some() {
+        &tgt_present
+    } else {
+        ref_present_own = FiniteMask::from_plane(ref_raw, w, h);
+        &ref_present_own
+    };
+    let mut out = serde_json::Map::new();
+    for arm in &ARMS {
+        let mut selection = if arm.selected {
+            LnStarSelection::default()
+        } else {
+            LnStarSelection::OFF
+        };
+        if let (true, Some(n)) = (arm.selected, args.max_stars_sel) {
+            selection.max_stars = n;
+        }
+        let inputs = ScaleInputs {
+            selection,
+            estimator: arm.estimator,
+            aperture: arm.aperture,
+            reference_present: ref_present,
+            target_present: &tgt_present,
+            reference: SelectionSide {
+                plane: ref_sane,
+                width: w,
+                height: h,
+                noise: &ref_noise,
+            },
+            target: SelectionSide {
+                plane: tgt_sane,
+                width: w,
+                height: h,
+                noise: &tgt_noise,
+            },
+        };
+        let res = match allowed {
+            Some(a) => relative_scale_against_masked_with_diag(
+                prepared,
+                tgt_sane,
+                w,
+                h,
+                args.max_stars,
+                MATCH_RADIUS_PX,
+                RCR_LIMIT,
+                false,
+                Some(pool),
+                a,
+                &inputs,
+            ),
+            None => relative_scale_against_with_diag(
+                prepared,
+                tgt_sane,
+                w,
+                h,
+                args.max_stars,
+                MATCH_RADIUS_PX,
+                RCR_LIMIT,
+                false,
+                Some(pool),
+                &inputs,
+            ),
+        };
+        let value = match res {
+            Ok((r, diag)) => serde_json::json!({
+                "s": r.scale,
+                "sigma": r.sigma,
+                "matches": r.matches,
+                "selected": r.selected,
+                "rule": r.selection.as_str(),
+                "aperturePx": r.aperture_px,
+                "commonFwhmPx": r.common_fwhm_px,
+                "growth": r.growth_factor,
+                "terciles": terciles(&diag),
+            }),
+            Err(e) => {
+                eprintln!("arm {}: {e}", arm.name);
+                serde_json::json!({"error": e.to_string()})
+            }
+        };
+        out.insert(arm.name.to_string(), value);
+    }
+    serde_json::Value::Object(out)
 }
 
 /// The estimator battery over one per-star CSV (`--estimators`): every
@@ -957,6 +1205,11 @@ struct SimMember {
     weight: f32,
     /// `s_true / s_applied` for this member — the corrected variant's factor.
     correction: f64,
+    /// Arm name -> `s_arm / s_applied` (the probe's per-estimator scales).
+    /// Every member carries the same names; each arm is simulated beside
+    /// the truth arm (`correction`).
+    #[serde(default)]
+    arms: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -988,8 +1241,11 @@ struct SimConfig {
 /// against the real master's pixels), once with each member's scale corrected
 /// to the photometric truth (`cor`: `v'' = v' + (c − 1)·(v' − sky_ref)`, the
 /// same `B = B_ref − A·B_tgt` bookkeeping with `A·c`, `sky_ref` the LN
-/// reference's local sky), and both again without rejection. Rejection
-/// normalization is assumed `local` (the working copy IS the LN copy).
+/// reference's local sky), and both again without rejection. Every arm a
+/// member carries (`arms`: arm -> `s_arm / s_applied`) adds one more such
+/// variant, with and without rejection, built by the same bookkeeping with
+/// that arm's factor. Rejection normalization is assumed `local` (the
+/// working copy IS the LN copy).
 fn stack_sim(cfg_path: &PathBuf) {
     use athenaeum_core::integration::combine::{
         combine_pixel_weighted, mask_clear, mask_get, mask_words, IntegrationRecipe, Rejection,
@@ -1008,6 +1264,22 @@ fn stack_sim(cfg_path: &PathBuf) {
     let side = 2 * cfg.half + 1;
     let npix = side * side;
     let n = cfg.members.len();
+    // The arm names, in BTreeMap order; every member must carry all of them.
+    let arm_names: Vec<String> = cfg
+        .members
+        .first()
+        .map(|m| m.arms.keys().cloned().collect())
+        .unwrap_or_default();
+    for m in &cfg.members {
+        if m.arms.keys().ne(arm_names.iter()) {
+            die(format!(
+                "{}: arms {:?} differ from the first member's {:?}",
+                m.label,
+                m.arms.keys().collect::<Vec<_>>(),
+                arm_names
+            ));
+        }
+    }
     let stars: Vec<(usize, usize)> = cfg
         .stars
         .iter()
@@ -1088,7 +1360,12 @@ fn stack_sim(cfg_path: &PathBuf) {
             vec![0f32; npix],
             vec![0f32; npix],
         ]; // cur, cor, cur_norej, cor_norej
+           // The arms: [rejection, no rejection] windows beside the truth arm.
+        let mut arm_win: Vec<[Vec<f32>; 2]> = (0..arm_names.len())
+            .map(|_| [vec![0f32; npix], vec![0f32; npix]])
+            .collect();
         let mut out_cor = vec![f32::NAN; n];
+        let mut out_arm = vec![f32::NAN; n];
         for p in 0..npix {
             let (wy, wx) = (p / side, p % side);
             let (dx, dy) = (wx as f64 - cfg.half as f64, wy as f64 - cfg.half as f64);
@@ -1145,6 +1422,37 @@ fn stack_sim(cfg_path: &PathBuf) {
                     max_abs_dev = max_abs_dev.max(d);
                     max_rel_dev = max_rel_dev.max(d / mv.abs().max(1e-12));
                 }
+            }
+            // The estimator arms: the same bookkeeping with the arm's factor.
+            for (a, name) in arm_names.iter().enumerate() {
+                for i in 0..n {
+                    let v = vals[i];
+                    out_arm[i] = if v.is_finite() {
+                        (v as f64 + (cfg.members[i].arms[name] - 1.0) * (v as f64 - sky_ref[s]))
+                            as f32
+                    } else {
+                        f32::NAN
+                    };
+                }
+                work.clear();
+                for (i, &v) in out_arm.iter().enumerate() {
+                    if v.is_finite() {
+                        work.push((v, i as u16));
+                    }
+                }
+                mask_clear(&mut mask);
+                let (value, _rej, _) = combine_pixel_weighted(
+                    &mut work, &out_arm, &weights, recipe, &mut mask, &mut sc,
+                );
+                arm_win[a][0][p] = value;
+                let (mut num, mut den) = (0.0f64, 0.0f64);
+                for (i, &v) in out_arm.iter().enumerate() {
+                    if v.is_finite() && v != 0.0 && weights[i] > 0.0 {
+                        num += v as f64 * weights[i] as f64;
+                        den += weights[i] as f64;
+                    }
+                }
+                arm_win[a][1][p] = (num / den) as f32;
             }
         }
         // photometry on the windows (centre = window centre)
@@ -1213,8 +1521,12 @@ fn stack_sim(cfg_path: &PathBuf) {
             }
             2.0 * (count as f64 / std::f64::consts::PI).sqrt()
         };
+        let mut arm_cols = String::new();
+        for aw in &arm_win {
+            arm_cols.push_str(&format!(",{:.9e},{:.9e}", phot(&aw[0]), phot(&aw[1])));
+        }
         star_rows.push(format!(
-            "{sx},{sy},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.4},{:.4},{:.4},{:.4}",
+            "{sx},{sy},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.4},{:.4},{:.4},{:.4}{arm_cols}",
             phot(&refw),
             phot(&masw),
             phot(&win[0]),
@@ -1230,11 +1542,13 @@ fn stack_sim(cfg_path: &PathBuf) {
     }
     let mut f = std::fs::File::create(&cfg.out_stars)
         .unwrap_or_else(|e| die(format!("{}: {e}", cfg.out_stars.display())));
-    writeln!(
-        f,
-        "x,y,ref,master,sim_cur,sim_cor,sim_cur_norej,sim_cor_norej,sky_ref,fwhm_ref,fwhm_master,fwhm_cur,fwhm_cor"
-    )
-    .ok();
+    let mut head = String::from(
+        "x,y,ref,master,sim_cur,sim_cor,sim_cur_norej,sim_cor_norej,sky_ref,fwhm_ref,fwhm_master,fwhm_cur,fwhm_cor",
+    );
+    for name in &arm_names {
+        head.push_str(&format!(",sim_{name},sim_{name}_norej"));
+    }
+    writeln!(f, "{head}").ok();
     for r in &star_rows {
         writeln!(f, "{r}").ok();
     }

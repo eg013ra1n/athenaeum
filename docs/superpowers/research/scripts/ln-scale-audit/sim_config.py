@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Config for `ln_scale_probe --stack-sim` on a frame-set group (ln-scale-audit 2026-10-04).
 
-    sim_config.py <frameset-frames.json> <group-key> <reference-stars.csv> <member-truth.csv> \
-        <warped-dir> <ln-reference.fits> <master.fits> <f_ref> <f_phot> <out.json> [n_stars]
+    sim_config.py [--arms <probe.jsonl>] <frameset-frames.json> <group-key> <reference-stars.csv> \
+        <member-truth.csv> <warped-dir> <ln-reference.fits> <master.fits> <f_ref> <f_phot> <out.json> [n_stars]
 
 <reference-stars.csv> is the probe's `--stars-dir` reference.p0.csv (every accepted LN
 reference fit). Stars: unsaturated (amp + b < 0.5), no other fit brighter than 2 % of the
@@ -12,6 +12,13 @@ output or equivalent); a member without a truth gets the correction its PSF vari
 predicts from the group's own linear fit of gap on delta sigma^2. The correction is
 c = phot / applied (the truth over the applied scale). Members read their warped plane
 from <warped-dir>/f<frame>.p0.fits (the probe's --dump-warped output).
+
+--arms <probe.jsonl>: the probe's main-mode output (one line per member label f<frame>, an
+"arms" object per line). Every member then carries `arms[name] = s_arm / applied` for every
+arm of its line, which `ln_scale_probe --stack-sim` simulates beside the truth arm (the
+`sim_<name>` / `sim_<name>_norej` columns). `applied` is the value the truth correction uses
+(the truth csv's, else the frame's own `lnScale`). A member with no probe line, or a line whose
+arm is not finite, is an error: an arm over a subset of the group would not be comparable.
 """
 import csv
 import json
@@ -23,9 +30,29 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from stars import load  # noqa: E402
 
 
+def load_arms(path):
+    """-> {label: {arm: s}} from the probe's jsonl (a line without "arms" is skipped)."""
+    out = {}
+    for line in open(path):
+        line = line.strip()
+        if not line:
+            continue
+        j = json.loads(line)
+        if "arms" in j:
+            out[j["label"]] = {k: v["s"] for k, v in j["arms"].items() if isinstance(v, dict) and "s" in v}
+    return out
+
+
 def main():
-    (frames_json, key, ref_csv, truth_csv, warped, ref_fits, master, f_ref, f_phot, out) = sys.argv[1:11]
-    n_stars = int(sys.argv[11]) if len(sys.argv) > 11 else 400
+    argv = sys.argv[1:]
+    arms_path = None
+    if "--arms" in argv:
+        i = argv.index("--arms")
+        arms_path = argv[i + 1]
+        del argv[i:i + 2]
+    (frames_json, key, ref_csv, truth_csv, warped, ref_fits, master, f_ref, f_phot, out) = argv[:10]
+    n_stars = int(argv[10]) if len(argv) > 10 else 400
+    arm_scales = load_arms(arms_path) if arms_path else None
     ref = load(ref_csv)
     x, y, sig, amp, b = ref["x"], ref["y"], ref["sig"], ref["amp"], ref["b"]
     ok = (amp + b < 0.5) & (x > 64) & (y > 64) & (sig > 0)
@@ -57,8 +84,19 @@ def main():
             # good enough for the one or two members whose truth photometry found too few stars.
             c = 1.0 / (1.0 + icpt + slope * (s2(f["fwhm"] * 1.1) - s2(fref_hm)))
             print(f"frame {f['frame']}: no truth, regression correction {c:.4f}", file=sys.stderr)
-        members.append(dict(label=f"f{f['frame']}", registered=f"{warped}/f{f['frame']}.p0.fits",
-                            athln=f["athlnPath"], weight=f["weight"], correction=c))
+        m = dict(label=f"f{f['frame']}", registered=f"{warped}/f{f['frame']}.p0.fits",
+                 athln=f["athlnPath"], weight=f["weight"], correction=c)
+        if arm_scales is not None:
+            line = arm_scales.get(m["label"])
+            if not line:
+                sys.exit(f"{m['label']}: no arms line in {arms_path}")
+            applied = float(t["applied"]) if t else float(f["lnScale"])
+            m["arms"] = {}
+            for name, sv in sorted(line.items()):
+                if not np.isfinite(sv) or sv <= 0:
+                    sys.exit(f"{m['label']}: arm {name} has no finite scale ({sv})")
+                m["arms"][name] = sv / applied
+        members.append(m)
     cfg = dict(reference=ref_fits, master=master, plane=0, stars=stars, half=32, sigmaLow=5.0, sigmaHigh=3.5,
                fRef=float(f_ref), fPhot=float(f_phot), interpolation="bicubicBSpline", clamping=0.3,
                members=members, outStars=out.replace(".json", "-stars.csv"), outFrames=out.replace(".json", "-frames.csv"))

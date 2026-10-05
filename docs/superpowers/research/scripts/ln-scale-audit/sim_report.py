@@ -13,6 +13,31 @@ for k in ('master','sim_cur','sim_cor','sim_cur_norej','sim_cor_norej'):
     m,se=med_se(S['ref'][ok]/S[k][ok]); print(f"   ref/{k:14s} {m:.4f} +- {se:.4f}")
 for a,b in (('sim_cor','sim_cur'),('sim_cur_norej','sim_cur'),('sim_cor_norej','sim_cor')):
     m,se=med_se(S[a][ok]/S[b][ok]); print(f"   {a}/{b}: {m:.4f} +- {se:.4f}")
+# estimator arms (ln_scale_probe --stack-sim with `arms` in the config): median +- bootstrap SE of
+# ref/arm with and without rejection, beside the truth-corrected no-rejection arm; L-22: the ratio of each
+# arm's no-rejection flux to the truth arm's and to the LN reference's
+fixed = {'sim_cur_norej', 'sim_cor_norej'}
+with open(stars) as fh:
+    header = next(csv.reader(fh))
+arms = [k[4:-6] for k in header if k.startswith('sim_') and k.endswith('_norej') and k not in fixed]
+if arms:
+    A = {a: {v: [] for v in ('rej', 'norej')} for a in arms}
+    for r in csv.DictReader(open(stars)):
+        for a in arms:
+            A[a]['rej'].append(float(r[f'sim_{a}'])); A[a]['norej'].append(float(r[f'sim_{a}_norej']))
+    A = {a: {v: np.array(x) for v, x in d.items()} for a, d in A.items()}
+    oka = ok.copy()
+    for a in arms:
+        for v in ('rej', 'norej'):
+            oka &= np.isfinite(A[a][v]) & (A[a][v] > 0)
+    print(f"\nestimator arms over {oka.sum()} stars: flux ratio LN reference / arm (median, bootstrap SE); truth arm for comparison:")
+    m, se = med_se(S['ref'][oka] / S['sim_cor_norej'][oka])
+    print(f"   {'truth (sim_cor_norej)':26s} ref/arm_norej {m:.4f} +- {se:.4f}")
+    for a in arms:
+        m1, s1 = med_se(S['ref'][oka] / A[a]['rej'][oka])
+        m2, s2 = med_se(S['ref'][oka] / A[a]['norej'][oka])
+        m3, s3 = med_se(A[a]['norej'][oka] / S['sim_cor_norej'][oka])
+        print(f"   {a:26s} ref/arm {m1:.4f} +- {s1:.4f}   ref/arm_norej {m2:.4f} +- {s2:.4f}   arm_norej/sim_cor_norej {m3:.4f} +- {s3:.4f}   (arm_norej/ref {1 / m2:.4f})")
 # brightness dependence
 q=np.quantile(S['ref'][ok],[0,0.5,0.9,1])
 for lo,hi in zip(q[:-1],q[1:]):

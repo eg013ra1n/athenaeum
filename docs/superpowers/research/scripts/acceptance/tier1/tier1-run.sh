@@ -6,6 +6,12 @@
 # stops the server. ATH_ACC_EXTRA_PATHS, if set in this process's own environment,
 # reaches server.sh unchanged — plain env inheritance across the `zsh "$SRV" ...`
 # child below, nothing this script does explicitly.
+#
+# ATH_ACC_SET_CONFIG, if set, names a file holding the `set_stacking_config` argument
+# document ({"setId": N, "config": {...}, "excludedFrameIds": [...]}); once the server answers
+# and before `start_stacking` it is sent with api.sh, the response is echoed and recorded in
+# run.txt, and anything but the command's `null` refuses the run (LN checkpoint B's F1 arm runs
+# the same template as its PSF-signal arm this way).
 set -uo pipefail
 REPO="$1"; W="$2"; PORT="$3"; SET_ID="${4:-109}"
 SRV="$REPO/docs/superpowers/research/scripts/acceptance/server.sh"
@@ -19,7 +25,25 @@ done
 curl -sN "http://127.0.0.1:$PORT/api/events" > "$W/events.log" 2>/dev/null &
 SSE_PID=$!
 sleep 2
+if [ -n "${ATH_ACC_SET_CONFIG:-}" ]; then
+  if [ ! -r "$ATH_ACC_SET_CONFIG" ]; then
+    echo "ATH_ACC_SET_CONFIG=$ATH_ACC_SET_CONFIG is not a readable file" >&2
+    kill $SSE_PID 2>/dev/null
+    pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
+    exit 1
+  fi
+  CFG_RESP=$(zsh "$REPO/docs/superpowers/research/scripts/acceptance/api.sh" set_stacking_config "$(cat "$ATH_ACC_SET_CONFIG")" "$PORT")
+  echo "set_stacking_config ($ATH_ACC_SET_CONFIG): $CFG_RESP"
+  # Success is the command's `null`; an error answers with its text.
+  if [ "$(printf '%s' "$CFG_RESP" | tr -d '[:space:]')" != "null" ]; then
+    echo "set_stacking_config refused for set $SET_ID: $CFG_RESP" >&2
+    kill $SSE_PID 2>/dev/null
+    pkill -f "$REPO/.superpowers/target-acc/release/athenaeum-web" 2>/dev/null
+    exit 1
+  fi
+fi
 T0=$(date +%s); echo "start $(date -u +%FT%TZ) epoch=$T0" > "$W/run.txt"
+if [ -n "${ATH_ACC_SET_CONFIG:-}" ]; then echo "set_stacking_config $ATH_ACC_SET_CONFIG: $CFG_RESP" >> "$W/run.txt"; fi
 RESP=$(curl -sS -X POST "http://127.0.0.1:$PORT/api/start_stacking" -H 'content-type: application/json' -d "{\"setId\":$SET_ID,\"rerunFrom\":\"calibrate\"}")
 echo "$RESP" >> "$W/run.txt"; echo >> "$W/run.txt"
 # A refused start (a plan blocker such as `space`, a bad set id, a server
