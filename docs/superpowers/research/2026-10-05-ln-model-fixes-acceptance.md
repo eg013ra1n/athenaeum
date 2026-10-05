@@ -112,3 +112,28 @@ The resolved scale was 1536 (auto, 9576 × 6388).
 - **The FWHM estimator jump** on OSC blue (§3).
 - **The master-median row's bar** (±0.1 % of the LN reference), which `main` does not meet either.
 - `nebula_boxes.py`'s `d_norm` column compares a master's normalized read with the control's RAW read. The table above uses norm − norm. It is a harness fix for the next harness task.
+
+## 7. Owner decision (2026-10-05)
+
+Checkpoint A accepted after an independent review (fable, `.superpowers/sdd/2026-10-05-ln-model-fixes-plan/checkpointA-review-fable.md`).
+
+The review measured the following:
+- The set-204 mono whole-frame MAD drop is the top and right 64-px edge. There `main` carried a dark rim inherited from the LN reference's partial-coverage edge:
+
+  | Edge (top / right) | Offset from sky |
+  | ---- | ---- |
+  | LN reference | −4.7 / −9.8 % |
+  | `main` | −3.5 / −5.6 % |
+  | Branch | −1.7 / −4.4 % |
+  | Raw registered frames | −0.6 / −2.5 % |
+
+  The branch is the closest to the raw sky.
+- OSC G/B keep the reference's 128–1000 px dust contrast (slope 0.996 / 0.973 against `main`'s 0.960 / 0.934).
+- 82 % of the B nodes that moved by more than 1 % lie in NaN strips, where `main` held garbage.
+- The FWHM jump is a β flip in the estimator; stacked star profiles agree to 1e-4 of peak.
+- The median offset is uniform and identical on `main` (asymmetric integration rejection is the leading candidate).
+
+Rulings:
+- Continue to the star selection and F1.
+- The master-median row reads **branch vs base ±0.1 %** from checkpoint B on.
+- The uniform master-to-LN-reference median offset becomes an integration-side open item.
