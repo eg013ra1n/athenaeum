@@ -17864,6 +17864,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -17957,6 +17959,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -18044,6 +18048,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -18168,6 +18174,13 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: this test reads the plan against the stored config, so OFF (not storable:
+        // it serializes as null) is replaced by the finite selection that cuts nothing.
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
+            min_peak_snr: 5.0,
+            max_stars: 5000,
+            saturation: 1.0,
+        };
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -18320,6 +18333,13 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: this test reads the plan against the stored config, so OFF (not storable:
+        // it serializes as null) is replaced by the finite selection that cuts nothing.
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection {
+            min_peak_snr: 5.0,
+            max_stars: 5000,
+            saturation: 1.0,
+        };
         cfg.normalization.local.scale_mode = Some(crate::stacking::integrate::LnScaleMode::Auto);
         let expected_scale =
             ln::resolve_scale(&cfg.normalization.local, STAR_FIELD_WIDTH, STAR_FIELD_HEIGHT);
@@ -18435,6 +18455,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -18527,6 +18549,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
         cfg.reference.mode = ReferenceMode::Manual;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
@@ -18638,6 +18662,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -18824,6 +18850,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -18908,6 +18936,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -19041,6 +19071,8 @@ mod tests {
 
         let mut cfg = StackingConfig::default();
         cfg.normalization.local.enabled = true;
+        // P-13: the subject is the LN run, not the star selection (synthetic stars, none saturated).
+        cfg.normalization.local.star_selection = crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();

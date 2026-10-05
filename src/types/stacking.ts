@@ -99,7 +99,9 @@ export type ScaleEstimator = "bwmv" | "mad" | "avgDev";
 
 export type LnScaleMode = "auto" | "fixed";
 
-export type LocalNormalizationConfig = { enabled: boolean, scale: number, scaleMode: LnScaleMode | null, gridSize: number, referenceFrames: number, psfModel: PsfModel, localScale: boolean, };
+export type LnStarSelection = { minPeakSnr: number, maxStars: number, saturation: number, };
+
+export type LocalNormalizationConfig = { enabled: boolean, scale: number, scaleMode: LnScaleMode | null, gridSize: number, referenceFrames: number, psfModel: PsfModel, localScale: boolean, starSelection: LnStarSelection, };
 
 export type NormalizationConfig = { output: OutputNormalization, rejection: RejectionNormalization, 
 /**

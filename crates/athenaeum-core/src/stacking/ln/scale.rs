@@ -37,11 +37,14 @@ use std::time::Instant;
 
 use tracing::{debug, warn};
 
+use super::background::{TileNoise, TileTable, CLEANING};
+use super::selection::{self, SelectionRule, SelectionSide};
 use super::LnError;
 use crate::geometry::kdtree::KdTree2;
 use crate::geometry::{
     select_nodes, Pair, PixelMap, ThinPlateSpline, TPS_MAX_NODES, TPS_MIN_NODES,
 };
+use crate::stacking::integrate::LnStarSelection;
 use crate::stacking::psf_signal::{
     fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
 };
@@ -81,7 +84,7 @@ pub const LN_LOCAL_SCALE_SMOOTHING_SIGMAS: f64 = 5.0;
 /// Perf tier A Task 0 (audit §3.1): wall time (ms) inside each phase of one
 /// [`relative_scale_against`] call — `detect_ms` ([`detect_seeds`] on the
 /// TARGET), `fit_ms` ([`psf_signal::fit_stars_with_beta`] on the target),
-/// `match_ms` (pairing — [`choose_pairing`]/[`ratio_sample`] — plus RCR and,
+/// `match_ms` (pairing — [`choose_pairing`]/[`measured_sample`] — plus RCR and,
 /// when asked for, [`fit_local_scale`], all together). `refine_ms` is
 /// reserved for the centroid-refine LM step Task 3 splits out of
 /// `detect_seeds`'s own detector call; it stays `0` until then. The four
@@ -97,16 +100,33 @@ pub struct ScaleTimings {
     pub match_ms: u64,
 }
 
+/// What the scale estimator needs beyond the two fit lists (spec §3): the
+/// selection and both sides' planes and noise. Built per frame and channel
+/// by `normalize_frame` (the reference side from the group's, or on a
+/// project member the restricted, background model — P-7).
+pub struct ScaleInputs<'a> {
+    pub selection: LnStarSelection,
+    pub reference: SelectionSide<'a>,
+    pub target: SelectionSide<'a>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScaleResult {
     /// RCR location of the matched flux ratios — the global relative scale.
     pub scale: f64,
     /// RCR dispersion of the same sample.
     pub sigma: f64,
-    /// Pairs that survived matching (before RCR rejection).
+    /// Valid PSF-signal pairs before the star selection and before RCR
+    /// rejection (`ln_matches`, P-15).
     pub matches: usize,
-    /// Of `matches`, how many RCR flagged as outliers.
+    /// Of the selected pairs, how many RCR flagged as outliers.
     pub rejected: usize,
+    /// Pairs the star selection kept — the sample RCR, the local scale and
+    /// `diag` read (`ln_selected`, P-15). Equals `matches` under
+    /// `LnStarSelection::OFF`.
+    pub selected: usize,
+    /// Which selection rule produced the sample (`ln_selection`, P-15).
+    pub selection: SelectionRule,
     /// The Moffat β both planes were fitted with — whatever the reference
     /// resolved (`psf::PsfModel::Moffat4`'s fixed 4.0, or `Auto`'s own
     /// per-plane search run once, on the reference only).
@@ -142,6 +162,8 @@ impl PartialEq for ScaleResult {
             && self.sigma == other.sigma
             && self.matches == other.matches
             && self.rejected == other.rejected
+            && self.selected == other.selected
+            && self.selection == other.selection
             && self.beta == other.beta
             && self.pass == other.pass
             && self.local == other.local
@@ -358,9 +380,10 @@ fn choose_pairing(
 ///
 /// `ref_signal`/`tgt_fwhm` (Tier C Task 2 diagnostics round, ruling C-11)
 /// are ADDITIVE — populated alongside `ratios`/`positions`/`ref_idx` from
-/// data `ratio_sample` already reads, never changing what those three
+/// data `measured_sample` already reads, never changing what those three
 /// contain. They exist only so [`ScaleMatchDiag`] can report a per-pair
 /// brightness/FWHM without a second pass over `pairs`.
+#[derive(Default)]
 struct RatioSample {
     ratios: Vec<f64>,
     positions: Vec<(f64, f64)>,
@@ -369,39 +392,50 @@ struct RatioSample {
     tgt_fwhm: Vec<f64>,
 }
 
-/// `ref_fits` is the REFERENCE outcome's own fit list — Tier C ruling C-10:
-/// the caller picks WHICH beta's reference fits to read (the default's, for
-/// the detection fallback; the target's own, for [`relative_scale_from_fits`]),
-/// so this function itself stays beta-agnostic — it only ever indexes `[r]`.
-fn ratio_sample(
+/// Selection, then the flux ratios of the kept pairs (spec §3, L-11).
+/// `matches` keeps its meaning — valid PSF-signal pairs BEFORE selection
+/// (P-15); the sample is the selected pairs in rank order.
+fn measured_sample(
     ref_fits: &[StarFit],
-    tgt_outcome: &FitOutcome,
+    tgt_fits: &[StarFit],
     pairs: &[(usize, usize)],
-) -> RatioSample {
-    let mut out = RatioSample {
-        ratios: Vec::with_capacity(pairs.len()),
-        positions: Vec::with_capacity(pairs.len()),
-        ref_idx: Vec::with_capacity(pairs.len()),
-        ref_signal: Vec::with_capacity(pairs.len()),
-        tgt_fwhm: Vec::with_capacity(pairs.len()),
-    };
-    for &(r, t) in pairs {
-        let rf = &ref_fits[r];
-        let (flux_ref, flux_tgt) = (rf.signal, tgt_outcome.fits[t].signal);
-        if flux_ref > 0.0 && flux_tgt > 0.0 {
-            out.ratios.push(flux_ref / flux_tgt);
-            out.positions.push((rf.x, rf.y));
-            out.ref_idx.push(r);
-            out.ref_signal.push(rf.signal);
-            out.tgt_fwhm.push(tgt_outcome.fits[t].fwhm());
+    inputs: &ScaleInputs<'_>,
+) -> Result<(RatioSample, usize, SelectionRule), LnError> {
+    let valid = |r: usize, t: usize| ref_fits[r].signal > 0.0 && tgt_fits[t].signal > 0.0;
+    let matches = pairs.iter().filter(|&&(r, t)| valid(r, t)).count();
+    let c = selection::rank_candidates(
+        pairs,
+        ref_fits,
+        tgt_fits,
+        &inputs.reference,
+        &inputs.target,
+        &inputs.selection,
+    )?;
+    let mut sample = RatioSample::default();
+    for &(r, t) in &c.ranked {
+        if sample.ratios.len() >= c.quota {
+            break;
+        }
+        if valid(r, t) {
+            let (rf, tf) = (&ref_fits[r], &tgt_fits[t]);
+            sample.ratios.push(rf.signal / tf.signal);
+            sample.positions.push((rf.x, rf.y));
+            sample.ref_idx.push(r);
+            sample.ref_signal.push(rf.signal);
+            sample.tgt_fwhm.push(tf.fwhm());
         }
     }
-    out
+    if sample.ratios.len() < MIN_MATCHES {
+        return Err(LnError::TooFewMatches {
+            matches: sample.ratios.len(),
+        });
+    }
+    Ok((sample, matches, c.rule))
 }
 
 /// Diagnostic-only match record (Tier C Task 2 diagnostics round, ruling
 /// C-11) — never read by `normalize_frame` or any other production caller.
-/// One entry per pair `ratio_sample` accepted (`flux_ref > 0 && flux_tgt >
+/// One entry per pair `measured_sample` kept (`flux_ref > 0 && flux_tgt >
 /// 0`), in the pairing's own order — exactly [`RatioSample`]'s own rows,
 /// plus the matching [`crate::stacking::robust::RcrResult::kept`] flag.
 #[derive(Debug, Clone, Copy)]
@@ -699,6 +733,7 @@ pub fn relative_scale_against(
     rcr_limit: f64,
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    inputs: &ScaleInputs<'_>,
 ) -> Result<ScaleResult, LnError> {
     relative_scale_against_core(
         prepared,
@@ -711,6 +746,7 @@ pub fn relative_scale_against(
         local_scale,
         pool,
         None,
+        inputs,
     )
     .map(|(r, _diag)| r)
 }
@@ -729,6 +765,7 @@ pub fn relative_scale_against_masked(
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
     allowed: &[bool],
+    inputs: &ScaleInputs<'_>,
 ) -> Result<ScaleResult, LnError> {
     relative_scale_against_core(
         prepared,
@@ -741,6 +778,7 @@ pub fn relative_scale_against_masked(
         local_scale,
         pool,
         Some(allowed),
+        inputs,
     )
     .map(|(r, _diag)| r)
 }
@@ -763,6 +801,7 @@ pub fn relative_scale_against_with_diag(
     rcr_limit: f64,
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    inputs: &ScaleInputs<'_>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
     relative_scale_against_core(
         prepared,
@@ -775,6 +814,7 @@ pub fn relative_scale_against_with_diag(
         local_scale,
         pool,
         None,
+        inputs,
     )
 }
 
@@ -790,6 +830,7 @@ fn relative_scale_against_core(
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
     allowed: Option<&[bool]>,
+    inputs: &ScaleInputs<'_>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
     let fit_params = FitParams::default();
 
@@ -832,12 +873,8 @@ fn relative_scale_against_core(
         match_radius_px,
     );
 
-    let sample = ratio_sample(&prepared.outcome.fits, &tgt_outcome, &pairs);
-    if sample.ratios.len() < MIN_MATCHES {
-        return Err(LnError::TooFewMatches {
-            matches: sample.ratios.len(),
-        });
-    }
+    let (sample, matches, rule) =
+        measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
 
     let r = crate::stacking::robust::rcr(&sample.ratios, rcr_limit);
     let local = if local_scale {
@@ -850,7 +887,9 @@ fn relative_scale_against_core(
     debug!(
         ln_scale = r.location,
         sigma = r.scale,
-        ln_matches = sample.ratios.len(),
+        ln_matches = matches,
+        ln_selected = sample.ratios.len(),
+        ln_selection = rule.as_str(),
         rejected = r.rejected,
         ln_pass = pass,
         ln_local_nodes = local.as_ref().map_or(0, |s| s.nodes.len()),
@@ -862,8 +901,10 @@ fn relative_scale_against_core(
         ScaleResult {
             scale: r.location,
             sigma: r.scale,
-            matches: sample.ratios.len(),
+            matches,
             rejected: r.rejected,
+            selected: sample.ratios.len(),
+            selection: rule,
             beta: prepared.beta,
             pass,
             local,
@@ -1019,7 +1060,7 @@ fn choose_pairing_widened(
 ///
 /// Pairing is [`choose_pairing_widened`] (ruling C-2 — there is still no
 /// detection barycentre to fall back on: the seeds are Measure's own
-/// positions, not a fresh detection's). [`ratio_sample`] /
+/// positions, not a fresh detection's). [`measured_sample`] /
 /// [`crate::stacking::robust::rcr`] / [`fit_local_scale`] run UNCHANGED.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_scale_from_seeds(
@@ -1034,6 +1075,7 @@ pub fn relative_scale_from_seeds(
     rcr_limit: f64,
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    inputs: &ScaleInputs<'_>,
 ) -> Result<ScaleResult, LnError> {
     relative_scale_from_seeds_core(
         prepared,
@@ -1048,6 +1090,7 @@ pub fn relative_scale_from_seeds(
         local_scale,
         pool,
         None,
+        inputs,
     )
     .map(|(r, _diag, _breakdown)| r)
 }
@@ -1068,6 +1111,7 @@ pub fn relative_scale_from_seeds_masked(
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
     allowed: &[bool],
+    inputs: &ScaleInputs<'_>,
 ) -> Result<ScaleResult, LnError> {
     relative_scale_from_seeds_core(
         prepared,
@@ -1082,6 +1126,7 @@ pub fn relative_scale_from_seeds_masked(
         local_scale,
         pool,
         Some(allowed),
+        inputs,
     )
     .map(|(r, _diag, _breakdown)| r)
 }
@@ -1107,7 +1152,7 @@ pub fn relative_scale_from_seeds_masked(
 /// seed — a seed can still be dropped here: the admission check in
 /// `psf_signal::fit_one`, a fit that failed to converge, or `dedupe`
 /// collapsing two seeds that walked onto the same star), `matched` (the
-/// pairing + `ratio_sample` step — [`ScaleResult::matches`] is exactly
+/// pairing + `measured_sample` step — [`ScaleResult::matches`] is exactly
 /// this number).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SeedFilterBreakdown {
@@ -1135,6 +1180,7 @@ pub fn relative_scale_from_seeds_with_breakdown(
     rcr_limit: f64,
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    inputs: &ScaleInputs<'_>,
 ) -> Result<(ScaleResult, SeedFilterBreakdown), LnError> {
     relative_scale_from_seeds_core(
         prepared,
@@ -1149,6 +1195,7 @@ pub fn relative_scale_from_seeds_with_breakdown(
         local_scale,
         pool,
         None,
+        inputs,
     )
     .map(|(r, _diag, breakdown)| (r, breakdown))
 }
@@ -1171,6 +1218,7 @@ pub fn relative_scale_from_seeds_with_diag(
     rcr_limit: f64,
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    inputs: &ScaleInputs<'_>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>), LnError> {
     relative_scale_from_seeds_core(
         prepared,
@@ -1185,6 +1233,7 @@ pub fn relative_scale_from_seeds_with_diag(
         local_scale,
         pool,
         None,
+        inputs,
     )
     .map(|(r, diag, _breakdown)| (r, diag))
 }
@@ -1203,6 +1252,7 @@ fn relative_scale_from_seeds_core(
     local_scale: bool,
     pool: Option<&Arc<rayon::ThreadPool>>,
     allowed: Option<&[bool]>,
+    inputs: &ScaleInputs<'_>,
 ) -> Result<(ScaleResult, Vec<ScaleMatchDiag>, SeedFilterBreakdown), LnError> {
     let fit_params = FitParams::default();
     let mut breakdown = SeedFilterBreakdown {
@@ -1290,13 +1340,15 @@ fn relative_scale_from_seeds_core(
         match_radius_px,
     );
 
-    let sample = ratio_sample(&prepared.outcome.fits, &tgt_outcome, &pairs);
-    breakdown.matched = sample.ratios.len();
-    if sample.ratios.len() < MIN_MATCHES {
-        return Err(LnError::TooFewMatches {
-            matches: sample.ratios.len(),
-        });
-    }
+    let measured = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs);
+    // `matched` is the pre-selection count, also when the sample is short.
+    breakdown.matched = pairs
+        .iter()
+        .filter(|&&(r, t)| {
+            prepared.outcome.fits[r].signal > 0.0 && tgt_outcome.fits[t].signal > 0.0
+        })
+        .count();
+    let (sample, matches, rule) = measured?;
 
     let r = crate::stacking::robust::rcr(&sample.ratios, rcr_limit);
     let local = if local_scale {
@@ -1309,7 +1361,9 @@ fn relative_scale_from_seeds_core(
     debug!(
         ln_scale = r.location,
         sigma = r.scale,
-        ln_matches = sample.ratios.len(),
+        ln_matches = matches,
+        ln_selected = sample.ratios.len(),
+        ln_selection = rule.as_str(),
         rejected = r.rejected,
         ln_pass = pass,
         ln_local_nodes = local.as_ref().map_or(0, |s| s.nodes.len()),
@@ -1321,8 +1375,10 @@ fn relative_scale_from_seeds_core(
         ScaleResult {
             scale: r.location,
             sigma: r.scale,
-            matches: sample.ratios.len(),
+            matches,
             rejected: r.rejected,
+            selected: sample.ratios.len(),
+            selection: rule,
             beta: prepared.beta,
             pass,
             local,
@@ -1356,8 +1412,28 @@ pub fn relative_scale(
     match_radius_px: f64,
     rcr_limit: f64,
     local_scale: bool,
+    selection: LnStarSelection,
 ) -> Result<ScaleResult, LnError> {
     let prepared = PreparedReferenceChannel::build(reference, width, height, psf, max_stars, None);
+    let ref_noise =
+        TileNoise::from_table(&TileTable::measure(reference, width, height, &CLEANING, None));
+    let tgt_noise =
+        TileNoise::from_table(&TileTable::measure(target, width, height, &CLEANING, None));
+    let inputs = ScaleInputs {
+        selection,
+        reference: SelectionSide {
+            plane: reference,
+            width,
+            height,
+            noise: &ref_noise,
+        },
+        target: SelectionSide {
+            plane: target,
+            width,
+            height,
+            noise: &tgt_noise,
+        },
+    };
     relative_scale_against(
         &prepared,
         target,
@@ -1368,6 +1444,7 @@ pub fn relative_scale(
         rcr_limit,
         local_scale,
         None,
+        &inputs,
     )
 }
 
@@ -1377,6 +1454,37 @@ mod tests {
     use crate::geometry::ransac::SplitMix64;
     use crate::stacking::test_fixtures::synthetic_star_field;
     use crate::test_support::{add_noise, moffat_field, MoffatStar};
+
+    /// P-13: the pre-existing pins run without a selection. Under
+    /// `LnStarSelection::OFF` neither side's plane nor noise is read.
+    fn off_inputs<'a>(
+        r: &'a [f32],
+        t: &'a [f32],
+        w: usize,
+        h: usize,
+        noise: &'a TileNoise,
+    ) -> ScaleInputs<'a> {
+        ScaleInputs {
+            selection: LnStarSelection::OFF,
+            reference: SelectionSide {
+                plane: r,
+                width: w,
+                height: h,
+                noise,
+            },
+            target: SelectionSide {
+                plane: t,
+                width: w,
+                height: h,
+                noise,
+            },
+        }
+    }
+
+    fn no_noise() -> &'static TileNoise {
+        static NOISE: std::sync::OnceLock<TileNoise> = std::sync::OnceLock::new();
+        NOISE.get_or_init(|| TileNoise::uniform(0.0, f32::NAN))
+    }
 
     const WIDTH: usize = 512;
     const HEIGHT: usize = 384;
@@ -1421,6 +1529,8 @@ mod tests {
             4.0,
             0.3,
             false,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("a clean uniformly-scaled field must match");
 
@@ -1460,6 +1570,8 @@ mod tests {
             4.0,
             0.3,
             false,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("a clean uniformly-scaled field must match");
 
@@ -1473,6 +1585,8 @@ mod tests {
         );
         let via_prepared = relative_scale_against(
             &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("the same prepared reference must match the same target");
 
@@ -1507,6 +1621,8 @@ mod tests {
         let t = std::time::Instant::now();
         let r = relative_scale_against(
             &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("a clean uniformly-scaled field must match");
         let wall_ms = t.elapsed().as_millis() as u64;
@@ -1556,6 +1672,8 @@ mod tests {
             4.0,
             0.3,
             false,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("a majority-clean field must still match");
 
@@ -1586,6 +1704,8 @@ mod tests {
             4.0,
             0.3,
             false,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect_err("a starless target cannot produce 20 matched pairs");
 
@@ -1668,6 +1788,8 @@ mod tests {
             4.0,
             0.3,
             false,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("a clean field differing only in seeing must still match");
 
@@ -1694,6 +1816,8 @@ mod tests {
             4.0,
             0.3,
             false,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("Auto must resolve on this clean, purely-Moffat4 field");
 
@@ -1733,6 +1857,8 @@ mod tests {
             4.0,
             0.3,
             false,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("a clean field differing only in seeing must still match");
 
@@ -2060,6 +2186,8 @@ mod tests {
             4.0,
             0.3,
             false,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("a clean uniformly-scaled field must match");
 
@@ -2102,6 +2230,8 @@ mod tests {
             4.0,
             0.3,
             true,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("a clean field with a smooth scale gradient must match");
 
@@ -2144,6 +2274,8 @@ mod tests {
             4.0,
             0.3,
             false,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("a clean field with a smooth scale gradient must match");
         let on = relative_scale(
@@ -2156,6 +2288,8 @@ mod tests {
             4.0,
             0.3,
             true,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("a clean field with a smooth scale gradient must match");
 
@@ -2229,6 +2363,8 @@ mod tests {
                 4.0,
                 0.3,
                 true,
+                // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+                LnStarSelection::OFF,
             )
             .expect("a uniformly-scaled field must match even at this noise level");
             assert!(
@@ -2284,6 +2420,8 @@ mod tests {
             4.0,
             0.3,
             true,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            LnStarSelection::OFF,
         )
         .expect("24 stars still clear MIN_MATCHES");
 
@@ -2465,6 +2603,8 @@ mod tests {
 
         let oracle = relative_scale_against(
             &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("the detection oracle must match a clean uniformly-scaled field");
 
@@ -2472,6 +2612,8 @@ mod tests {
         let identity = identity_map();
         let from_seeds = relative_scale_from_seeds(
             &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("seeds from Measure-like fits on the same field must also match");
 
@@ -2515,6 +2657,8 @@ mod tests {
         let identity = identity_map();
         let r = relative_scale_from_seeds(
             &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("a clean field must match");
         assert!((r.scale - 1.0 / 1.1).abs() < 0.02, "scale {}", r.scale);
@@ -2570,6 +2714,8 @@ mod tests {
             0.3,
             false,
             None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("matched-beta seeds must succeed");
         let from_4 = relative_scale_from_seeds(
@@ -2584,6 +2730,8 @@ mod tests {
             0.3,
             false,
             None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("a source beta far from the default must no longer matter");
 
@@ -2636,6 +2784,8 @@ mod tests {
             0.3,
             false,
             None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect_err("no fits at all cannot produce 20 matched pairs");
         assert!(matches!(err, LnError::TooFewMatches { matches: 0 }));
@@ -2663,34 +2813,42 @@ mod tests {
 
         let plain = relative_scale_against(
             &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("a clean uniformly-scaled field must match");
         let (diag_result, diag) = relative_scale_against_with_diag(
             &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("the diag variant must succeed identically");
         assert_eq!(plain, diag_result, "with_diag must not change the result");
-        assert_eq!(diag.len(), plain.matches);
+        assert_eq!(diag.len(), plain.selected);
         assert_eq!(
             diag.iter().filter(|d| d.kept).count(),
-            plain.matches - plain.rejected
+            plain.selected - plain.rejected
         );
 
         let fits = measure_like_fits(&target, WIDTH, HEIGHT, prepared.default_beta());
         let identity = identity_map();
         let plain_seeds = relative_scale_from_seeds(
             &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("seeds must match");
         let (diag_seeds_result, diag_seeds) = relative_scale_from_seeds_with_diag(
             &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("the diag variant must succeed identically");
         assert_eq!(plain_seeds, diag_seeds_result);
-        assert_eq!(diag_seeds.len(), plain_seeds.matches);
+        assert_eq!(diag_seeds.len(), plain_seeds.selected);
         assert_eq!(
             diag_seeds.iter().filter(|d| d.kept).count(),
-            plain_seeds.matches - plain_seeds.rejected
+            plain_seeds.selected - plain_seeds.rejected
         );
     }
 
@@ -2717,6 +2875,8 @@ mod tests {
         let identity = identity_map();
         let (plain, breakdown) = relative_scale_from_seeds_with_breakdown(
             &prepared, &fits, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            // P-13: pre-selection pin; selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            &off_inputs(&target, &target, WIDTH, HEIGHT, no_noise()),
         )
         .expect("a clean uniformly-scaled field must match");
 
@@ -2738,5 +2898,137 @@ mod tests {
         // Measure-like fit should clear every gate on this clean field.
         assert_eq!(breakdown.available, breakdown.in_coverage);
         assert_eq!(breakdown.in_coverage, breakdown.past_saturation);
+    }
+
+    /// The saturated-core field of the selection pins: `star_grid`'s field
+    /// plus a 0.98-peak 5 x 5 core on every 10th star, painted on both
+    /// planes, so `plane_max` = 0.98 and the 0.08-0.38 stars pass relative
+    /// saturation at 0.75.
+    fn saturated_pair(seed: u64) -> (Vec<f32>, Vec<f32>) {
+        let stars = star_grid(seed);
+        let mut reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, seed + 100);
+        let mut target = synthetic_star_field(
+            WIDTH,
+            HEIGHT,
+            &scale_stars(&stars, 0.8),
+            FWHM,
+            NOISE,
+            seed + 200,
+        );
+        for &(x, y, _) in stars.iter().step_by(10) {
+            let (cx, cy) = (x.round() as usize, y.round() as usize);
+            for plane in [&mut reference, &mut target] {
+                for yy in cy - 2..=cy + 2 {
+                    for xx in cx - 2..=cx + 2 {
+                        plane[yy * WIDTH + xx] = 0.98;
+                    }
+                }
+            }
+        }
+        (reference, target)
+    }
+
+    fn measured_inputs<'a>(
+        reference: &'a [f32],
+        target: &'a [f32],
+        ref_noise: &'a TileNoise,
+        tgt_noise: &'a TileNoise,
+        selection: LnStarSelection,
+    ) -> ScaleInputs<'a> {
+        ScaleInputs {
+            selection,
+            reference: SelectionSide {
+                plane: reference,
+                width: WIDTH,
+                height: HEIGHT,
+                noise: ref_noise,
+            },
+            target: SelectionSide {
+                plane: target,
+                width: WIDTH,
+                height: HEIGHT,
+                noise: tgt_noise,
+            },
+        }
+    }
+
+    fn noise_of(plane: &[f32]) -> TileNoise {
+        TileNoise::from_table(&TileTable::measure(plane, WIDTH, HEIGHT, &CLEANING, None))
+    }
+
+    /// L-11: the selection runs on both scale paths. A field with saturated
+    /// stars: the production selection drops exactly the saturated pairs,
+    /// and both paths agree.
+    #[test]
+    fn the_selection_runs_on_the_detection_and_the_seeds_path() {
+        let (reference, target) = saturated_pair(41);
+        let (rn, tn) = (noise_of(&reference), noise_of(&target));
+        let inputs = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::default());
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
+        let det = relative_scale_against(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+        )
+        .expect("the detection path must match");
+        assert_eq!(det.selection, SelectionRule::Snr);
+        assert!(
+            det.selected < det.matches,
+            "selected {} of {}",
+            det.selected,
+            det.matches
+        );
+        assert!((det.scale - 1.25).abs() < 0.01, "scale {}", det.scale);
+
+        let seeds = prepared.outcome.fits.clone();
+        let identity = identity_map();
+        let from_seeds = relative_scale_from_seeds(
+            &prepared, &seeds, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
+            &inputs,
+        )
+        .expect("the seeds path must match");
+        assert_eq!(from_seeds.selection, SelectionRule::Snr);
+        assert_eq!(from_seeds.selected, det.selected);
+        let rel = (from_seeds.scale - det.scale).abs() / det.scale;
+        assert!(
+            rel < 0.005,
+            "seeds {} vs detection {}",
+            from_seeds.scale,
+            det.scale
+        );
+    }
+
+    #[test]
+    fn matches_counts_pairs_before_selection_and_selected_after() {
+        let (reference, target) = saturated_pair(41);
+        let (rn, tn) = (noise_of(&reference), noise_of(&target));
+        let prepared = PreparedReferenceChannel::build(
+            &reference,
+            WIDTH,
+            HEIGHT,
+            PsfModel::Moffat4,
+            200,
+            None,
+        );
+        let run = |selection: LnStarSelection| {
+            let inputs = measured_inputs(&reference, &target, &rn, &tn, selection);
+            relative_scale_against(
+                &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+            )
+            .expect("the field must match")
+        };
+        let off = run(LnStarSelection::OFF);
+        assert_eq!(off.selected, off.matches);
+        let capped = run(LnStarSelection {
+            max_stars: 25,
+            ..LnStarSelection::OFF
+        });
+        assert_eq!(capped.selected, 25);
+        assert_eq!(capped.matches, off.matches);
     }
 }

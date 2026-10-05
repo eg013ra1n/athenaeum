@@ -48,7 +48,7 @@ use athenaeum_core::stacking::ln::calibration as ln_calibration;
 use athenaeum_core::stacking::ln::{
     build_reference, normalize_frame, relative_scale, relative_scale_from_seeds_with_breakdown,
     shared_refit, BackgroundModel, LnFrameGrids, LnGrid, LnReferenceForDetection, LnScaleSeeds,
-    TileTable, CLEANING,
+    ScaleInputs, SelectionSide, TileNoise, TileTable, CLEANING,
 };
 use athenaeum_core::stacking::measure::{measure_frame_with_fits, FrameMeasurement};
 use athenaeum_core::stacking::psf_signal::{group_beta, PsfModel};
@@ -813,6 +813,7 @@ catalog has no artifact for)",
             4.0,
             0.3,
             local_cfg.local_scale,
+            local_cfg.star_selection,
         );
         if let Err(e) = &scale_result {
             // Should not happen — `normalize_frame` above already ran the
@@ -826,6 +827,30 @@ catalog has no artifact for)",
         // (never through `normalize_frame`, which does not expose it).
         let seed_filter_breakdown = if args.diag {
             let plane_fits = target_fits.get(p).cloned().unwrap_or_default();
+            // The production default selection (Task 15 adds the probe's arms).
+            let ref_noise = TileNoise::from_model(&ref_models[p]);
+            let tgt_noise = TileNoise::from_table(&TileTable::measure(
+                &target_plane,
+                reference.width,
+                reference.height,
+                &CLEANING,
+                Some(&pool),
+            ));
+            let inputs = ScaleInputs {
+                selection: local_cfg.star_selection,
+                reference: SelectionSide {
+                    plane: &ref_for_detection.sanitized_planes[p],
+                    width: reference.width,
+                    height: reference.height,
+                    noise: &ref_noise,
+                },
+                target: SelectionSide {
+                    plane: &sanitized_target,
+                    width: reference.width,
+                    height: reference.height,
+                    noise: &tgt_noise,
+                },
+            };
             match relative_scale_from_seeds_with_breakdown(
                 &ref_for_detection.prepared[p],
                 &plane_fits,
@@ -838,6 +863,7 @@ catalog has no artifact for)",
                 0.3,
                 local_cfg.local_scale,
                 Some(&pool),
+                &inputs,
             ) {
                 Ok((_, breakdown)) => Some(breakdown),
                 Err(e) => {

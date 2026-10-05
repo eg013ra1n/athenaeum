@@ -210,6 +210,8 @@ pub struct LocalNormalizationConfig {
     pub reference_frames: u32,
     pub psf_model: crate::stacking::psf_signal::PsfModel,
     pub local_scale: bool,
+    // Which matched stars set the scale (spec §3).
+    pub star_selection: LnStarSelection,
 }
 
 impl Default for LocalNormalizationConfig {
@@ -222,6 +224,7 @@ impl Default for LocalNormalizationConfig {
             reference_frames: 20,
             psf_model: crate::stacking::psf_signal::PsfModel::Auto,
             local_scale: false,
+            star_selection: LnStarSelection::default(),
         }
     }
 }
@@ -1906,6 +1909,7 @@ mod tests {
                 reference_frames: 8,
                 psf_model: crate::stacking::psf_signal::PsfModel::Moffat4,
                 local_scale: true,
+                star_selection: LnStarSelection::default(),
             }
         );
     }

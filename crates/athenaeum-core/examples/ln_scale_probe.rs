@@ -58,10 +58,13 @@ use athenaeum_core::integration::registered_source::{RegisteredFrame, Registered
 use athenaeum_core::integration::source::FrameSource;
 use athenaeum_core::integration::stats::median_in_place;
 use athenaeum_core::resample::Interpolation;
+use athenaeum_core::stacking::integrate::LnStarSelection;
 use athenaeum_core::stacking::ln::scale::{
     relative_scale_against, relative_scale_against_masked, PreparedReferenceChannel,
 };
-use athenaeum_core::stacking::ln::{eroded_mask, LN_MASK_MARGIN_PX};
+use athenaeum_core::stacking::ln::{
+    eroded_mask, ScaleInputs, SelectionSide, TileNoise, TileTable, CLEANING, LN_MASK_MARGIN_PX,
+};
 use athenaeum_core::stacking::psf_signal::{
     fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
 };
@@ -590,6 +593,25 @@ fn main() {
             .map(|&v| if v.is_finite() { v } else { fill })
             .collect();
 
+        // The production default selection (Task 15 adds the probe's arms).
+        let ref_noise = TileNoise::from_table(&TileTable::measure(&ref_raw, w, h, &CLEANING, None));
+        let tgt_noise = TileNoise::from_table(&TileTable::measure(&tgt_raw, w, h, &CLEANING, None));
+        let inputs = ScaleInputs {
+            selection: LnStarSelection::default(),
+            reference: SelectionSide {
+                plane: &ref_sane,
+                width: w,
+                height: h,
+                noise: &ref_noise,
+            },
+            target: SelectionSide {
+                plane: &tgt_sane,
+                width: w,
+                height: h,
+                noise: &tgt_noise,
+            },
+        };
+
         // ---- 1. the production call ----
         let lib = match allowed.as_deref() {
             Some(a) => relative_scale_against_masked(
@@ -603,6 +625,7 @@ fn main() {
                 false,
                 Some(&pool),
                 a,
+                &inputs,
             ),
             None => relative_scale_against(
                 &prepared,
@@ -614,6 +637,7 @@ fn main() {
                 RCR_LIMIT,
                 false,
                 Some(&pool),
+                &inputs,
             ),
         };
         let (s_lib, lib_pass, lib_matches) = match &lib {

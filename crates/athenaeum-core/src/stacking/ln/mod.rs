@@ -72,7 +72,7 @@ pub use reference::{build_reference, read_reference, write_reference, LnReferenc
 pub use scale::{
     relative_scale, relative_scale_against, relative_scale_against_with_diag,
     relative_scale_from_seeds, relative_scale_from_seeds_with_breakdown,
-    relative_scale_from_seeds_with_diag, PreparedReferenceChannel, ScaleMatchDiag, ScaleResult,
+    relative_scale_from_seeds_with_diag, PreparedReferenceChannel, ScaleInputs, ScaleMatchDiag, ScaleResult,
     SeedFilterBreakdown, LN_BARYCENTRE_PASS_THRESHOLD, LN_LOCAL_SCALE_MIN_STARS,
     LN_LOCAL_SCALE_SMOOTHING_SIGMAS,
 };
@@ -81,8 +81,9 @@ pub use scale::{
 /// normalization subtree so a change in what an existing config produces
 /// moves the `ln`, `ln_reference` and `ln_calibration` hashes together.
 /// 1 = the cell model (implicit, never written); 2 = the background model
-/// at the scale; bump it again whenever an existing config's output moves.
-pub const LN_MODEL_VERSION: u32 = 2;
+/// at the scale; 3 = the star selection (spec §3); bump it again whenever
+/// an existing config's output moves.
+pub const LN_MODEL_VERSION: u32 = 3;
 
 /// What [`normalize_frame`] is given to seed the relative-scale step with
 /// (perf tier C Task 2 fix round 4, ruling C-14 item 3).
@@ -969,6 +970,28 @@ pub fn normalize_frame(
         // reporting too few matches after mapping/pre-selection — falls
         // back to the full-detection path on the warped `target` plane,
         // with exactly one `warn!` for the whole frame.
+        // P-7: on a project member the reference side is the member's
+        // restricted model (its plane maximum and tile sigma).
+        let ref_model_for_scale = member_ref_model.as_ref().unwrap_or(&ref_models[p]);
+        let (ref_noise, tgt_noise) = (
+            TileNoise::from_model(ref_model_for_scale),
+            TileNoise::from_model(&target_model),
+        );
+        let inputs = scale::ScaleInputs {
+            selection: cfg.star_selection,
+            reference: SelectionSide {
+                plane: &reference_for_detection.sanitized_planes[p],
+                width: reference.width,
+                height: reference.height,
+                noise: &ref_noise,
+            },
+            target: SelectionSide {
+                plane: &target,
+                width: reference.width,
+                height: reference.height,
+                noise: &tgt_noise,
+            },
+        };
         let t = Instant::now();
         let plane_fits = seeds.plane_fits(p);
         // Ruling C-14 item 3: only a GENUINE fallback is loud and counted.
@@ -1001,6 +1024,7 @@ pub fn normalize_frame(
                     cfg.local_scale,
                     pool,
                     a,
+                    &inputs,
                 ),
                 None => scale::relative_scale_against(
                     &reference_for_detection.prepared[p],
@@ -1012,6 +1036,7 @@ pub fn normalize_frame(
                     0.3,
                     cfg.local_scale,
                     pool,
+                    &inputs,
                 ),
             }
         };
@@ -1031,6 +1056,7 @@ pub fn normalize_frame(
                     cfg.local_scale,
                     pool,
                     a,
+                    &inputs,
                 ),
                 None => scale::relative_scale_from_seeds(
                     &reference_for_detection.prepared[p],
@@ -1044,6 +1070,7 @@ pub fn normalize_frame(
                     0.3,
                     cfg.local_scale,
                     pool,
+                    &inputs,
                 ),
             } {
                 Ok(r) => r,
@@ -2043,6 +2070,8 @@ mod tests {
         let cfg = LocalNormalizationConfig {
             enabled: true,
             scale: 256,
+            // P-13: pre-selection pin (synthetic field has no saturated star); selection is pinned by the_selection_runs_on_the_detection_and_the_seeds_path.
+            star_selection: crate::stacking::integrate::LnStarSelection::OFF,
             ..LocalNormalizationConfig::default()
         };
         let measure = crate::stacking::measure::MeasureOptions {
@@ -2356,6 +2385,8 @@ mod tests {
         let cfg = LocalNormalizationConfig {
             enabled: true,
             scale: 256,
+            // P-13: the probe pins coverage handling; its synthetic stars include no saturated one.
+            star_selection: crate::stacking::integrate::LnStarSelection::OFF,
             ..LocalNormalizationConfig::default()
         };
         let measure = crate::stacking::measure::MeasureOptions {

@@ -553,6 +553,32 @@ pub(crate) fn resolve_ln_fields(config: &mut StackingConfig) {
         );
         local.grid_size = clamped;
     }
+    let sel = &mut local.star_selection;
+    // `!(x >= MIN)` so a NaN clamps to the minimum too.
+    if !(sel.min_peak_snr >= 5.0) || sel.min_peak_snr > 200.0 {
+        let clamped = if sel.min_peak_snr > 200.0 { 200.0 } else { 5.0 };
+        warn!(
+            value = sel.min_peak_snr,
+            clamped, "stacking config: LN starSelection.minPeakSnr out of range; clamped"
+        );
+        sel.min_peak_snr = clamped;
+    }
+    if !(20..=5000).contains(&sel.max_stars) {
+        let clamped = sel.max_stars.clamp(20, 5000);
+        warn!(
+            value = sel.max_stars,
+            clamped, "stacking config: LN starSelection.maxStars out of range; clamped"
+        );
+        sel.max_stars = clamped;
+    }
+    if !(sel.saturation >= 0.5) || sel.saturation > 1.0 {
+        let clamped = if sel.saturation > 1.0 { 1.0 } else { 0.5 };
+        warn!(
+            value = sel.saturation,
+            clamped, "stacking config: LN starSelection.saturation out of range; clamped"
+        );
+        sel.saturation = clamped;
+    }
 }
 
 /// [`crate::stacking::integrate::LargeScaleRejection::protected_layers`]
@@ -1243,12 +1269,40 @@ mod tests {
     }
 
     #[test]
+    fn star_selection_is_clamped_to_its_ranges() {
+        let read = |sel: &str| {
+            resolve_config(
+                Some(&format!(
+                    r#"{{"normalization":{{"local":{{"starSelection":{sel}}}}}}}"#
+                )),
+                None,
+            )
+            .unwrap()
+            .normalization
+            .local
+            .star_selection
+        };
+        let s = read(r#"{"minPeakSnr":1,"maxStars":5,"saturation":0.2}"#);
+        assert_eq!((s.min_peak_snr, s.max_stars, s.saturation), (5.0, 20, 0.5));
+        let s = read(r#"{"minPeakSnr":900,"maxStars":90000,"saturation":2}"#);
+        assert_eq!(
+            (s.min_peak_snr, s.max_stars, s.saturation),
+            (200.0, 5000, 1.0)
+        );
+        assert_eq!(
+            read("{}"),
+            crate::stacking::integrate::LnStarSelection::default()
+        );
+    }
+
+    #[test]
     fn serde_names_follow_the_spec() {
         let s = serde_json::to_string(&StackingConfig::default()).unwrap();
         assert!(
             !s.contains("splitByExposure"),
             "the toggle is gone — exposure always splits: {s}"
         );
+        // 2026-10-05 LN model fixes Task 11: starSelection + lnModelVersion 3.
         for needle in [
             "\"exposureToleranceSec\":2.0",
             "\"exposureMode\":\"seconds\"",
@@ -1268,7 +1322,7 @@ mod tests {
             "\"output\":\"additiveWithScaling\"",
             "\"rejection\":\"scaleZeroOffset\"",
             "\"scaleEstimator\":\"bwmv\"",
-            "\"local\":{\"enabled\":false,\"scale\":1024,\"scaleMode\":\"auto\",\"gridSize\":4,\"referenceFrames\":20,\"psfModel\":\"auto\",\"localScale\":false}",
+            "\"local\":{\"enabled\":false,\"scale\":1024,\"scaleMode\":\"auto\",\"gridSize\":4,\"referenceFrames\":20,\"psfModel\":\"auto\",\"localScale\":false,\"starSelection\":{\"minPeakSnr\":40.0,\"maxStars\":500,\"saturation\":0.75}}",
             "\"rejection\":{\"method\":\"auto\"}",
             "\"writeRejectionMaps\":false",
             "\"dropShrink\":0.9",
@@ -1853,7 +1907,10 @@ mod tests {
         // And here (2026-10-05 LN model fixes Task 3): `normalization.local`
         // gains `scaleMode` and `gridSize` in the serialized config (the
         // fingerprint hashes the whole document).
-        assert_eq!(default_hash, "b10edef31aa31e3d");
+        //
+        // And here (2026-10-05 LN model fixes Task 11): `normalization.local`
+        // gains `starSelection` in the serialized config.
+        assert_eq!(default_hash, "f3615884e6f01084");
     }
 
     /// Tier C item C2 (ruling C-3): the drizzle kernel generation is part
