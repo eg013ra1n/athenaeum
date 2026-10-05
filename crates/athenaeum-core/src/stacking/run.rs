@@ -19383,6 +19383,9 @@ mod tests {
         let mut cfg_rejection_only = StackingConfig::default();
         cfg_rejection_only.normalization.rejection = RejectionNormalization::Local;
         cfg_rejection_only.normalization.local.enabled = false;
+        // P-13: the subject is the one grid-less frame among normalized ones, not the selection (synthetic stars, none saturated).
+        cfg_rejection_only.normalization.local.star_selection =
+            crate::stacking::integrate::LnStarSelection::OFF;
 
         let layout_a = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let output_dir = output.path().to_path_buf();
@@ -19429,6 +19432,11 @@ mod tests {
             .as_ref()
             .expect("group wrote a master and its stats");
         assert_eq!(stats_a.included, 4, "{stats_a:?}");
+        assert_eq!(
+            stats_a.ln_frames,
+            stats_a.included - 1,
+            "exactly the blocked frame's grid is missing: {stats_a:?}"
+        );
         assert!(
             stats_a.ln_frames < stats_a.included,
             "the blocked frame's own grid must be missing: {stats_a:?}"

@@ -1340,15 +1340,10 @@ fn relative_scale_from_seeds_core(
         match_radius_px,
     );
 
-    let measured = measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs);
-    // `matched` is the pre-selection count, also when the sample is short.
-    breakdown.matched = pairs
-        .iter()
-        .filter(|&&(r, t)| {
-            prepared.outcome.fits[r].signal > 0.0 && tgt_outcome.fits[t].signal > 0.0
-        })
-        .count();
-    let (sample, matches, rule) = measured?;
+    let (sample, matches, rule) =
+        measured_sample(&prepared.outcome.fits, &tgt_outcome.fits, &pairs, inputs)?;
+    // The pre-selection valid-pair count, as `measured_sample` defines it.
+    breakdown.matched = matches;
 
     let r = crate::stacking::robust::rcr(&sample.ratios, rcr_limit);
     let local = if local_scale {
@@ -2900,32 +2895,46 @@ mod tests {
         assert_eq!(breakdown.in_coverage, breakdown.past_saturation);
     }
 
-    /// The saturated-core field of the selection pins: `star_grid`'s field
-    /// plus a 0.98-peak 5 x 5 core on every 10th star, painted on both
-    /// planes, so `plane_max` = 0.98 and the 0.08-0.38 stars pass relative
-    /// saturation at 0.75.
+    /// Where the bright stars of [`saturated_pair`] sit: every 10th star of
+    /// `star_grid(seed)`.
+    fn bright_positions(seed: u64) -> Vec<(f64, f64)> {
+        star_grid(seed)
+            .iter()
+            .step_by(10)
+            .map(|&(x, y, _)| (x, y))
+            .collect()
+    }
+
+    /// The selection pins' field: `star_grid`'s stars, but every 10th one is
+    /// bright (amplitude 0.77, peak 0.85 on the reference) - above 0.75 x the
+    /// plane maximum yet below the absolute 0.95 guard, so detection keeps it
+    /// and only RELATIVE saturation can drop it. One saturated anchor star
+    /// (peak 0.98 on both planes, far from the grid) sets the plane maximum.
     fn saturated_pair(seed: u64) -> (Vec<f32>, Vec<f32>) {
-        let stars = star_grid(seed);
-        let mut reference = synthetic_star_field(WIDTH, HEIGHT, &stars, FWHM, NOISE, seed + 100);
-        let mut target = synthetic_star_field(
-            WIDTH,
-            HEIGHT,
-            &scale_stars(&stars, 0.8),
-            FWHM,
-            NOISE,
-            seed + 200,
-        );
-        for &(x, y, _) in stars.iter().step_by(10) {
-            let (cx, cy) = (x.round() as usize, y.round() as usize);
-            for plane in [&mut reference, &mut target] {
-                for yy in cy - 2..=cy + 2 {
-                    for xx in cx - 2..=cx + 2 {
-                        plane[yy * WIDTH + xx] = 0.98;
-                    }
-                }
-            }
+        let mut stars = star_grid(seed);
+        for st in stars.iter_mut().step_by(10) {
+            st.2 = 0.77;
         }
+        let anchor = (500.0, 368.0, 0.90);
+        let mut ref_stars = stars.clone();
+        ref_stars.push(anchor);
+        let mut tgt_stars = scale_stars(&stars, 0.8);
+        tgt_stars.push(anchor);
+        let reference = synthetic_star_field(WIDTH, HEIGHT, &ref_stars, FWHM, NOISE, seed + 100);
+        let target = synthetic_star_field(WIDTH, HEIGHT, &tgt_stars, FWHM, NOISE, seed + 200);
         (reference, target)
+    }
+
+    /// How many of `diag`'s pairs sit on a bright star of the field.
+    fn bright_in(diag: &[ScaleMatchDiag], seed: u64) -> usize {
+        let bright = bright_positions(seed);
+        diag.iter()
+            .filter(|d| {
+                bright
+                    .iter()
+                    .any(|&(x, y)| (d.ref_x - x).hypot(d.ref_y - y) < 3.0)
+            })
+            .count()
     }
 
     fn measured_inputs<'a>(
@@ -2963,7 +2972,8 @@ mod tests {
     fn the_selection_runs_on_the_detection_and_the_seeds_path() {
         let (reference, target) = saturated_pair(41);
         let (rn, tn) = (noise_of(&reference), noise_of(&target));
-        let inputs = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::default());
+        let default = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::default());
+        let off = measured_inputs(&reference, &target, &rn, &tn, LnStarSelection::OFF);
         let prepared = PreparedReferenceChannel::build(
             &reference,
             WIDTH,
@@ -2972,27 +2982,34 @@ mod tests {
             200,
             None,
         );
-        let det = relative_scale_against(
-            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &inputs,
+        let (_, det_all) = relative_scale_against_with_diag(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &off,
+        )
+        .expect("the unselected detection path must match");
+        assert!(
+            bright_in(&det_all, 41) >= 5,
+            "the bright stars are matched when nothing is selected: {}",
+            bright_in(&det_all, 41)
+        );
+        let (det, det_diag) = relative_scale_against_with_diag(
+            &prepared, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None, &default,
         )
         .expect("the detection path must match");
         assert_eq!(det.selection, SelectionRule::Snr);
-        assert!(
-            det.selected < det.matches,
-            "selected {} of {}",
-            det.selected,
-            det.matches
-        );
+        assert!(det.selected < det.matches, "{} of {}", det.selected, det.matches);
+        assert_eq!(bright_in(&det_diag, 41), 0, "relative saturation drops them");
         assert!((det.scale - 1.25).abs() < 0.01, "scale {}", det.scale);
 
         let seeds = prepared.outcome.fits.clone();
         let identity = identity_map();
-        let from_seeds = relative_scale_from_seeds(
+        let (from_seeds, seeds_diag) = relative_scale_from_seeds_with_diag(
             &prepared, &seeds, &identity, &target, WIDTH, HEIGHT, 200, 4.0, 0.3, false, None,
-            &inputs,
+            &default,
         )
         .expect("the seeds path must match");
         assert_eq!(from_seeds.selection, SelectionRule::Snr);
+        assert!(from_seeds.selected < from_seeds.matches);
+        assert_eq!(bright_in(&seeds_diag, 41), 0, "on the seeds path too");
         assert_eq!(from_seeds.selected, det.selected);
         let rel = (from_seeds.scale - det.scale).abs() / det.scale;
         assert!(
