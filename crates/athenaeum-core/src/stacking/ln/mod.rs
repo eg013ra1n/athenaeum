@@ -45,6 +45,7 @@ use crate::stacking::integrate::{LocalNormalizationConfig, StackFrame};
 use crate::stacking::measure::MeasureOptions;
 use crate::stacking::psf_signal::StarFit;
 
+pub mod aperture;
 pub mod background;
 pub mod calibration;
 pub mod grid;
@@ -56,6 +57,10 @@ pub mod selection;
 pub use scale_rule::{
     effective_scale_mode, resolve_scale, snap_ln_scale, LEGACY_DEFAULT_LN_SCALE, LN_SCALES,
     MAX_GRID_SIZE, MIN_GRID_SIZE,
+};
+pub use aperture::{
+    aperture_multiple, circle_flux, ApertureSide, FiniteMask, GROWTH_OUTER_FWHM, GROWTH_PAIRS,
+    SKY_INNER_FWHM, SKY_OUTER_FWHM,
 };
 pub use background::{
     shared_refit, BackgroundModel, BackgroundRefusal, CleaningParams, PairSurfaces, Surface,

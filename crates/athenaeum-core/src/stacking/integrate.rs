@@ -193,6 +193,46 @@ impl LnStarSelection {
     };
 }
 
+/// The LN scale's flux definition (spec 2026-10-04 §4): the PSF fit's own
+/// signal, or a common circular aperture (F1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum LnFluxEstimator {
+    #[default]
+    PsfSignal,
+    CommonAperture,
+}
+
+impl LnFluxEstimator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LnFluxEstimator::PsfSignal => "psfSignal",
+            LnFluxEstimator::CommonAperture => "commonAperture",
+        }
+    }
+}
+
+/// F1's circle (spec 2026-10-04 §4.1): 2 or 3 x FWHM, or 2 x FWHM with the
+/// growth-curve correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum LnAperture {
+    Fwhm2,
+    #[default]
+    Fwhm3,
+    GrowthCurve,
+}
+
+impl LnAperture {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LnAperture::Fwhm2 => "fwhm2",
+            LnAperture::Fwhm3 => "fwhm3",
+            LnAperture::GrowthCurve => "growthCurve",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LocalNormalizationConfig {
