@@ -169,7 +169,8 @@ export function NormalizePanel({ config, onChange, disabled, defaults, plan }: N
                 )}
               </select>
               <p className="mt-1 text-[11px] text-content-muted">
-                The background model follows structures larger than this and treats smaller ones as signal.
+                default {effectiveScaleMode(defaults.normalization.local) === 'auto' ? 'Auto' : `${defaults.normalization.local.scale} px`} — The
+                background model follows structures larger than this and treats smaller ones as signal.
               </p>
             </div>
 
