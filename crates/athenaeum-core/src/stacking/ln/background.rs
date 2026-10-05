@@ -1977,15 +1977,49 @@ mod tests {
     /// edge tiles — bit-identical to measuring the masked plane outright.
     #[test]
     fn restricted_tiles_equal_measuring_the_masked_plane() {
-        let (plane, w, h) = dirty_field();
+        let (mut plane, w, h) = dirty_field();
         let mask: Vec<bool> = (0..w * h)
             .map(|k| {
                 let (x, y) = ((k % w) as f64, (k / w) as f64);
                 x + 0.7 * y > 150.0 && (x - 260.0).hypot(y - 200.0) < 230.0
             })
             .collect();
+        // P-3 discriminator. Tile (u, v) = (4, 1) spans x 128..160, y 32..64 and
+        // lies wholly inside the mask, but its hot-pixel apron crosses the mask
+        // edge. Bright pixels (0.95) fill the 11 masked-out pixels of the 5 x 5
+        // window of (128, 32) plus the in-mask (128, 32) and (129, 32): 13 of 25
+        // are bright, so on the unmasked plane the window median is bright and
+        // (128, 32) is NOT replaced (it stays above the clip and drops out), while
+        // on the masked plane only 2 of its 14 present window pixels are bright and
+        // it IS replaced by the window median. A tile-only reuse rule would keep
+        // the group value for this tile and fail the assertion below.
+        for (x, y) in [
+            (126usize, 30usize),
+            (127, 30),
+            (128, 30),
+            (129, 30),
+            (126, 31),
+            (127, 31),
+            (128, 31),
+            (126, 32),
+            (127, 32),
+            (126, 33),
+            (126, 34),
+            (128, 32),
+            (129, 32),
+        ] {
+            plane[y * w + x] = 0.95;
+        }
         let group = TileTable::measure(&plane, w, h, &CLEANING, None);
         let restricted = group.restricted(&plane, &mask, &CLEANING, None);
+        let tile = TILE_PX;
+        let k = (32 / tile) * group.tw + 128 / tile;
+        let (g, r) = (&group.tiles[k], &restricted.tiles[k]);
+        assert!(
+            (g.present, g.value.to_bits(), g.max.to_bits())
+                != (r.present, r.value.to_bits(), r.max.to_bits()),
+            "tile (4, 1) must differ between the group and the masked measurement"
+        );
         let masked_plane: Vec<f32> = plane
             .iter()
             .zip(&mask)
