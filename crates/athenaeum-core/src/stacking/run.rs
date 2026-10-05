@@ -2717,28 +2717,26 @@ fn warn_flat_only_group(
         if !seen.insert(format!("{}|{phase:?}", m.path)) {
             continue;
         }
-        let divisor = if cfg.calibration.flat_norm {
-            match crate::export::calibrated_generator::flat_norm_divisor_cached(
-                rc.memo.divisors_mut(),
-                &m.path,
-                scratch,
-                cfg.calibration.flat_norm_mode,
-                &cfg.calibration.params,
-                inputs.cfa_geometry,
-            ) {
-                Ok(d) => d.global_value(),
-                Err(e) => {
-                    tracing::warn!(
-                        run_id = rc.run_id,
-                        path = %m.path,
-                        error = %e,
-                        "flat corner ratio unreadable; the pedestal warning omits it"
-                    );
-                    continue;
-                }
+        // The corner ratio is corner over centre whatever the light division
+        // does, so the divisor is always the generator's resolved constant.
+        let divisor = match crate::export::calibrated_generator::flat_norm_divisor_cached(
+            rc.memo.divisors_mut(),
+            &m.path,
+            scratch,
+            cfg.calibration.flat_norm_mode,
+            &cfg.calibration.params,
+            inputs.cfa_geometry,
+        ) {
+            Ok(d) => d.global_value(),
+            Err(e) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    path = %m.path,
+                    error = %e,
+                    "flat corner ratio unreadable; the pedestal warning omits it"
+                );
+                continue;
             }
-        } else {
-            1.0
         };
         match crate::calibration_library::light_cal::flat_corner_ratio(
             Path::new(&m.path),
@@ -12711,6 +12709,7 @@ mod tests {
         ctx: &Arc<ServiceContext>,
         db_path: &Path,
         keep_dark: bool,
+        flat_norm: bool,
     ) -> (RunContext, String, tempfile::TempDir, tempfile::TempDir) {
         let fixture_conn = rusqlite::Connection::open(db_path).unwrap();
         let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
@@ -12732,7 +12731,8 @@ mod tests {
         }
         let working = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
-        let cfg = StackingConfig::default();
+        let mut cfg = StackingConfig::default();
+        cfg.calibration.flat_norm = flat_norm;
         let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
         let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
         let group_key = plan_groups[0].key.clone();
@@ -12760,7 +12760,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("catalog.db");
         let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
-        let (mut rc, key, _w, _o) = pedestal_stage_one(&ctx, &db_path, false);
+        let (mut rc, key, _w, _o) = pedestal_stage_one(&ctx, &db_path, false, true);
 
         // The fixture flat is a constant 0.5 plane stamped ATH_FNRM = 0.5
         // and flat normalization is on: corners = centre -> ratio 1.
@@ -12798,7 +12798,7 @@ mod tests {
         let tmp2 = tempfile::tempdir().unwrap();
         let db2 = tmp2.path().join("catalog.db");
         let ctx2 = Arc::new(ServiceContext::new_for_tests(db2.clone()));
-        let (rc2, _k2, _w2, _o2) = pedestal_stage_one(&ctx2, &db2, true);
+        let (rc2, _k2, _w2, _o2) = pedestal_stage_one(&ctx2, &db2, true, true);
         assert!(
             !rc2
                 .warnings
@@ -12806,6 +12806,31 @@ mod tests {
                 .any(|w| w.contains("flat but no dark or bias")),
             "{:?}",
             rc2.warnings
+        );
+    }
+
+    /// The corner ratio is corner over centre, so switching flat
+    /// normalization off must not change the sentence.
+    #[test]
+    fn the_corner_ratio_does_not_depend_on_flat_normalization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (rc, key, _w, _o) = pedestal_stage_one(&ctx, &db_path, false, false);
+        let prefix =
+            format!("group {key}: 3 lights were calibrated with a flat but no dark or bias");
+        let hits: Vec<&String> = rc
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with(&prefix))
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", rc.warnings);
+        assert!(
+            hits[0].contains(
+                "reads 100 % of its centre, so the offset pedestal is 1.0\u{d7} larger there."
+            ),
+            "{}",
+            hits[0]
         );
     }
 

@@ -873,6 +873,12 @@ pub fn flat_corner_ratio(
     scratch_dir: &Path,
     divisor: f64,
 ) -> Result<f64, IntegrationError> {
+    if !(divisor.is_finite() && divisor > 0.0) {
+        return Err(IntegrationError::BadInput(format!(
+            "flat corner divisor {divisor} unusable ({})",
+            flat_path.display()
+        )));
+    }
     let src = BandSource::open(&[flat_path.to_path_buf()], scratch_dir, 1)?;
     let (w, h) = (src.width(), src.height());
     let c = 16usize
@@ -913,9 +919,9 @@ pub fn flat_corner_ratio(
     .into_iter()
     .filter(|m| m.is_finite())
     .fold(f32::INFINITY, f32::min);
-    if !darkest.is_finite() || !(divisor.is_finite() && divisor > 0.0) {
+    if !darkest.is_finite() || darkest <= 0.0 {
         return Err(IntegrationError::BadInput(format!(
-            "flat corners unreadable or divisor {divisor} unusable ({})",
+            "flat corners unreadable or not positive ({})",
             flat_path.display()
         )));
     }
@@ -1038,6 +1044,31 @@ mod tests {
         let r = flat_corner_ratio(&flat, dir.path(), 0.8).unwrap();
         assert!((r - 0.625).abs() < 1e-6, "ratio {r}");
         assert!(flat_corner_ratio(&flat, dir.path(), 0.0).is_err());
+        // A zero corner and an all-NaN corner set are refused, not reported.
+        let zero = write_fill(
+            dir.path(),
+            "zero.fits",
+            400,
+            300,
+            |x, y| if x < 20 && y < 20 { 0.0 } else { 1.0 },
+            &[],
+        );
+        assert!(flat_corner_ratio(&zero, dir.path(), 1.0).is_err());
+        let nan = write_fill(
+            dir.path(),
+            "nan.fits",
+            400,
+            300,
+            |x, y| {
+                if (x < 20 || x >= 380) && (y < 20 || y >= 280) {
+                    f32::NAN
+                } else {
+                    1.0
+                }
+            },
+            &[],
+        );
+        assert!(flat_corner_ratio(&nan, dir.path(), 1.0).is_err());
     }
 
     fn fnrm_card(v: f64) -> Card {
