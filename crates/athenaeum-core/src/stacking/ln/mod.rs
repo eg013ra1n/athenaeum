@@ -2392,6 +2392,7 @@ mod tests {
             crate::stacking::integrate::LnFluxEstimator::PsfSignal,
             crate::stacking::integrate::LnAperture::Fwhm3,
             0.0,
+            false,
         )
     }
 
@@ -2405,6 +2406,7 @@ mod tests {
         estimator: crate::stacking::integrate::LnFluxEstimator,
         aperture: crate::stacking::integrate::LnAperture,
         ramp: f32,
+        nan_cores: bool,
     ) -> (LnFrameOutcome, LnFrameGrids) {
         use crate::fits_writer::write_fits_f32;
         use crate::geometry::{Linear, PixelMap};
@@ -2434,7 +2436,7 @@ mod tests {
             .enumerate()
             .map(|(k, &v)| if k % W < ref_cover { v } else { f32::NAN })
             .collect();
-        let target: Vec<f32> = field
+        let mut target: Vec<f32> = field
             .iter()
             .enumerate()
             .map(|(k, &v)| {
@@ -2445,6 +2447,17 @@ mod tests {
                 }
             })
             .collect();
+        if nan_cores {
+            // A NaN core (a rejected hot pixel) on the TARGET at the pixel
+            // nearest the centre of 55 % of the stars; the reference stays
+            // clean. A circle with an absent pixel is invalid, so the
+            // presence mask must be taken before the sanitizing fill.
+            for (i, &(x, y, _)) in stars.iter().enumerate() {
+                if i % 20 < 11 {
+                    target[y.round() as usize * W + x.round() as usize] = f32::NAN;
+                }
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let reference = LnReference {
             width: W,
@@ -2609,10 +2622,19 @@ mod tests {
         // fills the member's NaN strip with the plane's global median, which
         // is not the local sky there, so the circles and annuli that reach
         // the strip must be refused through the presence mask.
-        for (cover, from, mode, ramp) in [
-            (420usize, 100usize, LnOverlap::Masked, 0.0f32),
-            (512, 0, LnOverlap::Legacy, 0.0),
-            (512, 108, LnOverlap::Legacy, 0.03),
+        for (cover, from, mode, ramp, nan_cores) in [
+            (420usize, 100usize, LnOverlap::Masked, 0.0f32, false),
+            (512, 0, LnOverlap::Legacy, 0.0, false),
+            (512, 108, LnOverlap::Legacy, 0.03, false),
+            // NaN cores on 55 % of the target's stars; only the pairs whose
+            // circle is clean may remain. The Legacy case is the one that
+            // discriminates a wrong presence mask (an all-present mask gives
+            // 1.394). The Masked case cannot: the NaN pixel leaves the
+            // overlap, so the 48 px erosion drops the star before any circle
+            // is read; it is kept as a recovery pin. It covers more of the
+            // field than (420, 100) so that MIN_MATCHES clean pairs remain.
+            (500, 0, LnOverlap::Masked, 0.0, true),
+            (512, 0, LnOverlap::Legacy, 0.0, true),
         ] {
             let (outcome, _) = masked_probe_with(
                 Interpolation::Bilinear,
@@ -2623,11 +2645,15 @@ mod tests {
                 LnFluxEstimator::CommonAperture,
                 LnAperture::Fwhm3,
                 ramp,
+                nan_cores,
             );
-            println!("F1 {mode:?} {from} ramp {ramp} scale {}", outcome.scale);
+            println!(
+                "F1 {mode:?} {from} ramp {ramp} nan_cores {nan_cores} scale {}",
+                outcome.scale
+            );
             assert!(
                 (outcome.scale - 1.25).abs() < 0.0125,
-                "{mode:?} ramp {ramp}: scale {}",
+                "{mode:?} ramp {ramp} nan_cores {nan_cores}: scale {}",
                 outcome.scale
             );
         }
