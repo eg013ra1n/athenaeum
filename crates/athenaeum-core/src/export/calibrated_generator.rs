@@ -39,6 +39,7 @@ use crate::fits_writer::{write_fits_f32_with, Card, CardValue, Durability};
 use crate::integration::banded::probe_bitpix;
 use crate::integration::cfa::CfaGeometry;
 use crate::integration::IntegrationError;
+use crate::models::LightCalParams;
 use astroimage::processing::vng::vng_debayer_f32;
 use astroimage::BayerPattern;
 
@@ -258,6 +259,26 @@ fn divisor_key(flat_path: &str, cfa: Option<CfaGeometry>) -> DivisorKey {
     )
 }
 
+/// The memoized flat-normalization divisor for one (flat, light phase): the
+/// one place the cache key is built, shared by the generator and the run's
+/// pedestal warning so both resolve the same constant.
+pub(crate) fn flat_norm_divisor_cached(
+    divisors: &mut DivisorCache,
+    flat_path: &str,
+    scratch_dir: &Path,
+    mode: FlatNormMode,
+    params: &LightCalParams,
+    cfa: Option<CfaGeometry>,
+) -> anyhow::Result<FlatNormDivisor> {
+    let key = divisor_key(flat_path, cfa);
+    if let Some(d) = divisors.entries.get(&key) {
+        return Ok(*d);
+    }
+    let d = resolve_flat_norm_divisor(Path::new(flat_path), scratch_dir, mode, params, cfa)?;
+    divisors.entries.insert(key, d);
+    Ok(d)
+}
+
 /// One run's memo of resolved flat-normalization divisors.
 ///
 /// [`resolve_flat_norm_divisor`] costs a FULL read of the master flat's plane
@@ -357,21 +378,14 @@ pub fn resolve_generation_cached(
             // Memoized per (flat, light phase): the miss path can read the
             // whole flat plane, and a set's lights overwhelmingly share one
             // flat and one phase.
-            let key = divisor_key(&m.path, resolved.cfa_geometry);
-            match divisors.entries.get(&key) {
-                Some(d) => *d,
-                None => {
-                    let d = resolve_flat_norm_divisor(
-                        Path::new(&m.path),
-                        scratch_dir,
-                        opts.flat_norm_mode,
-                        &opts.params,
-                        resolved.cfa_geometry,
-                    )?;
-                    divisors.entries.insert(key, d);
-                    d
-                }
-            }
+            flat_norm_divisor_cached(
+                divisors,
+                &m.path,
+                scratch_dir,
+                opts.flat_norm_mode,
+                &opts.params,
+                resolved.cfa_geometry,
+            )?
         }
         _ => FlatNormDivisor::Global(1.0),
     };

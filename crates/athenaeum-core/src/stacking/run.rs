@@ -2649,6 +2649,139 @@ fn stage_one_kind(rc: &RunContext) -> Result<StageOneKind, RunError> {
     })
 }
 
+/// Spec 2026-10-04 §5.1-§5.3 (P-11): one run warning per group whose lights
+/// link a flat but no dark or bias, with the flat's darkest corner over its
+/// normalization divisor. Advisory: a failure to tally or to read a corner
+/// is a `warn!` and the stage continues, never a failed run.
+fn warn_flat_only_group(
+    rc: &mut RunContext,
+    cfg: &StackingConfig,
+    group: &IntegrationGroup,
+    frame_ids: &[i64],
+    scratch: &Path,
+) {
+    use crate::api::lights::{
+        card_text, flat_only_lights, offset_gain_text, pedestal_run_sentence,
+    };
+    let handle = match db(&rc.ctx) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                run_id = rc.run_id,
+                error = %e,
+                "pedestal check skipped: catalog unavailable"
+            );
+            return;
+        }
+    };
+    let conn = handle.conn();
+    let tally = match flat_only_lights(&conn, frame_ids) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                run_id = rc.run_id,
+                group_key = %group.key,
+                error = %e,
+                "pedestal check skipped: link read failed"
+            );
+            return;
+        }
+    };
+    if tally.frame_ids.is_empty() {
+        return;
+    }
+    // The smallest ratio over the distinct flat masters the affected lights use.
+    let mut corner: Option<f64> = None;
+    let mut seen: HashSet<String> = HashSet::new();
+    for &id in &tally.frame_ids {
+        let inputs = match crate::calibration_library::light_resolve::resolve_frame_inputs(
+            &conn,
+            id,
+            cfg.calibration.flat_norm,
+        ) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    frame_id = id,
+                    error = %e,
+                    "flat corner ratio unreadable; the pedestal warning omits it"
+                );
+                continue;
+            }
+        };
+        let Some(m) = inputs.flat else { continue };
+        let phase = inputs
+            .cfa_geometry
+            .map(|g| (g.xoff.rem_euclid(2), g.yoff.rem_euclid(2)));
+        if !seen.insert(format!("{}|{phase:?}", m.path)) {
+            continue;
+        }
+        let divisor = if cfg.calibration.flat_norm {
+            match crate::export::calibrated_generator::flat_norm_divisor_cached(
+                rc.memo.divisors_mut(),
+                &m.path,
+                scratch,
+                cfg.calibration.flat_norm_mode,
+                &cfg.calibration.params,
+                inputs.cfa_geometry,
+            ) {
+                Ok(d) => d.global_value(),
+                Err(e) => {
+                    tracing::warn!(
+                        run_id = rc.run_id,
+                        path = %m.path,
+                        error = %e,
+                        "flat corner ratio unreadable; the pedestal warning omits it"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            1.0
+        };
+        match crate::calibration_library::light_cal::flat_corner_ratio(
+            Path::new(&m.path),
+            scratch,
+            divisor,
+        ) {
+            Ok(v) => corner = Some(corner.map_or(v, |c| c.min(v))),
+            Err(e) => {
+                tracing::warn!(
+                    run_id = rc.run_id,
+                    path = %m.path,
+                    error = %e,
+                    "flat corner ratio unreadable; the pedestal warning omits it"
+                );
+            }
+        }
+    }
+    let offset_text = card_text("OFFSET", &tally.offsets);
+    let gain_text = card_text("GAIN", &tally.gains);
+    let flat_ids_text = tally
+        .flat_set_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    tracing::warn!(
+        run_id = rc.run_id,
+        group_key = %group.key,
+        count = tally.frame_ids.len(),
+        light_offset = %offset_text,
+        light_gain = %gain_text,
+        flat_set_ids = %flat_ids_text,
+        flat_corner_ratio = corner.unwrap_or(f64::NAN),
+        "flat without a dark or bias: the offset pedestal is amplified in vignetted corners"
+    );
+    rc.warnings.push(pedestal_run_sentence(
+        &group.key,
+        tally.frame_ids.len(),
+        &offset_gain_text(&tally),
+        corner,
+    ));
+}
+
 /// Stage 1: calibrate every non-manually-excluded LIGHT frame, reusing a
 /// fresh `calibrated` artifact when one exists. Ruling 4's "sequentially,
 /// exactly as the calibrated-lights export does today" is retired as of
@@ -2810,6 +2943,17 @@ fn stage_calibrate(rc: &mut RunContext) -> Result<(), RunError> {
                 }
             }
         }
+        // Spec 2026-10-04 §5.1: evaluated here, per group, before the
+        // cached-group `continue`, so a run whose stage 1 is fully cached
+        // still names its flat-only lights.
+        let visited: Vec<i64> = group
+            .frames
+            .iter()
+            .map(|f| f.frame_id)
+            .filter(|id| !excluded_set.contains(id))
+            .filter(|id| !rc.runtime_exclusions.iter().any(|(e, _)| e == id))
+            .collect();
+        warn_flat_only_group(rc, &cfg, group, &visited, &scratch);
         if jobs.is_empty() {
             continue;
         }
@@ -12558,6 +12702,111 @@ mod tests {
         .unwrap();
 
         (fixture, light_ids, working, output)
+    }
+
+    /// Runs stage 1 on a fresh fixture whose three lights link the master
+    /// flat, and the master dark only when `keep_dark`; returns the context
+    /// (for a second run) and the group key.
+    fn pedestal_stage_one(
+        ctx: &Arc<ServiceContext>,
+        db_path: &Path,
+        keep_dark: bool,
+    ) -> (RunContext, String, tempfile::TempDir, tempfile::TempDir) {
+        let fixture_conn = rusqlite::Connection::open(db_path).unwrap();
+        let fixture = test_fixtures::frame_set_with_conn(fixture_conn, SET_NAME);
+        let mut light_ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let (id, _) = test_fixtures::add_light(&fixture, &light_spec(&format!("f{i}"), t));
+            light_ids.push(id);
+        }
+        test_fixtures::add_master_dark_and_flat(&fixture, &light_ids, 64, 48);
+        if !keep_dark {
+            fixture
+                .conn
+                .execute(
+                    "DELETE FROM calibration_set_to_frames \
+                     WHERE source_type = 'frame' AND calibration_type = 'Dark'",
+                    [],
+                )
+                .unwrap();
+        }
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let cfg = StackingConfig::default();
+        let layout = WorkingLayout::new(working.path(), &set_slug(SET_NAME));
+        let plan_groups = group_frames(&fixture.conn, fixture.set_id, &cfg.grouping).unwrap();
+        let group_key = plan_groups[0].key.clone();
+        let mut rc = test_context(
+            ctx.clone(),
+            Arc::new(NullEmitter) as Arc<dyn ProgressEmitter>,
+            1,
+            fixture.set_id,
+            SET_NAME,
+            cfg,
+            plan_groups,
+            layout,
+            output.path().to_path_buf(),
+            HashMap::new(),
+        );
+        stage_calibrate(&mut rc).unwrap();
+        (rc, group_key, working, output)
+    }
+
+    /// Spec 2026-10-04 §5.1-§5.3: a group whose lights link the master flat
+    /// only gets ONE run warning with the flat's corner ratio, again when
+    /// stage 1 is fully cached; a group with its dark links gets none.
+    #[test]
+    fn a_flat_only_group_gets_one_run_warning_with_the_corner_ratio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let ctx = Arc::new(ServiceContext::new_for_tests(db_path.clone()));
+        let (mut rc, key, _w, _o) = pedestal_stage_one(&ctx, &db_path, false);
+
+        // The fixture flat is a constant 0.5 plane stamped ATH_FNRM = 0.5
+        // and flat normalization is on: corners = centre -> ratio 1.
+        let prefix =
+            format!("group {key}: 3 lights were calibrated with a flat but no dark or bias");
+        let hits: Vec<&String> = rc
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with(&prefix))
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", rc.warnings);
+        assert!(
+            hits[0].contains(
+                "The flat's darkest corner reads 100 % of its centre, so the offset pedestal is 1.0\u{d7} larger there."
+            ),
+            "{}",
+            hits[0]
+        );
+
+        // Second run: every frame's stage-1 artifact is fresh (all Reused).
+        rc.warnings.clear();
+        stage_calibrate(&mut rc).unwrap();
+        assert!(
+            rc.cached_calibrated.values().all(|c| *c),
+            "stage 1 not cached"
+        );
+        let again = rc
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with(&prefix))
+            .count();
+        assert_eq!(again, 1, "{:?}", rc.warnings);
+
+        // Dark links kept: no such warning.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let db2 = tmp2.path().join("catalog.db");
+        let ctx2 = Arc::new(ServiceContext::new_for_tests(db2.clone()));
+        let (rc2, _k2, _w2, _o2) = pedestal_stage_one(&ctx2, &db2, true);
+        assert!(
+            !rc2
+                .warnings
+                .iter()
+                .any(|w| w.contains("flat but no dark or bias")),
+            "{:?}",
+            rc2.warnings
+        );
     }
 
     // ── start_stacking / cancel_stacking ────────────────────────────────

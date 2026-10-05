@@ -863,6 +863,65 @@ fn read_full_flat_plane(
     Ok((w, h, data))
 }
 
+/// The flat's darkest corner over its normalization divisor (spec
+/// 2026-10-04 §5.3, L-18): the median of each `c × c` corner patch,
+/// `c = max(16, round(0.05·min(W, H)))`, the smallest of the four, divided
+/// by `divisor` (the generator's `FlatNormDivisor::global_value`). Reads
+/// only the top and bottom `c` rows, band by band.
+pub fn flat_corner_ratio(
+    flat_path: &Path,
+    scratch_dir: &Path,
+    divisor: f64,
+) -> Result<f64, IntegrationError> {
+    let src = BandSource::open(&[flat_path.to_path_buf()], scratch_dir, 1)?;
+    let (w, h) = (src.width(), src.height());
+    let c = 16usize
+        .max((0.05 * w.min(h) as f64).round() as usize)
+        .min(w.min(h) / 2)
+        .max(1);
+    let band_rows = src.band_rows_for_budget(MIN_BUDGET_BYTES).max(1);
+    let mut planes = BandPlanes::new(&src);
+    let mut read_rows = |y0: usize| -> Result<Vec<f32>, IntegrationError> {
+        let mut out = vec![0f32; c * w];
+        let mut y = 0;
+        while y < c {
+            let rows = band_rows.min(c - y);
+            src.read_band(y0 + y, rows, &mut planes, 1)?;
+            planes.decode_frame_into(0, &mut out[y * w..(y + rows) * w]);
+            y += rows;
+        }
+        Ok(out)
+    };
+    let (top, bottom) = (read_rows(0)?, read_rows(h - c)?);
+    let patch = |rows: &[f32], x0: usize| -> f32 {
+        let mut v: Vec<f32> = (0..c)
+            .flat_map(|r| rows[r * w + x0..r * w + x0 + c].iter().copied())
+            .filter(|p| p.is_finite())
+            .collect();
+        if v.is_empty() {
+            f32::NAN
+        } else {
+            crate::integration::stats::median_in_place(&mut v)
+        }
+    };
+    let darkest = [
+        patch(&top, 0),
+        patch(&top, w - c),
+        patch(&bottom, 0),
+        patch(&bottom, w - c),
+    ]
+    .into_iter()
+    .filter(|m| m.is_finite())
+    .fold(f32::INFINITY, f32::min);
+    if !darkest.is_finite() || !(divisor.is_finite() && divisor > 0.0) {
+        return Err(IntegrationError::BadInput(format!(
+            "flat corners unreadable or divisor {divisor} unusable ({})",
+            flat_path.display()
+        )));
+    }
+    Ok(darkest as f64 / divisor)
+}
+
 /// Two-sided trimmed mean over the whole plane, discarding exactly
 /// `trim_fraction` of the pixels from EACH tail (a common two-sided clipping
 /// convention for flat normalization, spec §2; `trim_fraction` defaults to
@@ -948,6 +1007,37 @@ mod tests {
         let mut data = vec![0f32; w * h];
         planes.decode_frame_into(0, &mut data);
         (w, h, data)
+    }
+
+    /// Spec §5.3: the smallest of the four corner-patch medians over the
+    /// normalization divisor; c = max(16, round(0.05·min(W, H))).
+    #[test]
+    fn flat_corner_ratio_reads_the_darkest_corner_over_the_divisor() {
+        let dir = tempfile::tempdir().unwrap();
+        // 400 x 300: c = max(16, 15) = 16; the 20 x 20 corners hold the patches.
+        let flat = write_fill(
+            dir.path(),
+            "flat.fits",
+            400,
+            300,
+            |x, y| {
+                let right = x >= 380;
+                let bottom = y >= 280;
+                if x < 20 && y < 20 {
+                    0.5
+                } else if (x < 20 || right) && (y < 20 || bottom) {
+                    0.7
+                } else {
+                    1.0
+                }
+            },
+            &[],
+        );
+        let r = flat_corner_ratio(&flat, dir.path(), 1.0).unwrap();
+        assert!((r - 0.5).abs() < 1e-6, "ratio {r}");
+        let r = flat_corner_ratio(&flat, dir.path(), 0.8).unwrap();
+        assert!((r - 0.625).abs() < 1e-6, "ratio {r}");
+        assert!(flat_corner_ratio(&flat, dir.path(), 0.0).is_err());
     }
 
     fn fnrm_card(v: f64) -> Card {
