@@ -36,6 +36,7 @@ import {
   writeLightCalFormatPref,
   type CalibratedLightFormat,
 } from './lightCalPrefs';
+import { CalibrationWarnings } from './CalibrationWarnings';
 import type { CalibrationDetail, ExportMode } from '../../types/export';
 import type {
   ExportFileCounts,
@@ -560,6 +561,7 @@ export function ExportTab({ frameSetId, frameSetName }: ExportTabProps) {
                 choices carry over unchanged. */}
             {exportMode === 'calibratedLights' && (
               <div className="mt-3 pt-3 border-t border-border space-y-3">
+                <CalibrationWarnings warnings={readiness?.calibrationWarnings ?? []} />
                 {/* Flat normalization, with its statistic nested under it: the
                     statistic only means something while normalization runs. */}
                 <div>
