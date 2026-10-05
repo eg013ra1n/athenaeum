@@ -45,6 +45,7 @@ use crate::geometry::kdtree::KdTree2;
 use crate::geometry::{
     select_nodes, Pair, PixelMap, ThinPlateSpline, TPS_MAX_NODES, TPS_MIN_NODES,
 };
+use crate::stacking::groups::median_f64;
 use crate::stacking::integrate::{LnAperture, LnFluxEstimator, LnStarSelection};
 use crate::stacking::psf_signal::{
     fit_stars, fit_stars_with_beta, FitOutcome, FitParams, PsfModel, Seed, StarFit,
@@ -397,8 +398,8 @@ fn choose_pairing(
 
 /// The flux-ratio sample one pairing produces: `z_k` = the reference's flux
 /// over the target's (math §4.3 step 3; the PSF signals' ratio or the
-/// common-aperture fluxes' ratio, times the growth factor when asked), the REFERENCE fit's
-/// own centroid for each sample (where the local-scale spline is
+/// common-aperture fluxes' ratio, times the growth factor when asked), the
+/// REFERENCE fit's own centroid for each sample (where the local-scale spline is
 /// evaluated) and that fit's index (what the spline dedupes on). All three
 /// are index-aligned and in the pairing's own order, so the sample handed
 /// to RCR is exactly what M2's inline loop built.
@@ -417,9 +418,7 @@ struct RatioSample {
     tgt_fwhm: Vec<f64>,
 }
 
-/// Selection, then the flux ratios of the kept pairs (spec §3, L-11).
-/// `matches` keeps its meaning — valid PSF-signal pairs BEFORE selection
-/// (P-15); the sample is the selected pairs in rank order.
+/// What [`measured_sample`] returns: the sample plus its provenance.
 struct MeasuredSample {
     sample: RatioSample,
     matches: usize,
@@ -429,6 +428,10 @@ struct MeasuredSample {
     growth_factor: Option<f64>,
 }
 
+/// Selection, then the flux ratios of the kept pairs (spec §3, L-11).
+/// `matches` keeps its meaning — valid PSF-signal pairs BEFORE selection
+/// (P-15); the sample is the selected pairs in rank order. The ratios are
+/// the PSF signals' or, under `CommonAperture`, the circle fluxes' (§4.1).
 fn measured_sample(
     ref_fits: &[StarFit],
     tgt_fits: &[StarFit],
@@ -472,12 +475,18 @@ fn measured_sample(
                     .map(|p| fits[pick(p)].fwhm())
                     .filter(|f| f.is_finite() && *f > 0.0)
                     .collect();
-                v.sort_by(f64::total_cmp);
-                v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+                if v.is_empty() {
+                    f64::NAN
+                } else {
+                    median_f64(&mut v)
+                }
             };
             let f = fwhm_of(ref_fits, &|p| p.0).max(fwhm_of(tgt_fits, &|p| p.1));
             if !f.is_finite() {
-                warn!("ln common aperture: no finite fitted FWHM among the ranked pairs");
+                warn!(
+                    ln_matches = matches,
+                    "ln common aperture: no finite fitted FWHM among the ranked pairs"
+                );
                 return Err(LnError::TooFewMatches { matches: 0 });
             }
             let radius = aperture::aperture_multiple(inputs.aperture) * f;
@@ -552,8 +561,7 @@ fn measured_sample(
                     );
                     1.0
                 } else {
-                    cs.sort_by(f64::total_cmp);
-                    cs[cs.len() / 2]
+                    median_f64(&mut cs)
                 };
                 for z in sample.ratios.iter_mut() {
                     *z *= growth;
@@ -1710,9 +1718,8 @@ mod tests {
         h: usize,
         noise: &'a TileNoise,
     ) -> ScaleInputs<'a> {
-        // Test-only: two small all-present masks per call, leaked to borrow
-        // for `'a` (the P-13 inputs are built inline in every pin).
-        let present: &'a FiniteMask = Box::leak(Box::new(FiniteMask::all(w, h)));
+        debug_assert_eq!((w, h), (WIDTH, HEIGHT));
+        let present = all_present();
         ScaleInputs {
             selection: LnStarSelection::OFF,
             estimator: LnFluxEstimator::PsfSignal,
@@ -1732,6 +1739,12 @@ mod tests {
                 noise,
             },
         }
+    }
+
+    /// The all-present mask of the `WIDTH` x `HEIGHT` fixtures.
+    fn all_present() -> &'static FiniteMask {
+        static MASK: std::sync::OnceLock<FiniteMask> = std::sync::OnceLock::new();
+        MASK.get_or_init(|| FiniteMask::all(WIDTH, HEIGHT))
     }
 
     fn no_noise() -> &'static TileNoise {
@@ -3202,7 +3215,7 @@ mod tests {
         tgt_noise: &'a TileNoise,
         selection: LnStarSelection,
     ) -> ScaleInputs<'a> {
-        let present: &'a FiniteMask = Box::leak(Box::new(FiniteMask::all(WIDTH, HEIGHT)));
+        let present = all_present();
         ScaleInputs {
             selection,
             estimator: LnFluxEstimator::PsfSignal,
@@ -3364,6 +3377,11 @@ mod tests {
             psf.scale
         );
         let f = r.common_fwhm_px.expect("the common aperture reports F");
+        // F is the larger of the two median FWHMs: the target's (fixture
+        // 4.5 px), not the reference's (3.0). The fitted FWHM of the
+        // Gaussian fixture under the Moffat fit sits within 0.4 px of it.
+        println!("common FWHM {f}");
+        assert!((f - 4.5).abs() < 0.4, "F {f}");
         assert_eq!(r.aperture_px, Some(3.0 * f));
         assert_eq!(r.growth_factor, None);
         assert_eq!(psf.aperture_px, None);

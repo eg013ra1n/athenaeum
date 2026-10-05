@@ -2383,6 +2383,29 @@ mod tests {
         mode: LnOverlap,
         seeds: bool,
     ) -> (LnFrameOutcome, LnFrameGrids) {
+        masked_probe_with(
+            interpolation,
+            ref_cover,
+            from,
+            mode,
+            seeds,
+            crate::stacking::integrate::LnFluxEstimator::PsfSignal,
+            crate::stacking::integrate::LnAperture::Fwhm3,
+            0.0,
+        )
+    }
+
+    /// [`masked_probe`] with the flux estimator and aperture chosen.
+    fn masked_probe_with(
+        interpolation: crate::resample::Interpolation,
+        ref_cover: usize,
+        from: usize,
+        mode: LnOverlap,
+        seeds: bool,
+        estimator: crate::stacking::integrate::LnFluxEstimator,
+        aperture: crate::stacking::integrate::LnAperture,
+        ramp: f32,
+    ) -> (LnFrameOutcome, LnFrameGrids) {
         use crate::fits_writer::write_fits_f32;
         use crate::geometry::{Linear, PixelMap};
         use crate::stacking::measure::FrameMeasurement;
@@ -2399,7 +2422,13 @@ mod tests {
                 stars.push((x, y, 0.10 + ((row * 10 + col) % 9) as f64 * 0.02));
             }
         }
-        let field = synthetic_star_field(W, H, &stars, 4.2, 0.002, 11);
+        let mut field = synthetic_star_field(W, H, &stars, 4.2, 0.002, 11);
+        // A sky ramp along x (0.0 = none): the same on both frames, so the
+        // truth R = 1.25 T + 0.03 holds, but a fill value taken from the
+        // plane's global median no longer matches the local sky.
+        for (k, v) in field.iter_mut().enumerate() {
+            *v += ramp * (k % W) as f32 / W as f32;
+        }
         let reference_plane: Vec<f32> = field
             .iter()
             .enumerate()
@@ -2428,6 +2457,8 @@ mod tests {
             scale: 256,
             // P-13: the probe pins coverage handling; its synthetic stars include no saturated one.
             star_selection: crate::stacking::integrate::LnStarSelection::OFF,
+            flux_estimator: estimator,
+            aperture,
             ..LocalNormalizationConfig::default()
         };
         let measure = crate::stacking::measure::MeasureOptions {
@@ -2563,5 +2594,42 @@ mod tests {
             }
         }
         assert!(checked >= 40, "{checked} nodes");
+    }
+
+    /// F1 through `normalize_frame` (P-8): the masked member (reference
+    /// covers x < 420, member x >= 100) and the Legacy full-coverage member
+    /// both recover 1.25 under the common aperture within the bar of the
+    /// PSF-signal measured-seeds sibling. The third case adds a sky ramp so
+    /// the Legacy median fill differs from the local sky at the strip.
+    #[test]
+    fn the_common_aperture_recovers_the_scale_through_normalize_frame() {
+        use crate::resample::Interpolation;
+        use crate::stacking::integrate::{LnAperture, LnFluxEstimator};
+        // (coverage, member start, mode, sky ramp). The ramp case: Legacy
+        // fills the member's NaN strip with the plane's global median, which
+        // is not the local sky there, so the circles and annuli that reach
+        // the strip must be refused through the presence mask.
+        for (cover, from, mode, ramp) in [
+            (420usize, 100usize, LnOverlap::Masked, 0.0f32),
+            (512, 0, LnOverlap::Legacy, 0.0),
+            (512, 108, LnOverlap::Legacy, 0.03),
+        ] {
+            let (outcome, _) = masked_probe_with(
+                Interpolation::Bilinear,
+                cover,
+                from,
+                mode,
+                true,
+                LnFluxEstimator::CommonAperture,
+                LnAperture::Fwhm3,
+                ramp,
+            );
+            println!("F1 {mode:?} {from} ramp {ramp} scale {}", outcome.scale);
+            assert!(
+                (outcome.scale - 1.25).abs() < 0.0125,
+                "{mode:?} ramp {ramp}: scale {}",
+                outcome.scale
+            );
+        }
     }
 }

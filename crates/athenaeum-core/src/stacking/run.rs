@@ -18408,6 +18408,11 @@ mod tests {
             .find(|g| g.key == group_key)
             .expect("group summary pushed");
         assert_eq!(group_summary.ln_scale_px, Some(expected_scale));
+        assert_eq!(
+            group_summary.ln_flux_estimator,
+            Some(crate::stacking::integrate::LnFluxEstimator::PsfSignal)
+        );
+        assert_eq!(group_summary.ln_aperture, None);
         let ref_rows = crate::db::stacking::list_artifacts(
             &fixture.conn,
             &StackSubject::FrameSet(fixture.set_id),
