@@ -4,6 +4,7 @@
 // no side effects — so the board and (later) the inspector headers never
 // disagree (plan Ruling 8).
 
+import { effectiveScaleMode } from './panels/lnScale';
 import type {
   Combination,
   DistortionChoice,
@@ -301,7 +302,8 @@ export function stageSummary(
         // M4c (ruling R-M4c-8): the local SCALE spline is an option on top
         // of local BACKGROUND normalization, so it only shows once LN is on.
         const localScale = local.localScale ? ' · local scale' : '';
-        return `Local · scale ${local.scale} · ref ${local.referenceFrames} frames${localScale}`;
+        const scale = effectiveScaleMode(local) === 'auto' ? `scale auto (÷${local.gridSize})` : `scale ${local.scale}`;
+        return `Local · ${scale} · ref ${local.referenceFrames}${localScale}`;
       }
       return `Global · ${outputNormLabel(config.normalization.output)} · ${config.normalization.scaleEstimator.toUpperCase()}`;
     }

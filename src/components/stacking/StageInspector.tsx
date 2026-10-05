@@ -93,7 +93,7 @@ export function StageInspector({
         <RegisterPanel config={config} onChange={onChange} disabled={disabled} defaults={presetDefault} />
       )}
       {stage === 'normalize' && (
-        <NormalizePanel config={config} onChange={onChange} disabled={disabled} defaults={presetDefault} />
+        <NormalizePanel config={config} onChange={onChange} plan={plan} disabled={disabled} defaults={presetDefault} />
       )}
       {stage === 'integrate' && (
         <IntegratePanel config={config} onChange={onChange} disabled={disabled} defaults={presetDefault} />

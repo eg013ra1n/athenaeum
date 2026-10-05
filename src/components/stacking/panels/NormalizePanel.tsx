@@ -10,10 +10,11 @@
 // nothing.
 
 import { useEffect, useRef, useState } from 'react';
-import { ParamPair } from '../ParamPair';
+import { NumericField } from '../NumericField';
+import { LN_SCALES, effectiveScaleMode, resolvedScaleLines } from './lnScale';
 import { Checkbox } from '../../settings/Checkbox';
 import { outputNormLabel, psfModelLabel, rejectionNormLabel } from '../stageSummary';
-import type { OutputNormalization, PsfModel, RejectionNormalization, ScaleEstimator, StackingConfig } from '../../../types/stacking';
+import type { OutputNormalization, PsfModel, RejectionNormalization, ScaleEstimator, StackingConfig, StackingPlan } from '../../../types/stacking';
 
 const OUTPUT_NORMS: OutputNormalization[] = [
   'none',
@@ -36,10 +37,12 @@ export interface NormalizePanelProps {
   onChange: (next: StackingConfig) => void;
   disabled?: boolean;
   defaults: StackingConfig;
+  plan?: StackingPlan | null;
 }
 
-export function NormalizePanel({ config, onChange, disabled, defaults }: NormalizePanelProps) {
+export function NormalizePanel({ config, onChange, disabled, defaults, plan }: NormalizePanelProps) {
   const n = config.normalization;
+  const scaleMode = effectiveScaleMode(n.local);
 
   const [resetNotice, setResetNotice] = useState(false);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -146,21 +149,60 @@ export function NormalizePanel({ config, onChange, disabled, defaults }: Normali
 
         {n.local.enabled && (
           <div className="space-y-3 pt-1">
-            <ParamPair
-              leftLabel="Scale (px)"
-              leftValue={n.local.scale}
-              onLeftCommit={(v) => patchLocal({ scale: Math.round(v) })}
-              leftMin={256}
-              leftMax={4096}
-              leftStep={256}
-              rightLabel="Reference frames"
-              rightValue={n.local.referenceFrames}
-              onRightCommit={(v) => patchLocal({ referenceFrames: Math.round(v) })}
-              rightMin={3}
-              rightMax={50}
-              rightStep={1}
+            <div>
+              <label className="block text-xs text-content-secondary mb-1">Scale</label>
+              <select
+                value={scaleMode === 'auto' ? 'auto' : String(n.local.scale)}
+                disabled={disabled}
+                onChange={(e) => {
+                  if (e.target.value === 'auto') patchLocal({ scaleMode: 'auto' });
+                  else patchLocal({ scaleMode: 'fixed', scale: Number(e.target.value) });
+                }}
+                className="w-full px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent disabled:opacity-50"
+              >
+                <option value="auto">Auto</option>
+                {LN_SCALES.map((v) => (
+                  <option key={v} value={String(v)}>{v} px</option>
+                ))}
+                {scaleMode === 'fixed' && !(LN_SCALES as readonly number[]).includes(n.local.scale) && (
+                  <option value={String(n.local.scale)}>{n.local.scale} px</option>
+                )}
+              </select>
+              <p className="mt-1 text-[11px] text-content-muted">
+                The background model follows structures larger than this and treats smaller ones as signal.
+              </p>
+            </div>
+
+            {scaleMode === 'auto' && (
+              <>
+                <NumericField
+                  label="Grid size"
+                  value={n.local.gridSize}
+                  onCommit={(v) => patchLocal({ gridSize: Math.round(v) })}
+                  min={2}
+                  max={8}
+                  step={1}
+                  disabled={disabled}
+                  help={`Auto scale is the frames' short side divided by this, snapped to a supported size. default ${defaults.normalization.local.gridSize}`}
+                />
+                <div>
+                  <label className="block text-xs text-content-secondary mb-1">Resolved scale</label>
+                  {resolvedScaleLines(plan).map((line) => (
+                    <p key={line} className="text-xs text-content-muted">{line}</p>
+                  ))}
+                </div>
+              </>
+            )}
+
+            <NumericField
+              label="Reference frames"
+              value={n.local.referenceFrames}
+              onCommit={(v) => patchLocal({ referenceFrames: Math.round(v) })}
+              min={3}
+              max={50}
+              step={1}
               disabled={disabled}
-              help={`defaults ${defaults.normalization.local.scale} / ${defaults.normalization.local.referenceFrames}`}
+              help={`default ${defaults.normalization.local.referenceFrames}`}
             />
 
             <div>
