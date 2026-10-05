@@ -757,7 +757,7 @@ mastersUnrebuildable: Array<[number, string]>,
  * R3 (wave 6 §13): the set is attested "calibrated by an external
  * tool" — the calibrated-lights mode copies its lights as they are.
  */
-attested: boolean, };
+attested: boolean, calibrationWarnings: Array<string>, };
 
 export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
 

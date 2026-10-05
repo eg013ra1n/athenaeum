@@ -2634,6 +2634,30 @@ pub fn build_plan(
 
     warnings.extend(arm_warnings);
 
+    // Spec 2026-10-04 §5.2 (P-11): one advisory sentence per group whose
+    // included lights carry a flat but no dark or bias. Frame sets only; an
+    // attested set's lights are already calibrated. Not logged here — the
+    // plan is rebuilt on every debounced edit.
+    if project.is_none() && !readiness.attested {
+        for g in &groups {
+            let ids: Vec<i64> = g
+                .frames
+                .iter()
+                .map(|f| f.frame_id)
+                .filter(|id| !excluded_set.contains(id))
+                .collect();
+            let t = crate::api::lights::flat_only_lights(conn, &ids)?;
+            if !t.frame_ids.is_empty() {
+                warnings.push(crate::api::lights::pedestal_plan_sentence(
+                    &g.key,
+                    t.frame_ids.len(),
+                    ids.len(),
+                    &crate::api::lights::offset_gain_text(&t),
+                ));
+            }
+        }
+    }
+
     // Gate 2: reference.
     let reference = resolve_reference(conn, subject, &origins, &cfg, &mut blockers)?;
 
@@ -4014,6 +4038,107 @@ mod tests {
             vec![Stage::Calibrate, Stage::Measure, Stage::Register]
         );
         assert!(plan.estimate_bytes > 0);
+    }
+
+    /// Spec §5.2: one plan warning per affected group, counted over the
+    /// group's included lights; the readiness sentence is not copied in.
+    #[test]
+    fn the_plan_warns_per_group_for_flat_only_lights() {
+        let f = test_fixtures::frame_set("LDN 1272");
+        let mut a_ids = Vec::new();
+        for (i, t) in [
+            "2025-01-01T00:00:00",
+            "2025-01-01T00:05:00",
+            "2025-01-01T00:10:00",
+            "2025-01-01T00:15:00",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (id, _path) = test_fixtures::add_light(&f, &light_spec(&format!("a{i}"), t));
+            a_ids.push(id);
+        }
+        let mut b_ids = Vec::new();
+        for (i, t) in THREE_TIMES.iter().enumerate() {
+            let stem = format!("b{i}");
+            let mut spec = light_spec(&stem, t);
+            spec.filter = Some("Ha");
+            let (id, _path) = test_fixtures::add_light(&f, &spec);
+            b_ids.push(id);
+        }
+        let mut all_ids = a_ids.clone();
+        all_ids.extend(&b_ids);
+        test_fixtures::add_master_dark_and_flat(&f, &all_ids, 64, 48);
+        // Group A: Flat only (its Dark links are removed). Group B keeps both.
+        for &id in &a_ids {
+            f.conn
+                .execute(
+                    "DELETE FROM calibration_set_to_frames
+                     WHERE source_id = ?1 AND calibration_type = 'Dark'",
+                    [id],
+                )
+                .unwrap();
+        }
+
+        let working = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_WORKING_DIR,
+            working.path().to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &f.conn,
+            keys::STACKING_OUTPUT_DIR,
+            output.path().to_str().unwrap(),
+        )
+        .unwrap();
+        // One of A's four lights is manually excluded: m = 3, n = 3.
+        set_set_config(&f.conn, f.set_id, "{}", &[a_ids[3]]).unwrap();
+
+        let settings = SettingsManager::new();
+        let plan = build_plan(
+            &f.conn,
+            &settings,
+            &PathPolicy::AllowAll,
+            &StackSubject::FrameSet(f.set_id),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
+        let key_b = plan
+            .groups
+            .iter()
+            .find(|g| g.key.contains("Ha"))
+            .expect("the Ha group exists")
+            .key
+            .clone();
+        let key_a = plan
+            .groups
+            .iter()
+            .find(|g| g.key != key_b)
+            .expect("the other group exists")
+            .key
+            .clone();
+        let pedestal: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|w| w.contains("have a flat but no dark or bias"))
+            .collect();
+        assert_eq!(pedestal.len(), 1, "{:?}", plan.warnings);
+        assert!(
+            pedestal[0].starts_with(&format!("group {key_a}: 3 of 3 lights have a flat")),
+            "{:?}",
+            pedestal[0]
+        );
+        assert!(!plan.warnings.iter().any(|w| w.contains(&key_b) && w.contains("flat but no")));
+        // The set-level sentence rides on the readiness only.
+        assert_eq!(plan.readiness.calibration_warnings.len(), 1);
+        assert!(!plan
+            .warnings
+            .contains(&plan.readiness.calibration_warnings[0]));
     }
 
     /// M4b (rulings R-M4b-1/7): a group whose pixel scale sits far from the

@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{db, ApiError};
@@ -128,6 +128,150 @@ pub struct ExportReadiness {
     /// tool" — the calibrated-lights mode copies its lights as they are.
     #[serde(default)]
     pub attested: bool,
+    // Advisory calibration sentences (spec §5.2): today only the pedestal
+    // warning. Never a blocker; empty for an attested set.
+    #[serde(default)]
+    pub calibration_warnings: Vec<String>,
+}
+
+// ── Pedestal warning (spec 2026-10-04 §5) ──────────────────────────────────
+
+/// The lights a flat will calibrate with no dark and no bias (spec
+/// 2026-10-04 §5.1, L-17), judged on their calibration links — the same
+/// `get_links_for_frame` stage 1 and the export generator resolve, so it
+/// names exactly the frames that will get `CALSTAT = F`. Dividing `P + V·S`
+/// by a flat `V` gives `P/V + S`: the camera's offset pedestal `P` grows by
+/// `1/V` where the optics vignette. Advisory only: it never blocks, never
+/// writes, never changes a link (§5.4).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FlatOnlyTally {
+    pub frame_ids: Vec<i64>,
+    pub offsets: Vec<Option<f64>>,
+    pub gains: Vec<Option<f64>>,
+    pub flat_set_ids: Vec<i64>,
+}
+
+pub fn flat_only_lights(conn: &Connection, light_ids: &[i64]) -> Result<FlatOnlyTally, ApiError> {
+    let mut tally = FlatOnlyTally::default();
+    let mut flats = std::collections::BTreeSet::new();
+    for &id in light_ids {
+        let links = get_links_for_frame(conn, id)?;
+        let has = |t: &str| links.iter().any(|l| l.calibration_type == t);
+        if has("Flat") && !has("Dark") && !has("Bias") {
+            tally.frame_ids.push(id);
+            flats.extend(
+                links
+                    .iter()
+                    .filter(|l| l.calibration_type == "Flat")
+                    .map(|l| l.calibration_set_id),
+            );
+        }
+    }
+    let mut stmt = conn.prepare("SELECT offset, gain FROM frames WHERE id = ?1")?;
+    for &id in &tally.frame_ids {
+        let (offset, gain): (Option<f64>, Option<f64>) = stmt
+            .query_row(rusqlite::params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .unwrap_or((None, None));
+        tally.offsets.push(offset);
+        tally.gains.push(gain);
+    }
+    tally.flat_set_ids = flats.into_iter().collect();
+    Ok(tally)
+}
+
+/// `"OFFSET 1, GAIN 100"` (P-12): one value, a range, or not recorded.
+pub fn offset_gain_text(t: &FlatOnlyTally) -> String {
+    format!(
+        "{}, {}",
+        card_text("OFFSET", &t.offsets),
+        card_text("GAIN", &t.gains)
+    )
+}
+
+pub(crate) fn card_text(name: &str, values: &[Option<f64>]) -> String {
+    let mut recorded: Vec<f64> = values
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    recorded.sort_by(f64::total_cmp);
+    recorded.dedup();
+    let partial = if values.iter().any(|v| v.is_none()) {
+        " (not recorded on some)"
+    } else {
+        ""
+    };
+    match recorded.as_slice() {
+        [] => format!("{name} not recorded"),
+        [v] => format!("{name} {}{partial}", card_number(*v)),
+        [lo, .., hi] => format!(
+            "{name} {}\u{2013}{}{partial}",
+            card_number(*lo),
+            card_number(*hi)
+        ),
+    }
+}
+
+fn card_number(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        let s = format!("{v:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// Two significant figures: 2.4, 12, 120.
+fn two_significant(x: f64) -> String {
+    if !(x.is_finite() && x > 0.0) {
+        return format!("{x}");
+    }
+    let d = 1 - x.log10().floor() as i32;
+    let p = 10f64.powi(d);
+    let r = (x * p).round() / p;
+    if d > 0 {
+        format!("{r:.*}", d as usize)
+    } else {
+        format!("{r:.0}")
+    }
+}
+
+const PEDESTAL_WHY: &str =
+    "Dividing by the flat also divides the camera's offset pedestal, which brightens vignetted corners.";
+const PEDESTAL_FIX: &str = "Link a master dark or bias with the same gain and offset.";
+
+pub fn pedestal_readiness_sentence(n: usize, m: usize, offset_gain: &str) -> String {
+    format!(
+        "{n} of {m} lights have a flat but no dark or bias ({offset_gain}). {PEDESTAL_WHY} {PEDESTAL_FIX}"
+    )
+}
+
+pub fn pedestal_plan_sentence(group_key: &str, n: usize, m: usize, offset_gain: &str) -> String {
+    format!(
+        "group {group_key}: {}",
+        pedestal_readiness_sentence(n, m, offset_gain)
+    )
+}
+
+pub fn pedestal_run_sentence(
+    group_key: &str,
+    n: usize,
+    offset_gain: &str,
+    corner_ratio: Option<f64>,
+) -> String {
+    let corner = match corner_ratio {
+        Some(v) if v.is_finite() && v > 0.0 => format!(
+            " The flat's darkest corner reads {} % of its centre, so the offset pedestal is {}\u{d7} larger there.",
+            (100.0 * v).round() as i64,
+            two_significant(1.0 / v)
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "group {group_key}: {n} lights were calibrated with a flat but no dark or bias ({offset_gain}).{corner} {PEDESTAL_FIX}"
+    )
 }
 
 // ── Membership ──────────────────────────────────────────────────────────────
@@ -521,6 +665,20 @@ pub(crate) fn readiness_from_data(
         tracing::warn!(set_id, error = %e, "attestation read failed; treated as not attested");
         false
     });
+    let calibration_warnings = if attested {
+        Vec::new()
+    } else {
+        let t = flat_only_lights(conn, light_frame_ids)?;
+        if t.frame_ids.is_empty() {
+            Vec::new()
+        } else {
+            vec![pedestal_readiness_sentence(
+                t.frame_ids.len(),
+                light_frame_ids.len(),
+                &offset_gain_text(&t),
+            )]
+        }
+    };
     Ok(ExportReadiness {
         total,
         unlinked_lights,
@@ -534,6 +692,7 @@ pub(crate) fn readiness_from_data(
         masters_rebuildable,
         masters_unrebuildable,
         attested,
+        calibration_warnings,
     })
 }
 
@@ -751,7 +910,30 @@ pub fn get_export_readiness(
 ) -> Result<ExportReadiness, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    compute_export_readiness(&conn, set_id)
+    let r = compute_export_readiness(&conn, set_id)?;
+    if !r.calibration_warnings.is_empty() {
+        // P-11: the per-set log line lives here (and in the run), never in
+        // `readiness_from_data`, which also serves the per-light collab gate.
+        let light_ids: Vec<i64> = load_light_members(&conn, set_id)?
+            .into_iter()
+            .map(|(frame_id, _)| frame_id)
+            .collect();
+        let tally = flat_only_lights(&conn, &light_ids)?;
+        tracing::warn!(
+            set_id,
+            count = tally.frame_ids.len(),
+            light_offset = %card_text("OFFSET", &tally.offsets),
+            light_gain = %card_text("GAIN", &tally.gains),
+            flat_set_ids = %tally
+                .flat_set_ids
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            "flat without a dark or bias: the offset pedestal is amplified in vignetted corners"
+        );
+    }
+    Ok(r)
 }
 
 #[cfg(test)]
@@ -853,6 +1035,133 @@ mod tests {
         seed_set(conn, 100, "MasterDark", true);
         seed_set(conn, 101, "MasterFlat", true);
         seed_set(conn, 102, "MasterBias", true);
+    }
+
+    // ── Pedestal warning (spec 2026-10-04 §5) ───────────────────────────────
+
+    fn set_cards(conn: &Connection, frame_id: i64, offset: Option<f64>, gain: Option<f64>) {
+        conn.execute(
+            "UPDATE frames SET offset = ?1, gain = ?2 WHERE id = ?3",
+            params![offset, gain, frame_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn flat_only_lights_counts_exactly_the_lights_without_a_dark_or_bias() {
+        let conn = seed_db();
+        let s = seed_frame_set(&conn, 1);
+        seed_masters(&conn);
+        // 1: F only (warn); 2: F+D; 3: F+B; 4: D; 5: B; 6: none.
+        for id in 1..=6 {
+            seed_light(&conn, id, s);
+        }
+        add_link(&conn, 1, 101, "Flat");
+        add_link(&conn, 2, 101, "Flat");
+        add_link(&conn, 2, 100, "Dark");
+        add_link(&conn, 3, 101, "Flat");
+        add_link(&conn, 3, 102, "Bias");
+        add_link(&conn, 4, 100, "Dark");
+        add_link(&conn, 5, 102, "Bias");
+        set_cards(&conn, 1, Some(1.0), Some(100.0));
+        let t = flat_only_lights(&conn, &[1, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(t.frame_ids, vec![1]);
+        assert_eq!(t.flat_set_ids, vec![101]);
+        assert_eq!(offset_gain_text(&t), "OFFSET 1, GAIN 100");
+        // Excluded lights are not counted: the caller passes the included ones.
+        assert!(flat_only_lights(&conn, &[2, 3])
+            .unwrap()
+            .frame_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn offset_gain_text_covers_one_value_a_range_and_not_recorded() {
+        let t = |offsets: Vec<Option<f64>>, gains: Vec<Option<f64>>| {
+            offset_gain_text(&FlatOnlyTally {
+                frame_ids: vec![0; offsets.len()],
+                offsets,
+                gains,
+                flat_set_ids: vec![],
+            })
+        };
+        assert_eq!(
+            t(vec![Some(1.0), Some(1.0)], vec![Some(100.0), Some(100.0)]),
+            "OFFSET 1, GAIN 100"
+        );
+        assert_eq!(
+            t(vec![Some(1.0), Some(5.0)], vec![Some(100.0), Some(100.0)]),
+            "OFFSET 1\u{2013}5, GAIN 100"
+        );
+        assert_eq!(
+            t(vec![None, None], vec![None, None]),
+            "OFFSET not recorded, GAIN not recorded"
+        );
+        assert_eq!(
+            t(vec![Some(1.0), None], vec![Some(0.5), Some(0.5)]),
+            "OFFSET 1 (not recorded on some), GAIN 0.5"
+        );
+        assert_eq!(
+            t(vec![Some(12.25)], vec![Some(139.0)]),
+            "OFFSET 12.25, GAIN 139"
+        );
+    }
+
+    #[test]
+    fn the_run_sentence_states_the_corner_ratio_or_leaves_it_out() {
+        assert_eq!(
+            pedestal_run_sentence("mono__G", 28, "OFFSET 1, GAIN 100", Some(0.41)),
+            "group mono__G: 28 lights were calibrated with a flat but no dark or bias (OFFSET 1, GAIN 100). \
+             The flat's darkest corner reads 41 % of its centre, so the offset pedestal is 2.4\u{d7} larger there. \
+             Link a master dark or bias with the same gain and offset."
+        );
+        assert_eq!(
+            pedestal_run_sentence("mono__G", 28, "OFFSET 1, GAIN 100", None),
+            "group mono__G: 28 lights were calibrated with a flat but no dark or bias (OFFSET 1, GAIN 100). \
+             Link a master dark or bias with the same gain and offset."
+        );
+        assert!(pedestal_run_sentence("g", 1, "x", Some(0.083))
+            .contains("8 % of its centre, so the offset pedestal is 12\u{d7} larger"));
+    }
+
+    #[test]
+    fn readiness_lists_the_pedestal_warning_and_never_blocks() {
+        let conn = seed_db();
+        let s = seed_frame_set(&conn, 1);
+        seed_masters(&conn);
+        seed_light(&conn, 1, s);
+        add_link(&conn, 1, 101, "Flat");
+        let r = compute_export_readiness(&conn, 1).unwrap();
+        assert_eq!(
+            r.calibration_warnings,
+            vec!["1 of 1 lights have a flat but no dark or bias (OFFSET not recorded, GAIN not recorded). \
+                  Dividing by the flat also divides the camera's offset pedestal, which brightens vignetted \
+                  corners. Link a master dark or bias with the same gain and offset."
+                .to_string()]
+        );
+        // The warning is advisory: the gate's verdict is what it was without it.
+        let without = ExportReadiness {
+            calibration_warnings: Vec::new(),
+            ..r.clone()
+        };
+        assert_eq!(
+            check_mode_ready(&r, ExportMode::CalibratedLights),
+            check_mode_ready(&without, ExportMode::CalibratedLights)
+        );
+    }
+
+    #[test]
+    fn an_attested_set_has_no_pedestal_warning() {
+        let conn = seed_db();
+        let s = seed_frame_set(&conn, 1);
+        seed_masters(&conn);
+        seed_light(&conn, 1, s);
+        add_link(&conn, 1, 101, "Flat");
+        crate::db::collab::set_frames_set_attestation(&conn, 1, true).unwrap();
+        assert!(compute_export_readiness(&conn, 1)
+            .unwrap()
+            .calibration_warnings
+            .is_empty());
     }
 
     // ── Bayer copy-through: catalog-column fallback ─────────────────────────
@@ -1103,6 +1412,7 @@ mod tests {
             masters_rebuildable: vec![],
             masters_unrebuildable: vec![],
             attested: false,
+            calibration_warnings: Vec::new(),
         };
         for mode in [
             ExportMode::LightsOnly,

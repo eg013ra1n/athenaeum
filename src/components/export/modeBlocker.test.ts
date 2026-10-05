@@ -15,6 +15,7 @@ const ready: ExportReadiness = {
   mastersRebuildable: [],
   mastersUnrebuildable: [],
   attested: false,
+  calibrationWarnings: [],
 };
 
 describe('modeBlocker', () => {
