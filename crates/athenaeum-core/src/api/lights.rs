@@ -228,13 +228,17 @@ fn two_significant(x: f64) -> String {
     if !(x.is_finite() && x > 0.0) {
         return format!("{x}");
     }
-    let d = 1 - x.log10().floor() as i32;
+    let digits = |v: f64| 1 - v.log10().floor() as i32;
+    let d = digits(x);
     let p = 10f64.powi(d);
     let r = (x * p).round() / p;
+    // Rounding can carry into the next decade (9.96 -> 10): count again.
+    let d = digits(r);
     if d > 0 {
         format!("{r:.*}", d as usize)
     } else {
-        format!("{r:.0}")
+        let p = 10f64.powi(d);
+        format!("{:.0}", (r * p).round() / p)
     }
 }
 
@@ -1105,6 +1109,21 @@ mod tests {
             t(vec![Some(12.25)], vec![Some(139.0)]),
             "OFFSET 12.25, GAIN 139"
         );
+    }
+
+    #[test]
+    fn two_significant_keeps_two_figures_across_a_decade_carry() {
+        for (x, want) in [
+            (9.96, "10"),
+            (2.44, "2.4"),
+            (0.996, "1.0"),
+            (123.0, "120"),
+            (12.05, "12"),
+            (1.0 / 0.41, "2.4"),
+            (1.0 / 0.083, "12"),
+        ] {
+            assert_eq!(two_significant(x), want, "{x}");
+        }
     }
 
     #[test]

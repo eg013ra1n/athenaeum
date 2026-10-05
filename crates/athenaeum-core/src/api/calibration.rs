@@ -1758,118 +1758,132 @@ mod tests {
         );
     }
 
-    /// Spec 2026-10-04 §5.4: the pedestal warning path writes nothing and
-    /// never changes an auto-link pick. A frame set whose lights have a
-    /// matching master dark in the catalog and a flat-only link: auto-link
-    /// runs, the readiness and the flat-only tally are computed, and the
-    /// link table is what auto-link left (and a second run leaves it so).
-    #[test]
-    fn the_warning_never_changes_an_auto_link_pick() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
-        let snapshot = |conn: &Connection| -> Vec<String> {
-            conn.prepare(
+    /// Seed one frame set of three identical lights, each with a manual flat
+    /// link and no dark link, beside a matching master dark. Returns
+    /// `(frame_set_id, light_ids)`.
+    fn seed_flat_only_catalog(conn: &Connection) -> (i64, Vec<i64>) {
+        let _master_dark = seed_master_set(conn);
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'fs_1')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (1, '2026-06-05T20:00:00Z', '2026-06-05T23:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let night = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'TestCam')",
+            [night],
+        )
+        .unwrap();
+        let session = conn.last_insert_rowid();
+        let mut light_ids = Vec::new();
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 100, '2026-06-05', 'FITS')",
+                rusqlite::params![format!("/l/light{i}.fits"), format!("light{i}.fits")],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, instrume, exptime, gain, offset, binning, xbinning, ybinning, ccd_temp, date_obs)
+                 VALUES (?1, 'Light', 'TestCam', 300.0, 100.0, 50.0, '1x1', 1, 1, -10.0, ?2)",
+                rusqlite::params![file_id, format!("2026-06-05T21:0{i}:00Z")],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![session, frame_id],
+            )
+            .unwrap();
+            light_ids.push(frame_id);
+        }
+        conn.execute(
+            "INSERT INTO calibration_set
+             (imagetyp, exptime, ccd_temp, gain, offset, binning, instrume, date,
+              date_start, date_end, temp_min, temp_max, frame_count, is_master_library)
+             VALUES ('MasterFlat', 1.0, -10.0, 100.0, 50.0, '1x1', 'TestCam', '2026-06-05',
+              '2026-06-05T00:00:00Z', '2026-06-05T00:00:00Z', -10.0, -10.0, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let flat_set = conn.last_insert_rowid();
+        for &id in &light_ids {
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames
+                 (source_id, source_type, calibration_set_id, calibration_type, match_score, is_manual_override)
+                 VALUES (?1, 'frame', ?2, 'Flat', 0.9, 1)",
+                rusqlite::params![id, flat_set],
+            )
+            .unwrap();
+        }
+        (1, light_ids)
+    }
+
+    /// Link rows by content (never by autoincrement id).
+    fn link_snapshot(conn: &Connection) -> Vec<String> {
+        let mut rows: Vec<String> = conn
+            .prepare(
                 "SELECT source_id || '|' || source_type || '|' || calibration_set_id || '|' ||
-                        calibration_type || '|' || COALESCE(match_score, '') || '|' ||
-                        is_manual_override
-                 FROM calibration_set_to_frames ORDER BY id",
+                        calibration_type || '|' || is_manual_override || '|' ||
+                        date_warning || '|' || temp_warning
+                 FROM calibration_set_to_frames",
             )
             .unwrap()
             .query_map([], |r| r.get::<_, String>(0))
             .unwrap()
             .map(|r| r.unwrap())
-            .collect()
-        };
-        let (set_id, light_ids, flat_set) = {
-            let conn = db(&ctx).unwrap().conn();
-            let _master_dark = seed_master_set(&conn);
-            conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'fs_1')", [])
-                .unwrap();
-            conn.execute(
-                "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
-                 VALUES (1, '2026-06-05T20:00:00Z', '2026-06-05T23:00:00Z')",
-                [],
-            )
-            .unwrap();
-            let night = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'TestCam')",
-                [night],
-            )
-            .unwrap();
-            let session = conn.last_insert_rowid();
-            let mut light_ids = Vec::new();
-            for i in 0..3 {
-                conn.execute(
-                    "INSERT INTO files (path, filename, size, modified_at, format)
-                     VALUES (?1, ?2, 100, '2026-06-05', 'FITS')",
-                    rusqlite::params![format!("/l/light{i}.fits"), format!("light{i}.fits")],
-                )
-                .unwrap();
-                let file_id = conn.last_insert_rowid();
-                conn.execute(
-                    "INSERT INTO frames (file_id, imagetyp, instrume, exptime, gain, offset, binning, xbinning, ybinning, ccd_temp, date_obs)
-                     VALUES (?1, 'Light', 'TestCam', 300.0, 100.0, 50.0, '1x1', 1, 1, -10.0, ?2)",
-                    rusqlite::params![file_id, format!("2026-06-05T21:0{i}:00Z")],
-                )
-                .unwrap();
-                let frame_id = conn.last_insert_rowid();
-                conn.execute(
-                    "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
-                    rusqlite::params![session, frame_id],
-                )
-                .unwrap();
-                light_ids.push(frame_id);
-            }
-            // A flat-only link for every light, written the way a manual link is.
-            conn.execute(
-                "INSERT INTO calibration_set
-                 (imagetyp, exptime, ccd_temp, gain, offset, binning, instrume, date,
-                  date_start, date_end, temp_min, temp_max, frame_count, is_master_library)
-                 VALUES ('MasterFlat', 1.0, -10.0, 100.0, 50.0, '1x1', 'TestCam', '2026-06-05',
-                  '2026-06-05T00:00:00Z', '2026-06-05T00:00:00Z', -10.0, -10.0, 1, 1)",
-                [],
-            )
-            .unwrap();
-            let flat_set = conn.last_insert_rowid();
-            for &id in &light_ids {
-                conn.execute(
-                    "INSERT INTO calibration_set_to_frames
-                     (source_id, source_type, calibration_set_id, calibration_type, match_score, is_manual_override)
-                     VALUES (?1, 'frame', ?2, 'Flat', 0.9, 1)",
-                    rusqlite::params![id, flat_set],
-                )
-                .unwrap();
-            }
-            (1_i64, light_ids, flat_set)
-        };
+            .collect();
+        rows.sort();
+        rows
+    }
 
-        // Auto-link → snapshot A.
-        find_calibration_for_frame_set(&ctx, set_id, None, None, None, None).unwrap();
-        let a = {
-            let conn = db(&ctx).unwrap().conn();
-            snapshot(&conn)
-        };
-        assert!(
-            a.iter().any(|l| l.contains(&format!("|{flat_set}|Flat|"))),
-            "the manual flat link is still there: {a:?}"
-        );
-        assert!(
-            a.iter().any(|l| l.contains("|Dark|")),
-            "auto-link picked the matching master dark: {a:?}"
-        );
-
-        // Readiness and the tally are read-only → snapshot B == A.
+    /// Spec 2026-10-04 §5.4: the pedestal warning path writes nothing and
+    /// never changes an auto-link pick. Two identically seeded catalogs: on
+    /// the first the readiness and the flat-only tally run (and the warning
+    /// fires) BEFORE auto-link; on the second auto-link runs with no warning
+    /// code at all. Their link tables must be equal afterwards.
+    #[test]
+    fn the_warning_never_changes_an_auto_link_pick() {
+        // Catalog 1: warning path first.
+        let tmp1 = tempfile::TempDir::new().unwrap();
+        let ctx1 = ServiceContext::new_for_tests(tmp1.path().join("catalog.db"));
+        let (set1, lights1) = seed_flat_only_catalog(&db(&ctx1).unwrap().conn());
+        let before = link_snapshot(&db(&ctx1).unwrap().conn());
         {
-            let conn = db(&ctx).unwrap().conn();
-            let _ = crate::api::lights::compute_export_readiness(&conn, set_id).unwrap();
-            let _ = crate::api::lights::flat_only_lights(&conn, &light_ids).unwrap();
-            assert_eq!(snapshot(&conn), a);
+            let conn = db(&ctx1).unwrap().conn();
+            let r = crate::api::lights::compute_export_readiness(&conn, set1).unwrap();
+            assert_eq!(
+                r.calibration_warnings.len(),
+                1,
+                "{:?}",
+                r.calibration_warnings
+            );
+            let t = crate::api::lights::flat_only_lights(&conn, &lights1).unwrap();
+            assert_eq!(t.frame_ids, lights1);
+            assert_eq!(
+                link_snapshot(&conn),
+                before,
+                "the warning path wrote a link"
+            );
         }
+        find_calibration_for_frame_set(&ctx1, set1, None, None, None, None).unwrap();
+        let with_warning = link_snapshot(&db(&ctx1).unwrap().conn());
 
-        // Auto-link again → snapshot C == A.
-        find_calibration_for_frame_set(&ctx, set_id, None, None, None, None).unwrap();
-        let conn = db(&ctx).unwrap().conn();
-        assert_eq!(snapshot(&conn), a);
+        // Catalog 2: identical seed, no warning code path.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let ctx2 = ServiceContext::new_for_tests(tmp2.path().join("catalog.db"));
+        let (set2, _) = seed_flat_only_catalog(&db(&ctx2).unwrap().conn());
+        find_calibration_for_frame_set(&ctx2, set2, None, None, None, None).unwrap();
+        let without_warning = link_snapshot(&db(&ctx2).unwrap().conn());
+
+        assert_eq!(with_warning, without_warning);
+        assert!(
+            with_warning.iter().any(|l| l.contains("|Dark|")),
+            "auto-link picked the matching master dark: {with_warning:?}"
+        );
     }
 }
